@@ -5,7 +5,7 @@ Project context for Claude Code.
 ## Project Purpose
 
 **vmlab** is a VM lab management tool written in Rust. This is a fresh
-rewrite; the product requirements live in `docs/PRD.md` — read that first;
+rewrite; the product requirements live in `docs/vmlab-prd.md` — read that first;
 it is the source of truth for design and scope.
 
 Many earlier attempts are archived under
