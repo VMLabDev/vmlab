@@ -2121,6 +2121,7 @@ dependencies = [
  "glob",
  "hex",
  "image",
+ "ipnet",
  "miette",
  "nix",
  "predicates",

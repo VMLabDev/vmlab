@@ -1,6 +1,8 @@
 //! CLI surface (PRD §12). The same binary also hosts the supervisor and lab
 //! daemons via hidden subcommands, re-exec'd from the CLI as needed.
 
+mod validate;
+
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
@@ -33,24 +35,19 @@ pub enum Command {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Validate => cmd_validate(),
+        Command::Validate => validate::cmd_validate(),
         Command::Supervisord => todo_daemon("supervisor"),
         Command::Labd { .. } => todo_daemon("lab daemon"),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: {err:?}");
+            // ConfigErrors render as rich miette reports; everything else as
+            // a plain error chain.
+            eprintln!("{err:?}");
             ExitCode::FAILURE
         }
     }
-}
-
-fn cmd_validate() -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = crate::paths::find_lab_root(&cwd)?;
-    println!("lab root: {}", root.display());
-    Ok(())
 }
 
 fn todo_daemon(which: &str) -> anyhow::Result<()> {

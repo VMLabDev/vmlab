@@ -1,0 +1,216 @@
+// vmlab.wcl schema — the lab definition surface (PRD §5).
+//
+// Users opt in with `import <vmlab.wcl>` at the top of their lab file.
+// Semantics beyond structure (template existence, subnet membership,
+// dependency cycles, …) are enforced by `vmlab validate` in Rust.
+
+@document
+type VmlabDoc {
+  @children("lab")      labs: list<Lab>
+  @children("template") templates: list<TemplateDef>
+}
+
+@block("lab")
+type Lab {
+  @inline(0) name: utf8
+  @children("segment")   segments: list<Segment>
+  @children("vm")        vms: list<Vm>
+  @children("provision") provisions: list<Provision>
+  @children("on")        handlers: list<Handler>
+  // Lab-wide static DNS entries and sinkholes (PRD §9.5, §9.9).
+  @children("record")   records: list<DnsRecord>
+  @children("sinkhole") sinkholes: list<SinkholeRule>
+}
+
+@block("segment")
+type Segment {
+  @inline(0) name: utf8
+  subnet: utf8?            // CIDR; auto-allocated from the host pool if omitted
+  global: bool?            // owned by the supervisor, shared across labs (§9.2)
+  dhcp: bool?              // default true (§9.4)
+  nat: bool?               // internet egress for this segment (§9.7)
+  routes_to: list<utf8>?   // daemon inter-segment routing opt-in (§9.6)
+  @child("dns")         dns: SegmentDns?
+  @child("connect")     connect: Connect?
+  @children("route")    routes: list<Route>
+  @children("record")   records: list<DnsRecord>
+  @children("forward")  forwards: list<Forward>
+  @children("block")    block_rules: list<BlockRule>
+  @children("redirect") redirect_rules: list<RedirectRule>
+  @children("sinkhole") sinkholes: list<SinkholeRule>
+}
+
+// DNS service override for a segment (§9.5): hand out another server via
+// DHCP (e.g. a DC), or opt out entirely.
+@block("dns")
+type SegmentDns {
+  server: utf8?
+  enabled: bool?
+}
+
+// Cross-host segment peer (§9.2): the two supervisors bridge this segment
+// over TCP, authenticated by the pre-shared key from host config.
+@block("connect")
+type Connect {
+  host: utf8
+}
+
+// Guest route pushed via DHCP option 121 (§9.6).
+@block("route")
+type Route {
+  dest: utf8
+  via: utf8
+}
+
+// Static DNS entry (wildcards allowed in name) (§9.5).
+@block("record")
+type DnsRecord {
+  name: utf8
+  ip: utf8
+}
+
+// Host→guest port forward (§9.8).
+@block("forward")
+type Forward {
+  host_port: i64
+  to: utf8          // "vm:port"
+  proto: utf8?      // "tcp" (default) | "udp" | "both"
+}
+
+// L3 block rule at the switch (§9.9).
+@block("block")
+type BlockRule {
+  cidr: utf8
+  proto: utf8?      // "tcp" | "udp" | "icmp"
+  port: i64?
+}
+
+// L3 DNAT redirect rule (§9.9).
+@block("redirect")
+type RedirectRule {
+  from: utf8        // "ip[:port]"
+  to: utf8          // "ip[:port]"
+  proto: utf8?
+}
+
+// DNS sinkhole (§9.9): NXDOMAIN by default, or 0.0.0.0 with mode = "zero".
+@block("sinkhole")
+type SinkholeRule {
+  pattern: utf8
+  mode: utf8?       // "nxdomain" (default) | "zero"
+}
+
+@block("vm")
+type Vm {
+  @inline(0) name: utf8
+  template: utf8           // "<arch>/<name>[@<version>]", "scratch", or registry ref
+  arch: utf8?              // required for scratch and registry references
+  profile: utf8?
+  cpus: i64?
+  memory: utf8?            // "8G"
+  disk: utf8?              // primary disk size — scratch VMs only
+  cdrom: utf8?             // path to ISO
+  floppy: utf8?            // path to floppy image
+  depends_on: list<utf8>?
+  nested: bool?
+  display: utf8?
+  firmware: utf8?          // "ovmf" | "seabios"
+  tpm: bool?
+  secure_boot: bool?
+  qemu_args: list<utf8>?   // escape hatch, appended last (§5.2)
+  @child("gpu")     gpu: Gpu?
+  @children("nic")   nics: list<Nic>
+  @children("disk")  extra_disks: list<DiskBlock>
+  @children("share") shares: list<Share>
+  @children("media") media: list<Media>
+}
+
+@block("nic")
+type Nic {
+  segment: utf8?
+  nat: bool?        // shorthand: attach to the per-lab built-in NAT segment
+  ip: utf8?         // static → DHCP reservation
+  mac: utf8?        // fixed MAC; generated and persisted otherwise
+  isolated: bool?   // port isolation (§9.1)
+}
+
+// Additional disk (§5.2): blank by size, or pre-formatted from a folder.
+@block("disk")
+type DiskBlock {
+  @inline(0) name: utf8
+  size: utf8?
+  from: utf8?       // folder copied onto a fresh FAT filesystem
+}
+
+// Host↔guest shared folder over SMB (§7.5).
+@block("share")
+type Share {
+  host: utf8
+  guest: utf8
+  readonly: bool?
+  smb1: bool?       // legacy dialect + auth relaxation for XP/2003-era guests
+  name: utf8?       // share name; derived from guest path if omitted
+}
+
+// ISO/floppy image built from a folder (§6.3).
+@block("media")
+type Media {
+  kind: utf8        // "iso" | "floppy"
+  from: utf8        // source folder
+  label: utf8?
+}
+
+// GPU acceleration (§5.2).
+@block("gpu")
+type Gpu {
+  mode: utf8        // "passthrough" | "virgl" | "vulkan"
+  address: utf8?    // host PCI address — passthrough only
+}
+
+// Provision script run during `vmlab up` (§10.4). Optional vms list scopes
+// the script for depends_on satisfaction (§7.2).
+@block("provision")
+type Provision {
+  @inline(0) script: utf8
+  vms: list<utf8>?
+}
+
+// Event handler binding (§8.2).
+@block("on")
+type Handler {
+  @inline(0) event: utf8
+  run: utf8
+}
+
+// Template definition (§6.1), buildable with `vmlab template build`.
+@block("template")
+type TemplateDef {
+  @inline(0) name: utf8
+  arch: utf8
+  version: utf8
+  profile: utf8?
+  cpus: i64?
+  memory: utf8?
+  disk: utf8?              // working disk size for the build
+  display: utf8?
+  firmware: utf8?
+  tpm: bool?
+  secure_boot: bool?
+  nested: bool?
+  qemu_args: list<utf8>?
+  @child("source")       source: TemplateSource
+  @children("media")     media: list<Media>
+  @children("provision") provisions: list<Provision>
+  @children("nic")       nics: list<Nic>
+  @children("disk")      extra_disks: list<DiskBlock>
+}
+
+// Template build source (§6.1): exactly one of the four forms.
+@block("source")
+type TemplateSource {
+  @inline(0) kind: utf8   // "iso" | "qcow2" | "template" | "scratch"
+  path: utf8?             // local file — iso/qcow2
+  url: utf8?              // remote artefact — iso/qcow2; sha256 required
+  sha256: utf8?
+  from: utf8?             // "<arch>/<name>[@<version>]" — kind "template"
+}

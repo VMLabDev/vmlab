@@ -12,7 +12,9 @@ pub const LAB_FILE: &str = "vmlab.wcl";
 pub const LAB_DIR: &str = ".vmlab";
 
 fn home() -> PathBuf {
-    env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
@@ -125,6 +127,11 @@ mod tests {
         // Pure function check without mutating process env: xdg() reads env,
         // so just sanity-check shape of derived paths.
         assert!(template_store_dir().ends_with("vmlab/templates"));
-        assert!(supervisor_socket().ends_with("vmlab/vmlabd.sock") || supervisor_socket().to_string_lossy().contains("/tmp/vmlab-"));
+        assert!(
+            supervisor_socket().ends_with("vmlab/vmlabd.sock")
+                || supervisor_socket()
+                    .to_string_lossy()
+                    .contains("/tmp/vmlab-")
+        );
     }
 }
