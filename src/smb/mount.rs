@@ -177,6 +177,28 @@ pub fn windows_desktop_script_cmd(
     )
 }
 
+/// Build the command registering a machine-wide logon hook (HKLM Run) that
+/// stores the lab credential in each interactive user's session at logon —
+/// so the globally-visible drive letters authenticate without anyone
+/// running the desktop script. Re-registered on every mount, so a rotated
+/// credential (after `destroy`) heals on the next logon.
+pub fn windows_logon_cred_cmd(gateway: Ipv4Addr, user: &str, pass: &str) -> (String, Vec<String>) {
+    (
+        "reg".to_string(),
+        vec![
+            "add".to_string(),
+            "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run".to_string(),
+            "/v".to_string(),
+            "vmlab-shares".to_string(),
+            "/t".to_string(),
+            "REG_SZ".to_string(),
+            "/d".to_string(),
+            format!("cmdkey /add:{gateway} /user:{user} /pass:{pass}"),
+            "/f".to_string(),
+        ],
+    )
+}
+
 /// XP/2003-era `net use` string for screen-automation driving (PRD §7.5 XP-era
 /// caveat). These guests lack a guest agent, so the provision script types this
 /// at the console via the keystroke surface (§10.3). We always target a drive
@@ -264,6 +286,16 @@ mod tests {
         assert!(script.contains("echo cmdkey /add:10.0.0.1 /user:u /pass:p"));
         assert!(script.contains("X: Y:"));
         assert!(script.ends_with(&format!("> {DESKTOP_SCRIPT}")));
+    }
+
+    #[test]
+    fn windows_logon_hook_registers_cmdkey() {
+        let (prog, args) = windows_logon_cred_cmd(gw(), "u", "p");
+        assert_eq!(prog, "reg");
+        let joined = args.join(" ");
+        assert!(joined.contains("CurrentVersion\\Run /v vmlab-shares"));
+        assert!(joined.contains("cmdkey /add:10.0.0.1 /user:u /pass:p"));
+        assert!(joined.ends_with("/f"));
     }
 
     #[test]

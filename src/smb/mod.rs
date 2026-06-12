@@ -277,6 +277,14 @@ impl LabSmb {
                     command: cmd,
                     args,
                 });
+                // And authenticate future logons automatically.
+                let (cmd, args) =
+                    mount::windows_logon_cred_cmd(gw, &creds.username, &creds.password);
+                steps.push(MountStep {
+                    os_hint,
+                    command: cmd,
+                    args,
+                });
             }
         }
         steps
