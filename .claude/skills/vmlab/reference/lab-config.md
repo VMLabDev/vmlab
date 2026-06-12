@@ -11,6 +11,9 @@ working data (clones, snapshots, built media, screenshots) lives in
 import <vmlab.wcl>
 
 lab "demo" {
+  gui = true                  // optional, lab-wide default: show each guest's
+                              // screen in a QEMU window (VM `gui` overrides;
+                              // silently headless when no display server)
   vm "box" {
     template = "x86_64/linux-modern"
     memory   = "2G"
@@ -18,6 +21,9 @@ lab "demo" {
   }
 }
 ```
+
+Closing a `gui` window kills that VM (QEMU semantics) — it surfaces as
+`vm.crashed`. The VNC socket (`vmlab console`) is available either way.
 
 ## Worked example (examples/ad-lab/vmlab.wcl)
 
@@ -93,6 +99,7 @@ vm "name" {
   template = "x86_64/linux-modern"   // "<arch>/<name>[@<version>]", "scratch", or registry ref
   arch     = "x86_64"                // REQUIRED for scratch and registry references
   profile  = "linux-modern"          // guest OS profile (see host-config.md)
+  gui      = true                    // open QEMU's own display window; headless fallback
   cpus     = 4
   memory   = "8G"
   disk     = "80G"                   // primary disk size — scratch VMs only

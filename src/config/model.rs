@@ -32,6 +32,8 @@ pub struct TemplateFile {
 pub struct Lab {
     pub name: String,
     pub span: Span,
+    /// Default for all VMs: open QEMU's own display window (§11).
+    pub gui: Option<bool>,
     pub segments: Vec<Segment>,
     pub vms: Vec<Vm>,
     pub provisions: Vec<Provision>,
@@ -202,6 +204,8 @@ pub struct Vm {
     pub floppy: Option<PathBuf>,
     pub depends_on: Vec<String>,
     pub nested: bool,
+    /// Open QEMU's own display window (§11); None = inherit the lab default.
+    pub gui: Option<bool>,
     pub display: Option<String>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
@@ -337,6 +341,8 @@ pub struct TemplateDef {
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
     pub nested: bool,
+    /// Watch the build VM in QEMU's own window (§11).
+    pub gui: bool,
     pub qemu_args: Vec<String>,
     pub source: TemplateSource,
     pub media: Vec<Media>,

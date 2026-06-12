@@ -13,6 +13,7 @@ type VmlabDoc {
 @block("lab")
 type Lab {
   @inline(0) name: utf8
+  gui: bool?               // default for all VMs: open QEMU's own display window (§11)
   @children("segment")   segments: list<Segment>
   @children("vm")        vms: list<Vm>
   @children("provision") provisions: list<Provision>
@@ -113,6 +114,7 @@ type Vm {
   floppy: utf8?            // path to floppy image
   depends_on: list<utf8>?
   nested: bool?
+  gui: bool?               // open QEMU's own display window (§11); headless if no display server
   display: utf8?
   firmware: utf8?          // "ovmf" | "seabios"
   tpm: bool?
@@ -197,6 +199,7 @@ type TemplateDef {
   tpm: bool?
   secure_boot: bool?
   nested: bool?
+  gui: bool?               // watch the build VM in QEMU's own window (§11)
   qemu_args: list<utf8>?
   @child("source")       source: TemplateSource
   @children("media")     media: list<Media>

@@ -28,6 +28,9 @@ pub struct ResolvedVm {
     pub display_device: Option<String>,
     pub agent_channel: bool,
     pub nested: bool,
+    /// Open QEMU's own display window (§11). The cmdline builder falls back
+    /// to headless when the environment has no display server.
+    pub gui: bool,
     pub gpu: Option<Gpu>,
     pub qemu_args: Vec<String>,
 }
@@ -146,6 +149,9 @@ pub fn resolve_vm(
         display_device,
         agent_channel: profile.agent_channel,
         nested: lab_vm.nested,
+        // The lab-level default is applied by the caller (resolve only
+        // sees the vm block).
+        gui: lab_vm.gui.unwrap_or(false),
         gpu: lab_vm.gpu.clone(),
         qemu_args: lab_vm.qemu_args.clone(),
     })

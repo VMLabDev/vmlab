@@ -43,22 +43,17 @@ check: lint fmt-check test
 image tag='vmlab:latest':
 	docker build -t {{tag}} -f Containerfile ..
 
-# Open a viewer for each VM screen of a running lab ($VMLAB_VIEWER, default gvncviewer)
+# Bring a lab up (guest windows open when the lab sets `gui = true`)
 [group('lab')]
-screens-open lab='mixed-lab':
-	uv run python scripts/watch_screens.py --once --lab {{lab}}
+lab-up dir='examples/mixed-lab': release
+	cd {{dir}} && {{justfile_directory()}}/target/release/vmlab up
 
-# Watch for guest screens (labs and template builds) and open viewers as they appear
+# Stop a running lab gracefully (clones retained)
 [group('lab')]
-screens-watch:
-	uv run python scripts/watch_screens.py
+lab-down dir='examples/mixed-lab': release
+	cd {{dir}} && {{justfile_directory()}}/target/release/vmlab down
 
-# Bring a lab up with each guest screen popping into a viewer as it boots
+# Tear a lab down completely: stop + delete clones and lab-local state
 [group('lab')]
-lab-up-watch dir='examples/mixed-lab': release
-	cd {{dir}} && uv run python {{justfile_directory()}}/scripts/watch_screens.py -- {{justfile_directory()}}/target/release/vmlab up
-
-# Run a template build with the build VM's screen visible (watch the installer)
-[group('lab')]
-template-build-watch dir='examples/templates/ubuntu-24.04': release
-	cd {{dir}} && uv run python {{justfile_directory()}}/scripts/watch_screens.py -- {{justfile_directory()}}/target/release/vmlab template build
+lab-destroy dir='examples/mixed-lab': release
+	cd {{dir}} && {{justfile_directory()}}/target/release/vmlab destroy

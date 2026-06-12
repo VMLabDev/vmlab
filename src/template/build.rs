@@ -252,6 +252,9 @@ fn synth_lab(
     if let Some(c) = cdrom {
         writeln!(s, "    cdrom    = \"{}\"", c.display()).unwrap();
     }
+    if def.gui {
+        writeln!(s, "    gui      = true").unwrap();
+    }
     // Template-declared NICs carry over. The synthetic lab declares no
     // segments, so only NAT NICs make sense here — segment references are
     // rewritten to NAT. Builds with no NICs declared get internet egress by

@@ -237,6 +237,7 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
     let mut lab = Lab {
         name,
         span: span_of(b),
+        gui: get_bool(b, "gui", issues),
         segments: Vec::new(),
         vms: Vec::new(),
         provisions: Vec::new(),
@@ -673,6 +674,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         floppy: get_path(b, "floppy", issues),
         depends_on: get_str_list(b, "depends_on", issues),
         nested: get_bool(b, "nested", issues).unwrap_or(false),
+        gui: get_bool(b, "gui", issues),
         display: get_str(b, "display", issues).map(|(s, _)| s),
         firmware: extract_firmware(b, issues),
         tpm: get_bool(b, "tpm", issues),
@@ -781,6 +783,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         tpm: get_bool(b, "tpm", issues),
         secure_boot: get_bool(b, "secure_boot", issues),
         nested: get_bool(b, "nested", issues).unwrap_or(false),
+        gui: get_bool(b, "gui", issues).unwrap_or(false),
         qemu_args: get_str_list(b, "qemu_args", issues),
         source,
         media,

@@ -12,6 +12,8 @@ import <vmlab.wcl>
 
 lab "mixed-lab" {
 
+  gui = true        // open each guest's screen in a QEMU window on `vmlab up`
+
   segment "lan" {
     subnet = "10.70.0.0/24"
     nat    = true                                   // apt needs egress

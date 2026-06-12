@@ -87,8 +87,12 @@ pub fn build_args(
     arg(&mut a, "smp", vm.cpus.to_string());
     arg(&mut a, "m", format!("{}M", vm.memory >> 20));
 
-    // Headless with a VNC display always available (§11).
-    arg(&mut a, "display", "none".into());
+    // Headless by default, with a VNC display always available (§11).
+    // `gui = true` opens QEMU's own GTK window as well — unless the
+    // environment has no display server to put it on. Closing the window
+    // kills the VM (QEMU semantics), surfacing as vm.crashed.
+    let ui = display_backend(vm.gui, host_has_display());
+    arg(&mut a, "display", ui.into());
     arg(&mut a, "vnc", format!("unix:{}", paths.vnc_sock.display()));
 
     arg(
@@ -291,6 +295,24 @@ pub fn build_args(
     Ok(a)
 }
 
+/// Whether this process can put a window on screen.
+fn host_has_display() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// QEMU `-display` backend: GTK only when requested AND there is somewhere
+/// to show it — a `gui = true` lab must still come up on a headless host.
+fn display_backend(gui_requested: bool, has_display: bool) -> &'static str {
+    if gui_requested && has_display {
+        "gtk"
+    } else {
+        if gui_requested {
+            tracing::warn!("gui requested but no display server found — running headless");
+        }
+        "none"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +324,7 @@ mod tests {
         ResolvedVm {
             name: "t".into(),
             profile: Some(profile.into()),
+            gui: false,
             arch: arch.into(),
             cpus: 2,
             memory: 2 << 30,
@@ -421,6 +444,15 @@ mod tests {
         assert!(s.contains("ide-cd,drive=cd0"));
         assert!(s.contains("ide-cd,drive=cd1"));
         assert!(s.contains("if=floppy,format=raw,file=/lab/.vmlab/media/drivers.img"));
+    }
+
+    /// `gui = true` opens GTK only when a display server exists; a
+    /// headless host must still boot the VM (VNC stays available).
+    #[test]
+    fn gui_falls_back_headless_without_display() {
+        assert_eq!(display_backend(true, true), "gtk");
+        assert_eq!(display_backend(true, false), "none");
+        assert_eq!(display_backend(false, true), "none");
     }
 
     /// Two CD-ROMs on q35 must land on distinct AHCI ports (a port holds a
