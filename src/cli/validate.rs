@@ -36,10 +36,9 @@ impl ValidationContext for HostContext {
         self.profiles.exists(name)
     }
 
-    fn check_script(&self, _path: &Path) -> Result<(), String> {
-        // Wired to the wisp compiler once the host module exists (task: wisp
-        // host module); existence is already checked by the validator.
-        Ok(())
+    fn check_script(&self, path: &Path) -> Result<(), String> {
+        let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        crate::scripting::check_script_source(&source)
     }
 }
 

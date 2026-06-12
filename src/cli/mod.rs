@@ -66,6 +66,17 @@ pub enum Command {
     Snapshots { vm: String },
     /// Delete a VM snapshot
     SnapshotDelete { vm: String, name: String },
+    /// Run an ad-hoc wisp script against the current lab
+    Run {
+        /// Script path, relative to the lab root
+        script: String,
+    },
+    /// Write the wisp interface file (LSP support for lab scripts)
+    Wispi {
+        /// Output path
+        #[arg(default_value = "vmlab.wispi")]
+        out: std::path::PathBuf,
+    },
     /// Run a command in the guest via the agent
     Exec {
         vm: String,
@@ -119,6 +130,10 @@ pub fn run() -> ExitCode {
         Command::Restore { name, vm } => lab::cmd_restore(vm, name),
         Command::Snapshots { vm } => lab::cmd_snapshots(&vm),
         Command::SnapshotDelete { vm, name } => lab::cmd_snapshot_delete(&vm, name),
+        Command::Run { script } => lab::cmd_run(&script),
+        Command::Wispi { out } => crate::scripting::write_interface(&out)
+            .map_err(anyhow::Error::from)
+            .map(|()| println!("wrote {}", out.display())),
         Command::Exec { vm, cmd } => lab::cmd_exec(&vm, cmd),
         Command::Logs {
             target,

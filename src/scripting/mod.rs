@@ -1,0 +1,809 @@
+//! The wisp scripting surface (PRD §10): vmlab's host module exposing
+//! lab/VM/segment handles to provision scripts, event handlers, and ad-hoc
+//! runs. Scripts are daemon-unaware; the wisp VM is synchronous, so scripts
+//! execute on blocking threads and host methods bridge into the lab
+//! daemon's tokio runtime via `Handle::block_on`.
+
+pub mod keymap;
+mod runner;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use wisp::{Context, Module, Script};
+
+use crate::labd::lab::LabRuntime;
+use crate::labd::vm::{PowerState, VmInstance};
+use crate::vision;
+
+pub use runner::{OutputSink, run_event_handler, run_script_file};
+
+/// Convention: reference images resolve relative to the lab root, typically
+/// `images/` beside vmlab.wcl (PRD §10.3).
+const SCREENSHOT_DIR: &str = "screenshots";
+
+// ---------------------------------------------------------------------------
+// Script-visible types
+// ---------------------------------------------------------------------------
+
+/// The lab handle every script receives (PRD §10.1).
+#[derive(Script)]
+#[script(name = "Lab")]
+#[script(opaque)]
+pub struct LabHandle {
+    pub(crate) runtime: Arc<LabRuntime>,
+    pub(crate) rt: tokio::runtime::Handle,
+    pub(crate) output: OutputSink,
+}
+
+/// A VM handle (PRD §10.3).
+#[derive(Script)]
+#[script(name = "Vm")]
+#[script(opaque)]
+pub struct VmHandle {
+    pub(crate) vm: Arc<VmInstance>,
+    pub(crate) runtime: Arc<LabRuntime>,
+    pub(crate) rt: tokio::runtime::Handle,
+    pub(crate) output: OutputSink,
+}
+
+/// A segment handle (PRD §10.2).
+#[derive(Script)]
+#[script(name = "Segment")]
+#[script(opaque)]
+pub struct SegmentHandle {
+    pub(crate) segment: String,
+    pub(crate) runtime: Arc<LabRuntime>,
+    pub(crate) rt: tokio::runtime::Handle,
+}
+
+/// Result of `vm.exec` (PRD §10.3).
+#[derive(Script, Clone)]
+pub struct ExecResult {
+    pub exit_code: i64,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// An image/text match: location + score, usable to anchor a relative
+/// mouse click (PRD §10.3).
+#[derive(Script, Clone)]
+#[script(name = "Match")]
+pub struct ScriptMatch {
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
+    pub score: f64,
+    /// Center point, for `vm.mouse_move(m.cx, m.cy)`.
+    pub cx: i64,
+    pub cy: i64,
+    /// For wait_for_text: the matched text.
+    pub text: String,
+}
+
+impl From<vision::Match> for ScriptMatch {
+    fn from(m: vision::Match) -> Self {
+        let (cx, cy) = m.center();
+        ScriptMatch {
+            x: m.x as i64,
+            y: m.y as i64,
+            w: m.w as i64,
+            h: m.h as i64,
+            score: m.score,
+            cx: cx as i64,
+            cy: cy as i64,
+            text: String::new(),
+        }
+    }
+}
+
+/// Event payload for handler scripts (PRD §10.4: handlers receive
+/// `(event, lab)`). `data` is the JSON payload as text.
+#[derive(Script, Clone)]
+#[script(name = "Event")]
+pub struct EventData {
+    pub name: String,
+    pub vm: String,
+    pub data: String,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn estr(e: impl std::fmt::Display) -> String {
+    format!("{e:#}")
+}
+
+impl VmHandle {
+    fn block<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.rt.block_on(fut)
+    }
+
+    fn resolve_ref(&self, path: &str) -> PathBuf {
+        let p = PathBuf::from(path);
+        if p.is_absolute() {
+            p
+        } else {
+            self.runtime.root.join(p)
+        }
+    }
+
+    /// QMP screendump → decoded image.
+    fn grab_screen(&self) -> Result<image::RgbImage, String> {
+        self.block(async {
+            let qmp = self.vm.qmp().await.map_err(estr)?;
+            let dir = self.runtime.lab_local.join(SCREENSHOT_DIR);
+            std::fs::create_dir_all(&dir).map_err(estr)?;
+            let tmp = dir.join(format!(".grab-{}.ppm", self.vm.cfg.name));
+            qmp.screendump(&tmp).await.map_err(estr)?;
+            let img = vision::load_screen(&tmp).map_err(estr)?;
+            let _ = std::fs::remove_file(&tmp);
+            Ok(img)
+        })
+    }
+
+    fn match_opts(threshold: f64, region: Vec<i64>) -> Result<vision::MatchOptions, String> {
+        let region = match region.len() {
+            0 => None,
+            4 => Some((
+                region[0].max(0) as u32,
+                region[1].max(0) as u32,
+                region[2].max(0) as u32,
+                region[3].max(0) as u32,
+            )),
+            n => return Err(format!("region needs [x, y, w, h], got {n} elements")),
+        };
+        Ok(vision::MatchOptions { threshold, region })
+    }
+
+    fn find_once(
+        &self,
+        refs: &[String],
+        opts: &vision::MatchOptions,
+    ) -> Result<Option<ScriptMatch>, String> {
+        let screen = self.grab_screen()?;
+        for r in refs {
+            let path = self.resolve_ref(r);
+            let template = vision::load_screen(&path)
+                .map_err(|e| format!("reference image {}: {e:#}", path.display()))?;
+            if let Some(m) = vision::find_template(&screen, &template, opts) {
+                return Ok(Some(m.into()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn wait_for(
+        &self,
+        refs: &[String],
+        threshold: f64,
+        region: Vec<i64>,
+        timeout_secs: i64,
+        interval_ms: i64,
+    ) -> Result<ScriptMatch, String> {
+        let opts = Self::match_opts(threshold, region)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
+        loop {
+            if let Some(m) = self.find_once(refs, &opts)? {
+                return Ok(m);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout_secs}s waiting for {:?} on {}",
+                    refs, self.vm.cfg.name
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(interval_ms.max(50) as u64));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module registration
+// ---------------------------------------------------------------------------
+
+/// Build the `lab` host module (PRD §10). All state rides inside the opaque
+/// handles, so the same module serves compile-checking and live execution.
+pub fn lab_module() -> Module {
+    let mut m = Module::new("vmlab");
+    m.doc("vmlab lab/VM/segment API (PRD §10)");
+
+    m.fn_("sleep_ms", |ms: i64| {
+        std::thread::sleep(Duration::from_millis(ms.max(0) as u64));
+    });
+
+    // -- Lab (§10.1) ---------------------------------------------------------
+    m.ty::<LabHandle>()
+        .method("name", |l: &LabHandle| l.runtime.name.clone())
+        .method("log", |l: &LabHandle, msg: &str| {
+            (l.output)(format!("{msg}\n"));
+        })
+        .method(
+            "vm",
+            |l: &LabHandle, name: &str| -> Result<VmHandle, String> {
+                let vm = l.runtime.vm(name).map_err(estr)?.clone();
+                Ok(VmHandle {
+                    vm,
+                    runtime: l.runtime.clone(),
+                    rt: l.rt.clone(),
+                    output: l.output.clone(),
+                })
+            },
+        )
+        .method("vms", |l: &LabHandle| -> Vec<VmHandle> {
+            l.runtime
+                .vms
+                .values()
+                .map(|vm| VmHandle {
+                    vm: vm.clone(),
+                    runtime: l.runtime.clone(),
+                    rt: l.rt.clone(),
+                    output: l.output.clone(),
+                })
+                .collect()
+        })
+        .method(
+            "segment",
+            |l: &LabHandle, name: &str| -> Result<SegmentHandle, String> {
+                let exists = l
+                    .rt
+                    .block_on(async { l.runtime.network.lock().await.segments.contains_key(name) });
+                if !exists {
+                    return Err(format!(
+                        "no segment \"{name}\" in lab \"{}\"",
+                        l.runtime.name
+                    ));
+                }
+                Ok(SegmentHandle {
+                    segment: name.to_string(),
+                    runtime: l.runtime.clone(),
+                    rt: l.rt.clone(),
+                })
+            },
+        );
+
+    // -- Segment (§10.2) -----------------------------------------------------
+    m.ty::<SegmentHandle>()
+        .method("name", |s: &SegmentHandle| s.segment.clone())
+        .method(
+            "dns_set",
+            |s: &SegmentHandle, name: String, ip: String| -> Result<i64, String> {
+                let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| format!("bad IP `{ip}`"))?;
+                s.with_zone(|z| z.set_static(&name, ip) as i64)
+            },
+        )
+        .method(
+            "dns_sinkhole",
+            |s: &SegmentHandle, pattern: &str| -> Result<i64, String> {
+                s.with_zone(|z| {
+                    z.add_sinkhole(pattern, crate::config::model::SinkholeMode::Nxdomain) as i64
+                })
+            },
+        )
+        .method(
+            "dns_clear",
+            |s: &SegmentHandle, rule_id: i64| -> Result<bool, String> {
+                s.with_zone(|z| z.remove_rule(rule_id as u64))
+            },
+        )
+        .method(
+            "block",
+            |s: &SegmentHandle, cidr: &str| -> Result<i64, String> {
+                s.rule_block(cidr, None, None)
+            },
+        )
+        .method(
+            "block_port",
+            |s: &SegmentHandle, cidr: String, proto: String, port: i64| -> Result<i64, String> {
+                s.rule_block(&cidr, Some(&proto), Some(port))
+            },
+        )
+        .method(
+            "unblock",
+            |s: &SegmentHandle, rule_id: i64| -> Result<bool, String> { s.rule_remove(rule_id) },
+        )
+        .method(
+            "redirect",
+            |s: &SegmentHandle, from: String, to: String| -> Result<i64, String> {
+                s.rule_redirect(&from, &to)
+            },
+        )
+        .method(
+            "forward",
+            |s: &SegmentHandle,
+             host_port: i64,
+             vm: String,
+             guest_port: i64|
+             -> Result<i64, String> { s.add_forward(host_port, &vm, guest_port) },
+        )
+        .method(
+            "route_to",
+            |s: &SegmentHandle, other: &str| -> Result<(), String> { s.route_to(other, true) },
+        )
+        .method(
+            "unroute_to",
+            |s: &SegmentHandle, other: &str| -> Result<(), String> { s.route_to(other, false) },
+        )
+        .method("rules", |s: &SegmentHandle| -> Result<String, String> {
+            s.rules_json()
+        });
+
+    // -- VM (§10.3) ----------------------------------------------------------
+    m.ty::<VmHandle>()
+        .method("name", |v: &VmHandle| v.vm.cfg.name.clone())
+        // Lifecycle / state
+        .method("start", |v: &VmHandle| -> Result<(), String> {
+            let runtime = v.runtime.clone();
+            let name = v.vm.cfg.name.clone();
+            v.block(async move { runtime.start_vm(&name).await })
+                .map_err(estr)
+        })
+        .method("stop", |v: &VmHandle| -> Result<(), String> {
+            v.block(v.vm.stop(false)).map_err(estr)
+        })
+        .method("stop_force", |v: &VmHandle| -> Result<(), String> {
+            v.block(v.vm.stop(true)).map_err(estr)
+        })
+        .method("restart", |v: &VmHandle| -> Result<(), String> {
+            v.block(async {
+                v.vm.stop(false).await.map_err(estr)?;
+                v.vm.wait_state(PowerState::Stopped, Duration::from_secs(60))
+                    .await
+                    .map_err(estr)?;
+                v.runtime.start_vm(&v.vm.cfg.name).await.map_err(estr)
+            })
+        })
+        .method("state", |v: &VmHandle| -> String {
+            match v.block(v.vm.state()) {
+                PowerState::Stopped => "stopped".into(),
+                PowerState::Starting => "starting".into(),
+                PowerState::Running => "running".into(),
+                PowerState::Stopping => "stopping".into(),
+            }
+        })
+        .method("is_ready", |v: &VmHandle| -> bool {
+            v.block(v.vm.is_ready())
+        })
+        .method(
+            "wait_ready",
+            |v: &VmHandle, timeout_secs: i64| -> Result<(), String> {
+                v.block(v.vm.wait_ready(Duration::from_secs(timeout_secs.max(0) as u64)))
+                    .map_err(estr)
+            },
+        )
+        .method(
+            "wait_shutdown",
+            |v: &VmHandle, timeout_secs: i64| -> Result<(), String> {
+                v.block(v.vm.wait_state(
+                    PowerState::Stopped,
+                    Duration::from_secs(timeout_secs.max(0) as u64),
+                ))
+                .map_err(estr)
+            },
+        )
+        .method("ip", |v: &VmHandle| -> Result<String, String> {
+            v.block(v.vm.guest_ip(None)).map_err(estr)
+        })
+        .method(
+            "ip_nic",
+            |v: &VmHandle, nic: i64| -> Result<String, String> {
+                v.block(v.vm.guest_ip(Some(nic.max(0) as usize)))
+                    .map_err(estr)
+            },
+        )
+        // Snapshots (§10.3)
+        .method(
+            "snapshot",
+            |v: &VmHandle, name: &str| -> Result<(), String> {
+                let runtime = v.runtime.clone();
+                let vm_name = v.vm.cfg.name.clone();
+                let snap = name.to_string();
+                v.block(async move { runtime.snapshot(&vm_name, &snap).await })
+                    .map(|_| ())
+                    .map_err(estr)
+            },
+        )
+        .method(
+            "restore",
+            |v: &VmHandle, name: &str| -> Result<(), String> {
+                let runtime = v.runtime.clone();
+                let vm_name = v.vm.cfg.name.clone();
+                let snap = name.to_string();
+                v.block(async move { runtime.restore(&vm_name, &snap).await })
+                    .map_err(estr)
+            },
+        )
+        .method("snapshots", |v: &VmHandle| -> Result<Vec<String>, String> {
+            let runtime = v.runtime.clone();
+            let vm_name = v.vm.cfg.name.clone();
+            let val = v
+                .block(async move { runtime.snapshots(&vm_name).await })
+                .map_err(estr)?;
+            Ok(val
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default())
+        })
+        .method(
+            "delete_snapshot",
+            |v: &VmHandle, name: &str| -> Result<(), String> {
+                let runtime = v.runtime.clone();
+                let vm_name = v.vm.cfg.name.clone();
+                let snap = name.to_string();
+                v.block(async move { runtime.delete_snapshot(&vm_name, &snap).await })
+                    .map_err(estr)
+            },
+        )
+        // Input (§10.3)
+        .method(
+            "send_keys",
+            |v: &VmHandle, chord: &str| -> Result<(), String> {
+                let keys = keymap::parse_chord(chord)?;
+                let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                v.block(async {
+                    let qmp = v.vm.qmp().await.map_err(estr)?;
+                    qmp.send_key(&refs, None).await.map_err(estr)
+                })
+            },
+        )
+        .method(
+            "type_text",
+            |v: &VmHandle, text: &str| -> Result<(), String> { type_text(v, text, 35) },
+        )
+        .method(
+            "type_text_paced",
+            |v: &VmHandle, text: String, delay_ms: i64| -> Result<(), String> {
+                type_text(v, &text, delay_ms.max(0) as u64)
+            },
+        )
+        .method(
+            "mouse_move",
+            |v: &VmHandle, x: i64, y: i64| -> Result<(), String> {
+                v.block(async {
+                    let qmp = v.vm.qmp().await.map_err(estr)?;
+                    let (w, h) = screen_size(v)?;
+                    qmp.mouse_move_abs(x.max(0) as u32, y.max(0) as u32, w, h)
+                        .await
+                        .map_err(estr)
+                })
+            },
+        )
+        .method(
+            "mouse_click",
+            |v: &VmHandle, button: &str| -> Result<(), String> {
+                v.block(async {
+                    let qmp = v.vm.qmp().await.map_err(estr)?;
+                    qmp.mouse_button(button, true).await.map_err(estr)?;
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    qmp.mouse_button(button, false).await.map_err(estr)
+                })
+            },
+        )
+        .method(
+            "mouse_drag",
+            |v: &VmHandle, x1: i64, y1: i64, x2: i64, y2: i64| -> Result<(), String> {
+                v.block(async {
+                    let qmp = v.vm.qmp().await.map_err(estr)?;
+                    let (w, h) = screen_size(v)?;
+                    qmp.mouse_move_abs(x1.max(0) as u32, y1.max(0) as u32, w, h)
+                        .await
+                        .map_err(estr)?;
+                    qmp.mouse_button("left", true).await.map_err(estr)?;
+                    // Human-ish drag in a few steps.
+                    for step in 1..=8 {
+                        let x = x1 + (x2 - x1) * step / 8;
+                        let y = y1 + (y2 - y1) * step / 8;
+                        qmp.mouse_move_abs(x.max(0) as u32, y.max(0) as u32, w, h)
+                            .await
+                            .map_err(estr)?;
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                    qmp.mouse_button("left", false).await.map_err(estr)
+                })
+            },
+        )
+        // Screen (§10.3)
+        .method(
+            "screenshot",
+            |v: &VmHandle, path: &str| -> Result<String, String> {
+                let img = v.grab_screen()?;
+                let out = if path.is_empty() {
+                    let dir = v.runtime.lab_local.join(SCREENSHOT_DIR);
+                    std::fs::create_dir_all(&dir).map_err(estr)?;
+                    dir.join(format!(
+                        "{}-{}.png",
+                        v.vm.cfg.name,
+                        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f")
+                    ))
+                } else {
+                    v.resolve_ref(path)
+                };
+                vision::save_png(&img, &out).map_err(estr)?;
+                Ok(out.display().to_string())
+            },
+        )
+        .method(
+            "wait_for_image",
+            |v: &VmHandle, image: String, timeout_secs: i64| -> Result<ScriptMatch, String> {
+                v.wait_for(&[image], 0.9, vec![], timeout_secs, 1000)
+            },
+        )
+        .method(
+            "wait_for_image_opts",
+            |v: &VmHandle,
+             image: String,
+             timeout_secs: i64,
+             threshold: f64,
+             region: Vec<i64>|
+             -> Result<ScriptMatch, String> {
+                v.wait_for(&[image], threshold, region, timeout_secs, 1000)
+            },
+        )
+        .method(
+            "wait_for_any",
+            |v: &VmHandle, images: Vec<String>, timeout_secs: i64| -> Result<ScriptMatch, String> {
+                v.wait_for(&images, 0.9, vec![], timeout_secs, 1000)
+            },
+        )
+        .method(
+            "find_image",
+            |v: &VmHandle, image: &str| -> Result<Option<ScriptMatch>, String> {
+                let opts = VmHandle::match_opts(0.9, vec![])?;
+                v.find_once(&[image.to_string()], &opts)
+            },
+        )
+        .method("ocr", |v: &VmHandle| -> Result<String, String> {
+            let img = v.grab_screen()?;
+            v.block(vision::ocr(&img, None)).map_err(estr)
+        })
+        .method(
+            "ocr_region",
+            |v: &VmHandle, region: Vec<i64>| -> Result<String, String> {
+                let img = v.grab_screen()?;
+                let opts = VmHandle::match_opts(0.9, region)?;
+                v.block(vision::ocr(&img, opts.region)).map_err(estr)
+            },
+        )
+        .method(
+            "wait_for_text",
+            |v: &VmHandle, pattern: String, timeout_secs: i64| -> Result<ScriptMatch, String> {
+                let re = regex::Regex::new(&pattern).map_err(|e| format!("bad pattern: {e}"))?;
+                let deadline =
+                    std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
+                loop {
+                    let img = v.grab_screen()?;
+                    let text = v.block(vision::ocr(&img, None)).map_err(estr)?;
+                    if let Some(found) = re.find(&text) {
+                        return Ok(ScriptMatch {
+                            x: 0,
+                            y: 0,
+                            w: 0,
+                            h: 0,
+                            score: 1.0,
+                            cx: 0,
+                            cy: 0,
+                            text: found.as_str().to_string(),
+                        });
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "timed out after {timeout_secs}s waiting for /{pattern}/ on {}",
+                            v.vm.cfg.name
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1000));
+                }
+            },
+        )
+        // Guest agent (§10.3)
+        .method(
+            "exec",
+            |v: &VmHandle, cmd: String, args: Vec<String>| -> Result<ExecResult, String> {
+                v.block(async {
+                    let qga = v.vm.qga().await.map_err(estr)?;
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let r = qga
+                        .exec(&cmd, &arg_refs, true, Duration::from_secs(120))
+                        .await
+                        .map_err(estr)?;
+                    Ok(ExecResult {
+                        exit_code: r.exit_code as i64,
+                        stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+                    })
+                })
+            },
+        )
+        .method(
+            "exec_timeout",
+            |v: &VmHandle,
+             cmd: String,
+             args: Vec<String>,
+             timeout_secs: i64|
+             -> Result<ExecResult, String> {
+                v.block(async {
+                    let qga = v.vm.qga().await.map_err(estr)?;
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let r = qga
+                        .exec(
+                            &cmd,
+                            &arg_refs,
+                            true,
+                            Duration::from_secs(timeout_secs.max(1) as u64),
+                        )
+                        .await
+                        .map_err(estr)?;
+                    Ok(ExecResult {
+                        exit_code: r.exit_code as i64,
+                        stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+                    })
+                })
+            },
+        )
+        .method(
+            "copy_to",
+            |v: &VmHandle, local: String, guest_path: String| -> Result<(), String> {
+                let data = std::fs::read(v.resolve_ref(&local)).map_err(estr)?;
+                v.block(async {
+                    let qga = v.vm.qga().await.map_err(estr)?;
+                    qga.file_write(&guest_path, &data, Duration::from_secs(60))
+                        .await
+                        .map_err(estr)
+                })
+            },
+        )
+        .method(
+            "copy_from",
+            |v: &VmHandle, guest_path: String, local: String| -> Result<(), String> {
+                let data = v.block(async {
+                    let qga = v.vm.qga().await.map_err(estr)?;
+                    qga.file_read(&guest_path, Duration::from_secs(60))
+                        .await
+                        .map_err(estr)
+                })?;
+                let out = v.resolve_ref(&local);
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent).map_err(estr)?;
+                }
+                std::fs::write(out, data).map_err(estr)
+            },
+        );
+
+    m
+}
+
+fn type_text(v: &VmHandle, text: &str, delay_ms: u64) -> Result<(), String> {
+    v.block(async {
+        let qmp = v.vm.qmp().await.map_err(estr)?;
+        for c in text.chars() {
+            let keys = keymap::char_keys(c)?;
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            qmp.send_key(&refs, None).await.map_err(estr)?;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        Ok(())
+    })
+}
+
+/// Current screen dimensions, needed to scale absolute mouse coordinates.
+fn screen_size(v: &VmHandle) -> Result<(u32, u32), String> {
+    let img = v.grab_screen()?;
+    Ok((img.width(), img.height()))
+}
+
+/// Build the full wisp context for compiling and running lab scripts.
+pub fn context() -> Context {
+    Context::new()
+        .module(lab_module())
+        .register_type::<ExecResult>()
+        .register_type::<ScriptMatch>()
+        .register_type::<EventData>()
+}
+
+/// Compile-check a script (used by `vmlab validate`, PRD §5.1).
+pub fn check_script_source(source: &str) -> Result<(), String> {
+    match context().compile(source) {
+        Ok(_) => Ok(()),
+        Err(wisp::Error::Compile(diags)) => {
+            let msgs: Vec<String> = diags.iter().map(runner::render_diag).collect();
+            Err(msgs.join("; "))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Write the `.wispi` interface file for LSP support (PRD §10).
+pub fn write_interface(path: &std::path::Path) -> std::io::Result<()> {
+    context().write_interface(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_compiles_against_module() {
+        let src = r#"
+use vmlab
+
+fn provision_dc(lab: Lab) {
+    let Ok(dc) = lab.vm("dc01") else {
+        lab.log("no dc01")
+        return
+    }
+    match dc.wait_ready(600) {
+        Ok(_) => lab.log("dc01 ready"),
+        Err(e) => lab.log("not ready: " + e),
+    }
+    match dc.exec("ipconfig", ["/all"]) {
+        Ok(r) => lab.log(r.stdout),
+        Err(e) => lab.log("exec failed: " + e),
+    }
+    let k0 = dc.send_keys("ctrl-alt-del")
+    let k1 = dc.type_text("Password1!\n")
+    match dc.wait_for_image("images/login.png", 120) {
+        Ok(m) => {
+            let mv = dc.mouse_move(m.cx, m.cy)
+            let cl = dc.mouse_click("left")
+            lab.log("clicked")
+        }
+        Err(e) => lab.log(e),
+    }
+}
+
+fn main(lab: Lab) {
+    lab.log("lab " + lab.name())
+    for vm in lab.vms() {
+        lab.log(vm.name() + ": " + vm.state())
+    }
+    provision_dc(lab)
+}
+"#;
+        check_script_source(src).expect("API surface should type-check");
+    }
+
+    #[test]
+    fn bad_scripts_rejected() {
+        // Wrong arg type to exec.
+        let err = check_script_source(
+            "use vmlab\nfn main(lab: Lab) { let v = lab.vm(\"a\") let _ = v.exec(1, []) }",
+        )
+        .unwrap_err();
+        assert!(!err.is_empty());
+        // Unknown method.
+        assert!(check_script_source("use vmlab\nfn main(lab: Lab) { lab.frobnicate() }").is_err());
+    }
+
+    #[test]
+    fn handler_signature_compiles() {
+        let src = r#"
+use vmlab
+
+fn handle(event: Event, lab: Lab) {
+    lab.log("event " + event.name + " on " + event.vm)
+}
+"#;
+        check_script_source(src).expect("handler signature should type-check");
+    }
+
+    #[test]
+    fn interface_file_generates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vmlab.wispi");
+        write_interface(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("mod vmlab"), "{content}");
+        assert!(content.contains("Lab"), "{content}");
+    }
+}

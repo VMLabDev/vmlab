@@ -218,6 +218,21 @@ pub fn cmd_exec(vm_ref: &str, cmd: Vec<String>) -> Result<()> {
     })
 }
 
+pub fn cmd_run(script: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (name, root) = current_lab()?;
+        if !root.join(script).is_file() {
+            bail!("script {script} not found under {}", root.display());
+        }
+        let client = daemon::ensure_lab_daemon(&name, &root).await?;
+        client
+            .call_streaming("run", json!({"script": script}), |chunk| print!("{chunk}"))
+            .await
+            .map_err(remote)?;
+        Ok(())
+    })
+}
+
 pub fn cmd_snapshot(vm_ref: Option<String>, name: String) -> Result<()> {
     rt()?.block_on(async {
         let (lab, vm) = match &vm_ref {

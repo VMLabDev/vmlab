@@ -13,6 +13,7 @@ mod proto;
 mod qemu;
 mod qga;
 mod qmp;
+mod scripting;
 mod supervisor;
 mod template;
 mod vision;

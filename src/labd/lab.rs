@@ -212,9 +212,15 @@ impl LabRuntime {
         .await
     }
 
-    /// `vmlab up [vm...]` (PRD §7.2): start in depends_on waves; a
-    /// dependency is satisfied when its VM is ready.
-    pub async fn up(self: &Arc<Self>, subset: &[String]) -> Result<()> {
+    /// `vmlab up [vm...]` (PRD §7.2, §10.4): start in depends_on waves and
+    /// run provision scripts in declaration order. A dependency is
+    /// satisfied when its VM is ready and the provisions scoped to it have
+    /// completed.
+    pub async fn up(
+        self: &Arc<Self>,
+        subset: &[String],
+        output: crate::scripting::OutputSink,
+    ) -> Result<()> {
         let targets: Vec<String> = if subset.is_empty() {
             self.config.lab.vms.iter().map(|v| v.name.clone()).collect()
         } else {
@@ -242,6 +248,7 @@ impl LabRuntime {
 
         let mut remaining: Vec<String> = targets.clone();
         let mut done: HashSet<String> = HashSet::new();
+        let mut next_provision = 0usize;
         while !remaining.is_empty() {
             // A wave: every remaining VM whose deps (within the target set)
             // are all done.
@@ -279,9 +286,55 @@ impl LabRuntime {
                 done.insert(n.clone());
                 remaining.retain(|x| x != &n);
             }
+
+            // Between waves: run (in declaration order) every unrun
+            // provision scoped entirely to already-started VMs, so a VM
+            // depending on "dc01" starts only after dc01's provisions
+            // completed (§7.2).
+            self.run_provisions(&mut next_provision, &done, false, &output)
+                .await?;
         }
 
+        // Final pass: everything left, including unscoped scripts.
+        self.run_provisions(&mut next_provision, &done, true, &output)
+            .await?;
+
         self.events.emit("lab.up", json!({"vms": targets}));
+        Ok(())
+    }
+
+    /// Run provision scripts in strict declaration order starting at
+    /// `*next`: a scoped script runs once all its VMs are started (waiting
+    /// for their readiness first); an unscoped script runs only in the
+    /// final pass. Stops at the first script that isn't eligible yet.
+    async fn run_provisions(
+        self: &Arc<Self>,
+        next: &mut usize,
+        started: &HashSet<String>,
+        final_pass: bool,
+        output: &crate::scripting::OutputSink,
+    ) -> Result<()> {
+        let provisions = self.config.lab.provisions.clone();
+        while *next < provisions.len() {
+            let p = &provisions[*next];
+            let eligible = if p.vms.is_empty() {
+                final_pass
+            } else {
+                p.vms.iter().all(|v| started.contains(v))
+            };
+            if !eligible {
+                return Ok(());
+            }
+            for vm in &p.vms {
+                self.vm(vm)?.wait_ready(Duration::from_secs(600)).await?;
+            }
+            let script = self.root.join(&p.script);
+            output(format!("provision: {}\n", p.script.display()));
+            crate::scripting::run_script_file(self.clone(), &script, output.clone())
+                .await
+                .with_context(|| format!("provision {}", p.script.display()))?;
+            *next += 1;
+        }
         Ok(())
     }
 
