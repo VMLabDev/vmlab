@@ -136,6 +136,40 @@ pub fn windows_mount_cmds(
     }
 }
 
+/// Path of the connect script dropped on the shared desktop (visible to
+/// every interactive user).
+pub const DESKTOP_SCRIPT: &str = "C:\\Users\\Public\\Desktop\\vmlab-shares.cmd";
+
+/// Build the command that (re)writes a double-clickable script on the
+/// guest's shared desktop mapping every drive-letter share. Drive letters
+/// are per-logon-session — the agent's own mounts (SYSTEM session) are
+/// invisible to the console desktop, so interactive users run this once;
+/// `/persistent:yes` + stable lab credentials keep it connected across
+/// reboots.
+pub fn windows_desktop_script_cmd(
+    gateway: Ipv4Addr,
+    shares: &[(&str, &str)], // (share name, drive letter "X:")
+    user: &str,
+    pass: &str,
+) -> (String, Vec<String>) {
+    let mut lines = vec!["@echo off".to_string()];
+    for (share, letter) in shares {
+        lines.push(format!("net use {letter} /delete /y"));
+        lines.push(format!(
+            "net use {letter} \\\\{gateway}\\{share} /user:{user} {pass} /persistent:yes"
+        ));
+    }
+    lines.push("pause".to_string());
+    let echoes: Vec<String> = lines.into_iter().map(|l| format!("echo {l}")).collect();
+    (
+        "cmd".to_string(),
+        vec![
+            "/c".to_string(),
+            format!("({}) > {DESKTOP_SCRIPT}", echoes.join("& ")),
+        ],
+    )
+}
+
 /// XP/2003-era `net use` string for screen-automation driving (PRD §7.5 XP-era
 /// caveat). These guests lack a guest agent, so the provision script types this
 /// at the console via the keystroke surface (§10.3). We always target a drive
@@ -211,6 +245,18 @@ mod tests {
         assert!(joined.starts_with("use X: \\\\10.0.0.1\\data"));
         assert!(joined.contains("/user:u"));
         assert!(joined.contains("/persistent:yes"));
+    }
+
+    #[test]
+    fn windows_desktop_script_writes_all_letters() {
+        let (prog, args) =
+            windows_desktop_script_cmd(gw(), &[("data", "X:"), ("src", "Y:")], "u", "p");
+        assert_eq!(prog, "cmd");
+        let script = &args[1];
+        assert!(script.contains("echo net use X: /delete /y"));
+        assert!(script.contains("echo net use X: \\\\10.0.0.1\\data /user:u p /persistent:yes"));
+        assert!(script.contains("echo net use Y: \\\\10.0.0.1\\src /user:u p /persistent:yes"));
+        assert!(script.ends_with(&format!("> {DESKTOP_SCRIPT}")));
     }
 
     #[test]

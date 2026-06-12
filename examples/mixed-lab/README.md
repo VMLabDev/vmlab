@@ -27,13 +27,9 @@ Guest credentials: `Administrator` / `vmlab123!` (Windows), `vmlab` /
 
 Note on the share and desktop sessions: Windows drive letters are
 per-logon-session. The daemon maps `S:` in the agent's session (SYSTEM),
-which is what provision scripts and `vmlab exec` see. To use it from the
-desktop you're logged into on the console, map it once in that session —
-the lab's SMB credentials are in `.vmlab/smb/creds` (`user:password`):
-
-```bat
-net use S: \\10.70.0.1\s /user:<user> <password> /persistent:yes
-```
-
-They stay stable across `vmlab up` cycles, so the mapping reconnects on
-every boot until you `vmlab destroy`.
+which is what provision scripts and `vmlab exec` see. For the desktop
+you're logged into on the console, double-click **vmlab-shares** on the
+guest's desktop (vmlab drops it there) — it maps the same shares in your
+session. Credentials stay stable across `vmlab up` cycles (persisted in
+`.vmlab/smb/creds`), so the mapping reconnects on every boot until you
+`vmlab destroy`.

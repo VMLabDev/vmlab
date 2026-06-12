@@ -254,6 +254,31 @@ impl LabSmb {
                 }
             }
         }
+        // Drive letters are per-logon-session: the agent's mounts live in
+        // SYSTEM's session, invisible to the console desktop. Drop a
+        // double-clickable connect script on the shared desktop so
+        // interactive users can map the same shares in their own session.
+        if os_hint == OsHint::Windows {
+            let letters: Vec<(&str, &str)> = plan
+                .shares
+                .iter()
+                .filter(|(_, _, guest, _, _)| mount::is_drive_letter(guest))
+                .map(|(share, _, guest, _, _)| (share.as_str(), &guest[..2]))
+                .collect();
+            if !letters.is_empty() {
+                let (cmd, args) = mount::windows_desktop_script_cmd(
+                    gw,
+                    &letters,
+                    &creds.username,
+                    &creds.password,
+                );
+                steps.push(MountStep {
+                    os_hint,
+                    command: cmd,
+                    args,
+                });
+            }
+        }
         steps
     }
 
