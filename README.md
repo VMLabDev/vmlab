@@ -79,7 +79,9 @@ Worked examples under `examples/`, all built and run end-to-end:
 | `vmlab start / stop / restart <vm>` | Per-VM power operations |
 | `vmlab snapshot / restore / snapshots / snapshot-delete` | Snapshots |
 | `vmlab console <vm>` | Attach a VNC viewer (TCP-forward fallback for WSL2) |
-| `vmlab exec <vm> -- cmd` | Guest-agent exec |
+| `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |
+| `vmlab cp <src> <vm>:<dest>` | Copy a host file or directory tree into a guest |
+| `vmlab osinfo <vm>` | Guest OS identification (guest-get-osinfo) as JSON |
 | `vmlab run <script.wisp>` | Ad-hoc script against the current lab |
 | `vmlab wispi` | Write the wisp interface file for LSP support |
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |

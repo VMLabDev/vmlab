@@ -105,10 +105,22 @@ pub enum Command {
     /// Run a command in the guest via the agent
     Exec {
         vm: String,
+        /// Seconds to wait for the command to finish
+        #[arg(long, value_name = "SECS", default_value_t = 120)]
+        timeout: u64,
         /// Command and arguments (after --)
         #[arg(last = true)]
         cmd: Vec<String>,
     },
+    /// Copy a host file or directory tree into a guest via the agent
+    Cp {
+        /// Source path on the host
+        src: String,
+        /// Destination as <vm>:<path> (parent directories are created)
+        dest: String,
+    },
+    /// Print guest OS information (guest-get-osinfo) as JSON
+    Osinfo { vm: String },
     /// Tail or dump JSON-line logs for the lab or one VM
     Logs {
         /// [lab/][vm] (default: the cwd's lab)
@@ -163,7 +175,9 @@ pub fn run() -> ExitCode {
         Command::Wispi { out } => crate::scripting::write_interface(&out)
             .map_err(anyhow::Error::from)
             .map(|()| println!("wrote {}", out.display())),
-        Command::Exec { vm, cmd } => lab::cmd_exec(&vm, cmd),
+        Command::Exec { vm, timeout, cmd } => lab::cmd_exec(&vm, timeout, cmd),
+        Command::Cp { src, dest } => lab::cmd_cp(&src, &dest),
+        Command::Osinfo { vm } => lab::cmd_osinfo(&vm),
         Command::Logs {
             target,
             follow,

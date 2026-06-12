@@ -230,10 +230,39 @@ impl GaClient {
         data: &[u8],
         timeout: Duration,
     ) -> Result<(), GaError> {
-        let handle = self.file_open(guest_path, "w", timeout).await?;
+        self.file_write_mode(guest_path, data, "w", timeout).await
+    }
+
+    /// Append `data` to `guest_path` inside the guest (mode `"a"`),
+    /// creating the file if absent. Lets callers move a large file in
+    /// several transfers without holding it all in one message.
+    pub async fn file_append(
+        &self,
+        guest_path: &str,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), GaError> {
+        self.file_write_mode(guest_path, data, "a", timeout).await
+    }
+
+    async fn file_write_mode(
+        &self,
+        guest_path: &str,
+        data: &[u8],
+        mode: &str,
+        timeout: Duration,
+    ) -> Result<(), GaError> {
+        let handle = self.file_open(guest_path, mode, timeout).await?;
         let result = self.write_chunks(handle, data, timeout).await;
         let close_result = self.file_close(handle, timeout).await;
         result.and(close_result)
+    }
+
+    /// Guest OS identification via `guest-get-osinfo`: the raw response
+    /// object (`id`, `name`, `kernel-release`, …). On Windows guests
+    /// `id` is `"mswindows"`.
+    pub async fn get_osinfo(&self, timeout: Duration) -> Result<Value, GaError> {
+        self.execute("guest-get-osinfo", None, timeout).await
     }
 
     /// Read the contents of `guest_path` from the guest

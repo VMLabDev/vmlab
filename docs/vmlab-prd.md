@@ -523,7 +523,9 @@ Every VM gets a VNC display served on a unix socket (TCP optional, off by defaul
 | `vmlab validate` | Full §5.1 validation, no side effects |
 | `vmlab snapshot / restore / snapshots` | Per-VM or lab-wide |
 | `vmlab console <vm>` | Attach viewer |
-| `vmlab exec <vm> -- cmd` | Guest-agent exec |
+| `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |
+| `vmlab cp <src> <vm>:<dest>` | Copy a host file/tree into a guest via the agent |
+| `vmlab osinfo <vm>` | Guest OS identification as JSON |
 | `vmlab run <script.wisp>` | Ad-hoc script against the current lab |
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
 | `vmlab net rules / forward / block / redirect` | Inspect + mutate network rules |

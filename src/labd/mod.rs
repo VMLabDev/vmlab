@@ -249,6 +249,39 @@ impl Handler for LabdHandler {
                     "stderr": String::from_utf8_lossy(&result.stderr),
                 }))
             }
+            // Guest OS identification (PRD §12: vmlab osinfo, vmlab cp).
+            "vm.osinfo" => {
+                let name = vm_arg(&args)?;
+                let timeout =
+                    std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(30));
+                let qga = lab.vm(&name).map_err(err)?.qga().await.map_err(err)?;
+                qga.get_osinfo(timeout).await.map_err(|e| format!("{e}"))
+            }
+            // Guest-agent file write (PRD §12: vmlab cp). `append` lets the
+            // CLI move large files in several modest JSON-line messages
+            // instead of one giant one.
+            "vm.copy_in" => {
+                let name = vm_arg(&args)?;
+                let dest = args["dest"].as_str().ok_or("missing dest")?;
+                let data = args["data"].as_str().ok_or("missing data")?;
+                let append = args["append"].as_bool().unwrap_or(false);
+                let bytes = {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|e| format!("invalid base64 data: {e}"))?
+                };
+                let timeout =
+                    std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
+                let qga = lab.vm(&name).map_err(err)?.qga().await.map_err(err)?;
+                let result = if append {
+                    qga.file_append(dest, &bytes, timeout).await
+                } else {
+                    qga.file_write(dest, &bytes, timeout).await
+                };
+                result.map_err(|e| format!("{e}"))?;
+                Ok(json!(true))
+            }
             "vm.ip" => {
                 let name = vm_arg(&args)?;
                 let nic = args["nic"].as_u64().map(|n| n as usize);

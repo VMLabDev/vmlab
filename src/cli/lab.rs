@@ -194,7 +194,7 @@ pub fn cmd_vm_power(vm_ref: &str, op: &str, force: bool) -> Result<()> {
     })
 }
 
-pub fn cmd_exec(vm_ref: &str, cmd: Vec<String>) -> Result<()> {
+pub fn cmd_exec(vm_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
     if cmd.is_empty() {
         bail!("nothing to execute — usage: vmlab exec <vm> -- <cmd> [args...]");
     }
@@ -204,7 +204,7 @@ pub fn cmd_exec(vm_ref: &str, cmd: Vec<String>) -> Result<()> {
         let result = client
             .call(
                 "vm.exec",
-                json!({"vm": vm, "cmd": cmd[0], "args": cmd[1..].to_vec()}),
+                json!({"vm": vm, "cmd": cmd[0], "args": cmd[1..].to_vec(), "timeout": timeout}),
             )
             .await
             .map_err(remote)?;
@@ -216,6 +216,166 @@ pub fn cmd_exec(vm_ref: &str, cmd: Vec<String>) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// `vmlab osinfo <vm>` — guest OS identification as one JSON object, fit
+/// for machine consumption (config-weave's testlab parses it).
+pub fn cmd_osinfo(vm_ref: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let info = client
+            .call("vm.osinfo", json!({"vm": vm}))
+            .await
+            .map_err(remote)?;
+        println!("{info}");
+        Ok(())
+    })
+}
+
+/// Per-message payload for `vm.copy_in` (pre-base64). Modest chunks keep
+/// each JSON line small and each agent call inside its timeout.
+const CP_CHUNK: usize = 1 << 20;
+
+/// `vmlab cp <src> <vm>:<dest>` — copy a host file or directory tree into
+/// a guest through the agent, creating parent directories.
+pub fn cmd_cp(src: &str, dest: &str) -> Result<()> {
+    // Split on the *first* colon: VM names contain none, guest paths may
+    // (e.g. box:C:/weave).
+    let Some((vm_part, guest_dest)) = dest.split_once(':') else {
+        bail!("malformed destination `{dest}` — usage: vmlab cp <src> <vm>:<path>");
+    };
+    if vm_part.is_empty() || guest_dest.is_empty() {
+        bail!("malformed destination `{dest}` — usage: vmlab cp <src> <vm>:<path>");
+    }
+    let src_path = std::path::Path::new(src);
+    if !src_path.exists() {
+        bail!("source {src} does not exist");
+    }
+    let (lab, vm) = split_vm_ref(vm_part)?;
+    rt()?.block_on(async {
+        let (_name, client) = lab_client_for(lab).await?;
+        // The guest OS decides the mkdir command and path separator.
+        let osinfo = client
+            .call("vm.osinfo", json!({"vm": vm}))
+            .await
+            .map_err(remote)?;
+        let windows = osinfo["id"].as_str() == Some("mswindows");
+        if src_path.is_dir() {
+            guest_mkdir(&client, &vm, guest_dest, windows).await?;
+            copy_tree(&client, &vm, src_path, guest_dest, windows).await
+        } else {
+            if let Some((parent, _)) = guest_dest.rsplit_once(['/', '\\'])
+                && !parent.is_empty()
+                && !parent.ends_with(':')
+            {
+                guest_mkdir(&client, &vm, parent, windows).await?;
+            }
+            copy_file(&client, &vm, src_path, guest_dest).await
+        }
+    })
+}
+
+/// Create a directory (and parents) inside the guest via agent exec.
+async fn guest_mkdir(client: &Client, vm: &str, guest_dir: &str, windows: bool) -> Result<()> {
+    let (cmd, args) = if windows {
+        // cmd's mkdir creates intermediate directories but errors when the
+        // target exists; guard with `if not exist`. Backslashes only — cmd
+        // reads forward slashes as switches. The trailing backslash in the
+        // existence check makes it a directory test.
+        let d = guest_dir.replace('/', "\\");
+        (
+            "cmd.exe".to_string(),
+            vec![
+                "/C".to_string(),
+                "if".to_string(),
+                "not".to_string(),
+                "exist".to_string(),
+                format!("{d}\\"),
+                "mkdir".to_string(),
+                d,
+            ],
+        )
+    } else {
+        (
+            "mkdir".to_string(),
+            vec!["-p".to_string(), guest_dir.to_string()],
+        )
+    };
+    let result = client
+        .call("vm.exec", json!({"vm": vm, "cmd": cmd, "args": args}))
+        .await
+        .map_err(remote)?;
+    let code = result["exit_code"].as_i64().unwrap_or(0);
+    if code != 0 {
+        bail!(
+            "cannot create {guest_dir} in {vm} (exit {code}): {}",
+            result["stderr"].as_str().unwrap_or("").trim()
+        );
+    }
+    Ok(())
+}
+
+/// Copy one host file into the guest in chunked `vm.copy_in` calls.
+async fn copy_file(
+    client: &Client,
+    vm: &str,
+    src: &std::path::Path,
+    guest_dest: &str,
+) -> Result<()> {
+    use base64::Engine as _;
+    let data = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    // An empty file still needs one write to be created.
+    let chunks: Vec<&[u8]> = if data.is_empty() {
+        vec![&[]]
+    } else {
+        data.chunks(CP_CHUNK).collect()
+    };
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        client
+            .call(
+                "vm.copy_in",
+                json!({
+                    "vm": vm,
+                    "dest": guest_dest,
+                    "data": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    "append": i > 0,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow!("copying {} to {vm}:{guest_dest}: {e}", src.display()))?;
+    }
+    Ok(())
+}
+
+/// Recursively copy a host directory's contents into `guest_dir` (which
+/// already exists).
+async fn copy_tree(
+    client: &Client,
+    vm: &str,
+    dir: &std::path::Path,
+    guest_dir: &str,
+    windows: bool,
+) -> Result<()> {
+    let sep = if windows { '\\' } else { '/' };
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            bail!("non-UTF-8 file name under {}", dir.display());
+        };
+        let guest_path = format!("{guest_dir}{sep}{name}");
+        if entry.path().is_dir() {
+            guest_mkdir(client, vm, &guest_path, windows).await?;
+            Box::pin(copy_tree(client, vm, &entry.path(), &guest_path, windows)).await?;
+        } else {
+            copy_file(client, vm, &entry.path(), &guest_path).await?;
+        }
+    }
+    Ok(())
 }
 
 pub fn cmd_run(script: &str) -> Result<()> {

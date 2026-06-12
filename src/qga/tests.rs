@@ -232,6 +232,105 @@ async fn file_write_then_read_round_trips() {
 }
 
 #[tokio::test]
+async fn file_append_extends_existing_content() {
+    let (_dir, path) = spawn_mock(|mut reader, mut writer| async move {
+        let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut handles: HashMap<i64, (String, usize)> = HashMap::new();
+        let mut next_handle = 1000_i64;
+
+        while let Some(msg) = read_msg(&mut reader).await {
+            if answer_if_sync(&msg, &mut writer).await {
+                continue;
+            }
+            match execute_name(&msg) {
+                "guest-file-open" => {
+                    let file_path = msg["arguments"]["path"].as_str().unwrap().to_string();
+                    match msg["arguments"]["mode"].as_str().unwrap() {
+                        "w" => {
+                            files.insert(file_path.clone(), Vec::new());
+                        }
+                        "a" | "r" => {
+                            files.entry(file_path.clone()).or_default();
+                        }
+                        other => panic!("unexpected open mode: {other}"),
+                    }
+                    next_handle += 1;
+                    handles.insert(next_handle, (file_path, 0));
+                    send_return(&mut writer, json!(next_handle)).await;
+                }
+                "guest-file-write" => {
+                    let handle = msg["arguments"]["handle"].as_i64().unwrap();
+                    let data = BASE64
+                        .decode(msg["arguments"]["buf-b64"].as_str().unwrap())
+                        .expect("valid base64 from client");
+                    let (file_path, _) = &handles[&handle];
+                    let count = data.len();
+                    files.get_mut(file_path).unwrap().extend_from_slice(&data);
+                    send_return(&mut writer, json!({"count": count, "eof": false})).await;
+                }
+                "guest-file-read" => {
+                    let handle = msg["arguments"]["handle"].as_i64().unwrap();
+                    let (file_path, pos) = handles.get_mut(&handle).unwrap();
+                    let content = &files[file_path.as_str()];
+                    let n = content.len() - *pos;
+                    let chunk = &content[*pos..];
+                    *pos += n;
+                    send_return(
+                        &mut writer,
+                        json!({"count": n, "buf-b64": BASE64.encode(chunk), "eof": true}),
+                    )
+                    .await;
+                }
+                "guest-file-close" => {
+                    handles.remove(&msg["arguments"]["handle"].as_i64().unwrap());
+                    send_return(&mut writer, json!({})).await;
+                }
+                other => panic!("unexpected command: {other}"),
+            }
+        }
+    })
+    .await;
+
+    let client = GaClient::connect(&path).await.expect("connect");
+    client
+        .file_write("/tmp/chunked", b"first ", LONG)
+        .await
+        .expect("file_write");
+    client
+        .file_append("/tmp/chunked", b"second", LONG)
+        .await
+        .expect("file_append");
+    let read_back = client
+        .file_read("/tmp/chunked", LONG)
+        .await
+        .expect("file_read");
+    assert_eq!(read_back, b"first second");
+}
+
+#[tokio::test]
+async fn osinfo_returns_raw_object() {
+    let (_dir, path) = spawn_mock(|mut reader, mut writer| async move {
+        while let Some(msg) = read_msg(&mut reader).await {
+            if answer_if_sync(&msg, &mut writer).await {
+                continue;
+            }
+            assert_eq!(execute_name(&msg), "guest-get-osinfo");
+            send_return(
+                &mut writer,
+                json!({"id": "mswindows", "name": "Microsoft Windows", "version": "11"}),
+            )
+            .await;
+        }
+    })
+    .await;
+
+    let client = GaClient::connect(&path).await.expect("connect");
+    let info = client.get_osinfo(LONG).await.expect("osinfo");
+    assert_eq!(info["id"], "mswindows");
+    assert_eq!(info["name"], "Microsoft Windows");
+}
+
+#[tokio::test]
 async fn ping_timeout_leaves_client_usable() {
     let (_dir, path) = spawn_mock(|mut reader, mut writer| async move {
         let mut pings = 0;
