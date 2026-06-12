@@ -137,7 +137,7 @@ impl Supervisor {
 
         crate::paths::ensure_dir(sock.parent().expect("lab socket has parent"))
             .map_err(|e| e.to_string())?;
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = crate::paths::self_exe().map_err(|e| e.to_string())?;
         let log_path = crate::paths::state_dir().join(format!("labd-{name}.log"));
         let log = std::fs::OpenOptions::new()
             .create(true)

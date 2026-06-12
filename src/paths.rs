@@ -101,6 +101,20 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// This binary's path, robust against in-place rebuilds: when `cargo build`
+/// replaces the file under a long-running daemon, `/proc/self/exe` reads
+/// `<path> (deleted)` and spawning from it fails with ENOENT — strip the
+/// marker and use the rebuilt binary at the original path.
+pub fn self_exe() -> std::io::Result<PathBuf> {
+    let exe = env::current_exe()?;
+    if let Some(s) = exe.to_str()
+        && let Some(stripped) = s.strip_suffix(" (deleted)")
+    {
+        return Ok(PathBuf::from(stripped));
+    }
+    Ok(exe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

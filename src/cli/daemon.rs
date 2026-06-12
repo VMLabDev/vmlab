@@ -36,7 +36,7 @@ pub async fn ensure_supervisor() -> Result<Client> {
 
 fn spawn_supervisor() -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe()?;
+    let exe = crate::paths::self_exe()?;
     crate::paths::ensure_dir(&crate::paths::state_dir())?;
     let log_path = crate::paths::state_dir().join("vmlabd.log");
     let log = std::fs::OpenOptions::new()
