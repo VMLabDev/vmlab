@@ -1,0 +1,34 @@
+// Minimal worked example: a single Windows Server 2025 VM whose desktop
+// you actually watch. Built on examples/templates/windows-server-2025
+// (build that first). The point here is the display surface (PRD §11):
+//
+//   gui = true     opens QEMU's own window for the guest on `vmlab up`,
+//                  so the Server 2025 desktop renders live on the host.
+//
+//   vmlab console winsrv      attach a VNC viewer at any time instead
+//                             (works headless; also the WSL2 path).
+//
+//   vmlab up
+//   vmlab console winsrv      # if you didn't want the auto-opened window
+//   vmlab down
+
+import <vmlab.wcl>
+
+lab "winsrv-desktop" {
+
+  gui = true        // open each guest's screen in a QEMU window on `vmlab up`
+
+  segment "lan" {
+    subnet = "10.80.0.0/24"
+    nat    = true                   // so the desktop can reach the internet
+  }
+
+  vm "winsrv" {
+    template = "x86_64/windows-server-2025"
+    cpus     = 4
+    memory   = "8G"
+    nic { segment = "lan" ip = "10.80.0.10" }
+    // gui = true is inherited from the lab; set `gui = false` here to keep
+    // this one VM headless while still reachable via `vmlab console`.
+  }
+}
