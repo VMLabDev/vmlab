@@ -146,6 +146,7 @@ fn print_status(status: &Value) {
         }
     }
     if let Some(segments) = status["segments"].as_array() {
+        println!();
         println!(
             "  {:<16} {:<18} {:<15} NAT/DHCP",
             "SEGMENT", "SUBNET", "GATEWAY"
