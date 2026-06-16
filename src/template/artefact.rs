@@ -29,18 +29,101 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
             // Cache key = the expected digest, so a re-download is skipped
             // when the verified artefact is already present.
             let cached = dir.join(format!("{sha256}.artefact"));
-            if cached.is_file() && verify_file(&cached, sha256).await.is_ok() {
-                log(format!("using cached artefact {sha256}"));
-                return Ok(cached);
+            let comp = Compression::from_url(url);
+            match comp {
+                // Uncompressed: the cached artefact's own hash is the key, so
+                // we can re-verify it directly on a cache hit.
+                None => {
+                    if cached.is_file() && verify_file(&cached, sha256).await.is_ok() {
+                        log(format!("using cached artefact {sha256}"));
+                        return Ok(cached);
+                    }
+                    log(format!("downloading {url}"));
+                    download(url, &cached).await?;
+                    verify_file(&cached, sha256)
+                        .await
+                        .with_context(|| format!("hash mismatch for {url}"))?;
+                    log(format!("verified sha256 {sha256}"));
+                }
+                // Compressed: sha256 verifies the *download*, then we
+                // decompress. The cached artefact is the decompressed image,
+                // so its hash differs from the key — an `.ok` marker records
+                // that a verified decompression already happened.
+                Some(c) => {
+                    let marker = dir.join(format!("{sha256}.ok"));
+                    if cached.is_file() && marker.is_file() {
+                        log(format!("using cached artefact {sha256}"));
+                        return Ok(cached);
+                    }
+                    let dl = dir.join(format!("{sha256}.download"));
+                    log(format!("downloading {url}"));
+                    download(url, &dl).await?;
+                    verify_file(&dl, sha256)
+                        .await
+                        .with_context(|| format!("hash mismatch for {url}"))?;
+                    log(format!(
+                        "verified sha256 {sha256}; decompressing ({})",
+                        c.name()
+                    ));
+                    c.decompress(&dl, &cached).await?;
+                    std::fs::remove_file(&dl).ok();
+                    std::fs::write(&marker, [])?;
+                }
             }
-            log(format!("downloading {url}"));
-            download(url, &cached).await?;
-            verify_file(&cached, sha256)
-                .await
-                .with_context(|| format!("hash mismatch for {url}"))?;
-            log(format!("verified sha256 {sha256}"));
             Ok(cached)
         }
+    }
+}
+
+/// Compression of a downloaded artefact, inferred from the URL extension.
+/// Decompressed by shelling out (like qemu-img elsewhere) to avoid pulling
+/// in codec crates.
+#[derive(Clone, Copy)]
+enum Compression {
+    Xz,
+    Gzip,
+}
+
+impl Compression {
+    fn from_url(url: &str) -> Option<Self> {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".xz") {
+            Some(Compression::Xz)
+        } else if lower.ends_with(".gz") {
+            Some(Compression::Gzip)
+        } else {
+            None
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Compression::Xz => "xz",
+            Compression::Gzip => "gzip",
+        }
+    }
+
+    async fn decompress(self, src: &Path, dest: &Path) -> Result<()> {
+        let (prog, args): (&str, &[&str]) = match self {
+            Compression::Xz => ("xz", &["--decompress", "--stdout"]),
+            Compression::Gzip => ("gzip", &["--decompress", "--stdout"]),
+        };
+        let tmp = dest.with_extension("decomp");
+        let out =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let status = tokio::process::Command::new(prog)
+            .args(args)
+            .arg(src)
+            .stdout(std::process::Stdio::from(out))
+            .status()
+            .await
+            .with_context(|| format!("running `{prog}` (is it installed?)"))?;
+        if !status.success() {
+            bail!("`{prog}` failed to decompress {}", src.display());
+        }
+        tokio::fs::rename(&tmp, dest).await?;
+        Ok(())
     }
 }
 
@@ -49,7 +132,15 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
     let tmp = dest.with_extension("part");
-    let resp = reqwest::get(url)
+    // A User-Agent is required: some CDNs (e.g. Fastly fronting
+    // cloud.centos.org) answer 403 to requests with an empty UA.
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("vmlab/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?;
+    let resp = client
+        .get(url)
+        .send()
         .await
         .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
@@ -107,6 +198,19 @@ mod tests {
             span: (0, 0),
         };
         assert!(resolve(&src, |_| {}).await.is_err());
+    }
+
+    #[test]
+    fn compression_from_url() {
+        assert!(matches!(
+            Compression::from_url("https://x/y/FreeBSD-15.0-amd64.qcow2.xz"),
+            Some(Compression::Xz)
+        ));
+        assert!(matches!(
+            Compression::from_url("https://x/img.qcow2.gz?a=1"),
+            Some(Compression::Gzip)
+        ));
+        assert!(Compression::from_url("https://x/img.qcow2").is_none());
     }
 
     #[tokio::test]
