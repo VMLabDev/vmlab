@@ -153,18 +153,18 @@ impl VmHandle {
             Box<dyn std::future::Future<Output = Result<(), String>> + 'a>,
         >,
     {
+        // Reconnect fresh per call. A long-lived RFB connection that never
+        // drains the server's messages can desync and drop later keystrokes on
+        // real-mode guests (DOS/9x TUIs); a fresh connection per input op
+        // mirrors an external viewer's reliable behaviour.
         let mut guard = self.vnc_conn.lock().await;
-        if guard.is_none() {
-            *guard = Some(
-                crate::vnc::VncInput::connect(&self.vm.dirs.vnc_sock())
-                    .await
-                    .map_err(estr)?,
-            );
-        }
+        *guard = Some(
+            crate::vnc::VncInput::connect(&self.vm.dirs.vnc_sock())
+                .await
+                .map_err(estr)?,
+        );
         let result = op(guard.as_mut().unwrap()).await;
-        if result.is_err() {
-            *guard = None;
-        }
+        *guard = None;
         result
     }
 

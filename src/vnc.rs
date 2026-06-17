@@ -97,11 +97,15 @@ impl VncInput {
     pub async fn chord(&mut self, keysyms: &[u32]) -> Result<()> {
         for &k in keysyms {
             self.key(k, true).await?;
-            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }
+        // Hold briefly before release so slow real-mode guests (DOS/9x TUIs
+        // polling the BIOS keyboard) reliably latch the keystroke; an 8ms hold
+        // was dropped between menu redraws.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         for &k in keysyms.iter().rev() {
             self.key(k, false).await?;
-            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }
         Ok(())
     }
