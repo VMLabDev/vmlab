@@ -289,6 +289,7 @@ mod tests {
         let names: Vec<&str> = set.names().collect();
         for expected in [
             "windows-11",
+            "windows-10",
             "windows-server",
             "windows-legacy",
             "linux-modern",

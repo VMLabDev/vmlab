@@ -17,6 +17,19 @@ profile "windows-11" {
   memory      = "8G"
 }
 
+profile "windows-10" {
+  description = "Windows 10: q35, OVMF, virtio devices (no TPM/secure boot required)"
+  machine     = "q35"
+  firmware    = "ovmf"
+  secure_boot = false
+  tpm         = false
+  disk_bus    = "virtio"
+  nic_model   = "virtio-net-pci"
+  display     = "qxl"
+  cpus        = 4
+  memory      = "8G"
+}
+
 profile "windows-server" {
   description = "Windows Server: q35, OVMF, swtpm 2.0, virtio devices"
   machine     = "q35"
@@ -41,6 +54,22 @@ profile "windows-legacy" {
   display     = "std"
   cpus        = 2
   memory      = "2G"
+}
+
+profile "windows-9x" {
+  description = "DOS / Windows 3.x-ME / 2000-era PCs: i440fx, SeaBIOS, IDE disk, Cirrus VGA, AMD PCnet NIC (all drivable by these guests); cap RAM low per template"
+  machine     = "pc"
+  firmware    = "seabios"
+  secure_boot = false
+  tpm         = false
+  disk_bus    = "ide"
+  nic_model   = "pcnet"
+  display     = "cirrus-vga"
+  cpus        = 1
+  memory      = "256M"
+  // Real-mode DOS/9x TUIs (fdisk, setup) drop QMP send-key events between menu
+  // redraws; drive their keyboard over VNC instead, which lands reliably.
+  input_transport = "vnc"
 }
 
 profile "linux-modern" {
