@@ -50,9 +50,11 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
 
         let viewer = viewer.unwrap();
         match viewer.transport {
-            // remote-viewer dials the socket directly; nothing to hold open.
+            // A host-configured unix-socket viewer dials the socket directly;
+            // nothing to hold open.
             Transport::Unix => viewer::launch(&viewer, &sock.display().to_string()),
-            // gvncviewer/vncviewer need a TCP bridge held open for the life
+            // remote-viewer/gvncviewer/vncviewer need a TCP bridge held open
+            // for the life
             // of the viewer. Run it in a detached helper so the terminal is
             // freed; the helper exits when the viewer window closes.
             Transport::Tcp => {
@@ -82,8 +84,8 @@ pub fn run_bridge(lab: String, vm: String) -> Result<()> {
         let target = match viewer.transport {
             Transport::Unix => sock.display().to_string(),
             Transport::Tcp => {
-                let (_, display) = bridge(&sock).await?;
-                format!("127.0.0.1:{display}")
+                let (port, display) = bridge(&sock).await?;
+                viewer::tcp_target(&viewer, "127.0.0.1", port, display)
             }
         };
         let mut child = viewer::spawn_child(&viewer, &target)?;

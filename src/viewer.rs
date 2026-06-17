@@ -59,11 +59,13 @@ pub fn detect() -> Option<Viewer> {
         });
     }
     let known = [
-        (
-            "remote-viewer",
-            "remote-viewer vnc+unix://{}",
-            Transport::Unix,
-        ),
+        // remote-viewer (virt-viewer) is preferred, but its `vnc+unix://`
+        // URI is unsupported in virt-viewer 11 (gtk-vnc aborts with a
+        // `host != NULL` assertion), so drive it over the TCP bridge with a
+        // plain `vnc://` URI — that works on every version. The detached
+        // bridge helper holds the socket open, so the `gui = true` auto-open
+        // still works after the CLI exits.
+        ("remote-viewer", "remote-viewer vnc://{}", Transport::Tcp),
         ("gvncviewer", "gvncviewer {}", Transport::Tcp),
         ("vncviewer", "vncviewer {}", Transport::Tcp),
     ];
@@ -78,11 +80,23 @@ pub fn detect() -> Option<Viewer> {
     None
 }
 
+/// Format a bridged TCP endpoint for a viewer. URI-style viewers
+/// (`vnc://…`, e.g. remote-viewer) want the real port; gvncviewer/vncviewer
+/// take a VNC *display* number (`port − 5900`).
+pub fn tcp_target(viewer: &Viewer, host: &str, port: u16, display: u16) -> String {
+    if viewer.cmd.contains("://") {
+        format!("{host}:{port}")
+    } else {
+        format!("{host}:{display}")
+    }
+}
+
 /// Spawn a viewer against a resolved target, returning the child so the
 /// caller can wait on it. The target is a unix socket path for
-/// [`Transport::Unix`] or `host:display` for [`Transport::Tcp`]. `{}` in
-/// the command template is the target; a template without `{}` (a bare
-/// host-config command) gets `unix://<target>` appended.
+/// [`Transport::Unix`] or a host endpoint from [`tcp_target`] for
+/// [`Transport::Tcp`]. `{}` in the command template is the target; a
+/// template without `{}` (a bare host-config command) gets `unix://<target>`
+/// appended.
 pub fn spawn_child(viewer: &Viewer, target: &str) -> Result<std::process::Child> {
     let line = if viewer.cmd.contains("{}") {
         viewer.cmd.replace("{}", target)
