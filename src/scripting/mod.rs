@@ -469,9 +469,11 @@ pub fn lab_module() -> Module {
         .method(
             "mouse_move",
             |v: &VmHandle, x: i64, y: i64| -> Result<(), String> {
+                // screen_size grabs the screen (its own block_on), so it must
+                // run OUTSIDE the block below — nesting block_on panics.
+                let (w, h) = screen_size(v)?;
                 v.block(async {
                     let qmp = v.vm.qmp().await.map_err(estr)?;
-                    let (w, h) = screen_size(v)?;
                     qmp.mouse_move_abs(x.max(0) as u32, y.max(0) as u32, w, h)
                         .await
                         .map_err(estr)
@@ -492,9 +494,9 @@ pub fn lab_module() -> Module {
         .method(
             "mouse_drag",
             |v: &VmHandle, x1: i64, y1: i64, x2: i64, y2: i64| -> Result<(), String> {
+                let (w, h) = screen_size(v)?;
                 v.block(async {
                     let qmp = v.vm.qmp().await.map_err(estr)?;
-                    let (w, h) = screen_size(v)?;
                     qmp.mouse_move_abs(x1.max(0) as u32, y1.max(0) as u32, w, h)
                         .await
                         .map_err(estr)?;
