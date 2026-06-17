@@ -36,6 +36,17 @@ pub enum DiskBus {
     Sata,
 }
 
+/// How scripted input (`vm.send_keys`/`mouse_*`) reaches the guest. QMP
+/// `send-key` only drives the PS/2 keyboard, which USB-HID-only guests
+/// (macOS/OpenCore) ignore; `Vnc` routes input over the VM's VNC socket
+/// instead — the path a real viewer uses (PRD §10.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputTransport {
+    #[default]
+    Qmp,
+    Vnc,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareKind {
     Ovmf,
@@ -58,6 +69,7 @@ pub struct Profile {
     pub cpus: Option<u32>,
     pub memory: Option<u64>,
     pub agent_channel: bool,
+    pub input_transport: InputTransport,
 }
 
 /// The full profile set: shipped profiles plus user overrides/extensions.
@@ -238,6 +250,15 @@ fn parse_profiles(source: &str, name: &str) -> Result<Vec<Profile>> {
             None => None,
             Some(s) => Some(parse_size(&s).map_err(|e| anyhow!("profile {pname}: {e}"))?),
         };
+        let input_transport = match get_str("input_transport")?.as_deref() {
+            None | Some("qmp") => InputTransport::Qmp,
+            Some("vnc") => InputTransport::Vnc,
+            Some(other) => {
+                return Err(anyhow!(
+                    "profile {pname}: unknown input_transport `{other}` (expected qmp, vnc)"
+                ));
+            }
+        };
 
         out.push(Profile {
             name: pname.clone(),
@@ -252,6 +273,7 @@ fn parse_profiles(source: &str, name: &str) -> Result<Vec<Profile>> {
             cpus,
             memory,
             agent_channel: get_bool("agent_channel")?.unwrap_or(true),
+            input_transport,
         });
     }
     Ok(out)

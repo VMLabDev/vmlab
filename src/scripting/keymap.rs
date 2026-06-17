@@ -92,6 +92,68 @@ pub fn char_keys(c: char) -> Result<Vec<String>, String> {
     }
 }
 
+/// X11 keysym for a canonical qcode (as produced by [`parse_chord`] /
+/// [`char_keys`]). Used by the VNC input transport, which speaks keysyms
+/// rather than QMP qcodes. Printable ASCII keysyms equal their codepoint.
+pub fn keysym(qcode: &str) -> Result<u32, String> {
+    let sym = match qcode {
+        // Letters and digits: keysym == ASCII codepoint.
+        s if s.len() == 1 && s.chars().next().unwrap().is_ascii_alphanumeric() => {
+            s.chars().next().unwrap() as u32
+        }
+        // Punctuation qcodes → their ASCII character keysym.
+        "spc" => 0x20,
+        "minus" => 0x2d,
+        "equal" => 0x3d,
+        "bracket_left" => 0x5b,
+        "bracket_right" => 0x5d,
+        "semicolon" => 0x3b,
+        "apostrophe" => 0x27,
+        "grave_accent" => 0x60,
+        "backslash" => 0x5c,
+        "comma" => 0x2c,
+        "dot" => 0x2e,
+        "slash" => 0x2f,
+        // Control / navigation (X11 0xff__ keysyms).
+        "ret" => 0xff0d,
+        "tab" => 0xff09,
+        "esc" => 0xff1b,
+        "backspace" => 0xff08,
+        "delete" => 0xffff,
+        "insert" => 0xff63,
+        "up" => 0xff52,
+        "down" => 0xff54,
+        "left" => 0xff51,
+        "right" => 0xff53,
+        "home" => 0xff50,
+        "end" => 0xff57,
+        "pgup" => 0xff55,
+        "pgdn" => 0xff56,
+        "menu" => 0xff67,
+        "print" => 0xff61,
+        "pause" => 0xff13,
+        "caps_lock" => 0xffe5,
+        "num_lock" => 0xff7f,
+        "scroll_lock" => 0xff14,
+        // Modifiers.
+        "ctrl" => 0xffe3,
+        "alt" => 0xffe9,
+        "shift" => 0xffe1,
+        "meta_l" => 0xffe7,
+        // Function keys F1..F12 → 0xffbe..0xffc9.
+        s if s.starts_with('f')
+            && s[1..]
+                .parse::<u8>()
+                .map(|n| (1..=12).contains(&n))
+                .unwrap_or(false) =>
+        {
+            0xffbe + (s[1..].parse::<u32>().unwrap() - 1)
+        }
+        _ => return Err(format!("no keysym for qcode `{qcode}`")),
+    };
+    Ok(sym)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +176,23 @@ mod tests {
         assert_eq!(char_keys('!').unwrap(), vec!["shift", "1"]);
         assert_eq!(char_keys('\n').unwrap(), vec!["ret"]);
         assert!(char_keys('é').is_err());
+    }
+
+    #[test]
+    fn keysyms() {
+        assert_eq!(keysym("a").unwrap(), 0x61);
+        assert_eq!(keysym("1").unwrap(), 0x31);
+        assert_eq!(keysym("ret").unwrap(), 0xff0d);
+        assert_eq!(keysym("right").unwrap(), 0xff53);
+        assert_eq!(keysym("ctrl").unwrap(), 0xffe3);
+        assert_eq!(keysym("spc").unwrap(), 0x20);
+        assert_eq!(keysym("f1").unwrap(), 0xffbe);
+        assert_eq!(keysym("f12").unwrap(), 0xffc9);
+        assert_eq!(keysym("slash").unwrap(), 0x2f);
+        assert!(keysym("bogus").is_err());
+        // Every qcode parse_chord/char_keys can emit must have a keysym.
+        for c in "abz09".chars() {
+            assert!(keysym(&char_keys(c).unwrap()[0]).is_ok());
+        }
     }
 }

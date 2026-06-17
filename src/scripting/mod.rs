@@ -46,6 +46,10 @@ pub struct VmHandle {
     pub(crate) runtime: Arc<LabRuntime>,
     pub(crate) rt: tokio::runtime::Handle,
     pub(crate) output: OutputSink,
+    /// Last pointer position, for the VNC input transport: RFB PointerEvent
+    /// always carries x,y, but the API splits `mouse_move`/`mouse_click`, so
+    /// a click reuses the position the preceding move set.
+    pub(crate) last_pointer: Arc<std::sync::Mutex<(i64, i64)>>,
 }
 
 /// A segment handle (PRD §10.2).
@@ -123,6 +127,31 @@ impl VmHandle {
         F: std::future::Future<Output = T>,
     {
         self.rt.block_on(fut)
+    }
+
+    /// True when scripted input should go over VNC instead of QMP (for
+    /// USB-HID-only guests like macOS where QMP send-key is ignored).
+    fn input_vnc(&self) -> bool {
+        matches!(
+            self.vm.resolved.input_transport,
+            crate::profiles::InputTransport::Vnc
+        )
+    }
+
+    /// Open an RFB input connection to this VM's VNC socket.
+    async fn vnc(&self) -> Result<crate::vnc::VncInput, String> {
+        crate::vnc::VncInput::connect(&self.vm.dirs.vnc_sock())
+            .await
+            .map_err(estr)
+    }
+
+    /// Send a parsed chord (qcodes) over VNC as keysyms.
+    async fn vnc_chord(&self, qcodes: &[String]) -> Result<(), String> {
+        let syms: Vec<u32> = qcodes
+            .iter()
+            .map(|q| keymap::keysym(q))
+            .collect::<Result<_, String>>()?;
+        self.vnc().await?.chord(&syms).await.map_err(estr)
     }
 
     fn resolve_ref(&self, path: &str) -> PathBuf {
@@ -233,6 +262,7 @@ pub fn lab_module() -> Module {
                     runtime: l.runtime.clone(),
                     rt: l.rt.clone(),
                     output: l.output.clone(),
+                    last_pointer: Default::default(),
                 })
             },
         )
@@ -245,6 +275,7 @@ pub fn lab_module() -> Module {
                     runtime: l.runtime.clone(),
                     rt: l.rt.clone(),
                     output: l.output.clone(),
+                    last_pointer: Default::default(),
                 })
                 .collect()
         })
@@ -449,6 +480,9 @@ pub fn lab_module() -> Module {
             "send_keys",
             |v: &VmHandle, chord: &str| -> Result<(), String> {
                 let keys = keymap::parse_chord(chord)?;
+                if v.input_vnc() {
+                    return v.block(async { v.vnc_chord(&keys).await });
+                }
                 let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
                 v.block(async {
                     let qmp = v.vm.qmp().await.map_err(estr)?;
@@ -469,6 +503,10 @@ pub fn lab_module() -> Module {
         .method(
             "mouse_move",
             |v: &VmHandle, x: i64, y: i64| -> Result<(), String> {
+                *v.last_pointer.lock().unwrap() = (x, y);
+                if v.input_vnc() {
+                    return v.block(async { v.vnc().await?.mouse_move(x, y).await.map_err(estr) });
+                }
                 // screen_size grabs the screen (its own block_on), so it must
                 // run OUTSIDE the block below — nesting block_on panics.
                 let (w, h) = screen_size(v)?;
@@ -483,6 +521,11 @@ pub fn lab_module() -> Module {
         .method(
             "mouse_click",
             |v: &VmHandle, button: &str| -> Result<(), String> {
+                if v.input_vnc() {
+                    let mask = vnc_button(button)?;
+                    let (x, y) = *v.last_pointer.lock().unwrap();
+                    return v.block(async { v.vnc().await?.click(x, y, mask).await.map_err(estr) });
+                }
                 v.block(async {
                     let qmp = v.vm.qmp().await.map_err(estr)?;
                     qmp.mouse_button(button, true).await.map_err(estr)?;
@@ -494,6 +537,23 @@ pub fn lab_module() -> Module {
         .method(
             "mouse_drag",
             |v: &VmHandle, x1: i64, y1: i64, x2: i64, y2: i64| -> Result<(), String> {
+                *v.last_pointer.lock().unwrap() = (x2, y2);
+                if v.input_vnc() {
+                    return v.block(async {
+                        let mut c = v.vnc().await?;
+                        c.pointer(x1, y1, 0).await.map_err(estr)?;
+                        c.pointer(x1, y1, crate::vnc::BTN_LEFT)
+                            .await
+                            .map_err(estr)?;
+                        for step in 1..=8 {
+                            let x = x1 + (x2 - x1) * step / 8;
+                            let y = y1 + (y2 - y1) * step / 8;
+                            c.pointer(x, y, crate::vnc::BTN_LEFT).await.map_err(estr)?;
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                        }
+                        c.pointer(x2, y2, 0).await.map_err(estr)
+                    });
+                }
                 let (w, h) = screen_size(v)?;
                 v.block(async {
                     let qmp = v.vm.qmp().await.map_err(estr)?;
@@ -685,7 +745,32 @@ pub fn lab_module() -> Module {
     m
 }
 
+/// RFB button mask for a button name.
+fn vnc_button(button: &str) -> Result<u8, String> {
+    match button {
+        "left" => Ok(crate::vnc::BTN_LEFT),
+        "middle" => Ok(crate::vnc::BTN_MIDDLE),
+        "right" => Ok(crate::vnc::BTN_RIGHT),
+        other => Err(format!("unknown mouse button `{other}`")),
+    }
+}
+
 fn type_text(v: &VmHandle, text: &str, delay_ms: u64) -> Result<(), String> {
+    if v.input_vnc() {
+        return v.block(async {
+            let mut c = v.vnc().await?;
+            for ch in text.chars() {
+                let keys = keymap::char_keys(ch)?;
+                let syms: Vec<u32> = keys
+                    .iter()
+                    .map(|q| keymap::keysym(q))
+                    .collect::<Result<_, String>>()?;
+                c.chord(&syms).await.map_err(estr)?;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Ok(())
+        });
+    }
     v.block(async {
         let qmp = v.vm.qmp().await.map_err(estr)?;
         for c in text.chars() {

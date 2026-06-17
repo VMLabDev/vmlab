@@ -3,7 +3,7 @@
 //! (§6.5).
 
 use crate::config::model::{Firmware, Gpu, TemplateRef, Vm};
-use crate::profiles::{DiskBus, FirmwareKind, Machine, Profile, ProfileSet};
+use crate::profiles::{DiskBus, FirmwareKind, InputTransport, Machine, Profile, ProfileSet};
 use crate::template::TemplateMeta;
 
 /// Fully resolved hardware for one VM — input to the cmdline builder.
@@ -27,6 +27,8 @@ pub struct ResolvedVm {
     /// gpu block supplies the display device instead).
     pub display_device: Option<String>,
     pub agent_channel: bool,
+    /// How scripted input reaches the guest (QMP vs VNC).
+    pub input_transport: InputTransport,
     pub nested: bool,
     pub gpu: Option<Gpu>,
     pub qemu_args: Vec<String>,
@@ -145,6 +147,7 @@ pub fn resolve_vm(
             .unwrap_or_else(|| "virtio-net-pci".to_string()),
         display_device,
         agent_channel: profile.agent_channel,
+        input_transport: profile.input_transport,
         nested: lab_vm.nested,
         gpu: lab_vm.gpu.clone(),
         qemu_args: lab_vm.qemu_args.clone(),

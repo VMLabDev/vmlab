@@ -93,7 +93,15 @@ pub fn build_args(
     // would quit QEMU and kill the VM. Decoupling the window from the VM
     // lets the user close the viewer and reattach with `vmlab console`.
     arg(&mut a, "display", "none".into());
-    arg(&mut a, "vnc", format!("unix:{}", paths.vnc_sock.display()));
+    // share=force-shared so several clients coexist: a human viewer
+    // (`vmlab console`), screenshots, and the VNC input transport (§10.3)
+    // can all attach at once. QEMU's default (allow-exclusive) lets a viewer
+    // that connects non-shared kick the others.
+    arg(
+        &mut a,
+        "vnc",
+        format!("unix:{},share=force-shared", paths.vnc_sock.display()),
+    );
 
     arg(
         &mut a,
@@ -329,6 +337,7 @@ mod tests {
                 o => o.to_string(),
             }),
             agent_channel: true,
+            input_transport: crate::profiles::InputTransport::Qmp,
             nested: false,
             gpu: None,
             qemu_args: vec![],

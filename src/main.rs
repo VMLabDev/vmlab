@@ -20,6 +20,7 @@ mod supervisor;
 mod template;
 mod viewer;
 mod vision;
+mod vnc;
 
 fn main() -> std::process::ExitCode {
     cli::run()

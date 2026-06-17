@@ -20,4 +20,5 @@ type Profile {
   cpus: i64?
   memory: utf8?         // "4G"
   agent_channel: bool?  // virtio-serial guest agent channel (default true)
+  input_transport: utf8?  // "qmp" (default) | "vnc" — scripted input path (§10.3)
 }
