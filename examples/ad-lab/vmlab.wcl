@@ -24,7 +24,7 @@ lab "ad-lab" {
   }
 
   vm "client01" {
-    template   = "x86_64/windows-11@26100.1"
+    template   = "x86_64/windows-11@26100.1742"
     depends_on = ["dc01"]
     nic { segment = "corp" }
   }
