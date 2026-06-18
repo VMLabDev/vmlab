@@ -269,13 +269,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     ));
                 }
             }
-            TemplateSource::Scratch { span } => {
-                if t.disk.is_none() {
-                    issues.push(Issue::at(
-                        *span,
-                        format!("scratch-built template \"{}\" requires `disk`", t.name),
-                    ));
-                }
+            TemplateSource::Scratch { span } if t.disk.is_none() => {
+                issues.push(Issue::at(
+                    *span,
+                    format!("scratch-built template \"{}\" requires `disk`", t.name),
+                ));
             }
             _ => {}
         }
