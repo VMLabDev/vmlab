@@ -268,12 +268,12 @@ async fn run_build(
         .context("installing into the store")?;
     log(format!(
         "installed {}/{}@{}\n",
-        def.arch, def.name, def.version
+        meta.arch, meta.name, meta.version
     ));
     runtime.events.emit(
         "template.built",
         serde_json::json!({
-            "arch": def.arch, "name": def.name, "version": def.version,
+            "arch": meta.arch, "name": meta.name, "version": meta.version,
         }),
     );
     Ok(meta)
