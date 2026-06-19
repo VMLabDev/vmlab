@@ -219,7 +219,8 @@ async fn build(file: Option<PathBuf>, only: Option<String>, version: Option<Stri
 }
 
 fn list(json: bool) -> Result<()> {
-    let templates = store().list()?;
+    let store = store();
+    let templates = store.list()?;
     if json {
         let entries: Vec<_> = templates.iter().map(meta_json).collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -229,17 +230,57 @@ fn list(json: bool) -> Result<()> {
         println!("no templates in the store");
         return Ok(());
     }
-    println!("{:<10} {:<28} {:<12} CREATED", "ARCH", "NAME", "VERSION");
-    for t in templates {
+    // Show the full registry path when known, else the bare store name.
+    let name_of = |t: &crate::template::meta::TemplateMeta| {
+        t.registry.clone().unwrap_or_else(|| t.name.clone())
+    };
+    let name_w = templates
+        .iter()
+        .map(|t| name_of(t).len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    println!(
+        "{:<8} {:<name_w$} {:<16} {:<8} CREATED",
+        "ARCH", "TEMPLATE", "VERSION", "SIZE"
+    );
+    for t in &templates {
+        let disk = store
+            .root()
+            .join(&t.arch)
+            .join(&t.name)
+            .join(&t.version)
+            .join(crate::template::store::DISK_FILE);
+        let size = std::fs::metadata(&disk).map(|m| m.len()).unwrap_or(0);
         println!(
-            "{:<10} {:<28} {:<12} {}",
+            "{:<8} {:<name_w$} {:<16} {:<8} {}",
             t.arch,
-            t.name,
+            name_of(t),
             t.version,
+            human_size(size),
             t.created.format("%Y-%m-%d")
         );
     }
     Ok(())
+}
+
+/// Round a byte count to a short human string (`1.8G`, `456M`, `512B`).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    if bytes == 0 {
+        return "-".to_string();
+    }
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}{}", UNITS[0])
+    } else {
+        format!("{size:.1}{}", UNITS[unit])
+    }
 }
 
 /// Fixed-shape JSON for scripting: every key always present (null when
