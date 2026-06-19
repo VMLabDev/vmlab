@@ -24,6 +24,7 @@
 #![allow(unused_imports)]
 
 pub mod auth;
+pub mod catalog;
 pub mod chunking;
 pub mod client;
 pub mod config_blob;
@@ -35,6 +36,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
+pub use catalog::list_repositories;
 pub use chunking::{ChunkInfo, ChunkSet, DEFAULT_CHUNK_SIZE};
 pub use client::{Registry, Transport};
 pub use manifest::{Descriptor, ImageIndex, Manifest};

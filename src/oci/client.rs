@@ -69,6 +69,9 @@ pub trait Transport: Send + Sync {
     /// List the tags of `repository` (`GET /v2/<repo>/tags/list`). Returns an
     /// empty vec when the repository does not exist yet.
     async fn list_tags(&self, repository: &str) -> Result<Vec<String>>;
+    /// List every repository on the registry (`GET /v2/_catalog`). Errors on
+    /// registries that don't implement the catalog endpoint (e.g. GHCR).
+    async fn list_catalog(&self) -> Result<Vec<String>>;
 }
 
 /// The vmlab registry client.
@@ -112,6 +115,38 @@ impl Registry {
     /// tags plus any moving aliases). Empty when the repo does not yet exist.
     pub async fn list_tags(&self) -> Result<Vec<String>> {
         self.transport.list_tags(&self.reference.repository).await
+    }
+
+    /// List every repository on this reference's registry (`/v2/_catalog`).
+    pub async fn list_catalog(&self) -> Result<Vec<String>> {
+        self.transport.list_catalog().await
+    }
+
+    /// The architectures available under this reference's tag: the platform
+    /// entries of a multi-arch index, or the single arch of a plain manifest.
+    pub async fn index_arches(&self, tag: &str) -> Result<Vec<String>> {
+        let repo = &self.reference.repository;
+        let top = self
+            .transport
+            .get_manifest(repo, tag)
+            .await?
+            .ok_or_else(|| anyhow!("{}/{repo}:{tag} not found", self.reference.host))?;
+        match parse_manifest_or_index(&top.body)? {
+            ManifestOrIndex::Index(index) => Ok(index
+                .manifests
+                .iter()
+                .filter_map(|d| d.platform.as_ref().map(|p| p.architecture.clone()))
+                .collect()),
+            ManifestOrIndex::Manifest(m) => {
+                // Plain single-arch manifest: read its config blob for the arch.
+                let config_bytes = self
+                    .transport
+                    .get_blob(repo, &m.config.digest)
+                    .await
+                    .context("downloading config blob")?;
+                Ok(vec![TemplateConfig::from_json(&config_bytes)?.arch])
+            }
+        }
     }
 
     /// Push a template directory (containing `disk.qcow2` + `template.wcl`)
@@ -687,6 +722,48 @@ impl Transport for HttpTransport {
         }
         Ok(tags)
     }
+
+    async fn list_catalog(&self) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct Catalog {
+            #[serde(default)]
+            repositories: Option<Vec<String>>,
+        }
+        let scope = "registry:catalog:*";
+        let mut repos = Vec::new();
+        let mut next = Some(self.url("/v2/_catalog?n=1000"));
+        while let Some(url) = next.take() {
+            let resp = self.send_with_auth(scope, || self.client.get(&url)).await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                bail!(
+                    "registry {} does not support the catalog endpoint (/v2/_catalog)",
+                    self.host
+                );
+            }
+            if !resp.status().is_success() {
+                bail!("GET _catalog returned {}", resp.status());
+            }
+            let link = resp
+                .headers()
+                .get(reqwest::header::LINK)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let body = resp.bytes().await.context("reading _catalog body")?;
+            let parsed: Catalog =
+                serde_json::from_slice(&body).context("parsing _catalog response")?;
+            if let Some(mut r) = parsed.repositories {
+                repos.append(&mut r);
+            }
+            next = link.and_then(|l| next_link(&l)).map(|rel| {
+                if rel.starts_with("http://") || rel.starts_with("https://") {
+                    rel
+                } else {
+                    self.url(&rel)
+                }
+            });
+        }
+        Ok(repos)
+    }
 }
 
 /// Extract the `rel="next"` URL from an RFC 5988 `Link` header, if present.
@@ -823,6 +900,18 @@ mod tests {
             tags.dedup();
             Ok(tags)
         }
+        async fn list_catalog(&self) -> Result<Vec<String>> {
+            let mut repos: Vec<String> = self
+                .manifests
+                .lock()
+                .unwrap()
+                .keys()
+                .filter_map(|k| k.rsplit_once('@').map(|(repo, _)| repo.to_string()))
+                .collect();
+            repos.sort();
+            repos.dedup();
+            Ok(repos)
+        }
     }
 
     fn meta(arch: &str) -> TemplateMeta {
@@ -882,6 +971,9 @@ mod tests {
             }
             async fn list_tags(&self, r: &str) -> Result<Vec<String>> {
                 self.0.list_tags(r).await
+            }
+            async fn list_catalog(&self) -> Result<Vec<String>> {
+                self.0.list_catalog().await
             }
         }
         Registry::with_transport(Reference::parse(reference).unwrap(), Box::new(Shared(fake)))
@@ -992,6 +1084,20 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // index_arches reports every arch in the merged index; list_catalog
+        // surfaces the repo.
+        let mut arches = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .index_arches("3.20")
+            .await
+            .unwrap();
+        arches.sort();
+        assert_eq!(arches, vec!["aarch64".to_string(), "x86_64".to_string()]);
+        let catalog = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .list_catalog()
+            .await
+            .unwrap();
+        assert!(catalog.contains(&"owner/alpine".to_string()), "{catalog:?}");
 
         // the tag now resolves to an index — pulling without --arch fails
         let store_root = work.path().join("store");

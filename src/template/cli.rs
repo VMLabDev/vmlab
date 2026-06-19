@@ -31,6 +31,20 @@ pub enum TemplateCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Search a registry for published templates (name substring + arch filter)
+    Search {
+        /// Case-insensitive substring to match the template name (default: all)
+        query: Option<String>,
+        /// Registry namespace to search (default: the vmlab registry)
+        #[arg(long)]
+        registry: Option<String>,
+        /// Only show templates that have this arch
+        #[arg(long)]
+        arch: Option<String>,
+        /// Emit a JSON array instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Check whether a template is in the store (`<arch>/<name>[@<version>]`).
     /// Prints the resolved ref and exits 0 if present; exits nonzero if not.
     Exists { reference: String },
@@ -104,6 +118,9 @@ pub enum TemplateCmd {
     },
 }
 
+/// Default namespace for `vmlab template search` (override with `--registry`).
+const DEFAULT_SEARCH_REGISTRY: &str = "ghcr.io/vmlabdev/vmlab-templates";
+
 fn store() -> TemplateStore {
     TemplateStore::new(crate::paths::template_store_dir())
 }
@@ -118,6 +135,12 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 version,
             } => build(file, name, version).await,
             TemplateCmd::List { json } => list(json),
+            TemplateCmd::Search {
+                query,
+                registry,
+                arch,
+                json,
+            } => search(query, registry, arch, json).await,
             TemplateCmd::Exists { reference } => exists(&reference),
             TemplateCmd::Rm { reference, force } => rm(&reference, force),
             TemplateCmd::Relabel {
@@ -239,6 +262,103 @@ fn meta_json(t: &crate::template::meta::TemplateMeta) -> serde_json::Value {
         "origin": t.origin,
         "registry": t.registry,
         "sha256": t.sha256,
+    })
+}
+
+struct SearchRow {
+    name: String,
+    arches: Vec<String>,
+    version: String,
+    reference: String,
+}
+
+async fn search(
+    query: Option<String>,
+    registry: Option<String>,
+    arch: Option<String>,
+    json: bool,
+) -> Result<()> {
+    use futures::StreamExt as _;
+
+    let namespace = registry.unwrap_or_else(|| DEFAULT_SEARCH_REGISTRY.to_string());
+    let repos = crate::oci::list_repositories(&namespace)
+        .await
+        .with_context(|| format!("listing templates in {namespace}"))?;
+    let ns_prefix = format!("{}/", namespace.trim_end_matches('/'));
+
+    // Resolve each repo's latest version + arches concurrently.
+    let mut rows: Vec<SearchRow> = futures::stream::iter(repos.into_iter().map(|repo| {
+        let ns_prefix = ns_prefix.clone();
+        async move { fetch_search_row(repo, &ns_prefix).await }
+    }))
+    .buffer_unordered(8)
+    .filter_map(|row| async move { row })
+    .collect()
+    .await;
+
+    let q = query.map(|s| s.to_lowercase());
+    rows.retain(|r| {
+        q.as_ref().is_none_or(|q| r.name.to_lowercase().contains(q))
+            && arch
+                .as_ref()
+                .is_none_or(|a| r.arches.iter().any(|x| x == a))
+    });
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if json {
+        let entries: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name,
+                    "reference": r.reference,
+                    "arches": r.arches,
+                    "version": r.version,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no templates found in {namespace}");
+        return Ok(());
+    }
+    println!("{:<26} {:<28} VERSION", "NAME", "ARCH");
+    for r in rows {
+        println!("{:<26} {:<28} {}", r.name, r.arches.join(","), r.version);
+    }
+    Ok(())
+}
+
+/// Resolve one repository's display name, latest version and arches. Returns
+/// `None` (skipping the repo) on any error or when it has no usable tag.
+async fn fetch_search_row(repo: String, ns_prefix: &str) -> Option<SearchRow> {
+    let name = repo.strip_prefix(ns_prefix).unwrap_or(&repo).to_string();
+    let registry = crate::oci::Registry::new(&repo).ok()?;
+    let tags = match registry.list_tags().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("warning: {repo}: {e:#}");
+            return None;
+        }
+    };
+    // Prefer the highest concrete version tag; fall back to `latest`.
+    let versions: Vec<String> = tags
+        .iter()
+        .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .cloned()
+        .collect();
+    let tag = versions
+        .into_iter()
+        .max_by(|a, b| crate::template::store::compare_versions(a, b))
+        .or_else(|| tags.iter().find(|t| *t == "latest").cloned())?;
+    let arches = registry.index_arches(&tag).await.ok()?;
+    Some(SearchRow {
+        name,
+        arches,
+        version: tag.clone(),
+        reference: format!("{repo}:{tag}"),
     })
 }
 
