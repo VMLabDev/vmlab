@@ -180,12 +180,25 @@ impl LabRuntime {
             }
 
             let first_boot_script = meta.as_ref().and_then(|m| m.first_boot_script.clone());
+            // Each NIC inherits its segment's effective MTU (jumbo on NAT/global
+            // by default); drives `host_mtu=` on virtio NICs in the cmdline.
+            let nic_mtus: Vec<u16> = vm_cfg
+                .nics
+                .iter()
+                .map(|nic| {
+                    network
+                        .segments
+                        .get(nic_segment_name(nic))
+                        .map_or(crate::labd::network::STANDARD_MTU, |s| s.effective_mtu())
+                })
+                .collect();
             let vm = VmInstance::new(
                 &name,
                 vm_cfg.clone(),
                 resolved,
                 dirs,
                 macs,
+                nic_mtus,
                 backing,
                 disk_size,
                 cdroms,

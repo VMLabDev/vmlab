@@ -45,7 +45,24 @@ pub struct SegmentNet {
     listeners: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Default MTU for NAT segments. The guest↔gateway link is an in-memory UNIX
+/// socket and NAT terminates TCP, so a jumbo MTU here cuts per-frame overhead
+/// with no fragmentation risk (see `net::nat`). Plain L2 and cross-host global
+/// segments stay at the classic 1500 — jumbo there would need end-to-end
+/// agreement across bridged/peer topologies, so it's opt-in via `mtu`.
+pub const JUMBO_MTU: u16 = 9000;
+pub const STANDARD_MTU: u16 = 1500;
+
 impl SegmentNet {
+    /// The MTU advertised to guests on this segment: an explicit `mtu` attribute
+    /// wins; otherwise jumbo on NAT segments and 1500 everywhere else.
+    pub fn effective_mtu(&self) -> u16 {
+        self.config
+            .as_ref()
+            .and_then(|c| c.mtu)
+            .unwrap_or(if self.nat { JUMBO_MTU } else { STANDARD_MTU })
+    }
+
     /// Listen on a unix socket for one VM NIC; QEMU connects to it.
     pub async fn listen_nic(&mut self, sock: &Path, isolated: bool) -> Result<()> {
         let handle = self
@@ -229,6 +246,7 @@ impl LabNetwork {
                 continue;
             }
             let gw_mac = gateway_mac(&lab.name, &seg.name);
+            let mtu = seg.effective_mtu();
 
             // -- DHCP -------------------------------------------------------
             let seg_dns = seg
@@ -247,6 +265,7 @@ impl LabNetwork {
                     Some(seg_dns.server.unwrap_or(seg.gateway_ip))
                 };
                 cfg.domain = Some(format!("{}.{}", lab.name, host.dns_suffix));
+                cfg.mtu = mtu;
                 if let Some(c) = &seg.config {
                     cfg.routes = c.routes.iter().map(|r| (r.dest, r.via)).collect();
                 }
@@ -322,7 +341,7 @@ impl LabNetwork {
             // NAT + L3 rule services on the same switch (§9.6–§9.9). Declared
             // routes' block/redirect/forward rules are pre-installed.
             let services =
-                super::netservices::SegmentServices::install(&seg.switch, &handle, seg.nat);
+                super::netservices::SegmentServices::install(&seg.switch, &handle, seg.nat, mtu);
             if let Some(cfg) = &seg.config {
                 super::netservices::preinstall_rules(&services, cfg, lab);
             }

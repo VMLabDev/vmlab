@@ -95,6 +95,9 @@ pub struct VmInstance {
     pub resolved: qemu::ResolvedVm,
     pub dirs: VmDirs,
     pub macs: Vec<MacAddr>,
+    /// Effective MTU of each NIC's segment, in declaration order. Drives
+    /// `host_mtu=` on virtio NICs so the guest matches a jumbo segment.
+    pub nic_mtus: Vec<u16>,
     /// Backing template disk in the store (None for scratch).
     pub backing: Option<PathBuf>,
     /// Primary disk virtual size (scratch: from config; clone: template's).
@@ -128,6 +131,7 @@ impl VmInstance {
         resolved: qemu::ResolvedVm,
         dirs: VmDirs,
         macs: Vec<MacAddr>,
+        nic_mtus: Vec<u16>,
         backing: Option<PathBuf>,
         disk_size: Option<u64>,
         cdroms: Vec<PathBuf>,
@@ -140,6 +144,7 @@ impl VmInstance {
             resolved,
             dirs,
             macs,
+            nic_mtus,
             backing,
             disk_size,
             cdroms,
@@ -260,7 +265,7 @@ impl VmInstance {
                 .macs
                 .iter()
                 .enumerate()
-                .map(|(i, mac)| (*mac, self.dirs.nic_sock(i)))
+                .map(|(i, mac)| (*mac, self.dirs.nic_sock(i), self.nic_mtus.get(i).copied()))
                 .collect(),
             ovmf_vars: (self.resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf))
                 .then(|| self.dirs.ovmf_vars()),

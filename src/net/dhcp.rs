@@ -49,6 +49,7 @@ const OPT_SUBNET_MASK: u8 = 1;
 const OPT_ROUTER: u8 = 3;
 const OPT_DNS: u8 = 6;
 const OPT_DOMAIN: u8 = 15;
+const OPT_MTU: u8 = 26;
 const OPT_REQUESTED_IP: u8 = 50;
 const OPT_LEASE_TIME: u8 = 51;
 const OPT_MSG_TYPE: u8 = 53;
@@ -75,6 +76,10 @@ pub struct DhcpConfig {
     /// pool and may sit outside it (PRD §9.4).
     pub reservations: HashMap<MacAddr, Ipv4Addr>,
     pub lease_secs: u32,
+    /// Interface MTU pushed via option 26. Lets Linux guests raise their NIC
+    /// MTU to match a jumbo segment (Windows generally ignores this and relies
+    /// on virtio-net `host_mtu`).
+    pub mtu: u16,
 }
 
 impl DhcpConfig {
@@ -90,6 +95,7 @@ impl DhcpConfig {
             routes: Vec::new(),
             reservations: HashMap::new(),
             lease_secs: 3600,
+            mtu: 1500,
         }
     }
 }
@@ -354,6 +360,9 @@ impl DhcpServer {
             if let Some(domain) = &cfg.domain {
                 opt(&mut b, OPT_DOMAIN, domain.as_bytes());
             }
+            if cfg.mtu != 1500 {
+                opt(&mut b, OPT_MTU, &cfg.mtu.to_be_bytes());
+            }
             if !cfg.routes.is_empty() {
                 opt(
                     &mut b,
@@ -616,6 +625,17 @@ mod tests {
         assert_eq!(r.opts[&OPT_LEASE_TIME], 3600u32.to_be_bytes().to_vec());
         assert_eq!(r.opts[&OPT_SERVER_ID], GW.octets().to_vec());
         assert!(!r.opts.contains_key(&OPT_CLASSLESS_ROUTES));
+        // Default MTU is 1500 — option 26 is omitted.
+        assert!(!r.opts.contains_key(&OPT_MTU));
+    }
+
+    #[test]
+    fn jumbo_mtu_sets_option_26() {
+        let mut cfg = config();
+        cfg.mtu = 9000;
+        let mut s = DhcpServer::new(cfg);
+        let r = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        assert_eq!(r.opts[&OPT_MTU], 9000u16.to_be_bytes().to_vec());
     }
 
     #[test]

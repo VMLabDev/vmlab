@@ -30,6 +30,7 @@ type Segment {
   global: bool?            // owned by the supervisor, shared across labs (§9.2)
   dhcp: bool?              // default true (§9.4)
   nat: bool?               // internet egress for this segment (§9.7)
+  mtu: i64?                // link MTU; default jumbo (9000) on nat/global, else 1500
   routes_to: list<utf8>?   // daemon inter-segment routing opt-in (§9.6)
   @child("dns")         dns: SegmentDns?
   @child("connect")     connect: Connect?

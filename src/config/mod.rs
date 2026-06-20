@@ -176,7 +176,7 @@ lab "ad-lab" {
     route { dest = "10.60.0.0/24" via = "10.50.0.254" }
   }
 
-  segment "dmz" { }
+  segment "dmz" { mtu = 9000 }
 
   vm "dc01" {
     template = "x86_64/windows-server-2025"
@@ -240,6 +240,8 @@ lab "ad-lab" {
 
         let dmz = &lab.segments[1];
         assert!(dmz.subnet.is_none());
+        assert_eq!(dmz.mtu, Some(9000));
+        assert_eq!(corp.mtu, None); // unset → default resolved at assembly time
 
         let dc = &lab.vms[0];
         assert_eq!(dc.name, "dc01");
@@ -282,6 +284,17 @@ lab "ad-lab" {
         assert!(
             err.issues.iter().any(|i| i.message.contains("bogus_attr")),
             "expected unknown-attribute error, got: {:?}",
+            err.issues
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_mtu() {
+        let src = "import <vmlab.wcl>\nlab \"x\" {\n  segment \"s\" { mtu = 100 }\n}\n";
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        assert!(
+            err.issues.iter().any(|i| i.message.contains("mtu")),
+            "expected mtu range error, got: {:?}",
             err.issues
         );
     }

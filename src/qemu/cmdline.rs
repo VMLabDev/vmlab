@@ -25,8 +25,10 @@ pub struct VmPaths {
     pub cdroms: Vec<PathBuf>,
     /// Floppy attachment.
     pub floppy: Option<PathBuf>,
-    /// One unix socket per NIC, in declaration order, with its MAC.
-    pub nics: Vec<(MacAddr, PathBuf)>,
+    /// One unix socket per NIC, in declaration order: (MAC, socket, segment
+    /// MTU). The MTU drives `host_mtu=` on virtio NICs so the guest can use a
+    /// jumbo segment; `None`/1500 leaves the link at the default.
+    pub nics: Vec<(MacAddr, PathBuf, Option<u16>)>,
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
     /// the template in `firmware::UefiFirmware::vars_template`).
     pub ovmf_vars: Option<PathBuf>,
@@ -260,7 +262,7 @@ pub fn build_args(
 
     // NICs: stream-socket netdevs into the segment switch (§9.1). The
     // daemon listens; QEMU connects.
-    for (i, (mac, sock)) in paths.nics.iter().enumerate() {
+    for (i, (mac, sock, mtu)) in paths.nics.iter().enumerate() {
         arg(
             &mut a,
             "netdev",
@@ -269,10 +271,16 @@ pub fn build_args(
                 sock.display()
             ),
         );
+        // virtio-net negotiates a jumbo MTU with the guest via `host_mtu`;
+        // e1000/pcnet don't support it reliably, so they stay at the default.
+        let host_mtu = mtu
+            .filter(|m| *m != 1500 && vm.nic_model.starts_with("virtio-net"))
+            .map(|m| format!(",host_mtu={m}"))
+            .unwrap_or_default();
         arg(
             &mut a,
             "device",
-            format!("{},netdev=net{i},mac={mac}", vm.nic_model),
+            format!("{},netdev=net{i},mac={mac}{host_mtu}", vm.nic_model),
         );
     }
     if paths.nics.is_empty() {
@@ -408,6 +416,7 @@ mod tests {
             nics: vec![(
                 "52:54:00:00:00:01".parse().unwrap(),
                 PathBuf::from("/run/l/t/nic0.sock"),
+                None,
             )],
             ..Default::default()
         }
@@ -464,6 +473,33 @@ mod tests {
         assert!(s.contains("-nic none"));
         assert!(s.contains("-accel tcg"));
         assert!(s.contains("-cpu max"));
+    }
+
+    #[test]
+    fn jumbo_mtu_sets_host_mtu_on_virtio_only() {
+        // virtio-net guest on a jumbo segment gets host_mtu=.
+        let vm = resolved("linux-modern", "x86_64");
+        assert!(vm.nic_model.starts_with("virtio-net"));
+        let mut p = paths();
+        p.ovmf_vars = Some("/v".into());
+        p.nics[0].2 = Some(9000);
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(s.contains("host_mtu=9000"), "{s}");
+
+        // 1500 is the default — no host_mtu emitted even on virtio.
+        let mut p = paths();
+        p.ovmf_vars = Some("/v".into());
+        p.nics[0].2 = Some(1500);
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(!s.contains("host_mtu"), "{s}");
+
+        // Legacy e1000 NICs never get host_mtu, even on a jumbo segment.
+        let vm = resolved("windows-legacy", "x86_64");
+        assert!(!vm.nic_model.starts_with("virtio-net"));
+        let mut p = paths();
+        p.nics[0].2 = Some(9000);
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(!s.contains("host_mtu"), "{s}");
     }
 
     #[test]

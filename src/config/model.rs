@@ -50,6 +50,11 @@ pub struct Segment {
     pub global: bool,
     pub dhcp: bool,
     pub nat: bool,
+    /// Segment MTU. `None` means "use the default" (jumbo on NAT/global
+    /// segments, 1500 otherwise) — see the network assembly. The guest↔gateway
+    /// path is an in-memory UNIX socket, so a jumbo MTU here cuts per-frame
+    /// overhead with no fragmentation risk.
+    pub mtu: Option<u16>,
     pub routes_to: Vec<String>,
     pub dns: SegmentDns,
     pub connect: Option<Connect>,

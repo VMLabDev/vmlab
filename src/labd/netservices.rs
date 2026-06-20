@@ -35,6 +35,7 @@ impl SegmentServices {
         switch: &Arc<Switch>,
         gateway: &GatewayHandle,
         nat_enabled: bool,
+        mtu: u16,
     ) -> Arc<SegmentServices> {
         let rules = Arc::new(Mutex::new(RuleSet::new()));
         let gw_mac = gateway.gw_mac();
@@ -77,7 +78,7 @@ impl SegmentServices {
         }));
 
         let nat = if nat_enabled {
-            Some(spawn_nat(switch, gateway, gw_mac, rules.clone()))
+            Some(spawn_nat(switch, gateway, gw_mac, mtu, rules.clone()))
         } else {
             None
         };
@@ -98,10 +99,12 @@ fn spawn_nat(
     _switch: &Arc<Switch>,
     gateway: &GatewayHandle,
     gw_mac: MacAddr,
+    mtu: u16,
     rules: Arc<Mutex<RuleSet>>,
 ) -> Arc<NatEngine> {
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
-    let cfg = NatConfig::new(gateway.gw_ip(), gw_mac);
+    let mut cfg = NatConfig::new(gateway.gw_ip(), gw_mac);
+    cfg.mtu = mtu;
     let engine = NatEngine::new(cfg, out_tx);
 
     // Forward NAT output into the switch via the gateway port. Replies

@@ -296,6 +296,16 @@ fn extract_segment(b: &Block, issues: &mut IssueList) -> Option<Segment> {
         global: get_bool(b, "global", issues).unwrap_or(false),
         dhcp: get_bool(b, "dhcp", issues).unwrap_or(true),
         nat: get_bool(b, "nat", issues).unwrap_or(false),
+        mtu: get_int(b, "mtu", issues).and_then(|(n, span)| match u16::try_from(n) {
+            Ok(m) if m >= 576 => Some(m),
+            _ => {
+                issues.push(Issue::at(
+                    span,
+                    format!("`mtu` must be between 576 and 65535, got {n}"),
+                ));
+                None
+            }
+        }),
         routes_to: get_str_list(b, "routes_to", issues),
         dns: SegmentDns {
             server: None,
