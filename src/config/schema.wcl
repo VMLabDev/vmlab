@@ -202,6 +202,7 @@ type TemplateDef {
   nested: bool?
   gui: bool?               // watch the build VM via a VNC viewer (§11)
   qemu_args: list<utf8>?
+  first_boot: utf8?        // wisp script run on first instantiation, before ready
   @child("source")       source: TemplateSource
   @children("media")     media: list<Media>
   @children("provision") provisions: list<Provision>

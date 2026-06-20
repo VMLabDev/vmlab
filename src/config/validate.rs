@@ -203,6 +203,9 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for p in &t.provisions {
             scripts.push((&p.script, p.span));
         }
+        if let Some(fb) = &t.first_boot {
+            scripts.push((fb, t.span));
+        }
     }
     for (script, span) in scripts {
         let path = file.root.join(script);

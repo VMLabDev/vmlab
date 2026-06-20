@@ -234,6 +234,19 @@ async fn run_build(
 
     let info = super::qimg::image_info(&sealed).await?;
     let sha = super::store::sha256_file(&sealed).context("hashing sealed image")?;
+    // Embed the first-boot provision script (run on first instantiation, before
+    // ready). It rides in the metadata, so the file is read relative to the
+    // template root and baked in here (PRD §6.1).
+    let first_boot_script = match &def.first_boot {
+        Some(path) => {
+            let full = root.join(path);
+            Some(
+                std::fs::read_to_string(&full)
+                    .with_context(|| format!("reading first-boot script {}", full.display()))?,
+            )
+        }
+        None => None,
+    };
     let meta = TemplateMeta {
         name: def.name.clone(),
         arch: def.arch.clone(),
@@ -253,6 +266,7 @@ async fn run_build(
         origin: source_origin(&def.source),
         registry: def.registry.clone(),
         sha256: Some(sha),
+        first_boot_script,
     };
 
     store
@@ -411,5 +425,25 @@ mod tests {
         ));
         let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
         assert!(wcl.contains("nic { nat = true }"), "{wcl}");
+    }
+
+    /// `first_boot` parses to the script path; it is build-time-only, so the
+    /// synthetic build lab must NOT replay it (first-boot runs at instantiation,
+    /// not during the build).
+    #[test]
+    fn first_boot_parses_and_is_not_in_build_lab() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "  first_boot = \"scripts/firstboot.wisp\"\n",
+            "}\n"
+        ));
+        assert_eq!(
+            d.first_boot.as_deref(),
+            Some(Path::new("scripts/firstboot.wisp"))
+        );
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
+        assert!(!wcl.contains("firstboot.wisp"), "{wcl}");
     }
 }

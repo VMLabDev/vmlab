@@ -72,6 +72,12 @@ impl VmDirs {
     pub fn primary_disk(&self) -> PathBuf {
         self.local.join("disk0.qcow2")
     }
+    /// Sentinel marking that the template's first-boot provision has completed
+    /// for this clone. Written once first-boot succeeds; gates run-once so a
+    /// second boot never waits on a marker that is not re-written (PRD §6.1).
+    pub fn firstboot_sentinel(&self) -> PathBuf {
+        self.local.join("firstboot.done")
+    }
     pub fn extra_disk(&self, name: &str) -> PathBuf {
         self.local.join(format!("disk-{name}.qcow2"))
     }
@@ -96,8 +102,16 @@ pub struct VmInstance {
     /// CD-ROM image paths (config cdrom + built media), resolved absolute.
     pub cdroms: Vec<PathBuf>,
     pub floppy: Option<PathBuf>,
+    /// Embedded first-boot provision script carried by the backing template
+    /// (None for scratch / templates without one). Run on first instantiation,
+    /// before the VM is reported ready (PRD §6.1).
+    pub first_boot_script: Option<String>,
 
     state: RwLock<PowerState>,
+    /// The guest agent answers `guest-ping`. Set by the readiness poller.
+    agent_up: RwLock<bool>,
+    /// The VM is fully provisioned and usable: agent up AND the first-boot
+    /// provision (if any) has completed. Gates dependents and provisions.
     ready: RwLock<bool>,
     stop_requested: RwLock<bool>,
     qemu: Mutex<Option<Arc<Proc>>>,
@@ -118,6 +132,7 @@ impl VmInstance {
         disk_size: Option<u64>,
         cdroms: Vec<PathBuf>,
         floppy: Option<PathBuf>,
+        first_boot_script: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             lab: lab.to_string(),
@@ -129,7 +144,9 @@ impl VmInstance {
             disk_size,
             cdroms,
             floppy,
+            first_boot_script,
             state: RwLock::new(PowerState::Stopped),
+            agent_up: RwLock::new(false),
             ready: RwLock::new(false),
             stop_requested: RwLock::new(false),
             qemu: Mutex::new(None),
@@ -145,6 +162,25 @@ impl VmInstance {
 
     pub async fn is_ready(&self) -> bool {
         *self.ready.read().await
+    }
+
+    /// Whether the guest agent has answered at least once (PRD §2). This is a
+    /// weaker signal than [`is_ready`]: it can be true while a first-boot
+    /// provision is still running.
+    pub async fn is_agent_up(&self) -> bool {
+        *self.agent_up.read().await
+    }
+
+    /// Mark the VM fully ready. Called by the orchestration layer once the
+    /// first-boot provision (if any) has completed.
+    pub async fn mark_ready(&self) {
+        *self.ready.write().await = true;
+    }
+
+    /// Whether a first-boot provision still needs to run for this clone: the
+    /// template carries one and no completion sentinel exists yet.
+    pub fn first_boot_pending(&self) -> bool {
+        self.first_boot_script.is_some() && !self.dirs.firstboot_sentinel().exists()
     }
 
     pub async fn qmp(&self) -> Result<QmpClient> {
@@ -362,13 +398,19 @@ impl VmInstance {
             };
             me.teardown().await;
             *me.state.write().await = PowerState::Stopped;
+            *me.agent_up.write().await = false;
             *me.ready.write().await = false;
             on_exit(reason, status);
         });
 
-        // Readiness poller: ready = agent responds (PRD §2, §7.4).
+        // Readiness poller: the guest agent answering `guest-ping` makes the VM
+        // "agent up" (PRD §2, §7.4). When the template has no pending first-boot
+        // provision, agent-up is also full readiness, so set both and fire
+        // on_ready. Otherwise leave `ready` for the orchestration layer to flip
+        // once the first-boot provision completes.
         let me = self.clone();
         tokio::spawn(async move {
+            let defer_ready = me.first_boot_pending();
             loop {
                 if me.state().await != PowerState::Running {
                     return;
@@ -377,8 +419,11 @@ impl VmInstance {
                 if let Some(qga) = qga
                     && qga.ping(Duration::from_secs(2)).await
                 {
-                    *me.ready.write().await = true;
-                    on_ready();
+                    *me.agent_up.write().await = true;
+                    if !defer_ready {
+                        *me.ready.write().await = true;
+                        on_ready();
+                    }
                     return;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -416,7 +461,7 @@ impl VmInstance {
         }
 
         // Rung 1: guest agent shutdown.
-        if self.is_ready().await
+        if self.is_agent_up().await
             && let Ok(qga) = self.qga().await
         {
             let _ = qga.shutdown("powerdown", Duration::from_secs(5)).await;
@@ -461,7 +506,8 @@ impl VmInstance {
         Ok(())
     }
 
-    /// Wait until the agent responds (PRD §10.3 wait_ready).
+    /// Wait until the VM is fully ready (PRD §10.3 wait_ready): agent up and
+    /// any first-boot provision complete.
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -473,6 +519,24 @@ impl VmInstance {
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!("{}: not ready after {timeout:?}", self.cfg.name);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Wait until the guest agent first responds, ahead of the first-boot
+    /// provision. Weaker than [`wait_ready`].
+    pub async fn wait_agent_up(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.is_agent_up().await {
+                return Ok(());
+            }
+            if self.state().await == PowerState::Stopped {
+                bail!("{} stopped while waiting for agent", self.cfg.name);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("{}: agent not up after {timeout:?}", self.cfg.name);
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

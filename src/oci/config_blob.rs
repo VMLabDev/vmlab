@@ -46,6 +46,9 @@ pub struct TemplateConfig {
     pub registry: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sha256: Option<String>,
+    /// Embedded first-boot wisp script source (PRD §6.1).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub first_boot_script: Option<String>,
 }
 
 impl TemplateConfig {
@@ -66,6 +69,7 @@ impl TemplateConfig {
             origin: meta.origin.clone(),
             registry: meta.registry.clone(),
             sha256: meta.sha256.clone(),
+            first_boot_script: meta.first_boot_script.clone(),
         }
     }
 
@@ -92,6 +96,7 @@ impl TemplateConfig {
             origin: origin_override.or(self.origin),
             registry: self.registry,
             sha256: self.sha256,
+            first_boot_script: self.first_boot_script,
         })
     }
 
@@ -128,6 +133,7 @@ mod tests {
             origin: Some("https://example.com/win11.iso".into()),
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),
             sha256: Some("ab".repeat(32)),
+            first_boot_script: Some("use vmlab\nfn main(lab) { let vm = lab.this_vm() }\n".into()),
         }
     }
 

@@ -179,6 +179,7 @@ impl LabRuntime {
                 }
             }
 
+            let first_boot_script = meta.as_ref().and_then(|m| m.first_boot_script.clone());
             let vm = VmInstance::new(
                 &name,
                 vm_cfg.clone(),
@@ -189,6 +190,7 @@ impl LabRuntime {
                 disk_size,
                 cdroms,
                 floppy,
+                first_boot_script,
             );
             vms.insert(vm_cfg.name.clone(), vm);
         }
@@ -511,12 +513,17 @@ impl LabRuntime {
             for name in &wave {
                 let me = self.clone();
                 let n = name.clone();
+                let out = output.clone();
                 handles.push(tokio::spawn(async move {
                     me.start_vm(&n).await?;
                     // Mount the VM's shares as soon as its agent answers —
                     // detached, so provisions can rely on them (§7.5)
                     // without the wave blocking on the mount retry window.
                     me.spawn_share_mount(&n);
+                    // Run the template's first-boot provision before this VM
+                    // can be considered ready (§6.1). A no-op for templates
+                    // without one, so leaf-VM timing is unchanged.
+                    me.run_first_boot(&n, &out).await?;
                     // Only gate the wave on readiness when something later
                     // depends on this VM.
                     let dependents = me.config.lab.vms.iter().any(|v| v.depends_on.contains(&n));
@@ -635,6 +642,59 @@ impl LabRuntime {
                 .with_context(|| format!("provision {}", p.script.display()))?;
             *next += 1;
         }
+        Ok(())
+    }
+
+    /// Run the backing template's first-boot provision the first time a clone
+    /// is instantiated, before the VM is reported ready (PRD §6.1). For VMs
+    /// with no pending first-boot the readiness poller already flips `ready`
+    /// (and emits `vm.ready`), so this returns immediately without blocking —
+    /// preserving the timing of templates that carry no first-boot script.
+    ///
+    /// For a pending first-boot it waits for the guest agent, runs the embedded
+    /// script scoped to this VM (reached via `lab.this_vm()`), then writes the
+    /// run-once sentinel, marks the VM ready, and emits `vm.ready`. Any error or
+    /// the overall timeout fails `up` and leaves the VM running for inspection.
+    async fn run_first_boot(
+        self: &Arc<Self>,
+        name: &str,
+        output: &crate::scripting::OutputSink,
+    ) -> Result<()> {
+        let vm = self.vm(name)?.clone();
+        if !vm.first_boot_pending() {
+            return Ok(());
+        }
+        let script = vm
+            .first_boot_script
+            .clone()
+            .expect("first_boot_pending implies a script");
+
+        output(format!("first-boot: provisioning {name}...\n"));
+        vm.wait_agent_up(Duration::from_secs(600))
+            .await
+            .with_context(|| format!("first-boot {name}: agent did not come up"))?;
+
+        // Hard ceiling: Windows specialize/OOBE can be slow, but a hung guest
+        // must not wedge `up` forever.
+        let label = format!("first-boot:{name}");
+        let run = crate::scripting::run_script_source(
+            self.clone(),
+            script,
+            &label,
+            vm.dirs.local.clone(),
+            Some(name.to_string()),
+            output.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(1800), run)
+            .await
+            .map_err(|_| anyhow!("first-boot {name}: timed out after 1800s"))?
+            .with_context(|| format!("first-boot provision for {name}"))?;
+
+        std::fs::write(vm.dirs.firstboot_sentinel(), b"")
+            .with_context(|| format!("writing first-boot sentinel for {name}"))?;
+        vm.mark_ready().await;
+        self.events.emit("vm.ready", json!({"vm": name}));
+        output(format!("first-boot: {name} ready\n"));
         Ok(())
     }
 

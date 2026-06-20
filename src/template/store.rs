@@ -520,6 +520,7 @@ mod tests {
             origin: None,
             registry: None,
             sha256: None,
+            first_boot_script: None,
         }
     }
 

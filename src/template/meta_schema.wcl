@@ -26,4 +26,5 @@ type TemplateMeta {
   origin: utf8?       // source ISO URL / registry reference
   registry: utf8?     // full OCI repo this template publishes to
   sha256: utf8?       // hex digest of disk.qcow2
+  first_boot_script: utf8?  // embedded wisp script run on first instantiation
 }

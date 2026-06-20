@@ -44,6 +44,9 @@ pub struct TemplateMeta {
     pub registry: Option<String>,
     /// Hex SHA-256 digest of `disk.qcow2`.
     pub sha256: Option<String>,
+    /// Embedded wisp script (full source text) run the first time a VM is
+    /// instantiated from this template, before it is reported ready (PRD §6.1).
+    pub first_boot_script: Option<String>,
 }
 
 impl TemplateMeta {
@@ -89,6 +92,9 @@ impl TemplateMeta {
         }
         if let Some(s) = &self.sha256 {
             let _ = writeln!(out, "  sha256 = {}", quote(s));
+        }
+        if let Some(s) = &self.first_boot_script {
+            let _ = writeln!(out, "  first_boot_script = {}", quote(s));
         }
         let _ = writeln!(out, "}}");
         out
@@ -163,6 +169,7 @@ fn extract(block: &Block) -> Result<TemplateMeta> {
         origin: get_str(block, "origin")?,
         registry: get_str(block, "registry")?,
         sha256: get_str(block, "sha256")?,
+        first_boot_script: get_str(block, "first_boot_script")?,
     })
 }
 
@@ -282,6 +289,9 @@ mod tests {
             origin: Some("https://example.com/win11.iso".into()),
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),
             sha256: Some("ab".repeat(32)),
+            first_boot_script: Some(
+                "use vmlab\nfn main(lab) {\n    let vm = lab.this_vm()\n}\n".into(),
+            ),
         }
     }
 
@@ -302,6 +312,7 @@ mod tests {
             origin: None,
             registry: None,
             sha256: None,
+            first_boot_script: None,
         }
     }
 
@@ -332,6 +343,23 @@ mod tests {
         assert!(text.contains("disk = \"1536M\""));
         let back = TemplateMeta::from_wcl(&text, "<test>").unwrap();
         assert_eq!(meta, back);
+    }
+
+    #[test]
+    fn round_trip_first_boot_script() {
+        // A real first-boot script: multi-line, embedded quotes, and Windows
+        // backslash paths (C:\Windows\Temp) — the exact shapes most likely to
+        // break WCL string escaping.
+        let mut meta = minimal_meta();
+        meta.first_boot_script = Some(
+            "use vmlab\nfn main(lab) {\n    let vm = lab.this_vm()\n    \
+             vm.exec(\"cmd\", [\"/c\", \"del C:\\\\Windows\\\\Temp\\\\vmlab-firstboot.done\"])\n}\n"
+                .into(),
+        );
+        let text = meta.to_wcl();
+        let back = TemplateMeta::from_wcl(&text, "<test>").unwrap();
+        assert_eq!(meta, back);
+        assert_eq!(meta.first_boot_script, back.first_boot_script);
     }
 
     #[test]

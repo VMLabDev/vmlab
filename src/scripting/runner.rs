@@ -48,7 +48,23 @@ pub async fn run_script_file(
     let source =
         std::fs::read_to_string(script).with_context(|| format!("reading {}", script.display()))?;
     let name = script.display().to_string();
-    let ref_base = Arc::new(script_dir(script));
+    run_script_source(runtime, source, &name, script_dir(script), None, output).await
+}
+
+/// Run a `main(lab)` script from in-memory source (a template's embedded
+/// first-boot provision, or a file via [`run_script_file`]). `ref_base` roots
+/// relative reference-image/screenshot paths; `target_vm`, when set, is the VM
+/// the script reaches with `lab.this_vm()`.
+pub async fn run_script_source(
+    runtime: Arc<LabRuntime>,
+    source: String,
+    name: &str,
+    ref_base: std::path::PathBuf,
+    target_vm: Option<String>,
+    output: OutputSink,
+) -> Result<()> {
+    let name = name.to_string();
+    let ref_base = Arc::new(ref_base);
     let rt = tokio::runtime::Handle::current();
     let out_err = output.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -62,6 +78,7 @@ pub async fn run_script_file(
             rt,
             output,
             ref_base,
+            first_boot_vm: target_vm,
         };
         vm.call_unit::<_, ()>(&unit, "main", (lab,))
             .map_err(|e| anyhow!("{name}: {}", run_error(e)))
@@ -100,6 +117,7 @@ pub async fn run_event_handler(
             rt,
             output,
             ref_base,
+            first_boot_vm: None,
         };
         vm.call_unit::<_, ()>(&unit, "handle", (event, lab))
             .map_err(|e| anyhow!("{name}: {}", run_error(e)))

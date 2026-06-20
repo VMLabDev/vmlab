@@ -17,7 +17,7 @@ use crate::labd::lab::LabRuntime;
 use crate::labd::vm::{PowerState, VmInstance};
 use crate::vision;
 
-pub use runner::{OutputSink, run_event_handler, run_script_file};
+pub use runner::{OutputSink, run_event_handler, run_script_file, run_script_source};
 
 /// Convention: reference images resolve relative to the lab root, typically
 /// `images/` beside vmlab.wcl (PRD §10.3).
@@ -40,6 +40,9 @@ pub struct LabHandle {
     /// reference crops next to itself (the build runs from a separate work
     /// dir, where `runtime.root` points, so that base would not find them).
     pub(crate) ref_base: Arc<std::path::PathBuf>,
+    /// For a template first-boot provision: the VM the script targets, fetched
+    /// with `lab.this_vm()`. `None` for ordinary provisions/handlers.
+    pub(crate) first_boot_vm: Option<String>,
 }
 
 /// A VM handle (PRD §10.3).
@@ -289,6 +292,22 @@ pub fn lab_module() -> Module {
                 })
             },
         )
+        .method("this_vm", |l: &LabHandle| -> Result<VmHandle, String> {
+            let name = l
+                .first_boot_vm
+                .as_deref()
+                .ok_or("this_vm() is only available inside a template first-boot provision")?;
+            let vm = l.runtime.vm(name).map_err(estr)?.clone();
+            Ok(VmHandle {
+                vm,
+                runtime: l.runtime.clone(),
+                rt: l.rt.clone(),
+                output: l.output.clone(),
+                last_pointer: Default::default(),
+                vnc_conn: Default::default(),
+                ref_base: l.ref_base.clone(),
+            })
+        })
         .method("vms", |l: &LabHandle| -> Vec<VmHandle> {
             l.runtime
                 .vms
@@ -927,6 +946,26 @@ fn main(lab: Lab) {
         assert!(!err.is_empty());
         // Unknown method.
         assert!(check_script_source("use vmlab\nfn main(lab: Lab) { lab.frobnicate() }").is_err());
+    }
+
+    #[test]
+    fn first_boot_this_vm_compiles() {
+        // A template first-boot provision reaches its VM via lab.this_vm().
+        let src = r#"
+use vmlab
+
+fn main(lab: Lab) {
+    let vm = lab.this_vm().expect("no target vm")
+    for i in 0..10 {
+        match vm.exec("cmd.exe", ["/c", "if exist C:\\m (exit 0) else (exit 1)"]) {
+            Ok(r) => { if r.exit_code == 0 { return } }
+            Err(e) => lab.log("waiting: " + e),
+        }
+        vmlab::sleep_ms(1000)
+    }
+}
+"#;
+        check_script_source(src).expect("first-boot this_vm() should type-check");
     }
 
     #[test]

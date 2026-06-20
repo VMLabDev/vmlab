@@ -786,6 +786,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         nested: get_bool(b, "nested", issues).unwrap_or(false),
         gui: get_bool(b, "gui", issues).unwrap_or(false),
         qemu_args: get_str_list(b, "qemu_args", issues),
+        first_boot: get_path(b, "first_boot", issues),
         source,
         media,
         provisions,
