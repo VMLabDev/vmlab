@@ -4,7 +4,7 @@
 //! detaches it into its own process group).
 
 pub mod global;
-mod registry;
+pub mod registry;
 
 use std::path::PathBuf;
 use std::sync::Arc;

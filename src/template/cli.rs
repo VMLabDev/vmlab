@@ -59,6 +59,22 @@ pub enum TemplateCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Prune superseded builds, keeping the latest per template. Dry-run
+    /// unless `--yes`; builds still backing a clone are skipped unless `--force`.
+    Clean {
+        /// Limit to a family: `<arch>/<name>`, `<arch>/` (all names in an arch),
+        /// or `<name>` (that name in any arch). Default: every template.
+        filter: Option<String>,
+        /// Most-recent builds to keep per template (by version order)
+        #[arg(long, default_value_t = 1)]
+        keep: usize,
+        /// Actually delete; without this, only prints what would be removed
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Also remove builds that still back existing clones
+        #[arg(long)]
+        force: bool,
+    },
     /// Re-tag a template in the store (new version and/or registry), reusing
     /// the built image — no rebuild
     Relabel {
@@ -147,6 +163,12 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
             } => search(query, registry, arch, json).await,
             TemplateCmd::Exists { reference } => exists(&reference),
             TemplateCmd::Rm { reference, force } => rm(&reference, force),
+            TemplateCmd::Clean {
+                filter,
+                keep,
+                yes,
+                force,
+            } => clean(filter, keep, yes, force).await,
             TemplateCmd::Relabel {
                 reference,
                 to,
@@ -515,6 +537,138 @@ fn rm(reference: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `vmlab template clean`: per `<arch>/<name>` family, keep the `keep` newest
+/// builds (by version order) and remove the rest. Dry-run unless `yes`; a build
+/// still backing a clone is skipped unless `force`.
+async fn clean(filter: Option<String>, keep: usize, yes: bool, force: bool) -> Result<()> {
+    if keep == 0 {
+        bail!("--keep must be >= 1 (use `template rm` to remove specific versions)");
+    }
+    let store = store();
+    let templates = store.list()?;
+
+    // Group versions by (arch, name), preserving the list's arch/name/version
+    // ordering (ascending version within each family).
+    let mut families: Vec<((String, String), Vec<crate::template::meta::TemplateMeta>)> =
+        Vec::new();
+    for t in templates {
+        if !family_matches(filter.as_deref(), &t.arch, &t.name) {
+            continue;
+        }
+        match families.last_mut() {
+            Some((k, v)) if k.0 == t.arch && k.1 == t.name => v.push(t),
+            _ => families.push(((t.arch.clone(), t.name.clone()), vec![t])),
+        }
+    }
+
+    // Decide removals: all but the `keep` highest versions per family.
+    let mut removals: Vec<crate::template::meta::TemplateMeta> = Vec::new();
+    for (_, metas) in &families {
+        let cut = metas.len().saturating_sub(keep);
+        removals.extend(metas.iter().take(cut).cloned());
+    }
+    if removals.is_empty() {
+        println!("nothing to clean — every template is within --keep {keep}");
+        return Ok(());
+    }
+
+    // In-use protection: store disks currently backing a clone are skipped
+    // unless --force.
+    let in_use = if force {
+        std::collections::HashSet::new()
+    } else {
+        backing_disks_in_use().await
+    };
+
+    let mut to_remove = Vec::new();
+    let mut skipped = Vec::new();
+    for t in removals {
+        let disk = store
+            .root()
+            .join(&t.arch)
+            .join(&t.name)
+            .join(&t.version)
+            .join(crate::template::store::DISK_FILE);
+        let canon = disk.canonicalize().unwrap_or(disk.clone());
+        if in_use.contains(&canon) {
+            skipped.push(t);
+        } else {
+            to_remove.push((t, disk));
+        }
+    }
+
+    let mut freed = 0u64;
+    for (t, disk) in &to_remove {
+        freed += std::fs::metadata(disk).map(|m| m.len()).unwrap_or(0);
+        let verb = if yes { "removing" } else { "would remove" };
+        println!("{verb} {}/{}@{}", t.arch, t.name, t.version);
+    }
+    for t in &skipped {
+        println!(
+            "skipping {}/{}@{} — backs a clone (use --force)",
+            t.arch, t.name, t.version
+        );
+    }
+
+    if !yes {
+        println!(
+            "\n{} build(s), {} — dry run; re-run with --yes to remove",
+            to_remove.len(),
+            human_size(freed)
+        );
+        return Ok(());
+    }
+
+    let mut removed = 0usize;
+    for (t, _) in &to_remove {
+        store
+            .remove(&t.arch, &t.name, &t.version, true, &|_| None)
+            .with_context(|| format!("removing {}/{}@{}", t.arch, t.name, t.version))?;
+        removed += 1;
+    }
+    println!("\nremoved {removed} build(s), freed {}", human_size(freed));
+    Ok(())
+}
+
+/// Whether a `filter` selects `<arch>/<name>`: `None` matches all; `arch/name`
+/// is exact; `arch/` matches any name in that arch; a bare `name` matches that
+/// leaf name in any arch.
+fn family_matches(filter: Option<&str>, arch: &str, name: &str) -> bool {
+    let Some(f) = filter else { return true };
+    match f.split_once('/') {
+        Some((a, "")) => a == arch,
+        Some((a, n)) => a == arch && n == name,
+        None => f == name,
+    }
+}
+
+/// Canonical store disk paths (`<version>/disk.qcow2`) currently backing a
+/// linked clone in any registered lab. Best-effort: unreadable labs/clones are
+/// skipped, so a scan hiccup never blocks a clean.
+async fn backing_disks_in_use() -> std::collections::HashSet<PathBuf> {
+    let mut in_use = std::collections::HashSet::new();
+    let reg = crate::supervisor::registry::Registry::load();
+    for lab in reg.labs() {
+        let vms = crate::paths::lab_local_dir(&lab.root).join("vms");
+        let Ok(entries) = std::fs::read_dir(&vms) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let disk = e.path().join("disk0.qcow2");
+            if !disk.is_file() {
+                continue;
+            }
+            if let Ok(info) = super::qimg::image_info(&disk).await
+                && let Some(backing) = info.backing_file
+                && let Ok(canon) = backing.canonicalize()
+            {
+                in_use.insert(canon);
+            }
+        }
+    }
+    in_use
+}
+
 fn relabel(reference: &str, to: Option<String>, registry: Option<String>) -> Result<()> {
     let (arch, name, version) = parse_store_ref(reference)?;
     let version = version
@@ -664,7 +818,36 @@ fn parse_store_ref(reference: &str) -> Result<(String, String, Option<String>)> 
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_git_url;
+    use super::{family_matches, normalize_git_url};
+
+    #[test]
+    fn family_filter_matching() {
+        // None matches everything.
+        assert!(family_matches(None, "x86_64", "win11"));
+        // Exact arch/name.
+        assert!(family_matches(Some("x86_64/win11"), "x86_64", "win11"));
+        assert!(!family_matches(Some("x86_64/win11"), "x86_64", "win10"));
+        assert!(!family_matches(Some("x86_64/win11"), "aarch64", "win11"));
+        // arch-only (trailing slash) matches any name in that arch.
+        assert!(family_matches(Some("x86_64/"), "x86_64", "anything"));
+        assert!(!family_matches(Some("x86_64/"), "aarch64", "anything"));
+        // Bare name matches that leaf name in any arch.
+        assert!(family_matches(
+            Some("ubuntu-24.04"),
+            "x86_64",
+            "ubuntu-24.04"
+        ));
+        assert!(family_matches(
+            Some("ubuntu-24.04"),
+            "aarch64",
+            "ubuntu-24.04"
+        ));
+        assert!(!family_matches(
+            Some("ubuntu-24.04"),
+            "x86_64",
+            "ubuntu-26.04"
+        ));
+    }
 
     #[test]
     fn normalizes_git_remote_forms() {
