@@ -94,7 +94,10 @@ impl TemplateStore {
 
     /// Resolve `<arch>/<name>[@version]` to a store entry. `version`
     /// of `None` selects the highest version by natural-sort order
-    /// (PRD §6.2).
+    /// (PRD §6.2). A `version` that is a build-counter prefix (e.g. the
+    /// 2-component `26100.1742`) resolves to the highest `<version>.<N>`
+    /// sub-build present, falling back to an exact match (see
+    /// [`resolve_version_pin`]).
     pub fn resolve(
         &self,
         arch: &str,
@@ -102,7 +105,8 @@ impl TemplateStore {
         version: Option<&str>,
     ) -> Result<ResolvedTemplate> {
         let version = match version {
-            Some(v) => v.to_string(),
+            Some(v) => resolve_version_pin(&self.versions_of(arch, name).unwrap_or_default(), v)
+                .ok_or_else(|| anyhow!("template {arch}/{name}@{v} not found in the store"))?,
             None => self
                 .versions_of(arch, name)?
                 .into_iter()
@@ -387,6 +391,29 @@ pub fn next_subbuild(prefix: &str, existing: &[String]) -> String {
     }
 }
 
+/// Resolve a version `pin` against the available `versions`. Prefers the highest
+/// `<pin>.<N>` sub-build — so a build-counter prefix like `26100.1742` resolves
+/// to the latest `26100.1742.<N>` — and falls back to an exact `<pin>` match
+/// (so a full version, a moving alias, or a template with no sub-builds still
+/// resolves). Returns `None` when neither is present. Mirrors
+/// [`next_subbuild`]'s notion of a sub-build: exactly one extra all-numeric
+/// component, so `26100.1742` matches `26100.1742.3` but not `26100.17425` or
+/// `26100.1742.3.1`.
+pub fn resolve_version_pin(versions: &[String], pin: &str) -> Option<String> {
+    let dotted = format!("{pin}.");
+    let sub = versions
+        .iter()
+        .filter(|v| {
+            v.strip_prefix(&dotted)
+                .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .max_by(|a, b| compare_versions(a, b));
+    if let Some(s) = sub {
+        return Some(s.clone());
+    }
+    versions.iter().find(|v| v.as_str() == pin).cloned()
+}
+
 enum Run<'a> {
     Num(&'a str),
     Text(&'a str),
@@ -564,6 +591,46 @@ mod tests {
         assert_eq!(next_subbuild("3.23.4", &[]), "3.23.4.0");
     }
 
+    // ---- resolve_version_pin ------------------------------------------------
+
+    #[test]
+    fn resolve_version_pin_prefers_latest_subbuild() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // 2-component pin -> highest matching sub-build.
+        assert_eq!(
+            resolve_version_pin(
+                &s(&["26100.1742.0", "26100.1742.3", "26100.1742.10"]),
+                "26100.1742"
+            )
+            .as_deref(),
+            Some("26100.1742.10")
+        );
+        // Sub-build wins even when an exact bare-prefix version also exists.
+        assert_eq!(
+            resolve_version_pin(&s(&["26100.1742", "26100.1742.0"]), "26100.1742").as_deref(),
+            Some("26100.1742.0")
+        );
+        // No sub-build -> exact match fallback (full pins / aliases still work).
+        assert_eq!(
+            resolve_version_pin(&s(&["26100.1742.0", "latest"]), "26100.1742.0").as_deref(),
+            Some("26100.1742.0")
+        );
+        assert_eq!(
+            resolve_version_pin(&s(&["26100.1742.0", "latest"]), "latest").as_deref(),
+            Some("latest")
+        );
+        // Unrelated / near-miss versions are ignored.
+        assert_eq!(
+            resolve_version_pin(
+                &s(&["26100.1743.0", "26100.17425", "26100.1742.3.1"]),
+                "26100.1742"
+            )
+            .as_deref(),
+            None
+        );
+    }
+
     // ---- install / list / resolve --------------------------------------------
 
     #[test]
@@ -617,6 +684,30 @@ mod tests {
         install(&store, &meta("x86_64", "win", "10.2"), b"b").unwrap();
         let r = store.resolve("x86_64", "win", None).unwrap();
         assert_eq!(r.meta.version, "10.2");
+    }
+
+    #[test]
+    fn resolve_2digit_pin_picks_latest_subbuild() {
+        let (_tmp, store) = new_store();
+        install(&store, &meta("x86_64", "windows-11", "26100.1742.0"), b"a").unwrap();
+        install(&store, &meta("x86_64", "windows-11", "26100.1742.2"), b"b").unwrap();
+        // A 2-component pin resolves to the highest matching sub-build.
+        let r = store
+            .resolve("x86_64", "windows-11", Some("26100.1742"))
+            .unwrap();
+        assert_eq!(r.meta.version, "26100.1742.2");
+        assert_eq!(fs::read(&r.disk_path).unwrap(), b"b");
+        // An exact sub-build pin still resolves exactly.
+        let r = store
+            .resolve("x86_64", "windows-11", Some("26100.1742.0"))
+            .unwrap();
+        assert_eq!(r.meta.version, "26100.1742.0");
+        // A prefix with no sub-builds present is not found.
+        assert!(
+            store
+                .resolve("x86_64", "windows-11", Some("26100.9999"))
+                .is_err()
+        );
     }
 
     #[test]

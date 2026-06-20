@@ -90,14 +90,33 @@ impl LabRuntime {
                         // Tag is a concrete, already-cached version: stay offline.
                         Ok(r) => r,
                         Err(_) => {
-                            // Resolve the tag (possibly a moving alias) to its
-                            // real version without downloading the disk.
+                            // Not cached. Resolve the requested tag against the
+                            // registry's published tags first: a build-counter
+                            // prefix (e.g. 26100.1742) resolves to the latest
+                            // 26100.1742.<N>; a moving alias or exact tag is used
+                            // as-is. Then resolve that to its real version without
+                            // downloading the disk, and only pull when absent.
+                            let pull_tag = match registry.list_tags().await {
+                                Ok(tags) => crate::template::store::resolve_version_pin(
+                                    &tags,
+                                    registry.tag(),
+                                )
+                                .unwrap_or_else(|| registry.tag().to_string()),
+                                Err(_) => registry.tag().to_string(),
+                            };
+                            let registry = if pull_tag.as_str() == registry.tag() {
+                                registry
+                            } else {
+                                crate::oci::Registry::new(&crate::oci::with_version_tag(
+                                    reference, &pull_tag,
+                                )?)?
+                            };
                             let real = registry
                                 .resolve_version(Some(&arch))
                                 .await
                                 .with_context(|| format!("resolving {reference}"))?;
                             match store.resolve(&arch, &store_name, Some(&real)) {
-                                // Moving tag points at an already-cached version.
+                                // Resolved tag points at an already-cached version.
                                 Ok(r) => r,
                                 Err(_) => {
                                     let work = crate::paths::template_store_dir().join(".oci-pull");
