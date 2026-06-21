@@ -760,6 +760,30 @@ impl LabRuntime {
         Ok(())
     }
 
+    /// Stop one VM and delete its clone and runtime state, leaving the rest of
+    /// the lab running. The VM stays in the lab config, so a later `up <vm>`
+    /// re-clones it from the template (per-VM analogue of [`destroy`]).
+    pub async fn destroy_vm(self: &Arc<Self>, name: &str) -> Result<()> {
+        let vm = self.vm(name)?.clone();
+        vm.stop(true).await?;
+        // Wait for the exit monitor to settle before removing its disks.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while vm.state().await != PowerState::Stopped {
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if vm.dirs.local.exists() {
+            std::fs::remove_dir_all(&vm.dirs.local)
+                .with_context(|| format!("removing {}", vm.dirs.local.display()))?;
+        }
+        let _ = std::fs::remove_dir_all(&vm.dirs.run);
+        self.events
+            .emit("vm.destroyed", json!({"vm": name.to_string()}));
+        Ok(())
+    }
+
     pub async fn status(&self) -> Value {
         let mut vms = Vec::new();
         for (name, vm) in &self.vms {

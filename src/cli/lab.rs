@@ -365,6 +365,163 @@ pub fn cmd_vm_power(vm_ref: &str, op: &str, force: bool) -> Result<()> {
     })
 }
 
+pub fn cmd_vm_destroy(vm_ref: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        client
+            .call("vm.destroy", json!({"vm": vm}))
+            .await
+            .map_err(remote)?;
+        println!("vm \"{vm}\" destroyed");
+        Ok(())
+    })
+}
+
+/// Make a CLI-supplied path absolute against the cwd, so the daemon (whose
+/// working directory differs) resolves it to the same file.
+fn abs_path(path: &str) -> Result<std::path::PathBuf> {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(p))
+    }
+}
+
+/// Validate an optional `--region x y w h` flag into a JSON value for the RPC.
+fn region_value(region: Option<Vec<i64>>) -> Result<Value> {
+    match region {
+        None => Ok(Value::Null),
+        Some(r) if r.len() == 4 => Ok(json!(r)),
+        Some(r) => bail!("--region needs 4 values (x y w h), got {}", r.len()),
+    }
+}
+
+pub fn cmd_vm_screenshot(vm_ref: &str, path: &str) -> Result<()> {
+    let out = abs_path(path)?;
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let result = client
+            .call(
+                "vm.screenshot",
+                json!({"vm": vm, "path": out.to_string_lossy()}),
+            )
+            .await
+            .map_err(remote)?;
+        println!("{}", result["path"].as_str().unwrap_or(path));
+        Ok(())
+    })
+}
+
+pub fn cmd_vm_sendkeys(vm_ref: &str, chord: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        client
+            .call("vm.sendkeys", json!({"vm": vm, "keys": chord}))
+            .await
+            .map_err(remote)?;
+        Ok(())
+    })
+}
+
+pub fn cmd_vm_mouse_move(vm_ref: &str, x: i64, y: i64) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        client
+            .call("vm.mouse_move", json!({"vm": vm, "x": x, "y": y}))
+            .await
+            .map_err(remote)?;
+        Ok(())
+    })
+}
+
+pub fn cmd_vm_click(vm_ref: &str, x: Option<i64>, y: Option<i64>, button: &str) -> Result<()> {
+    if x.is_some() != y.is_some() {
+        bail!("click coordinates need both x and y");
+    }
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let mut args = json!({"vm": vm, "button": button});
+        if let (Some(x), Some(y)) = (x, y) {
+            args["x"] = json!(x);
+            args["y"] = json!(y);
+        }
+        client.call("vm.mouse_click", args).await.map_err(remote)?;
+        Ok(())
+    })
+}
+
+pub fn cmd_vm_drag(vm_ref: &str, x1: i64, y1: i64, x2: i64, y2: i64) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        client
+            .call(
+                "vm.mouse_drag",
+                json!({"vm": vm, "x1": x1, "y1": y1, "x2": x2, "y2": y2}),
+            )
+            .await
+            .map_err(remote)?;
+        Ok(())
+    })
+}
+
+pub fn cmd_vm_ocr(vm_ref: &str, region: Option<Vec<i64>>) -> Result<()> {
+    let region = region_value(region)?;
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let text = client
+            .call("vm.ocr", json!({"vm": vm, "region": region}))
+            .await
+            .map_err(remote)?;
+        println!("{}", text.as_str().unwrap_or_default());
+        Ok(())
+    })
+}
+
+pub fn cmd_vm_find_image(
+    vm_ref: &str,
+    image: &str,
+    threshold: f64,
+    region: Option<Vec<i64>>,
+) -> Result<()> {
+    let img = std::fs::canonicalize(image).with_context(|| format!("reference image {image}"))?;
+    let region = region_value(region)?;
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let m = client
+            .call(
+                "vm.find_image",
+                json!({"vm": vm, "image": img.to_string_lossy(),
+                       "threshold": threshold, "region": region}),
+            )
+            .await
+            .map_err(remote)?;
+        if m.is_null() {
+            eprintln!("no match");
+            std::process::exit(1);
+        }
+        println!(
+            "x={} y={} w={} h={} score={:.3} center={},{}",
+            m["x"],
+            m["y"],
+            m["w"],
+            m["h"],
+            m["score"].as_f64().unwrap_or(0.0),
+            m["cx"],
+            m["cy"],
+        );
+        Ok(())
+    })
+}
+
 pub fn cmd_exec(vm_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
     if cmd.is_empty() {
         bail!("nothing to execute — usage: vmlab exec <vm> -- <cmd> [args...]");

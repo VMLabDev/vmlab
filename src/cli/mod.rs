@@ -37,7 +37,7 @@ pub enum Command {
     Status,
     /// Validate the lab file with no side effects
     Validate,
-    /// Per-VM power control: start / stop / restart
+    /// Per-VM power control and interaction: start/stop, screenshot, input, OCR
     Vm {
         #[command(subcommand)]
         cmd: VmCmd,
@@ -133,7 +133,7 @@ pub enum Command {
     },
 }
 
-/// Per-VM power control (PRD §12).
+/// Per-VM power control and interaction (PRD §12, §10.3).
 #[derive(Subcommand)]
 pub enum VmCmd {
     /// Start one VM
@@ -146,6 +146,55 @@ pub enum VmCmd {
     },
     /// Restart one VM
     Restart { vm: String },
+    /// Destroy one VM: stop it and delete its clone (config retained)
+    Destroy { vm: String },
+    /// Capture a running VM's screen to a PNG file
+    Screenshot {
+        vm: String,
+        /// Output PNG path
+        path: String,
+    },
+    /// Send a key chord (e.g. ctrl-alt-delete)
+    Sendkeys { vm: String, chord: String },
+    /// Move the mouse pointer to absolute screen coordinates
+    MouseMove { vm: String, x: i64, y: i64 },
+    /// Click a mouse button, optionally first moving to x,y
+    Click {
+        vm: String,
+        /// Move here before clicking (omit to click at the current position)
+        x: Option<i64>,
+        y: Option<i64>,
+        /// Button to click
+        #[arg(long, default_value = "left", value_parser = ["left", "right", "middle"])]
+        button: String,
+    },
+    /// Press, drag from x1,y1 to x2,y2, and release the left button
+    Drag {
+        vm: String,
+        x1: i64,
+        y1: i64,
+        x2: i64,
+        y2: i64,
+    },
+    /// OCR the screen (optionally a region)
+    Ocr {
+        vm: String,
+        /// Restrict to a region: x y w h
+        #[arg(long, num_args = 4, value_names = ["X", "Y", "W", "H"])]
+        region: Option<Vec<i64>>,
+    },
+    /// Search the screen for a template image
+    FindImage {
+        vm: String,
+        /// Template image path (PNG/PPM)
+        image: String,
+        /// Match threshold 0.0–1.0
+        #[arg(long, default_value_t = 0.9)]
+        threshold: f64,
+        /// Restrict the search to a region: x y w h
+        #[arg(long, num_args = 4, value_names = ["X", "Y", "W", "H"])]
+        region: Option<Vec<i64>>,
+    },
 }
 
 /// Snapshot management (PRD §7.3).
@@ -185,6 +234,19 @@ pub fn run() -> ExitCode {
             VmCmd::Start { vm } => lab::cmd_vm_power(&vm, "start", false),
             VmCmd::Stop { vm, force } => lab::cmd_vm_power(&vm, "stop", force),
             VmCmd::Restart { vm } => lab::cmd_vm_power(&vm, "restart", false),
+            VmCmd::Destroy { vm } => lab::cmd_vm_destroy(&vm),
+            VmCmd::Screenshot { vm, path } => lab::cmd_vm_screenshot(&vm, &path),
+            VmCmd::Sendkeys { vm, chord } => lab::cmd_vm_sendkeys(&vm, &chord),
+            VmCmd::MouseMove { vm, x, y } => lab::cmd_vm_mouse_move(&vm, x, y),
+            VmCmd::Click { vm, x, y, button } => lab::cmd_vm_click(&vm, x, y, &button),
+            VmCmd::Drag { vm, x1, y1, x2, y2 } => lab::cmd_vm_drag(&vm, x1, y1, x2, y2),
+            VmCmd::Ocr { vm, region } => lab::cmd_vm_ocr(&vm, region),
+            VmCmd::FindImage {
+                vm,
+                image,
+                threshold,
+                region,
+            } => lab::cmd_vm_find_image(&vm, &image, threshold, region),
         },
         Command::Lab { cmd } => lab::cmd_lab(cmd),
         Command::Snapshot { cmd } => match cmd {

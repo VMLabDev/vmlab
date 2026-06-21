@@ -4,6 +4,7 @@
 //! execute on blocking threads and host methods bridge into the lab
 //! daemon's tokio runtime via `Handle::block_on`.
 
+pub mod interact;
 pub mod keymap;
 mod runner;
 
@@ -58,10 +59,6 @@ pub struct VmHandle {
     /// always carries x,y, but the API splits `mouse_move`/`mouse_click`, so
     /// a click reuses the position the preceding move set.
     pub(crate) last_pointer: Arc<std::sync::Mutex<(i64, i64)>>,
-    /// Cached RFB connection for the VNC input transport, reused across calls
-    /// to avoid a per-call handshake. Dropped (and reopened on next use) if a
-    /// send fails — e.g. the QEMU process was restarted.
-    pub(crate) vnc_conn: Arc<tokio::sync::Mutex<Option<crate::vnc::VncInput>>>,
     /// Directory the running script lives in (see [`LabHandle::ref_base`]).
     pub(crate) ref_base: Arc<std::path::PathBuf>,
 }
@@ -143,41 +140,6 @@ impl VmHandle {
         self.rt.block_on(fut)
     }
 
-    /// True when scripted input should go over VNC instead of QMP (for
-    /// USB-HID-only guests like macOS where QMP send-key is ignored).
-    fn input_vnc(&self) -> bool {
-        matches!(
-            self.vm.resolved.input_transport,
-            crate::profiles::InputTransport::Vnc
-        )
-    }
-
-    /// Run an input operation against the cached RFB connection, opening one
-    /// on first use. If the operation fails (e.g. QEMU restarted), the
-    /// connection is dropped so the next call reconnects.
-    async fn vnc_with<F>(&self, op: F) -> Result<(), String>
-    where
-        F: for<'a> FnOnce(
-            &'a mut crate::vnc::VncInput,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), String>> + 'a>,
-        >,
-    {
-        // Reconnect fresh per call. A long-lived RFB connection that never
-        // drains the server's messages can desync and drop later keystrokes on
-        // real-mode guests (DOS/9x TUIs); a fresh connection per input op
-        // mirrors an external viewer's reliable behaviour.
-        let mut guard = self.vnc_conn.lock().await;
-        *guard = Some(
-            crate::vnc::VncInput::connect(&self.vm.dirs.vnc_sock())
-                .await
-                .map_err(estr)?,
-        );
-        let result = op(guard.as_mut().unwrap()).await;
-        *guard = None;
-        result
-    }
-
     fn resolve_ref(&self, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() {
@@ -189,16 +151,7 @@ impl VmHandle {
 
     /// QMP screendump → decoded image.
     fn grab_screen(&self) -> Result<image::RgbImage, String> {
-        self.block(async {
-            let qmp = self.vm.qmp().await.map_err(estr)?;
-            let dir = self.runtime.lab_local.join(SCREENSHOT_DIR);
-            std::fs::create_dir_all(&dir).map_err(estr)?;
-            let tmp = dir.join(format!(".grab-{}.ppm", self.vm.cfg.name));
-            qmp.screendump(&tmp).await.map_err(estr)?;
-            let img = vision::load_screen(&tmp).map_err(estr)?;
-            let _ = std::fs::remove_file(&tmp);
-            Ok(img)
-        })
+        self.block(interact::grab_screen(&self.vm)).map_err(estr)
     }
 
     fn match_opts(threshold: f64, region: Vec<i64>) -> Result<vision::MatchOptions, String> {
@@ -287,7 +240,6 @@ pub fn lab_module() -> Module {
                     rt: l.rt.clone(),
                     output: l.output.clone(),
                     last_pointer: Default::default(),
-                    vnc_conn: Default::default(),
                     ref_base: l.ref_base.clone(),
                 })
             },
@@ -304,7 +256,6 @@ pub fn lab_module() -> Module {
                 rt: l.rt.clone(),
                 output: l.output.clone(),
                 last_pointer: Default::default(),
-                vnc_conn: Default::default(),
                 ref_base: l.ref_base.clone(),
             })
         })
@@ -318,7 +269,6 @@ pub fn lab_module() -> Module {
                     rt: l.rt.clone(),
                     output: l.output.clone(),
                     last_pointer: Default::default(),
-                    vnc_conn: Default::default(),
                     ref_base: l.ref_base.clone(),
                 })
                 .collect()
@@ -538,120 +488,54 @@ pub fn lab_module() -> Module {
         .method(
             "send_keys",
             |v: &VmHandle, chord: &str| -> Result<(), String> {
-                let keys = keymap::parse_chord(chord)?;
-                if v.input_vnc() {
-                    let syms: Vec<u32> = keys
-                        .iter()
-                        .map(|q| keymap::keysym(q))
-                        .collect::<Result<_, String>>()?;
-                    return v.block(v.vnc_with(move |c| {
-                        Box::pin(async move { c.chord(&syms).await.map_err(estr) })
-                    }));
-                }
-                let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-                v.block(async {
-                    let qmp = v.vm.qmp().await.map_err(estr)?;
-                    qmp.send_key(&refs, None).await.map_err(estr)
-                })
+                v.block(interact::send_keys(&v.vm, chord)).map_err(estr)
             },
         )
         .method(
             "type_text",
-            |v: &VmHandle, text: &str| -> Result<(), String> { type_text(v, text, 35) },
+            |v: &VmHandle, text: &str| -> Result<(), String> {
+                v.block(interact::type_text(&v.vm, text, 35)).map_err(estr)
+            },
         )
         .method(
             "type_text_paced",
             |v: &VmHandle, text: String, delay_ms: i64| -> Result<(), String> {
-                type_text(v, &text, delay_ms.max(0) as u64)
+                v.block(interact::type_text(&v.vm, &text, delay_ms.max(0) as u64))
+                    .map_err(estr)
             },
         )
         .method(
             "mouse_move",
             |v: &VmHandle, x: i64, y: i64| -> Result<(), String> {
                 *v.last_pointer.lock().unwrap() = (x, y);
-                if v.input_vnc() {
-                    return v.block(v.vnc_with(move |c| {
-                        Box::pin(async move { c.mouse_move(x, y).await.map_err(estr) })
-                    }));
-                }
-                // screen_size grabs the screen (its own block_on), so it must
-                // run OUTSIDE the block below — nesting block_on panics.
-                let (w, h) = screen_size(v)?;
-                v.block(async {
-                    let qmp = v.vm.qmp().await.map_err(estr)?;
-                    qmp.mouse_move_abs(x.max(0) as u32, y.max(0) as u32, w, h)
-                        .await
-                        .map_err(estr)
-                })
+                v.block(interact::mouse_move(&v.vm, x, y)).map_err(estr)
             },
         )
         .method(
             "mouse_click",
             |v: &VmHandle, button: &str| -> Result<(), String> {
-                if v.input_vnc() {
-                    let mask = vnc_button(button)?;
-                    let (x, y) = *v.last_pointer.lock().unwrap();
-                    return v.block(v.vnc_with(move |c| {
-                        Box::pin(async move { c.click(x, y, mask).await.map_err(estr) })
-                    }));
-                }
-                v.block(async {
-                    let qmp = v.vm.qmp().await.map_err(estr)?;
-                    qmp.mouse_button(button, true).await.map_err(estr)?;
-                    tokio::time::sleep(Duration::from_millis(60)).await;
-                    qmp.mouse_button(button, false).await.map_err(estr)
-                })
+                // A click reuses the position the preceding move set; for QMP
+                // this is a no-op (QEMU retains the last absolute position),
+                // for VNC it is the click target.
+                let at = *v.last_pointer.lock().unwrap();
+                v.block(interact::mouse_click(&v.vm, button, Some(at)))
+                    .map_err(estr)
             },
         )
         .method(
             "mouse_drag",
             |v: &VmHandle, x1: i64, y1: i64, x2: i64, y2: i64| -> Result<(), String> {
                 *v.last_pointer.lock().unwrap() = (x2, y2);
-                if v.input_vnc() {
-                    return v.block(v.vnc_with(move |c| {
-                        Box::pin(async move {
-                            c.pointer(x1, y1, 0).await.map_err(estr)?;
-                            c.pointer(x1, y1, crate::vnc::BTN_LEFT)
-                                .await
-                                .map_err(estr)?;
-                            for step in 1..=8 {
-                                let x = x1 + (x2 - x1) * step / 8;
-                                let y = y1 + (y2 - y1) * step / 8;
-                                c.pointer(x, y, crate::vnc::BTN_LEFT).await.map_err(estr)?;
-                                tokio::time::sleep(Duration::from_millis(30)).await;
-                            }
-                            c.pointer(x2, y2, 0).await.map_err(estr)
-                        })
-                    }));
-                }
-                let (w, h) = screen_size(v)?;
-                v.block(async {
-                    let qmp = v.vm.qmp().await.map_err(estr)?;
-                    qmp.mouse_move_abs(x1.max(0) as u32, y1.max(0) as u32, w, h)
-                        .await
-                        .map_err(estr)?;
-                    qmp.mouse_button("left", true).await.map_err(estr)?;
-                    // Human-ish drag in a few steps.
-                    for step in 1..=8 {
-                        let x = x1 + (x2 - x1) * step / 8;
-                        let y = y1 + (y2 - y1) * step / 8;
-                        qmp.mouse_move_abs(x.max(0) as u32, y.max(0) as u32, w, h)
-                            .await
-                            .map_err(estr)?;
-                        tokio::time::sleep(Duration::from_millis(30)).await;
-                    }
-                    qmp.mouse_button("left", false).await.map_err(estr)
-                })
+                v.block(interact::mouse_drag(&v.vm, x1, y1, x2, y2))
+                    .map_err(estr)
             },
         )
         // Screen (§10.3)
         .method(
             "screenshot",
             |v: &VmHandle, path: &str| -> Result<String, String> {
-                let img = v.grab_screen()?;
                 let out = if path.is_empty() {
                     let dir = v.runtime.lab_local.join(SCREENSHOT_DIR);
-                    std::fs::create_dir_all(&dir).map_err(estr)?;
                     dir.join(format!(
                         "{}-{}.png",
                         v.vm.cfg.name,
@@ -660,7 +544,7 @@ pub fn lab_module() -> Module {
                 } else {
                     v.resolve_ref(path)
                 };
-                vision::save_png(&img, &out).map_err(estr)?;
+                v.block(interact::screenshot(&v.vm, &out)).map_err(estr)?;
                 Ok(out.display().to_string())
             },
         )
@@ -695,15 +579,13 @@ pub fn lab_module() -> Module {
             },
         )
         .method("ocr", |v: &VmHandle| -> Result<String, String> {
-            let img = v.grab_screen()?;
-            v.block(vision::ocr(&img, None)).map_err(estr)
+            v.block(interact::ocr(&v.vm, None)).map_err(estr)
         })
         .method(
             "ocr_region",
             |v: &VmHandle, region: Vec<i64>| -> Result<String, String> {
-                let img = v.grab_screen()?;
                 let opts = VmHandle::match_opts(0.9, region)?;
-                v.block(vision::ocr(&img, opts.region)).map_err(estr)
+                v.block(interact::ocr(&v.vm, opts.region)).map_err(estr)
             },
         )
         .method(
@@ -813,56 +695,6 @@ pub fn lab_module() -> Module {
         );
 
     m
-}
-
-/// RFB button mask for a button name.
-fn vnc_button(button: &str) -> Result<u8, String> {
-    match button {
-        "left" => Ok(crate::vnc::BTN_LEFT),
-        "middle" => Ok(crate::vnc::BTN_MIDDLE),
-        "right" => Ok(crate::vnc::BTN_RIGHT),
-        other => Err(format!("unknown mouse button `{other}`")),
-    }
-}
-
-fn type_text(v: &VmHandle, text: &str, delay_ms: u64) -> Result<(), String> {
-    if v.input_vnc() {
-        // Resolve all keysyms up front so the input closure owns plain data.
-        let mut per_char: Vec<Vec<u32>> = Vec::with_capacity(text.len());
-        for ch in text.chars() {
-            let keys = keymap::char_keys(ch)?;
-            per_char.push(
-                keys.iter()
-                    .map(|q| keymap::keysym(q))
-                    .collect::<Result<_, String>>()?,
-            );
-        }
-        return v.block(v.vnc_with(move |c| {
-            Box::pin(async move {
-                for syms in &per_char {
-                    c.chord(syms).await.map_err(estr)?;
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Ok(())
-            })
-        }));
-    }
-    v.block(async {
-        let qmp = v.vm.qmp().await.map_err(estr)?;
-        for c in text.chars() {
-            let keys = keymap::char_keys(c)?;
-            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            qmp.send_key(&refs, None).await.map_err(estr)?;
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        }
-        Ok(())
-    })
-}
-
-/// Current screen dimensions, needed to scale absolute mouse coordinates.
-fn screen_size(v: &VmHandle) -> Result<(u32, u32), String> {
-    let img = v.grab_screen()?;
-    Ok((img.width(), img.height()))
 }
 
 /// Build the full wisp context for compiling and running lab scripts.

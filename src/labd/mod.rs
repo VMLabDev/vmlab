@@ -163,6 +163,22 @@ fn vms_arg(args: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Optional `region` arg as `[x, y, w, h]` (absent/null → whole screen).
+fn region_arg(args: &Value) -> Result<Option<(u32, u32, u32, u32)>, String> {
+    match args["region"].as_array() {
+        None if args["region"].is_null() => Ok(None),
+        None => Err("region must be [x, y, w, h]".to_string()),
+        Some(r) if r.len() == 4 => {
+            let v = |i: usize| r[i].as_i64().unwrap_or(0).max(0) as u32;
+            Ok(Some((v(0), v(1), v(2), v(3))))
+        }
+        Some(r) => Err(format!(
+            "region needs [x, y, w, h], got {} elements",
+            r.len()
+        )),
+    }
+}
+
 #[async_trait::async_trait]
 impl Handler for LabdHandler {
     async fn handle(&self, cmd: &str, args: Value, _stream: &Streamer) -> Result<Value, String> {
@@ -222,6 +238,93 @@ impl Handler for LabdHandler {
                 }
                 lab.start_vm(&name).await.map_err(err)?;
                 Ok(json!(true))
+            }
+            "vm.destroy" => {
+                lab.destroy_vm(&vm_arg(&args)?).await.map_err(err)?;
+                Ok(json!(true))
+            }
+            // VM interaction (PRD §10.3: vmlab vm screenshot/sendkeys/mouse/…).
+            "vm.screenshot" => {
+                let name = vm_arg(&args)?;
+                let path = args["path"].as_str().ok_or("missing path")?;
+                let vm = lab.vm(&name).map_err(err)?;
+                crate::scripting::interact::screenshot(vm, std::path::Path::new(path))
+                    .await
+                    .map_err(err)?;
+                Ok(json!({"path": path}))
+            }
+            "vm.sendkeys" => {
+                let name = vm_arg(&args)?;
+                let keys = args["keys"].as_str().ok_or("missing keys")?;
+                let vm = lab.vm(&name).map_err(err)?;
+                crate::scripting::interact::send_keys(vm, keys)
+                    .await
+                    .map_err(err)?;
+                Ok(json!(true))
+            }
+            "vm.mouse_move" => {
+                let name = vm_arg(&args)?;
+                let x = args["x"].as_i64().ok_or("missing x")?;
+                let y = args["y"].as_i64().ok_or("missing y")?;
+                let vm = lab.vm(&name).map_err(err)?;
+                crate::scripting::interact::mouse_move(vm, x, y)
+                    .await
+                    .map_err(err)?;
+                Ok(json!(true))
+            }
+            "vm.mouse_click" => {
+                let name = vm_arg(&args)?;
+                let button = args["button"].as_str().unwrap_or("left");
+                let at = match (args["x"].as_i64(), args["y"].as_i64()) {
+                    (Some(x), Some(y)) => Some((x, y)),
+                    _ => None,
+                };
+                let vm = lab.vm(&name).map_err(err)?;
+                crate::scripting::interact::mouse_click(vm, button, at)
+                    .await
+                    .map_err(err)?;
+                Ok(json!(true))
+            }
+            "vm.mouse_drag" => {
+                let name = vm_arg(&args)?;
+                let x1 = args["x1"].as_i64().ok_or("missing x1")?;
+                let y1 = args["y1"].as_i64().ok_or("missing y1")?;
+                let x2 = args["x2"].as_i64().ok_or("missing x2")?;
+                let y2 = args["y2"].as_i64().ok_or("missing y2")?;
+                let vm = lab.vm(&name).map_err(err)?;
+                crate::scripting::interact::mouse_drag(vm, x1, y1, x2, y2)
+                    .await
+                    .map_err(err)?;
+                Ok(json!(true))
+            }
+            "vm.ocr" => {
+                let name = vm_arg(&args)?;
+                let region = region_arg(&args)?;
+                let vm = lab.vm(&name).map_err(err)?;
+                let text = crate::scripting::interact::ocr(vm, region)
+                    .await
+                    .map_err(err)?;
+                Ok(json!(text))
+            }
+            "vm.find_image" => {
+                let name = vm_arg(&args)?;
+                let image = args["image"].as_str().ok_or("missing image")?;
+                let threshold = args["threshold"].as_f64().unwrap_or(0.9);
+                let region = region_arg(&args)?;
+                let opts = crate::vision::MatchOptions { threshold, region };
+                let vm = lab.vm(&name).map_err(err)?;
+                let found =
+                    crate::scripting::interact::find_image(vm, &[PathBuf::from(image)], &opts)
+                        .await
+                        .map_err(err)?;
+                Ok(match found {
+                    Some(m) => {
+                        let (cx, cy) = m.center();
+                        json!({"x": m.x, "y": m.y, "w": m.w, "h": m.h,
+                               "score": m.score, "cx": cx, "cy": cy})
+                    }
+                    None => Value::Null,
+                })
             }
             // Guest-agent exec (PRD §12: vmlab exec <vm> -- cmd).
             "vm.exec" => {
@@ -347,5 +450,28 @@ impl Handler for LabdHandler {
             }
             _ => Err(format!("unknown command `{cmd}`")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::region_arg;
+    use serde_json::json;
+
+    #[test]
+    fn region_arg_parses_and_validates() {
+        assert_eq!(region_arg(&json!({})).unwrap(), None);
+        assert_eq!(region_arg(&json!({"region": null})).unwrap(), None);
+        assert_eq!(
+            region_arg(&json!({"region": [1, 2, 3, 4]})).unwrap(),
+            Some((1, 2, 3, 4))
+        );
+        // Negative values clamp to 0.
+        assert_eq!(
+            region_arg(&json!({"region": [-5, 2, 3, 4]})).unwrap(),
+            Some((0, 2, 3, 4))
+        );
+        assert!(region_arg(&json!({"region": [1, 2, 3]})).is_err());
+        assert!(region_arg(&json!({"region": "nope"})).is_err());
     }
 }
