@@ -252,8 +252,16 @@ impl Supervisor {
             reg.set_state(name, LabState::Stopping);
             reg.save();
         }
+        // A live daemon shuts down gracefully; its reaper drops the entry on
+        // exit. A daemon that's already gone (e.g. a crashed/Failed lab) has no
+        // reaper watching it, so remove the entry here — otherwise it would be
+        // stuck in Stopping forever.
         if let Ok(client) = Client::connect(&sock).await {
             let _ = client.call("shutdown", Value::Null).await;
+        } else {
+            let mut reg = self.registry.lock().await;
+            reg.remove(name);
+            reg.save();
         }
         Ok(())
     }
