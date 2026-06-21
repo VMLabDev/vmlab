@@ -792,9 +792,52 @@ pub fn cmd_snapshot_delete(vm_ref: &str, name: String) -> Result<()> {
     })
 }
 
+/// Render one raw log line according to `format`. `is_events` marks lines
+/// from a structured `events.jsonl` (worth pretty-printing); plain-text VM
+/// logs pass through unchanged. `color` enables ANSI styling (TTY only).
+fn format_log_line(
+    line: &str,
+    is_events: bool,
+    format: crate::cli::LogFormat,
+    color: bool,
+) -> String {
+    use crate::cli::LogFormat;
+    if format == LogFormat::Jsonl || !is_events {
+        return line.to_string();
+    }
+    let Ok(ev) = serde_json::from_str::<crate::proto::Event>(line) else {
+        return line.to_string();
+    };
+    let ts = ev.ts.with_timezone(&chrono::Local).format("%H:%M:%S");
+    let data = match ev.data.as_object() {
+        Some(map) => map
+            .iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => format!("{k}={s}"),
+                _ => format!("{k}={v}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        None if ev.data.is_null() => String::new(),
+        None => ev.data.to_string(),
+    };
+    if color {
+        format!("\x1b[2m{ts}\x1b[0m  \x1b[36m{:<16}\x1b[0m {data}", ev.event)
+    } else {
+        format!("{ts}  {:<16} {data}", ev.event)
+    }
+    .trim_end()
+    .to_string()
+}
+
 /// `vmlab logs [lab/][vm]` — tail or dump JSON-line logs (PRD §8.3). Reads
 /// the state-dir files directly so it works with no daemon running.
-pub fn cmd_logs(target: Option<String>, follow: bool, lines: usize) -> Result<()> {
+pub fn cmd_logs(
+    target: Option<String>,
+    follow: bool,
+    lines: usize,
+    format: crate::cli::LogFormat,
+) -> Result<()> {
     let (lab, vm) = match &target {
         None => (current_lab()?.0, None),
         Some(t) => match split_vm_ref(t)? {
@@ -835,6 +878,10 @@ pub fn cmd_logs(target: Option<String>, follow: bool, lines: usize) -> Result<()
         );
     }
 
+    let is_events = |p: &std::path::Path| p.file_name().is_some_and(|n| n == "events.jsonl");
+    use std::io::IsTerminal;
+    let color = format == crate::cli::LogFormat::Pretty && std::io::stdout().is_terminal();
+
     for path in &existing {
         let content = std::fs::read_to_string(path).unwrap_or_default();
         let all: Vec<&str> = content.lines().collect();
@@ -842,14 +889,16 @@ pub fn cmd_logs(target: Option<String>, follow: bool, lines: usize) -> Result<()
         if existing.len() > 1 {
             println!("==> {} <==", path.display());
         }
+        let ev = is_events(path);
         for line in &all[start..] {
-            println!("{line}");
+            println!("{}", format_log_line(line, ev, format, color));
         }
     }
 
     if follow {
         // Poll-based tail on the first file (simple, portable).
         let path = existing[0].clone();
+        let ev = is_events(&path);
         let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -860,7 +909,9 @@ pub fn cmd_logs(target: Option<String>, follow: bool, lines: usize) -> Result<()
                 f.seek(std::io::SeekFrom::Start(offset))?;
                 let mut buf = String::new();
                 f.read_to_string(&mut buf)?;
-                print!("{buf}");
+                for line in buf.lines() {
+                    println!("{}", format_log_line(line, ev, format, color));
+                }
                 offset = len;
             }
         }
@@ -870,8 +921,58 @@ pub fn cmd_logs(target: Option<String>, follow: bool, lines: usize) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::root_for;
+    use super::{format_log_line, region_value, root_for};
+    use crate::cli::LogFormat;
     use serde_json::json;
+
+    #[test]
+    fn region_value_validates_arity() {
+        assert_eq!(region_value(None).unwrap(), serde_json::Value::Null);
+        assert_eq!(
+            region_value(Some(vec![1, 2, 3, 4])).unwrap(),
+            json!([1, 2, 3, 4])
+        );
+        assert!(region_value(Some(vec![1, 2, 3])).is_err());
+        assert!(region_value(Some(vec![1, 2, 3, 4, 5])).is_err());
+    }
+
+    #[test]
+    fn pretty_formats_events_without_color() {
+        let line = json!({
+            "event": "vm.started",
+            "ts": "2026-06-21T14:32:01Z",
+            "data": {"vm": "web01", "pid": 12345}
+        })
+        .to_string();
+        let out = format_log_line(&line, true, LogFormat::Pretty, false);
+        assert!(out.contains("vm.started"), "got: {out}");
+        assert!(out.contains("vm=web01"), "got: {out}");
+        assert!(out.contains("pid=12345"), "got: {out}");
+        // No ANSI escapes when color is disabled.
+        assert!(!out.contains('\x1b'), "got: {out}");
+    }
+
+    #[test]
+    fn jsonl_returns_input_verbatim() {
+        let line = r#"{"event":"vm.ready","ts":"2026-06-21T14:32:09Z"}"#;
+        assert_eq!(format_log_line(line, true, LogFormat::Jsonl, false), line);
+    }
+
+    #[test]
+    fn plain_text_passes_through_in_pretty() {
+        let line = "qemu: some raw serial output";
+        assert_eq!(
+            format_log_line(line, false, LogFormat::Pretty, true),
+            line,
+            "non-events lines must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn unparseable_events_line_falls_back_to_raw() {
+        let line = "not json at all";
+        assert_eq!(format_log_line(line, true, LogFormat::Pretty, false), line);
+    }
 
     #[test]
     fn root_for_matches_by_name() {

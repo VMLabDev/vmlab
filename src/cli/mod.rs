@@ -6,8 +6,18 @@ pub mod daemon;
 mod lab;
 mod validate;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::process::ExitCode;
+
+/// How `vmlab logs` renders its output.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Human-readable, terminal-rendered (colorized on a TTY)
+    #[default]
+    Pretty,
+    /// Raw JSON-lines, one event per line
+    Jsonl,
+}
 
 #[derive(Parser)]
 #[command(name = "vmlab", version, about = "Single-host VM lab orchestrator")]
@@ -103,6 +113,9 @@ pub enum Command {
         /// Lines of history to show
         #[arg(short = 'n', long, default_value_t = 100)]
         lines: usize,
+        /// Output format
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = LogFormat::Pretty)]
+        output: LogFormat,
     },
     /// Supervisor control (normally automatic)
     #[command(hide = true)]
@@ -268,7 +281,8 @@ pub fn run() -> ExitCode {
             target,
             follow,
             lines,
-        } => lab::cmd_logs(target, follow, lines),
+            output,
+        } => lab::cmd_logs(target, follow, lines, output),
         Command::Daemon { cmd } => daemon::cmd_daemon(cmd),
         Command::Supervisord => {
             init_daemon_tracing();
