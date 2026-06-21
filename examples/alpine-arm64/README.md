@@ -12,7 +12,7 @@ Build the aarch64 Alpine template first (from the
 ```sh
 cd vmlab-templates/alpine-3.23-arm64
 vmlab template build          # downloads the cloud image, slow under TCG
-vmlab template exists aarch64/alpine-3.23
+vmlab template list           # confirm aarch64/alpine-3.23 landed in the store
 ```
 
 ## Run

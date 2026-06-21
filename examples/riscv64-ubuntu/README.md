@@ -16,7 +16,7 @@ Build the riscv64 Ubuntu template first (from the
 ```sh
 cd vmlab-templates/ubuntu-riscv64
 vmlab template build          # downloads the cloud image, slow under TCG
-vmlab template exists riscv64/ubuntu-24.04
+vmlab template list           # confirm riscv64/ubuntu-24.04 landed in the store
 ```
 
 ## Run

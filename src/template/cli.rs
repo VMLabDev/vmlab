@@ -49,9 +49,6 @@ pub enum TemplateCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Check whether a template is in the store (`<arch>/<name>[@<version>]`).
-    /// Prints the resolved ref and exits 0 if present; exits nonzero if not.
-    Exists { reference: String },
     /// Remove a template (`<arch>/<name>[@<version>]`)
     Rm {
         reference: String,
@@ -74,18 +71,6 @@ pub enum TemplateCmd {
         /// Also remove builds that still back existing clones
         #[arg(long)]
         force: bool,
-    },
-    /// Re-tag a template in the store (new version and/or registry), reusing
-    /// the built image — no rebuild
-    Relabel {
-        /// Existing template `<arch>/<name>@<version>`
-        reference: String,
-        /// New version to give it (default: keep the current version)
-        #[arg(long)]
-        to: Option<String>,
-        /// Set the template's publish registry (full OCI repo)
-        #[arg(long)]
-        registry: Option<String>,
     },
     /// Export a template to a portable archive
     Export {
@@ -161,7 +146,6 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 arch,
                 json,
             } => search(query, registry, arch, json).await,
-            TemplateCmd::Exists { reference } => exists(&reference),
             TemplateCmd::Rm { reference, force } => rm(&reference, force),
             TemplateCmd::Clean {
                 filter,
@@ -169,11 +153,6 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 yes,
                 force,
             } => clean(filter, keep, yes, force).await,
-            TemplateCmd::Relabel {
-                reference,
-                to,
-                registry,
-            } => relabel(&reference, to, registry),
             TemplateCmd::Export { reference, out } => export(&reference, &out),
             TemplateCmd::Import { archive, overwrite } => import(&archive, overwrite),
             TemplateCmd::Push {
@@ -502,22 +481,6 @@ async fn fetch_search_row(repo: String, ns_prefix: &str) -> Option<SearchRow> {
     })
 }
 
-fn exists(reference: &str) -> Result<()> {
-    let (arch, name, version) = parse_store_ref(reference)?;
-    let resolved =
-        store()
-            .resolve(&arch, &name, version.as_deref())
-            .map_err(|_| match &version {
-                Some(v) => anyhow!("{arch}/{name}@{v} not in the store"),
-                None => anyhow!("{arch}/{name} not in the store"),
-            })?;
-    println!(
-        "{}/{}@{}",
-        resolved.meta.arch, resolved.meta.name, resolved.meta.version
-    );
-    Ok(())
-}
-
 fn rm(reference: &str, force: bool) -> Result<()> {
     let (arch, name, version) = parse_store_ref(reference)?;
     let version = version.ok_or_else(|| {
@@ -667,30 +630,6 @@ async fn backing_disks_in_use() -> std::collections::HashSet<PathBuf> {
         }
     }
     in_use
-}
-
-fn relabel(reference: &str, to: Option<String>, registry: Option<String>) -> Result<()> {
-    let (arch, name, version) = parse_store_ref(reference)?;
-    let version = version
-        .ok_or_else(|| anyhow!("specify the exact version, e.g. {arch}/{name}@<version>"))?;
-    if to.is_none() && registry.is_none() {
-        bail!("nothing to change — pass --to <version> and/or --registry <url>");
-    }
-    let store = store();
-    let resolved = store.resolve(&arch, &name, Some(&version))?;
-    let mut meta = resolved.meta.clone();
-    if let Some(v) = &to {
-        meta.version = v.clone();
-    }
-    if let Some(r) = &registry {
-        meta.registry = Some(r.clone());
-    }
-    store.relabel(&arch, &name, &version, &meta)?;
-    println!(
-        "relabeled {arch}/{name}@{version} -> {}/{}@{}",
-        meta.arch, meta.name, meta.version
-    );
-    Ok(())
 }
 
 fn export(reference: &str, out: &std::path::Path) -> Result<()> {

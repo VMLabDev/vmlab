@@ -60,7 +60,6 @@ wisp-api.md).
 ```sh
 vmlab template build [-f <file>] [<name>]   # build template {} blocks (default ./vmlab.wcl; name = just one)
 vmlab template list [--json]                # --json: full metadata array (ref, sizes in bytes, RFC 3339 created)
-vmlab template exists <arch>/<name>[@<ver>] # prints resolved ref, exit 0 if in store / 1 if not (for scripting)
 vmlab template rm <arch>/<name>@<version> [--force]   # exact version required; --force if clones back it
 vmlab template export <arch>/<name>[@<ver>] <out.tar.zst>
 vmlab template import <archive.tar.zst> [--overwrite]

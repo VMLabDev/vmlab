@@ -191,41 +191,6 @@ impl TemplateStore {
         Ok(())
     }
 
-    /// Re-tag an existing template under refreshed metadata (a new version
-    /// and/or registry), reusing the on-disk image — no rebuild. Moves the
-    /// existing version directory aside, then re-installs it as `new_meta`.
-    /// Refuses to clobber a *different* existing version.
-    pub fn relabel(
-        &self,
-        arch: &str,
-        name: &str,
-        old_version: &str,
-        new_meta: &TemplateMeta,
-    ) -> Result<()> {
-        let _lock = self.lock()?;
-        let old_dir = self.version_dir(arch, name, old_version);
-        ensure!(
-            old_dir.join(META_FILE).is_file(),
-            "template {arch}/{name}@{old_version} not found in the store"
-        );
-        let dest = self.version_dir(&new_meta.arch, &new_meta.name, &new_meta.version);
-        if dest.exists() && dest != old_dir {
-            bail!(
-                "cannot relabel onto existing {}/{}@{} — remove it first",
-                new_meta.arch,
-                new_meta.name,
-                new_meta.version
-            );
-        }
-        let staging = self.root.join(format!(
-            "{STAGING_PREFIX}relabel-{arch}-{name}-{old_version}"
-        ));
-        let _ = fs::remove_dir_all(&staging);
-        fs::rename(&old_dir, &staging)
-            .with_context(|| format!("cannot stage {}", old_dir.display()))?;
-        self.install_locked(&staging, new_meta, true)
-    }
-
     /// Remove `<arch>/<name>@<version>`. `in_use` reports why the
     /// template cannot go (e.g. clones backed by it, PRD §7.1); a
     /// `Some(reason)` refuses the removal unless `force` is set.
