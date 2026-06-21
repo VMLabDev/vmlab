@@ -42,17 +42,17 @@ pub enum Command {
         #[command(subcommand)]
         cmd: VmCmd,
     },
-    /// Take, restore, list, and delete VM/lab snapshots (PRD §7.3)
+    /// Take, restore, list, and delete VM/lab snapshots
     Snapshot {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
-    /// Manage the template store and OCI distribution (PRD §6)
+    /// Manage the template store and OCI distribution
     Template {
         #[command(subcommand)]
         cmd: crate::template::cli::TemplateCmd,
     },
-    /// Attach a console viewer to a VM (PRD §11)
+    /// Attach a console viewer to a VM
     Console {
         vm: String,
         /// Forward the VNC display over TCP instead of launching a viewer
