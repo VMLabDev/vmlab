@@ -17,7 +17,7 @@ page getting_started { sites = [:vmlab]  title = "Getting started"
       # Or run the container (only /dev/kvm is granted):
       docker run --rm -it --device /dev/kvm \
         -v ~/.local/share/vmlab/templates:/root/.local/share/vmlab/templates \
-        -v "$PWD":/lab -w /lab ghcr.io/wiltaylor/vmlab vmlab up
+        -v "$PWD":/lab -w /lab ghcr.io/vmlabdev/vmlab vmlab up
       SH
   }
 

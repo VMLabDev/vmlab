@@ -31,7 +31,7 @@ site vmlab {
     // The reference is its own built site (the vmlab wskill's book); link by its
     // root-relative output path.
     item "Reference"       { href = "wskills/vmlab/" }
-    item "Source"          { href = "https://github.com/wiltaylor/vmlab" }
+    item "Source"          { href = "https://github.com/VMLabDev/vmlab" }
   }
 }
 
