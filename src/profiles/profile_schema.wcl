@@ -18,7 +18,7 @@ type Profile {
   nic_model: utf8?      // "virtio-net-pci" | "e1000" | "rtl8139"
   display: utf8?        // "qxl" | "virtio-gpu" | "std"
   cpus: i64?
-  memory: utf8?         // "4G"
+  memory: std.ByteSize?  // 4GiB
   agent_channel: bool?  // virtio-serial guest agent channel (default true)
   input_transport: utf8?  // "qmp" (default) | "vnc" — scripted input path (§10.3)
 }

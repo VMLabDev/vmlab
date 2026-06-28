@@ -1,8 +1,8 @@
 // Schema for template store metadata (`template.wcl`, PRD §6.1, §6.2).
 //
 // Store metadata files opt in with `import <vmlab-meta.wcl>` at the top.
-// One `template_meta` block per file; sizes are human strings ("8G")
-// parsed by crate::config::model::parse_size.
+// One `template_meta` block per file; sizes are `std.ByteSize` literals
+// (`8GiB`), stored and re-emitted as byte counts.
 
 @document
 type MetaDoc {
@@ -16,8 +16,8 @@ type TemplateMeta {
   version: utf8
   profile: utf8?
   cpus: i64?
-  memory: utf8?       // RAM, "8G" style
-  disk: utf8?         // primary disk virtual size, "64G" style
+  memory: std.ByteSize?  // RAM, 8GiB style
+  disk: std.ByteSize?    // primary disk virtual size, 64GiB style
   firmware: utf8?
   tpm: bool?
   secure_boot: bool?

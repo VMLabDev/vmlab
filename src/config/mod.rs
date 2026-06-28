@@ -182,7 +182,7 @@ lab "ad-lab" {
     template = "x86_64/windows-server-2025"
     profile  = "windows-server"
     cpus     = 4
-    memory   = "8G"
+    memory   = 8GiB
     nic { segment = "corp"  ip = "10.50.0.10" }
   }
 
@@ -203,7 +203,7 @@ lab "ad-lab" {
     template = "scratch"
     arch     = "x86_64"
     profile  = "windows-11"
-    disk     = "80G"
+    disk     = 80GiB
     cdrom    = "./isos/win11-build.iso"
   }
 
@@ -213,10 +213,10 @@ lab "ad-lab" {
     nic { segment = "dmz" }
   }
 
-  provision "scripts/setup.wscript" { }
+  provision "scripts/setup.ws" { }
 
-  on "vm.crashed"    { run = "scripts/collect-dumps.wscript" }
-  on "host.disk_low" { run = "scripts/alert.wscript" }
+  on "vm.crashed"    { run = "scripts/collect-dumps.ws" }
+  on "host.disk_low" { run = "scripts/alert.ws" }
 }
 "#;
 
@@ -313,10 +313,10 @@ template "base" {
   arch    = "x86_64"
   version = "1.0"
   profile = "linux-modern"
-  disk    = "20G"
+  disk    = 20GiB
   source "iso" { url = "https://example.com/x.iso" sha256 = "abc123" }
   media { kind = "iso" from = "./unattend/" }
-  provision "scripts/install.wscript" { }
+  provision "scripts/install.ws" { }
 }
 "#;
         let lf = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap();

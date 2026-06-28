@@ -3,6 +3,10 @@
 // Users opt in with `import <vmlab.wcl>` at the top of their lab file.
 // Semantics beyond structure (template existence, subnet membership,
 // dependency cycles, …) are enforced by `vmlab validate` in Rust.
+//
+// Per-field `@doc("…")` decorators are the single source for the generated
+// schema reference (the vmlab wskill reflects them with `type_table`); keep
+// them one-line and current.
 
 @document
 type VmlabDoc {
@@ -12,33 +16,55 @@ type VmlabDoc {
 
 @block("lab")
 type Lab {
+  @doc("Lab name (DNS label, ≤63 chars); the inline block label")
   @inline(0) name: utf8
-  gui: bool?               // default for all VMs: open a VNC viewer on `up` (§11)
+  @doc("Default for all VMs: open a VNC viewer on `up` (§11); VM `gui` overrides")
+  gui: bool?
+  @doc("Virtual L2 network segments in this lab")
   @children("segment")   segments: list<Segment>
+  @doc("The VMs in this lab")
   @children("vm")        vms: list<Vm>
+  @doc("wscript provision scripts run on `vmlab up`, in declaration order")
   @children("provision") provisions: list<Provision>
+  @doc("Lifecycle event handlers (failures are logged, never fatal)")
   @children("on")        handlers: list<Handler>
-  // Lab-wide static DNS entries and sinkholes (PRD §9.5, §9.9).
+  @doc("Lab-wide static DNS entries (wildcards allowed) (§9.5)")
   @children("record")   records: list<DnsRecord>
+  @doc("Lab-wide DNS sinkholes (§9.9)")
   @children("sinkhole") sinkholes: list<SinkholeRule>
 }
 
 @block("segment")
 type Segment {
+  @doc("Segment name (DNS label); unique per lab; the inline block label")
   @inline(0) name: utf8
-  subnet: utf8?            // CIDR; auto-allocated from the host pool if omitted
-  global: bool?            // owned by the supervisor, shared across labs (§9.2)
-  dhcp: bool?              // default true (§9.4)
-  nat: bool?               // internet egress for this segment (§9.7)
-  mtu: i64?                // link MTU; default jumbo (9000) on nat/global, else 1500
-  routes_to: list<utf8>?   // daemon inter-segment routing opt-in (§9.6)
+  @doc("CIDR; auto-allocated as a /24 from the host pool if omitted (§9.4)")
+  subnet: utf8?
+  @doc("Owned by the supervisor and shared across labs (§9.2)")
+  global: bool?
+  @doc("Enable DHCP (default true) (§9.4)")
+  dhcp: bool?
+  @doc("Enable NAT/internet egress for this segment (default false) (§9.7)")
+  nat: bool?
+  @doc("Link MTU (576–65535); default jumbo (9000) on nat/global, else 1500")
+  mtu: i64?
+  @doc("Names of other segments to route to — daemon inter-segment routing opt-in (§9.6)")
+  routes_to: list<utf8>?
+  @doc("DNS service override: hand out another server, or opt out (§9.5)")
   @child("dns")         dns: SegmentDns?
+  @doc("Cross-host segment peer over TCP (PSK from host config) (§9.2)")
   @child("connect")     connect: Connect?
+  @doc("Guest routes pushed via DHCP option 121 (§9.6)")
   @children("route")    routes: list<Route>
+  @doc("Static DNS entries for this segment (wildcards allowed) (§9.5)")
   @children("record")   records: list<DnsRecord>
+  @doc("Host→guest port forwards (§9.8)")
   @children("forward")  forwards: list<Forward>
+  @doc("L3 block rules at the switch (§9.9)")
   @children("block")    block_rules: list<BlockRule>
+  @doc("L3 DNAT redirect rules (§9.9)")
   @children("redirect") redirect_rules: list<RedirectRule>
+  @doc("DNS sinkhole rules (§9.9)")
   @children("sinkhole") sinkholes: list<SinkholeRule>
 }
 
@@ -46,7 +72,9 @@ type Segment {
 // DHCP (e.g. a DC), or opt out entirely.
 @block("dns")
 type SegmentDns {
+  @doc("IPv4 of the DNS server to hand out via DHCP instead of the daemon")
   server: utf8?
+  @doc("Hand out a DNS server at all (default true); false suppresses the DHCP option")
   enabled: bool?
 }
 
@@ -54,169 +82,255 @@ type SegmentDns {
 // over TCP, authenticated by the pre-shared key from host config.
 @block("connect")
 type Connect {
+  @doc("Remote supervisor `host[:port]` to bridge this segment with (required)")
   host: utf8
 }
 
 // Guest route pushed via DHCP option 121 (§9.6).
 @block("route")
 type Route {
+  @doc("Destination CIDR, e.g. `10.60.0.0/24` (required)")
   dest: utf8
+  @doc("Gateway IPv4 the route points at (required)")
   via: utf8
 }
 
 // Static DNS entry (wildcards allowed in name) (§9.5).
 @block("record")
 type DnsRecord {
+  @doc("DNS name to resolve; wildcards allowed, e.g. `*.internal` (required)")
   name: utf8
+  @doc("IPv4 address the name resolves to (required)")
   ip: utf8
 }
 
 // Host→guest port forward (§9.8).
 @block("forward")
 type Forward {
+  @doc("Host port to listen on (1–65535); unique across the lab (required)")
   host_port: i64
-  to: utf8          // "vm:port"
-  proto: utf8?      // "tcp" (default) | "udp" | "both"
+  @doc("Target as `vm:port`; the VM must be declared (required)")
+  to: utf8
+  @doc("Protocol: `tcp` (default) | `udp` | `both`")
+  proto: utf8?
 }
 
 // L3 block rule at the switch (§9.9).
 @block("block")
 type BlockRule {
+  @doc("IPv4 CIDR to drop traffic to/from (required)")
   cidr: utf8
-  proto: utf8?      // "tcp" | "udp" | "icmp"
+  @doc("Protocol to scope the rule: `tcp` | `udp` | `icmp`")
+  proto: utf8?
+  @doc("Port to scope the rule (1–65535); requires `proto`")
   port: i64?
 }
 
 // L3 DNAT redirect rule (§9.9).
 @block("redirect")
 type RedirectRule {
-  from: utf8        // "ip[:port]"
-  to: utf8          // "ip[:port]"
+  @doc("Match destination as `ip[:port]` (required)")
+  from: utf8
+  @doc("Rewrite destination to `ip[:port]` (required)")
+  to: utf8
+  @doc("Protocol to scope the rule: `tcp` | `udp`")
   proto: utf8?
 }
 
 // DNS sinkhole (§9.9): NXDOMAIN by default, or 0.0.0.0 with mode = "zero".
 @block("sinkhole")
 type SinkholeRule {
+  @doc("DNS name pattern to sink; wildcards allowed (required)")
   pattern: utf8
-  mode: utf8?       // "nxdomain" (default) | "zero"
+  @doc("Response: `nxdomain` (default) | `zero` (resolve to 0.0.0.0)")
+  mode: utf8?
 }
 
 @block("vm")
 type Vm {
+  @doc("VM name (DNS label); unique per lab; the inline block label")
   @inline(0) name: utf8
-  template: utf8           // "<arch>/<name>[@<version>]", "scratch", or registry ref
-  arch: utf8?              // required for scratch and registry references
+  @doc("`<arch>/<name>[@<version>]`, `scratch`, or an OCI registry ref (required)")
+  template: utf8
+  @doc("Architecture; required for `scratch` and registry references")
+  arch: utf8?
+  @doc("Guest OS profile (hardware defaults); required for `scratch`")
   profile: utf8?
+  @doc("vCPU count (> 0); inherited from template→profile if omitted")
   cpus: i64?
-  memory: utf8?            // "8G"
-  disk: utf8?              // primary disk size — scratch VMs only
-  cdrom: utf8?             // path to ISO
-  floppy: utf8?            // path to floppy image
+  @doc("RAM as a byte size, e.g. `8GiB`/`512MiB`; inherited if omitted")
+  memory: std.ByteSize?
+  @doc("Primary disk size, e.g. `64GiB` — scratch VMs only (rejected on cloned VMs)")
+  disk: std.ByteSize?
+  @doc("Path to an ISO to attach as a CD-ROM (relative to lab root)")
+  cdrom: utf8?
+  @doc("Path to a floppy image to attach (relative to lab root)")
+  floppy: utf8?
+  @doc("VM names to wait for before this one (no cycles)")
   depends_on: list<utf8>?
+  @doc("Enable nested virtualisation (host CPU passthrough)")
   nested: bool?
-  gui: bool?               // open a VNC viewer on `up` (§11); VM always runs headless
+  @doc("Open a VNC viewer on `up` (§11); the VM always runs headless")
+  gui: bool?
+  @doc("QEMU display string; inherited from template→profile if omitted")
   display: utf8?
-  firmware: utf8?          // "ovmf" | "seabios"
+  @doc("Firmware: `ovmf` | `seabios`; inherited from template→profile")
+  firmware: utf8?
+  @doc("Enable a TPM 2.0 device; inherited from template→profile")
   tpm: bool?
+  @doc("Enable secure boot (OVMF only); inherited from template→profile")
   secure_boot: bool?
-  qemu_args: list<utf8>?   // escape hatch, appended last (§5.2)
+  @doc("Raw QEMU flags appended last — escape hatch (§5.2)")
+  qemu_args: list<utf8>?
+  @doc("GPU acceleration (passthrough / virgl / vulkan)")
   @child("gpu")     gpu: Gpu?
+  @doc("Network interfaces; no NICs = air-gapped (shares need ≥1 NIC)")
   @children("nic")   nics: list<Nic>
+  @doc("Additional disks beyond the primary disk")
   @children("disk")  extra_disks: list<DiskBlock>
+  @doc("SMB shared folders (require ≥1 NIC) (§7.5)")
   @children("share") shares: list<Share>
+  @doc("ISO/floppy images built from a folder (§6.3)")
   @children("media") media: list<Media>
 }
 
 @block("nic")
 type Nic {
+  @doc("Segment name to attach to; required unless `nat = true`")
   segment: utf8?
-  nat: bool?        // shorthand: attach to the per-lab built-in NAT segment
-  ip: utf8?         // static → DHCP reservation
-  mac: utf8?        // fixed MAC; generated and persisted otherwise
-  isolated: bool?   // port isolation (§9.1)
+  @doc("Shorthand: attach to the per-lab built-in NAT segment (§9.7)")
+  nat: bool?
+  @doc("Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique")
+  ip: utf8?
+  @doc("Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise")
+  mac: utf8?
+  @doc("Port isolation: reach gateway/forwards but not segment neighbours (§9.1)")
+  isolated: bool?
 }
 
 // Additional disk (§5.2): blank by size, or pre-formatted from a folder.
 @block("disk")
 type DiskBlock {
+  @doc("Disk identifier; the inline block label")
   @inline(0) name: utf8
-  size: utf8?
-  from: utf8?       // folder copied onto a fresh FAT filesystem
+  @doc("Blank disk size, e.g. `10GiB`; one of `size`/`from` is required")
+  size: std.ByteSize?
+  @doc("Folder copied onto a fresh FAT filesystem; one of `size`/`from` is required")
+  from: utf8?
 }
 
 // Host↔guest shared folder over SMB (§7.5).
 @block("share")
 type Share {
+  @doc("Host directory to share; must exist (required)")
   host: utf8
+  @doc("Guest mount path, e.g. `/mnt/src` or `D:\\data` (required)")
   guest: utf8
+  @doc("Mount read-only (default false)")
   readonly: bool?
-  smb1: bool?       // legacy dialect + auth relaxation for XP/2003-era guests
-  name: utf8?       // share name; derived from guest path if omitted
+  @doc("Enable the SMB1 dialect + auth relaxation for XP/2003-era guests")
+  smb1: bool?
+  @doc("SMB share name; derived from the guest path if omitted")
+  name: utf8?
 }
 
 // ISO/floppy image built from a folder (§6.3).
 @block("media")
 type Media {
-  kind: utf8        // "iso" | "floppy"
-  from: utf8        // source folder
+  @doc("Image kind: `iso` | `floppy` (required)")
+  kind: utf8
+  @doc("Source folder built into the image; must exist (required)")
+  from: utf8
+  @doc("Volume label for the image")
   label: utf8?
 }
 
 // GPU acceleration (§5.2).
 @block("gpu")
 type Gpu {
-  mode: utf8        // "passthrough" | "virgl" | "vulkan"
-  address: utf8?    // host PCI address — passthrough only
+  @doc("Mode: `passthrough` | `virgl` | `vulkan` (required)")
+  mode: utf8
+  @doc("Host PCI address, e.g. `0000:01:00.0` — required for `passthrough`")
+  address: utf8?
 }
 
 // Provision script run during `vmlab up` (§10.4). Optional vms list scopes
 // the script for depends_on satisfaction (§7.2).
 @block("provision")
 type Provision {
+  @doc("Path to the `.ws` file; must exist and compile; the inline label")
   @inline(0) script: utf8
+  @doc("VM names this script is scoped to (gates their `depends_on`) (§7.2)")
   vms: list<utf8>?
 }
 
 // Event handler binding (§8.2).
 @block("on")
 type Handler {
+  @doc("Event name to handle, e.g. `vm.crashed`; the inline block label")
   @inline(0) event: utf8
+  @doc("Path to the handler `.ws` file; must exist and compile (required)")
   run: utf8
 }
 
 // Template definition (§6.1), buildable with `vmlab template build`.
 @block("template")
 type TemplateDef {
+  @doc("Template name, e.g. `linux-modern`; the inline block label")
   @inline(0) name: utf8
+  @doc("Architecture — selects the QEMU system emulator (required)")
   arch: utf8
+  @doc("Version string, non-empty; name+arch+version is unique (required)")
   version: utf8
-  registry: utf8?          // full OCI repo to publish to / version-bump against
+  @doc("Full OCI repo to publish to / version-bump against (§6.4)")
+  registry: utf8?
+  @doc("Guest OS profile (hardware defaults) for the build VM")
   profile: utf8?
+  @doc("vCPU count for the build VM; inherited by clones")
   cpus: i64?
-  memory: utf8?
-  disk: utf8?              // working disk size for the build
+  @doc("RAM for the build VM, e.g. `8GiB`; inherited by clones")
+  memory: std.ByteSize?
+  @doc("Working disk size for the build, e.g. `64GiB`; required for `scratch` source")
+  disk: std.ByteSize?
+  @doc("QEMU display string for the build VM")
   display: utf8?
+  @doc("Firmware: `ovmf` | `seabios`")
   firmware: utf8?
+  @doc("Enable a TPM 2.0 device")
   tpm: bool?
+  @doc("Enable secure boot (OVMF only)")
   secure_boot: bool?
+  @doc("Enable nested virtualisation for the build VM")
   nested: bool?
-  gui: bool?               // watch the build VM via a VNC viewer (§11)
+  @doc("Watch the build VM via a VNC viewer (§11)")
+  gui: bool?
+  @doc("Raw QEMU flags for the build VM — escape hatch (§5.2)")
   qemu_args: list<utf8>?
-  first_boot: utf8?        // wscript script run on first instantiation, before ready
+  @doc("wscript run on first instantiation of a clone, before ready")
+  first_boot: utf8?
+  @doc("What the build starts from — exactly one of four forms (required)")
   @child("source")       source: TemplateSource
+  @doc("ISO/floppy images attached to the build (§6.3)")
   @children("media")     media: list<Media>
+  @doc("Provision scripts that drive the build")
   @children("provision") provisions: list<Provision>
+  @doc("NICs for the build VM (optional; the build VM may be air-gapped)")
   @children("nic")       nics: list<Nic>
+  @doc("Additional disks attached during the build")
   @children("disk")      extra_disks: list<DiskBlock>
 }
 
 // Template build source (§6.1): exactly one of the four forms.
 @block("source")
 type TemplateSource {
-  @inline(0) kind: utf8   // "iso" | "qcow2" | "template" | "scratch"
-  path: utf8?             // local file — iso/qcow2
-  url: utf8?              // remote artefact — iso/qcow2; sha256 required
+  @doc("Source kind: `iso` | `qcow2` | `template` | `scratch`; the inline label")
+  @inline(0) kind: utf8
+  @doc("Local file path — `iso`/`qcow2`; mutually exclusive with `url`")
+  path: utf8?
+  @doc("Remote artefact URL — `iso`/`qcow2`; requires `sha256`")
+  url: utf8?
+  @doc("SHA-256 of the remote artefact; required with `url`")
   sha256: utf8?
-  from: utf8?             // "<arch>/<name>[@<version>]" — kind "template"
+  @doc("Source template `<arch>/<name>[@<version>]` — kind `template` (layered build)")
+  from: utf8?
 }

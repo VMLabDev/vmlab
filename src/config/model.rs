@@ -466,28 +466,6 @@ pub fn parse_template_ref(s: &str) -> Result<TemplateRef, String> {
     })
 }
 
-/// Parse a human size string: bare bytes or `K`/`M`/`G`/`T` suffix
-/// (binary units), e.g. `8G`, `512M`.
-pub fn parse_size(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty size".into());
-    }
-    let (num, mult) = match s.chars().last().unwrap() {
-        'k' | 'K' => (&s[..s.len() - 1], 1u64 << 10),
-        'm' | 'M' => (&s[..s.len() - 1], 1u64 << 20),
-        'g' | 'G' => (&s[..s.len() - 1], 1u64 << 30),
-        't' | 'T' => (&s[..s.len() - 1], 1u64 << 40),
-        _ => (s, 1),
-    };
-    let n: u64 = num
-        .trim()
-        .parse()
-        .map_err(|_| format!("malformed size `{s}` (expected e.g. \"8G\", \"512M\")"))?;
-    n.checked_mul(mult)
-        .ok_or_else(|| format!("size `{s}` overflows"))
-}
-
 /// Parse `ip[:port]`.
 pub fn parse_host_port(s: &str) -> Result<HostPort, String> {
     let (ip_s, port) = match s.rsplit_once(':') {
@@ -532,14 +510,6 @@ mod tests {
         assert!(parse_template_ref("windows-11").is_err());
         assert!(parse_template_ref("bogusarch/win").is_err());
         assert!(parse_template_ref("x86_64/win@").is_err());
-    }
-
-    #[test]
-    fn sizes() {
-        assert_eq!(parse_size("8G").unwrap(), 8 << 30);
-        assert_eq!(parse_size("512M").unwrap(), 512 << 20);
-        assert_eq!(parse_size("1024").unwrap(), 1024);
-        assert!(parse_size("eight gigs").is_err());
     }
 
     #[test]

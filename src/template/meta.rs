@@ -10,8 +10,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use wcl_lang::{Block, Document, Environment, Registry, Value, disk_loader};
 
-use crate::config::model::parse_size;
-
 /// Embedded schema, registered in the loader as `vmlab-meta.wcl`.
 const META_SCHEMA: &str = include_str!("meta_schema.wcl");
 const SCHEMA_IMPORT: &str = "import <vmlab-meta.wcl>";
@@ -66,10 +64,10 @@ impl TemplateMeta {
             let _ = writeln!(out, "  cpus = {c}");
         }
         if let Some(m) = self.memory {
-            let _ = writeln!(out, "  memory = {}", quote(&format_size(m)));
+            let _ = writeln!(out, "  memory = {}", format_size(m));
         }
         if let Some(d) = self.disk {
-            let _ = writeln!(out, "  disk = {}", quote(&format_size(d)));
+            let _ = writeln!(out, "  disk = {}", format_size(d));
         }
         if let Some(f) = &self.firmware {
             let _ = writeln!(out, "  firmware = {}", quote(f));
@@ -221,25 +219,28 @@ fn get_cpus(block: &Block) -> Result<Option<u32>> {
 }
 
 fn get_size(block: &Block, name: &str) -> Result<Option<u64>> {
-    match get_str(block, name)? {
-        None => Ok(None),
-        Some(s) => parse_size(&s)
-            .map(Some)
-            .map_err(|e| anyhow!("`{name}`: {e}")),
-    }
+    let n = match field_value(block, name)? {
+        None => return Ok(None),
+        Some(Value::I64(n)) => n,
+        Some(other) => bail!("`{name}` must be a byte size, got {other:?}"),
+    };
+    u64::try_from(n)
+        .map(Some)
+        .map_err(|_| anyhow!("`{name}` must not be negative: {n}"))
 }
 
 // ---- formatting ------------------------------------------------------------
 
-/// Format a byte count as the shortest exact `K`/`M`/`G`/`T` string
-/// (binary units), falling back to bare bytes. Round-trips through
-/// [`parse_size`].
+/// Format a byte count as the shortest exact `std.ByteSize` literal — an
+/// IEC suffix (`KiB`/`MiB`/`GiB`/`TiB`, powers of 1024) when the count is a
+/// whole multiple, else a bare byte integer. Both forms re-parse to the same
+/// `u64` via the metadata read path.
 pub(crate) fn format_size(bytes: u64) -> String {
-    const UNITS: [(u64, char); 4] = [
-        (1 << 40, 'T'),
-        (1 << 30, 'G'),
-        (1 << 20, 'M'),
-        (1 << 10, 'K'),
+    const UNITS: [(u64, &str); 4] = [
+        (1 << 40, "TiB"),
+        (1 << 30, "GiB"),
+        (1 << 20, "MiB"),
+        (1 << 10, "KiB"),
     ];
     for (unit, suffix) in UNITS {
         if bytes >= unit && bytes.is_multiple_of(unit) {
@@ -336,11 +337,11 @@ mod tests {
     fn round_trip_odd_sizes_and_strings() {
         let mut meta = minimal_meta();
         meta.memory = Some((1 << 30) + 1); // not unit-aligned: bare bytes
-        meta.disk = Some(1536 << 20); // 1.5G → "1536M"
+        meta.disk = Some(1536 << 20); // 1.5G → "1536MiB"
         meta.origin = Some("say \"hi\" \\ back\ttab".into());
         let text = meta.to_wcl();
-        assert!(text.contains("memory = \"1073741825\""));
-        assert!(text.contains("disk = \"1536M\""));
+        assert!(text.contains("memory = 1073741825"));
+        assert!(text.contains("disk = 1536MiB"));
         let back = TemplateMeta::from_wcl(&text, "<test>").unwrap();
         assert_eq!(meta, back);
     }
@@ -412,14 +413,14 @@ mod tests {
 
     #[test]
     fn format_size_cases() {
-        assert_eq!(format_size(8 << 30), "8G");
-        assert_eq!(format_size(512 << 20), "512M");
-        assert_eq!(format_size(2 << 40), "2T");
-        assert_eq!(format_size(4 << 10), "4K");
-        assert_eq!(format_size(1536 << 20), "1536M");
+        assert_eq!(format_size(8 << 30), "8GiB");
+        assert_eq!(format_size(512 << 20), "512MiB");
+        assert_eq!(format_size(2 << 40), "2TiB");
+        assert_eq!(format_size(4 << 10), "4KiB");
+        assert_eq!(format_size(1536 << 20), "1536MiB");
         assert_eq!(format_size(1023), "1023");
         assert_eq!(format_size(0), "0");
-        // every case round-trips through parse_size
+        // every case round-trips through the metadata read path
         for n in [
             8u64 << 30,
             512 << 20,
@@ -428,7 +429,10 @@ mod tests {
             1023,
             (1 << 30) + 1,
         ] {
-            assert_eq!(parse_size(&format_size(n)).unwrap(), n);
+            let mut meta = minimal_meta();
+            meta.memory = Some(n);
+            let back = TemplateMeta::from_wcl(&meta.to_wcl(), "<test>").unwrap();
+            assert_eq!(back.memory, Some(n));
         }
     }
 }

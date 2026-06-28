@@ -107,9 +107,17 @@ impl HostConfig {
         }
         cfg.psk = get_str("psk")?;
         cfg.viewer = get_str("viewer")?;
-        if let Some(s) = get_str("oci_chunk_size")? {
-            cfg.oci_chunk_size =
-                super::model::parse_size(&s).map_err(|e| anyhow!("host config: {e}"))?;
+        if let Some(f) = block.field("oci_chunk_size") {
+            match f.value() {
+                Ok(Value::I64(n)) if *n >= 0 => cfg.oci_chunk_size = *n as u64,
+                Ok(Value::None) => {}
+                Ok(other) => {
+                    return Err(anyhow!(
+                        "host config: oci_chunk_size must be a non-negative byte size, got {other:?}"
+                    ));
+                }
+                Err(e) => return Err(anyhow!("host config: {e}")),
+            }
         }
         Ok(cfg)
     }
@@ -173,7 +181,7 @@ host {
   dns_suffix       = "lab.local"
   disk_low_percent = 5
   psk              = "sekrit"
-  oci_chunk_size   = "128M"
+  oci_chunk_size   = 128MiB
 }
 "#,
             "<test>",

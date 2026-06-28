@@ -733,7 +733,7 @@ lab "l" {
     #[test]
     fn missing_script() {
         assert_err(
-            "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" }\n  provision \"no/such/script.wscript\" { } }",
+            "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" }\n  provision \"no/such/script.ws\" { } }",
             "does not exist",
         );
     }
@@ -752,7 +752,7 @@ lab "l" {
     #[test]
     fn unknown_event() {
         assert_err(
-            "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" }\n  on \"vm.exploded\" { run = \"x.wscript\" } }",
+            "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" }\n  on \"vm.exploded\" { run = \"x.ws\" } }",
             "unknown event",
         );
     }

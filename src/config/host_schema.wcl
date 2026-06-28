@@ -1,4 +1,6 @@
 // Host-level daemon configuration (`~/.config/vmlab/config.wcl`).
+//
+// Per-field `@doc("…")` decorators feed the generated schema reference.
 
 @document
 type HostDoc {
@@ -7,11 +9,18 @@ type HostDoc {
 
 @block("host")
 type HostConfig {
-  subnet_pool: utf8?        // auto-allocation pool, default 10.213.0.0/16 (§9.4)
-  dns_suffix: utf8?         // default "vmlab.internal" (§9.5)
-  dns_upstream: utf8?       // upstream resolver ip[:port]; default host resolver
-  disk_low_percent: i64?    // host.disk_low threshold, default 10 (§8.1)
-  psk: utf8?                // pre-shared key for cross-host segment links (§9.2)
-  viewer: utf8?             // VNC viewer command; {} replaced by target (§11)
-  oci_chunk_size: utf8?     // OCI layer chunk size, default 512M (§6.4)
+  @doc("Segment auto-allocation pool (CIDR); default `10.213.0.0/16` (§9.4)")
+  subnet_pool: utf8?
+  @doc("Suffix for auto-registered VM names; default `vmlab.internal` (§9.5)")
+  dns_suffix: utf8?
+  @doc("Upstream resolver `ip[:port]`; default: the host resolver")
+  dns_upstream: utf8?
+  @doc("`host.disk_low` watchdog threshold percent (0–100); default 10 (§8.1)")
+  disk_low_percent: i64?
+  @doc("Pre-shared key for cross-host segment links (§9.2)")
+  psk: utf8?
+  @doc("VNC viewer command; `{}` is replaced by the target (§11)")
+  viewer: utf8?
+  @doc("OCI layer chunk size for template push; default `512MiB` (§6.4)")
+  oci_chunk_size: std.ByteSize?
 }

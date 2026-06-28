@@ -202,8 +202,17 @@ fn get_parsed<T>(
     }
 }
 
+/// Read a `std.ByteSize` field — a non-negative integer count of bytes
+/// (unit suffixes like `8GiB` are resolved to bytes by wcl).
 fn get_size(b: &Block, name: &str, issues: &mut IssueList) -> Option<u64> {
-    get_parsed(b, name, issues, parse_size).map(|(v, _)| v)
+    let (n, span) = get_int(b, name, issues)?;
+    match u64::try_from(n) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            issues.push(Issue::at(span, format!("`{name}` must not be negative")));
+            None
+        }
+    }
 }
 
 fn get_path(b: &Block, name: &str, issues: &mut IssueList) -> Option<PathBuf> {

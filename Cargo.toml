@@ -6,7 +6,7 @@ license = "MIT"
 description = "Single-host virtual machine lab orchestrator"
 
 [dependencies]
-wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "1bf3af0876536166855b46e6cd6eb3937505ae5e" }
+wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "ed84924565334008ae0656be78e29338328c8419" }
 wscript = { git = "https://github.com/Configweave/wscript.git", rev = "fcd51236239225ea3e89a82fec44d30f7b871426" }
 
 anyhow = "1"

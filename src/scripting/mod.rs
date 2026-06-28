@@ -840,7 +840,7 @@ mod example_tests {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "wscript") {
+                } else if path.extension().is_some_and(|e| e == "ws") {
                     let src = std::fs::read_to_string(&path)
                         .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
                     check_script_source(&src).unwrap_or_else(|e| panic!("{}: {e}", path.display()));

@@ -228,7 +228,7 @@ mod tests {
     fn scratch_uses_profile_floor() {
         let profiles = ProfileSet::shipped().unwrap();
         let v = vm(
-            "vm \"a\" { template = \"scratch\" arch = \"x86_64\" profile = \"windows-legacy\" disk = \"10G\" }",
+            "vm \"a\" { template = \"scratch\" arch = \"x86_64\" profile = \"windows-legacy\" disk = 10GiB }",
         );
         let r = resolve_vm(&v, None, &profiles).unwrap();
         assert_eq!(r.machine, "pc");
@@ -242,7 +242,7 @@ mod tests {
     fn aarch64_uses_virt_machine() {
         let profiles = ProfileSet::shipped().unwrap();
         let v = vm(
-            "vm \"a\" { template = \"scratch\" arch = \"aarch64\" profile = \"linux-modern\" disk = \"10G\" }",
+            "vm \"a\" { template = \"scratch\" arch = \"aarch64\" profile = \"linux-modern\" disk = 10GiB }",
         );
         let r = resolve_vm(&v, None, &profiles).unwrap();
         assert_eq!(r.machine, "virt");
@@ -252,7 +252,7 @@ mod tests {
     fn riscv64_uses_virt_machine() {
         let profiles = ProfileSet::shipped().unwrap();
         let v = vm(
-            "vm \"a\" { template = \"scratch\" arch = \"riscv64\" profile = \"linux-modern\" disk = \"10G\" }",
+            "vm \"a\" { template = \"scratch\" arch = \"riscv64\" profile = \"linux-modern\" disk = 10GiB }",
         );
         let r = resolve_vm(&v, None, &profiles).unwrap();
         assert_eq!(r.machine, "virt,acpi=off");
@@ -262,7 +262,7 @@ mod tests {
     fn vm_firmware_override_beats_profile() {
         let profiles = ProfileSet::shipped().unwrap();
         let v = vm(
-            "vm \"a\" { template = \"scratch\" arch = \"x86_64\" profile = \"windows-11\" disk = \"10G\" firmware = \"seabios\" secure_boot = false }",
+            "vm \"a\" { template = \"scratch\" arch = \"x86_64\" profile = \"windows-11\" disk = 10GiB firmware = \"seabios\" secure_boot = false }",
         );
         let r = resolve_vm(&v, None, &profiles).unwrap();
         assert_eq!(r.firmware, Some(FirmwareKind::Seabios));

@@ -9,8 +9,6 @@ use std::path::Path;
 use anyhow::{Context as _, Result, anyhow};
 use wcl_lang::{Document, Environment, Registry, Value, disk_loader};
 
-use crate::config::model::parse_size;
-
 pub const PROFILE_SCHEMA_WCL: &str = include_str!("profile_schema.wcl");
 pub const SHIPPED_PROFILES_WCL: &str = include_str!("shipped.wcl");
 
@@ -246,9 +244,18 @@ fn parse_profiles(source: &str, name: &str) -> Result<Vec<Profile>> {
                 Err(e) => return Err(anyhow!("profile {pname}: cannot evaluate cpus: {e}")),
             },
         };
-        let memory = match get_str("memory")? {
+        let memory = match block.field("memory") {
             None => None,
-            Some(s) => Some(parse_size(&s).map_err(|e| anyhow!("profile {pname}: {e}"))?),
+            Some(f) => match f.value() {
+                Ok(Value::I64(n)) if *n >= 0 => Some(*n as u64),
+                Ok(Value::None) => None,
+                Ok(other) => {
+                    return Err(anyhow!(
+                        "profile {pname}: memory must be a non-negative byte size, got {other:?}"
+                    ));
+                }
+                Err(e) => return Err(anyhow!("profile {pname}: cannot evaluate memory: {e}")),
+            },
         };
         let input_transport = match get_str("input_transport")?.as_deref() {
             None | Some("qmp") => InputTransport::Qmp,

@@ -14,7 +14,7 @@ profile "windows-11" {
   nic_model   = "virtio-net-pci"
   display     = "virtio-vga"
   cpus        = 4
-  memory      = "8G"
+  memory      = 8GiB
 }
 
 profile "windows-10" {
@@ -27,7 +27,7 @@ profile "windows-10" {
   nic_model   = "virtio-net-pci"
   display     = "virtio-vga"
   cpus        = 4
-  memory      = "8G"
+  memory      = 8GiB
 }
 
 profile "windows-server" {
@@ -40,7 +40,7 @@ profile "windows-server" {
   nic_model   = "virtio-net-pci"
   display     = "virtio-vga"
   cpus        = 4
-  memory      = "8G"
+  memory      = 8GiB
 }
 
 profile "windows-legacy" {
@@ -53,7 +53,7 @@ profile "windows-legacy" {
   nic_model   = "e1000"
   display     = "std"
   cpus        = 2
-  memory      = "2G"
+  memory      = 2GiB
 }
 
 profile "windows-9x" {
@@ -66,7 +66,7 @@ profile "windows-9x" {
   nic_model   = "pcnet"
   display     = "cirrus-vga"
   cpus        = 1
-  memory      = "256M"
+  memory      = 256MiB
   // Real-mode DOS/9x TUIs (fdisk, setup) drop QMP send-key events between menu
   // redraws; drive their keyboard over VNC instead, which lands reliably.
   input_transport = "vnc"
@@ -84,7 +84,7 @@ profile "linux-modern" {
   // non-x86 `virt` machine (no legacy VGA there). See display_device_name.
   display     = "virtio-vga"
   cpus        = 2
-  memory      = "4G"
+  memory      = 4GiB
 }
 
 profile "linux-generic" {
@@ -97,7 +97,7 @@ profile "linux-generic" {
   nic_model   = "virtio-net-pci"
   display     = "std"
   cpus        = 2
-  memory      = "2G"
+  memory      = 2GiB
 }
 
 profile "custom" {

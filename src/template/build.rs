@@ -436,14 +436,14 @@ mod tests {
             "import <vmlab.wcl>\n",
             "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
             "  source \"scratch\" { }\n",
-            "  first_boot = \"scripts/firstboot.wscript\"\n",
+            "  first_boot = \"scripts/firstboot.ws\"\n",
             "}\n"
         ));
         assert_eq!(
             d.first_boot.as_deref(),
-            Some(Path::new("scripts/firstboot.wscript"))
+            Some(Path::new("scripts/firstboot.ws"))
         );
         let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
-        assert!(!wcl.contains("firstboot.wscript"), "{wcl}");
+        assert!(!wcl.contains("firstboot.ws"), "{wcl}");
     }
 }
