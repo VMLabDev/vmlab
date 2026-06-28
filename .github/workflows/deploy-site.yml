@@ -2,7 +2,7 @@ name: Deploy Site
 
 # Builds the vmlab documentation site (docs/main.wcl -> docs/_site) with the
 # `wcl` CLI and deploys it to Cloudflare Pages (project "vmlab", configured in
-# wrangler.toml; the vmlab.dev custom domain is attached in the Cloudflare
+# wrangler.toml; the vmlab.io custom domain is attached in the Cloudflare
 # dashboard). Runs only when docs/ — or the deploy config — change on main, so
 # an ordinary code push doesn't trigger a deploy.
 
