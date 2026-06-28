@@ -1,0 +1,139 @@
+// vmlab landing-page template. The home page (`index.wcl`) selects this with
+// `template = :vmlab_home`; the template renders the whole page from a single
+// raw-HTML block (wdoc's documented "bring your own fancy HTML/CSS" seam — see
+// the `:website` template in wcl_wdoc/lib/website.wcl). The design is fully
+// self-contained: it carries its own `:root` CSS variables and sets
+// `data-theme` on its inner `.page` div, so it does not depend on wdoc's theme.
+//
+// Source design: a Claude Design artifact (vmlab.dc.html), converted to static
+// HTML — the `x-dc`/DCLogic runtime, `{{…}}` bindings and `<sc-if>` blocks are
+// stripped; copy buttons are wired to the vanilla `vmlabCopy()` below; the
+// framework's flex utility classes (.fx/.ac/.jb/.gap*) are defined inline.
+namespace wdoc
+
+// Single injection point for the version badge. CI patches just this line to
+// stamp the release version. WCL has no env() builtin, so a `let` is the seam.
+let vmlab_version = "0.1.0"
+
+// Quoted heredoc (<<'HTML') — no ${…} interpolation, so the literal `$` shell
+// prompts in the terminal mockup pass through untouched. `@@VERSION@@` is
+// swapped for `vmlab_version` below with the `replace(s, old, new)` builtin.
+let vmlab_home_template = <<'HTML'
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+:root{--bg-0:#0B0D10;--bg-1:#11141A;--bg-2:#171B22;--bg-3:#1E232C;--bg-4:#252B36;--fg-0:#ECEEF2;--fg-1:#B7BDC8;--fg-2:#7C8593;--fg-3:#4E5664;--border-subtle:#1A1F27;--border:#262C36;--border-strong:#3A4250;--accent:oklch(0.62 0.16 250);--accent-hover:oklch(0.66 0.17 250);--accent-press:oklch(0.56 0.16 250);--accent-bg:oklch(0.62 0.16 250 / 0.14);--accent-fg:oklch(0.82 0.13 250);--success-fg:oklch(0.82 0.16 150);--warning-fg:oklch(0.86 0.13 80);--info-fg:oklch(0.82 0.12 230);--danger-fg:oklch(0.78 0.16 25);--font-sans:'IBM Plex Sans',ui-sans-serif,system-ui,sans-serif;--font-mono:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;--r-sm:4px;--r-md:6px;--r-lg:8px;--ease-out:cubic-bezier(0.2,0,0,1)}
+[data-theme="light"]{--bg-0:#FAFAFA;--bg-1:#FFFFFF;--bg-2:#F4F5F7;--bg-3:#EAECEF;--bg-4:#FFFFFF;--fg-0:#0C0F14;--fg-1:#3D4654;--fg-2:#6B7383;--fg-3:#A0A6B2;--border-subtle:#EEF0F3;--border:#DCDFE4;--border-strong:#B6BBC4;--accent:oklch(0.52 0.18 250);--accent-hover:oklch(0.46 0.19 250);--accent-fg:oklch(0.38 0.19 250);--success-fg:oklch(0.36 0.14 150);--warning-fg:oklch(0.40 0.14 60);--info-fg:oklch(0.36 0.13 230)}
+.page *{box-sizing:border-box}
+.fx{display:flex}.ac{align-items:center}.jb{justify-content:space-between}.gap16{gap:16px}.gap24{gap:24px}
+.page a{text-decoration:none;color:inherit}
+.page{background:var(--bg-0);color:var(--fg-0);min-height:100vh;overflow-x:hidden;font-family:var(--font-sans);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1160px;margin:0 auto;padding:0 24px}
+.mono{font-family:var(--font-mono)}
+.eyebrow{font-family:var(--font-mono);font-size:12px;letter-spacing:0.02em;color:var(--accent-fg);text-transform:none}
+.muted{color:var(--fg-2)}.dim{color:var(--fg-3)}
+.c-acc{color:var(--accent-fg)}.c-ok{color:var(--success-fg)}.c-info{color:var(--info-fg)}.c-warn{color:var(--warning-fg)}.c-dim{color:var(--fg-2)}.c-fg{color:var(--fg-0)}
+.alpha-banner{background:var(--accent-bg);color:var(--accent-fg);border-bottom:1px solid var(--border);font-family:var(--font-mono);font-size:12.5px;line-height:1.45;text-align:center;padding:8px 16px}
+.alpha-banner strong{font-weight:600}
+.nav{position:sticky;top:0;z-index:20;height:56px;border-bottom:1px solid var(--border);background:rgba(11,13,16,0.82);backdrop-filter:blur(8px)}
+[data-theme="light"] .nav{background:rgba(250,250,250,0.82)}
+.navin{height:56px}
+.brand{display:flex;align-items:center;gap:9px;font-family:var(--font-mono);font-weight:600;font-size:16px;color:var(--fg-0);letter-spacing:-0.01em}
+.mark{width:24px;height:24px;display:block}
+.bvm{color:var(--accent-fg)}.blab{color:#9AA1AB}
+.ver{font-family:var(--font-mono);font-size:11px;color:var(--fg-2);border:1px solid var(--border);border-radius:var(--r-sm);padding:1px 6px}
+.navlink{color:var(--fg-1);font-size:13px;display:inline-flex;align-items:center;gap:6px;transition:color 80ms var(--ease-out)}
+.navlink:hover{color:var(--fg-0)}
+.btn{display:inline-flex;align-items:center;gap:8px;height:40px;padding:0 16px;border-radius:var(--r-sm);font-family:var(--font-sans);font-size:14px;font-weight:500;border:1px solid transparent;cursor:pointer;text-decoration:none;transition:background 80ms var(--ease-out),border-color 80ms var(--ease-out),color 80ms var(--ease-out)}
+.btn svg{width:16px;height:16px}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+.btn-outline{background:transparent;color:var(--fg-0);border-color:var(--border-strong)}
+.btn-outline:hover{background:var(--bg-2)}
+.btn-sm{height:32px;padding:0 12px;font-size:13px}
+.hero{padding:84px 0 56px}
+.hegrid{display:grid;grid-template-columns:1.02fr 1.2fr;gap:52px;align-items:center}
+.h1{font-size:48px;line-height:1.06;letter-spacing:-0.025em;font-weight:600;margin:18px 0 0}
+.lead{font-size:17px;color:var(--fg-1);line-height:1.6;max-width:48ch;margin:18px 0 0}
+.kw{font-family:var(--font-mono);color:var(--accent-fg);font-weight:600}
+.heroact{display:flex;gap:12px;margin-top:28px;flex-wrap:wrap}
+.cmd{display:flex;align-items:center;gap:12px;height:50px;padding:0 6px 0 16px;background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-md);font-family:var(--font-mono);font-size:14px;max-width:520px}
+.cmd .ct{color:var(--fg-0);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.copybtn{margin-left:auto;display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 12px;border-radius:var(--r-sm);background:var(--bg-2);border:1px solid var(--border);color:var(--fg-1);font-family:var(--font-mono);font-size:12px;cursor:pointer;transition:border-color 80ms var(--ease-out),color 80ms}
+.copybtn:hover{border-color:var(--border-strong);color:var(--fg-0)}
+.term{background:#090B0F;border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden}
+.termbar{display:flex;align-items:center;gap:9px;height:38px;padding:0 6px 0 12px;border-bottom:1px solid var(--border-subtle);background:var(--bg-2)}
+.tappicon{width:15px;height:15px;color:var(--accent-fg);flex:none}
+.tttl{font-family:var(--font-sans);font-size:12.5px;color:var(--fg-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.twin{margin-left:auto;display:flex;align-items:center;gap:1px}
+.twbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;color:var(--fg-2);transition:background 80ms var(--ease-out),color 80ms var(--ease-out)}
+.twbtn svg{width:13px;height:13px}
+.twbtn:hover{background:var(--bg-4);color:var(--fg-0)}
+.termbody{padding:20px 22px;font-family:var(--font-mono);font-size:13px;line-height:1.75;white-space:pre;overflow-x:auto;color:var(--fg-1)}
+.cursor{display:inline-block;width:8px;height:15px;transform:translateY(2px);background:var(--accent-fg);animation:blink 1.1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.section{padding:72px 0;border-top:1px solid var(--border-subtle)}
+.sechead{max-width:640px;margin-bottom:40px}
+.h2{font-size:30px;line-height:1.12;letter-spacing:-0.02em;font-weight:600;margin:12px 0 0}
+.featgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.feat{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-md);padding:22px;transition:border-color 80ms var(--ease-out)}
+.feat:hover{border-color:var(--border-strong)}
+.ficon{display:flex;align-items:center;justify-content:center;width:40px;height:40px;border-radius:var(--r-sm);background:var(--bg-2);border:1px solid var(--border-subtle);color:var(--accent-fg)}
+.ficon svg{width:20px;height:20px}
+.fttl{font-size:15px;font-weight:600;color:var(--fg-0);margin:16px 0 0}
+.fdesc{font-size:13.5px;color:var(--fg-2);line-height:1.6;margin:7px 0 0}
+.qs{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.code{background:#090B0F;border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden}
+.codehead{display:flex;align-items:center;gap:8px;height:36px;padding:0 14px;border-bottom:1px solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--fg-2)}
+.codebody{padding:18px 20px;font-family:var(--font-mono);font-size:12.5px;line-height:1.75;white-space:pre;overflow-x:auto;color:var(--fg-1)}
+.t-key{color:var(--accent-fg)}.t-str{color:var(--success-fg)}.t-num{color:var(--warning-fg)}.t-com{color:var(--fg-3)}.t-cmd{color:var(--fg-0)}
+.install{text-align:center}
+.insthead{max-width:560px;margin:0 auto 28px}
+.instcmd{margin:0 auto;max-width:560px;height:56px}
+.instnote{margin:20px auto 0;font-size:13px;color:var(--fg-2);font-family:var(--font-mono)}
+.altrow{display:flex;justify-content:center;gap:10px;margin-top:24px;flex-wrap:wrap}
+.alt{font-family:var(--font-mono);font-size:12px;color:var(--fg-1);background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-sm);padding:7px 12px}
+.footer{border-top:1px solid var(--border-subtle);padding:56px 0 44px}
+.fgrid{display:grid;grid-template-columns:1.5fr 1fr 1fr 1fr;gap:36px}
+.ftag{font-size:13px;color:var(--fg-2);line-height:1.6;margin:14px 0 0;max-width:30ch}
+.fcol h6{font-family:var(--font-mono);font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:var(--fg-2);margin:0 0 12px;font-weight:600}
+.flink{display:block;color:var(--fg-1);font-size:13px;padding:5px 0;transition:color 80ms var(--ease-out)}
+.flink:hover{color:var(--fg-0)}
+.fbar{display:flex;justify-content:space-between;align-items:center;margin-top:44px;padding-top:24px;border-top:1px solid var(--border-subtle);font-size:12px;color:var(--fg-3);font-family:var(--font-mono);flex-wrap:wrap;gap:12px}
+[data-density="compact"] .hero{padding:52px 0 40px}
+[data-density="compact"] .section{padding:48px 0}
+[data-density="compact"] .h1{font-size:40px}
+@media(max-width:880px){.hegrid{grid-template-columns:1fr;gap:36px}.qs{grid-template-columns:1fr}.featgrid{grid-template-columns:1fr 1fr}.fgrid{grid-template-columns:1fr 1fr}.h1{font-size:38px}.hidesm{display:none}}
+@media(max-width:560px){.featgrid{grid-template-columns:1fr}.fgrid{grid-template-columns:1fr 1fr}}
+</style>
+<div class="page" data-theme="dark" data-density="comfortable"><div class="alpha-banner">⚠ <strong>Alpha software.</strong> vmlab is under active development — expect frequent breaking changes.</div><nav class="nav"><div class="wrap fx ac jb navin"><div class="fx ac gap16"><div class="brand"><svg class="mark" viewBox="0 0 24 24" fill="none" stroke="var(--accent-fg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="m7 9 3 3-3 3"></path><line x1="13" y1="15" x2="17" y2="15"></line></svg><span><span class="bvm">vm</span><span class="blab">lab</span></span></div><span class="ver hidesm">v@@VERSION@@</span></div><div class="fx ac gap24"><a class="navlink hidesm" href="wskills/vmlab/">Reference</a><a class="navlink" href="https://github.com/VMLabDev/vmlab"><svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.8 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.5-2.7 5.5-5.3 5.8.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"></path></svg>GitHub</a></div></div></nav><section class="hero"><div class="wrap hegrid"><div><div class="eyebrow">// declarative VM labs · QEMU/KVM</div><h1 class="h1">Orchestrate virtual machine labs from your terminal.</h1><p class="lead">vmlab turns a single <span class="kw">vmlab.wcl</span> into a running fleet of VMs — machines, networks, and provisioning, wired automatically. Boot, snapshot, and tear down complex topologies with one command.</p><div class="cmd" style="margin-top:28px"><span class="c-acc">$</span><span class="ct">curl -fsSL https://vmlab.dev/install.sh | sh</span><button class="copybtn" onclick="vmlabCopy(this)">copy</button></div><div class="heroact"><a class="btn btn-primary" href="wskills/vmlab/">Read the reference<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg></a><a class="btn btn-outline" href="https://github.com/VMLabDev/vmlab">View on GitHub</a></div></div><div class="term"><div class="termbar"><svg class="tappicon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg><span class="tttl">vmlab : win-domain</span><div class="twin"><span class="twbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"></line></svg></span><span class="twbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="1"></rect></svg></span><span class="twbtn tclose"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"></line><line x1="18" y1="6" x2="6" y2="18"></line></svg></span></div></div><div class="termbody"><span class="c-acc">$</span> vmlab up labs/win-domain.wcl
+<span class="c-ok">✔</span> resolved <span class="c-fg">2 machines</span> · <span class="c-fg">1 network</span>
+<span class="c-info">→</span> booting dc01        <span class="c-ok">ready</span>  <span class="c-dim">1m08s</span>
+<span class="c-info">→</span> booting client01    <span class="c-ok">ready</span>    <span class="c-dim">52s</span>
+<span class="c-ok">✔</span> lab <span class="c-fg">"win-domain"</span> is up  <span class="c-dim">· 10.50.0.0/24</span>
+
+<span class="c-acc">$</span> vmlab console dc01<span class="cursor"></span></div></div></div></section><section class="section"><div class="wrap"><div class="sechead"><div class="eyebrow">// capabilities</div><h2 class="h2">Everything a lab needs, in one binary.</h2></div><div class="featgrid"><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg></div><h4 class="fttl">Declarative labs</h4><p class="fdesc">Describe machines, networks, and provisioning in one file. <span class="mono">vmlab up</span> does the rest.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="2" x2="9" y2="4"></line><line x1="15" y1="2" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="22"></line><line x1="15" y1="20" x2="15" y2="22"></line><line x1="20" y1="9" x2="22" y2="9"></line><line x1="20" y1="14" x2="22" y2="14"></line><line x1="2" y1="9" x2="4" y2="9"></line><line x1="2" y1="14" x2="4" y2="14"></line></svg></div><h4 class="fttl">Powered by QEMU</h4><p class="fdesc">Runs x86_64, aarch64, and riscv guests — all emulated on an x86_64 host.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M3 5v14a9 3 0 0 0 18 0V5"></path><path d="M3 12a9 3 0 0 0 18 0"></path></svg></div><h4 class="fttl">Isolated networking</h4><p class="fdesc">Virtual switches, NAT, DNS, and DHCP are provisioned per lab on private subnets — no manual wiring.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg></div><h4 class="fttl">Snapshots</h4><p class="fdesc">Capture a single VM or the whole lab, then roll back to any snapshot in seconds.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg></div><h4 class="fttl">Isolated guest management</h4><p class="fdesc">Share files and run commands inside guests over the QEMU agent — no network connectivity to the VM required.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg></div><h4 class="fttl">OCI registry support</h4><p class="fdesc">Distribute templates through any OCI container registry like GitHub — or pull defaults from <span class="mono">templates.vmlab.dev</span>.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"></path><path d="M13 13l6 6"></path></svg></div><h4 class="fttl">UI automation</h4><p class="fdesc">Drive keyboard, mouse, and OCR-based screen reads over VNC or QEMU sockets — script GUI flows headlessly.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v5H4z"></path><path d="M4 13h10v7H4z"></path><path d="M18 13v7"></path><path d="M21.5 16.5 18 20l-2-2"></path></svg></div><h4 class="fttl">Rich provisioning</h4><p class="fdesc">Script setup with wscript — handle sysprep, wait for the OS to be ready, then gate the next steps on it.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></div><h4 class="fttl">Linked clone templates</h4><p class="fdesc">Spin up machines as qcow2 linked clones of a base image — labs share backing files and stay small on the host.</p></div><div class="feat"><div class="ficon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="12" x2="12" y2="18"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg></div><h4 class="fttl">Template creation</h4><p class="fdesc">Define a <span class="mono">template</span> block in your <span class="mono">vmlab.wcl</span> and vmlab builds a reusable image — no extra tooling.</p></div></div></div></section><section class="section"><div class="wrap"><div class="sechead"><div class="eyebrow">// quick start</div><h2 class="h2">From a single file to a running lab in one command.</h2></div><div class="qs"><div class="code"><div class="codehead"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>vmlab.wcl</div><div class="codebody"><span class="t-key">import</span> <span class="t-str">&lt;vmlab.wcl&gt;</span>
+
+<span class="t-key">lab </span><span class="t-str">"alpine-3-23"</span> {
+
+  <span class="t-key">segment</span> <span class="t-str">"lan"</span> {
+    <span class="t-key">subnet</span> = <span class="t-str">"10.99.0.0/24"</span>
+    <span class="t-key">nat</span>    = <span class="t-num">true</span>
+  }
+
+  <span class="t-key">vm</span> <span class="t-str">"myvm"</span> {
+    <span class="t-key">template</span> = <span class="t-str">"x86_64/alpine-3.23"</span>
+    <span class="t-key">nic</span> { <span class="t-key">segment</span> = <span class="t-str">"lan"</span> }
+  }
+}</div></div><div class="code"><div class="codehead"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>shell</div><div class="codebody"><span class="c-acc">$</span> <span class="t-cmd">vmlab up</span>
+</div></div></div></div></section><section class="section install"><div class="wrap"><div class="insthead"><div class="eyebrow">// install</div><h2 class="h2">Install vmlab</h2></div><div class="cmd instcmd"><span class="c-acc">$</span><span class="ct">curl -fsSL https://vmlab.dev/install.sh | sh</span><button class="copybtn" onclick="vmlabCopy(this)">copy</button></div><p class="instnote">Linux, or Windows 11 via WSL 2 or Docker · QEMU/KVM</p><div class="altrow"><span class="alt">docker run ghcr.io/vmlabdev/vmlab</span></div></div></section><footer class="footer"><div class="wrap"><div class="fgrid"><div><div class="brand"><svg class="mark" viewBox="0 0 24 24" fill="none" stroke="var(--accent-fg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="m7 9 3 3-3 3"></path><line x1="13" y1="15" x2="17" y2="15"></line></svg><span><span class="bvm">vm</span><span class="blab">lab</span></span></div><p class="ftag">Orchestrate virtual machine labs from your terminal. Open source under the MIT license.</p></div><div class="fcol"><h6>Docs</h6><a class="flink" href="wskills/vmlab/">Reference</a></div><div class="fcol"><h6>Resources</h6><a class="flink" href="https://github.com/VMLabDev/vmlab/releases">Changelog</a><a class="flink" href="https://github.com/VMLabDev/vmlab">Source</a></div><div class="fcol"><h6>Project</h6><a class="flink" href="https://github.com/VMLabDev/vmlab/issues">Issues</a><a class="flink" href="https://github.com/VMLabDev/vmlab/discussions">Discussions</a></div></div><div class="fbar"><span>© 2026 vmlab · MIT License</span><span>curl -fsSL https://vmlab.dev/install.sh | sh</span></div></div></footer></div>
+<script>function vmlabCopy(b){try{navigator.clipboard&&navigator.clipboard.writeText('curl -fsSL https://vmlab.dev/install.sh | sh');}catch(e){}var t=b.textContent;b.textContent='copied';setTimeout(function(){b.textContent=t;},1500);}</script>
+HTML
+
+// Stamp the version badge (@@VERSION@@ → vmlab_version) into the page HTML.
+let vmlab_home_html = replace(vmlab_home_template, "@@VERSION@@", vmlab_version)
+
+// The landing template: render the whole page from the one raw-HTML block.
+template vmlab_home {
+  render = fn(c: TemplateCtx) -> list<HtmlFundamental>
+    [ HtmlFundamental::Raw { html: vmlab_home_html } ]
+}

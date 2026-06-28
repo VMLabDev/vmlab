@@ -1,55 +1,7 @@
-// vmlab landing page. `start = true` makes it the page served at `/`. The site
-// header already shows "vmlab", so the page leads with the motivation.
+// vmlab landing page. `start = true` makes it the page served at `/`. The whole
+// page is rendered by the custom `:vmlab_home` template (see home-template.wcl),
+// which emits a self-contained marketing landing from one raw-HTML block — so
+// this page carries no wdoc body blocks; `content` is unused by that template.
 page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
-  h1 "Declarative VM labs, driven by code"
-
-  p "**vmlab** orchestrates single-host virtual-machine labs. You declare a lab — the VMs and the virtual networks that connect them — in [WCL](https://github.com/wiltaylor/wcl), build reusable disk templates once and distribute them over any OCI registry, and automate the guests with [wscript](https://github.com/wiltaylor/wscript). One command brings the whole thing up."
-
-  code wcl {
-    source = <<'WCL'
-      import <vmlab.wcl>
-
-      lab "demo" {
-        segment "corp" { subnet = "10.50.0.0/24" }
-
-        vm "dc01" {
-          template = "x86_64/windows-server-2025"
-          memory   = "8G"
-          nic { segment = "corp" ip = "10.50.0.10" }
-        }
-
-        vm "client01" {
-          template   = "x86_64/windows-11"
-          depends_on = ["dc01"]
-          nic { segment = "corp" }
-        }
-
-        provision "scripts/setup.wscript" { vms = ["dc01"] }
-      }
-      WCL
-  }
-
-  code console {
-    source = <<'SH'
-      vmlab validate   # schema + semantic checks, no side effects
-      vmlab up         # clone, boot, run provisions
-      vmlab status     # VM/segment state, IPs, ready flags
-      vmlab down       # graceful stop; clones retained
-      SH
-  }
-
-  h2 "Why vmlab?"
-
-  p "Lab environments are usually a pile of imperative scripts and hand-clicked VM managers. vmlab makes the whole lab — machines, networks, shared folders, and the automation that provisions them — a single declarative artifact you can version, validate and reproduce. The network fabric is entirely userspace, so it runs unprivileged in a container or on WSL2 with nothing but `/dev/kvm`."
-
-  h2 "Reference"
-
-  p "vmlab's full reference is published as a **wskill** — a self-contained WCL model projected into both the book linked below and a Claude Code skill, so humans and AI agents read from one source."
-
-  // One linked entry per wskill under docs/wskills/, discovered by the `include`
-  // in main.wcl. Title / summary come from the member's book site; the
-  // `wskills/<name>/` href is root-relative (this landing is the root site).
-  wdoc_repeater { each = included_sites({ folder: "wskills", entry: "wdoc/book/main.wcl" })  as = :s
-    p $"**[${s.title}](./${s.href})**${match s.summary { none => "", su => $" — ${su}" }}"
-  }
+  template = :vmlab_home
 }

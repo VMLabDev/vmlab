@@ -35,7 +35,10 @@ site vmlab {
   }
 }
 
-// vmlab landing pages (sites = [:vmlab]).
+// vmlab landing pages (sites = [:vmlab]). The home page uses a custom
+// full-page template defined in home-template.wcl (imported first so
+// `:vmlab_home` is in scope when index.wcl selects it).
+import "./pages/vmlab/home-template.wcl"
 import "./pages/vmlab/index.wcl"
 import "./pages/vmlab/features.wcl"
 import "./pages/vmlab/getting-started.wcl"
