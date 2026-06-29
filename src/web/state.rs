@@ -101,6 +101,19 @@ impl AppState {
         client.call(cmd, args).await.map_err(proto_err)
     }
 
+    /// Resolve a lab's root directory (public wrapper over `root_for`), used by
+    /// the config read/write handlers.
+    pub async fn lab_root(&self, lab: &str) -> Result<PathBuf, String> {
+        self.root_for(lab).await
+    }
+
+    /// Drop the cached lab-daemon client so the next `lab_call` reconnects.
+    /// Used after a daemon restart (config reload), where the old socket is
+    /// gone and a fresh daemon now owns the lab.
+    pub async fn drop_lab_client(&self, lab: &str) {
+        self.labs.lock().await.remove(lab);
+    }
+
     /// Resolve a lab's root: the cwd lab, a cached entry, or the supervisor
     /// registry.
     async fn root_for(&self, lab: &str) -> Result<PathBuf, String> {

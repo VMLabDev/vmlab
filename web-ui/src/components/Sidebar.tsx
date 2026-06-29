@@ -5,13 +5,14 @@ import {
   showLab,
   showNetwork,
   showLogs,
+  showConfig,
   showVm,
   doLogout,
   look,
   osOf,
   archOf,
 } from "../store";
-import { Chevron, Check, Grid, Network, Logs } from "./icons";
+import { Chevron, Check, Grid, Network, Logs, Code } from "./icons";
 
 export default function Sidebar() {
   const [menu, setMenu] = createSignal(false);
@@ -110,6 +111,19 @@ export default function Sidebar() {
           <span class="nitext">
             <span class="niname">logs</span>
             <span class="nimeta">live stream</span>
+          </span>
+        </button>
+        <button
+          class="navitem"
+          classList={{ on: state.view.kind === "config" }}
+          onClick={showConfig}
+        >
+          <span class="niic">
+            <Code />
+          </span>
+          <span class="nitext">
+            <span class="niname">config</span>
+            <span class="nimeta">vmlab.wcl</span>
           </span>
         </button>
 

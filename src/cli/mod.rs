@@ -4,7 +4,7 @@
 pub mod console;
 pub mod daemon;
 pub mod lab;
-mod validate;
+pub mod validate;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process::ExitCode;

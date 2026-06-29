@@ -42,6 +42,60 @@ impl ValidationContext for HostContext {
     }
 }
 
+/// A validation problem reduced for the web editor: a message and an optional
+/// 1-based line number (derived from the issue's source span).
+pub struct SourceIssue {
+    pub message: String,
+    pub line: Option<usize>,
+}
+
+impl SourceIssue {
+    fn from_issue(source: &str, issue: &config::Issue) -> Self {
+        let line = issue.span.map(|s| {
+            let off = s.offset().min(source.len());
+            source[..off].bytes().filter(|&b| b == b'\n').count() + 1
+        });
+        Self {
+            message: issue.message.clone(),
+            line,
+        }
+    }
+}
+
+/// Validate an in-memory lab source against the host (parse + schema + §5.1
+/// semantic checks) without touching disk. `Ok(())` means it's safe to write;
+/// `Err` carries the issues (with best-effort line numbers) for the editor.
+pub fn validate_source(content: &str, root: &Path) -> std::result::Result<(), Vec<SourceIssue>> {
+    let file = match config::load_lab_source(content, crate::paths::LAB_FILE, root) {
+        Ok(f) => f,
+        Err(errs) => {
+            return Err(errs
+                .issues
+                .iter()
+                .map(|i| SourceIssue::from_issue(content, i))
+                .collect());
+        }
+    };
+    let ctx = match HostContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(vec![SourceIssue {
+                message: format!("validation context: {e}"),
+                line: None,
+            }]);
+        }
+    };
+    let issues = config::validate(&file, &ctx);
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(issues
+            .iter()
+            .map(|i| SourceIssue::from_issue(content, i))
+            .collect())
+    }
+}
+
 pub fn cmd_validate() -> Result<()> {
     let file = validate_current()?;
     println!(

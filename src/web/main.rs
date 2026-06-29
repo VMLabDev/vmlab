@@ -209,6 +209,10 @@ async fn main() -> ExitCode {
                 web::post().to(api::snapshot_take),
             )
             .route("/api/labs/{lab}/logs", web::get().to(logs::logs))
+            // Config editing (literal before the `{action}` catch-all).
+            .route("/api/labs/{lab}/config", web::get().to(api::get_config))
+            .route("/api/labs/{lab}/config", web::post().to(api::save_config))
+            .route("/api/labs/{lab}/reload", web::post().to(api::reload_lab))
             .route("/api/labs/{lab}/{action}", web::post().to(api::lab_action))
             .route("/api/labs/{lab}", web::get().to(api::lab_status))
             // Live streams.

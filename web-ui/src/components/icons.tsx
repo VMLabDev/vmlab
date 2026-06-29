@@ -47,6 +47,14 @@ export const Logs = () =>
     </>,
     "1.6",
   );
+export const Code = () =>
+  stroke(
+    <>
+      <polyline points="16 18 22 12 16 6" />
+      <polyline points="8 6 2 12 8 18" />
+    </>,
+    "1.6",
+  );
 export const Play = () => (
   <svg viewBox="0 0 24 24" fill="currentColor">
     <polygon points="6 4 20 12 6 20" />

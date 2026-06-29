@@ -186,6 +186,112 @@ pub async fn snapshot_delete(
     }
 }
 
+/// `GET /api/labs/{lab}/config` — read the lab's `vmlab.wcl`.
+pub async fn get_config(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
+    let root = match state.lab_root(&lab).await {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let path = root.join(vmlab::paths::LAB_FILE);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => ok(json!({"path": path.to_string_lossy(), "content": content})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HttpResponse::NotFound()
+            .json(json!({"error": format!("{}: not found", path.display())})),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ConfigBody {
+    content: String,
+    /// When true, validate only and don't write the file (the "Validate"
+    /// button); the on-disk config is left untouched either way.
+    #[serde(default)]
+    validate_only: bool,
+}
+
+/// `POST /api/labs/{lab}/config` `{content, validate_only?}` — validate then
+/// (unless `validate_only`) write `vmlab.wcl`. On validation failure responds
+/// 422 with the issues and leaves the on-disk file untouched, so a running
+/// daemon never inherits a broken config.
+pub async fn save_config(
+    state: web::Data<AppState>,
+    lab: web::Path<String>,
+    body: web::Json<ConfigBody>,
+) -> HttpResponse {
+    let root = match state.lab_root(&lab).await {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let body = body.into_inner();
+    let content = body.content;
+
+    // WCL parse + the §5.1 host checks are blocking; the server runs a single
+    // worker, so keep them off the async runtime thread.
+    let validate_root = root.clone();
+    let validate_content = content.clone();
+    let result = web::block(move || {
+        vmlab::cli::validate::validate_source(&validate_content, &validate_root)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(issues)) => {
+            let issues: Vec<Value> = issues
+                .into_iter()
+                .map(|i| json!({"message": i.message, "line": i.line}))
+                .collect();
+            return HttpResponse::UnprocessableEntity().json(json!({"issues": issues}));
+        }
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(json!({"error": e.to_string()}));
+        }
+    }
+
+    if body.validate_only {
+        return ok(json!({"ok": true}));
+    }
+
+    let path = root.join(vmlab::paths::LAB_FILE);
+    match tokio::fs::write(&path, content).await {
+        Ok(()) => ok(json!({"ok": true})),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+/// `POST /api/labs/{lab}/reload` — restart the lab daemon so it re-reads
+/// `vmlab.wcl`. Requires the lab to be down (the daemon can't re-adopt running
+/// VMs across a restart); responds 409 if any VM is still running.
+pub async fn reload_lab(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
+    // Only block on running VMs if the daemon is actually up. If it isn't,
+    // there's nothing running to lose and the restart just starts it fresh.
+    if let Ok(status) = state.lab_call(&lab, "status", Value::Null).await {
+        let running = status["vms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|v| v["state"].as_str() != Some("stopped"));
+        if running {
+            return HttpResponse::Conflict()
+                .json(json!({"error": "stop all VMs before reloading the lab"}));
+        }
+    }
+
+    let root = match state.lab_root(&lab).await {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let args = json!({"name": lab.as_str(), "root": root.to_string_lossy()});
+    match state.supervisor_call("lab.restart", args).await {
+        Ok(_) => {
+            // The old socket is gone; force a reconnect to the fresh daemon.
+            state.drop_lab_client(&lab).await;
+            ok(json!({"ok": true}))
+        }
+        Err(e) => fail(e),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct RestoreBody {
     #[serde(default)]

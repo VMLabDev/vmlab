@@ -271,6 +271,36 @@ impl Supervisor {
         }
         Ok(())
     }
+
+    /// Restart a lab daemon so it re-reads `vmlab.wcl` from disk (the web UI's
+    /// "reload" after editing the config). Stop the current daemon, wait for it
+    /// to fully exit, then spawn a fresh one. Returns the new control socket.
+    ///
+    /// The caller is responsible for ensuring the lab is down (no running VMs):
+    /// a restart drops the daemon's in-memory state, so a fresh daemon cannot
+    /// re-adopt VMs the old one left running.
+    async fn restart_lab(self: &Arc<Self>, name: &str, root: PathBuf) -> Result<PathBuf, String> {
+        let registered = { self.registry.lock().await.get(name).is_some() };
+        if registered {
+            self.release_lab(name).await?;
+            // Wait for the old daemon to fully exit before re-spawning. On a
+            // clean shutdown the reaper removes the registry entry; a daemon
+            // that was already dead was removed by `release_lab` directly.
+            // Without this, `ensure_lab` could see the still-alive old daemon
+            // (state Running + socket up) and hand back the stale socket.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if self.registry.lock().await.get(name).is_none() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("lab daemon for {name} did not stop in time"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        self.ensure_lab(name, root).await
+    }
 }
 
 /// Wrapper giving command handlers access to `Arc<Supervisor>` (needed for
@@ -300,6 +330,13 @@ impl Handler for SupervisorHandler {
                 let name = args["name"].as_str().ok_or("missing name")?;
                 sup.release_lab(name).await?;
                 Ok(json!(true))
+            }
+            // Restart a lab daemon so it re-reads its config (web "reload").
+            "lab.restart" => {
+                let name = args["name"].as_str().ok_or("missing name")?.to_string();
+                let root = PathBuf::from(args["root"].as_str().ok_or("missing root")?);
+                let sock = sup.restart_lab(&name, root).await?;
+                Ok(json!({"socket": sock}))
             }
             // Global segments (PRD §9.2): attach returns the trunk socket.
             "global.attach" => {

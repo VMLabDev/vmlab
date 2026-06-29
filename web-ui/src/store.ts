@@ -7,7 +7,7 @@ import { createSignal } from "solid-js";
 import * as api from "./api";
 import type { LabEntry, LabStatus, Vm, DaemonEvent } from "./api";
 
-export type ViewKind = "lab" | "network" | "vm" | "logs";
+export type ViewKind = "lab" | "network" | "vm" | "logs" | "config";
 
 interface State {
   ready: boolean; // initial auth probe done
@@ -133,8 +133,25 @@ export function showNetwork() {
 export function showLogs() {
   setState("view", { kind: "logs", vm: null });
 }
+export function showConfig() {
+  setState("view", { kind: "config", vm: null });
+}
 export function showVm(vm: string) {
   setState("view", { kind: "vm", vm });
+}
+
+/** True if any VM in the current lab is not stopped (gates a reload). */
+export function anyVmRunning(): boolean {
+  return (state.status?.vms ?? []).some((v) => v.state !== "stopped");
+}
+
+/** Restart the lab daemon so it re-reads vmlab.wcl, then refresh the view. */
+export async function reloadLab(): Promise<void> {
+  const lab = state.currentLab;
+  if (!lab) return;
+  await api.reloadLab(lab);
+  await loadLabs();
+  await refreshStatus();
 }
 
 // --- actions --------------------------------------------------------------

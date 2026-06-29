@@ -128,6 +128,66 @@ export const restoreSnapshot = (lab: string, name: string, vm?: string) =>
     { vm },
   );
 
+// --- config editing -------------------------------------------------------
+
+export interface ConfigDoc {
+  path: string;
+  content: string;
+}
+export interface ConfigIssue {
+  message: string;
+  line: number | null;
+}
+
+/** Thrown by saveConfig/validateConfig on a 422; carries the WCL issues. */
+export class ValidationError extends Error {
+  issues: ConfigIssue[];
+  constructor(issues: ConfigIssue[]) {
+    super(`${issues.length} validation issue(s)`);
+    this.issues = issues;
+  }
+}
+
+export const getConfig = (lab: string): Promise<ConfigDoc> =>
+  req(`/api/labs/${encodeURIComponent(lab)}/config`);
+
+// Validate (+ optionally write) the config. A 422 carries the issue list, which
+// the generic `req` would flatten away, so post directly and parse the body.
+async function putConfig(lab: string, content: string, validateOnly: boolean): Promise<void> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const t = getToken();
+  if (t) headers["Authorization"] = `Bearer ${t}`;
+  const res = await fetch(`/api/labs/${encodeURIComponent(lab)}/config`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ content, validate_only: validateOnly }),
+  });
+  if (res.status === 401) {
+    clearToken();
+    throw new Unauthorized("authentication required");
+  }
+  if (res.status === 422) {
+    const body = await res.json().catch(() => ({ issues: [] }));
+    throw new ValidationError(body.issues ?? []);
+  }
+  if (!res.ok) {
+    let msg = res.statusText;
+    try {
+      msg = (await res.json()).error ?? msg;
+    } catch {
+      /* keep statusText */
+    }
+    throw new Error(msg);
+  }
+}
+
+export const validateConfig = (lab: string, content: string): Promise<void> =>
+  putConfig(lab, content, true);
+export const saveConfig = (lab: string, content: string): Promise<void> =>
+  putConfig(lab, content, false);
+export const reloadLab = (lab: string): Promise<unknown> =>
+  post(`/api/labs/${encodeURIComponent(lab)}/reload`);
+
 // --- websockets -----------------------------------------------------------
 
 export function wsUrl(path: string): string {
