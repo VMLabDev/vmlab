@@ -28,8 +28,11 @@ export default function VncScreen(props: { lab: string; vm: string; powered: boo
         `/vnc/${encodeURIComponent(props.lab)}/${encodeURIComponent(props.vm)}`,
       );
       rfb = new RFB(container, url, {});
+      // Scale the remote framebuffer to fit the fixed box rather than letting
+      // it drive the layout. clipViewport must be off so noVNC scales (and
+      // shrinks) instead of clipping to native resolution.
       rfb.scaleViewport = true;
-      rfb.clipViewport = true;
+      rfb.clipViewport = false;
       rfb.addEventListener("connect", () => setStatus("connected"));
       rfb.addEventListener("disconnect", () => setStatus("disconnected"));
     } catch {
@@ -87,7 +90,7 @@ export default function VncScreen(props: { lab: string; vm: string; powered: boo
       </div>
       <div class="screen">
         <Show when={props.powered} fallback={<Off vm={props.vm} />}>
-          <div ref={container} style="flex:1;min-width:0;display:flex" />
+          <div ref={container} class="vncmount" />
         </Show>
       </div>
     </div>

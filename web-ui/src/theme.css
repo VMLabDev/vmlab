@@ -62,7 +62,7 @@
 .btn-danger:hover{background:var(--danger-bg);border-color:var(--danger)}
 .btn.dis{opacity:0.38;pointer-events:none}
 .body{padding:24px 28px 40px}
-.vmlayout{display:grid;grid-template-columns:1fr 304px;gap:20px;align-items:start}
+.vmlayout{display:grid;grid-template-columns:minmax(0,1fr) 304px;gap:20px;align-items:start}
 .vnc{border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;background:#05070A}
 .vnctoolbar{display:flex;align-items:center;gap:10px;height:38px;padding:0 12px;background:var(--bg-2);border-bottom:1px solid var(--border-subtle)}
 .vncconn{display:flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:12px;color:var(--fg-1)}
@@ -72,6 +72,9 @@
 .vtbtn:hover{background:var(--bg-3);color:var(--fg-0)}
 .vtbtn svg{width:15px;height:15px}
 .screen{aspect-ratio:16/10;background:#05070A;position:relative;display:flex;overflow:hidden}
+/* Absolutely pinned to .screen so the noVNC canvas (sized to the guest's
+   resolution) scales within this fixed box and can never inflate the layout. */
+.vncmount{position:absolute;inset:0;overflow:hidden;min-width:0;min-height:0}
 .console{flex:1;padding:22px 24px;font-family:var(--font-mono);font-size:13px;line-height:1.7;color:#c7d0d9;white-space:pre-wrap;overflow:hidden}
 .console .pr{color:var(--success-fg)}
 .curblk{display:inline-block;width:8px;height:15px;transform:translateY(2px);background:#c7d0d9;animation:blink 1.1s steps(1) infinite}
