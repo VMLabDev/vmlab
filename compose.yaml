@@ -2,9 +2,13 @@
 #
 #   docker compose up --build      # build + serve the web UI on :7878
 #
-# Then open http://localhost:7878 and sign in with VMLAB_WEB_USER /
-# VMLAB_WEB_PASSWORD (defaults below — change them before exposing this beyond
-# your machine). Put your lab's vmlab.wcl in ./docker/lab (a sample is shipped).
+# Open http://localhost:7878 — by default there is no login and the lab in
+# ./docker/lab is brought up automatically, so it is already running when the UI
+# loads. Set VMLAB_WEB_UP=0 to leave it stopped instead — the UI lists it and
+# you start it with the "up" button. To require a login (recommended before
+# exposing this beyond your machine), set VMLAB_WEB_USER and VMLAB_WEB_PASSWORD
+# (e.g. in a .env file or your shell). Put your lab's vmlab.wcl in ./docker/lab
+# (a sample is shipped).
 services:
   vmlab-web:
     build:
@@ -16,10 +20,13 @@ services:
     # KVM acceleration. Drop this line to run under TCG emulation (much slower).
     devices:
       - "/dev/kvm:/dev/kvm"
+    # VMLAB_WEB_UP=0 leaves the lab stopped (start it from the UI). To require a
+    # login, set both VMLAB_WEB_USER and VMLAB_WEB_PASSWORD (supplied credentials
+    # take precedence over the image's --no-auth default):
     environment:
-      # The web UI binds 0.0.0.0 in the container, which requires a login.
-      VMLAB_WEB_USER: "${VMLAB_WEB_USER:-vmlab}"
-      VMLAB_WEB_PASSWORD: "${VMLAB_WEB_PASSWORD:-vmlab}"
+      VMLAB_WEB_UP: "0"
+    #     VMLAB_WEB_USER: "${VMLAB_WEB_USER:?set a username}"
+    #     VMLAB_WEB_PASSWORD: "${VMLAB_WEB_PASSWORD:?set a password}"
     volumes:
       # Your lab directory — edit ./docker/lab/vmlab.wcl on the host.
       - ./docker/lab:/lab

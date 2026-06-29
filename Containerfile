@@ -4,9 +4,10 @@
 # network mode — `--device /dev/kvm` is the only host grant needed for
 # acceleration (without it, vmlab falls back to TCG with a loud warning).
 #
-# By default the container runs `vmlab-web` bound to 0.0.0.0:7878 so the web UI
-# is reachable through a published port. A non-loopback bind auto-enables auth,
-# so supply credentials:
+# By default the container runs `vmlab-web` bound to 0.0.0.0:7878 (with
+# --no-auth) so the web UI is reachable through a published port with no login.
+# Set VMLAB_WEB_USER + VMLAB_WEB_PASSWORD to require a login instead — supplied
+# credentials take precedence over --no-auth:
 #
 #   docker run --rm -p 7878:7878 --device /dev/kvm \
 #     -e VMLAB_WEB_USER=admin -e VMLAB_WEB_PASSWORD=secret \
@@ -75,6 +76,13 @@ VOLUME ["/root/.local/share/vmlab/templates"]
 WORKDIR /lab
 EXPOSE 7878
 
-# Default: serve the web UI. No ENTRYPOINT, so the command is overridable for
-# CLI/one-shot use (e.g. `docker run vmlab vmlab up`).
-CMD ["vmlab-web", "--bind", "0.0.0.0", "--port", "7878"]
+# Auto-start the mounted /lab on startup so it is already running when the UI is
+# opened. Set VMLAB_WEB_UP=0 to leave it stopped instead — the UI then lists it
+# and the user starts it with the "up" button.
+ENV VMLAB_WEB_UP=1
+
+# Default: serve the web UI with no login (--no-auth). VMLAB_WEB_UP (above)
+# controls whether the lab auto-starts. Setting VMLAB_WEB_USER +
+# VMLAB_WEB_PASSWORD overrides --no-auth and requires a login. No ENTRYPOINT, so
+# the command is overridable for CLI/one-shot use (e.g. `docker run vmlab vmlab up`).
+CMD ["vmlab-web", "--bind", "0.0.0.0", "--port", "7878", "--no-auth"]

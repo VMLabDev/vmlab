@@ -31,6 +31,9 @@ struct Args {
     /// Require username/password login (auto-enabled for non-loopback binds)
     #[arg(long)]
     auth: bool,
+    /// Allow a non-loopback bind with no login (ignored if credentials are set)
+    #[arg(long)]
+    no_auth: bool,
     /// Login username (or VMLAB_WEB_USER)
     #[arg(long)]
     user: Option<String>,
@@ -40,40 +43,70 @@ struct Args {
     /// Pre-computed argon2 PHC password hash (or VMLAB_WEB_PASSWORD_HASH)
     #[arg(long)]
     password_hash: Option<String>,
+    /// Bring the working-directory lab up on startup (or VMLAB_WEB_UP)
+    #[arg(long)]
+    up: bool,
 }
 
-/// A CLI flag value, falling back to an environment variable.
+/// A CLI flag value, falling back to an environment variable. Empty values
+/// (e.g. an env var set to "" by a compose `${VAR:-}` default) count as unset.
 fn or_env(flag: &Option<String>, var: &str) -> Option<String> {
-    flag.clone().or_else(|| std::env::var(var).ok())
+    flag.clone()
+        .or_else(|| std::env::var(var).ok())
+        .filter(|s| !s.is_empty())
+}
+
+/// A boolean environment toggle: set and not falsey ("", "0", "false", "no").
+fn env_flag(var: &str) -> bool {
+    std::env::var(var)
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"))
+        .unwrap_or(false)
 }
 
 fn build_auth(args: &Args) -> Result<AuthConfig, String> {
-    let enabled = args.auth || !args.bind.is_loopback();
-    if !enabled {
+    let user = or_env(&args.user, "VMLAB_WEB_USER");
+    let hash = or_env(&args.password_hash, "VMLAB_WEB_PASSWORD_HASH");
+    let plain = or_env(&args.password, "VMLAB_WEB_PASSWORD");
+
+    // Credentials win: if a username + a password/hash are supplied, enable auth
+    // regardless of --no-auth.
+    if let Some(user) = user
+        && (hash.is_some() || plain.is_some())
+    {
+        let password_hash = match (hash, plain) {
+            (Some(h), _) => h,
+            (None, Some(p)) => auth::hash_password(&p)?,
+            (None, None) => unreachable!(),
+        };
+        return Ok(AuthConfig {
+            enabled: true,
+            user,
+            password_hash,
+        });
+    }
+    if args.auth {
+        return Err(
+            "--auth requires --user + --password/--password-hash (or the \
+                    VMLAB_WEB_USER / VMLAB_WEB_PASSWORD[_HASH] env vars)"
+                .into(),
+        );
+    }
+
+    // No credentials. Running open is allowed on a loopback bind, or anywhere
+    // with an explicit --no-auth opt-in; otherwise refuse (secure default).
+    if args.no_auth || args.bind.is_loopback() {
         return Ok(AuthConfig {
             enabled: false,
             user: String::new(),
             password_hash: String::new(),
         });
     }
-    let user = or_env(&args.user, "VMLAB_WEB_USER")
-        .ok_or("auth is enabled but --user (or VMLAB_WEB_USER) is not set")?;
-    let hash = or_env(&args.password_hash, "VMLAB_WEB_PASSWORD_HASH");
-    let plain = or_env(&args.password, "VMLAB_WEB_PASSWORD");
-    let password_hash = match (hash, plain) {
-        (Some(h), _) => h,
-        (None, Some(p)) => auth::hash_password(&p)?,
-        (None, None) => {
-            return Err(
-                "auth is enabled but no --password / --password-hash (or env) is set".into(),
-            );
-        }
-    };
-    Ok(AuthConfig {
-        enabled: true,
-        user,
-        password_hash,
-    })
+    Err(
+        "binding a non-loopback address with no login is refused by default — set \
+         credentials (--user + --password/--password-hash, or the VMLAB_WEB_USER / \
+         VMLAB_WEB_PASSWORD env vars) or pass --no-auth to opt in"
+            .into(),
+    )
 }
 
 #[actix_web::main]
@@ -99,10 +132,39 @@ async fn main() -> ExitCode {
     }
     if auth.enabled {
         println!("vmlab-web: authentication enabled (user `{}`)", auth.user);
+    } else if !args.bind.is_loopback() {
+        println!(
+            "vmlab-web: WARNING — no authentication on a non-loopback bind ({}); \
+             anyone who can reach this port has full control of the labs",
+            args.bind
+        );
     }
 
     let data = web::Data::new(AppState::new(auth, default_lab));
     let (bind, port) = (args.bind, args.port);
+
+    // Optionally bring the working-directory lab up so it is already running
+    // (or visibly booting) when the user opens the UI. Done in the background
+    // so the server starts serving immediately — the lab's progress streams to
+    // the events feed as VMs come up.
+    if args.up || env_flag("VMLAB_WEB_UP") {
+        match data.default_lab.clone() {
+            Some((name, _)) => {
+                let data = data.clone();
+                actix_web::rt::spawn(async move {
+                    println!("vmlab-web: bringing lab `{name}` up…");
+                    match data.lab_call(&name, "up", serde_json::json!({})).await {
+                        Ok(_) => println!("vmlab-web: lab `{name}` is up"),
+                        Err(e) => eprintln!("vmlab-web: lab `{name}` failed to come up: {e}"),
+                    }
+                });
+            }
+            None => eprintln!(
+                "vmlab-web: --up set but no lab in the working directory; nothing to start"
+            ),
+        }
+    }
+
     println!("vmlab-web: listening on http://{bind}:{port}");
 
     let server = HttpServer::new(move || {
