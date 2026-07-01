@@ -6,6 +6,7 @@
 pub mod cli;
 mod config;
 mod labd;
+mod lifecycle;
 pub mod logs;
 mod media;
 mod net;

@@ -136,11 +136,13 @@ pub fn free_space_percent(path: &Path) -> Result<u8> {
 
 /// Periodic free-space watchdog (PRD §8.1): emits via `alert` when the
 /// filesystem holding `path` drops below `threshold_percent` free —
-/// edge-triggered, re-arming once space recovers.
+/// edge-triggered, re-arming once space recovers. Exits when `cancel`
+/// fires (daemon shutdown).
 pub fn spawn_disk_watchdog(
     path: std::path::PathBuf,
     threshold_percent: u8,
     period: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
     alert: impl Fn(u8) + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -154,7 +156,10 @@ pub fn spawn_disk_watchdog(
                     alerted = false;
                 }
             }
-            tokio::time::sleep(period).await;
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(period) => {}
+            }
         }
     })
 }
@@ -216,10 +221,12 @@ host {
     async fn watchdog_edge_triggers() {
         // Threshold 101% can't be satisfied → alert exactly once per arm.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_disk_watchdog(
             std::env::temp_dir(),
             101,
             std::time::Duration::from_millis(10),
+            cancel.clone(),
             move |free| {
                 let _ = tx.send(free);
             },
@@ -231,6 +238,11 @@ host {
         // No second alert while still below threshold.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(rx.try_recv().is_err());
-        handle.abort();
+        // Cancellation stops the loop (joinable, not aborted).
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("watchdog exits on cancel")
+            .unwrap();
     }
 }

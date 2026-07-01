@@ -47,8 +47,15 @@ async fn run_async() -> Result<()> {
         ensure_locks: Mutex::new(std::collections::HashMap::new()),
     });
 
+    // Long-lived background tasks register here so the `shutdown` command
+    // can cancel and join them deterministically.
+    let tasks = Arc::new(crate::lifecycle::TaskGroup::new());
+
     let sock = crate::paths::supervisor_socket();
-    let handler: Arc<dyn Handler> = Arc::new(SupervisorHandler(supervisor.clone()));
+    let handler: Arc<dyn Handler> = Arc::new(SupervisorHandler {
+        sup: supervisor.clone(),
+        tasks: tasks.clone(),
+    });
     let server = Server::bind(&sock, handler)
         .await
         .with_context(|| format!("binding {}", sock.display()))?;
@@ -68,10 +75,11 @@ async fn run_async() -> Result<()> {
     let store_dir = crate::paths::data_dir();
     crate::paths::ensure_dir(&store_dir)?;
     let sup_wd = supervisor.clone();
-    crate::config::host::spawn_disk_watchdog(
+    let watchdog = crate::config::host::spawn_disk_watchdog(
         store_dir.clone(),
         host_cfg.disk_low_percent,
         std::time::Duration::from_secs(60),
+        tasks.cancel_token(),
         move |free| {
             sup_wd.emit(Event::new(
                 "host.disk_low",
@@ -80,6 +88,7 @@ async fn run_async() -> Result<()> {
             ));
         },
     );
+    tasks.adopt("disk-watchdog", watchdog);
 
     // Run until killed; the `shutdown` command exits the process directly.
     futures::future::pending::<()>().await;
@@ -400,12 +409,16 @@ impl Supervisor {
 
 /// Wrapper giving command handlers access to `Arc<Supervisor>` (needed for
 /// the tasks they spawn).
-struct SupervisorHandler(Arc<Supervisor>);
+struct SupervisorHandler {
+    sup: Arc<Supervisor>,
+    /// The daemon's background tasks, cancelled + joined on `shutdown`.
+    tasks: Arc<crate::lifecycle::TaskGroup>,
+}
 
 #[async_trait::async_trait]
 impl Handler for SupervisorHandler {
     async fn handle(&self, cmd: &str, args: Value, _stream: &Streamer) -> Result<Value, String> {
-        let sup = &self.0;
+        let sup = &self.sup;
         match cmd {
             "ping" => Ok(json!("pong")),
             "version" => Ok(json!(env!("CARGO_PKG_VERSION"))),
@@ -464,6 +477,7 @@ impl Handler for SupervisorHandler {
             "shutdown" => {
                 tracing::info!("supervisor shutdown requested");
                 let sup = sup.clone();
+                let tasks = self.tasks.clone();
                 tokio::spawn(async move {
                     let names: Vec<String> = {
                         let reg = sup.registry.lock().await;
@@ -472,6 +486,9 @@ impl Handler for SupervisorHandler {
                     for name in names {
                         let _ = sup.release_lab(&name).await;
                     }
+                    // Cancel + join the supervisor's background tasks
+                    // (disk watchdog) so exit is deterministic.
+                    tasks.shutdown(std::time::Duration::from_secs(5)).await;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     std::process::exit(0);
                 });

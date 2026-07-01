@@ -51,8 +51,15 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
         tracing::warn!("attaching global segments: {e:#}");
     }
 
+    // Long-lived background tasks register here so the `shutdown` command
+    // can cancel and join them deterministically.
+    let tasks = Arc::new(crate::lifecycle::TaskGroup::new());
+
     let sock = crate::paths::lab_socket(&lab);
-    let handler: Arc<dyn Handler> = Arc::new(LabdHandler(runtime.clone()));
+    let handler: Arc<dyn Handler> = Arc::new(LabdHandler {
+        lab: runtime.clone(),
+        tasks: tasks.clone(),
+    });
     let server = Server::bind_with_events(&sock, handler, events_tx.clone())
         .await
         .with_context(|| format!("binding {}", sock.display()))?;
@@ -62,10 +69,11 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
     let wd_events = runtime.events.clone();
     let wd_path = runtime.lab_local.clone();
-    crate::config::host::spawn_disk_watchdog(
+    let watchdog = crate::config::host::spawn_disk_watchdog(
         wd_path.clone(),
         host_cfg.disk_low_percent,
         std::time::Duration::from_secs(60),
+        tasks.cancel_token(),
         move |free| {
             wd_events.emit(
                 "host.disk_low",
@@ -73,6 +81,7 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
             );
         },
     );
+    tasks.adopt("disk-watchdog", watchdog);
 
     // Event → wscript handler bindings (PRD §8.2). Failures are logged, never
     // fatal.
@@ -81,12 +90,17 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
         if !handlers.is_empty() {
             let mut rx = events_tx.subscribe();
             let runtime = runtime.clone();
-            tokio::spawn(async move {
+            let group = tasks.clone();
+            let cancel = tasks.cancel_token();
+            tasks.spawn("handler-dispatch", async move {
                 loop {
-                    let ev = match rx.recv().await {
-                        Ok(ev) => ev,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    let ev = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        ev = rx.recv() => match ev {
+                            Ok(ev) => ev,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
                     };
                     for h in handlers.iter().filter(|h| h.event == ev.event) {
                         let script = runtime.root.join(&h.run);
@@ -99,7 +113,10 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
                         let output: crate::scripting::OutputSink = Arc::new(
                             |line| tracing::info!(target: "handler", "{}", line.trim_end()),
                         );
-                        tokio::spawn(async move {
+                        // Registered so shutdown waits (bounded) for
+                        // in-flight handler scripts instead of killing them
+                        // mid-run at process exit.
+                        group.spawn("handler-run", async move {
                             crate::scripting::run_event_handler(runtime, &script, event, output)
                                 .await;
                         });
@@ -115,7 +132,11 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-struct LabdHandler(Arc<LabRuntime>);
+struct LabdHandler {
+    lab: Arc<LabRuntime>,
+    /// The daemon's background tasks, cancelled + joined on `shutdown`.
+    tasks: Arc<crate::lifecycle::TaskGroup>,
+}
 
 /// Output sink for provision/script runs: streamed live to the invoking CLI
 /// and appended to the lab log (PRD §8.3).
@@ -182,13 +203,13 @@ fn region_arg(args: &Value) -> Result<Option<(u32, u32, u32, u32)>, String> {
 #[async_trait::async_trait]
 impl Handler for LabdHandler {
     async fn handle(&self, cmd: &str, args: Value, _stream: &Streamer) -> Result<Value, String> {
-        let lab = &self.0;
+        let lab = &self.lab;
         let err = |e: anyhow::Error| format!("{e:#}");
         match cmd {
             "ping" => Ok(json!("pong")),
             "status" => Ok(lab.status().await),
             "up" => {
-                let output = stream_sink(&self.0, _stream);
+                let output = stream_sink(&self.lab, _stream);
                 lab.up(&vms_arg(&args), output).await.map_err(err)?;
                 Ok(json!(true))
             }
@@ -196,7 +217,7 @@ impl Handler for LabdHandler {
             "run" => {
                 let script = args["script"].as_str().ok_or("missing script")?;
                 let path = lab.root.join(script);
-                let output = stream_sink(&self.0, _stream);
+                let output = stream_sink(&self.lab, _stream);
                 crate::scripting::run_script_file(lab.clone(), &path, output)
                     .await
                     .map_err(err)?;
@@ -435,6 +456,7 @@ impl Handler for LabdHandler {
             "shutdown" => {
                 tracing::info!("lab daemon shutdown requested");
                 let lab = lab.clone();
+                let tasks = self.tasks.clone();
                 tokio::spawn(async move {
                     // A lab daemon going away must not orphan QEMU processes
                     // it can no longer manage (PRD §3: the daemon owns them),
@@ -446,6 +468,11 @@ impl Handler for LabdHandler {
                         smb.stop();
                     }
                     lab.network.lock().await.detach_globals().await;
+                    // Cancel + join the daemon's background tasks (watchdog,
+                    // handler dispatch, in-flight handler scripts — the
+                    // `down` above may have spawned some for its final
+                    // events), so exit doesn't kill work mid-flight.
+                    tasks.shutdown(std::time::Duration::from_secs(5)).await;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     std::process::exit(0);
                 });
