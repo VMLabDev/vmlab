@@ -40,6 +40,11 @@ pub async fn logs(
     path: web::Path<String>,
 ) -> Result<HttpResponse, Error> {
     let lab = path.into_inner();
+    // The name comes straight from the URL and becomes a log-directory path.
+    if !super::state::valid_name(&lab) {
+        return Ok(actix_web::HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "invalid lab name"})));
+    }
     let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body)?;
 
     actix_web::rt::spawn(async move {

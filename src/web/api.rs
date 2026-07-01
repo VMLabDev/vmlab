@@ -11,7 +11,9 @@ use super::state::AppState;
 fn fail(e: String) -> HttpResponse {
     // Unknown lab / vm is the client's fault; everything else is treated as a
     // bad gateway to the daemon.
-    if e.contains("unknown lab") || e.contains("no such") || e.contains("not found") {
+    if e.contains("invalid lab name") {
+        HttpResponse::BadRequest().json(json!({"error": e}))
+    } else if e.contains("unknown lab") || e.contains("no such") || e.contains("not found") {
         HttpResponse::NotFound().json(json!({"error": e}))
     } else {
         HttpResponse::BadGateway().json(json!({"error": e}))
@@ -115,7 +117,16 @@ pub async fn vm_screenshot(
     path: web::Path<(String, String)>,
 ) -> HttpResponse {
     let (lab, vm) = path.into_inner();
-    let out = std::env::temp_dir().join(format!("vmlab-web-{lab}-{vm}.png"));
+    // `lab` is checked by lab_call's root lookup; `vm` lands in a filename.
+    if !super::state::valid_name(&vm) {
+        return HttpResponse::BadRequest().json(json!({"error": "invalid vm name"}));
+    }
+    // A unique file under the lab's private runtime dir (not the shared
+    // system temp dir), removed once streamed.
+    static SHOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SHOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out = vmlab::paths::lab_runtime_dir(&lab)
+        .join(format!("web-shot-{vm}-{}-{seq}.png", std::process::id()));
     let out_str = out.to_string_lossy().to_string();
     if let Err(e) = state
         .lab_call(&lab, "vm.screenshot", json!({"vm": vm, "path": out_str}))
@@ -123,7 +134,9 @@ pub async fn vm_screenshot(
     {
         return fail(e);
     }
-    match tokio::fs::read(&out).await {
+    let bytes = tokio::fs::read(&out).await;
+    let _ = tokio::fs::remove_file(&out).await;
+    match bytes {
         Ok(bytes) => HttpResponse::Ok()
             .content_type("image/png")
             .insert_header(("Cache-Control", "no-store"))

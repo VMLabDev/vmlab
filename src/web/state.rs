@@ -5,6 +5,7 @@
 //! (`vmlab::cli::daemon`), cached, and re-established on a dropped connection.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,27 @@ use vmlab::cli::daemon;
 use vmlab::proto::ProtoError;
 use vmlab::proto::client::Client;
 
-/// Sessions older than this with no activity are dropped.
-const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+/// Sessions older than this with no activity are dropped. Overridable via
+/// `VMLAB_WEB_SESSION_TTL_SECS`.
+const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Consecutive login failures from one address before throttling kicks in.
+const LOGIN_FAILURE_LIMIT: u32 = 5;
+/// How long a throttled address must stay quiet before trying again.
+const LOGIN_THROTTLE: Duration = Duration::from_secs(30);
+/// Failure records idle longer than this are forgotten.
+const LOGIN_FAILURE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Lab and VM names arrive in URL path segments and become filesystem paths
+/// (control sockets, VNC sockets, screenshot files). Accept exactly what the
+/// config layer accepts — a DNS label (§9.5) — so nothing can traverse.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
 
 pub struct AuthConfig {
     pub enabled: bool,
@@ -29,6 +49,9 @@ pub struct AppState {
     pub auth: AuthConfig,
     /// token → last-seen instant.
     sessions: Mutex<HashMap<String, Instant>>,
+    session_ttl: Duration,
+    /// login-failure backoff: address → (consecutive failures, last attempt).
+    login_failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     /// The lab discovered from the server's working directory at startup.
     pub default_lab: Option<(String, PathBuf)>,
     /// lab name → root directory (seeded from the cwd lab and the supervisor
@@ -44,9 +67,17 @@ impl AppState {
         if let Some((name, root)) = &default_lab {
             roots.insert(name.clone(), root.clone());
         }
+        let session_ttl = std::env::var("VMLAB_WEB_SESSION_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&secs| secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_SESSION_TTL);
         Self {
             auth,
             sessions: Mutex::new(HashMap::new()),
+            session_ttl,
+            login_failures: Mutex::new(HashMap::new()),
             default_lab,
             roots: Mutex::new(roots),
             supervisor: Mutex::new(None),
@@ -58,13 +89,13 @@ impl AppState {
 
     pub async fn create_session(&self, token: String) {
         let mut s = self.sessions.lock().await;
-        prune(&mut s);
+        prune(&mut s, self.session_ttl);
         s.insert(token, Instant::now());
     }
 
     pub async fn valid_session(&self, token: &str) -> bool {
         let mut s = self.sessions.lock().await;
-        prune(&mut s);
+        prune(&mut s, self.session_ttl);
         match s.get_mut(token) {
             Some(seen) => {
                 *seen = Instant::now();
@@ -76,6 +107,29 @@ impl AppState {
 
     pub async fn drop_session(&self, token: &str) {
         self.sessions.lock().await.remove(token);
+    }
+
+    // --- login backoff ------------------------------------------------------
+
+    /// Is this address currently locked out of `/api/login`?
+    pub async fn login_throttled(&self, addr: IpAddr) -> bool {
+        let mut f = self.login_failures.lock().await;
+        let now = Instant::now();
+        f.retain(|_, (_, last)| now.duration_since(*last) < LOGIN_FAILURE_TTL);
+        matches!(f.get(&addr),
+            Some((count, last)) if *count >= LOGIN_FAILURE_LIMIT
+                && now.duration_since(*last) < LOGIN_THROTTLE)
+    }
+
+    pub async fn login_failed(&self, addr: IpAddr) {
+        let mut f = self.login_failures.lock().await;
+        let entry = f.entry(addr).or_insert((0, Instant::now()));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = Instant::now();
+    }
+
+    pub async fn login_succeeded(&self, addr: IpAddr) {
+        self.login_failures.lock().await.remove(&addr);
     }
 
     // --- daemon clients ---------------------------------------------------
@@ -115,8 +169,13 @@ impl AppState {
     }
 
     /// Resolve a lab's root: the cwd lab, a cached entry, or the supervisor
-    /// registry.
+    /// registry. Every lab-addressed call funnels through here, so this is
+    /// also where URL-supplied lab names are rejected before they can reach
+    /// a socket path.
     async fn root_for(&self, lab: &str) -> Result<PathBuf, String> {
+        if !valid_name(lab) {
+            return Err(format!("invalid lab name `{lab}`"));
+        }
         if let Some(p) = self.roots.lock().await.get(lab) {
             return Ok(p.clone());
         }
@@ -186,11 +245,60 @@ impl AppState {
     }
 }
 
-fn prune(sessions: &mut HashMap<String, Instant>) {
+fn prune(sessions: &mut HashMap<String, Instant>, ttl: Duration) {
     let now = Instant::now();
-    sessions.retain(|_, seen| now.duration_since(*seen) < SESSION_TTL);
+    sessions.retain(|_, seen| now.duration_since(*seen) < ttl);
 }
 
 fn proto_err(e: ProtoError) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_name_is_a_dns_label() {
+        for good in ["web", "dc01", "my-lab", "a", "x2-y3"] {
+            assert!(valid_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a b",
+            "-lead",
+            "trail-",
+            "a.b",
+            "x\u{0}y",
+            &"a".repeat(64),
+        ] {
+            assert!(!valid_name(bad), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_backoff_locks_after_repeated_failures() {
+        let state = AppState::new(
+            AuthConfig {
+                enabled: true,
+                user: "u".into(),
+                password_hash: String::new(),
+            },
+            None,
+        );
+        let addr: IpAddr = "192.0.2.7".parse().unwrap();
+        assert!(!state.login_throttled(addr).await);
+        for _ in 0..LOGIN_FAILURE_LIMIT {
+            state.login_failed(addr).await;
+        }
+        assert!(state.login_throttled(addr).await);
+        // Another address is unaffected; success clears the record.
+        assert!(!state.login_throttled("192.0.2.8".parse().unwrap()).await);
+        state.login_succeeded(addr).await;
+        assert!(!state.login_throttled(addr).await);
+    }
 }

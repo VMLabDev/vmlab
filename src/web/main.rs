@@ -2,6 +2,9 @@
 //! API and serves the embedded SolidJS console UI. It talks to the same
 //! supervisor and lab daemons the CLI does, over the existing unix-socket
 //! protocol; no daemon changes are involved.
+//!
+//! Besides the flags below, `VMLAB_WEB_SESSION_TTL_SECS` overrides the idle
+//! session lifetime (default 12 hours).
 
 mod api;
 mod assets;

@@ -108,17 +108,35 @@ pub struct LoginBody {
     password: String,
 }
 
-pub async fn login(state: web::Data<AppState>, body: web::Json<LoginBody>) -> HttpResponse {
+pub async fn login(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Json<LoginBody>,
+) -> HttpResponse {
     if !state.auth.enabled {
         // Auth off: hand back a throwaway token so the SPA flow is uniform.
         let token = new_token();
         state.create_session(token.clone()).await;
         return HttpResponse::Ok().json(json!({"token": token}));
     }
+    // Per-address backoff: argon2 alone still allows an online brute force.
+    let addr = req.peer_addr().map(|a| a.ip());
+    if let Some(addr) = addr
+        && state.login_throttled(addr).await
+    {
+        return HttpResponse::TooManyRequests()
+            .json(json!({"error": "too many failed logins; try again shortly"}));
+    }
     let ok = body.username == state.auth.user
         && verify_password(&state.auth.password_hash, &body.password);
     if !ok {
+        if let Some(addr) = addr {
+            state.login_failed(addr).await;
+        }
         return HttpResponse::Unauthorized().json(json!({"error": "invalid credentials"}));
+    }
+    if let Some(addr) = addr {
+        state.login_succeeded(addr).await;
     }
     let token = new_token();
     state.create_session(token.clone()).await;

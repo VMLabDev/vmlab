@@ -19,6 +19,12 @@ pub async fn vnc(
     _state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
     let (lab, vm) = path.into_inner();
+    // The names come straight from the URL and become a socket path.
+    if !super::state::valid_name(&lab) || !super::state::valid_name(&vm) {
+        return Ok(
+            HttpResponse::BadRequest().json(serde_json::json!({"error": "invalid lab or vm name"}))
+        );
+    }
     let sock = paths::lab_runtime_dir(&lab)
         .join("vms")
         .join(&vm)
