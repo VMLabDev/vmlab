@@ -16,7 +16,7 @@ use crate::net::frame::{ETHERTYPE_IPV4, EthView, eth_build};
 use crate::net::gateway::GatewayHandle;
 use crate::net::nat::{NatConfig, NatEngine};
 use crate::net::rules::{RuleSet, Verdict};
-use crate::net::switch::{HookAction, PortClass, PortId, Switch};
+use crate::net::switch::{HookAction, PortClass, Switch};
 
 /// Per-segment network services available for runtime mutation from scripts
 /// and the CLI (PRD §9.9).
@@ -152,11 +152,6 @@ fn wrap_eth(src: MacAddr, dst: MacAddr, ipv4: &[u8]) -> Bytes {
     Bytes::from(eth_build(dst, src, ETHERTYPE_IPV4, ipv4))
 }
 
-/// The PortId of a segment's gateway, for diagnostics.
-pub fn gateway_port(gateway: &GatewayHandle) -> PortId {
-    gateway.port_id()
-}
-
 /// Install the segment's declared `block {}` / `redirect {}` rules (PRD
 /// §9.9). Declared `forward {}` rules are wired separately by the lab
 /// runtime (they need the guest's leased IP, known only at start).
@@ -207,6 +202,10 @@ impl SegmentServices {
         Ok(id)
     }
 
+    /// Tear down a forward spawned by [`Self::add_forward`]. Declared
+    /// forwards live for the lab's lifetime, so nothing calls this yet; it
+    /// completes the add/remove contract for dynamic (scripted) forwards.
+    #[allow(dead_code)]
     pub fn remove_forward(&self, id: u64) -> bool {
         let mut fwds = self.forwards.lock().expect("forwards poisoned");
         if let Some(pos) = fwds.iter().position(|(fid, _)| *fid == id) {

@@ -29,11 +29,6 @@ impl MediaCache {
         Self { cache_dir }
     }
 
-    /// The directory this cache stores images in.
-    pub fn dir(&self) -> &Path {
-        &self.cache_dir
-    }
-
     /// Returns the path to a built image for `src_folder`, building it only
     /// if no cache entry exists for the folder's current contents.
     ///
@@ -77,7 +72,10 @@ impl MediaCache {
     }
 
     /// Deletes cache entries whose paths are not in `keep`. Stale temporary
-    /// files from interrupted builds are removed as well.
+    /// files from interrupted builds are removed as well. (No caller prunes
+    /// the cache yet — entries are tiny relative to disks — but the tested
+    /// GC is kept for when one does.)
+    #[allow(dead_code)]
     pub fn gc(&self, keep: &[PathBuf]) -> Result<()> {
         if !self.cache_dir.is_dir() {
             return Ok(());

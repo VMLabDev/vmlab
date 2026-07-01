@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use super::{QmpClient, QmpError, RunState};
+use super::QmpClient;
+use super::error::QmpError;
+use super::types::RunState;
 
 /// A mock QMP server: sends the greeting, then answers each incoming
 /// command with whatever lines `responder` produces. Every received

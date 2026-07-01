@@ -324,7 +324,6 @@ impl LabNetwork {
                 GatewayConfig {
                     segment_name: seg.name.clone(),
                     lab_name: lab.name.clone(),
-                    subnet: seg.subnet,
                     gw_ip: seg.gateway_ip,
                     gw_mac,
                     dhcp,

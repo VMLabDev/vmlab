@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use super::error::QmpError;
-use super::types::{NamedBlockNode, QmpEvent, RunState};
+use super::types::{QmpEvent, RunState};
 
 /// Maximum value on the abs axes of QEMU's `input-send-event` (per QAPI,
 /// absolute pointer coordinates are scaled to a 0..32767 range).
@@ -57,6 +57,18 @@ struct Inner {
     event_tx: broadcast::Sender<QmpEvent>,
     next_id: AtomicU64,
     reader_task: StdMutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for Inner {
+    /// Last clone gone: stop the background reader so it does not outlive
+    /// the client (it would otherwise run until the socket EOFs).
+    fn drop(&mut self) {
+        if let Ok(mut task) = self.reader_task.lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+    }
 }
 
 /// Async QMP client over a unix socket.
@@ -173,6 +185,9 @@ impl QmpClient {
     /// Gracefully shut the connection down: stops the reader task, closes
     /// the write half, and fails all in-flight requests with
     /// [`QmpError::Closed`]. Affects every clone of this client.
+    /// (Production drops the last clone instead — see `Drop` on `Inner` —
+    /// but the tests close explicitly to assert in-flight behaviour.)
+    #[allow(dead_code)]
     pub async fn close(&self) {
         let task = self
             .inner
@@ -212,7 +227,9 @@ impl QmpClient {
         self.execute("cont", None).await.map(|_| ())
     }
 
-    /// Query the VM run state (`query-status`).
+    /// Query the VM run state (`query-status`). (The daemon watches run
+    /// state via events; the QMP tests poll through this.)
+    #[allow(dead_code)]
     pub async fn query_status(&self) -> Result<RunState, QmpError> {
         let value = self.execute("query-status", None).await?;
         let status = value
@@ -289,13 +306,6 @@ impl QmpClient {
     }
 
     // --- snapshots ----------------------------------------------------------
-
-    /// List named block nodes (`query-named-block-nodes`), used to pick
-    /// `vmstate`/`devices` for the snapshot commands.
-    pub async fn query_named_block_nodes(&self) -> Result<Vec<NamedBlockNode>, QmpError> {
-        let value = self.execute("query-named-block-nodes", None).await?;
-        Ok(serde_json::from_value(value)?)
-    }
 
     /// Take an online snapshot (`snapshot-save`): disk + RAM + device
     /// state into the qcow2-internal snapshot `tag`. Blocks until the

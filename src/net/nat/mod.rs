@@ -51,8 +51,6 @@ mod vtcp;
 #[cfg(test)]
 mod tests;
 
-// Consumed by the daemon/gateway modules as they land.
-#[allow(unused_imports)]
 pub use forward::PortForwarder;
 pub use icmp::{Pinger, SubprocessPinger};
 pub use vtcp::{FlowKey, GuestStream};
@@ -275,7 +273,9 @@ impl NatEngine {
 
     /// One-shot UDP datagram to a guest from `gw_ip:<ephemeral>`. Replies
     /// (if any) are not routed anywhere; use [`Self::udp_bind_guest_flow`]
-    /// for request/response exchanges.
+    /// for request/response exchanges. (Exercised by the NAT tests; the
+    /// port-forward paths all use the bound-flow variant.)
+    #[allow(dead_code)]
     pub async fn udp_to_guest(
         self: &Arc<Self>,
         guest_ip: Ipv4Addr,

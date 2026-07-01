@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ipnet::Ipv4Net;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -28,7 +27,7 @@ use crate::net::frame::{
     ArpOp, ArpView, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthView, IPPROTO_ICMP, IPPROTO_UDP, Ipv4View,
     UdpView, arp_reply_build, eth_build, icmp_echo_reply_for,
 };
-use crate::net::switch::{ChannelPort, PortClass, PortId, Switch};
+use crate::net::switch::{ChannelPort, PortClass, Switch};
 
 /// How long the gateway waits for an upstream DNS resolver.
 const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -63,7 +62,6 @@ pub fn gateway_mac(lab: &str, segment: &str) -> MacAddr {
 pub struct GatewayConfig {
     pub segment_name: String,
     pub lab_name: String,
-    pub subnet: Ipv4Net,
     /// The gateway's address: the segment's first usable IP.
     pub gw_ip: Ipv4Addr,
     /// See [`gateway_mac`].
@@ -79,10 +77,8 @@ pub struct GatewayConfig {
 
 /// Handle to a running gateway. Dropping it aborts the gateway task.
 pub struct GatewayHandle {
-    port_id: PortId,
     gw_ip: Ipv4Addr,
     gw_mac: MacAddr,
-    subnet: Ipv4Net,
     tx: mpsc::Sender<Bytes>,
     dhcp: Option<Arc<Mutex<DhcpServer>>>,
     dns: Option<Arc<Mutex<DnsZone>>>,
@@ -91,10 +87,6 @@ pub struct GatewayHandle {
 }
 
 impl GatewayHandle {
-    pub fn port_id(&self) -> PortId {
-        self.port_id
-    }
-
     pub fn gw_ip(&self) -> Ipv4Addr {
         self.gw_ip
     }
@@ -103,11 +95,10 @@ impl GatewayHandle {
         self.gw_mac
     }
 
-    pub fn subnet(&self) -> Ipv4Net {
-        self.subnet
-    }
-
-    /// Current DHCP leases for status display; empty when DHCP is disabled.
+    /// Current DHCP leases; empty when DHCP is disabled. (Production syncs
+    /// leases through [`Self::leases_probe`]; the gateway tests assert
+    /// through this.)
+    #[allow(dead_code)]
     pub fn dhcp_leases(&self) -> Vec<(MacAddr, Ipv4Addr)> {
         self.dhcp
             .as_ref()
@@ -139,6 +130,9 @@ impl GatewayHandle {
 
     /// Send a frame out the gateway port into the switch (the NAT return
     /// path). Returns `false` if the port queue is full or closed.
+    /// Production code uses the detached [`Self::injector`]; the gateway
+    /// tests inject through the handle directly.
+    #[allow(dead_code)]
     pub fn inject(&self, frame: Bytes) -> bool {
         self.tx.try_send(frame).is_ok()
     }
@@ -166,7 +160,6 @@ impl Gateway {
         let GatewayConfig {
             segment_name,
             lab_name,
-            subnet,
             gw_ip,
             gw_mac,
             dhcp,
@@ -202,10 +195,8 @@ impl Gateway {
         let join = tokio::spawn(task.run(rx));
 
         GatewayHandle {
-            port_id: id,
             gw_ip,
             gw_mac,
-            subnet,
             tx,
             dhcp,
             dns: dns_zone,
@@ -358,6 +349,7 @@ impl GatewayTask {
 mod tests {
     use std::time::Duration;
 
+    use ipnet::Ipv4Net;
     use tokio::time::timeout;
 
     use super::*;
@@ -382,7 +374,6 @@ mod tests {
         GatewayConfig {
             segment_name: "seg".into(),
             lab_name: "lab".into(),
-            subnet: subnet(),
             gw_ip: gw_ip(),
             gw_mac,
             dhcp: Some(DhcpConfig::new(subnet(), gw_ip(), gw_mac)),

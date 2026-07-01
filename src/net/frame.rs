@@ -15,6 +15,9 @@ use crate::config::model::MacAddr;
 
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 pub const ETHERTYPE_ARP: u16 = 0x0806;
+/// Recognised for completeness; the fabric is IPv4-only (tests use this to
+/// exercise the "not ours" paths).
+#[allow(dead_code)]
 pub const ETHERTYPE_IPV6: u16 = 0x86DD;
 
 pub const IPPROTO_ICMP: u8 = 1;
@@ -150,6 +153,8 @@ pub struct ArpView<'a> {
     buf: &'a [u8],
 }
 
+// Each header view exposes its complete field surface, consumers or not.
+#[allow(dead_code)]
 impl<'a> ArpView<'a> {
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
         if buf.len() < ARP_LEN {
@@ -207,7 +212,9 @@ fn arp_build(op: u16, sha: MacAddr, spa: Ipv4Addr, tha: MacAddr, tpa: Ipv4Addr) 
 }
 
 /// Build a complete ethernet frame carrying an ARP request (who-has `tpa`),
-/// broadcast at L2.
+/// broadcast at L2. The fabric never sends requests (MACs are learned
+/// passively); tests use this to synthesise guest ARP traffic.
+#[cfg(test)]
 pub fn arp_request_build(sha: MacAddr, spa: Ipv4Addr, tpa: Ipv4Addr) -> Vec<u8> {
     let arp = arp_build(1, sha, spa, MacAddr([0; 6]), tpa);
     eth_build(MAC_BROADCAST, sha, ETHERTYPE_ARP, &arp)
@@ -234,6 +241,8 @@ pub struct Ipv4View<'a> {
     buf: &'a [u8],
 }
 
+// Each header view exposes its complete field surface, consumers or not.
+#[allow(dead_code)]
 impl<'a> Ipv4View<'a> {
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
         if buf.len() < IPV4_MIN_HEADER_LEN {
@@ -368,6 +377,8 @@ pub struct UdpView<'a> {
     buf: &'a [u8],
 }
 
+// Each header view exposes its complete field surface, consumers or not.
+#[allow(dead_code)]
 impl<'a> UdpView<'a> {
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
         if buf.len() < UDP_HEADER_LEN {
@@ -452,6 +463,8 @@ pub struct TcpView<'a> {
     buf: &'a [u8],
 }
 
+// Each header view exposes its complete field surface, consumers or not.
+#[allow(dead_code)]
 impl<'a> TcpView<'a> {
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
         if buf.len() < TCP_MIN_HEADER_LEN {
@@ -595,6 +608,8 @@ pub struct IcmpView<'a> {
     buf: &'a [u8],
 }
 
+// Each header view exposes its complete field surface, consumers or not.
+#[allow(dead_code)]
 impl<'a> IcmpView<'a> {
     pub fn parse(buf: &'a [u8]) -> Option<Self> {
         (buf.len() >= ICMP_HEADER_LEN).then_some(Self { buf })

@@ -65,7 +65,6 @@ type Result<T> = std::result::Result<T, SmbError>;
 #[derive(Debug)]
 pub struct SmbServer {
     child: Option<Child>,
-    pid: u32,
     config: SmbConfig,
 }
 
@@ -145,8 +144,6 @@ impl SmbServer {
                 }
             })?;
 
-        let pid = child.id();
-
         // Give smbd a beat; if it immediately died (e.g. port in use), report.
         std::thread::sleep(std::time::Duration::from_millis(300));
         if let Ok(Some(status)) = child.try_wait() {
@@ -158,33 +155,12 @@ impl SmbServer {
 
         Ok(SmbServer {
             child: Some(child),
-            pid,
             config,
         })
     }
 
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
     pub fn listen_port(&self) -> u16 {
         self.config.listen_port
-    }
-
-    pub fn log_path(&self) -> PathBuf {
-        self.config.log_path()
-    }
-
-    pub fn config(&self) -> &SmbConfig {
-        &self.config
-    }
-
-    /// Whether the child is still running (non-blocking).
-    pub fn is_running(&mut self) -> bool {
-        match self.child.as_mut() {
-            Some(c) => matches!(c.try_wait(), Ok(None)),
-            None => false,
-        }
     }
 
     /// Kill the `smbd` child and reap it.

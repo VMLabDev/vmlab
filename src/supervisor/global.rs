@@ -101,7 +101,6 @@ impl GlobalSegments {
             GatewayConfig {
                 segment_name: name.to_string(),
                 lab_name: "__global".to_string(),
-                subnet,
                 gw_ip,
                 gw_mac,
                 dhcp: Some(dhcp),

@@ -10,12 +10,15 @@ pub struct QmpEvent {
     pub event: String,
     /// Event payload (`data` member); `Value::Null` when absent.
     pub data: Value,
-    /// Host-side timestamp QEMU attached to the event.
+    /// Host-side timestamp QEMU attached to the event. No consumer reads
+    /// it today; carried so the event mirrors the wire format.
+    #[allow(dead_code)]
     pub timestamp: EventTimestamp,
 }
 
 /// Timestamp attached to QMP events (`{"seconds": ..., "microseconds": ...}`).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[allow(dead_code)]
 pub struct EventTimestamp {
     #[serde(default)]
     pub seconds: i64,
@@ -66,24 +69,4 @@ impl RunState {
             other => RunState::Other(other.to_string()),
         }
     }
-}
-
-/// A block node as returned by `query-named-block-nodes`.
-///
-/// Only the fields vmlab's snapshot routing needs are typed; everything
-/// else QEMU reports is ignored on deserialisation.
-#[derive(Debug, Clone, Deserialize)]
-pub struct NamedBlockNode {
-    /// Graph node name (used as `vmstate`/`devices` for snapshot commands).
-    #[serde(rename = "node-name")]
-    pub node_name: String,
-    /// Block driver (e.g. `"qcow2"`, `"file"`).
-    #[serde(default)]
-    pub drv: Option<String>,
-    /// Whether the node is read-only.
-    #[serde(default)]
-    pub ro: bool,
-    /// Backing file path, if any.
-    #[serde(default)]
-    pub file: Option<String>,
 }

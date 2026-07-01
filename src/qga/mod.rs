@@ -91,7 +91,10 @@ pub struct ExecResult {
 /// A guest network interface from `guest-network-get-interfaces`.
 #[derive(Debug, Clone)]
 pub struct GaInterface {
-    /// Interface name inside the guest (e.g. `eth0`, `Ethernet`).
+    /// Interface name inside the guest (e.g. `eth0`, `Ethernet`). Unread —
+    /// IP discovery filters by address type — but kept to mirror the agent's
+    /// wire format.
+    #[allow(dead_code)]
     pub name: String,
     /// MAC address, if the agent reports one.
     pub hardware_address: Option<String>,

@@ -29,7 +29,7 @@ impl Default for HostConfig {
             disk_low_percent: 10,
             psk: None,
             viewer: None,
-            oci_chunk_size: 512 << 20,
+            oci_chunk_size: crate::oci::chunking::DEFAULT_CHUNK_SIZE,
         }
     }
 }

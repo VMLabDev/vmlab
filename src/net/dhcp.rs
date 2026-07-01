@@ -137,10 +137,6 @@ impl DhcpServer {
         }
     }
 
-    pub fn config(&self) -> &DhcpConfig {
-        &self.config
-    }
-
     /// Process one ethernet frame. Returns the full ethernet reply frame for
     /// DISCOVER/REQUEST that warrant one (OFFER/ACK/NAK); `None` for
     /// non-DHCP traffic, RELEASE, DECLINE, and pool exhaustion.

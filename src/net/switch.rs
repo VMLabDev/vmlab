@@ -50,7 +50,10 @@ pub enum PortClass {
 pub enum HookAction {
     /// Forward the frame unmodified.
     Pass,
-    /// Drop the frame.
+    /// Drop the frame. (No in-tree hook returns this today — the L3 rules
+    /// hook drops via `Inject { forward: None, .. }` — but it stays part of
+    /// the seam contract and the switch tests exercise it.)
+    #[allow(dead_code)]
     Drop,
     /// Forward this frame instead of the original.
     Replace(Vec<u8>),
@@ -139,16 +142,14 @@ impl Switch {
         })
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Install (or replace) the ingress hook. The hook runs synchronously on
     /// every ingress frame before MAC learning and forwarding.
     pub fn set_ingress_hook(&self, hook: IngressHook) {
         *self.hook.lock().expect("hook lock poisoned") = Some(hook);
     }
 
+    /// Diagnostics counters; consumed by the switch tests only so far.
+    #[allow(dead_code)]
     pub fn stats(&self) -> SwitchStats {
         SwitchStats {
             ports: self.inner.lock().expect("switch lock poisoned").ports.len(),

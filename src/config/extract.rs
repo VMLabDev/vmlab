@@ -48,7 +48,7 @@ pub fn extract_lab_file(doc: &Document, root: &Path, issues: &mut IssueList) -> 
 }
 
 /// Extract only template definitions (for dedicated template files).
-pub fn extract_template_file(doc: &Document, root: &Path, issues: &mut IssueList) -> TemplateFile {
+pub fn extract_template_file(doc: &Document, issues: &mut IssueList) -> TemplateFile {
     let mut templates = Vec::new();
     for block in doc.blocks() {
         if block.kind() == "template"
@@ -57,10 +57,7 @@ pub fn extract_template_file(doc: &Document, root: &Path, issues: &mut IssueList
             templates.push(t);
         }
     }
-    TemplateFile {
-        root: root.to_path_buf(),
-        templates,
-    }
+    TemplateFile { templates }
 }
 
 fn span_of(b: &Block) -> Span {

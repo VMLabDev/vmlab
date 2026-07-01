@@ -357,7 +357,8 @@ impl RuleSet {
         }
     }
 
-    /// Number of live translation entries (diagnostics).
+    /// Number of live translation entries (diagnostics; asserted by tests).
+    #[allow(dead_code)]
     pub fn conn_count(&self) -> usize {
         self.conns.lock().expect("conns lock").len()
     }

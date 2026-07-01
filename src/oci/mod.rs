@@ -19,10 +19,6 @@
 //! the registry's `/v2/` endpoint, then stores it in the Docker config so a
 //! later `push`/`pull` just works.
 
-// Buildout in progress: the CLI consumers of these re-exports land later
-// (the crate root's dead_code allow does not cover unused imports).
-#![allow(unused_imports)]
-
 pub mod auth;
 pub mod catalog;
 pub mod chunking;
@@ -37,11 +33,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 pub use catalog::list_repositories;
-pub use chunking::{ChunkInfo, ChunkSet, DEFAULT_CHUNK_SIZE};
-pub use client::{PullProgress, Registry, Transport, ensure_registry_template};
-pub use manifest::{Descriptor, ImageIndex, Manifest};
-pub use media_types::ARTIFACT_TYPE_TEMPLATE;
-pub use reference::{Reference, with_version_tag};
+pub use client::{PullProgress, Registry, ensure_registry_template};
+pub use reference::with_version_tag;
 
 /// Validate `username`/`password` against `registry`'s `/v2/` endpoint and,
 /// on success, persist them into the Docker config (PRD §6.4 — `vmlab

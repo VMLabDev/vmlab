@@ -8,8 +8,8 @@
 //! - [`find_template`] — normalised cross-correlation template matching,
 //!   returning a [`Match`] (location + score) that can anchor a relative
 //!   mouse click.
-//! - [`ocr`] / [`text_matches`] — Tesseract-backed text extraction and regex
-//!   matching.
+//! - [`ocr`] — Tesseract-backed text extraction (`vm.wait_for_text` applies
+//!   its regex in the scripting layer).
 //!
 //! Wait/retry loops and lab-relative path resolution live in the scripting
 //! layer; this module is pure image-in, result-out.
@@ -18,11 +18,6 @@ mod matching;
 mod ocr;
 mod screenshot;
 
-// The consumer (wscript scripting bridge) lands later in the buildout; until
-// then the re-exports are intentionally unused.
-#[allow(unused_imports)]
 pub use matching::{Match, MatchOptions, find_template};
-#[allow(unused_imports)]
-pub use ocr::{ocr, text_matches};
-#[allow(unused_imports)]
+pub use ocr::ocr;
 pub use screenshot::{load_screen, save_png};

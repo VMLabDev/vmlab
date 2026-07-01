@@ -56,6 +56,10 @@ pub enum FirmwareKind {
 #[derive(Debug, Clone, Default)]
 pub struct Profile {
     pub name: String,
+    /// Human-readable summary from the profile's WCL `description`. Nothing
+    /// surfaces it yet (there is no `profile list` verb); parsed for schema
+    /// parity.
+    #[allow(dead_code)]
     pub description: Option<String>,
     pub machine: Option<Machine>,
     pub firmware: Option<FirmwareKind>,
@@ -121,6 +125,8 @@ impl ProfileSet {
         self.profiles.contains_key(name)
     }
 
+    /// All profile names (tests assert the shipped set through this).
+    #[allow(dead_code)]
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.profiles.keys().map(String::as_str)
     }

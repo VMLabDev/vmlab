@@ -24,7 +24,6 @@ pub struct LabFile {
 /// contain templates with no lab.
 #[derive(Debug, Clone)]
 pub struct TemplateFile {
-    pub root: PathBuf,
     pub templates: Vec<TemplateDef>,
 }
 

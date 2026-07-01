@@ -1,4 +1,4 @@
-//! OCR via the `tesseract` CLI, and regex matching of its output.
+//! OCR via the `tesseract` CLI.
 //!
 //! Tesseract is driven as a subprocess (it ships in the official runtime
 //! image, PRD §14): the image is written to a temporary PNG, then
@@ -76,31 +76,10 @@ fn temp_png_path() -> PathBuf {
     std::env::temp_dir().join(format!("vmlab-ocr-{}-{n}.png", std::process::id()))
 }
 
-/// Whether `text` matches the regex `pattern`.
-///
-/// The pattern is used exactly as given — matching is case-sensitive unless
-/// the pattern opts out itself (e.g. `(?i)login:`). Returns an error for an
-/// invalid pattern.
-pub fn text_matches(text: &str, pattern: &str) -> Result<bool> {
-    let re = regex::Regex::new(pattern)
-        .with_context(|| format!("invalid regex pattern: {pattern:?}"))?;
-    Ok(re.is_match(text))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::Rgb;
-
-    #[test]
-    fn text_matches_basics() {
-        assert!(text_matches("login: _", r"login:").unwrap());
-        assert!(!text_matches("LOGIN: _", r"login:").unwrap());
-        assert!(text_matches("LOGIN: _", r"(?i)login:").unwrap());
-        assert!(text_matches("Setup is complete", r"Setup\s+is\s+\w+").unwrap());
-        assert!(text_matches("anything", r".*").unwrap());
-        assert!(text_matches("a", r"[(").is_err());
-    }
 
     /// 7-row bitmap glyphs (variable width), one string per row, '#' = ink.
     /// The O gets octagonal corners so tesseract does not read it as D.

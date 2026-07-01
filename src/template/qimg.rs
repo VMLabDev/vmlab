@@ -39,7 +39,8 @@ pub struct ImageInfo {
     /// Guest-visible disk size in bytes.
     #[serde(rename = "virtual-size")]
     pub virtual_size: u64,
-    /// Bytes actually allocated on the host.
+    /// Bytes actually allocated on the host (the sparseness test reads it).
+    #[allow(dead_code)]
     #[serde(rename = "actual-size")]
     pub actual_size: u64,
     /// Backing image, present for linked clones.
@@ -138,26 +139,6 @@ pub async fn snapshot_delete(path: &Path, name: &str) -> Result<()> {
     let path = path_str(path);
     run(&["snapshot", "-d", name, &path]).await?;
     Ok(())
-}
-
-/// List qcow2-internal snapshot tags.
-pub async fn snapshot_list(path: &Path) -> Result<Vec<String>> {
-    let path_arg = path_str(path);
-    let stdout = run(&["info", "--output=json", &path_arg]).await?;
-    #[derive(Deserialize)]
-    struct Info {
-        #[serde(default)]
-        snapshots: Vec<Snap>,
-    }
-    #[derive(Deserialize)]
-    struct Snap {
-        name: String,
-    }
-    let info: Info = serde_json::from_slice(&stdout).map_err(|e| QemuImgError::Parse {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    Ok(info.snapshots.into_iter().map(|s| s.name).collect())
 }
 
 #[cfg(test)]

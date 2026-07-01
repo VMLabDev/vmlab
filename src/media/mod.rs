@@ -9,11 +9,4 @@ mod floppy;
 mod hash;
 mod iso;
 
-#[allow(unused_imports)]
 pub use cache::MediaCache;
-#[allow(unused_imports)]
-pub use floppy::build_floppy;
-#[allow(unused_imports)]
-pub use hash::folder_digest;
-#[allow(unused_imports)]
-pub use iso::build_iso;

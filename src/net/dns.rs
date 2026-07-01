@@ -147,6 +147,9 @@ impl DnsZone {
     }
 
     /// Remove an auto-registered record. Returns whether it existed.
+    /// ([`Self::register`]'s inverse; nothing unregisters today — records
+    /// die with the zone — but the pair keeps the API symmetric.)
+    #[allow(dead_code)]
     pub fn unregister(&mut self, name: &str) -> bool {
         let fqdn = self.fqdn(name);
         self.records.remove(&fqdn).is_some()
@@ -279,6 +282,9 @@ pub enum DnsAction {
     /// `respond.build_frame(...)`.
     ForwardUpstream {
         upstream: SocketAddr,
+        /// The query's DNS transaction id (also embedded in `raw_query`;
+        /// production forwards the raw bytes, tests assert on this).
+        #[allow(dead_code)]
         query_id: u16,
         raw_query: Vec<u8>,
         respond: DnsRespondCtx,
@@ -293,6 +299,8 @@ pub struct DnsServer {
 }
 
 impl DnsServer {
+    /// Own a fresh zone (tests; production wraps the gateway's shared zone).
+    #[allow(dead_code)]
     pub fn new(zone: DnsZone) -> Self {
         Self {
             zone: Arc::new(Mutex::new(zone)),
@@ -303,11 +311,6 @@ impl DnsServer {
     /// runtime mutation).
     pub fn shared(zone: Arc<Mutex<DnsZone>>) -> Self {
         Self { zone }
-    }
-
-    /// Shared handle to the zone for runtime mutation.
-    pub fn zone(&self) -> Arc<Mutex<DnsZone>> {
-        Arc::clone(&self.zone)
     }
 
     /// Process one ethernet frame addressed to UDP port 53.
@@ -450,7 +453,9 @@ fn parse_qname(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
     Some((name, off))
 }
 
-/// Encode a dotted name as DNS labels.
+/// Encode a dotted name as DNS labels (query-building helper for the DNS
+/// and gateway tests; production only parses queries).
+#[cfg(test)]
 pub fn encode_qname(name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len() + 2);
     for label in name.trim_end_matches('.').split('.') {

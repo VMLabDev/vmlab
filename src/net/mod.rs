@@ -14,16 +14,3 @@ pub mod gateway;
 pub mod nat;
 pub mod rules;
 pub mod switch;
-
-// Re-exports for consumers (DHCP/DNS/NAT/daemon modules); nothing inside the
-// bin uses them yet, hence the allow.
-#[allow(unused_imports)]
-pub use frame::{
-    ArpOp, ArpView, EthView, IcmpView, Ipv4View, TcpFields, TcpView, UdpView, arp_reply_build,
-    arp_request_build, eth_build, icmp_build, icmp_echo_reply_for, icmp_unreachable_for,
-    internet_checksum, ipv4_build, l4_checksum, tcp_build, udp_build,
-};
-#[allow(unused_imports)]
-pub use framing::{MAX_FRAME_LEN, read_frame, write_frame};
-#[allow(unused_imports)]
-pub use switch::{ChannelPort, HookAction, IngressHook, PortClass, PortId, Switch, SwitchStats};

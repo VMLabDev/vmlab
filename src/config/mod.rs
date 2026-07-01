@@ -1,9 +1,6 @@
 //! Lab configuration: WCL schema, typed model, extraction, validation
 //! (PRD §5).
 
-// False positives raised inside the miette `Diagnostic` derive expansions.
-#![allow(unused_assignments)]
-
 mod extract;
 pub mod host;
 pub mod model;
@@ -15,8 +12,6 @@ use miette::{Diagnostic, NamedSource};
 use thiserror::Error;
 use wcl_lang::{Document, Environment, Registry, disk_loader};
 
-#[allow(unused_imports)]
-pub use extract::derive_share_name;
 pub use model::{LabFile, TemplateFile};
 pub use validate::{ValidationContext, validate};
 
@@ -149,7 +144,7 @@ pub fn load_template_source(
 ) -> Result<TemplateFile, ConfigErrors> {
     let doc = open(source, name, Some(root))?;
     let mut issues = schema_issues(&doc);
-    let tf = extract::extract_template_file(&doc, root, &mut issues);
+    let tf = extract::extract_template_file(&doc, &mut issues);
     if issues.is_empty() {
         Ok(tf)
     } else {

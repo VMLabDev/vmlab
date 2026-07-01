@@ -6,7 +6,7 @@
 //! `child.wait()` would deadlock `kill()`); killing goes through a signal to
 //! the recorded pid instead.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -114,16 +114,6 @@ impl Proc {
             );
         }
     }
-
-    /// SIGTERM (used for helpers like swtpm that exit cleanly on it).
-    pub async fn terminate(&self) {
-        if let Some(pid) = self.pid() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
-    }
 }
 
 /// Spawn swtpm for a VM (PRD §5.3): TPM 2.0 emulator on a unix control
@@ -145,30 +135,6 @@ pub async fn spawn_swtpm(
         "--terminate".to_string(),
     ];
     Proc::spawn(&format!("swtpm:{vm_name}"), "swtpm", &args, log_path).await
-}
-
-/// Where the binaries live — verified at daemon start for clear errors.
-pub fn check_binaries(arches: &[&str]) -> Vec<String> {
-    let mut missing = Vec::new();
-    for arch in arches {
-        let bin = super::cmdline::emulator_binary(arch);
-        if which(&bin).is_none() {
-            missing.push(bin);
-        }
-    }
-    for bin in ["qemu-img", "swtpm"] {
-        if which(bin).is_none() {
-            missing.push(bin.to_string());
-        }
-    }
-    missing
-}
-
-fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(bin))
-        .find(|p| p.is_file())
 }
 
 /// Does this raw `/proc/<pid>/cmdline` (NUL-separated argv) belong to a VM in
@@ -250,11 +216,6 @@ mod tests {
             .await
             .unwrap();
         assert!(status.contains("signal"), "{status}");
-    }
-
-    #[test]
-    fn binaries_present_on_host() {
-        assert!(check_binaries(&["x86_64"]).is_empty());
     }
 
     #[test]

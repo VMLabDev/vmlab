@@ -39,6 +39,9 @@ use crate::template::{META_FILE, TemplateMeta};
 /// A blob or manifest body plus the media type the server reported.
 #[derive(Debug, Clone)]
 pub struct Fetched {
+    /// `Content-Type` as reported by the registry. Unread — manifest/index
+    /// discrimination sniffs the JSON instead — but mirrors the wire.
+    #[allow(dead_code)]
     pub media_type: String,
     pub body: Vec<u8>,
 }
@@ -106,6 +109,7 @@ impl Registry {
     }
 
     /// Build a client over an explicit transport (used by tests).
+    #[allow(dead_code)]
     pub fn with_transport(reference: Reference, transport: Box<dyn Transport>) -> Self {
         Self {
             reference,
@@ -113,9 +117,6 @@ impl Registry {
         }
     }
 
-    pub fn host(&self) -> &str {
-        &self.reference.host
-    }
     pub fn repository(&self) -> &str {
         &self.reference.repository
     }

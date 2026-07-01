@@ -54,7 +54,6 @@ pub struct VmHandle {
     pub(crate) vm: Arc<VmInstance>,
     pub(crate) runtime: Arc<LabRuntime>,
     pub(crate) rt: tokio::runtime::Handle,
-    pub(crate) output: OutputSink,
     /// Last pointer position, for the VNC input transport: RFB PointerEvent
     /// always carries x,y, but the API splits `mouse_move`/`mouse_click`, so
     /// a click reuses the position the preceding move set.
@@ -238,7 +237,6 @@ pub fn lab_module() -> Module {
                     vm,
                     runtime: l.runtime.clone(),
                     rt: l.rt.clone(),
-                    output: l.output.clone(),
                     last_pointer: Default::default(),
                     ref_base: l.ref_base.clone(),
                 })
@@ -254,7 +252,6 @@ pub fn lab_module() -> Module {
                 vm,
                 runtime: l.runtime.clone(),
                 rt: l.rt.clone(),
-                output: l.output.clone(),
                 last_pointer: Default::default(),
                 ref_base: l.ref_base.clone(),
             })
@@ -267,7 +264,6 @@ pub fn lab_module() -> Module {
                     vm: vm.clone(),
                     runtime: l.runtime.clone(),
                     rt: l.rt.clone(),
-                    output: l.output.clone(),
                     last_pointer: Default::default(),
                     ref_base: l.ref_base.clone(),
                 })

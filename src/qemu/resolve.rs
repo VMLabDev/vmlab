@@ -29,6 +29,10 @@ pub struct ResolvedVm {
     pub agent_channel: bool,
     /// How scripted input reaches the guest (QMP vs VNC).
     pub input_transport: InputTransport,
+    /// The `nested` flag from config. No cmdline consumer: `-cpu host`
+    /// already exposes VMX/SVM (see cmdline.rs §5.2), so nested virt needs
+    /// no extra QEMU argument; carried for a future non-host CPU model.
+    #[allow(dead_code)]
     pub nested: bool,
     pub gpu: Option<Gpu>,
     pub qemu_args: Vec<String>,

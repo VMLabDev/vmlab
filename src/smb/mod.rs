@@ -31,12 +31,8 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-// Re-exports for daemon consumers; the bin does not wire these in yet.
-#[allow(unused_imports)]
-pub use config::{ShareDef, SmbConfig, SmbCredentials, check_nt1_supported};
-#[allow(unused_imports)]
-pub use mount::{is_drive_letter, linux_mount_cmd, windows_mount_cmds, xp_net_use_string};
-#[allow(unused_imports)]
+pub use config::{ShareDef, SmbConfig, SmbCredentials};
+pub use mount::{linux_mount_cmd, windows_mount_cmds, xp_net_use_string};
 pub use server::{SmbError, SmbServer};
 
 use crate::config::model::Share;
@@ -73,7 +69,6 @@ struct VmPlan {
 /// High-level SMB orchestration for one lab.
 #[derive(Debug)]
 pub struct LabSmb {
-    lab: String,
     listen_port: u16,
     smb_dir: PathBuf,
     vms: HashMap<String, VmPlan>,
@@ -123,7 +118,6 @@ impl LabSmb {
             );
         }
         LabSmb {
-            lab: lab.to_string(),
             listen_port,
             smb_dir,
             vms: plans,
@@ -131,7 +125,9 @@ impl LabSmb {
         }
     }
 
-    /// The credential minted for a VM (plumbed into the guest mount).
+    /// The credential minted for a VM. `mount_plan` embeds it in the guest
+    /// mount commands; the tests assert stability through this accessor.
+    #[allow(dead_code)]
     pub fn credentials(&self, vm: &str) -> Option<&SmbCredentials> {
         self.vms.get(vm).map(|p| &p.creds)
     }
@@ -185,14 +181,6 @@ impl LabSmb {
         let port = server.listen_port();
         self.server = Some(server);
         Ok(port)
-    }
-
-    /// Whether the lab's `smbd` is up.
-    pub fn is_running(&mut self) -> bool {
-        self.server
-            .as_mut()
-            .map(|s| s.is_running())
-            .unwrap_or(false)
     }
 
     /// Stop the lab's `smbd`.
@@ -288,10 +276,6 @@ impl LabSmb {
             }
         }
         steps
-    }
-
-    pub fn lab(&self) -> &str {
-        &self.lab
     }
 }
 

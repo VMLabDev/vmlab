@@ -184,7 +184,10 @@ impl SmbConfig {
         out.push_str(&format!("    lock directory = {dir}\n"));
         out.push_str(&format!("    pid directory = {dir}\n"));
         out.push_str(&format!("    ncalrpc dir = {dir}/ncalrpc\n"));
-        out.push_str(&format!("    passdb backend = tdbsam:{dir}/passdb.tdb\n"));
+        out.push_str(&format!(
+            "    passdb backend = tdbsam:{}\n",
+            self.passdb_path().display()
+        ));
         // --- Auth model -----------------------------------------------------
         // User-level security; reject any fallthrough to guest access so a
         // share is *only* reachable with its owning VM's credential.
