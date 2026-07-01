@@ -32,9 +32,14 @@ fmt-check:
 fmt:
 	cargo fmt
 
-# Lint, format check, and tests
+# Typecheck the web UI (`vite build` strips types without checking them)
 [group('check')]
-check: lint fmt-check test
+web-ui-check:
+	cd web-ui && npm run typecheck
+
+# Lint, format check, tests, and the web UI typecheck
+[group('check')]
+check: lint fmt-check test web-ui-check
 
 # Build the official runtime container image: `vmlab` CLI + `vmlab-web` (PRD §14)
 [group('build')]

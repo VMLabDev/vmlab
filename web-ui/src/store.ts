@@ -310,7 +310,7 @@ function handlePullEvent(ev: DaemonEvent) {
       break;
     case "template.pull.error":
       setState("pulls", key, (p) =>
-        p ? { ...p, status: "error", error: String(ev.data.error ?? "pull failed") } : p,
+        p ? { ...p, status: "error" as const, error: String(ev.data.error ?? "pull failed") } : p,
       );
       // Leave the error visible briefly, then drop it.
       setTimeout(() => clearPull(key), 6000);
