@@ -32,7 +32,7 @@ actix-ws = { version = "0.3", optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 argon2 = { version = "0.5", optional = true, features = ["std"] }
-wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "ed84924565334008ae0656be78e29338328c8419" }
+wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "cc63fcca0412082399e4e80a78caf6d6b18bb44e" }
 wscript = { git = "https://github.com/Configweave/wscript.git", rev = "fcd51236239225ea3e89a82fec44d30f7b871426" }
 
 anyhow = "1"
