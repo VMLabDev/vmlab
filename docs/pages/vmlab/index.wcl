@@ -1,7 +1,179 @@
-// vmlab landing page. `start = true` makes it the page served at `/`. The whole
-// page is rendered by the custom `:vmlab_home` template (see home-template.wcl),
-// which emits a self-contained marketing landing from one raw-HTML block — so
-// this page carries no wdoc body blocks; `content` is unused by that template.
+// vmlab landing page. `start = true` makes it the page served at `/`.
+// Rendered through the stdlib `website` template: the alpha banner and the
+// footer are named `region`s (slotted by the template), everything else is
+// ordinary page content built from the landing components in
+// landing-parts.wcl. The same content degrades to the Markdown / PDF
+// backends — no parallel fallback copy needed.
+
+// Single injection point for the version badge (shown in the banner). CI can
+// patch just this line to stamp the release version.
+let vmlab_version = "0.1.0"
+
+// The wskill registry, discovered from the `include`s in main.wcl: every
+// member's book, plus the optional deck / training views (their entry
+// files exist only when a member ships that view).
+let wskill_books   = included_sites({ folder: "wskills", entry: "wdoc/book/main.wcl" })
+let wskill_decks   = included_sites({ folder: "wskills", entry: "wdoc/presentation/main.wcl", prefix: "decks" })
+let wskill_courses = included_sites({ folder: "wskills", entry: "wdoc/training/main.wcl", prefix: "training" })
+
+// Extra ` · [deck](…) · [course](…)` links appended to a member's card
+// when it ships those views.
+let wskill_view_links = fn(n: utf8) -> utf8 {
+  let d = join(map(filter(wskill_decks,   fn(x: IncludeEntry) -> bool { x.name == n }), fn(x: IncludeEntry) -> utf8 { $" · [deck](./${x.href})" }), "");
+  let c = join(map(filter(wskill_courses, fn(x: IncludeEntry) -> bool { x.name == n }), fn(x: IncludeEntry) -> utf8 { $" · [course](./${x.href})" }), "");
+  $"${d}${c}"
+}
+
+// Card icon per wskill; new members fall back to a generic book.
+let wskill_icon = fn(n: utf8) -> utf8
+  if n == "vmlab" { "lucide.square-terminal" }
+  else { "lucide.book" }
+
+// One reference card per wskill book (data for `lp_cards`).
+let ref_cards = map(wskill_books, fn(s: IncludeEntry) -> LpRefCard {
+  {
+    name: s.name,
+    summary: s.summary ?? "",
+    href: $"./${s.href}",
+    icon: wskill_icon(s.name),
+    links: wskill_view_links(s.name),
+  }
+})
+
+// Every published view as a footer link (books, then decks, then courses).
+let ref_links = flatten([
+  map(wskill_books,   fn(s: IncludeEntry) -> LpFootlink { { label: s.name, href: $"./${s.href}" } }),
+  map(wskill_decks,   fn(s: IncludeEntry) -> LpFootlink { { label: $"${s.name} deck", href: $"./${s.href}" } }),
+  map(wskill_courses, fn(s: IncludeEntry) -> LpFootlink { { label: $"${s.name} course", href: $"./${s.href}" } }),
+])
+
 page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
-  template = :vmlab_home
+  region "banner" {
+    callout $"Alpha software (v${vmlab_version}) — vmlab is under active development." {
+      class = ["warning"]
+      body  = "Expect frequent breaking changes to labs, templates, and the CLI."
+    }
+  }
+
+  lp_hero "Orchestrate virtual machine labs from your terminal." {
+    badge    = "Declarative VM labs · QEMU/KVM"
+    lede     = "vmlab turns a single `vmlab.wcl` into a running fleet of VMs — machines, networks, and provisioning, wired automatically. Boot, snapshot, and tear down complex topologies with one command."
+    footnote = "Open source · MIT · Linux, or Windows 11 via WSL 2 or Docker"
+    lp_cta "Get started"         { href = "#start"  primary = true }
+    lp_cta "Read the reference"  { href = "./wskills/vmlab/" }
+  }
+
+  lp_showcase {
+    id      = taste
+    eyebrow = "A taste"
+    heading = "From a single file to a running lab in one command."
+    body    = "The lab is the file: segments with built-in DHCP, DNS and NAT, VMs booting linked clones of a template — pulled from an OCI registry on first `up` if it isn't local. `vmlab validate` type-checks the whole lab (wscript included) before anything boots."
+    code wcl {
+      filename = "vmlab.wcl"
+      source = <<'WCL'
+        import <vmlab.wcl>
+
+        lab "demo" {
+
+          segment "lan" {
+            subnet = "10.81.0.0/24"
+            nat    = true                                  // guest egress
+            forward { host_port = 12222 to = "alp:22" }    // host SSH → guest
+          }
+
+          vm "alp" {
+            template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+            memory   = 1GiB
+            nic { segment = "lan" }
+          }
+
+          provision "scripts/setup.ws" { }   // wscript, typed & checked
+        }
+        WCL
+    }
+  }
+
+  lp_features {
+    id      = features
+    eyebrow = "Capabilities"
+    title   = "Everything a lab needs, in one binary."
+    lede    = "No bridges, no root, no setup step — a per-user daemon pair starts on demand and the whole network fabric runs in userspace."
+
+    lp_feature "Declarative labs" {
+      icon = "lucide.file-code"
+      body = "A `lab {}` block declares VMs and the networks between them. Hardware comes from guest OS profiles with clear precedence, so most VMs are a couple of lines — `vmlab validate` checks it all before boot."
+    }
+    lp_feature "Powered by QEMU/KVM" {
+      icon = "lucide.cpu"
+      body = "Runs x86_64, aarch64, and riscv64 guests from the same tool — KVM-accelerated natively, emulated across arches. No KVM? It falls back to TCG with a loud warning."
+    }
+    lp_feature "Userspace networking" {
+      icon = "lucide.network"
+      body = "Per-lab virtual switches with DHCP, DNS, NAT, routes, port forwards and L3 filtering — all declared in the lab, no taps, no `CAP_NET_ADMIN`, no manual wiring."
+    }
+    lp_feature "Snapshots" {
+      icon = "lucide.camera"
+      body = "Capture a single VM or the whole lab, then roll back to any snapshot in seconds."
+    }
+    lp_feature "Guests without networking" {
+      icon = "lucide.refresh-cw"
+      body = "Run commands and copy files over the QEMU guest agent — no network path to the VM required, so automation works before the guest is even configured."
+    }
+    lp_feature "OCI distribution" {
+      icon = "lucide.package"
+      body = "Push templates to any OCI registry as chunked, multi-arch artifacts; reference a registry ref straight from a lab and `vmlab up` pulls it on demand."
+    }
+    lp_feature "GUI automation & vision" {
+      icon = "lucide.mouse-pointer"
+      body = "Keystrokes, mouse, screenshots, image matching and OCR — script installers and GUI flows headlessly, even where no agent can run."
+    }
+    lp_feature "wscript provisioning" {
+      icon = "lucide.workflow"
+      body = "Provision scripts and event handlers drive guests through a typed API, compiled and type-checked at validate time — handle sysprep, wait for ready, gate the next step on it."
+    }
+    lp_feature "Linked-clone templates" {
+      icon = "lucide.boxes"
+      body = "Build a sealed qcow2 template once from installer media; labs boot copy-on-write clones, so templates stay immutable and labs stay small on disk."
+    }
+  }
+
+  lp_cards {
+    id      = reference
+    eyebrow = "Reference"
+    title   = "The manual"
+    lede    = "The reference is published as a **wskill** — a self-contained WCL model projected into a readable book, a Claude Code skill, an overview deck, and a hands-on training course."
+    cards   = ref_cards
+  }
+
+  lp_steps {
+    id      = start
+    eyebrow = "Getting started"
+    title   = "Install it and boot your first lab."
+    lede    = "Needs `/dev/kvm` (on WSL 2 enable nested virtualisation). Or skip the install and run the container image with only `--device /dev/kvm`: `docker run --rm -it --device /dev/kvm ghcr.io/vmlabdev/vmlab`."
+
+    lp_step "Install the CLI"                { command = "curl -fsSL https://vmlab.io/install.sh | sh" }
+    lp_step "Write a lab, then validate it"  { command = "vmlab validate" }
+    lp_step "Boot it"                        { command = "vmlab up" }
+  }
+
+  region "footer" {
+    lp_footer {
+      brand     = "vmlab"
+      tagline   = "Orchestrate virtual machine labs from your terminal. Open source under the MIT license."
+      copyright = "© 2026 vmlab · MIT License"
+      note      = "curl -fsSL https://vmlab.io/install.sh | sh"
+
+      lp_footcol "vmlab" {
+        lp_footlink "Home"            { href = "index" }
+        lp_footlink "Features"        { href = "#features" }
+        lp_footlink "Getting started" { href = "#start" }
+      }
+      lp_footcol "Reference" { links = ref_links }
+      lp_footcol "Project" {
+        lp_footlink "GitHub"    { href = "https://github.com/VMLabDev/vmlab" }
+        lp_footlink "Templates" { href = "https://github.com/VMLabDev/vmlab-templates" }
+        lp_footlink "Issues"    { href = "https://github.com/VMLabDev/vmlab/issues" }
+      }
+    }
+  }
 }

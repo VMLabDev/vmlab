@@ -220,7 +220,7 @@ jobs:
   # ── Container image ───────────────────────────────────────────────────────
   # Build the version-stamped image (CLI + web UI) and push it to GHCR as
   # ghcr.io/<owner>/vmlab:<version> (+ :latest), per release — matching the docs
-  # (docs/pages/vmlab/getting-started.wcl). The Containerfile builds from source,
+  # (docs/pages/vmlab/index.wcl). The Containerfile builds from source,
   # so this recompiles independently of the `build` job; GHA layer cache speeds
   # up repeat runs. linux/amd64 only (vmlab drives QEMU/KVM → Linux x86_64).
   image:
