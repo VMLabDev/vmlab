@@ -87,10 +87,10 @@ wskill-check:
 docs-build: wskill-check
 	wcl wdoc build docs/main.wcl --out docs/_site
 
-# Serve the website locally with live reload; pass `true` to enable comment review mode (`just docs-serve true`)
+# Serve the website locally with live reload; pass `true` to enable comment review mode, and a port to pin one (`just docs-serve true 9090`). Default `auto` picks the first free port near 8080 and prints the URL
 [group('docs')]
-docs-serve comment="false":
-	wcl wdoc serve docs/main.wcl {{ if comment == "true" { "--comment" } else { "" } }}
+docs-serve comment="false" port="auto":
+	wcl wdoc serve docs/main.wcl --addr {{ if port == "auto" { "auto" } else { "127.0.0.1:" + port } }} {{ if comment == "true" { "--comment" } else { "" } }}
 
 # Regenerate the Claude Code skill at .claude/skills/vmlab from the wskill (single source)
 [group('docs')]
