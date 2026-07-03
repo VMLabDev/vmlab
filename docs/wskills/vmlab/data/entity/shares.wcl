@@ -1,6 +1,6 @@
 entity shares {
   name     = "share {} block"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Mounts a host folder into a guest over SMB, served by the lab daemon at the segment gateway."
   related  = [vms, nic_block, daemon_model]
   audience = :both

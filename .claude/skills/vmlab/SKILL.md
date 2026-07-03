@@ -1,8 +1,10 @@
 ---
 name: vmlab
 description: "Reference and processes for vmlab. A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript. Use when working with vmlab or answering questions about it."
-wskill_schema_version: 1.1.0
-allowed-tools: []
+wskill_schema_version: 1.0.0
+allowed-tools:
+  - Bash
+  - Read
 disallowed-tools: []
 disable-model-invocation: false
 ---
@@ -171,8 +173,20 @@ How vmlab runs: the two-tier daemon, the optional host config, guest OS profiles
 
 - [The vmlab.wcl schema](references/fact_schema_reference.md)
 
-- [CLI reference](references/cli_ref.md) — every `vmlab` subcommand, its arguments and switches.
+- [CLI reference](references/cli_ref.md) — every `vmlab` subcommand, its arguments and switches
 
-- [Glossary](references/glossary_ref.md) — terms and definitions.
+- [Glossary](references/glossary_ref.md) — terms and definitions
 
-- [Related skills](references/related_ref.md) — cross-references to other wskills.
+- [Related skills](references/related_ref.md) — cross-references to other wskills
+
+## Views
+
+Beyond this skill, the wskill ships these views — build them with `just render` in the wskill folder:
+
+- **book** (`wdoc/book/main.wcl`)
+
+- **ai skill** (`wdoc/skill/main.wcl`)
+
+- **presentation** — vmlab in a nutshell — an overview deck. (`wdoc/presentation/main.wcl`)
+
+- **training** — Learn vmlab — a hands-on lesson series. (`wdoc/training/main.wcl`)

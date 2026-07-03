@@ -1,6 +1,6 @@
 # ExecResult
 
-_wscript data type_
+_data type_
 
 The result of a guest command run via vm.exec: exit_code, stdout, stderr.
 

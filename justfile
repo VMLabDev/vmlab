@@ -73,14 +73,16 @@ winsrv-desktop: (lab-up 'examples/winsrv-desktop')
 # The website + vmlab wskill are authored in wdoc and rendered by the `wcl` CLI.
 # Install it from https://wcl.dev (or `cargo install --git …/wcl wcl`).
 
-# Validate the vmlab wskill model and both projection templates
+# Validate the vmlab wskill model and every projection template
 [group('docs')]
 wskill-check:
 	wcl check docs/wskills/vmlab/wskill.wcl
 	wcl check docs/wskills/vmlab/wdoc/book/main.wcl
 	wcl check docs/wskills/vmlab/wdoc/skill/main.wcl
+	wcl check docs/wskills/vmlab/wdoc/presentation/main.wcl
+	wcl check docs/wskills/vmlab/wdoc/training/main.wcl
 
-# Build the documentation website to docs/_site (landing pages + embedded reference book)
+# Build the documentation website to docs/_site (landing + embedded reference book, deck, and course)
 [group('docs')]
 docs-build: wskill-check
 	wcl wdoc build docs/main.wcl --out docs/_site

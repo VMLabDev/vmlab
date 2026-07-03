@@ -1,6 +1,6 @@
 entity lab_api {
   name     = "Lab"
-  kind     = "wscript API object"
+  kind     = :api_object
   summary  = "The lab handle passed to fn main(lab: Lab) / fn handle(event, lab) — find VMs and segments, log."
   related  = [vm_api, seg_api, wscript_matching, provisions]
   audience = :both

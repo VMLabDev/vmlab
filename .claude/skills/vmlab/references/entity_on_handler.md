@@ -1,6 +1,6 @@
 # on "event" {} handler
 
-_WCL block_
+_wcl block_
 
 Binds a wscript file to a lifecycle event; handler failures are logged, never fatal.
 

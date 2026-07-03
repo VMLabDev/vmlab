@@ -1,6 +1,6 @@
 entity labs {
   name     = "lab {} block"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Declares a lab: a set of VMs plus the virtual networks connecting them, in vmlab.wcl."
   related  = [vms, segment_block, networking, provisions, daemon_model, vmlab_wcl, dot_vmlab, schema_reference]
   audience = :both

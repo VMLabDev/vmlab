@@ -1,6 +1,6 @@
 # Segment
 
-_wscript API object_
+_api object_
 
 Runtime network-rule mutation: DNS, blocking, redirects and forwards on a live segment.
 

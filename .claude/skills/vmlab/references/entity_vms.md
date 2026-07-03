@@ -1,6 +1,6 @@
 # vm {} block
 
-_WCL block_
+_wcl block_
 
 Declares one guest: its template, hardware, NICs, disks, shares and media.
 

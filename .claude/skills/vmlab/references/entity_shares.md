@@ -1,6 +1,6 @@
 # share {} block
 
-_WCL block_
+_wcl block_
 
 Mounts a host folder into a guest over SMB, served by the lab daemon at the segment gateway.
 

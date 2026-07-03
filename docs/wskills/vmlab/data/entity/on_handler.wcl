@@ -1,6 +1,6 @@
 entity on_handler {
   name     = "on \"event\" {} handler"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Binds a wscript file to a lifecycle event; handler failures are logged, never fatal."
   related  = [provisions, provision_block, events, event_type]
   audience = :both

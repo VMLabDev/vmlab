@@ -9,13 +9,17 @@ import <wdoc.wcl>
 import "./schema/base.wcl"
 import "./schema/extensions.wcl"
 import "./schema/cli.wcl"               // opt-in: map the vmlab CLI as data
+import "./schema/presentation.wcl"      // opt-in: the overview deck view
+import "./schema/training.wcl"          // opt-in: the tutorial-series view
 
 // Data — split into per-type folders (concept/ entity/ fact/ process/), one atomic
 // note per file, plus the grouped reference units (glossary, examples, CLI) and the
 // curated indexes. data/main.wcl aggregates them all.
 import "./data/main.wcl"
+import "./data/presentation/main.wcl"
+import "./data/training/main.wcl"
 
-schema_version = "1.1.0"
+schema_version = "1.0.0"
 
 topic vmlab {
   name    = "vmlab"
@@ -40,6 +44,7 @@ END
 // Skill-projection config (→ SKILL.md frontmatter). No bundled artifacts. The skill
 // block kind is `wcl.wskill::skill` (the base schema's namespace), not the topic's.
 wcl.wskill::skill {
+  allowed_tools = ["Bash", "Read"]
   summary {
     overview = [
       "vmlab orchestrates single-host VM labs: labs (VMs + virtual networks) are declared in WCL (`vmlab.wcl`), disk templates are built and stored locally or distributed via OCI registries, and automation is written in wscript scripts that drive guests (power, exec, keystrokes, screen matching, OCR).",
@@ -65,6 +70,13 @@ wcl.wskill::skill {
     ]
   }
 }
+
+// The views this wskill ships — first-class data the overview and any registry
+// landing can enumerate. Declaring one documents it; `just render` builds it.
+artifact book     { kind = :book      entry = "wdoc/book/main.wcl"   output = "out/book" }
+artifact ai_skill { kind = :ai_skill  entry = "wdoc/skill/main.wcl"  output = "out/skill" }
+artifact slides   { kind = :presentation  entry = "wdoc/presentation/main.wcl"  output = "out/presentation"  summary = "vmlab in a nutshell — an overview deck." }
+artifact training { kind = :training      entry = "wdoc/training/main.wcl"      output = "out/training"      summary = "Learn vmlab — a hands-on lesson series." }
 
 // ---- Sources (update-workflow metadata only) ----
 

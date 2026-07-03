@@ -46,10 +46,27 @@ let skill_unit_ids = map(skill_all_units, fn(u: UnitRef) -> identifier { u.id })
 // The skill block, for the SKILL.md preview's parameters / boundaries / summary.
 let skill = head(skills)
 
+// Bundled-artifact link — mirror wdoc/skill/main.wcl's `bundle_refs` so the
+// SKILL.md preview matches the real file byte-for-byte.
+let skill_bundle_refs = match len(skill.skill_scripts) + len(skill.skill_assets) {
+  0 => [],
+  _ => [{ label: "Bundled files", href: "assets_ref", summary: "The scripts and data files shipped with this skill, and how to run them." }],
+}
+
+// Same extra reference links the real SKILL.md carries (CLI / glossary /
+// related / bundled) — KEEP IN SYNC with `extra_refs` in wdoc/skill/main.wcl.
+let skill_extra_refs = flatten([
+  match len(filter(clis,  fn(x: Cli)  -> bool { in_skill(x.audience) })) { 0 => [], _ => [{ label: "CLI reference",  href: "cli_ref",      summary: "every `vmlab` subcommand, its arguments and switches" }] },
+  match len(filter(terms, fn(t: Term) -> bool { in_skill(t.audience) })) { 0 => [], _ => [{ label: "Glossary",       href: "glossary_ref", summary: "terms and definitions" }] },
+  match len(refs)                                                        { 0 => [], _ => [{ label: "Related skills", href: "related_ref",  summary: "cross-references to other wskills" }] },
+  skill_bundle_refs,
+])
+
 // Every page name the skill projects — `markdown_source.pages`, so the
 // previewed Markdown's internal links (`[…](references/…)`) resolve faithfully.
 let skill_pages = flatten([
-  ["index"],
+  ["index", "cli_ref", "glossary_ref", "related_ref"],
+  match len(skill_bundle_refs) { 0 => [], _ => ["assets_ref"] },
   map(skill_concepts,    fn(c: Concept)   -> utf8 { $"concept_${c.id}" }),
   map(skill_entities,    fn(e: Entity)    -> utf8 { $"entity_${e.id}" }),
   map(skill_facts,       fn(f: Fact)      -> utf8 { $"fact_${f.id}" }),
@@ -261,7 +278,6 @@ page skillpage_index { title = "SKILL.md"
   p  "The skill's entry point. The build also prepends YAML front matter (`name`, `description`, `wskill_schema_version`, tool permissions), shown by `wcl wdoc skill` but not reproduced here."
   p  $"[:lucide.arrow-left: Back to the skill graph](skill_links_page)" { class = ["skill-nav"] }
   markdown_source { id = "index"  start_page = "index"  reference = false  pages = skill_pages
-    skill_md_body { topic = topic  skill = skill  indexes = skill_indexes  concepts = skill_concepts  entities = skill_entities  facts = skill_facts  procedures = skill_procedures  extra_refs = [] }
+    skill_md_body { topic = topic  skill = skill  indexes = skill_indexes  concepts = skill_concepts  entities = skill_entities  facts = skill_facts  procedures = skill_procedures  extra_refs = skill_extra_refs  artifacts = artifacts }
   }
 }
-

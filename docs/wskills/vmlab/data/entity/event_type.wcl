@@ -1,6 +1,6 @@
 entity event_type {
   name     = "Event"
-  kind     = "wscript data type"
+  kind     = :data_type
   summary  = "The payload passed to an event handler's fn handle(event, lab): name, vm, data (JSON as text)."
   related  = [on_handler, events, vm_api]
   audience = :both

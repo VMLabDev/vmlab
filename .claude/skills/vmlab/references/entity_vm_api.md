@@ -1,6 +1,6 @@
 # Vm
 
-_wscript API object_
+_api object_
 
 A VM handle obtained from lab.vm(name): the entry point to lifecycle, snapshots, input, screen matching and the guest agent.
 

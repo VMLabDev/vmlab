@@ -1,6 +1,6 @@
 # provision {} block
 
-_WCL block_
+_wcl block_
 
 Names a wscript file that runs on `vmlab up`; scoping it to VMs gates their depends_on.
 

@@ -1,6 +1,6 @@
 entity segment_block {
   name     = "segment {} block"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Declares a virtual L2 switch and its subnet, DHCP, NAT, routing and peering options."
   related  = [networking, segment_subblocks, nic_block, seg_api, schema_reference]
   audience = :both

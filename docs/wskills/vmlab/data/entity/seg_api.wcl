@@ -1,6 +1,6 @@
 entity seg_api {
   name     = "Segment"
-  kind     = "wscript API object"
+  kind     = :api_object
   summary  = "Runtime network-rule mutation: DNS, blocking, redirects and forwards on a live segment."
   related  = [networking, segment_block, lab_api]
   audience = :both

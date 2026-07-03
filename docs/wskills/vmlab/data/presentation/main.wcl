@@ -1,0 +1,131 @@
+// The presentation view's deck — "vmlab in a nutshell", the topic's
+// introduction as slides (schema/presentation.wcl). Slides feature existing
+// units where possible (`unit = <id>` pulls the headline + summary); the
+// detail stays in the book.
+presentation nutshell {
+  title   = "vmlab in a nutshell"
+  summary = "Declarative QEMU/KVM VM labs: machines and networks in one WCL file, reusable disk templates over OCI, and guest automation in wscript — unprivileged, from your terminal."
+
+  pres_section labs_as_code {
+    title = "Labs as code"
+    pres_slide declare {
+      title = "One file, one lab"
+      unit  = vmlab_wcl
+      body {
+        p "- A `lab` block declares the VMs and the networks that join them"
+        p "- `vmlab validate` checks it; `vmlab up` boots it"
+        p "- Clones, leases, and provisioning are wired automatically"
+      }
+      speaker_notes = "The pitch in one line: the lab IS the file. Everything else in the deck is what that file can say and what happens when it runs."
+    }
+    pres_slide machines {
+      title = "Declaring machines"
+      unit  = vms
+      body {
+        p "- `template = \"x86_64/windows-server-2025\"` — boot from a stored disk"
+        p "- `cpus` / `memory` (byte sizes: `8GiB`), `nic { segment = \"corp\" }`"
+        p "- `depends_on` orders boot; per-VM `media` folders become ISO/floppy"
+      }
+    }
+    pres_slide lifecycle {
+      unit = vm_lifecycle
+      body {
+        p "- `vmlab up` → linked clones boot, provisions run in order"
+        p "- `vmlab status` / `console` / `exec` / `logs` while it runs"
+        p "- `vmlab down` stops; `vmlab destroy` deletes the clones"
+      }
+      speaker_notes = "down vs destroy is the one distinction worth calling out: down keeps state, destroy deletes the clone disks."
+    }
+    pres_slide daemons {
+      unit = daemon_model
+      speaker_notes = "Nobody manages the daemons by hand — the CLI starts the supervisor and the per-lab daemon on demand. Mention it only so logs and `vmlab daemon status` make sense."
+    }
+  }
+
+  pres_section networks {
+    title = "Isolated networks"
+    pres_slide segments {
+      unit = networking
+      body {
+        p "- `segment` blocks: a subnet with built-in DHCP and DNS"
+        p "- Static IPs are reservations: `nic { ip = \"10.50.0.10\" }`"
+        p "- `nat = true`, `forward { host_port = … }`, `route`, `dns` per segment"
+      }
+    }
+    pres_slide anywhere {
+      title = "Unprivileged by design"
+      unit  = containers
+      body {
+        p "- The whole fabric is userspace — no bridges, no root, no capabilities"
+        p "- Runs in containers and on WSL2 with only `/dev/kvm`"
+      }
+      speaker_notes = "This is the differentiator against libvirt-style setups: nothing to configure on the host, nothing privileged."
+    }
+  }
+
+  pres_section templates_and_distribution {
+    title = "Templates & distribution"
+    pres_slide reusable_disks {
+      unit = templates
+      body {
+        p "- A template is a reusable, versioned guest disk in the local store"
+        p "- VMs boot **linked clones** — instant, and the template stays pristine"
+        p "- Store refs: `<arch>/<name>@<version>` (`x86_64/linux-modern@1.0`)"
+      }
+    }
+    pres_slide building {
+      unit = template_builds
+      body {
+        p "- `template` blocks describe installer media + an install script"
+        p "- `vmlab template build` runs the unattended install and stores the disk"
+        p "- Builds are wscript-driven — keystrokes, screen matching, OCR included"
+      }
+    }
+    pres_slide registries {
+      title = "Any OCI registry"
+      unit  = oci
+      body {
+        p "- `vmlab template push` / `pull` — chunked, multi-arch OCI artifacts"
+        p "- Or reference the registry directly: `template = \"ghcr.io/…/alpine-3.23\"`"
+        p "- Missing templates are pulled automatically on `vmlab up`"
+      }
+      speaker_notes = "Registry refs in vmlab.wcl are the golden path for sharing: consumers never run a build."
+    }
+  }
+
+  pres_section automation {
+    title = "Automation with wscript"
+    pres_slide provisions_and_events {
+      unit = wscript_overview
+      body {
+        p "- `provision \"scripts/setup.ws\"` runs after boot, in declaration order"
+        p "- `on \"vm.crashed\" { run = … }` handlers react to lab events"
+        p "- Scripts get the typed `lab` / `vm` / `seg` API objects"
+      }
+    }
+    pres_slide guest_control {
+      title = "Drive guests without networking"
+      unit  = vm_agent
+      body {
+        p "- `vm.exec(…)`, file copy, `wait_ready` — all over the guest agent"
+        p "- Works before the guest has (or without it ever having) a network"
+      }
+    }
+    pres_slide vision {
+      unit = vm_vision
+      body {
+        p "- Screenshot the console, match image templates, OCR the screen"
+        p "- Combine with keystrokes to automate GUIs and installers end-to-end"
+      }
+      speaker_notes = "This is how the Windows and vintage-DOS templates get built — there is no agent during an OS install, only the screen."
+    }
+    pres_slide next {
+      title = "Where to go next"
+      body {
+        p "- The **golden path** procedure in the book: template → lab → automation"
+        p "- The **reference book** — every block, verb, and API call"
+        p "- The **Learn vmlab** training course — hands-on lessons"
+      }
+    }
+  }
+}

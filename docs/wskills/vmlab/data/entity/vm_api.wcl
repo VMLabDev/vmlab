@@ -1,6 +1,6 @@
 entity vm_api {
   name     = "Vm"
-  kind     = "wscript API object"
+  kind     = :api_object
   summary  = "A VM handle obtained from lab.vm(name): the entry point to lifecycle, snapshots, input, screen matching and the guest agent."
   related  = [lab_api, vm_lifecycle, vm_snapshots, vm_input, vm_vision, vm_agent]
   audience = :both

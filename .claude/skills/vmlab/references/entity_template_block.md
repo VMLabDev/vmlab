@@ -1,6 +1,6 @@
 # template {} block
 
-_WCL block_
+_wcl block_
 
 Declares a disk template to build: arch, version, profile, working disk, exactly one source, build media/NICs and provisions.
 

@@ -49,7 +49,7 @@ CSS
 }
 
 page reference_page {
-  h1 "WSkill Graph"
+  h1 $"${topic.name} graph"
   p  "Everything about this topic, mapped below as a force-directed graph and listed beneath it."
   p  "Each circle is a note (click it to open its page) and each line is a `related` link — colour-coded by type (**concepts** blue, **entities** amber, **facts** green, **processes** purple). Scroll to zoom and drag to pan."
   p  "Curious how the *skill* projection is wired? The **Skill preview** sidebar button opens a graph of the skill's pages (`SKILL.md` + `references/*`) and each page's generated Markdown."

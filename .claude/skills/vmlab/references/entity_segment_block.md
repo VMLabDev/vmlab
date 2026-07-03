@@ -1,6 +1,6 @@
 # segment {} block
 
-_WCL block_
+_wcl block_
 
 Declares a virtual L2 switch and its subnet, DHCP, NAT, routing and peering options.
 

@@ -1,6 +1,6 @@
 entity nic_block {
   name     = "nic {} block"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Attaches a VM to a segment, with optional static IP/MAC, NAT shorthand or port isolation."
   related  = [vms, segment_block, networking]
   audience = :both

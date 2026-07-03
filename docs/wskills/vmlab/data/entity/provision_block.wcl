@@ -1,6 +1,6 @@
 entity provision_block {
   name     = "provision {} block"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Names a wscript file that runs on `vmlab up`; scoping it to VMs gates their depends_on."
   related  = [provisions, on_handler, wscript_overview, labs]
   audience = :both

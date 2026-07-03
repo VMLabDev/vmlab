@@ -1,6 +1,6 @@
 # nic {} block
 
-_WCL block_
+_wcl block_
 
 Attaches a VM to a segment, with optional static IP/MAC, NAT shorthand or port isolation.
 

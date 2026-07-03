@@ -1,6 +1,6 @@
 entity vms {
   name     = "vm {} block"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Declares one guest: its template, hardware, NICs, disks, shares and media."
   related  = [labs, nic_block, shares, segment_block, profiles, templates, scratch_vms, schema_reference]
   audience = :both

@@ -1,6 +1,6 @@
 entity template_block {
   name     = "template {} block"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Declares a disk template to build: arch, version, profile, working disk, exactly one source, build media/NICs and provisions."
   related  = [templates, template_builds, template_sources, media, profiles, schema_reference]
   audience = :both

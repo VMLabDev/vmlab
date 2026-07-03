@@ -2,14 +2,15 @@
 
 _vmlab runs unprivileged in Docker/Podman with only --device /dev/kvm; the network fabric is entirely userspace._
 
-vmlab runs unprivileged. The container image is defined by `Containerfile`; because
-vmlab builds against sibling `WCL/` and `wscript/` workspaces, the \*\*build context
-is the parent directory\*\* containing all three. The image is published per release
-as `ghcr.io/<owner>/vmlab:<version>`.
+vmlab runs unprivileged. The container image is defined by `Containerfile`; WCL and
+wscript are git dependencies (fetched during the build), so the \*\*build context is
+just the vmlab repo\*\*. The image bundles the `vmlab` CLI and the `vmlab-web` UI
+server, and is published per release as `ghcr.io/<owner>/vmlab:<version>` (and
+`:latest`).
 
 
 ```console
-docker build -t vmlab -f vmlab/Containerfile .   # run from the parent dir (or: just image)
+docker build -t vmlab -f Containerfile .   # from the repo (or: just image)
 
 docker run --rm -it --device /dev/kvm \
   -v ~/.local/share/vmlab/templates:/root/.local/share/vmlab/templates \
@@ -18,9 +19,10 @@ docker run --rm -it --device /dev/kvm \
 
 `--device /dev/kvm` is the **only host grant needed** — no `--privileged`, no extra
 capabilities, no host network mode (the fabric is entirely userspace). Without KVM,
-vmlab falls back to slow TCG emulation with a loud warning. The entrypoint is
-`vmlab` with default command `daemon start`: run long-running and drive via
-`docker exec <ctr> vmlab ...`, or override the command for one-shot/CI use.
+vmlab falls back to slow TCG emulation with a loud warning. By default the container
+serves the web UI (`vmlab-web` on :7878 — see the `docker compose` stack); override
+the command for one-shot/CI CLI use, or drive a running container via
+`docker exec <ctr> vmlab ...`.
 
 
 ## Related

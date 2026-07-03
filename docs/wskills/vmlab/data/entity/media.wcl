@@ -1,6 +1,6 @@
 entity media {
   name     = "media {} block"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Turns a host folder into an ISO or floppy image with a content-addressed cache; declarative, no CLI."
   related  = [vms, templates, template_block, scratch_vms]
   audience = :both

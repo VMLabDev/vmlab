@@ -1,6 +1,6 @@
 # lab {} block
 
-_WCL block_
+_wcl block_
 
 Declares a lab: a set of VMs plus the virtual networks connecting them, in vmlab.wcl.
 

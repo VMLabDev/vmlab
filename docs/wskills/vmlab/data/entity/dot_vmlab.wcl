@@ -1,6 +1,6 @@
 entity dot_vmlab {
   name     = ".vmlab/"
-  kind     = "directory"
+  kind     = :directory
   summary  = "Lab-local working data beside vmlab.wcl: linked clones, snapshots, built media, screenshots, SMB creds. Gitignore it."
   related  = [vmlab_wcl, template_store, linked_clones]
   audience = :both

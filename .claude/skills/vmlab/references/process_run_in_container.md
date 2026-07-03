@@ -15,17 +15,18 @@ Run a lab unprivileged inside Docker/Podman with only /dev/kvm.
 
 ## Steps
 
-### Step 1: Build the image
+### Step 1: Build (or pull) the image
 
 ```console
-$ docker build -t vmlab -f vmlab/Containerfile .   # from the PARENT dir (or: just image)
+$ docker build -t vmlab -f Containerfile .   # from the repo (or: just image)
+$ docker pull ghcr.io/<owner>/vmlab:latest   # or a published release
 ```
 
 > [!NOTE]
 > **Build context**
-> vmlab builds against sibling WCL/ and wscript/ workspaces, so the build context is the parent directory containing all three.
+> WCL and wscript are git dependencies (fetched during the build), so the context is just the vmlab repo. The image bundles the `vmlab` CLI and the `vmlab-web` UI server.
 
-Build from the parent directory (or run `just image` from inside vmlab/). The image is also published per release as `ghcr.io/<owner>/vmlab:<version>`.
+Build with `just image` (or the command above), or skip building — every release is published to GHCR as `ghcr.io/<owner>/vmlab:<version>` (and `:latest`).
 
 ### Step 2: Run a lab
 
@@ -39,7 +40,7 @@ $ docker run --rm -it --device /dev/kvm \
 > **Only /dev/kvm**
 > No --privileged, no extra capabilities, no host network mode — the fabric is entirely userspace.
 
-Mount the template store (persistent) and the lab directory, grant `--device /dev/kvm`, and run a vmlab verb. For long-running use, start with the default `daemon start` CMD and drive via `docker exec <ctr> vmlab ...`.
+Mount the template store (persistent) and the lab directory, grant `--device /dev/kvm`, and run a vmlab verb (the command above overrides the default). By default the container serves the web UI (`vmlab-web` on :7878 — see the `docker compose` stack); for CLI use, override the command or drive a running container via `docker exec <ctr> vmlab ...`.
 
 > [!TIP]
 > **Verification**

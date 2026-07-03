@@ -1,6 +1,6 @@
 entity template_sources {
   name     = "source {} build source"
-  kind     = "WCL block"
+  kind     = :wcl_block
   summary  = "Exactly one source {} block per template selects what the build starts from: iso, qcow2, template, or scratch."
   related  = [template_block, templates, template_builds]
   audience = :both

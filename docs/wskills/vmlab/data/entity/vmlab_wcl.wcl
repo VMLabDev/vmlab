@@ -1,6 +1,6 @@
 entity vmlab_wcl {
   name     = "vmlab.wcl"
-  kind     = "file"
+  kind     = :file
   summary  = "The lab definition, found by walking up from the current directory (like git)."
   related  = [labs, dot_vmlab]
   audience = :both

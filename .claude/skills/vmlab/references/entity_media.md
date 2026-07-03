@@ -1,6 +1,6 @@
 # media {} block
 
-_WCL block_
+_wcl block_
 
 Turns a host folder into an ISO or floppy image with a content-addressed cache; declarative, no CLI.
 

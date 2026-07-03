@@ -1,6 +1,6 @@
 entity exec_result_type {
   name     = "ExecResult"
-  kind     = "wscript data type"
+  kind     = :data_type
   summary  = "The result of a guest command run via vm.exec: exit_code, stdout, stderr."
   related  = [vm_api, vm_agent]
   audience = :both

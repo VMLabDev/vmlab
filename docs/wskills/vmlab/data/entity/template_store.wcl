@@ -1,6 +1,6 @@
 entity template_store {
   name     = "Template store"
-  kind     = "directory"
+  kind     = :directory
   summary  = "~/.local/share/vmlab/templates/<arch>/<name>/<version>/ — sealed disk.qcow2 + template.wcl metadata."
   related  = [templates, oci]
   audience = :both

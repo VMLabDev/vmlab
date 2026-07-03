@@ -17,3 +17,5 @@
 | OCI artifact | How a template is stored in a registry: a non-runnable artifact (frozen media type) whose qcow2 is chunked into zstd layers. |  |
 | wscript | vmlab's statically typed, Rust-flavoured scripting language for guest automation. Compiled and type-checked at `vmlab validate` time. |  |
 | guest agent | The QEMU guest agent running inside a VM. `vm.is_ready()` / `vm.wait_ready()` test it; `vm.exec` / `copy_to` / `copy_from` use it. | QEMU guest agent |
+
+[← Back to SKILL.md](../SKILL.md)

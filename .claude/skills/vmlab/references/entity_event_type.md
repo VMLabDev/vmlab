@@ -1,6 +1,6 @@
 # Event
 
-_wscript data type_
+_data type_
 
 The payload passed to an event handler's fn handle(event, lab): name, vm, data (JSON as text).
 

@@ -1,6 +1,6 @@
 # Lab
 
-_wscript API object_
+_api object_
 
 The lab handle passed to fn main(lab: Lab) / fn handle(event, lab) — find VMs and segments, log.
 

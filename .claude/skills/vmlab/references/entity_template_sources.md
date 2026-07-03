@@ -1,6 +1,6 @@
 # source {} build source
 
-_WCL block_
+_wcl block_
 
 Exactly one source {} block per template selects what the build starts from: iso, qcow2, template, or scratch.
 

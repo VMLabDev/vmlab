@@ -1,6 +1,6 @@
 # Match
 
-_wscript data type_
+_data type_
 
 An image-match or OCR hit: bounding box, score, center point (cx/cy) and OCR text.
 

@@ -1,0 +1,376 @@
+// The training view's course — "Learn vmlab" (schema/training.wcl). Ordered
+// modules of hands-on lessons; `related` links each lesson back to the
+// reference units it teaches. Snippets follow the shipped examples/ labs —
+// every exercise is runnable on a host with /dev/kvm.
+
+module first_lab {
+  n       = 1
+  title   = "Your first lab"
+  summary = "Install vmlab, declare a one-VM lab, boot it, poke at the guest, and tear it down."
+
+  lesson install_and_validate {
+    n       = 1
+    title   = "Install vmlab and validate a lab"
+    summary = "Get the CLI running, write a minimal `vmlab.wcl`, and let `vmlab validate` check it."
+    objectives = [
+      "Install the `vmlab` binary and verify it runs",
+      "Declare a lab: one segment, one VM booting a registry template",
+      "Validate the file before ever booting it",
+    ]
+    related = [vmlab_wcl, labs, validate_checks]
+    body {
+      p "vmlab ships as one binary plus your `vmlab.wcl`. Build it from source (`cargo install --locked --path .` in a clone of the repo) and confirm `vmlab --version` prints a version. The only host requirement is `/dev/kvm` — no bridges, no root."
+      p "A lab file is WCL: `import <vmlab.wcl>` brings in the schema, then a single `lab` block declares segments and VMs. The `template` below is an **OCI registry ref**, so you don't need to build anything first — the disk is pulled on first `up`. `vmlab validate` checks the whole model (schema, refs, subnets, dependency cycles) and is the habit to build: validate after every edit, before every `up`."
+    }
+    exercise minimal_lab {
+      title     = "A first checked lab"
+      task      = "Write a one-VM lab in an empty directory and validate it."
+      code_lang = "wcl"
+      code      = <<'WCL'
+// vmlab.wcl — the whole lab.
+import <vmlab.wcl>
+
+lab "hello" {
+
+  segment "lan" {
+    subnet = "10.81.0.0/24"
+    nat    = true                                  // guest egress for the pull
+    forward { host_port = 12222 to = "alp:22" }    // host SSH → guest 22
+  }
+
+  vm "alp" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+    arch     = "x86_64"
+    memory   = 1GiB
+    nic { segment = "lan" }
+  }
+}
+WCL
+      expected = "`vmlab validate` reports the lab as valid — one segment, one VM, no errors."
+      hint     = "Every `nic` must name a declared `segment` (or set `nat = true` directly). Misspell `lan` in the nic block and validate points at exactly that line."
+    }
+  }
+
+  lesson boot_and_inspect {
+    n       = 2
+    title   = "Boot it and look around"
+    summary = "Bring the lab up, watch the template pull, and inspect it with status, console, and logs."
+    objectives = [
+      "Boot a lab with `vmlab up` (daemons start automatically)",
+      "Read `vmlab status` output: power, agent, leases",
+      "Open a VM's console and follow the lab log",
+    ]
+    prerequisites = [install_and_validate]
+    related = [vm_lifecycle, daemon_model, key_chords]
+    body {
+      p "`vmlab up` creates a linked clone per VM and boots them. On the first run the Alpine template is pulled from the registry into the local store — after that, ups are instant. You never start a daemon by hand: the CLI launches the supervisor and the per-lab daemon on demand."
+      p "While it runs: `vmlab status` shows each VM's power state, agent state, and DHCP lease; `vmlab console alp` opens a VNC viewer on the guest (add `--tcp` on WSL2 or over SSH); `vmlab logs` follows the lab's event log."
+    }
+    exercise up_and_status {
+      title     = "Up, then prove it's up"
+      task      = "Boot the lesson-1 lab and check the guest reached the running state with a lease."
+      code_lang = "console"
+      code      = <<'SH'
+vmlab up
+vmlab status
+SH
+      expected = "`vmlab status` lists `alp` as running with an agent and a `10.81.0.x` lease."
+      hint     = "First boot includes the registry pull — give it a minute. If `up` fails immediately, check `/dev/kvm` exists and is writable (`ls -l /dev/kvm`)."
+    }
+  }
+
+  lesson exec_and_teardown {
+    n       = 3
+    title   = "Run commands in the guest, then tear down"
+    summary = "Use the guest agent from the CLI, then learn the difference between down and destroy."
+    objectives = [
+      "Run a guest command with `vmlab exec … -- …`",
+      "Stop a lab with `vmlab down` (state kept)",
+      "Delete the clones with `vmlab destroy` (state gone)",
+    ]
+    prerequisites = [boot_and_inspect]
+    related = [vm_agent, vm_lifecycle]
+    body {
+      p "`vmlab exec <vm> -- <cmd>` runs a command inside the guest over the **guest agent** — no SSH, no network path required — and prints its stdout/stderr. It's the quickest smoke test that a guest is truly alive."
+      p "Teardown has two levels: `vmlab down` powers the VMs off but keeps their clone disks, so the next `up` resumes where you left off; `vmlab destroy` deletes the clones entirely — the next `up` is a fresh lab. The template in the store is never touched by either."
+    }
+    exercise exec_release {
+      title     = "Ask the guest who it is"
+      task      = "Print the guest's Alpine release via the agent, then bring the lab down."
+      code_lang = "console"
+      code      = <<'SH'
+vmlab exec alp -- cat /etc/alpine-release
+vmlab down
+SH
+      expected = "The Alpine version string (e.g. `3.23.0`) prints on your terminal, then `down` stops the VM."
+      hint     = "Everything after `--` is the guest command line, verbatim. Without `--` the CLI would try to parse the guest flags as its own."
+    }
+  }
+}
+
+module templates_course {
+  n       = 2
+  title   = "Templates"
+  summary = "Where guest disks come from: pull them from a registry, build your own, and move them between hosts."
+
+  lesson registry_refs {
+    n       = 1
+    title   = "Boot straight from a registry"
+    summary = "OCI refs in `template =` and what pull-on-up does."
+    objectives = [
+      "Tell a local store ref (`arch/name@version`) from a registry ref (`host/owner/name:tag`)",
+      "Pin a version with `@`/`:tag` or track `:latest`",
+      "See what landed in the store with `vmlab template list`",
+    ]
+    related = [oci, template_sources, oci_artifact, template_store]
+    body {
+      p "A VM's `template` accepts two shapes. A **store ref** like `x86_64/linux-modern@1.0` names a disk already in the local store. A **registry ref** like `ghcr.io/vmlabdev/vmlab-templates/alpine-3.23` names an OCI artifact; on `vmlab up`, anything missing locally is pulled first. No tag means `:latest`."
+      p "After the module-1 lab, run `vmlab template list` — the pulled Alpine template is now an ordinary store entry, shared by every lab on the host."
+    }
+    exercise list_store {
+      title     = "Inspect the store"
+      task      = "List the local template store and identify the Alpine entry's arch, name, and version."
+      code_lang = "console"
+      code      = <<'SH'
+vmlab template list
+vmlab template list --json
+SH
+      expected = "An `x86_64/alpine-3.23@<version>` row; `--json` adds sizes and the created timestamp."
+      hint     = "Registry pulls land under the artifact's recorded arch/name — the registry path is not stored verbatim."
+    }
+  }
+
+  lesson build_your_own {
+    n       = 2
+    title   = "Build a template from installer media"
+    summary = "The `template` block: sources, an unattended install, and `vmlab template build`."
+    objectives = [
+      "Declare a `template` block with `source` media and build settings",
+      "Run `vmlab template build` and follow the build VM",
+      "Version the result into the store",
+    ]
+    prerequisites = [registry_refs]
+    related = [template_block, template_builds, build_template, media]
+    body {
+      p "A `template` block is a recipe: `source` blocks fetch or reference installer media (ISO URLs are downloaded and cached), a `media` folder can carry unattended-install answer files, and a build script drives the install. `vmlab template build` boots a scratch VM from that recipe, runs the install to completion, and commits the disk into the store as `<arch>/<name>@<version>`."
+      p "Linux cloud images make the easiest first build — no interactive installer, just cloud-init answers in a `media { kind = \"iso\" … }` folder. The `build_template` procedure in the reference walks the full checklist, including the wscript-driven installs used for Windows."
+    }
+    exercise build_one {
+      title     = "Build and list"
+      task      = "Using a template recipe (e.g. one from the vmlab-templates repo), build it and confirm the store entry."
+      code_lang = "console"
+      code      = <<'SH'
+vmlab template build            # builds the template {} blocks in ./vmlab.wcl
+vmlab template list
+SH
+      expected = "The build VM boots, installs unattended, exits, and `list` shows the new `<arch>/<name>@<version>`."
+      hint     = "Name one template (`vmlab template build linux-modern`) to build a single block; `-f templates.wcl` points at a different file."
+    }
+  }
+
+  lesson move_and_share {
+    n       = 3
+    title   = "Share templates: push, pull, export"
+    summary = "Publish a store entry to any OCI registry, or move it as an archive."
+    objectives = [
+      "Log in to a registry and push a store template",
+      "Pull it back on another host",
+      "Use export/import where there is no registry",
+    ]
+    prerequisites = [build_your_own]
+    related = [distribute_oci, template_store]
+    body {
+      p "`vmlab template login ghcr.io -u <user> -p <token>` reuses docker's credential store, then `vmlab template push x86_64/linux-modern@1.0 ghcr.io/you/vmlab-templates/linux-modern` uploads the disk as a chunked OCI artifact — multi-arch indexes assemble automatically when you push the same name from several arches. Consumers either `template pull` it or just reference it in `vmlab.wcl`."
+      p "Air-gapped? `vmlab template export <ref> out.tar.zst` writes a portable archive and `vmlab template import` loads it on the other side."
+    }
+    exercise round_trip {
+      title     = "Export / import round trip"
+      task      = "Export the Alpine template to an archive, remove it from the store, and import it back."
+      code_lang = "console"
+      code      = <<'SH'
+vmlab template export x86_64/alpine-3.23 alpine.tar.zst
+vmlab template rm x86_64/alpine-3.23@<version>
+vmlab template import alpine.tar.zst
+vmlab template list
+SH
+      expected = "After the import, `list` shows the same `x86_64/alpine-3.23@<version>` entry again."
+      hint     = "`template rm` requires the exact `@<version>` — copy it from `vmlab template list`. It refuses while clones back it; `vmlab destroy` the lesson lab first (or pass `--force`)."
+    }
+  }
+}
+
+module networking_course {
+  n       = 3
+  title   = "Networking"
+  summary = "Segments as declared networks: addressing, DHCP, NAT, port forwards, and inter-segment routes."
+
+  lesson segments_and_addresses {
+    n       = 1
+    title   = "Segments, leases, and static IPs"
+    summary = "Declare isolated networks and control who gets which address."
+    objectives = [
+      "Declare segments with `subnet`",
+      "Attach VMs with `nic { segment = … }` for DHCP leases",
+      "Reserve a static address with `nic { ip = … }`",
+    ]
+    related = [segment_block, nic_block, networking]
+    body {
+      p "A `segment` is an isolated L2 network with a built-in DHCP and DNS server, entirely in userspace. VMs join it with `nic { segment = \"corp\" }` and get a lease; add `ip = \"10.50.0.10\"` to the nic and the address becomes a DHCP reservation — the guest still just does DHCP, but always receives that address. Guests on one segment see each other and nothing else."
+      p "VM names resolve over the segment's DNS, so guests reach each other by name (`ping web01`) without caring who leased what."
+    }
+    exercise two_vms {
+      title     = "Two guests, one wire"
+      task      = "Declare two Alpine VMs on one segment — one static, one dynamic — and ping between them."
+      code_lang = "wcl"
+      code      = <<'WCL'
+segment "corp" { subnet = "10.50.0.0/24"  nat = true }
+
+vm "a" {
+  template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+  memory   = 1GiB
+  nic { segment = "corp" ip = "10.50.0.10" }
+}
+vm "b" {
+  template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+  memory   = 1GiB
+  nic { segment = "corp" }
+}
+WCL
+      expected = "`vmlab exec b -- ping -c1 10.50.0.10` (or `ping -c1 a`) succeeds; `vmlab status` shows `a` holding exactly `10.50.0.10`."
+      hint     = "The reserved `ip` must sit inside the segment's `subnet` — `vmlab validate` rejects an out-of-range reservation."
+    }
+  }
+
+  lesson egress_and_forwards {
+    n       = 2
+    title   = "NAT, port forwards, and routes"
+    summary = "Let guests out, let the host in, and join segments together."
+    objectives = [
+      "Give a segment egress with `nat = true`",
+      "Expose a guest port on the host with `forward`",
+      "Add an inter-segment `route` and per-segment `dns`",
+    ]
+    prerequisites = [segments_and_addresses]
+    related = [segment_subblocks, networking]
+    body {
+      p "Segments are isolated until you say otherwise. `nat = true` gives the whole segment outbound internet through the userspace NAT engine. A `forward { host_port = 12222 to = \"alp:22\" }` publishes a guest port on the host loopback — that is how you SSH into a lab. `route { dest = … via = … }` teaches a segment the path to another one, and `dns { server = … }` swaps the built-in resolver for one of your VMs (an AD domain controller, say)."
+    }
+    exercise ssh_in {
+      title     = "SSH through a forward"
+      task      = "Add a `forward` for guest port 22 and SSH in from the host."
+      code_lang = "console"
+      code      = <<'SH'
+# segment "corp" { … forward { host_port = 12222 to = "a:22" } }
+vmlab validate && vmlab up
+ssh vmlab@localhost -p 12222
+SH
+      expected = "An SSH session in the guest (the published Alpine templates use user `vmlab`, password `vmlab`)."
+      hint     = "Forwards bind on the host, so the target guest port needs a listener — Alpine's sshd is up by default; a fresh template of your own may need it provisioned."
+    }
+  }
+}
+
+module automation_course {
+  n       = 4
+  title   = "Automation with wscript"
+  summary = "Provision scripts, event handlers, and driving guests through the agent — and through the screen."
+
+  lesson first_provision {
+    n       = 1
+    title   = "Your first provision script"
+    summary = "A `provision` block that waits for the guest and configures it through the typed API."
+    objectives = [
+      "Attach a `provision` script to the lab",
+      "Use `lab.vm(…)`, `wait_ready`, and `exec` from wscript",
+      "Understand when provisions run (after boot, in declaration order)",
+    ]
+    related = [provisions, wscript_overview, lab_api, vm_api]
+    body {
+      p "A `provision \"scripts/setup.ws\" { }` block runs its script after `vmlab up` boots the VMs (scope it with `vms = [\"dc01\"]` to run only when those VMs come up). The script's `fn main(lab: Lab)` receives the running lab; `lab.vm(\"alp\")?` yields a VM handle whose `wait_ready(secs)` blocks until the guest agent answers and whose `exec` runs guest commands with a typed `ExecResult` back."
+      p "This replaces chains of `vmlab exec` calls: one script, real control flow, real error handling."
+    }
+    exercise setup_ws {
+      title     = "Wait, exec, report"
+      task      = "Write `scripts/setup.ws` that waits for the guest and logs its Alpine release, then re-run `vmlab up`."
+      code_lang = "wscript"
+      code      = <<'WS'
+use vmlab
+
+fn main(lab: Lab) {
+    let alp = lab.vm("alp").expect("no vm alp")
+    alp.wait_ready(600).expect("agent never came up")
+    let rel = alp.exec("/bin/cat", ["/etc/alpine-release"]).expect("exec failed")
+    lab.log("alpine release: " + rel.stdout.trim())
+}
+WS
+      expected = "`vmlab up` ends with `alpine release: 3.23.x` in the lab log (also visible via `vmlab logs`)."
+      hint     = "`exec` takes the program and its arguments separately — `alp.exec(\"/bin/cat\", [\"/etc/alpine-release\"])`, not one shell string."
+    }
+  }
+
+  lesson events_and_handlers {
+    n       = 2
+    title   = "React to lab events"
+    summary = "`on` handlers: run a script when something happens instead of polling for it."
+    objectives = [
+      "Attach `on \"<event>\" { run = … }` handlers to a lab",
+      "Know the event families (vm.*, host.*) and their payloads",
+      "Test a handler with an ad-hoc `vmlab script` run",
+    ]
+    prerequisites = [first_provision]
+    related = [on_handler, events, event_type]
+    body {
+      p "Where a provision runs once at boot, an `on` handler runs whenever its event fires for the lab's lifetime: `on \"vm.crashed\" { run = \"scripts/collect-dumps.ws\" }` reacts to a guest dying, `on \"host.disk_low\" { run = \"scripts/alert.ws\" }` to the host filling up. The handler script receives the event (VM name, details) alongside the lab handle."
+      p "For iterating on a script without bouncing the lab, `vmlab script scripts/test.ws` runs any wscript file against the running lab right now."
+    }
+    exercise crash_handler {
+      title     = "Notice a crash"
+      task      = "Add a `vm.crashed` handler that logs which VM died, then force-kill the guest's QEMU process to trigger it."
+      code_lang = "wscript"
+      code      = <<'WS'
+use vmlab
+
+fn handle(event: Event, lab: Lab) {
+    lab.log("handler: " + event.vm + " crashed — collecting nothing, just proving the wiring")
+}
+WS
+      expected = "Killing the VM's QEMU process makes the handler line appear in `vmlab logs`."
+      hint     = "Handlers fire on *unexpected* exits — `vmlab vm stop alp` is a clean stop and won't trigger `vm.crashed`."
+    }
+  }
+
+  lesson drive_the_screen {
+    n       = 3
+    title   = "Drive the screen: keys, matching, OCR"
+    summary = "Automate what has no agent — installers and GUIs — with keystrokes and vision."
+    objectives = [
+      "Send keystrokes and key chords to a VM",
+      "Wait for screen content with image matching and OCR",
+      "Combine them into an installer-style loop",
+    ]
+    prerequisites = [first_provision]
+    related = [vm_input, vm_vision, wscript_matching, key_chords]
+    body {
+      p "During an OS install there is no guest agent — only the console. The VM API covers that end: `type_text` / `send_keys` inject input (chords like ctrl-alt-del included), `screenshot` grabs the console, and `wait_for_image` / `wait_for_text` block until a reference image or an OCR'd regex appears on screen before the script proceeds."
+      p "This is exactly how vmlab's own Windows and vintage-DOS templates are built: wait for the dialog, press the key, wait for the next screen. The `wscript_matching` concept in the reference covers thresholds and match regions."
+    }
+    exercise login_by_screen {
+      title     = "Log in without the agent"
+      task      = "At the Alpine console, wait for the `login:` prompt via OCR, then type the login sequence."
+      code_lang = "wscript"
+      code      = <<'WS'
+use vmlab
+
+fn main(lab: Lab) {
+    let alp = lab.vm("alp").expect("no vm alp")
+    alp.wait_for_text("login:", 300).expect("no login prompt on screen")
+    alp.type_text("root\n")
+    alp.wait_for_text("#", 60).expect("no shell prompt")
+    lab.log("logged in at the console, no agent involved")
+}
+WS
+      expected = "The script proceeds past both waits and logs the final line — the console session is live."
+      hint     = "OCR needs a legible console. If the match times out, `vmlab console alp` and look: the guest may still be booting, or the prompt text may differ from what you're waiting for."
+    }
+  }
+}

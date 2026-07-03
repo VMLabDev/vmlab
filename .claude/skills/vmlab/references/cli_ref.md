@@ -371,3 +371,5 @@ Show supervisor version and running labs (name/state/pid/root).
 ```console
 vmlab daemon status
 ```
+
+[← Back to SKILL.md](../SKILL.md)
