@@ -332,13 +332,15 @@ fn synth_lab(
     writeln!(s, "    arch     = \"{}\"", def.arch).unwrap();
     let profile = def.profile.as_deref().unwrap_or("linux-generic");
     writeln!(s, "    profile  = \"{profile}\"").unwrap();
+    // Bare integers: `disk`/`memory` are std.ByteSize in the schema, which
+    // takes byte counts or size literals — never quoted strings.
     let disk = def.disk.unwrap_or(20 << 30);
-    writeln!(s, "    disk     = \"{}\"", disk).unwrap();
+    writeln!(s, "    disk     = {disk}").unwrap();
     if let Some(cpus) = def.cpus {
         writeln!(s, "    cpus     = {cpus}").unwrap();
     }
     if let Some(mem) = def.memory {
-        writeln!(s, "    memory   = \"{mem}\"").unwrap();
+        writeln!(s, "    memory   = {mem}").unwrap();
     }
     if let Some(c) = cdrom {
         writeln!(s, "    cdrom    = \"{}\"", c.display()).unwrap();
@@ -425,6 +427,24 @@ mod tests {
         ));
         let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
         assert!(wcl.contains("nic { nat = true }"), "{wcl}");
+    }
+
+    /// The synthetic build lab must satisfy the lab schema — `disk`/`memory`
+    /// are std.ByteSize and must render as bare integers, not quoted strings
+    /// (quoted values broke every build after the ByteSize migration).
+    #[test]
+    fn build_lab_parses_against_the_schema() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  memory = 2GiB\n",
+            "  disk   = 20GiB\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
+        crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
     }
 
     /// `first_boot` parses to the script path; it is build-time-only, so the

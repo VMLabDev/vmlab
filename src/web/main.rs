@@ -217,6 +217,27 @@ async fn main() -> ExitCode {
                 web::post().to(api::snapshot_take),
             )
             .route("/api/labs/{lab}/logs", web::get().to(logs::logs))
+            // Templates (literal before the `{action}` catch-all).
+            .route(
+                "/api/labs/{lab}/templates",
+                web::get().to(api::list_templates),
+            )
+            .route(
+                "/api/labs/{lab}/templates/ops",
+                web::get().to(api::template_ops),
+            )
+            .route(
+                "/api/labs/{lab}/templates/{tpl}/remote",
+                web::get().to(api::template_remote),
+            )
+            .route(
+                "/api/labs/{lab}/templates/{tpl}/build",
+                web::post().to(api::template_build),
+            )
+            .route(
+                "/api/labs/{lab}/templates/{tpl}/publish",
+                web::post().to(api::template_publish),
+            )
             // Config editing (literal before the `{action}` catch-all).
             .route("/api/labs/{lab}/config", web::get().to(api::get_config))
             .route("/api/labs/{lab}/config", web::post().to(api::save_config))

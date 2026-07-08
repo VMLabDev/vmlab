@@ -211,6 +211,35 @@
 .logmsg{color:var(--fg-1);white-space:pre-wrap;overflow-wrap:anywhere}
 .logempty{padding:20px 16px;color:var(--fg-3);font-family:var(--font-mono);font-size:12.5px}
 
+/* templates view (build + publish) */
+.tpl{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-md);padding:16px 18px;margin-bottom:14px}
+.tplhd{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.tplname{font-family:var(--font-mono);font-size:15px;font-weight:600;color:var(--fg-0)}
+.tplver{font-family:var(--font-mono);font-size:11px;color:var(--fg-2)}
+.tplreg{font-family:var(--font-mono);font-size:11px;color:var(--fg-3);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tplact{margin-left:auto;display:flex;gap:8px;flex:none}
+.tplcols{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:16px}
+.tplempty{font-family:var(--font-mono);font-size:12px;color:var(--fg-3);padding:4px 0}
+.tpllist{display:flex;flex-direction:column;gap:6px;max-height:180px;overflow-y:auto}
+.tplverrow{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:7px 10px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg-2);cursor:pointer;transition:border-color 80ms var(--ease-out)}
+.tplverrow:hover{border-color:var(--border-strong)}
+.tplverrow.static{cursor:default}
+.tplverrow.static:hover{border-color:var(--border)}
+.tplverrow .tplcheck{width:14px;height:14px;color:var(--accent-fg);margin-left:auto;flex:none;opacity:0}
+.tplverrow.on{border-color:var(--accent)}
+.tplverrow.on .tplcheck{opacity:1}
+.tplvname{font-family:var(--font-mono);font-size:12.5px;color:var(--fg-0)}
+.tpltag{font-family:var(--font-mono);font-size:10px;color:var(--success-fg);border:1px solid var(--border);border-radius:3px;padding:1px 5px}
+.tplarches{font-family:var(--font-mono);font-size:11px;color:var(--fg-2);margin-left:auto}
+.tplrefresh{font-family:var(--font-mono);font-size:10.5px;color:var(--fg-2);background:none;border:1px solid var(--border);border-radius:var(--r-sm);padding:2px 8px;margin-left:10px;cursor:pointer;text-transform:none;letter-spacing:normal;transition:border-color 80ms var(--ease-out),color 80ms}
+.tplrefresh:hover{border-color:var(--border-strong);color:var(--fg-0)}
+.tplop{margin-top:16px;border-top:1px solid var(--border-subtle);padding-top:13px}
+.tplophd{display:flex;align-items:center;gap:9px}
+.tplopstate{font-family:var(--font-mono);font-size:12px;color:var(--fg-1)}
+.tploperr{margin-top:9px;padding:9px 12px;border:1px solid var(--danger);border-radius:var(--r-sm);background:var(--danger-bg);font-family:var(--font-mono);font-size:12px;color:var(--fg-0);white-space:pre-wrap;overflow-wrap:anywhere}
+.tpllog{margin-top:10px;max-height:260px;overflow-y:auto;background:var(--bg-0);border:1px solid var(--border);border-radius:var(--r-sm);font-family:var(--font-mono);font-size:11.5px;line-height:1.6;padding:8px 12px;color:var(--fg-1);white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:1080px){.tplcols{grid-template-columns:1fr}}
+
 /* config editor (vmlab.wcl) */
 .cfgbody{display:flex;flex-direction:column;height:calc(100vh - 150px);min-height:280px}
 .cfgbox{flex:1;min-height:160px;overflow:hidden;background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-md)}

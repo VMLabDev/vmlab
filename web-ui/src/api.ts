@@ -128,6 +128,52 @@ export const restoreSnapshot = (lab: string, name: string, vm?: string) =>
     { vm },
   );
 
+// --- templates (build + publish) --------------------------------------------
+
+/** One `template {}` block from the lab's vmlab.wcl, joined with the local
+ *  store and any in-flight operation (GET /templates). */
+export interface TemplateInfo {
+  name: string;
+  arch: string;
+  version_prefix: string;
+  registry: string | null;
+  /** Locally stored builds, newest first. */
+  local_versions: string[];
+  op: { kind: string; started: string } | null;
+}
+export interface RemoteTag {
+  tag: string;
+  arches: string[];
+}
+/** Published tags on the template's registry (GET /templates/{tpl}/remote). */
+export interface RemoteStatus {
+  registry: string;
+  tags: RemoteTag[];
+}
+/** A running build/push with its recent log (GET /templates/ops). */
+export interface TemplateOpStatus {
+  template: string;
+  kind: string;
+  started: string;
+  log_tail: string[];
+}
+
+export const listTemplates = (lab: string): Promise<TemplateInfo[]> =>
+  req(`/api/labs/${encodeURIComponent(lab)}/templates`);
+export const templateOps = (lab: string): Promise<TemplateOpStatus[]> =>
+  req(`/api/labs/${encodeURIComponent(lab)}/templates/ops`);
+export const templateRemote = (lab: string, tpl: string): Promise<RemoteStatus> =>
+  req(
+    `/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/remote`,
+  );
+export const buildTemplate = (lab: string, tpl: string) =>
+  post(`/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/build`, {});
+export const publishTemplate = (lab: string, tpl: string, version?: string) =>
+  post(
+    `/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/publish`,
+    { version },
+  );
+
 // --- config editing -------------------------------------------------------
 
 export interface ConfigDoc {

@@ -5,9 +5,9 @@
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
 import * as api from "./api";
-import type { LabEntry, LabStatus, Vm, DaemonEvent } from "./api";
+import type { LabEntry, LabStatus, TemplateInfo, Vm, DaemonEvent } from "./api";
 
-export type ViewKind = "lab" | "network" | "vm" | "logs" | "config";
+export type ViewKind = "lab" | "network" | "vm" | "logs" | "config" | "templates";
 
 // A template download in progress, driven by the template.pull.* events the
 // supervisor streams while bringing a lab up (issue #1). Keyed by `lab/vm`.
@@ -19,6 +19,19 @@ export interface Pull {
   percent: number;
   bytesDone: number;
   bytesTotal: number;
+  error?: string;
+}
+
+// A template build or push running on the supervisor, driven by the
+// template.op.* events (started from the Templates page). Keyed by
+// `lab/template`; settled entries stay visible until dismissed.
+export interface TemplateOp {
+  lab: string;
+  template: string;
+  kind: string; // "build" | "push"
+  status: "running" | "done" | "error";
+  log: string[];
+  version?: string;
   error?: string;
 }
 
@@ -34,6 +47,8 @@ interface State {
   connected: boolean;
   error: string | null;
   pulls: Record<string, Pull>;
+  templates: TemplateInfo[];
+  templateOps: Record<string, TemplateOp>;
 }
 
 const [state, setState] = createStore<State>({
@@ -48,6 +63,8 @@ const [state, setState] = createStore<State>({
   connected: false,
   error: null,
   pulls: {},
+  templates: [],
+  templateOps: {},
 });
 
 export { state };
@@ -95,7 +112,15 @@ export async function doLogout() {
   }
   api.clearToken();
   eventSocket?.close();
-  setState({ loggedIn: false, labs: [], status: null, currentLab: null, pulls: {} });
+  setState({
+    loggedIn: false,
+    labs: [],
+    status: null,
+    currentLab: null,
+    pulls: {},
+    templates: [],
+    templateOps: {},
+  });
 }
 
 async function afterLogin() {
@@ -118,8 +143,56 @@ export async function loadLabs() {
 }
 
 export async function selectLab(name: string) {
-  setState({ currentLab: name, view: { kind: "lab", vm: null } });
+  setState({ currentLab: name, view: { kind: "lab", vm: null }, templates: [] });
   await refreshStatus();
+  await loadTemplates();
+  await resyncTemplateOps();
+}
+
+/** Load the lab's `template {}` definitions (drives the Templates page and
+ *  its sidebar entry — no templates in vmlab.wcl means neither appears). */
+export async function loadTemplates() {
+  const lab = state.currentLab;
+  if (!lab) return;
+  try {
+    const templates = await api.listTemplates(lab);
+    if (state.currentLab === lab) setState({ templates });
+  } catch {
+    // Unreachable daemon or an unparsable lab file: just hide the page.
+    if (state.currentLab === lab) setState({ templates: [] });
+  }
+}
+
+/** Re-fetch running build/push ops (with their log tails) after a WS
+ *  (re)connect or lab switch, so a reloaded browser picks up mid-flight ops. */
+async function resyncTemplateOps() {
+  const lab = state.currentLab;
+  if (!lab) return;
+  try {
+    const ops = await api.templateOps(lab);
+    if (state.currentLab !== lab) return;
+    // Solid stores shallow-merge objects: keep settled entries (recent
+    // results stay visible), delete stale running ones (undefined removes a
+    // key), and overwrite with the server's view of what is running.
+    setState("templateOps", (prev) => {
+      const next: Record<string, TemplateOp> = {};
+      for (const [key, op] of Object.entries(prev)) {
+        if (op && op.status === "running") next[key] = undefined as unknown as TemplateOp;
+      }
+      for (const op of ops) {
+        next[`${lab}/${op.template}`] = {
+          lab,
+          template: op.template,
+          kind: op.kind,
+          status: "running",
+          log: op.log_tail.slice(),
+        };
+      }
+      return next;
+    });
+  } catch {
+    /* ignore — events still arrive */
+  }
 }
 
 export async function refreshStatus() {
@@ -150,6 +223,10 @@ export function showLogs() {
 }
 export function showConfig() {
   setState("view", { kind: "config", vm: null });
+}
+export function showTemplates() {
+  setState("view", { kind: "templates", vm: null });
+  loadTemplates();
 }
 export function showVm(vm: string) {
   setState("view", { kind: "vm", vm });
@@ -202,6 +279,26 @@ export const restoreSnapshot = (name: string, vm?: string) =>
 export const deleteSnapshot = (vm: string, name: string) =>
   run("Snapshot deleted", () => api.deleteSnapshot(state.currentLab!, vm, name));
 
+/** Start a template build; progress arrives as template.op.* events. */
+export async function buildTemplate(tpl: string) {
+  try {
+    await api.buildTemplate(state.currentLab!, tpl);
+    showToast(`Building ${tpl}`);
+  } catch (e) {
+    showToast(`Failed: ${e}`);
+  }
+}
+
+/** Push a stored template version (default: newest) to its registry. */
+export async function publishTemplate(tpl: string, version?: string) {
+  try {
+    await api.publishTemplate(state.currentLab!, tpl, version);
+    showToast(`Publishing ${tpl}`);
+  } catch (e) {
+    showToast(`Failed: ${e}`);
+  }
+}
+
 /** Delete a snapshot from every VM in the lab that has it (lab-wide delete). */
 export async function deleteLabSnapshot(name: string) {
   const lab = state.currentLab;
@@ -242,7 +339,11 @@ function connectEvents() {
   eventSocket?.close();
   const ws = new WebSocket(api.wsUrl("/api/events"));
   eventSocket = ws;
-  ws.onopen = () => setState({ connected: true });
+  ws.onopen = () => {
+    setState({ connected: true });
+    // Events missed while disconnected are gone; re-sync running ops.
+    resyncTemplateOps();
+  };
   ws.onclose = () => {
     setState({ connected: false });
     // Reconnect after a short delay while still logged in.
@@ -265,6 +366,11 @@ function handleEvent(ev: DaemonEvent) {
   // a pull settles, by which point the daemon is (about to be) up.
   if (ev.event.startsWith("template.pull.")) {
     handlePullEvent(ev);
+    return;
+  }
+  // Template builds/pushes: tracked separately, no status refresh per log line.
+  if (ev.event.startsWith("template.op.")) {
+    handleTemplateOpEvent(ev);
     return;
   }
   // Host-scoped registry changes refresh the lab list; lab-scoped VM/state
@@ -321,6 +427,80 @@ function handlePullEvent(ev: DaemonEvent) {
 
 function clearPull(key: string) {
   setState("pulls", key, undefined as unknown as Pull);
+}
+
+// Log lines kept per operation (matches the supervisor's ring).
+const MAX_OP_LOG = 500;
+
+function handleTemplateOpEvent(ev: DaemonEvent) {
+  const template = ev.data?.template as string | undefined;
+  if (!ev.lab || !template) return;
+  const key = `${ev.lab}/${template}`;
+  const fresh = (): TemplateOp => ({
+    lab: ev.lab,
+    template,
+    kind: String(ev.data.kind ?? "build"),
+    status: "running",
+    log: [],
+  });
+  switch (ev.event) {
+    case "template.op.start":
+      // Merge semantics: explicitly clear leftovers from a previous settled
+      // op under the same key (undefined deletes the field).
+      setState("templateOps", key, {
+        ...fresh(),
+        version: ev.data.version,
+        error: undefined,
+      });
+      break;
+    case "template.op.log": {
+      const line = String(ev.data.line ?? "");
+      // A missed start (reconnect race) still gets a live entry.
+      setState("templateOps", key, (op) => {
+        const base = op ?? fresh();
+        const log =
+          base.log.length >= MAX_OP_LOG
+            ? [...base.log.slice(1), line]
+            : [...base.log, line];
+        return { ...base, log };
+      });
+      break;
+    }
+    case "template.op.done":
+      setState("templateOps", key, (op) => ({
+        ...(op ?? fresh()),
+        status: "done" as const,
+        version: ev.data.version,
+      }));
+      showToast(
+        `${ev.data.kind === "push" ? "Published" : "Built"} ${template}@${ev.data.version ?? ""}`,
+      );
+      loadTemplates();
+      break;
+    case "template.op.error":
+      setState("templateOps", key, (op) => ({
+        ...(op ?? fresh()),
+        status: "error" as const,
+        error: String(ev.data.error ?? "operation failed"),
+      }));
+      showToast(`Failed: ${template}`);
+      loadTemplates();
+      break;
+  }
+}
+
+/** Drop a settled (done/error) operation from the Templates page. */
+export function dismissTemplateOp(key: string) {
+  setState("templateOps", key, undefined as unknown as TemplateOp);
+}
+
+/** Build/push operations for the current lab, stable order by template. */
+export function currentTemplateOps(): TemplateOp[] {
+  const lab = state.currentLab;
+  if (!lab) return [];
+  return Object.values(state.templateOps)
+    .filter((o): o is TemplateOp => !!o && o.lab === lab)
+    .sort((a, b) => a.template.localeCompare(b.template));
 }
 
 /** Active template pulls for the current lab, newest-stable order by vm name. */

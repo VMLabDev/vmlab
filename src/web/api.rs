@@ -11,9 +11,18 @@ use super::state::AppState;
 fn fail(e: String) -> HttpResponse {
     // Unknown lab / vm is the client's fault; everything else is treated as a
     // bad gateway to the daemon.
-    if e.contains("invalid lab name") {
+    if e.contains("already running") {
+        HttpResponse::Conflict().json(json!({"error": e}))
+    } else if e.contains("invalid lab name")
+        || e.contains("no push target")
+        || e.contains("has no `registry`")
+    {
         HttpResponse::BadRequest().json(json!({"error": e}))
-    } else if e.contains("unknown lab") || e.contains("no such") || e.contains("not found") {
+    } else if e.contains("unknown lab")
+        || e.contains("no such")
+        || e.contains("not found")
+        || e.contains("no template named")
+    {
         HttpResponse::NotFound().json(json!({"error": e}))
     } else {
         HttpResponse::BadGateway().json(json!({"error": e}))
@@ -303,6 +312,79 @@ pub async fn reload_lab(state: web::Data<AppState>, lab: web::Path<String>) -> H
         }
         Err(e) => fail(e),
     }
+}
+
+/// Forward a `template.*` command to the supervisor with the lab's `lab` +
+/// `root` filled in (the supervisor loads `vmlab.wcl` from the root itself).
+/// Template names are NOT `valid_name`-checked: they may contain dots
+/// (`ubuntu-24.04`) and are only equality-matched against the parsed config,
+/// never used as paths.
+async fn template_call(state: &AppState, lab: &str, cmd: &str, mut args: Value) -> HttpResponse {
+    let root = match state.lab_root(lab).await {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    args["lab"] = json!(lab);
+    args["root"] = json!(root.to_string_lossy());
+    match state.supervisor_call(cmd, args).await {
+        Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
+/// `GET /api/labs/{lab}/templates` — the lab's `template {}` definitions with
+/// local store versions and any in-flight operation. `[]` when the lab file
+/// defines none (the UI hides the Templates page then).
+pub async fn list_templates(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
+    template_call(&state, &lab, "template.list", json!({})).await
+}
+
+/// `GET /api/labs/{lab}/templates/ops` — running build/push operations with
+/// their log tails, for reconnecting UIs.
+pub async fn template_ops(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
+    template_call(&state, &lab, "template.op_status", json!({})).await
+}
+
+/// `GET /api/labs/{lab}/templates/{tpl}/remote` — published tags/arches on
+/// the template's registry.
+pub async fn template_remote(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (lab, tpl) = path.into_inner();
+    template_call(&state, &lab, "template.remote", json!({"template": tpl})).await
+}
+
+/// `POST /api/labs/{lab}/templates/{tpl}/build` — start a background build;
+/// progress arrives as `template.op.*` events. 409 while one is running.
+pub async fn template_build(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (lab, tpl) = path.into_inner();
+    template_call(&state, &lab, "template.build", json!({"template": tpl})).await
+}
+
+#[derive(Deserialize)]
+pub struct PublishBody {
+    /// Local store version to push; omitted = newest.
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// `POST /api/labs/{lab}/templates/{tpl}/publish` `{version?}` — start a
+/// background push of a stored version to the template's registry.
+pub async fn template_publish(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    body: web::Json<PublishBody>,
+) -> HttpResponse {
+    let (lab, tpl) = path.into_inner();
+    let mut args = json!({"template": tpl});
+    if let Some(v) = &body.version {
+        args["version"] = json!(v);
+    }
+    template_call(&state, &lab, "template.push", args).await
 }
 
 #[derive(Deserialize)]

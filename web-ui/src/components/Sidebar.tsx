@@ -6,13 +6,14 @@ import {
   showNetwork,
   showLogs,
   showConfig,
+  showTemplates,
   showVm,
   doLogout,
   look,
   osOf,
   archOf,
 } from "../store";
-import { Chevron, Check, Grid, Network, Logs, Code } from "./icons";
+import { Chevron, Check, Grid, Network, Logs, Code, Box } from "./icons";
 
 export default function Sidebar() {
   const [menu, setMenu] = createSignal(false);
@@ -126,6 +127,22 @@ export default function Sidebar() {
             <span class="nimeta">vmlab.wcl</span>
           </span>
         </button>
+
+        <Show when={state.templates.length > 0}>
+          <button
+            class="navitem"
+            classList={{ on: state.view.kind === "templates" }}
+            onClick={showTemplates}
+          >
+            <span class="niic">
+              <Box />
+            </span>
+            <span class="nitext">
+              <span class="niname">templates</span>
+              <span class="nimeta">{state.templates.length} defined</span>
+            </span>
+          </button>
+        </Show>
 
         <div class="navsec">Machines</div>
         <For each={cur()?.vms ?? []}>

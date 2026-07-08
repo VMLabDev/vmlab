@@ -5,6 +5,7 @@
 
 pub mod global;
 pub mod registry;
+pub mod templates;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,8 @@ pub struct Supervisor {
     /// `lab.ensure` calls (a status poll plus an `up`, say) would each spawn a
     /// daemon and pre-pull the same templates in parallel.
     ensure_locks: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// In-flight template builds/pushes (web Templates page, PRD §6).
+    template_ops: templates::TemplateOps,
 }
 
 /// Entry point for `vmlab __supervisord`.
@@ -45,6 +48,7 @@ async fn run_async() -> Result<()> {
         server_events: tokio::sync::OnceCell::new(),
         globals: GlobalSegments::new(host_cfg.dns_suffix.clone(), host_cfg.psk.clone()),
         ensure_locks: Mutex::new(std::collections::HashMap::new()),
+        template_ops: templates::TemplateOps::default(),
     });
 
     // Long-lived background tasks register here so the `shutdown` command
@@ -407,6 +411,13 @@ impl Supervisor {
     }
 }
 
+/// The `lab` + `root` argument pair shared by lab-addressed commands.
+fn lab_root_args(args: &Value) -> Result<(String, PathBuf), String> {
+    let lab = args["lab"].as_str().ok_or("missing lab")?.to_string();
+    let root = PathBuf::from(args["root"].as_str().ok_or("missing root")?);
+    Ok((lab, root))
+}
+
 /// Wrapper giving command handlers access to `Arc<Supervisor>` (needed for
 /// the tasks they spawn).
 struct SupervisorHandler {
@@ -473,6 +484,33 @@ impl Handler for SupervisorHandler {
                         .map(|(n, s, r)| json!({"name": n, "subnet": s, "refcount": r}))
                         .collect::<Vec<_>>()
                 ))
+            }
+            // Template operations for the web Templates page (PRD §6). All
+            // take `lab` + `root` like `lab.ensure`, so the supervisor works
+            // for labs it never started.
+            "template.list" => {
+                let (lab, root) = lab_root_args(&args)?;
+                templates::list(lab, root, sup.template_ops.clone()).await
+            }
+            "template.remote" => {
+                let (_, root) = lab_root_args(&args)?;
+                let template = args["template"].as_str().ok_or("missing template")?;
+                templates::remote(root, template.to_string()).await
+            }
+            "template.build" => {
+                let (lab, root) = lab_root_args(&args)?;
+                let template = args["template"].as_str().ok_or("missing template")?;
+                templates::start_build(sup.clone(), lab, root, template.to_string()).await
+            }
+            "template.push" => {
+                let (lab, root) = lab_root_args(&args)?;
+                let template = args["template"].as_str().ok_or("missing template")?;
+                let version = args["version"].as_str().map(String::from);
+                templates::start_push(sup.clone(), lab, root, template.to_string(), version).await
+            }
+            "template.op_status" => {
+                let lab = args["lab"].as_str().ok_or("missing lab")?;
+                Ok(sup.template_ops.status(lab))
             }
             "shutdown" => {
                 tracing::info!("supervisor shutdown requested");
