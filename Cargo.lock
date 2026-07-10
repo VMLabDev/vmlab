@@ -834,7 +834,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "forge-core"
 version = "0.1.0"
-source = "git+https://github.com/wiltaylor/forge.git?rev=58f33b526285aaef278198871852fdb9b27b999c#58f33b526285aaef278198871852fdb9b27b999c"
+source = "git+https://github.com/wiltaylor/forge.git?rev=c634d1bda814f6ee1469c6b647633c05b8434875#c634d1bda814f6ee1469c6b647633c05b8434875"
 dependencies = [
  "serde",
  "serde_json",
