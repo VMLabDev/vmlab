@@ -51,6 +51,17 @@ image tag='vmlab:latest':
 install:
 	cargo install --path . --locked
 
+# Build the container micro-VM guest asset (kernel + initramfs, PRD §18)
+[group('build')]
+guest-build arch='x86_64 aarch64':
+	./guest/build-asset.sh {{arch}}
+
+# Build + install the guest asset into ~/.local/share/vmlab/guest
+[group('build')]
+guest-install: guest-build
+	mkdir -p ~/.local/share/vmlab/guest
+	cp -r guest/dist/* ~/.local/share/vmlab/guest/
+
 # Bring a lab up (a VNC viewer opens per VM when the lab sets `gui = true`)
 [group('lab')]
 lab-up dir='examples/mixed-lab': release
