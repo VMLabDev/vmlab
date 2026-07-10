@@ -42,7 +42,7 @@ argon2 = { version = "0.5", optional = true, features = ["std"] }
 # The Forge desktop-widget session engine: server-side RFB decode → RGBA rect
 # frames for the console UI's DesktopViewer (docs/widgets-protocol.md there).
 forge-core = { git = "https://github.com/wiltaylor/forge.git", rev = "c634d1bda814f6ee1469c6b647633c05b8434875", features = ["vnc"], optional = true }
-wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "cc63fcca0412082399e4e80a78caf6d6b18bb44e" }
+wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "89a49e42258e9d3e4ead31ca9de3d25f7ccfde19" }
 wscript = { git = "https://github.com/Configweave/wscript.git", rev = "fcd51236239225ea3e89a82fec44d30f7b871426" }
 
 anyhow = "1"

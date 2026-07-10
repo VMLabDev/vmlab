@@ -10,6 +10,7 @@ mod api;
 mod assets;
 mod auth;
 mod desktop;
+mod editor;
 mod events;
 mod logs;
 mod state;
@@ -186,6 +187,17 @@ async fn main() -> ExitCode {
             .route("/api/logout", web::post().to(auth::logout))
             // Labs.
             .route("/api/labs", web::get().to(api::list_labs))
+            .route("/api/labs", web::post().to(api::create_lab))
+            // Catalogs for the visual editor's pickers.
+            .route(
+                "/api/catalog/templates",
+                web::get().to(api::catalog_templates),
+            )
+            .route(
+                "/api/catalog/profiles",
+                web::get().to(api::catalog_profiles),
+            )
+            .route("/api/catalog/meta", web::get().to(api::catalog_meta))
             // VM sub-routes (literal before the `{action}` catch-all).
             .route(
                 "/api/labs/{lab}/vms/{vm}/sendkeys",
@@ -241,6 +253,13 @@ async fn main() -> ExitCode {
             // Config editing (literal before the `{action}` catch-all).
             .route("/api/labs/{lab}/config", web::get().to(api::get_config))
             .route("/api/labs/{lab}/config", web::post().to(api::save_config))
+            // The visual editor's structured model (literal before the
+            // `{action}` catch-all).
+            .route("/api/labs/{lab}/model", web::get().to(editor::get_model))
+            .route(
+                "/api/labs/{lab}/model/edit",
+                web::post().to(editor::edit_model),
+            )
             .route("/api/labs/{lab}/reload", web::post().to(api::reload_lab))
             .route("/api/labs/{lab}/{action}", web::post().to(api::lab_action))
             .route("/api/labs/{lab}", web::get().to(api::lab_status))

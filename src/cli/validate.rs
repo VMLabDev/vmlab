@@ -50,7 +50,7 @@ pub struct SourceIssue {
 }
 
 impl SourceIssue {
-    fn from_issue(source: &str, issue: &config::Issue) -> Self {
+    pub fn from_issue(source: &str, issue: &config::Issue) -> Self {
         let line = issue.span.map(|s| {
             let off = s.offset().min(source.len());
             source[..off].bytes().filter(|&b| b == b'\n').count() + 1

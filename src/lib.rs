@@ -1,10 +1,12 @@
 //! vmlab as a library: the CLI binary (`src/main.rs`) and the web binary
 //! (`src/web/main.rs`) both build on these modules. Only the surface the web
-//! binary needs is `pub` (`cli`, `proto`, `paths`); the rest stays
-//! crate-internal and is reached via `crate::…` as before.
+//! binary needs is `pub` (`cli`, `proto`, `paths`, plus `config`, `profiles`
+//! and `template` for the visual lab editor and its catalog pickers); the
+//! rest stays crate-internal and is reached via `crate::…` as before.
 
 pub mod cli;
-mod config;
+pub mod config;
+pub mod lab_init;
 mod labd;
 mod lifecycle;
 pub mod logs;
@@ -12,7 +14,7 @@ mod media;
 mod net;
 mod oci;
 pub mod paths;
-mod profiles;
+pub mod profiles;
 pub mod proto;
 mod qemu;
 mod qga;
@@ -21,7 +23,7 @@ mod scripting;
 mod smb;
 mod supervisor;
 mod sync;
-mod template;
+pub mod template;
 mod viewer;
 mod vision;
 mod vnc;

@@ -177,6 +177,24 @@ impl AppState {
         self.labs.lock().await.remove(lab);
     }
 
+    /// Make a freshly created lab resolvable before any daemon knows about
+    /// it (the "New Lab" flow registers the directory it just wrote).
+    pub async fn register_root(&self, lab: &str, root: PathBuf) {
+        self.roots.lock().await.insert(lab.to_string(), root);
+    }
+
+    /// Every cached name → root entry (the cwd lab, registry hits, and labs
+    /// created this session). `list_labs` merges these into its output so
+    /// custom-path labs show up before their daemon ever runs.
+    pub async fn known_roots(&self) -> Vec<(String, PathBuf)> {
+        self.roots
+            .lock()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Resolve a lab's root: the cwd lab, a cached entry, or the supervisor
     /// registry. Every lab-addressed call funnels through here, so this is
     /// also where URL-supplied lab names are rejected before they can reach
@@ -195,8 +213,20 @@ impl AppState {
             .flatten()
             .find(|l| l["name"].as_str() == Some(lab))
             .and_then(|l| l["root"].as_str())
-            .map(PathBuf::from)
-            .ok_or_else(|| format!("unknown lab `{lab}`"))?;
+            .map(PathBuf::from);
+        // Labs created under the managed labs home aren't in the supervisor
+        // registry until their daemon first runs; resolve them from disk
+        // (`lab` is a validated DNS label, so it can't traverse).
+        let root = match root {
+            Some(r) => r,
+            None => {
+                let managed = vmlab::paths::labs_home().join(lab);
+                if !managed.join(vmlab::paths::LAB_FILE).is_file() {
+                    return Err(format!("unknown lab `{lab}`"));
+                }
+                managed
+            }
+        };
         self.roots
             .lock()
             .await
@@ -235,11 +265,17 @@ impl AppState {
         }
     }
 
-    /// Lab names to subscribe to / list: the cwd lab plus every registry entry.
+    /// Lab names to subscribe to / list: the cwd lab, every cached root
+    /// (labs created this session), plus every registry entry.
     pub async fn lab_names(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         if let Some((name, _)) = &self.default_lab {
             names.push(name.clone());
+        }
+        for (name, _) in self.known_roots().await {
+            if !names.contains(&name) {
+                names.push(name);
+            }
         }
         if let Ok(labs) = self.supervisor_call("status", Value::Null).await {
             for l in labs.as_array().into_iter().flatten() {

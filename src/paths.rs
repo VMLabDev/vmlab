@@ -35,6 +35,13 @@ pub fn template_store_dir() -> PathBuf {
     data_dir().join("templates")
 }
 
+/// `~/.local/share/vmlab/labs` — the managed home for labs created through
+/// the web UI's "New Lab" (a lab is any directory containing `vmlab.wcl`;
+/// this is just the default place the server puts new ones).
+pub fn labs_home() -> PathBuf {
+    data_dir().join("labs")
+}
+
 /// `~/.local/state/vmlab` — daemon state, logs, event history.
 pub fn state_dir() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("vmlab")

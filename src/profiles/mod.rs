@@ -125,8 +125,7 @@ impl ProfileSet {
         self.profiles.contains_key(name)
     }
 
-    /// All profile names (tests assert the shipped set through this).
-    #[allow(dead_code)]
+    /// All profile names (the web catalog endpoint and tests use this).
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.profiles.keys().map(String::as_str)
     }

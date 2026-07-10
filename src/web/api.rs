@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::state::AppState;
 
 /// Map a daemon error string to an HTTP response.
-fn fail(e: String) -> HttpResponse {
+pub(crate) fn fail(e: String) -> HttpResponse {
     // Unknown lab / vm is the client's fault; everything else is treated as a
     // bad gateway to the daemon.
     if e.contains("already running") {
@@ -33,7 +33,8 @@ fn ok(v: Value) -> HttpResponse {
     HttpResponse::Ok().json(v)
 }
 
-/// `GET /api/labs` — running labs (registry) merged with the cwd lab.
+/// `GET /api/labs` — running labs (registry) merged with the cwd lab, labs
+/// created this session (cached roots), and the managed labs home on disk.
 pub async fn list_labs(state: web::Data<AppState>) -> HttpResponse {
     let mut labs = state
         .supervisor_call("status", Value::Null)
@@ -42,17 +43,177 @@ pub async fn list_labs(state: web::Data<AppState>) -> HttpResponse {
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
+    let push_stopped = |labs: &mut Vec<Value>, name: &str, root: &std::path::Path| {
+        if !labs.iter().any(|l| l["name"].as_str() == Some(name)) {
+            labs.push(json!({
+                "name": name,
+                "root": root.to_string_lossy(),
+                "state": "stopped",
+            }));
+        }
+    };
+
     // Ensure the cwd lab shows up even if its daemon isn't running yet.
-    if let Some((name, root)) = &state.default_lab
-        && !labs.iter().any(|l| l["name"].as_str() == Some(name))
-    {
-        labs.push(json!({
-            "name": name,
-            "root": root.to_string_lossy(),
-            "state": "stopped",
-        }));
+    if let Some((name, root)) = &state.default_lab {
+        push_stopped(&mut labs, name, root);
+    }
+    // Labs created through the web this session (covers custom-path labs).
+    for (name, root) in state.known_roots().await {
+        push_stopped(&mut labs, &name, &root);
+    }
+    // Labs on disk under the managed labs home (durable across restarts).
+    if let Ok(mut dir) = tokio::fs::read_dir(vmlab::paths::labs_home()).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let root = entry.path();
+            if super::state::valid_name(&name)
+                && tokio::fs::try_exists(root.join(vmlab::paths::LAB_FILE))
+                    .await
+                    .unwrap_or(false)
+            {
+                push_stopped(&mut labs, &name, &root);
+            }
+        }
     }
     ok(json!(labs))
+}
+
+#[derive(Deserialize)]
+pub struct CreateLabBody {
+    name: String,
+    /// Absolute directory to create the lab in; omitted = the managed labs
+    /// home (`~/.local/share/vmlab/labs/<name>`).
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// `POST /api/labs` `{name, path?}` — scaffold a new lab: create the
+/// directory, write an initial `vmlab.wcl`, and register the root so every
+/// other lab-addressed endpoint resolves it immediately.
+pub async fn create_lab(
+    state: web::Data<AppState>,
+    body: web::Json<CreateLabBody>,
+) -> HttpResponse {
+    let name = body.name.trim().to_string();
+    if !super::state::valid_name(&name) {
+        return HttpResponse::BadRequest().json(json!({
+            "error": format!("invalid lab name `{name}` — use a DNS label (letters, digits, hyphens)"),
+        }));
+    }
+    if state.lab_root(&name).await.is_ok() {
+        return HttpResponse::Conflict().json(json!({
+            "error": format!("lab `{name}` already exists"),
+        }));
+    }
+    let dir = match body.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => {
+            let dir = std::path::PathBuf::from(p);
+            if !dir.is_absolute()
+                || dir
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return HttpResponse::BadRequest().json(json!({
+                    "error": "custom location must be an absolute path without `..`",
+                }));
+            }
+            dir
+        }
+        None => vmlab::paths::labs_home().join(&name),
+    };
+
+    let (create_name, create_dir) = (name.clone(), dir.clone());
+    match web::block(move || vmlab::lab_init::create_lab_dir(&create_name, &create_dir)).await {
+        Ok(Ok(())) => {
+            state.register_root(&name, dir.clone()).await;
+            HttpResponse::Created().json(json!({
+                "name": name,
+                "root": dir.to_string_lossy(),
+            }))
+        }
+        Ok(Err(e)) => {
+            let msg = format!("{e:#}");
+            if msg.contains("already exists") {
+                HttpResponse::Conflict().json(json!({"error": msg}))
+            } else {
+                HttpResponse::InternalServerError().json(json!({"error": msg}))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+/// `GET /api/catalog/templates` — every template in the local store, for the
+/// editor's template picker. Read in-process (same pattern as `get_config`:
+/// the store belongs to the same host user as the daemons).
+pub async fn catalog_templates() -> HttpResponse {
+    let result = web::block(|| {
+        vmlab::template::TemplateStore::new(vmlab::paths::template_store_dir()).list()
+    })
+    .await;
+    match result {
+        Ok(Ok(list)) => {
+            let rows: Vec<Value> = list
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "arch": t.arch,
+                        "version": t.version,
+                        "profile": t.profile,
+                        "cpus": t.cpus,
+                        "memory": t.memory,
+                        "disk": t.disk,
+                        "firmware": t.firmware,
+                        "tpm": t.tpm,
+                        "secure_boot": t.secure_boot,
+                        "display": t.display,
+                        "created": t.created.to_rfc3339(),
+                        "origin": t.origin,
+                        "registry": t.registry,
+                    })
+                })
+                .collect();
+            ok(json!(rows))
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(json!({"error": format!("{e:#}")})),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+/// `GET /api/catalog/profiles` — guest OS profile names for the editor's
+/// profile picker.
+pub async fn catalog_profiles() -> HttpResponse {
+    let result = web::block(|| {
+        vmlab::profiles::ProfileSet::load_default().map(|set| {
+            let mut names: Vec<String> = set.names().map(str::to_string).collect();
+            names.sort();
+            names
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(names)) => ok(json!(names)),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(json!({"error": format!("{e:#}")})),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+/// `GET /api/catalog/meta` — schema enums the editor renders as pickers,
+/// sourced from the Rust constants so they can never drift from the code.
+pub async fn catalog_meta() -> HttpResponse {
+    ok(json!({
+        "arches": vmlab::config::model::KNOWN_ARCHES,
+        "events": vmlab::config::model::EVENT_NAMES,
+        "firmware": ["ovmf", "seabios"],
+        "gpu_modes": ["passthrough", "virgl", "vulkan"],
+        "sinkhole_modes": ["nxdomain", "zero"],
+        "forward_protos": ["tcp", "udp", "both"],
+        "l4_protos": ["tcp", "udp", "icmp"],
+        "media_kinds": ["iso", "floppy"],
+    }))
 }
 
 /// `GET /api/labs/{lab}` — full lab status (vms + segments).

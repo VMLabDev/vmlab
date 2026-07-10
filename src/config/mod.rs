@@ -1,6 +1,8 @@
 //! Lab configuration: WCL schema, typed model, extraction, validation
 //! (PRD §5).
 
+pub mod dto;
+pub mod edit_ops;
 mod extract;
 pub mod host;
 pub mod model;
