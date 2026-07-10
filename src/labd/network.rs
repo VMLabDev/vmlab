@@ -124,7 +124,7 @@ impl LabNetwork {
             );
         }
 
-        let needs_nat_segment = lab.vms.iter().flat_map(|v| &v.nics).any(|n| n.nat);
+        let needs_nat_segment = machine_nics(lab).any(|(_, nics)| nics.iter().any(|n| n.nat));
         if needs_nat_segment {
             if segments.contains_key(NAT_SEGMENT) {
                 bail!(
@@ -270,11 +270,12 @@ impl LabNetwork {
                     cfg.routes = c.routes.iter().map(|r| (r.dest, r.via)).collect();
                 }
                 // Static IPs → reservations keyed on the persisted MAC (§9.4).
-                for vm in &lab.vms {
-                    for (i, nic) in vm.nics.iter().enumerate() {
+                // Containers attach like VMs, so they get the same treatment.
+                for (mname, nics) in machine_nics(lab) {
+                    for (i, nic) in nics.iter().enumerate() {
                         if nic_segment_name(nic) == seg.name
                             && let Some(ip) = nic.ip
-                            && let Some(mac) = macs_by_vm.get(&vm.name).and_then(|m| m.get(i))
+                            && let Some(mac) = macs_by_vm.get(mname).and_then(|m| m.get(i))
                         {
                             cfg.reservations.insert(*mac, ip);
                         }
@@ -290,13 +291,13 @@ impl LabNetwork {
                 let mut zone = DnsZone::new(&host.dns_suffix);
                 // Static-IP guests resolve immediately; dynamic leases are
                 // synced by the task below.
-                for vm in &lab.vms {
-                    for nic in &vm.nics {
+                for (mname, nics) in machine_nics(lab) {
+                    for nic in nics {
                         if nic_segment_name(nic) == seg.name
                             && let Some(ip) = nic.ip
                         {
-                            zone.register(&format!("{}.{}", vm.name, lab.name), ip);
-                            zone.register(&vm.name, ip);
+                            zone.register(&format!("{mname}.{}", lab.name), ip);
+                            zone.register(mname, ip);
                         }
                     }
                 }
@@ -416,6 +417,20 @@ fn host_resolver() -> Option<std::net::SocketAddr> {
 
 /// Segment a NIC attaches to: its declared segment, or the built-in NAT
 /// segment for `nat = true`.
+/// All machine NICs in the lab, `(name, nics)` per machine — VMs and
+/// containers attach to segments identically, so network assembly treats
+/// them uniformly.
+fn machine_nics(lab: &Lab) -> impl Iterator<Item = (&str, &[crate::config::model::Nic])> {
+    lab.vms
+        .iter()
+        .map(|v| (v.name.as_str(), v.nics.as_slice()))
+        .chain(
+            lab.containers
+                .iter()
+                .map(|c| (c.name.as_str(), c.nics.as_slice())),
+        )
+}
+
 pub fn nic_segment_name(nic: &crate::config::model::Nic) -> &str {
     if nic.nat {
         NAT_SEGMENT

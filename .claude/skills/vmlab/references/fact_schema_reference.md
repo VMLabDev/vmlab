@@ -7,7 +7,7 @@ A complete reference of the `vmlab.wcl` (and host `config.wcl`) schema, reflecte
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `name` | `utf8` | yes | Lab name (DNS label, ≤63 chars); the inline block label |
-| `gui` | `bool` | no | Default for all VMs: open a VNC viewer on `up` (§11); VM `gui` overrides |
+| `gui` | `bool` | no | Default for all VMs: open a VNC viewer on `up`; VM `gui` overrides |
 
 #### Child blocks
 
@@ -15,10 +15,11 @@ A complete reference of the `vmlab.wcl` (and host `config.wcl`) schema, reflecte
 | --- | --- | --- | --- |
 | `segments` | `segment` | yes | Virtual L2 network segments in this lab |
 | `vms` | `vm` | yes | The VMs in this lab |
+| `containers` | `container` | yes | OCI containers in this lab, each run in a micro-VM |
 | `provisions` | `provision` | yes | wscript provision scripts run on `vmlab up`, in declaration order |
 | `handlers` | `on` | yes | Lifecycle event handlers (failures are logged, never fatal) |
-| `records` | `record` | yes | Lab-wide static DNS entries (wildcards allowed) (§9.5) |
-| `sinkholes` | `sinkhole` | yes | Lab-wide DNS sinkholes (§9.9) |
+| `records` | `record` | yes | Lab-wide static DNS entries (wildcards allowed) |
+| `sinkholes` | `sinkhole` | yes | Lab-wide DNS sinkholes |
 
 Example:
 
@@ -38,25 +39,25 @@ lab "demo" {
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `name` | `utf8` | yes | Segment name (DNS label); unique per lab; the inline block label |
-| `subnet` | `utf8` | no | CIDR; auto-allocated as a /24 from the host pool if omitted (§9.4) |
-| `global` | `bool` | no | Owned by the supervisor and shared across labs (§9.2) |
-| `dhcp` | `bool` | no | Enable DHCP (default true) (§9.4) |
-| `nat` | `bool` | no | Enable NAT/internet egress for this segment (default false) (§9.7) |
+| `subnet` | `utf8` | no | CIDR; auto-allocated as a /24 from the host pool if omitted |
+| `global` | `bool` | no | Owned by the supervisor and shared across labs |
+| `dhcp` | `bool` | no | Enable DHCP (default true) |
+| `nat` | `bool` | no | Enable NAT/internet egress for this segment (default false) |
 | `mtu` | `i64` | no | Link MTU (576–65535); default jumbo (9000) on nat/global, else 1500 |
-| `routes_to` | `list<utf8>` | no | Names of other segments to route to — daemon inter-segment routing opt-in (§9.6) |
+| `routes_to` | `list<utf8>` | no | Names of other segments to route to — daemon inter-segment routing opt-in |
 
 #### Child blocks
 
 | Slot | Accepts | Multiple | Description |
 | --- | --- | --- | --- |
-| `dns` | `dns` | no | DNS service override: hand out another server, or opt out (§9.5) |
-| `connect` | `connect` | no | Cross-host segment peer over TCP (PSK from host config) (§9.2) |
-| `routes` | `route` | yes | Guest routes pushed via DHCP option 121 (§9.6) |
-| `records` | `record` | yes | Static DNS entries for this segment (wildcards allowed) (§9.5) |
-| `forwards` | `forward` | yes | Host→guest port forwards (§9.8) |
-| `block_rules` | `block` | yes | L3 block rules at the switch (§9.9) |
-| `redirect_rules` | `redirect` | yes | L3 DNAT redirect rules (§9.9) |
-| `sinkholes` | `sinkhole` | yes | DNS sinkhole rules (§9.9) |
+| `dns` | `dns` | no | DNS service override: hand out another server, or opt out |
+| `connect` | `connect` | no | Cross-host segment peer over TCP (PSK from host config) |
+| `routes` | `route` | yes | Guest routes pushed via DHCP option 121 |
+| `records` | `record` | yes | Static DNS entries for this segment (wildcards allowed) |
+| `forwards` | `forward` | yes | Host→guest port forwards |
+| `block_rules` | `block` | yes | L3 block rules at the switch |
+| `redirect_rules` | `redirect` | yes | L3 DNAT redirect rules |
+| `sinkholes` | `sinkhole` | yes | DNS sinkhole rules |
 
 Example:
 
@@ -190,12 +191,12 @@ sinkhole { pattern = "*.telemetry.com" mode = "nxdomain" }   // or mode = "zero"
 | `floppy` | `utf8` | no | Path to a floppy image to attach (relative to lab root) |
 | `depends_on` | `list<utf8>` | no | VM names to wait for before this one (no cycles) |
 | `nested` | `bool` | no | Enable nested virtualisation (host CPU passthrough) |
-| `gui` | `bool` | no | Open a VNC viewer on `up` (§11); the VM always runs headless |
+| `gui` | `bool` | no | Open a VNC viewer on `up`; the VM always runs headless |
 | `display` | `utf8` | no | QEMU display string; inherited from template→profile if omitted |
 | `firmware` | `utf8` | no | Firmware: `ovmf` \| `seabios`; inherited from template→profile |
 | `tpm` | `bool` | no | Enable a TPM 2.0 device; inherited from template→profile |
 | `secure_boot` | `bool` | no | Enable secure boot (OVMF only); inherited from template→profile |
-| `qemu_args` | `list<utf8>` | no | Raw QEMU flags appended last — escape hatch (§5.2) |
+| `qemu_args` | `list<utf8>` | no | Raw QEMU flags appended last — escape hatch |
 
 #### Child blocks
 
@@ -204,8 +205,8 @@ sinkhole { pattern = "*.telemetry.com" mode = "nxdomain" }   // or mode = "zero"
 | `gpu` | `gpu` | no | GPU acceleration (passthrough / virgl / vulkan) |
 | `nics` | `nic` | yes | Network interfaces; no NICs = air-gapped (shares need ≥1 NIC) |
 | `extra_disks` | `disk` | yes | Additional disks beyond the primary disk |
-| `shares` | `share` | yes | SMB shared folders (require ≥1 NIC) (§7.5) |
-| `media` | `media` | yes | ISO/floppy images built from a folder (§6.3) |
+| `shares` | `share` | yes | SMB shared folders (require ≥1 NIC) |
+| `media` | `media` | yes | ISO/floppy images built from a folder |
 
 Example:
 
@@ -237,10 +238,10 @@ gpu { mode = "passthrough" address = "0000:01:00.0" }   // or mode = "virgl" | "
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `segment` | `utf8` | no | Segment name to attach to; required unless `nat = true` |
-| `nat` | `bool` | no | Shorthand: attach to the per-lab built-in NAT segment (§9.7) |
+| `nat` | `bool` | no | Shorthand: attach to the per-lab built-in NAT segment |
 | `ip` | `utf8` | no | Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique |
 | `mac` | `utf8` | no | Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise |
-| `isolated` | `bool` | no | Port isolation: reach gateway/forwards but not segment neighbours (§9.1) |
+| `isolated` | `bool` | no | Port isolation: reach gateway/forwards but not segment neighbours |
 
 Example:
 
@@ -298,15 +299,162 @@ media { kind = "iso"    from = "./unattend/" label = "CIDATA" }
 media { kind = "floppy" from = "./drivers/"  label = "DRV" }
 ```
 
+### `container` (in `lab`)
+
+OCI container, run in a micro-VM. Attaches to segments exactly like a VM;
+no NICs = air-gapped (exec/copy/logs still work via the agent channel).
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `id` | `identifier` | no | Name used to connect the shape (`a -> b`) and to anchor others to it. |
+| `class` | `list<utf8>` | no | Style classes — text and SVG paint via the `class` system. |
+| `link` | `utf8` | no | Link the shape to an in-site page (bare page name, or `site:page`). Wraps it in a clickable `<a>`; an unknown page fails the build like a bad prose link. |
+| `stroke` | `utf8` | no | Optional chrome — outline colour of the background rect that makes the group visible. |
+| `fill` | `utf8` | no | Optional chrome — fill colour of the background rect that makes the group visible. |
+| `padding` | `f64` | no | Inset between the chrome and the child shapes. |
+| `width` | `f64` | no | Declared interior width (when no layout/anchor sizes it). |
+| `height` | `f64` | no | Declared interior height (when no layout/anchor sizes it). |
+| `layout` | `symbol` | no | Layout mode: `:free` (default, manual) / `:grid` / `:layered` / `:force` / `:radial`. |
+| `columns` | `i64` | no | Number of columns for `:grid` layout. |
+| `cell_width` | `f64` | no | Grid cell width for `:grid` layout. |
+| `cell_height` | `f64` | no | Grid cell height for `:grid` layout. |
+| `gap` | `f64` | no | Gap between cells in `:grid` layout. |
+| `direction` | `symbol` | no | Flow direction for `:layered`: `:top_to_bottom` (default) / `:left_to_right`. |
+| `layer_gap` | `f64` | no | Spacing between ranks (layers) in `:layered` layout. |
+| `node_gap` | `f64` | no | Spacing between nodes within a rank in `:layered` layout. |
+| `iterations` | `i64` | no | `:force` relaxation steps (default 300). |
+| `repulsion` | `f64` | no | `:force` node repulsion strength (default 9000). |
+| `link_distance` | `f64` | no | `:force` ideal edge-to-edge length (default 60). |
+| `gravity` | `f64` | no | `:force` centering pull (default 0.05). |
+| `seed` | `i64` | no | `:force` random seed for reproducible layouts (default 1). |
+| `hub` | `identifier` | no | `:radial` hub shape id (defaults to the highest-degree shape). |
+| `radius` | `f64` | no | `:radial` radius of the first ring (default: auto-fit to shape sizes). |
+| `ring_gap` | `f64` | no | `:radial` added radius per successive ring (default 120). |
+| `start_angle` | `f64` | no | `:radial` angle (radians) of the first shape on each ring (default -PI/2, i.e. top). |
+| `anchor_left` | `f64` | no | Fractional anchor (0–1) pinning the left edge to the parent box. |
+| `anchor_right` | `f64` | no | Fractional anchor (0–1) pinning the right edge to the parent box. |
+| `anchor_top` | `f64` | no | Fractional anchor (0–1) pinning the top edge to the parent box. |
+| `anchor_bottom` | `f64` | no | Fractional anchor (0–1) pinning the bottom edge to the parent box. |
+| `connect_points` | `list<AnchorSide>` | no | Which sides (`:left`/`:right`/`:top`/`:bottom`) edges attach to. |
+| `icon` | `utf8` | no | Icon-badge icon (a `pack.name`). |
+| `icon_size` | `f64` | no | Icon-badge size. |
+| `icon_pos` | `IconPos` | no | Icon-badge position (`:center` / `:top_left` / …). |
+| `icon_class` | `list<utf8>` | no | Icon-badge style classes. |
+| `edges` | `list<Edge>` | yes | Edges connecting child shapes (`a -> b`). |
+
+#### Child blocks
+
+| Slot | Accepts | Multiple | Description |
+| --- | --- | --- | --- |
+| `children` | `SvgBlock` | yes | The child shapes laid out by the container. |
+
+Example:
+
+```wcl
+container "web" {
+  image      = "nginx:1.27"              // docker.io shorthand; @sha256:… pins
+  depends_on = ["db"]                    // VM or container names — one namespace
+  restart    = "on-failure"              // "no" (default) | "on-failure" | "always"
+  nic    { segment = "corp" ip = "10.50.0.20" }
+  env    { name = "MODE" value = "prod" }
+  volume { name = "data" target = "/var/lib/data" }
+  port   { host = 18080 container = 80 }
+  healthcheck { command = ["curl", "-fsS", "http://localhost/"] interval = 5s }
+}
+```
+
+#### `nic` (in `container`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `segment` | `utf8` | no | Segment name to attach to; required unless `nat = true` |
+| `nat` | `bool` | no | Shorthand: attach to the per-lab built-in NAT segment |
+| `ip` | `utf8` | no | Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique |
+| `mac` | `utf8` | no | Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise |
+| `isolated` | `bool` | no | Port isolation: reach gateway/forwards but not segment neighbours |
+
+Example:
+
+```wcl
+nic { segment = "corp" ip = "10.50.0.10" mac = "52:54:00:aa:bb:cc" }
+nic { nat = true }                       // per-lab built-in NAT segment shorthand
+nic { segment = "dmz" isolated = true }  // port isolation
+```
+
+#### `env` (in `container`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | `utf8` | yes | Variable name (required) |
+| `value` | `utf8` | yes | Variable value (required) |
+
+Example:
+
+```wcl
+env { name = "PGUSER" value = "app" }
+```
+
+#### `volume` (in `container`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `host` | `utf8` | no | Host path to bind-mount, relative to the lab root; one of `host`/`name` is required |
+| `name` | `utf8` | no | Named volume kept under the lab dir, shared by name, retained until lab destroy; one of `host`/`name` |
+| `target` | `utf8` | yes | Absolute mount path inside the container (required) |
+| `read_only` | `bool` | no | Mount read-only (default false) |
+
+Example:
+
+```wcl
+volume { name = "data"  target = "/var/lib/data" }               // named, lab-scoped
+volume { host = "./www" target = "/srv/www" read_only = true }   // host bind
+```
+
+#### `port` (in `container`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `host` | `i64` | yes | Host port to listen on (1–65535); unique across the lab (required) |
+| `container` | `i64` | yes | Container port to forward to (1–65535) (required) |
+| `proto` | `utf8` | no | Protocol: `tcp` (default) \| `udp` \| `both` |
+
+Example:
+
+```wcl
+port { host = 18080 container = 80 proto = "tcp" }   // sugar for a segment forward
+```
+
+#### `healthcheck` (in `container`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `command` | `list<utf8>` | yes | Probe command run inside the container (exec form); exit 0 = healthy (required) |
+| `interval` | `std.Duration` | no | Time between probes, e.g. `10s` (default 10s) |
+| `timeout` | `std.Duration` | no | Per-probe timeout (default 5s) |
+| `retries` | `i64` | no | Consecutive failures before unhealthy (default 3) |
+| `start_period` | `std.Duration` | no | Grace period after start before failures count (default 10s) |
+
+Example:
+
+```wcl
+healthcheck {
+  command      = ["curl", "-fsS", "http://localhost/"]   // exit 0 = healthy
+  interval     = 10s
+  timeout      = 5s
+  retries      = 3
+  start_period = 10s
+}
+```
+
 ### `provision` (in `lab`)
 
-Provision script run during `vmlab up` (§10.4). Optional vms list scopes
-the script for depends_on satisfaction (§7.2).
+Provision script run during `vmlab up`. Optional vms list scopes
+the script for depends_on satisfaction.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `script` | `utf8` | yes | Path to the `.ws` file; must exist and compile; the inline label |
-| `vms` | `list<utf8>` | no | VM names this script is scoped to (gates their `depends_on`) (§7.2) |
+| `vms` | `list<utf8>` | no | VM names this script is scoped to (gates their `depends_on`) |
 
 Example:
 
@@ -317,7 +465,7 @@ provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
 
 ### `on` (in `lab`)
 
-Event handler binding (§8.2).
+Event handler binding.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -333,7 +481,7 @@ on "host.disk_low" { run = "scripts/alert.ws" }
 
 ### `record` (in `lab`)
 
-Static DNS entry (wildcards allowed in name) (§9.5).
+Static DNS entry (wildcards allowed in name).
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -348,7 +496,7 @@ record { name = "srv" ip = "10.50.0.5" }     // wildcards OK: name = "*.internal
 
 ### `sinkhole` (in `lab`)
 
-DNS sinkhole (§9.9): NXDOMAIN by default, or 0.0.0.0 with mode = "zero".
+DNS sinkhole: NXDOMAIN by default, or 0.0.0.0 with mode = "zero".
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -363,14 +511,14 @@ sinkhole { pattern = "*.telemetry.com" mode = "nxdomain" }   // or mode = "zero"
 
 ## `template` block
 
-Template definition (§6.1), buildable with `vmlab template build`.
+Template definition, buildable with `vmlab template build`.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `name` | `utf8` | yes | Template name, e.g. `linux-modern`; the inline block label |
 | `arch` | `utf8` | yes | Architecture — selects the QEMU system emulator (required) |
 | `version` | `utf8` | yes | Version string, non-empty; name+arch+version is unique (required) |
-| `registry` | `utf8` | no | Full OCI repo to publish to / version-bump against (§6.4) |
+| `registry` | `utf8` | no | Full OCI repo to publish to / version-bump against |
 | `profile` | `utf8` | no | Guest OS profile (hardware defaults) for the build VM |
 | `cpus` | `i64` | no | vCPU count for the build VM; inherited by clones |
 | `memory` | `std.ByteSize` | no | RAM for the build VM, e.g. `8GiB`; inherited by clones |
@@ -380,8 +528,8 @@ Template definition (§6.1), buildable with `vmlab template build`.
 | `tpm` | `bool` | no | Enable a TPM 2.0 device |
 | `secure_boot` | `bool` | no | Enable secure boot (OVMF only) |
 | `nested` | `bool` | no | Enable nested virtualisation for the build VM |
-| `gui` | `bool` | no | Watch the build VM via a VNC viewer (§11) |
-| `qemu_args` | `list<utf8>` | no | Raw QEMU flags for the build VM — escape hatch (§5.2) |
+| `gui` | `bool` | no | Watch the build VM via a VNC viewer |
+| `qemu_args` | `list<utf8>` | no | Raw QEMU flags for the build VM — escape hatch |
 | `first_boot` | `utf8` | no | wscript run on first instantiation of a clone, before ready |
 
 #### Child blocks
@@ -389,7 +537,7 @@ Template definition (§6.1), buildable with `vmlab template build`.
 | Slot | Accepts | Multiple | Description |
 | --- | --- | --- | --- |
 | `source` | `source` | no | What the build starts from — exactly one of four forms (required) |
-| `media` | `media` | yes | ISO/floppy images attached to the build (§6.3) |
+| `media` | `media` | yes | ISO/floppy images attached to the build |
 | `provisions` | `provision` | yes | Provision scripts that drive the build |
 | `nics` | `nic` | yes | NICs for the build VM (optional; the build VM may be air-gapped) |
 | `extra_disks` | `disk` | yes | Additional disks attached during the build |
@@ -409,7 +557,7 @@ template "linux-modern" {
 
 ### `source` (in `template`)
 
-Template build source (§6.1): exactly one of the four forms.
+Template build source: exactly one of the four forms.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -431,7 +579,7 @@ source "scratch"  { }                                     // blank disk
 
 ### `media` (in `template`)
 
-ISO/floppy image built from a folder (§6.3).
+ISO/floppy image built from a folder.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -448,13 +596,13 @@ media { kind = "floppy" from = "./drivers/"  label = "DRV" }
 
 ### `provision` (in `template`)
 
-Provision script run during `vmlab up` (§10.4). Optional vms list scopes
-the script for depends_on satisfaction (§7.2).
+Provision script run during `vmlab up`. Optional vms list scopes
+the script for depends_on satisfaction.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `script` | `utf8` | yes | Path to the `.ws` file; must exist and compile; the inline label |
-| `vms` | `list<utf8>` | no | VM names this script is scoped to (gates their `depends_on`) (§7.2) |
+| `vms` | `list<utf8>` | no | VM names this script is scoped to (gates their `depends_on`) |
 
 Example:
 
@@ -468,10 +616,10 @@ provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `segment` | `utf8` | no | Segment name to attach to; required unless `nat = true` |
-| `nat` | `bool` | no | Shorthand: attach to the per-lab built-in NAT segment (§9.7) |
+| `nat` | `bool` | no | Shorthand: attach to the per-lab built-in NAT segment |
 | `ip` | `utf8` | no | Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique |
 | `mac` | `utf8` | no | Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise |
-| `isolated` | `bool` | no | Port isolation: reach gateway/forwards but not segment neighbours (§9.1) |
+| `isolated` | `bool` | no | Port isolation: reach gateway/forwards but not segment neighbours |
 
 Example:
 
@@ -483,7 +631,7 @@ nic { segment = "dmz" isolated = true }  // port isolation
 
 ### `disk` (in `template`)
 
-Additional disk (§5.2): blank by size, or pre-formatted from a folder.
+Additional disk: blank by size, or pre-formatted from a folder.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -502,13 +650,13 @@ disk "formatted" { from = "./payload/" }  // folder copied onto a fresh FAT file
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `subnet_pool` | `utf8` | no | Segment auto-allocation pool (CIDR); default `10.213.0.0/16` (§9.4) |
-| `dns_suffix` | `utf8` | no | Suffix for auto-registered VM names; default `vmlab.internal` (§9.5) |
+| `subnet_pool` | `utf8` | no | Segment auto-allocation pool (CIDR); default `10.213.0.0/16` |
+| `dns_suffix` | `utf8` | no | Suffix for auto-registered VM names; default `vmlab.internal` |
 | `dns_upstream` | `utf8` | no | Upstream resolver `ip[:port]`; default: the host resolver |
-| `disk_low_percent` | `i64` | no | `host.disk_low` watchdog threshold percent (0–100); default 10 (§8.1) |
-| `psk` | `utf8` | no | Pre-shared key for cross-host segment links (§9.2) |
-| `viewer` | `utf8` | no | VNC viewer command; `{}` is replaced by the target (§11) |
-| `oci_chunk_size` | `std.ByteSize` | no | OCI layer chunk size for template push; default `512MiB` (§6.4) |
+| `disk_low_percent` | `i64` | no | `host.disk_low` watchdog threshold percent (0–100); default 10 |
+| `psk` | `utf8` | no | Pre-shared key for cross-host segment links |
+| `viewer` | `utf8` | no | VNC viewer command; `{}` is replaced by the target |
+| `oci_chunk_size` | `std.ByteSize` | no | OCI layer chunk size for template push; default `512MiB` |
 
 Example:
 

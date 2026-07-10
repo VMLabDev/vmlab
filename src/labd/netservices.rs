@@ -171,6 +171,17 @@ pub fn preinstall_rules(
 }
 
 impl SegmentServices {
+    /// Prime the NAT engine's IP → MAC table. Forwards to a guest that has
+    /// never originated egress would otherwise send the SYN in a broadcast
+    /// frame — which the guest's TCP stack discards (`pkt_type != HOST`).
+    /// labd knows the lease MAC, so it seeds the table when installing a
+    /// forward.
+    pub fn learn_mac(&self, ip: std::net::Ipv4Addr, mac: crate::config::model::MacAddr) {
+        if let Some(engine) = self.nat.as_ref() {
+            engine.learn_mac(ip, mac);
+        }
+    }
+
     /// Spawn a host→guest port forward (PRD §9.8). Requires NAT on the
     /// segment (the engine originates the guest-side TCP/UDP). Returns a
     /// forward id usable with [`SegmentServices::remove_forward`].
@@ -201,9 +212,9 @@ impl SegmentServices {
     }
 
     /// Tear down a forward spawned by [`Self::add_forward`]. Declared
-    /// forwards live for the lab's lifetime, so nothing calls this yet; it
-    /// completes the add/remove contract for dynamic (scripted) forwards.
-    #[allow(dead_code)]
+    /// segment forwards live for the lab's lifetime; container `port {}`
+    /// forwards are removed and re-installed when a restart changes the
+    /// lease.
     pub fn remove_forward(&self, id: u64) -> bool {
         let mut fwds = self.forwards.lock_recover();
         if let Some(pos) = fwds.iter().position(|(fid, _)| *fid == id) {

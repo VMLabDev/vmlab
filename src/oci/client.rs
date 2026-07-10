@@ -66,6 +66,29 @@ pub trait Transport: Send + Sync {
     async fn blob_exists(&self, repository: &str, digest: &str) -> Result<bool>;
     /// GET a blob's bytes.
     async fn get_blob(&self, repository: &str, digest: &str) -> Result<Vec<u8>>;
+    /// GET a blob into a file on disk, verifying its digest and reporting
+    /// cumulative bytes to `progress`. Returns the byte count. The default
+    /// implementation buffers through [`get_blob`](Self::get_blob);
+    /// [`HttpTransport`] overrides it to stream, so multi-hundred-MiB
+    /// container layers never land in memory.
+    async fn get_blob_to_file(
+        &self,
+        repository: &str,
+        digest: &str,
+        dest: &Path,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<u64> {
+        let bytes = self.get_blob(repository, digest).await?;
+        let got = digest_of(&bytes);
+        if !got.eq_ignore_ascii_case(digest) {
+            bail!("blob {digest} digest mismatch: got {got} — download corrupt");
+        }
+        tokio::fs::write(dest, &bytes)
+            .await
+            .with_context(|| format!("cannot write {}", dest.display()))?;
+        progress(bytes.len() as u64);
+        Ok(bytes.len() as u64)
+    }
     /// Upload `data` as a blob with the given `digest` (monolithic).
     async fn put_blob(&self, repository: &str, digest: &str, data: Vec<u8>) -> Result<()>;
     /// Upload a blob whose bytes are streamed from a file on disk.
@@ -539,7 +562,7 @@ pub async fn ensure_registry_template(
 }
 
 /// `sha256:<hex>` of a byte slice.
-fn digest_of(bytes: &[u8]) -> String {
+pub(crate) fn digest_of(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
@@ -702,6 +725,51 @@ impl Transport for HttpTransport {
             bail!("GET blob {digest} returned {}", resp.status());
         }
         Ok(resp.bytes().await.context("reading blob body")?.to_vec())
+    }
+
+    async fn get_blob_to_file(
+        &self,
+        repository: &str,
+        digest: &str,
+        dest: &Path,
+        progress: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<u64> {
+        use futures::StreamExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let url = self.url(&format!("/v2/{repository}/blobs/{digest}"));
+        let scope = self.scope(repository, false);
+        let resp = self
+            .send_with_auth(&scope, || self.client.get(&url))
+            .await?;
+        if !resp.status().is_success() {
+            bail!("GET blob {digest} returned {}", resp.status());
+        }
+        let mut file = tokio::fs::File::create(dest)
+            .await
+            .with_context(|| format!("cannot create {}", dest.display()))?;
+        let mut hasher = Sha256::new();
+        let mut done: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("reading blob {digest} stream"))?;
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("cannot write {}", dest.display()))?;
+            done += chunk.len() as u64;
+            progress(done);
+        }
+        file.flush()
+            .await
+            .with_context(|| format!("cannot flush {}", dest.display()))?;
+        drop(file);
+        let got = format!("sha256:{}", hex::encode(hasher.finalize()));
+        if !got.eq_ignore_ascii_case(digest) {
+            let _ = tokio::fs::remove_file(dest).await;
+            bail!("blob {digest} digest mismatch: got {got} — download corrupt");
+        }
+        Ok(done)
     }
 
     async fn put_blob(&self, repository: &str, digest: &str, data: Vec<u8>) -> Result<()> {

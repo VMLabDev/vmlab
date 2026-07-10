@@ -73,6 +73,10 @@ impl Descriptor {
 pub struct Platform {
     pub architecture: String,
     pub os: String,
+    /// CPU variant, present on container-image platforms (e.g. `arm64`/`v8`);
+    /// never set on vmlab template indexes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub variant: Option<String>,
 }
 
 /// The `os` value used for vmlab template platform descriptors.
@@ -215,6 +219,7 @@ impl ImageIndex {
         manifest_desc.platform = Some(Platform {
             architecture: arch.to_string(),
             os: PLATFORM_OS.to_string(),
+            variant: None,
         });
         if let Some(existing) = self
             .manifests
@@ -275,8 +280,10 @@ pub enum ManifestOrIndex {
 }
 
 /// Parse raw bytes as either an image index or an image manifest. The
-/// `mediaType` field (when present) disambiguates; otherwise the presence
-/// of `manifests` (index) vs `layers` (manifest) decides.
+/// `mediaType` field (when present) disambiguates — the OCI types and their
+/// Docker schema-2 equivalents are both accepted, so container images pulled
+/// from Docker Hub resolve; otherwise the presence of `manifests` (index) vs
+/// `layers` (manifest) decides.
 pub fn parse_manifest_or_index(bytes: &[u8]) -> Result<ManifestOrIndex> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| anyhow!("malformed manifest JSON: {e}"))?;
@@ -284,13 +291,17 @@ pub fn parse_manifest_or_index(bytes: &[u8]) -> Result<ManifestOrIndex> {
         .get("mediaType")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let is_index =
-        media == media_types::OCI_INDEX || (media.is_empty() && value.get("manifests").is_some());
+    let is_index = media == media_types::OCI_INDEX
+        || media == media_types::DOCKER_MANIFEST_LIST
+        || (media.is_empty() && value.get("manifests").is_some());
     if is_index {
         let index: ImageIndex =
             serde_json::from_value(value).map_err(|e| anyhow!("malformed image index: {e}"))?;
         Ok(ManifestOrIndex::Index(index))
-    } else if value.get("layers").is_some() || media == media_types::OCI_MANIFEST {
+    } else if value.get("layers").is_some()
+        || media == media_types::OCI_MANIFEST
+        || media == media_types::DOCKER_MANIFEST
+    {
         let manifest: Manifest =
             serde_json::from_value(value).map_err(|e| anyhow!("malformed image manifest: {e}"))?;
         Ok(ManifestOrIndex::Manifest(manifest))
@@ -448,6 +459,61 @@ mod tests {
             Descriptor::new(media_types::OCI_MANIFEST, "sha256:1", 1),
         );
         assert_eq!(index.resolve(None).unwrap().digest, "sha256:1");
+    }
+
+    #[test]
+    fn parses_docker_media_types() {
+        // A docker schema-2 manifest list is an index …
+        let list = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": media_types::DOCKER_MANIFEST_LIST,
+            "manifests": [{
+                "mediaType": media_types::DOCKER_MANIFEST,
+                "digest": "sha256:1111",
+                "size": 10,
+                "platform": { "architecture": "amd64", "os": "linux" }
+            }, {
+                "mediaType": media_types::DOCKER_MANIFEST,
+                "digest": "sha256:2222",
+                "size": 11,
+                "platform": { "architecture": "arm64", "os": "linux", "variant": "v8" }
+            }]
+        });
+        match parse_manifest_or_index(&serde_json::to_vec(&list).unwrap()).unwrap() {
+            ManifestOrIndex::Index(i) => {
+                assert_eq!(i.manifests.len(), 2);
+                // the variant survives the round trip
+                assert_eq!(
+                    i.manifests[1].platform.as_ref().unwrap().variant.as_deref(),
+                    Some("v8")
+                );
+                assert_eq!(i.manifests[0].platform.as_ref().unwrap().variant, None);
+            }
+            ManifestOrIndex::Manifest(_) => panic!("docker manifest list parsed as manifest"),
+        }
+
+        // … and a docker schema-2 manifest is a manifest.
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": media_types::DOCKER_MANIFEST,
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "digest": "sha256:cc",
+                "size": 42
+            },
+            "layers": [{
+                "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                "digest": "sha256:aa",
+                "size": 100
+            }]
+        });
+        match parse_manifest_or_index(&serde_json::to_vec(&manifest).unwrap()).unwrap() {
+            ManifestOrIndex::Manifest(m) => {
+                assert_eq!(m.layers.len(), 1);
+                assert!(!m.is_vmlab_template(), "container image is not a template");
+            }
+            ManifestOrIndex::Index(_) => panic!("docker manifest parsed as index"),
+        }
     }
 
     #[test]

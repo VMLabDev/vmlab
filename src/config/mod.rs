@@ -275,6 +275,85 @@ lab "ad-lab" {
     }
 
     #[test]
+    fn container_blocks_extract() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" }
+  container "web" {
+    image      = "ghcr.io/owner/web:2.1"
+    entrypoint = ["/entry.sh"]
+    command    = ["--serve"]
+    workdir    = "/srv"
+    user       = "33:33"
+    cpus       = 2
+    memory     = 512MiB
+    depends_on = ["db"]
+    restart    = "on-failure"
+    nic { segment = "s" ip = "10.1.1.30" }
+    env { name = "MODE" value = "prod" }
+    volume { name = "data" target = "/var/lib/data" }
+    volume { host = "./www" target = "/srv/www" read_only = true }
+    port { host = 18080 container = 80 proto = "both" }
+    healthcheck {
+      command      = ["curl", "-fsS", "http://localhost/"]
+      interval     = 5s
+      timeout      = 2s
+      retries      = 5
+      start_period = 30s
+    }
+  }
+  container "db" { image = "postgres:16" nic { segment = "s" } }
+}
+"#;
+        let lf = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap();
+        let lab = &lf.lab;
+        assert_eq!(lab.containers.len(), 2);
+
+        let web = &lab.containers[0];
+        assert_eq!(web.name, "web");
+        assert_eq!(web.image.reference, "ghcr.io/owner/web:2.1");
+        assert_eq!(
+            web.entrypoint.as_deref(),
+            Some(&["/entry.sh".to_string()][..])
+        );
+        assert_eq!(web.command.as_deref(), Some(&["--serve".to_string()][..]));
+        assert_eq!(web.workdir.as_deref(), Some("/srv"));
+        assert_eq!(web.user.as_deref(), Some("33:33"));
+        assert_eq!(web.cpus, Some(2));
+        assert_eq!(web.memory, Some(512 << 20));
+        assert_eq!(web.depends_on, vec!["db"]);
+        assert_eq!(web.restart, RestartPolicy::OnFailure);
+        assert_eq!(web.nics.len(), 1);
+        assert_eq!(web.nics[0].ip.unwrap().to_string(), "10.1.1.30");
+        assert_eq!(web.env.len(), 1);
+        assert_eq!(
+            (web.env[0].name.as_str(), web.env[0].value.as_str()),
+            ("MODE", "prod")
+        );
+        assert_eq!(web.volumes.len(), 2);
+        assert!(matches!(&web.volumes[0].source, VolumeSource::Named(n) if n == "data"));
+        assert!(!web.volumes[0].read_only);
+        assert!(matches!(&web.volumes[1].source, VolumeSource::Host(_)));
+        assert!(web.volumes[1].read_only);
+        assert_eq!(web.ports.len(), 1);
+        assert_eq!(web.ports[0].host_port, 18080);
+        assert_eq!(web.ports[0].container_port, 80);
+        assert_eq!(web.ports[0].proto, Proto::Both);
+        let hc = web.healthcheck.as_ref().unwrap();
+        assert_eq!(hc.command[0], "curl");
+        assert_eq!(hc.interval, std::time::Duration::from_secs(5));
+        assert_eq!(hc.timeout, std::time::Duration::from_secs(2));
+        assert_eq!(hc.retries, 5);
+        assert_eq!(hc.start_period, std::time::Duration::from_secs(30));
+
+        let db = &lab.containers[1];
+        assert_eq!(db.restart, RestartPolicy::No);
+        assert!(db.entrypoint.is_none());
+        assert!(db.command.is_none());
+        assert!(db.healthcheck.is_none());
+    }
+
+    #[test]
     fn rejects_unknown_attributes() {
         let src = "import <vmlab.wcl>\nlab \"x\" {\n  vm \"a\" { template = \"x86_64/t\" bogus_attr = 1 }\n}\n";
         let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();

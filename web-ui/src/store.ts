@@ -6,12 +6,13 @@ import { createStore } from "solid-js/store";
 import { toast } from "@forge/ui";
 import type { StatusTone, Tone } from "@forge/ui";
 import * as api from "./api";
-import type { LabEntry, LabStatus, TemplateInfo, Vm, DaemonEvent } from "./api";
+import type { Container, LabEntry, LabStatus, TemplateInfo, Vm, DaemonEvent } from "./api";
 
-export type ViewKind = "lab" | "network" | "vm" | "logs" | "templates" | "editor";
+export type ViewKind = "lab" | "vm" | "container" | "templates";
 
-// A template download in progress, driven by the template.pull.* events the
-// supervisor streams while bringing a lab up (issue #1). Keyed by `lab/vm`.
+// A template or container-image download in progress, driven by the
+// template.pull.* / container.pull.* events the supervisor streams while
+// bringing a lab up (issue #1). Keyed by `lab/vm` (`vm` = machine name).
 export interface Pull {
   lab: string;
   vm: string;
@@ -221,12 +222,6 @@ function scheduleRefresh() {
 export function showLab() {
   setState("view", { kind: "lab", vm: null });
 }
-export function showNetwork() {
-  setState("view", { kind: "network", vm: null });
-}
-export function showLogs() {
-  setState("view", { kind: "logs", vm: null });
-}
 export function showTemplates() {
   setState("view", { kind: "templates", vm: null });
   loadTemplates();
@@ -234,24 +229,28 @@ export function showTemplates() {
 export function showVm(vm: string) {
   setState("view", { kind: "vm", vm });
 }
-export function showEditor() {
-  setState("view", { kind: "editor", vm: null });
+export function showContainer(name: string) {
+  setState("view", { kind: "container", vm: name });
 }
-
-/** Create a new lab, refresh the list, and jump into its visual editor. */
+/** Create a new lab, refresh the list, and jump to its page (the designer
+ *  lives there under the stats). */
 export async function createLabAndOpen(name: string, path?: string): Promise<void> {
   await api.createLab(name, path);
   const labs = await api.listLabs();
   setState({ labs });
   if (navGuard && !(await navGuard())) return;
-  setState({ currentLab: name, view: { kind: "editor", vm: null }, templates: [] });
+  setState({ currentLab: name, view: { kind: "lab", vm: null }, templates: [] });
   await refreshStatus();
   await loadTemplates();
 }
 
-/** True if any VM in the current lab is not stopped (gates a reload). */
+/** True if any VM or container in the current lab is not stopped (gates a
+ *  reload — the daemon can't re-adopt running machines). */
 export function anyVmRunning(): boolean {
-  return (state.status?.vms ?? []).some((v) => v.state !== "stopped");
+  return (
+    (state.status?.vms ?? []).some((v) => v.state !== "stopped") ||
+    (state.status?.containers ?? []).some((c) => c.state !== "stopped")
+  );
 }
 
 /** Restart the lab daemon so it re-reads vmlab.wcl, then refresh the view. */
@@ -288,6 +287,13 @@ export const vmStop = (vm: string) =>
   run(`Stopping ${vm}`, () => api.vmAction(state.currentLab!, vm, "stop"));
 export const vmRestart = (vm: string) =>
   run(`Restarting ${vm}`, () => api.vmAction(state.currentLab!, vm, "restart"));
+
+export const containerStart = (name: string) =>
+  run(`Starting ${name}`, () => api.containerAction(state.currentLab!, name, "start"));
+export const containerStop = (name: string) =>
+  run(`Stopping ${name}`, () => api.containerAction(state.currentLab!, name, "stop"));
+export const containerRestart = (name: string) =>
+  run(`Restarting ${name}`, () => api.containerAction(state.currentLab!, name, "restart"));
 
 export const takeSnapshot = (name: string, vm?: string) =>
   run("Snapshot saved", () => api.takeSnapshot(state.currentLab!, name, vm));
@@ -377,11 +383,12 @@ function connectEvents() {
 }
 
 function handleEvent(ev: DaemonEvent) {
-  // Template pulls (issue #1): track download progress separately and DON'T
-  // schedule a status refresh on every chunk — the status call blocks behind
-  // the pull, so one queued refresh per tick would pile up. Refresh only when
-  // a pull settles, by which point the daemon is (about to be) up.
-  if (ev.event.startsWith("template.pull.")) {
+  // Template / container-image pulls (issue #1): track download progress
+  // separately and DON'T schedule a status refresh on every chunk — the
+  // status call blocks behind the pull, so one queued refresh per tick would
+  // pile up. Refresh only when a pull settles, by which point the daemon is
+  // (about to be) up.
+  if (ev.event.startsWith("template.pull.") || ev.event.startsWith("container.pull.")) {
     handlePullEvent(ev);
     return;
   }
@@ -401,11 +408,15 @@ function handleEvent(ev: DaemonEvent) {
 }
 
 function handlePullEvent(ev: DaemonEvent) {
-  const vm = ev.data?.vm as string | undefined;
+  // template.pull.* carries the VM name under `vm`; container.pull.* the
+  // container name under `container`. Both feed the same progress panel.
+  const vm = (ev.data?.vm ?? ev.data?.container) as string | undefined;
   if (!ev.lab || !vm) return;
   const key = `${ev.lab}/${vm}`;
-  switch (ev.event) {
-    case "template.pull.start":
+  // "template.pull.start" / "container.pull.start" → "start", etc.
+  const phase = ev.event.split(".").pop();
+  switch (phase) {
+    case "start":
       setState("pulls", key, {
         lab: ev.lab,
         vm,
@@ -416,7 +427,7 @@ function handlePullEvent(ev: DaemonEvent) {
         bytesTotal: 0,
       });
       break;
-    case "template.pull.progress":
+    case "progress":
       setState("pulls", key, {
         lab: ev.lab,
         vm,
@@ -427,11 +438,11 @@ function handlePullEvent(ev: DaemonEvent) {
         bytesTotal: ev.data.bytes_total ?? 0,
       });
       break;
-    case "template.pull.done":
+    case "done":
       clearPull(key);
       scheduleRefresh();
       break;
-    case "template.pull.error":
+    case "error":
       setState("pulls", key, (p) =>
         p ? { ...p, status: "error" as const, error: String(ev.data.error ?? "pull failed") } : p,
       );
@@ -546,6 +557,22 @@ export function look(vm: Vm): StateLook {
       return { label: "booting", tone: "warning" };
     default:
       return { label: "stopped", tone: "neutral" };
+  }
+}
+
+/** Container state badge: like [`look`], plus the healthcheck verdict. */
+export function containerLook(c: Container): StateLook {
+  switch (c.state) {
+    case "running":
+      if (!c.ready) return { label: "starting", tone: "warning" };
+      if (c.health === false) return { label: "unhealthy", tone: "danger" };
+      return { label: "running", tone: "success" };
+    case "starting":
+      return { label: "starting", tone: "warning" };
+    default:
+      return c.exit_code != null && c.exit_code !== 0
+        ? { label: `exited (${c.exit_code})`, tone: "danger" }
+        : { label: "stopped", tone: "neutral" };
   }
 }
 

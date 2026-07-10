@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
 use super::events::EventLog;
 use super::network::{LabNetwork, nic_segment_name};
 use super::state::{LabState, SnapshotRecord, generate_mac};
@@ -25,12 +26,17 @@ pub struct LabRuntime {
     pub lab_local: PathBuf,
     pub config: LabFile,
     pub vms: BTreeMap<String, Arc<VmInstance>>,
+    pub containers: BTreeMap<String, Arc<ContainerInstance>>,
     pub network: Mutex<LabNetwork>,
     pub state: Mutex<LabState>,
     pub events: Arc<EventLog>,
     /// SMB server for the lab's shares (PRD §7.5); `None` until `up` starts
     /// it (only when some VM declares shares).
     pub smb: Mutex<Option<crate::smb::LabSmb>>,
+    /// Forward ids installed for container `port {}` blocks, keyed by
+    /// container — removed and re-installed when a restart brings a new
+    /// lease, so a forward never points at a stale IP.
+    container_forwards: Mutex<std::collections::HashMap<String, Vec<(String, u64)>>>,
 }
 
 impl LabRuntime {
@@ -155,25 +161,111 @@ impl LabRuntime {
             );
             vms.insert(vm_cfg.name.clone(), vm);
         }
+
+        // Containers: resolve each image (offline once pulled — the
+        // supervisor pre-pulls with progress before spawning this daemon,
+        // mirroring registry templates) and pin the digest so `up` never
+        // re-pulls implicitly (PRD §6.4 semantics).
+        let mut containers = BTreeMap::new();
+        if !config.lab.containers.is_empty() {
+            // Micro-VM containers run the host architecture (v1).
+            let arch = std::env::consts::ARCH;
+            let cache = crate::oci::image::ImageCache::new(crate::paths::oci_cache_dir());
+            for c_cfg in &config.lab.containers {
+                let c_state = state.container_mut(&c_cfg.name);
+                if c_state.image_ref.as_deref() != Some(c_cfg.image.reference.as_str()) {
+                    // The `image =` line changed — drop the stale pin.
+                    c_state.image_digest = None;
+                }
+                let reference = match &c_state.image_digest {
+                    // `name:tag@digest` is valid and the digest wins; a
+                    // reference already carrying a digest equals its pin.
+                    Some(d) if !c_cfg.image.reference.contains('@') => {
+                        format!("{}@{}", c_cfg.image.reference, d)
+                    }
+                    _ => c_cfg.image.reference.clone(),
+                };
+                let image = crate::oci::image::ensure_container_image(
+                    &reference,
+                    arch,
+                    &cache,
+                    &mut |_| {},
+                )
+                .await
+                .with_context(|| format!("container \"{}\": image {}", c_cfg.name, c_cfg.image))?;
+                c_state.image_digest = Some(image.manifest_digest.clone());
+                c_state.image_ref = Some(c_cfg.image.reference.clone());
+
+                // Stable MACs: explicit > persisted > generated — the unified
+                // name namespace keeps the hash inputs collision-free.
+                let mut macs = Vec::new();
+                for (i, nic) in c_cfg.nics.iter().enumerate() {
+                    let mac = nic
+                        .mac
+                        .or_else(|| c_state.macs.get(i).copied())
+                        .unwrap_or_else(|| generate_mac(&name, &c_cfg.name, i));
+                    macs.push(mac);
+                }
+                c_state.macs = macs.clone();
+
+                let nic_mtus: Vec<u16> = c_cfg
+                    .nics
+                    .iter()
+                    .map(|nic| {
+                        network
+                            .segments
+                            .get(nic_segment_name(nic))
+                            .map_or(crate::labd::network::STANDARD_MTU, |s| s.effective_mtu())
+                    })
+                    .collect();
+                let dirs = ContainerDirs::new(&root, &name, &c_cfg.name);
+                let volumes = resolve_volume_hosts(c_cfg, &root);
+                let container = ContainerInstance::new(
+                    &name,
+                    c_cfg.clone(),
+                    arch,
+                    dirs,
+                    macs,
+                    nic_mtus,
+                    image,
+                    volumes,
+                );
+                containers.insert(c_cfg.name.clone(), container);
+            }
+        }
         state.save(&lab_local)?;
 
-        for vm_cfg in &config.lab.vms {
-            for nic in &vm_cfg.nics {
+        for (owner, nics) in config
+            .lab
+            .vms
+            .iter()
+            .map(|v| (&v.name, &v.nics))
+            .chain(config.lab.containers.iter().map(|c| (&c.name, &c.nics)))
+        {
+            for nic in nics {
                 let seg_name = nic_segment_name(nic);
                 if network.segment_mut(seg_name).is_none() {
-                    bail!("nic references unknown segment {seg_name}");
+                    bail!("\"{owner}\": nic references unknown segment {seg_name}");
                 }
             }
         }
 
         // Phase 2: gateways with DHCP (reservations from persisted MACs),
-        // DNS (auto-registration + statics + sinkholes) per segment.
+        // DNS (auto-registration + statics + sinkholes) per segment. The MAC
+        // map spans VMs and containers (one name namespace), so container
+        // static IPs and lease-DNS registrations work identically.
         let host_cfg = crate::config::host::HostConfig::load_default()?;
         let macs_by_vm: std::collections::HashMap<String, Vec<crate::config::model::MacAddr>> =
             state
                 .vms
                 .iter()
                 .map(|(n, v)| (n.clone(), v.macs.clone()))
+                .chain(
+                    state
+                        .containers
+                        .iter()
+                        .map(|(n, c)| (n.clone(), c.macs.clone())),
+                )
                 .collect();
         network.wire_gateways(&config.lab, &macs_by_vm, &host_cfg);
 
@@ -183,10 +275,12 @@ impl LabRuntime {
             lab_local,
             config,
             vms,
+            containers,
             network: Mutex::new(network),
             state: Mutex::new(state),
             events,
             smb: Mutex::new(None),
+            container_forwards: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -363,9 +457,47 @@ impl LabRuntime {
     }
 
     pub fn vm(&self, name: &str) -> Result<&Arc<VmInstance>> {
-        self.vms
-            .get(name)
-            .ok_or_else(|| anyhow!("no vm \"{name}\" in lab \"{}\"", self.name))
+        self.vms.get(name).ok_or_else(|| {
+            if self.containers.contains_key(name) {
+                anyhow!("\"{name}\" is a container — use `vmlab container ...`")
+            } else {
+                anyhow!("no vm \"{name}\" in lab \"{}\"", self.name)
+            }
+        })
+    }
+
+    pub fn container(&self, name: &str) -> Result<&Arc<ContainerInstance>> {
+        self.containers.get(name).ok_or_else(|| {
+            if self.vms.contains_key(name) {
+                anyhow!("\"{name}\" is a vm — use `vmlab vm ...`")
+            } else {
+                anyhow!("no container \"{name}\" in lab \"{}\"", self.name)
+            }
+        })
+    }
+
+    /// `depends_on` of a machine (VM or container) by name.
+    fn machine_deps(&self, name: &str) -> Option<&[String]> {
+        if let Some(v) = self.config.lab.vms.iter().find(|v| v.name == name) {
+            return Some(&v.depends_on);
+        }
+        self.config
+            .lab
+            .containers
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.depends_on.as_slice())
+    }
+
+    /// Something in the lab waits on this machine's readiness.
+    fn has_dependents(&self, name: &str) -> bool {
+        self.config
+            .lab
+            .vms
+            .iter()
+            .map(|v| &v.depends_on)
+            .chain(self.config.lab.containers.iter().map(|c| &c.depends_on))
+            .any(|deps| deps.iter().any(|d| d == name))
     }
 
     /// Verify the external binaries starting `targets` will need are on PATH
@@ -375,6 +507,13 @@ impl LabRuntime {
     pub fn preflight_binaries(&self, targets: &[String]) -> Result<()> {
         let mut needed: Vec<String> = vec!["qemu-img".to_string()];
         for name in targets {
+            if let Some(c) = self.containers.get(name) {
+                let emu = crate::qemu::emulator_binary(&c.arch);
+                if !needed.contains(&emu) {
+                    needed.push(emu);
+                }
+                continue;
+            }
             let vm = self.vm(name)?;
             let emu = crate::qemu::emulator_binary(&vm.resolved.arch);
             if !needed.contains(&emu) {
@@ -442,6 +581,149 @@ impl LabRuntime {
         .await
     }
 
+    /// Start one container: wire its NIC sockets into the segment switches
+    /// (identically to a VM), then boot its micro-VM with event-emitting
+    /// callbacks. Restarts driven by the container's restart policy happen
+    /// inside the instance; the callbacks fire again on each attempt.
+    pub async fn start_container(self: &Arc<Self>, name: &str) -> Result<()> {
+        let container = self.container(name)?.clone();
+        if container.state().await != PowerState::Stopped {
+            return Ok(());
+        }
+        self.events
+            .emit("container.starting", json!({"container": name}));
+
+        std::fs::create_dir_all(&container.dirs.run)?;
+        {
+            let mut net = self.network.lock().await;
+            for (i, nic) in container.cfg.nics.iter().enumerate() {
+                let sock = container.dirs.nic_sock(i);
+                let _ = std::fs::remove_file(&sock);
+                let seg = net
+                    .segment_mut(nic_segment_name(nic))
+                    .ok_or_else(|| anyhow!("unknown segment for nic {i}"))?;
+                seg.listen_nic(&sock, nic.isolated).await?;
+            }
+        }
+
+        let events_exit = self.events.clone();
+        let events_ready = self.events.clone();
+        let events_health = self.events.clone();
+        let me = self.clone();
+        let n_exit = name.to_string();
+        let n_ready = name.to_string();
+        let n_health = name.to_string();
+        let n_fwd = name.to_string();
+        container
+            .start(
+                move |reason, exit_code, will_restart| {
+                    let payload = json!({
+                        "container": n_exit,
+                        "reason": reason,
+                        "exit_code": exit_code,
+                        "restarting": will_restart,
+                    });
+                    if reason == StopReason::Crashed {
+                        events_exit.emit("container.crashed", payload.clone());
+                    }
+                    if !will_restart {
+                        events_exit.emit("container.stopped", payload);
+                    }
+                },
+                move || {
+                    events_ready.emit("container.ready", json!({"container": n_ready}));
+                    // Forwards target the container's lease; (re-)install on
+                    // every readiness so restarts keep them pointed right.
+                    let me = me.clone();
+                    let n = n_fwd.clone();
+                    tokio::spawn(async move {
+                        me.install_container_ports(&n).await;
+                    });
+                },
+                move |healthy| {
+                    if !healthy {
+                        events_health.emit("container.unhealthy", json!({"container": n_health}));
+                    }
+                },
+            )
+            .await
+    }
+
+    /// Install a container's `port {}` forwards on its first NIC's segment —
+    /// the same NAT forward machinery as segment `forward {}` blocks.
+    /// Best-effort, like [`install_declared_forwards`].
+    async fn install_container_ports(self: &Arc<Self>, name: &str) {
+        let Ok(container) = self.container(name) else {
+            return;
+        };
+        if container.cfg.ports.is_empty() {
+            return;
+        }
+        let Some(nic) = container.cfg.nics.first() else {
+            return; // validated: ports require a NIC
+        };
+        let Ok(ip) = container.guest_ip().await else {
+            self.events.emit(
+                "forward.skipped",
+                json!({"reason": "no lease", "container": name}),
+            );
+            return;
+        };
+        let Ok(guest_ip) = ip.parse::<std::net::Ipv4Addr>() else {
+            return;
+        };
+        let seg_name = nic_segment_name(nic).to_string();
+        let net = self.network.lock().await;
+        // Drop forwards from a previous run/lease before re-installing.
+        let stale = self
+            .container_forwards
+            .lock()
+            .await
+            .remove(name)
+            .unwrap_or_default();
+        for (seg, id) in stale {
+            if let Some(s) = net.segments.get(&seg).and_then(|s| s.services.as_ref()) {
+                s.remove_forward(id);
+            }
+        }
+        let Some(services) = net
+            .segments
+            .get(&seg_name)
+            .and_then(|s| s.services.as_ref())
+        else {
+            return;
+        };
+        // Prime the NAT engine with the lease MAC: a container that never
+        // originates egress (an idle nginx, say) is otherwise unreachable —
+        // the engine would broadcast the SYN and the guest TCP stack drops
+        // broadcast-framed segments.
+        if let Some(mac) = container.macs.first() {
+            services.learn_mac(guest_ip, *mac);
+        }
+        let mut installed = Vec::new();
+        for port in &container.cfg.ports {
+            let host_addr =
+                std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port.host_port));
+            match services.add_forward(host_addr, guest_ip, port.container_port, port.proto) {
+                Ok(id) => installed.push((seg_name.clone(), id)),
+                Err(e) => {
+                    self.events.emit(
+                        "forward.skipped",
+                        json!({
+                            "reason": e.to_string(),
+                            "container": name,
+                            "host_port": port.host_port,
+                        }),
+                    );
+                }
+            }
+        }
+        self.container_forwards
+            .lock()
+            .await
+            .insert(name.to_string(), installed);
+    }
+
     /// `vmlab up [vm...]` (PRD §7.2, §10.4): start in depends_on waves and
     /// run provision scripts in declaration order. A dependency is
     /// satisfied when its VM is ready and the provisions scoped to it have
@@ -451,28 +733,38 @@ impl LabRuntime {
         subset: &[String],
         output: crate::scripting::OutputSink,
     ) -> Result<()> {
+        // One machine list spanning VMs and containers — they share the
+        // dependency graph and the waves.
+        let all_machines: Vec<String> = self
+            .config
+            .lab
+            .vms
+            .iter()
+            .map(|v| v.name.clone())
+            .chain(self.config.lab.containers.iter().map(|c| c.name.clone()))
+            .collect();
         let targets: Vec<String> = if subset.is_empty() {
-            self.config.lab.vms.iter().map(|v| v.name.clone()).collect()
+            all_machines.clone()
         } else {
             for s in subset {
-                self.vm(s)?;
+                if !self.vms.contains_key(s) && !self.containers.contains_key(s) {
+                    bail!("no vm or container \"{s}\" in lab \"{}\"", self.name);
+                }
             }
             // Pull in transitive dependencies of the subset.
             let mut wanted: HashSet<String> = HashSet::new();
             let mut stack: Vec<String> = subset.to_vec();
             while let Some(n) = stack.pop() {
                 if wanted.insert(n.clone())
-                    && let Some(cfg) = self.config.lab.vms.iter().find(|v| v.name == n)
+                    && let Some(deps) = self.machine_deps(&n)
                 {
-                    stack.extend(cfg.depends_on.iter().cloned());
+                    stack.extend(deps.iter().cloned());
                 }
             }
-            self.config
-                .lab
-                .vms
+            all_machines
                 .iter()
-                .map(|v| v.name.clone())
-                .filter(|n| wanted.contains(n))
+                .filter(|n| wanted.contains(*n))
+                .cloned()
                 .collect()
         };
 
@@ -486,13 +778,13 @@ impl LabRuntime {
         let mut done: HashSet<String> = HashSet::new();
         let mut next_provision = 0usize;
         while !remaining.is_empty() {
-            // A wave: every remaining VM whose deps (within the target set)
-            // are all done.
+            // A wave: every remaining machine whose deps (within the target
+            // set) are all done.
             let wave: Vec<String> = remaining
                 .iter()
                 .filter(|n| {
-                    let cfg = self.config.lab.vms.iter().find(|v| &v.name == *n).unwrap();
-                    cfg.depends_on
+                    self.machine_deps(n)
+                        .unwrap_or(&[])
                         .iter()
                         .all(|d| done.contains(d) || !targets.contains(d))
                 })
@@ -508,6 +800,19 @@ impl LabRuntime {
                 let n = name.clone();
                 let out = output.clone();
                 handles.push(tokio::spawn(async move {
+                    if me.containers.contains_key(&n) {
+                        me.start_container(&n).await?;
+                        // Only gate the wave on readiness when something
+                        // later depends on this container. Container
+                        // entrypoints start fast; healthchecks govern the
+                        // rest — 300s is generous.
+                        if me.has_dependents(&n) {
+                            me.container(&n)?
+                                .wait_ready(Duration::from_secs(300))
+                                .await?;
+                        }
+                        return Ok::<_, anyhow::Error>(n);
+                    }
                     me.start_vm(&n).await?;
                     // Mount the VM's shares as soon as its agent answers —
                     // detached, so provisions can rely on them (§7.5)
@@ -519,8 +824,7 @@ impl LabRuntime {
                     me.run_first_boot(&n, &out).await?;
                     // Only gate the wave on readiness when something later
                     // depends on this VM.
-                    let dependents = me.config.lab.vms.iter().any(|v| v.depends_on.contains(&n));
-                    if dependents {
+                    if me.has_dependents(&n) {
                         me.vm(&n)?.wait_ready(Duration::from_secs(600)).await?;
                     }
                     Ok::<_, anyhow::Error>(n)
@@ -573,13 +877,20 @@ impl LabRuntime {
         });
     }
 
-    /// Wire each segment's declared `forward {}` rules (PRD §9.8) once VMs
-    /// have leases. Best-effort: a forward to a not-yet-ready VM is skipped.
+    /// Wire each segment's declared `forward {}` rules (PRD §9.8) once
+    /// machines have leases. Targets resolve against VMs and containers.
+    /// Best-effort: a forward to a not-yet-ready machine is skipped.
     async fn install_declared_forwards(self: &Arc<Self>) {
         for seg in &self.config.lab.segments {
             for fwd in &seg.forwards {
-                let Ok(vm) = self.vm(&fwd.vm) else { continue };
-                let Ok(ip) = vm.guest_ip(None).await else {
+                let ip = if let Ok(vm) = self.vm(&fwd.vm) {
+                    vm.guest_ip(None).await
+                } else if let Ok(c) = self.container(&fwd.vm) {
+                    c.guest_ip().await
+                } else {
+                    continue;
+                };
+                let Ok(ip) = ip else {
                     self.events.emit(
                         "forward.skipped",
                         json!({"reason": "no lease", "vm": fwd.vm, "host_port": fwd.host_port}),
@@ -597,6 +908,14 @@ impl LabRuntime {
                     .get(&seg.name)
                     .and_then(|s| s.services.as_ref())
                 {
+                    // Container targets: prime the lease MAC so a forward to
+                    // an egress-quiet container works from the first SYN
+                    // (see install_container_ports).
+                    if let Ok(c) = self.container(&fwd.vm)
+                        && let Some(mac) = c.macs.first()
+                    {
+                        services.learn_mac(guest_ip, *mac);
+                    }
                     let _ = services.add_forward(host_addr, guest_ip, fwd.guest_port, fwd.proto);
                 }
             }
@@ -625,8 +944,12 @@ impl LabRuntime {
             if !eligible {
                 return Ok(());
             }
-            for vm in &p.vms {
-                self.vm(vm)?.wait_ready(Duration::from_secs(600)).await?;
+            for m in &p.vms {
+                if let Some(c) = self.containers.get(m) {
+                    c.wait_ready(Duration::from_secs(300)).await?;
+                } else {
+                    self.vm(m)?.wait_ready(Duration::from_secs(600)).await?;
+                }
             }
             let script = self.root.join(&p.script);
             output(format!("provision: {}\n", p.script.display()));
@@ -694,12 +1017,21 @@ impl LabRuntime {
     /// Graceful stop; clones retained (PRD §12).
     pub async fn down(self: &Arc<Self>, subset: &[String], force: bool) -> Result<()> {
         let targets: Vec<String> = if subset.is_empty() {
-            self.vms.keys().cloned().collect()
+            self.vms
+                .keys()
+                .chain(self.containers.keys())
+                .cloned()
+                .collect()
         } else {
             subset.to_vec()
         };
         let mut handles = Vec::new();
         for name in targets {
+            if let Some(c) = self.containers.get(&name) {
+                let c = c.clone();
+                handles.push(tokio::spawn(async move { c.stop(force).await }));
+                continue;
+            }
             let vm = self.vm(&name)?.clone();
             handles.push(tokio::spawn(async move { vm.stop(force).await }));
         }
@@ -731,12 +1063,24 @@ impl LabRuntime {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+        for c in self.containers.values() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while c.state().await != PowerState::Stopped {
+                if tokio::time::Instant::now() > deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        // Removes clones, container overlays, AND named volumes — destroy is
+        // the lab-scoped volume lifecycle boundary (PRD §12).
         if self.lab_local.exists() {
             std::fs::remove_dir_all(&self.lab_local)
                 .with_context(|| format!("removing {}", self.lab_local.display()))?;
         }
         let run_dir = crate::paths::lab_runtime_dir(&self.name);
         let _ = std::fs::remove_dir_all(run_dir.join("vms"));
+        let _ = std::fs::remove_dir_all(run_dir.join("containers"));
         Ok(())
     }
 
@@ -761,6 +1105,40 @@ impl LabRuntime {
         let _ = std::fs::remove_dir_all(&vm.dirs.run);
         self.events
             .emit("vm.destroyed", json!({"vm": name.to_string()}));
+        Ok(())
+    }
+
+    /// Stop one container and delete its writable overlay, runtime state,
+    /// and pinned image digest — the config stays, so a later `up <name>`
+    /// re-resolves the image fresh. Named volumes are lab-scoped and
+    /// survive; only lab [`destroy`] removes them.
+    pub async fn destroy_container(self: &Arc<Self>, name: &str) -> Result<()> {
+        let container = self.container(name)?.clone();
+        container.stop(true).await?;
+        // Wait for the exit monitor to settle before removing state.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while container.state().await != PowerState::Stopped {
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if container.dirs.local.exists() {
+            std::fs::remove_dir_all(&container.dirs.local)
+                .with_context(|| format!("removing {}", container.dirs.local.display()))?;
+        }
+        let _ = std::fs::remove_dir_all(&container.dirs.run);
+        {
+            let mut state = self.state.lock().await;
+            let c = state.container_mut(name);
+            c.image_digest = None;
+            c.image_ref = None;
+            state.save(&self.lab_local)?;
+        }
+        self.events.emit(
+            "container.destroyed",
+            json!({"container": name.to_string()}),
+        );
         Ok(())
     }
 
@@ -801,6 +1179,37 @@ impl LabRuntime {
                 "nics": nics,
             }));
         }
+        let mut containers = Vec::new();
+        for (name, c) in &self.containers {
+            let state = c.state().await;
+            let ready = c.is_ready().await;
+            let ip = if ready { c.guest_ip().await.ok() } else { None };
+            let nics: Vec<Value> = c
+                .cfg
+                .nics
+                .iter()
+                .enumerate()
+                .map(|(i, nic)| {
+                    json!({
+                        "segment": nic.segment,
+                        "mac": c.macs.get(i).map(|m| m.to_string()),
+                        "static_ip": nic.ip.map(|a| a.to_string()),
+                    })
+                })
+                .collect();
+            containers.push(json!({
+                "name": name,
+                "state": state,
+                "ready": ready,
+                "health": c.health().await,
+                "ip": ip,
+                "image": c.cfg.image.reference,
+                "digest": c.image.manifest_digest,
+                "restarts": c.restart_count(),
+                "exit_code": c.last_exit().await,
+                "nics": nics,
+            }));
+        }
         let net = self.network.lock().await;
         let mut segments = Vec::new();
         for seg in net.segments.values() {
@@ -812,12 +1221,23 @@ impl LabRuntime {
                 "dhcp": seg.dhcp,
             }));
         }
-        json!({"lab": self.name, "vms": vms, "segments": segments})
+        json!({
+            "lab": self.name,
+            "vms": vms,
+            "containers": containers,
+            "segments": segments,
+        })
     }
 
     // ---- snapshots (PRD §7.3) ----------------------------------------------
 
     pub async fn snapshot(&self, vm_name: &str, snap: &str) -> Result<bool> {
+        if self.containers.contains_key(vm_name) {
+            bail!(
+                "\"{vm_name}\" is a container — containers are not snapshottable; they rebuild \
+                 from image + volumes (restart it instead)"
+            );
+        }
         let vm = self.vm(vm_name)?;
         let online = vm.snapshot(snap).await?;
         {
@@ -850,6 +1270,12 @@ impl LabRuntime {
     }
 
     pub async fn restore(self: &Arc<Self>, vm_name: &str, snap: &str) -> Result<()> {
+        if self.containers.contains_key(vm_name) {
+            bail!(
+                "\"{vm_name}\" is a container — containers are not snapshottable; they rebuild \
+                 from image + volumes (restart it instead)"
+            );
+        }
         let record = {
             let mut state = self.state.lock().await;
             state.vm_mut(vm_name).snapshots.get(snap).cloned()

@@ -3,6 +3,8 @@
 //! events. One process per running lab, spawned and reaped by the
 //! supervisor; the CLI talks to it directly for lab-scoped operations.
 
+pub mod container;
+pub mod container_ctl;
 pub mod events;
 pub mod lab;
 pub mod netservices;
@@ -104,9 +106,16 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
                     };
                     for h in handlers.iter().filter(|h| h.event == ev.event) {
                         let script = runtime.root.join(&h.run);
+                        // Container events carry the name under "container";
+                        // handlers read it from `event.vm` either way (the
+                        // full payload is in `event.data`).
+                        let machine = ev.data["vm"]
+                            .as_str()
+                            .or_else(|| ev.data["container"].as_str())
+                            .unwrap_or_default();
                         let event = crate::scripting::EventData {
                             name: ev.event.clone(),
-                            vm: ev.data["vm"].as_str().unwrap_or_default().to_string(),
+                            vm: machine.to_string(),
                             data: ev.data.to_string(),
                         };
                         let runtime = runtime.clone();
@@ -171,6 +180,13 @@ fn vm_arg(args: &Value) -> Result<String, String> {
         .as_str()
         .map(String::from)
         .ok_or_else(|| "missing vm".to_string())
+}
+
+fn container_arg(args: &Value) -> Result<String, String> {
+    args["container"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| "missing container".to_string())
 }
 
 fn vms_arg(args: &Value) -> Vec<String> {
@@ -419,6 +435,131 @@ impl Handler for LabdHandler {
                     .await
                     .map_err(err)?;
                 Ok(json!(ip))
+            }
+            // Container lifecycle (mirrors the vm.* verbs; PRD §18).
+            "container.start" => {
+                let name = container_arg(&args)?;
+                lab.preflight_binaries(std::slice::from_ref(&name))
+                    .map_err(err)?;
+                lab.start_container(&name).await.map_err(err)?;
+                Ok(json!(true))
+            }
+            "container.stop" => {
+                let force = args["force"].as_bool().unwrap_or(false);
+                lab.container(&container_arg(&args)?)
+                    .map_err(err)?
+                    .stop(force)
+                    .await
+                    .map_err(err)?;
+                Ok(json!(true))
+            }
+            "container.restart" => {
+                let name = container_arg(&args)?;
+                let c = lab.container(&name).map_err(err)?.clone();
+                c.stop(false).await.map_err(err)?;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                while c.state().await != vm::PowerState::Stopped {
+                    if tokio::time::Instant::now() > deadline {
+                        return Err(format!("{name} did not stop for restart"));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                lab.start_container(&name).await.map_err(err)?;
+                Ok(json!(true))
+            }
+            "container.destroy" => {
+                lab.destroy_container(&container_arg(&args)?)
+                    .await
+                    .map_err(err)?;
+                Ok(json!(true))
+            }
+            "container.exec" => {
+                let name = container_arg(&args)?;
+                let cmd = args["cmd"].as_str().ok_or("missing cmd")?;
+                let cmd_args: Vec<String> = args["args"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let timeout =
+                    std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
+                let c = lab.container(&name).map_err(err)?;
+                let arg_refs: Vec<&str> = cmd_args.iter().map(String::as_str).collect();
+                let result = c.exec(cmd, &arg_refs, timeout).await.map_err(err)?;
+                Ok(json!({
+                    "exit_code": result.exit_code,
+                    "stdout": String::from_utf8_lossy(&result.stdout),
+                    "stderr": String::from_utf8_lossy(&result.stderr),
+                }))
+            }
+            "container.logs" => {
+                let name = container_arg(&args)?;
+                let lines = args["lines"].as_u64().unwrap_or(100) as usize;
+                let c = lab.container(&name).map_err(err)?;
+                if !args["follow"].as_bool().unwrap_or(false) {
+                    return Ok(json!(c.logs(lines).map_err(err)?));
+                }
+                // Follow: stream the tail, then poll the console log for
+                // growth until the client hangs up or the container stops.
+                let path = c.dirs.console_log();
+                _stream.chunk(c.logs(lines).map_err(err)?).await;
+                let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let c = c.clone();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if len > offset {
+                        use std::io::{Read, Seek};
+                        let chunk = std::fs::File::open(&path)
+                            .and_then(|mut f| {
+                                f.seek(std::io::SeekFrom::Start(offset))?;
+                                let mut buf = String::new();
+                                f.read_to_string(&mut buf)?;
+                                Ok(buf)
+                            })
+                            .unwrap_or_default();
+                        offset = len;
+                        if !chunk.is_empty() {
+                            _stream.chunk(chunk).await;
+                        }
+                    }
+                    if c.state().await == vm::PowerState::Stopped {
+                        break;
+                    }
+                }
+                Ok(json!(true))
+            }
+            "container.ip" => {
+                let ip = lab
+                    .container(&container_arg(&args)?)
+                    .map_err(err)?
+                    .guest_ip()
+                    .await
+                    .map_err(err)?;
+                Ok(json!(ip))
+            }
+            "container.copy_in" => {
+                let name = container_arg(&args)?;
+                let dest = args["dest"].as_str().ok_or("missing dest")?;
+                let data = args["data"].as_str().ok_or("missing data")?;
+                let bytes = {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|e| format!("invalid base64 data: {e}"))?
+                };
+                let timeout =
+                    std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
+                let c = lab.container(&name).map_err(err)?;
+                let tmp = std::env::temp_dir().join(format!("vmlab-cp-{}", std::process::id()));
+                std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+                let res = c.copy_to(&tmp, dest, timeout).await;
+                let _ = std::fs::remove_file(&tmp);
+                res.map_err(err)?;
+                Ok(json!(true))
             }
             "snapshot.take" => {
                 let snap = args["name"].as_str().ok_or("missing name")?;

@@ -35,6 +35,7 @@ pub struct Lab {
     pub gui: Option<bool>,
     pub segments: Vec<Segment>,
     pub vms: Vec<Vm>,
+    pub containers: Vec<Container>,
     pub provisions: Vec<Provision>,
     pub handlers: Vec<Handler>,
     pub records: Vec<DnsRecord>,
@@ -319,6 +320,104 @@ pub struct Gpu {
     pub span: Span,
 }
 
+/// An OCI container declared in the lab, run in a micro-VM (PRD §18).
+#[derive(Debug, Clone)]
+pub struct Container {
+    pub name: String,
+    pub span: Span,
+    /// Image reference as written; normalised (docker.io shorthand etc.) by
+    /// the OCI image layer at pull time.
+    pub image: ImageRef,
+    pub image_span: Span,
+    /// Entrypoint override (exec form); `None` = image default.
+    pub entrypoint: Option<Vec<String>>,
+    /// Cmd override (exec form); `None` = image default.
+    pub command: Option<Vec<String>>,
+    pub workdir: Option<String>,
+    /// `uid[:gid]` or a user/group name resolved against the image.
+    pub user: Option<String>,
+    /// Micro-VM vCPUs; default 1 at runtime.
+    pub cpus: Option<u32>,
+    /// Micro-VM RAM in bytes; default 256 MiB at runtime.
+    pub memory: Option<u64>,
+    /// VM or container names — the namespaces are unified.
+    pub depends_on: Vec<String>,
+    pub restart: RestartPolicy,
+    pub nics: Vec<Nic>,
+    pub env: Vec<EnvVar>,
+    pub volumes: Vec<Volume>,
+    pub ports: Vec<PortMap>,
+    pub healthcheck: Option<Healthcheck>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    #[default]
+    No,
+    OnFailure,
+    Always,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvVar {
+    pub name: String,
+    pub value: String,
+    pub span: Span,
+}
+
+/// Where a container mount's data lives on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeSource {
+    /// Bind mount of a host path (relative paths resolve against the lab root).
+    Host(PathBuf),
+    /// Named volume kept under the lab dir; shared across containers by name,
+    /// retained until lab destroy.
+    Named(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Volume {
+    pub source: VolumeSource,
+    /// Absolute mount path inside the container.
+    pub target: String,
+    pub read_only: bool,
+    pub span: Span,
+}
+
+/// Host→container port forward — sugar for the segment forward machinery.
+#[derive(Debug, Clone)]
+pub struct PortMap {
+    pub host_port: u16,
+    pub container_port: u16,
+    pub proto: Proto,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct Healthcheck {
+    /// Probe command (exec form) run inside the container; exit 0 = healthy.
+    pub command: Vec<String>,
+    pub interval: std::time::Duration,
+    pub timeout: std::time::Duration,
+    pub retries: u32,
+    pub start_period: std::time::Duration,
+    pub span: Span,
+}
+
+/// OCI container image reference as written in config; syntax-checked here,
+/// normalised (docker.io shorthand, default tag) by the OCI image layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRef {
+    pub reference: String,
+}
+
+impl std::fmt::Display for ImageRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reference)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Provision {
     pub script: PathBuf,
@@ -399,6 +498,11 @@ pub const EVENT_NAMES: &[&str] = &[
     "vm.ready",
     "vm.stopped",
     "vm.crashed",
+    "container.starting",
+    "container.ready",
+    "container.stopped",
+    "container.crashed",
+    "container.unhealthy",
     "lab.up",
     "lab.down",
     "lab.daemon_crashed",
@@ -468,6 +572,91 @@ pub fn parse_template_ref(s: &str) -> Result<TemplateRef, String> {
     })
 }
 
+/// Parse an `image =` value: `[host/]repo[:tag][@sha256:<hex>]`, docker
+/// shorthand allowed (`nginx`, `owner/app:v1`). The reference is kept as
+/// written — the OCI image layer normalises shorthand (docker.io, `latest`)
+/// at pull time; this only rejects syntax that can never resolve.
+pub fn parse_image_ref(s: &str) -> Result<ImageRef, String> {
+    if s.is_empty() {
+        return Err("empty image reference".to_string());
+    }
+    if s.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "malformed image reference `{s}`: contains whitespace"
+        ));
+    }
+    let (rest, digest) = match s.split_once('@') {
+        Some((r, d)) => (r, Some(d)),
+        None => (s, None),
+    };
+    if let Some(d) = digest {
+        let ok = d
+            .strip_prefix("sha256:")
+            .is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
+        if !ok {
+            return Err(format!(
+                "malformed digest in image reference `{s}` (expected `@sha256:<64 hex chars>`)"
+            ));
+        }
+    }
+    if rest.is_empty() {
+        return Err(format!(
+            "malformed image reference `{s}`: missing repository"
+        ));
+    }
+    // A registry host is a first path segment with a dot or :port (or
+    // `localhost`) — the same detection rule as template references.
+    let path = match rest.split_once('/') {
+        Some((first, p)) if first.contains('.') || first.contains(':') || first == "localhost" => {
+            let host_ok = !first.is_empty()
+                && first
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'));
+            if !host_ok {
+                return Err(format!(
+                    "malformed registry host `{first}` in image reference `{s}`"
+                ));
+            }
+            p
+        }
+        _ => rest,
+    };
+    let (repo, tag) = match path.rsplit_once(':') {
+        Some((r, t)) => (r, Some(t)),
+        None => (path, None),
+    };
+    if repo.is_empty() {
+        return Err(format!(
+            "malformed image reference `{s}`: missing repository"
+        ));
+    }
+    for part in repo.split('/') {
+        let ok = !part.is_empty()
+            && part.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+            });
+        if !ok {
+            return Err(format!(
+                "malformed image reference `{s}`: repository names are lowercase \
+                 (letters, digits, `.`, `_`, `-`)"
+            ));
+        }
+    }
+    if let Some(t) = tag {
+        let ok = !t.is_empty()
+            && t.len() <= 128
+            && !t.starts_with(['.', '-'])
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !ok {
+            return Err(format!("malformed tag `{t}` in image reference `{s}`"));
+        }
+    }
+    Ok(ImageRef {
+        reference: s.to_string(),
+    })
+}
+
 /// Parse `ip[:port]`.
 pub fn parse_host_port(s: &str) -> Result<HostPort, String> {
     let (ip_s, port) = match s.rsplit_once(':') {
@@ -512,6 +701,34 @@ mod tests {
         assert!(parse_template_ref("windows-11").is_err());
         assert!(parse_template_ref("bogusarch/win").is_err());
         assert!(parse_template_ref("x86_64/win@").is_err());
+    }
+
+    #[test]
+    fn image_refs() {
+        for ok in [
+            "nginx",
+            "nginx:1.27",
+            "owner/app:v1",
+            "ghcr.io/owner/app:2.0",
+            "localhost:5000/dev/img",
+            "registry.example.com:8443/a/b/c:latest",
+            "alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "ghcr.io/o/a:v1@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(parse_image_ref(ok).is_ok(), "expected `{ok}` to parse");
+        }
+        for bad in [
+            "",
+            "has space",
+            "UPPER/case",
+            "nginx:",
+            "nginx:.badtag",
+            "img@sha256:short",
+            "img@md5:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "ghcr.io/",
+        ] {
+            assert!(parse_image_ref(bad).is_err(), "expected `{bad}` to fail");
+        }
     }
 
     #[test]

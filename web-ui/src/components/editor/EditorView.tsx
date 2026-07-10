@@ -1,9 +1,9 @@
-// The visual lab designer page: topology canvas + inspector in a split
-// pane, with the ConfigView-style Revert/Validate/Save/Save & reload
-// toolbar and validation-issue surfacing.
+// The visual lab designer: topology canvas + inspector in a split pane,
+// with a compact Revert/Validate/Save/Save & reload toolbar and
+// validation-issue surfacing. Embedded in the lab page's Design tab.
 
 import { For, Show, createEffect, createMemo } from "solid-js";
-import { Alert, Button, Empty, PageHead, Spinner, SplitPane } from "@forge/ui";
+import { Alert, Button, Empty, Spinner, SplitPane } from "@forge/ui";
 import {
   anyVmRunning,
   reloadLab as reloadCurrentLab,
@@ -28,7 +28,7 @@ import TopologyCanvas from "./TopologyCanvas";
 export default function EditorView() {
   createEffect(() => {
     const lab = state.currentLab;
-    if (lab && state.view.kind === "editor") void openEditor(lab);
+    if (lab && state.view.kind === "lab") void openEditor(lab);
   });
 
   const ops = createMemo(() => (editor.draft && editor.baseline ? pendingOps() : []));
@@ -48,12 +48,15 @@ export default function EditorView() {
 
   return (
     <Show when={state.currentLab} fallback={<Empty title="No lab selected" />}>
-      <PageHead
-        title="designer"
-        sub={`${editor.path || "—"}${dirty() ? ` · ${ops().length} pending change(s)` : ""}`}
-        actions={
-          <>
+      <div class="stack">
+        <div class="editor-toolbar">
+          <span class="editor-path">
+            {editor.path || "—"}
+            {dirty() ? ` · ${ops().length} pending change(s)` : ""}
+          </span>
+          <div class="editor-actions">
             <Button
+              size="sm"
               variant="ghost"
               onClick={revertDraft}
               disabled={disabled() || !dirty()}
@@ -62,16 +65,18 @@ export default function EditorView() {
               Revert
             </Button>
             <Button
+              size="sm"
               onClick={validateDraft}
               disabled={disabled() || !dirty()}
               title="Validate the pending changes without saving"
             >
               Validate
             </Button>
-            <Button onClick={saveDraft} disabled={disabled() || !dirty()}>
+            <Button size="sm" onClick={saveDraft} disabled={disabled() || !dirty()}>
               Save
             </Button>
             <Button
+              size="sm"
               variant="primary"
               onClick={saveReload}
               disabled={disabled() || anyVmRunning()}
@@ -83,10 +88,8 @@ export default function EditorView() {
             >
               Save & reload
             </Button>
-          </>
-        }
-      />
-      <div class="stack">
+          </div>
+        </div>
         <Show when={editor.conflict}>
           <Alert tone="danger" title="vmlab.wcl changed on disk">
             Someone edited the config underneath this draft (Config page or another session).{" "}

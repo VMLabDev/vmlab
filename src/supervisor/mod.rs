@@ -330,6 +330,77 @@ impl Supervisor {
                 )),
             }
         }
+
+        // Container images get the same treatment (PRD §18): pull before the
+        // daemon spawns so its build resolves offline. Honour the digest pin
+        // persisted in the lab state so a moved tag doesn't advance here.
+        if config.lab.containers.is_empty() {
+            return;
+        }
+        let arch = std::env::consts::ARCH;
+        let cache = crate::oci::image::ImageCache::new(crate::paths::oci_cache_dir());
+        let state = crate::labd::state::LabState::load(&crate::paths::lab_local_dir(root));
+        for c in &config.lab.containers {
+            let pinned = state
+                .containers
+                .get(&c.name)
+                .filter(|s| s.image_ref.as_deref() == Some(c.image.reference.as_str()))
+                .and_then(|s| s.image_digest.clone());
+            let reference = match pinned {
+                Some(d) if !c.image.reference.contains('@') => {
+                    format!("{}@{}", c.image.reference, d)
+                }
+                _ => c.image.reference.clone(),
+            };
+            let c_name = c.name.clone();
+            self.emit(Event::new(
+                "container.pull.start",
+                lab,
+                json!({"container": c_name, "reference": reference, "arch": arch}),
+            ));
+
+            let sup = self.clone();
+            let lab_s = lab.to_string();
+            let cn_s = c_name.clone();
+            let ref_s = reference.clone();
+            let mut progress = move |p: crate::oci::image::ImagePullProgress| {
+                let percent = p
+                    .bytes_done
+                    .saturating_mul(100)
+                    .checked_div(p.bytes_total)
+                    .unwrap_or(0) as u32;
+                sup.emit(Event::new(
+                    "container.pull.progress",
+                    lab_s.clone(),
+                    json!({
+                        "container": cn_s,
+                        "reference": ref_s,
+                        "layer": p.layer,
+                        "layers": p.layers,
+                        "bytes_done": p.bytes_done,
+                        "bytes_total": p.bytes_total,
+                        "percent": percent,
+                    }),
+                ));
+            };
+            let result =
+                crate::oci::image::ensure_container_image(&reference, arch, &cache, &mut progress)
+                    .await;
+            drop(progress);
+
+            match result {
+                Ok(_) => self.emit(Event::new(
+                    "container.pull.done",
+                    lab,
+                    json!({"container": c_name, "reference": reference}),
+                )),
+                Err(e) => self.emit(Event::new(
+                    "container.pull.error",
+                    lab,
+                    json!({"container": c_name, "reference": reference, "error": format!("{e:#}")}),
+                )),
+            }
+        }
     }
 
     /// Forward a lab daemon's events into the host-wide aggregate stream

@@ -52,6 +52,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: VmCmd,
     },
+    /// Per-container lifecycle and interaction: start/stop, exec, logs, IP
+    Container {
+        #[command(subcommand)]
+        cmd: ContainerCmd,
+    },
     /// Manage running labs host-wide: list / info / stop / destroy
     Lab {
         #[command(subcommand)]
@@ -212,6 +217,45 @@ pub enum VmCmd {
     },
 }
 
+/// Per-container lifecycle and interaction (PRD §16).
+#[derive(Subcommand)]
+pub enum ContainerCmd {
+    /// Start one container
+    Start { container: String },
+    /// Stop one container (graceful ladder; --force to kill)
+    Stop {
+        container: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Restart one container
+    Restart { container: String },
+    /// Destroy one container: stop it and delete its scratch state (config retained)
+    Destroy { container: String },
+    /// Run a command inside the container via the agent
+    Exec {
+        container: String,
+        /// Seconds to wait for the command to finish
+        #[arg(long, value_name = "SECS", default_value_t = 120)]
+        timeout: u64,
+        /// Command and arguments (after --)
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Tail or dump a container's console log (kernel + stdout/stderr)
+    Logs {
+        container: String,
+        /// Keep following
+        #[arg(short, long)]
+        follow: bool,
+        /// Lines of history to show
+        #[arg(short = 'n', long, default_value_t = 100)]
+        lines: usize,
+    },
+    /// Print a container's IP address
+    Ip { container: String },
+}
+
 /// Snapshot management (PRD §7.3).
 #[derive(Subcommand)]
 pub enum SnapshotCmd {
@@ -262,6 +306,29 @@ pub fn run() -> ExitCode {
                 threshold,
                 region,
             } => lab::cmd_vm_find_image(&vm, &image, threshold, region),
+        },
+        Command::Container { cmd } => match cmd {
+            ContainerCmd::Start { container } => {
+                lab::cmd_container_power(&container, "start", false)
+            }
+            ContainerCmd::Stop { container, force } => {
+                lab::cmd_container_power(&container, "stop", force)
+            }
+            ContainerCmd::Restart { container } => {
+                lab::cmd_container_power(&container, "restart", false)
+            }
+            ContainerCmd::Destroy { container } => lab::cmd_container_destroy(&container),
+            ContainerCmd::Exec {
+                container,
+                timeout,
+                cmd,
+            } => lab::cmd_container_exec(&container, timeout, cmd),
+            ContainerCmd::Logs {
+                container,
+                follow,
+                lines,
+            } => lab::cmd_container_logs(&container, follow, lines),
+            ContainerCmd::Ip { container } => lab::cmd_container_ip(&container),
         },
         Command::Lab { cmd } => lab::cmd_lab(cmd),
         Command::Snapshot { cmd } => match cmd {

@@ -405,6 +405,43 @@ lab "demo" {
     }
 
     #[test]
+    fn add_block_container_with_nested_children() {
+        let lab = model();
+        let out = apply_ops(
+            SRC,
+            &[op(json!({"op": "add_block", "parent": lab.span, "block": {
+                "kind": "container",
+                "labels": ["web"],
+                "fields": [
+                    {"name": "image", "value": "nginx:1.27"},
+                    {"name": "memory", "value": {"num": 256, "unit": "MiB"}},
+                    {"name": "restart", "value": "always"},
+                ],
+                "children": [
+                    {"kind": "nic", "fields": [{"name": "segment", "value": "corp"}]},
+                    {"kind": "env", "fields": [
+                        {"name": "name", "value": "MODE"},
+                        {"name": "value", "value": "prod"},
+                    ]},
+                    {"kind": "port", "fields": [
+                        {"name": "host", "value": 18080},
+                        {"name": "container", "value": 80},
+                    ]},
+                ],
+            }}))],
+        )
+        .unwrap();
+        let re = reload(&out);
+        let web = re.containers.iter().find(|c| c.name == "web").unwrap();
+        assert_eq!(web.image.reference, "nginx:1.27");
+        assert_eq!(web.memory, Some(256 << 20));
+        assert_eq!(web.restart, crate::config::model::RestartPolicy::Always);
+        assert_eq!(web.nics.len(), 1);
+        assert_eq!(web.env.len(), 1);
+        assert_eq!(web.ports[0].host_port, 18080);
+    }
+
+    #[test]
     fn add_block_after_sibling_orders() {
         let lab = model();
         let first_vm = lab.vms[0].span;

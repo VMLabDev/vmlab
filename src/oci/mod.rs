@@ -14,6 +14,9 @@
 //!   ChunkSet → manifest / multi-arch index construction.
 //! - [`auth`] — Docker-style credential reuse and the Bearer token flow.
 //! - [`client`] — the async registry client ([`Registry`]) with push/pull.
+//! - [`image`] — pulling plain **container images** (Docker-shorthand
+//!   references, multi-arch resolution, layer flattening into a squashfs
+//!   rootfs) for labs that run containers.
 //!
 //! `vmlab template login` is [`login`]: it validates a credential against
 //! the registry's `/v2/` endpoint, then stores it in the Docker config so a
@@ -24,6 +27,7 @@ pub mod catalog;
 pub mod chunking;
 pub mod client;
 pub mod config_blob;
+pub mod image;
 pub mod manifest;
 pub mod media_types;
 pub mod reference;
@@ -34,6 +38,10 @@ use anyhow::{Context, Result, bail};
 
 pub use catalog::list_repositories;
 pub use client::{PullProgress, Registry, ensure_registry_template};
+// No in-crate consumer until the container-runtime wiring lands (`image` has
+// the matching module-level dead_code allow).
+#[allow(unused_imports)]
+pub use image::{ImageCache, ImagePullProgress, PulledImage, ensure_container_image};
 pub use reference::with_version_tag;
 
 /// Validate `username`/`password` against `registry`'s `/v2/` endpoint and,

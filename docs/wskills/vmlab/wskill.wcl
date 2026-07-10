@@ -24,7 +24,7 @@ schema_version = "1.0.0"
 topic vmlab {
   name    = "vmlab"
   summary = "A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript."
-  version = "1.0"
+  version = "1.1"
   description = <<END
 vmlab orchestrates single-host virtual-machine labs. A **lab** — a set of VMs plus
 the virtual networks that connect them — is declared in **WCL** (`vmlab.wcl`).
@@ -48,7 +48,7 @@ wcl.wskill::skill {
   summary {
     overview = [
       "vmlab orchestrates single-host VM labs: labs (VMs + virtual networks) are declared in WCL (`vmlab.wcl`), disk templates are built and stored locally or distributed via OCI registries, and automation is written in wscript scripts that drive guests (power, exec, keystrokes, screen matching, OCR).",
-      "A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by the CLI. This skill captures the full reference as data; `docs/vmlab-prd.md` is the binding spec if anything here disagrees.",
+      "A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by the CLI. This skill captures the full reference as data.",
     ]
   }
   skill_param "$ARGUMENTS" {
@@ -83,14 +83,6 @@ artifact training { kind = :training      entry = "wdoc/training/main.wcl"      
 // Qualified `wcl.wskill::source` — bare `source` is ambiguous now that the
 // reflected schema import (data/reference/schema.wcl) brings vmlab's own
 // `@block("source")` (TemplateSource) into scope.
-wcl.wskill::source vmlab_prd {
-  kind         = "docs"
-  locator      = "docs/vmlab-prd.md"
-  covers       = "The binding product requirements: the source of truth for design and scope (sections §N are referenced throughout the code)."
-  last_checked = "2026-06-21"
-  reflects_version = "1.0"
-}
-
 wcl.wskill::source vmlab_repo {
   kind         = "repo"
   locator      = "/home/wil/dev/vmlab"

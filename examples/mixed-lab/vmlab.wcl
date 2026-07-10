@@ -1,41 +1,76 @@
-// A small mixed Windows/Linux lab built on the two example templates
-// (examples/templates/windows-server-2025 and examples/templates/
-// ubuntu-24.04 — build those first). Demonstrates a NAT'd segment, a
-// static IP, boot ordering, an SMB share, a host port-forward, and a
-// provision script driving both guests.
-//
-//   vmlab up
-//   curl http://localhost:18080      # nginx on nix01, via the forward
-//   vmlab down
+# A small mixed Windows/Linux lab built on the two example templates
+# (examples/templates/windows-server-2025 and examples/templates/
+# ubuntu-24.04 — build those first). Demonstrates a NAT'd segment, a
+# static IP, boot ordering, an SMB share, a host port-forward, an OCI
+# container on the same segment (§18), and a provision script driving
+# both guests.
+#
+# vmlab up
+# curl http://localhost:18080      # nginx on nix01, via the forward
+# curl http://localhost:18081      # nginx in the "web" container
+# vmlab down
 
 import <vmlab.wcl>
 
 lab "mixed-lab" {
 
-  gui = true        // open a VNC viewer for each guest on `vmlab up`
+  gui = true  # open a VNC viewer for each guest on `vmlab up`
 
   segment "lan" {
     subnet = "10.70.0.0/24"
-    nat    = true                                   // apt needs egress
-    forward { host_port = 18080 to = "nix01:80" }   // host → nginx
+    nat = true  # apt needs egress
+    forward {
+      host_port = 18080
+      to = "nix01:80"
+    }  # host → nginx
   }
 
   vm "winsrv" {
     template = "x86_64/windows-server-2025"
-    cpus     = 4
-    memory   = 8GiB
-    nic { segment = "lan" ip = "10.70.0.10" }       // DHCP reservation
-    share { host = "./shared" guest = "S:" }        // auto-mounted when ready
+    cpus = 4
+    memory = 8GiB
+    nic {
+      segment = "lan"
+      ip = "10.70.0.10"
+    }  # DHCP reservation
+    share {
+      host = "./shared"
+      guest = "S:"
+    }  # auto-mounted when ready
   }
 
   vm "nix01" {
-    template   = "x86_64/ubuntu-24.04"
-    memory     = 2GiB
+    template = "x86_64/ubuntu-24.04"
+    memory = 2GiB
     depends_on = ["winsrv"]
-    nic { segment = "lan" }                         // dynamic lease
+    nic {
+      segment = "lan"
+    }  # dynamic lease
   }
 
-  provision "scripts/setup.ws" { }
+  # An OCI container on the same segment: pulled like a docker image,
+  # run in a micro-VM, resolvable as web.mixed-lab.<suffix> from the VMs.
+  container "web" {
+    image = "nginx:1.27"
+    depends_on = ["nix01"]
+    nic {
+      segment = "lan"
+    }
+    port {
+      host = 18081
+      container = 80
+    }  # host → container nginx
+    healthcheck {
+      command = ["curl", "-fsS", "http://localhost/"]
+      interval = 5s
+    }
+  }
 
-  on "vm.crashed" { run = "scripts/on-crash.ws" }
+  provision "scripts/setup.ws" {
+    vms = ["winsrv"]
+  }
+
+  on "vm.crashed" {
+    run = "scripts/on-crash.ws"
+  }
 }

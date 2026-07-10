@@ -1,6 +1,5 @@
 import { For, Show, createResource, createSignal } from "solid-js";
 import {
-  Badge,
   Button,
   Card,
   Empty,
@@ -11,12 +10,10 @@ import {
   Progress,
   Spinner,
   Stat,
-  StatusDot,
 } from "@forge/ui";
 import {
   Camera,
   History,
-  Monitor,
   Play,
   Square,
   Trash2,
@@ -30,18 +27,13 @@ import {
   restoreSnapshot,
   deleteLabSnapshot,
   labSnapshotList,
-  vmStart,
-  vmStop,
-  showVm,
-  look,
-  osOf,
-  archOf,
   fmtMem,
   fmtBytes,
   currentPulls,
   type Pull,
 } from "../store";
 import { confirmDialog, promptDialog } from "./dialogs";
+import LabEditorView from "./editor/LabEditorView";
 
 function fmtTime(t: string): string {
   if (!t) return "";
@@ -52,8 +44,12 @@ function fmtTime(t: string): string {
 export default function LabView() {
   const s = () => state.status;
   const pulls = () => currentPulls();
-  const running = () => s()?.vms.filter((v) => v.state === "running").length ?? 0;
-  const total = () => s()?.vms.length ?? 0;
+  // "Machines" spans VMs and containers (they share one lab namespace).
+  const containers = () => s()?.containers ?? [];
+  const running = () =>
+    (s()?.vms.filter((v) => v.state === "running").length ?? 0) +
+    containers().filter((c) => c.state === "running").length;
+  const total = () => (s()?.vms.length ?? 0) + containers().length;
   const vcpu = () => s()?.vms.reduce((a, v) => a + (v.cpus ?? 0), 0) ?? 0;
   const mem = () => s()?.vms.reduce((a, v) => a + (v.memory ?? 0), 0) ?? 0;
 
@@ -101,23 +97,14 @@ export default function LabView() {
   };
 
   return (
-    <Show
-      when={s()}
-      fallback={
-        <Show
-          when={pulls().length}
-          fallback={<Empty title="No lab selected">Or the lab daemon isn't reachable.</Empty>}
-        >
-          <div class="stack">
-            <PullPanel pulls={pulls()} />
-            <Empty title="Starting the lab">Downloading templates…</Empty>
-          </div>
-        </Show>
-      }
-    >
+    <Show when={state.currentLab} fallback={<Empty title="No lab selected" />}>
       <PageHead
-        title={s()!.lab}
-        sub={`${total()} machines · ${s()!.segments.length} segments`}
+        title={s()?.lab ?? state.currentLab!}
+        sub={
+          s()
+            ? `${total()} machines · ${s()!.segments.length} segments`
+            : "lab daemon not running"
+        }
         actions={
           <>
             <Button variant="primary" icon={Play} onClick={startAll}>
@@ -146,7 +133,11 @@ export default function LabView() {
 
         <Grid>
           <Card>
-            <Stat label="Machines up" value={String(running())} delta={`/ ${total()}`} />
+            <Stat
+              label="Machines up"
+              value={s() ? String(running()) : "—"}
+              delta={s() ? `/ ${total()}` : undefined}
+            />
           </Card>
           <Card>
             <Stat
@@ -159,42 +150,11 @@ export default function LabView() {
             <Stat label="Memory" value={fmtMem(mem() || null)} />
           </Card>
           <Card>
-            <Stat label="Segments" value={String(s()!.segments.length)} />
+            <Stat label="Segments" value={s() ? String(s()!.segments.length) : "—"} />
           </Card>
         </Grid>
 
-        <div>
-          <For each={s()!.vms}>
-            {(vm) => {
-              const on = () => vm.state === "running";
-              return (
-                <div class="vm-row">
-                  <StatusDot tone={look(vm).tone} />
-                  <div style={{ "min-width": "0" }}>
-                    <div class="vm-row-name">{vm.name}</div>
-                    <div class="vm-row-os">
-                      {osOf(vm)} · {archOf(vm)}
-                    </div>
-                  </div>
-                  <span class="vm-row-state">
-                    <Badge tone={look(vm).tone} dot>
-                      {look(vm).label}
-                    </Badge>
-                  </span>
-                  <span class="vm-row-ip">{vm.ip ?? "—"}</span>
-                  <div class="vm-row-actions">
-                    <Button size="sm" onClick={() => (on() ? vmStop(vm.name) : vmStart(vm.name))}>
-                      {on() ? "Stop" : "Start"}
-                    </Button>
-                    <Button size="sm" icon={Monitor} onClick={() => showVm(vm.name)}>
-                      Console
-                    </Button>
-                  </div>
-                </div>
-              );
-            }}
-          </For>
-        </div>
+        <LabEditorView />
       </div>
 
       <Modal

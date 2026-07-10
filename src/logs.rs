@@ -7,6 +7,7 @@
 //!   - `events.jsonl` — structured [`crate::proto::Event`] lines (timestamped)
 //!   - `lab.log`      — provision/script output (raw text)
 //!   - `vms/<vm>/{serial,qemu,swtpm}.log` — raw per-VM text
+//!   - `containers/<name>/console.log` — micro-VM kernel + container stdout/stderr
 
 use std::path::{Path, PathBuf};
 
@@ -22,9 +23,9 @@ pub const LAB_SOURCE: &str = "lab";
 /// parsed into a timestamp plus a flattened `event key=value …` summary.
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
-    /// `"lab"` or the VM name.
+    /// `"lab"`, the VM name, or the container name.
     pub source: String,
-    /// `"events" | "lab" | "serial" | "qemu" | "swtpm"`.
+    /// `"events" | "lab" | "serial" | "qemu" | "swtpm" | "console"`.
     pub stream: String,
     /// Present only for `events.jsonl` lines.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,7 +49,8 @@ pub fn lab_dir(lab: &str) -> PathBuf {
 
 /// Every log file that currently exists for a lab, in a stable order: the
 /// lab-level events then `lab.log`, then each VM's serial/qemu/swtpm (VMs
-/// sorted by name). Re-scanning picks up VMs that start after the stream opens.
+/// sorted by name), then each container's console log (sorted by name).
+/// Re-scanning picks up VMs/containers that start after the stream opens.
 pub fn enumerate(lab: &str) -> Vec<LogFile> {
     enumerate_in(&lab_dir(lab))
 }
@@ -88,6 +90,29 @@ fn enumerate_in(base: &Path) -> Vec<LogFile> {
                     path,
                 });
             }
+        }
+    }
+
+    // Containers: one console.log each (kernel messages + stdout/stderr).
+    let mut containers: Vec<PathBuf> = std::fs::read_dir(base.join("containers"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    containers.sort();
+    for dir in containers {
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let path = dir.join("console.log");
+        if path.is_file() {
+            files.push(LogFile {
+                source: name.to_string(),
+                stream: "console".to_string(),
+                path,
+            });
         }
     }
     files
@@ -204,6 +229,20 @@ mod tests {
         assert!(vm_sources.contains(&"web01"));
         // swtpm.log absent → not listed.
         assert!(!files.iter().any(|f| f.stream == "swtpm"));
+    }
+
+    #[test]
+    fn enumerate_finds_container_console_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("containers/web")).unwrap();
+        std::fs::create_dir_all(base.join("containers/empty")).unwrap();
+        std::fs::write(base.join("containers/web/console.log"), "hello\n").unwrap();
+
+        let files = enumerate_in(base);
+        let consoles: Vec<_> = files.iter().filter(|f| f.stream == "console").collect();
+        assert_eq!(consoles.len(), 1);
+        assert_eq!(consoles[0].source, "web");
     }
 
     #[test]

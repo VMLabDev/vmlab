@@ -161,6 +161,34 @@ fn print_status(status: &Value) {
             );
         }
     }
+    if let Some(containers) = status["containers"].as_array()
+        && !containers.is_empty()
+    {
+        println!();
+        println!(
+            "  {:<16} {:<10} {:<7} {:<10} {:<16} IMAGE",
+            "CONTAINER", "STATE", "READY", "HEALTH", "IP"
+        );
+        for c in containers {
+            println!(
+                "  {:<16} {:<10} {:<7} {:<10} {:<16} {}",
+                c["name"].as_str().unwrap_or("?"),
+                c["state"].as_str().unwrap_or("?"),
+                if c["ready"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                match c["health"].as_bool() {
+                    None => "-",
+                    Some(true) => "ok",
+                    Some(false) => "unhealthy",
+                },
+                c["ip"].as_str().unwrap_or("-"),
+                c["image"].as_str().unwrap_or("?"),
+            );
+        }
+    }
     if let Some(segments) = status["segments"].as_array() {
         println!();
         println!(
@@ -374,6 +402,127 @@ pub fn cmd_vm_destroy(vm_ref: &str) -> Result<()> {
             .await
             .map_err(remote)?;
         println!("vm \"{vm}\" destroyed");
+        Ok(())
+    })
+}
+
+pub fn cmd_container_power(container_ref: &str, op: &str, force: bool) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, container) = split_vm_ref(container_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        match op {
+            "start" => client
+                .call("container.start", json!({"container": container}))
+                .await
+                .map_err(remote)?,
+            "stop" => client
+                .call(
+                    "container.stop",
+                    json!({"container": container, "force": force}),
+                )
+                .await
+                .map_err(remote)?,
+            "restart" => client
+                .call("container.restart", json!({"container": container}))
+                .await
+                .map_err(remote)?,
+            _ => unreachable!(),
+        };
+        Ok(())
+    })
+}
+
+pub fn cmd_container_destroy(container_ref: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, container) = split_vm_ref(container_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        client
+            .call("container.destroy", json!({"container": container}))
+            .await
+            .map_err(remote)?;
+        println!("container \"{container}\" destroyed");
+        Ok(())
+    })
+}
+
+pub fn cmd_container_exec(container_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
+    if cmd.is_empty() {
+        bail!("nothing to execute — usage: vmlab container exec <container> -- <cmd> [args...]");
+    }
+    rt()?.block_on(async {
+        let (lab, container) = split_vm_ref(container_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let result = client
+            .call(
+                "container.exec",
+                json!({"container": container, "cmd": cmd[0],
+                       "args": cmd[1..].to_vec(), "timeout": timeout}),
+            )
+            .await
+            .map_err(remote)?;
+        print!("{}", result["stdout"].as_str().unwrap_or(""));
+        eprint!("{}", result["stderr"].as_str().unwrap_or(""));
+        let code = result["exit_code"].as_i64().unwrap_or(0);
+        if code != 0 {
+            std::process::exit(code as i32);
+        }
+        Ok(())
+    })
+}
+
+/// `vmlab container logs <container>` — dump the console log tail, or with
+/// `--follow` stream it (the daemon polls the log for growth) until ^C or
+/// the container stops.
+pub fn cmd_container_logs(container_ref: &str, follow: bool, lines: usize) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, container) = split_vm_ref(container_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        if !follow {
+            let logs = client
+                .call(
+                    "container.logs",
+                    json!({"container": container, "lines": lines}),
+                )
+                .await
+                .map_err(remote)?;
+            let text = logs.as_str().unwrap_or_default();
+            if !text.is_empty() {
+                println!("{text}");
+            }
+            return Ok(());
+        }
+        // Follow: the first chunk is the tail (no trailing newline — the
+        // daemon joins lines); later chunks are raw file bytes.
+        let mut first = true;
+        client
+            .call_streaming(
+                "container.logs",
+                json!({"container": container, "lines": lines, "follow": true}),
+                |chunk| {
+                    if std::mem::take(&mut first) {
+                        if !chunk.is_empty() {
+                            println!("{chunk}");
+                        }
+                    } else {
+                        print!("{chunk}");
+                    }
+                },
+            )
+            .await
+            .map_err(remote)?;
+        Ok(())
+    })
+}
+
+pub fn cmd_container_ip(container_ref: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, container) = split_vm_ref(container_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let ip = client
+            .call("container.ip", json!({"container": container}))
+            .await
+            .map_err(remote)?;
+        println!("{}", ip.as_str().unwrap_or_default());
         Ok(())
     })
 }

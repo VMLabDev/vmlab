@@ -4,18 +4,26 @@
 
 import { createStore, produce } from "solid-js/store";
 import * as api from "../api";
-import type { CatalogMeta, ConfigIssue, StoreTemplate } from "../api";
+import type { CatalogMeta, ConfigIssue, HostInfo, StoreTemplate } from "../api";
 import { StaleRev, ValidationError } from "../api";
 import { setNavGuard, showToast } from "../store";
 import { confirmDialog } from "../components/dialogs";
-import type { LabModel, Span, TemplateSummary, VmModel, SegmentModel } from "./model";
-import { deepClone, emptySegment, emptyVm, uniqueName } from "./model";
+import type {
+  ContainerModel,
+  LabModel,
+  Span,
+  TemplateSummary,
+  VmModel,
+  SegmentModel,
+} from "./model";
+import { deepClone, emptyContainer, emptySegment, emptyVm, uniqueName } from "./model";
 import { buildOps } from "./ops";
 
 export type Selection =
   | { kind: "lab" }
   | { kind: "segment"; index: number }
   | { kind: "vm"; index: number }
+  | { kind: "container"; index: number }
   | { kind: "nat" };
 
 interface EditorState {
@@ -39,6 +47,7 @@ interface EditorState {
     templates: StoreTemplate[];
     profiles: string[];
     meta: CatalogMeta | null;
+    host: HostInfo | null;
   };
 }
 
@@ -56,7 +65,7 @@ const [editor, setEditor] = createStore<EditorState>({
   selection: { kind: "lab" },
   busy: null,
   issues: [],
-  catalog: { templates: [], profiles: [], meta: null },
+  catalog: { templates: [], profiles: [], meta: null, host: null },
 });
 
 export { editor, setEditor };
@@ -120,12 +129,13 @@ export async function reloadModel(lab = editor.lab): Promise<void> {
 }
 
 async function loadCatalogs() {
-  const [templates, profiles, meta] = await Promise.all([
+  const [templates, profiles, meta, host] = await Promise.all([
     api.listStoreTemplates().catch(() => [] as StoreTemplate[]),
     api.listProfiles().catch(() => [] as string[]),
     api.catalogMeta().catch(() => null),
+    api.hostInfo().catch(() => null),
   ]);
-  setEditor("catalog", { templates, profiles, meta });
+  setEditor("catalog", { templates, profiles, meta, host });
 }
 
 // --- selection ---------------------------------------------------------------
@@ -150,6 +160,20 @@ export function addVm(): number {
   return index;
 }
 
+export function addContainer(image = ""): number {
+  const draft = editor.draft;
+  if (!draft) return -1;
+  // VMs and containers share one name namespace.
+  const name = uniqueName(
+    "container",
+    [...draft.vms.map((v) => v.name), ...draft.containers.map((c) => c.name)],
+  );
+  setEditor("draft", "containers", draft.containers.length, emptyContainer(name, image));
+  const index = editor.draft!.containers.length - 1;
+  select({ kind: "container", index });
+  return index;
+}
+
 export function addSegment(): number {
   const draft = editor.draft;
   if (!draft) return -1;
@@ -171,6 +195,17 @@ export function removeVm(index: number) {
   select({ kind: "lab" });
 }
 
+export function removeContainer(index: number) {
+  setEditor(
+    "draft",
+    "containers",
+    produce((containers: ContainerModel[]) => {
+      containers.splice(index, 1);
+    }),
+  );
+  select({ kind: "lab" });
+}
+
 export function removeSegment(index: number) {
   setEditor(
     "draft",
@@ -182,18 +217,102 @@ export function removeSegment(index: number) {
   select({ kind: "lab" });
 }
 
-/** Attach a new NIC on VM `vmIndex` (segment name, or null = NAT). */
-export function addNic(vmIndex: number, segment: string | null) {
-  const vm = editor.draft?.vms[vmIndex];
-  if (!vm) return;
-  setEditor("draft", "vms", vmIndex, "nics", vm.nics.length, {
+/** VMs and containers attach to segments the same way; NIC edits address a
+ *  machine by kind + index into the matching draft collection. */
+export type MachineKind = "vm" | "container";
+
+/** The addressed machine's NIC list, or null when it doesn't exist. */
+function machineNics(kind: MachineKind, index: number) {
+  const d = editor.draft;
+  if (!d) return null;
+  return (kind === "vm" ? d.vms[index] : d.containers[index])?.nics ?? null;
+}
+
+/** Attach a new NIC on machine `index` (segment name, or null = NAT). */
+export function addMachineNic(kind: MachineKind, index: number, segment: string | null) {
+  const nics = machineNics(kind, index);
+  if (!nics) return;
+  const nic = {
     span: null as Span | null,
     segment,
     nat: segment === null,
     ip: null,
     mac: null,
     isolated: false,
-  });
+  };
+  if (kind === "vm") setEditor("draft", "vms", index, "nics", nics.length, nic);
+  else setEditor("draft", "containers", index, "nics", nics.length, nic);
+}
+
+/** Re-home NIC `nicIndex` of machine `index` (segment name, or null = NAT/WAN). */
+export function setMachineNicTarget(
+  kind: MachineKind,
+  index: number,
+  nicIndex: number,
+  segment: string | null,
+) {
+  if (!machineNics(kind, index)?.[nicIndex]) return;
+  const patch = { segment, nat: segment === null };
+  if (kind === "vm") setEditor("draft", "vms", index, "nics", nicIndex, patch);
+  else setEditor("draft", "containers", index, "nics", nicIndex, patch);
+}
+
+/** Unplug NIC `nicIndex` of machine `index`: it stays on the machine as a
+ *  loose port (no segment, no NAT) ready to be cabled somewhere else. */
+export function disconnectMachineNic(kind: MachineKind, index: number, nicIndex: number) {
+  if (!machineNics(kind, index)?.[nicIndex]) return;
+  const patch = { segment: null, nat: false };
+  if (kind === "vm") setEditor("draft", "vms", index, "nics", nicIndex, patch);
+  else setEditor("draft", "containers", index, "nics", nicIndex, patch);
+}
+
+/** Attach a new NIC on VM `vmIndex` (segment name, or null = NAT). */
+export const addNic = (vmIndex: number, segment: string | null) =>
+  addMachineNic("vm", vmIndex, segment);
+
+/** Interconnect: segment `fromIndex` routes to segment `to` (idempotent). */
+export function addSegmentRoute(fromIndex: number, to: string) {
+  const seg = editor.draft?.segments[fromIndex];
+  if (!seg || seg.name === to || seg.routes_to.includes(to)) return;
+  setEditor("draft", "segments", fromIndex, "routes_to", [...seg.routes_to, to]);
+}
+
+/** Remove the `fromIndex` → `to` interconnect. */
+export function removeSegmentRoute(fromIndex: number, to: string) {
+  const seg = editor.draft?.segments[fromIndex];
+  if (!seg) return;
+  setEditor(
+    "draft",
+    "segments",
+    fromIndex,
+    "routes_to",
+    seg.routes_to.filter((n) => n !== to),
+  );
+}
+
+/** Connect/disconnect segment `index` to the WAN (NAT egress). */
+export function setSegmentNat(index: number, on: boolean) {
+  if (!editor.draft?.segments[index]) return;
+  setEditor("draft", "segments", index, "nat", on);
+}
+
+/** Rewrite every name reference shared by VMs and containers (depends_on
+ *  spans both, provisions and forwards target machines by name). */
+function rewriteMachineRefs(d: LabModel, from: string, to: string) {
+  for (const vm of d.vms) {
+    vm.depends_on = vm.depends_on.map((n) => (n === from ? to : n));
+  }
+  for (const c of d.containers) {
+    c.depends_on = c.depends_on.map((n) => (n === from ? to : n));
+  }
+  for (const p of d.provisions) {
+    p.vms = p.vms.map((n) => (n === from ? to : n));
+  }
+  for (const s of d.segments) {
+    for (const f of s.forwards) {
+      if (f.vm === from) f.vm = to;
+    }
+  }
 }
 
 /** Rename a VM and rewrite every reference to it in the draft. */
@@ -207,17 +326,23 @@ export function renameVm(index: number, to: string) {
     produce((d: LabModel | null) => {
       if (!d) return;
       d.vms[index].name = to;
-      for (const vm of d.vms) {
-        vm.depends_on = vm.depends_on.map((n) => (n === from ? to : n));
-      }
-      for (const p of d.provisions) {
-        p.vms = p.vms.map((n) => (n === from ? to : n));
-      }
-      for (const s of d.segments) {
-        for (const f of s.forwards) {
-          if (f.vm === from) f.vm = to;
-        }
-      }
+      rewriteMachineRefs(d, from, to);
+    }),
+  );
+}
+
+/** Rename a container and rewrite every reference to it in the draft. */
+export function renameContainer(index: number, to: string) {
+  const draft = editor.draft;
+  if (!draft) return;
+  const from = draft.containers[index].name;
+  if (from === to) return;
+  setEditor(
+    "draft",
+    produce((d: LabModel | null) => {
+      if (!d) return;
+      d.containers[index].name = to;
+      rewriteMachineRefs(d, from, to);
     }),
   );
 }
@@ -236,8 +361,8 @@ export function renameSegment(index: number, to: string) {
       for (const s of d.segments) {
         s.routes_to = s.routes_to.map((n) => (n === from ? to : n));
       }
-      for (const vm of d.vms) {
-        for (const n of vm.nics) {
+      for (const m of [...d.vms, ...d.containers]) {
+        for (const n of m.nics) {
           if (n.segment === from) n.segment = to;
         }
       }
@@ -308,7 +433,22 @@ export async function saveDraft(): Promise<boolean> {
 
 /** Names usable as references in the draft (pickers). */
 export const vmNames = () => editor.draft?.vms.map((v) => v.name) ?? [];
+export const containerNames = () => editor.draft?.containers.map((c) => c.name) ?? [];
+/** VM + container names — `depends_on` spans both kinds. */
+export const machineNames = () => [...vmNames(), ...containerNames()];
 export const segmentNames = () => editor.draft?.segments.map((s) => s.name) ?? [];
+
+/** The store-catalog entry a `<arch>/<name>[@version]` ref resolves to —
+ *  the source of a VM's inherited defaults (cpus/memory/profile/…). */
+export function storeTemplateFor(ref: string): StoreTemplate | undefined {
+  const m = /^([^/@]+)\/([^/@]+)(?:@(.+))?$/.exec(ref);
+  if (!m) return undefined;
+  const [, arch, name, version] = m;
+  const candidates = editor.catalog.templates.filter(
+    (t) => t.arch === arch && t.name === name,
+  );
+  return (version && candidates.find((t) => t.version === version)) || candidates[0];
+}
 
 // Lab switches consult this guard so an unsaved draft is never silently
 // dropped (the draft itself survives view switches — it dies only when a
@@ -339,6 +479,9 @@ export function selectionForLine(line: number | null): Selection | null {
   const contains = (span: Span | null) => span && offset >= span[0] && offset < span[1];
   for (let i = 0; i < base.vms.length; i++) {
     if (contains(base.vms[i].span)) return { kind: "vm", index: i };
+  }
+  for (let i = 0; i < base.containers.length; i++) {
+    if (contains(base.containers[i].span)) return { kind: "container", index: i };
   }
   for (let i = 0; i < base.segments.length; i++) {
     if (contains(base.segments[i].span)) return { kind: "segment", index: i };

@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod guest_asset;
 pub mod lab_init;
 mod labd;
 mod lifecycle;

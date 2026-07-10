@@ -1,0 +1,7 @@
+# Build outputs of build-asset.sh (rebuild them; the pins in the script are
+# the source of truth) and the apk download cache.
+dist/
+.cache/
+# Standalone-crate build dirs (these crates are not workspace members).
+cinit/target/
+cinit-proto/target/

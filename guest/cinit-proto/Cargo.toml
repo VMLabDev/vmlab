@@ -1,0 +1,22 @@
+# The host <-> micro-VM init wire contract. Deliberately tiny: serde types
+# only, so it builds for the host (as a normal dependency of the main `vmlab`
+# crate) and for the static-musl guest init (`guest/cinit`) alike.
+
+[package]
+name = "vmlab-cinit-proto"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Host <-> micro-VM init (vmlab-cinit) wire contract for vmlab OCI containers"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "deny"
+
+# Standalone: not a member of any surrounding workspace.
+[workspace]

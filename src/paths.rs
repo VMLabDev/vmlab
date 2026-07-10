@@ -35,6 +35,13 @@ pub fn template_store_dir() -> PathBuf {
     data_dir().join("templates")
 }
 
+/// `~/.local/share/vmlab/oci` — the digest-addressed cache of pulled
+/// container images (compressed layer blobs, flattened rootfs images, and
+/// tag-resolution records).
+pub fn oci_cache_dir() -> PathBuf {
+    data_dir().join("oci")
+}
+
 /// `~/.local/share/vmlab/labs` — the managed home for labs created through
 /// the web UI's "New Lab" (a lab is any directory containing `vmlab.wcl`;
 /// this is just the default place the server puts new ones).

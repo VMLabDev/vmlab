@@ -216,6 +216,30 @@ fn get_path(b: &Block, name: &str, issues: &mut IssueList) -> Option<PathBuf> {
     get_str(b, name, issues).map(|(s, _)| PathBuf::from(s))
 }
 
+/// Read a `std.Duration` field — a non-negative nanosecond count (unit
+/// suffixes like `10s` are resolved to nanoseconds by wcl).
+fn get_duration(b: &Block, name: &str, issues: &mut IssueList) -> Option<std::time::Duration> {
+    let (n, span) = get_int(b, name, issues)?;
+    match u64::try_from(n) {
+        Ok(ns) => Some(std::time::Duration::from_nanos(ns)),
+        Err(_) => {
+            issues.push(Issue::at(span, format!("`{name}` must not be negative")));
+            None
+        }
+    }
+}
+
+/// Like `get_str_list`, but distinguishes an absent field (`None`) from an
+/// empty list — needed where the empty list is meaningful (e.g. a container
+/// `command` override of `[]`).
+fn get_opt_str_list(b: &Block, name: &str, issues: &mut IssueList) -> Option<Vec<String>> {
+    if b.field(name).is_some() {
+        Some(get_str_list(b, name, issues))
+    } else {
+        None
+    }
+}
+
 fn get_enum<T: Copy>(
     b: &Block,
     name: &str,
@@ -246,6 +270,7 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
         gui: get_bool(b, "gui", issues),
         segments: Vec::new(),
         vms: Vec::new(),
+        containers: Vec::new(),
         provisions: Vec::new(),
         handlers: Vec::new(),
         records: Vec::new(),
@@ -261,6 +286,11 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
             "vm" => {
                 if let Some(v) = extract_vm(&child, issues) {
                     lab.vms.push(v);
+                }
+            }
+            "container" => {
+                if let Some(c) = extract_container(&child, issues) {
+                    lab.containers.push(c);
                 }
             }
             "provision" => {
@@ -727,6 +757,241 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         }
     }
     Some(vm)
+}
+
+fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
+    let name = label_name(b, "container", issues)?;
+    let span = span_of(b);
+    let (image, image_span) = match get_str(b, "image", issues) {
+        Some((s, ispan)) => match parse_image_ref(&s) {
+            Ok(r) => (r, ispan),
+            Err(e) => {
+                issues.push(Issue::at(ispan, e));
+                return None;
+            }
+        },
+        None => {
+            issues.push(Issue::at(
+                span,
+                format!("container \"{name}\" is missing required `image`"),
+            ));
+            return None;
+        }
+    };
+    let restart = if b.field("restart").is_some() {
+        get_enum(
+            b,
+            "restart",
+            &[
+                ("no", RestartPolicy::No),
+                ("on-failure", RestartPolicy::OnFailure),
+                ("always", RestartPolicy::Always),
+            ],
+            issues,
+        )
+        .unwrap_or_default()
+    } else {
+        RestartPolicy::No
+    };
+    let mut c = Container {
+        name,
+        span,
+        image,
+        image_span,
+        entrypoint: get_opt_str_list(b, "entrypoint", issues),
+        command: get_opt_str_list(b, "command", issues),
+        workdir: get_str(b, "workdir", issues).map(|(s, _)| s),
+        user: get_str(b, "user", issues).map(|(s, _)| s),
+        cpus: get_int(b, "cpus", issues).and_then(|(n, s)| {
+            u32::try_from(n).ok().filter(|&c| c > 0).or_else(|| {
+                issues.push(Issue::at(
+                    s,
+                    format!("cpus must be a positive integer, got {n}"),
+                ));
+                None
+            })
+        }),
+        memory: get_size(b, "memory", issues),
+        depends_on: get_str_list(b, "depends_on", issues),
+        restart,
+        nics: Vec::new(),
+        env: Vec::new(),
+        volumes: Vec::new(),
+        ports: Vec::new(),
+        healthcheck: None,
+    };
+    for child in b.blocks() {
+        match child.kind() {
+            "nic" => c.nics.push(extract_nic(&child, issues)),
+            "env" => {
+                if let Some(e) = extract_env(&child, issues) {
+                    c.env.push(e);
+                }
+            }
+            "volume" => {
+                if let Some(v) = extract_volume(&child, issues) {
+                    c.volumes.push(v);
+                }
+            }
+            "port" => {
+                if let Some(p) = extract_port(&child, issues) {
+                    c.ports.push(p);
+                }
+            }
+            "healthcheck" => c.healthcheck = extract_healthcheck(&child, issues),
+            _ => {}
+        }
+    }
+    Some(c)
+}
+
+fn extract_env(b: &Block, issues: &mut IssueList) -> Option<EnvVar> {
+    let (name, nspan) = get_str(b, "name", issues)?;
+    if name.is_empty() || name.contains('=') {
+        issues.push(Issue::at(
+            nspan,
+            format!("malformed environment variable name `{name}`"),
+        ));
+        return None;
+    }
+    let (value, _) = get_str(b, "value", issues)?;
+    Some(EnvVar {
+        name,
+        value,
+        span: span_of(b),
+    })
+}
+
+fn extract_volume(b: &Block, issues: &mut IssueList) -> Option<Volume> {
+    let span = span_of(b);
+    let host = get_path(b, "host", issues);
+    let name = get_str(b, "name", issues).map(|(s, _)| s);
+    let source = match (host, name) {
+        (Some(h), None) => VolumeSource::Host(h),
+        (None, Some(n)) => {
+            let ok =
+                !n.is_empty() && n != "." && n != ".." && !n.contains('/') && !n.contains('\\');
+            if !ok {
+                issues.push(Issue::at(
+                    span,
+                    format!("malformed volume name `{n}` — it becomes a directory name"),
+                ));
+                return None;
+            }
+            VolumeSource::Named(n)
+        }
+        (Some(_), Some(_)) => {
+            issues.push(Issue::at(
+                span,
+                "volume has both `host` and `name` — pick one",
+            ));
+            return None;
+        }
+        (None, None) => {
+            issues.push(Issue::at(
+                span,
+                "volume needs `host = ...` (bind mount) or `name = ...` (named volume)",
+            ));
+            return None;
+        }
+    };
+    let (target, tspan) = get_str(b, "target", issues)?;
+    if !target.starts_with('/') {
+        issues.push(Issue::at(
+            tspan,
+            format!("volume target `{target}` must be an absolute path inside the container"),
+        ));
+        return None;
+    }
+    Some(Volume {
+        source,
+        target,
+        read_only: get_bool(b, "read_only", issues).unwrap_or(false),
+        span,
+    })
+}
+
+fn extract_port(b: &Block, issues: &mut IssueList) -> Option<PortMap> {
+    let span = span_of(b);
+    let port_field = |field: &str, issues: &mut IssueList| -> Option<u16> {
+        let (n, s) = get_int(b, field, issues)?;
+        u16::try_from(n).ok().filter(|&p| p > 0).or_else(|| {
+            issues.push(Issue::at(
+                s,
+                format!("`{field}` port {n} out of range (1–65535)"),
+            ));
+            None
+        })
+    };
+    let host_port = port_field("host", issues)?;
+    let container_port = port_field("container", issues)?;
+    let proto = if b.field("proto").is_some() {
+        get_enum(
+            b,
+            "proto",
+            &[
+                ("tcp", Proto::Tcp),
+                ("udp", Proto::Udp),
+                ("both", Proto::Both),
+            ],
+            issues,
+        )
+        .unwrap_or(Proto::Tcp)
+    } else {
+        Proto::Tcp
+    };
+    Some(PortMap {
+        host_port,
+        container_port,
+        proto,
+        span,
+    })
+}
+
+fn extract_healthcheck(b: &Block, issues: &mut IssueList) -> Option<Healthcheck> {
+    let span = span_of(b);
+    let command = get_str_list(b, "command", issues);
+    if command.is_empty() {
+        issues.push(Issue::at(
+            span,
+            "healthcheck requires a non-empty `command`",
+        ));
+        return None;
+    }
+    let positive_dur =
+        |name: &str, default_secs: u64, issues: &mut IssueList| -> std::time::Duration {
+            match get_duration(b, name, issues) {
+                Some(d) if d.is_zero() => {
+                    issues.push(Issue::at(span, format!("healthcheck `{name}` must be > 0")));
+                    std::time::Duration::from_secs(default_secs)
+                }
+                Some(d) => d,
+                None => std::time::Duration::from_secs(default_secs),
+            }
+        };
+    let interval = positive_dur("interval", 10, issues);
+    let timeout = positive_dur("timeout", 5, issues);
+    let start_period =
+        get_duration(b, "start_period", issues).unwrap_or(std::time::Duration::from_secs(10));
+    let retries = get_int(b, "retries", issues)
+        .and_then(|(n, s)| {
+            u32::try_from(n).ok().filter(|&r| r >= 1).or_else(|| {
+                issues.push(Issue::at(
+                    s,
+                    format!("healthcheck retries must be ≥ 1, got {n}"),
+                ));
+                None
+            })
+        })
+        .unwrap_or(3);
+    Some(Healthcheck {
+        command,
+        interval,
+        timeout,
+        retries,
+        start_period,
+        span,
+    })
 }
 
 fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {

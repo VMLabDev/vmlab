@@ -1,17 +1,20 @@
-// The combined lab-editing page: one sidebar entry, two tabs — the visual
-// Design canvas and the raw Config (vmlab.wcl) editor — swapped at the top.
+// The lab page's tabbed body: the visual Design canvas, the raw Config
+// (vmlab.wcl) editor, and the lab daemon's Logs — swapped at the top.
 //
-// The two tabs edit the same file through different doors, so swapping
-// re-syncs: Config remounts (fresh disk read) every time it activates, and
-// Design re-fetches its model when it isn't holding unsaved edits.
+// Design and Config edit the same file through different doors, so
+// swapping re-syncs: Config remounts (fresh disk read) every time it
+// activates, and Design re-fetches its model when it isn't holding
+// unsaved edits. Logs remounts too (fresh backlog from the stream).
 
 import { Show, createSignal } from "solid-js";
 import { Tabs } from "@forge/ui";
 import { editorDirty, reloadModel } from "../../editor/store";
+import { state } from "../../store";
 import ConfigView from "../ConfigView";
+import LogPanel from "../LogPanel";
 import EditorView from "./EditorView";
 
-const [tab, setTab] = createSignal<"design" | "config">("design");
+const [tab, setTab] = createSignal<"design" | "config" | "logs">("design");
 
 /** Jump to the raw-WCL tab (used when the model can't be opened visually). */
 export function openConfigTab() {
@@ -20,7 +23,7 @@ export function openConfigTab() {
 
 export default function LabEditorView() {
   function onTab(id: string) {
-    const next = id as "design" | "config";
+    const next = id as "design" | "config" | "logs";
     if (next === "design" && tab() !== "design" && !editorDirty()) {
       // Pick up whatever the raw editor (or anyone else) wrote to disk.
       void reloadModel();
@@ -34,6 +37,7 @@ export default function LabEditorView() {
         tabs={[
           { id: "design", label: "Design" },
           { id: "config", label: "Config" },
+          { id: "logs", label: "Logs" },
         ]}
         active={tab()}
         onChange={onTab}
@@ -43,6 +47,9 @@ export default function LabEditorView() {
       </Show>
       <Show when={tab() === "config"}>
         <ConfigView />
+      </Show>
+      <Show when={tab() === "logs" && state.currentLab}>
+        <LogPanel lab={state.currentLab!} source="lab" />
       </Show>
     </div>
   );

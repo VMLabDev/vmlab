@@ -11,23 +11,6 @@
 .login-card { width: 380px; max-width: 100%; }
 .login-form { display: flex; flex-direction: column; gap: var(--sp-4); }
 
-/* Lab view machine rows. */
-.vm-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) 90px 130px auto;
-  align-items: center;
-  gap: var(--sp-4);
-  padding: var(--sp-3) var(--sp-4);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--bg-1);
-  margin-bottom: var(--sp-2);
-}
-.vm-row-name { font-weight: 550; color: var(--fg-0); }
-.vm-row-os { font-size: var(--fs-xs); color: var(--fg-2); }
-.vm-row-ip { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--fg-1); }
-.vm-row-actions { display: flex; gap: var(--sp-2); }
-
 /* Template pull progress captions. */
 .pull-list { display: flex; flex-direction: column; gap: var(--sp-4); }
 .pull-sub { font-size: var(--fs-xs); color: var(--fg-2); margin-top: var(--sp-1); }
@@ -70,27 +53,29 @@
 .kv-k { color: var(--fg-2); }
 .kv-v { color: var(--fg-0); font-family: var(--font-mono); font-size: var(--fs-xs); text-align: right; overflow-wrap: anywhere; }
 
-/* Log rows: vmlab needs time/source/stream/text — forge's LogLine is a fixed
-   3-column grid, so the rows stay custom inside the <Logs> container. */
+/* Log rows: time/stream/text — forge's LogLine is a fixed 3-column grid
+   with its own semantics, so the rows stay custom inside <Logs>. */
 .logrow {
   display: grid;
-  grid-template-columns: 64px 92px 56px minmax(0, 1fr);
+  grid-template-columns: 64px 56px minmax(0, 1fr);
   gap: var(--sp-3);
   padding: 2px var(--sp-3);
   line-height: 1.7;
 }
 .logrow:hover { background: var(--bg-1); }
 .logrow-ts { color: var(--fg-3); }
-.logrow-src { color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; }
-.logrow-src.is-lab { color: var(--accent); }
 .logrow-stream { color: var(--fg-3); }
 .logrow-stream.ls-events, .logrow-stream.ls-lab { color: var(--info-fg); }
 .logrow-stream.ls-serial { color: var(--success-fg); }
 .logrow-stream.ls-qemu { color: var(--warning-fg); }
+.logrow-stream.ls-console { color: var(--success-fg); }
 .logrow-msg { color: var(--fg-1); white-space: pre-wrap; overflow-wrap: anywhere; }
 .log-empty { padding: var(--sp-6); color: var(--fg-3); }
 .log-controls { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .log-controls .ffield { min-width: 140px; }
+.log-panel { display: flex; flex-direction: column; gap: var(--sp-3); }
+.log-panel .flogs { height: calc(100vh - 420px); min-height: 280px; overflow-y: auto; }
+.log-count { color: var(--fg-3); font-size: var(--fs-xs); margin-left: auto; }
 
 /* Templates page. */
 .tpl-cols {
@@ -137,14 +122,18 @@
 @media (max-width: 1080px) {
   .vm-layout { grid-template-columns: 1fr; }
   .tpl-cols { grid-template-columns: 1fr; }
-  .vm-row { grid-template-columns: auto minmax(0, 1fr) auto; }
-  .vm-row-ip, .vm-row-state { display: none; }
 }
 
 /* --- visual lab designer ------------------------------------------------- */
 
-.editor-split { height: calc(100vh - 210px); }
+.editor-split { height: calc(100vh - 340px); min-height: 420px; }
 .editor-loading { display: flex; align-items: center; gap: var(--sp-2); color: var(--fg-2); }
+.editor-toolbar { display: flex; align-items: center; gap: var(--sp-3); }
+.editor-path {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--fg-3); font-family: var(--font-mono); font-size: var(--fs-xs);
+}
+.editor-actions { display: flex; gap: var(--sp-2); }
 .editor-issue { cursor: pointer; }
 .editor-issue:hover { text-decoration: underline; }
 
@@ -153,6 +142,10 @@
 .topo {
   width: 100%; height: 100%; display: block; touch-action: none; outline: none;
   background: var(--bg-1); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+  /* Drags must never start a text selection: a later pointerdown on the
+     selection becomes a native drag and the browser pointercancels the
+     cable drag mid-flight. */
+  user-select: none; -webkit-user-select: none;
 }
 .topo-toolbar {
   position: absolute; top: var(--sp-2); left: var(--sp-2); z-index: 2;
@@ -161,26 +154,107 @@
 .topo-vm rect {
   fill: var(--bg-2); stroke: var(--border); stroke-width: 1.25; cursor: grab;
 }
-.topo-vm.selected rect { stroke: var(--accent); stroke-width: 2; }
+.topo-vm.selected > rect:first-child { stroke: var(--accent); stroke-width: 2; }
 .topo-vm-name { fill: var(--fg-0); font-size: 13px; font-weight: 600; pointer-events: none; }
-.topo-vm-meta { fill: var(--fg-3); font-size: 11px; pointer-events: none; }
+.topo-vm-meta { fill: var(--fg-3); font-size: 10px; pointer-events: none; }
+
+/* container nodes: VM footprint, but a dashed outline + container glyph */
+.topo-ctr > rect:first-child { stroke-dasharray: 5 3; }
+.topo-ctr.selected > rect:first-child { stroke-dasharray: none; }
+.topo-ctr-glyph { color: var(--accent); pointer-events: none; }
+
+/* the lab block */
+.topo-lab rect { fill: var(--bg-2); stroke: var(--border); stroke-width: 1.25; cursor: grab; }
+.topo-lab.selected rect { stroke: var(--accent); stroke-width: 2; }
+.topo-lab-glyph { color: var(--accent); pointer-events: none; }
+.topo-lab-kind {
+  fill: var(--fg-3); font-size: 8px; font-weight: 700; letter-spacing: 0.1em;
+  pointer-events: none;
+}
+.topo-lab-name { fill: var(--fg-0); font-size: 12px; font-weight: 600; pointer-events: none; }
+
+/* VM dressing: guest-OS icon, hardware badge, power LED, console button */
+.topo-os { pointer-events: none; color: var(--fg-1); }
+.topo-os-brand path { fill: currentColor; }
+.topo-vm-badge { pointer-events: none; }
+.topo-vm-badge rect { fill: var(--bg-1); stroke: var(--border-subtle); }
+.topo-vm-badge text { fill: var(--fg-2); font-size: 9px; font-family: var(--font-mono); }
+.topo-led { stroke-width: 1; }
+.topo-led.success { fill: var(--success-fg); stroke: var(--success-fg); }
+.topo-led.warning { fill: var(--warning-fg); stroke: var(--warning-fg); }
+.topo-led.neutral { fill: var(--bg-1); stroke: var(--fg-3); }
+.topo-console { cursor: pointer; color: var(--fg-2); }
+.topo-console rect { fill: var(--bg-1); stroke: var(--border); }
+.topo-console .lucide { pointer-events: none; }
+.topo-console:hover { color: var(--accent); }
+.topo-console:hover rect { stroke: var(--accent); }
 .topo-seg rect { fill: var(--bg-2); stroke: var(--border); stroke-width: 1.25; cursor: grab; }
 .topo-seg.selected rect { stroke: var(--accent); stroke-width: 2; }
 .topo-seg-name { fill: var(--fg-1); font-size: 12px; font-weight: 600; pointer-events: none; }
 .topo-seg-meta { fill: var(--fg-3); font-size: 11px; text-anchor: end; pointer-events: none; }
-.topo-nat rect { stroke-dasharray: 6 4; }
+/* WAN / internet cloud: fill-only blob (strokes would show seams between
+   the body and its bumps); selection draws its own dashed outline. */
+.topo-nat .topo-wan-cloud {
+  fill: color-mix(in srgb, var(--accent) 14%, var(--bg-2));
+  stroke: none; cursor: grab;
+}
+.topo-nat.selected .topo-wan-cloud {
+  fill: color-mix(in srgb, var(--accent) 24%, var(--bg-2));
+}
+.topo-wan-outline {
+  fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 6 4;
+  pointer-events: none;
+}
+.topo-wan-globe circle, .topo-wan-globe ellipse, .topo-wan-globe line {
+  fill: none; stroke: var(--fg-1); stroke-width: 1.25; pointer-events: none;
+}
+.topo-wan-name {
+  fill: var(--fg-0); font-size: 12px; font-weight: 600; pointer-events: none;
+}
 .topo-edge-line { stroke: var(--fg-3); stroke-width: 1.5; fill: none; pointer-events: none; }
-.topo-edge-hit { stroke: transparent; stroke-width: 10; fill: none; cursor: pointer; }
+/* live traffic: powered-on VM cables (and NAT uplinks) flow green */
+@keyframes topo-flow {
+  to { stroke-dashoffset: -20; }
+}
+.topo-edge.live .topo-edge-line {
+  stroke: var(--success-fg); stroke-dasharray: 6 4;
+  animation: topo-flow 0.6s linear infinite;
+}
+.topo-link.live .topo-link-line {
+  stroke: var(--success-fg); stroke-dasharray: 6 4; /* multiple of the -20 offset */
+  animation: topo-flow 0.8s linear infinite;
+}
+.topo-edge-hit {
+  stroke: transparent; stroke-width: 10; fill: none; cursor: pointer;
+  pointer-events: stroke; /* transparent strokes aren't hit-tested otherwise */
+}
 .topo-edge:hover .topo-edge-line { stroke: var(--accent); }
 .topo-edge-label { fill: var(--fg-3); font-size: 10px; font-family: var(--font-mono); pointer-events: none; }
 .topo-edge-draft { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 4 3; fill: none; pointer-events: none; }
-.topo-port { fill: var(--accent); pointer-events: none; }
+.topo-port { fill: var(--accent); cursor: grab; }
+.topo-port:hover { stroke: var(--accent); stroke-width: 3; }
+.topo-port.target { fill: var(--bg-1); stroke: var(--accent); stroke-width: 1.5; }
+.topo-port.loose { fill: var(--bg-1); stroke: var(--fg-3); stroke-width: 1.5; }
+.topo-port.loose:hover { stroke: var(--accent); }
 .topo-socket {
-  fill: var(--bg-1); stroke: var(--border); stroke-width: 1; pointer-events: none;
+  fill: var(--bg-1); stroke: var(--border); stroke-width: 1; cursor: crosshair;
 }
-.topo-socket.lit { fill: var(--accent); stroke: var(--accent); }
-.topo-port-new { fill: var(--bg-1); stroke: var(--accent); stroke-width: 1.5; cursor: crosshair; }
-.topo-port-new:hover { fill: var(--accent); }
+.topo-socket:hover { stroke: var(--accent); }
+.topo-socket.lit { fill: var(--accent); stroke: var(--accent); cursor: grab; }
+.topo-linkport {
+  fill: var(--bg-1); stroke: var(--fg-2); stroke-width: 1.25; cursor: crosshair;
+}
+.topo-linkport:hover { stroke: var(--accent); }
+.topo-linkport.lit { fill: var(--fg-2); }
+.topo-link-line {
+  stroke: var(--fg-2); stroke-width: 1.5; stroke-dasharray: 7 4; fill: none;
+  pointer-events: none;
+}
+.topo-link-hit {
+  stroke: transparent; stroke-width: 10; fill: none; cursor: grab;
+  pointer-events: stroke; /* transparent strokes aren't hit-tested otherwise */
+}
+.topo-link:hover .topo-link-line { stroke: var(--accent); }
 
 /* inspector */
 .inspector {
@@ -217,3 +291,51 @@
 /* new-lab dialog + picker */
 .newlab-error { color: var(--danger-fg); font-size: var(--fs-sm); }
 .template-picker { display: flex; flex-direction: column; gap: var(--sp-2); }
+
+/* depends-on list */
+.vmref-list { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 180px; }
+.vmref-row {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 2px var(--sp-2); border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm); font-size: var(--fs-sm);
+}
+.vmref-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* hardware sliders */
+.slider-row { display: flex; align-items: center; gap: var(--sp-2); min-width: 260px; }
+.slider-row > :first-child { flex: 1; }
+.slider-value { font-size: var(--fs-xs); font-family: var(--font-mono); white-space: nowrap; cursor: text; }
+.slider-value:hover { text-decoration: underline dotted; }
+.slider-value.inherited { color: var(--fg-3); }
+.slider-value-edit {
+  width: 90px; font-size: var(--fs-xs); font-family: var(--font-mono);
+  padding: 2px var(--sp-1); color: var(--fg-0);
+  background: var(--bg-1); border: 1px solid var(--accent); border-radius: var(--r-sm);
+  outline: none;
+}
+
+/* add-disk kind picker */
+.disk-kind-choices { display: flex; flex-direction: column; gap: var(--sp-3); }
+
+/* server-side file browser */
+.fs-browser { display: flex; flex-direction: column; gap: var(--sp-2); }
+.fs-crumb { display: flex; align-items: center; gap: var(--sp-2); }
+.fs-path {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  direction: rtl; text-align: left;
+  color: var(--fg-2); font-family: var(--font-mono); font-size: var(--fs-xs);
+}
+.fs-loading { display: flex; align-items: center; gap: var(--sp-2); color: var(--fg-2); }
+.fs-list {
+  max-height: 340px; overflow-y: auto;
+  border: 1px solid var(--border-subtle); border-radius: var(--r-sm);
+}
+.fs-row {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2); font-size: var(--fs-sm);
+}
+.fs-row.pickable { cursor: pointer; }
+.fs-row.pickable:hover { background: var(--bg-2); }
+.fs-row.muted { color: var(--fg-3); }
+.fs-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fs-size { color: var(--fg-3); font-size: var(--fs-xs); font-family: var(--font-mono); }

@@ -12,15 +12,19 @@ import type {
   BlockRuleModel,
   BlockSpec,
   ConnectModel,
+  ContainerModel,
   DiskModel,
   DnsModel,
+  EnvVarModel,
   ForwardModel,
   GpuModel,
+  HealthcheckModel,
   LabModel,
   MediaModel,
   ModelOp,
   NicModel,
   OpValue,
+  PortMapModel,
   ProvisionModel,
   HandlerModel,
   RecordModel,
@@ -31,18 +35,23 @@ import type {
   SinkholeModel,
   Span,
   VmModel,
+  VolumeModel,
 } from "./model";
+import { HEALTHCHECK_DEFAULTS } from "./model";
 import { toUnitValue } from "./bytesize";
 
 // A field value with enough typing to encode + compare. `flag` is a bool
 // the schema defaults (never removed, skipped in add-specs at its default);
-// `strdef` is the string equivalent (e.g. forward proto defaulting to tcp).
+// `strdef`/`intdef`/`secs` are the string / int / duration-in-seconds
+// equivalents (e.g. forward proto defaulting to tcp, healthcheck timings).
 type FV =
   | { k: "str"; v: string | null }
   | { k: "int"; v: number | null }
   | { k: "bool"; v: boolean | null }
   | { k: "flag"; v: boolean; def: boolean }
   | { k: "strdef"; v: string; def: string }
+  | { k: "intdef"; v: number; def: number }
+  | { k: "secs"; v: number; def: number }
   | { k: "bytes"; v: number | null }
   | { k: "list"; v: string[] };
 
@@ -51,6 +60,8 @@ const int = (v: number | null): FV => ({ k: "int", v });
 const bool = (v: boolean | null): FV => ({ k: "bool", v });
 const flag = (v: boolean, def: boolean): FV => ({ k: "flag", v, def });
 const strdef = (v: string, def: string): FV => ({ k: "strdef", v, def });
+const intdef = (v: number, def: number): FV => ({ k: "intdef", v, def });
+const secs = (v: number, def: number): FV => ({ k: "secs", v, def });
 const bytes = (v: number | null): FV => ({ k: "bytes", v });
 const list = (v: string[]): FV => ({ k: "list", v });
 
@@ -67,6 +78,11 @@ function encode(f: FV): OpValue | null {
       return f.v;
     case "strdef":
       return f.v;
+    case "intdef":
+      return f.v;
+    case "secs":
+      // std.Duration: `{num, unit}` → a unit literal (`interval = 10s`).
+      return { num: f.v, unit: "s" };
     case "bytes":
       return f.v === null ? null : toUnitValue(f.v);
     case "list":
@@ -108,6 +124,7 @@ function specFields(pairs: [string, FV][]): { name: string; value: OpValue }[] {
   for (const [name, f] of pairs) {
     if (f.k === "flag" && f.v === f.def) continue;
     if (f.k === "strdef" && f.v === f.def) continue;
+    if ((f.k === "intdef" || f.k === "secs") && f.v === f.def) continue;
     const value = encode(f);
     if (value !== null) out.push({ name, value });
   }
@@ -222,6 +239,46 @@ const gpuPairs = (g: GpuModel): [string, FV][] => [
   ["address", str(g.address)],
 ];
 
+// --- container field tables ----------------------------------------------------
+
+const containerPairs = (c: ContainerModel): [string, FV][] => [
+  ["image", str(c.image)],
+  ["entrypoint", list(c.entrypoint ?? [])],
+  ["command", list(c.command ?? [])],
+  ["workdir", str(c.workdir)],
+  ["user", str(c.user)],
+  ["cpus", int(c.cpus)],
+  ["memory", bytes(c.memory)],
+  ["depends_on", list(c.depends_on)],
+  ["restart", strdef(c.restart || "no", "no")],
+];
+
+const envPairs = (e: EnvVarModel): [string, FV][] => [
+  ["name", str(e.name)],
+  ["value", str(e.value)],
+];
+
+const volumePairs = (v: VolumeModel): [string, FV][] => [
+  ["host", str(v.host)],
+  ["name", str(v.name)],
+  ["target", str(v.target)],
+  ["read_only", flag(v.read_only, false)],
+];
+
+const portPairs = (p: PortMapModel): [string, FV][] => [
+  ["host", int(p.host)],
+  ["container", int(p.container)],
+  ["proto", strdef(p.proto || "tcp", "tcp")],
+];
+
+const healthcheckPairs = (h: HealthcheckModel): [string, FV][] => [
+  ["command", list(h.command)],
+  ["interval", secs(h.interval, HEALTHCHECK_DEFAULTS.interval)],
+  ["timeout", secs(h.timeout, HEALTHCHECK_DEFAULTS.timeout)],
+  ["retries", intdef(h.retries, HEALTHCHECK_DEFAULTS.retries)],
+  ["start_period", secs(h.start_period, HEALTHCHECK_DEFAULTS.start_period)],
+];
+
 const segmentPairs = (s: SegmentModel): [string, FV][] => [
   ["subnet", str(s.subnet)],
   ["global", flag(s.global, false)],
@@ -332,6 +389,35 @@ const handlerSpec = (h: HandlerModel): BlockSpec => ({
   fields: specFields(handlerPairs(h)),
 });
 
+const envSpec = (e: EnvVarModel): BlockSpec => ({ kind: "env", fields: specFields(envPairs(e)) });
+const volumeSpec = (v: VolumeModel): BlockSpec => ({
+  kind: "volume",
+  fields: specFields(volumePairs(v)),
+});
+const portSpec = (p: PortMapModel): BlockSpec => ({
+  kind: "port",
+  fields: specFields(portPairs(p)),
+});
+const healthcheckSpec = (h: HealthcheckModel): BlockSpec => ({
+  kind: "healthcheck",
+  fields: specFields(healthcheckPairs(h)),
+});
+
+function containerSpec(c: ContainerModel): BlockSpec {
+  const children: BlockSpec[] = [];
+  children.push(...c.nics.map(nicSpec));
+  children.push(...c.env.map(envSpec));
+  children.push(...c.volumes.map(volumeSpec));
+  children.push(...c.ports.map(portSpec));
+  if (c.healthcheck) children.push(healthcheckSpec(c.healthcheck));
+  return {
+    kind: "container",
+    labels: [c.name],
+    fields: specFields(containerPairs(c)),
+    children,
+  };
+}
+
 function vmSpec(v: VmModel): BlockSpec {
   const children: BlockSpec[] = [];
   if (v.gpu) children.push(gpuSpec(v.gpu));
@@ -398,6 +484,22 @@ function diffHandler(ops: Ops, base: HandlerModel, draft: HandlerModel) {
   fieldDiffer(handlerPairs)(ops, base, draft);
 }
 
+const diffEnv = fieldDiffer(envPairs);
+const diffVolume = fieldDiffer(volumePairs);
+const diffPort = fieldDiffer(portPairs);
+const diffHealthcheck = fieldDiffer(healthcheckPairs);
+
+function diffContainer(ops: Ops, base: ContainerModel, draft: ContainerModel) {
+  const span = base.span!;
+  diffLabel(ops, span, base.name, draft.name);
+  fieldDiffer(containerPairs)(ops, base, draft);
+  diffChildren(ops, span, base.nics, draft.nics, diffNic, nicSpec);
+  diffChildren(ops, span, base.env, draft.env, diffEnv, envSpec);
+  diffChildren(ops, span, base.volumes, draft.volumes, diffVolume, volumeSpec);
+  diffChildren(ops, span, base.ports, draft.ports, diffPort, portSpec);
+  diffChild(ops, span, base.healthcheck, draft.healthcheck, diffHealthcheck, healthcheckSpec);
+}
+
 function diffVm(ops: Ops, base: VmModel, draft: VmModel) {
   const span = base.span!;
   diffLabel(ops, span, base.name, draft.name);
@@ -437,6 +539,7 @@ export function buildOps(base: LabModel, draft: LabModel): ModelOp[] {
   diffFields(ops, labSpan, [["gui", bool(base.gui), bool(draft.gui)]]);
   diffChildren(ops, labSpan, base.segments, draft.segments, diffSegment, segmentSpec);
   diffChildren(ops, labSpan, base.vms, draft.vms, diffVm, vmSpec);
+  diffChildren(ops, labSpan, base.containers, draft.containers, diffContainer, containerSpec);
   diffChildren(ops, labSpan, base.provisions, draft.provisions, diffProvision, provisionSpec);
   diffChildren(ops, labSpan, base.handlers, draft.handlers, diffHandler, handlerSpec);
   diffChildren(ops, labSpan, base.records, draft.records, diffRecord, recordSpec);

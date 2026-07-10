@@ -1,5 +1,5 @@
-import { For, Show, createResource } from "solid-js";
-import { Badge, Button, Card, Empty, Icon, PageHead } from "@forge/ui";
+import { For, Show, createResource, createSignal } from "solid-js";
+import { Badge, Button, Card, Empty, Icon, PageHead, Tabs } from "@forge/ui";
 import { Camera, Power, RotateCcw } from "lucide-solid";
 import {
   state,
@@ -17,8 +17,10 @@ import {
 import { vmSnapshots } from "../api";
 import { confirmDialog, promptDialog } from "./dialogs";
 import ConsoleScreen from "./ConsoleScreen";
+import LogPanel from "./LogPanel";
 
 export default function MachineView() {
+  const [tab, setTab] = createSignal<"console" | "log">("console");
   // All of these are accessors so the view tracks the selected VM reactively —
   // switching machines re-runs them rather than pinning to the first one.
   const vm = () => state.status?.vms.find((v) => v.name === state.view.vm);
@@ -100,7 +102,20 @@ export default function MachineView() {
         }
       />
 
-      <div class="vm-layout">
+      <Tabs
+        tabs={[
+          { id: "console", label: "Console" },
+          { id: "log", label: "Log" },
+        ]}
+        active={tab()}
+        onChange={(id) => setTab(id as "console" | "log")}
+      />
+
+      <Show when={tab() === "log"}>
+        <LogPanel lab={state.currentLab!} source={vm()!.name} />
+      </Show>
+
+      <div class="vm-layout" style={{ display: tab() === "console" ? undefined : "none" }}>
         <ConsoleScreen lab={state.currentLab!} vm={vm()!.name} powered={on()} />
         <div class="vm-side">
           <Card title="Machine">

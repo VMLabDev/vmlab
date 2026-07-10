@@ -72,6 +72,60 @@ cli vmlab_cli {
     }
   }
 
+  // ---- Containers (PRD §18) ----
+
+  subcommand c_container {
+    name = "container"
+    description = "Per-container lifecycle, exec and logs (OCI containers run as micro-VMs, PRD §18)."
+    subcommand c_ctr_start {
+      name = "start"
+      description = "Start a single container."
+      cli_arg a_ctr_start { name = "container"  description = "Container name." }
+      code_example { lang = "console"  code = "vmlab container start web" }
+    }
+    subcommand c_ctr_stop {
+      name = "stop"
+      description = "Stop a container gracefully (stop signal → guest shutdown → kill)."
+      cli_arg a_ctr_stop { name = "container"  description = "Container name." }
+      cli_switch s_ctr_stop_force { long = "--force"  description = "Kill immediately." }
+      code_example { lang = "console"  code = "vmlab container stop web" }
+    }
+    subcommand c_ctr_restart {
+      name = "restart"
+      description = "Restart a single container."
+      cli_arg a_ctr_restart { name = "container"  description = "Container name." }
+      code_example { lang = "console"  code = "vmlab container restart web" }
+    }
+    subcommand c_ctr_destroy {
+      name = "destroy"
+      description = "Stop and delete the container's writable overlay + pinned image digest; named volumes survive. A later `up` re-resolves the image."
+      cli_arg a_ctr_destroy { name = "container"  description = "Container name." }
+      code_example { lang = "console"  code = "vmlab container destroy web" }
+    }
+    subcommand c_ctr_exec {
+      name = "exec"
+      description = "Run a command inside the container; exits with the command's exit code."
+      cli_arg a_ctr_exec { name = "container"  description = "Container name." }
+      cli_arg a_ctr_exec_cmd { name = "cmd"  description = "Command + args (after --)."  variadic = true }
+      cli_switch s_ctr_exec_timeout { long = "--timeout"  description = "Seconds (default 120)." }
+      code_example { lang = "console"  code = "vmlab container exec web -- nginx -t" }
+    }
+    subcommand c_ctr_logs {
+      name = "logs"
+      description = "Container stdout/stderr (the serial console log)."
+      cli_arg a_ctr_logs { name = "container"  description = "Container name." }
+      cli_switch s_ctr_logs_follow { long = "--follow"  short = "-f"  description = "Stream as it grows." }
+      cli_switch s_ctr_logs_lines  { long = "--lines"   short = "-n"  description = "Tail length (default 100)." }
+      code_example { lang = "console"  code = "vmlab container logs web -f" }
+    }
+    subcommand c_ctr_ip {
+      name = "ip"
+      description = "The container's DHCP lease (errors on an air-gapped container)."
+      cli_arg a_ctr_ip { name = "container"  description = "Container name." }
+      code_example { lang = "console"  code = "vmlab container ip web" }
+    }
+  }
+
   // ---- Snapshots ----
 
   subcommand c_snapshot {

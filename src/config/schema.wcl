@@ -18,19 +18,21 @@ type VmlabDoc {
 type Lab {
   @doc("Lab name (DNS label, ≤63 chars); the inline block label")
   @inline(0) name: utf8
-  @doc("Default for all VMs: open a VNC viewer on `up` (§11); VM `gui` overrides")
+  @doc("Default for all VMs: open a VNC viewer on `up`; VM `gui` overrides")
   gui: bool?
   @doc("Virtual L2 network segments in this lab")
   @children("segment")   segments: list<Segment>
   @doc("The VMs in this lab")
   @children("vm")        vms: list<Vm>
+  @doc("OCI containers in this lab, each run in a micro-VM")
+  @children("container") containers: list<Container>
   @doc("wscript provision scripts run on `vmlab up`, in declaration order")
   @children("provision") provisions: list<Provision>
   @doc("Lifecycle event handlers (failures are logged, never fatal)")
   @children("on")        handlers: list<Handler>
-  @doc("Lab-wide static DNS entries (wildcards allowed) (§9.5)")
+  @doc("Lab-wide static DNS entries (wildcards allowed)")
   @children("record")   records: list<DnsRecord>
-  @doc("Lab-wide DNS sinkholes (§9.9)")
+  @doc("Lab-wide DNS sinkholes")
   @children("sinkhole") sinkholes: list<SinkholeRule>
 }
 
@@ -38,37 +40,37 @@ type Lab {
 type Segment {
   @doc("Segment name (DNS label); unique per lab; the inline block label")
   @inline(0) name: utf8
-  @doc("CIDR; auto-allocated as a /24 from the host pool if omitted (§9.4)")
+  @doc("CIDR; auto-allocated as a /24 from the host pool if omitted")
   subnet: utf8?
-  @doc("Owned by the supervisor and shared across labs (§9.2)")
+  @doc("Owned by the supervisor and shared across labs")
   global: bool?
-  @doc("Enable DHCP (default true) (§9.4)")
+  @doc("Enable DHCP (default true)")
   dhcp: bool?
-  @doc("Enable NAT/internet egress for this segment (default false) (§9.7)")
+  @doc("Enable NAT/internet egress for this segment (default false)")
   nat: bool?
   @doc("Link MTU (576–65535); default jumbo (9000) on nat/global, else 1500")
   mtu: i64?
-  @doc("Names of other segments to route to — daemon inter-segment routing opt-in (§9.6)")
+  @doc("Names of other segments to route to — daemon inter-segment routing opt-in")
   routes_to: list<utf8>?
-  @doc("DNS service override: hand out another server, or opt out (§9.5)")
+  @doc("DNS service override: hand out another server, or opt out")
   @child("dns")         dns: SegmentDns?
-  @doc("Cross-host segment peer over TCP (PSK from host config) (§9.2)")
+  @doc("Cross-host segment peer over TCP (PSK from host config)")
   @child("connect")     connect: Connect?
-  @doc("Guest routes pushed via DHCP option 121 (§9.6)")
+  @doc("Guest routes pushed via DHCP option 121")
   @children("route")    routes: list<Route>
-  @doc("Static DNS entries for this segment (wildcards allowed) (§9.5)")
+  @doc("Static DNS entries for this segment (wildcards allowed)")
   @children("record")   records: list<DnsRecord>
-  @doc("Host→guest port forwards (§9.8)")
+  @doc("Host→guest port forwards")
   @children("forward")  forwards: list<Forward>
-  @doc("L3 block rules at the switch (§9.9)")
+  @doc("L3 block rules at the switch")
   @children("block")    block_rules: list<BlockRule>
-  @doc("L3 DNAT redirect rules (§9.9)")
+  @doc("L3 DNAT redirect rules")
   @children("redirect") redirect_rules: list<RedirectRule>
-  @doc("DNS sinkhole rules (§9.9)")
+  @doc("DNS sinkhole rules")
   @children("sinkhole") sinkholes: list<SinkholeRule>
 }
 
-// DNS service override for a segment (§9.5): hand out another server via
+// DNS service override for a segment: hand out another server via
 // DHCP (e.g. a DC), or opt out entirely.
 @block("dns")
 type SegmentDns {
@@ -78,7 +80,7 @@ type SegmentDns {
   enabled: bool?
 }
 
-// Cross-host segment peer (§9.2): the two supervisors bridge this segment
+// Cross-host segment peer: the two supervisors bridge this segment
 // over TCP, authenticated by the pre-shared key from host config.
 @block("connect")
 type Connect {
@@ -86,7 +88,7 @@ type Connect {
   host: utf8
 }
 
-// Guest route pushed via DHCP option 121 (§9.6).
+// Guest route pushed via DHCP option 121.
 @block("route")
 type Route {
   @doc("Destination CIDR, e.g. `10.60.0.0/24` (required)")
@@ -95,7 +97,7 @@ type Route {
   via: utf8
 }
 
-// Static DNS entry (wildcards allowed in name) (§9.5).
+// Static DNS entry (wildcards allowed in name).
 @block("record")
 type DnsRecord {
   @doc("DNS name to resolve; wildcards allowed, e.g. `*.internal` (required)")
@@ -104,7 +106,7 @@ type DnsRecord {
   ip: utf8
 }
 
-// Host→guest port forward (§9.8).
+// Host→guest port forward.
 @block("forward")
 type Forward {
   @doc("Host port to listen on (1–65535); unique across the lab (required)")
@@ -115,7 +117,7 @@ type Forward {
   proto: utf8?
 }
 
-// L3 block rule at the switch (§9.9).
+// L3 block rule at the switch.
 @block("block")
 type BlockRule {
   @doc("IPv4 CIDR to drop traffic to/from (required)")
@@ -126,7 +128,7 @@ type BlockRule {
   port: i64?
 }
 
-// L3 DNAT redirect rule (§9.9).
+// L3 DNAT redirect rule.
 @block("redirect")
 type RedirectRule {
   @doc("Match destination as `ip[:port]` (required)")
@@ -137,7 +139,7 @@ type RedirectRule {
   proto: utf8?
 }
 
-// DNS sinkhole (§9.9): NXDOMAIN by default, or 0.0.0.0 with mode = "zero".
+// DNS sinkhole: NXDOMAIN by default, or 0.0.0.0 with mode = "zero".
 @block("sinkhole")
 type SinkholeRule {
   @doc("DNS name pattern to sink; wildcards allowed (required)")
@@ -170,7 +172,7 @@ type Vm {
   depends_on: list<utf8>?
   @doc("Enable nested virtualisation (host CPU passthrough)")
   nested: bool?
-  @doc("Open a VNC viewer on `up` (§11); the VM always runs headless")
+  @doc("Open a VNC viewer on `up`; the VM always runs headless")
   gui: bool?
   @doc("QEMU display string; inherited from template→profile if omitted")
   display: utf8?
@@ -180,7 +182,7 @@ type Vm {
   tpm: bool?
   @doc("Enable secure boot (OVMF only); inherited from template→profile")
   secure_boot: bool?
-  @doc("Raw QEMU flags appended last — escape hatch (§5.2)")
+  @doc("Raw QEMU flags appended last — escape hatch")
   qemu_args: list<utf8>?
   @doc("GPU acceleration (passthrough / virgl / vulkan)")
   @child("gpu")     gpu: Gpu?
@@ -188,9 +190,9 @@ type Vm {
   @children("nic")   nics: list<Nic>
   @doc("Additional disks beyond the primary disk")
   @children("disk")  extra_disks: list<DiskBlock>
-  @doc("SMB shared folders (require ≥1 NIC) (§7.5)")
+  @doc("SMB shared folders (require ≥1 NIC)")
   @children("share") shares: list<Share>
-  @doc("ISO/floppy images built from a folder (§6.3)")
+  @doc("ISO/floppy images built from a folder")
   @children("media") media: list<Media>
 }
 
@@ -198,17 +200,101 @@ type Vm {
 type Nic {
   @doc("Segment name to attach to; required unless `nat = true`")
   segment: utf8?
-  @doc("Shorthand: attach to the per-lab built-in NAT segment (§9.7)")
+  @doc("Shorthand: attach to the per-lab built-in NAT segment")
   nat: bool?
   @doc("Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique")
   ip: utf8?
   @doc("Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise")
   mac: utf8?
-  @doc("Port isolation: reach gateway/forwards but not segment neighbours (§9.1)")
+  @doc("Port isolation: reach gateway/forwards but not segment neighbours")
   isolated: bool?
 }
 
-// Additional disk (§5.2): blank by size, or pre-formatted from a folder.
+// OCI container, run in a micro-VM. Attaches to segments exactly like a VM;
+// no NICs = air-gapped (exec/copy/logs still work via the agent channel).
+@block("container")
+type Container {
+  @doc("Container name (DNS label); unique per lab — VMs and containers share one namespace; the inline block label")
+  @inline(0) name: utf8
+  @doc("OCI image reference, e.g. `nginx:1.27` or `ghcr.io/owner/app@sha256:…` (required)")
+  image: utf8
+  @doc("Override the image entrypoint (exec form, e.g. [\"/bin/sh\", \"-c\"])")
+  entrypoint: list<utf8>?
+  @doc("Override the image cmd (exec form)")
+  command: list<utf8>?
+  @doc("Working directory inside the container; image default if omitted")
+  workdir: utf8?
+  @doc("User to run as: `uid[:gid]` or a name from the image; image default if omitted")
+  user: utf8?
+  @doc("vCPU count for the micro-VM (> 0); default 1")
+  cpus: i64?
+  @doc("RAM for the micro-VM, e.g. `512MiB`; default 256MiB")
+  memory: std.ByteSize?
+  @doc("VM/container names to wait for before this one (no cycles)")
+  depends_on: list<utf8>?
+  @doc("Restart policy: `no` (default) | `on-failure` | `always`")
+  restart: utf8?
+  @doc("Network interfaces; none = air-gapped (exec/copy still work via the agent)")
+  @children("nic")      nics: list<Nic>
+  @doc("Environment variables passed to the container process")
+  @children("env")      env: list<EnvVar>
+  @doc("Host binds and named volumes mounted into the container")
+  @children("volume")   volumes: list<Volume>
+  @doc("Host→container port forwards (sugar for a segment `forward` to this container)")
+  @children("port")     ports: list<PortMap>
+  @doc("Health probe gating readiness; without one the container is ready once its process starts")
+  @child("healthcheck") healthcheck: Healthcheck?
+}
+
+// Environment variable passed to the container process.
+@block("env")
+type EnvVar {
+  @doc("Variable name (required)")
+  name: utf8
+  @doc("Variable value (required)")
+  value: utf8
+}
+
+// Container mount: host bind (`host`) or named volume (`name`) — exactly one.
+@block("volume")
+type Volume {
+  @doc("Host path to bind-mount, relative to the lab root; one of `host`/`name` is required")
+  host: utf8?
+  @doc("Named volume kept under the lab dir, shared by name, retained until lab destroy; one of `host`/`name`")
+  name: utf8?
+  @doc("Absolute mount path inside the container (required)")
+  target: utf8
+  @doc("Mount read-only (default false)")
+  read_only: bool?
+}
+
+// Host→container port forward (compiles into the segment forward machinery).
+@block("port")
+type PortMap {
+  @doc("Host port to listen on (1–65535); unique across the lab (required)")
+  host: i64
+  @doc("Container port to forward to (1–65535) (required)")
+  container: i64
+  @doc("Protocol: `tcp` (default) | `udp` | `both`")
+  proto: utf8?
+}
+
+// Container health probe; readiness gates on the first pass.
+@block("healthcheck")
+type Healthcheck {
+  @doc("Probe command run inside the container (exec form); exit 0 = healthy (required)")
+  command: list<utf8>
+  @doc("Time between probes, e.g. `10s` (default 10s)")
+  interval: std.Duration?
+  @doc("Per-probe timeout (default 5s)")
+  timeout: std.Duration?
+  @doc("Consecutive failures before unhealthy (default 3)")
+  retries: i64?
+  @doc("Grace period after start before failures count (default 10s)")
+  start_period: std.Duration?
+}
+
+// Additional disk: blank by size, or pre-formatted from a folder.
 @block("disk")
 type DiskBlock {
   @doc("Disk identifier; the inline block label")
@@ -219,7 +305,7 @@ type DiskBlock {
   from: utf8?
 }
 
-// Host↔guest shared folder over SMB (§7.5).
+// Host↔guest shared folder over SMB.
 @block("share")
 type Share {
   @doc("Host directory to share; must exist (required)")
@@ -234,7 +320,7 @@ type Share {
   name: utf8?
 }
 
-// ISO/floppy image built from a folder (§6.3).
+// ISO/floppy image built from a folder.
 @block("media")
 type Media {
   @doc("Image kind: `iso` | `floppy` (required)")
@@ -245,7 +331,7 @@ type Media {
   label: utf8?
 }
 
-// GPU acceleration (§5.2).
+// GPU acceleration.
 @block("gpu")
 type Gpu {
   @doc("Mode: `passthrough` | `virgl` | `vulkan` (required)")
@@ -254,17 +340,17 @@ type Gpu {
   address: utf8?
 }
 
-// Provision script run during `vmlab up` (§10.4). Optional vms list scopes
-// the script for depends_on satisfaction (§7.2).
+// Provision script run during `vmlab up`. Optional vms list scopes
+// the script for depends_on satisfaction.
 @block("provision")
 type Provision {
   @doc("Path to the `.ws` file; must exist and compile; the inline label")
   @inline(0) script: utf8
-  @doc("VM names this script is scoped to (gates their `depends_on`) (§7.2)")
+  @doc("VM names this script is scoped to (gates their `depends_on`)")
   vms: list<utf8>?
 }
 
-// Event handler binding (§8.2).
+// Event handler binding.
 @block("on")
 type Handler {
   @doc("Event name to handle, e.g. `vm.crashed`; the inline block label")
@@ -273,7 +359,7 @@ type Handler {
   run: utf8
 }
 
-// Template definition (§6.1), buildable with `vmlab template build`.
+// Template definition, buildable with `vmlab template build`.
 @block("template")
 type TemplateDef {
   @doc("Template name, e.g. `linux-modern`; the inline block label")
@@ -282,7 +368,7 @@ type TemplateDef {
   arch: utf8
   @doc("Version string, non-empty; name+arch+version is unique (required)")
   version: utf8
-  @doc("Full OCI repo to publish to / version-bump against (§6.4)")
+  @doc("Full OCI repo to publish to / version-bump against")
   registry: utf8?
   @doc("Guest OS profile (hardware defaults) for the build VM")
   profile: utf8?
@@ -302,15 +388,15 @@ type TemplateDef {
   secure_boot: bool?
   @doc("Enable nested virtualisation for the build VM")
   nested: bool?
-  @doc("Watch the build VM via a VNC viewer (§11)")
+  @doc("Watch the build VM via a VNC viewer")
   gui: bool?
-  @doc("Raw QEMU flags for the build VM — escape hatch (§5.2)")
+  @doc("Raw QEMU flags for the build VM — escape hatch")
   qemu_args: list<utf8>?
   @doc("wscript run on first instantiation of a clone, before ready")
   first_boot: utf8?
   @doc("What the build starts from — exactly one of four forms (required)")
   @child("source")       source: TemplateSource
-  @doc("ISO/floppy images attached to the build (§6.3)")
+  @doc("ISO/floppy images attached to the build")
   @children("media")     media: list<Media>
   @doc("Provision scripts that drive the build")
   @children("provision") provisions: list<Provision>
@@ -320,7 +406,7 @@ type TemplateDef {
   @children("disk")      extra_disks: list<DiskBlock>
 }
 
-// Template build source (§6.1): exactly one of the four forms.
+// Template build source: exactly one of the four forms.
 @block("source")
 type TemplateSource {
   @doc("Source kind: `iso` | `qcow2` | `template` | `scratch`; the inline label")

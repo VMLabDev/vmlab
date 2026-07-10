@@ -38,6 +38,18 @@ RUN pnpm install
 COPY web-ui/ ./
 RUN pnpm build
 
+# ---- guest asset --------------------------------------------------------------
+# The container micro-VM kernel + initramfs (PRD §18): pinned Alpine linux-virt
+# + a static-musl vmlab-cinit, assembled rootlessly. Baked into the runtime
+# image so lab containers work offline, preserving the no-privileges promise.
+FROM rust:1.92-bookworm AS guest
+RUN apt-get update && apt-get install -y --no-install-recommends cpio \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+WORKDIR /build
+COPY guest/ ./guest/
+RUN ./guest/build-asset.sh x86_64 aarch64
+
 # ---- builder ----------------------------------------------------------------
 FROM rust:1.92-bookworm AS builder
 WORKDIR /build/vmlab
@@ -61,6 +73,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         swtpm \
         tesseract-ocr \
         passt \
+        squashfs-tools \
         xorriso \
         mtools \
         dosfstools \
@@ -72,6 +85,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # it as a sibling), so both must sit in the same directory.
 COPY --from=builder /build/vmlab/target/release/vmlab     /usr/local/bin/vmlab
 COPY --from=builder /build/vmlab/target/release/vmlab-web /usr/local/bin/vmlab-web
+
+# Container micro-VM kernel + initramfs (PRD §18) — checked by
+# `ensure_guest_asset` at /usr/share/vmlab/guest/<arch>/.
+COPY --from=guest /build/guest/dist/ /usr/share/vmlab/guest/
 
 # Documented volume mounts (PRD §14):
 #   /root/.local/share/vmlab/templates  — the template store

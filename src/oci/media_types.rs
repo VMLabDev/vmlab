@@ -29,6 +29,14 @@ pub const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 /// Standard OCI image index (multi-arch) media type.
 pub const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 
+/// Docker schema-2 image manifest media type. Accepted on *pull* so plain
+/// Docker Hub container images resolve; vmlab never emits it.
+pub const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+
+/// Docker schema-2 manifest list (multi-arch index) media type. Accepted on
+/// pull only, like [`DOCKER_MANIFEST`].
+pub const DOCKER_MANIFEST_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +54,13 @@ mod tests {
         assert_eq!(CHUNK_ZSTD, "application/vnd.vmlab.template.chunk.v1+zstd");
         assert_eq!(OCI_MANIFEST, "application/vnd.oci.image.manifest.v1+json");
         assert_eq!(OCI_INDEX, "application/vnd.oci.image.index.v1+json");
+        assert_eq!(
+            DOCKER_MANIFEST,
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+        assert_eq!(
+            DOCKER_MANIFEST_LIST,
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        );
     }
 }

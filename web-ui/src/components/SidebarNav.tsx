@@ -1,13 +1,12 @@
 import { For, Show } from "solid-js";
 import { NavLink, NavSection, StatusDot } from "@forge/ui";
-import { LayoutGrid, Network, Package, PencilRuler, ScrollText } from "lucide-solid";
+import { LayoutGrid, Package } from "lucide-solid";
 import {
   archOf,
+  containerLook,
   look,
-  showEditor,
+  showContainer,
   showLab,
-  showLogs,
-  showNetwork,
   showTemplates,
   showVm,
   state,
@@ -32,31 +31,6 @@ export default function SidebarNav() {
         onClick={nav(showLab)}
       >
         {state.currentLab ?? "—"}
-      </NavLink>
-      <NavLink
-        href="#"
-        icon={Network}
-        active={state.view.kind === "network"}
-        count={s()?.segments.length}
-        onClick={nav(showNetwork)}
-      >
-        network
-      </NavLink>
-      <NavLink
-        href="#"
-        icon={ScrollText}
-        active={state.view.kind === "logs"}
-        onClick={nav(showLogs)}
-      >
-        logs
-      </NavLink>
-      <NavLink
-        href="#"
-        icon={PencilRuler}
-        active={state.view.kind === "editor"}
-        onClick={nav(showEditor)}
-      >
-        editor
       </NavLink>
       <Show when={state.templates.length > 0}>
         <NavLink
@@ -84,6 +58,23 @@ export default function SidebarNav() {
           </NavLink>
         )}
       </For>
+
+      <Show when={(s()?.containers ?? []).length > 0}>
+        <NavSection>Containers</NavSection>
+        <For each={s()?.containers ?? []}>
+          {(c) => (
+            <NavLink
+              href="#"
+              active={state.view.kind === "container" && state.view.vm === c.name}
+              count="oci"
+              onClick={nav(() => showContainer(c.name))}
+            >
+              <StatusDot tone={containerLook(c).tone} />
+              {c.name}
+            </NavLink>
+          )}
+        </For>
+      </Show>
     </>
   );
 }

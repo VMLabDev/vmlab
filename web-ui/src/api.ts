@@ -81,6 +81,20 @@ export interface Vm {
   memory: number | null;
   nics: Nic[];
 }
+/** One container's runtime status (labd `status()` containers array). */
+export interface Container {
+  name: string;
+  state: string;
+  ready: boolean;
+  /** Latest healthcheck verdict; null = no check, or no report yet. */
+  health: boolean | null;
+  ip: string | null;
+  image: string;
+  digest: string | null;
+  restarts: number;
+  exit_code: number | null;
+  nics: Nic[];
+}
 export interface Segment {
   name: string;
   subnet: string;
@@ -91,6 +105,7 @@ export interface Segment {
 export interface LabStatus {
   lab: string;
   vms: Vm[];
+  containers: Container[];
   segments: Segment[];
 }
 export interface Snapshot {
@@ -109,6 +124,14 @@ export const vmAction = (
   vm: string,
   action: "start" | "stop" | "restart" | "destroy",
 ) => post(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/${action}`);
+export const containerAction = (
+  lab: string,
+  container: string,
+  action: "start" | "stop" | "restart" | "destroy",
+) =>
+  post(
+    `/api/labs/${encodeURIComponent(lab)}/containers/${encodeURIComponent(container)}/${action}`,
+  );
 export const sendKeys = (lab: string, vm: string, keys: string) =>
   post(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/sendkeys`, {
     keys,
@@ -278,11 +301,43 @@ export interface CatalogMeta {
   forward_protos: string[];
   l4_protos: string[];
   media_kinds: string[];
+  restart_policies: string[];
+  /** `healthcheck {}` schema defaults (seconds / count). */
+  healthcheck_defaults: {
+    interval: number;
+    timeout: number;
+    retries: number;
+    start_period: number;
+  };
 }
 
 export const listStoreTemplates = (): Promise<StoreTemplate[]> => req("/api/catalog/templates");
 export const listProfiles = (): Promise<string[]> => req("/api/catalog/profiles");
 export const catalogMeta = (): Promise<CatalogMeta> => req("/api/catalog/meta");
+
+/** Host capacity for the editor's hardware sliders (GET /api/host). */
+export interface HostInfo {
+  cpus: number;
+  memory: number; // bytes
+}
+
+export const hostInfo = (): Promise<HostInfo> => req("/api/host");
+
+/** One entry in a server-side directory listing (GET /api/host/fs). */
+export interface FsEntry {
+  name: string;
+  dir: boolean;
+  size: number | null;
+}
+
+export interface FsListing {
+  path: string;
+  parent: string | null;
+  entries: FsEntry[];
+}
+
+export const browseFs = (path: string): Promise<FsListing> =>
+  req(`/api/host/fs?path=${encodeURIComponent(path)}`);
 
 /** The parsed lab model; 422 (unparsable file) throws ValidationError. */
 export async function getLabModel(lab: string): Promise<LabDocument> {
@@ -370,11 +425,12 @@ export interface DaemonEvent {
   ts: string;
 }
 
-// One line from the lab's logs (lab events + each VM's serial/qemu/swtpm),
-// streamed over /api/labs/{lab}/logs. `ts` is set only for events.jsonl lines.
+// One line from the lab's logs (lab events, each VM's serial/qemu/swtpm, each
+// container's console), streamed over /api/labs/{lab}/logs. `ts` is set only
+// for events.jsonl lines.
 export interface LogEntry {
-  source: string; // "lab" or the VM name
-  stream: string; // "events" | "lab" | "serial" | "qemu" | "swtpm"
+  source: string; // "lab", the VM name, or the container name
+  stream: string; // "events" | "lab" | "serial" | "qemu" | "swtpm" | "console"
   ts?: string | null;
   text: string;
 }

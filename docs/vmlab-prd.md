@@ -600,3 +600,56 @@ Formerly open; all resolved 2026-06-12 and folded into the sections referenced:
 ## 17. Out-of-scope ideas recorded for later
 
 vhost-user / tap fast paths per segment; SPICE; a TUI; daemon inter-segment routing policies beyond pair allow; PCAP capture per segment (the switch sees everything — cheap and very lab-useful, first candidate for v1.1); record/replay of input scripts; per-lab resource limits (the per-lab daemon makes a cgroup subtree per lab a natural extension); replacing the interim smbd share backend with the embedded SMB2 server (§7.5) if v1 ships with smbd.
+
+---
+
+## 18. Lab containers (micro-VM)
+
+Labs may declare **OCI containers** alongside VMs. A `container` block names a
+standard container image (`nginx:1.27`, `ghcr.io/owner/app@sha256:…` — Docker
+Hub shorthand normalises to `registry-1.docker.io`) plus compose-style
+configuration: `env {}` variables, `volume {}` binds and named volumes,
+`entrypoint`/`command`/`workdir`/`user` overrides, `port {}` host forwards, a
+`healthcheck {}`, a `restart` policy, and `nic {}` blocks identical to VM NICs.
+VM and container names share one namespace: DNS, `depends_on` waves,
+`forward { to = "name:port" }` targets, and provision scoping all resolve
+across both kinds. A container with no NICs is valid — air-gapped, still
+reachable via `exec`/`cp` over the agent channel.
+
+**Architecture.** Every container runs in a **micro-VM**: a pinned Alpine
+`linux-virt` kernel + purpose-built initramfs (`vmlab-cinit` as PID 1,
+bundling `qemu-ga`), booted directly with `-kernel/-initrd`, 1 vCPU / 256 MiB
+by default. The image's layers are flattened (whiteout-aware, tar-level, no
+host privileges) into a squashfs mounted read-only, with a per-container
+scratch qcow2 as the overlayfs writable layer. Config reaches the guest as
+`container.json` on a read-only 9p share; volumes are 9p shares
+(`security_model=mapped-xattr`). This preserves the §14 guarantee verbatim:
+containers work inside the official image with **no** `--privileged`, no added
+capabilities — `/dev/kvm` only, TCG fallback without it.
+
+**Networking.** A container NIC is a VM NIC: the same `-netdev stream` unix
+socket into the segment switch, the same DHCP lease/reservation, DNS
+registration (`<name>.<lab>.<suffix>`), NAT egress, and L3 rules. `port {}`
+blocks are sugar for the segment forward machinery, installed against the
+container's lease when it turns ready and re-installed after restarts.
+
+**Lifecycle.** Image references resolve like registry templates (§6.4): the
+digest resolved at first pull is pinned in lab state and never re-pulled
+implicitly; `vmlab container destroy` (or editing the `image =` line) clears
+the pin. The supervisor pre-pulls images with `container.pull.*` progress
+events before spawning the lab daemon. Readiness is two-stage — process
+started, then the first passing healthcheck (when declared) — and gates
+`depends_on` waves. Exit handling is host-side: `restart = "on-failure" |
+"always"` respawns with 1→30 s backoff (giving up after 5 rapid failures);
+events `container.starting/ready/stopped/crashed/unhealthy` are bindable with
+`on {}`. The stop ladder mirrors VMs: in-guest stop signal + grace, then
+guest shutdown, then kill. Container stdout/stderr is the serial console log
+(`vmlab container logs [-f]`).
+
+**Deliberate exclusions.** Containers are **not snapshottable** — they rebuild
+from image + volumes; snapshot verbs on a container name fail with a clear
+error and lab-wide snapshots skip them. Named volumes are lab-scoped, shared
+by name, and survive `down` and per-container destroy; only lab `destroy`
+removes them. Cross-arch containers (image arch ≠ host arch) are out of scope
+for v1, as is a crun/native runtime backend (recorded as a possible fast path
+if micro-VM start latency ever matters).

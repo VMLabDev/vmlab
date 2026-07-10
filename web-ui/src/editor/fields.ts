@@ -16,9 +16,6 @@ export type FieldType =
   | "segrefs" // several segment names
   | "vmref" // one VM name
   | "vmrefs" // several VM names
-  | "template" // template reference picker
-  | "profile" // guest OS profile picker
-  | "arch" // architecture picker
   | "event"; // lifecycle event picker
 
 export interface FieldDesc {
@@ -40,50 +37,22 @@ export interface Section {
 }
 
 // --- vm ---------------------------------------------------------------------
-
-export const VM_GENERAL: FieldDesc[] = [
-  {
-    key: "template",
-    label: "Template",
-    doc: "`<arch>/<name>[@<version>]`, `scratch`, or an OCI registry ref (required)",
-    type: "template",
-    required: true,
-  },
-  {
-    key: "arch",
-    label: "Architecture",
-    doc: "Required for `scratch` and registry references",
-    type: "arch",
-  },
-  {
-    key: "profile",
-    label: "Profile",
-    doc: "Guest OS profile (hardware defaults); required for `scratch`",
-    type: "profile",
-  },
-  {
-    key: "depends_on",
-    label: "Depends on",
-    doc: "VM names to wait for before this one (no cycles)",
-    type: "vmrefs",
-  },
-];
+// The General tab's template picker (arch/profile fold into it) and the
+// depends-on list are dedicated components, not descriptor rows; the
+// Hardware tab's cpu/memory sliders likewise.
 
 export const VM_HARDWARE: FieldDesc[] = [
   {
-    key: "cpus",
-    label: "vCPUs",
-    doc: "vCPU count (> 0); inherited from template→profile if omitted",
-    type: "int",
-    min: 1,
+    key: "nested",
+    label: "Nested virt",
+    doc: "Enable nested virtualisation (host CPU passthrough)",
+    type: "flag",
   },
-  {
-    key: "memory",
-    label: "Memory",
-    doc: "RAM as a byte size, e.g. `8GiB`/`512MiB`; inherited if omitted",
-    type: "bytes",
-    placeholder: "e.g. 8GiB",
-  },
+];
+
+/** Everything normally supplied by the template/profile, plus escape
+ *  hatches — the trailing Overrides tab. */
+export const VM_OVERRIDES: FieldDesc[] = [
   {
     key: "firmware",
     label: "Firmware",
@@ -104,14 +73,12 @@ export const VM_HARDWARE: FieldDesc[] = [
     type: "bool3",
   },
   {
-    key: "nested",
-    label: "Nested virt",
-    doc: "Enable nested virtualisation (host CPU passthrough)",
-    type: "flag",
+    key: "display",
+    label: "Display",
+    doc: "QEMU display string; inherited from template→profile if omitted",
+    type: "text",
+    placeholder: "e.g. virtio-vga",
   },
-];
-
-export const VM_STORAGE: FieldDesc[] = [
   {
     key: "disk",
     label: "Primary disk",
@@ -120,33 +87,10 @@ export const VM_STORAGE: FieldDesc[] = [
     placeholder: "e.g. 64GiB",
   },
   {
-    key: "cdrom",
-    label: "CD-ROM",
-    doc: "Path to an ISO to attach (relative to lab root)",
-    type: "text",
-    placeholder: "./isos/install.iso",
-  },
-  {
     key: "floppy",
     label: "Floppy",
     doc: "Path to a floppy image to attach (relative to lab root)",
     type: "text",
-  },
-];
-
-export const VM_ADVANCED: FieldDesc[] = [
-  {
-    key: "gui",
-    label: "VNC viewer",
-    doc: "Open a VNC viewer on `up`; the VM always runs headless",
-    type: "bool3",
-  },
-  {
-    key: "display",
-    label: "Display",
-    doc: "QEMU display string; inherited from template→profile if omitted",
-    type: "text",
-    placeholder: "e.g. virtio-vga",
   },
   {
     key: "qemu_args",
@@ -158,18 +102,14 @@ export const VM_ADVANCED: FieldDesc[] = [
 
 // --- vm children --------------------------------------------------------------
 
+// NAT attachment (and port isolation) are wired on the canvas / raw config,
+// not per-NIC form fields — the form covers segment, address, MAC.
 export const NIC_FIELDS: FieldDesc[] = [
   {
     key: "segment",
     label: "Segment",
     doc: "Segment name to attach to; required unless NAT",
     type: "segref",
-  },
-  {
-    key: "nat",
-    label: "NAT",
-    doc: "Shorthand: attach to the per-lab built-in NAT segment",
-    type: "flag",
   },
   {
     key: "ip",
@@ -184,12 +124,6 @@ export const NIC_FIELDS: FieldDesc[] = [
     doc: "Fixed MAC; generated and persisted otherwise",
     type: "text",
     placeholder: "52:54:00:ab:cd:ef",
-  },
-  {
-    key: "isolated",
-    label: "Isolated",
-    doc: "Port isolation: reach gateway/forwards but not segment neighbours",
-    type: "flag",
   },
 ];
 
@@ -251,30 +185,6 @@ export const SHARE_FIELDS: FieldDesc[] = [
   },
 ];
 
-export const MEDIA_FIELDS: FieldDesc[] = [
-  {
-    key: "kind",
-    label: "Kind",
-    doc: "Image kind: `iso` | `floppy` (required)",
-    type: "enum",
-    options: ["iso", "floppy"],
-    required: true,
-  },
-  {
-    key: "from",
-    label: "From folder",
-    doc: "Source folder built into the image; must exist (required)",
-    type: "text",
-    required: true,
-  },
-  {
-    key: "label",
-    label: "Volume label",
-    doc: "Volume label for the image",
-    type: "text",
-  },
-];
-
 export const GPU_FIELDS: FieldDesc[] = [
   {
     key: "mode",
@@ -290,6 +200,163 @@ export const GPU_FIELDS: FieldDesc[] = [
     doc: "Host PCI address, e.g. `0000:01:00.0` — required for passthrough",
     type: "text",
     placeholder: "0000:01:00.0",
+  },
+];
+
+// --- container ------------------------------------------------------------------
+// Image (with restart policy) and depends-on render as dedicated controls in
+// the container inspector; cpus/memory as sliders — these tables cover the
+// rest of the block's scalar surface plus its child collections.
+
+export const CONTAINER_GENERAL: FieldDesc[] = [
+  {
+    key: "restart",
+    label: "Restart",
+    doc: "Restart policy: `no` (default) | `on-failure` | `always`",
+    type: "enum",
+    options: ["no", "on-failure", "always"],
+    required: true,
+  },
+  {
+    key: "workdir",
+    label: "Working dir",
+    doc: "Working directory inside the container; image default if omitted",
+    type: "text",
+    placeholder: "/app",
+  },
+  {
+    key: "user",
+    label: "User",
+    doc: "User to run as: `uid[:gid]` or a name from the image; image default if omitted",
+    type: "text",
+    placeholder: "1000:1000",
+  },
+  {
+    key: "entrypoint",
+    label: "Entrypoint",
+    doc: "Override the image entrypoint (exec form, one argument per line)",
+    type: "lines",
+  },
+  {
+    key: "command",
+    label: "Command",
+    doc: "Override the image cmd (exec form, one argument per line)",
+    type: "lines",
+  },
+];
+
+export const ENV_FIELDS: FieldDesc[] = [
+  {
+    key: "name",
+    label: "Name",
+    doc: "Variable name (required)",
+    type: "text",
+    required: true,
+    placeholder: "APP_ENV",
+  },
+  {
+    key: "value",
+    label: "Value",
+    doc: "Variable value (required)",
+    type: "text",
+    required: true,
+  },
+];
+
+export const VOLUME_FIELDS: FieldDesc[] = [
+  {
+    key: "host",
+    label: "Host path",
+    doc: "Host path to bind-mount, relative to the lab root; exactly one of host path / volume name",
+    type: "text",
+    placeholder: "data/www",
+  },
+  {
+    key: "name",
+    label: "Volume name",
+    doc: "Named volume kept under the lab dir, shared by name; exactly one of host path / volume name",
+    type: "text",
+    placeholder: "dbdata",
+  },
+  {
+    key: "target",
+    label: "Target",
+    doc: "Absolute mount path inside the container (required)",
+    type: "text",
+    required: true,
+    placeholder: "/var/lib/data",
+  },
+  {
+    key: "read_only",
+    label: "Read-only",
+    doc: "Mount read-only (default false)",
+    type: "flag",
+  },
+];
+
+export const PORT_FIELDS: FieldDesc[] = [
+  {
+    key: "host",
+    label: "Host port",
+    doc: "Host port to listen on (1–65535); unique across the lab (required)",
+    type: "int",
+    required: true,
+    min: 1,
+    max: 65535,
+  },
+  {
+    key: "container",
+    label: "Container port",
+    doc: "Container port to forward to (1–65535) (required)",
+    type: "int",
+    required: true,
+    min: 1,
+    max: 65535,
+  },
+  {
+    key: "proto",
+    label: "Protocol",
+    doc: "`tcp` (default) | `udp` | `both`",
+    type: "enum",
+    options: ["tcp", "udp", "both"],
+    required: true,
+  },
+];
+
+export const HEALTHCHECK_FIELDS: FieldDesc[] = [
+  {
+    key: "command",
+    label: "Command",
+    doc: "Probe command run inside the container (exec form, one argument per line); exit 0 = healthy",
+    type: "lines",
+  },
+  {
+    key: "interval",
+    label: "Interval (s)",
+    doc: "Seconds between probes (default 10)",
+    type: "int",
+    min: 1,
+  },
+  {
+    key: "timeout",
+    label: "Timeout (s)",
+    doc: "Per-probe timeout in seconds (default 5)",
+    type: "int",
+    min: 1,
+  },
+  {
+    key: "retries",
+    label: "Retries",
+    doc: "Consecutive failures before unhealthy (default 3)",
+    type: "int",
+    min: 1,
+  },
+  {
+    key: "start_period",
+    label: "Start period (s)",
+    doc: "Grace period in seconds after start before failures count (default 10)",
+    type: "int",
+    min: 0,
   },
 ];
 
@@ -309,14 +376,7 @@ export const SEGMENT_GENERAL: FieldDesc[] = [
     doc: "Owned by the supervisor and shared across labs",
     type: "flag",
   },
-  {
-    key: "mtu",
-    label: "MTU",
-    doc: "Link MTU (576–65535); default jumbo on nat/global, else 1500",
-    type: "int",
-    min: 576,
-    max: 65535,
-  },
+  // mtu renders as a dedicated SliderRow in the segment inspector.
   {
     key: "routes_to",
     label: "Routes to",
@@ -545,11 +605,5 @@ export const HANDLER_FIELDS: FieldDesc[] = [
   },
 ];
 
-export const LAB_FIELDS: FieldDesc[] = [
-  {
-    key: "gui",
-    label: "VNC viewers",
-    doc: "Default for all VMs: open a VNC viewer on `up`; VM gui overrides",
-    type: "bool3",
-  },
-];
+// The lab block has no form fields in the UI (the `gui` VNC-viewer default
+// stays raw-config-only); the lab inspector is its child collections.

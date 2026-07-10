@@ -5,6 +5,7 @@ import "./labs.wcl"
 import "./vms.wcl"
 import "./segment_block.wcl"
 import "./nic_block.wcl"
+import "./container_block.wcl"
 import "./shares.wcl"
 import "./media.wcl"
 import "./template_block.wcl"
@@ -20,6 +21,7 @@ import "./template_store.wcl"
 // wscript host-API objects
 import "./lab_api.wcl"
 import "./vm_api.wcl"
+import "./container_api.wcl"
 import "./seg_api.wcl"
 
 // wscript data types

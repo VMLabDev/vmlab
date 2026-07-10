@@ -75,6 +75,73 @@ export interface VmModel {
   media: MediaModel[];
 }
 
+// --- container children -------------------------------------------------------
+
+export interface EnvVarModel {
+  span: Span | null;
+  name: string;
+  value: string;
+}
+
+export interface VolumeModel {
+  span: Span | null;
+  /** Host bind path; exactly one of `host`/`name` is set. */
+  host: string | null;
+  /** Named volume (kept under the lab dir, shared by name). */
+  name: string | null;
+  target: string;
+  read_only: boolean;
+}
+
+export interface PortMapModel {
+  span: Span | null;
+  host: number;
+  container: number;
+  proto: string; // tcp | udp | both
+}
+
+export interface HealthcheckModel {
+  span: Span | null;
+  command: string[];
+  /** Seconds. */
+  interval: number;
+  /** Seconds. */
+  timeout: number;
+  retries: number;
+  /** Seconds. */
+  start_period: number;
+}
+
+/** Schema defaults for `healthcheck {}` (mirrors src/config extraction). */
+export const HEALTHCHECK_DEFAULTS = {
+  interval: 10,
+  timeout: 5,
+  retries: 3,
+  start_period: 10,
+} as const;
+
+export interface ContainerModel {
+  span: Span | null;
+  name: string;
+  /** OCI image reference exactly as written. */
+  image: string;
+  image_span: Span | null;
+  entrypoint: string[] | null;
+  command: string[] | null;
+  workdir: string | null;
+  user: string | null;
+  cpus: number | null;
+  /** Bytes. */
+  memory: number | null;
+  depends_on: string[];
+  restart: string; // no | on-failure | always
+  nics: NicModel[];
+  env: EnvVarModel[];
+  volumes: VolumeModel[];
+  ports: PortMapModel[];
+  healthcheck: HealthcheckModel | null;
+}
+
 export interface DnsModel {
   declared: boolean;
   span: Span | null;
@@ -164,6 +231,7 @@ export interface LabModel {
   gui: boolean | null;
   segments: SegmentModel[];
   vms: VmModel[];
+  containers: ContainerModel[];
   provisions: ProvisionModel[];
   handlers: HandlerModel[];
   records: RecordModel[];
@@ -241,6 +309,28 @@ export function emptyVm(name: string, template: string): VmModel {
     extra_disks: [],
     shares: [],
     media: [],
+  };
+}
+
+export function emptyContainer(name: string, image: string): ContainerModel {
+  return {
+    span: null,
+    name,
+    image,
+    image_span: null,
+    entrypoint: null,
+    command: null,
+    workdir: null,
+    user: null,
+    cpus: null,
+    memory: null,
+    depends_on: [],
+    restart: "no",
+    nics: [],
+    env: [],
+    volumes: [],
+    ports: [],
+    healthcheck: null,
   };
 }
 

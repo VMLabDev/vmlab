@@ -21,9 +21,15 @@ PRD implemented (M1–M6). Module map under `src/`:
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles.
 - `profiles/` — guest OS profiles (WCL data, user-overridable).
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
-  firmware lookup, process management.
+  firmware lookup, process management; `container.rs` builds the micro-VM
+  argv for lab containers (§18).
 - `qmp/`, `qga/` — QMP and guest-agent clients.
 - `template/` — store, qemu-img, builds, artefact cache, store/OCI CLI.
+- `oci/image/` — standard container-image pull: docker/OCI manifests,
+  layer flatten (whiteouts → squashfs via sqfstar), digest-addressed cache.
+- `guest_asset.rs` + `guest/` — the container micro-VM kernel/initramfs:
+  `vmlab-cinit` (guest PID 1), `cinit-proto` (host↔init contract, shared
+  crate), `build-asset.sh` (pinned Alpine, rootless build).
 - `media/` — folder → ISO/floppy with content-addressed cache.
 - `vision/` — screenshot, template matching, OCR.
 - `net/` — userspace fabric: frame codecs, L2 switch, DHCP, DNS, gateway,
@@ -31,7 +37,8 @@ PRD implemented (M1–M6). Module map under `src/`:
 - `proto/` — JSON-lines daemon wire protocol (client + server).
 - `supervisor/` — `vmlabd`: lab registry, global segments, watchdogs.
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
-  SMB integration, the lab runtime the wscript host binds to.
+  SMB integration, the lab runtime the wscript host binds to;
+  `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18).
 - `scripting/` — wscript host module (lab/VM/segment API), provisions, handlers.
 - `smb/` — bundled-smbd shared folders.
 - `oci/` — OCI registry push/pull (chunked, multi-arch).

@@ -29,9 +29,27 @@ pub struct SnapshotRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContainerState {
+    /// MAC per NIC index — same stability contract as VM MACs.
+    #[serde(default)]
+    pub macs: Vec<MacAddr>,
+    /// Image manifest digest resolved at first pull — pins the container
+    /// across `up`s (never re-pulled implicitly, mirroring registry
+    /// templates, PRD §6.4) until `container destroy` / lab destroy.
+    #[serde(default)]
+    pub image_digest: Option<String>,
+    /// The `image =` reference the digest was resolved from; editing the
+    /// reference in vmlab.wcl invalidates the pin.
+    #[serde(default)]
+    pub image_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LabState {
     #[serde(default)]
     pub vms: BTreeMap<String, VmState>,
+    #[serde(default)]
+    pub containers: BTreeMap<String, ContainerState>,
 }
 
 impl LabState {
@@ -56,6 +74,10 @@ impl LabState {
 
     pub fn vm_mut(&mut self, name: &str) -> &mut VmState {
         self.vms.entry(name.to_string()).or_default()
+    }
+
+    pub fn container_mut(&mut self, name: &str) -> &mut ContainerState {
+        self.containers.entry(name.to_string()).or_default()
     }
 }
 

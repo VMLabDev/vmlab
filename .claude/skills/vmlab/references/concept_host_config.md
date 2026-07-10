@@ -10,7 +10,7 @@ host {
   dns_suffix       = "vmlab.internal"  // suffix for auto-registered VM names
   dns_upstream     = "1.1.1.1"         // upstream resolver ip[:port]; default: host resolver
   disk_low_percent = 10                // host.disk_low watchdog threshold (default 10)
-  psk              = "secret"          // pre-shared key for cross-host segment peering (§9.2)
+  psk              = "secret"          // pre-shared key for cross-host segment peering
   viewer           = "vncviewer {}"    // console viewer command; {} = target
   oci_chunk_size   = 512MiB            // OCI push layer chunk size (default 512M)
 }

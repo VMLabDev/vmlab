@@ -6,11 +6,9 @@ import Login from "./components/Login";
 import Topbar from "./components/Topbar";
 import SidebarNav from "./components/SidebarNav";
 import LabView from "./components/LabView";
-import NetworkView from "./components/NetworkView";
-import LogsView from "./components/LogsView";
 import TemplatesView from "./components/TemplatesView";
 import MachineView from "./components/MachineView";
-import LabEditorView from "./components/editor/LabEditorView";
+import ContainerView from "./components/ContainerView";
 import NewLabModal from "./components/NewLabModal";
 
 export default function App() {
@@ -29,20 +27,14 @@ export default function App() {
           <Show when={state.view.kind === "lab"}>
             <LabView />
           </Show>
-          <Show when={state.view.kind === "network"}>
-            <NetworkView />
-          </Show>
-          <Show when={state.view.kind === "logs"}>
-            <LogsView />
-          </Show>
           <Show when={state.view.kind === "templates"}>
             <TemplatesView />
           </Show>
           <Show when={state.view.kind === "vm"}>
             <MachineView />
           </Show>
-          <Show when={state.view.kind === "editor"}>
-            <LabEditorView />
+          <Show when={state.view.kind === "container"}>
+            <ContainerView />
           </Show>
         </AppShell>
       </Show>

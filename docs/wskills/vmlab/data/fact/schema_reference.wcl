@@ -106,6 +106,42 @@ nic { nat = true }                       // per-lab built-in NAT segment shortha
 nic { segment = "dmz" isolated = true }  // port isolation
 WCL
 
+let ex_container = <<'WCL'
+container "web" {
+  image      = "nginx:1.27"              // docker.io shorthand; @sha256:… pins
+  depends_on = ["db"]                    // VM or container names — one namespace
+  restart    = "on-failure"              // "no" (default) | "on-failure" | "always"
+  nic    { segment = "corp" ip = "10.50.0.20" }
+  env    { name = "MODE" value = "prod" }
+  volume { name = "data" target = "/var/lib/data" }
+  port   { host = 18080 container = 80 }
+  healthcheck { command = ["curl", "-fsS", "http://localhost/"] interval = 5s }
+}
+WCL
+
+let ex_env = <<'WCL'
+env { name = "PGUSER" value = "app" }
+WCL
+
+let ex_volume = <<'WCL'
+volume { name = "data"  target = "/var/lib/data" }               // named, lab-scoped
+volume { host = "./www" target = "/srv/www" read_only = true }   // host bind
+WCL
+
+let ex_port = <<'WCL'
+port { host = 18080 container = 80 proto = "tcp" }   // sugar for a segment forward
+WCL
+
+let ex_healthcheck = <<'WCL'
+healthcheck {
+  command      = ["curl", "-fsS", "http://localhost/"]   // exit 0 = healthy
+  interval     = 10s
+  timeout      = 5s
+  retries      = 3
+  start_period = 10s
+}
+WCL
+
 let ex_disk = <<'WCL'
 disk "data"      { size = 10GiB }         // extra blank disk
 disk "formatted" { from = "./payload/" }  // folder copied onto a fresh FAT filesystem
@@ -182,6 +218,11 @@ let example_for = fn(k: utf8) -> list<utf8> {
     "sinkhole"  => [ex_sinkhole],
     "vm"        => [ex_vm],
     "nic"       => [ex_nic],
+    "container"   => [ex_container],
+    "env"         => [ex_env],
+    "volume"      => [ex_volume],
+    "port"        => [ex_port],
+    "healthcheck" => [ex_healthcheck],
     "disk"      => [ex_disk],
     "share"     => [ex_share],
     "media"     => [ex_media],

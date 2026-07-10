@@ -183,13 +183,28 @@ impl GaClient {
         capture: bool,
         timeout: Duration,
     ) -> Result<ExecResult, GaError> {
+        self.exec_env(cmd, args, &[], capture, timeout).await
+    }
+
+    /// Like [`exec`](Self::exec), but with an explicit `KEY=VALUE`
+    /// environment for the spawned process. An empty `env` omits the
+    /// argument entirely (QGA treats a present `env` as the *complete*
+    /// environment, so `[]` would clear it).
+    pub async fn exec_env(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        env: &[String],
+        capture: bool,
+        timeout: Duration,
+    ) -> Result<ExecResult, GaError> {
         let deadline = Instant::now() + timeout;
+        let mut arguments = json!({"path": cmd, "arg": args, "capture-output": capture});
+        if !env.is_empty() {
+            arguments["env"] = json!(env);
+        }
         let spawn = self
-            .execute(
-                "guest-exec",
-                Some(json!({"path": cmd, "arg": args, "capture-output": capture})),
-                remaining(deadline)?,
-            )
+            .execute("guest-exec", Some(arguments), remaining(deadline)?)
             .await?;
         let pid = spawn.get("pid").and_then(|p| p.as_i64()).ok_or_else(|| {
             GaError::Protocol(format!("guest-exec response missing pid: {spawn}"))

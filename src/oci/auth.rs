@@ -97,32 +97,56 @@ pub fn resolve_from_file(registry: &str, path: &std::path::Path) -> Result<Crede
 }
 
 fn resolve_from_config(registry: &str, config: &DockerConfig) -> Result<Credential> {
+    let candidates = candidate_hosts(registry);
     // 1. A per-registry credential helper wins.
-    if let Some(helper) = config.cred_helpers.get(registry) {
-        return run_cred_helper(helper, registry);
+    for host in &candidates {
+        if let Some(helper) = config.cred_helpers.get(*host) {
+            return run_cred_helper(helper, host);
+        }
     }
     // 2. A direct `auths` entry: base64 `auth`, or explicit user/pass.
-    if let Some(entry) = lookup_auth(&config.auths, registry) {
-        if let Some(auth) = &entry.auth {
-            return decode_basic_auth(auth);
-        }
-        if let (Some(u), Some(p)) = (&entry.username, &entry.password) {
-            return Ok(Credential::Basic {
-                username: u.clone(),
-                password: p.clone(),
-            });
+    for host in &candidates {
+        if let Some(entry) = lookup_auth(&config.auths, host) {
+            if let Some(auth) = &entry.auth {
+                return decode_basic_auth(auth);
+            }
+            if let (Some(u), Some(p)) = (&entry.username, &entry.password) {
+                return Ok(Credential::Basic {
+                    username: u.clone(),
+                    password: p.clone(),
+                });
+            }
         }
     }
     // 3. A global credsStore helper.
     if let Some(helper) = &config.creds_store {
         // The store may or may not have this registry; missing creds are
         // not fatal (anonymous pull stays possible).
-        match run_cred_helper(helper, registry) {
-            Ok(cred) => return Ok(cred),
-            Err(_) => return Ok(Credential::Anonymous),
+        for host in &candidates {
+            if let Ok(cred) = run_cred_helper(helper, host) {
+                return Ok(cred);
+            }
         }
+        return Ok(Credential::Anonymous);
     }
     Ok(Credential::Anonymous)
+}
+
+/// The docker-config keys to try for `registry`. Docker Hub's registry
+/// answers as `registry-1.docker.io`, but docker tooling keys its credential
+/// as `docker.io` or the legacy `https://index.docker.io/v1/` — try those
+/// aliases too so an existing `docker login` just works.
+fn candidate_hosts(registry: &str) -> Vec<&str> {
+    if registry == "registry-1.docker.io" {
+        vec![
+            registry,
+            "docker.io",
+            "index.docker.io",
+            "https://index.docker.io/v1/",
+        ]
+    } else {
+        vec![registry]
+    }
 }
 
 /// Look up an `auths` entry tolerant of Docker's habit of keying on full
@@ -355,6 +379,34 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
         let cred = resolve_from_file("ghcr.io", &path).unwrap();
         assert!(matches!(cred, Credential::Basic { .. }));
+    }
+
+    #[test]
+    fn docker_hub_registry_tries_alias_keys() {
+        // `docker login` keys Docker Hub as `docker.io` or the legacy
+        // `https://index.docker.io/v1/`; both must satisfy a lookup for the
+        // actual registry host `registry-1.docker.io`.
+        for key in ["docker.io", "https://index.docker.io/v1/"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            let auth = BASE64.encode("hubuser:hubpass");
+            let json = serde_json::json!({ "auths": { key: { "auth": auth } } });
+            std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+            let cred = resolve_from_file("registry-1.docker.io", &path).unwrap();
+            assert_eq!(
+                cred,
+                Credential::Basic {
+                    username: "hubuser".into(),
+                    password: "hubpass".into()
+                },
+                "key {key} should resolve for registry-1.docker.io"
+            );
+            // …and the alias never leaks onto other registries.
+            assert_eq!(
+                resolve_from_file("ghcr.io", &path).unwrap(),
+                Credential::Anonymous
+            );
+        }
     }
 
     #[test]

@@ -6,9 +6,10 @@
 use serde::Serialize;
 
 use super::model::{
-    BlockRule, Connect, DiskBlock, DnsRecord, Firmware, Forward, Gpu, GpuMode, Handler, HostPort,
-    L4Proto, Lab, LabFile, Media, MediaKind, Nic, Provision, RedirectRule, Route, Segment,
-    SegmentDns, Share, SinkholeMode, SinkholeRule, Span, TemplateDef, Vm,
+    BlockRule, Connect, Container, DiskBlock, DnsRecord, EnvVar, Firmware, Forward, Gpu, GpuMode,
+    Handler, Healthcheck, HostPort, L4Proto, Lab, LabFile, Media, MediaKind, Nic, PortMap,
+    Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share, SinkholeMode,
+    SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
 };
 
 #[derive(Serialize)]
@@ -35,6 +36,7 @@ pub struct LabDto {
     pub gui: Option<bool>,
     pub segments: Vec<SegmentDto>,
     pub vms: Vec<VmDto>,
+    pub containers: Vec<ContainerDto>,
     pub provisions: Vec<ProvisionDto>,
     pub handlers: Vec<HandlerDto>,
     pub records: Vec<DnsRecordDto>,
@@ -49,6 +51,7 @@ impl From<&Lab> for LabDto {
             gui: l.gui,
             segments: l.segments.iter().map(SegmentDto::from).collect(),
             vms: l.vms.iter().map(VmDto::from).collect(),
+            containers: l.containers.iter().map(ContainerDto::from).collect(),
             provisions: l.provisions.iter().map(ProvisionDto::from).collect(),
             handlers: l.handlers.iter().map(HandlerDto::from).collect(),
             records: l.records.iter().map(DnsRecordDto::from).collect(),
@@ -315,6 +318,142 @@ impl From<&Vm> for VmDto {
             extra_disks: v.extra_disks.iter().map(DiskDto::from).collect(),
             shares: v.shares.iter().map(ShareDto::from).collect(),
             media: v.media.iter().map(MediaDto::from).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ContainerDto {
+    pub name: String,
+    pub span: Span,
+    /// OCI image reference exactly as written (`image = "…"`).
+    pub image: String,
+    pub image_span: Span,
+    pub entrypoint: Option<Vec<String>>,
+    pub command: Option<Vec<String>>,
+    pub workdir: Option<String>,
+    pub user: Option<String>,
+    pub cpus: Option<u32>,
+    /// Bytes.
+    pub memory: Option<u64>,
+    pub depends_on: Vec<String>,
+    pub restart: RestartPolicy,
+    pub nics: Vec<NicDto>,
+    pub env: Vec<EnvVarDto>,
+    pub volumes: Vec<VolumeDto>,
+    pub ports: Vec<PortMapDto>,
+    pub healthcheck: Option<HealthcheckDto>,
+}
+
+impl From<&Container> for ContainerDto {
+    fn from(c: &Container) -> Self {
+        Self {
+            name: c.name.clone(),
+            span: c.span,
+            image: c.image.reference.clone(),
+            image_span: c.image_span,
+            entrypoint: c.entrypoint.clone(),
+            command: c.command.clone(),
+            workdir: c.workdir.clone(),
+            user: c.user.clone(),
+            cpus: c.cpus,
+            memory: c.memory,
+            depends_on: c.depends_on.clone(),
+            restart: c.restart,
+            nics: c.nics.iter().map(NicDto::from).collect(),
+            env: c.env.iter().map(EnvVarDto::from).collect(),
+            volumes: c.volumes.iter().map(VolumeDto::from).collect(),
+            ports: c.ports.iter().map(PortMapDto::from).collect(),
+            healthcheck: c.healthcheck.as_ref().map(HealthcheckDto::from),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct EnvVarDto {
+    pub span: Span,
+    pub name: String,
+    pub value: String,
+}
+
+impl From<&EnvVar> for EnvVarDto {
+    fn from(e: &EnvVar) -> Self {
+        Self {
+            span: e.span,
+            name: e.name.clone(),
+            value: e.value.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct VolumeDto {
+    pub span: Span,
+    /// Host bind path (`host = …`); exactly one of `host`/`name` is set.
+    pub host: Option<String>,
+    /// Named volume (`name = …`).
+    pub name: Option<String>,
+    pub target: String,
+    pub read_only: bool,
+}
+
+impl From<&Volume> for VolumeDto {
+    fn from(v: &Volume) -> Self {
+        let (host, name) = match &v.source {
+            VolumeSource::Host(p) => (Some(p.display().to_string()), None),
+            VolumeSource::Named(n) => (None, Some(n.clone())),
+        };
+        Self {
+            span: v.span,
+            host,
+            name,
+            target: v.target.clone(),
+            read_only: v.read_only,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct PortMapDto {
+    pub span: Span,
+    pub host: u16,
+    pub container: u16,
+    pub proto: super::model::Proto,
+}
+
+impl From<&PortMap> for PortMapDto {
+    fn from(p: &PortMap) -> Self {
+        Self {
+            span: p.span,
+            host: p.host_port,
+            container: p.container_port,
+            proto: p.proto,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct HealthcheckDto {
+    pub span: Span,
+    pub command: Vec<String>,
+    /// Seconds.
+    pub interval: u64,
+    /// Seconds.
+    pub timeout: u64,
+    pub retries: u32,
+    /// Seconds.
+    pub start_period: u64,
+}
+
+impl From<&Healthcheck> for HealthcheckDto {
+    fn from(h: &Healthcheck) -> Self {
+        Self {
+            span: h.span,
+            command: h.command.clone(),
+            interval: h.interval.as_secs(),
+            timeout: h.timeout.as_secs(),
+            retries: h.retries,
+            start_period: h.start_period.as_secs(),
         }
     }
 }

@@ -218,6 +218,15 @@ pub async fn catalog_meta() -> HttpResponse {
         "forward_protos": ["tcp", "udp", "both"],
         "l4_protos": ["tcp", "udp", "icmp"],
         "media_kinds": ["iso", "floppy"],
+        "restart_policies": ["no", "on-failure", "always"],
+        // Schema defaults for `healthcheck {}` (seconds / count), so the
+        // editor's placeholders can never drift from the parser's defaults.
+        "healthcheck_defaults": {
+            "interval": 10,
+            "timeout": 5,
+            "retries": 3,
+            "start_period": 10,
+        },
     }))
 }
 
@@ -259,6 +268,30 @@ pub async fn vm_action(
         _ => return HttpResponse::NotFound().json(json!({"error": "unknown vm action"})),
     };
     match state.lab_call(&lab, cmd, json!({"vm": vm})).await {
+        Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
+/// `POST /api/labs/{lab}/containers/{container}/{action}` where action ∈
+/// start|stop|restart|destroy — the container mirror of [`vm_action`], proxied
+/// to the labd `container.*` commands (arg key `container`, not `vm`).
+pub async fn container_action(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String, String)>,
+) -> HttpResponse {
+    let (lab, container, action) = path.into_inner();
+    let cmd = match action.as_str() {
+        "start" => "container.start",
+        "stop" => "container.stop",
+        "restart" => "container.restart",
+        "destroy" => "container.destroy",
+        _ => return HttpResponse::NotFound().json(json!({"error": "unknown container action"})),
+    };
+    match state
+        .lab_call(&lab, cmd, json!({"container": container}))
+        .await
+    {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -454,14 +487,16 @@ pub async fn reload_lab(state: web::Data<AppState>, lab: web::Path<String>) -> H
     // Only block on running VMs if the daemon is actually up. If it isn't,
     // there's nothing running to lose and the restart just starts it fresh.
     if let Ok(status) = state.lab_call(&lab, "status", Value::Null).await {
-        let running = status["vms"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|v| v["state"].as_str() != Some("stopped"));
+        let running = ["vms", "containers"].iter().any(|kind| {
+            status[kind]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|v| v["state"].as_str() != Some("stopped"))
+        });
         if running {
             return HttpResponse::Conflict()
-                .json(json!({"error": "stop all VMs before reloading the lab"}));
+                .json(json!({"error": "stop all VMs and containers before reloading the lab"}));
         }
     }
 
@@ -559,6 +594,89 @@ pub struct RestoreBody {
     vm: Option<String>,
 }
 
+/// `GET /api/host` — host capacity (CPU cores + total RAM) for the editor's
+/// hardware sliders.
+pub async fn host_info() -> HttpResponse {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let memory = tokio::fs::read_to_string("/proc/meminfo")
+        .await
+        .ok()
+        .and_then(|s| parse_mem_total(&s))
+        .unwrap_or(0);
+    ok(json!({"cpus": cpus, "memory": memory}))
+}
+
+/// Total RAM in bytes from `/proc/meminfo` (`MemTotal:  16384000 kB`).
+fn parse_mem_total(meminfo: &str) -> Option<u64> {
+    let rest = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;
+    let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+#[derive(Deserialize)]
+pub struct FsQuery {
+    path: String,
+}
+
+/// `GET /api/host/fs?path=<abs dir>` — list one directory for the editor's
+/// server-side file picker (the ISO browser). Hidden entries are skipped;
+/// directories sort first. Auth-gated like every other `/api` route.
+pub async fn host_fs(q: web::Query<FsQuery>) -> HttpResponse {
+    let path = std::path::PathBuf::from(&q.path);
+    if !path.is_absolute() {
+        return HttpResponse::BadRequest().json(json!({"error": "path must be absolute"}));
+    }
+    // Normalise `..`/symlinks so the breadcrumb the UI shows is canonical.
+    let path = match tokio::fs::canonicalize(&path).await {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return HttpResponse::NotFound()
+                .json(json!({"error": format!("{}: not found", path.display())}));
+        }
+        Err(e) => return HttpResponse::Forbidden().json(json!({"error": e.to_string()})),
+    };
+    let mut dir = match tokio::fs::read_dir(&path).await {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+            return HttpResponse::BadRequest().json(json!({"error": "not a directory"}));
+        }
+        Err(e) => return HttpResponse::Forbidden().json(json!({"error": e.to_string()})),
+    };
+    let mut entries: Vec<(bool, String, Option<u64>)> = Vec::new();
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        // Follow symlinks so a linked ISO directory still browses.
+        let Ok(meta) = tokio::fs::metadata(entry.path()).await else {
+            continue;
+        };
+        if meta.is_dir() {
+            entries.push((true, name, None));
+        } else if meta.is_file() {
+            entries.push((false, name, Some(meta.len())));
+        }
+    }
+    entries.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    let rows: Vec<Value> = entries
+        .into_iter()
+        .map(|(dir, name, size)| json!({"name": name, "dir": dir, "size": size}))
+        .collect();
+    ok(json!({
+        "path": path.to_string_lossy(),
+        "parent": path.parent().map(|p| p.to_string_lossy().into_owned()),
+        "entries": rows,
+    }))
+}
+
 /// `POST /api/labs/{lab}/snapshots/{name}/restore` `{vm?}` — restore a snapshot.
 pub async fn snapshot_restore(
     state: web::Data<AppState>,
@@ -573,5 +691,66 @@ pub async fn snapshot_restore(
     match state.lab_call(&lab, "snapshot.restore", args).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{App, test};
+
+    #[actix_web::test]
+    async fn mem_total_parses_meminfo() {
+        let s = "MemTotal:       65670920 kB\nMemFree:        1234 kB\n";
+        assert_eq!(parse_mem_total(s), Some(65670920 * 1024));
+        assert_eq!(parse_mem_total("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_mem_total("MemTotal: garbage kB\n"), None);
+    }
+
+    #[actix_web::test]
+    async fn host_fs_rejects_relative_paths() {
+        let app =
+            test::init_service(App::new().route("/api/host/fs", web::get().to(host_fs))).await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/host/fs?path=relative/dir")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[actix_web::test]
+    async fn host_fs_lists_dirs_first_and_skips_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("a.iso"), b"x").unwrap();
+        std::fs::write(tmp.path().join(".hidden"), b"x").unwrap();
+
+        let app =
+            test::init_service(App::new().route("/api/host/fs", web::get().to(host_fs))).await;
+        let uri = format!("/api/host/fs?path={}", tmp.path().display());
+        let resp = test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = test::read_body_json(resp).await;
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["name"], "sub");
+        assert_eq!(entries[0]["dir"], true);
+        assert_eq!(entries[1]["name"], "a.iso");
+        assert_eq!(entries[1]["size"], 1);
+        assert!(body["parent"].as_str().is_some());
+    }
+
+    #[actix_web::test]
+    async fn host_info_reports_capacity() {
+        let app = test::init_service(App::new().route("/api/host", web::get().to(host_info))).await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/api/host").to_request()).await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["cpus"].as_u64().unwrap() >= 1);
+        assert!(body["memory"].as_u64().unwrap() > 0);
     }
 }

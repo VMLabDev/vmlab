@@ -11,7 +11,7 @@ DHCP, DNS, NAT, routing and L3 filtering (see [the networking model](../referenc
 ```wcl
 segment "name" {
   subnet    = "10.0.0.0/24"      // CIDR; auto-allocated from host pool if omitted
-  global    = true               // owned by the supervisor, shared across labs (§9.2)
+  global    = true               // owned by the supervisor, shared across labs
   dhcp      = true               // default true
   nat       = true               // internet egress for this segment (default false)
   routes_to = ["other_segment"]  // daemon inter-segment routing opt-in

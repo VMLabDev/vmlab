@@ -62,10 +62,10 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             }
         }
         for fwd in &seg.forwards {
-            if !lab.vms.iter().any(|v| v.name == fwd.vm) {
+            if !machine_exists(lab, &fwd.vm) {
                 issues.push(Issue::at(
                     fwd.span,
-                    format!("forward references undefined vm \"{}\"", fwd.vm),
+                    format!("forward references undefined vm/container \"{}\"", fwd.vm),
                 ));
             }
         }
@@ -77,6 +77,8 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     }
 
     // -- duplicate forward host ports across the lab ----------------------
+    // Container `port` blocks compile into the same forward machinery, so
+    // they share the uniqueness space with segment forwards.
     let mut fwd_ports: HashMap<u16, Span> = HashMap::new();
     for seg in &lab.segments {
         for fwd in &seg.forwards {
@@ -88,25 +90,46 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             }
         }
     }
+    for c in &lab.containers {
+        for p in &c.ports {
+            if fwd_ports.insert(p.host_port, p.span).is_some() {
+                issues.push(Issue::at(
+                    p.span,
+                    format!("duplicate forward host port {}", p.host_port),
+                ));
+            }
+        }
+    }
 
     // -- VMs --------------------------------------------------------------
-    let mut vm_names: HashSet<&str> = HashSet::new();
+    // VMs and containers share one name namespace (they share DNS, forwards,
+    // and dependency waves).
+    let mut machine_names: HashSet<&str> = HashSet::new();
     let mut static_ips: HashMap<Ipv4Addr, Span> = HashMap::new();
     let mut macs: HashMap<MacAddr, Span> = HashMap::new();
     for vm in &lab.vms {
-        if !vm_names.insert(&vm.name) {
-            issues.push(Issue::at(vm.span, format!("duplicate vm \"{}\"", vm.name)));
+        if !machine_names.insert(&vm.name) {
+            issues.push(Issue::at(
+                vm.span,
+                format!(
+                    "duplicate name \"{}\" — VM and container names share one namespace",
+                    vm.name
+                ),
+            ));
         }
         check_dns_label(&vm.name, vm.span, "vm name", &mut issues);
         check_vm_template(file, vm, ctx, &mut issues);
         check_vm_hardware(file, vm, ctx, &mut issues);
-        check_nics(lab, vm, &mut static_ips, &mut macs, &mut issues);
+        check_nics(lab, &vm.nics, &mut static_ips, &mut macs, &mut issues);
 
         for dep in &vm.depends_on {
-            if !lab.vms.iter().any(|v| &v.name == dep) {
+            if !machine_exists(lab, dep) {
                 issues.push(Issue::at(
                     vm.span,
-                    format!("vm \"{}\" depends_on undefined vm \"{dep}\"", vm.name),
+                    format!(
+                        "vm \"{}\" depends_on undefined vm/container \"{dep}\"",
+                        vm.name
+                    ),
                 ));
             }
         }
@@ -171,6 +194,56 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         }
     }
 
+    // -- containers ---------------------------------------------------------
+    for c in &lab.containers {
+        if !machine_names.insert(&c.name) {
+            issues.push(Issue::at(
+                c.span,
+                format!(
+                    "duplicate name \"{}\" — VM and container names share one namespace",
+                    c.name
+                ),
+            ));
+        }
+        check_dns_label(&c.name, c.span, "container name", &mut issues);
+        check_nics(lab, &c.nics, &mut static_ips, &mut macs, &mut issues);
+
+        for dep in &c.depends_on {
+            if !machine_exists(lab, dep) {
+                issues.push(Issue::at(
+                    c.span,
+                    format!(
+                        "container \"{}\" depends_on undefined vm/container \"{dep}\"",
+                        c.name
+                    ),
+                ));
+            }
+        }
+
+        if !c.ports.is_empty() && c.nics.is_empty() {
+            issues.push(Issue::at(
+                c.span,
+                format!(
+                    "container \"{}\" declares ports but has no NICs — forwards need a segment \
+                     to reach the container over",
+                    c.name
+                ),
+            ));
+        }
+
+        for v in &c.volumes {
+            if let VolumeSource::Host(host) = &v.source {
+                let path = file.root.join(host);
+                if !path.is_dir() {
+                    issues.push(Issue::at(
+                        v.span,
+                        format!("volume host path {} is not a directory", host.display()),
+                    ));
+                }
+            }
+        }
+    }
+
     check_dependency_cycles(lab, &mut issues);
 
     // -- scripts ------------------------------------------------------------
@@ -178,10 +251,10 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     for p in &lab.provisions {
         scripts.push((&p.script, p.span));
         for vm in &p.vms {
-            if !lab.vms.iter().any(|v| &v.name == vm) {
+            if !machine_exists(lab, vm) {
                 issues.push(Issue::at(
                     p.span,
-                    format!("provision scopes undefined vm \"{vm}\""),
+                    format!("provision scopes undefined vm/container \"{vm}\""),
                 ));
             }
         }
@@ -391,14 +464,19 @@ fn check_vm_hardware(
     }
 }
 
+/// `name` resolves against the unified VM + container namespace.
+fn machine_exists(lab: &Lab, name: &str) -> bool {
+    lab.vms.iter().any(|v| v.name == name) || lab.containers.iter().any(|c| c.name == name)
+}
+
 fn check_nics(
     lab: &Lab,
-    vm: &Vm,
+    nics: &[Nic],
     static_ips: &mut HashMap<Ipv4Addr, Span>,
     macs: &mut HashMap<MacAddr, Span>,
     issues: &mut IssueList,
 ) {
-    for nic in &vm.nics {
+    for nic in nics {
         let seg = match (&nic.segment, nic.nat) {
             (Some(_), true) => {
                 issues.push(Issue::at(
@@ -411,8 +489,8 @@ fn check_nics(
             (None, false) => {
                 issues.push(Issue::at(
                     nic.span,
-                    "nic needs `segment = \"...\"` or `nat = true` (a vm with no nic blocks is \
-                     air-gapped — an empty nic is meaningless)",
+                    "nic needs `segment = \"...\"` or `nat = true` (a machine with no nic blocks \
+                     is air-gapped — an empty nic is meaningless)",
                 ));
                 continue;
             }
@@ -495,9 +573,11 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
         Visiting,
         Done,
     }
+    // Dependency waves span VMs and containers, so cycles are detected over
+    // the unified graph.
     fn visit<'a>(
         name: &'a str,
-        lab: &'a Lab,
+        deps: &HashMap<&'a str, &'a [String]>,
         state: &mut HashMap<&'a str, State>,
         stack: &mut Vec<&'a str>,
     ) -> Option<Vec<String>> {
@@ -513,9 +593,9 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
         }
         state.insert(name, State::Visiting);
         stack.push(name);
-        if let Some(vm) = lab.vms.iter().find(|v| v.name == name) {
-            for dep in &vm.depends_on {
-                if let Some(cycle) = visit(dep, lab, state, stack) {
+        if let Some(names) = deps.get(name) {
+            for dep in names.iter() {
+                if let Some(cycle) = visit(dep, deps, state, stack) {
                     return Some(cycle);
                 }
             }
@@ -525,12 +605,23 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
         None
     }
 
-    let mut state = HashMap::new();
+    let mut deps: HashMap<&str, &[String]> = HashMap::new();
+    let mut roots: Vec<(&str, Span)> = Vec::new();
     for vm in &lab.vms {
+        deps.insert(&vm.name, &vm.depends_on);
+        roots.push((&vm.name, vm.span));
+    }
+    for c in &lab.containers {
+        deps.insert(&c.name, &c.depends_on);
+        roots.push((&c.name, c.span));
+    }
+
+    let mut state = HashMap::new();
+    for (name, span) in roots {
         let mut stack = Vec::new();
-        if let Some(cycle) = visit(&vm.name, lab, &mut state, &mut stack) {
+        if let Some(cycle) = visit(name, &deps, &mut state, &mut stack) {
             issues.push(Issue::at(
-                vm.span,
+                span,
                 format!("dependency cycle: {}", cycle.join(" -> ")),
             ));
             return; // one cycle report is enough to act on
@@ -622,6 +713,24 @@ pub(crate) mod tests {
 
     fn assert_err(src: &str, needle: &str) {
         let es = errs(src);
+        assert!(
+            es.iter().any(|m| m.contains(needle)),
+            "expected error containing {needle:?}, got: {es:#?}"
+        );
+    }
+
+    /// Collect issues whether they surface at extraction or validation —
+    /// some structural container rules (volume shape, image syntax) are
+    /// reported while extracting.
+    fn assert_any_err(src: &str, needle: &str) {
+        let tmp = std::env::temp_dir();
+        let es: Vec<String> = match load_lab_source(src, "<test>", &tmp) {
+            Ok(f) => validate(&f, &Permissive)
+                .into_iter()
+                .map(|i| i.message)
+                .collect(),
+            Err(e) => e.issues.into_iter().map(|i| i.message).collect(),
+        };
         assert!(
             es.iter().any(|m| m.contains(needle)),
             "expected error containing {needle:?}, got: {es:#?}"
@@ -754,6 +863,152 @@ lab "l" {
         assert_err(
             "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" }\n  on \"vm.exploded\" { run = \"x.ws\" } }",
             "unknown event",
+        );
+    }
+
+    #[test]
+    fn container_vm_name_collision() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" }
+  container "a" { image = "nginx:1.27" }
+}"#,
+            "share one namespace",
+        );
+    }
+
+    #[test]
+    fn container_cross_kind_cycle() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" depends_on = ["c"] }
+  container "c" { image = "nginx" depends_on = ["a"] }
+}"#,
+            "dependency cycle",
+        );
+    }
+
+    #[test]
+    fn container_deps_resolve_across_kinds() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" }
+  vm "a" { template = "x86_64/t" depends_on = ["c"] nic { segment = "s" } }
+  container "c" { image = "nginx:1.27" nic { segment = "s" ip = "10.1.1.20" } }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    #[test]
+    fn forward_to_container_resolves() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { forward { host_port = 18080 to = "c:80" } }
+  container "c" { image = "nginx" nic { segment = "s" } }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    #[test]
+    fn container_port_collides_with_forward() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { forward { host_port = 18080 to = "c:80" } }
+  vm "v" { template = "x86_64/t" nic { segment = "s" } }
+  container "c" { image = "nginx" nic { segment = "s" } port { host = 18080 container = 80 } }
+}"#,
+            "duplicate forward host port",
+        );
+    }
+
+    #[test]
+    fn container_ports_need_nics() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  container "c" { image = "nginx" port { host = 18080 container = 80 } }
+}"#,
+            "no NICs",
+        );
+    }
+
+    #[test]
+    fn airgapped_container_is_valid() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  container "c" { image = "alpine" command = ["sleep", "infinity"] }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    #[test]
+    fn container_volume_and_env_rules() {
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  container "c" { image = "nginx" volume { target = "/data" } }
+}"#,
+            "volume needs",
+        );
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  container "c" { image = "nginx" volume { host = "x" name = "y" target = "/data" } }
+}"#,
+            "pick one",
+        );
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  container "c" { image = "nginx" volume { name = "data" target = "relative/path" } }
+}"#,
+            "absolute path",
+        );
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  container "c" { image = "nginx" volume { host = "no/such/dir" target = "/data" } }
+}"#,
+            "not a directory",
+        );
+    }
+
+    #[test]
+    fn container_bad_image_and_restart() {
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "UPPER/Case" } }"#,
+            "lowercase",
+        );
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "nginx" restart = "sometimes" } }"#,
+            "`restart` must be one of",
+        );
+    }
+
+    #[test]
+    fn container_events_bindable() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  container "c" { image = "nginx" }
+  on "container.crashed" { run = "h.ws" }
+}"#,
+        );
+        // The handler script does not exist, but the event name must be known.
+        assert!(
+            !es.iter().any(|m| m.contains("unknown event")),
+            "container.crashed should be bindable: {es:#?}"
         );
     }
 

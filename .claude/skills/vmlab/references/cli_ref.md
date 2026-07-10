@@ -99,6 +99,108 @@ Restart a single VM.
 vmlab vm restart dc01
 ```
 
+## vmlab container
+
+Per-container lifecycle, exec and logs (OCI containers run as micro-VMs, PRD §18).
+
+### vmlab container start
+
+Start a single container.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| container | required | Container name. |
+
+```console
+vmlab container start web
+```
+
+### vmlab container stop
+
+Stop a container gracefully (stop signal → guest shutdown → kill).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| container | required | Container name. |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --force | — | Kill immediately. |
+
+```console
+vmlab container stop web
+```
+
+### vmlab container restart
+
+Restart a single container.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| container | required | Container name. |
+
+```console
+vmlab container restart web
+```
+
+### vmlab container destroy
+
+Stop and delete the container's writable overlay + pinned image digest; named volumes survive. A later `up` re-resolves the image.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| container | required | Container name. |
+
+```console
+vmlab container destroy web
+```
+
+### vmlab container exec
+
+Run a command inside the container; exits with the command's exit code.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| container | required | Container name. |
+| cmd… | required | Command + args (after --). |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --timeout | — | Seconds (default 120). |
+
+```console
+vmlab container exec web -- nginx -t
+```
+
+### vmlab container logs
+
+Container stdout/stderr (the serial console log).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| container | required | Container name. |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| -f, --follow | — | Stream as it grows. |
+| -n, --lines | — | Tail length (default 100). |
+
+```console
+vmlab container logs web -f
+```
+
+### vmlab container ip
+
+The container's DHCP lease (errors on an air-gapped container).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| container | required | Container name. |
+
+```console
+vmlab container ip web
+```
+
 ## vmlab snapshot
 
 Online (running: disk+RAM+device state) or offline (powered off: disk only) snapshots, per current power state. Restoring an online snapshot resumes running.

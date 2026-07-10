@@ -2845,6 +2845,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "flate2",
  "forge-core",
  "futures",
  "glob",
@@ -2869,9 +2870,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "vmlab-cinit-proto",
  "wcl_lang",
  "wscript",
  "zstd",
+]
+
+[[package]]
+name = "vmlab-cinit-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

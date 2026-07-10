@@ -198,6 +198,9 @@ async fn main() -> ExitCode {
                 web::get().to(api::catalog_profiles),
             )
             .route("/api/catalog/meta", web::get().to(api::catalog_meta))
+            // Host capacity + server-side file picker for the visual editor.
+            .route("/api/host", web::get().to(api::host_info))
+            .route("/api/host/fs", web::get().to(api::host_fs))
             // VM sub-routes (literal before the `{action}` catch-all).
             .route(
                 "/api/labs/{lab}/vms/{vm}/sendkeys",
@@ -218,6 +221,11 @@ async fn main() -> ExitCode {
             .route(
                 "/api/labs/{lab}/vms/{vm}/{action}",
                 web::post().to(api::vm_action),
+            )
+            // Container lifecycle (mirrors the VM actions).
+            .route(
+                "/api/labs/{lab}/containers/{container}/{action}",
+                web::post().to(api::container_action),
             )
             // Snapshots (literal before the `{action}` catch-all).
             .route(

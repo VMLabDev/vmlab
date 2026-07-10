@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use wscript::{Context, Module, Script};
 
+use crate::labd::container::ContainerInstance;
 use crate::labd::lab::LabRuntime;
 use crate::labd::vm::{PowerState, VmInstance};
 use crate::vision;
@@ -59,6 +60,20 @@ pub struct VmHandle {
     /// always carries x,y, but the API splits `mouse_move`/`mouse_click`, so
     /// a click reuses the position the preceding move set.
     pub(crate) last_pointer: Arc<std::sync::Mutex<(i64, i64)>>,
+    /// Directory the running script lives in (see [`LabHandle::ref_base`]).
+    pub(crate) ref_base: Arc<std::path::PathBuf>,
+}
+
+/// A container handle (PRD §16): the lifecycle/exec/ip subset of the VM
+/// surface — containers have no display, so no input/vision methods, and no
+/// snapshots.
+#[derive(Script)]
+#[script(name = "Container")]
+#[script(opaque)]
+pub struct ContainerHandle {
+    pub(crate) container: Arc<ContainerInstance>,
+    pub(crate) runtime: Arc<LabRuntime>,
+    pub(crate) rt: tokio::runtime::Handle,
     /// Directory the running script lives in (see [`LabHandle::ref_base`]).
     pub(crate) ref_base: Arc<std::path::PathBuf>,
 }
@@ -210,6 +225,26 @@ impl VmHandle {
     }
 }
 
+impl ContainerHandle {
+    fn block<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.rt.block_on(fut)
+    }
+
+    /// Relative local paths resolve against the running script's directory,
+    /// exactly like [`VmHandle::resolve_ref`].
+    fn resolve_ref(&self, path: &str) -> PathBuf {
+        let p = PathBuf::from(path);
+        if p.is_absolute() {
+            p
+        } else {
+            self.ref_base.join(p)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
@@ -266,6 +301,30 @@ pub fn lab_module() -> Module {
                     runtime: l.runtime.clone(),
                     rt: l.rt.clone(),
                     last_pointer: Default::default(),
+                    ref_base: l.ref_base.clone(),
+                })
+                .collect()
+        })
+        .method(
+            "container",
+            |l: &LabHandle, name: &str| -> Result<ContainerHandle, String> {
+                let container = l.runtime.container(name).map_err(estr)?.clone();
+                Ok(ContainerHandle {
+                    container,
+                    runtime: l.runtime.clone(),
+                    rt: l.rt.clone(),
+                    ref_base: l.ref_base.clone(),
+                })
+            },
+        )
+        .method("containers", |l: &LabHandle| -> Vec<ContainerHandle> {
+            l.runtime
+                .containers
+                .values()
+                .map(|container| ContainerHandle {
+                    container: container.clone(),
+                    runtime: l.runtime.clone(),
+                    rt: l.rt.clone(),
                     ref_base: l.ref_base.clone(),
                 })
                 .collect()
@@ -691,6 +750,156 @@ pub fn lab_module() -> Module {
             },
         );
 
+    // -- Container (§16) -------------------------------------------------------
+    m.ty::<ContainerHandle>()
+        .method("name", |c: &ContainerHandle| c.container.cfg.name.clone())
+        // Lifecycle / state
+        .method("start", |c: &ContainerHandle| -> Result<(), String> {
+            // Via the runtime, which wires the NIC listeners and events.
+            let runtime = c.runtime.clone();
+            let name = c.container.cfg.name.clone();
+            c.block(async move { runtime.start_container(&name).await })
+                .map_err(estr)
+        })
+        .method("stop", |c: &ContainerHandle| -> Result<(), String> {
+            c.block(c.container.stop(false)).map_err(estr)
+        })
+        .method("stop_force", |c: &ContainerHandle| -> Result<(), String> {
+            c.block(c.container.stop(true)).map_err(estr)
+        })
+        .method("restart", |c: &ContainerHandle| -> Result<(), String> {
+            c.block(async {
+                c.container.stop(false).await.map_err(estr)?;
+                c.container
+                    .wait_state(PowerState::Stopped, Duration::from_secs(60))
+                    .await
+                    .map_err(estr)?;
+                c.runtime
+                    .start_container(&c.container.cfg.name)
+                    .await
+                    .map_err(estr)
+            })
+        })
+        .method("state", |c: &ContainerHandle| -> String {
+            match c.block(c.container.state()) {
+                PowerState::Stopped => "stopped".into(),
+                PowerState::Starting => "starting".into(),
+                PowerState::Running => "running".into(),
+                PowerState::Stopping => "stopping".into(),
+            }
+        })
+        .method("is_ready", |c: &ContainerHandle| -> bool {
+            c.block(c.container.is_ready())
+        })
+        // Healthy = the healthcheck's latest verdict is passing; a container
+        // with no healthcheck (no verdict at all) counts as healthy once
+        // it is ready.
+        .method("is_healthy", |c: &ContainerHandle| -> bool {
+            c.block(async {
+                match c.container.health().await {
+                    Some(healthy) => healthy,
+                    None => c.container.is_ready().await,
+                }
+            })
+        })
+        .method(
+            "wait_ready",
+            |c: &ContainerHandle, timeout_secs: i64| -> Result<(), String> {
+                c.block(
+                    c.container
+                        .wait_ready(Duration::from_secs(timeout_secs.max(0) as u64)),
+                )
+                .map_err(estr)
+            },
+        )
+        .method(
+            "wait_shutdown",
+            |c: &ContainerHandle, timeout_secs: i64| -> Result<(), String> {
+                c.block(c.container.wait_state(
+                    PowerState::Stopped,
+                    Duration::from_secs(timeout_secs.max(0) as u64),
+                ))
+                .map_err(estr)
+            },
+        )
+        .method("ip", |c: &ContainerHandle| -> Result<String, String> {
+            c.block(c.container.guest_ip()).map_err(estr)
+        })
+        // Exec + files (runs inside the container rootfs, via the agent)
+        .method(
+            "exec",
+            |c: &ContainerHandle, cmd: String, args: Vec<String>| -> Result<ExecResult, String> {
+                c.block(async {
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let r = c
+                        .container
+                        .exec(&cmd, &arg_refs, Duration::from_secs(120))
+                        .await
+                        .map_err(estr)?;
+                    Ok(ExecResult {
+                        exit_code: r.exit_code as i64,
+                        stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+                    })
+                })
+            },
+        )
+        .method(
+            "exec_timeout",
+            |c: &ContainerHandle,
+             cmd: String,
+             args: Vec<String>,
+             timeout_secs: i64|
+             -> Result<ExecResult, String> {
+                c.block(async {
+                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let r = c
+                        .container
+                        .exec(
+                            &cmd,
+                            &arg_refs,
+                            Duration::from_secs(timeout_secs.max(1) as u64),
+                        )
+                        .await
+                        .map_err(estr)?;
+                    Ok(ExecResult {
+                        exit_code: r.exit_code as i64,
+                        stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+                    })
+                })
+            },
+        )
+        .method(
+            "copy_to",
+            |c: &ContainerHandle, local: String, container_path: String| -> Result<(), String> {
+                let src = c.resolve_ref(&local);
+                c.block(
+                    c.container
+                        .copy_to(&src, &container_path, Duration::from_secs(60)),
+                )
+                .map_err(estr)
+            },
+        )
+        .method(
+            "copy_from",
+            |c: &ContainerHandle, container_path: String, local: String| -> Result<(), String> {
+                let out = c.resolve_ref(&local);
+                c.block(
+                    c.container
+                        .copy_from(&container_path, &out, Duration::from_secs(60)),
+                )
+                .map_err(estr)
+            },
+        )
+        // Console log (kernel messages + the container's stdout/stderr)
+        .method(
+            "logs",
+            |c: &ContainerHandle, lines: i64| -> Result<String, String> {
+                c.container.logs(lines.max(0) as usize).map_err(estr)
+            },
+        );
+
     m
 }
 
@@ -763,6 +972,50 @@ fn main(lab: Lab) {
 }
 "#;
         check_script_source(src).expect("API surface should type-check");
+    }
+
+    #[test]
+    fn container_api_compiles() {
+        let src = r#"
+use vmlab
+
+fn main(lab: Lab) {
+    let Ok(web) = lab.container("web") else {
+        lab.log("no web container")
+        return
+    }
+    let s = web.start()
+    match web.wait_ready(120) {
+        Ok(_) => lab.log(web.name() + " is ready"),
+        Err(e) => lab.log("not ready: " + e),
+    }
+    match web.ip() {
+        Ok(ip) => lab.log("ip " + ip),
+        Err(e) => lab.log(e),
+    }
+    if web.is_ready() && web.is_healthy() {
+        match web.exec("nginx", ["-t"]) {
+            Ok(r) => { if r.exit_code == 0 { lab.log(r.stdout) } else { lab.log(r.stderr) } }
+            Err(e) => lab.log("exec failed: " + e),
+        }
+        let t = web.exec_timeout("sleep", ["5"], 10)
+    }
+    let up = web.copy_to("conf/nginx.conf", "/etc/nginx/nginx.conf")
+    let down = web.copy_from("/var/log/nginx/error.log", "logs/error.log")
+    let r = web.restart()
+    match web.logs(50) {
+        Ok(text) => lab.log(text),
+        Err(e) => lab.log(e),
+    }
+    for c in lab.containers() {
+        lab.log(c.name() + ": " + c.state())
+    }
+    let st = web.stop()
+    let sf = web.stop_force()
+    let w = web.wait_shutdown(60)
+}
+"#;
+        check_script_source(src).expect("container API surface should type-check");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 _api object_
 
-The lab handle passed to fn main(lab: Lab) / fn handle(event, lab) — find VMs and segments, log.
+The lab handle passed to fn main(lab: Lab) / fn handle(event, lab) — find VMs, containers and segments, log.
 
 | Method | Returns | Notes |
 | --- | --- | --- |
@@ -10,6 +10,8 @@ The lab handle passed to fn main(lab: Lab) / fn handle(event, lab) — find VMs 
 | `lab.log(msg: string)` | `unit` | Lab log + live CLI stream |
 | `lab.vm(name: string)` | `Result[Vm, string]` | Err if not defined |
 | `lab.vms()` | `List[Vm]` | All VMs |
+| `lab.container(name: string)` | `Result[Container, string]` | Err if not defined |
+| `lab.containers()` | `List[Container]` | All containers |
 | `lab.segment(name: string)` | `Result[Segment, string]` | Err if not declared |
 
 ## Free functions
@@ -21,6 +23,8 @@ The lab handle passed to fn main(lab: Lab) / fn handle(event, lab) — find VMs 
 ## Related
 
 - [Vm](../references/entity_vm_api.md)
+
+- [Container](../references/entity_container_api.md)
 
 - [Segment](../references/entity_seg_api.md)
 

@@ -13,11 +13,11 @@ disable-model-invocation: false
 
 A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript.
 
-**Upstream version:** `1.0`. If the real upstream has moved past this, the skill may be stale — bump `topic.version` and re-verify (see the update workflow).
+**Upstream version:** `1.1`. If the real upstream has moved past this, the skill may be stale — bump `topic.version` and re-verify (see the update workflow).
 
 vmlab orchestrates single-host VM labs: labs (VMs + virtual networks) are declared in WCL (`vmlab.wcl`), disk templates are built and stored locally or distributed via OCI registries, and automation is written in wscript scripts that drive guests (power, exec, keystrokes, screen matching, OCR).
 
-A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by the CLI. This skill captures the full reference as data; `docs/vmlab-prd.md` is the binding spec if anything here disagrees.
+A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by the CLI. This skill captures the full reference as data.
 
 ## Parameters
 

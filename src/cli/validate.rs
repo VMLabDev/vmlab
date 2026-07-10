@@ -99,9 +99,10 @@ pub fn validate_source(content: &str, root: &Path) -> std::result::Result<(), Ve
 pub fn cmd_validate() -> Result<()> {
     let file = validate_current()?;
     println!(
-        "ok: lab \"{}\" — {} vm(s), {} segment(s)",
+        "ok: lab \"{}\" — {} vm(s), {} container(s), {} segment(s)",
         file.lab.name,
         file.lab.vms.len(),
+        file.lab.containers.len(),
         file.lab.segments.len()
     );
     Ok(())

@@ -10,3 +10,7 @@ docs/_site/
 docs/wskills/*/out/
 **/.vmlab/
 docker/lab/.vmlab/
+guest/dist/
+guest/.cache/
+guest/cinit/target/
+guest/cinit-proto/target/
