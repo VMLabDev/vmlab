@@ -45,10 +45,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      # --store-dir: pnpm/action-setup's default store lives under its own
+      # node_modules; the @forge git deps then build inside a node_modules
+      # path, where TypeScript's wildcard matching silently skips source files
+      # and the packages ship stub .d.ts files.
       - name: Build web UI
         run: |
           cd web-ui
-          pnpm install
+          pnpm install --store-dir "$RUNNER_TEMP/pnpm-store"
           pnpm build
       - run: just check
 
@@ -175,10 +179,12 @@ jobs:
       - name: Build CLI
         run: cargo build --bin vmlab --release --target ${{ matrix.target }}
       # The web UI is embedded into vmlab-web (rust-embed), so build it first.
+      # --store-dir: see the check job — the default store path breaks the
+      # @forge git deps' TypeScript builds.
       - name: Build web UI
         run: |
           cd web-ui
-          pnpm install
+          pnpm install --store-dir "$RUNNER_TEMP/pnpm-store"
           pnpm build
       - name: Build web server
         run: cargo build --bin vmlab-web --features web --release --target ${{ matrix.target }}
