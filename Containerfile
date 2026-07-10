@@ -31,8 +31,10 @@
 FROM node:22-bookworm-slim AS web
 WORKDIR /web
 RUN corepack enable
-COPY web-ui/package.json web-ui/pnpm-lock.yaml web-ui/pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+# No lockfile on purpose (see web-ui/.gitignore) — fresh resolution extracts
+# the @forge/* git-subdir deps correctly; their revs are pinned in package.json.
+COPY web-ui/package.json web-ui/pnpm-workspace.yaml ./
+RUN pnpm install
 COPY web-ui/ ./
 RUN pnpm build
 

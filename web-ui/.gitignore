@@ -1,2 +1,8 @@
 node_modules/
 dist/
+# Deliberately not committed: pnpm cold-store installs FROM a lockfile fetch
+# `path:` git deps as the raw monorepo tarball (no subdir extraction, no
+# prepare) — pnpm 10.34 behavior. Fresh resolution handles them correctly;
+# the @forge/* deps are rev-pinned in package.json, which is the pin that
+# matters.
+pnpm-lock.yaml

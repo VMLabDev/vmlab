@@ -36,18 +36,19 @@ jobs:
       # `just check` lints --all-features, which compiles vmlab-web; rust-embed
       # needs web-ui/dist present at compile time, so build the frontend first.
       # pnpm (major pinned): the @forge/* deps are git-subdir deps npm can't do.
+      # No lockfile on purpose — pnpm installs FROM a lockfile fetch path: git
+      # deps as the raw monorepo (web-ui/.gitignore); fresh resolution is
+      # correct, and the @forge revs are pinned in package.json.
       - uses: pnpm/action-setup@v4
         with:
           version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'pnpm'
-          cache-dependency-path: web-ui/pnpm-lock.yaml
       - name: Build web UI
         run: |
           cd web-ui
-          pnpm install --frozen-lockfile
+          pnpm install
           pnpm build
       - run: just check
 
@@ -164,8 +165,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'pnpm'
-          cache-dependency-path: web-ui/pnpm-lock.yaml
       - uses: Swatinem/rust-cache@v2
         with:
           key: build-${{ matrix.target }}
@@ -179,7 +178,7 @@ jobs:
       - name: Build web UI
         run: |
           cd web-ui
-          pnpm install --frozen-lockfile
+          pnpm install
           pnpm build
       - name: Build web server
         run: cargo build --bin vmlab-web --features web --release --target ${{ matrix.target }}
