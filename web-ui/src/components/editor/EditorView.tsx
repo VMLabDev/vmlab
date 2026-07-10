@@ -7,10 +7,10 @@ import { Alert, Button, Empty, PageHead, Spinner, SplitPane } from "@forge/ui";
 import {
   anyVmRunning,
   reloadLab as reloadCurrentLab,
-  showConfig,
   showToast,
   state,
 } from "../../store";
+import { openConfigTab } from "./LabEditorView";
 import {
   editor,
   openEditor,
@@ -98,7 +98,7 @@ export default function EditorView() {
         <Show when={editor.fallback}>
           <Alert tone="warning" title="Can't open the visual editor">
             {editor.fallback}{" "}
-            <Button size="sm" onClick={showConfig}>
+            <Button size="sm" onClick={openConfigTab}>
               Open raw config
             </Button>
           </Alert>

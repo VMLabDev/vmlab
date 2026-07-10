@@ -174,7 +174,11 @@
 .topo-edge:hover .topo-edge-line { stroke: var(--accent); }
 .topo-edge-label { fill: var(--fg-3); font-size: 10px; font-family: var(--font-mono); pointer-events: none; }
 .topo-edge-draft { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 4 3; fill: none; pointer-events: none; }
-.topo-port { fill: var(--fg-3); pointer-events: none; }
+.topo-port { fill: var(--accent); pointer-events: none; }
+.topo-socket {
+  fill: var(--bg-1); stroke: var(--border); stroke-width: 1; pointer-events: none;
+}
+.topo-socket.lit { fill: var(--accent); stroke: var(--accent); }
 .topo-port-new { fill: var(--bg-1); stroke: var(--accent); stroke-width: 1.5; cursor: crosshair; }
 .topo-port-new:hover { fill: var(--accent); }
 

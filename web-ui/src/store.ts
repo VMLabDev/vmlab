@@ -8,7 +8,7 @@ import type { StatusTone, Tone } from "@forge/ui";
 import * as api from "./api";
 import type { LabEntry, LabStatus, TemplateInfo, Vm, DaemonEvent } from "./api";
 
-export type ViewKind = "lab" | "network" | "vm" | "logs" | "config" | "templates" | "editor";
+export type ViewKind = "lab" | "network" | "vm" | "logs" | "templates" | "editor";
 
 // A template download in progress, driven by the template.pull.* events the
 // supervisor streams while bringing a lab up (issue #1). Keyed by `lab/vm`.
@@ -226,9 +226,6 @@ export function showNetwork() {
 }
 export function showLogs() {
   setState("view", { kind: "logs", vm: null });
-}
-export function showConfig() {
-  setState("view", { kind: "config", vm: null });
 }
 export function showTemplates() {
   setState("view", { kind: "templates", vm: null });

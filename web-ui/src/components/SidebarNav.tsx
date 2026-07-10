@@ -1,10 +1,9 @@
 import { For, Show } from "solid-js";
 import { NavLink, NavSection, StatusDot } from "@forge/ui";
-import { Code, LayoutGrid, Network, Package, PencilRuler, ScrollText } from "lucide-solid";
+import { LayoutGrid, Network, Package, PencilRuler, ScrollText } from "lucide-solid";
 import {
   archOf,
   look,
-  showConfig,
   showEditor,
   showLab,
   showLogs,
@@ -57,15 +56,7 @@ export default function SidebarNav() {
         active={state.view.kind === "editor"}
         onClick={nav(showEditor)}
       >
-        designer
-      </NavLink>
-      <NavLink
-        href="#"
-        icon={Code}
-        active={state.view.kind === "config"}
-        onClick={nav(showConfig)}
-      >
-        config
+        editor
       </NavLink>
       <Show when={state.templates.length > 0}>
         <NavLink

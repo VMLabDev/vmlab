@@ -11,15 +11,19 @@ import { Button } from "@forge/ui";
 import { Expand, LayoutGrid, Monitor, Waypoints } from "lucide-solid";
 import type { Layout, NodePos } from "../../editor/layout";
 import {
+  PORT_SIZE,
+  PORT_SPACING,
+  PORT_X0,
   SEG_H,
-  SEG_W,
   VM_H,
   VM_W,
   autoLayout,
   hasNatNic,
   loadLayout,
+  portCapacity,
   renameInLayout,
   saveLayout,
+  segWidthFor,
 } from "../../editor/layout";
 import type { LabModel, NicModel } from "../../editor/model";
 import {
@@ -92,6 +96,34 @@ export default function TopologyCanvas() {
     layout().nat ?? { x: 60, y: 200 + model().segments.length * 170 };
 
   const showNat = createMemo(() => hasNatNic(model()) || nicDrag() !== null);
+
+  // --- port assignment --------------------------------------------------------
+  // Each bar (segment or the NAT bus) owns a bank of sockets; every attached
+  // NIC claims the next one in declaration order (vm order, then nic order),
+  // so edges spread left-to-right like a patch panel.
+
+  const NAT_KEY = "__nat__";
+
+  const ports = createMemo(() => {
+    const byNic = new Map<string, number>(); // `${vm}:${nicIndex}` → socket index
+    const used = new Map<string, number>(); // bar key → sockets in use
+    for (const vm of model().vms) {
+      vm.nics.forEach((nic, i) => {
+        const key = nic.nat ? NAT_KEY : nic.segment;
+        if (!key) return;
+        const n = used.get(key) ?? 0;
+        byNic.set(`${vm.name}:${i}`, n);
+        used.set(key, n + 1);
+      });
+    }
+    return { byNic, used };
+  });
+
+  const barUsed = (key: string) => ports().used.get(key) ?? 0;
+  const barWidth = (key: string) => segWidthFor(barUsed(key));
+  const barCapacity = (key: string) => portCapacity(barWidth(key));
+  const socketX = (barX: number, idx: number) => barX + PORT_X0 + idx * PORT_SPACING;
+  const vmPortX = (vp: NodePos, nicIndex: number) => vp.x + 18 + nicIndex * 16;
 
   // --- interactions ---------------------------------------------------------
 
@@ -167,7 +199,12 @@ export default function TopologyCanvas() {
       // Drop on a bar → create the NIC.
       for (const s of model().segments) {
         const p = segPos(s.name);
-        if (w.x >= p.x && w.x <= p.x + SEG_W && w.y >= p.y - 8 && w.y <= p.y + SEG_H + 8) {
+        if (
+          w.x >= p.x &&
+          w.x <= p.x + barWidth(s.name) &&
+          w.y >= p.y - 8 &&
+          w.y <= p.y + SEG_H + 8
+        ) {
           addNic(nd.vmIndex, s.name);
           setNicDrag(null);
           return;
@@ -175,7 +212,12 @@ export default function TopologyCanvas() {
       }
       if (showNat()) {
         const p = natPos();
-        if (w.x >= p.x && w.x <= p.x + SEG_W && w.y >= p.y - 8 && w.y <= p.y + SEG_H + 8) {
+        if (
+          w.x >= p.x &&
+          w.x <= p.x + barWidth(NAT_KEY) &&
+          w.y >= p.y - 8 &&
+          w.y <= p.y + SEG_H + 8
+        ) {
           addNic(nd.vmIndex, null);
         }
       }
@@ -243,12 +285,12 @@ export default function TopologyCanvas() {
     }
     for (const s of model().segments) {
       const p = segPos(s.name);
-      xs.push(p.x, p.x + SEG_W);
+      xs.push(p.x, p.x + barWidth(s.name));
       ys.push(p.y, p.y + SEG_H);
     }
     if (showNat()) {
       const p = natPos();
-      xs.push(p.x, p.x + SEG_W);
+      xs.push(p.x, p.x + barWidth(NAT_KEY));
       ys.push(p.y, p.y + SEG_H);
     }
     if (!xs.length || !svg) return;
@@ -286,17 +328,59 @@ export default function TopologyCanvas() {
   const selectedSeg = () =>
     editor.selection.kind === "segment" ? model().segments[editor.selection.index]?.name : null;
 
+  /** The router-style socket bank straddling a bar's top and bottom edges.
+   *  Sockets left of the used count are lit (an edge terminates there). */
+  function Sockets(props: { barKey: string; pos: NodePos }) {
+    return (
+      <Index each={Array.from({ length: barCapacity(props.barKey) })}>
+        {(_, i) => {
+          const cx = () => socketX(props.pos.x, i);
+          const lit = () => i < barUsed(props.barKey);
+          return (
+            <>
+              <rect
+                x={cx() - PORT_SIZE / 2}
+                y={props.pos.y - PORT_SIZE / 2}
+                width={PORT_SIZE}
+                height={PORT_SIZE}
+                rx="1.5"
+                class="topo-socket"
+                classList={{ lit: lit() }}
+              />
+              <rect
+                x={cx() - PORT_SIZE / 2}
+                y={props.pos.y + SEG_H - PORT_SIZE / 2}
+                width={PORT_SIZE}
+                height={PORT_SIZE}
+                rx="1.5"
+                class="topo-socket"
+                classList={{ lit: lit() }}
+              />
+            </>
+          );
+        }}
+      </Index>
+    );
+  }
+
+  /** Edge from a VM's port dot to its assigned socket on the target bar. */
   function edgePath(vmName: string, nicIndex: number, nic: NicModel): string | null {
+    const key = nic.nat ? NAT_KEY : nic.segment;
+    if (!key || (nic.nat && !showNat())) return null;
+    const bar = nic.nat ? natPos() : segPos(key);
+    const socket = ports().byNic.get(`${vmName}:${nicIndex}`);
+    if (socket === undefined) return null;
     const vp = vmPos(vmName);
-    const px = vp.x + 18 + nicIndex * 16;
+    const px = vmPortX(vp, nicIndex);
     const py = vp.y + VM_H;
-    const target = nic.nat ? (showNat() ? natPos() : null) : nic.segment ? segPos(nic.segment) : null;
-    if (!target) return null;
-    const barY = py <= target.y ? target.y : target.y + SEG_H;
-    const cx = Math.min(Math.max(px, target.x + 12), target.x + SEG_W - 12);
-    if (cx === px) return `M ${px} ${py} L ${px} ${barY}`;
-    const elbow = py <= target.y ? barY - 16 : barY + 16;
-    return `M ${px} ${py} L ${px} ${elbow} L ${cx} ${elbow} L ${cx} ${barY}`;
+    const sx = socketX(bar.x, socket);
+    // Enter through the socket face nearest the VM (sockets straddle both
+    // edges, like through-ports on a patch panel).
+    const fromAbove = py <= bar.y + SEG_H / 2;
+    const sy = fromAbove ? bar.y - PORT_SIZE / 2 : bar.y + SEG_H + PORT_SIZE / 2;
+    if (px === sx) return `M ${px} ${py} L ${px} ${sy}`;
+    const elbow = fromAbove ? sy - 14 : sy + 14;
+    return `M ${px} ${py} L ${px} ${elbow} L ${sx} ${elbow} L ${sx} ${sy}`;
   }
 
   return (
@@ -379,17 +463,19 @@ export default function TopologyCanvas() {
           <For each={model().segments}>
             {(seg) => {
               const p = () => segPos(seg.name);
+              const w = () => barWidth(seg.name);
               return (
                 <g
                   class="topo-seg"
                   classList={{ selected: selectedSeg() === seg.name }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "segment", seg.name)}
                 >
-                  <rect x={p().x} y={p().y} width={SEG_W} height={SEG_H} rx="8" />
+                  <rect x={p().x} y={p().y} width={w()} height={SEG_H} rx="8" />
+                  <Sockets barKey={seg.name} pos={p()} />
                   <text x={p().x + 12} y={p().y + SEG_H / 2 + 4} class="topo-seg-name">
                     {seg.name}
                   </text>
-                  <text x={p().x + SEG_W - 12} y={p().y + SEG_H / 2 + 4} class="topo-seg-meta">
+                  <text x={p().x + w() - 12} y={p().y + SEG_H / 2 + 4} class="topo-seg-meta">
                     {[
                       seg.subnet ?? "auto subnet",
                       seg.nat ? "nat" : null,
@@ -411,12 +497,19 @@ export default function TopologyCanvas() {
               classList={{ selected: editor.selection.kind === "nat" }}
               onPointerDown={(e: PointerEvent) => nodeDown(e, "nat", "__nat__")}
             >
-              <rect x={natPos().x} y={natPos().y} width={SEG_W} height={SEG_H} rx="8" />
+              <rect
+                x={natPos().x}
+                y={natPos().y}
+                width={barWidth(NAT_KEY)}
+                height={SEG_H}
+                rx="8"
+              />
+              <Sockets barKey={NAT_KEY} pos={natPos()} />
               <text x={natPos().x + 12} y={natPos().y + SEG_H / 2 + 4} class="topo-seg-name">
                 NAT ⇄ internet
               </text>
               <text
-                x={natPos().x + SEG_W - 12}
+                x={natPos().x + barWidth(NAT_KEY) - 12}
                 y={natPos().y + SEG_H / 2 + 4}
                 class="topo-seg-meta"
               >
