@@ -73,6 +73,9 @@ pub struct SegmentDns {
     pub enabled: bool,
     /// Whether a `dns {}` block was declared at all.
     pub declared: bool,
+    /// Span of the declared `dns {}` block (None when not declared) — the
+    /// visual editor's block address.
+    pub span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]

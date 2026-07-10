@@ -104,6 +104,8 @@ impl From<&Segment> for SegmentDto {
 pub struct SegmentDnsDto {
     /// Whether a `dns {}` block is present in the source at all.
     pub declared: bool,
+    /// Block address when declared.
+    pub span: Option<Span>,
     pub server: Option<String>,
     pub enabled: bool,
 }
@@ -112,6 +114,7 @@ impl From<&SegmentDns> for SegmentDnsDto {
     fn from(d: &SegmentDns) -> Self {
         Self {
             declared: d.declared,
+            span: d.span,
             server: d.server.map(|ip| ip.to_string()),
             enabled: d.enabled,
         }

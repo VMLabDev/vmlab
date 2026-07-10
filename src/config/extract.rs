@@ -317,6 +317,7 @@ fn extract_segment(b: &Block, issues: &mut IssueList) -> Option<Segment> {
             server: None,
             enabled: true,
             declared: false,
+            span: None,
         },
         connect: None,
         routes: Vec::new(),
@@ -336,6 +337,7 @@ fn extract_segment(b: &Block, issues: &mut IssueList) -> Option<Segment> {
                     .map(|(v, _)| v),
                     enabled: get_bool(&child, "enabled", issues).unwrap_or(true),
                     declared: true,
+                    span: Some(span_of(&child)),
                 };
             }
             "connect" => {
