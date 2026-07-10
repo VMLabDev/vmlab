@@ -11,6 +11,8 @@ import LogsView from "./components/LogsView";
 import ConfigView from "./components/ConfigView";
 import TemplatesView from "./components/TemplatesView";
 import MachineView from "./components/MachineView";
+import EditorView from "./components/editor/EditorView";
+import NewLabModal from "./components/NewLabModal";
 
 export default function App() {
   onMount(init);
@@ -43,10 +45,14 @@ export default function App() {
           <Show when={state.view.kind === "vm"}>
             <MachineView />
           </Show>
+          <Show when={state.view.kind === "editor"}>
+            <EditorView />
+          </Show>
         </AppShell>
       </Show>
       <Toaster />
       <Dialogs />
+      <NewLabModal />
     </Show>
   );
 }

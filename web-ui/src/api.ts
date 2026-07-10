@@ -234,6 +234,126 @@ export const saveConfig = (lab: string, content: string): Promise<void> =>
 export const reloadLab = (lab: string): Promise<unknown> =>
   post(`/api/labs/${encodeURIComponent(lab)}/reload`);
 
+// --- visual editor ----------------------------------------------------------
+
+import type { LabDocument, LabModel, ModelOp, TemplateSummary } from "./editor/model";
+
+/** Thrown by editLabModel when the file changed underneath the editor. */
+export class StaleRev extends Error {
+  rev: string;
+  constructor(rev: string) {
+    super("config changed on disk — reload the editor");
+    this.rev = rev;
+  }
+}
+
+export const createLab = (name: string, path?: string): Promise<{ name: string; root: string }> =>
+  post("/api/labs", { name, path });
+
+/** One template in the local store (GET /api/catalog/templates). */
+export interface StoreTemplate {
+  name: string;
+  arch: string;
+  version: string;
+  profile: string | null;
+  cpus: number | null;
+  memory: number | null;
+  disk: number | null;
+  firmware: string | null;
+  tpm: boolean | null;
+  secure_boot: boolean | null;
+  display: string | null;
+  created: string;
+  origin: string | null;
+  registry: string | null;
+}
+
+/** Schema enums for the editor's pickers (GET /api/catalog/meta). */
+export interface CatalogMeta {
+  arches: string[];
+  events: string[];
+  firmware: string[];
+  gpu_modes: string[];
+  sinkhole_modes: string[];
+  forward_protos: string[];
+  l4_protos: string[];
+  media_kinds: string[];
+}
+
+export const listStoreTemplates = (): Promise<StoreTemplate[]> => req("/api/catalog/templates");
+export const listProfiles = (): Promise<string[]> => req("/api/catalog/profiles");
+export const catalogMeta = (): Promise<CatalogMeta> => req("/api/catalog/meta");
+
+/** The parsed lab model; 422 (unparsable file) throws ValidationError. */
+export async function getLabModel(lab: string): Promise<LabDocument> {
+  const res = await rawFetch(`/api/labs/${encodeURIComponent(lab)}/model`);
+  if (res.status === 422) {
+    const body = await res.json().catch(() => ({ issues: [] }));
+    throw new ValidationError(body.issues ?? []);
+  }
+  return finish(res);
+}
+
+export interface EditResult {
+  ok: boolean;
+  rev?: string;
+  lab?: LabModel;
+  templates?: TemplateSummary[];
+  source?: string;
+}
+
+/** Apply a surgical op batch. 422 → ValidationError, 409 → StaleRev. */
+export async function editLabModel(
+  lab: string,
+  baseRev: string,
+  ops: ModelOp[],
+  validateOnly: boolean,
+): Promise<EditResult> {
+  const res = await rawFetch(`/api/labs/${encodeURIComponent(lab)}/model/edit`, {
+    method: "POST",
+    body: JSON.stringify({ base_rev: baseRev, validate_only: validateOnly, ops }),
+  });
+  if (res.status === 422) {
+    const body = await res.json().catch(() => ({ issues: [] }));
+    throw new ValidationError(body.issues ?? []);
+  }
+  if (res.status === 409) {
+    const body = await res.json().catch(() => ({}));
+    throw new StaleRev(body.rev ?? "");
+  }
+  return finish(res);
+}
+
+/** Authenticated fetch that leaves non-2xx handling to the caller (for
+ *  endpoints with structured error bodies the generic `req` would flatten). */
+async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response> {
+  const headers: Record<string, string> = {
+    ...((opts.headers as Record<string, string>) ?? {}),
+  };
+  const t = getToken();
+  if (t) headers["Authorization"] = `Bearer ${t}`;
+  if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  const res = await fetch(path, { ...opts, headers });
+  if (res.status === 401) {
+    clearToken();
+    throw new Unauthorized("authentication required");
+  }
+  return res;
+}
+
+async function finish(res: Response): Promise<any> {
+  if (!res.ok) {
+    let msg = res.statusText;
+    try {
+      msg = (await res.json()).error ?? msg;
+    } catch {
+      /* keep statusText */
+    }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
 // --- websockets -----------------------------------------------------------
 
 export function wsUrl(path: string): string {

@@ -107,7 +107,12 @@ pub async fn create_lab(
             "error": format!("lab `{name}` already exists"),
         }));
     }
-    let dir = match body.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    let dir = match body
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         Some(p) => {
             let dir = std::path::PathBuf::from(p);
             if !dir.is_absolute()

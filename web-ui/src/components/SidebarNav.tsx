@@ -1,10 +1,11 @@
 import { For, Show } from "solid-js";
 import { NavLink, NavSection, StatusDot } from "@forge/ui";
-import { Code, LayoutGrid, Network, Package, ScrollText } from "lucide-solid";
+import { Code, LayoutGrid, Network, Package, PencilRuler, ScrollText } from "lucide-solid";
 import {
   archOf,
   look,
   showConfig,
+  showEditor,
   showLab,
   showLogs,
   showNetwork,
@@ -49,6 +50,14 @@ export default function SidebarNav() {
         onClick={nav(showLogs)}
       >
         logs
+      </NavLink>
+      <NavLink
+        href="#"
+        icon={PencilRuler}
+        active={state.view.kind === "editor"}
+        onClick={nav(showEditor)}
+      >
+        designer
       </NavLink>
       <NavLink
         href="#"

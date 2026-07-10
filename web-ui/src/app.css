@@ -140,3 +140,76 @@
   .vm-row { grid-template-columns: auto minmax(0, 1fr) auto; }
   .vm-row-ip, .vm-row-state { display: none; }
 }
+
+/* --- visual lab designer ------------------------------------------------- */
+
+.editor-split { height: calc(100vh - 210px); }
+.editor-loading { display: flex; align-items: center; gap: var(--sp-2); color: var(--fg-2); }
+.editor-issue { cursor: pointer; }
+.editor-issue:hover { text-decoration: underline; }
+
+/* canvas */
+.topo-wrap { position: relative; height: 100%; min-height: 320px; }
+.topo {
+  width: 100%; height: 100%; display: block; touch-action: none; outline: none;
+  background: var(--bg-1); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+}
+.topo-toolbar {
+  position: absolute; top: var(--sp-2); left: var(--sp-2); z-index: 2;
+  display: flex; gap: var(--sp-2);
+}
+.topo-vm rect {
+  fill: var(--bg-2); stroke: var(--border); stroke-width: 1.25; cursor: grab;
+}
+.topo-vm.selected rect { stroke: var(--accent); stroke-width: 2; }
+.topo-vm-name { fill: var(--fg-0); font-size: 13px; font-weight: 600; pointer-events: none; }
+.topo-vm-meta { fill: var(--fg-3); font-size: 11px; pointer-events: none; }
+.topo-seg rect { fill: var(--bg-2); stroke: var(--border); stroke-width: 1.25; cursor: grab; }
+.topo-seg.selected rect { stroke: var(--accent); stroke-width: 2; }
+.topo-seg-name { fill: var(--fg-1); font-size: 12px; font-weight: 600; pointer-events: none; }
+.topo-seg-meta { fill: var(--fg-3); font-size: 11px; text-anchor: end; pointer-events: none; }
+.topo-nat rect { stroke-dasharray: 6 4; }
+.topo-edge-line { stroke: var(--fg-3); stroke-width: 1.5; fill: none; pointer-events: none; }
+.topo-edge-hit { stroke: transparent; stroke-width: 10; fill: none; cursor: pointer; }
+.topo-edge:hover .topo-edge-line { stroke: var(--accent); }
+.topo-edge-label { fill: var(--fg-3); font-size: 10px; font-family: var(--font-mono); pointer-events: none; }
+.topo-edge-draft { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 4 3; fill: none; pointer-events: none; }
+.topo-port { fill: var(--fg-3); pointer-events: none; }
+.topo-port-new { fill: var(--bg-1); stroke: var(--accent); stroke-width: 1.5; cursor: crosshair; }
+.topo-port-new:hover { fill: var(--accent); }
+
+/* inspector */
+.inspector {
+  height: 100%; overflow-y: auto; padding: var(--sp-3);
+  display: flex; flex-direction: column; gap: var(--sp-4);
+}
+.inspector-head { display: flex; align-items: center; gap: var(--sp-2); }
+.inspector-head > :nth-child(2) { flex: 1; }
+.inspector-kind {
+  color: var(--fg-3); font-size: var(--fs-xs); font-family: var(--font-mono);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.inspector-name { font-weight: 600; }
+.inspector-note { color: var(--fg-3); font-size: var(--fs-sm); }
+.block-form { display: flex; flex-direction: column; gap: var(--sp-3); }
+.field-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: var(--sp-2); }
+.field-row-label { font-size: var(--fs-sm); color: var(--fg-1); cursor: help; }
+.field-row-none { color: var(--fg-3); font-size: var(--fs-sm); }
+
+/* block lists */
+.block-list { display: flex; flex-direction: column; gap: var(--sp-1); }
+.block-list-head { display: flex; align-items: center; justify-content: space-between; }
+.block-list-title { font-size: var(--fs-sm); font-weight: 600; color: var(--fg-1); }
+.block-list-empty { color: var(--fg-3); font-size: var(--fs-sm); padding: var(--sp-1) 0; }
+.block-list-item { border: 1px solid var(--border-subtle); border-radius: var(--r-sm); }
+.block-list-row {
+  display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-2);
+  cursor: pointer; font-size: var(--fs-sm);
+}
+.block-list-row:hover { background: var(--bg-2); }
+.block-list-summary { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.block-list-body { padding: var(--sp-3); border-top: 1px solid var(--border-subtle); }
+
+/* new-lab dialog + picker */
+.newlab-error { color: var(--danger-fg); font-size: var(--fs-sm); }
+.template-picker { display: flex; flex-direction: column; gap: var(--sp-2); }

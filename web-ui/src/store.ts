@@ -8,7 +8,7 @@ import type { StatusTone, Tone } from "@forge/ui";
 import * as api from "./api";
 import type { LabEntry, LabStatus, TemplateInfo, Vm, DaemonEvent } from "./api";
 
-export type ViewKind = "lab" | "network" | "vm" | "logs" | "config" | "templates";
+export type ViewKind = "lab" | "network" | "vm" | "logs" | "config" | "templates" | "editor";
 
 // A template download in progress, driven by the template.pull.* events the
 // supervisor streams while bringing a lab up (issue #1). Keyed by `lab/vm`.
@@ -139,7 +139,16 @@ export async function loadLabs() {
   }
 }
 
+/** Guard consulted before switching labs (the visual editor registers one
+ *  while it holds unsaved edits). Returns false to cancel the switch. */
+let navGuard: (() => Promise<boolean>) | null = null;
+export function setNavGuard(guard: (() => Promise<boolean>) | null) {
+  navGuard = guard;
+}
+
 export async function selectLab(name: string) {
+  if (name === state.currentLab) return;
+  if (navGuard && !(await navGuard())) return;
   setState({ currentLab: name, view: { kind: "lab", vm: null }, templates: [] });
   await refreshStatus();
   await loadTemplates();
@@ -227,6 +236,20 @@ export function showTemplates() {
 }
 export function showVm(vm: string) {
   setState("view", { kind: "vm", vm });
+}
+export function showEditor() {
+  setState("view", { kind: "editor", vm: null });
+}
+
+/** Create a new lab, refresh the list, and jump into its visual editor. */
+export async function createLabAndOpen(name: string, path?: string): Promise<void> {
+  await api.createLab(name, path);
+  const labs = await api.listLabs();
+  setState({ labs });
+  if (navGuard && !(await navGuard())) return;
+  setState({ currentLab: name, view: { kind: "editor", vm: null }, templates: [] });
+  await refreshStatus();
+  await loadTemplates();
 }
 
 /** True if any VM in the current lab is not stopped (gates a reload). */

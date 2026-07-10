@@ -198,8 +198,9 @@ pub async fn edit_model(
             "rev": rev,
         })),
         Ok(EditOutcome::OpFail(e)) => HttpResponse::BadRequest().json(json!({"error": e})),
-        Ok(EditOutcome::Invalid { issues, source }) => HttpResponse::UnprocessableEntity()
-            .json(json!({"issues": issues, "source": source})),
+        Ok(EditOutcome::Invalid { issues, source }) => {
+            HttpResponse::UnprocessableEntity().json(json!({"issues": issues, "source": source}))
+        }
         Ok(EditOutcome::Missing(e)) => HttpResponse::NotFound().json(json!({"error": e})),
         Ok(EditOutcome::Io(e)) => HttpResponse::InternalServerError().json(json!({"error": e})),
         Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),

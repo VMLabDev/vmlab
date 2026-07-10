@@ -330,7 +330,10 @@ lab "demo" {
         .unwrap();
         // client01 can't depend on itself — but that's validation's job, not
         // the op layer's; the text must simply round-trip.
-        assert!(out.contains(r#"depends_on = ["dc01", "client01"]"#), "{out}");
+        assert!(
+            out.contains(r#"depends_on = ["dc01", "client01"]"#),
+            "{out}"
+        );
     }
 
     #[test]

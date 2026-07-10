@@ -22,14 +22,13 @@ pub fn create_lab_dir(name: &str, dir: &Path) -> Result<()> {
         bail!("{} already exists", lab_file.display());
     }
     if dir.exists() {
-        let mut entries = std::fs::read_dir(dir)
-            .with_context(|| format!("cannot read {}", dir.display()))?;
+        let mut entries =
+            std::fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))?;
         if entries.next().is_some() {
             bail!("{} already exists and is not empty", dir.display());
         }
     } else {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("cannot create {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
     std::fs::write(&lab_file, initial_lab_wcl(name))
         .with_context(|| format!("cannot write {}", lab_file.display()))?;
