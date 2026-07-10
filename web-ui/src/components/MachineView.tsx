@@ -1,4 +1,6 @@
 import { For, Show, createResource } from "solid-js";
+import { Badge, Button, Card, Empty, Icon, PageHead } from "@forge/ui";
+import { Camera, Power, RotateCcw } from "lucide-solid";
 import {
   state,
   vmStart,
@@ -13,8 +15,8 @@ import {
   fmtMem,
 } from "../store";
 import { vmSnapshots } from "../api";
-import * as I from "./icons";
-import VncScreen from "./VncScreen";
+import { confirmDialog, promptDialog } from "./dialogs";
+import ConsoleScreen from "./ConsoleScreen";
 
 export default function MachineView() {
   // All of these are accessors so the view tracks the selected VM reactively —
@@ -23,7 +25,7 @@ export default function MachineView() {
   const on = () => vm()?.state === "running";
   const lk = () => {
     const v = vm();
-    return v ? look(v) : { label: "", dot: "var(--fg-3)", cls: "sb-stop" };
+    return v ? look(v) : { label: "", tone: "neutral" as const };
   };
   const segments = () =>
     vm()
@@ -39,128 +41,110 @@ export default function MachineView() {
   );
 
   const takeVmSnapshot = async () => {
-    const name = prompt(`Snapshot name for ${vm()!.name}:`);
+    const name = await promptDialog({
+      title: "Take snapshot",
+      label: `Snapshot name for ${vm()!.name}`,
+      confirmLabel: "Take snapshot",
+    });
     if (!name) return;
     await takeSnapshot(name, vm()!.name);
     refetch();
   };
 
   const delVmSnapshot = async (name: string) => {
-    if (!confirm(`Delete snapshot "${name}" of ${vm()!.name}?`)) return;
+    const ok = await confirmDialog({
+      title: "Delete snapshot",
+      body: (
+        <>
+          Delete snapshot <b>{name}</b> of {vm()!.name}?
+        </>
+      ),
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
     await deleteSnapshot(vm()!.name, name);
     refetch();
   };
 
   return (
-    <Show
-      when={vm()}
-      fallback={
-        <div class="body">
-          <div class="csub">Machine not found.</div>
-        </div>
-      }
-    >
-      <header class="chead">
-        <div>
-          <div class="eyebrow">// machine</div>
-          <h1 class="ctitle">
+    <Show when={vm()} fallback={<Empty title="Machine not found" />}>
+      <PageHead
+        title={
+          <span style={{ display: "inline-flex", "align-items": "center", gap: "10px" }}>
             {vm()!.name}
-            <span class={`statebadge ${lk().cls}`}>
-              <span class="sdot" style={`background:${lk().dot}`} />
+            <Badge tone={lk().tone} dot>
               {lk().label}
-            </span>
-          </h1>
-          <div class="csub">
-            {osOf(vm()!)} · {archOf(vm()!)} · {vm()!.template}
-          </div>
-        </div>
-        <div class="actions">
-          <Show when={!on()}>
-            <button class="btn btn-primary" onClick={() => vmStart(vm()!.name)}>
-              <I.Power />
-              Power on
-            </button>
-          </Show>
-          <Show when={on()}>
-            <button class="btn" onClick={() => vmStop(vm()!.name)}>
-              <I.Power />
-              Power off
-            </button>
-          </Show>
-          <button class="btn" classList={{ dis: !on() }} onClick={() => vmRestart(vm()!.name)}>
-            <I.Restart />
-            Restart
-          </button>
-        </div>
-      </header>
+            </Badge>
+          </span>
+        }
+        sub={`${osOf(vm()!)} · ${archOf(vm()!)} · ${vm()!.template}`}
+        actions={
+          <>
+            <Show
+              when={on()}
+              fallback={
+                <Button variant="primary" icon={Power} onClick={() => vmStart(vm()!.name)}>
+                  Power on
+                </Button>
+              }
+            >
+              <Button icon={Power} onClick={() => vmStop(vm()!.name)}>
+                Power off
+              </Button>
+            </Show>
+            <Button icon={RotateCcw} disabled={!on()} onClick={() => vmRestart(vm()!.name)}>
+              Restart
+            </Button>
+          </>
+        }
+      />
 
-      <div class="body">
-        <div class="vmlayout">
-          <div class="screencol">
-            <VncScreen lab={state.currentLab!} vm={vm()!.name} powered={on()} />
-          </div>
-          <div class="vmside">
-            <div class="card">
-              <div class="cardhd">Machine</div>
-              <div class="cardbd">
-                <KV k="Template" v={vm()!.template} />
-                <KV k="vCPU" v={vm()!.cpus ? String(vm()!.cpus) : "default"} />
-                <KV k="Memory" v={vm()!.memory ? fmtMem(vm()!.memory) : "default"} />
-                <KV k="Arch" v={archOf(vm()!)} />
-                <KV k="Address" v={vm()!.ip ?? "—"} />
-                <KV k="MAC" v={vm()!.nics[0]?.mac ?? "—"} />
-                <KV k="Segment" v={segments()} />
-              </div>
-            </div>
-            <div class="card">
-              <div class="cardhd">Snapshots</div>
-              <div class="cardbd">
-                <Show
-                  when={(snaps()?.length ?? 0) > 0}
-                  fallback={
-                    <div class="csub" style="padding:8px 0">
-                      No snapshots yet.
-                    </div>
-                  }
-                >
-                  <For each={snaps()}>
-                    {(sn) => (
-                      <div class="snaprow">
-                        <span class="snapic">
-                          <I.Camera />
-                        </span>
-                        <div class="snapmeta">
-                          <div class="snapname">{sn.name}</div>
-                          <div class="snaptime">{sn.online ? "online" : "offline"}</div>
-                        </div>
-                        <button
-                          class="snaprestore"
-                          onClick={() => restoreSnapshot(sn.name, vm()!.name)}
-                        >
-                          Restore
-                        </button>
-                        <button
-                          class="snaprestore"
-                          style="color:var(--danger-fg)"
-                          onClick={() => delVmSnapshot(sn.name)}
-                        >
-                          Delete
-                        </button>
+      <div class="vm-layout">
+        <ConsoleScreen lab={state.currentLab!} vm={vm()!.name} powered={on()} />
+        <div class="vm-side">
+          <Card title="Machine">
+            <KV k="Template" v={vm()!.template} />
+            <KV k="vCPU" v={vm()!.cpus ? String(vm()!.cpus) : "default"} />
+            <KV k="Memory" v={vm()!.memory ? fmtMem(vm()!.memory) : "default"} />
+            <KV k="Arch" v={archOf(vm()!)} />
+            <KV k="Address" v={vm()!.ip ?? "—"} />
+            <KV k="MAC" v={vm()!.nics[0]?.mac ?? "—"} />
+            <KV k="Segment" v={segments()} />
+          </Card>
+          <Card
+            title="Snapshots"
+            action={
+              <Button size="sm" icon={Camera} onClick={takeVmSnapshot}>
+                Take
+              </Button>
+            }
+          >
+            <Show
+              when={(snaps()?.length ?? 0) > 0}
+              fallback={<div class="snap-row-time">No snapshots yet.</div>}
+            >
+              <div class="snap-list">
+                <For each={snaps()}>
+                  {(sn) => (
+                    <div class="snap-row">
+                      <Icon of={Camera} size={14} />
+                      <div class="snap-row-meta">
+                        <div class="snap-row-name">{sn.name}</div>
+                        <div class="snap-row-time">{sn.online ? "online" : "offline"}</div>
                       </div>
-                    )}
-                  </For>
-                </Show>
-                <button
-                  class="btn"
-                  style="width:100%;margin-top:12px;height:32px"
-                  onClick={takeVmSnapshot}
-                >
-                  <I.Camera />
-                  Take snapshot
-                </button>
+                      <Button size="sm" onClick={() => restoreSnapshot(sn.name, vm()!.name)}>
+                        Restore
+                      </Button>
+                      <Button size="sm" variant="danger" onClick={() => delVmSnapshot(sn.name)}>
+                        Delete
+                      </Button>
+                    </div>
+                  )}
+                </For>
               </div>
-            </div>
-          </div>
+            </Show>
+          </Card>
         </div>
       </div>
     </Show>
@@ -170,8 +154,8 @@ export default function MachineView() {
 function KV(p: { k: string; v: string }) {
   return (
     <div class="kv">
-      <span class="kvk">{p.k}</span>
-      <span class="kvv">{p.v}</span>
+      <span class="kv-k">{p.k}</span>
+      <span class="kv-v">{p.v}</span>
     </div>
   );
 }

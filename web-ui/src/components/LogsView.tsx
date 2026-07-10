@@ -6,6 +6,8 @@ import {
   createSignal,
   onCleanup,
 } from "solid-js";
+import { Badge, Button, Empty, Input, Logs, PageHead, Select, Toggle } from "@forge/ui";
+import { Search } from "lucide-solid";
 import { state } from "../store";
 import { logsWsUrl } from "../api";
 import type { LogEntry } from "../api";
@@ -26,7 +28,11 @@ export default function LogsView() {
   let pane: HTMLDivElement | undefined;
 
   // Distinct sources for the filter dropdown: lab + each VM in the lab.
-  const sources = () => ["lab", ...(state.status?.vms ?? []).map((v) => v.name)];
+  const sources = () => [
+    { value: "all", label: "all sources" },
+    { value: "lab", label: "lab" },
+    ...(state.status?.vms ?? []).map((v) => ({ value: v.name, label: v.name })),
+  ];
 
   const filtered = createMemo(() => {
     const v = vm();
@@ -89,78 +95,63 @@ export default function LogsView() {
     });
   });
 
-  const jumpToBottom = () => {
-    setFollow(true);
-    if (pane) pane.scrollTop = pane.scrollHeight;
+  const setFollowing = (on: boolean) => {
+    setFollow(on);
+    if (on && pane) pane.scrollTop = pane.scrollHeight;
   };
 
   return (
-    <Show
-      when={state.currentLab}
-      fallback={
-        <div class="body">
-          <div class="csub">No lab selected.</div>
-        </div>
-      }
-    >
-      <header class="chead">
-        <div>
-          <div class="eyebrow">// logs</div>
-          <h1 class="ctitle">logs</h1>
-          <div class="csub">
-            {filtered().length} lines
-            {query() || vm() !== "all" ? ` (of ${entries().length})` : ""}
+    <Show when={state.currentLab} fallback={<Empty title="No lab selected" />}>
+      <PageHead
+        title="logs"
+        sub={`${filtered().length} lines${
+          query() || vm() !== "all" ? ` (of ${entries().length})` : ""
+        }`}
+        actions={
+          <div class="log-controls">
+            <Select options={sources()} value={vm()} onChange={setVm} />
+            <Input
+              icon={Search}
+              type="search"
+              placeholder="filter…"
+              value={query()}
+              onInput={(e) => setQuery(e.currentTarget.value)}
+            />
+            <Button variant="ghost" onClick={() => setEntries([])} title="Clear the view">
+              clear
+            </Button>
+            <Toggle checked={follow()} onChange={setFollowing}>
+              follow
+            </Toggle>
+            <Badge tone={connected() ? "success" : "neutral"} dot>
+              {connected() ? "live" : "offline"}
+            </Badge>
           </div>
-        </div>
-        <div class="logctl">
-          <select class="logsel" value={vm()} onChange={(e) => setVm(e.currentTarget.value)}>
-            <option value="all">all sources</option>
-            <For each={sources()}>{(s) => <option value={s}>{s}</option>}</For>
-          </select>
-          <input
-            class="logq"
-            type="search"
-            placeholder="filter…"
-            value={query()}
-            onInput={(e) => setQuery(e.currentTarget.value)}
-          />
-          <button class="logbtn" onClick={() => setEntries([])} title="Clear the view">
-            clear
-          </button>
-          <button
-            class="logbtn"
-            classList={{ on: follow() }}
-            onClick={jumpToBottom}
-            title="Follow the tail"
-          >
-            follow
-          </button>
-          <span class={connected() ? "c-ok" : "c-dim"}>
-            ● {connected() ? "live" : "offline"}
-          </span>
-        </div>
-      </header>
-      <div class="body">
-        <div class="logpane" ref={pane} onScroll={onScroll}>
-          <Show
-            when={filtered().length}
-            fallback={<div class="logempty">No log lines{query() ? " match the filter" : " yet"}.</div>}
-          >
-            <For each={filtered()}>
-              {(e) => (
-                <div class="logrow">
-                  <span class="logts">{fmtTs(e.ts)}</span>
-                  <span class="logsrc" classList={{ "logsrc-lab": e.source === "lab" }}>
-                    {e.source}
-                  </span>
-                  <span class={`logstream ls-${e.stream}`}>{e.stream}</span>
-                  <span class="logmsg">{e.text}</span>
-                </div>
-              )}
-            </For>
-          </Show>
-        </div>
-      </div>
+        }
+      />
+      <Logs ref={pane} onScroll={onScroll}>
+        <Show
+          when={filtered().length}
+          fallback={
+            <div class="log-empty">
+              No log lines{query() ? " match the filter" : " yet"}.
+            </div>
+          }
+        >
+          <For each={filtered()}>
+            {(e) => (
+              <div class="logrow">
+                <span class="logrow-ts">{fmtTs(e.ts)}</span>
+                <span class="logrow-src" classList={{ "is-lab": e.source === "lab" }}>
+                  {e.source}
+                </span>
+                <span class={`logrow-stream ls-${e.stream}`}>{e.stream}</span>
+                <span class="logrow-msg">{e.text}</span>
+              </div>
+            )}
+          </For>
+        </Show>
+      </Logs>
     </Show>
   );
 }

@@ -35,14 +35,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # `just check` lints --all-features, which compiles vmlab-web; rust-embed
       # needs web-ui/dist present at compile time, so build the frontend first.
+      # pnpm (major pinned): the @forge/* deps are git-subdir deps npm can't do.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: web-ui/pnpm-lock.yaml
       - name: Build web UI
         run: |
           cd web-ui
-          npm ci
-          npm run build
+          pnpm install --frozen-lockfile
+          pnpm build
       - run: just check
 
   # ── Version ───────────────────────────────────────────────────────────────
@@ -152,9 +158,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: web-ui/pnpm-lock.yaml
       - uses: Swatinem/rust-cache@v2
         with:
           key: build-${{ matrix.target }}
@@ -168,8 +179,8 @@ jobs:
       - name: Build web UI
         run: |
           cd web-ui
-          npm ci
-          npm run build
+          pnpm install --frozen-lockfile
+          pnpm build
       - name: Build web server
         run: cargo build --bin vmlab-web --features web --release --target ${{ matrix.target }}
       - name: Stage assets

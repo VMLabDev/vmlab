@@ -3,7 +3,8 @@
 // and let the confirming event refresh the view.
 
 import { createStore } from "solid-js/store";
-import { createSignal } from "solid-js";
+import { toast } from "@forge/ui";
+import type { StatusTone, Tone } from "@forge/ui";
 import * as api from "./api";
 import type { LabEntry, LabStatus, TemplateInfo, Vm, DaemonEvent } from "./api";
 
@@ -69,13 +70,9 @@ const [state, setState] = createStore<State>({
 
 export { state };
 
-const [toast, setToast] = createSignal<string | null>(null);
-export { toast };
-let toastTimer: number | undefined;
-export function showToast(msg: string) {
-  setToast(msg);
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => setToast(null), 2600) as unknown as number;
+/** App-wide notification via the forge Toaster (mounted once in App). */
+export function showToast(msg: string, tone: Tone = "success") {
+  toast(msg, { tone });
 }
 
 let eventSocket: WebSocket | null = null;
@@ -254,7 +251,7 @@ async function run(label: string, fn: () => Promise<unknown>) {
     showToast(label);
     scheduleRefresh();
   } catch (e) {
-    showToast(`Failed: ${e}`);
+    showToast(`Failed: ${e}`, "danger");
   }
 }
 
@@ -516,20 +513,19 @@ export function currentPulls(): Pull[] {
 
 export interface StateLook {
   label: string;
-  dot: string; // CSS color
-  cls: string; // statebadge class
+  tone: StatusTone; // forge Badge/StatusDot tone
 }
 
 export function look(vm: Vm): StateLook {
   switch (vm.state) {
     case "running":
       return vm.ready
-        ? { label: "running", dot: "var(--success-fg)", cls: "sb-run" }
-        : { label: "booting", dot: "var(--warning-fg)", cls: "sb-boot" };
+        ? { label: "running", tone: "success" }
+        : { label: "booting", tone: "warning" };
     case "starting":
-      return { label: "booting", dot: "var(--warning-fg)", cls: "sb-boot" };
+      return { label: "booting", tone: "warning" };
     default:
-      return { label: "stopped", dot: "var(--fg-3)", cls: "sb-stop" };
+      return { label: "stopped", tone: "neutral" };
   }
 }
 

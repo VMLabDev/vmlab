@@ -26,12 +26,15 @@
 
 # ---- frontend ---------------------------------------------------------------
 # Build the SolidJS web UI; the output is embedded into vmlab-web (rust-embed).
-FROM node:20-bookworm-slim AS web
+# pnpm (via corepack, pinned by web-ui's packageManager field): the @forge/*
+# deps are git-subdir deps, which npm cannot install.
+FROM node:22-bookworm-slim AS web
 WORKDIR /web
-COPY web-ui/package.json web-ui/package-lock.json ./
-RUN npm ci
+RUN corepack enable
+COPY web-ui/package.json web-ui/pnpm-lock.yaml web-ui/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
 COPY web-ui/ ./
-RUN npm run build
+RUN pnpm build
 
 # ---- builder ----------------------------------------------------------------
 FROM rust:1.92-bookworm AS builder

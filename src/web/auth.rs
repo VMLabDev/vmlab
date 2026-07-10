@@ -4,7 +4,7 @@
 //! pass-through and the SPA never shows a login screen. When enabled, the user
 //! signs in with username + password (argon2-verified); a successful login
 //! mints a random session token that guards `/api/*` (except the login/probe
-//! endpoints) and `/vnc/*`.
+//! endpoints), including the desktop console WebSocket.
 
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
@@ -90,8 +90,9 @@ pub async fn gate(
 
     let path = req.path();
     let protected = state.auth.enabled
-        && (path.starts_with("/vnc/")
-            || (path.starts_with("/api/") && path != "/api/login" && path != "/api/auth"));
+        && path.starts_with("/api/")
+        && path != "/api/login"
+        && path != "/api/auth";
 
     if protected {
         let ok = match request_token(req.request()) {
@@ -180,7 +181,7 @@ mod tests {
     }
 
     /// A test app with the real gate, probe, and login handlers plus a
-    /// protected API route and a protected VNC-style route.
+    /// protected API route and a protected console-WebSocket-style route.
     macro_rules! gated_app {
         ($state:expr) => {
             test::init_service(
@@ -190,7 +191,7 @@ mod tests {
                     .route("/api/auth", web::get().to(probe))
                     .route("/api/login", web::post().to(login))
                     .route("/api/labs", web::get().to(protected))
-                    .route("/vnc/lab/vm", web::get().to(protected)),
+                    .route("/api/desktop/vnc/lab/vm", web::get().to(protected)),
             )
             .await
         };
@@ -211,7 +212,7 @@ mod tests {
     #[actix_web::test]
     async fn gate_blocks_protected_routes_without_a_token() {
         let app = gated_app!(auth_state());
-        for path in ["/api/labs", "/vnc/lab/vm"] {
+        for path in ["/api/labs", "/api/desktop/vnc/lab/vm"] {
             let resp =
                 test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
             assert_eq!(resp.status(), 401, "{path}");
@@ -257,7 +258,7 @@ mod tests {
 
         // WebSocket upgrades / <img> loads use the query-param form.
         let req = test::TestRequest::get()
-            .uri(&format!("/vnc/lab/vm?token={token}"))
+            .uri(&format!("/api/desktop/vnc/lab/vm?token={token}"))
             .to_request();
         assert_eq!(test::call_service(&app, req).await.status(), 200);
     }

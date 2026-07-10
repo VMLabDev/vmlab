@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@10.34.4",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -10,17 +11,19 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@codemirror/language": "^6.10.2",
-    "@codemirror/lint": "^6.8.1",
-    "@codemirror/state": "^6.4.1",
-    "@codemirror/view": "^6.28.0",
-    "@novnc/novnc": "^1.5.0",
-    "codemirror": "^6.0.1",
+    "@codemirror/language": "^6.11.0",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.38.0",
+    "@forge/code": "github:wiltaylor/forge#888c4b1b35046a912bc96b77905bc20e52757b74&path:packages/code",
+    "@forge/desktop": "github:wiltaylor/forge#888c4b1b35046a912bc96b77905bc20e52757b74&path:packages/desktop",
+    "@forge/tokens": "github:wiltaylor/forge#888c4b1b35046a912bc96b77905bc20e52757b74&path:packages/tokens",
+    "@forge/ui": "github:wiltaylor/forge#888c4b1b35046a912bc96b77905bc20e52757b74&path:packages/ui",
+    "lucide-solid": "^0.469.0",
     "solid-js": "^1.9.3"
   },
   "devDependencies": {
-    "typescript": "^5.6.3",
-    "vite": "^5.4.10",
-    "vite-plugin-solid": "^2.10.2"
+    "typescript": "^5.8.0",
+    "vite": "^6.0.0",
+    "vite-plugin-solid": "^2.11.0"
   }
 }

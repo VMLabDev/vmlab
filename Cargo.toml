@@ -24,7 +24,14 @@ required-features = ["web"]
 default = []
 # Pulls in the HTTP stack for the `vmlab-web` binary. Kept optional so a plain
 # CLI build stays lean.
-web = ["dep:actix-web", "dep:actix-ws", "dep:rust-embed", "dep:mime_guess", "dep:argon2"]
+web = [
+    "dep:actix-web",
+    "dep:actix-ws",
+    "dep:rust-embed",
+    "dep:mime_guess",
+    "dep:argon2",
+    "dep:forge-core",
+]
 
 [dependencies]
 actix-web = { version = "4", optional = true }
@@ -32,6 +39,9 @@ actix-ws = { version = "0.3", optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 argon2 = { version = "0.5", optional = true, features = ["std"] }
+# The Forge desktop-widget session engine: server-side RFB decode → RGBA rect
+# frames for the console UI's DesktopViewer (docs/widgets-protocol.md there).
+forge-core = { git = "https://github.com/wiltaylor/forge.git", rev = "888c4b1b35046a912bc96b77905bc20e52757b74", features = ["vnc"], optional = true }
 wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "cc63fcca0412082399e4e80a78caf6d6b18bb44e" }
 wscript = { git = "https://github.com/Configweave/wscript.git", rev = "fcd51236239225ea3e89a82fec44d30f7b871426" }
 

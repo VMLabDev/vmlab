@@ -1,4 +1,26 @@
-import { For, Show, createResource, createSignal, type JSX } from "solid-js";
+import { For, Show, createResource, createSignal } from "solid-js";
+import {
+  Badge,
+  Button,
+  Card,
+  Empty,
+  Grid,
+  Icon,
+  Modal,
+  PageHead,
+  Progress,
+  Spinner,
+  Stat,
+  StatusDot,
+} from "@forge/ui";
+import {
+  Camera,
+  History,
+  Monitor,
+  Play,
+  Square,
+  Trash2,
+} from "lucide-solid";
 import {
   state,
   startAll,
@@ -19,7 +41,7 @@ import {
   currentPulls,
   type Pull,
 } from "../store";
-import * as I from "./icons";
+import { confirmDialog, promptDialog } from "./dialogs";
 
 function fmtTime(t: string): string {
   if (!t) return "";
@@ -35,12 +57,16 @@ export default function LabView() {
   const vcpu = () => s()?.vms.reduce((a, v) => a + (v.cpus ?? 0), 0) ?? 0;
   const mem = () => s()?.vms.reduce((a, v) => a + (v.memory ?? 0), 0) ?? 0;
 
-  const snapshotLab = () => {
-    const name = prompt("Snapshot name for the whole lab:");
+  const snapshotLab = async () => {
+    const name = await promptDialog({
+      title: "Snapshot lab",
+      label: "Snapshot name for the whole lab",
+      confirmLabel: "Take snapshot",
+    });
     if (name) takeSnapshot(name);
   };
 
-  // Restore-lab picker: open a modal listing every snapshot across the lab.
+  // Restore-lab picker: a modal listing every snapshot across the lab.
   const [restoreOpen, setRestoreOpen] = createSignal(false);
   const [labSnaps, { refetch: refetchLabSnaps }] = createResource(restoreOpen, (open) =>
     open ? labSnapshotList() : Promise.resolve([]),
@@ -50,225 +76,200 @@ export default function LabView() {
     restoreSnapshot(name);
   };
   const delLabSnapshot = async (name: string) => {
-    if (!confirm(`Delete snapshot "${name}" from every VM in the lab?`)) return;
+    const ok = await confirmDialog({
+      title: "Delete snapshot",
+      body: (
+        <>
+          Delete snapshot <b>{name}</b> from every VM in the lab?
+        </>
+      ),
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
     await deleteLabSnapshot(name);
     refetchLabSnaps();
   };
-  const destroy = () => {
-    if (confirm("Destroy this lab? Clones and lab-local state are deleted.")) {
-      destroyLab();
-    }
+  const destroy = async () => {
+    const ok = await confirmDialog({
+      title: "Destroy lab",
+      body: <>Destroy this lab? Clones and lab-local state are deleted.</>,
+      confirmLabel: "Destroy",
+      danger: true,
+    });
+    if (ok) destroyLab();
   };
 
   return (
     <Show
       when={s()}
       fallback={
-        <div class="body">
-          <Show
-            when={pulls().length}
-            fallback={
-              <div class="csub">No lab selected, or the lab daemon isn't reachable.</div>
-            }
-          >
+        <Show
+          when={pulls().length}
+          fallback={<Empty title="No lab selected">Or the lab daemon isn't reachable.</Empty>}
+        >
+          <div class="stack">
             <PullPanel pulls={pulls()} />
-            <div class="csub">Starting the lab — downloading templates…</div>
-          </Show>
-        </div>
+            <Empty title="Starting the lab">Downloading templates…</Empty>
+          </div>
+        </Show>
       }
     >
-      <header class="chead">
-        <div>
-          <div class="eyebrow">// lab</div>
-          <h1 class="ctitle">{s()!.lab}</h1>
-          <div class="csub">
-            {total()} machines · {s()!.segments.length} segments
-          </div>
-        </div>
-        <div class="actions">
-          <button class="btn btn-primary" onClick={startAll}>
-            <I.Play />
-            Start all
-          </button>
-          <button class="btn" onClick={stopAll}>
-            <I.Stop />
-            Stop all
-          </button>
-          <button class="btn" onClick={snapshotLab}>
-            <I.Camera />
-            Snapshot lab
-          </button>
-          <button class="btn" onClick={() => setRestoreOpen(true)}>
-            <I.Restore />
-            Restore lab
-          </button>
-          <button class="btn btn-danger" onClick={destroy}>
-            <I.Trash />
-            Destroy lab
-          </button>
-        </div>
-      </header>
+      <PageHead
+        title={s()!.lab}
+        sub={`${total()} machines · ${s()!.segments.length} segments`}
+        actions={
+          <>
+            <Button variant="primary" icon={Play} onClick={startAll}>
+              Start all
+            </Button>
+            <Button icon={Square} onClick={stopAll}>
+              Stop all
+            </Button>
+            <Button icon={Camera} onClick={snapshotLab}>
+              Snapshot
+            </Button>
+            <Button icon={History} onClick={() => setRestoreOpen(true)}>
+              Restore
+            </Button>
+            <Button variant="danger" icon={Trash2} onClick={destroy}>
+              Destroy
+            </Button>
+          </>
+        }
+      />
 
-      <div class="body">
+      <div class="stack">
         <Show when={pulls().length}>
           <PullPanel pulls={pulls()} />
         </Show>
 
-        <div class="statgrid">
-          <Stat icon={<I.Servers />} k="Machines up" v={String(running())} u={`/ ${total()}`} />
-          <Stat icon={<I.Cpu />} k="Allocated vCPU" v={vcpu() ? String(vcpu()) : "—"} u="cores" />
-          <Stat icon={<I.Memory />} k="Memory" v={fmtMem(mem() || null)} u="" />
-          <Stat icon={<I.Nodes />} k="Segments" v={String(s()!.segments.length)} u="" />
-        </div>
+        <Grid>
+          <Card>
+            <Stat label="Machines up" value={String(running())} delta={`/ ${total()}`} />
+          </Card>
+          <Card>
+            <Stat
+              label="Allocated vCPU"
+              value={vcpu() ? String(vcpu()) : "—"}
+              delta={vcpu() ? "cores" : undefined}
+            />
+          </Card>
+          <Card>
+            <Stat label="Memory" value={fmtMem(mem() || null)} />
+          </Card>
+          <Card>
+            <Stat label="Segments" value={String(s()!.segments.length)} />
+          </Card>
+        </Grid>
 
-        <h3 class="sectitle">Machines</h3>
-        <For each={s()!.vms}>
-          {(vm) => {
-            const lk = look(vm);
-            const on = () => vm.state === "running";
-            return (
-              <div class="lvm">
-                <span class="sdot" style={`background:${lk.dot}`} />
-                <div style="min-width:0">
-                  <div class="lvmname">{vm.name}</div>
-                  <div class="lvmos">
-                    {osOf(vm)} · {archOf(vm)}
+        <div>
+          <For each={s()!.vms}>
+            {(vm) => {
+              const on = () => vm.state === "running";
+              return (
+                <div class="vm-row">
+                  <StatusDot tone={look(vm).tone} />
+                  <div style={{ "min-width": "0" }}>
+                    <div class="vm-row-name">{vm.name}</div>
+                    <div class="vm-row-os">
+                      {osOf(vm)} · {archOf(vm)}
+                    </div>
+                  </div>
+                  <span class="vm-row-state">
+                    <Badge tone={look(vm).tone} dot>
+                      {look(vm).label}
+                    </Badge>
+                  </span>
+                  <span class="vm-row-ip">{vm.ip ?? "—"}</span>
+                  <div class="vm-row-actions">
+                    <Button size="sm" onClick={() => (on() ? vmStop(vm.name) : vmStart(vm.name))}>
+                      {on() ? "Stop" : "Start"}
+                    </Button>
+                    <Button size="sm" icon={Monitor} onClick={() => showVm(vm.name)}>
+                      Console
+                    </Button>
                   </div>
                 </div>
-                <span class="lvmstate" style={`color:${lk.dot}`}>
-                  {lk.label}
-                </span>
-                <span class="lvmip">{vm.ip ?? "—"}</span>
-                <div class="miniact">
-                  <button
-                    class="mbtn"
-                    onClick={() => (on() ? vmStop(vm.name) : vmStart(vm.name))}
-                  >
-                    {on() ? "Stop" : "Start"}
-                  </button>
-                  <button class="mbtn" onClick={() => showVm(vm.name)}>
-                    <I.Monitor />
-                    Console
-                  </button>
-                </div>
-              </div>
-            );
-          }}
-        </For>
+              );
+            }}
+          </For>
+        </div>
       </div>
 
-      <Show when={restoreOpen()}>
-        <div class="mback" onClick={() => setRestoreOpen(false)}>
-          <div class="modal" onClick={(e) => e.stopPropagation()}>
-            <div class="modalhd">
-              <div class="modaltitle">Restore lab</div>
-              <div class="modalsub">
-                Roll {s()!.lab} back to a saved snapshot. Choose one to restore.
-              </div>
+      <Modal
+        open={restoreOpen()}
+        onClose={() => setRestoreOpen(false)}
+        title="Restore lab"
+        footer={
+          <Button variant="ghost" onClick={() => setRestoreOpen(false)}>
+            Cancel
+          </Button>
+        }
+      >
+        <Show
+          when={!labSnaps.loading}
+          fallback={
+            <div style={{ padding: "8px 0" }}>
+              <Spinner label="Loading snapshots" /> Loading snapshots…
             </div>
-            <div class="modalbd">
-              <Show
-                when={(labSnaps()?.length ?? 0) > 0}
-                fallback={
-                  <div class="csub" style="padding:6px 2px 12px">
-                    {labSnaps.loading
-                      ? "Loading snapshots…"
-                      : "No snapshots found in this lab."}
+          }
+        >
+          <Show
+            when={(labSnaps()?.length ?? 0) > 0}
+            fallback={<Empty title="No snapshots found in this lab" />}
+          >
+            <div class="snap-list">
+              <For each={labSnaps()}>
+                {(snap) => (
+                  <div class="snap-row">
+                    <Icon of={Camera} size={14} />
+                    <div class="snap-row-meta">
+                      <div class="snap-row-name">{snap.name}</div>
+                      <div class="snap-row-time">{fmtTime(snap.taken_at)}</div>
+                    </div>
+                    <Button size="sm" onClick={() => pickRestore(snap.name)}>
+                      Restore
+                    </Button>
+                    <Button size="sm" variant="danger" onClick={() => delLabSnapshot(snap.name)}>
+                      Delete
+                    </Button>
                   </div>
-                }
-              >
-                <div class="snaplist">
-                  <For each={labSnaps()}>
-                    {(snap) => (
-                      <div class="snapopt">
-                        <span class="snapic">
-                          <I.Camera />
-                        </span>
-                        <div class="snapmeta">
-                          <div class="snapname">{snap.name}</div>
-                          <div class="snaptime">{fmtTime(snap.taken_at)}</div>
-                        </div>
-                        <button class="snaprestore" onClick={() => pickRestore(snap.name)}>
-                          Restore
-                        </button>
-                        <button
-                          class="snaprestore"
-                          style="color:var(--danger-fg)"
-                          onClick={() => delLabSnapshot(snap.name)}
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    )}
-                  </For>
-                </div>
-              </Show>
+                )}
+              </For>
             </div>
-            <div class="modalft">
-              <button class="btn" onClick={() => setRestoreOpen(false)}>
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      </Show>
+          </Show>
+        </Show>
+      </Modal>
     </Show>
   );
 }
 
 function PullPanel(p: { pulls: Pull[] }) {
   return (
-    <div class="pullbox">
-      <h3 class="sectitle">Downloading templates</h3>
-      <For each={p.pulls}>
-        {(pl) => (
-          <div class="pull">
-            <div class="pullhd">
-              <span class="pullvm">{pl.vm}</span>
-              <span class="pullref">{pl.reference}</span>
-              <span class="pullpct">
-                {pl.status === "checking"
-                  ? "checking…"
-                  : pl.status === "error"
-                    ? "failed"
-                    : `${pl.percent}%`}
-              </span>
-            </div>
-            <div class="pullbar">
-              <div
-                class="pullfill"
-                classList={{
-                  "pullfill-indet": pl.status === "checking",
-                  "pullfill-err": pl.status === "error",
-                }}
-                style={pl.status === "checking" ? "" : `width:${pl.status === "error" ? 100 : pl.percent}%`}
+    <Card title="Downloading templates">
+      <div class="pull-list">
+        <For each={p.pulls}>
+          {(pl) => (
+            <div>
+              <Progress
+                label={`${pl.vm} — ${pl.reference}`}
+                value={pl.status === "error" ? 100 : pl.percent}
+                indeterminate={pl.status === "checking"}
+                tone={pl.status === "error" ? "danger" : "accent"}
+                showValue={pl.status === "pulling"}
               />
+              <div class="pull-sub" classList={{ "is-error": pl.status === "error" }}>
+                {pl.status === "error"
+                  ? pl.error
+                  : pl.status === "checking"
+                    ? "Resolving template…"
+                    : `${fmtBytes(pl.bytesDone)} / ${fmtBytes(pl.bytesTotal)}`}
+              </div>
             </div>
-            <div class="pullsub" classList={{ "c-dan": pl.status === "error" }}>
-              {pl.status === "error"
-                ? pl.error
-                : pl.status === "checking"
-                  ? "Resolving template…"
-                  : `${fmtBytes(pl.bytesDone)} / ${fmtBytes(pl.bytesTotal)}`}
-            </div>
-          </div>
-        )}
-      </For>
-    </div>
-  );
-}
-
-function Stat(p: { icon: JSX.Element; k: string; v: string; u: string }) {
-  return (
-    <div class="stat">
-      <div class="statk">
-        {p.icon}
-        {p.k}
+          )}
+        </For>
       </div>
-      <div class="statv">
-        {p.v}
-        {p.u ? <span class="statu">{p.u}</span> : null}
-      </div>
-    </div>
+    </Card>
   );
 }

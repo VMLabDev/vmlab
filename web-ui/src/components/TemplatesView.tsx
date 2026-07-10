@@ -1,5 +1,17 @@
 import { For, Show, createEffect, createResource, createSignal } from "solid-js";
 import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Empty,
+  ListBox,
+  PageHead,
+  Spinner,
+  StatusDot,
+} from "@forge/ui";
+import { Play, RefreshCw, Upload } from "lucide-solid";
+import {
   state,
   buildTemplate,
   publishTemplate,
@@ -8,29 +20,18 @@ import {
 } from "../store";
 import { templateRemote } from "../api";
 import type { TemplateInfo, RemoteStatus } from "../api";
-import * as I from "./icons";
 
 export default function TemplatesView() {
   return (
     <Show
       when={state.currentLab && state.templates.length}
-      fallback={
-        <div class="body">
-          <div class="csub">No template blocks in this lab's vmlab.wcl.</div>
-        </div>
-      }
+      fallback={<Empty title="No templates">No template blocks in this lab's vmlab.wcl.</Empty>}
     >
-      <header class="chead">
-        <div>
-          <div class="eyebrow">// templates</div>
-          <h1 class="ctitle">templates</h1>
-          <div class="csub">
-            {state.templates.length} defined · built on this host, published to a
-            registry
-          </div>
-        </div>
-      </header>
-      <div class="body">
+      <PageHead
+        title="templates"
+        sub={`${state.templates.length} defined · built on this host, published to a registry`}
+      />
+      <div class="stack">
         <For each={state.templates}>{(t) => <TemplateCard t={t} />}</For>
       </div>
     </Show>
@@ -51,62 +52,64 @@ function TemplateCard(p: { t: TemplateInfo }) {
   };
 
   return (
-    <div class="tpl">
-      <div class="tplhd">
-        <span class="tplname">{p.t.name}</span>
-        <span class="niarch">{p.t.arch}</span>
-        <span class="tplver">prefix {p.t.version_prefix}</span>
-        <Show when={p.t.registry}>
-          <span class="tplreg">{p.t.registry}</span>
-        </Show>
-        <div class="tplact">
-          <button
-            class="btn btn-primary"
-            classList={{ dis: running() }}
+    <Card
+      title={
+        <span class="tpl-title">
+          {p.t.name}
+          <Badge>{p.t.arch}</Badge>
+          <span class="tpl-meta">prefix {p.t.version_prefix}</span>
+          <Show when={p.t.registry}>
+            <span class="tpl-meta">{p.t.registry}</span>
+          </Show>
+        </span>
+      }
+      action={
+        <span style={{ display: "inline-flex", gap: "8px" }}>
+          <Button
+            size="sm"
+            variant="primary"
+            icon={Play}
+            disabled={running()}
             onClick={() => buildTemplate(p.t.name)}
           >
-            <I.Play />
             Build
-          </button>
-          <button
-            class="btn"
-            classList={{ dis: running() || !selected() }}
+          </Button>
+          <Button
+            size="sm"
+            icon={Upload}
+            disabled={running() || !selected()}
             onClick={publish}
-            title={selected() ? `Push ${selected()} to the registry` : "No local build to publish"}
+            title={
+              selected() ? `Push ${selected()} to the registry` : "No local build to publish"
+            }
           >
-            <I.Upload />
             Publish
-          </button>
-        </div>
-      </div>
-
-      <div class="tplcols">
+          </Button>
+        </span>
+      }
+    >
+      <div class="tpl-cols">
         <div>
-          <h3 class="sectitle">Local builds</h3>
+          <div class="tpl-sec">Local builds</div>
           <Show
             when={p.t.local_versions.length}
-            fallback={<div class="tplempty">Nothing built yet.</div>}
+            fallback={<div class="tpl-meta">Nothing built yet.</div>}
           >
-            <div class="tpllist">
-              <For each={p.t.local_versions}>
-                {(v) => (
-                  <button
-                    class="tplverrow"
-                    classList={{ on: v === selected() }}
-                    onClick={() => setVersion(v)}
-                    title="Select for publishing"
-                  >
-                    <span class="tplvname">{v}</span>
-                    <Show when={v === p.t.local_versions[0]}>
-                      <span class="tpltag">newest</span>
+            <ListBox
+              options={p.t.local_versions.map((v, i) => ({
+                value: v,
+                label: (
+                  <span class="tpl-title">
+                    {v}
+                    <Show when={i === 0}>
+                      <Badge tone="accent">newest</Badge>
                     </Show>
-                    <span class="tplcheck">
-                      <I.Check />
-                    </span>
-                  </button>
-                )}
-              </For>
-            </div>
+                  </span>
+                ),
+              }))}
+              value={selected() ?? undefined}
+              onChange={(v) => setVersion(v)}
+            />
           </Show>
         </div>
         <RemotePanel t={p.t} />
@@ -115,7 +118,7 @@ function TemplateCard(p: { t: TemplateInfo }) {
       <Show when={op()}>
         <OpPanel op={op()!} opKey={key()} />
       </Show>
-    </div>
+    </Card>
   );
 }
 
@@ -127,37 +130,43 @@ function RemotePanel(p: { t: TemplateInfo }) {
   );
   return (
     <div>
-      <h3 class="sectitle">
+      <div class="tpl-sec">
         Registry
         <Show when={p.t.registry}>
-          <button
-            class="tplrefresh"
+          <Button
+            size="sm"
+            variant="ghost"
+            icon={RefreshCw}
             onClick={() => setTick(tick() + 1)}
             title="Re-query the registry"
           >
             refresh
-          </button>
+          </Button>
         </Show>
-      </h3>
-      <Show
-        when={p.t.registry}
-        fallback={<div class="tplempty">No registry configured.</div>}
-      >
-        <Show when={!remote.loading} fallback={<div class="tplempty">Checking registry…</div>}>
+      </div>
+      <Show when={p.t.registry} fallback={<div class="tpl-meta">No registry configured.</div>}>
+        <Show
+          when={!remote.loading}
+          fallback={
+            <div class="tpl-meta">
+              <Spinner size={12} /> Checking registry…
+            </div>
+          }
+        >
           <Show
             when={!remote.error}
-            fallback={<div class="tplempty c-dan">{String(remote.error)}</div>}
+            fallback={<Alert tone="danger">{String(remote.error)}</Alert>}
           >
             <Show
               when={remote()?.tags.length}
-              fallback={<div class="tplempty">Nothing published yet.</div>}
+              fallback={<div class="tpl-meta">Nothing published yet.</div>}
             >
-              <div class="tpllist">
+              <div>
                 <For each={remote()!.tags}>
                   {(tag) => (
-                    <div class="tplverrow static">
-                      <span class="tplvname">{tag.tag}</span>
-                      <span class="tplarches">{tag.arches.join(", ") || "—"}</span>
+                    <div class="tag-row">
+                      <span>{tag.tag}</span>
+                      <span class="tag-row-arches">{tag.arches.join(", ") || "—"}</span>
                     </div>
                   )}
                 </For>
@@ -189,32 +198,25 @@ function OpPanel(p: { op: TemplateOp; opKey: string }) {
     }
   };
   return (
-    <div class="tplop">
-      <div class="tplophd">
-        <span
-          class="sdot"
-          style={`background:${
-            p.op.status === "running"
-              ? "var(--warning-fg)"
-              : p.op.status === "done"
-                ? "var(--success-fg)"
-                : "var(--danger-fg)"
-          }`}
+    <div class="tpl-op">
+      <div class="tpl-op-head">
+        <StatusDot
+          tone={
+            p.op.status === "running" ? "warning" : p.op.status === "done" ? "success" : "danger"
+          }
         />
-        <span class="tplopstate" classList={{ "c-dan": p.op.status === "error" }}>
-          {label()}
-        </span>
+        <span>{label()}</span>
         <Show when={p.op.status !== "running"}>
-          <button class="tplrefresh" onClick={() => dismissTemplateOp(p.opKey)}>
+          <Button size="sm" variant="ghost" onClick={() => dismissTemplateOp(p.opKey)}>
             dismiss
-          </button>
+          </Button>
         </Show>
       </div>
       <Show when={p.op.error}>
-        <div class="tploperr">{p.op.error}</div>
+        <Alert tone="danger">{p.op.error}</Alert>
       </Show>
       <Show when={p.op.log.length}>
-        <div class="tpllog" ref={pane}>
+        <div class="tpl-log" ref={pane}>
           <For each={p.op.log}>{(line) => <div>{line}</div>}</For>
         </div>
       </Show>

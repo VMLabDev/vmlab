@@ -1,4 +1,5 @@
-import { Show, createSignal } from "solid-js";
+import { createSignal } from "solid-js";
+import { Button, Card, Input, Spinner } from "@forge/ui";
 import { doLogin, state } from "../store";
 
 export default function Login() {
@@ -21,44 +22,37 @@ export default function Login() {
   };
 
   return (
-    <div class="mback" style="position:fixed">
-      <form class="modal" style="width:380px" onSubmit={submit}>
-        <div class="modalhd">
-          <div class="modaltitle">
-            <span class="bvm">vm</span>
-            <span class="blab">lab</span> sign in
-          </div>
-          <div class="modalsub">Enter your credentials to access the console.</div>
-        </div>
-        <div class="modalbd">
-          <label class="flbl">Username</label>
-          <input
-            class="input"
+    <div class="login-wrap">
+      <Card
+        class="login-card"
+        title={
+          <span>
+            <span class="brand-vm">vm</span>
+            <span class="brand-lab">lab</span> — sign in
+          </span>
+        }
+      >
+        <form class="login-form" onSubmit={submit}>
+          <Input
+            label="Username"
             value={user()}
             onInput={(e) => setUser(e.currentTarget.value)}
             autofocus
           />
-          <label class="flbl" style="margin-top:14px">
-            Password
-          </label>
-          <input
-            class="input"
+          <Input
+            label="Password"
             type="password"
             value={pass()}
             onInput={(e) => setPass(e.currentTarget.value)}
+            error={!!err()}
+            help={err() || undefined}
           />
-          <Show when={err()}>
-            <div class="csub" style="color:var(--danger-fg);margin-top:10px">
-              {err()}
-            </div>
-          </Show>
-        </div>
-        <div class="modalft">
-          <button class="btn btn-primary" type="submit" classList={{ dis: busy() }}>
+          <Button variant="primary" type="submit" disabled={busy()}>
+            {busy() ? <Spinner size={12} /> : null}
             {busy() ? "Signing in…" : "Sign in"}
-          </button>
-        </div>
-      </form>
+          </Button>
+        </form>
+      </Card>
     </div>
   );
 }

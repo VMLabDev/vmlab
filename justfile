@@ -35,7 +35,7 @@ fmt:
 # Typecheck the web UI (`vite build` strips types without checking them)
 [group('check')]
 web-ui-check:
-	cd web-ui && npm run typecheck
+	cd web-ui && pnpm typecheck
 
 # Lint, format check, tests, and the web UI typecheck
 [group('check')]
@@ -102,15 +102,23 @@ skill-build: wskill-check
 docs-clean:
 	rm -rf docs/_site docs/wskills/vmlab/out
 
-# Install the SolidJS web UI's npm dependencies
+# Install the SolidJS web UI's pnpm dependencies (@forge/* are git-subdir deps)
 [group('web')]
 web-ui-install:
-	cd web-ui && npm install
+	cd web-ui && pnpm install
 
 # Build the web UI to web-ui/dist (embedded into vmlab-web at compile time)
 [group('web')]
 web-ui-build:
-	cd web-ui && npm run build
+	cd web-ui && pnpm build
+
+# Pin the @forge/* deps to a new forge rev (updates package.json + the
+# pnpm-workspace.yaml prepare allowlist together, then reinstalls)
+[group('web')]
+web-ui-forge-bump rev:
+	cd web-ui && sed -i -E 's|(github:wiltaylor/forge#)[0-9a-f]{40}|\1{{rev}}|g' package.json && \
+		sed -i -E 's|(codeload.github.com/wiltaylor/forge/tar.gz/)[0-9a-f]{40}|\1{{rev}}|g; s|(github:wiltaylor/forge#)[0-9a-f]{40}|\1{{rev}}|g' pnpm-workspace.yaml && \
+		pnpm install
 
 # Build the vmlab-web binary (frontend first, then the embedded server)
 [group('web')]
@@ -140,4 +148,4 @@ compose-down:
 # Run the Vite dev server with hot reload (proxies to a running vmlab-web on :7878)
 [group('web')]
 web-dev:
-	cd web-ui && npm run dev
+	cd web-ui && pnpm dev

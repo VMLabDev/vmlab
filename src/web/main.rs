@@ -9,10 +9,10 @@
 mod api;
 mod assets;
 mod auth;
+mod desktop;
 mod events;
 mod logs;
 mod state;
-mod vnc;
 
 use std::net::IpAddr;
 use std::process::ExitCode;
@@ -246,7 +246,7 @@ async fn main() -> ExitCode {
             .route("/api/labs/{lab}", web::get().to(api::lab_status))
             // Live streams.
             .route("/api/events", web::get().to(events::events))
-            .route("/vnc/{lab}/{vm}", web::get().to(vnc::vnc))
+            .route("/api/desktop/vnc/{lab}/{vm}", web::get().to(desktop::vnc))
             // SPA + static assets.
             .default_service(web::route().to(assets::spa))
     })
