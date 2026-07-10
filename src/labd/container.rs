@@ -593,9 +593,12 @@ impl ContainerInstance {
         });
     }
 
-    /// Readiness (PRD §7.4 shape): ctl `started`, then the agent answering
-    /// `guest-ping`, then the healthcheck gate — ready when started and
-    /// (no healthcheck || first healthy report).
+    /// Readiness (PRD §7.4 shape): ctl `started`, then the healthcheck gate —
+    /// ready when the container process runs and (no healthcheck || first
+    /// healthy report). Deliberately NOT gated on the bundled agent: the
+    /// entrypoint runs regardless (docker semantics), and an agent hiccup
+    /// must not wedge readiness. The agent is polled separately below; it
+    /// only gates `exec`/`cp`.
     fn spawn_readiness(self: &Arc<Self>, cbs: &Arc<Callbacks>) {
         let me = self.clone();
         let cbs = cbs.clone();
@@ -610,21 +613,7 @@ impl ContainerInstance {
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            // Phase 2: the bundled agent answers (mirrors the VM poller).
-            loop {
-                if me.state().await != PowerState::Running {
-                    return;
-                }
-                let qga = { me.qga.lock().await.clone() };
-                if let Some(qga) = qga
-                    && qga.ping(Duration::from_secs(2)).await
-                {
-                    *me.agent_up.write().await = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            // Phase 3: the healthcheck gate.
+            // Phase 2: the healthcheck gate.
             if me.spec.healthcheck.is_some() {
                 loop {
                     if me.state().await != PowerState::Running {
@@ -639,6 +628,25 @@ impl ContainerInstance {
             *me.ready.write().await = true;
             if !cbs.ready_fired.swap(true, Ordering::SeqCst) {
                 (cbs.on_ready)();
+            }
+        });
+
+        // Agent poller (mirrors the VM poller): tracks `agent_up` for
+        // exec/cp availability without holding readiness hostage.
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if me.state().await != PowerState::Running {
+                    return;
+                }
+                let qga = { me.qga.lock().await.clone() };
+                if let Some(qga) = qga
+                    && qga.ping(Duration::from_secs(2)).await
+                {
+                    *me.agent_up.write().await = true;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
