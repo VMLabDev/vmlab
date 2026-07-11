@@ -136,6 +136,11 @@ async fn fastpath_sockmap_gateway_frames_reach_hook_and_service() {
     let (mut a_read, mut a_write) = guest_port(&sw, false).await;
     let mut svc = sw.add_channel_port(PortClass::Service);
     announce(&mut a_write, MAC_A).await;
+    // Drain the service port's copy of A's announce flood.
+    timeout(Duration::from_secs(2), svc.rx.recv())
+        .await
+        .expect("timed out draining announce")
+        .expect("service port closed");
     // Teach the switch the service MAC (like the gateway's ARP would).
     svc.tx
         .send(Bytes::from(eth_build(
@@ -275,8 +280,10 @@ async fn fastpath_sockmap_single_writer_integrity() {
         a_write
     });
     // Userspace path: a service port unicasts at B through the TX loopback.
-    // Pace it just enough that B's 512-slot egress queue doesn't overflow
-    // (drops are legal ethernet but would make the count assertion moot).
+    // Rate-limited like real gateway traffic: the switch drops on a full
+    // egress queue (legal ethernet), so an unpaced blast would just measure
+    // queue overflow instead of path integrity (~30k frames/s here vs the
+    // unpaced kernel-path flood above, which the psock backlog absorbs).
     let svc_tx = svc.tx.clone();
     let service_writer = tokio::spawn(async move {
         for i in 0..PER_SOURCE {
@@ -285,8 +292,8 @@ async fn fastpath_sockmap_single_writer_integrity() {
             payload.resize(64, 0);
             let f = eth_build(MAC_B, MAC_SVC, ETHERTYPE_IPV4, &payload);
             svc_tx.send(Bytes::from(f)).await.unwrap();
-            if i % 128 == 0 {
-                tokio::task::yield_now().await;
+            if i % 32 == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
     });
