@@ -1,6 +1,6 @@
 // The visual lab designer: topology canvas + inspector in a split pane,
 // with a compact Revert/Validate/Save/Save & reload toolbar and
-// validation-issue surfacing. Embedded in the lab page's Design tab.
+// validation-issue surfacing. Embedded in the lab page's Overview tab.
 
 import { For, Show, createEffect, createMemo } from "solid-js";
 import { Alert, Button, Empty, Spinner, SplitPane } from "@forge/ui";
@@ -10,7 +10,6 @@ import {
   showToast,
   state,
 } from "../../store";
-import { openConfigTab } from "./LabEditorView";
 import {
   editor,
   openEditor,
@@ -25,7 +24,7 @@ import {
 import Inspector from "./Inspector";
 import TopologyCanvas from "./TopologyCanvas";
 
-export default function EditorView() {
+export default function EditorView(props: { onEditConfig: () => void }) {
   createEffect(() => {
     const lab = state.currentLab;
     if (lab && state.view.kind === "lab") void openEditor(lab);
@@ -82,7 +81,7 @@ export default function EditorView() {
               disabled={disabled() || anyVmRunning()}
               title={
                 anyVmRunning()
-                  ? "Stop all VMs before reloading"
+                  ? "Stop all VMs and containers before reloading"
                   : "Save and restart the lab to apply changes"
               }
             >
@@ -101,7 +100,7 @@ export default function EditorView() {
         <Show when={editor.fallback}>
           <Alert tone="warning" title="Can't open the visual editor">
             {editor.fallback}{" "}
-            <Button size="sm" onClick={openConfigTab}>
+            <Button size="sm" onClick={props.onEditConfig}>
               Open raw config
             </Button>
           </Alert>
@@ -114,14 +113,14 @@ export default function EditorView() {
         <Show when={editor.draft && !editor.fallback}>
           <SplitPane
             class="editor-split"
-            first={<TopologyCanvas />}
+            first={<TopologyCanvas onEditConfig={props.onEditConfig} />}
             second={<Inspector />}
             initial={Math.max(480, window.innerWidth - 720)}
             min={320}
           />
           <Show when={anyVmRunning()}>
             <Alert tone="warning">
-              Some VMs are running — stop the lab before reloading to apply config changes.
+              Some machines are up — running machines and networking are read-only until they stop.
             </Alert>
           </Show>
           <Show when={editor.issues.length}>

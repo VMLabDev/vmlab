@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
-import { Alert, Button, Empty, PageHead } from "@forge/ui";
+import { Alert, Button, Empty } from "@forge/ui";
 import { CodeEditor } from "@forge/code";
 import type { CodeAnnotation } from "@forge/code";
 import {
@@ -120,15 +120,19 @@ export default function ConfigView() {
   }
 
   const disabled = () => !loaded() || busy() !== null;
+  const readOnly = () => anyVmRunning();
 
   return (
     <Show when={state.currentLab} fallback={<Empty title="No lab selected" />}>
-      <PageHead
-        title="vmlab.wcl"
-        sub={`${path() || "—"}${dirty() ? " · unsaved changes" : ""}`}
-        actions={
-          <>
+      <div class="config-modal">
+        <div class="config-modal-head">
+          <span class="config-modal-path">
+            {path() || "—"}
+            {dirty() ? " · unsaved changes" : ""}
+          </span>
+          <div class="config-modal-actions">
             <Button
+              size="sm"
               variant="ghost"
               onClick={revert}
               disabled={disabled()}
@@ -136,52 +140,61 @@ export default function ConfigView() {
             >
               Revert
             </Button>
-            <Button onClick={validate} disabled={disabled()} title="Validate without saving">
+            <Button
+              size="sm"
+              onClick={validate}
+              disabled={disabled() || readOnly()}
+              title={
+                readOnly() ? "Stop all machines before editing config" : "Validate without saving"
+              }
+            >
               Validate
             </Button>
-            <Button onClick={save} disabled={disabled() || !dirty()}>
+            <Button size="sm" onClick={save} disabled={disabled() || readOnly() || !dirty()}>
               Save
             </Button>
             <Button
+              size="sm"
               variant="primary"
               onClick={saveReload}
               disabled={disabled() || anyVmRunning()}
               title={
                 anyVmRunning()
-                  ? "Stop all VMs before reloading"
+                  ? "Stop all VMs and containers before reloading"
                   : "Save and restart the lab to apply changes"
               }
             >
               Save & reload
             </Button>
-          </>
-        }
-      />
-      <div class="stack">
-        <CodeEditor
-          value={text()}
-          onChange={setText}
-          language={wclLanguage}
-          annotations={annotations()}
-          height="calc(100vh - 240px)"
-        />
-        <Show when={anyVmRunning()}>
-          <Alert tone="warning">
-            Some VMs are running — stop the lab before reloading to apply config changes.
-          </Alert>
-        </Show>
-        <Show when={issues().length}>
-          <Alert tone="danger" title={`${issues().length} validation issue(s)`}>
-            <For each={issues()}>
-              {(i) => (
-                <div class="cfg-issue">
-                  <span class="cfg-issue-line">{i.line != null ? `line ${i.line}` : ""}</span>
-                  <span>{i.message}</span>
-                </div>
-              )}
-            </For>
-          </Alert>
-        </Show>
+          </div>
+        </div>
+        <div class="stack">
+          <CodeEditor
+            value={text()}
+            onChange={setText}
+            readOnly={readOnly()}
+            language={wclLanguage}
+            annotations={annotations()}
+            height="min(66vh, 720px)"
+          />
+          <Show when={anyVmRunning()}>
+            <Alert tone="warning">
+              Config is read-only while any VM or container is up. Stop all machines to edit it.
+            </Alert>
+          </Show>
+          <Show when={issues().length}>
+            <Alert tone="danger" title={`${issues().length} validation issue(s)`}>
+              <For each={issues()}>
+                {(i) => (
+                  <div class="cfg-issue">
+                    <span class="cfg-issue-line">{i.line != null ? `line ${i.line}` : ""}</span>
+                    <span>{i.message}</span>
+                  </div>
+                )}
+              </For>
+            </Alert>
+          </Show>
+        </div>
       </div>
     </Show>
   );

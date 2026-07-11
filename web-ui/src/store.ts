@@ -253,6 +253,18 @@ export function anyVmRunning(): boolean {
   );
 }
 
+/** Runtime configuration is mutable only once a machine is fully stopped. */
+export function vmIsUp(name: string): boolean {
+  const vm = state.status?.vms.find((v) => v.name === name);
+  return vm !== undefined && vm.state !== "stopped";
+}
+
+/** Containers follow the same conservative lifecycle rule as VMs. */
+export function containerIsUp(name: string): boolean {
+  const container = state.status?.containers.find((c) => c.name === name);
+  return container !== undefined && container.state !== "stopped";
+}
+
 /** Restart the lab daemon so it re-reads vmlab.wcl, then refresh the view. */
 export async function reloadLab(): Promise<void> {
   const lab = state.currentLab;

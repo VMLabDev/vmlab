@@ -176,6 +176,21 @@
   pointer-events: none;
 }
 .topo-lab-name { fill: var(--fg-0); font-size: 12px; font-weight: 600; pointer-events: none; }
+.topo-lab-edit { cursor: pointer; color: var(--fg-2); }
+.topo-lab-edit rect { fill: var(--bg-1); stroke: var(--border-subtle); cursor: pointer; }
+.topo-lab-edit text { fill: var(--fg-1); font-size: 9px; font-weight: 600; pointer-events: none; }
+.topo-lab-edit:hover rect { stroke: var(--accent); }
+.topo-lab-edit:hover { color: var(--accent); }
+
+/* The source editor needs more room than confirmation/form modals. */
+.fmodal-panel:has(.config-modal) { width: min(1100px, calc(100vw - 32px)); }
+.config-modal { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
+.config-modal-head { display: flex; align-items: center; gap: var(--sp-3); }
+.config-modal-path {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--fg-3); font-family: var(--font-mono); font-size: var(--fs-xs);
+}
+.config-modal-actions { display: flex; align-items: center; gap: var(--sp-2); }
 
 /* VM dressing: guest-OS icon, hardware badge, power LED, console button */
 .topo-os { pointer-events: none; color: var(--fg-1); }
@@ -240,11 +255,14 @@
 .topo-port.target { fill: var(--bg-1); stroke: var(--accent); stroke-width: 1.5; }
 .topo-port.loose { fill: var(--bg-1); stroke: var(--fg-3); stroke-width: 1.5; }
 .topo-port.loose:hover { stroke: var(--accent); }
+.topo-port.locked { cursor: not-allowed; opacity: 0.55; }
 .topo-socket {
   fill: var(--bg-1); stroke: var(--border); stroke-width: 1; cursor: crosshair;
 }
 .topo-socket:hover { stroke: var(--accent); }
 .topo-socket.lit { fill: var(--accent); stroke: var(--accent); cursor: grab; }
+.topo-socket.locked,
+.topo-linkport.locked { cursor: not-allowed; opacity: 0.55; }
 .topo-linkport {
   fill: var(--bg-1); stroke: var(--fg-2); stroke-width: 1.25; cursor: crosshair;
 }
@@ -258,6 +276,7 @@
   stroke: transparent; stroke-width: 10; fill: none; cursor: grab;
   pointer-events: stroke; /* transparent strokes aren't hit-tested otherwise */
 }
+.topo-link.locked .topo-link-hit { cursor: not-allowed; }
 .topo-link:hover .topo-link-line { stroke: var(--accent); }
 
 /* inspector */
@@ -273,6 +292,18 @@
 }
 .inspector-name { font-weight: 600; }
 .inspector-note { color: var(--fg-3); font-size: var(--fs-sm); }
+.inspector-fields {
+  min-width: 0; margin: 0; padding: 0; border: 0;
+  display: flex; flex-direction: column; gap: var(--sp-4);
+}
+.inspector-fields:disabled { opacity: 0.72; }
+.inspector-lock {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid color-mix(in srgb, var(--warning-fg) 35%, var(--border));
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--warning-fg) 8%, var(--bg-1));
+  color: var(--warning-fg); font-size: var(--fs-sm); font-weight: 600;
+}
 .block-form { display: flex; flex-direction: column; gap: var(--sp-3); }
 .field-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: var(--sp-2); }
 .field-row-label { font-size: var(--fs-sm); color: var(--fg-1); cursor: help; }

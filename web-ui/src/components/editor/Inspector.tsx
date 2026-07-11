@@ -32,6 +32,7 @@ import {
   setEditor,
   storeTemplateFor,
 } from "../../editor/store";
+import { anyVmRunning, containerIsUp, vmIsUp } from "../../store";
 import { confirmDialog } from "../dialogs";
 import BlockForm from "./BlockForm";
 import BlockList from "./BlockList";
@@ -50,25 +51,49 @@ const mutate = (fn: (d: LabModel) => void) =>
 
 export default function Inspector() {
   const sel = () => editor.selection;
+  const readOnly = () => {
+    const selection = sel();
+    if (selection.kind === "vm") {
+      const name = editor.draft?.vms[selection.index]?.name;
+      return name ? vmIsUp(name) : false;
+    }
+    if (selection.kind === "container") {
+      const name = editor.draft?.containers[selection.index]?.name;
+      return name ? containerIsUp(name) : false;
+    }
+    return selection.kind === "segment" && anyVmRunning();
+  };
+  const readOnlyMessage = () =>
+    sel().kind === "segment"
+      ? "Networking is read-only while any machine is up."
+      : "Properties are read-only while this machine is up.";
+
   return (
     <div class="inspector">
-      <Show when={sel().kind === "lab"}>
-        <LabInspector />
+      <Show when={readOnly()}>
+        <div class="inspector-lock" role="status">
+          {readOnlyMessage()}
+        </div>
       </Show>
-      <Show when={sel().kind === "nat"}>
-        <NatInspector />
-      </Show>
-      <Show when={sel().kind === "vm" && editor.draft?.vms[(sel() as any).index]}>
-        <VmInspector index={(sel() as { index: number }).index} />
-      </Show>
-      <Show
-        when={sel().kind === "container" && editor.draft?.containers[(sel() as any).index]}
-      >
-        <ContainerInspector index={(sel() as { index: number }).index} />
-      </Show>
-      <Show when={sel().kind === "segment" && editor.draft?.segments[(sel() as any).index]}>
-        <SegmentInspector index={(sel() as { index: number }).index} />
-      </Show>
+      <fieldset class="inspector-fields" disabled={readOnly()}>
+        <Show when={sel().kind === "lab"}>
+          <LabInspector />
+        </Show>
+        <Show when={sel().kind === "nat"}>
+          <NatInspector />
+        </Show>
+        <Show when={sel().kind === "vm" && editor.draft?.vms[(sel() as any).index]}>
+          <VmInspector index={(sel() as { index: number }).index} />
+        </Show>
+        <Show
+          when={sel().kind === "container" && editor.draft?.containers[(sel() as any).index]}
+        >
+          <ContainerInspector index={(sel() as { index: number }).index} />
+        </Show>
+        <Show when={sel().kind === "segment" && editor.draft?.segments[(sel() as any).index]}>
+          <SegmentInspector index={(sel() as { index: number }).index} />
+        </Show>
+      </fieldset>
     </div>
   );
 }

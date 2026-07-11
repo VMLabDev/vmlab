@@ -20,6 +20,7 @@ import {
   Container,
   Expand,
   FlaskConical,
+  FilePenLine,
   LayoutGrid,
   Monitor,
   Play,
@@ -63,6 +64,8 @@ import {
 } from "../../editor/store";
 import { formatMemory } from "../../editor/bytesize";
 import {
+  anyVmRunning,
+  containerIsUp,
   containerLook,
   containerRestart,
   containerStart,
@@ -70,6 +73,7 @@ import {
   look,
   showVm,
   state,
+  vmIsUp,
   vmRestart,
   vmStart,
   vmStop,
@@ -118,7 +122,7 @@ interface LinkDrag {
   y: number;
 }
 
-export default function TopologyCanvas() {
+export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   let svg: SVGSVGElement | undefined;
   const model = () => editor.draft!;
   const lab = () => editor.lab!;
@@ -176,8 +180,8 @@ export default function TopologyCanvas() {
   const labPos = (): NodePos => layout().lab ?? { x: 60, y: 30 };
 
   /** The lab block's size (name-dependent width). */
-  const LAB_H = 40;
-  const labW = () => Math.max(120, 58 + model().name.length * 8);
+  const LAB_H = 64;
+  const labW = () => Math.max(220, 58 + model().name.length * 8);
 
   // --- port assignment --------------------------------------------------------
   // Each bar (segment or the NAT bus) owns a bank of sockets; every attached
@@ -336,6 +340,10 @@ export default function TopologyCanvas() {
   /** Grab a NIC's port dot on its machine: re-home (or unplug) that NIC. */
   function dotDown(e: PointerEvent, kind: MachineKind, index: number, nicIndex: number) {
     e.stopPropagation();
+    if (anyVmRunning()) {
+      select({ kind, index });
+      return;
+    }
     const w = world(e);
     setConnDrag({ kind, index, nicIndex, moved: false, x: w.x, y: w.y });
   }
@@ -343,6 +351,7 @@ export default function TopologyCanvas() {
   /** Grab a bar socket: lit = re-home its NIC, free = cable out to a VM. */
   function socketDown(e: PointerEvent, barKey: string, socketIdx: number, ax: number, ay: number) {
     e.stopPropagation();
+    if (anyVmRunning()) return;
     const w = world(e);
     const occupant = ports().bySocket.get(`${barKey}:${socketIdx}`);
     if (occupant) {
@@ -355,6 +364,7 @@ export default function TopologyCanvas() {
   /** Grab a bar's side port: cable a new interconnect out. */
   function linkDown(e: PointerEvent, from: string) {
     e.stopPropagation();
+    if (anyVmRunning()) return;
     const w = world(e);
     setLinkDrag({ from, existing: null, moved: false, x: w.x, y: w.y });
   }
@@ -362,6 +372,7 @@ export default function TopologyCanvas() {
   /** Grab an existing interconnect cable to re-home or remove it. */
   function linkGrab(e: PointerEvent, link: { from: string; kind: "route" | "wan"; to: string }) {
     e.stopPropagation();
+    if (anyVmRunning()) return;
     const w = world(e);
     setLinkDrag({
       from: link.from,
@@ -574,6 +585,7 @@ export default function TopologyCanvas() {
     const sel = editor.selection;
     if (sel.kind === "vm") {
       const vm = model().vms[sel.index];
+      if (vm && vmIsUp(vm.name)) return;
       if (
         vm &&
         (await confirmDialog({ title: `Delete VM "${vm.name}"?`, danger: true }))
@@ -582,6 +594,7 @@ export default function TopologyCanvas() {
       }
     } else if (sel.kind === "container") {
       const c = model().containers[sel.index];
+      if (c && containerIsUp(c.name)) return;
       if (
         c &&
         (await confirmDialog({ title: `Delete container "${c.name}"?`, danger: true }))
@@ -590,6 +603,7 @@ export default function TopologyCanvas() {
       }
     } else if (sel.kind === "segment") {
       const seg = model().segments[sel.index];
+      if (anyVmRunning()) return;
       if (
         seg &&
         (await confirmDialog({ title: `Delete segment "${seg.name}"?`, danger: true }))
@@ -720,7 +734,9 @@ export default function TopologyCanvas() {
           const down = (e: PointerEvent, faceY: number) =>
             socketDown(e, props.barKey, i, cx(), faceY);
           const hint = () =>
-            cableAbove() !== null
+            anyVmRunning()
+              ? "Networking is read-only while a machine is up"
+              : cableAbove() !== null
               ? "Drag to another bar to move (empty space unplugs)"
               : "Drag onto a VM to connect";
           return (
@@ -732,7 +748,7 @@ export default function TopologyCanvas() {
                 height={PORT_SIZE}
                 rx="1.5"
                 class="topo-socket"
-                classList={{ lit: cableAbove() === true }}
+                classList={{ lit: cableAbove() === true, locked: anyVmRunning() }}
                 onPointerDown={(e: PointerEvent) => down(e, props.pos.y)}
               >
                 <title>{hint()}</title>
@@ -744,7 +760,7 @@ export default function TopologyCanvas() {
                 height={PORT_SIZE}
                 rx="1.5"
                 class="topo-socket"
-                classList={{ lit: cableAbove() === false }}
+                classList={{ lit: cableAbove() === false, locked: anyVmRunning() }}
                 onPointerDown={(e: PointerEvent) => down(e, props.pos.y + SEG_H)}
               >
                 <title>{hint()}</title>
@@ -771,8 +787,10 @@ export default function TopologyCanvas() {
           (l.to === props.barKey && ends.bSide === side)
         );
       });
-    const hint =
-      "Drag onto another switch to route to it, or onto the NAT cloud for internet egress";
+    const hint = () =>
+      anyVmRunning()
+        ? "Networking is read-only while a machine is up"
+        : "Drag onto another switch to route to it, or onto the NAT cloud for internet egress";
     return (
       <>
         <rect
@@ -782,10 +800,10 @@ export default function TopologyCanvas() {
           height={PORT_SIZE}
           rx="1.5"
           class="topo-linkport"
-          classList={{ lit: sideLit("left") }}
+          classList={{ lit: sideLit("left"), locked: anyVmRunning() }}
           onPointerDown={down}
         >
-          <title>{hint}</title>
+          <title>{hint()}</title>
         </rect>
         <rect
           x={pos().x + w() - PORT_SIZE / 2}
@@ -794,10 +812,10 @@ export default function TopologyCanvas() {
           height={PORT_SIZE}
           rx="1.5"
           class="topo-linkport"
-          classList={{ lit: sideLit("right") }}
+          classList={{ lit: sideLit("right"), locked: anyVmRunning() }}
           onPointerDown={down}
         >
-          <title>{hint}</title>
+          <title>{hint()}</title>
         </rect>
       </>
     );
@@ -924,7 +942,13 @@ export default function TopologyCanvas() {
         <Button size="sm" icon={Container} onClick={() => addContainer()}>
           Add container
         </Button>
-        <Button size="sm" icon={Waypoints} onClick={() => addSegment()}>
+        <Button
+          size="sm"
+          icon={Waypoints}
+          onClick={() => addSegment()}
+          disabled={anyVmRunning()}
+          title={anyVmRunning() ? "Networking is read-only while a machine is up" : undefined}
+        >
           Add segment
         </Button>
         <Button size="sm" variant="ghost" icon={LayoutGrid} onClick={arrange} title="Auto-arrange">
@@ -1008,12 +1032,14 @@ export default function TopologyCanvas() {
                 <Show when={!grabbed()}>
                   <g
                     class="topo-link"
-                    classList={{ live: link.kind === "wan" }}
+                    classList={{ live: link.kind === "wan", locked: anyVmRunning() }}
                     onPointerDown={(e: PointerEvent) => linkGrab(e, link)}
                   >
                     <path d={linkPath(link.from, link.to, li())} class="topo-link-hit">
                       <title>
-                        {link.kind === "wan"
+                        {anyVmRunning()
+                          ? "Networking is read-only while a machine is up"
+                          : link.kind === "wan"
                           ? `${link.from} ⇄ WAN — drag off to disconnect`
                           : `${link.from} routes to ${link.to} — drag off to disconnect`}
                       </title>
@@ -1088,6 +1114,22 @@ export default function TopologyCanvas() {
             <text class="topo-lab-name" x={labPos().x + 34} y={labPos().y + 31}>
               {model().name}
             </text>
+            <g
+              class="topo-lab-edit"
+              transform={`translate(${labPos().x + 10} ${labPos().y + 41})`}
+              onPointerDown={(e: PointerEvent) => e.stopPropagation()}
+              onClick={(e: MouseEvent) => {
+                e.stopPropagation();
+                props.onEditConfig();
+              }}
+            >
+              <rect width="118" height="17" rx="4" />
+              <g transform="translate(5 3)">
+                <FilePenLine size={11} />
+              </g>
+              <text x="21" y="12">Edit vmlab.wcl</text>
+              <title>Open vmlab.wcl in the config editor</title>
+            </g>
             <title>Lab-wide properties: provisions, event handlers, DNS</title>
           </g>
 
@@ -1181,13 +1223,15 @@ export default function TopologyCanvas() {
                           height={PORT_SIZE + 2}
                           rx="2"
                           class="topo-socket"
-                          classList={{ lit: wanSideUsed()[side] }}
+                          classList={{ lit: wanSideUsed()[side], locked: anyVmRunning() }}
                           onPointerDown={(e: PointerEvent) =>
                             socketDown(e, NAT_KEY, 0, pt().x, pt().y)
                           }
                         >
                           <title>
-                            Drag onto a VM for a NAT NIC, or onto a switch for segment egress
+                            {anyVmRunning()
+                              ? "Networking is read-only while a machine is up"
+                              : "Drag onto a VM for a NAT NIC, or onto a switch for segment egress"}
                           </title>
                         </rect>
                       );
@@ -1221,7 +1265,7 @@ export default function TopologyCanvas() {
               return (
                 <g
                   class="topo-vm"
-                  classList={{ selected: selectedVm() === vm.name }}
+                  classList={{ selected: selectedVm() === vm.name, locked: vmIsUp(vm.name) }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "vm", vm.name)}
                 >
                   <rect x={p().x} y={p().y} width={VM_W} height={VM_H} rx="10" />
@@ -1300,11 +1344,14 @@ export default function TopologyCanvas() {
                         classList={{
                           target: socketDrag() !== null,
                           loose: !nic().segment && !nic().nat,
+                          locked: anyVmRunning(),
                         }}
                         onPointerDown={(e: PointerEvent) => dotDown(e, "vm", vi(), i)}
                       >
                         <title>
-                          {!nic().segment && !nic().nat
+                          {anyVmRunning()
+                            ? "Networking is read-only while a machine is up"
+                            : !nic().segment && !nic().nat
                             ? "Unplugged NIC — drag onto a switch or the WAN to connect"
                             : "Drag to another bar to move (empty space unplugs)"}
                         </title>
@@ -1332,7 +1379,7 @@ export default function TopologyCanvas() {
               return (
                 <g
                   class="topo-vm topo-ctr"
-                  classList={{ selected: selectedCtr() === ctr.name }}
+                  classList={{ selected: selectedCtr() === ctr.name, locked: containerIsUp(ctr.name) }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "container", ctr.name)}
                 >
                   <rect x={p().x} y={p().y} width={VM_W} height={VM_H} rx="10" />
@@ -1401,11 +1448,14 @@ export default function TopologyCanvas() {
                         classList={{
                           target: socketDrag() !== null,
                           loose: !nic().segment && !nic().nat,
+                          locked: anyVmRunning(),
                         }}
                         onPointerDown={(e: PointerEvent) => dotDown(e, "container", ci(), i)}
                       >
                         <title>
-                          {!nic().segment && !nic().nat
+                          {anyVmRunning()
+                            ? "Networking is read-only while a machine is up"
+                            : !nic().segment && !nic().nat
                             ? "Unplugged NIC — drag onto a switch or the WAN to connect"
                             : "Drag to another bar to move (empty space unplugs)"}
                         </title>
