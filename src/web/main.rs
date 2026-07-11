@@ -203,6 +203,8 @@ async fn main() -> ExitCode {
             // Host capacity + server-side file picker for the visual editor.
             .route("/api/host", web::get().to(api::host_info))
             .route("/api/host/fs", web::get().to(api::host_fs))
+            // The daemon's network fast-path tier (Topbar badge).
+            .route("/api/fastpath", web::get().to(api::fastpath))
             // VM sub-routes (literal before the `{action}` catch-all).
             .route(
                 "/api/labs/{lab}/vms/{vm}/sendkeys",

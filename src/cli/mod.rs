@@ -129,6 +129,8 @@ pub enum Command {
         #[arg(short = 'o', long = "output", value_enum, default_value_t = LogFormat::Pretty)]
         output: LogFormat,
     },
+    /// Show which network fast-path tier is active (and why others are not)
+    Fastpath,
     /// Supervisor control (normally automatic)
     #[command(hide = true)]
     Daemon {
@@ -362,6 +364,7 @@ pub fn run() -> ExitCode {
             lines,
             output,
         } => lab::cmd_logs(target, follow, lines, output),
+        Command::Fastpath => daemon::cmd_fastpath(),
         Command::Daemon { cmd } => daemon::cmd_daemon(cmd),
         Command::Supervisord => {
             init_daemon_tracing();

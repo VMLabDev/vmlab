@@ -26,7 +26,11 @@ path = "src/web/main.rs"
 required-features = ["web"]
 
 [features]
-default = []
+default = ["ebpf"]
+# The eBPF network fast path (PRD §9.1's substitutable backend): compiled in
+# by default; an empirical probe at daemon startup decides per-host whether a
+# kernel tier is actually used, falling back to the userspace fabric.
+ebpf = []
 # Pulls in the HTTP stack for the `vmlab-web` binary. Kept optional so a plain
 # CLI build stays lean.
 web = [

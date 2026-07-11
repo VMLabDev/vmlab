@@ -6,7 +6,15 @@ import { createStore } from "solid-js/store";
 import { toast } from "@forge/ui";
 import type { StatusTone, Tone } from "@forge/ui";
 import * as api from "./api";
-import type { Container, LabEntry, LabStatus, TemplateInfo, Vm, DaemonEvent } from "./api";
+import type {
+  Container,
+  FastpathInfo,
+  LabEntry,
+  LabStatus,
+  TemplateInfo,
+  Vm,
+  DaemonEvent,
+} from "./api";
 import { playDestroyRecreate } from "./fx";
 
 export type ViewKind = "lab" | "vm" | "container" | "templates";
@@ -53,6 +61,7 @@ interface State {
   pulls: Record<string, Pull>;
   templates: TemplateInfo[];
   templateOps: Record<string, TemplateOp>;
+  fastpath: FastpathInfo | null;
 }
 
 const [state, setState] = createStore<State>({
@@ -69,6 +78,7 @@ const [state, setState] = createStore<State>({
   pulls: {},
   templates: [],
   templateOps: {},
+  fastpath: null,
 });
 
 export { state };
@@ -120,12 +130,24 @@ export async function doLogout() {
     pulls: {},
     templates: [],
     templateOps: {},
+    fastpath: null,
   });
 }
 
 async function afterLogin() {
   await loadLabs();
   connectEvents();
+  loadFastpath();
+}
+
+/** The daemon's network fast-path tier for the Topbar badge; a server
+ *  without the endpoint just leaves the badge hidden. */
+async function loadFastpath() {
+  try {
+    setState({ fastpath: await api.fastpathInfo() });
+  } catch {
+    setState({ fastpath: null });
+  }
 }
 
 // --- data -----------------------------------------------------------------

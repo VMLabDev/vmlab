@@ -5,6 +5,12 @@ import { Check, CircleHelp, LogOut, Moon, Plus } from "lucide-solid";
 import { doLogout, selectLab, showLab, state } from "../store";
 import { openNewLabModal } from "./NewLabModal";
 
+function fastpathHint(fp: NonNullable<typeof state.fastpath>): string {
+  const skipped = Object.entries(fp.reasons).map(([tier, why]) => `${tier}: ${why}`);
+  const head = `network fast path: ${fp.tier} (mode ${fp.mode})`;
+  return skipped.length ? `${head}\n${skipped.join("\n")}` : head;
+}
+
 function toggleTheme() {
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   const current = document.documentElement.dataset.theme ?? (dark ? "dark" : "light");
@@ -47,6 +53,17 @@ export default function Topbar() {
         ]}
       />
       <div style={{ flex: 1 }} />
+      {/* Network fast-path tier (kernel acceleration vs plain userspace
+          fabric); hover shows why the faster tiers were skipped. */}
+      <Show when={state.fastpath} keyed>
+        {(fp) => (
+          <span title={fastpathHint(fp)}>
+            <Badge tone={fp.tier === "userspace" ? "neutral" : "success"} dot>
+              {`net ${fp.tier}`}
+            </Badge>
+          </span>
+        )}
+      </Show>
       <Badge tone={state.connected ? "success" : "neutral"} dot>
         {state.connected ? "connected" : "offline"}
       </Badge>

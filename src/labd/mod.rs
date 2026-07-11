@@ -43,6 +43,11 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     let (events_tx, _) = tokio::sync::broadcast::channel(1024);
     let event_log = Arc::new(EventLog::new(&lab, events_tx.clone())?);
 
+    // Select the network fast-path tier (PRD §9.1) before the runtime builds
+    // any switches; the host config is reused for the disk watchdog below.
+    let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
+    crate::net::fastpath::init(host_cfg.fastpath);
+
     let profiles = crate::profiles::ProfileSet::load_default()?;
     let runtime = LabRuntime::build(config, event_log, &profiles).await?;
 
@@ -68,7 +73,6 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
 
     // Disk-space watchdog on the lab-local filesystem — linked clones grow
     // (PRD §8.1); matters even more on WSL2's growing VHDX (§13).
-    let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
     let wd_events = runtime.events.clone();
     let wd_path = runtime.lab_local.clone();
     let watchdog = crate::config::host::spawn_disk_watchdog(

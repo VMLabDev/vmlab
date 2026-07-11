@@ -43,6 +43,9 @@ async fn run_async() -> Result<()> {
     crate::paths::ensure_dir(&crate::paths::state_dir())?;
 
     let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
+    // Select the network fast-path tier (PRD §9.1) before any switch exists —
+    // the global segments this daemon hosts pick it up from here.
+    crate::net::fastpath::init(host_cfg.fastpath);
     // One aggregate event channel, created before the socket binds so the
     // global-segment trunks can emit through it from day one.
     let (events_tx, _) = tokio::sync::broadcast::channel::<Event>(1024);
@@ -371,6 +374,9 @@ impl Handler for SupervisorHandler {
         match cmd {
             "ping" => Ok(json!("pong")),
             "version" => Ok(json!(env!("CARGO_PKG_VERSION"))),
+            // Which network fast-path tier this daemon selected (PRD §9.1),
+            // plus why the skipped kernel tiers were unavailable.
+            "fastpath" => Ok(crate::net::fastpath::status_json()),
             "status" => {
                 let reg = sup.registry.lock().await;
                 Ok(serde_json::to_value(reg.labs()).map_err(|e| e.to_string())?)

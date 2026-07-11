@@ -346,6 +346,17 @@ export interface HostInfo {
 
 export const hostInfo = (): Promise<HostInfo> => req("/api/host");
 
+/** The daemon's network fast-path tier (GET /api/fastpath): which
+ *  acceleration tier the supervisor probed into use, and why the skipped
+ *  kernel tiers were unavailable (keyed by tier name). */
+export interface FastpathInfo {
+  tier: "afxdp" | "sockmap" | "userspace";
+  mode: string;
+  reasons: Record<string, string>;
+}
+
+export const fastpathInfo = (): Promise<FastpathInfo> => req("/api/fastpath");
+
 /** One entry in a server-side directory listing (GET /api/host/fs). */
 export interface FsEntry {
   name: string;

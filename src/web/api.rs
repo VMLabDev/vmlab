@@ -630,6 +630,16 @@ pub async fn host_info() -> HttpResponse {
     ok(json!({"cpus": cpus, "memory": memory}))
 }
 
+/// `GET /api/fastpath` — the network fast-path tier the supervisor selected
+/// (PRD §9.1) plus why the skipped kernel tiers were unavailable; drives the
+/// Topbar badge.
+pub async fn fastpath(state: web::Data<AppState>) -> HttpResponse {
+    match state.supervisor_call("fastpath", Value::Null).await {
+        Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
 /// Total RAM in bytes from `/proc/meminfo` (`MemTotal:  16384000 kB`).
 fn parse_mem_total(meminfo: &str) -> Option<u64> {
     let rest = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;

@@ -23,6 +23,8 @@ type HostConfig {
   trunk_port: i64?
   @doc("VNC viewer command; `{}` is replaced by the target")
   viewer: utf8?
+  @doc("Network fast path: `auto` (probe; default), `off`, `sockmap`, or `afxdp`")
+  fastpath: utf8?
   @doc("OCI layer chunk size for template push; default `512MiB`")
   oci_chunk_size: std.ByteSize?
 }

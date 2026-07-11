@@ -20,6 +20,8 @@ pub struct HostConfig {
     pub trunk_port: u16,
     pub viewer: Option<String>,
     pub oci_chunk_size: u64,
+    /// Network fast-path tier selection (§9.1 substitutable backend).
+    pub fastpath: crate::net::fastpath::FastpathMode,
 }
 
 impl Default for HostConfig {
@@ -33,6 +35,7 @@ impl Default for HostConfig {
             trunk_port: 13947,
             viewer: None,
             oci_chunk_size: crate::oci::chunking::DEFAULT_CHUNK_SIZE,
+            fastpath: crate::net::fastpath::FastpathMode::Auto,
         }
     }
 }
@@ -122,6 +125,11 @@ impl HostConfig {
             }
         }
         cfg.viewer = get_str("viewer")?;
+        if let Some(s) = get_str("fastpath")? {
+            cfg.fastpath = crate::net::fastpath::FastpathMode::parse(&s).ok_or_else(|| {
+                anyhow!("host config: fastpath must be auto|off|sockmap|afxdp, got `{s}`")
+            })?;
+        }
         if let Some(f) = block.field("oci_chunk_size") {
             match f.value() {
                 Ok(Value::I64(n)) if *n >= 0 => cfg.oci_chunk_size = *n as u64,
@@ -203,6 +211,7 @@ host {
   psk              = "sekrit"
   trunk_port       = 13948
   oci_chunk_size   = 128MiB
+  fastpath         = "sockmap"
 }
 "#,
             "<test>",
@@ -214,6 +223,7 @@ host {
         assert_eq!(cfg.psk.as_deref(), Some("sekrit"));
         assert_eq!(cfg.trunk_port, 13948);
         assert_eq!(cfg.oci_chunk_size, 128 << 20);
+        assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
     }
 
     #[test]
@@ -231,6 +241,13 @@ host {
         assert!(
             HostConfig::parse(
                 "import <vmlab-host.wcl>\nhost { trunk_port = 70000 }\n",
+                "<t>"
+            )
+            .is_err()
+        );
+        assert!(
+            HostConfig::parse(
+                "import <vmlab-host.wcl>\nhost { fastpath = \"fast\" }\n",
                 "<t>"
             )
             .is_err()

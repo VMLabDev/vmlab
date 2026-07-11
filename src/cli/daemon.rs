@@ -84,6 +84,32 @@ pub async fn try_lab_daemon(name: &str) -> Option<Client> {
     Some(client)
 }
 
+/// `vmlab fastpath` — which network fast-path tier the supervisor selected
+/// (PRD §9.1's substitutable backend) and why faster tiers were skipped.
+/// Auto-starts the supervisor like every other verb: the answer is the
+/// probe result of the daemon that will carry the traffic.
+pub fn cmd_fastpath() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = ensure_supervisor().await?;
+        let v = client
+            .call("fastpath", Value::Null)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!(
+            "network fast path: {} (mode {})",
+            v["tier"].as_str().unwrap_or("?"),
+            v["mode"].as_str().unwrap_or("?"),
+        );
+        if let Some(reasons) = v["reasons"].as_object() {
+            for (tier, reason) in reasons {
+                println!("  {tier} unavailable: {}", reason.as_str().unwrap_or("?"));
+            }
+        }
+        Ok(())
+    })
+}
+
 #[derive(clap::Subcommand)]
 pub enum DaemonCmd {
     /// Start the supervisor (normally automatic)
@@ -134,6 +160,9 @@ pub fn cmd_daemon(cmd: DaemonCmd) -> Result<()> {
                             version.as_str().unwrap_or("?"),
                             sock.display()
                         );
+                        if let Ok(fp) = client.call("fastpath", Value::Null).await {
+                            println!("network fast path: {}", fp["tier"].as_str().unwrap_or("?"));
+                        }
                         let entries = labs.as_array().cloned().unwrap_or_default();
                         if entries.is_empty() {
                             println!("no lab daemons");
