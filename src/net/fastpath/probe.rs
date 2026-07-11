@@ -58,10 +58,30 @@ fn sockmap_impl() -> Result<()> {
 
     // 1. Known unicast A→B must splice in-kernel: written into QEMU A's
     //    side, readable on QEMU B's side (validates *egress* redirect on
-    //    af_unix, the historically shakiest piece).
+    //    af_unix, the historically shakiest piece). On failure, work out
+    //    where the frame went — it pinpoints whether the verdict passed it
+    //    (program/map problem) or the kernel accepted the redirect and then
+    //    dropped it (af_unix egress redirect unsupported on this kernel).
     let spliced = eth_build(MAC_B, MAC_A, ETHERTYPE_IPV4, b"fastpath probe: splice");
     send_framed(&qemu_a, &spliced)?;
-    let got = recv_framed(&qemu_b).context("kernel splice of known unicast (egress redirect)")?;
+    let got = match recv_framed(&qemu_b) {
+        Ok(got) => got,
+        Err(e) => {
+            let (frames, _) = engine.stats();
+            let disposition = if recv_framed(&daemon_a).is_ok() {
+                "the verdict SK_PASSed it to the daemon instead of redirecting"
+            } else if frames > 0 {
+                "the verdict redirected it but the kernel dropped it — af_unix \
+                 egress redirect appears unsupported on this kernel"
+            } else {
+                "it vanished before the redirect counter — likely dropped by \
+                 the verdict/sockmap layer"
+            };
+            return Err(e.context(format!(
+                "kernel splice of known unicast (egress redirect); {disposition}"
+            )));
+        }
+    };
     if got != spliced {
         bail!("kernel splice corrupted the frame");
     }
