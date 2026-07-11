@@ -96,8 +96,8 @@ fastpath-test:
 	set -euo pipefail
 	bin=$(cargo test --lib --no-run 2>&1 | sed -n 's|.*Executable unittests src/lib.rs (\(.*\))$|\1|p')
 	[ -n "$bin" ] || { echo "could not locate the test binary"; exit 1; }
-	sudo VMLAB_FASTPATH=sockmap "$bin" fastpath_sockmap --ignored --test-threads=1
-	sudo VMLAB_FASTPATH=afxdp "$bin" fastpath_afxdp --ignored --test-threads=1
+	sudo VMLAB_FASTPATH=sockmap "$bin" fastpath_sockmap --ignored --test-threads=1 --nocapture
+	sudo VMLAB_FASTPATH=afxdp "$bin" fastpath_afxdp --ignored --test-threads=1 --nocapture
 
 # A/B throughput smoke: the same frame pump with the fast path off vs on
 [group('test')]

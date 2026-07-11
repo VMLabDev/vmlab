@@ -33,9 +33,10 @@ fn tier_is(want: FastpathTier) -> bool {
     let got = init(FastpathMode::Auto);
     if got != want {
         eprintln!(
-            "skipping: fast-path tier is {} (want {}) — run via `just fastpath-test`",
+            "SKIPPING: fast-path tier is {} (want {}) — probe status: {}",
             got.as_str(),
-            want.as_str()
+            want.as_str(),
+            super::status_json(),
         );
         return false;
     }
@@ -399,6 +400,8 @@ async fn fastpath_bench_ab() {
     const WINDOW: Duration = Duration::from_secs(5);
     const SIZE: usize = 1400;
     let tier = init(FastpathMode::Auto);
+    // Make a degraded run diagnosable: the whole point is comparing tiers.
+    eprintln!("probe status: {}", super::status_json());
     let sw = Switch::new("fp-bench".into());
     let (mut a_read, mut a_write) = guest_port(&sw, false).await;
     let (mut b_read, mut b_write) = guest_port(&sw, false).await;
