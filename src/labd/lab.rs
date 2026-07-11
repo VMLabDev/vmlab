@@ -717,17 +717,56 @@ impl LabRuntime {
         let Ok(vm) = self.vm(vm_name) else { return };
         let os_hint = guest_os_hint(vm.template().resolved.profile.as_deref());
 
-        // virtiofs shares first (§7.5): mkdir + `mount -t virtiofs` by tag.
-        // Linux commands — `auto` only picks virtiofs on profiles that mount
-        // it natively, and those are Linux until the Windows plan lands.
+        // virtiofs shares first (§7.5). Linux: mkdir + `mount -t virtiofs`
+        // by tag. Windows: register the WinFsp launcher class for
+        // virtiofs.exe (idempotent reg adds; virtio-win ships the binary but
+        // not the class), then a per-tag launchctl instance mounts the tag
+        // at the drive letter. Needs WinFsp in the template — without it
+        // the launchctl step fails and surfaces as the usual mount warning.
         let mut steps: Vec<crate::smb::MountStep> = Vec::new();
-        for m in vm.virtiofs_mounts().await {
+        let virtiofs_mounts = vm.virtiofs_mounts().await;
+        if os_hint == crate::smb::OsHint::Windows && !virtiofs_mounts.is_empty() {
+            const CLASS: &str = r"HKLM\Software\WOW6432Node\WinFsp\Services\virtiofs";
+            for (value, kind, data) in [
+                (
+                    "Executable",
+                    "REG_SZ",
+                    r"C:\Program Files\Virtio-Win\VioFS\virtiofs.exe",
+                ),
+                ("CommandLine", "REG_SZ", "-t %1 -m %2"),
+                ("Security", "REG_SZ", "D:P(A;;RPWPLC;;;WD)"),
+                ("JobControl", "REG_DWORD", "1"),
+            ] {
+                steps.push(crate::smb::MountStep {
+                    os_hint,
+                    command: "reg".into(),
+                    args: vec![
+                        "add".into(),
+                        CLASS.into(),
+                        "/v".into(),
+                        value.into(),
+                        "/t".into(),
+                        kind.into(),
+                        "/d".into(),
+                        data.into(),
+                        "/f".into(),
+                    ],
+                });
+            }
+        }
+        for m in &virtiofs_mounts {
             if os_hint == crate::smb::OsHint::Windows {
-                tracing::warn!(
-                    "{vm_name}: virtiofs share {} on a Windows guest is not supported yet — \
-                     use transport = \"smb\"",
-                    m.tag
-                );
+                steps.push(crate::smb::MountStep {
+                    os_hint,
+                    command: r"C:\Program Files (x86)\WinFsp\bin\launchctl-x64.exe".into(),
+                    args: vec![
+                        "start".into(),
+                        "virtiofs".into(),
+                        format!("viofs-{}", m.tag),
+                        m.tag.clone(),
+                        m.guest.clone(),
+                    ],
+                });
                 continue;
             }
             steps.push(crate::smb::MountStep {
