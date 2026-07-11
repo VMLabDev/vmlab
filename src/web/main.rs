@@ -14,6 +14,7 @@ mod editor;
 mod events;
 mod logs;
 mod state;
+mod tty;
 
 use std::net::IpAddr;
 use std::process::ExitCode;
@@ -223,6 +224,10 @@ async fn main() -> ExitCode {
                 web::post().to(api::vm_action),
             )
             // Container lifecycle (mirrors the VM actions).
+            .route(
+                "/api/labs/{lab}/containers/{container}/tty",
+                web::get().to(tty::tty),
+            )
             .route(
                 "/api/labs/{lab}/containers/{container}/{action}",
                 web::post().to(api::container_action),

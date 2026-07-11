@@ -47,6 +47,17 @@ pub fn mount_early() -> Result<()> {
     do_mount("proc", "/proc", "proc", MsFlags::empty(), None)?;
     do_mount("sysfs", "/sys", "sysfs", MsFlags::empty(), None)?;
     do_mount("devtmpfs", "/dev", "devtmpfs", MsFlags::empty(), None)?;
+    // devpts in the init namespace too: the interactive-shell PTY (tty.rs)
+    // is allocated here, not inside the container root — without this,
+    // openpty fails with ENODEV.
+    ensure_dir("/dev/pts")?;
+    do_mount(
+        "devpts",
+        "/dev/pts",
+        "devpts",
+        MsFlags::empty(),
+        Some("mode=0620,ptmxmode=0666"),
+    )?;
     Ok(())
 }
 
@@ -178,6 +189,22 @@ pub fn mount_rootfs_runtime() -> Result<()> {
         Some("mode=1777"),
     )?;
     Ok(())
+}
+
+/// Best-effort: copy the initramfs' static busybox into the overlay at
+/// [`crate::tty::BUSYBOX_FALLBACK`] so the interactive shell has something
+/// to exec even in a distroless image (tiny, and it lands in the scratch
+/// upper layer, never the read-only image). Failures only cost the fallback.
+pub fn install_shell_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = format!("{ROOTFS}/.vmlab");
+    let dest = format!("{dir}/busybox");
+    let result = fs::create_dir_all(&dir)
+        .and_then(|()| fs::copy("/bin/busybox", &dest).map(|_| ()))
+        .and_then(|()| fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)));
+    if let Err(e) = result {
+        eprintln!("vmlab-cinit: warning: busybox shell fallback not installed: {e}");
+    }
 }
 
 /// Write /etc/hostname and /etc/hosts inside the rootfs and set the (shared —

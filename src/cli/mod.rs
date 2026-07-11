@@ -254,6 +254,8 @@ pub enum ContainerCmd {
     },
     /// Print a container's IP address
     Ip { container: String },
+    /// Attach an interactive shell inside the container (Ctrl-] to detach)
+    Shell { container: String },
 }
 
 /// Snapshot management (PRD §7.3).
@@ -329,6 +331,7 @@ pub fn run() -> ExitCode {
                 lines,
             } => lab::cmd_container_logs(&container, follow, lines),
             ContainerCmd::Ip { container } => lab::cmd_container_ip(&container),
+            ContainerCmd::Shell { container } => lab::cmd_container_shell(&container),
         },
         Command::Lab { cmd } => lab::cmd_lab(cmd),
         Command::Snapshot { cmd } => match cmd {

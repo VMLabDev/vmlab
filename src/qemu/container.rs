@@ -7,9 +7,10 @@
 //! `guest/cinit/src/cmdline.rs` and `guest/build-asset.sh`): direct kernel
 //! boot with `vmlab.root=`/`vmlab.scratch=` naming the first two virtio-blk
 //! devices, a read-only 9p config share tagged `vmlab.cfg`, volume shares
-//! tagged `vol0..volN`, and two virtio-serial ports —
-//! `org.qemu.guest_agent.0` (qemu-ga) and `vmlab.ctl.0` (the ndjson ctl
-//! channel, [`crate::labd::container_ctl`]).
+//! tagged `vol0..volN`, and three virtio-serial ports —
+//! `org.qemu.guest_agent.0` (qemu-ga), `vmlab.ctl.0` (the ndjson ctl
+//! channel, [`crate::labd::container_ctl`]) and `vmlab.tty.0` (the raw
+//! interactive-shell byte stream, guest/cinit/src/tty.rs).
 
 use std::path::PathBuf;
 
@@ -47,6 +48,9 @@ pub struct ContainerVmPaths {
     pub qga_sock: PathBuf,
     /// The `vmlab.ctl.0` channel socket (QEMU listens; the host connects).
     pub ctl_sock: PathBuf,
+    /// The `vmlab.tty.0` interactive-shell socket (raw PTY bytes; QEMU
+    /// listens, shell clients connect).
+    pub tty_sock: PathBuf,
     /// Serial console log — the container's stdout/stderr land here.
     pub serial_log: PathBuf,
 }
@@ -145,9 +149,9 @@ pub(crate) fn build_container_args_with_accel(
     a.push("-monitor".into());
     a.push("none".into());
 
-    // One virtio-serial bus, two ports: the guest agent and the vmlab ctl
-    // channel. QEMU owns both sockets (server=on,wait=off); the host
-    // connects as a client.
+    // One virtio-serial bus, three ports: the guest agent, the vmlab ctl
+    // channel and the interactive-shell tty. QEMU owns all three sockets
+    // (server=on,wait=off); the host connects as a client.
     arg(
         &mut a,
         "chardev",
@@ -164,6 +168,14 @@ pub(crate) fn build_container_args_with_accel(
             paths.ctl_sock.display()
         ),
     );
+    arg(
+        &mut a,
+        "chardev",
+        format!(
+            "socket,id=tty0,path={},server=on,wait=off",
+            paths.tty_sock.display()
+        ),
+    );
     arg(&mut a, "device", "virtio-serial-pci".into());
     arg(
         &mut a,
@@ -174,6 +186,11 @@ pub(crate) fn build_container_args_with_accel(
         &mut a,
         "device",
         "virtserialport,chardev=ctl0,name=vmlab.ctl.0".into(),
+    );
+    arg(
+        &mut a,
+        "device",
+        "virtserialport,chardev=tty0,name=vmlab.tty.0".into(),
     );
 
     // Rootfs (raw squashfs, read-only) then scratch (qcow2): the virtio-blk
@@ -274,6 +291,7 @@ mod tests {
             qmp_sock: "/run/l/web/qmp.sock".into(),
             qga_sock: "/run/l/web/qga.sock".into(),
             ctl_sock: "/run/l/web/ctl.sock".into(),
+            tty_sock: "/run/l/web/tty.sock".into(),
             serial_log: "/logs/l/web/console.log".into(),
         }
     }
@@ -320,6 +338,10 @@ mod tests {
             s.contains("socket,id=ctl0,path=/run/l/web/ctl.sock,server=on,wait=off"),
             "{s}"
         );
+        assert!(
+            s.contains("socket,id=tty0,path=/run/l/web/tty.sock,server=on,wait=off"),
+            "{s}"
+        );
         assert!(s.contains("-device virtio-serial-pci"), "{s}");
         assert!(
             s.contains("virtserialport,chardev=qga0,name=org.qemu.guest_agent.0"),
@@ -327,6 +349,10 @@ mod tests {
         );
         assert!(
             s.contains("virtserialport,chardev=ctl0,name=vmlab.ctl.0"),
+            "{s}"
+        );
+        assert!(
+            s.contains("virtserialport,chardev=tty0,name=vmlab.tty.0"),
             "{s}"
         );
         assert!(

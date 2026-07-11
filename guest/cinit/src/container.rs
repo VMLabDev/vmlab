@@ -18,7 +18,8 @@ use crate::mounts::ROOTFS;
 use crate::users::ResolvedUser;
 use crate::util::{Ctx, Result};
 
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub(crate) const DEFAULT_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// The container environment: the spec's env verbatim (the host pre-merges
 /// image env with lab overrides), plus a sane PATH if absent and HOME from

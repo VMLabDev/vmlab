@@ -527,6 +527,111 @@ pub fn cmd_container_ip(container_ref: &str) -> Result<()> {
     })
 }
 
+/// `vmlab container shell` — attach an interactive shell running inside the
+/// container (guest/cinit's `vmlab.tty.0` PTY, PRD §18). The local terminal
+/// goes raw for the session; `Ctrl-]` detaches, like telnet.
+pub fn cmd_container_shell(container_ref: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, container) = split_vm_ref(container_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let path = client
+            .call("container.tty_path", json!({"container": container}))
+            .await
+            .map_err(remote)?;
+        let path = std::path::PathBuf::from(path.as_str().unwrap_or_default());
+        if !path.exists() {
+            anyhow::bail!(
+                "no shell socket for \"{container}\" ({}) — is the container running?",
+                path.display()
+            );
+        }
+        let mut sock = tokio::net::UnixStream::connect(&path)
+            .await
+            .with_context(|| format!("connecting {}", path.display()))?;
+
+        // Size the guest PTY to this terminal, now and on every SIGWINCH.
+        let send_size = |client: Client, container: String| async move {
+            if let Ok(ws) = rustix::termios::tcgetwinsize(std::io::stdout()) {
+                let _ = client
+                    .call(
+                        "container.tty_resize",
+                        json!({"container": container, "cols": ws.ws_col, "rows": ws.ws_row}),
+                    )
+                    .await;
+            }
+        };
+        send_size(client.clone(), container.clone()).await;
+        {
+            let client = client.clone();
+            let container = container.clone();
+            tokio::spawn(async move {
+                let Ok(mut winch) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                else {
+                    return;
+                };
+                while winch.recv().await.is_some() {
+                    send_size(client.clone(), container.clone()).await;
+                }
+            });
+        }
+
+        println!("connected to \"{container}\" — escape character is ^]");
+
+        // Raw mode with restore-on-drop (covers errors and ^] alike).
+        struct RawGuard(rustix::termios::Termios);
+        impl Drop for RawGuard {
+            fn drop(&mut self) {
+                let _ = rustix::termios::tcsetattr(
+                    std::io::stdin(),
+                    rustix::termios::OptionalActions::Now,
+                    &self.0,
+                );
+            }
+        }
+        let saved = rustix::termios::tcgetattr(std::io::stdin()).context("not a terminal")?;
+        let mut raw = saved.clone();
+        raw.make_raw();
+        rustix::termios::tcsetattr(
+            std::io::stdin(),
+            rustix::termios::OptionalActions::Now,
+            &raw,
+        )?;
+        let _guard = RawGuard(saved);
+
+        let (mut rx, mut tx) = sock.split();
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        let mut inbuf = [0u8; 4096];
+        let mut outbuf = [0u8; 4096];
+        loop {
+            tokio::select! {
+                n = tokio::io::AsyncReadExt::read(&mut stdin, &mut inbuf) => {
+                    let n = n?;
+                    if n == 0 { break; }
+                    // Ctrl-] detaches; bytes before it still go through.
+                    if let Some(esc) = inbuf[..n].iter().position(|&b| b == 0x1d) {
+                        if esc > 0 {
+                            tokio::io::AsyncWriteExt::write_all(&mut tx, &inbuf[..esc]).await?;
+                        }
+                        break;
+                    }
+                    tokio::io::AsyncWriteExt::write_all(&mut tx, &inbuf[..n]).await?;
+                }
+                n = tokio::io::AsyncReadExt::read(&mut rx, &mut outbuf) => {
+                    let n = n?;
+                    if n == 0 { break; } // container/QEMU gone
+                    tokio::io::AsyncWriteExt::write_all(&mut stdout, &outbuf[..n]).await?;
+                    tokio::io::AsyncWriteExt::flush(&mut stdout).await?;
+                }
+            }
+        }
+        drop(_guard);
+        println!();
+        Ok(())
+    })
+}
+
 /// Make a CLI-supplied path absolute against the cwd, so the daemon (whose
 /// working directory differs) resolves it to the same file.
 fn abs_path(path: &str) -> Result<std::path::PathBuf> {

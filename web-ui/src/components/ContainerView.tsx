@@ -13,6 +13,7 @@ import {
   state,
 } from "../store";
 import LogPanel from "./LogPanel";
+import TerminalPanel from "./TerminalPanel";
 
 export default function ContainerView() {
   // Accessors so the view tracks the selected container reactively.
@@ -73,7 +74,12 @@ export default function ContainerView() {
       />
 
       <div class="vm-layout">
-        <LogPanel lab={state.currentLab!} source={ctr()!.name} />
+        <div class="ctr-main">
+          <Show when={on()}>
+            <TerminalPanel lab={state.currentLab!} container={ctr()!.name} />
+          </Show>
+          <LogPanel lab={state.currentLab!} source={ctr()!.name} />
+        </div>
         <div class="vm-side">
           <Card title="Container">
             <KV k="Image" v={ctr()!.image} />

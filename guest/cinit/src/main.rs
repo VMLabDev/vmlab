@@ -23,6 +23,7 @@ mod mounts;
 mod net;
 mod reap;
 mod sig;
+mod tty;
 mod users;
 mod util;
 
@@ -99,6 +100,7 @@ fn run() -> Result<()> {
         mounts::mount_volume(&vol.tag, &vol.target, vol.read_only)?;
     }
     mounts::mount_rootfs_runtime()?;
+    mounts::install_shell_fallback();
     mounts::write_identity(&spec.hostname)?;
 
     // -- networking ----------------------------------------------------------
@@ -129,15 +131,20 @@ fn run() -> Result<()> {
         None => Signal::SIGTERM,
     };
 
+    let reaper = Arc::new(reap::Reaper::default());
+    let exited = Arc::new(AtomicBool::new(false));
+
+    // Interactive shell sessions on the vmlab.tty.0 port (chrooted into the
+    // container rootfs, respawned across exits).
+    let tty = tty::Tty::start(&spec, &env, reaper.clone());
+
     let child = container::spawn(&spec, user.as_ref(), &env)?;
     ctl.emit(&CtlEvent::Started {
         pid: child.as_raw() as u32,
     });
 
-    let reaper = Arc::new(reap::Reaper::default());
-    let exited = Arc::new(AtomicBool::new(false));
-
-    // Host commands: Stop = graceful signal now, SIGKILL after the grace.
+    // Host commands: Stop = graceful signal now, SIGKILL after the grace;
+    // TtyResize goes to the shell session's PTY.
     {
         let exited = exited.clone();
         ctl.spawn_reader(move |cmd| match cmd {
@@ -153,6 +160,7 @@ fn run() -> Result<()> {
                     }
                 });
             }
+            CtlCommand::TtyResize { cols, rows } => tty.resize(cols, rows),
         });
     }
 

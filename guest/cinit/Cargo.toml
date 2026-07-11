@@ -27,6 +27,8 @@ nix = { version = "0.29", features = [
     "fs",
     "reboot",
     "hostname",
+    "term",
+    "ioctl",
 ] }
 
 [dev-dependencies]

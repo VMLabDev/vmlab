@@ -84,6 +84,10 @@ impl ContainerDirs {
     pub fn ctl_sock(&self) -> PathBuf {
         self.run.join("ctl.sock")
     }
+    /// The `vmlab.tty.0` interactive-shell socket (raw PTY bytes).
+    pub fn tty_sock(&self) -> PathBuf {
+        self.run.join("tty.sock")
+    }
     pub fn nic_sock(&self, i: usize) -> PathBuf {
         self.run.join(format!("nic{i}.sock"))
     }
@@ -438,6 +442,7 @@ impl ContainerInstance {
             qmp_sock: self.dirs.qmp_sock(),
             qga_sock: self.dirs.qga_sock(),
             ctl_sock: self.dirs.ctl_sock(),
+            tty_sock: self.dirs.tty_sock(),
             serial_log: self.dirs.console_log(),
         }
     }

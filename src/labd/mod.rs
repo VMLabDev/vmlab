@@ -532,6 +532,22 @@ impl Handler for LabdHandler {
                 }
                 Ok(json!(true))
             }
+            // Interactive shell (guest/cinit's `vmlab.tty.0` port): clients
+            // connect to the raw PTY socket; resize rides the ctl channel.
+            "container.tty_path" => {
+                let c = lab.container(&container_arg(&args)?).map_err(err)?;
+                Ok(json!(c.dirs.tty_sock()))
+            }
+            "container.tty_resize" => {
+                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
+                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
+                let c = lab.container(&container_arg(&args)?).map_err(err)?;
+                let ctl = c.ctl().await.map_err(err)?;
+                ctl.send(&vmlab_cinit_proto::CtlCommand::TtyResize { cols, rows })
+                    .await
+                    .map_err(err)?;
+                Ok(json!(true))
+            }
             "container.ip" => {
                 let ip = lab
                     .container(&container_arg(&args)?)

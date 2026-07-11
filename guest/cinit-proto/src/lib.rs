@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 /// Version of this contract. cinit reports it in [`CtlEvent::Boot`]; the host
 /// refuses to drive an init speaking a different major version.
-pub const PROTO_VERSION: u32 = 1;
+///
+/// v2: `tty_resize` command + the `vmlab.tty.0` interactive-shell port.
+pub const PROTO_VERSION: u32 = 2;
 
 /// A 9p volume mounted into the container root.
 ///
@@ -138,6 +140,9 @@ pub enum CtlCommand {
     /// Graceful stop: send the spec's stop signal, escalate to SIGKILL after
     /// `grace_secs`.
     Stop { grace_secs: u64 },
+    /// Resize the interactive shell's PTY (the `vmlab.tty.0` port). Applies
+    /// to the current session and is remembered for future ones.
+    TtyResize { cols: u16, rows: u16 },
 }
 
 #[cfg(test)]
@@ -201,7 +206,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
-            r#"{"event":"boot","proto_version":1}"#
+            r#"{"event":"boot","proto_version":2}"#
         );
         let ev = CtlEvent::NetUp {
             ip: "10.0.0.9".into(),
@@ -238,6 +243,13 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&cmd).unwrap(),
             r#"{"cmd":"stop","grace_secs":7}"#
+        );
+        assert_eq!(roundtrip(&cmd), cmd);
+
+        let cmd = CtlCommand::TtyResize { cols: 132, rows: 43 };
+        assert_eq!(
+            serde_json::to_string(&cmd).unwrap(),
+            r#"{"cmd":"tty_resize","cols":132,"rows":43}"#
         );
         assert_eq!(roundtrip(&cmd), cmd);
     }
