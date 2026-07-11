@@ -305,7 +305,7 @@ type DiskBlock {
   from: utf8?
 }
 
-// Host↔guest shared folder over SMB.
+// Host↔guest shared folder over virtiofs or SMB.
 @block("share")
 type Share {
   @doc("Host directory to share; must exist (required)")
@@ -316,8 +316,10 @@ type Share {
   readonly: bool?
   @doc("Enable the SMB1 dialect + auth relaxation for XP/2003-era guests")
   smb1: bool?
-  @doc("SMB share name; derived from the guest path if omitted")
+  @doc("Share name; derived from the guest path if omitted")
   name: utf8?
+  @doc("Transport: auto (default; virtiofs when host + guest support it, else SMB) | virtiofs | smb")
+  transport: utf8?
 }
 
 // ISO/floppy image built from a folder.

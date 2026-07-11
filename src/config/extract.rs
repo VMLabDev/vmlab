@@ -578,13 +578,37 @@ fn extract_share(b: &Block, issues: &mut IssueList) -> Option<Share> {
         Some((n, _)) => n,
         None => derive_share_name(&guest),
     };
+    let smb1 = get_bool(b, "smb1", issues).unwrap_or(false);
+    let transport = match get_str(b, "transport", issues) {
+        None => ShareTransport::Auto,
+        Some((s, span)) => match s.as_str() {
+            "auto" => ShareTransport::Auto,
+            "virtiofs" => ShareTransport::Virtiofs,
+            "smb" => ShareTransport::Smb,
+            other => {
+                issues.push(Issue::at(
+                    span,
+                    format!("unknown share transport `{other}` (expected auto, virtiofs, smb)"),
+                ));
+                ShareTransport::Auto
+            }
+        },
+    };
+    if smb1 && transport == ShareTransport::Virtiofs {
+        issues.push(Issue::at(
+            span_of(b),
+            "`smb1 = true` conflicts with `transport = \"virtiofs\"` — SMB1 guests have no \
+             virtiofs client",
+        ));
+    }
     Some(Share {
         span: span_of(b),
         host,
         guest,
         readonly: get_bool(b, "readonly", issues).unwrap_or(false),
-        smb1: get_bool(b, "smb1", issues).unwrap_or(false),
+        smb1,
         name,
+        transport,
     })
 }
 

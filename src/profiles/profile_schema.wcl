@@ -21,4 +21,5 @@ type Profile {
   memory: std.ByteSize?  // 4GiB
   agent_channel: bool?  // virtio-serial guest agent channel (default true)
   input_transport: utf8?  // "qmp" (default) | "vnc" — scripted input path (§10.3)
+  virtiofs: bool?       // guest mounts virtiofs natively (default false) — §7.5 share transport
 }

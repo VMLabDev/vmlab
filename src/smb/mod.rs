@@ -291,6 +291,7 @@ mod tests {
             readonly,
             smb1,
             name: name.to_string(),
+            transport: crate::config::model::ShareTransport::Smb,
         }
     }
 

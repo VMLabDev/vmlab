@@ -70,6 +70,10 @@ impl VmDirs {
     pub fn nic_sock(&self, i: usize) -> PathBuf {
         self.run.join(format!("nic{i}.sock"))
     }
+    /// vhost-user socket of the i-th share's virtiofsd (§7.5).
+    pub fn vfs_sock(&self, i: usize) -> PathBuf {
+        self.run.join(format!("vfs{i}.sock"))
+    }
     pub fn primary_disk(&self) -> PathBuf {
         self.local.join("disk0.qcow2")
     }
@@ -107,6 +111,15 @@ pub struct TemplateParts {
     pub first_boot_script: Option<String>,
 }
 
+/// One share the guest mounts natively over virtiofs this run (§7.5) —
+/// the guest agent runs `mount -t virtiofs <tag> <guest>` once ready.
+#[derive(Debug, Clone)]
+pub struct VirtiofsMount {
+    pub tag: String,
+    pub guest: String,
+    pub readonly: bool,
+}
+
 pub struct VmInstance {
     pub lab: String,
     pub cfg: model::Vm,
@@ -118,6 +131,9 @@ pub struct VmInstance {
     /// CD-ROM image paths (config cdrom + built media), resolved absolute.
     pub cdroms: Vec<PathBuf>,
     pub floppy: Option<PathBuf>,
+    /// Absolute host dir per `cfg.shares` entry (relative paths resolved
+    /// against the lab root by the lab builder).
+    pub share_hosts: Vec<PathBuf>,
     /// See [`TemplateParts`] — std lock (never held across await).
     template: std::sync::RwLock<Arc<TemplateParts>>,
 
@@ -134,6 +150,12 @@ pub struct VmInstance {
     stop_requested: RwLock<bool>,
     qemu: Mutex<Option<Arc<Proc>>>,
     swtpm: Mutex<Option<Arc<Proc>>>,
+    /// Per-share virtiofsd daemons of the current run (§7.5). Killed on
+    /// teardown; respawned by every start.
+    virtiofsd: Mutex<Vec<Arc<Proc>>>,
+    /// The shares this run attached over virtiofs, for the ready-time mount
+    /// (see `LabRuntime::mount_shares`).
+    virtiofs_mounts: Mutex<Vec<VirtiofsMount>>,
     qmp: Mutex<Option<QmpClient>>,
     qga: Mutex<Option<GaClient>>,
 }
@@ -148,6 +170,7 @@ impl VmInstance {
         nic_mtus: Vec<u16>,
         cdroms: Vec<PathBuf>,
         floppy: Option<PathBuf>,
+        share_hosts: Vec<PathBuf>,
         template: TemplateParts,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -158,6 +181,7 @@ impl VmInstance {
             nic_mtus,
             cdroms,
             floppy,
+            share_hosts,
             template: std::sync::RwLock::new(Arc::new(template)),
             nic_attachments: Mutex::new(Vec::new()),
             state: RwLock::new(PowerState::Stopped),
@@ -166,9 +190,41 @@ impl VmInstance {
             stop_requested: RwLock::new(false),
             qemu: Mutex::new(None),
             swtpm: Mutex::new(None),
+            virtiofsd: Mutex::new(Vec::new()),
+            virtiofs_mounts: Mutex::new(Vec::new()),
             qmp: Mutex::new(None),
             qga: Mutex::new(None),
         })
+    }
+
+    /// Indices into `cfg.shares` that ride virtiofs (§7.5): explicit
+    /// `transport = "virtiofs"` always (a missing host virtiofsd errors at
+    /// start rather than silently degrading), `auto` when the host has a
+    /// virtiofsd AND the resolved profile says the guest mounts it natively.
+    /// `ensure_smb` uses the complement, so a share is served by exactly one
+    /// transport.
+    pub fn virtiofs_share_indices(&self) -> Vec<usize> {
+        let host_has = crate::qemu::virtiofsd::available();
+        let guest_ok = self.template().resolved.virtiofs;
+        self.cfg
+            .shares
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let vfs = match s.transport {
+                    crate::config::model::ShareTransport::Smb => false,
+                    crate::config::model::ShareTransport::Virtiofs => true,
+                    crate::config::model::ShareTransport::Auto => host_has && guest_ok,
+                };
+                vfs.then_some(i)
+            })
+            .collect()
+    }
+
+    /// The shares the current run attached over virtiofs (empty when
+    /// stopped or all-SMB).
+    pub async fn virtiofs_mounts(&self) -> Vec<VirtiofsMount> {
+        self.virtiofs_mounts.lock().await.clone()
     }
 
     /// The current template-derived parts (placeholder until a deferred
@@ -275,7 +331,12 @@ impl VmInstance {
         v
     }
 
-    fn build_paths(&self, t: &TemplateParts, nics: Vec<qemu::NicSpec>) -> Result<VmPaths> {
+    fn build_paths(
+        &self,
+        t: &TemplateParts,
+        nics: Vec<qemu::NicSpec>,
+        virtiofs_shares: Vec<(String, PathBuf)>,
+    ) -> Result<VmPaths> {
         Ok(VmPaths {
             qmp_sock: self.dirs.qmp_sock(),
             qga_sock: self.dirs.qga_sock(),
@@ -294,7 +355,54 @@ impl VmInstance {
                 .then(|| self.dirs.ovmf_vars()),
             tpm_sock: t.resolved.tpm.then(|| self.dirs.tpm_sock()),
             serial_log: Some(self.dirs.logs.join("serial.log")),
+            virtiofs_shares,
         })
+    }
+
+    /// Spawn one virtiofsd per virtiofs share (listening before QEMU
+    /// starts) and return the (tag, socket) device list; also records the
+    /// ready-time mount plan. Explicit `transport = "virtiofs"` with no
+    /// host virtiofsd is a start error.
+    async fn start_virtiofsds(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mut procs = Vec::new();
+        let mut devices = Vec::new();
+        let mut mounts = Vec::new();
+        for i in self.virtiofs_share_indices() {
+            let share = &self.cfg.shares[i];
+            if !crate::qemu::virtiofsd::available() {
+                bail!(
+                    "{}: share \"{}\" demands transport = \"virtiofs\" but no virtiofsd was \
+                     found on this host (install one or set VMLAB_VIRTIOFSD)",
+                    self.cfg.name,
+                    share.name
+                );
+            }
+            let host = self
+                .share_hosts
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| share.host.clone());
+            let tag = crate::qemu::virtiofsd::mount_tag(&share.name);
+            let sock = self.dirs.vfs_sock(i);
+            let proc = crate::qemu::virtiofsd::spawn(
+                &format!("{}/{}", self.cfg.name, share.name),
+                &sock,
+                &host,
+                share.readonly,
+                &self.dirs.logs.join(format!("virtiofsd{i}.log")),
+            )
+            .await?;
+            procs.push(proc);
+            devices.push((tag.clone(), sock));
+            mounts.push(VirtiofsMount {
+                tag,
+                guest: share.guest.clone(),
+                readonly: share.readonly,
+            });
+        }
+        *self.virtiofsd.lock().await = procs;
+        *self.virtiofs_mounts.lock().await = mounts;
+        Ok(devices)
     }
 
     /// Per-NIC argv specs + the child fd mappings tap attachments need,
@@ -399,11 +507,15 @@ impl VmInstance {
                     t.resolved.arch
                 );
             }
+            // virtiofsd daemons must be listening before QEMU spawns (its
+            // vhost-user chardevs connect at startup).
+            let vfs_devices = self.start_virtiofsds().await?;
+
             let (nic_specs, nic_fds) = self.nic_specs().await?;
             let args = qemu::build_args(
                 &self.lab,
                 &t.resolved,
-                &self.build_paths(&t, nic_specs)?,
+                &self.build_paths(&t, nic_specs, vfs_devices)?,
                 accel,
             )?;
             let proc = Proc::spawn_with_fds(
@@ -512,6 +624,14 @@ impl VmInstance {
         if let Some(tpm) = self.swtpm.lock().await.take() {
             tpm.kill().await;
         }
+        // virtiofsd usually exits on its own once QEMU disconnects; kill
+        // covers daemons that never got a connection (failed start).
+        for proc in self.virtiofsd.lock().await.drain(..) {
+            if proc.is_running() {
+                proc.kill().await;
+            }
+        }
+        self.virtiofs_mounts.lock().await.clear();
         // RAII: dropping tap attachments detaches their switch ports and
         // XDP state; with QEMU gone, the kernel then destroys the taps.
         self.nic_attachments.lock().await.clear();

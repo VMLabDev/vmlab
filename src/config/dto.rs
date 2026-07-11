@@ -8,8 +8,8 @@ use serde::Serialize;
 use super::model::{
     BlockRule, Connect, Container, DiskBlock, DnsRecord, EnvVar, Firmware, Forward, Gpu, GpuMode,
     Handler, Healthcheck, HostPort, L4Proto, Lab, LabFile, Media, MediaKind, Nic, PortMap,
-    Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share, SinkholeMode,
-    SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
+    Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share, ShareTransport,
+    SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
 };
 
 #[derive(Serialize)]
@@ -527,6 +527,7 @@ pub struct ShareDto {
     pub smb1: bool,
     /// Share name — derived from the guest path when not declared.
     pub name: String,
+    pub transport: ShareTransport,
 }
 
 impl From<&Share> for ShareDto {
@@ -538,6 +539,7 @@ impl From<&Share> for ShareDto {
             readonly: s.readonly,
             smb1: s.smb1,
             name: s.name.clone(),
+            transport: s.transport,
         }
     }
 }

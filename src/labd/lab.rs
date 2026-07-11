@@ -175,6 +175,11 @@ impl LabRuntime {
                         .map_or(crate::labd::network::STANDARD_MTU, |s| s.effective_mtu())
                 })
                 .collect();
+            let share_hosts = vm_cfg
+                .shares
+                .iter()
+                .map(|s| resolve_share_host(&root, &s.host))
+                .collect();
             let vm = VmInstance::new(
                 &name,
                 vm_cfg.clone(),
@@ -183,6 +188,7 @@ impl LabRuntime {
                 nic_mtus,
                 cdroms,
                 floppy,
+                share_hosts,
                 crate::labd::vm::TemplateParts {
                     resolved,
                     backing,
@@ -539,12 +545,27 @@ impl LabRuntime {
                 if vm.shares.is_empty() {
                     continue;
                 }
+                // Shares riding virtiofs (§7.5) are served by per-share
+                // virtiofsd daemons at VM start — smbd only exports the rest.
+                let vfs: std::collections::HashSet<usize> = self
+                    .vm(&vm.name)
+                    .map(|i| i.virtiofs_share_indices().into_iter().collect())
+                    .unwrap_or_default();
+                let mut shares: Vec<crate::config::model::Share> = vm
+                    .shares
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !vfs.contains(i))
+                    .map(|(_, s)| s.clone())
+                    .collect();
+                if shares.is_empty() {
+                    continue;
+                }
                 let Some(nic) = vm.nics.first() else { continue };
                 let seg_name = nic_segment_name(nic);
                 let Some(seg) = net.segments.get(seg_name) else {
                     continue;
                 };
-                let mut shares = vm.shares.clone();
                 for s in &mut shares {
                     s.host = resolve_share_host(&self.root, &s.host);
                 }
@@ -584,6 +605,7 @@ impl LabRuntime {
                         readonly: *ro,
                         smb1: false,
                         name: share.clone(),
+                        transport: crate::config::model::ShareTransport::Smb,
                     })
                     .collect();
                 sharing.push((name.clone(), seg.gateway_ip, shares));
@@ -689,14 +711,57 @@ impl LabRuntime {
         if cfg.shares.is_empty() {
             return;
         }
-        let smb = self.smb.lock().await;
-        let Some(labsmb) = smb.as_ref() else { return };
 
         // Detect the guest OS family from the resolved profile (which folds
         // in template metadata — the lab vm block usually omits `profile`).
         let Ok(vm) = self.vm(vm_name) else { return };
         let os_hint = guest_os_hint(vm.template().resolved.profile.as_deref());
-        let steps = labsmb.mount_plan(vm_name, os_hint);
+
+        // virtiofs shares first (§7.5): mkdir + `mount -t virtiofs` by tag.
+        // Linux commands — `auto` only picks virtiofs on profiles that mount
+        // it natively, and those are Linux until the Windows plan lands.
+        let mut steps: Vec<crate::smb::MountStep> = Vec::new();
+        for m in vm.virtiofs_mounts().await {
+            if os_hint == crate::smb::OsHint::Windows {
+                tracing::warn!(
+                    "{vm_name}: virtiofs share {} on a Windows guest is not supported yet — \
+                     use transport = \"smb\"",
+                    m.tag
+                );
+                continue;
+            }
+            steps.push(crate::smb::MountStep {
+                os_hint,
+                command: "mkdir".into(),
+                args: vec!["-p".into(), m.guest.clone()],
+            });
+            let mut args = vec![
+                "-t".into(),
+                "virtiofs".into(),
+                m.tag.clone(),
+                m.guest.clone(),
+            ];
+            if m.readonly {
+                args.push("-o".into());
+                args.push("ro".into());
+            }
+            steps.push(crate::smb::MountStep {
+                os_hint,
+                command: "mount".into(),
+                args,
+            });
+        }
+
+        // Then the SMB plan for whatever smbd serves for this VM.
+        {
+            let smb = self.smb.lock().await;
+            if let Some(labsmb) = smb.as_ref() {
+                steps.extend(labsmb.mount_plan(vm_name, os_hint));
+            }
+        }
+        if steps.is_empty() {
+            return;
+        }
         let Ok(qga) = vm.qga().await else {
             tracing::warn!("{vm_name}: no agent, cannot auto-mount shares");
             return;

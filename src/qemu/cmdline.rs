@@ -34,6 +34,10 @@ pub struct VmPaths {
     pub tpm_sock: Option<PathBuf>,
     /// Serial console log file.
     pub serial_log: Option<PathBuf>,
+    /// virtiofs shares in declaration order: (mount tag, virtiofsd socket).
+    /// The daemons must be listening before QEMU spawns; non-empty switches
+    /// the RAM to a shared memory-backend-memfd (§7.5).
+    pub virtiofs_shares: Vec<(String, PathBuf)>,
 }
 
 /// One NIC attachment for the argv builder.
@@ -101,7 +105,27 @@ pub fn build_args(
     let mut a: Vec<String> = Vec::new();
 
     arg(&mut a, "name", format!("vmlab:{lab}/{}", vm.name));
-    arg(&mut a, "machine", vm.machine.clone());
+    // vhost-user-fs shares need the guest RAM in shared memory. Only VMs
+    // that carry one get the memfd backend: it renames the RAM block in
+    // internal snapshots (pc.ram → mem0), so the plain `-m` shape stays
+    // untouched for every other VM (§7.5).
+    if paths.virtiofs_shares.is_empty() {
+        arg(&mut a, "machine", vm.machine.clone());
+    } else {
+        arg(
+            &mut a,
+            "machine",
+            format!("{},memory-backend=mem0", vm.machine),
+        );
+        arg(
+            &mut a,
+            "object",
+            format!(
+                "memory-backend-memfd,id=mem0,size={}M,share=on",
+                vm.memory >> 20
+            ),
+        );
+    }
     match accel {
         Accel::Kvm => {
             arg(&mut a, "accel", "kvm".into());
@@ -376,6 +400,21 @@ pub fn build_args(
     }
     arg(&mut a, "device", "usb-tablet".into());
 
+    // virtiofs shares: one vhost-user-fs device per export, tag = share
+    // name — the guest agent mounts by tag once the VM is ready (§7.5).
+    for (i, (tag, sock)) in paths.virtiofs_shares.iter().enumerate() {
+        arg(
+            &mut a,
+            "chardev",
+            format!("socket,id=vfs{i},path={}", sock.display()),
+        );
+        arg(
+            &mut a,
+            "device",
+            format!("vhost-user-fs-pci,chardev=vfs{i},tag={tag}"),
+        );
+    }
+
     // Don't start the guest CPU until the daemon says go — lets the switch
     // ports and QMP attach race-free.
     a.push("-S".into());
@@ -430,6 +469,7 @@ mod tests {
             }),
             agent_channel: true,
             input_transport: crate::profiles::InputTransport::Qmp,
+            virtiofs: p.virtiofs,
             nested: false,
             gpu: None,
             qemu_args: vec![],
@@ -455,6 +495,32 @@ mod tests {
 
     fn joined(args: &[String]) -> String {
         args.join(" ")
+    }
+
+    /// virtiofs shares attach as vhost-user-fs devices and flip the RAM to
+    /// a shared memfd backend; share-less VMs keep plain `-m` (RAM block
+    /// name stability for existing snapshots).
+    #[test]
+    fn virtiofs_shares_shape() {
+        let vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        p.ovmf_vars = Some("/v".into());
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(!s.contains("memory-backend"), "{s}");
+        assert!(!s.contains("vhost-user-fs"), "{s}");
+
+        p.virtiofs_shares = vec![("mnt_src".into(), PathBuf::from("/run/l/t/vfs0.sock"))];
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(s.contains("-machine q35,memory-backend=mem0"), "{s}");
+        assert!(
+            s.contains("memory-backend-memfd,id=mem0,size=2048M,share=on"),
+            "{s}"
+        );
+        assert!(s.contains("socket,id=vfs0,path=/run/l/t/vfs0.sock"), "{s}");
+        assert!(
+            s.contains("vhost-user-fs-pci,chardev=vfs0,tag=mnt_src"),
+            "{s}"
+        );
     }
 
     #[test]

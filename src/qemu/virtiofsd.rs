@@ -51,6 +51,26 @@ pub fn available() -> bool {
     binary().is_some()
 }
 
+/// virtio-fs mount tags are limited to 36 bytes on the device. Share names
+/// almost always fit; a longer one keeps a recognisable prefix plus an
+/// FNV-1a hash suffix so distinct names never collapse to the same tag.
+pub fn mount_tag(name: &str) -> String {
+    const MAX: usize = 36;
+    if name.len() <= MAX {
+        return name.to_string();
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let mut end = MAX - 9; // room for '-' + 8 hex digits
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}-{:08x}", &name[..end], h as u32)
+}
+
 /// Spawn one virtiofsd exporting `shared_dir` on `socket` and wait for the
 /// socket to appear (QEMU's vhost-user chardev connects at startup, so the
 /// daemon must be listening before the VM spawns). The stale socket from a
@@ -131,6 +151,21 @@ mod tests {
     // `binary()` reads the environment, which tests must not mutate
     // (edition 2024); the lookup-order logic is simple enough that only the
     // spawn contract is exercised, and only when a virtiofsd exists.
+
+    #[test]
+    fn mount_tags_fit_the_device_limit() {
+        assert_eq!(mount_tag("mnt_src"), "mnt_src");
+        assert_eq!(mount_tag(&"a".repeat(36)), "a".repeat(36));
+        let long = "very_long_share_name_that_exceeds_the_virtio_limit";
+        let tag = mount_tag(long);
+        assert!(tag.len() <= 36, "{tag}");
+        assert!(tag.starts_with("very_long_share_name_that_e"), "{tag}");
+        // Distinct long names get distinct tags.
+        assert_ne!(tag, mount_tag(&format!("{long}_2")));
+        // Multibyte input truncates on a char boundary without panicking.
+        let multi = mount_tag(&"ü".repeat(40));
+        assert!(multi.len() <= 36, "{multi}");
+    }
 
     #[tokio::test]
     async fn spawn_creates_socket_and_kill_reaps() {

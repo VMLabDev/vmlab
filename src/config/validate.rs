@@ -889,6 +889,43 @@ lab "l" {
         );
     }
 
+    /// Extract-stage share issues: bad transport values and the
+    /// smb1/virtiofs conflict surface at parse, not validation.
+    #[test]
+    fn share_transport_parses_and_rejects_conflicts() {
+        let parse_err = |src: &str| {
+            load_lab_source(src, "<test>", &std::env::temp_dir())
+                .expect_err("source should be rejected")
+                .issues
+                .iter()
+                .map(|i| i.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let err = parse_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    nic { nat = true }
+    share { host = "." guest = "/mnt/x" transport = "nfs" }
+  }
+}"#,
+        );
+        assert!(err.contains("unknown share transport"), "{err}");
+        let err = parse_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    nic { nat = true }
+    share { host = "." guest = "/mnt/x" smb1 = true transport = "virtiofs" }
+  }
+}"#,
+        );
+        assert!(err.contains("conflicts"), "{err}");
+    }
+
     #[test]
     fn unknown_event() {
         assert_err(

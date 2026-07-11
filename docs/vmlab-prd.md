@@ -271,7 +271,7 @@ Both **online** and **offline** snapshots are required:
 
 Every snapshot records the VM's **power state at capture time**. Restore must do the right thing: restoring an online snapshot resumes the VM running exactly where it was; restoring an offline snapshot leaves the VM powered off. Snapshots are named, listable, and deletable per VM; a lab-wide snapshot verb captures all VMs (and containers, §18) in a lab under one name (consistency across VMs is best-effort, not coordinated — document this).
 
-Snapshots use **qcow2-internal snapshots wherever the mechanism supports the case**, keeping the on-disk footprint to the clone file itself; external snapshot files are permitted only where internal snapshots cannot deliver the behavioural contract above. Either way the mechanism must coexist with the linked-clone backing chain, and the contract — not the mechanism — is what binds. Shared folders (§7.5) are SMB-based precisely so they carry no device state into snapshots.
+Snapshots use **qcow2-internal snapshots wherever the mechanism supports the case**, keeping the on-disk footprint to the clone file itself; external snapshot files are permitted only where internal snapshots cannot deliver the behavioural contract above. Either way the mechanism must coexist with the linked-clone backing chain, and the contract — not the mechanism — is what binds. Shared folders (§7.5) stay snapshot-compatible on both transports: SMB carries no device state at all, and virtiofs shares transfer the virtiofsd session state through the snapshot's migration stream.
 
 ### 7.4 Guest agent
 
@@ -289,19 +289,24 @@ vm "dev01" {
 }
 ```
 
-**Mechanism: SMB, served by the daemon at the segment gateway.** Each declared share is exposed as `\\<gateway>\<share>` on the VM's segment. This was chosen over virtio-fs deliberately, after working through the alternatives:
+**Mechanism: two transports behind one `share {}` surface.** Each share carries `transport = "auto" | "virtiofs" | "smb"` (default `auto`).
 
-- **No snapshot conflict.** virtio-fs (vhost-user-fs) carries FUSE session state outside QEMU, which historically made VMs unmigratable and blocks savevm-style online snapshots; the modern QEMU 8.2+ state-transfer path exists but is fragile for restore-much-later scenarios. SMB is pure network traffic — zero device state in the snapshot. A restored VM's SMB sessions are stale TCP that the guest's SMB client transparently re-establishes; mounts persist.
+**virtiofs** is the fast path: one `virtiofsd` per share, attached as a vhost-user-fs device, mounted natively by the guest (`mount -t virtiofs <tag>`). The original objection — virtio-fs carries FUSE session state outside QEMU, which historically made VMs unmigratable and blocked savevm-style online snapshots — expired with the QEMU ≥8.2 / virtiofsd ≥1.10 device-state transfer: vmlab runs virtiofsd with `--migration-mode=find-paths --migration-verify-handles`, so its session state (open handles included) rides the snapshot's migration stream. Validated: save under dirty FUSE state, online reload, and restore-much-later into a fresh QEMU + virtiofsd. Costs accepted: the VM's RAM moves to a shared `memory-backend-memfd` (pre-existing snapshots of that VM stop restoring — the RAM block is renamed), one daemon per share, and the guest needs a virtiofs client (profile capability flag `virtiofs`; Linux ≥5.4 kernels have it, Windows needs the virtio-win driver + WinFsp in the template).
+
+**SMB, served by the daemon at the segment gateway**, remains the universal fallback and the `auto` choice whenever host or guest lacks virtiofs support. Each SMB share is exposed as `\\<gateway>\<share>` on the VM's segment:
+
 - **No guest driver burden.** Windows speaks SMB natively — nothing extra in template builds. Linux needs only `cifs-utils` (kernel CIFS is ubiquitous).
-- **`windows-legacy` works** instead of being excluded — SMB2 covers Windows 7/2008R2-era guests, and **SMB1 (NT1/CIFS) is supported for guests that predate SMB2** (XP/2003-era): `smb1 = true` on a share enables the SMB1 dialect *and* the auth relaxation those guests require (NTLMv1/LM acceptance — XP doesn't send NTLMv2 by default). Off unless asked for; irrelevant as a security concern on an isolated lab segment, which is the whole reason vmlab can offer what the rest of the world has rightly abandoned.
-- **No memory-backend constraint**, no per-share `virtiofsd` processes.
-- Performance is worse than virtio-fs would have been — accepted under the §1.2 non-goal.
+- **`windows-legacy` works** instead of being excluded — SMB2 covers Windows 7/2008R2-era guests, and **SMB1 (NT1/CIFS) is supported for guests that predate SMB2** (XP/2003-era): `smb1 = true` on a share enables the SMB1 dialect *and* the auth relaxation those guests require (NTLMv1/LM acceptance — XP doesn't send NTLMv2 by default; conflicts with `transport = "virtiofs"`). Off unless asked for; irrelevant as a security concern on an isolated lab segment, which is the whole reason vmlab can offer what the rest of the world has rightly abandoned.
+- **Zero device state in the snapshot** — pure network traffic; a restored VM's SMB sessions are stale TCP that the guest's SMB client transparently re-establishes; mounts persist.
+
+Share contents are outside snapshot scope on both transports (§7.3).
 
 **Access model.** vmlab generates per-lab SMB credentials automatically; a share is mappable only with its owning VM's credential, scoping shares to their declaring VM even on a shared segment. Authenticated NTLMv2 + SMB signing is the baseline — required anyway because current Windows hardening (guest-auth blocking, signing requirements on recent Windows 11) rejects unauthenticated shares. None of this is user-visible: credentials are plumbed by vmlab.
 
 **Guest mounting** is performed through the guest agent once the VM is ready:
 
-- **Linux:** `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential.
+- **Linux (virtiofs):** `mount -t virtiofs <tag> <guest_path>` — no credential, no network dependency.
+- **Linux (SMB):** `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential.
 - **Windows:** mapped via the SMB client with the generated credential. A drive-letter `guest` target maps directly; a folder-path target is realised as a directory symlink/junction to the UNC path. **⚠ Implementation note:** verify the folder-path mechanism (mklink-to-UNC behaviour, profile-vs-machine mapping persistence across reboots) against current Windows at implementation time.
 
 **Server implementation.** No mature embeddable SMB *server* library exists in the Rust ecosystem (clients only, verified at time of writing), so this is the largest single engineering component the feature implies. Two permitted strategies behind the identical WCL/user surface:

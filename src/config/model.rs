@@ -280,6 +280,18 @@ pub struct DiskBlock {
     pub from: Option<PathBuf>,
 }
 
+/// How a share reaches the guest. `Auto` picks virtiofs when the host has a
+/// virtiofsd and the guest profile advertises the client, else SMB — decided
+/// at VM start (vhost-user-fs devices cannot hotplug).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareTransport {
+    #[default]
+    Auto,
+    Virtiofs,
+    Smb,
+}
+
 #[derive(Debug, Clone)]
 pub struct Share {
     pub span: Span,
@@ -288,6 +300,7 @@ pub struct Share {
     pub readonly: bool,
     pub smb1: bool,
     pub name: String,
+    pub transport: ShareTransport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

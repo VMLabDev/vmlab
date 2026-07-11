@@ -85,6 +85,9 @@ profile "linux-modern" {
   display     = "virtio-vga"
   cpus        = 2
   memory      = 4GiB
+  // Kernel ≥5.4 ships the virtiofs client — `transport = "auto"` shares
+  // mount natively instead of over SMB (§7.5).
+  virtiofs    = true
 }
 
 profile "linux-generic" {

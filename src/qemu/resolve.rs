@@ -29,6 +29,10 @@ pub struct ResolvedVm {
     pub agent_channel: bool,
     /// How scripted input reaches the guest (QMP vs VNC).
     pub input_transport: InputTransport,
+    /// The guest mounts virtiofs natively (profile capability) — with a
+    /// host virtiofsd, `transport = "auto"` shares attach as vhost-user-fs
+    /// devices instead of SMB (§7.5).
+    pub virtiofs: bool,
     /// The `nested` flag from config. No cmdline consumer: `-cpu host`
     /// already exposes VMX/SVM (see cmdline.rs §5.2), so nested virt needs
     /// no extra QEMU argument; carried for a future non-host CPU model.
@@ -172,6 +176,7 @@ pub fn resolve_vm(
         display_device,
         agent_channel: profile.agent_channel,
         input_transport: profile.input_transport,
+        virtiofs: profile.virtiofs,
         nested: lab_vm.nested,
         gpu: lab_vm.gpu.clone(),
         qemu_args: lab_vm.qemu_args.clone(),

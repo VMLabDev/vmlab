@@ -72,6 +72,10 @@ pub struct Profile {
     pub memory: Option<u64>,
     pub agent_channel: bool,
     pub input_transport: InputTransport,
+    /// The guest OS mounts virtiofs natively (`mount -t virtiofs` on Linux,
+    /// the virtio-win driver + WinFsp on Windows) — makes it a candidate
+    /// for `transport = "auto"` shares (§7.5).
+    pub virtiofs: bool,
 }
 
 /// The full profile set: shipped profiles plus user overrides/extensions.
@@ -286,6 +290,7 @@ fn parse_profiles(source: &str, name: &str) -> Result<Vec<Profile>> {
             memory,
             agent_channel: get_bool("agent_channel")?.unwrap_or(true),
             input_transport,
+            virtiofs: get_bool("virtiofs")?.unwrap_or(false),
         });
     }
     Ok(out)
