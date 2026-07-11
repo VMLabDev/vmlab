@@ -71,7 +71,9 @@ pub enum SkbClass {
 /// Advance the boundary state machine across one skb of `len` bytes.
 ///
 /// `read` must copy skb bytes `[offset, offset + dst.len())` into `dst`,
-/// returning `false` on failure; it is only called with in-bounds ranges.
+/// returning `false` on failure; it is only called with in-bounds ranges
+/// of 1..=4 bytes (the BPF shim relies on that bound to dispatch onto
+/// constant-size loads the verifier accepts).
 /// The state is updated to describe the stream position after this skb —
 /// including for [`SkbClass::Aligned`], where the position lands back on a
 /// boundary whether or not the caller ends up redirecting the skb.

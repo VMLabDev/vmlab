@@ -83,11 +83,7 @@ pub fn verdict_guest(ctx: SkBuffContext) -> u32 {
     // serialized by the kernel, so this is not racy.
     let mut st = unsafe { *state_ptr };
     let len = ctx.len();
-    let class = step_skb(&mut st.fs, len, &mut |off, dst| {
-        ctx.load_bytes(off as usize, dst)
-            .map(|n| n == dst.len())
-            .unwrap_or(false)
-    });
+    let class = step_skb(&mut st.fs, len, &mut |off, dst| load_exact(&ctx, off, dst));
     unsafe { (*state_ptr).fs = st.fs };
 
     let SkbClass::Aligned { .. } = class else {
@@ -114,6 +110,33 @@ pub fn verdict_guest(ctx: SkBuffContext) -> u32 {
             PORT_HASH.redirect_skb(&ctx, dst_port, 0) as u32
         }
         FrameVerdict::Pass => sk_action::SK_PASS,
+    }
+}
+
+/// Copy exactly `dst.len()` skb bytes at `off` into `dst`, dispatching to
+/// constant-size loads. `bpf_skb_load_bytes` needs a verifier-provable
+/// nonzero length, which a runtime slice length is not — the verifier
+/// rejected the naive `ctx.load_bytes(off, dst)` with
+/// "R4 invalid zero-sized read". The framing state machine only ever asks
+/// for 1..=4 bytes (length-prefix pieces), so four arms cover it; anything
+/// else fails the read, which the state machine treats as a safe desync.
+#[inline(always)]
+fn load_exact(ctx: &SkBuffContext, off: u32, dst: &mut [u8]) -> bool {
+    fn copy<const N: usize>(ctx: &SkBuffContext, off: u32, dst: &mut [u8]) -> bool {
+        match ctx.load::<[u8; N]>(off as usize) {
+            Ok(v) => {
+                dst[..N].copy_from_slice(&v);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    match dst.len() {
+        1 => copy::<1>(ctx, off, dst),
+        2 => copy::<2>(ctx, off, dst),
+        3 => copy::<3>(ctx, off, dst),
+        4 => copy::<4>(ctx, off, dst),
+        _ => false,
     }
 }
 
