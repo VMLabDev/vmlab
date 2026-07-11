@@ -162,6 +162,7 @@ compose-up:
 [group('web')]
 compose-rebuild:
 	docker compose up -d --build --force-recreate
+	@echo "web UI: http://localhost:7878"
 
 # Stop and remove the Docker web UI stack
 [group('web')]
