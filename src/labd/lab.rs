@@ -1531,14 +1531,37 @@ impl LabRuntime {
             }));
         }
         let net = self.network.lock().await;
+        // Cross-host trunk state lives in the supervisor (it owns the global
+        // switches); one best-effort RPC per status when the lab has global
+        // segments. None = supervisor unreachable → peer state reads null.
+        let trunk_states: Option<std::collections::HashMap<String, bool>> =
+            if net.segments.values().any(|s| s.global) {
+                fetch_global_peer_states().await
+            } else {
+                Some(Default::default())
+            };
         let mut segments = Vec::new();
         for seg in net.segments.values() {
+            // null = not a global segment (no trunk possible) or supervisor
+            // unreachable; bool = live trunk state keyed by segment name, so
+            // the accept side (no local `connect`) lights up too.
+            let peer_connected = if seg.global {
+                trunk_states
+                    .as_ref()
+                    .map(|m| json!(m.get(&seg.name).copied().unwrap_or(false)))
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
             segments.push(json!({
                 "name": seg.name,
                 "subnet": seg.subnet.to_string(),
                 "gateway": seg.gateway_ip.to_string(),
                 "nat": seg.nat,
                 "dhcp": seg.dhcp,
+                "global": seg.global,
+                "connect": seg.peer,
+                "peer_connected": peer_connected,
             }));
         }
         json!({
@@ -1748,6 +1771,27 @@ fn resolve_share_host(root: &std::path::Path, host: &std::path::Path) -> PathBuf
         return root.join(host);
     }
     host.to_path_buf()
+}
+
+/// Cross-host trunk state per global segment name, from the supervisor's
+/// `global.list` (PRD §9.2). `None` = supervisor unreachable; used by
+/// [`LabRuntime::status`] to report `peer_connected` per segment.
+async fn fetch_global_peer_states() -> Option<std::collections::HashMap<String, bool>> {
+    let client = crate::proto::client::Client::connect(&crate::paths::supervisor_socket())
+        .await
+        .ok()?;
+    let list = client.call("global.list", Value::Null).await.ok()?;
+    Some(
+        list.as_array()?
+            .iter()
+            .filter_map(|e| {
+                Some((
+                    e["name"].as_str()?.to_string(),
+                    e["peer_connected"].as_bool().unwrap_or(false),
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// Guess the guest OS family for SMB mount-command selection (PRD §7.5).

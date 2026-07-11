@@ -12,3 +12,6 @@ docker/lab/.vmlab/
 /docs/help/*
 !/docs/help/.gitkeep
 .playwright-cli/
+
+# `just peer-demo` scratch homes (two isolated vmlab instances).
+/.vmlab-peer-demo/

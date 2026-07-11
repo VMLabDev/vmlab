@@ -74,6 +74,26 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 issues.push(Issue::at(s.span, "empty sinkhole pattern"));
             }
         }
+        // Cross-host peering rides the supervisor's shared switch, so a
+        // connect {} on a lab-local segment would be silently ignored.
+        if let Some(c) = &seg.connect {
+            if !seg.global {
+                issues.push(Issue::at(
+                    c.span,
+                    format!(
+                        "segment \"{}\" declares connect {{ }} but is not global — cross-host \
+                         peering requires `global = true` (PRD §9.2)",
+                        seg.name
+                    ),
+                ));
+            }
+            if c.host.trim().is_empty() {
+                issues.push(Issue::at(
+                    c.span,
+                    format!("segment \"{}\": connect host must not be empty", seg.name),
+                ));
+            }
+        }
     }
 
     // -- duplicate forward host ports across the lab ----------------------
@@ -1021,6 +1041,32 @@ lab "l" {
             !es.iter().any(|m| m.contains("unknown event")),
             "container.crashed should be bindable: {es:#?}"
         );
+    }
+
+    #[test]
+    fn connect_requires_global() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" connect { host = "otherhost:13947" } }
+}"#,
+            "requires `global = true`",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { global = true connect { host = "" } }
+}"#,
+            "connect host must not be empty",
+        );
+        // Global + a host: clean.
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { global = true connect { host = "otherhost:13947" } }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
     }
 
     #[test]

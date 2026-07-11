@@ -493,7 +493,9 @@ function handleEvent(ev: DaemonEvent) {
     }
   }
   // Host-scoped registry changes refresh the lab list; lab-scoped VM/state
-  // events refresh the current lab's status.
+  // events refresh the current lab's status. Host-scoped events with no lab
+  // (segment.peer.up/down from the supervisor's trunk table, host.disk_low)
+  // also land in the refetch branch — the peer LED is status-driven.
   if (ev.event.startsWith("lab.")) {
     loadLabs();
   }

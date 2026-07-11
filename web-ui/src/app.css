@@ -228,6 +228,7 @@
 .topo-led { stroke-width: 1; }
 .topo-led.success { fill: var(--success-fg); stroke: var(--success-fg); }
 .topo-led.warning { fill: var(--warning-fg); stroke: var(--warning-fg); }
+.topo-led.danger { fill: var(--danger-fg); stroke: var(--danger-fg); }
 .topo-led.neutral { fill: var(--bg-1); stroke: var(--fg-3); }
 .topo-console { cursor: pointer; color: var(--fg-2); }
 .topo-console rect { fill: var(--bg-1); stroke: var(--border); }
@@ -257,6 +258,32 @@
 .topo-wan-name {
   fill: var(--fg-0); font-size: 12px; font-weight: 600; pointer-events: none;
 }
+/* remote-vmlab peer node: a small router box with antennas */
+.topo-remote .topo-remote-box {
+  fill: color-mix(in srgb, var(--accent) 6%, var(--bg-2));
+  stroke: var(--border); stroke-width: 1.25; cursor: grab;
+}
+.topo-remote.selected .topo-remote-box { stroke: var(--accent); stroke-width: 2; }
+.topo-remote-antenna { stroke: var(--fg-2); stroke-width: 1.25; pointer-events: none; }
+.topo-remote-antenna-tip { fill: var(--fg-2); pointer-events: none; }
+.topo-remote-glyph { color: var(--accent); pointer-events: none; }
+.topo-remote-kind {
+  fill: var(--fg-3); font-size: 8px; font-weight: 700; letter-spacing: 0.1em;
+  pointer-events: none;
+}
+.topo-remote-name {
+  fill: var(--fg-0); font-size: 12px; font-weight: 600; font-family: var(--font-mono);
+  pointer-events: none;
+}
+.topo-remote-name.placeholder { fill: var(--fg-3); font-style: italic; }
+/* RemoteInspector: rows of segments bridged to the node */
+.remote-attached { display: flex; flex-direction: column; gap: 4px; margin: 4px 0 10px; }
+.remote-attached-row {
+  text-align: left; padding: 5px 9px; border: 1px solid var(--border-subtle);
+  border-radius: 6px; background: var(--bg-1); color: var(--fg-1); cursor: pointer;
+  font: inherit; font-size: 12px;
+}
+.remote-attached-row:hover { border-color: var(--accent); color: var(--accent); }
 .topo-edge-line { stroke: var(--fg-3); stroke-width: 1.5; fill: none; pointer-events: none; }
 /* live traffic: powered-on VM cables (and NAT uplinks) flow green */
 @keyframes topo-flow {

@@ -24,12 +24,16 @@ import {
   editor,
   machineNames,
   removeContainer,
+  removeRemote,
   removeSegment,
   removeVm,
   renameContainer,
+  renameRemote,
   renameSegment,
   renameVm,
+  select,
   setEditor,
+  setSegmentPeer,
   storeTemplateFor,
 } from "../../editor/store";
 import { anyVmRunning, containerIsUp, vmIsUp } from "../../store";
@@ -61,10 +65,10 @@ export default function Inspector() {
       const name = editor.draft?.containers[selection.index]?.name;
       return name ? containerIsUp(name) : false;
     }
-    return selection.kind === "segment" && anyVmRunning();
+    return (selection.kind === "segment" || selection.kind === "remote") && anyVmRunning();
   };
   const readOnlyMessage = () =>
-    sel().kind === "segment"
+    sel().kind === "segment" || sel().kind === "remote"
       ? "Networking is read-only while any machine is up."
       : "Properties are read-only while this machine is up.";
 
@@ -81,6 +85,9 @@ export default function Inspector() {
         </Show>
         <Show when={sel().kind === "nat"}>
           <NatInspector />
+        </Show>
+        <Show when={sel().kind === "remote"}>
+          <RemoteInspector host={(sel() as { host: string }).host} />
         </Show>
         <Show when={sel().kind === "vm" && editor.draft?.vms[(sel() as any).index]}>
           <VmInspector index={(sel() as { index: number }).index} />
@@ -168,6 +175,73 @@ function NatInspector() {
         <code>nat = true</code> on the NIC), or cable a switch's side port to it to give that
         whole segment internet access (<code>nat = true</code> on the segment). It isn't
         declared in the config — it appears through those connections.
+      </div>
+    </>
+  );
+}
+
+// --- remote vmlab ---------------------------------------------------------------
+
+function RemoteInspector(props: { host: string }) {
+  const attached = () =>
+    (editor.draft?.segments ?? [])
+      .map((s, i) => ({ seg: s, index: i }))
+      .filter(({ seg }) => seg.connect?.host === props.host);
+  const del = async () => {
+    if (
+      await confirmDialog({
+        title: `Delete remote vmlab "${props.host || "(no address)"}"?`,
+        body: "Segments cabled to it lose their peer link (they stay global).",
+        confirmLabel: "Delete",
+        danger: true,
+      })
+    ) {
+      removeRemote(props.host);
+    }
+  };
+  return (
+    <>
+      <div class="inspector-head">
+        <span class="inspector-kind">remote</span>
+        <Input
+          value={props.host}
+          placeholder="otherhost:13947"
+          error={!props.host.trim()}
+          onInput={(e: InputEvent) =>
+            renameRemote(props.host, (e.currentTarget as HTMLInputElement).value)
+          }
+        />
+        <IconButton icon={Trash2} label="Delete remote vmlab" onClick={del} />
+      </div>
+      <div class="inspector-section-title">Bridged segments</div>
+      <Show
+        when={attached().length}
+        fallback={
+          <div class="inspector-note">
+            Not cabled to any segment yet — drag a switch's side port onto this node (or this
+            node's port onto a switch) to bridge that segment to the remote vmlab instance.
+          </div>
+        }
+      >
+        <div class="remote-attached">
+          <For each={attached()}>
+            {({ seg, index }) => (
+              <button
+                type="button"
+                class="remote-attached-row"
+                onClick={() => select({ kind: "segment", index })}
+              >
+                {seg.name}
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+      <div class="inspector-note">
+        Cabling writes <code>connect {"{ host }"}</code> and <code>global = true</code> on the
+        segment: both vmlab instances share the segment over a TCP trunk, authenticated by the
+        <code> psk</code> in each host's config (<code>~/.config/vmlab/config.wcl</code>). The
+        LED and cable animate while the trunk is up.
       </div>
     </>
   );
@@ -871,7 +945,9 @@ function SegmentInspector(props: { index: number }) {
           <div class="field-row-control">
             <Toggle
               checked={seg().connect !== null}
-              onChange={(on) => setSeg((s) => (s.connect = on ? { span: null, host: "" } : null))}
+              // Attach also sets global = true (peering rides the shared
+              // switch); detach keeps global — same semantics as the canvas.
+              onChange={(on) => setSegmentPeer(props.index, on ? "" : null)}
             />
           </div>
         </div>

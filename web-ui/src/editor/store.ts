@@ -24,7 +24,8 @@ export type Selection =
   | { kind: "segment"; index: number }
   | { kind: "vm"; index: number }
   | { kind: "container"; index: number }
-  | { kind: "nat" };
+  | { kind: "nat" }
+  | { kind: "remote"; host: string };
 
 interface EditorState {
   lab: string | null;
@@ -43,6 +44,10 @@ interface EditorState {
   selection: Selection;
   busy: string | null;
   issues: ConfigIssue[];
+  /** Remote-vmlab peer nodes not (yet) referenced by any segment's connect
+   *  block — pure UI state, persisted per lab in localStorage like node
+   *  positions (an unattached node writes nothing to WCL). */
+  remoteDrafts: string[];
   catalog: {
     templates: StoreTemplate[];
     profiles: string[];
@@ -65,6 +70,7 @@ const [editor, setEditor] = createStore<EditorState>({
   selection: { kind: "lab" },
   busy: null,
   issues: [],
+  remoteDrafts: [],
   catalog: { templates: [], profiles: [], meta: null, host: null },
 });
 
@@ -93,8 +99,129 @@ export async function openEditor(lab: string) {
     draft: null,
     issues: [],
     selection: { kind: "lab" },
+    remoteDrafts: loadRemoteDrafts(lab),
   });
   await Promise.all([reloadModel(lab), loadCatalogs()]);
+}
+
+// --- remote-vmlab peer nodes ---------------------------------------------------
+
+const remotesKey = (lab: string) => `vmlab.editor.remotes.${lab}`;
+
+function loadRemoteDrafts(lab: string): string[] {
+  try {
+    const raw = localStorage.getItem(remotesKey(lab));
+    const list = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(list) ? list.filter((h) => typeof h === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistRemoteDrafts() {
+  if (!editor.lab) return;
+  try {
+    localStorage.setItem(remotesKey(editor.lab), JSON.stringify(editor.remoteDrafts));
+  } catch {
+    /* quota — cosmetic data, ignore */
+  }
+}
+
+/** Distinct remote-vmlab nodes: every host referenced by a segment's connect
+ *  block, plus unattached drafts (`""` = the not-yet-addressed placeholder). */
+export function remoteHosts(): string[] {
+  return [
+    ...new Set([
+      ...(editor.draft?.segments ?? []).flatMap((s) => (s.connect ? [s.connect.host] : [])),
+      ...editor.remoteDrafts,
+    ]),
+  ];
+}
+
+/** Toolbar: create (or reuse) the unaddressed placeholder node, selected so
+ *  the inspector opens on its address field. */
+export function addRemote() {
+  if (!remoteHosts().includes("")) {
+    setEditor("remoteDrafts", editor.remoteDrafts.length, "");
+    persistRemoteDrafts();
+  }
+  select({ kind: "remote", host: "" });
+}
+
+/** Cable segment `index` to a remote peer (`host`), or detach (`null`).
+ *  Attaching also sets `global = true` — cross-host peering rides the
+ *  supervisor's shared switch, and validation rejects connect without it.
+ *  Detaching keeps `global` (it has independent meaning) and keeps the node
+ *  on the canvas as an unattached draft. */
+export function setSegmentPeer(index: number, host: string | null) {
+  const seg = editor.draft?.segments[index];
+  if (!seg) return;
+  if (host === null) {
+    const old = seg.connect?.host;
+    setEditor("draft", "segments", index, "connect", null);
+    if (old !== undefined && !editor.remoteDrafts.includes(old)) {
+      setEditor("remoteDrafts", editor.remoteDrafts.length, old);
+      persistRemoteDrafts();
+    }
+    return;
+  }
+  setEditor(
+    "draft",
+    "segments",
+    index,
+    produce((s: SegmentModel) => {
+      if (s.connect) s.connect.host = host; // keep span → surgical set_field
+      else s.connect = { span: null, host };
+      s.global = true;
+    }),
+  );
+}
+
+/** Re-address a node: rewrite every attached segment's connect block, the
+ *  draft entry, and the selection. Renaming onto an existing node merges. */
+export function renameRemote(from: string, to: string) {
+  if (from === to) return;
+  setEditor(
+    "draft",
+    produce((d: LabModel | null) => {
+      if (!d) return;
+      for (const s of d.segments) {
+        if (s.connect?.host === from) s.connect.host = to;
+      }
+    }),
+  );
+  setEditor(
+    "remoteDrafts",
+    editor.remoteDrafts.filter((h) => h !== from && h !== to).concat(
+      // Keep a draft entry only while nothing references the new host —
+      // attached nodes are derived from the connect blocks.
+      editor.draft?.segments.some((s) => s.connect?.host === to) ? [] : [to],
+    ),
+  );
+  persistRemoteDrafts();
+  if (editor.selection.kind === "remote" && editor.selection.host === from) {
+    select({ kind: "remote", host: to });
+  }
+}
+
+/** Delete the node: detach every attached segment (connect = null, global
+ *  kept) and drop the draft entry. */
+export function removeRemote(host: string) {
+  setEditor(
+    "draft",
+    produce((d: LabModel | null) => {
+      if (!d) return;
+      for (const s of d.segments) {
+        if (s.connect?.host === host) s.connect = null;
+      }
+    }),
+  );
+  setEditor(
+    "remoteDrafts",
+    editor.remoteDrafts.filter((h) => h !== host),
+  );
+  persistRemoteDrafts();
+  select({ kind: "lab" });
 }
 
 /** Discard the draft and re-fetch the model from disk. */

@@ -21,7 +21,7 @@ use registry::{LabEntry, LabState, Registry};
 
 pub struct Supervisor {
     registry: Mutex<Registry>,
-    server_events: tokio::sync::OnceCell<tokio::sync::broadcast::Sender<Event>>,
+    events: tokio::sync::broadcast::Sender<Event>,
     globals: Arc<GlobalSegments>,
     /// Per-lab locks serialising `ensure_lab`: without this, concurrent
     /// `lab.ensure` calls (a status poll plus an `up`, say) would each spawn
@@ -43,10 +43,17 @@ async fn run_async() -> Result<()> {
     crate::paths::ensure_dir(&crate::paths::state_dir())?;
 
     let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
+    // One aggregate event channel, created before the socket binds so the
+    // global-segment trunks can emit through it from day one.
+    let (events_tx, _) = tokio::sync::broadcast::channel::<Event>(1024);
     let supervisor = Arc::new(Supervisor {
         registry: Mutex::new(Registry::load()),
-        server_events: tokio::sync::OnceCell::new(),
-        globals: GlobalSegments::new(host_cfg.dns_suffix.clone(), host_cfg.psk.clone()),
+        events: events_tx.clone(),
+        globals: GlobalSegments::new(
+            host_cfg.dns_suffix.clone(),
+            host_cfg.psk.clone(),
+            events_tx.clone(),
+        ),
         ensure_locks: Mutex::new(std::collections::HashMap::new()),
         template_ops: templates::TemplateOps::default(),
     });
@@ -60,16 +67,20 @@ async fn run_async() -> Result<()> {
         sup: supervisor.clone(),
         tasks: tasks.clone(),
     });
-    let server = Server::bind(&sock, handler)
+    let server = Server::bind_with_events(&sock, handler, events_tx)
         .await
         .with_context(|| format!("binding {}", sock.display()))?;
-    let _ = supervisor.server_events.set(server.events.clone());
 
     // Cross-host trunk listener (PRD §9.2): enabled when a PSK is configured.
-    // Bind on a fixed port (the peer addresses it as host:port).
+    // The port comes from host config (`trunk_port`, default 13947) so two
+    // instances on one machine can listen side by side; peers address it as
+    // `host:port` in their segment `connect {}` blocks.
     if let Some(psk) = &host_cfg.psk {
-        let bind: std::net::SocketAddr = ([0, 0, 0, 0], 13947).into();
-        global::spawn_peer_listener(supervisor.globals.clone(), bind, psk.clone());
+        let bind: std::net::SocketAddr = ([0, 0, 0, 0], host_cfg.trunk_port).into();
+        match global::bind_peer_listener(supervisor.globals.clone(), bind, psk.clone()).await {
+            Ok((_addr, _task)) => {}
+            Err(e) => tracing::error!("{e:#}"),
+        }
     }
 
     tracing::info!("vmlabd listening on {}", sock.display());
@@ -102,9 +113,7 @@ async fn run_async() -> Result<()> {
 
 impl Supervisor {
     fn emit(&self, event: Event) {
-        if let Some(tx) = self.server_events.get() {
-            let _ = tx.send(event);
-        }
+        let _ = self.events.send(event);
     }
 
     /// Reconnect registry entries from a previous supervisor run: lab
@@ -406,14 +415,7 @@ impl Handler for SupervisorHandler {
                 sup.globals.detach(name).await;
                 Ok(json!(true))
             }
-            "global.list" => {
-                let list = sup.globals.list().await;
-                Ok(json!(
-                    list.into_iter()
-                        .map(|(n, s, r)| json!({"name": n, "subnet": s, "refcount": r}))
-                        .collect::<Vec<_>>()
-                ))
-            }
+            "global.list" => Ok(json!(sup.globals.list().await)),
             // Template operations for the web Templates page (PRD §6). All
             // take `lab` + `root` like `lab.ensure`, so the supervisor works
             // for labs it never started.

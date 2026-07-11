@@ -19,6 +19,8 @@ type HostConfig {
   disk_low_percent: i64?
   @doc("Pre-shared key for cross-host segment links")
   psk: utf8?
+  @doc("TCP listen port for inbound cross-host segment trunks; default 13947")
+  trunk_port: i64?
   @doc("VNC viewer command; `{}` is replaced by the target")
   viewer: utf8?
   @doc("OCI layer chunk size for template push; default `512MiB`")

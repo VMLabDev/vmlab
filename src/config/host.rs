@@ -16,6 +16,8 @@ pub struct HostConfig {
     pub dns_upstream: Option<String>,
     pub disk_low_percent: u8,
     pub psk: Option<String>,
+    /// TCP listen port for inbound cross-host segment trunks (§9.2).
+    pub trunk_port: u16,
     pub viewer: Option<String>,
     pub oci_chunk_size: u64,
 }
@@ -28,6 +30,7 @@ impl Default for HostConfig {
             dns_upstream: None,
             disk_low_percent: 10,
             psk: None,
+            trunk_port: 13947,
             viewer: None,
             oci_chunk_size: crate::oci::chunking::DEFAULT_CHUNK_SIZE,
         }
@@ -106,6 +109,18 @@ impl HostConfig {
             }
         }
         cfg.psk = get_str("psk")?;
+        if let Some(f) = block.field("trunk_port") {
+            match f.value() {
+                Ok(Value::I64(n)) if (1..=65535).contains(n) => cfg.trunk_port = *n as u16,
+                Ok(Value::None) => {}
+                Ok(other) => {
+                    return Err(anyhow!(
+                        "host config: trunk_port must be 1..=65535, got {other:?}"
+                    ));
+                }
+                Err(e) => return Err(anyhow!("host config: {e}")),
+            }
+        }
         cfg.viewer = get_str("viewer")?;
         if let Some(f) = block.field("oci_chunk_size") {
             match f.value() {
@@ -186,6 +201,7 @@ host {
   dns_suffix       = "lab.local"
   disk_low_percent = 5
   psk              = "sekrit"
+  trunk_port       = 13948
   oci_chunk_size   = 128MiB
 }
 "#,
@@ -196,6 +212,7 @@ host {
         assert_eq!(cfg.dns_suffix, "lab.local");
         assert_eq!(cfg.disk_low_percent, 5);
         assert_eq!(cfg.psk.as_deref(), Some("sekrit"));
+        assert_eq!(cfg.trunk_port, 13948);
         assert_eq!(cfg.oci_chunk_size, 128 << 20);
     }
 
@@ -204,6 +221,16 @@ host {
         assert!(
             HostConfig::parse(
                 "import <vmlab-host.wcl>\nhost { disk_low_percent = 200 }\n",
+                "<t>"
+            )
+            .is_err()
+        );
+        assert!(
+            HostConfig::parse("import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n", "<t>").is_err()
+        );
+        assert!(
+            HostConfig::parse(
+                "import <vmlab-host.wcl>\nhost { trunk_port = 70000 }\n",
                 "<t>"
             )
             .is_err()

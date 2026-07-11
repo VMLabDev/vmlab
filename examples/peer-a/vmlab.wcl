@@ -1,0 +1,38 @@
+// Cross-instance peering demo, side A (see also examples/peer-b).
+//
+// The "wan" segment is `global` (owned by the supervisor, shared across labs)
+// and declares a `connect {}` peer: the supervisor bridges it to the other
+// vmlab instance's supervisor over a PSK-authenticated TCP trunk (PRD §9.2),
+// so a1 here and b1 over there share one L2 segment.
+//
+// Both sides may declare `connect` at each other (that is what the web UI's
+// remote-vmlab node writes); the trunk table converges the mutual dial to a
+// single trunk. Run the whole thing with:
+//
+//   just peer-demo        # two isolated vmlab instances on :7871 / :7872
+//   just peer-demo-stop
+//
+// Caveat: BOTH supervisors run a DHCP server on the bridged segment, so
+// leases can race/collide. The provision adds a deterministic secondary IP
+// (10.99.0.10 here, .20 on side B) so the cross-trunk ping has a stable
+// target either way.
+
+import <vmlab.wcl>
+
+lab "peer-a" {
+
+  segment "wan" {
+    subnet = "10.99.0.0/24"
+    global = true
+    connect { host = "127.0.0.1:13948" }   // side B's trunk_port
+  }
+
+  vm "a1" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+    arch     = "x86_64"
+    memory   = 1GiB
+    nic { segment = "wan" }
+  }
+
+  provision "scripts/setup.ws" { }
+}

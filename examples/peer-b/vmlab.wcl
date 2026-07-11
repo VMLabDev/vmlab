@@ -1,0 +1,22 @@
+// Cross-instance peering demo, side B — see examples/peer-a/vmlab.wcl for
+// the full story. b1 lands on the same bridged "wan" segment as a1.
+
+import <vmlab.wcl>
+
+lab "peer-b" {
+
+  segment "wan" {
+    subnet = "10.99.0.0/24"
+    global = true
+    connect { host = "127.0.0.1:13947" }   // side A's trunk_port
+  }
+
+  vm "b1" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+    arch     = "x86_64"
+    memory   = 1GiB
+    nic { segment = "wan" }
+  }
+
+  provision "scripts/setup.ws" { }
+}

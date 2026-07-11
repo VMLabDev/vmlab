@@ -25,6 +25,7 @@ import {
   Monitor,
   Play,
   RotateCw,
+  Router,
   Square,
   Waypoints,
 } from "lucide-solid";
@@ -48,18 +49,22 @@ import type { MachineKind } from "../../editor/store";
 import {
   addContainer,
   addMachineNic,
+  addRemote,
   addSegment,
   addSegmentRoute,
   addVm,
   disconnectMachineNic,
   editor,
+  remoteHosts,
   removeContainer,
+  removeRemote,
   removeSegment,
   removeSegmentRoute,
   removeVm,
   select,
   setMachineNicTarget,
   setSegmentNat,
+  setSegmentPeer,
   storeTemplateFor,
 } from "../../editor/store";
 import { formatMemory } from "../../editor/bytesize";
@@ -83,7 +88,7 @@ import OsIcon from "./OsIcon";
 import { registerFxNode } from "../../fx";
 
 interface Drag {
-  kind: "vm" | "container" | "segment" | "nat" | "lab";
+  kind: "vm" | "container" | "segment" | "nat" | "lab" | "remote";
   name: string;
   dx: number;
   dy: number;
@@ -113,11 +118,15 @@ interface SocketDrag {
 }
 
 /** An interconnect in flight: cabling out from a bar's side port, or
- *  re-homing an existing segment↔segment / segment↔WAN link. */
+ *  re-homing an existing segment↔segment / segment↔WAN / segment↔peer link. */
 interface LinkDrag {
   /** Source bar: a segment name, or NAT_KEY when cabling out of the WAN. */
   from: string;
-  existing: { kind: "route"; to: string } | { kind: "wan" } | null;
+  existing:
+    | { kind: "route"; to: string }
+    | { kind: "wan" }
+    | { kind: "peer"; to: string }
+    | null;
   moved: boolean;
   x: number;
   y: number;
@@ -193,6 +202,21 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
 
   const NAT_KEY = "__nat__";
 
+  // Remote-vmlab peer nodes are addressed as bars under a prefixed key so
+  // barAt/barPos/linkEnds treat them like fixed-size switches. Segment and
+  // machine names are DNS labels, so the prefix can never collide.
+  const REMOTE_PREFIX = "__remote__:";
+  const remoteKey = (host: string) => REMOTE_PREFIX + host;
+  const remoteHostOf = (key: string): string | null =>
+    key.startsWith(REMOTE_PREFIX) ? key.slice(REMOTE_PREFIX.length) : null;
+  /** Remote-vmlab node footprint (fixed, like the WAN cloud). */
+  const REMOTE_W = 170;
+  const remotePos = (host: string): NodePos =>
+    layout().remotes?.[host] ?? {
+      x: 60,
+      y: 200 + (model().segments.length + 1) * 170 + Math.max(0, remoteHosts().indexOf(host)) * 90,
+    };
+
   const ports = createMemo(() => {
     const byNic = new Map<string, number>(); // `${machine}:${nicIndex}` → socket index
     const used = new Map<string, number>(); // bar key → sockets in use
@@ -219,22 +243,32 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   const WAN_W = 150;
 
   const barUsed = (key: string) => ports().used.get(key) ?? 0;
-  const barWidth = (key: string) => (key === NAT_KEY ? WAN_W : segWidthFor(barUsed(key)));
+  const barWidth = (key: string) =>
+    key === NAT_KEY
+      ? WAN_W
+      : remoteHostOf(key) !== null
+        ? REMOTE_W
+        : segWidthFor(barUsed(key));
   // The socket bank is exactly the connections plus a couple of spares.
   const barCapacity = (key: string) => barUsed(key) + MIN_FREE_PORTS;
   const socketX = (barX: number, idx: number) => barX + PORT_X0 + idx * PORT_SPACING;
   const vmPortX = (vp: NodePos, nicIndex: number) => vp.x + 18 + nicIndex * 16;
-  const barPos = (key: string): NodePos => (key === NAT_KEY ? natPos() : segPos(key));
+  const barPos = (key: string): NodePos => {
+    const host = remoteHostOf(key);
+    return key === NAT_KEY ? natPos() : host !== null ? remotePos(host) : segPos(key);
+  };
 
-  // Interconnects: declared segment↔segment routes plus segment↔WAN (nat).
+  // Interconnects: declared segment↔segment routes, segment↔WAN (nat), and
+  // segment↔remote-vmlab peers (connect blocks).
   const links = createMemo(() => {
     const names = new Set(model().segments.map((s) => s.name));
-    const out: { from: string; kind: "route" | "wan"; to: string }[] = [];
+    const out: { from: string; kind: "route" | "wan" | "peer"; to: string }[] = [];
     for (const s of model().segments) {
       for (const t of s.routes_to) {
         if (names.has(t)) out.push({ from: s.name, kind: "route", to: t });
       }
       if (s.nat) out.push({ from: s.name, kind: "wan", to: NAT_KEY });
+      if (s.connect) out.push({ from: s.name, kind: "peer", to: remoteKey(s.connect.host) });
     }
     return out;
   });
@@ -276,6 +310,7 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
         const ps = wanPorts();
         return { left: ps.left, right: ps.right };
       }
+      // Segments and remote nodes both expose left/right mid-edge ports.
       const p = barPos(key);
       const y = p.y + SEG_H / 2;
       return { left: { x: p.x, y }, right: { x: p.x + barWidth(key), y } };
@@ -334,7 +369,9 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
             ? segPos(name)
             : kind === "lab"
               ? labPos()
-              : natPos();
+              : kind === "remote"
+                ? remotePos(name)
+                : natPos();
     setDrag({ kind, name, dx: w.x - pos.x, dy: w.y - pos.y, moved: false });
   }
 
@@ -371,20 +408,29 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   }
 
   /** Grab an existing interconnect cable to re-home or remove it. */
-  function linkGrab(e: PointerEvent, link: { from: string; kind: "route" | "wan"; to: string }) {
+  function linkGrab(
+    e: PointerEvent,
+    link: { from: string; kind: "route" | "wan" | "peer"; to: string },
+  ) {
     e.stopPropagation();
     if (anyVmRunning()) return;
     const w = world(e);
     setLinkDrag({
       from: link.from,
-      existing: link.kind === "route" ? { kind: "route", to: link.to } : { kind: "wan" },
+      existing:
+        link.kind === "route"
+          ? { kind: "route", to: link.to }
+          : link.kind === "peer"
+            ? { kind: "peer", to: link.to }
+            : { kind: "wan" },
       moved: false,
       x: w.x,
       y: w.y,
     });
   }
 
-  /** The bar (segment or the WAN) under a world point, with a little slack. */
+  /** The bar (segment, the WAN, or a remote-vmlab node) under a world
+   *  point, with a little slack. */
   function barAt(x: number, y: number): string | null {
     for (const s of model().segments) {
       const p = segPos(s.name);
@@ -395,6 +441,12 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     const p = natPos();
     if (x >= p.x && x <= p.x + barWidth(NAT_KEY) && y >= p.y - 8 && y <= p.y + SEG_H + 8) {
       return NAT_KEY;
+    }
+    for (const host of remoteHosts()) {
+      const rp = remotePos(host);
+      if (x >= rp.x && x <= rp.x + REMOTE_W && y >= rp.y - 8 && y <= rp.y + SEG_H + 8) {
+        return remoteKey(host);
+      }
     }
     return null;
   }
@@ -440,9 +492,11 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
             ? { ...l, containers: { ...l.containers, [d.name]: pos } }
             : d.kind === "segment"
               ? { ...l, segments: { ...l.segments, [d.name]: pos } }
-              : d.kind === "lab"
-                ? { ...l, lab: pos }
-                : { ...l, nat: pos },
+              : d.kind === "remote"
+                ? { ...l, remotes: { ...(l.remotes ?? {}), [d.name]: pos } }
+                : d.kind === "lab"
+                  ? { ...l, lab: pos }
+                  : { ...l, nat: pos },
       );
       return;
     }
@@ -486,6 +540,8 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
           if (i >= 0) select({ kind: "segment", index: i });
         } else if (d.kind === "lab") {
           select({ kind: "lab" });
+        } else if (d.kind === "remote") {
+          select({ kind: "remote", host: d.name });
         } else {
           select({ kind: "nat" });
         }
@@ -516,6 +572,17 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       setSocketDrag(null);
       if (!sd.moved) return;
       const w = world(e);
+      // A remote node's port only cables onto switches (peer attach) —
+      // remote keys must never become a NIC's segment.
+      const srcHost = remoteHostOf(sd.barKey);
+      if (srcHost !== null) {
+        const drop = barAt(w.x, w.y);
+        if (drop && drop !== NAT_KEY && remoteHostOf(drop) === null) {
+          const i = model().segments.findIndex((s) => s.name === drop);
+          if (i >= 0) setSegmentPeer(i, srcHost);
+        }
+        return;
+      }
       const seg = sd.barKey === NAT_KEY ? null : sd.barKey;
       const target = machineTargetAt(w.x, w.y);
       if (target) {
@@ -554,7 +621,14 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
         removeSegmentRoute(from, ld.existing.to);
       }
       if (ld.existing?.kind === "wan" && drop !== NAT_KEY) setSegmentNat(from, false);
-      if (drop === NAT_KEY) setSegmentNat(from, true);
+      if (ld.existing?.kind === "peer" && drop !== ld.existing.to) setSegmentPeer(from, null);
+      const dropHost = drop ? remoteHostOf(drop) : null;
+      if (dropHost !== null) {
+        setSegmentPeer(from, dropHost);
+        // Cable-first onto the unaddressed placeholder: open its inspector
+        // so the address field is front and center.
+        if (dropHost === "") select({ kind: "remote", host: "" });
+      } else if (drop === NAT_KEY) setSegmentNat(from, true);
       else if (drop) addSegmentRoute(from, drop);
       return;
     }
@@ -611,6 +685,18 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       ) {
         removeSegment(sel.index);
       }
+    } else if (sel.kind === "remote") {
+      if (anyVmRunning()) return;
+      const host = sel.host;
+      if (
+        await confirmDialog({
+          title: `Delete remote vmlab "${host || "(no address)"}"?`,
+          body: "Segments cabled to it lose their peer link.",
+          danger: true,
+        })
+      ) {
+        removeRemote(host);
+      }
     }
   }
 
@@ -648,6 +734,11 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       xs.push(p.x, p.x + labW());
       ys.push(p.y, p.y + LAB_H);
     }
+    for (const host of remoteHosts()) {
+      const p = remotePos(host);
+      xs.push(p.x, p.x + REMOTE_W);
+      ys.push(p.y - 14, p.y + SEG_H); // antennas poke above the box
+    }
     if (!xs.length || !svg) return;
     const rect = svg.getBoundingClientRect();
     const minX = Math.min(...xs) - 40;
@@ -681,6 +772,20 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       }
     }
     lastNames = names;
+  });
+
+  // Same trick for remote nodes: an inspector keystroke is one host rename —
+  // migrate its stored position so the node doesn't jump mid-edit.
+  let lastRemotes: string[] = [];
+  createEffect(() => {
+    const hosts = remoteHosts();
+    if (lastRemotes.length === hosts.length) {
+      const changed = hosts.findIndex((h, i) => h !== lastRemotes[i]);
+      if (changed >= 0 && hosts.filter((h, i) => h !== lastRemotes[i]).length === 1) {
+        setLayout((l) => renameInLayout(l, "remotes", lastRemotes[changed], hosts[changed]));
+      }
+    }
+    lastRemotes = [...hosts];
   });
 
   // Drags are tracked at the window level so a release outside the canvas
@@ -872,6 +977,26 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   const machineRunning = (kind: MachineKind, name: string) =>
     kind === "vm" ? vmRunning(name) : ctrRunning(name);
 
+  /** Live cross-host trunk state for a segment (daemon status; null-ish =
+   *  unknown / no daemon / not global). */
+  const segPeerConnected = (segName: string) =>
+    state.status?.segments.find((s) => s.name === segName)?.peer_connected === true;
+  /** Draft segments cabled to a remote node. */
+  const remoteAttached = (host: string) =>
+    model().segments.filter((s) => s.connect?.host === host);
+  /** Remote node LED: neutral when unattached/unknown, success when any
+   *  attached segment's trunk is up, danger when attached but down. */
+  const remoteLed = (host: string): { tone: string; label: string } => {
+    const attached = remoteAttached(host);
+    if (!attached.length) return { tone: "neutral", label: "not cabled to a segment" };
+    const states = attached.map(
+      (s) => state.status?.segments.find((r) => r.name === s.name)?.peer_connected,
+    );
+    if (states.some((v) => v === true)) return { tone: "success", label: "peer connected" };
+    if (states.some((v) => v === false)) return { tone: "danger", label: "peer disconnected" };
+    return { tone: "neutral", label: "no daemon" };
+  };
+
   /** A small in-canvas icon button on a VM box. */
   function VmBtn(props: {
     x: number;
@@ -952,6 +1077,19 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
         >
           Add segment
         </Button>
+        <Button
+          size="sm"
+          icon={Router}
+          onClick={() => addRemote()}
+          disabled={anyVmRunning()}
+          title={
+            anyVmRunning()
+              ? "Networking is read-only while a machine is up"
+              : "Bridge a segment to another vmlab instance over a cross-host trunk"
+          }
+        >
+          Add remote vmlab
+        </Button>
         <Button size="sm" variant="ghost" icon={LayoutGrid} onClick={arrange} title="Auto-arrange">
           Arrange
         </Button>
@@ -1027,13 +1165,20 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                 if (!ld || ld.from !== link.from || !ld.existing) return false;
                 return ld.existing.kind === "wan"
                   ? link.kind === "wan"
-                  : link.kind === "route" && ld.existing.to === link.to;
+                  : ld.existing.kind === "peer"
+                    ? link.kind === "peer" && ld.existing.to === link.to
+                    : link.kind === "route" && ld.existing.to === link.to;
               };
               return (
                 <Show when={!grabbed()}>
                   <g
                     class="topo-link"
-                    classList={{ live: link.kind === "wan", locked: anyVmRunning() }}
+                    classList={{
+                      live:
+                        link.kind === "wan" ||
+                        (link.kind === "peer" && segPeerConnected(link.from)),
+                      locked: anyVmRunning(),
+                    }}
                     onPointerDown={(e: PointerEvent) => linkGrab(e, link)}
                   >
                     <path d={linkPath(link.from, link.to, li())} class="topo-link-hit">
@@ -1042,6 +1187,8 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                           ? "Networking is read-only while a machine is up"
                           : link.kind === "wan"
                           ? `${link.from} ⇄ WAN — drag off to disconnect`
+                          : link.kind === "peer"
+                          ? `${link.from} ⇄ remote vmlab ${remoteHostOf(link.to) || "(no address)"} — drag off to disconnect`
                           : `${link.from} routes to ${link.to} — drag off to disconnect`}
                       </title>
                     </path>
@@ -1251,6 +1398,127 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
               );
             })()}
           </g>
+
+          {/* remote-vmlab peer nodes: routers representing another vmlab
+              instance — cable a switch's side port here to bridge that
+              (global) segment over a cross-host trunk (connect { host }).
+              The LED and cable animation follow the live trunk state. */}
+          <For each={remoteHosts()}>
+            {(host) => {
+              const p = () => remotePos(host);
+              const isSel = () =>
+                editor.selection.kind === "remote" && editor.selection.host === host;
+              const led = () => remoteLed(host);
+              const portLit = (side: "left" | "right") =>
+                links().some(
+                  (l) =>
+                    l.kind === "peer" &&
+                    l.to === remoteKey(host) &&
+                    linkEnds(l.from, l.to).bSide === side,
+                );
+              return (
+                <g
+                  class="topo-seg topo-remote"
+                  classList={{ selected: isSel() }}
+                  onPointerDown={(e: PointerEvent) => nodeDown(e, "remote", host)}
+                >
+                  <Show when={isSel()}>
+                    <rect
+                      x={p().x - 6}
+                      y={p().y - 22}
+                      width={REMOTE_W + 12}
+                      height={SEG_H + 30}
+                      rx="12"
+                      class="topo-wan-outline"
+                    />
+                  </Show>
+                  {/* two antennas poking above the box */}
+                  <line
+                    x1={p().x + 22}
+                    y1={p().y + 2}
+                    x2={p().x + 14}
+                    y2={p().y - 14}
+                    class="topo-remote-antenna"
+                  />
+                  <circle cx={p().x + 14} cy={p().y - 14} r="2.2" class="topo-remote-antenna-tip" />
+                  <line
+                    x1={p().x + REMOTE_W - 22}
+                    y1={p().y + 2}
+                    x2={p().x + REMOTE_W - 14}
+                    y2={p().y - 14}
+                    class="topo-remote-antenna"
+                  />
+                  <circle
+                    cx={p().x + REMOTE_W - 14}
+                    cy={p().y - 14}
+                    r="2.2"
+                    class="topo-remote-antenna-tip"
+                  />
+                  <rect
+                    x={p().x}
+                    y={p().y}
+                    width={REMOTE_W}
+                    height={SEG_H}
+                    rx="10"
+                    class="topo-remote-box"
+                  />
+                  <g
+                    class="topo-remote-glyph"
+                    transform={`translate(${p().x + 10} ${p().y + 11})`}
+                  >
+                    <Router size={17} />
+                  </g>
+                  <text class="topo-remote-kind" x={p().x + 34} y={p().y + 15}>
+                    REMOTE VMLAB
+                  </text>
+                  <text
+                    class="topo-remote-name"
+                    classList={{ placeholder: !host }}
+                    x={p().x + 34}
+                    y={p().y + 30}
+                  >
+                    {host || "set address…"}
+                  </text>
+                  {/* live trunk LED */}
+                  <circle
+                    cx={p().x + REMOTE_W - 12}
+                    cy={p().y + 12}
+                    r="4"
+                    class={`topo-led ${led().tone}`}
+                  >
+                    <title>{led().label}</title>
+                  </circle>
+                  {/* one peer port per short side */}
+                  <For each={["left", "right"] as const}>
+                    {(side) => {
+                      const px = () => (side === "left" ? p().x : p().x + REMOTE_W);
+                      const py = () => p().y + SEG_H / 2;
+                      return (
+                        <rect
+                          x={px() - (PORT_SIZE + 2) / 2}
+                          y={py() - (PORT_SIZE + 2) / 2}
+                          width={PORT_SIZE + 2}
+                          height={PORT_SIZE + 2}
+                          rx="2"
+                          class="topo-socket"
+                          classList={{ lit: portLit(side), locked: anyVmRunning() }}
+                          onPointerDown={(e: PointerEvent) =>
+                            socketDown(e, remoteKey(host), 0, px(), py())
+                          }
+                        >
+                          <title>
+                            {anyVmRunning()
+                              ? "Networking is read-only while a machine is up"
+                              : "Drag onto a switch to bridge that segment to this remote vmlab"}
+                          </title>
+                        </rect>
+                      );
+                    }}
+                  </For>
+                </g>
+              );
+            }}
+          </For>
 
           {/* VM nodes */}
           <For each={model().vms}>

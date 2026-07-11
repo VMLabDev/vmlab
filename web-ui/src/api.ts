@@ -105,6 +105,13 @@ export interface Segment {
   gateway: string;
   nat: boolean;
   dhcp: boolean;
+  global?: boolean;
+  /** Cross-host peer target (`connect { host }`), when declared. */
+  connect?: string | null;
+  /** Live trunk state: true/false for global segments (any trunk up, keyed
+   *  by segment name), null when not global or the supervisor is
+   *  unreachable. Drives the remote-vmlab node's LED. */
+  peer_connected?: boolean | null;
 }
 export interface LabStatus {
   lab: string;

@@ -209,25 +209,37 @@ fn print_status(status: &Value) {
     if let Some(segments) = status["segments"].as_array() {
         println!();
         println!(
-            "  {:<16} {:<18} {:<15} NAT/DHCP",
-            "SEGMENT", "SUBNET", "GATEWAY"
+            "  {:<16} {:<18} {:<15} {:<8} PEER",
+            "SEGMENT", "SUBNET", "GATEWAY", "NAT/DHCP"
         );
         for s in segments {
+            // PEER: the cross-host trunk state (PRD §9.2) — the configured
+            // `connect` target plus whether the trunk is currently up.
+            let peer = match (s["connect"].as_str(), s["peer_connected"].as_bool()) {
+                (Some(host), Some(true)) => format!("{host} (up)"),
+                (Some(host), Some(false)) => format!("{host} (down)"),
+                (Some(host), None) => host.to_string(),
+                (None, Some(true)) => "connected".to_string(),
+                _ => "-".to_string(),
+            };
             println!(
-                "  {:<16} {:<18} {:<15} {}/{}",
+                "  {:<16} {:<18} {:<15} {:<8} {peer}",
                 s["name"].as_str().unwrap_or("?"),
                 s["subnet"].as_str().unwrap_or("?"),
                 s["gateway"].as_str().unwrap_or("?"),
-                if s["nat"].as_bool().unwrap_or(false) {
-                    "on"
-                } else {
-                    "off"
-                },
-                if s["dhcp"].as_bool().unwrap_or(false) {
-                    "on"
-                } else {
-                    "off"
-                },
+                format!(
+                    "{}/{}",
+                    if s["nat"].as_bool().unwrap_or(false) {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    if s["dhcp"].as_bool().unwrap_or(false) {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
             );
         }
     }
