@@ -13,7 +13,9 @@
 //!   wired in later via [`GatewayHandle::set_uplink`].
 
 use crate::sync::LockRecover;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,7 +36,11 @@ use crate::net::switch::{ChannelPort, PortClass, Switch};
 const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Uplink handler: receives every frame the gateway routes off-segment.
-pub type UplinkFn = Box<dyn Fn(Bytes) + Send + Sync>;
+///
+/// The returned future is awaited by the gateway task, preserving frame
+/// order and propagating backpressure into the gateway port instead of
+/// spawning independently-racing tasks for consecutive TCP segments.
+pub type UplinkFn = Arc<dyn Fn(Bytes) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 type SharedUplink = Arc<Mutex<Option<UplinkFn>>>;
 
@@ -126,6 +132,12 @@ impl GatewayHandle {
         *self.uplink.lock_recover() = Some(handler);
     }
 
+    /// A sender for the gateway's switch port. Awaiting `send` applies
+    /// backpressure rather than silently dropping NAT return traffic.
+    pub fn sender(&self) -> mpsc::Sender<Bytes> {
+        self.tx.clone()
+    }
+
     /// Send a frame out the gateway port into the switch (the NAT return
     /// path). Returns `false` if the port queue is full or closed.
     /// Production code uses the detached [`Self::injector`]; the gateway
@@ -133,13 +145,6 @@ impl GatewayHandle {
     #[allow(dead_code)]
     pub fn inject(&self, frame: Bytes) -> bool {
         self.tx.try_send(frame).is_ok()
-    }
-
-    /// A detached injector closure (the NAT engine's return path) that
-    /// outlives borrows of the handle.
-    pub fn injector(&self) -> impl Fn(Bytes) -> bool + Send + Sync + 'static {
-        let tx = self.tx.clone();
-        move |frame: Bytes| tx.try_send(frame).is_ok()
     }
 }
 
@@ -217,18 +222,18 @@ struct GatewayTask {
 impl GatewayTask {
     async fn run(self, mut rx: mpsc::Receiver<Bytes>) {
         while let Some(frame) = rx.recv().await {
-            self.handle_frame(&frame);
+            self.handle_frame(&frame).await;
         }
         debug!(segment = %self.segment, "gateway port closed, task exiting");
     }
 
-    fn handle_frame(&self, frame: &Bytes) {
+    async fn handle_frame(&self, frame: &Bytes) {
         let Some(eth) = EthView::parse(frame) else {
             return;
         };
         match eth.ethertype() {
             ETHERTYPE_ARP => self.handle_arp(eth.payload()),
-            ETHERTYPE_IPV4 => self.handle_ipv4(&eth, frame),
+            ETHERTYPE_IPV4 => self.handle_ipv4(&eth, frame).await,
             _ => {}
         }
     }
@@ -247,7 +252,7 @@ impl GatewayTask {
         }
     }
 
-    fn handle_ipv4(&self, eth: &EthView<'_>, frame: &Bytes) {
+    async fn handle_ipv4(&self, eth: &EthView<'_>, frame: &Bytes) {
         let Some(ip) = Ipv4View::parse(eth.payload()) else {
             return;
         };
@@ -295,9 +300,9 @@ impl GatewayTask {
         // Addressed to the gateway MAC but not its IP: a guest routing
         // off-segment traffic through us. Hand it to the uplink.
         if eth.dst_mac() == self.gw_mac {
-            let uplink = self.uplink.lock_recover();
-            match uplink.as_ref() {
-                Some(f) => f(frame.clone()),
+            let uplink = self.uplink.lock_recover().clone();
+            match uplink {
+                Some(f) => f(frame.clone()).await,
                 None => {
                     debug!(segment = %self.segment, dst = %ip.dst(), "no uplink attached, frame dropped");
                 }
@@ -556,8 +561,11 @@ mod tests {
         let guest = sw.add_channel_port(PortClass::Guest { isolated: false });
 
         let (utx, mut urx) = mpsc::unbounded_channel::<Bytes>();
-        gw.set_uplink(Box::new(move |f| {
-            let _ = utx.send(f);
+        gw.set_uplink(Arc::new(move |f| {
+            let utx = utx.clone();
+            Box::pin(async move {
+                let _ = utx.send(f);
+            })
         }));
 
         let udp = udp_build(GUEST_IP, Ipv4Addr::new(8, 8, 8, 8), 5555, 443, b"hello").unwrap();
@@ -591,8 +599,11 @@ mod tests {
         let guest = sw.add_channel_port(PortClass::Guest { isolated: false });
 
         let (utx, mut urx) = mpsc::unbounded_channel::<Bytes>();
-        gw.set_uplink(Box::new(move |f| {
-            let _ = utx.send(f);
+        gw.set_uplink(Arc::new(move |f| {
+            let utx = utx.clone();
+            Box::pin(async move {
+                let _ = utx.send(f);
+            })
         }));
 
         let tcp = crate::net::frame::tcp_build(
@@ -619,6 +630,66 @@ mod tests {
             .expect("gw-addressed TCP never reached the uplink")
             .expect("uplink channel closed");
         assert_eq!(got, frame);
+    }
+
+    #[tokio::test]
+    async fn uplink_frames_are_awaited_in_arrival_order() {
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let guest = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        let (utx, mut urx) = mpsc::unbounded_channel::<u16>();
+        gw.set_uplink(Arc::new(move |frame| {
+            let utx = utx.clone();
+            Box::pin(async move {
+                let eth = EthView::parse(&frame).unwrap();
+                let ip = Ipv4View::parse(eth.payload()).unwrap();
+                let udp = UdpView::parse(ip.payload()).unwrap();
+                if udp.src_port() == 5000 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let _ = utx.send(udp.src_port());
+            })
+        }));
+
+        for sport in [5000, 5001] {
+            let udp = udp_build(
+                GUEST_IP,
+                Ipv4Addr::new(192, 0, 2, 1),
+                sport,
+                443,
+                b"ordered",
+            )
+            .unwrap();
+            let ip = ipv4_build(
+                GUEST_IP,
+                Ipv4Addr::new(192, 0, 2, 1),
+                IPPROTO_UDP,
+                64,
+                &udp,
+                sport,
+            )
+            .unwrap();
+            guest
+                .tx
+                .send(Bytes::from(eth_build(
+                    gw.gw_mac(),
+                    GUEST_MAC,
+                    ETHERTYPE_IPV4,
+                    &ip,
+                )))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), urx.recv()).await.unwrap(),
+            Some(5000)
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), urx.recv()).await.unwrap(),
+            Some(5001)
+        );
     }
 
     #[tokio::test]

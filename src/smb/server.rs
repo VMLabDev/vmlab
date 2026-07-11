@@ -90,6 +90,7 @@ impl SmbServer {
             path: ncalrpc,
             source,
         })?;
+        clear_stale_pidfile(&config);
 
         // 2. Write smb.conf.
         let conf_path = config.conf_path();
@@ -169,12 +170,39 @@ impl SmbServer {
             let _ = c.kill();
             let _ = c.wait();
         }
+        clear_stale_pidfile(&self.config);
     }
 }
 
 impl Drop for SmbServer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Remove Samba's lab-local pidfile only when it names a process that no
+/// longer exists. A live PID (including an unrelated process after PID
+/// reuse) is left untouched rather than risking interference.
+fn clear_stale_pidfile(config: &SmbConfig) {
+    let path = config.pid_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return;
+    };
+    if pid <= 0 {
+        return;
+    }
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Err(nix::errno::Errno::ESRCH) => {
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::debug!(path = %path.display(), %error, "failed to remove stale smbd pidfile");
+            }
+        }
+        _ => {}
     }
 }
 
@@ -270,6 +298,59 @@ mod tests {
         // Bind :0 to grab a free port, then release it for smbd to reuse.
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
+    }
+
+    fn test_config(dir: PathBuf) -> SmbConfig {
+        SmbConfig {
+            listen_port: 14450,
+            lab_dir: dir,
+            any_smb1: false,
+            shares: vec![],
+        }
+    }
+
+    #[test]
+    fn stale_smbd_pidfile_is_removed_but_live_pid_is_preserved() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vmlab-smb-pid-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = test_config(tmp.clone());
+
+        std::fs::write(config.pid_path(), "2147483647\n").unwrap();
+        clear_stale_pidfile(&config);
+        assert!(!config.pid_path().exists());
+
+        std::fs::write(config.pid_path(), format!("{}\n", std::process::id())).unwrap();
+        clear_stale_pidfile(&config);
+        assert!(config.pid_path().exists());
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn stop_kills_and_reaps_owned_child() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vmlab-smb-stop-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id() as i32;
+        let mut server = SmbServer {
+            child: Some(child),
+            config: test_config(tmp.clone()),
+        };
+
+        server.stop();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

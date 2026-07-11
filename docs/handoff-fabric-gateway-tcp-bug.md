@@ -1,11 +1,25 @@
 # Handoff: fabric gateway TCP stalls + silently loses bulk guest→host writes
 
-Status: **OPEN, unfixed.** Found 2026-07-12 while benchmarking the SMB share
+Status: **FIXED.** Found 2026-07-12 while benchmarking the SMB share
 path during the virtiofs transport work (commits 4be70a5 / 4204b5f / eb5d719).
 virtiofs is now the default share/volume transport, so day-to-day impact is
 limited to the SMB fallback tier — but SMB remains the only transport for
 vintage guests (XP/2003/DOS via smb1) and for hosts without virtiofsd, and
 **it can silently lose data**, so this should be fixed, not just documented.
+
+## Resolution
+
+The gateway handed each frame to NAT in a separately spawned Tokio task.
+Consecutive TCP segments could therefore overtake one another before reaching
+the deliberately in-order vTCP receiver; bounded `try_send` queues compounded
+the problem by silently dropping frames under pressure. The fix awaits the NAT
+uplink from the gateway's single ordered task and applies bounded backpressure
+in both directions. Regression coverage now sends 10 MiB through passive vTCP
+and verifies the exact bytes received by a loopback sink.
+
+The side findings were addressed at the same time: smbd startup clears a
+lab-local pidfile only when its PID is confirmed dead, and the Ubuntu 24.04
+template's autoinstall netplan matches `en*` rather than a PCI-derived name.
 
 ## Symptom
 

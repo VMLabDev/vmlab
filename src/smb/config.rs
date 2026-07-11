@@ -149,6 +149,9 @@ impl SmbConfig {
     pub fn log_path(&self) -> PathBuf {
         self.lab_dir.join("smbd.log")
     }
+    pub fn pid_path(&self) -> PathBuf {
+        self.lab_dir.join("smbd.pid")
+    }
 
     /// Render the `smb.conf`. Every directive is annotated below; the key
     /// theme is "run as a normal user, keep all state under `lab_dir`".

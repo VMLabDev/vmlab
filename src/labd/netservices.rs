@@ -111,7 +111,7 @@ fn spawn_nat(
     // Forward NAT output into the switch via the gateway port. Replies
     // sourced from a redirect target are un-NAT'd first (§9.9) — the guest
     // expects them from the address it originally dialled.
-    let inject = gateway.injector();
+    let gateway_tx = gateway.sender();
     tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let frame = {
@@ -131,20 +131,21 @@ fn spawn_nat(
                     });
                 rewritten.unwrap_or(frame)
             };
-            if !inject(frame) {
-                tracing::debug!("NAT output dropped: gateway port full/closed");
+            if gateway_tx.send(frame).await.is_err() {
+                tracing::debug!("NAT output stopped: gateway port closed");
+                break;
             }
         }
     });
 
-    // The gateway hands every off-segment frame to the engine. The uplink
-    // closure is synchronous; handle_frame is async, so spawn it.
+    // The gateway awaits every off-segment frame in arrival order. This is
+    // essential for vTCP: spawning one task per frame reorders bulk streams.
     let engine_uplink = engine.clone();
-    gateway.set_uplink(Box::new(move |frame: Bytes| {
+    gateway.set_uplink(Arc::new(move |frame: Bytes| {
         let e = engine_uplink.clone();
-        tokio::spawn(async move {
+        Box::pin(async move {
             e.handle_frame(frame).await;
-        });
+        })
     }));
     engine
 }

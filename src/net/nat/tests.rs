@@ -281,6 +281,105 @@ async fn vtcp_passive_echo_roundtrip() {
 }
 
 #[tokio::test]
+async fn vtcp_passive_bulk_upload_is_complete_and_stall_free() {
+    const SIZE: usize = 10 * 1024 * 1024;
+    const SEGMENT: usize = 1400;
+    const WINDOW_SEGMENTS: usize = 32;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dst = listener.local_addr().unwrap();
+    let sink = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::with_capacity(SIZE);
+        stream.read_to_end(&mut received).await.unwrap();
+        received
+    });
+
+    let expected: Vec<u8> = (0..SIZE)
+        .map(|i| (i.wrapping_mul(31) & 0xff) as u8)
+        .collect();
+    let (engine, mut rx) = engine();
+    let sport = 40_010;
+    let guest_isn = 10_000u32;
+
+    guest_tcp(
+        &engine,
+        sport,
+        (Ipv4Addr::LOCALHOST, dst.port()),
+        guest_isn,
+        0,
+        TCP_SYN,
+        b"",
+        &[2, 4, 0x05, 0xB4],
+    )
+    .await;
+    let synack = recv_tcp(&mut rx).await;
+    let server_ack = synack.seq.wrapping_add(1);
+    let mut guest_seq = guest_isn.wrapping_add(1);
+    guest_tcp(
+        &engine,
+        sport,
+        (Ipv4Addr::LOCALHOST, dst.port()),
+        guest_seq,
+        server_ack,
+        TCP_ACK,
+        b"",
+        &[],
+    )
+    .await;
+
+    for window in expected.chunks(SEGMENT * WINDOW_SEGMENTS) {
+        for payload in window.chunks(SEGMENT) {
+            guest_tcp(
+                &engine,
+                sport,
+                (Ipv4Addr::LOCALHOST, dst.port()),
+                guest_seq,
+                server_ack,
+                TCP_ACK | TCP_PSH,
+                payload,
+                &[],
+            )
+            .await;
+            guest_seq = guest_seq.wrapping_add(payload.len() as u32);
+        }
+
+        loop {
+            let ack = recv_tcp(&mut rx).await;
+            assert!(ack.payload.is_empty());
+            if ack.ack == guest_seq {
+                break;
+            }
+        }
+    }
+
+    guest_tcp(
+        &engine,
+        sport,
+        (Ipv4Addr::LOCALHOST, dst.port()),
+        guest_seq,
+        server_ack,
+        TCP_ACK | TCP_FIN,
+        b"",
+        &[],
+    )
+    .await;
+    guest_seq = guest_seq.wrapping_add(1);
+    loop {
+        let ack = recv_tcp(&mut rx).await;
+        if ack.ack == guest_seq {
+            break;
+        }
+    }
+
+    let received = timeout(Duration::from_secs(30), sink)
+        .await
+        .expect("bulk upload stalled")
+        .expect("sink task failed");
+    assert_eq!(received, expected);
+}
+
+#[tokio::test]
 async fn vtcp_rst_on_connect_refused() {
     // Bind then drop to find a (very probably still) closed port.
     let closed = {

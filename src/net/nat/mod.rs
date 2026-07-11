@@ -192,8 +192,10 @@ impl NatEngine {
         let seg = vtcp::Segment::from_view(&tcp);
         let tx = self.tcp_flows.lock_recover().get(&key).cloned();
         if let Some(tx) = tx {
-            // Full channel = flow is drowning; drop, the guest retransmits.
-            let _ = tx.try_send(seg);
+            // Preserve arrival order and backpressure. Deliberately dropping
+            // here turns a busy in-process proxy into apparent network loss
+            // and can poison protocols such as SMB under sustained writes.
+            let _ = tx.send(seg).await;
             return;
         }
         if seg.is_syn() && !seg.is_ack() {
