@@ -238,17 +238,31 @@ pub async fn lab_status(state: web::Data<AppState>, lab: web::Path<String>) -> H
     }
 }
 
+/// Optional `?force=true` on the stop-shaped actions: force-kill instead of
+/// the graceful ladder (`down`, `*.stop`, and the stop half of `*.restart`).
+#[derive(Deserialize)]
+pub struct ForceQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 /// `POST /api/labs/{lab}/{action}` where action ∈ up|down|destroy.
 pub async fn lab_action(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
+    q: web::Query<ForceQuery>,
 ) -> HttpResponse {
     let (lab, action) = path.into_inner();
     let cmd = match action.as_str() {
         "up" | "down" | "destroy" => action.as_str(),
         _ => return HttpResponse::NotFound().json(json!({"error": "unknown lab action"})),
     };
-    match state.lab_call(&lab, cmd, json!({})).await {
+    let args = if cmd == "down" {
+        json!({"force": q.force})
+    } else {
+        json!({})
+    };
+    match state.lab_call(&lab, cmd, args).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -258,6 +272,7 @@ pub async fn lab_action(
 pub async fn vm_action(
     state: web::Data<AppState>,
     path: web::Path<(String, String, String)>,
+    q: web::Query<ForceQuery>,
 ) -> HttpResponse {
     let (lab, vm, action) = path.into_inner();
     let cmd = match action.as_str() {
@@ -267,7 +282,10 @@ pub async fn vm_action(
         "destroy" => "vm.destroy",
         _ => return HttpResponse::NotFound().json(json!({"error": "unknown vm action"})),
     };
-    match state.lab_call(&lab, cmd, json!({"vm": vm})).await {
+    match state
+        .lab_call(&lab, cmd, json!({"vm": vm, "force": q.force}))
+        .await
+    {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -279,6 +297,7 @@ pub async fn vm_action(
 pub async fn container_action(
     state: web::Data<AppState>,
     path: web::Path<(String, String, String)>,
+    q: web::Query<ForceQuery>,
 ) -> HttpResponse {
     let (lab, container, action) = path.into_inner();
     let cmd = match action.as_str() {
@@ -289,7 +308,7 @@ pub async fn container_action(
         _ => return HttpResponse::NotFound().json(json!({"error": "unknown container action"})),
     };
     match state
-        .lab_call(&lab, cmd, json!({"container": container}))
+        .lab_call(&lab, cmd, json!({"container": container, "force": q.force}))
         .await
     {
         Ok(v) => ok(v),

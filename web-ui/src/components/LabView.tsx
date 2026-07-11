@@ -33,6 +33,7 @@ import {
   type Pull,
 } from "../store";
 import { confirmDialog, promptDialog } from "./dialogs";
+import ActionButton from "./ActionButton";
 import LabEditorView from "./editor/LabEditorView";
 
 function fmtTime(t: string): string {
@@ -107,12 +108,22 @@ export default function LabView() {
         }
         actions={
           <>
-            <Button variant="primary" icon={Play} onClick={startAll}>
-              Start all
-            </Button>
-            <Button icon={Square} onClick={stopAll}>
-              Stop all
-            </Button>
+            <ActionButton
+              label="Start all"
+              busyLabel="Starting…"
+              icon={Play}
+              variant="primary"
+              onClick={startAll}
+            />
+            <ActionButton
+              label="Stop all"
+              busyLabel="Stopping…"
+              icon={Square}
+              onClick={() => stopAll()}
+              menu={[
+                { label: "Force stop all", danger: true, onClick: () => stopAll(true) },
+              ]}
+            />
             <Button icon={Camera} onClick={snapshotLab}>
               Snapshot
             </Button>

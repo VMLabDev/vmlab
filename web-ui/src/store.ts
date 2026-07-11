@@ -286,26 +286,32 @@ async function run(label: string, fn: () => Promise<unknown>) {
   }
 }
 
+// `force` = kill instead of the graceful stop ladder (down / stop / the
+// stop half of restart).
+const f = (force?: boolean) => (force ? "Force stopping" : "Stopping");
+
 export const startAll = () =>
   run("Starting lab", () => api.labAction(state.currentLab!, "up"));
-export const stopAll = () =>
-  run("Stopping lab", () => api.labAction(state.currentLab!, "down"));
+export const stopAll = (force?: boolean) =>
+  run(`${f(force)} lab`, () => api.labAction(state.currentLab!, "down", force));
 export const destroyLab = () =>
   run("Destroying lab", () => api.labAction(state.currentLab!, "destroy"));
 
 export const vmStart = (vm: string) =>
   run(`Starting ${vm}`, () => api.vmAction(state.currentLab!, vm, "start"));
-export const vmStop = (vm: string) =>
-  run(`Stopping ${vm}`, () => api.vmAction(state.currentLab!, vm, "stop"));
-export const vmRestart = (vm: string) =>
-  run(`Restarting ${vm}`, () => api.vmAction(state.currentLab!, vm, "restart"));
+export const vmStop = (vm: string, force?: boolean) =>
+  run(`${f(force)} ${vm}`, () => api.vmAction(state.currentLab!, vm, "stop", force));
+export const vmRestart = (vm: string, force?: boolean) =>
+  run(`Restarting ${vm}`, () => api.vmAction(state.currentLab!, vm, "restart", force));
 
 export const containerStart = (name: string) =>
   run(`Starting ${name}`, () => api.containerAction(state.currentLab!, name, "start"));
-export const containerStop = (name: string) =>
-  run(`Stopping ${name}`, () => api.containerAction(state.currentLab!, name, "stop"));
-export const containerRestart = (name: string) =>
-  run(`Restarting ${name}`, () => api.containerAction(state.currentLab!, name, "restart"));
+export const containerStop = (name: string, force?: boolean) =>
+  run(`${f(force)} ${name}`, () => api.containerAction(state.currentLab!, name, "stop", force));
+export const containerRestart = (name: string, force?: boolean) =>
+  run(`Restarting ${name}`, () =>
+    api.containerAction(state.currentLab!, name, "restart", force),
+  );
 
 export const takeSnapshot = (name: string, vm?: string) =>
   run("Snapshot saved", () => api.takeSnapshot(state.currentLab!, name, vm));

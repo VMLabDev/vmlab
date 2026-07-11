@@ -41,6 +41,20 @@
 .ctr-main { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
 .power-busy { display: inline-flex; align-items: center; gap: var(--sp-2); }
 
+/* Split button: a main action joined to a caret dropdown of variants
+   (Stop | Force stop). A 1px page-background seam divides the halves —
+   theme-agnostic, no per-variant border colors. */
+.split-btn { display: inline-flex; align-items: stretch; gap: 1px; }
+.split-btn > .fbtn {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.split-btn > .fmenu > .fbtn {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  padding-inline: var(--sp-2);
+}
+
 .ctr-term { height: 320px; }
 .ctr-term .xterm { height: 100%; padding: var(--sp-2); }
 .ctr-term-start {

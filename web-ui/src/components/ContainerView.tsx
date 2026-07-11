@@ -5,8 +5,9 @@
 // for this container, timestamped and stream-tagged).
 
 import { Show, createSignal } from "solid-js";
-import { Badge, Button, Card, Empty, PageHead, Tabs } from "@forge/ui";
+import { Badge, Card, Empty, PageHead, Tabs } from "@forge/ui";
 import { RotateCcw } from "lucide-solid";
+import ActionButton from "./ActionButton";
 import PowerButton from "./PowerButton";
 import {
   containerLook,
@@ -61,10 +62,22 @@ export default function ContainerView() {
               stopLabel="Stop"
               onStart={() => containerStart(ctr()!.name)}
               onStop={() => containerStop(ctr()!.name)}
+              onForceStop={() => containerStop(ctr()!.name, true)}
             />
-            <Button icon={RotateCcw} disabled={!on()} onClick={() => containerRestart(ctr()!.name)}>
-              Restart
-            </Button>
+            <ActionButton
+              label="Restart"
+              busyLabel="Restarting…"
+              icon={RotateCcw}
+              disabled={!on()}
+              onClick={() => containerRestart(ctr()!.name)}
+              menu={[
+                {
+                  label: "Force restart",
+                  danger: true,
+                  onClick: () => containerRestart(ctr()!.name, true),
+                },
+              ]}
+            />
           </>
         }
       />

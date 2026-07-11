@@ -266,8 +266,9 @@ impl Handler for LabdHandler {
             }
             "vm.restart" => {
                 let name = vm_arg(&args)?;
+                let force = args["force"].as_bool().unwrap_or(false);
                 let vm = lab.vm(&name).map_err(err)?.clone();
-                vm.stop(false).await.map_err(err)?;
+                vm.stop(force).await.map_err(err)?;
                 // Wait for the exit monitor to settle, then boot again.
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                 while vm.state().await != vm::PowerState::Stopped {
@@ -455,8 +456,9 @@ impl Handler for LabdHandler {
             }
             "container.restart" => {
                 let name = container_arg(&args)?;
+                let force = args["force"].as_bool().unwrap_or(false);
                 let c = lab.container(&name).map_err(err)?.clone();
-                c.stop(false).await.map_err(err)?;
+                c.stop(force).await.map_err(err)?;
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                 while c.state().await != vm::PowerState::Stopped {
                     if tokio::time::Instant::now() > deadline {

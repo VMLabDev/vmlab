@@ -1,6 +1,7 @@
 import { For, Show, createResource, createSignal } from "solid-js";
 import { Badge, Button, Card, Empty, Icon, PageHead, Tabs } from "@forge/ui";
 import { Camera, RotateCcw } from "lucide-solid";
+import ActionButton from "./ActionButton";
 import PowerButton from "./PowerButton";
 import {
   state,
@@ -91,10 +92,22 @@ export default function MachineView() {
               stopLabel="Power off"
               onStart={() => vmStart(vm()!.name)}
               onStop={() => vmStop(vm()!.name)}
+              onForceStop={() => vmStop(vm()!.name, true)}
             />
-            <Button icon={RotateCcw} disabled={!on()} onClick={() => vmRestart(vm()!.name)}>
-              Restart
-            </Button>
+            <ActionButton
+              label="Restart"
+              busyLabel="Restarting…"
+              icon={RotateCcw}
+              disabled={!on()}
+              onClick={() => vmRestart(vm()!.name)}
+              menu={[
+                {
+                  label: "Force restart",
+                  danger: true,
+                  onClick: () => vmRestart(vm()!.name, true),
+                },
+              ]}
+            />
           </>
         }
       />

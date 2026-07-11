@@ -117,20 +117,28 @@ export interface Snapshot {
 export const listLabs = (): Promise<LabEntry[]> => req("/api/labs");
 export const labStatus = (lab: string): Promise<LabStatus> =>
   req(`/api/labs/${encodeURIComponent(lab)}`);
-export const labAction = (lab: string, action: "up" | "down" | "destroy") =>
-  post(`/api/labs/${encodeURIComponent(lab)}/${action}`);
+// `force` applies to the stop-shaped actions (down / stop / restart's stop
+// half): kill instead of the graceful ladder.
+const forceQs = (force?: boolean) => (force ? "?force=true" : "");
+export const labAction = (lab: string, action: "up" | "down" | "destroy", force?: boolean) =>
+  post(`/api/labs/${encodeURIComponent(lab)}/${action}${forceQs(force)}`);
 export const vmAction = (
   lab: string,
   vm: string,
   action: "start" | "stop" | "restart" | "destroy",
-) => post(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/${action}`);
+  force?: boolean,
+) =>
+  post(
+    `/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/${action}${forceQs(force)}`,
+  );
 export const containerAction = (
   lab: string,
   container: string,
   action: "start" | "stop" | "restart" | "destroy",
+  force?: boolean,
 ) =>
   post(
-    `/api/labs/${encodeURIComponent(lab)}/containers/${encodeURIComponent(container)}/${action}`,
+    `/api/labs/${encodeURIComponent(lab)}/containers/${encodeURIComponent(container)}/${action}${forceQs(force)}`,
   );
 export const sendKeys = (lab: string, vm: string, keys: string) =>
   post(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/sendkeys`, {

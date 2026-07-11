@@ -5,8 +5,8 @@
 // respawn, a CLI-initiated stop) spin too via the reported state.
 
 import { Show, createEffect, createSignal } from "solid-js";
-import { Button, Spinner } from "@forge/ui";
-import { Power } from "lucide-solid";
+import { Button, DropdownMenu, Spinner } from "@forge/ui";
+import { ChevronDown, Power } from "lucide-solid";
 
 export default function PowerButton(p: {
   /** Machine name — a page switch to another machine drops local pending. */
@@ -17,6 +17,9 @@ export default function PowerButton(p: {
   stopLabel: string;
   onStart: () => Promise<unknown>;
   onStop: () => Promise<unknown>;
+  /** Kill instead of the graceful ladder — offered behind the stop side's
+   *  dropdown caret when present. */
+  onForceStop?: () => Promise<unknown>;
 }) {
   // Local pending bridges the gaps the reported state can't see: the action
   // request in flight (the daemon flips state only once it gets there) and
@@ -70,9 +73,24 @@ export default function PowerButton(p: {
           </Button>
         }
       >
-        <Button icon={Power} onClick={() => act("stop", p.onStop)}>
-          {p.stopLabel}
-        </Button>
+        <span class="split-btn">
+          <Button icon={Power} onClick={() => act("stop", p.onStop)}>
+            {p.stopLabel}
+          </Button>
+          <Show when={p.onForceStop}>
+            <DropdownMenu
+              icon={ChevronDown}
+              align="end"
+              items={[
+                {
+                  label: `Force ${p.stopLabel.toLowerCase()}`,
+                  danger: true,
+                  onSelect: () => void act("stop", p.onForceStop!),
+                },
+              ]}
+            />
+          </Show>
+        </span>
       </Show>
     </Show>
   );
