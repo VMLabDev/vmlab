@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 pub use catalog::list_repositories;
-pub use client::{PullProgress, Registry, ensure_registry_template};
+pub use client::{PullProgress, Registry, cached_registry_template, ensure_registry_template};
 // No in-crate consumer until the container-runtime wiring lands (`image` has
 // the matching module-level dead_code allow).
 #[allow(unused_imports)]

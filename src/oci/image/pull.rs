@@ -47,6 +47,18 @@ pub struct PulledImage {
     pub rootfs_image: PathBuf,
 }
 
+/// Offline-only check: `Some` when `reference` pins a digest that is already
+/// flattened in the cache. Tag references always return `None` — without the
+/// registry we cannot know what they point at (the digest pin persisted in
+/// lab state is what makes previously-pulled containers hit this).
+pub fn cached_container_image(reference: &str, cache: &ImageCache) -> Result<Option<PulledImage>> {
+    let reference = parse_image_reference(reference)?;
+    match &reference.selector {
+        Selector::Digest(d) => load_cached(cache, d),
+        Selector::Tag(_) => Ok(None),
+    }
+}
+
 /// Resolve `reference` for vmlab `arch` against `cache`, pulling from the
 /// registry only when the image is not already installed. `progress` fires
 /// during the layer download (never when the image is cached).
@@ -592,6 +604,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pinned.manifest_digest, md);
+
+        // The offline-only probe behind deferred pulls: a digest reference
+        // hits the cache, a tag reference never does (even when its digest
+        // is cached — without the registry a tag's target is unknowable).
+        let probe = cached_container_image(&format!("nginx@{md}"), &cache)
+            .unwrap()
+            .expect("digest-pinned probe should hit the cache");
+        assert_eq!(probe.manifest_digest, md);
+        assert!(
+            cached_container_image("nginx:latest", &cache)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

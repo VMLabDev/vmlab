@@ -37,6 +37,23 @@ pub struct LabRuntime {
     /// container — removed and re-installed when a restart brings a new
     /// lease, so a forward never points at a stale IP.
     container_forwards: Mutex<std::collections::HashMap<String, Vec<(String, u64)>>>,
+    /// Kept for post-pull re-resolution (deferred templates fold their meta
+    /// into the hardware resolution only once pulled).
+    profiles: ProfileSet,
+    /// Machines whose template/image is not in the local cache yet — the
+    /// deferred-pull work list. [`Self::ensure_pulled`] drains it; `status`
+    /// reports it as `template_cached` / `image_cached`.
+    pending_pulls: Mutex<BTreeMap<String, PendingPull>>,
+    /// Serialises pull runs (concurrent `up` + `pull` + `vm.start` must not
+    /// double-download); the loser re-checks the pending list and no-ops.
+    pull_lock: Mutex<()>,
+}
+
+/// One outstanding deferred download.
+#[derive(Clone)]
+enum PendingPull {
+    Template { reference: String, arch: String },
+    Image { reference: String },
 }
 
 impl LabRuntime {
@@ -53,6 +70,7 @@ impl LabRuntime {
         let mut state = LabState::load(&lab_local);
         let store = TemplateStore::new(crate::paths::template_store_dir());
         let mut network = LabNetwork::build(&config.lab)?;
+        let mut pending: BTreeMap<String, PendingPull> = BTreeMap::new();
 
         let mut vms = BTreeMap::new();
         for vm_cfg in &config.lab.vms {
@@ -72,20 +90,31 @@ impl LabRuntime {
                 TemplateRef::Registry { reference } => {
                     // A registry reference is pulled on first `up` if absent
                     // from the store, never re-pulled implicitly (PRD §6.4).
-                    // The supervisor pre-pulls (streaming progress to the UI)
-                    // before spawning this daemon, so by the time we get here
-                    // the template is usually cached and this resolves offline;
-                    // the shared helper still pulls as a fallback if not.
+                    // Build NEVER downloads: an uncached template becomes a
+                    // pending pull (placeholder hardware resolution below) so
+                    // the daemon starts instantly; `ensure_pulled` binds the
+                    // real parts at up/start/`pull` time, with progress.
                     let arch = vm_cfg.arch.clone().ok_or_else(|| {
                         anyhow!(
                             "vm \"{}\": registry template needs an explicit arch",
                             vm_cfg.name
                         )
                     })?;
-                    let resolved =
-                        crate::oci::ensure_registry_template(reference, &arch, &store, &mut |_| {})
-                            .await?;
-                    (Some(resolved.disk_path.clone()), Some(resolved.meta), None)
+                    match crate::oci::cached_registry_template(reference, &arch, &store)? {
+                        Some(resolved) => {
+                            (Some(resolved.disk_path.clone()), Some(resolved.meta), None)
+                        }
+                        None => {
+                            pending.insert(
+                                vm_cfg.name.clone(),
+                                PendingPull::Template {
+                                    reference: reference.clone(),
+                                    arch,
+                                },
+                            );
+                            (None, None, None)
+                        }
+                    }
                 }
             };
 
@@ -149,23 +178,26 @@ impl LabRuntime {
             let vm = VmInstance::new(
                 &name,
                 vm_cfg.clone(),
-                resolved,
                 dirs,
                 macs,
                 nic_mtus,
-                backing,
-                disk_size,
                 cdroms,
                 floppy,
-                first_boot_script,
+                crate::labd::vm::TemplateParts {
+                    resolved,
+                    backing,
+                    disk_size,
+                    first_boot_script,
+                },
             );
             vms.insert(vm_cfg.name.clone(), vm);
         }
 
-        // Containers: resolve each image (offline once pulled — the
-        // supervisor pre-pulls with progress before spawning this daemon,
-        // mirroring registry templates) and pin the digest so `up` never
-        // re-pulls implicitly (PRD §6.4 semantics).
+        // Containers: bind each image offline when it is already cached (the
+        // digest pin makes previously-pulled images hit); an uncached image
+        // becomes a pending pull, mirroring registry templates — build never
+        // downloads, `ensure_pulled` does (with progress) and pins the digest
+        // so `up` never re-pulls implicitly (PRD §6.4 semantics).
         let mut containers = BTreeMap::new();
         if !config.lab.containers.is_empty() {
             // Micro-VM containers run the host architecture (v1).
@@ -185,16 +217,16 @@ impl LabRuntime {
                     }
                     _ => c_cfg.image.reference.clone(),
                 };
-                let image = crate::oci::image::ensure_container_image(
-                    &reference,
-                    arch,
-                    &cache,
-                    &mut |_| {},
-                )
-                .await
-                .with_context(|| format!("container \"{}\": image {}", c_cfg.name, c_cfg.image))?;
-                c_state.image_digest = Some(image.manifest_digest.clone());
-                c_state.image_ref = Some(c_cfg.image.reference.clone());
+                let image = crate::oci::image::cached_container_image(&reference, &cache)
+                    .with_context(|| {
+                        format!("container \"{}\": image {}", c_cfg.name, c_cfg.image)
+                    })?;
+                if let Some(image) = &image {
+                    c_state.image_digest = Some(image.manifest_digest.clone());
+                    c_state.image_ref = Some(c_cfg.image.reference.clone());
+                } else {
+                    pending.insert(c_cfg.name.clone(), PendingPull::Image { reference });
+                }
 
                 // Stable MACs: explicit > persisted > generated — the unified
                 // name namespace keeps the hash inputs collision-free.
@@ -281,7 +313,206 @@ impl LabRuntime {
             events,
             smb: Mutex::new(None),
             container_forwards: Mutex::new(std::collections::HashMap::new()),
+            profiles: profiles.clone(),
+            pending_pulls: Mutex::new(pending),
+            pull_lock: Mutex::new(()),
         }))
+    }
+
+    /// Download every pending registry template / container image among
+    /// `targets` (empty = the whole lab), emitting the same
+    /// `template.pull.{start,progress,done,error}` / `container.pull.*`
+    /// events the supervisor pre-pull used to stream, so the web UI's
+    /// download panel works unchanged (issue #1). Called from `up`, from the
+    /// individual start paths, and from the `pull` command — a no-op once
+    /// everything is cached, so a fully-cached lab stays offline.
+    ///
+    /// Serialised by `pull_lock`; the work list is re-read under the lock so
+    /// a concurrent caller that lost the race finds nothing left to do. A
+    /// failed download emits `.error` and fails the caller; the pending
+    /// entry survives for retry.
+    pub async fn ensure_pulled(
+        self: &Arc<Self>,
+        targets: &[String],
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
+        // Cheap common case: nothing pending anywhere.
+        if self.pending_pulls.lock().await.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.pull_lock.lock().await;
+        let work: Vec<(String, PendingPull)> = self
+            .pending_pulls
+            .lock()
+            .await
+            .iter()
+            .filter(|(n, _)| targets.is_empty() || targets.contains(n))
+            .map(|(n, p)| (n.clone(), p.clone()))
+            .collect();
+        for (machine, job) in work {
+            match job {
+                PendingPull::Template { reference, arch } => {
+                    self.pull_template(&machine, &reference, &arch, output)
+                        .await?;
+                }
+                PendingPull::Image { reference } => {
+                    self.pull_image(&machine, &reference, output).await?;
+                }
+            }
+            self.pending_pulls.lock().await.remove(&machine);
+        }
+        Ok(())
+    }
+
+    /// Pull one registry template, then bind the resolved parts (hardware
+    /// re-resolution with the template meta, backing disk, first-boot script)
+    /// into the VM instance.
+    async fn pull_template(
+        self: &Arc<Self>,
+        vm_name: &str,
+        reference: &str,
+        arch: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
+        let store = TemplateStore::new(crate::paths::template_store_dir());
+        self.events.emit(
+            "template.pull.start",
+            json!({"vm": vm_name, "reference": reference, "arch": arch}),
+        );
+        if let Some(out) = output {
+            out(format!("pull: {reference} ({arch})\n"));
+        }
+        let events = self.events.clone();
+        let vm_s = vm_name.to_string();
+        let ref_s = reference.to_string();
+        let mut progress = move |p: crate::oci::PullProgress| {
+            let percent = p
+                .bytes_done
+                .saturating_mul(100)
+                .checked_div(p.bytes_total)
+                .unwrap_or(0) as u32;
+            events.emit(
+                "template.pull.progress",
+                json!({
+                    "vm": vm_s,
+                    "reference": ref_s,
+                    "chunk": p.chunk,
+                    "chunks": p.chunks,
+                    "bytes_done": p.bytes_done,
+                    "bytes_total": p.bytes_total,
+                    "percent": percent,
+                }),
+            );
+        };
+        let result =
+            crate::oci::ensure_registry_template(reference, arch, &store, &mut progress).await;
+        drop(progress);
+        match result {
+            Ok(resolved) => {
+                self.events.emit(
+                    "template.pull.done",
+                    json!({"vm": vm_name, "reference": reference}),
+                );
+                if let Some(out) = output {
+                    out(format!("pull: {reference} done\n"));
+                }
+                let vm_cfg = self
+                    .config
+                    .lab
+                    .vms
+                    .iter()
+                    .find(|v| v.name == vm_name)
+                    .ok_or_else(|| anyhow!("no vm \"{vm_name}\" in the lab config"))?;
+                let resolved_vm =
+                    crate::qemu::resolve_vm(vm_cfg, Some(&resolved.meta), &self.profiles)?;
+                self.vm(vm_name)?.set_template(super::vm::TemplateParts {
+                    resolved: resolved_vm,
+                    backing: Some(resolved.disk_path.clone()),
+                    disk_size: None,
+                    first_boot_script: resolved.meta.first_boot_script.clone(),
+                });
+                Ok(())
+            }
+            Err(e) => {
+                self.events.emit(
+                    "template.pull.error",
+                    json!({"vm": vm_name, "reference": reference, "error": format!("{e:#}")}),
+                );
+                Err(e.context(format!("pulling template for vm \"{vm_name}\"")))
+            }
+        }
+    }
+
+    /// Pull one container image, pin its digest into the lab state, and bind
+    /// it (re-merging the cinit spec) into the container instance.
+    async fn pull_image(
+        self: &Arc<Self>,
+        name: &str,
+        reference: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
+        let arch = std::env::consts::ARCH;
+        let cache = crate::oci::image::ImageCache::new(crate::paths::oci_cache_dir());
+        self.events.emit(
+            "container.pull.start",
+            json!({"container": name, "reference": reference, "arch": arch}),
+        );
+        if let Some(out) = output {
+            out(format!("pull: {reference}\n"));
+        }
+        let events = self.events.clone();
+        let cn_s = name.to_string();
+        let ref_s = reference.to_string();
+        let mut progress = move |p: crate::oci::image::ImagePullProgress| {
+            let percent = p
+                .bytes_done
+                .saturating_mul(100)
+                .checked_div(p.bytes_total)
+                .unwrap_or(0) as u32;
+            events.emit(
+                "container.pull.progress",
+                json!({
+                    "container": cn_s,
+                    "reference": ref_s,
+                    "layer": p.layer,
+                    "layers": p.layers,
+                    "bytes_done": p.bytes_done,
+                    "bytes_total": p.bytes_total,
+                    "percent": percent,
+                }),
+            );
+        };
+        let result =
+            crate::oci::image::ensure_container_image(reference, arch, &cache, &mut progress).await;
+        drop(progress);
+        match result {
+            Ok(image) => {
+                self.events.emit(
+                    "container.pull.done",
+                    json!({"container": name, "reference": reference}),
+                );
+                if let Some(out) = output {
+                    out(format!("pull: {reference} done\n"));
+                }
+                let container = self.container(name)?;
+                {
+                    let mut state = self.state.lock().await;
+                    let c_state = state.container_mut(name);
+                    c_state.image_digest = Some(image.manifest_digest.clone());
+                    c_state.image_ref = Some(container.cfg.image.reference.clone());
+                    state.save(&self.lab_local)?;
+                }
+                container.set_image(image);
+                Ok(())
+            }
+            Err(e) => {
+                self.events.emit(
+                    "container.pull.error",
+                    json!({"container": name, "reference": reference, "error": format!("{e:#}")}),
+                );
+                Err(e.context(format!("pulling image for container \"{name}\"")))
+            }
+        }
     }
 
     /// Start the SMB server for the lab's shares — VM `share {}` blocks and
@@ -334,11 +565,13 @@ impl LabRuntime {
                     continue;
                 };
                 // Volume hosts are pre-resolved (resolve_volume_hosts); the
-                // guest target rides along for smb.conf comments only.
+                // guest target rides along for smb.conf comments only. Read
+                // targets from the config (1:1 with the resolved exports) so
+                // the SMB plan doesn't depend on the image being pulled yet.
                 let shares = container
                     .volumes
                     .iter()
-                    .zip(container.spec.volumes.iter())
+                    .zip(container.cfg.volumes.iter())
                     .map(|((share, host, ro), vol)| crate::config::model::Share {
                         span: (0, 0),
                         host: host.clone(),
@@ -457,7 +690,7 @@ impl LabRuntime {
         // Detect the guest OS family from the resolved profile (which folds
         // in template metadata — the lab vm block usually omits `profile`).
         let Ok(vm) = self.vm(vm_name) else { return };
-        let os_hint = guest_os_hint(vm.resolved.profile.as_deref());
+        let os_hint = guest_os_hint(vm.template().resolved.profile.as_deref());
         let steps = labsmb.mount_plan(vm_name, os_hint);
         let Ok(qga) = vm.qga().await else {
             tracing::warn!("{vm_name}: no agent, cannot auto-mount shares");
@@ -574,11 +807,12 @@ impl LabRuntime {
                 continue;
             }
             let vm = self.vm(name)?;
-            let emu = crate::qemu::emulator_binary(&vm.resolved.arch);
+            let t = vm.template();
+            let emu = crate::qemu::emulator_binary(&t.resolved.arch);
             if !needed.contains(&emu) {
                 needed.push(emu);
             }
-            if vm.resolved.tpm && !needed.iter().any(|b| b == "swtpm") {
+            if t.resolved.tpm && !needed.iter().any(|b| b == "swtpm") {
                 needed.push("swtpm".to_string());
             }
         }
@@ -603,6 +837,10 @@ impl LabRuntime {
         if vm.state().await != PowerState::Stopped {
             return Ok(());
         }
+        // Safety net for paths that don't pull explicitly (restore, wscript):
+        // a no-op unless this VM's template download is still pending.
+        self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
+            .await?;
         self.events.emit("vm.starting", json!({"vm": name}));
 
         std::fs::create_dir_all(&vm.dirs.run)?;
@@ -649,6 +887,9 @@ impl LabRuntime {
         if container.state().await != PowerState::Stopped {
             return Ok(());
         }
+        // Safety net (see start_vm): no-op unless this image is still pending.
+        self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
+            .await?;
         // Volumes mount from the lab's SMB server; make sure it is serving
         // (idempotent — a no-op when `up` already started it).
         if !container.volumes.is_empty() {
@@ -832,6 +1073,12 @@ impl LabRuntime {
                 .cloned()
                 .collect()
         };
+
+        // Deferred template/image downloads happen here — before the binary
+        // preflight (pulled meta can change the resolved firmware/TPM needs)
+        // and before any clone or boot work, streaming progress to both the
+        // CLI sink and the event feed.
+        self.ensure_pulled(&targets, Some(&output)).await?;
 
         self.preflight_binaries(&targets)?;
 
@@ -1046,6 +1293,7 @@ impl LabRuntime {
             return Ok(());
         }
         let script = vm
+            .template()
             .first_boot_script
             .clone()
             .expect("first_boot_pending implies a script");
@@ -1210,6 +1458,9 @@ impl LabRuntime {
     }
 
     pub async fn status(&self) -> Value {
+        // One cheap map lookup per machine: is its template/image download
+        // still pending? Drives the web UI's "Download templates" button.
+        let pending = self.pending_pulls.lock().await;
         let mut vms = Vec::new();
         for (name, vm) in &self.vms {
             let state = vm.state().await;
@@ -1239,6 +1490,7 @@ impl LabRuntime {
                 "state": state,
                 "ready": ready,
                 "ip": ip,
+                "template_cached": !pending.contains_key(name),
                 "template": vm.cfg.template.to_string(),
                 "arch": vm.cfg.arch,
                 "cpus": vm.cfg.cpus,
@@ -1270,8 +1522,9 @@ impl LabRuntime {
                 "ready": ready,
                 "health": c.health().await,
                 "ip": ip,
+                "image_cached": !pending.contains_key(name),
                 "image": c.cfg.image.reference,
-                "digest": c.image.manifest_digest,
+                "digest": c.image_digest(),
                 "restarts": c.restart_count(),
                 "exit_code": c.last_exit().await,
                 "nics": nics,
@@ -1311,7 +1564,7 @@ impl LabRuntime {
                     SnapshotRecord {
                         online,
                         taken_at: chrono::Utc::now(),
-                        image_digest: Some(container.image.manifest_digest.clone()),
+                        image_digest: container.image_digest(),
                     },
                 );
                 state.save(&self.lab_local)?;
@@ -1406,17 +1659,22 @@ impl LabRuntime {
         }
         .ok_or_else(|| anyhow!("container \"{name}\" has no snapshot \"{snap}\""))?;
 
+        // The image must be bound before the pin comparison below (a daemon
+        // restarted after a cache wipe re-pends the pull).
+        self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
+            .await?;
         let container = self.container(name)?.clone();
         // The scratch overlay (and any vmstate) is only valid against the
         // rootfs it was captured over — refuse a changed image pin.
+        let current = container.image_digest();
         if let Some(want) = &record.image_digest
-            && *want != container.image.manifest_digest
+            && Some(want) != current.as_ref()
         {
             bail!(
                 "container \"{name}\": snapshot \"{snap}\" was taken against image {want}, but \
                  the pinned image is now {} — destroy the container (clearing its snapshots) or \
                  restore the original pin",
-                container.image.manifest_digest
+                current.as_deref().unwrap_or("<not pulled>")
             );
         }
 

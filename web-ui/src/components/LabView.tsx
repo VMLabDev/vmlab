@@ -13,6 +13,7 @@ import {
 } from "@forge/ui";
 import {
   Camera,
+  Download,
   History,
   Play,
   Square,
@@ -23,6 +24,8 @@ import {
   startAll,
   stopAll,
   destroyLab,
+  pullLab,
+  needsPull,
   takeSnapshot,
   restoreSnapshot,
   deleteLabSnapshot,
@@ -108,6 +111,14 @@ export default function LabView() {
         }
         actions={
           <>
+            <Show when={needsPull()}>
+              <ActionButton
+                label="Download templates"
+                busyLabel="Downloading…"
+                icon={Download}
+                onClick={pullLab}
+              />
+            </Show>
             <ActionButton
               label="Start all"
               busyLabel="Starting…"

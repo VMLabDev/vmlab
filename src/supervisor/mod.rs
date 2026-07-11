@@ -24,8 +24,8 @@ pub struct Supervisor {
     server_events: tokio::sync::OnceCell<tokio::sync::broadcast::Sender<Event>>,
     globals: Arc<GlobalSegments>,
     /// Per-lab locks serialising `ensure_lab`: without this, concurrent
-    /// `lab.ensure` calls (a status poll plus an `up`, say) would each spawn a
-    /// daemon and pre-pull the same templates in parallel.
+    /// `lab.ensure` calls (a status poll plus an `up`, say) would each spawn
+    /// the same daemon in parallel.
     ensure_locks: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// In-flight template builds/pushes (web Templates page, PRD §6).
     template_ops: templates::TemplateOps,
@@ -151,7 +151,7 @@ impl Supervisor {
     /// control socket answers. Returns the socket path.
     async fn ensure_lab(self: &Arc<Self>, name: &str, root: PathBuf) -> Result<PathBuf, String> {
         // Serialise per lab: a status poll and an `up` arriving together must
-        // not both spawn the daemon and pre-pull templates in parallel.
+        // not both spawn the daemon in parallel.
         let lock = self.ensure_lock(name).await;
         let _guard = lock.lock().await;
 
@@ -167,11 +167,11 @@ impl Supervisor {
             }
         }
 
-        // Pre-pull any registry templates the lab needs before the daemon
-        // boots, streaming download progress to the UI's event feed (issue
-        // #1). The daemon's own build re-resolves and pulls as a fallback, so
-        // a failure here only costs the progress display, never the `up`.
-        self.prepull_templates(name, &root).await;
+        // Note: templates are NOT pre-pulled here. The daemon's build binds
+        // cached templates offline and defers missing ones; the lab daemon
+        // downloads them at up/start/`pull` time, streaming the same
+        // `template.pull.*` progress events through its event log (which
+        // `watch_lab_events` below forwards into the aggregate feed).
 
         crate::paths::ensure_dir(sock.parent().expect("lab socket has parent"))
             .map_err(|e| e.to_string())?;
@@ -231,13 +231,12 @@ impl Supervisor {
             }
         });
 
-        // Wait for the control socket to come up. The daemon binds only
-        // after `LabRuntime::build`, which on a first `up` may pull missing
-        // templates from an OCI registry (PRD §6.4) — that can take minutes,
-        // so a short fixed window is wrong. Instead allow a generous deadline
-        // but bail immediately if the reaper marks the daemon Failed (or it
-        // vanishes), so a genuine startup crash still reports fast.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+        // Wait for the control socket to come up. Build is fully offline now
+        // (missing templates defer to pull-on-up), so startup is quick; the
+        // deadline only covers slow hosts. Bail immediately if the reaper
+        // marks the daemon Failed (or it vanishes), so a genuine startup
+        // crash still reports fast.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             if let Ok(c) = Client::connect(&sock).await
                 && c.call("ping", Value::Null).await.is_ok()
@@ -259,147 +258,6 @@ impl Supervisor {
                 return Err(format!("lab daemon for {name} did not come up"));
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    }
-
-    /// Resolve and download every registry-backed template the lab references
-    /// that isn't already cached, emitting `template.pull.{start,progress,done,
-    /// error}` events as it goes so the web UI can show a download bar instead
-    /// of an indefinite spinner (issue #1). Best-effort: config errors and pull
-    /// failures are left for the lab daemon's build to surface properly.
-    async fn prepull_templates(self: &Arc<Self>, lab: &str, root: &std::path::Path) {
-        let config = match crate::config::load_lab_root(root) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let store = crate::template::TemplateStore::new(crate::paths::template_store_dir());
-        for vm in &config.lab.vms {
-            let crate::config::model::TemplateRef::Registry { reference } = &vm.template else {
-                continue;
-            };
-            let Some(arch) = vm.arch.clone() else {
-                continue;
-            };
-            let vm_name = vm.name.clone();
-            let reference = reference.clone();
-            self.emit(Event::new(
-                "template.pull.start",
-                lab,
-                json!({"vm": vm_name, "reference": reference, "arch": arch}),
-            ));
-
-            let sup = self.clone();
-            let lab_s = lab.to_string();
-            let vm_s = vm_name.clone();
-            let ref_s = reference.clone();
-            let mut progress = move |p: crate::oci::PullProgress| {
-                let percent = p
-                    .bytes_done
-                    .saturating_mul(100)
-                    .checked_div(p.bytes_total)
-                    .unwrap_or(0) as u32;
-                sup.emit(Event::new(
-                    "template.pull.progress",
-                    lab_s.clone(),
-                    json!({
-                        "vm": vm_s,
-                        "reference": ref_s,
-                        "chunk": p.chunk,
-                        "chunks": p.chunks,
-                        "bytes_done": p.bytes_done,
-                        "bytes_total": p.bytes_total,
-                        "percent": percent,
-                    }),
-                ));
-            };
-            let result =
-                crate::oci::ensure_registry_template(&reference, &arch, &store, &mut progress)
-                    .await;
-            drop(progress);
-
-            match result {
-                Ok(_) => self.emit(Event::new(
-                    "template.pull.done",
-                    lab,
-                    json!({"vm": vm_name, "reference": reference}),
-                )),
-                Err(e) => self.emit(Event::new(
-                    "template.pull.error",
-                    lab,
-                    json!({"vm": vm_name, "reference": reference, "error": format!("{e:#}")}),
-                )),
-            }
-        }
-
-        // Container images get the same treatment (PRD §18): pull before the
-        // daemon spawns so its build resolves offline. Honour the digest pin
-        // persisted in the lab state so a moved tag doesn't advance here.
-        if config.lab.containers.is_empty() {
-            return;
-        }
-        let arch = std::env::consts::ARCH;
-        let cache = crate::oci::image::ImageCache::new(crate::paths::oci_cache_dir());
-        let state = crate::labd::state::LabState::load(&crate::paths::lab_local_dir(root));
-        for c in &config.lab.containers {
-            let pinned = state
-                .containers
-                .get(&c.name)
-                .filter(|s| s.image_ref.as_deref() == Some(c.image.reference.as_str()))
-                .and_then(|s| s.image_digest.clone());
-            let reference = match pinned {
-                Some(d) if !c.image.reference.contains('@') => {
-                    format!("{}@{}", c.image.reference, d)
-                }
-                _ => c.image.reference.clone(),
-            };
-            let c_name = c.name.clone();
-            self.emit(Event::new(
-                "container.pull.start",
-                lab,
-                json!({"container": c_name, "reference": reference, "arch": arch}),
-            ));
-
-            let sup = self.clone();
-            let lab_s = lab.to_string();
-            let cn_s = c_name.clone();
-            let ref_s = reference.clone();
-            let mut progress = move |p: crate::oci::image::ImagePullProgress| {
-                let percent = p
-                    .bytes_done
-                    .saturating_mul(100)
-                    .checked_div(p.bytes_total)
-                    .unwrap_or(0) as u32;
-                sup.emit(Event::new(
-                    "container.pull.progress",
-                    lab_s.clone(),
-                    json!({
-                        "container": cn_s,
-                        "reference": ref_s,
-                        "layer": p.layer,
-                        "layers": p.layers,
-                        "bytes_done": p.bytes_done,
-                        "bytes_total": p.bytes_total,
-                        "percent": percent,
-                    }),
-                ));
-            };
-            let result =
-                crate::oci::image::ensure_container_image(&reference, arch, &cache, &mut progress)
-                    .await;
-            drop(progress);
-
-            match result {
-                Ok(_) => self.emit(Event::new(
-                    "container.pull.done",
-                    lab,
-                    json!({"container": c_name, "reference": reference}),
-                )),
-                Err(e) => self.emit(Event::new(
-                    "container.pull.error",
-                    lab,
-                    json!({"container": c_name, "reference": reference, "error": format!("{e:#}")}),
-                )),
-            }
         }
     }
 

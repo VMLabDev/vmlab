@@ -34,6 +34,6 @@ pub use cache::ImageCache;
 #[allow(unused_imports)]
 pub use model::{ImageConfig, oci_arch};
 #[allow(unused_imports)]
-pub use pull::{ImagePullProgress, PulledImage, ensure_container_image};
+pub use pull::{ImagePullProgress, PulledImage, cached_container_image, ensure_container_image};
 #[allow(unused_imports)]
 pub use reference::{ImageReference, Selector, parse_image_reference};

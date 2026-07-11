@@ -229,6 +229,16 @@ impl Handler for LabdHandler {
                 lab.up(&vms_arg(&args), output).await.map_err(err)?;
                 Ok(json!(true))
             }
+            // Download any pending templates/images without starting anything
+            // (the web UI's "Download templates" button, `vmlab pull`). The
+            // exact code path `up` runs first — same progress events.
+            "pull" => {
+                let output = stream_sink(&self.lab, _stream);
+                lab.ensure_pulled(&vms_arg(&args), Some(&output))
+                    .await
+                    .map_err(err)?;
+                Ok(json!(true))
+            }
             // Ad-hoc script against the lab (PRD §12: vmlab script).
             "run" => {
                 let script = args["script"].as_str().ok_or("missing script")?;
@@ -250,6 +260,13 @@ impl Handler for LabdHandler {
             }
             "vm.start" => {
                 let vm = vm_arg(&args)?;
+                // Pull with CLI-visible progress before the preflight (the
+                // pulled meta can change the resolved firmware/TPM needs);
+                // start_vm's internal pull is then a no-op.
+                let output = stream_sink(&self.lab, _stream);
+                lab.ensure_pulled(std::slice::from_ref(&vm), Some(&output))
+                    .await
+                    .map_err(err)?;
                 lab.preflight_binaries(std::slice::from_ref(&vm))
                     .map_err(err)?;
                 lab.start_vm(&vm).await.map_err(err)?;
@@ -440,6 +457,12 @@ impl Handler for LabdHandler {
             // Container lifecycle (mirrors the vm.* verbs; PRD §18).
             "container.start" => {
                 let name = container_arg(&args)?;
+                // Same ordering as vm.start: pull (with progress), preflight,
+                // start.
+                let output = stream_sink(&self.lab, _stream);
+                lab.ensure_pulled(std::slice::from_ref(&name), Some(&output))
+                    .await
+                    .map_err(err)?;
                 lab.preflight_binaries(std::slice::from_ref(&name))
                     .map_err(err)?;
                 lab.start_container(&name).await.map_err(err)?;

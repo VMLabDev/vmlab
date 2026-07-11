@@ -89,26 +89,36 @@ impl VmDirs {
     }
 }
 
+/// The template-derived half of a VM: hardware resolution, backing disk, and
+/// first-boot payload. Held behind a lock on [`VmInstance`] so a deferred
+/// registry pull can bind the real parts after the daemon is already up —
+/// `build()` installs a meta-less placeholder when the template isn't cached
+/// yet, and `LabRuntime::ensure_pulled` swaps in the resolved parts.
+pub struct TemplateParts {
+    pub resolved: qemu::ResolvedVm,
+    /// Backing template disk in the store (None for scratch / not yet pulled).
+    pub backing: Option<PathBuf>,
+    /// Primary disk virtual size (scratch: from config; clone: template's).
+    pub disk_size: Option<u64>,
+    /// Embedded first-boot provision script carried by the backing template
+    /// (None for scratch / templates without one). Run on first instantiation,
+    /// before the VM is reported ready (PRD §6.1).
+    pub first_boot_script: Option<String>,
+}
+
 pub struct VmInstance {
     pub lab: String,
     pub cfg: model::Vm,
-    pub resolved: qemu::ResolvedVm,
     pub dirs: VmDirs,
     pub macs: Vec<MacAddr>,
     /// Effective MTU of each NIC's segment, in declaration order. Drives
     /// `host_mtu=` on virtio NICs so the guest matches a jumbo segment.
     pub nic_mtus: Vec<u16>,
-    /// Backing template disk in the store (None for scratch).
-    pub backing: Option<PathBuf>,
-    /// Primary disk virtual size (scratch: from config; clone: template's).
-    pub disk_size: Option<u64>,
     /// CD-ROM image paths (config cdrom + built media), resolved absolute.
     pub cdroms: Vec<PathBuf>,
     pub floppy: Option<PathBuf>,
-    /// Embedded first-boot provision script carried by the backing template
-    /// (None for scratch / templates without one). Run on first instantiation,
-    /// before the VM is reported ready (PRD §6.1).
-    pub first_boot_script: Option<String>,
+    /// See [`TemplateParts`] — std lock (never held across await).
+    template: std::sync::RwLock<Arc<TemplateParts>>,
 
     state: RwLock<PowerState>,
     /// The guest agent answers `guest-ping`. Set by the readiness poller.
@@ -128,28 +138,22 @@ impl VmInstance {
     pub fn new(
         lab: &str,
         cfg: model::Vm,
-        resolved: qemu::ResolvedVm,
         dirs: VmDirs,
         macs: Vec<MacAddr>,
         nic_mtus: Vec<u16>,
-        backing: Option<PathBuf>,
-        disk_size: Option<u64>,
         cdroms: Vec<PathBuf>,
         floppy: Option<PathBuf>,
-        first_boot_script: Option<String>,
+        template: TemplateParts,
     ) -> Arc<Self> {
         Arc::new(Self {
             lab: lab.to_string(),
             cfg,
-            resolved,
             dirs,
             macs,
             nic_mtus,
-            backing,
-            disk_size,
             cdroms,
             floppy,
-            first_boot_script,
+            template: std::sync::RwLock::new(Arc::new(template)),
             state: RwLock::new(PowerState::Stopped),
             agent_up: RwLock::new(false),
             ready: RwLock::new(false),
@@ -159,6 +163,17 @@ impl VmInstance {
             qmp: Mutex::new(None),
             qga: Mutex::new(None),
         })
+    }
+
+    /// The current template-derived parts (placeholder until a deferred
+    /// registry pull binds the real ones).
+    pub fn template(&self) -> Arc<TemplateParts> {
+        self.template.read().expect("template lock").clone()
+    }
+
+    /// Bind the template parts resolved by a deferred pull.
+    pub fn set_template(&self, parts: TemplateParts) {
+        *self.template.write().expect("template lock") = Arc::new(parts);
     }
 
     pub async fn state(&self) -> PowerState {
@@ -185,7 +200,7 @@ impl VmInstance {
     /// Whether a first-boot provision still needs to run for this clone: the
     /// template carries one and no completion sentinel exists yet.
     pub fn first_boot_pending(&self) -> bool {
-        self.first_boot_script.is_some() && !self.dirs.firstboot_sentinel().exists()
+        self.template().first_boot_script.is_some() && !self.dirs.firstboot_sentinel().exists()
     }
 
     pub async fn qmp(&self) -> Result<QmpClient> {
@@ -210,7 +225,8 @@ impl VmInstance {
         std::fs::create_dir_all(&self.dirs.local)?;
         let primary = self.dirs.primary_disk();
         if !primary.exists() {
-            match (&self.backing, self.disk_size) {
+            let t = self.template();
+            match (&t.backing, t.disk_size) {
                 (Some(backing), _) => {
                     crate::template::qimg::create_linked_clone(backing, &primary).await?;
                 }
@@ -247,7 +263,7 @@ impl VmInstance {
         v
     }
 
-    fn build_paths(&self) -> Result<VmPaths> {
+    fn build_paths(&self, t: &TemplateParts) -> Result<VmPaths> {
         Ok(VmPaths {
             qmp_sock: self.dirs.qmp_sock(),
             qga_sock: self.dirs.qga_sock(),
@@ -267,9 +283,9 @@ impl VmInstance {
                 .enumerate()
                 .map(|(i, mac)| (*mac, self.dirs.nic_sock(i), self.nic_mtus.get(i).copied()))
                 .collect(),
-            ovmf_vars: (self.resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf))
+            ovmf_vars: (t.resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf))
                 .then(|| self.dirs.ovmf_vars()),
-            tpm_sock: self.resolved.tpm.then(|| self.dirs.tpm_sock()),
+            tpm_sock: t.resolved.tpm.then(|| self.dirs.tpm_sock()),
             serial_log: Some(self.dirs.logs.join("serial.log")),
         })
     }
@@ -291,17 +307,20 @@ impl VmInstance {
         }
         *self.stop_requested.write().await = false;
 
+        // Snapshot the template parts for the whole start sequence (a deferred
+        // pull can't swap them mid-boot under us).
+        let t = self.template();
         let run = async {
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
             self.ensure_disks().await?;
 
             // Per-VM writable OVMF VARS from the firmware template.
-            if self.resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf)
+            if t.resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf)
                 && !self.dirs.ovmf_vars().exists()
             {
-                let fw = match self.resolved.arch.as_str() {
-                    "x86_64" => qemu::firmware::ovmf_x86_64(self.resolved.secure_boot)?,
+                let fw = match t.resolved.arch.as_str() {
+                    "x86_64" => qemu::firmware::ovmf_x86_64(t.resolved.secure_boot)?,
                     "aarch64" => qemu::firmware::uefi_aarch64()?,
                     "riscv64" => qemu::firmware::uefi_riscv64()?,
                     a => bail!("no UEFI firmware for arch {a}"),
@@ -310,7 +329,7 @@ impl VmInstance {
                     .context("copying OVMF VARS template")?;
             }
 
-            if self.resolved.tpm {
+            if t.resolved.tpm {
                 let swtpm = qemu::process::spawn_swtpm(
                     &self.cfg.name,
                     &self.dirs.tpm_state(),
@@ -328,18 +347,18 @@ impl VmInstance {
                 *self.swtpm.lock().await = Some(swtpm);
             }
 
-            let accel = qemu::pick_accel(&self.resolved.arch);
+            let accel = qemu::pick_accel(&t.resolved.arch);
             if accel == qemu::Accel::Tcg {
                 tracing::warn!(
                     "{}: KVM unavailable for {} — falling back to TCG (slow)",
                     self.cfg.name,
-                    self.resolved.arch
+                    t.resolved.arch
                 );
             }
-            let args = qemu::build_args(&self.lab, &self.resolved, &self.build_paths()?, accel)?;
+            let args = qemu::build_args(&self.lab, &t.resolved, &self.build_paths(&t)?, accel)?;
             let proc = Proc::spawn(
                 &format!("qemu:{}", self.cfg.name),
-                &qemu::emulator_binary(&self.resolved.arch),
+                &qemu::emulator_binary(&t.resolved.arch),
                 &args,
                 &self.dirs.logs.join("qemu.log"),
             )

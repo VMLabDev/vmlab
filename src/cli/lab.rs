@@ -85,6 +85,23 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
     })
 }
 
+/// `vmlab pull [vms…]`: download missing registry templates/images with
+/// streamed progress, without starting anything — the CLI twin of the web
+/// UI's "Download templates" button.
+pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
+    rt()?.block_on(async {
+        super::validate::validate_current()?;
+        let (name, root) = current_lab()?;
+        let client = daemon::ensure_lab_daemon(&name, &root).await?;
+        client
+            .call_streaming("pull", json!({"vms": vms}), |chunk| print!("{chunk}"))
+            .await
+            .map_err(remote)?;
+        println!("lab \"{name}\": templates ready");
+        Ok(())
+    })
+}
+
 pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
     rt()?.block_on(async {
         let (name, _root) = current_lab()?;

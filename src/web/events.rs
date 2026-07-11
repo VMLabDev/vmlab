@@ -34,12 +34,12 @@ pub async fn events(
             });
         }
 
-        // Each lab daemon that is already up. This is best-effort and must
-        // never block the forward loop below: subscribing through `ensure`
-        // would stall here for the whole of a template pull (issue #1), during
-        // which the supervisor stream — already wired above — is what carries
-        // the pull-progress events. Labs that come up later are picked up via
-        // the supervisor's aggregate forwarding.
+        // Each lab daemon that is already up. Best-effort and never blocks
+        // the forward loop below (no subscribing through `ensure`, which
+        // would spawn daemons just to watch them). Labs that come up later —
+        // including their `template.pull.*` progress events, which originate
+        // in the lab daemon's event log — are picked up via the supervisor's
+        // aggregate forwarding (`watch_lab_events`).
         {
             let state = state.clone();
             let tx = tx.clone();

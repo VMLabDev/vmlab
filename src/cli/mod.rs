@@ -41,6 +41,11 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Download missing registry templates/images without starting anything
+    Pull {
+        /// Machines to pull for (default: all)
+        vms: Vec<String>,
+    },
     /// Stop the lab and delete clones, lab-local state, dynamic net config
     Destroy,
     /// Lab/VM/segment state, IPs, ready flags
@@ -287,6 +292,7 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Up { vms } => lab::cmd_up(vms),
+        Command::Pull { vms } => lab::cmd_pull(vms),
         Command::Down { vms, force } => lab::cmd_down(vms, force),
         Command::Destroy => lab::cmd_destroy(),
         Command::Status => lab::cmd_status(),

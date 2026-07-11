@@ -1,6 +1,6 @@
 //! Transport-aware VM interaction primitives (PRD §10.3): screen capture,
 //! keyboard, pointer, OCR, and image search over a [`VmInstance`]. The
-//! QMP-vs-VNC choice (`vm.resolved.input_transport`) lives here so the wscript
+//! QMP-vs-VNC choice (the resolved `input_transport`) lives here so the wscript
 //! `VmHandle` methods and the `vmlab vm` CLI subcommands share one
 //! implementation.
 
@@ -18,7 +18,7 @@ use crate::vision::{self, Match, MatchOptions};
 /// guests like macOS where QMP `send-key` is ignored).
 fn input_vnc(vm: &VmInstance) -> bool {
     matches!(
-        vm.resolved.input_transport,
+        vm.template().resolved.input_transport,
         crate::profiles::InputTransport::Vnc
     )
 }

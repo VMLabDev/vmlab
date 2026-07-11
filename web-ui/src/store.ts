@@ -12,8 +12,9 @@ import { playDestroyRecreate } from "./fx";
 export type ViewKind = "lab" | "vm" | "container" | "templates";
 
 // A template or container-image download in progress, driven by the
-// template.pull.* / container.pull.* events the supervisor streams while
-// bringing a lab up (issue #1). Keyed by `lab/vm` (`vm` = machine name).
+// template.pull.* / container.pull.* events the lab daemon streams while
+// pulling on up/start or via the "Download templates" button (issue #1).
+// Keyed by `lab/vm` (`vm` = machine name).
 export interface Pull {
   lab: string;
   vm: string;
@@ -245,6 +246,15 @@ export async function createLabAndOpen(name: string, path?: string): Promise<voi
   await loadTemplates();
 }
 
+/** True when some machine's template/image still needs downloading — shows
+ *  the "Download templates" button on the lab overview. */
+export function needsPull(): boolean {
+  return (
+    (state.status?.vms ?? []).some((v) => v.template_cached === false) ||
+    (state.status?.containers ?? []).some((c) => c.image_cached === false)
+  );
+}
+
 /** True if any VM or container in the current lab is not stopped (gates a
  *  reload — the daemon can't re-adopt running machines). */
 export function anyVmRunning(): boolean {
@@ -326,6 +336,10 @@ const f = (force?: boolean) => (force ? "Force stopping" : "Stopping");
 
 export const startAll = () =>
   run("Starting lab", () => api.labAction(state.currentLab!, "up"));
+/** Download missing templates/images without starting anything; progress
+ *  arrives as template.pull.* / container.pull.* events (PullPanel). */
+export const pullLab = () =>
+  run("Templates downloaded", () => api.labAction(state.currentLab!, "pull"));
 export const stopAll = (force?: boolean) =>
   run(`${f(force)} lab`, () => api.labAction(state.currentLab!, "down", force));
 // Not via run(): the fx session must be armed BEFORE the await — the

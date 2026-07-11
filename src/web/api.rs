@@ -246,7 +246,10 @@ pub struct ForceQuery {
     force: bool,
 }
 
-/// `POST /api/labs/{lab}/{action}` where action ∈ up|down|destroy.
+/// `POST /api/labs/{lab}/{action}` where action ∈ up|down|destroy|pull.
+/// `pull` downloads any missing templates/images without starting machines
+/// (the overview's "Download templates" button); like `up`, the response
+/// blocks until done while `template.pull.*` events drive the UI.
 pub async fn lab_action(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
@@ -254,7 +257,7 @@ pub async fn lab_action(
 ) -> HttpResponse {
     let (lab, action) = path.into_inner();
     let cmd = match action.as_str() {
-        "up" | "down" | "destroy" => action.as_str(),
+        "up" | "down" | "destroy" | "pull" => action.as_str(),
         _ => return HttpResponse::NotFound().json(json!({"error": "unknown lab action"})),
     };
     let args = if cmd == "down" {

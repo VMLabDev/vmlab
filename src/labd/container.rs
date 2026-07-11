@@ -297,6 +297,16 @@ struct Callbacks {
     ready_fired: AtomicBool,
 }
 
+/// The image-derived half of a container: the pulled image (rootfs squashfs
+/// and config) plus the pre-merged spec ([`build_spec`]) cinit receives over
+/// the ctl channel. Behind a lock on [`ContainerInstance`] so a deferred
+/// registry pull can bind it after the daemon is already up (`None` until
+/// then).
+pub struct ImageParts {
+    pub image: PulledImage,
+    pub spec: ContainerSpec,
+}
+
 pub struct ContainerInstance {
     pub lab: String,
     pub cfg: model::Container,
@@ -306,11 +316,9 @@ pub struct ContainerInstance {
     pub macs: Vec<MacAddr>,
     /// Effective MTU of each NIC's segment, in declaration order.
     pub nic_mtus: Vec<u16>,
-    /// The resolved, cached image (rootfs squashfs + config).
-    pub image: PulledImage,
-    /// The pre-merged spec (see [`build_spec`]); sent to cinit over the ctl
-    /// channel with the SMB coordinates injected ([`Self::spec_for_guest`]).
-    pub spec: ContainerSpec,
+    /// See [`ImageParts`] — std lock (never held across await); `None` while
+    /// the deferred image pull is still pending.
+    image: std::sync::RwLock<Option<Arc<ImageParts>>>,
     /// SMB volume exports in declaration order: (share name, host dir,
     /// read-only) — see [`resolve_volume_hosts`].
     pub volumes: Vec<(String, PathBuf, bool)>,
@@ -351,10 +359,13 @@ impl ContainerInstance {
         dirs: ContainerDirs,
         macs: Vec<MacAddr>,
         nic_mtus: Vec<u16>,
-        image: PulledImage,
+        image: Option<PulledImage>,
         volumes: Vec<(String, PathBuf, bool)>,
     ) -> Arc<Self> {
-        let spec = build_spec(&cfg, &image.config, &cfg.name);
+        let parts = image.map(|image| {
+            let spec = build_spec(&cfg, &image.config, &cfg.name);
+            Arc::new(ImageParts { image, spec })
+        });
         Arc::new(Self {
             lab: lab.to_string(),
             cfg,
@@ -362,8 +373,7 @@ impl ContainerInstance {
             dirs,
             macs,
             nic_mtus,
-            image,
-            spec,
+            image: std::sync::RwLock::new(parts),
             volumes,
             smb: RwLock::new(None),
             state: RwLock::new(PowerState::Stopped),
@@ -380,6 +390,36 @@ impl ContainerInstance {
             qga: Mutex::new(None),
             ctl: Mutex::new(None),
         })
+    }
+
+    /// The pulled image + merged spec, or an error while the deferred pull
+    /// is still pending (`vmlab pull` / `up` binds it).
+    pub fn image_parts(&self) -> Result<Arc<ImageParts>> {
+        self.image
+            .read()
+            .expect("image lock")
+            .clone()
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}: image not pulled yet — run `vmlab pull` or `vmlab up`",
+                    self.cfg.name
+                )
+            })
+    }
+
+    /// The pinned manifest digest, when the image is bound.
+    pub fn image_digest(&self) -> Option<String> {
+        self.image
+            .read()
+            .expect("image lock")
+            .as_ref()
+            .map(|p| p.image.manifest_digest.clone())
+    }
+
+    /// Bind the image resolved by a deferred pull (re-merges the spec).
+    pub fn set_image(&self, image: PulledImage) {
+        let spec = build_spec(&self.cfg, &image.config, &self.cfg.name);
+        *self.image.write().expect("image lock") = Some(Arc::new(ImageParts { image, spec }));
     }
 
     pub async fn state(&self) -> PowerState {
@@ -442,7 +482,7 @@ impl ContainerInstance {
     /// The spec as cinit receives it: the pre-merged document plus the SMB
     /// coordinates when volumes are declared.
     async fn spec_for_guest(&self) -> Result<ContainerSpec> {
-        let mut spec = self.spec.clone();
+        let mut spec = self.image_parts()?.spec.clone();
         if !spec.volumes.is_empty() {
             spec.smb = Some(self.smb.read().await.clone().ok_or_else(|| {
                 anyhow!(
@@ -467,11 +507,15 @@ impl ContainerInstance {
         self.cfg.memory.unwrap_or(DEFAULT_MEMORY)
     }
 
-    fn build_paths(&self, asset: &crate::guest_asset::GuestAsset) -> ContainerVmPaths {
+    fn build_paths(
+        &self,
+        asset: &crate::guest_asset::GuestAsset,
+        parts: &ImageParts,
+    ) -> ContainerVmPaths {
         ContainerVmPaths {
             kernel: asset.kernel.clone(),
             initrd: asset.initrd.clone(),
-            rootfs_image: self.image.rootfs_image.clone(),
+            rootfs_image: parts.image.rootfs_image.clone(),
             scratch_disk: self.dirs.scratch_disk(),
             nics: self
                 .macs
@@ -538,6 +582,15 @@ impl ContainerInstance {
         *self.last_exit.write().await = None;
         *self.healthy.write().await = None;
 
+        // Snapshot the image parts for the whole start sequence; errors out
+        // while the deferred pull is still pending.
+        let parts = match self.image_parts() {
+            Ok(p) => p,
+            Err(e) => {
+                *self.state.write().await = PowerState::Stopped;
+                return Err(e);
+            }
+        };
         let run = async {
             std::fs::create_dir_all(&self.dirs.local)?;
             std::fs::create_dir_all(&self.dirs.run)?;
@@ -550,7 +603,7 @@ impl ContainerInstance {
             }
             // Debug copy only (no credential); the guest gets the spec over
             // the ctl channel.
-            write_json_atomic(&self.dirs.container_json(), &self.spec)?;
+            write_json_atomic(&self.dirs.container_json(), &parts.spec)?;
 
             if !self.dirs.scratch_disk().exists() {
                 crate::template::qimg::create_blank(&self.dirs.scratch_disk(), SCRATCH_SIZE)
@@ -572,7 +625,7 @@ impl ContainerInstance {
                 &self.arch,
                 self.cpus(),
                 self.memory(),
-                &self.build_paths(&asset),
+                &self.build_paths(&asset, &parts),
             )?;
             let proc = Proc::spawn(
                 &format!("qemu:{}", self.cfg.name),
@@ -674,8 +727,13 @@ impl ContainerInstance {
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            // Phase 2: the healthcheck gate.
-            if me.spec.healthcheck.is_some() {
+            // Phase 2: the healthcheck gate. (Running implies the image is
+            // bound; a missing one just means no healthcheck gate.)
+            let has_healthcheck = me
+                .image_parts()
+                .map(|p| p.spec.healthcheck.is_some())
+                .unwrap_or(false);
+            if has_healthcheck {
                 loop {
                     if me.state().await != PowerState::Running {
                         return;
@@ -816,8 +874,12 @@ impl ContainerInstance {
         }
 
         // Rung 1: the ctl channel — cinit signals the container and powers
-        // off once it exits (SIGKILL after the grace).
-        let grace = self.spec.stop_grace_secs;
+        // off once it exits (SIGKILL after the grace). A running container
+        // always has its image bound; the fallback grace is cinit's default.
+        let grace = self
+            .image_parts()
+            .map(|p| p.spec.stop_grace_secs)
+            .unwrap_or(10);
         if let Ok(ctl) = self.ctl().await
             && ctl
                 .send(&CtlCommand::Stop { grace_secs: grace })
@@ -1029,15 +1091,16 @@ impl ContainerInstance {
         timeout: Duration,
     ) -> Result<crate::qga::ExecResult> {
         let qga = self.qga().await?;
+        let parts = self.image_parts()?;
         let mut wrapped: Vec<&str> = vec!["chroot", "/rootfs", cmd];
         wrapped.extend_from_slice(args);
-        let mut env: Vec<String> = self
+        let mut env: Vec<String> = parts
             .spec
             .env
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
-        if !self.spec.env.iter().any(|(k, _)| k == "PATH") {
+        if !parts.spec.env.iter().any(|(k, _)| k == "PATH") {
             env.push(DEFAULT_PATH.to_string());
         }
         Ok(qga

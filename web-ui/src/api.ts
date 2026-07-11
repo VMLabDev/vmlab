@@ -75,6 +75,8 @@ export interface Vm {
   state: string;
   ready: boolean;
   ip: string | null;
+  /** False while the registry template still needs downloading. */
+  template_cached?: boolean;
   template: string;
   arch: string | null;
   cpus: number | null;
@@ -89,6 +91,8 @@ export interface Container {
   /** Latest healthcheck verdict; null = no check, or no report yet. */
   health: boolean | null;
   ip: string | null;
+  /** False while the container image still needs downloading. */
+  image_cached?: boolean;
   image: string;
   digest: string | null;
   restarts: number;
@@ -120,7 +124,11 @@ export const labStatus = (lab: string): Promise<LabStatus> =>
 // `force` applies to the stop-shaped actions (down / stop / restart's stop
 // half): kill instead of the graceful ladder.
 const forceQs = (force?: boolean) => (force ? "?force=true" : "");
-export const labAction = (lab: string, action: "up" | "down" | "destroy", force?: boolean) =>
+export const labAction = (
+  lab: string,
+  action: "up" | "down" | "destroy" | "pull",
+  force?: boolean,
+) =>
   post(`/api/labs/${encodeURIComponent(lab)}/${action}${forceQs(force)}`);
 export const vmAction = (
   lab: string,

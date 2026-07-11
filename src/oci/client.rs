@@ -499,11 +499,34 @@ impl Registry {
     }
 }
 
+/// Offline-only resolution of a `registry` template reference: `Some` when
+/// the referenced tag is already a store entry, `None` when a pull would be
+/// needed. Zero network — this is the cheap "is it cached?" probe behind the
+/// deferred pulls (labd build placeholders, status `template_cached`). A
+/// moving alias (`latest`) never resolves here until its first pull records
+/// a concrete version.
+pub fn cached_registry_template(
+    reference: &str,
+    arch: &str,
+    store: &TemplateStore,
+) -> Result<Option<crate::template::store::ResolvedTemplate>> {
+    let registry = Registry::new(reference)?;
+    // Templates live at `host/owner/[group/]name:VERSION`; the store name is
+    // the last repository path component.
+    let store_name = registry
+        .repository()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    Ok(store.resolve(arch, &store_name, Some(registry.tag())).ok())
+}
+
 /// Resolve a `registry` template reference to a cached store entry, pulling it
 /// (with progress) only when it isn't already present (PRD §6.4). This mirrors
-/// the resolution a first `up` performs, factored out so both the lab build
-/// (no progress) and the supervisor's pre-pull (streaming progress to the UI,
-/// issue #1) share one implementation.
+/// the resolution a first `up` performs, factored out so every pull site
+/// (labd's deferred `ensure_pulled`, streaming progress to the UI) shares one
+/// implementation.
 ///
 /// A concrete tag already in the store is used offline. A moving alias
 /// (`latest` / `latest-prerelease`) or a build-counter prefix is resolved
@@ -516,19 +539,17 @@ pub async fn ensure_registry_template(
     store: &TemplateStore,
     progress: &mut (dyn FnMut(PullProgress) + Send),
 ) -> Result<crate::template::store::ResolvedTemplate> {
+    // Tag is a concrete, already-cached version: stay offline.
+    if let Some(r) = cached_registry_template(reference, arch, store)? {
+        return Ok(r);
+    }
     let registry = Registry::new(reference)?;
-    // Templates live at `host/owner/[group/]name:VERSION`; the store name is
-    // the last repository path component.
     let store_name = registry
         .repository()
         .rsplit('/')
         .next()
         .unwrap_or_default()
         .to_string();
-    // Tag is a concrete, already-cached version: stay offline.
-    if let Ok(r) = store.resolve(arch, &store_name, Some(registry.tag())) {
-        return Ok(r);
-    }
     // Not cached. Resolve the requested tag against the registry's published
     // tags first: a build-counter prefix (e.g. 26100.1742) resolves to the
     // latest 26100.1742.<N>; a moving alias or exact tag is used as-is. Then
@@ -1465,5 +1486,64 @@ mod tests {
         std::fs::write(&img, b"abc").unwrap();
         let set = chunking::chunk_and_compress(&img, 1024 * 1024, &dir.path().join("c")).unwrap();
         assert_eq!(set.chunk_count, 1);
+    }
+
+    #[test]
+    fn cached_registry_template_hit_and_miss() {
+        // Purely offline: no transport exists to reach, so a network attempt
+        // would fail loudly rather than pass.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::template::TemplateStore::new(dir.path().join("templates"));
+
+        // Miss: empty store.
+        let miss =
+            cached_registry_template("ghcr.io/acme/ubuntu-2404:1.0", "x86_64", &store).unwrap();
+        assert!(miss.is_none());
+
+        // Install a matching entry, then the same reference resolves offline.
+        let meta = crate::template::meta::TemplateMeta {
+            name: "ubuntu-2404".into(),
+            arch: "x86_64".into(),
+            version: "1.0".into(),
+            profile: Some("linux".into()),
+            cpus: Some(2),
+            memory: Some(4 << 30),
+            disk: Some(20 << 30),
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            created: "2026-06-12T00:00:00Z".parse().unwrap(),
+            origin: None,
+            registry: None,
+            sha256: None,
+            first_boot_script: None,
+        };
+        std::fs::create_dir_all(store.root()).unwrap();
+        let staging = tempfile::tempdir_in(store.root()).unwrap();
+        std::fs::write(
+            staging.path().join(crate::template::store::DISK_FILE),
+            b"qcow2",
+        )
+        .unwrap();
+        store.install(&staging.keep(), &meta, false).unwrap();
+
+        let hit = cached_registry_template("ghcr.io/acme/ubuntu-2404:1.0", "x86_64", &store)
+            .unwrap()
+            .expect("installed version should resolve offline");
+        assert_eq!(hit.meta.version, "1.0");
+
+        // A different tag (or arch) still misses — moving aliases stay
+        // "not cached" until their first pull records a concrete version.
+        assert!(
+            cached_registry_template("ghcr.io/acme/ubuntu-2404:2.0", "x86_64", &store)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cached_registry_template("ghcr.io/acme/ubuntu-2404:1.0", "aarch64", &store)
+                .unwrap()
+                .is_none()
+        );
     }
 }
