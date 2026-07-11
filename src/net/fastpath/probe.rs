@@ -202,10 +202,15 @@ async fn recv_expect(io: &super::afxdp::TapIo, want: &[u8]) -> Result<()> {
     }
 }
 
+/// Send one length-prefixed frame the way QEMU's stream netdev does: prefix
+/// and payload in a single send (one skb). Two separate writes would arrive
+/// as two skbs, which the verdict correctly passes to userspace instead of
+/// splicing — the probe must exercise the aligned single-skb case.
 fn send_framed(sock: &UnixStream, frame: &[u8]) -> Result<()> {
+    let mut buf = (frame.len() as u32).to_be_bytes().to_vec();
+    buf.extend_from_slice(frame);
     let mut s = sock;
-    s.write_all(&(frame.len() as u32).to_be_bytes())?;
-    s.write_all(frame)?;
+    s.write_all(&buf)?;
     Ok(())
 }
 

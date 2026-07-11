@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use super::{FastpathMode, FastpathTier, init};
 use crate::config::model::MacAddr;
 use crate::net::frame::{ETHERTYPE_IPV4, MAC_BROADCAST, eth_build};
-use crate::net::framing::{read_frame, write_frame};
+use crate::net::framing::read_frame;
 use crate::net::switch::{HookAction, PortClass, Switch};
 
 const MAC_A: MacAddr = MacAddr([0x52, 0x54, 0xee, 0x00, 0x00, 0x0a]);
@@ -66,10 +66,21 @@ async fn recv_frame(read: &mut tokio::net::unix::OwnedReadHalf) -> Bytes {
         .expect("unexpected EOF")
 }
 
+/// Send one frame the way QEMU's stream netdev does: prefix + payload in a
+/// single write (one skb). `framing::write_frame`'s two writes would arrive
+/// as two skbs, which the verdict rightly passes to userspace — the tests
+/// must produce the aligned single-skb traffic the fast path targets.
+async fn send_qemu_framed(write: &mut tokio::net::unix::OwnedWriteHalf, frame: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let mut buf = (frame.len() as u32).to_be_bytes().to_vec();
+    buf.extend_from_slice(frame);
+    write.write_all(&buf).await.unwrap();
+}
+
 /// Teach the switch (and through it the kernel MAC map) a port's MAC.
 async fn announce(write: &mut tokio::net::unix::OwnedWriteHalf, mac: MacAddr) {
     let f = eth_build(MAC_BROADCAST, mac, ETHERTYPE_IPV4, b"announce");
-    write_frame(write, &f).await.unwrap();
+    send_qemu_framed(write, &f).await;
     // Give the learn + kernel mirror a moment to land.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
@@ -92,7 +103,7 @@ async fn fastpath_sockmap_forwards_in_kernel() {
     // Known unicast splices in-kernel: delivered, and counted as offloaded.
     for i in 0..100u32 {
         let f = eth_build(MAC_B, MAC_A, ETHERTYPE_IPV4, &i.to_be_bytes());
-        write_frame(&mut a_write, &f).await.unwrap();
+        send_qemu_framed(&mut a_write, &f).await;
         assert_eq!(recv_frame(&mut b_read).await, Bytes::from(f));
     }
     let stats = sw.stats();
@@ -103,7 +114,7 @@ async fn fastpath_sockmap_forwards_in_kernel() {
 
     // And the reply direction too.
     let f = eth_build(MAC_A, MAC_B, ETHERTYPE_IPV4, b"reply");
-    write_frame(&mut b_write, &f).await.unwrap();
+    send_qemu_framed(&mut b_write, &f).await;
     assert_eq!(recv_frame(&mut a_read).await, Bytes::from(f));
 }
 
@@ -141,7 +152,7 @@ async fn fastpath_sockmap_gateway_frames_reach_hook_and_service() {
     // pass to userspace, traverse the hook, and reach the service port —
     // exactly the L3-rules contract.
     let f = eth_build(MAC_SVC, MAC_A, ETHERTYPE_IPV4, b"to gateway");
-    write_frame(&mut a_write, &f).await.unwrap();
+    send_qemu_framed(&mut a_write, &f).await;
     let got = timeout(Duration::from_secs(2), svc.rx.recv())
         .await
         .expect("timed out")
@@ -167,7 +178,7 @@ async fn fastpath_sockmap_isolated_ports_stay_userspace() {
     // kernel never learned the isolated port, so nothing can splice around
     // that rule.
     let f = eth_build(MAC_B, MAC_C, ETHERTYPE_IPV4, b"must not arrive");
-    write_frame(&mut c_write, &f).await.unwrap();
+    send_qemu_framed(&mut c_write, &f).await;
     let got = timeout(Duration::from_millis(300), read_frame(&mut b_read)).await;
     assert!(got.is_err(), "isolated frame leaked: {got:?}");
     assert_eq!(sw.stats().frames_offloaded, 0);
@@ -187,7 +198,7 @@ async fn fastpath_sockmap_port_close_cleans_up() {
     recv_frame(&mut a_read).await;
     recv_frame(&mut b_read).await;
     let f = eth_build(MAC_B, MAC_A, ETHERTYPE_IPV4, b"pre-close");
-    write_frame(&mut a_write, &f).await.unwrap();
+    send_qemu_framed(&mut a_write, &f).await;
     recv_frame(&mut b_read).await;
 
     // Close "QEMU B": the port and its kernel state must go away, so
@@ -205,7 +216,7 @@ async fn fastpath_sockmap_port_close_cleans_up() {
 
     let (mut d_read, _d_write) = guest_port(&sw, false).await;
     let f = eth_build(MAC_B, MAC_A, ETHERTYPE_IPV4, b"post-close flood");
-    write_frame(&mut a_write, &f).await.unwrap();
+    send_qemu_framed(&mut a_write, &f).await;
     assert_eq!(recv_frame(&mut d_read).await, Bytes::from(f));
 }
 
@@ -259,7 +270,7 @@ async fn fastpath_sockmap_single_writer_integrity() {
             payload.extend_from_slice(&i.to_be_bytes());
             payload.resize(64, 0);
             let f = eth_build(MAC_B, MAC_A, ETHERTYPE_IPV4, &payload);
-            write_frame(&mut a_write, &f).await.unwrap();
+            send_qemu_framed(&mut a_write, &f).await;
         }
         a_write
     });
@@ -425,7 +436,7 @@ async fn fastpath_bench_ab() {
     let start = Instant::now();
     let mut sent = 0u64;
     while start.elapsed() < WINDOW {
-        write_frame(&mut a_write, &frame).await.unwrap();
+        send_qemu_framed(&mut a_write, &frame).await;
         sent += 1;
     }
     let secs = start.elapsed().as_secs_f64();
