@@ -269,7 +269,7 @@ Both **online** and **offline** snapshots are required:
 - **Offline** (VM powered off): disk state only.
 - **Online** (VM running): disk + RAM + device state, taken without stopping the guest beyond the unavoidable pause.
 
-Every snapshot records the VM's **power state at capture time**. Restore must do the right thing: restoring an online snapshot resumes the VM running exactly where it was; restoring an offline snapshot leaves the VM powered off. Snapshots are named, listable, and deletable per VM; a lab-wide snapshot verb captures all VMs in a lab under one name (consistency across VMs is best-effort, not coordinated — document this).
+Every snapshot records the VM's **power state at capture time**. Restore must do the right thing: restoring an online snapshot resumes the VM running exactly where it was; restoring an offline snapshot leaves the VM powered off. Snapshots are named, listable, and deletable per VM; a lab-wide snapshot verb captures all VMs (and containers, §18) in a lab under one name (consistency across VMs is best-effort, not coordinated — document this).
 
 Snapshots use **qcow2-internal snapshots wherever the mechanism supports the case**, keeping the on-disk footprint to the clone file itself; external snapshot files are permitted only where internal snapshots cannot deliver the behavioural contract above. Either way the mechanism must coexist with the linked-clone backing chain, and the contract — not the mechanism — is what binds. Shared folders (§7.5) are SMB-based precisely so they carry no device state into snapshots.
 
@@ -614,16 +614,23 @@ configuration: `env {}` variables, `volume {}` binds and named volumes,
 VM and container names share one namespace: DNS, `depends_on` waves,
 `forward { to = "name:port" }` targets, and provision scoping all resolve
 across both kinds. A container with no NICs is valid — air-gapped, still
-reachable via `exec`/`cp` over the agent channel.
+reachable via `exec`/`cp` over the agent channel — unless it declares
+volumes, which are network-mounted (validation error, mirroring §7.5).
 
 **Architecture.** Every container runs in a **micro-VM**: a pinned Alpine
 `linux-virt` kernel + purpose-built initramfs (`vmlab-cinit` as PID 1,
 bundling `qemu-ga`), booted directly with `-kernel/-initrd`, 1 vCPU / 256 MiB
 by default. The image's layers are flattened (whiteout-aware, tar-level, no
 host privileges) into a squashfs mounted read-only, with a per-container
-scratch qcow2 as the overlayfs writable layer. Config reaches the guest as
-`container.json` on a read-only 9p share; volumes are 9p shares
-(`security_model=mapped-xattr`). This preserves the §14 guarantee verbatim:
+scratch qcow2 as the overlayfs writable layer. Config reaches the guest as a
+`ContainerSpec` pushed over the ctl channel (the virtio-serial port that also
+carries lifecycle events and stop/resync commands). Volumes are SMB shares
+served by the lab daemon at the segment gateway — the same bundled-`smbd`
+mechanism as §7.5 shared folders — mounted by cinit over CIFS once the
+network is up. No virtfs/9p device is attached, which is what keeps the
+micro-VM fully snapshottable (§7.3): SMB is pure network traffic and carries
+no device state into a snapshot. Ownership on volume files is mount-level
+(CIFS), not per-file container uid/gid. This preserves the §14 guarantee verbatim:
 containers work inside the official image with **no** `--privileged`, no added
 capabilities — `/dev/kvm` only, TCG fallback without it.
 
@@ -646,9 +653,22 @@ events `container.starting/ready/stopped/crashed/unhealthy` are bindable with
 guest shutdown, then kill. Container stdout/stderr is the serial console log
 (`vmlab container logs [-f]`).
 
-**Deliberate exclusions.** Containers are **not snapshottable** — they rebuild
-from image + volumes; snapshot verbs on a container name fail with a clear
-error and lab-wide snapshots skip them. Named volumes are lab-scoped, shared
+**Snapshots.** Containers are snapshottable with full VM parity (§7.3).
+Offline snapshots capture the scratch disk; online snapshots capture scratch
++ RAM + device state, both as qcow2-internal snapshots on the per-container
+scratch qcow2 (the read-only rootfs squashfs is immutable and outside the
+snapshot). The power state recorded at capture drives restore exactly as for
+VMs — an online snapshot resumes the container mid-flight, process state and
+all — and lab-wide snapshot verbs cover containers alongside VMs. Volume
+contents are host state outside snapshot scope, exactly like §7.5 shares —
+restore never rolls back volume files, and like a restored VM's SMB session
+the volume's CIFS session is stale TCP the client re-establishes (the
+micro-VM mounts with `echo_interval=5`, so the first post-restore volume
+access stalls seconds, not minutes). Each snapshot records the container's
+pinned image digest; restoring under a different pin fails (the writable
+layer is only valid against the same rootfs).
+
+**Deliberate exclusions.** Named volumes are lab-scoped, shared
 by name, and survive `down` and per-container destroy; only lab `destroy`
 removes them. Cross-arch containers (image arch ≠ host arch) are out of scope
 for v1, as is a crun/native runtime backend (recorded as a possible fast path

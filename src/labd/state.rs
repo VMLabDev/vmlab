@@ -26,6 +26,11 @@ pub struct SnapshotRecord {
     /// Captured while running (disk+RAM+device) vs powered off (disk only).
     pub online: bool,
     pub taken_at: chrono::DateTime<chrono::Utc>,
+    /// Container snapshots only: the image digest pinned at capture. The
+    /// scratch overlay (and any vmstate) is valid only against the same
+    /// read-only rootfs, so restore refuses a changed pin. `None` for VMs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -42,6 +47,9 @@ pub struct ContainerState {
     /// reference in vmlab.wcl invalidates the pin.
     #[serde(default)]
     pub image_ref: Option<String>,
+    /// Snapshot name → record, same contract as VM snapshots (PRD §18).
+    #[serde(default)]
+    pub snapshots: BTreeMap<String, SnapshotRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -120,11 +128,26 @@ mod tests {
             SnapshotRecord {
                 online: true,
                 taken_at: chrono::Utc::now(),
+                image_digest: None,
+            },
+        );
+        s.container_mut("web").snapshots.insert(
+            "prepped".into(),
+            SnapshotRecord {
+                online: false,
+                taken_at: chrono::Utc::now(),
+                image_digest: Some("sha256:abc".into()),
             },
         );
         s.save(tmp.path()).unwrap();
         let loaded = LabState::load(tmp.path());
         assert_eq!(loaded.vms["a"].macs.len(), 1);
         assert!(loaded.vms["a"].snapshots["clean"].online);
+        assert_eq!(
+            loaded.containers["web"].snapshots["prepped"]
+                .image_digest
+                .as_deref(),
+            Some("sha256:abc")
+        );
     }
 }

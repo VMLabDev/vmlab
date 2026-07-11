@@ -64,9 +64,9 @@ pub struct VmHandle {
     pub(crate) ref_base: Arc<std::path::PathBuf>,
 }
 
-/// A container handle (PRD §16): the lifecycle/exec/ip subset of the VM
-/// surface — containers have no display, so no input/vision methods, and no
-/// snapshots.
+/// A container handle (PRD §16, §18): the lifecycle/exec/ip/snapshot subset
+/// of the VM surface — containers have no display, so no input/vision
+/// methods.
 #[derive(Script)]
 #[script(name = "Container")]
 #[script(opaque)]
@@ -791,6 +791,57 @@ pub fn lab_module() -> Module {
         .method("is_ready", |c: &ContainerHandle| -> bool {
             c.block(c.container.is_ready())
         })
+        // Snapshots (§18) — same contract as VMs, routed through the runtime
+        // so records/events/digest-guarding stay in one place.
+        .method(
+            "snapshot",
+            |c: &ContainerHandle, name: &str| -> Result<(), String> {
+                let runtime = c.runtime.clone();
+                let cname = c.container.cfg.name.clone();
+                let snap = name.to_string();
+                c.block(async move { runtime.snapshot(&cname, &snap).await })
+                    .map(|_| ())
+                    .map_err(estr)
+            },
+        )
+        .method(
+            "restore",
+            |c: &ContainerHandle, name: &str| -> Result<(), String> {
+                let runtime = c.runtime.clone();
+                let cname = c.container.cfg.name.clone();
+                let snap = name.to_string();
+                c.block(async move { runtime.restore(&cname, &snap).await })
+                    .map_err(estr)
+            },
+        )
+        .method(
+            "snapshots",
+            |c: &ContainerHandle| -> Result<Vec<String>, String> {
+                let runtime = c.runtime.clone();
+                let cname = c.container.cfg.name.clone();
+                let val = c
+                    .block(async move { runtime.snapshots(&cname).await })
+                    .map_err(estr)?;
+                Ok(val
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s["name"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default())
+            },
+        )
+        .method(
+            "delete_snapshot",
+            |c: &ContainerHandle, name: &str| -> Result<(), String> {
+                let runtime = c.runtime.clone();
+                let cname = c.container.cfg.name.clone();
+                let snap = name.to_string();
+                c.block(async move { runtime.delete_snapshot(&cname, &snap).await })
+                    .map_err(estr)
+            },
+        )
         // Healthy = the healthcheck's latest verdict is passing; a container
         // with no healthcheck (no verdict at all) counts as healthy once
         // it is ready.
@@ -1007,6 +1058,13 @@ fn main(lab: Lab) {
         Ok(text) => lab.log(text),
         Err(e) => lab.log(e),
     }
+    let snap = web.snapshot("clean")
+    match web.snapshots() {
+        Ok(names) => { for n in names { lab.log(n) } }
+        Err(e) => lab.log(e),
+    }
+    let rs = web.restore("clean")
+    let ds = web.delete_snapshot("clean")
     for c in lab.containers() {
         lab.log(c.name() + ": " + c.state())
     }

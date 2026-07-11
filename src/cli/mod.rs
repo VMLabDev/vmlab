@@ -258,14 +258,14 @@ pub enum ContainerCmd {
     Shell { container: String },
 }
 
-/// Snapshot management (PRD §7.3).
+/// Snapshot management (PRD §7.3; containers snapshot identically, §18).
 #[derive(Subcommand)]
 pub enum SnapshotCmd {
-    /// Take a snapshot of one VM, or lab-wide with no --vm
+    /// Take a snapshot of one VM/container, or lab-wide with no --vm
     Create {
         /// Snapshot name
         name: String,
-        /// VM ([lab/]vm); omitted = every VM in the lab
+        /// Machine ([lab/]name); omitted = every VM and container in the lab
         #[arg(long)]
         vm: Option<String>,
     },
@@ -273,13 +273,13 @@ pub enum SnapshotCmd {
     Restore {
         /// Snapshot name
         name: String,
-        /// VM ([lab/]vm); omitted = every VM in the lab
+        /// Machine ([lab/]name); omitted = every VM and container in the lab
         #[arg(long)]
         vm: Option<String>,
     },
-    /// List a VM's snapshots
+    /// List a VM's/container's snapshots
     List { vm: String },
-    /// Delete a VM snapshot
+    /// Delete a VM/container snapshot
     Delete { vm: String, name: String },
 }
 

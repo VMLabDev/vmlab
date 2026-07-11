@@ -231,6 +231,17 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             ));
         }
 
+        if !c.volumes.is_empty() && c.nics.is_empty() {
+            issues.push(Issue::at(
+                c.span,
+                format!(
+                    "container \"{}\" declares volumes but has no NICs — volumes mount over \
+                     the network from the segment gateway (PRD §18)",
+                    c.name
+                ),
+            ));
+        }
+
         for v in &c.volumes {
             if let VolumeSource::Host(host) = &v.source {
                 let path = file.root.join(host);

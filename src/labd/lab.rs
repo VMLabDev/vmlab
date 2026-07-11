@@ -284,14 +284,23 @@ impl LabRuntime {
         }))
     }
 
-    /// Start the SMB server for the lab's shares and DNAT each relevant
-    /// segment gateway's port 445 to it (PRD §7.5). Best-effort: a failure
-    /// is logged and the rest of the lab still works. Called from `up`.
+    /// Start the SMB server for the lab's shares — VM `share {}` blocks and
+    /// container volumes (PRD §18: volumes are SMB exports mounted by cinit)
+    /// — and DNAT each relevant segment gateway's port 445 to it (PRD §7.5).
+    /// Best-effort: a failure is logged and the rest of the lab still works.
+    /// Idempotent; called from `up` and from any individual container start.
     async fn ensure_smb(self: &Arc<Self>, output: &crate::scripting::OutputSink) {
-        // Collect sharing VMs with their gateway IP (first NIC's segment).
+        if self.smb.lock().await.is_some() {
+            return; // already serving
+        }
+        // Collect sharing VMs and volume-declaring containers with their
+        // gateway IP (first NIC's segment).
         let mut sharing: Vec<(String, std::net::Ipv4Addr, Vec<crate::config::model::Share>)> =
             Vec::new();
         let mut seg_ports: Vec<String> = Vec::new();
+        // Container name → the gateway its volumes mount from, for the
+        // post-spawn SmbInfo handout.
+        let mut volume_gateways: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
         {
             let net = self.network.lock().await;
             for vm in &self.config.lab.vms {
@@ -308,6 +317,39 @@ impl LabRuntime {
                     s.host = resolve_share_host(&self.root, &s.host);
                 }
                 sharing.push((vm.name.clone(), seg.gateway_ip, shares));
+                if !seg_ports.contains(&seg_name.to_string()) {
+                    seg_ports.push(seg_name.to_string());
+                }
+            }
+            for (name, container) in &self.containers {
+                if container.volumes.is_empty() {
+                    continue;
+                }
+                // Validated: volumes require a NIC (§5.1).
+                let Some(nic) = container.cfg.nics.first() else {
+                    continue;
+                };
+                let seg_name = nic_segment_name(nic);
+                let Some(seg) = net.segments.get(seg_name) else {
+                    continue;
+                };
+                // Volume hosts are pre-resolved (resolve_volume_hosts); the
+                // guest target rides along for smb.conf comments only.
+                let shares = container
+                    .volumes
+                    .iter()
+                    .zip(container.spec.volumes.iter())
+                    .map(|((share, host, ro), vol)| crate::config::model::Share {
+                        span: (0, 0),
+                        host: host.clone(),
+                        guest: vol.target.clone(),
+                        readonly: *ro,
+                        smb1: false,
+                        name: share.clone(),
+                    })
+                    .collect();
+                sharing.push((name.clone(), seg.gateway_ip, shares));
+                volume_gateways.push((name.clone(), seg.gateway_ip));
                 if !seg_ports.contains(&seg_name.to_string()) {
                     seg_ports.push(seg_name.to_string());
                 }
@@ -376,6 +418,23 @@ impl LabRuntime {
                         span: (0, 0),
                     });
                 }
+            }
+        }
+
+        // Hand each volume-declaring container its mount coordinates; the
+        // spec sent over ctl carries them (cinit mounts CIFS after net-up).
+        for (name, gateway) in volume_gateways {
+            let Some(creds) = labsmb.credentials(&name) else {
+                continue;
+            };
+            if let Ok(container) = self.container(&name) {
+                container
+                    .set_smb(vmlab_cinit_proto::SmbInfo {
+                        gateway: gateway.to_string(),
+                        username: creds.username.clone(),
+                        password: creds.password.clone(),
+                    })
+                    .await;
             }
         }
 
@@ -589,6 +648,12 @@ impl LabRuntime {
         let container = self.container(name)?.clone();
         if container.state().await != PowerState::Stopped {
             return Ok(());
+        }
+        // Volumes mount from the lab's SMB server; make sure it is serving
+        // (idempotent — a no-op when `up` already started it).
+        if !container.volumes.is_empty() {
+            let quiet: crate::scripting::OutputSink = std::sync::Arc::new(|_| {});
+            self.ensure_smb(&quiet).await;
         }
         self.events
             .emit("container.starting", json!({"container": name}));
@@ -1133,6 +1198,8 @@ impl LabRuntime {
             let c = state.container_mut(name);
             c.image_digest = None;
             c.image_ref = None;
+            // The scratch qcow2 (which held the snapshot data) is gone.
+            c.snapshots.clear();
             state.save(&self.lab_local)?;
         }
         self.events.emit(
@@ -1229,14 +1296,31 @@ impl LabRuntime {
         })
     }
 
-    // ---- snapshots (PRD §7.3) ----------------------------------------------
+    // ---- snapshots (PRD §7.3; containers §18) --------------------------------
 
+    /// Snapshot one machine — VM or container, same contract. The event and
+    /// state record note which; container records also pin the image digest
+    /// the capture is valid against.
     pub async fn snapshot(&self, vm_name: &str, snap: &str) -> Result<bool> {
-        if self.containers.contains_key(vm_name) {
-            bail!(
-                "\"{vm_name}\" is a container — containers are not snapshottable; they rebuild \
-                 from image + volumes (restart it instead)"
+        if let Some(container) = self.containers.get(vm_name) {
+            let online = container.snapshot(snap).await?;
+            {
+                let mut state = self.state.lock().await;
+                state.container_mut(vm_name).snapshots.insert(
+                    snap.to_string(),
+                    SnapshotRecord {
+                        online,
+                        taken_at: chrono::Utc::now(),
+                        image_digest: Some(container.image.manifest_digest.clone()),
+                    },
+                );
+                state.save(&self.lab_local)?;
+            }
+            self.events.emit(
+                "snapshot.created",
+                json!({"vm": vm_name, "name": snap, "online": online}),
             );
+            return Ok(online);
         }
         let vm = self.vm(vm_name)?;
         let online = vm.snapshot(snap).await?;
@@ -1247,6 +1331,7 @@ impl LabRuntime {
                 SnapshotRecord {
                     online,
                     taken_at: chrono::Utc::now(),
+                    image_digest: None,
                 },
             );
             state.save(&self.lab_local)?;
@@ -1258,11 +1343,11 @@ impl LabRuntime {
         Ok(online)
     }
 
-    /// Lab-wide snapshot: all VMs under one name; consistency across VMs is
-    /// best-effort, not coordinated (PRD §7.3).
+    /// Lab-wide snapshot: every VM and container under one name; consistency
+    /// across machines is best-effort, not coordinated (PRD §7.3).
     pub async fn snapshot_all(&self, snap: &str) -> Result<Value> {
         let mut results = Vec::new();
-        for name in self.vms.keys() {
+        for name in self.vms.keys().chain(self.containers.keys()) {
             let online = self.snapshot(name, snap).await?;
             results.push(json!({"vm": name, "online": online}));
         }
@@ -1271,10 +1356,7 @@ impl LabRuntime {
 
     pub async fn restore(self: &Arc<Self>, vm_name: &str, snap: &str) -> Result<()> {
         if self.containers.contains_key(vm_name) {
-            bail!(
-                "\"{vm_name}\" is a container — containers are not snapshottable; they rebuild \
-                 from image + volumes (restart it instead)"
-            );
+            return self.restore_container(vm_name, snap).await;
         }
         let record = {
             let mut state = self.state.lock().await;
@@ -1312,22 +1394,80 @@ impl LabRuntime {
         Ok(())
     }
 
+    /// Restore a container snapshot with full VM semantics (PRD §18): an
+    /// online record boots the micro-VM if needed, loads the snapshot and
+    /// resumes exactly where it was; an offline record reverts the scratch
+    /// disk and leaves the container stopped. Volume contents are host state
+    /// and never roll back.
+    async fn restore_container(self: &Arc<Self>, name: &str, snap: &str) -> Result<()> {
+        let record = {
+            let mut state = self.state.lock().await;
+            state.container_mut(name).snapshots.get(snap).cloned()
+        }
+        .ok_or_else(|| anyhow!("container \"{name}\" has no snapshot \"{snap}\""))?;
+
+        let container = self.container(name)?.clone();
+        // The scratch overlay (and any vmstate) is only valid against the
+        // rootfs it was captured over — refuse a changed image pin.
+        if let Some(want) = &record.image_digest
+            && *want != container.image.manifest_digest
+        {
+            bail!(
+                "container \"{name}\": snapshot \"{snap}\" was taken against image {want}, but \
+                 the pinned image is now {} — destroy the container (clearing its snapshots) or \
+                 restore the original pin",
+                container.image.manifest_digest
+            );
+        }
+
+        if record.online {
+            // Ensure a running micro-VM to load into — the normal start path
+            // wires NIC listeners and the event callbacks. Whatever the
+            // fresh boot writes is rewound by the load.
+            if container.state().await == PowerState::Stopped {
+                self.start_container(name).await?;
+            }
+            container.restore_online(snap).await?;
+            // Re-point forwards / re-prime the NAT MAC at the restored lease.
+            self.install_container_ports(name).await;
+        } else {
+            container.restore_offline(snap).await?;
+        }
+        self.events.emit(
+            "snapshot.restored",
+            json!({"vm": name, "name": snap, "online": record.online}),
+        );
+        Ok(())
+    }
+
     pub async fn delete_snapshot(&self, vm_name: &str, snap: &str) -> Result<()> {
-        let vm = self.vm(vm_name)?;
-        vm.delete_snapshot(snap).await?;
         let mut state = self.state.lock().await;
-        state.vm_mut(vm_name).snapshots.remove(snap);
+        if let Some(container) = self.containers.get(vm_name) {
+            container.delete_snapshot(snap).await?;
+            state.container_mut(vm_name).snapshots.remove(snap);
+        } else {
+            self.vm(vm_name)?.delete_snapshot(snap).await?;
+            state.vm_mut(vm_name).snapshots.remove(snap);
+        }
         state.save(&self.lab_local)?;
         Ok(())
     }
 
     pub async fn snapshots(&self, vm_name: &str) -> Result<Value> {
         let state = self.state.lock().await;
-        let snaps = state
-            .vms
-            .get(vm_name)
-            .map(|v| v.snapshots.clone())
-            .unwrap_or_default();
+        let snaps = if self.containers.contains_key(vm_name) {
+            state
+                .containers
+                .get(vm_name)
+                .map(|c| c.snapshots.clone())
+                .unwrap_or_default()
+        } else {
+            state
+                .vms
+                .get(vm_name)
+                .map(|v| v.snapshots.clone())
+                .unwrap_or_default()
+        };
         Ok(json!(
             snaps
                 .into_iter()

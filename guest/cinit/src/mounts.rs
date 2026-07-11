@@ -1,6 +1,6 @@
 //! Filesystem assembly: early pseudo-filesystems, the squashfs + ext4-scratch
-//! overlay that becomes the container root, 9p shares, and the runtime mounts
-//! inside the container rootfs.
+//! overlay that becomes the container root, CIFS volume mounts, and the
+//! runtime mounts inside the container rootfs.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -15,12 +15,6 @@ use crate::util::{Ctx, Result};
 pub const ROOTFS: &str = "/rootfs";
 const ROOTFS_RO: &str = "/rootfs-ro";
 const SCRATCH: &str = "/scratch";
-/// 9p config share mount point (contains container.json).
-pub const CFG_DIR: &str = "/vmlab-cfg";
-/// virtio-9p tag of the config share.
-pub const CFG_TAG: &str = "vmlab.cfg";
-
-const P9_OPTS: &str = "trans=virtio,version=9p2000.L,msize=1048576";
 
 pub fn ensure_dir(path: &str) -> Result<()> {
     fs::create_dir_all(path).ctx(&format!("mkdir -p {path}"))
@@ -126,22 +120,44 @@ pub fn mount_container_root(root_dev: &str, scratch_dev: &str) -> Result<()> {
     )
 }
 
-/// Mount the read-only 9p config share at [`CFG_DIR`].
-pub fn mount_cfg_share() -> Result<()> {
-    ensure_dir(CFG_DIR)?;
-    do_mount(CFG_TAG, CFG_DIR, "9p", MsFlags::MS_RDONLY, Some(P9_OPTS))
-}
-
-/// Mount one 9p volume share inside the container rootfs.
-pub fn mount_volume(tag: &str, target: &str, read_only: bool) -> Result<()> {
+/// Mount one volume share inside the container rootfs over CIFS, from the
+/// lab's SMB server at the segment gateway (PRD §18: volumes are network
+/// mounts precisely so no filesystem device state lands in snapshots).
+/// Requires the network to be up. Options mirror the VM shared-folder mount
+/// (§7.5, `vers=3.0`); `ip=` skips in-kernel name resolution — the source is
+/// already the gateway address. `echo_interval=5` makes the client notice a
+/// dead session in ~10s instead of the 2-minute default: after an online
+/// snapshot restore the rewound TCP session is stale, and the first volume
+/// access stalls until the client re-establishes it (same semantics as VM
+/// shares across restore, §7.5).
+pub fn mount_volume(
+    smb: &vmlab_cinit_proto::SmbInfo,
+    share: &str,
+    target: &str,
+    read_only: bool,
+) -> Result<()> {
     let inside = format!("{ROOTFS}/{}", target.trim_start_matches('/'));
     ensure_dir(&inside)?;
+    let source = format!("//{}/{}", smb.gateway, share);
+    let opts = format!(
+        "username={},password={},vers=3.0,ip={},echo_interval=5",
+        smb.username, smb.password, smb.gateway
+    );
     let flags = if read_only {
         MsFlags::MS_RDONLY
     } else {
         MsFlags::empty()
     };
-    do_mount(tag, &inside, "9p", flags, Some(P9_OPTS))
+    // Not do_mount: its error context echoes the option string, which here
+    // carries the SMB credential — keep that out of the console log.
+    mount(
+        Some(source.as_str()),
+        inside.as_str(),
+        Some("cifs"),
+        flags,
+        Some(opts.as_str()),
+    )
+    .ctx(&format!("mount -t cifs {source} {inside}"))
 }
 
 /// The runtime mounts every container expects: /proc, /sys, /dev, /dev/pts,

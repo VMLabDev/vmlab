@@ -11,7 +11,7 @@
 #                         closure — glib, pcre2, libintl, ... — is pinned
 #                         explicitly below rather than resolved at build time,
 #                         so every byte in the image is checksum-verified)
-#   /lib/modules/...      trimmed module tree (squashfs/overlay/ext4/9p/virtio
+#   /lib/modules/...      trimmed module tree (squashfs/overlay/ext4/cifs/virtio
 #                         + deps from modules.dep), loaded via /etc/vmlab-modules
 #
 # All Alpine packages are pinned (version + sha256) and fetched from the
@@ -52,8 +52,15 @@ PACKAGES=(
 # virtio_net are not. crc32c_generic is a runtime (request_module) dependency
 # of ext4 that modules.dep cannot see — without it the scratch mount fails
 # with "Cannot load crc32c driver". af_packet backs udhcpc's raw DHCP socket.
+# cifs mounts the SMB volume shares (PRD §18); cmac/gcm/ccm/ctr/ghash_generic
+# are its request_module crypto deps for SMB3 signing/encryption (hmac, sha*,
+# aes are builtin everywhere) and nls_utf8 backs the default iocharset — none
+# visible to modules.dep, same story as crc32c_generic. Which of the crypto
+# set are modules varies per arch (aarch64 builds ctr/gcm/ghash in);
+# resolve_modules skips the builtin ones.
 WANTED_MODULES=(
-  virtio_blk virtio_net af_packet squashfs overlay crc32c_generic ext4 9p 9pnet_virtio
+  virtio_blk virtio_net af_packet squashfs overlay crc32c_generic ext4
+  cifs cmac gcm ccm ctr ghash_generic nls_utf8
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -119,9 +126,12 @@ build_cinit() {
 }
 
 # Resolve the wanted module names to a dependency-first, de-duplicated list
-# of module paths (as they appear in modules.dep).
+# of module paths (as they appear in modules.dep). A wanted module that is
+# built into the kernel (modules.builtin, sibling of modules.dep) is skipped —
+# arches differ on which of the crypto helpers are modules.
 resolve_modules() {
   local depfile="$1"
+  local builtinfile="${depfile%modules.dep}modules.builtin"
   shift
   local -A seen=()
   local -a order=()
@@ -147,7 +157,16 @@ resolve_modules() {
         sub(/^.*\//, "", n); sub(/\.ko(\.gz)?$/, "", n); gsub(/-/, "_", n)
         if (n == w) { print p; exit }
       }' "$depfile")"
-    [[ -n "$path" ]] || die "module $want not found in $depfile"
+    if [[ -z "$path" ]]; then
+      if [[ -f "$builtinfile" ]] && awk -v w="$want" '{
+          n = $0; sub(/^.*\//, "", n); sub(/\.ko(\.gz)?$/, "", n); gsub(/-/, "_", n)
+          if (n == w) { found = 1; exit }
+        } END { exit !found }' "$builtinfile"; then
+        log "module $want is builtin, skipping"
+        continue
+      fi
+      die "module $want not found in $depfile (nor builtin)"
+    fi
     resolve_one "$path"
   done
   printf '%s\n' "${order[@]}"
@@ -258,10 +277,12 @@ build_arch() {
   done
 
   local -a module_paths=()
-  mapfile -t module_paths < <(resolve_modules "$kmoddir/modules.dep" "${WANTED_MODULES[@]}")
-  # die inside the process substitution can't stop the script — check here.
-  [[ ${#module_paths[@]} -ge ${#WANTED_MODULES[@]} ]] \
-    || die "module resolution failed (got ${#module_paths[@]} paths)"
+  # No process substitution: die inside resolve_modules must stop the script,
+  # and builtin skips make a count-based check meaningless.
+  local resolved="$kextract/resolved-modules"
+  resolve_modules "$kmoddir/modules.dep" "${WANTED_MODULES[@]}" >"$resolved"
+  mapfile -t module_paths <"$resolved"
+  [[ ${#module_paths[@]} -gt 0 ]] || die "module resolution produced no modules"
   : >"$root/etc/vmlab-modules"
   local mpath mname
   for mpath in "${module_paths[@]}"; do

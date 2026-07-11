@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::{Mutex, RwLock};
 
-use vmlab_cinit_proto::{ContainerSpec, CtlCommand, CtlEvent, HealthSpec, VolumeMount};
+use vmlab_cinit_proto::{ContainerSpec, CtlCommand, CtlEvent, HealthSpec, SmbInfo, VolumeMount};
 
 use super::container_ctl::CtlHandle;
 use super::vm::{PowerState, StopReason};
@@ -95,12 +95,11 @@ impl ContainerDirs {
     pub fn scratch_disk(&self) -> PathBuf {
         self.local.join("scratch.qcow2")
     }
-    /// Directory exported read-only over 9p as `vmlab.cfg`.
-    pub fn cfg_dir(&self) -> PathBuf {
-        self.local.join("cfg")
-    }
+    /// Debug copy of the merged spec. The guest receives the spec over the
+    /// ctl channel (plus the SMB credential, which this copy omits) — this
+    /// file exists purely for humans troubleshooting a container.
     pub fn container_json(&self) -> PathBuf {
-        self.cfg_dir().join("container.json")
+        self.local.join("container.json")
     }
     /// Serial console log: kernel messages + container stdout/stderr.
     pub fn console_log(&self) -> PathBuf {
@@ -115,9 +114,18 @@ pub fn named_volume_dir(lab_local: &Path, volume: &str) -> PathBuf {
     lab_local.join("volumes").join(volume)
 }
 
-/// Resolve the config's volume list to concrete 9p exports in declaration
-/// order: (tag `vol<i>`, host dir, read-only). Relative host binds resolve
-/// against the lab root; named volumes land under the lab work dir.
+/// SMB share name for a container's i-th volume. Deterministic from the
+/// container name alone, so [`build_spec`] (guest mount source) and
+/// [`resolve_volume_hosts`] (host export) agree without plumbing.
+pub fn volume_share_name(container: &str, i: usize) -> String {
+    format!("vol-{container}-{i}")
+}
+
+/// Resolve the config's volume list to concrete SMB exports in declaration
+/// order: (share name, host dir, read-only). Relative host binds resolve
+/// against the lab root; named volumes land under the lab work dir. The lab
+/// serves these from its `smbd` at the segment gateway (PRD §18 — volumes
+/// are network mounts so no filesystem device state lands in snapshots).
 pub fn resolve_volume_hosts(
     cfg: &model::Container,
     lab_root: &Path,
@@ -132,7 +140,7 @@ pub fn resolve_volume_hosts(
                 VolumeSource::Host(p) => lab_root.join(p),
                 VolumeSource::Named(name) => named_volume_dir(&lab_local, name),
             };
-            (format!("vol{i}"), host, v.read_only)
+            (volume_share_name(&cfg.name, i), host, v.read_only)
         })
         .collect()
 }
@@ -208,11 +216,14 @@ pub fn build_spec(cfg: &model::Container, image: &ImageConfig, hostname: &str) -
             .iter()
             .enumerate()
             .map(|(i, v)| VolumeMount {
-                tag: format!("vol{i}"),
+                share: volume_share_name(&cfg.name, i),
                 target: v.target.clone(),
                 read_only: v.read_only,
             })
             .collect(),
+        // Filled per send from the lab's live SMB server (see
+        // `ContainerInstance::spec_for_guest`) — never persisted.
+        smb: None,
         nics: cfg.nics.len() as u32,
         healthcheck,
     }
@@ -297,11 +308,16 @@ pub struct ContainerInstance {
     pub nic_mtus: Vec<u16>,
     /// The resolved, cached image (rootfs squashfs + config).
     pub image: PulledImage,
-    /// The pre-merged `container.json` document (see [`build_spec`]).
+    /// The pre-merged spec (see [`build_spec`]); sent to cinit over the ctl
+    /// channel with the SMB coordinates injected ([`Self::spec_for_guest`]).
     pub spec: ContainerSpec,
-    /// 9p volume exports in declaration order: (tag, host dir, read-only) —
-    /// see [`resolve_volume_hosts`].
+    /// SMB volume exports in declaration order: (share name, host dir,
+    /// read-only) — see [`resolve_volume_hosts`].
     pub volumes: Vec<(String, PathBuf, bool)>,
+    /// How the guest reaches the lab's SMB server for volume mounts —
+    /// set by the lab once its `smbd` is up, before any volume-declaring
+    /// start.
+    smb: RwLock<Option<SmbInfo>>,
 
     state: RwLock<PowerState>,
     /// The bundled qemu-ga answers `guest-ping`.
@@ -349,6 +365,7 @@ impl ContainerInstance {
             image,
             spec,
             volumes,
+            smb: RwLock::new(None),
             state: RwLock::new(PowerState::Stopped),
             agent_up: RwLock::new(false),
             started: RwLock::new(false),
@@ -417,6 +434,31 @@ impl ContainerInstance {
             .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
     }
 
+    /// Record how the guest reaches the lab's SMB server (volume mounts).
+    pub async fn set_smb(&self, info: SmbInfo) {
+        *self.smb.write().await = Some(info);
+    }
+
+    /// The spec as cinit receives it: the pre-merged document plus the SMB
+    /// coordinates when volumes are declared.
+    async fn spec_for_guest(&self) -> Result<ContainerSpec> {
+        let mut spec = self.spec.clone();
+        if !spec.volumes.is_empty() {
+            spec.smb = Some(self.smb.read().await.clone().ok_or_else(|| {
+                anyhow!(
+                    "{}: volumes declared but the lab SMB server is not up",
+                    self.cfg.name
+                )
+            })?);
+        }
+        Ok(spec)
+    }
+
+    async fn send_spec(&self, ctl: &CtlHandle) -> Result<()> {
+        let spec = self.spec_for_guest().await?;
+        ctl.send(&CtlCommand::Spec { spec }).await
+    }
+
     fn cpus(&self) -> u32 {
         self.cfg.cpus.unwrap_or(DEFAULT_CPUS)
     }
@@ -431,8 +473,6 @@ impl ContainerInstance {
             initrd: asset.initrd.clone(),
             rootfs_image: self.image.rootfs_image.clone(),
             scratch_disk: self.dirs.scratch_disk(),
-            cfg_dir: self.dirs.cfg_dir(),
-            volumes: self.volumes.clone(),
             nics: self
                 .macs
                 .iter()
@@ -502,12 +542,14 @@ impl ContainerInstance {
             std::fs::create_dir_all(&self.dirs.local)?;
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
-            std::fs::create_dir_all(self.dirs.cfg_dir())?;
-            // Host dirs behind the 9p exports must exist before QEMU starts.
+            // Host dirs behind the SMB volume exports must exist before the
+            // guest tries to mount them.
             for (_, host, _) in &self.volumes {
                 std::fs::create_dir_all(host)
                     .with_context(|| format!("creating volume dir {}", host.display()))?;
             }
+            // Debug copy only (no credential); the guest gets the spec over
+            // the ctl channel.
             write_json_atomic(&self.dirs.container_json(), &self.spec)?;
 
             if !self.dirs.scratch_disk().exists() {
@@ -550,6 +592,10 @@ impl ContainerInstance {
             // case we won the race.
             let ctl = connect_ctl_retry(&self.dirs.ctl_sock(), &proc).await?;
             *self.ctl.lock().await = Some(ctl.clone());
+            // cinit blocks its boot on the spec. Send one now (the guest
+            // port is usually already open); the ctl watcher re-answers
+            // every `boot` announcement in case this one raced the guest.
+            self.send_spec(&ctl).await?;
             *self.qga.lock().await = Some(GaClient::connect(&self.dirs.qga_sock()).await?);
 
             Ok::<_, anyhow::Error>((proc, ctl))
@@ -578,10 +624,20 @@ impl ContainerInstance {
     fn spawn_ctl_watcher(self: &Arc<Self>, ctl: &CtlHandle, cbs: &Arc<Callbacks>) {
         let me = self.clone();
         let cbs = cbs.clone();
+        let ctl = ctl.clone();
         let mut rx = ctl.subscribe();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
+                    // cinit announces boot every second until the spec lands
+                    // (a send can race the guest opening its port, and a
+                    // snapshot-restore resync replays `boot` too) — answer
+                    // every announcement; cinit ignores duplicates.
+                    Ok(CtlEvent::Boot { .. }) => {
+                        if let Err(e) = me.send_spec(&ctl).await {
+                            tracing::warn!("{}: spec send failed: {e:#}", me.cfg.name);
+                        }
+                    }
                     Ok(CtlEvent::Started { .. }) => *me.started.write().await = true,
                     Ok(CtlEvent::Health { healthy }) => {
                         let prev = me.healthy.write().await.replace(healthy);
@@ -810,6 +866,115 @@ impl ContainerInstance {
                 );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+
+    // ---- snapshots (PRD §7.3, §18) ------------------------------------------
+
+    /// Take a snapshot of the scratch disk — the container's only writable
+    /// state (the rootfs squashfs is immutable, volume contents are host
+    /// state outside snapshot scope, §7.5 semantics). Online captures RAM +
+    /// device state into the same qcow2, exactly like a VM; returns whether
+    /// the capture was online.
+    pub async fn snapshot(&self, name: &str) -> Result<bool> {
+        super::vm::validate_snapshot_name(name)?;
+        match self.state().await {
+            PowerState::Running => {
+                let qmp = self.qmp().await?;
+                qmp.snapshot_save(name, "scratch", &["scratch"]).await?;
+                Ok(true)
+            }
+            PowerState::Stopped => {
+                let scratch = self.dirs.scratch_disk();
+                if !scratch.exists() {
+                    bail!(
+                        "{}: no scratch disk yet — the container has never started",
+                        self.cfg.name
+                    );
+                }
+                crate::template::qimg::snapshot_create(&scratch, name).await?;
+                Ok(false)
+            }
+            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
+        }
+    }
+
+    /// Load an online snapshot into the (already running) micro-VM and
+    /// resume it exactly where it was, then ask cinit to replay lifecycle
+    /// events — the resumed guest never re-emits `net_up`/`started`/`health`
+    /// on its own, and host-side caches need them after a fresh boot.
+    pub async fn restore_online(&self, name: &str) -> Result<()> {
+        let qmp = self.qmp().await?;
+        qmp.stop().await?;
+        qmp.snapshot_load(name, "scratch", &["scratch"]).await?;
+        // Drop the agent connection BEFORE resuming: the rewound guest
+        // replays virtio-serial response bytes the host already consumed,
+        // and qga responses carry no request ids — a stale `{"return":…}`
+        // silently poisons a later exchange. With no client attached, QEMU
+        // discards the replayed bytes; the reconnect below starts clean.
+        self.qga.lock().await.take();
+        qmp.cont().await?;
+        self.reconnect_agent_after_load().await;
+        if let Ok(ctl) = self.ctl().await {
+            ctl.send(&CtlCommand::Resync).await?;
+        }
+        Ok(())
+    }
+
+    /// Re-establish the guest-agent connection after an online restore
+    /// (see [`Self::restore_online`] for why it was dropped), giving the
+    /// resumed guest a moment to flush its replayed output into the void
+    /// first, then pinging (bounded) so restore hands back a container
+    /// whose exec/cp surface demonstrably works.
+    async fn reconnect_agent_after_load(&self) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let mut qga = self.qga.lock().await;
+            match GaClient::connect(&self.dirs.qga_sock()).await {
+                Ok(c) => *qga = Some(c),
+                Err(e) => {
+                    tracing::warn!(
+                        "{}: agent reconnect after restore failed: {e:#}",
+                        self.cfg.name
+                    );
+                    return;
+                }
+            }
+        }
+        if let Ok(qga) = self.qga().await {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !qga.ping(Duration::from_secs(2)).await {
+                if tokio::time::Instant::now() > deadline {
+                    tracing::warn!("{}: agent not answering after restore", self.cfg.name);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Apply an offline snapshot: power off if needed, revert the scratch
+    /// disk, stay off (PRD §7.3 restore semantics). The stop sets
+    /// `stop_requested`, so no restart policy fires.
+    pub async fn restore_offline(&self, name: &str) -> Result<()> {
+        if self.state().await != PowerState::Stopped {
+            self.stop(false).await?;
+            self.wait_state(PowerState::Stopped, Duration::from_secs(60))
+                .await?;
+        }
+        crate::template::qimg::snapshot_apply(&self.dirs.scratch_disk(), name).await?;
+        Ok(())
+    }
+
+    pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        match self.state().await {
+            PowerState::Running => {
+                let qmp = self.qmp().await?;
+                qmp.snapshot_delete(name, &["scratch"]).await?;
+            }
+            _ => {
+                crate::template::qimg::snapshot_delete(&self.dirs.scratch_disk(), name).await?;
+            }
         }
         Ok(())
     }
@@ -1158,17 +1323,19 @@ mod tests {
             spec.volumes,
             vec![
                 VolumeMount {
-                    tag: "vol0".into(),
+                    share: "vol-db-0".into(),
                     target: "/var/lib/db".into(),
                     read_only: false,
                 },
                 VolumeMount {
-                    tag: "vol1".into(),
+                    share: "vol-db-1".into(),
                     target: "/shared".into(),
                     read_only: true,
                 },
             ]
         );
+        // The credential is injected per send, never baked into the spec.
+        assert!(spec.smb.is_none());
     }
 
     // ---- build_spec: healthchecks -------------------------------------------
@@ -1341,8 +1508,7 @@ mod tests {
         assert_eq!(dirs.ctl_sock(), dirs.run.join("ctl.sock"));
         assert_eq!(dirs.nic_sock(1), dirs.run.join("nic1.sock"));
         assert_eq!(dirs.scratch_disk(), dirs.local.join("scratch.qcow2"));
-        assert_eq!(dirs.cfg_dir(), dirs.local.join("cfg"));
-        assert_eq!(dirs.container_json(), dirs.local.join("cfg/container.json"));
+        assert_eq!(dirs.container_json(), dirs.local.join("container.json"));
         assert_eq!(dirs.console_log(), dirs.logs.join("console.log"));
     }
 
@@ -1370,11 +1536,11 @@ mod tests {
             },
         ];
         let vols = resolve_volume_hosts(&cfg, Path::new("/labs/demo"));
-        assert_eq!(vols[0].0, "vol0");
+        assert_eq!(vols[0].0, "vol-c-0");
         assert_eq!(vols[0].1, PathBuf::from("/labs/demo/./html"));
         assert!(vols[0].2);
         assert_eq!(vols[1].1, PathBuf::from("/abs/certs"));
-        assert_eq!(vols[2].0, "vol2");
+        assert_eq!(vols[2].0, "vol-c-2");
         // Named volumes are LAB-scoped: under the lab work dir, not the
         // container's own dir.
         assert!(vols[2].1.ends_with("volumes/pgdata"), "{:?}", vols[2].1);

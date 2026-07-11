@@ -16,15 +16,15 @@
 //!   attaches are delivered once it does. [`Ctl::drain`] bounds the final
 //!   flush before poweroff.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use vmlab_cinit_proto::{CtlCommand, CtlEvent};
+use vmlab_cinit_proto::{CtlCommand, CtlEvent, PROTO_VERSION};
 
 /// Resolve a virtio-serial port by its name property.
 pub fn find_virtio_port(name: &str) -> Option<PathBuf> {
@@ -45,13 +45,26 @@ struct Pending {
     drained: Condvar,
 }
 
+/// Lifecycle events remembered for [`Ctl::resync`]: after an online snapshot
+/// restore the resumed guest never repeats `net_up`/`started`/`health`, so
+/// the host asks for a replay instead.
+#[derive(Default)]
+struct Replay {
+    net_up: Option<CtlEvent>,
+    started: Option<CtlEvent>,
+    health: Option<CtlEvent>,
+}
+
 /// Event writer for the ctl port. Degrades to console-only when the port is
 /// absent (a hand-launched debug VM), so boot still proceeds.
 pub struct Ctl {
     tx: Option<Sender<String>>,
     pending: Arc<Pending>,
-    /// Cloned fd for the command reader, consumed by [`Ctl::spawn_reader`].
-    reader: Mutex<Option<File>>,
+    /// Parsed host commands, fed by the reader thread; drained directly
+    /// ([`Ctl::recv_command`]) before the container runs, then handed to the
+    /// runtime dispatcher ([`Ctl::spawn_dispatcher`]).
+    commands: Mutex<Option<Receiver<CtlCommand>>>,
+    replay: Mutex<Replay>,
 }
 
 impl Ctl {
@@ -59,7 +72,8 @@ impl Ctl {
         let disabled = Ctl {
             tx: None,
             pending: Arc::default(),
-            reader: Mutex::new(None),
+            commands: Mutex::new(None),
+            replay: Mutex::new(Replay::default()),
         };
         let Some(path) = find_virtio_port("vmlab.ctl.0") else {
             eprintln!(
@@ -77,10 +91,17 @@ impl Ctl {
                 return disabled;
             }
         };
-        let reader = file.try_clone().ok();
-        if reader.is_none() {
-            eprintln!("vmlab-cinit: warning: ctl reader clone failed; commands disabled");
-        }
+        let commands = match file.try_clone() {
+            Ok(reader) => {
+                let (cmd_tx, cmd_rx) = channel::<CtlCommand>();
+                spawn_command_reader(reader, cmd_tx);
+                Some(cmd_rx)
+            }
+            Err(_) => {
+                eprintln!("vmlab-cinit: warning: ctl reader clone failed; commands disabled");
+                None
+            }
+        };
 
         let (tx, rx) = channel::<String>();
         let pending = Arc::new(Pending::default());
@@ -102,8 +123,15 @@ impl Ctl {
         Ctl {
             tx: Some(tx),
             pending,
-            reader: Mutex::new(reader),
+            commands: Mutex::new(commands),
+            replay: Mutex::new(Replay::default()),
         }
+    }
+
+    /// Whether the ctl port exists — without it there is no way to receive
+    /// the spec, so boot cannot proceed.
+    pub fn available(&self) -> bool {
+        self.tx.is_some()
     }
 
     /// Emit one event line (also echoed to the console for debuggability).
@@ -114,6 +142,15 @@ impl Ctl {
             eprintln!("vmlab-cinit: warning: cannot serialise event");
             return;
         };
+        {
+            let mut replay = self.replay.lock().unwrap();
+            match ev {
+                CtlEvent::NetUp { .. } => replay.net_up = Some(ev.clone()),
+                CtlEvent::Started { .. } => replay.started = Some(ev.clone()),
+                CtlEvent::Health { .. } => replay.health = Some(ev.clone()),
+                _ => {}
+            }
+        }
         println!("vmlab-cinit: event {line}");
         if let Some(tx) = &self.tx {
             *self.pending.count.lock().unwrap() += 1;
@@ -138,38 +175,88 @@ impl Ctl {
         }
     }
 
-    /// Read commands line-by-line on a dedicated thread, invoking `on_cmd`
-    /// for each parsed command. No-op when the port is absent.
-    pub fn spawn_reader(&self, on_cmd: impl Fn(CtlCommand) + Send + 'static) {
-        let Some(file) = self.reader.lock().unwrap().take() else {
+    /// Wait up to `timeout` for the next host command. Used during boot,
+    /// before the runtime dispatcher owns the stream. `None` = timeout (or
+    /// no port / dispatcher already running).
+    pub fn recv_command(&self, timeout: Duration) -> Option<CtlCommand> {
+        let guard = self.commands.lock().unwrap();
+        let rx = guard.as_ref()?;
+        match rx.recv_timeout(timeout) {
+            Ok(cmd) => Some(cmd),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                thread::sleep(timeout);
+                None
+            }
+        }
+    }
+
+    /// Hand the command stream to a dedicated thread invoking `on_cmd` for
+    /// each command from here on. No-op when the port is absent.
+    pub fn spawn_dispatcher(&self, on_cmd: impl Fn(CtlCommand) + Send + 'static) {
+        let Some(rx) = self.commands.lock().unwrap().take() else {
             return;
         };
         thread::spawn(move || {
-            let mut reader = BufReader::new(file);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    // EOF: host side detached; it may reconnect, don't spin.
-                    Ok(0) => thread::sleep(Duration::from_millis(200)),
-                    Ok(_) => {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<CtlCommand>(trimmed) {
-                            Ok(cmd) => on_cmd(cmd),
-                            Err(e) => {
-                                eprintln!("vmlab-cinit: warning: bad ctl command {trimmed:?}: {e}")
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("vmlab-cinit: warning: ctl read failed: {e}");
-                        thread::sleep(Duration::from_millis(200));
-                    }
-                }
+            for cmd in rx {
+                on_cmd(cmd);
             }
         });
     }
+
+    /// Replay current state for a host that just (re)attached — sent after an
+    /// online snapshot restore: `boot`, then whichever of `net_up`/`started`/
+    /// `health` have happened.
+    pub fn resync(&self) {
+        self.emit(&CtlEvent::Boot {
+            proto_version: PROTO_VERSION,
+        });
+        let (net_up, started, health) = {
+            let replay = self.replay.lock().unwrap();
+            (
+                replay.net_up.clone(),
+                replay.started.clone(),
+                replay.health.clone(),
+            )
+        };
+        for ev in [net_up, started, health].into_iter().flatten() {
+            self.emit(&ev);
+        }
+    }
+}
+
+/// Read host command lines off the ctl port on a dedicated thread, parsing
+/// each into the channel. Runs for the life of the machine.
+fn spawn_command_reader(file: fs::File, tx: Sender<CtlCommand>) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                // EOF: host side detached; it may reconnect, don't spin.
+                Ok(0) => thread::sleep(Duration::from_millis(200)),
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<CtlCommand>(trimmed) {
+                        Ok(cmd) => {
+                            if tx.send(cmd).is_err() {
+                                return; // both consumers gone — machine is dying
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("vmlab-cinit: warning: bad ctl command {trimmed:?}: {e}")
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("vmlab-cinit: warning: ctl read failed: {e}");
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    });
 }

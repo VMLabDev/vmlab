@@ -125,9 +125,9 @@ impl LabSmb {
         }
     }
 
-    /// The credential minted for a VM. `mount_plan` embeds it in the guest
-    /// mount commands; the tests assert stability through this accessor.
-    #[allow(dead_code)]
+    /// The credential minted for a machine. `mount_plan` embeds it in VM
+    /// guest mount commands; the lab daemon hands it to volume-declaring
+    /// containers (their cinit mounts CIFS itself, PRD §18).
     pub fn credentials(&self, vm: &str) -> Option<&SmbCredentials> {
         self.vms.get(vm).map(|p| &p.creds)
     }

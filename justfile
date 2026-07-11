@@ -158,6 +158,11 @@ web-stop:
 compose-up:
 	docker compose up --build
 
+# Rebuild the runtime image from the current tree (host + guest asset) and (re)start the stack detached; follow with `docker compose logs -f`
+[group('web')]
+compose-rebuild:
+	docker compose up -d --build --force-recreate
+
 # Stop and remove the Docker web UI stack
 [group('web')]
 compose-down:

@@ -6,11 +6,13 @@
 //! The guest side of this contract is FROZEN in `guest/` (see
 //! `guest/cinit/src/cmdline.rs` and `guest/build-asset.sh`): direct kernel
 //! boot with `vmlab.root=`/`vmlab.scratch=` naming the first two virtio-blk
-//! devices, a read-only 9p config share tagged `vmlab.cfg`, volume shares
-//! tagged `vol0..volN`, and three virtio-serial ports —
-//! `org.qemu.guest_agent.0` (qemu-ga), `vmlab.ctl.0` (the ndjson ctl
-//! channel, [`crate::labd::container_ctl`]) and `vmlab.tty.0` (the raw
-//! interactive-shell byte stream, guest/cinit/src/tty.rs).
+//! devices, and three virtio-serial ports — `org.qemu.guest_agent.0`
+//! (qemu-ga), `vmlab.ctl.0` (the ndjson ctl channel,
+//! [`crate::labd::container_ctl`], which also delivers the spec) and
+//! `vmlab.tty.0` (the raw interactive-shell byte stream,
+//! guest/cinit/src/tty.rs). Deliberately NO virtfs/9p device: config arrives
+//! over ctl and volumes are CIFS mounts, so nothing blocks vmstate capture —
+//! containers stay snapshottable (PRD §18).
 
 use std::path::PathBuf;
 
@@ -33,13 +35,6 @@ pub struct ContainerVmPaths {
     /// Writable scratch qcow2 for the overlay upper layer — the second
     /// virtio-blk device (`/dev/vdb`).
     pub scratch_disk: PathBuf,
-    /// Directory holding `container.json`, exported read-only over 9p as
-    /// `vmlab.cfg`.
-    pub cfg_dir: PathBuf,
-    /// 9p volume exports in declaration order: (mount tag `vol<i>`, host
-    /// path, read-only). The tag must match the `VolumeMount::tag` the spec
-    /// carries — cinit mounts by tag.
-    pub volumes: Vec<(String, PathBuf, bool)>,
     /// One unix socket per NIC, in declaration order: (MAC, socket, segment
     /// MTU) — byte-for-byte the full-VM netdev shape so labd's switch ports
     /// attach unchanged.
@@ -210,30 +205,6 @@ pub(crate) fn build_container_args_with_accel(
     a.push("-device".into());
     a.push("virtio-blk-pci,drive=scratch".into());
 
-    // 9p shares: the read-only config dir (container.json) plus one export
-    // per volume. Tags are the contract with cinit: `vmlab.cfg` and
-    // `vol0..volN` (guest/cinit/src/mounts.rs). Volumes use mapped-xattr so
-    // in-guest ownership/modes survive on the host without root.
-    arg(
-        &mut a,
-        "virtfs",
-        format!(
-            "local,id=cfg,path={},mount_tag=vmlab.cfg,security_model=none,readonly=on",
-            paths.cfg_dir.display()
-        ),
-    );
-    for (i, (tag, host, read_only)) in paths.volumes.iter().enumerate() {
-        let ro = if *read_only { ",readonly=on" } else { "" };
-        arg(
-            &mut a,
-            "virtfs",
-            format!(
-                "local,id=vol{i},path={},mount_tag={tag},security_model=mapped-xattr{ro}",
-                host.display()
-            ),
-        );
-    }
-
     // NICs: identical to full VMs (stream-socket netdev into the segment
     // switch; the daemon listens, QEMU connects). Containers are always
     // virtio-net.
@@ -278,11 +249,6 @@ mod tests {
             initrd: "/assets/x86_64/initramfs.img".into(),
             rootfs_image: "/cache/oci/sha256-ab/rootfs.sqfs".into(),
             scratch_disk: "/lab/.vmlab/containers/web/scratch.qcow2".into(),
-            cfg_dir: "/lab/.vmlab/containers/web/cfg".into(),
-            volumes: vec![
-                ("vol0".into(), "/lab/html".into(), true),
-                ("vol1".into(), "/lab/.vmlab/volumes/data".into(), false),
-            ],
             nics: vec![(
                 "52:54:00:00:00:07".parse().unwrap(),
                 PathBuf::from("/run/l/web/nic0.sock"),
@@ -369,28 +335,10 @@ mod tests {
             ),
             "{s}"
         );
-        assert!(
-            s.contains(
-                "-virtfs local,id=cfg,path=/lab/.vmlab/containers/web/cfg,\
-                 mount_tag=vmlab.cfg,security_model=none,readonly=on"
-            ),
-            "{s}"
-        );
-        assert!(
-            s.contains(
-                "local,id=vol0,path=/lab/html,mount_tag=vol0,\
-                 security_model=mapped-xattr,readonly=on"
-            ),
-            "{s}"
-        );
-        assert!(
-            s.contains(
-                "local,id=vol1,path=/lab/.vmlab/volumes/data,mount_tag=vol1,\
-                 security_model=mapped-xattr"
-            ),
-            "{s}"
-        );
-        assert!(!s.contains("mount_tag=vol1,security_model=mapped-xattr,readonly"));
+        // No virtfs, ever: a 9p device would add a migration blocker and
+        // break online snapshots (PRD §18).
+        assert!(!s.contains("-virtfs"), "{s}");
+        assert!(!s.contains("mount_tag"), "{s}");
         assert!(
             s.contains("stream,id=net0,server=off,addr.type=unix,addr.path=/run/l/web/nic0.sock"),
             "{s}"
@@ -437,7 +385,6 @@ mod tests {
     fn aarch64_airgapped_shape() {
         let mut p = paths();
         p.nics.clear();
-        p.volumes.clear();
         let args =
             build_container_args_with_accel("lab1", "iso", "aarch64", 1, 128 << 20, &p, Accel::Tcg)
                 .unwrap();
@@ -450,8 +397,7 @@ mod tests {
         assert!(s.contains("console=ttyAMA0"), "{s}");
         assert!(s.contains("-nic none"), "{s}");
         assert!(!s.contains("-netdev"), "{s}");
-        assert!(!s.contains("mount_tag=vol"), "{s}");
-        assert!(s.contains("mount_tag=vmlab.cfg"), "{s}");
+        assert!(!s.contains("-virtfs"), "{s}");
         assert_eq!(args.last().unwrap(), "-S");
     }
 

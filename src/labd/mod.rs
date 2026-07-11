@@ -594,7 +594,12 @@ impl Handler for LabdHandler {
                         lab.restore(vm, snap).await.map_err(err)?;
                     }
                     None => {
-                        let names: Vec<String> = lab.vms.keys().cloned().collect();
+                        let names: Vec<String> = lab
+                            .vms
+                            .keys()
+                            .chain(lab.containers.keys())
+                            .cloned()
+                            .collect();
                         for vm in names {
                             lab.restore(&vm, snap).await.map_err(err)?;
                         }

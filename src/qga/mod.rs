@@ -162,9 +162,16 @@ impl GaClient {
             return Err(GaError::Closed);
         }
         if inner.needs_sync {
+            tracing::debug!("qga: syncing before {command}");
             inner.sync_delimited(deadline).await?;
         }
-        inner.call(command, args, deadline).await
+        let res = inner.call(command, args, deadline).await;
+        match &res {
+            // Command name only: responses can carry guest file contents.
+            Ok(_) => tracing::debug!("qga: {command} ok"),
+            Err(e) => tracing::debug!("qga: {command} failed: {e}"),
+        }
+        res
     }
 
     /// Probe agent liveness with `guest-ping`. `false` on any failure —

@@ -590,7 +590,19 @@ impl VmInstance {
             let nodes = disk_nodes(self.all_disk_paths().len());
             let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
             qmp.snapshot_load(name, "disk0", &refs).await?;
+            // Drop the agent connection BEFORE resuming: the rewound guest
+            // replays virtio-serial response bytes the host already
+            // consumed, and qga responses carry no request ids — a stale
+            // `{"return":…}` silently poisons a later exchange. With no
+            // client attached QEMU discards the replayed bytes; reconnect
+            // starts clean (best-effort: agentless guests have no channel
+            // to poison).
+            self.qga.lock().await.take();
             qmp.cont().await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if let Ok(c) = GaClient::connect(&self.dirs.qga_sock()).await {
+                *self.qga.lock().await = Some(c);
+            }
             Ok(())
         } else {
             // Offline: power off if needed, apply, stay off.
@@ -655,7 +667,7 @@ fn disk_nodes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("disk{i}")).collect()
 }
 
-fn validate_snapshot_name(name: &str) -> Result<()> {
+pub(crate) fn validate_snapshot_name(name: &str) -> Result<()> {
     if name.is_empty()
         || !name
             .chars()

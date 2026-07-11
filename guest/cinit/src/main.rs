@@ -4,10 +4,13 @@
 //!  1. mount /proc, /sys, /dev; load the kernel modules the asset ships
 //!  2. parse `vmlab.root=` / `vmlab.scratch=` from the kernel cmdline
 //!  3. squashfs (RO) + ext4 scratch (mkfs on first boot) → overlay /rootfs
-//!  4. mount the `vmlab.cfg` 9p share, read container.json (ContainerSpec)
-//!  5. open the `vmlab.ctl.0` virtio port, emit `boot`
-//!  6. mount volumes + runtime filesystems, write identity files
-//!  7. loopback + DHCP per NIC (busybox udhcpc — see net.rs), emit `net_up`
+//!  4. open the `vmlab.ctl.0` virtio port; emit `boot` (repeating) until the
+//!     host answers with the `spec` command (ContainerSpec)
+//!  5. mount runtime filesystems, write identity files
+//!  6. loopback + DHCP per NIC (busybox udhcpc — see net.rs), emit `net_up`
+//!  7. mount volumes over CIFS from the segment gateway (network must be up;
+//!     no virtfs device exists — that is what keeps the micro-VM
+//!     snapshottable, PRD §18)
 //!  8. start bundled qemu-ga in the init namespace (not the container root)
 //!  9. resolve user, build env, clone namespaces + exec container, emit `started`
 //! 10. reap children; when the container exits: emit `exited`, power off
@@ -40,7 +43,7 @@ use nix::unistd::Pid;
 
 use vmlab_cinit_proto::{ContainerSpec, CtlCommand, CtlEvent, PROTO_VERSION};
 
-use crate::util::{Ctx, Result, power_off};
+use crate::util::{Result, power_off};
 
 fn main() {
     println!("vmlab-cinit: starting (proto v{PROTO_VERSION})");
@@ -50,10 +53,25 @@ fn main() {
     power_off();
 }
 
-fn read_spec() -> Result<ContainerSpec> {
-    let path = format!("{}/container.json", mounts::CFG_DIR);
-    let raw = std::fs::read_to_string(&path).ctx(&format!("read {path}"))?;
-    serde_json::from_str(&raw).ctx(&format!("parse {path}"))
+/// Announce boot until the host answers with the spec. The `boot` line
+/// repeats each second: with `server=on,wait=off` chardevs, lines written
+/// before the host attaches are dropped, so a single announcement could be
+/// lost. Commands other than `spec` are meaningless this early; `stop` aborts
+/// boot.
+fn wait_for_spec(ctl: &ctl::Ctl) -> Result<ContainerSpec> {
+    if !ctl.available() {
+        return Err("ctl port vmlab.ctl.0 absent — cannot receive the container spec".into());
+    }
+    loop {
+        ctl.emit(&CtlEvent::Boot {
+            proto_version: PROTO_VERSION,
+        });
+        match ctl.recv_command(Duration::from_secs(1)) {
+            Some(CtlCommand::Spec { spec }) => return Ok(spec),
+            Some(CtlCommand::Stop { .. }) => return Err("stop requested before spec".into()),
+            Some(_) | None => {}
+        }
+    }
 }
 
 fn spawn_qemu_ga() {
@@ -85,20 +103,11 @@ fn run() -> Result<()> {
     mounts::load_modules()?;
     let devices = cmdline::read()?;
     mounts::mount_container_root(&devices.root, &devices.scratch)?;
-    mounts::mount_cfg_share()?;
-    let spec = read_spec()?;
 
-    // -- ctl channel ---------------------------------------------------------
-    // Open before the remaining setup so net_up/started can flow as they
-    // happen; `boot` is the first line on the wire.
+    // -- ctl channel + spec ---------------------------------------------------
     let ctl = Arc::new(ctl::Ctl::open());
-    ctl.emit(&CtlEvent::Boot {
-        proto_version: PROTO_VERSION,
-    });
+    let spec = wait_for_spec(&ctl)?;
 
-    for vol in &spec.volumes {
-        mounts::mount_volume(&vol.tag, &vol.target, vol.read_only)?;
-    }
     mounts::mount_rootfs_runtime()?;
     mounts::install_shell_fallback();
     mounts::write_identity(&spec.hostname)?;
@@ -115,6 +124,17 @@ fn run() -> Result<()> {
     }
     if spec.nics > 0 {
         net::write_resolv_conf(spec.nics)?;
+    }
+
+    // -- volumes (network mounts — after DHCP) --------------------------------
+    if !spec.volumes.is_empty() {
+        let smb = spec
+            .smb
+            .as_ref()
+            .ok_or("spec declares volumes but no smb coordinates")?;
+        for vol in &spec.volumes {
+            mounts::mount_volume(smb, &vol.share, &vol.target, vol.read_only)?;
+        }
     }
 
     // -- guest agent ---------------------------------------------------------
@@ -144,10 +164,12 @@ fn run() -> Result<()> {
     });
 
     // Host commands: Stop = graceful signal now, SIGKILL after the grace;
-    // TtyResize goes to the shell session's PTY.
+    // TtyResize goes to the shell session's PTY; Resync replays lifecycle
+    // events after an online snapshot restore. A duplicate Spec is ignored.
     {
         let exited = exited.clone();
-        ctl.spawn_reader(move |cmd| match cmd {
+        let ctl_replay = ctl.clone();
+        ctl.spawn_dispatcher(move |cmd| match cmd {
             CtlCommand::Stop { grace_secs } => {
                 println!("vmlab-cinit: stop requested (grace {grace_secs}s)");
                 let _ = kill(child, stop_signal);
@@ -161,6 +183,13 @@ fn run() -> Result<()> {
                 });
             }
             CtlCommand::TtyResize { cols, rows } => tty.resize(cols, rows),
+            CtlCommand::Resync => {
+                println!("vmlab-cinit: resync requested");
+                ctl_replay.resync();
+            }
+            CtlCommand::Spec { .. } => {
+                eprintln!("vmlab-cinit: warning: spec received after boot, ignoring");
+            }
         });
     }
 

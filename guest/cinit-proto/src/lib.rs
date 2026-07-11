@@ -1,14 +1,12 @@
 //! The wire contract between the vmlab host and `vmlab-cinit`, the PID 1 of
 //! an OCI-container micro-VM.
 //!
-//! Two channels use these types:
-//!
-//! - **`container.json`** on the read-only 9p config share (`vmlab.cfg`):
-//!   one [`ContainerSpec`] document, written by the host, read by cinit at
-//!   boot.
-//! - **The ctl channel** (virtio-serial port `vmlab.ctl.0`): newline-delimited
-//!   JSON. cinit emits [`CtlEvent`]s (starting with `boot`), the host sends
-//!   [`CtlCommand`]s.
+//! One channel uses these types: **the ctl channel** (virtio-serial port
+//! `vmlab.ctl.0`), newline-delimited JSON. cinit emits [`CtlEvent`]s
+//! (starting with `boot`, repeated until the spec arrives), the host sends
+//! [`CtlCommand`]s — the first being [`CtlCommand::Spec`], which carries the
+//! [`ContainerSpec`]. No filesystem device is involved: keeping the micro-VM
+//! free of virtfs is what makes it snapshottable (PRD §18).
 //!
 //! Everything is plain serde so this crate builds for the host (a normal
 //! dependency of the `vmlab` crate) and for the static-musl guest init.
@@ -19,22 +17,37 @@ use serde::{Deserialize, Serialize};
 /// refuses to drive an init speaking a different major version.
 ///
 /// v2: `tty_resize` command + the `vmlab.tty.0` interactive-shell port.
-pub const PROTO_VERSION: u32 = 2;
+/// v3: the spec arrives over the ctl channel (`spec` command) instead of a
+///     9p config share; volumes are CIFS mounts instead of 9p shares;
+///     `resync` command for post-snapshot-restore state replay.
+pub const PROTO_VERSION: u32 = 3;
 
-/// A 9p volume mounted into the container root.
+/// A volume mounted into the container root over CIFS.
 ///
-/// The host exports each volume as a 9p share tagged `vol0..volN` (the `tag`
-/// field carries the exact tag) and cinit mounts it at `target` inside the
-/// container rootfs.
+/// The host serves each named volume as an SMB share at the segment gateway
+/// (the same mechanism as VM shared folders); cinit mounts
+/// `//<gateway>/<share>` at `target` inside the container rootfs using the
+/// credentials in [`ContainerSpec::smb`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeMount {
-    /// virtio-9p mount tag, e.g. `vol0`.
-    pub tag: String,
+    /// SMB share name at the gateway, e.g. `vol-data`.
+    pub share: String,
     /// Absolute path inside the container rootfs.
     pub target: String,
     /// Mount read-only.
     #[serde(default)]
     pub read_only: bool,
+}
+
+/// How to reach the lab's SMB server for volume mounts. Present whenever the
+/// spec declares volumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmbInfo {
+    /// Segment gateway serving the shares (dotted IPv4).
+    pub gateway: String,
+    /// Lab SMB credential.
+    pub username: String,
+    pub password: String,
 }
 
 /// Container healthcheck, mirroring the OCI image / compose semantics.
@@ -96,9 +109,12 @@ pub struct ContainerSpec {
     /// Seconds between the stop signal and SIGKILL.
     #[serde(default = "default_stop_grace")]
     pub stop_grace_secs: u64,
-    /// 9p volumes to mount inside the rootfs.
+    /// CIFS volumes to mount inside the rootfs (after the network is up).
     #[serde(default)]
     pub volumes: Vec<VolumeMount>,
+    /// SMB server coordinates for `volumes`; required when they are non-empty.
+    #[serde(default)]
+    pub smb: Option<SmbInfo>,
     /// Number of virtio NICs (`eth0..`) to bring up via DHCP. 0 = loopback
     /// only.
     #[serde(default = "default_nics")]
@@ -137,12 +153,19 @@ pub enum CtlEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum CtlCommand {
+    /// The container spec. Sent once the host sees `boot`; cinit blocks its
+    /// boot sequence until this arrives.
+    Spec { spec: ContainerSpec },
     /// Graceful stop: send the spec's stop signal, escalate to SIGKILL after
     /// `grace_secs`.
     Stop { grace_secs: u64 },
     /// Resize the interactive shell's PTY (the `vmlab.tty.0` port). Applies
     /// to the current session and is remembered for future ones.
     TtyResize { cols: u16, rows: u16 },
+    /// Re-emit current state as events (`boot`, then `net_up`/`started`/
+    /// `health` as applicable). Sent after an online snapshot restore, where
+    /// the resumed guest would otherwise never repeat its lifecycle events.
+    Resync,
 }
 
 #[cfg(test)]
@@ -168,10 +191,15 @@ mod tests {
             stop_signal: Some("SIGQUIT".into()),
             stop_grace_secs: 5,
             volumes: vec![VolumeMount {
-                tag: "vol0".into(),
+                share: "vol-data".into(),
                 target: "/data".into(),
                 read_only: true,
             }],
+            smb: Some(SmbInfo {
+                gateway: "10.0.0.1".into(),
+                username: "lab".into(),
+                password: "s3cret".into(),
+            }),
             nics: 2,
             healthcheck: Some(HealthSpec {
                 command: vec!["/bin/true".into()],
@@ -195,6 +223,7 @@ mod tests {
         assert_eq!(spec.stop_grace_secs, 10);
         assert_eq!(spec.nics, 1);
         assert!(spec.volumes.is_empty());
+        assert!(spec.smb.is_none());
         assert!(spec.healthcheck.is_none());
         assert!(spec.user.is_none());
     }
@@ -206,7 +235,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
-            r#"{"event":"boot","proto_version":2}"#
+            r#"{"event":"boot","proto_version":3}"#
         );
         let ev = CtlEvent::NetUp {
             ip: "10.0.0.9".into(),
@@ -251,6 +280,17 @@ mod tests {
             serde_json::to_string(&cmd).unwrap(),
             r#"{"cmd":"tty_resize","cols":132,"rows":43}"#
         );
+        assert_eq!(roundtrip(&cmd), cmd);
+
+        let cmd = CtlCommand::Resync;
+        assert_eq!(serde_json::to_string(&cmd).unwrap(), r#"{"cmd":"resync"}"#);
+        assert_eq!(roundtrip(&cmd), cmd);
+
+        let cmd = CtlCommand::Spec {
+            spec: serde_json::from_str(r#"{ "hostname": "c1", "cmd": ["/bin/sh"] }"#).unwrap(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.starts_with(r#"{"cmd":"spec","spec":{"#));
         assert_eq!(roundtrip(&cmd), cmd);
     }
 }
