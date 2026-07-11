@@ -1,9 +1,11 @@
 // A container's page: state/health badges, start/stop/restart, its facts
-// (image, digest, address, restarts), and the live console log. Containers
-// have no display, so there is no console/VNC pane — the log takes its place.
+// (image, digest, address, restarts), and three tabs — Console (the raw
+// text the container writes, i.e. the `console` log stream), Recovery
+// terminal (an on-demand shell into the micro-VM) and Log (every log line
+// for this container, timestamped and stream-tagged).
 
-import { Show } from "solid-js";
-import { Badge, Button, Card, Empty, PageHead } from "@forge/ui";
+import { Show, createSignal } from "solid-js";
+import { Badge, Button, Card, Empty, PageHead, Tabs } from "@forge/ui";
 import { Power, RotateCcw } from "lucide-solid";
 import {
   containerLook,
@@ -16,6 +18,7 @@ import LogPanel from "./LogPanel";
 import TerminalPanel from "./TerminalPanel";
 
 export default function ContainerView() {
+  const [tab, setTab] = createSignal<"console" | "terminal" | "log">("console");
   // Accessors so the view tracks the selected container reactively.
   const ctr = () => state.status?.containers?.find((c) => c.name === state.view.vm);
   const on = () => ctr()?.state === "running";
@@ -73,12 +76,34 @@ export default function ContainerView() {
         }
       />
 
-      <div class="vm-layout">
+      <Tabs
+        tabs={[
+          { id: "console", label: "Console" },
+          { id: "terminal", label: "Recovery terminal" },
+          { id: "log", label: "Log" },
+        ]}
+        active={tab()}
+        onChange={(id) => setTab(id as "console" | "terminal" | "log")}
+      />
+
+      <Show when={tab() === "log"}>
+        <LogPanel lab={state.currentLab!} source={ctr()!.name} />
+      </Show>
+
+      {/* display:none rather than unmount, so a started terminal session
+          survives switching tabs; stopping the container tears it down. */}
+      <div style={{ display: tab() === "terminal" ? undefined : "none" }}>
+        <Show
+          when={on()}
+          fallback={<Empty title="Container is stopped">Start it to open a terminal.</Empty>}
+        >
+          <TerminalPanel lab={state.currentLab!} container={ctr()!.name} />
+        </Show>
+      </div>
+
+      <div class="vm-layout" style={{ display: tab() === "console" ? undefined : "none" }}>
         <div class="ctr-main">
-          <Show when={on()}>
-            <TerminalPanel lab={state.currentLab!} container={ctr()!.name} />
-          </Show>
-          <LogPanel lab={state.currentLab!} source={ctr()!.name} />
+          <LogPanel lab={state.currentLab!} source={ctr()!.name} stream="console" plain />
         </div>
         <div class="vm-side">
           <Card title="Container">

@@ -1,7 +1,9 @@
 // A live log pane for one source: the lab daemon's own logs on the lab
-// page's Logs tab, or a single VM's logs on its machine page. Streams the
+// page's Logs tab, or a single machine's logs on its page. Streams the
 // lab's log WebSocket and keeps only the wanted source's lines, with
-// search / clear / follow controls.
+// search / clear / follow controls. `stream` narrows to one stream (e.g. a
+// container's `console`), and `plain` drops the timestamp/stream columns for
+// a raw console-style read.
 
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { Badge, Button, Input, Logs, Toggle } from "@forge/ui";
@@ -16,7 +18,12 @@ const MAX = 5000;
 // chronologically without re-parsing the timestamp on every comparison.
 type Row = LogEntry & { _t: number };
 
-export default function LogPanel(props: { lab: string; source: string }) {
+export default function LogPanel(props: {
+  lab: string;
+  source: string;
+  stream?: string;
+  plain?: boolean;
+}) {
   const [entries, setEntries] = createSignal<Row[]>([]);
   const [query, setQuery] = createSignal("");
   const [follow, setFollow] = createSignal(true);
@@ -44,7 +51,7 @@ export default function LogPanel(props: { lab: string; source: string }) {
 
   // (Re)connect the stream whenever the lab or the wanted source changes.
   createEffect(() => {
-    const { lab, source } = props;
+    const { lab, source, stream } = props;
     setEntries([]);
     let ws: WebSocket | null = null;
     let closed = false;
@@ -60,6 +67,7 @@ export default function LogPanel(props: { lab: string; source: string }) {
         try {
           const e: LogEntry = JSON.parse(msg.data);
           if (e.source !== source) return;
+          if (stream && e.stream !== stream) return;
           const row: Row = { ...e, _t: e.ts ? Date.parse(e.ts) : Date.now() };
           setEntries((prev) => {
             const next = prev.length >= MAX ? prev.slice(prev.length - MAX + 1) : prev.slice();
@@ -114,9 +122,11 @@ export default function LogPanel(props: { lab: string; source: string }) {
         >
           <For each={filtered()}>
             {(e) => (
-              <div class="logrow">
-                <span class="logrow-ts">{fmtTs(e.ts)}</span>
-                <span class={`logrow-stream ls-${e.stream}`}>{e.stream}</span>
+              <div class={props.plain ? "logrow plain" : "logrow"}>
+                <Show when={!props.plain}>
+                  <span class="logrow-ts">{fmtTs(e.ts)}</span>
+                  <span class={`logrow-stream ls-${e.stream}`}>{e.stream}</span>
+                </Show>
                 <span class="logrow-msg">{e.text}</span>
               </div>
             )}

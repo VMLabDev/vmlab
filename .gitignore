@@ -7,3 +7,4 @@ docker/lab/.vmlab/
 # Generated documentation site + wskill projections (regenerate with `just docs-build` / `just skill-build`).
 /docs/_site
 /docs/wskills/*/out
+.playwright-cli/

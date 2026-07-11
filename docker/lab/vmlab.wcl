@@ -1,33 +1,45 @@
-// Sample lab for the Docker compose stack. Replace this with your own lab.
-// It references a public OCI template, pulled into the template-store volume on
-// the first `up` (no pre-built store needed).
+# Sample lab for the Docker compose stack. Replace this with your own lab.
+# It references a public OCI template, pulled into the template-store volume on
+# the first `up` (no pre-built store needed).
 
 import <vmlab.wcl>
 
 lab "demo" {
   segment "lan" {
     subnet = "10.80.0.0/24"
-    nat    = true
+    nat = true
   }
 
   vm "alpine" {
     template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
-    arch     = "x86_64"   // OCI registry refs are multi-arch — pick one
-    memory   = 1GiB
-    nic { segment = "lan" }
-    // Files in ./docker/share on the host (bind-mounted to /share) appear
-    // here at /mnt/share. provision.ws installs cifs-utils and creates the
-    // mount point so the daemon's SMB auto-mount lands (see ../README.md).
-    share { host = "/share" guest = "/mnt/share" }
+    arch = "x86_64"  # OCI registry refs are multi-arch — pick one
+    memory = 1GiB
+    nic {
+      segment = "lan"
+    }
+    # Files in ./docker/share on the host (bind-mounted to /share) appear
+    # here at /mnt/share. provision.ws installs cifs-utils and creates the
+    # mount point so the daemon's SMB auto-mount lands (see ../README.md).
+    share {
+      host = "/share"
+      guest = "/mnt/share"
+    }
   }
 
   vm "alpine2" {
     template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
-    arch     = "x86_64"   // OCI registry refs are multi-arch — pick one
-    memory   = 1GiB
-    nic { segment = "lan" }
+    arch = "x86_64"  # OCI registry refs are multi-arch — pick one
+    memory = 1GiB
+    nic {
+      segment = "lan"
+    }
   }
 
-  // Prepares the alpine guest for the /share mount (cifs-utils + mkdir).
-  provision "provision.ws" { vms = ["alpine"] }
+  # Prepares the alpine guest for the /share mount (cifs-utils + mkdir).
+  provision "provision.ws" {
+    vms = ["alpine"]
+  }
+  container "container" {
+    image = "hello-world"
+  }
 }
