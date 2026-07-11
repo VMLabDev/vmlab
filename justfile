@@ -87,6 +87,30 @@ ebpf-build:
 ebpf-verify: ebpf-build
 	git diff --exit-code src/net/fastpath/bpf/
 
+# Run the privileged fast-path integration tests (kernel splice + XDP; sudo
+# prompts once). The tier is a per-process singleton, so each tier gets its
+# own invocation of the test binary with VMLAB_FASTPATH forced.
+[group('test')]
+fastpath-test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	bin=$(cargo test --lib --no-run 2>&1 | sed -n 's|.*Executable unittests src/lib.rs (\(.*\))$|\1|p')
+	[ -n "$bin" ] || { echo "could not locate the test binary"; exit 1; }
+	sudo VMLAB_FASTPATH=sockmap "$bin" fastpath_sockmap --ignored --test-threads=1
+	sudo VMLAB_FASTPATH=afxdp "$bin" fastpath_afxdp --ignored --test-threads=1
+
+# A/B throughput smoke: the same frame pump with the fast path off vs on
+[group('test')]
+fastpath-bench:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	bin=$(cargo test --release --lib --no-run 2>&1 | sed -n 's|.*Executable unittests src/lib.rs (\(.*\))$|\1|p')
+	[ -n "$bin" ] || { echo "could not locate the test binary"; exit 1; }
+	echo "--- userspace ---"
+	VMLAB_FASTPATH=off "$bin" fastpath_bench_ab --ignored --nocapture --test-threads=1
+	echo "--- sockmap (skipped without CAP_BPF/CAP_NET_ADMIN) ---"
+	sudo VMLAB_FASTPATH=sockmap "$bin" fastpath_bench_ab --ignored --nocapture --test-threads=1
+
 # Bring a lab up (a VNC viewer opens per VM when the lab sets `gui = true`)
 [group('lab')]
 lab-up dir='examples/mixed-lab': release

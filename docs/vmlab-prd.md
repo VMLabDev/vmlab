@@ -356,6 +356,16 @@ Each segment is a virtual L2 switch inside its owning daemon (lab daemon for lab
 - **Port isolation:** any NIC may set `isolated = true`. The switch then drops guest-to-guest frames for that port (the private-VLAN model) — the NIC can reach the daemon's gateway services (DHCP/DNS), the segment's NAT port, port-forwards, and daemon routing, but never neighbouring guests. Works on any segment, built-in or declared.
 - Throughput is a stated non-goal (§1.2). The netdev attachment is designed so a vhost-user or tap backend can be substituted per segment later without changing lab semantics.
 
+#### 9.1.1 Kernel fast paths (implemented optimisation)
+
+The substitution seam above is exercised by two opt-in eBPF fast-path tiers, selected empirically at daemon startup and surfaced by `vmlab fastpath` (and a badge in the web UI):
+
+- **afxdp** — VM NICs attach as tap devices (`-netdev tap,fd=`) with a per-segment XDP program forwarding known non-isolated guest unicast tap-to-tap in-kernel. Broadcast, gateway-addressed, unknown, and isolated traffic punts to the daemon over a tagged host tap and traverses the userspace switch as before.
+- **sockmap** — the stream-socket attachment is kept, but sk_skb programs splice known guest-to-guest unicast between the QEMU sockets in-kernel; everything else passes to the daemon's readers unchanged.
+- **userspace** — the fabric exactly as specified above; always the fallback.
+
+The rootless guarantee is untouched: both kernel tiers need CAP_BPF + CAP_NET_ADMIN, and each daemon *proves* a tier works on its host (loading the programs and pushing frames through throwaway taps/sockets) before using it — an unprivileged or WSL2 daemon degrades to `userspace` silently. Lab semantics are tier-invariant by construction: only frames the daemon provably doesn't need to see (known unicast between two non-isolated guest ports of one segment) are ever forwarded in-kernel; the gateway MAC and service/trunk ports never enter the kernel forwarding tables. Selection can be forced with the `fastpath` host-config field (`auto`/`off`/`sockmap`/`afxdp`) or `VMLAB_FASTPATH`.
+
 ### 9.2 Segments and namespacing
 
 - Segments are **lab-scoped by default**: `corp` in lab A and `corp` in lab B are different wires.

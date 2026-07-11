@@ -17,6 +17,8 @@
 
 #[cfg(feature = "ebpf")]
 mod afxdp;
+#[cfg(all(test, feature = "ebpf"))]
+mod priv_tests;
 #[cfg(feature = "ebpf")]
 mod probe;
 #[cfg(feature = "ebpf")]
