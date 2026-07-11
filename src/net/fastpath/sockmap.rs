@@ -66,6 +66,7 @@ struct Maps {
     sock_state: BpfHashMap<MapData, u64, [u8; SOCK_STATE_LEN]>,
     tx_target: BpfHashMap<MapData, u64, u64>,
     fp_stats: PerCpuArray<MapData, [u64; 2]>,
+    fp_debug: PerCpuArray<MapData, u64>,
 }
 
 impl Engine {
@@ -84,6 +85,7 @@ impl Engine {
         let sock_state = BpfHashMap::try_from(take("SOCK_STATE")?)?;
         let tx_target = BpfHashMap::try_from(take("TX_TARGET")?)?;
         let fp_stats = PerCpuArray::try_from(take("FP_STATS")?)?;
+        let fp_debug = PerCpuArray::try_from(take("FP_DEBUG")?)?;
 
         let attach = |ebpf: &mut aya::Ebpf, name: &str, fd| -> Result<()> {
             let prog: &mut SkSkb = ebpf
@@ -107,6 +109,7 @@ impl Engine {
                 sock_state,
                 tx_target,
                 fp_stats,
+                fp_debug,
             }),
         })
     }
@@ -173,6 +176,30 @@ impl Engine {
             Ok(values) => values.iter().fold((0, 0), |(f, b), v| (f + v[0], b + v[1])),
             Err(_) => (0, 0),
         }
+    }
+
+    /// The verdict programs' branch counters (see FP_DEBUG in the BPF
+    /// source), summed across CPUs — probe/field diagnosis only.
+    pub(super) fn debug_counters(&self) -> String {
+        let maps = self.maps.lock_recover();
+        let read = |i: u32| -> u64 {
+            maps.fp_debug
+                .get(&i, 0)
+                .map(|v| v.iter().sum())
+                .unwrap_or(0)
+        };
+        format!(
+            "invoked={} no_state={} passthrough={} aligned={} classify_pass={} \
+             redirect={} redirect_drop={} tx_invoked={}",
+            read(0),
+            read(1),
+            read(2),
+            read(3),
+            read(4),
+            read(5),
+            read(6),
+            read(7),
+        )
     }
 }
 

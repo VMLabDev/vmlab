@@ -78,7 +78,8 @@ fn sockmap_impl() -> Result<()> {
                  the verdict/sockmap layer"
             };
             return Err(e.context(format!(
-                "kernel splice of known unicast (egress redirect); {disposition}"
+                "kernel splice of known unicast (egress redirect); {disposition} [{}]",
+                engine.debug_counters()
             )));
         }
     };

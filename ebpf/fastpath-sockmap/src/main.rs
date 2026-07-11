@@ -72,11 +72,36 @@ static TX_TARGET: HashMap<u64, u64> = HashMap::with_max_entries(256, 0);
 #[map]
 static FP_STATS: PerCpuArray<FpStats> = PerCpuArray::with_max_entries(1, 0);
 
+/// Branch counters for field diagnosis (dumped by the probe on failure):
+/// 0 invoked, 1 no-state (cookie miss), 2 non-aligned passthrough,
+/// 3 aligned, 4 classify pass, 5 redirect attempted, 6 redirect returned
+/// drop, 7 tx-verdict invoked.
+#[map]
+static FP_DEBUG: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
+
+pub const DBG_INVOKED: u32 = 0;
+pub const DBG_NO_STATE: u32 = 1;
+pub const DBG_PASSTHROUGH: u32 = 2;
+pub const DBG_ALIGNED: u32 = 3;
+pub const DBG_CLASSIFY_PASS: u32 = 4;
+pub const DBG_REDIRECT: u32 = 5;
+pub const DBG_REDIRECT_DROP: u32 = 6;
+pub const DBG_TX_INVOKED: u32 = 7;
+
+#[inline(always)]
+fn dbg(index: u32) {
+    if let Some(v) = FP_DEBUG.get_ptr_mut(index) {
+        unsafe { *v += 1 };
+    }
+}
+
 #[stream_verdict]
 pub fn verdict_guest(ctx: SkBuffContext) -> u32 {
+    dbg(DBG_INVOKED);
     let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
     let Some(state_ptr) = SOCK_STATE.get_ptr_mut(&cookie) else {
         // Not a managed socket: leave the stream alone.
+        dbg(DBG_NO_STATE);
         return sk_action::SK_PASS;
     };
     // Copy to the stack, run the logic, write back. Per-socket verdicts are
@@ -87,8 +112,10 @@ pub fn verdict_guest(ctx: SkBuffContext) -> u32 {
     unsafe { (*state_ptr).fs = st.fs };
 
     let SkbClass::Aligned { .. } = class else {
+        dbg(DBG_PASSTHROUGH);
         return sk_action::SK_PASS;
     };
+    dbg(DBG_ALIGNED);
     let Ok(dst_mac) = ctx.load::<[u8; 6]>(PREFIX_LEN as usize) else {
         return sk_action::SK_PASS;
     };
@@ -100,6 +127,7 @@ pub fn verdict_guest(ctx: SkBuffContext) -> u32 {
     });
     match verdict {
         FrameVerdict::Redirect { dst_port } => {
+            dbg(DBG_REDIRECT);
             if let Some(stats) = FP_STATS.get_ptr_mut(0) {
                 unsafe {
                     (*stats).frames += 1;
@@ -107,9 +135,16 @@ pub fn verdict_guest(ctx: SkBuffContext) -> u32 {
                 }
             }
             // Egress redirect (flags 0): transmit out of the target socket.
-            PORT_HASH.redirect_skb(&ctx, dst_port, 0) as u32
+            let ret = PORT_HASH.redirect_skb(&ctx, dst_port, 0);
+            if ret == sk_action::SK_DROP as i64 {
+                dbg(DBG_REDIRECT_DROP);
+            }
+            ret as u32
         }
-        FrameVerdict::Pass => sk_action::SK_PASS,
+        FrameVerdict::Pass => {
+            dbg(DBG_CLASSIFY_PASS);
+            sk_action::SK_PASS
+        }
     }
 }
 
@@ -142,6 +177,7 @@ fn load_exact(ctx: &SkBuffContext, off: u32, dst: &mut [u8]) -> bool {
 
 #[stream_verdict]
 pub fn verdict_tx(ctx: SkBuffContext) -> u32 {
+    dbg(DBG_TX_INVOKED);
     let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
     let Some(port) = (unsafe { TX_TARGET.get(&cookie) }) else {
         // Orphaned loopback: nothing sane to do with the frame.
