@@ -67,12 +67,14 @@ impl FastpathTier {
 /// The `fastpath` host-config knob; `VMLAB_FASTPATH` overrides it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FastpathMode {
-    /// Probe afxdp, then sockmap, then fall back to userspace.
+    /// Probe afxdp, else fall back to userspace. Never picks sockmap: it
+    /// works but measures slower than the userspace fabric (see `select`).
     #[default]
     Auto,
     /// Never use a kernel fast path.
     Off,
-    /// Probe only the sockmap tier.
+    /// Probe only the sockmap tier (evaluation only — measured slower
+    /// than the userspace fabric on current kernels).
     Sockmap,
     /// Probe only the afxdp tier.
     AfXdp,
@@ -181,8 +183,7 @@ fn env_mode(fallback: FastpathMode) -> FastpathMode {
 /// A forced tier that fails its probe degrades to userspace rather than
 /// failing daemon startup.
 fn select(mode: FastpathMode) -> FastpathStatus {
-    let mut reasons: Vec<(&'static str, String)> = Vec::new();
-    let mut probe = |tier: FastpathTier| -> bool {
+    fn probe(tier: FastpathTier, reasons: &mut Vec<(&'static str, String)>) -> bool {
         let result = match tier {
             FastpathTier::AfXdp => probe_afxdp(),
             FastpathTier::Sockmap => probe_sockmap(),
@@ -195,27 +196,37 @@ fn select(mode: FastpathMode) -> FastpathStatus {
                 false
             }
         }
-    };
+    }
+    let mut reasons: Vec<(&'static str, String)> = Vec::new();
     let tier = match mode {
         FastpathMode::Off => FastpathTier::Userspace,
         FastpathMode::Auto => {
-            if probe(FastpathTier::AfXdp) {
+            if probe(FastpathTier::AfXdp, &mut reasons) {
                 FastpathTier::AfXdp
-            } else if probe(FastpathTier::Sockmap) {
-                FastpathTier::Sockmap
             } else {
+                // The sockmap tier works but measured ~8x SLOWER than the
+                // userspace fabric (every af_unix redirect rides the psock
+                // backlog workqueue, ~30µs/frame), so auto never picks it —
+                // it stays available for explicit evaluation.
+                reasons.push((
+                    FastpathTier::Sockmap.as_str(),
+                    "not used in auto mode: af_unix kernel splicing measures slower than \
+                     the userspace fabric (psock backlog workqueue); force with \
+                     `fastpath = \"sockmap\"` to evaluate it"
+                        .into(),
+                ));
                 FastpathTier::Userspace
             }
         }
         FastpathMode::Sockmap => {
-            if probe(FastpathTier::Sockmap) {
+            if probe(FastpathTier::Sockmap, &mut reasons) {
                 FastpathTier::Sockmap
             } else {
                 FastpathTier::Userspace
             }
         }
         FastpathMode::AfXdp => {
-            if probe(FastpathTier::AfXdp) {
+            if probe(FastpathTier::AfXdp, &mut reasons) {
                 FastpathTier::AfXdp
             } else {
                 FastpathTier::Userspace
@@ -296,7 +307,9 @@ mod tests {
         let skipped: Vec<&str> = status.reasons.iter().map(|(t, _)| *t).collect();
         match status.tier {
             FastpathTier::AfXdp => assert!(skipped.is_empty()),
-            FastpathTier::Sockmap => assert_eq!(skipped, vec!["afxdp"]),
+            // Sockmap measured slower than the userspace fabric; auto must
+            // never select it (explicit `fastpath = "sockmap"` only).
+            FastpathTier::Sockmap => panic!("auto selected the demoted sockmap tier"),
             FastpathTier::Userspace => assert_eq!(skipped, vec!["afxdp", "sockmap"]),
         }
     }
