@@ -6,7 +6,8 @@
 
 import { Show, createSignal } from "solid-js";
 import { Badge, Button, Card, Empty, PageHead, Tabs } from "@forge/ui";
-import { Power, RotateCcw } from "lucide-solid";
+import { RotateCcw } from "lucide-solid";
+import PowerButton from "./PowerButton";
 import {
   containerLook,
   containerRestart,
@@ -53,22 +54,14 @@ export default function ContainerView() {
         sub={`container · ${ctr()!.image}`}
         actions={
           <>
-            <Show
-              when={on()}
-              fallback={
-                <Button
-                  variant="primary"
-                  icon={Power}
-                  onClick={() => containerStart(ctr()!.name)}
-                >
-                  Start
-                </Button>
-              }
-            >
-              <Button icon={Power} onClick={() => containerStop(ctr()!.name)}>
-                Stop
-              </Button>
-            </Show>
+            <PowerButton
+              name={ctr()!.name}
+              state={ctr()!.state}
+              startLabel="Start"
+              stopLabel="Stop"
+              onStart={() => containerStart(ctr()!.name)}
+              onStop={() => containerStop(ctr()!.name)}
+            />
             <Button icon={RotateCcw} disabled={!on()} onClick={() => containerRestart(ctr()!.name)}>
               Restart
             </Button>

@@ -39,6 +39,8 @@
 .vm-side { display: flex; flex-direction: column; gap: var(--sp-4); }
 /* Container page: terminal above the log panel, one column. */
 .ctr-main { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
+.power-busy { display: inline-flex; align-items: center; gap: var(--sp-2); }
+
 .ctr-term { height: 320px; }
 .ctr-term .xterm { height: 100%; padding: var(--sp-2); }
 .ctr-term-start {

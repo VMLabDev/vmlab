@@ -1,6 +1,7 @@
 import { For, Show, createResource, createSignal } from "solid-js";
 import { Badge, Button, Card, Empty, Icon, PageHead, Tabs } from "@forge/ui";
-import { Camera, Power, RotateCcw } from "lucide-solid";
+import { Camera, RotateCcw } from "lucide-solid";
+import PowerButton from "./PowerButton";
 import {
   state,
   vmStart,
@@ -83,18 +84,14 @@ export default function MachineView() {
         sub={`${osOf(vm()!)} · ${archOf(vm()!)} · ${vm()!.template}`}
         actions={
           <>
-            <Show
-              when={on()}
-              fallback={
-                <Button variant="primary" icon={Power} onClick={() => vmStart(vm()!.name)}>
-                  Power on
-                </Button>
-              }
-            >
-              <Button icon={Power} onClick={() => vmStop(vm()!.name)}>
-                Power off
-              </Button>
-            </Show>
+            <PowerButton
+              name={vm()!.name}
+              state={vm()!.state ?? "stopped"}
+              startLabel="Power on"
+              stopLabel="Power off"
+              onStart={() => vmStart(vm()!.name)}
+              onStop={() => vmStop(vm()!.name)}
+            />
             <Button icon={RotateCcw} disabled={!on()} onClick={() => vmRestart(vm()!.name)}>
               Restart
             </Button>
