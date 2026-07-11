@@ -60,12 +60,16 @@ static TX_HASH: SockHash<u64> = SockHash::with_max_entries(256, 0);
 #[map]
 static MAC_MAP: HashMap<[u8; 6], u64> = HashMap::with_max_entries(1024, 0);
 
-/// Socket cookie -> SockState for the QEMU-facing sockets.
+/// Per-stream state, keyed by the *sender* socket's cookie (what the
+/// kernel attributes af_unix skbs to — QEMU's end of each stream).
+/// Created lazily by `verdict_guest` itself (self-priming: userspace can't
+/// query the peer's cookie); userspace only scans-and-deletes entries by
+/// port id on removal.
 #[map]
 static SOCK_STATE: HashMap<u64, SockState> = HashMap::with_max_entries(512, 0);
 
-/// Socket cookie of a TX loopback -> the port id whose QEMU socket its
-/// dgrams are written to.
+/// Sender-cookie of a TX loopback's `tx_user` end -> the port id whose
+/// QEMU socket its dgrams are written to.
 #[map]
 static TX_TARGET: HashMap<u64, u64> = HashMap::with_max_entries(256, 0);
 
@@ -73,9 +77,9 @@ static TX_TARGET: HashMap<u64, u64> = HashMap::with_max_entries(256, 0);
 static FP_STATS: PerCpuArray<FpStats> = PerCpuArray::with_max_entries(1, 0);
 
 /// Branch counters for field diagnosis (dumped by the probe on failure):
-/// 0 invoked, 1 no-state (cookie miss), 2 non-aligned passthrough,
-/// 3 aligned, 4 classify pass, 5 redirect attempted, 6 redirect returned
-/// drop, 7 tx-verdict invoked.
+/// 0 invoked, 1 no-state (zero cookie, or unlearned source blocking a
+/// self-prime), 2 non-aligned passthrough, 3 aligned, 4 classify pass,
+/// 5 redirect attempted, 6 redirect returned drop, 7 tx-verdict invoked.
 #[map]
 static FP_DEBUG: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
 
@@ -98,18 +102,34 @@ fn dbg(index: u32) {
 #[stream_verdict]
 pub fn verdict_guest(ctx: SkBuffContext) -> u32 {
     dbg(DBG_INVOKED);
+    // On af_unix ingress the kernel attributes the skb to the *sending*
+    // socket (the skb owner), so this cookie identifies QEMU's end of the
+    // stream — stable for the stream's lifetime, which is all the state
+    // machine needs. 0 means no attribution at all: never touch those.
     let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
-    let Some(state_ptr) = SOCK_STATE.get_ptr_mut(&cookie) else {
-        // Not a managed socket: leave the stream alone.
+    if cookie == 0 {
         dbg(DBG_NO_STATE);
         return sk_action::SK_PASS;
-    };
+    }
+    // Userspace cannot learn QEMU's cookie (the fd lives in QEMU), so state
+    // is created *here*, lazily: see the self-priming branch below.
+    let state_ptr = SOCK_STATE.get_ptr_mut(&cookie);
     // Copy to the stack, run the logic, write back. Per-socket verdicts are
     // serialized by the kernel, so this is not racy.
-    let mut st = unsafe { *state_ptr };
+    let mut st = match state_ptr {
+        Some(p) => unsafe { *p },
+        None => SockState {
+            // Placeholder that can never match a real port: classify only
+            // runs after the priming branch replaced it.
+            port_id: u64::MAX,
+            fs: FrameState::default(),
+        },
+    };
     let len = ctx.len();
     let class = step_skb(&mut st.fs, len, &mut |off, dst| load_exact(&ctx, off, dst));
-    unsafe { (*state_ptr).fs = st.fs };
+    if let Some(p) = state_ptr {
+        unsafe { (*p).fs = st.fs };
+    }
 
     let SkbClass::Aligned { .. } = class else {
         dbg(DBG_PASSTHROUGH);
@@ -122,6 +142,21 @@ pub fn verdict_guest(ctx: SkBuffContext) -> u32 {
     let Ok(src_mac) = ctx.load::<[u8; 6]>(PREFIX_LEN as usize + 6) else {
         return sk_action::SK_PASS;
     };
+    if state_ptr.is_none() {
+        // Self-prime: a whole-frame skb is self-evidently on a frame
+        // boundary, and a learned source MAC (userspace mirrors learns into
+        // MAC_MAP) tells us which offloaded port this stream belongs to.
+        // Anything else keeps passing until such an skb arrives — QEMU
+        // sends one frame per write, so that's normally the first one
+        // after the port's MAC is learned.
+        let Some(port) = (unsafe { MAC_MAP.get(&src_mac) }) else {
+            dbg(DBG_NO_STATE);
+            return sk_action::SK_PASS;
+        };
+        st.port_id = *port;
+        // st.fs is at a boundary (this aligned skb was consumed whole).
+        let _ = SOCK_STATE.insert(&cookie, &st, 0);
+    }
     let verdict = classify_frame(&dst_mac, &src_mac, st.port_id, |mac| unsafe {
         MAC_MAP.get(mac).copied()
     });

@@ -35,16 +35,12 @@ use crate::sync::LockRecover;
 const OBJ: &[u8] = include_bytes!("bpf/fastpath_sockmap.bpf.o");
 
 /// `SOCK_STATE` map value: the BPF side's `SockState` (repr(C): `u64`
-/// port_id, then the 12-byte framing state, padded to 24). Userspace only
-/// ever writes the initial state — zeroed framing position, port id set —
-/// so a byte array avoids needing an `unsafe impl aya::Pod` in this crate.
+/// port_id, then the 12-byte framing state, padded to 24). The kernel
+/// self-primes entries (keyed by the *sender* cookie, which userspace
+/// cannot query for QEMU's sockets); userspace only reads the leading
+/// port id when scanning entries to delete on port removal — so a byte
+/// array avoids needing an `unsafe impl aya::Pod` in this crate.
 const SOCK_STATE_LEN: usize = 24;
-
-fn initial_sock_state(port_id: u64) -> [u8; SOCK_STATE_LEN] {
-    let mut v = [0u8; SOCK_STATE_LEN];
-    v[..8].copy_from_slice(&port_id.to_ne_bytes());
-    v
-}
 
 fn socket_cookie(fd: impl AsFd) -> Result<u64> {
     rustix::net::sockopt::socket_cookie(fd).context("SO_COOKIE")
@@ -115,32 +111,33 @@ impl Engine {
     }
 
     /// Register a QEMU-facing stream socket as offloaded port `id`. The
-    /// state entry goes in first so the verdict never sees a managed
-    /// socket without one.
-    pub(super) fn register_stream(&self, id: u64, sock: impl AsFd) -> Result<u64> {
-        let fd = sock.as_fd();
-        let cookie = socket_cookie(fd)?;
+    /// per-stream state is self-primed by the verdict program (keyed by
+    /// the sender cookie only the kernel sees), so this is just the
+    /// sockmap membership that makes the verdict run at all.
+    pub(super) fn register_stream(&self, id: u64, sock: impl AsFd) -> Result<()> {
         let mut maps = self.maps.lock_recover();
-        maps.sock_state
-            .insert(cookie, initial_sock_state(id), 0)
-            .context("sock_state insert")?;
-        if let Err(e) = maps.port_hash.insert(id, fd.as_raw_fd(), 0) {
-            let _ = maps.sock_state.remove(&cookie);
-            return Err(anyhow::Error::new(e).context("port_hash insert"));
-        }
-        Ok(cookie)
+        maps.port_hash
+            .insert(id, sock.as_fd().as_raw_fd(), 0)
+            .context("port_hash insert")?;
+        Ok(())
     }
 
-    /// Register a TX-loopback kernel end whose dgrams are spliced into
-    /// port `id`'s QEMU socket.
-    pub(super) fn register_tx(&self, id: u64, sock: impl AsFd) -> Result<u64> {
-        let fd = sock.as_fd();
-        let cookie = socket_cookie(fd)?;
+    /// Register a TX loopback: `map_sock` (the kernel end) joins the
+    /// sockmap so the TX verdict runs on its ingress; `cookie_sock` (the
+    /// `tx_user` end the daemon writes) is the *sender* the kernel
+    /// attributes those dgrams to, hence the TX_TARGET key.
+    pub(super) fn register_tx(
+        &self,
+        id: u64,
+        map_sock: impl AsFd,
+        cookie_sock: impl AsFd,
+    ) -> Result<u64> {
+        let cookie = socket_cookie(cookie_sock.as_fd())?;
         let mut maps = self.maps.lock_recover();
         maps.tx_target
             .insert(cookie, id, 0)
             .context("tx_target insert")?;
-        if let Err(e) = maps.tx_hash.insert(id, fd.as_raw_fd(), 0) {
+        if let Err(e) = maps.tx_hash.insert(id, map_sock.as_fd().as_raw_fd(), 0) {
             let _ = maps.tx_target.remove(&cookie);
             return Err(anyhow::Error::new(e).context("tx_hash insert"));
         }
@@ -158,14 +155,25 @@ impl Engine {
 
     /// Best-effort cleanup of everything a port registered. Closed sockets
     /// are auto-removed by the kernel, so failures here are non-events.
-    pub(super) fn unregister(&self, id: u64, cookie: u64, tx_cookie: u64, macs: &[[u8; 6]]) {
+    /// SOCK_STATE entries are keyed by cookies only the kernel saw, so
+    /// they're found by scanning for the port id in the value.
+    pub(super) fn unregister(&self, id: u64, tx_cookie: u64, macs: &[[u8; 6]]) {
         let mut maps = self.maps.lock_recover();
         let _ = maps.port_hash.remove(&id);
         let _ = maps.tx_hash.remove(&id);
-        let _ = maps.sock_state.remove(&cookie);
         let _ = maps.tx_target.remove(&tx_cookie);
         for mac in macs {
             let _ = maps.mac_map.remove(mac);
+        }
+        let stale: Vec<u64> = maps
+            .sock_state
+            .iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|(_, v)| v[..8] == id.to_ne_bytes())
+            .map(|(k, _)| k)
+            .collect();
+        for cookie in stale {
+            let _ = maps.sock_state.remove(&cookie);
         }
     }
 
@@ -220,7 +228,6 @@ impl PortTx {
 }
 
 struct OffloadPort {
-    cookie: u64,
     tx_cookie: u64,
     /// Keeps the kernel end of the TX loopback (and its sockmap entry)
     /// alive for the port's lifetime.
@@ -268,15 +275,15 @@ impl SegmentOffload {
     /// state machine starts at a true frame boundary).
     pub fn add_port(&self, id: PortId, stream: &tokio::net::UnixStream) -> Result<PortTx> {
         let pid = id.raw();
-        let cookie = self.engine.register_stream(pid, stream)?;
+        self.engine.register_stream(pid, stream)?;
         let (tx_user, tx_kernel) = UnixDatagram::pair().context("tx loopback pair")?;
-        let tx_cookie = match self.engine.register_tx(pid, &tx_kernel) {
+        let tx_cookie = match self.engine.register_tx(pid, &tx_kernel, &tx_user) {
             Ok(c) => c,
             Err(e) => {
                 // Never leave a half-offloaded port behind: stream-redirect
                 // without the TX loopback would reintroduce the two-writer
                 // corruption this design exists to prevent.
-                self.engine.unregister(pid, cookie, 0, &[]);
+                self.engine.unregister(pid, 0, &[]);
                 return Err(e);
             }
         };
@@ -284,7 +291,6 @@ impl SegmentOffload {
         self.ports.lock_recover().insert(
             pid,
             OffloadPort {
-                cookie,
                 tx_cookie,
                 _tx_kernel: tx_kernel,
                 write_half: None,
@@ -329,8 +335,7 @@ impl SegmentOffload {
             return;
         };
         let macs: Vec<[u8; 6]> = purged.iter().map(|m| m.0).collect();
-        self.engine
-            .unregister(id.raw(), port.cookie, port.tx_cookie, &macs);
+        self.engine.unregister(id.raw(), port.tx_cookie, &macs);
         debug!(port = %id, "offloaded port removed");
     }
 

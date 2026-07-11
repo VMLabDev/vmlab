@@ -103,7 +103,7 @@ fn sockmap_impl() -> Result<()> {
     //    of QEMU B's socket.
     let (tx_user, tx_kernel) = UnixDatagram::pair().context("dgram pair")?;
     engine
-        .register_tx(2, &tx_kernel)
+        .register_tx(2, &tx_kernel, &tx_user)
         .context("adding a unix dgram socket to the sockmap")?;
     let injected = eth_build(MAC_B, MAC_UNKNOWN, ETHERTYPE_IPV4, b"fastpath probe: tx");
     let mut buf = (injected.len() as u32).to_be_bytes().to_vec();
