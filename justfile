@@ -141,6 +141,13 @@ web-build: web-ui-build
 web-serve dir='examples/mixed-lab': web-build
 	cd {{dir}} && {{justfile_directory()}}/target/debug/vmlab-web
 
+# Rebuild/install the x86_64 guest and run vmlab-web; restart existing containers from the UI.
+[group('web')]
+web-serve-guest dir='examples/mixed-lab': web-build (guest-build 'x86_64')
+	mkdir -p ~/.local/share/vmlab/guest/x86_64
+	cp -r guest/dist/x86_64/. ~/.local/share/vmlab/guest/x86_64/
+	cd {{dir}} && {{justfile_directory()}}/target/debug/vmlab-web
+
 # Stop any running vmlab-web server (useful when it was started in the background)
 [group('web')]
 web-stop:

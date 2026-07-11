@@ -9,7 +9,7 @@
 //!  6. mount volumes + runtime filesystems, write identity files
 //!  7. loopback + DHCP per NIC (busybox udhcpc — see net.rs), emit `net_up`
 //!  8. start bundled qemu-ga in the init namespace (not the container root)
-//!  9. resolve user, build env, fork+chroot+exec the container, emit `started`
+//!  9. resolve user, build env, clone namespaces + exec container, emit `started`
 //! 10. reap children; when the container exits: emit `exited`, power off
 //!
 //! Any fatal init error prints to the console and powers off, so the host's
@@ -134,11 +134,11 @@ fn run() -> Result<()> {
     let reaper = Arc::new(reap::Reaper::default());
     let exited = Arc::new(AtomicBool::new(false));
 
-    // Interactive shell sessions on the vmlab.tty.0 port (chrooted into the
-    // container rootfs, respawned across exits).
-    let tty = tty::Tty::start(&spec, &env, reaper.clone());
-
-    let child = container::spawn(&spec, user.as_ref(), &env)?;
+    let process = container::spawn(&spec, user.as_ref(), &env)?;
+    let child = process.pid;
+    // Interactive shell sessions join the workload's PID and mount
+    // namespaces, then chroot into its rootfs.
+    let tty = tty::Tty::start(&spec, &env, process.namespaces.clone(), reaper.clone());
     ctl.emit(&CtlEvent::Started {
         pid: child.as_raw() as u32,
     });
@@ -165,7 +165,14 @@ fn run() -> Result<()> {
     }
 
     if let Some(hc) = &spec.healthcheck {
-        health::spawn(hc, &env, ctl.clone(), reaper.clone(), exited.clone())?;
+        health::spawn(
+            hc,
+            &env,
+            ctl.clone(),
+            reaper.clone(),
+            exited.clone(),
+            process.namespaces.clone(),
+        )?;
     }
 
     // -- reap loop (main thread) ---------------------------------------------

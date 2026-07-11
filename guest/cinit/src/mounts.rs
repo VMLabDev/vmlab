@@ -197,11 +197,29 @@ pub fn mount_rootfs_runtime() -> Result<()> {
 /// upper layer, never the read-only image). Failures only cost the fallback.
 pub fn install_shell_fallback() {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
     let dir = format!("{ROOTFS}/.vmlab");
     let dest = format!("{dir}/busybox");
+    let bin_dir = format!("{ROOTFS}{}", crate::tty::BUSYBOX_BIN_DIR);
     let result = fs::create_dir_all(&dir)
         .and_then(|()| fs::copy("/bin/busybox", &dest).map(|_| ()))
-        .and_then(|()| fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)));
+        .and_then(|()| fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)))
+        .and_then(|()| fs::create_dir_all(&bin_dir))
+        .and_then(|()| {
+            let output = Command::new("/bin/busybox").arg("--list").output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other("busybox --list failed"));
+            }
+            for applet in String::from_utf8_lossy(&output.stdout).lines() {
+                let link = format!("{bin_dir}/{applet}");
+                match symlink("../busybox", &link) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        });
     if let Err(e) = result {
         eprintln!("vmlab-cinit: warning: busybox shell fallback not installed: {e}");
     }

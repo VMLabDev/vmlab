@@ -1,16 +1,20 @@
 //! Launch the container process.
 //!
-//! Isolation note (v1): the child confines itself with plain `chroot` into
-//! the overlay rootfs and stays in init's namespaces. `pivot_root` + mount
-//! namespace would be tidier, but the whole VM already *is* the isolation
-//! boundary — chroot only has to make the container see its own filesystem
-//! layout, not defend against escape.
+//! The workload owns a PID and mount namespace.  Exec-style helpers join
+//! both, so `/proc` describes the container process tree rather than the
+//! surrounding micro-VM while every process still uses the shared overlay.
 
 use std::ffi::CString;
+use std::fs::File;
+use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
-use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, chroot, execve, fork, setgid, setuid};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use nix::sched::{CloneFlags, clone, setns};
+use nix::sys::signal::Signal;
+use nix::unistd::{Gid, Pid, Uid, chdir, chroot, execve, setgid, setuid};
 
 use vmlab_cinit_proto::ContainerSpec;
 
@@ -20,6 +24,41 @@ use crate::util::{Ctx, Result};
 
 pub(crate) const DEFAULT_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+const CLONE_STACK_SIZE: usize = 1024 * 1024;
+const ROOTFS_PROC: &str = "/rootfs/proc";
+
+/// Open namespace handles remain valid across workload exec and are shared
+/// with shell and healthcheck threads.
+#[derive(Clone)]
+pub struct Namespaces {
+    pid: Arc<File>,
+    mount: Arc<File>,
+}
+
+impl Namespaces {
+    fn open(pid: Pid) -> Result<Self> {
+        let base = format!("/proc/{}/ns", pid.as_raw());
+        Ok(Self {
+            pid: Arc::new(File::open(format!("{base}/pid")).ctx("open container PID namespace")?),
+            mount: Arc::new(
+                File::open(format!("{base}/mnt")).ctx("open container mount namespace")?,
+            ),
+        })
+    }
+
+    /// Enter the mount namespace immediately. Entering a PID namespace only
+    /// affects subsequently-created children, so callers must fork once more.
+    pub fn enter_for_child(&self) -> Result<()> {
+        setns(self.mount.as_fd(), CloneFlags::CLONE_NEWNS).ctx("join container mount namespace")?;
+        setns(self.pid.as_fd(), CloneFlags::CLONE_NEWPID).ctx("join container PID namespace")
+    }
+}
+
+pub struct ContainerProcess {
+    pub pid: Pid,
+    pub namespaces: Namespaces,
+}
 
 /// The container environment: the spec's env verbatim (the host pre-merges
 /// image env with lab overrides), plus a sane PATH if absent and HOME from
@@ -97,7 +136,7 @@ pub fn spawn(
     spec: &ContainerSpec,
     user: Option<&ResolvedUser>,
     env: &[(String, String)],
-) -> Result<Pid> {
+) -> Result<ContainerProcess> {
     let argv = build_argv(spec)?;
     let exe = resolve_exe(ROOTFS, &argv[0], env)?;
     let workdir = spec.workdir.as_deref().unwrap_or("/");
@@ -112,39 +151,102 @@ pub fn spawn(
         .collect::<Result<_>>()?;
     let c_workdir = cstring(workdir)?;
     let ids = user.map(|u| (Uid::from_raw(u.uid), Gid::from_raw(u.gid)));
-
-    // SAFETY: multithreaded fork; the child only performs async-signal-safe
-    // operations (raw syscalls via nix + _exit) before execve.
-    match unsafe { fork() }.ctx("fork container")? {
-        ForkResult::Parent { child } => Ok(child),
-        ForkResult::Child => {
-            let die = |what: &str| -> ! {
-                // eprintln! allocates, but we are already on the error path —
-                // a hang here is no worse than a lost message.
-                eprintln!("vmlab-cinit: container launch failed: {what}");
-                unsafe { libc::_exit(127) }
-            };
-            if chroot(ROOTFS).is_err() {
-                die("chroot");
-            }
-            if chdir(c_workdir.as_c_str()).is_err() {
-                die("chdir to workdir");
-            }
-            if let Some((uid, gid)) = ids {
-                if nix::unistd::setgroups(&[gid]).is_err() {
-                    die("setgroups");
-                }
-                if setgid(gid).is_err() {
-                    die("setgid");
-                }
-                if setuid(uid).is_err() {
-                    die("setuid");
-                }
-            }
-            let _ = execve(&c_exe, &c_argv, &c_env);
-            die("execve");
-        }
+    let mut ready_fds = [0_i32; 2];
+    if unsafe { libc::pipe2(ready_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!(
+            "create container readiness pipe: {}",
+            nix::errno::Errno::last()
+        ));
     }
+    let ready_read = ready_fds[0];
+    let ready_write = ready_fds[1];
+
+    let mut stack = vec![0_u8; CLONE_STACK_SIZE];
+    let callback = Box::new(move || -> isize {
+        let die = |what: &str| -> ! {
+            eprintln!("vmlab-cinit: container launch failed: {what}");
+            unsafe { libc::_exit(127) }
+        };
+        unsafe { libc::close(ready_read) };
+
+        // Stop mount changes in this namespace propagating back to cinit,
+        // then replace the inherited host-namespace procfs with one owned by
+        // the new PID namespace.
+        if mount::<str, str, str, str>(None, "/", None, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None)
+            .is_err()
+        {
+            die("make mounts private");
+        }
+        if umount2(ROOTFS_PROC, MntFlags::MNT_DETACH).is_err() {
+            die("unmount inherited /proc");
+        }
+        if mount(
+            Some("proc"),
+            ROOTFS_PROC,
+            Some("proc"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .is_err()
+        {
+            die("mount container /proc");
+        }
+        // The parent must not publish namespace handles until their procfs is
+        // ready; otherwise a fast shell attach can observe the inherited
+        // micro-VM process view.
+        let ready = [1_u8];
+        if unsafe { libc::write(ready_write, ready.as_ptr().cast(), 1) } != 1 {
+            die("signal namespace readiness");
+        }
+        unsafe { libc::close(ready_write) };
+        if chroot(ROOTFS).is_err() {
+            die("chroot");
+        }
+        if chdir(c_workdir.as_c_str()).is_err() {
+            die("chdir to workdir");
+        }
+        if let Some((uid, gid)) = ids {
+            if nix::unistd::setgroups(&[gid]).is_err() {
+                die("setgroups");
+            }
+            if setgid(gid).is_err() {
+                die("setgid");
+            }
+            if setuid(uid).is_err() {
+                die("setuid");
+            }
+        }
+        let _ = execve(&c_exe, &c_argv, &c_env);
+        die("execve");
+    });
+
+    // SAFETY: the callback follows the same post-fork restrictions as the
+    // previous fork path and receives a dedicated stack. CLONE_VM is absent.
+    let pid_result = unsafe {
+        clone(
+            callback,
+            &mut stack,
+            CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS,
+            Some(Signal::SIGCHLD as i32),
+        )
+    }
+    .ctx("clone container namespaces");
+    unsafe { libc::close(ready_write) };
+    let pid = match pid_result {
+        Ok(pid) => pid,
+        Err(e) => {
+            unsafe { libc::close(ready_read) };
+            return Err(e);
+        }
+    };
+    let mut ready = [0_u8];
+    let n = unsafe { libc::read(ready_read, ready.as_mut_ptr().cast(), 1) };
+    unsafe { libc::close(ready_read) };
+    if n != 1 {
+        return Err("container namespace setup failed before readiness".into());
+    }
+    let namespaces = Namespaces::open(pid)?;
+    Ok(ContainerProcess { pid, namespaces })
 }
 
 #[cfg(test)]

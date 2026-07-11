@@ -33,6 +33,7 @@ use nix::unistd::{ForkResult, Pid, chdir, chroot, dup2, execve, fork, setsid};
 
 use vmlab_cinit_proto::ContainerSpec;
 
+use crate::container::Namespaces;
 use crate::ctl::find_virtio_port;
 use crate::mounts::ROOTFS;
 use crate::reap::Reaper;
@@ -42,8 +43,24 @@ use crate::util::{Ctx, Result};
 /// overlay (see [`crate::mounts::install_shell_fallback`]), so distroless
 /// images still get a shell.
 pub const BUSYBOX_FALLBACK: &str = "/.vmlab/busybox";
+pub const BUSYBOX_BIN_DIR: &str = "/.vmlab/bin";
 
 const PORT_NAME: &str = "vmlab.tty.0";
+
+// Generated with: npx --yes figlet-cli -f Small VMLAB
+const TERMINAL_MOTD: &str = concat!(
+    "\n",
+    " __   ____  __ _      _   ___ \n",
+    " \\ \\ / /  \\/  | |    /_\\ | _ )\n",
+    "  \\ V /| |\\/| | |__ / _ \\| _ \\\n",
+    "   \\_/ |_|  |_|____/_/ \\_\\___/\n",
+    "\n",
+    "vmlab container troubleshooting terminal\n",
+    "  BusyBox shell running as root inside the container PID and mount namespaces.\n",
+    "  The image filesystem, environment, volumes, and processes are available here.\n",
+    "  Run 'busybox --list' to see tools; 'exit' resets the shell; Ctrl-] detaches the CLI.\n",
+    "\n",
+);
 
 /// Respawn delay after a shell exits, so a client typing `exit` and
 /// re-attaching lands on a fresh prompt rather than a dead port.
@@ -63,9 +80,10 @@ pub fn winsize(cols: u16, rows: u16) -> Winsize {
     }
 }
 
-/// Pick the shell argv for the session: the rootfs' own `/bin/sh` when it
-/// has one, else the busybox copy the mount phase installed. Paths are as
-/// the post-chroot child sees them.
+/// Pick the shell argv for the session: prefer the injected static BusyBox
+/// toolbox so troubleshooting commands are consistent across images, then
+/// fall back to the image's `/bin/sh` if injection failed. Paths are as the
+/// post-chroot child sees them.
 pub fn choose_shell(rootfs: &str) -> Option<Vec<String>> {
     let executable = |inside: &str| {
         let full = format!("{rootfs}{inside}");
@@ -74,24 +92,31 @@ pub fn choose_shell(rootfs: &str) -> Option<Vec<String>> {
             .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
     };
-    if executable("/bin/sh") {
-        return Some(vec!["/bin/sh".to_string()]);
-    }
     if executable(BUSYBOX_FALLBACK) {
         return Some(vec![BUSYBOX_FALLBACK.to_string(), "sh".to_string()]);
+    }
+    if executable("/bin/sh") {
+        return Some(vec!["/bin/sh".to_string()]);
     }
     None
 }
 
 /// The shell's environment: the container env verbatim plus a terminal type
-/// and a PATH fallback when the spec carries none.
+/// and the injected BusyBox applets at the front of PATH.
 pub fn shell_env(env: &[(String, String)]) -> Vec<(String, String)> {
     let mut env = env.to_vec();
     if !env.iter().any(|(k, _)| k == "TERM") {
         env.push(("TERM".into(), "xterm-256color".into()));
     }
-    if !env.iter().any(|(k, _)| k == "PATH") {
-        env.push(("PATH".into(), crate::container::DEFAULT_PATH.into()));
+    if let Some((_, path)) = env.iter_mut().find(|(k, _)| k == "PATH") {
+        if !path.split(':').any(|part| part == BUSYBOX_BIN_DIR) {
+            *path = format!("{BUSYBOX_BIN_DIR}:{path}");
+        }
+    } else {
+        env.push((
+            "PATH".into(),
+            format!("{BUSYBOX_BIN_DIR}:{}", crate::container::DEFAULT_PATH),
+        ));
     }
     env
 }
@@ -115,7 +140,12 @@ pub struct Tty {
 impl Tty {
     /// Open the tty port and start the session manager. Never fails: with no
     /// port (or an unopenable one) the returned handle only remembers sizes.
-    pub fn start(spec: &ContainerSpec, env: &[(String, String)], reaper: Arc<Reaper>) -> Tty {
+    pub fn start(
+        spec: &ContainerSpec,
+        env: &[(String, String)],
+        namespaces: Namespaces,
+        reaper: Arc<Reaper>,
+    ) -> Tty {
         let shared = Arc::new(Shared {
             size: Mutex::new(winsize(80, 24)),
             master: Mutex::new(None),
@@ -125,9 +155,7 @@ impl Tty {
         };
 
         let Some(path) = find_virtio_port(PORT_NAME) else {
-            eprintln!(
-                "vmlab-cinit: warning: tty port {PORT_NAME} not found; no interactive shell"
-            );
+            eprintln!("vmlab-cinit: warning: tty port {PORT_NAME} not found; no interactive shell");
             return tty;
         };
         // Exclusive-open like the ctl port: open once read+write, clone fds
@@ -191,7 +219,7 @@ impl Tty {
                     continue;
                 };
                 let size = *shared.size.lock().unwrap();
-                let (master, pid) = match spawn_shell(&shell, &env, &workdir, &size) {
+                let (master, pid) = match spawn_shell(&shell, &env, &workdir, &size, &namespaces) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("vmlab-cinit: warning: tty shell spawn failed: {e}");
@@ -268,9 +296,14 @@ fn spawn_shell(
     env: &[(String, String)],
     workdir: &str,
     size: &Winsize,
+    namespaces: &Namespaces,
 ) -> Result<(OwnedFd, Pid)> {
     let pty = openpty(size, None).ctx("openpty")?;
-    fcntl(pty.master.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).ctx("cloexec master")?;
+    fcntl(
+        pty.master.as_raw_fd(),
+        FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC),
+    )
+    .ctx("cloexec master")?;
 
     // Everything the child needs, allocated before fork (same contract as
     // container::spawn: the child must not allocate).
@@ -284,6 +317,7 @@ fn spawn_shell(
     let c_workdir = cstring(workdir)?;
     let c_root = cstring("/")?;
     let slave_raw = pty.slave.as_raw_fd();
+    let master_raw = pty.master.as_raw_fd();
 
     // SAFETY: multithreaded fork; the child only performs async-signal-safe
     // operations (raw syscalls via nix + _exit) before execve.
@@ -297,6 +331,22 @@ fn spawn_shell(
                 eprintln!("vmlab-cinit: tty shell launch failed: {what}");
                 unsafe { libc::_exit(127) }
             };
+            if namespaces.enter_for_child().is_err() {
+                die("setns");
+            }
+            // PID setns applies to children, so this outer child supervises
+            // the actual shell and mirrors its status to cinit's reaper.
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { child }) => {
+                    unsafe {
+                        libc::close(slave_raw);
+                        libc::close(master_raw);
+                    }
+                    mirror_child_exit(child);
+                }
+                Ok(ForkResult::Child) => {}
+                Err(_) => die("fork after setns"),
+            }
             if setsid().is_err() {
                 die("setsid");
             }
@@ -309,6 +359,9 @@ fn spawn_shell(
                     die("dup2");
                 }
             }
+            // Best-effort MOTD before the shell prompt. Writing the static
+            // bytes directly keeps the post-fork path allocation-free.
+            let _ = write_all_raw(libc::STDOUT_FILENO, TERMINAL_MOTD.as_bytes());
             if chroot(ROOTFS).is_err() {
                 die("chroot");
             }
@@ -317,6 +370,42 @@ fn spawn_shell(
             }
             let _ = execve(&c_exe, &c_argv, &c_env);
             die("execve");
+        }
+    }
+}
+
+fn write_all_raw(fd: libc::c_int, mut buf: &[u8]) -> bool {
+    while !buf.is_empty() {
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n > 0 {
+            buf = &buf[n as usize..];
+        } else if n < 0 && nix::errno::Errno::last() == nix::errno::Errno::EINTR {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Wait for a namespace child and exit with an equivalent status. This runs
+/// only in the small supervisor created after `setns`.
+fn mirror_child_exit(child: Pid) -> ! {
+    let mut status = 0;
+    loop {
+        let rc = unsafe { libc::waitpid(child.as_raw(), &mut status, 0) };
+        if rc >= 0 {
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                continue;
+            };
+            unsafe { libc::_exit(code) }
+        }
+        if nix::errno::Errno::last() != nix::errno::Errno::EINTR {
+            unsafe { libc::_exit(127) }
         }
     }
 }
@@ -333,23 +422,31 @@ mod tests {
     }
 
     #[test]
-    fn shell_choice_prefers_rootfs_sh_then_busybox() {
+    fn shell_choice_prefers_busybox_then_falls_back_to_rootfs_sh() {
         let dir = tempfile::tempdir().unwrap();
         let rootfs = dir.path().to_str().unwrap().to_string();
 
         // Nothing there: no shell.
         assert_eq!(choose_shell(&rootfs), None);
 
-        // Busybox fallback only (a distroless image).
+        // BusyBox toolbox only (a distroless image).
         touch_exe(&format!("{rootfs}{BUSYBOX_FALLBACK}"));
         assert_eq!(
             choose_shell(&rootfs),
             Some(vec![BUSYBOX_FALLBACK.to_string(), "sh".to_string()])
         );
 
-        // The image's own /bin/sh wins.
+        // If toolbox injection failed, the image shell remains usable.
+        fs::remove_file(format!("{rootfs}{BUSYBOX_FALLBACK}")).unwrap();
         touch_exe(&format!("{rootfs}/bin/sh"));
         assert_eq!(choose_shell(&rootfs), Some(vec!["/bin/sh".to_string()]));
+
+        // BusyBox remains preferred when the image also has /bin/sh.
+        touch_exe(&format!("{rootfs}{BUSYBOX_FALLBACK}"));
+        assert_eq!(
+            choose_shell(&rootfs),
+            Some(vec![BUSYBOX_FALLBACK.to_string(), "sh".to_string()])
+        );
     }
 
     #[test]
@@ -367,10 +464,9 @@ mod tests {
     fn shell_env_adds_term_and_path_fallbacks() {
         let env = shell_env(&[("FOO".into(), "bar".into())]);
         assert!(env.contains(&("TERM".into(), "xterm-256color".into())));
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "PATH" && v == crate::container::DEFAULT_PATH)
-        );
+        assert!(env.iter().any(|(k, v)| {
+            k == "PATH" && v == &format!("{BUSYBOX_BIN_DIR}:{}", crate::container::DEFAULT_PATH)
+        }));
         assert!(env.contains(&("FOO".into(), "bar".into())));
 
         // Explicit values win.
@@ -381,16 +477,18 @@ mod tests {
         assert_eq!(env.iter().filter(|(k, _)| k == "TERM").count(), 1);
         assert_eq!(env.iter().filter(|(k, _)| k == "PATH").count(), 1);
         assert!(env.contains(&("TERM".into(), "vt100".into())));
-        assert!(env.contains(&("PATH".into(), "/only".into())));
+        assert!(env.contains(&("PATH".into(), format!("{BUSYBOX_BIN_DIR}:/only"))));
     }
 
     #[test]
     fn resize_is_stored_for_future_sessions() {
-        // On a host with no /sys/class/virtio-ports the handle degrades to a
-        // size store — exactly what the "apply to new sessions" path needs.
-        let spec: ContainerSpec =
-            serde_json::from_str(r#"{ "hostname": "t", "cmd": ["/bin/true"] }"#).unwrap();
-        let tty = Tty::start(&spec, &[], Arc::new(Reaper::default()));
+        // This path cannot construct live namespace handles; size storage is
+        // covered through the Shared state without starting a real TTY.
+        let shared = Arc::new(Shared {
+            size: Mutex::new(winsize(80, 24)),
+            master: Mutex::new(None),
+        });
+        let tty = Tty { shared };
         tty.resize(132, 43);
         let ws = *tty.shared.size.lock().unwrap();
         assert_eq!((ws.ws_col, ws.ws_row), (132, 43));
@@ -402,5 +500,13 @@ mod tests {
         let ws = winsize(80, 24);
         assert_eq!(ws.ws_col, 80);
         assert_eq!(ws.ws_row, 24);
+    }
+
+    #[test]
+    fn motd_explains_the_terminal_context() {
+        assert!(TERMINAL_MOTD.contains("\\ V /"));
+        assert!(TERMINAL_MOTD.contains("vmlab container troubleshooting terminal"));
+        assert!(TERMINAL_MOTD.contains("container PID and mount namespaces"));
+        assert!(TERMINAL_MOTD.contains("busybox --list"));
     }
 }

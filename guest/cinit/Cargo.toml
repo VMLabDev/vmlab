@@ -29,6 +29,7 @@ nix = { version = "0.29", features = [
     "hostname",
     "term",
     "ioctl",
+    "sched",
 ] }
 
 [dev-dependencies]

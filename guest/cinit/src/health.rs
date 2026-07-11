@@ -11,10 +11,11 @@ use std::thread;
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::{ForkResult, chdir, chroot, execve, fork};
+use nix::unistd::{ForkResult, Pid, chdir, chroot, execve, fork, setsid};
 
 use vmlab_cinit_proto::{CtlEvent, HealthSpec};
 
+use crate::container::Namespaces;
 use crate::ctl::Ctl;
 use crate::mounts::ROOTFS;
 use crate::reap::Reaper;
@@ -28,12 +29,23 @@ fn run_check(
     c_argv: &[CString],
     c_env: &[CString],
     timeout: Duration,
+    namespaces: &Namespaces,
 ) -> bool {
     // SAFETY: same contract as the container fork — the child only makes
     // async-signal-safe calls before execve, with everything pre-allocated.
     let child = match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => child,
         Ok(ForkResult::Child) => {
+            // A process group lets the timeout path kill both this supervisor
+            // and the check created after PID-namespace entry.
+            if setsid().is_err() || namespaces.enter_for_child().is_err() {
+                unsafe { libc::_exit(126) }
+            }
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { child }) => mirror_child_exit(child),
+                Ok(ForkResult::Child) => {}
+                Err(_) => unsafe { libc::_exit(126) },
+            }
             if chroot(ROOTFS).is_err() || chdir("/").is_err() {
                 unsafe { libc::_exit(126) }
             }
@@ -51,7 +63,7 @@ fn run_check(
         Ok(code) => code == 0,
         Err(_) => {
             // Timed out: kill and wait for the reap loop to deliver the exit.
-            let _ = kill(child, Signal::SIGKILL);
+            let _ = kill(Pid::from_raw(-child.as_raw()), Signal::SIGKILL);
             let _ = rx.recv_timeout(Duration::from_secs(5));
             false
         }
@@ -67,6 +79,7 @@ pub fn spawn(
     ctl: Arc<Ctl>,
     reaper: Arc<Reaper>,
     exited: Arc<AtomicBool>,
+    namespaces: Namespaces,
 ) -> Result<()> {
     if spec.command.is_empty() {
         return Err("healthcheck with empty command".into());
@@ -91,7 +104,7 @@ pub fn spawn(
         let mut consecutive_fails: u32 = 0;
         let mut state: Option<bool> = None; // None until the first report
         while !exited.load(Ordering::SeqCst) {
-            let pass = run_check(&reaper, &c_exe, &c_argv, &c_env, timeout);
+            let pass = run_check(&reaper, &c_exe, &c_argv, &c_env, timeout, &namespaces);
             if exited.load(Ordering::SeqCst) {
                 break;
             }
@@ -113,4 +126,24 @@ pub fn spawn(
         }
     });
     Ok(())
+}
+
+fn mirror_child_exit(child: Pid) -> ! {
+    let mut status = 0;
+    loop {
+        let rc = unsafe { libc::waitpid(child.as_raw(), &mut status, 0) };
+        if rc >= 0 {
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                continue;
+            };
+            unsafe { libc::_exit(code) }
+        }
+        if nix::errno::Errno::last() != nix::errno::Errno::EINTR {
+            unsafe { libc::_exit(127) }
+        }
+    }
 }
