@@ -7,6 +7,7 @@ import { toast } from "@forge/ui";
 import type { StatusTone, Tone } from "@forge/ui";
 import * as api from "./api";
 import type { Container, LabEntry, LabStatus, TemplateInfo, Vm, DaemonEvent } from "./api";
+import { playDestroyRecreate } from "./fx";
 
 export type ViewKind = "lab" | "vm" | "container" | "templates";
 
@@ -274,6 +275,39 @@ export async function reloadLab(): Promise<void> {
   await refreshStatus();
 }
 
+// --- destroy fx session (armed only by destroyLab; never by stop-all) ------
+
+// While a session is armed, each machine's power-off shatters its topology
+// node into particles that reform (the lab definition survives a destroy).
+let destroyFx: { lab: string; fired: Set<string>; timer: number } | null = null;
+
+function fireDestroyFx(key: string) {
+  if (!destroyFx || destroyFx.fired.has(key)) return; // once per machine
+  destroyFx.fired.add(key);
+  playDestroyRecreate(key);
+}
+
+function beginDestroyFx(lab: string) {
+  endDestroyFx();
+  destroyFx = {
+    lab,
+    fired: new Set(),
+    // Safety net: a dropped WS means lab.down never arrives to disarm us.
+    timer: setTimeout(endDestroyFx, 60_000) as unknown as number,
+  };
+  // Machines already powered off emit no stop event — explode them now.
+  for (const v of state.status?.vms ?? [])
+    if (v.state === "stopped") fireDestroyFx(`vm:${v.name}`);
+  for (const c of state.status?.containers ?? [])
+    if (c.state === "stopped") fireDestroyFx(`container:${c.name}`);
+}
+
+function endDestroyFx() {
+  if (!destroyFx) return;
+  clearTimeout(destroyFx.timer);
+  destroyFx = null;
+}
+
 // --- actions --------------------------------------------------------------
 
 async function run(label: string, fn: () => Promise<unknown>) {
@@ -294,8 +328,21 @@ export const startAll = () =>
   run("Starting lab", () => api.labAction(state.currentLab!, "up"));
 export const stopAll = (force?: boolean) =>
   run(`${f(force)} lab`, () => api.labAction(state.currentLab!, "down", force));
-export const destroyLab = () =>
-  run("Destroying lab", () => api.labAction(state.currentLab!, "destroy"));
+// Not via run(): the fx session must be armed BEFORE the await — the
+// per-machine stop events stream while the destroy POST is still in flight.
+export async function destroyLab() {
+  const lab = state.currentLab;
+  if (!lab) return;
+  beginDestroyFx(lab);
+  try {
+    await api.labAction(lab, "destroy");
+    showToast("Destroying lab");
+    scheduleRefresh();
+  } catch (e) {
+    endDestroyFx();
+    showToast(`Failed: ${e}`, "danger");
+  }
+}
 
 export const vmStart = (vm: string) =>
   run(`Starting ${vm}`, () => api.vmAction(state.currentLab!, vm, "start"));
@@ -414,6 +461,22 @@ function handleEvent(ev: DaemonEvent) {
   if (ev.event.startsWith("template.op.")) {
     handleTemplateOpEvent(ev);
     return;
+  }
+  // Destroy fx: shatter each node as its machine powers off. Falls through —
+  // the same events still drive loadLabs()/scheduleRefresh() below.
+  if (destroyFx && ev.lab === destroyFx.lab) {
+    if (ev.event === "vm.stopped" && ev.data?.vm) {
+      fireDestroyFx(`vm:${ev.data.vm}`);
+    } else if (ev.event === "container.stopped" && ev.data?.container) {
+      fireDestroyFx(`container:${ev.data.container}`);
+    } else if (ev.event === "lab.down") {
+      // Sweep: a machine whose stop was a no-op (stale status said running)
+      // emitted nothing — every node gets its effect exactly once.
+      for (const v of state.status?.vms ?? []) fireDestroyFx(`vm:${v.name}`);
+      for (const c of state.status?.containers ?? [])
+        fireDestroyFx(`container:${c.name}`);
+      endDestroyFx();
+    }
   }
   // Host-scoped registry changes refresh the lab list; lab-scoped VM/state
   // events refresh the current lab's status.

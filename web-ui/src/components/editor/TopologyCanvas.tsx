@@ -80,6 +80,7 @@ import {
 } from "../../store";
 import { confirmDialog } from "../dialogs";
 import OsIcon from "./OsIcon";
+import { registerFxNode } from "../../fx";
 
 interface Drag {
   kind: "vm" | "container" | "segment" | "nat" | "lab";
@@ -1262,8 +1263,13 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                 return `${cpus ?? "?"} vCPU · ${mem != null ? formatMemory(mem) : "?"}`;
               };
               const badgeW = () => hw().length * 5.6 + 12;
+              let gEl!: SVGGElement;
+              // Post-mount so gEl is set; re-runs on rename, unregisters on
+              // row disposal (destroy fx looks nodes up by machine name).
+              createEffect(() => onCleanup(registerFxNode(`vm:${vm.name}`, gEl)));
               return (
                 <g
+                  ref={gEl}
                   class="topo-vm"
                   classList={{ selected: selectedVm() === vm.name, locked: vmIsUp(vm.name) }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "vm", vm.name)}
@@ -1376,8 +1382,11 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                 return `${cpus} vCPU · ${formatMemory(mem)}`;
               };
               const badgeW = () => hw().length * 5.6 + 12;
+              let gEl!: SVGGElement;
+              createEffect(() => onCleanup(registerFxNode(`container:${ctr.name}`, gEl)));
               return (
                 <g
+                  ref={gEl}
                   class="topo-vm topo-ctr"
                   classList={{ selected: selectedCtr() === ctr.name, locked: containerIsUp(ctr.name) }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "container", ctr.name)}
