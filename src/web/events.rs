@@ -4,6 +4,7 @@
 
 use actix_web::{Error, HttpRequest, HttpResponse, web};
 use futures::StreamExt;
+use serde_json::Value;
 
 use super::state::AppState;
 
@@ -18,18 +19,51 @@ pub async fn events(
         // A single merge channel fed by the supervisor and every lab daemon.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
 
-        // Supervisor (host-scoped events: lab daemon crashes, etc.).
-        if let Ok(sup) = state.supervisor().await
-            && let Ok(mut events) = sup.subscribe().await
+        // Supervisor aggregate (host-scoped events plus every lab stream
+        // forwarded by watch_lab_events). Self-healing: a one-shot
+        // subscription dies silently when the supervisor restarts — the WS
+        // still looks connected while the browser misses every later event
+        // (a segment.peer.* transition, say) and its status goes stale. So:
+        // (re)subscribe in a loop, and after each (re)subscribe send a
+        // synthetic resync nudge — the SPA refetches status on it, covering
+        // both the initial fetch→subscribe race and any gap while the
+        // subscription was down.
         {
+            let state = state.clone();
             let tx = tx.clone();
             actix_web::rt::spawn(async move {
-                while let Some(ev) = events.recv().await {
-                    if let Ok(s) = serde_json::to_string(&ev)
-                        && tx.send(s).await.is_err()
+                loop {
+                    // Ensure the supervisor is up via the shared client, but
+                    // subscribe on a DEDICATED connection: Client::subscribe
+                    // is one-slot-per-client, so subscribing on the shared
+                    // cached client would let every new WS session steal the
+                    // previous one's event stream (older tabs go silent).
+                    if state.supervisor().await.is_ok()
+                        && let Ok(sub) = vmlab::proto::client::Client::connect(
+                            &vmlab::paths::supervisor_socket(),
+                        )
+                        .await
+                        && let Ok(mut events) = sub.subscribe().await
                     {
-                        break;
+                        let nudge = vmlab::proto::Event::new("web.resync", "", Value::Null);
+                        if let Ok(s) = serde_json::to_string(&nudge)
+                            && tx.send(s).await.is_err()
+                        {
+                            return; // browser gone
+                        }
+                        while let Some(ev) = events.recv().await {
+                            if let Ok(s) = serde_json::to_string(&ev)
+                                && tx.send(s).await.is_err()
+                            {
+                                return;
+                            }
+                        }
                     }
+                    // Supervisor down or restarting: retry while the WS lives.
+                    if tx.is_closed() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             });
         }
