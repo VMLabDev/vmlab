@@ -12,6 +12,7 @@ mod auth;
 mod desktop;
 mod editor;
 mod events;
+mod help;
 mod logs;
 mod state;
 mod tty;
@@ -280,6 +281,9 @@ async fn main() -> ExitCode {
             .route("/api/events", web::get().to(events::events))
             .route("/api/desktop/vnc/{lab}/{vm}", web::get().to(desktop::vnc))
             // SPA + static assets.
+            // The embedded documentation book (the vmlab wskill).
+            .route("/help", web::get().to(help::root))
+            .route("/help/{path:.*}", web::get().to(help::page))
             .default_service(web::route().to(assets::spa))
     })
     // One worker keeps the cached daemon clients on a single runtime.

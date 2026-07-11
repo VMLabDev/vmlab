@@ -7,4 +7,8 @@ docker/lab/.vmlab/
 # Generated documentation site + wskill projections (regenerate with `just docs-build` / `just skill-build`).
 /docs/_site
 /docs/wskills/*/out
+# The in-app help book (`just help-build`); .gitkeep stays so rust-embed's
+# folder exists on a fresh checkout.
+/docs/help/*
+!/docs/help/.gitkeep
 .playwright-cli/

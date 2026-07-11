@@ -108,10 +108,16 @@ docs-serve comment="false" port="auto":
 skill-build: wskill-check
 	wcl wdoc skill docs/wskills/vmlab/wdoc/skill/main.wcl --out .claude/skills/vmlab
 
-# Remove generated site + wskill projections
+# Render the wskill book to docs/help — embedded into vmlab-web as the in-app /help
+[group('docs')]
+help-build:
+	wcl wdoc build docs/wskills/vmlab/wdoc/book/main.wcl --out docs/help
+
+# Remove generated site + wskill projections + the in-app help render
 [group('docs')]
 docs-clean:
 	rm -rf docs/_site docs/wskills/vmlab/out
+	find docs/help -mindepth 1 -not -name .gitkeep -delete
 
 # Install the SolidJS web UI's pnpm dependencies (@forge/* are git-subdir deps)
 [group('web')]
@@ -131,9 +137,9 @@ web-ui-forge-bump rev:
 		sed -i -E 's|(codeload.github.com/wiltaylor/forge/tar.gz/)[0-9a-f]{40}|\1{{rev}}|g; s|(github:wiltaylor/forge#)[0-9a-f]{40}|\1{{rev}}|g' pnpm-workspace.yaml && \
 		pnpm install
 
-# Build the vmlab-web binary (frontend first, then the embedded server)
+# Build the vmlab-web binary (frontend + help book first, then the embedded server)
 [group('web')]
-web-build: web-ui-build
+web-build: web-ui-build help-build
 	cargo build --features web --bin vmlab-web
 
 # Build and run vmlab-web against the lab in `dir` (Ctrl-C to stop)

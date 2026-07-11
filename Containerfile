@@ -50,12 +50,28 @@ WORKDIR /build
 COPY guest/ ./guest/
 RUN ./guest/build-asset.sh x86_64 aarch64
 
+# ---- help book ----------------------------------------------------------------
+# The vmlab wskill rendered to static HTML — embedded into vmlab-web as the
+# in-app /help. Keep WCL_REV in sync with the wcl_lang rev in Cargo.toml (and
+# deploy-site.yml) so the book renders with the wdoc version it was authored
+# against; the slow install layer is cached until the rev changes.
+FROM rust:1.92-bookworm AS help
+ARG WCL_REV=89a49e42258e9d3e4ead31ca9de3d25f7ccfde19
+WORKDIR /build
+RUN cargo install --git https://github.com/wiltaylor/wcl.git --rev "$WCL_REV" --locked wcl
+COPY docs/ ./docs/
+# The wskill's schema-reference fact reflects the live vmlab schema.
+COPY src/config/schema.wcl src/config/host_schema.wcl ./src/config/
+RUN wcl wdoc build docs/wskills/vmlab/wdoc/book/main.wcl --out docs/help
+
 # ---- builder ----------------------------------------------------------------
 FROM rust:1.92-bookworm AS builder
 WORKDIR /build/vmlab
 COPY . .
-# Supply the built web assets so rust-embed can bake them into vmlab-web.
+# Supply the built web assets + help book so rust-embed bakes them into
+# vmlab-web.
 COPY --from=web /web/dist ./web-ui/dist
+COPY --from=help /build/docs/help ./docs/help
 # No --locked: release CI stamps the package version into Cargo.toml, which the
 # lockfile would otherwise reject. Deps are still pinned by Cargo.lock.
 RUN cargo build --release --features web --bin vmlab --bin vmlab-web
