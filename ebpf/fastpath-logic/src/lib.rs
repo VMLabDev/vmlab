@@ -24,8 +24,9 @@ pub const PREFIX_LEN: u32 = 4;
 /// Minimum parsable ethernet frame: dst + src + ethertype.
 pub const ETH_HEADER_LEN: u32 = 14;
 /// Largest frame body the framing layer accepts (net/framing.rs
-/// `MAX_FRAME_LEN` minus the prefix): 64 KiB payload + ethernet header.
-pub const MAX_FRAME_LEN: u32 = 65536 + 14;
+/// `MAX_FRAME_LEN`): 64 KiB of L3 payload + ethernet header + slack.
+/// Kept identical so a frame userspace would accept never desyncs us.
+pub const MAX_FRAME_LEN: u32 = 65536 + 14 + 4;
 /// Frame boundaries walked within a single skb before giving up. More
 /// frames per skb than this means a pathological sender; desync (= pass
 /// everything to userspace) rather than loop further.

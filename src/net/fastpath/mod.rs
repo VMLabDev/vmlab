@@ -15,6 +15,17 @@
 //! rootless / no-CAP_NET_ADMIN guarantee (§1.1, §13, §14) holds on hosts
 //! without privileges — those simply keep today's path.
 
+#[cfg(feature = "ebpf")]
+mod probe;
+#[cfg(feature = "ebpf")]
+mod sockmap;
+#[cfg(feature = "ebpf")]
+pub use sockmap::SegmentOffload;
+#[cfg(not(feature = "ebpf"))]
+mod stub;
+#[cfg(not(feature = "ebpf"))]
+pub use stub::SegmentOffload;
+
 use std::sync::OnceLock;
 
 /// Which fast path this daemon uses for eligible switch traffic.
@@ -114,6 +125,15 @@ pub fn init(mode: FastpathMode) -> FastpathTier {
         .tier
 }
 
+/// The selected tier; `Userspace` when [`init`] was never called (unit
+/// tests, the plain CLI process) — switches then never offload.
+pub fn tier() -> FastpathTier {
+    SELECTION
+        .get()
+        .map(|s| s.tier)
+        .unwrap_or(FastpathTier::Userspace)
+}
+
 /// Selection outcome as JSON, the shape the `fastpath` proto command (and
 /// through it the CLI and web UI) reports.
 pub fn status_json() -> serde_json::Value {
@@ -211,7 +231,7 @@ fn probe_afxdp() -> Result<(), String> {
 
 #[cfg(feature = "ebpf")]
 fn probe_sockmap() -> Result<(), String> {
-    Err("sockmap tier not implemented yet".into())
+    probe::sockmap()
 }
 
 #[cfg(test)]
@@ -240,20 +260,29 @@ mod tests {
     }
 
     #[test]
-    fn forced_tier_degrades_with_reason() {
-        // No kernel tier is implemented/available in unit tests, so a forced
-        // tier must fall back to userspace and say why.
+    fn forced_tier_selects_or_degrades_with_reason() {
+        // The real probe runs here: on a host/user with BPF privileges the
+        // forced tier is selected; anywhere else it degrades to userspace
+        // with a recorded reason. Both are correct.
         let status = select(FastpathMode::Sockmap);
-        assert_eq!(status.tier, FastpathTier::Userspace);
-        assert_eq!(status.reasons.len(), 1);
-        assert_eq!(status.reasons[0].0, "sockmap");
+        match status.tier {
+            FastpathTier::Sockmap => assert!(status.reasons.is_empty()),
+            FastpathTier::Userspace => {
+                assert_eq!(status.reasons.len(), 1);
+                assert_eq!(status.reasons[0].0, "sockmap");
+            }
+            FastpathTier::AfXdp => panic!("forced sockmap must never select afxdp"),
+        }
     }
 
     #[test]
     fn auto_records_every_skipped_tier() {
         let status = select(FastpathMode::Auto);
-        assert_eq!(status.tier, FastpathTier::Userspace);
-        let tiers: Vec<&str> = status.reasons.iter().map(|(t, _)| *t).collect();
-        assert_eq!(tiers, vec!["afxdp", "sockmap"]);
+        let skipped: Vec<&str> = status.reasons.iter().map(|(t, _)| *t).collect();
+        match status.tier {
+            FastpathTier::AfXdp => assert!(skipped.is_empty()),
+            FastpathTier::Sockmap => assert_eq!(skipped, vec!["afxdp"]),
+            FastpathTier::Userspace => assert_eq!(skipped, vec!["afxdp", "sockmap"]),
+        }
     }
 }

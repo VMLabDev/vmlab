@@ -32,7 +32,7 @@ default = ["ebpf"]
 # The eBPF network fast path (PRD §9.1's substitutable backend): compiled in
 # by default; an empirical probe at daemon startup decides per-host whether a
 # kernel tier is actually used, falling back to the userspace fabric.
-ebpf = []
+ebpf = ["dep:aya"]
 # Pulls in the HTTP stack for the `vmlab-web` binary. Kept optional so a plain
 # CLI build stays lean.
 web = [
@@ -92,7 +92,12 @@ tar = "0.4"
 glob = "0.3"
 ipnet = "2.12.0"
 async-trait = "0.1.89"
-rustix = { version = "1.1.4", features = ["termios"] }
+# `net` is for sockopt::socket_cookie (SO_COOKIE), the sockmap fast path's
+# per-socket BPF map key.
+rustix = { version = "1.1.4", features = ["termios", "net"] }
+# The eBPF loader for the network fast path. Its userspace API is safe, so
+# the crate-level `unsafe_code = "deny"` holds.
+aya = { version = "0.14", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

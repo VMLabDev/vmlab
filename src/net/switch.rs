@@ -18,6 +18,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use super::fastpath;
 use super::framing;
 use crate::config::model::MacAddr;
 
@@ -27,6 +28,13 @@ pub const PORT_QUEUE_CAPACITY: usize = 512;
 /// Opaque switch-port identifier, unique per switch for its lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PortId(u64);
+
+impl PortId {
+    /// The raw id, used as the port's key in the fast-path BPF maps.
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+}
 
 impl std::fmt::Display for PortId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,6 +99,9 @@ pub struct SwitchStats {
     /// Frames that died: hook drops, isolation drops, runts, full or closed
     /// egress queues, and floods that reached nobody.
     pub frames_dropped: u64,
+    /// Frames forwarded in-kernel by the fast path (already included in
+    /// `frames_forwarded`); 0 on a pure-userspace switch.
+    pub frames_offloaded: u64,
 }
 
 struct PortEntry {
@@ -113,6 +124,9 @@ pub struct Switch {
     forwarded: AtomicU64,
     flooded: AtomicU64,
     dropped: AtomicU64,
+    /// Kernel fast path for this segment (PRD §9.1's substitutable
+    /// backend); `None` whenever the daemon's tier probe chose userspace.
+    offload: Option<Arc<fastpath::SegmentOffload>>,
 }
 
 /// May a frame ingressing on a port of class `ingress` egress a port of
@@ -132,6 +146,7 @@ fn is_multicast(mac: &MacAddr) -> bool {
 
 impl Switch {
     pub fn new(name: String) -> Arc<Switch> {
+        let offload = fastpath::SegmentOffload::for_segment(&name);
         Arc::new(Switch {
             name,
             inner: Mutex::new(Inner::default()),
@@ -140,23 +155,37 @@ impl Switch {
             forwarded: AtomicU64::new(0),
             flooded: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            offload,
         })
     }
 
     /// Install (or replace) the ingress hook. The hook runs synchronously on
     /// every ingress frame before MAC learning and forwarding.
+    ///
+    /// Fast-path caveat: with a kernel offload active, known unicast
+    /// between two non-isolated guest stream ports is forwarded in-kernel
+    /// and never reaches this hook. Everything else — broadcast/multicast,
+    /// unknown MACs, and anything addressed outside the offloaded guest
+    /// set (notably the gateway MAC) — always does. The L3 rules hook
+    /// qualifies: it acts only on gateway-addressed IPv4. A future hook
+    /// that must observe every frame has to disable the segment's offload
+    /// first.
     pub fn set_ingress_hook(&self, hook: IngressHook) {
         *self.hook.lock_recover() = Some(hook);
     }
 
     /// Diagnostics counters; consumed by the switch tests only so far.
+    /// Kernel-forwarded frames never traverse `ingress`, so the offload's
+    /// counters are merged here to keep `frames_forwarded` truthful.
     #[allow(dead_code)]
     pub fn stats(&self) -> SwitchStats {
+        let offloaded = self.offload.as_ref().map(|o| o.stats().0).unwrap_or(0);
         SwitchStats {
             ports: self.inner.lock_recover().ports.len(),
-            frames_forwarded: self.forwarded.load(Ordering::Relaxed),
+            frames_forwarded: self.forwarded.load(Ordering::Relaxed) + offloaded,
             frames_flooded: self.flooded.load(Ordering::Relaxed),
             frames_dropped: self.dropped.load(Ordering::Relaxed),
+            frames_offloaded: offloaded,
         }
     }
 
@@ -166,17 +195,54 @@ impl Switch {
     pub async fn add_stream_port(self: &Arc<Self>, stream: UnixStream, class: PortClass) -> PortId {
         let id = self.alloc_port(class);
         let mut rx = self.attach(id, class);
-        let (mut read_half, mut write_half) = stream.into_split();
 
-        let name = self.name.clone();
-        tokio::spawn(async move {
-            while let Some(frame) = rx.recv().await {
-                if let Err(error) = framing::write_frame(&mut write_half, &frame).await {
-                    debug!(switch = %name, %id, %error, "stream port write failed");
-                    break;
+        // Kernel fast path: register eligible QEMU sockets before any bytes
+        // flow (VMs start paused until their ports attach, so the socket is
+        // still silent and the BPF framing state machine starts on a true
+        // boundary). Any failure just leaves this port on the plain path.
+        let offload_tx = match (&self.offload, class) {
+            (Some(off), PortClass::Guest { isolated: false }) => match off.add_port(id, &stream) {
+                Ok(tx) => Some(tx),
+                Err(error) => {
+                    debug!(switch = %self.name, %id, %error,
+                        "fast-path registration failed; port stays userspace");
+                    None
                 }
+            },
+            _ => None,
+        };
+
+        let (mut read_half, mut write_half) = stream.into_split();
+        let name = self.name.clone();
+        match offload_tx {
+            Some(tx) => {
+                // Single-writer invariant: the kernel owns this socket's
+                // send path now. Userspace egress rides the dgram loopback;
+                // the write half is parked in the offload so dropping it on
+                // removal still EOFs QEMU.
+                if let Some(off) = &self.offload {
+                    off.adopt_write_half(id, write_half);
+                }
+                tokio::spawn(async move {
+                    while let Some(frame) = rx.recv().await {
+                        if let Err(error) = tx.send_frame(&frame).await {
+                            debug!(switch = %name, %id, %error, "offloaded port egress failed");
+                            break;
+                        }
+                    }
+                });
             }
-        });
+            None => {
+                tokio::spawn(async move {
+                    while let Some(frame) = rx.recv().await {
+                        if let Err(error) = framing::write_frame(&mut write_half, &frame).await {
+                            debug!(switch = %name, %id, %error, "stream port write failed");
+                            break;
+                        }
+                    }
+                });
+            }
+        }
 
         let switch = Arc::clone(self);
         tokio::spawn(async move {
@@ -222,12 +288,26 @@ impl Switch {
         }
     }
 
-    /// Detach a port and purge every MAC learned on it. Idempotent.
+    /// Detach a port and purge every MAC learned on it (kernel fast-path
+    /// state included). Idempotent.
     pub fn remove_port(&self, id: PortId) {
-        let mut inner = self.inner.lock_recover();
-        if inner.ports.remove(&id).is_some() {
+        let purged = {
+            let mut inner = self.inner.lock_recover();
+            if inner.ports.remove(&id).is_none() {
+                return;
+            }
+            let purged: Vec<MacAddr> = inner
+                .macs
+                .iter()
+                .filter(|(_, p)| **p == id)
+                .map(|(m, _)| *m)
+                .collect();
             inner.macs.retain(|_, p| *p != id);
             debug!(switch = %self.name, %id, "port removed");
+            purged
+        };
+        if let Some(off) = &self.offload {
+            off.remove_port(id, &purged);
         }
     }
 
@@ -341,8 +421,17 @@ impl Switch {
         let inner = &mut *self.inner.lock_recover();
 
         // Learn the source MAC; relearning moves it (VM migrated ports).
+        // Binding changes mirror into the kernel fast path: toward the MAC's
+        // new port when that port is offloaded, otherwise deleting any stale
+        // kernel entry (BPF map updates are ~1µs non-blocking syscalls;
+        // deferring them would open learn/unlearn ordering races).
         if !is_multicast(&src) {
-            inner.macs.insert(src, port);
+            let prev = inner.macs.insert(src, port);
+            if prev != Some(port)
+                && let Some(off) = &self.offload
+            {
+                off.relearn(src, port);
+            }
         }
 
         let unicast_target = if is_multicast(&dst) {
