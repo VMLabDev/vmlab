@@ -7,8 +7,10 @@ description = "Single-host virtual machine lab orchestrator"
 # guest/ holds the micro-VM guest-side crates and build assets; only
 # guest/cinit-proto is consumed here (as a path dependency below). The rest —
 # notably guest/cinit, which is musl-only and allows unsafe — must never be
-# swept into this package.
-exclude = ["/guest"]
+# swept into this package. ebpf/ is the BPF fast-path workspace (nightly +
+# bpf-linker, allows unsafe); only its committed objects under
+# src/net/fastpath/bpf/ are consumed here.
+exclude = ["/guest", "/ebpf"]
 
 [lib]
 name = "vmlab"

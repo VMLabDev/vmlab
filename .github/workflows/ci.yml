@@ -56,6 +56,29 @@ jobs:
           pnpm build
       - run: just check
 
+  # The committed BPF fast-path objects (src/net/fastpath/bpf/) must match
+  # the ebpf/ sources: rebuild with the pinned toolchain and byte-diff.
+  # bpf-linker's LLVM proxy dlopens the pinned toolchain's libLLVM, so the
+  # objects are deterministic given the rust-toolchain.toml pin + the
+  # bpf-linker version pinned in the justfile.
+  ebpf-verify:
+    name: ebpf objects match source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ebpf/rust-toolchain.toml selects the pinned nightly automatically;
+      # install it (with rust-src) up front so cargo doesn't have to.
+      - name: Install pinned ebpf toolchain
+        run: |
+          channel=$(grep '^channel' ebpf/rust-toolchain.toml | cut -d'"' -f2)
+          rustup toolchain install "$channel" --profile minimal --component rust-src
+      - uses: taiki-e/install-action@just
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ebpf
+      - run: just ebpf-tools
+      - run: just ebpf-verify
+
   # ── Version ───────────────────────────────────────────────────────────────
   # Trailer-gated: a release only happens when HEAD carries a publish trailer.
   #   pre-release: true   → X.Y.Z-alpha, marked as a GitHub pre-release

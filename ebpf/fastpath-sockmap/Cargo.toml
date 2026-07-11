@@ -1,0 +1,14 @@
+[package]
+name = "fastpath-sockmap"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "vmlab sockmap fast path: sk_skb verdict programs splicing QEMU stream sockets"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+fastpath-logic = { path = "../fastpath-logic" }
+
+[[bin]]
+name = "fastpath-sockmap"
+path = "src/main.rs"

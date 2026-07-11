@@ -62,6 +62,31 @@ guest-install: guest-build
 	mkdir -p ~/.local/share/vmlab/guest
 	cp -r guest/dist/* ~/.local/share/vmlab/guest/
 
+# The eBPF fast-path programs (ebpf/ workspace) need the nightly pinned in
+# ebpf/rust-toolchain.toml plus bpf-linker built against that same toolchain
+# (its LLVM proxy dlopens the toolchain's libLLVM — a mismatched install
+# falls back to whatever LLVM the host has, breaking reproducibility).
+
+# Install the pinned bpf-linker for the ebpf toolchain (one-time setup)
+[group('build')]
+ebpf-tools:
+	cd ebpf && rustup run "$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)" \
+		cargo install bpf-linker --version 0.10.3 --locked --force
+
+# Rebuild the committed BPF fast-path objects from ebpf/ (pinned toolchain)
+[group('build')]
+ebpf-build:
+	cd ebpf && cargo test -p fastpath-logic
+	cd ebpf && cargo build --release --target bpfel-unknown-none -Z build-std=core \
+		-p fastpath-sockmap -p xdp-switch
+	cp ebpf/target/bpfel-unknown-none/release/fastpath-sockmap src/net/fastpath/bpf/fastpath_sockmap.bpf.o
+	cp ebpf/target/bpfel-unknown-none/release/xdp-switch src/net/fastpath/bpf/xdp_switch.bpf.o
+
+# Verify the committed BPF objects match the ebpf/ sources (CI)
+[group('check')]
+ebpf-verify: ebpf-build
+	git diff --exit-code src/net/fastpath/bpf/
+
 # Bring a lab up (a VNC viewer opens per VM when the lab sets `gui = true`)
 [group('lab')]
 lab-up dir='examples/mixed-lab': release

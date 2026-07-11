@@ -1,0 +1,15 @@
+# The eBPF fast-path programs (PRD §9.1 substitutable backend). A standalone
+# workspace, deliberately NOT part of the main crate's build (same pattern as
+# guest/cinit): it needs a pinned nightly + bpf-linker, may use `unsafe`
+# (kernel map access demands it), and its compiled objects are committed under
+# src/net/fastpath/bpf/ so `cargo build` never needs a BPF toolchain.
+# Rebuild with `just ebpf-build`; CI checks the committed objects match.
+[workspace]
+resolver = "2"
+members = ["fastpath-logic", "fastpath-sockmap", "xdp-switch"]
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+debug = false
