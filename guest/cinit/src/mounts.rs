@@ -120,6 +120,23 @@ pub fn mount_container_root(root_dev: &str, scratch_dev: &str) -> Result<()> {
     )
 }
 
+/// Mount one virtiofs volume inside the container rootfs, from the
+/// vhost-user-fs device the host attached for it (proto v4). Native FUSE
+/// over shared memory — no network, no credentials — so these mount before
+/// DHCP. Snapshot-safe: virtiofsd migrates its state through QEMU's
+/// migration stream (the host runs it with `--migration-mode`), which is
+/// exactly what an online snapshot stores.
+pub fn mount_virtiofs(tag: &str, target: &str, read_only: bool) -> Result<()> {
+    let inside = format!("{ROOTFS}/{}", target.trim_start_matches('/'));
+    ensure_dir(&inside)?;
+    let flags = if read_only {
+        MsFlags::MS_RDONLY
+    } else {
+        MsFlags::empty()
+    };
+    do_mount(tag, &inside, "virtiofs", flags, None)
+}
+
 /// Mount one volume share inside the container rootfs over CIFS, from the
 /// lab's SMB server at the segment gateway (PRD §18: volumes are network
 /// mounts precisely so no filesystem device state lands in snapshots).

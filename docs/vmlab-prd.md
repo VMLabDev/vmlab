@@ -634,15 +634,21 @@ by default. The image's layers are flattened (whiteout-aware, tar-level, no
 host privileges) into a squashfs mounted read-only, with a per-container
 scratch qcow2 as the overlayfs writable layer. Config reaches the guest as a
 `ContainerSpec` pushed over the ctl channel (the virtio-serial port that also
-carries lifecycle events and stop/resync commands). Volumes are SMB shares
-served by the lab daemon at the segment gateway — the same bundled-`smbd`
-mechanism as §7.5 shared folders — mounted by cinit over CIFS once the
-network is up. No virtfs/9p device is attached, which is what keeps the
-micro-VM fully snapshottable (§7.3): SMB is pure network traffic and carries
-no device state into a snapshot. Ownership on volume files is mount-level
-(CIFS), not per-file container uid/gid. This preserves the §14 guarantee verbatim:
-containers work inside the official image with **no** `--privileged`, no added
-capabilities — `/dev/kvm` only, TCG fallback without it.
+carries lifecycle events and stop/resync commands). Volumes attach as
+**vhost-user-fs devices** — one `virtiofsd` per volume, spawned by the lab
+daemon with `--migration-mode` so its FUSE session state rides the
+snapshot's migration stream — mounted natively by cinit (`mount -t
+virtiofs`) before the network is even up; a volume-carrying micro-VM's RAM
+switches to a shared `memory-backend-memfd` (a vhost-user requirement).
+Hosts without a `virtiofsd` binary fall back to the v1 transport: SMB
+shares served by the lab daemon at the segment gateway — the same
+bundled-`smbd` mechanism as §7.5 shared folders — mounted by cinit over
+CIFS once the network is up. No 9p device is ever attached (it would add a
+migration blocker and break online snapshots, §7.3). Ownership on volume
+files is mount-level, not per-file container uid/gid. This preserves the
+§14 guarantee verbatim: containers work inside the official image with
+**no** `--privileged`, no added capabilities — `/dev/kvm` only, TCG
+fallback without it.
 
 **Networking.** A container NIC is a VM NIC: the same `-netdev stream` unix
 socket into the segment switch, the same DHCP lease/reservation, DNS
@@ -671,10 +677,14 @@ snapshot). The power state recorded at capture drives restore exactly as for
 VMs — an online snapshot resumes the container mid-flight, process state and
 all — and lab-wide snapshot verbs cover containers alongside VMs. Volume
 contents are host state outside snapshot scope, exactly like §7.5 shares —
-restore never rolls back volume files, and like a restored VM's SMB session
-the volume's CIFS session is stale TCP the client re-establishes (the
-micro-VM mounts with `echo_interval=5`, so the first post-restore volume
-access stalls seconds, not minutes). Each snapshot records the container's
+restore never rolls back volume files. virtiofs volumes survive restore
+natively: `virtiofsd` transfers its session state through the snapshot
+(open handles included), validated for online reload and
+restore-much-later into a fresh daemon. On the CIFS fallback, like a
+restored VM's SMB session the volume's session is stale TCP the client
+re-establishes (the micro-VM mounts with `echo_interval=5`, so the first
+post-restore volume access stalls seconds, not minutes). Each snapshot
+records the container's
 pinned image digest; restoring under a different pin fails (the writable
 layer is only valid against the same rootfs).
 

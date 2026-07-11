@@ -57,10 +57,11 @@ PACKAGES=(
 # aes are builtin everywhere) and nls_utf8 backs the default iocharset — none
 # visible to modules.dep, same story as crc32c_generic. Which of the crypto
 # set are modules varies per arch (aarch64 builds ctr/gcm/ghash in);
-# resolve_modules skips the builtin ones.
+# resolve_modules skips the builtin ones. virtiofs mounts the vhost-user-fs
+# volume devices (proto v4; fuse comes along via modules.dep).
 WANTED_MODULES=(
   virtio_blk virtio_net af_packet squashfs overlay crc32c_generic ext4
-  cifs cmac gcm ccm ctr ghash_generic nls_utf8
+  cifs cmac gcm ccm ctr ghash_generic nls_utf8 virtiofs
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

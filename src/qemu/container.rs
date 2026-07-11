@@ -10,9 +10,12 @@
 //! (qemu-ga), `vmlab.ctl.0` (the ndjson ctl channel,
 //! [`crate::labd::container_ctl`], which also delivers the spec) and
 //! `vmlab.tty.0` (the raw interactive-shell byte stream,
-//! guest/cinit/src/tty.rs). Deliberately NO virtfs/9p device: config arrives
-//! over ctl and volumes are CIFS mounts, so nothing blocks vmstate capture —
-//! containers stay snapshottable (PRD §18).
+//! guest/cinit/src/tty.rs). Deliberately NO 9p device — it would add a
+//! migration blocker and break online snapshots. Volumes attach as
+//! vhost-user-fs devices instead (one virtiofsd per volume, spawned by
+//! labd with `--migration-mode` so its state rides the snapshot), which
+//! also forces the memory backend to shared memfd; CIFS mounts remain the
+//! no-virtiofsd fallback (PRD §18).
 
 use std::path::PathBuf;
 
@@ -48,6 +51,11 @@ pub struct ContainerVmPaths {
     pub tty_sock: PathBuf,
     /// Serial console log — the container's stdout/stderr land here.
     pub serial_log: PathBuf,
+    /// One vhost-user-fs device per virtiofs volume, in declaration order:
+    /// (mount tag, virtiofsd socket). virtiofsd must be listening before
+    /// QEMU spawns. Non-empty switches the VM's RAM to a shared
+    /// memory-backend-memfd (vhost-user back-ends map guest memory).
+    pub volumes: Vec<(String, PathBuf)>,
 }
 
 /// Build the full argv (excluding argv[0], [`super::emulator_binary`]),
@@ -89,7 +97,26 @@ pub(crate) fn build_container_args_with_accel(
         "riscv64" => "virt,acpi=off",
         other => bail!("containers do not run on arch {other} (x86_64, aarch64, riscv64)"),
     };
-    arg(&mut a, "machine", machine.to_string());
+    // vhost-user-fs back-ends map guest RAM, which requires a shared memory
+    // backend. Only volume-carrying containers get one: switching the
+    // backend renames the RAM block inside existing snapshots (pc.ram →
+    // mem0), so the plain `-m` shape stays untouched for everyone else.
+    let machine = if paths.volumes.is_empty() {
+        machine.to_string()
+    } else {
+        format!("{machine},memory-backend=mem0")
+    };
+    arg(&mut a, "machine", machine);
+    if !paths.volumes.is_empty() {
+        arg(
+            &mut a,
+            "object",
+            format!(
+                "memory-backend-memfd,id=mem0,size={}M,share=on",
+                memory_bytes >> 20
+            ),
+        );
+    }
     match accel {
         Accel::Kvm => {
             arg(&mut a, "accel", "kvm".into());
@@ -232,6 +259,22 @@ pub(crate) fn build_container_args_with_accel(
         a.push("none".into());
     }
 
+    // virtiofs volumes: one vhost-user-fs device per export, tag = share
+    // name (cinit mounts by tag, guest/cinit/src/mounts.rs). After the
+    // virtio-blk devices so vda/vdb enumeration stays fixed.
+    for (i, (tag, sock)) in paths.volumes.iter().enumerate() {
+        arg(
+            &mut a,
+            "chardev",
+            format!("socket,id=vfs{i},path={}", sock.display()),
+        );
+        arg(
+            &mut a,
+            "device",
+            format!("vhost-user-fs-pci,chardev=vfs{i},tag={tag}"),
+        );
+    }
+
     // Start paused; labd releases the CPUs via QMP `cont` once everything
     // is attached, exactly like full VMs.
     a.push("-S".into());
@@ -259,6 +302,7 @@ mod tests {
             ctl_sock: "/run/l/web/ctl.sock".into(),
             tty_sock: "/run/l/web/tty.sock".into(),
             serial_log: "/logs/l/web/console.log".into(),
+            volumes: vec![],
         }
     }
 
@@ -335,10 +379,13 @@ mod tests {
             ),
             "{s}"
         );
-        // No virtfs, ever: a 9p device would add a migration blocker and
-        // break online snapshots (PRD §18).
+        // No 9p, ever: it would add a migration blocker and break online
+        // snapshots (PRD §18). Shared folders attach as vhost-user-fs.
         assert!(!s.contains("-virtfs"), "{s}");
         assert!(!s.contains("mount_tag"), "{s}");
+        // No volumes → plain anonymous RAM, no vhost-user-fs devices.
+        assert!(!s.contains("memory-backend"), "{s}");
+        assert!(!s.contains("vhost-user-fs"), "{s}");
         assert!(
             s.contains("stream,id=net0,server=off,addr.type=unix,addr.path=/run/l/web/nic0.sock"),
             "{s}"
@@ -417,6 +464,48 @@ mod tests {
         );
         assert!(s.contains("-machine virt,acpi=off"), "{s}");
         assert!(s.contains("console=ttyS0"), "{s}");
+    }
+
+    /// Volumes attach as vhost-user-fs devices and flip the RAM to a shared
+    /// memfd backend (vhost-user requirement); still zero 9p.
+    #[test]
+    fn volumes_add_vhost_user_fs_and_shared_memory() {
+        let mut p = paths();
+        p.volumes = vec![
+            ("vol-web-0".into(), PathBuf::from("/run/l/web/vfs0.sock")),
+            ("vol-web-1".into(), PathBuf::from("/run/l/web/vfs1.sock")),
+        ];
+        let args =
+            build_container_args_with_accel("lab1", "web", "x86_64", 1, 512 << 20, &p, Accel::Kvm)
+                .unwrap();
+        let s = joined(&args);
+        assert!(s.contains("-machine q35,memory-backend=mem0"), "{s}");
+        assert!(
+            s.contains("memory-backend-memfd,id=mem0,size=512M,share=on"),
+            "{s}"
+        );
+        assert!(
+            s.contains("socket,id=vfs0,path=/run/l/web/vfs0.sock"),
+            "{s}"
+        );
+        assert!(
+            s.contains("vhost-user-fs-pci,chardev=vfs0,tag=vol-web-0"),
+            "{s}"
+        );
+        assert!(
+            s.contains("vhost-user-fs-pci,chardev=vfs1,tag=vol-web-1"),
+            "{s}"
+        );
+        assert!(!s.contains("-virtfs"), "{s}");
+        assert!(!s.contains("mount_tag"), "{s}");
+        // The fs devices come after both virtio-blk devices — vda/vdb
+        // enumeration must not shift under the kernel-cmdline names.
+        let pos = |needle: &str| {
+            args.iter()
+                .position(|a| a.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not in argv"))
+        };
+        assert!(pos("drive=scratch") < pos("vhost-user-fs-pci"), "{s}");
     }
 
     #[test]

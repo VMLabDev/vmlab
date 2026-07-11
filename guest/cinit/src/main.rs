@@ -6,11 +6,12 @@
 //!  3. squashfs (RO) + ext4 scratch (mkfs on first boot) → overlay /rootfs
 //!  4. open the `vmlab.ctl.0` virtio port; emit `boot` (repeating) until the
 //!     host answers with the `spec` command (ContainerSpec)
-//!  5. mount runtime filesystems, write identity files
+//!  5. mount runtime filesystems, write identity files; mount virtiofs
+//!     volumes (proto v4 — vhost-user-fs devices the host attached; its
+//!     virtiofsd migrates state through the snapshot, PRD §18)
 //!  6. loopback + DHCP per NIC (busybox udhcpc — see net.rs), emit `net_up`
-//!  7. mount volumes over CIFS from the segment gateway (network must be up;
-//!     no virtfs device exists — that is what keeps the micro-VM
-//!     snapshottable, PRD §18)
+//!  7. mount CIFS volumes from the segment gateway (network must be up;
+//!     the fallback when the host has no virtiofsd)
 //!  8. start bundled qemu-ga in the init namespace (not the container root)
 //!  9. resolve user, build env, clone namespaces + exec container, emit `started`
 //! 10. reap children; when the container exits: emit `exited`, power off
@@ -112,6 +113,12 @@ fn run() -> Result<()> {
     mounts::install_shell_fallback();
     mounts::write_identity(&spec.hostname)?;
 
+    // -- virtiofs volumes (device mounts — no network needed) ------------------
+    for vol in spec.volumes.iter().filter(|v| v.tag.is_some()) {
+        let tag = vol.tag.as_deref().expect("filtered on tag");
+        mounts::mount_virtiofs(tag, &vol.target, vol.read_only)?;
+    }
+
     // -- networking ----------------------------------------------------------
     net::loopback_up()?;
     for n in 0..spec.nics {
@@ -126,13 +133,13 @@ fn run() -> Result<()> {
         net::write_resolv_conf(spec.nics)?;
     }
 
-    // -- volumes (network mounts — after DHCP) --------------------------------
-    if !spec.volumes.is_empty() {
+    // -- CIFS volumes (network mounts — after DHCP) ----------------------------
+    if spec.volumes.iter().any(|v| v.tag.is_none()) {
         let smb = spec
             .smb
             .as_ref()
-            .ok_or("spec declares volumes but no smb coordinates")?;
-        for vol in &spec.volumes {
+            .ok_or("spec declares CIFS volumes but no smb coordinates")?;
+        for vol in spec.volumes.iter().filter(|v| v.tag.is_none()) {
             mounts::mount_volume(smb, &vol.share, &vol.target, vol.read_only)?;
         }
     }

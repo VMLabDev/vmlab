@@ -88,6 +88,10 @@ impl ContainerDirs {
     pub fn tty_sock(&self) -> PathBuf {
         self.run.join("tty.sock")
     }
+    /// vhost-user socket of the i-th volume's virtiofsd.
+    pub fn vfs_sock(&self, i: usize) -> PathBuf {
+        self.run.join(format!("vfs{i}.sock"))
+    }
     pub fn nic_sock(&self, i: usize) -> PathBuf {
         self.run.join(format!("nic{i}.sock"))
     }
@@ -121,11 +125,13 @@ pub fn volume_share_name(container: &str, i: usize) -> String {
     format!("vol-{container}-{i}")
 }
 
-/// Resolve the config's volume list to concrete SMB exports in declaration
+/// Resolve the config's volume list to concrete exports in declaration
 /// order: (share name, host dir, read-only). Relative host binds resolve
-/// against the lab root; named volumes land under the lab work dir. The lab
-/// serves these from its `smbd` at the segment gateway (PRD §18 — volumes
-/// are network mounts so no filesystem device state lands in snapshots).
+/// against the lab root; named volumes land under the lab work dir. Each
+/// export is served by a per-volume virtiofsd (vhost-user-fs device,
+/// snapshot-safe via its migration mode) or, when the host has no
+/// virtiofsd, by the lab's `smbd` at the segment gateway (PRD §18; volume
+/// contents stay outside snapshot scope either way).
 pub fn resolve_volume_hosts(
     cfg: &model::Container,
     lab_root: &Path,
@@ -219,6 +225,10 @@ pub fn build_spec(cfg: &model::Container, image: &ImageConfig, hostname: &str) -
                 share: volume_share_name(&cfg.name, i),
                 target: v.target.clone(),
                 read_only: v.read_only,
+                // Filled per send when the volumes ride virtiofs (see
+                // `ContainerInstance::spec_for_guest`) — the transport is a
+                // start-time host decision, not part of the merged spec.
+                tag: None,
             })
             .collect(),
         // Filled per send from the lab's live SMB server (see
@@ -324,8 +334,16 @@ pub struct ContainerInstance {
     pub volumes: Vec<(String, PathBuf, bool)>,
     /// How the guest reaches the lab's SMB server for volume mounts —
     /// set by the lab once its `smbd` is up, before any volume-declaring
-    /// start.
+    /// start. Only consulted when the volumes ride CIFS (no virtiofsd).
     smb: RwLock<Option<SmbInfo>>,
+    /// The per-volume virtiofsd daemons of the current run (empty when the
+    /// volumes ride CIFS). Killed on teardown; respawned by every start
+    /// attempt.
+    virtiofsd: Mutex<Vec<Arc<Proc>>>,
+    /// This run's volumes are vhost-user-fs devices (virtiofsd found and
+    /// spawned) rather than CIFS mounts. Decided per start attempt;
+    /// `spec_for_guest` tags the volumes accordingly.
+    virtiofs_active: AtomicBool,
 
     state: RwLock<PowerState>,
     /// The bundled qemu-ga answers `guest-ping`.
@@ -376,6 +394,8 @@ impl ContainerInstance {
             image: std::sync::RwLock::new(parts),
             volumes,
             smb: RwLock::new(None),
+            virtiofsd: Mutex::new(Vec::new()),
+            virtiofs_active: AtomicBool::new(false),
             state: RwLock::new(PowerState::Stopped),
             agent_up: RwLock::new(false),
             started: RwLock::new(false),
@@ -479,17 +499,24 @@ impl ContainerInstance {
         *self.smb.write().await = Some(info);
     }
 
-    /// The spec as cinit receives it: the pre-merged document plus the SMB
-    /// coordinates when volumes are declared.
+    /// The spec as cinit receives it: the pre-merged document plus this
+    /// run's volume transport — virtiofs tags when the daemons are up, else
+    /// the SMB coordinates for the CIFS fallback.
     async fn spec_for_guest(&self) -> Result<ContainerSpec> {
         let mut spec = self.image_parts()?.spec.clone();
         if !spec.volumes.is_empty() {
-            spec.smb = Some(self.smb.read().await.clone().ok_or_else(|| {
-                anyhow!(
-                    "{}: volumes declared but the lab SMB server is not up",
-                    self.cfg.name
-                )
-            })?);
+            if self.virtiofs_active.load(Ordering::SeqCst) {
+                for v in &mut spec.volumes {
+                    v.tag = Some(v.share.clone());
+                }
+            } else {
+                spec.smb = Some(self.smb.read().await.clone().ok_or_else(|| {
+                    anyhow!(
+                        "{}: volumes declared but the lab SMB server is not up",
+                        self.cfg.name
+                    )
+                })?);
+            }
         }
         Ok(spec)
     }
@@ -511,6 +538,7 @@ impl ContainerInstance {
         &self,
         asset: &crate::guest_asset::GuestAsset,
         parts: &ImageParts,
+        volumes: Vec<(String, PathBuf)>,
     ) -> ContainerVmPaths {
         ContainerVmPaths {
             kernel: asset.kernel.clone(),
@@ -528,7 +556,43 @@ impl ContainerInstance {
             ctl_sock: self.dirs.ctl_sock(),
             tty_sock: self.dirs.tty_sock(),
             serial_log: self.dirs.console_log(),
+            volumes,
         }
+    }
+
+    /// Spawn one virtiofsd per volume (listening before QEMU starts) and
+    /// return the (tag, socket) list for the argv builder. With no
+    /// virtiofsd on the host the volumes fall back to CIFS — empty list,
+    /// `virtiofs_active` false — and the lab's smbd serves them as before.
+    async fn start_virtiofsds(&self) -> Result<Vec<(String, PathBuf)>> {
+        if self.volumes.is_empty() || !crate::qemu::virtiofsd::available() {
+            if !self.volumes.is_empty() {
+                tracing::warn!(
+                    "{}: no virtiofsd on this host — volumes fall back to CIFS",
+                    self.cfg.name
+                );
+            }
+            self.virtiofs_active.store(false, Ordering::SeqCst);
+            return Ok(Vec::new());
+        }
+        let mut procs = Vec::new();
+        let mut devices = Vec::new();
+        for (i, (share, host, ro)) in self.volumes.iter().enumerate() {
+            let sock = self.dirs.vfs_sock(i);
+            let proc = crate::qemu::virtiofsd::spawn(
+                &format!("{}/{share}", self.cfg.name),
+                &sock,
+                host,
+                *ro,
+                &self.dirs.logs.join(format!("virtiofsd{i}.log")),
+            )
+            .await?;
+            procs.push(proc);
+            devices.push((share.clone(), sock));
+        }
+        self.virtiofs_active.store(true, Ordering::SeqCst);
+        *self.virtiofsd.lock().await = procs;
+        Ok(devices)
     }
 
     /// Spawn the micro-VM paused, connect QMP, release the CPUs, then attach
@@ -610,6 +674,10 @@ impl ContainerInstance {
                     .await?;
             }
 
+            // virtiofsd daemons must be listening before QEMU spawns (its
+            // vhost-user chardevs connect at startup).
+            let vfs_devices = self.start_virtiofsds().await?;
+
             let asset = crate::guest_asset::ensure_guest_asset(&self.arch)?;
             let accel = qemu::pick_accel(&self.arch);
             if accel == qemu::Accel::Tcg {
@@ -625,7 +693,7 @@ impl ContainerInstance {
                 &self.arch,
                 self.cpus(),
                 self.memory(),
-                &self.build_paths(&asset, &parts),
+                &self.build_paths(&asset, &parts, vfs_devices),
             )?;
             let proc = Proc::spawn(
                 &format!("qemu:{}", self.cfg.name),
@@ -850,6 +918,13 @@ impl ContainerInstance {
             && proc.is_running()
         {
             proc.kill().await;
+        }
+        // virtiofsd usually exits on its own once QEMU disconnects; kill
+        // covers daemons that never got a connection (failed start).
+        for proc in self.virtiofsd.lock().await.drain(..) {
+            if proc.is_running() {
+                proc.kill().await;
+            }
         }
     }
 
@@ -1389,11 +1464,13 @@ mod tests {
                     share: "vol-db-0".into(),
                     target: "/var/lib/db".into(),
                     read_only: false,
+                    tag: None,
                 },
                 VolumeMount {
                     share: "vol-db-1".into(),
                     target: "/shared".into(),
                     read_only: true,
+                    tag: None,
                 },
             ]
         );
@@ -1570,6 +1647,7 @@ mod tests {
         assert_eq!(dirs.qga_sock(), dirs.run.join("qga.sock"));
         assert_eq!(dirs.ctl_sock(), dirs.run.join("ctl.sock"));
         assert_eq!(dirs.nic_sock(1), dirs.run.join("nic1.sock"));
+        assert_eq!(dirs.vfs_sock(0), dirs.run.join("vfs0.sock"));
         assert_eq!(dirs.scratch_disk(), dirs.local.join("scratch.qcow2"));
         assert_eq!(dirs.container_json(), dirs.local.join("container.json"));
         assert_eq!(dirs.console_log(), dirs.logs.join("console.log"));

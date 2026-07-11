@@ -516,7 +516,8 @@ impl LabRuntime {
     }
 
     /// Start the SMB server for the lab's shares — VM `share {}` blocks and
-    /// container volumes (PRD §18: volumes are SMB exports mounted by cinit)
+    /// container volumes that fall back to CIFS (PRD §18: volumes ride
+    /// virtiofs when the host has a virtiofsd, smbd otherwise)
     /// — and DNAT each relevant segment gateway's port 445 to it (PRD §7.5).
     /// Best-effort: a failure is logged and the rest of the lab still works.
     /// Idempotent; called from `up` and from any individual container start.
@@ -552,8 +553,12 @@ impl LabRuntime {
                     seg_ports.push(seg_name.to_string());
                 }
             }
+            // Containers only need smbd for the CIFS fallback: with a
+            // virtiofsd on the host their volumes attach as vhost-user-fs
+            // devices instead (spawned per container start, PRD §18).
+            let containers_on_cifs = !crate::qemu::virtiofsd::available();
             for (name, container) in &self.containers {
-                if container.volumes.is_empty() {
+                if container.volumes.is_empty() || !containers_on_cifs {
                     continue;
                 }
                 // Validated: volumes require a NIC (§5.1).

@@ -5,8 +5,10 @@
 //! `vmlab.ctl.0`), newline-delimited JSON. cinit emits [`CtlEvent`]s
 //! (starting with `boot`, repeated until the spec arrives), the host sends
 //! [`CtlCommand`]s — the first being [`CtlCommand::Spec`], which carries the
-//! [`ContainerSpec`]. No filesystem device is involved: keeping the micro-VM
-//! free of virtfs is what makes it snapshottable (PRD §18).
+//! [`ContainerSpec`]. The spec itself never touches a filesystem device;
+//! volumes attach as snapshot-safe vhost-user-fs devices (or CIFS mounts on
+//! hosts without virtiofsd) — never 9p, which would block snapshots
+//! (PRD §18).
 //!
 //! Everything is plain serde so this crate builds for the host (a normal
 //! dependency of the `vmlab` crate) and for the static-musl guest init.
@@ -20,23 +22,34 @@ use serde::{Deserialize, Serialize};
 /// v3: the spec arrives over the ctl channel (`spec` command) instead of a
 ///     9p config share; volumes are CIFS mounts instead of 9p shares;
 ///     `resync` command for post-snapshot-restore state replay.
-pub const PROTO_VERSION: u32 = 3;
+/// v4: volumes may arrive as virtiofs mounts (`tag` set) instead of CIFS —
+///     the host spawns one virtiofsd per volume and attaches a
+///     vhost-user-fs device; CIFS (`tag` absent + `smb`) remains the
+///     fallback when the host has no virtiofsd.
+pub const PROTO_VERSION: u32 = 4;
 
-/// A volume mounted into the container root over CIFS.
+/// A volume mounted into the container root, over virtiofs or CIFS.
 ///
-/// The host serves each named volume as an SMB share at the segment gateway
-/// (the same mechanism as VM shared folders); cinit mounts
-/// `//<gateway>/<share>` at `target` inside the container rootfs using the
-/// credentials in [`ContainerSpec::smb`].
+/// With `tag` set the host has attached a vhost-user-fs device for this
+/// volume and cinit mounts it natively (`mount -t virtiofs <tag>`), before
+/// the network is even up. Without a `tag` the host serves the volume as an
+/// SMB share at the segment gateway (the same mechanism as VM shared
+/// folders) and cinit mounts `//<gateway>/<share>` at `target` after DHCP,
+/// using the credentials in [`ContainerSpec::smb`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeMount {
-    /// SMB share name at the gateway, e.g. `vol-data`.
+    /// SMB share name at the gateway, e.g. `vol-data`. Also doubles as the
+    /// virtiofs tag when `tag` is set (they are minted from the same name).
     pub share: String,
     /// Absolute path inside the container rootfs.
     pub target: String,
     /// Mount read-only.
     #[serde(default)]
     pub read_only: bool,
+    /// virtiofs mount tag of the vhost-user-fs device backing this volume.
+    /// `None` = CIFS volume (see [`ContainerSpec::smb`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 /// How to reach the lab's SMB server for volume mounts. Present whenever the
@@ -109,10 +122,11 @@ pub struct ContainerSpec {
     /// Seconds between the stop signal and SIGKILL.
     #[serde(default = "default_stop_grace")]
     pub stop_grace_secs: u64,
-    /// CIFS volumes to mount inside the rootfs (after the network is up).
+    /// Volumes to mount inside the rootfs — virtiofs (tagged, pre-network)
+    /// or CIFS (untagged, after DHCP). See [`VolumeMount`].
     #[serde(default)]
     pub volumes: Vec<VolumeMount>,
-    /// SMB server coordinates for `volumes`; required when they are non-empty.
+    /// SMB server coordinates; required when any volume is untagged (CIFS).
     #[serde(default)]
     pub smb: Option<SmbInfo>,
     /// Number of virtio NICs (`eth0..`) to bring up via DHCP. 0 = loopback
@@ -190,11 +204,20 @@ mod tests {
             user: Some("nginx:nginx".into()),
             stop_signal: Some("SIGQUIT".into()),
             stop_grace_secs: 5,
-            volumes: vec![VolumeMount {
-                share: "vol-data".into(),
-                target: "/data".into(),
-                read_only: true,
-            }],
+            volumes: vec![
+                VolumeMount {
+                    share: "vol-data".into(),
+                    target: "/data".into(),
+                    read_only: true,
+                    tag: None,
+                },
+                VolumeMount {
+                    share: "vol-fast".into(),
+                    target: "/fast".into(),
+                    read_only: false,
+                    tag: Some("vol-fast".into()),
+                },
+            ],
             smb: Some(SmbInfo {
                 gateway: "10.0.0.1".into(),
                 username: "lab".into(),
@@ -229,13 +252,24 @@ mod tests {
     }
 
     #[test]
+    fn volume_mount_tag_is_optional_on_the_wire() {
+        // A v3-era document (no `tag`) still parses: CIFS volume.
+        let v: VolumeMount =
+            serde_json::from_str(r#"{ "share": "vol-c-0", "target": "/data" }"#).unwrap();
+        assert_eq!(v.tag, None);
+        assert!(!v.read_only);
+        // And an untagged volume serializes without the key at all.
+        assert!(!serde_json::to_string(&v).unwrap().contains("tag"));
+    }
+
+    #[test]
     fn events_use_snake_case_tags() {
         let ev = CtlEvent::Boot {
             proto_version: PROTO_VERSION,
         };
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
-            r#"{"event":"boot","proto_version":3}"#
+            r#"{"event":"boot","proto_version":4}"#
         );
         let ev = CtlEvent::NetUp {
             ip: "10.0.0.9".into(),
@@ -275,7 +309,10 @@ mod tests {
         );
         assert_eq!(roundtrip(&cmd), cmd);
 
-        let cmd = CtlCommand::TtyResize { cols: 132, rows: 43 };
+        let cmd = CtlCommand::TtyResize {
+            cols: 132,
+            rows: 43,
+        };
         assert_eq!(
             serde_json::to_string(&cmd).unwrap(),
             r#"{"cmd":"tty_resize","cols":132,"rows":43}"#

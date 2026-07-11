@@ -6,6 +6,7 @@ pub mod container;
 pub mod firmware;
 pub mod process;
 pub mod resolve;
+pub mod virtiofsd;
 
 pub use cmdline::{Accel, NicBackend, NicSpec, VmPaths, build_args, emulator_binary, pick_accel};
 pub use process::Proc;
