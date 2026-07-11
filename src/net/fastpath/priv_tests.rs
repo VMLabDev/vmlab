@@ -386,13 +386,17 @@ async fn recv_tap_matches(io: &super::afxdp::TapIo, want: &[u8], wait: Duration)
     }
 }
 
-/// A/B throughput smoke (`just fastpath-bench`): pumps unicast frames
-/// between two stream ports and prints frames/s. Run once with
-/// `VMLAB_FASTPATH=off` and once with `=sockmap` to compare.
+/// A/B throughput smoke (`just fastpath-bench`): floods unicast frames
+/// between two stream ports for a fixed window and reports the *delivered*
+/// rate. Time-boxed rather than frame-counted on purpose: the userspace
+/// switch drops on a full egress queue (legal ethernet), so waiting for an
+/// exact frame count would never finish under flood — drops just lower the
+/// reported rate instead. Run once with `VMLAB_FASTPATH=off` and once with
+/// `=sockmap` to compare.
 #[tokio::test]
 #[ignore = "benchmark — run via `just fastpath-bench`"]
 async fn fastpath_bench_ab() {
-    const FRAMES: u64 = 200_000;
+    const WINDOW: Duration = Duration::from_secs(5);
     const SIZE: usize = 1400;
     let tier = init(FastpathMode::Auto);
     let sw = Switch::new("fp-bench".into());
@@ -403,31 +407,39 @@ async fn fastpath_bench_ab() {
     recv_frame(&mut a_read).await;
     recv_frame(&mut b_read).await;
 
+    // Reader: count until the stream goes idle after the writer stops.
     let reader = tokio::spawn(async move {
         let mut n = 0u64;
-        while n < FRAMES {
-            match read_frame(&mut b_read).await {
-                Ok(Some(_)) => n += 1,
-                other => panic!("stream ended early: {other:?}"),
+        loop {
+            match timeout(Duration::from_secs(2), read_frame(&mut b_read)).await {
+                Ok(Ok(Some(_))) => n += 1,
+                _ => return n, // idle, EOF, or error: the window is over
             }
         }
-        n
     });
+
     let frame = eth_build(MAC_B, MAC_A, ETHERTYPE_IPV4, &vec![0xBE; SIZE - 14]);
     let start = Instant::now();
-    for _ in 0..FRAMES {
+    let mut sent = 0u64;
+    while start.elapsed() < WINDOW {
         write_frame(&mut a_write, &frame).await.unwrap();
+        sent += 1;
     }
-    let received = timeout(Duration::from_secs(120), reader)
-        .await
-        .expect("bench timed out")
-        .unwrap();
     let secs = start.elapsed().as_secs_f64();
+    drop(a_write); // EOF ends the port; the reader exits on idle
+
+    let received = timeout(Duration::from_secs(30), reader)
+        .await
+        .expect("reader wedged")
+        .unwrap();
     let stats = sw.stats();
     println!(
-        "tier={} frames={received} size={SIZE} elapsed={secs:.2}s rate={:.0} frames/s offloaded={}",
+        "tier={} size={SIZE} window={secs:.2}s sent={sent} delivered={received} \
+         rate={:.0} frames/s ({:.1} MiB/s) dropped={} offloaded={}",
         tier.as_str(),
         received as f64 / secs,
+        received as f64 * SIZE as f64 / secs / (1024.0 * 1024.0),
+        sent - received,
         stats.frames_offloaded,
     );
 }
