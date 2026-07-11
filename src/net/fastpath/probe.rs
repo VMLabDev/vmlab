@@ -15,12 +15,21 @@ use anyhow::{Context, Result, bail};
 
 use super::sockmap::Engine;
 use crate::config::model::MacAddr;
-use crate::net::frame::{ETHERTYPE_IPV4, eth_build};
+use crate::net::frame::{ETHERTYPE_IPV4, MAC_BROADCAST, eth_build};
 
 const MAC_A: MacAddr = MacAddr([0x52, 0x54, 0xfa, 0x57, 0x00, 0x0a]);
 const MAC_B: MacAddr = MacAddr([0x52, 0x54, 0xfa, 0x57, 0x00, 0x0b]);
 const MAC_UNKNOWN: MacAddr = MacAddr([0x52, 0x54, 0xfa, 0x57, 0x00, 0xff]);
 const TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Decorate permission failures with the one actionable fix.
+fn hint(msg: String) -> String {
+    if msg.contains("EPERM") || msg.contains("Operation not permitted") {
+        format!("{msg} — run the vmlab daemons with CAP_BPF + CAP_NET_ADMIN to enable")
+    } else {
+        msg
+    }
+}
 
 /// Validate the sockmap tier: load + attach the programs, then prove the
 /// three load-bearing behaviours on unix socketpairs standing in for QEMU
@@ -29,14 +38,7 @@ const TIMEOUT: Duration = Duration::from_millis(500);
 /// TX-loopback path (daemon egress). Any kernel where one of these is
 /// missing or broken fails closed.
 pub(super) fn sockmap() -> Result<(), String> {
-    sockmap_impl().map_err(|e| {
-        let msg = format!("{e:#}");
-        if msg.contains("EPERM") || msg.contains("Operation not permitted") {
-            format!("{msg} — run the vmlab daemons with CAP_BPF + CAP_NET_ADMIN to enable")
-        } else {
-            msg
-        }
-    })
+    sockmap_impl().map_err(|e| hint(format!("{e:#}")))
 }
 
 fn sockmap_impl() -> Result<()> {
@@ -92,6 +94,92 @@ fn sockmap_impl() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Validate the afxdp tier by driving the real datapath end-to-end on
+/// throwaway resources: a [`SegmentXdp`] with two probe NICs on a real
+/// switch, exercising the in-kernel tap-to-tap forward (standard + jumbo
+/// frames) and the full punt→switch→inject round trip. Runs on its own
+/// thread + single-thread runtime so it works from any caller (the daemons
+/// call [`super::init`] inside a runtime; unit tests call it without one).
+pub(super) fn afxdp() -> Result<(), String> {
+    let handle = std::thread::Builder::new()
+        .name("fastpath-probe".into())
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("probe runtime: {e}"))?;
+            rt.block_on(async { afxdp_impl().await.map_err(|e| hint(format!("{e:#}"))) })
+        })
+        .map_err(|e| format!("probe thread: {e}"))?;
+    handle
+        .join()
+        .map_err(|_| "probe thread panicked".to_string())?
+}
+
+async fn afxdp_impl() -> Result<()> {
+    use super::afxdp::SegmentXdp;
+    use crate::net::switch::Switch;
+
+    // Jumbo-capable taps so one probe covers standard and jumbo frames.
+    const MTU: u16 = 9000;
+    // The probe switch has no offload of its own: the tier is still
+    // undecided while we run, so `fastpath::tier()` reads Userspace.
+    let switch = Switch::new("fastpath-probe".into());
+    let seg = SegmentXdp::new("fastpath-probe", MTU)?;
+    let nic_a = seg.add_nic(&switch, MAC_A, false)?;
+    let nic_b = seg.add_nic(&switch, MAC_B, false)?;
+    let a = nic_a.io()?;
+    let b = nic_b.io()?;
+
+    // 1. Known unicast A→B must forward tap-to-tap in-kernel.
+    let fwd = eth_build(MAC_B, MAC_A, ETHERTYPE_IPV4, &[0xA5; 1400]);
+    a.send(&fwd).await.context("tap send")?;
+    recv_expect(&b, &fwd)
+        .await
+        .context("in-kernel tap-to-tap forward")?;
+    if seg.stats()[0] == 0 {
+        anyhow::bail!("forward counter not accounting");
+    }
+
+    // 2. A jumbo frame takes the same path (generic XDP must not bypass it).
+    let jumbo = eth_build(MAC_B, MAC_A, ETHERTYPE_IPV4, &[0x5A; 8900]);
+    a.send(&jumbo).await.context("tap send (jumbo)")?;
+    recv_expect(&b, &jumbo)
+        .await
+        .context("in-kernel forward of a jumbo frame")?;
+
+    // 3. Broadcast must punt to the daemon, flood through the userspace
+    //    switch, and inject back out B's tap — the whole bridge round trip.
+    let bcast = eth_build(
+        MAC_BROADCAST,
+        MAC_A,
+        ETHERTYPE_IPV4,
+        b"fastpath probe: punt",
+    );
+    a.send(&bcast).await.context("tap send (broadcast)")?;
+    recv_expect(&b, &bcast)
+        .await
+        .context("punt/inject round trip via the userspace switch")?;
+
+    Ok(())
+}
+
+/// Read frames off a tap until the expected one arrives (the host stack may
+/// emit its own chatter — IPv6 ND and friends — out any UP tap).
+async fn recv_expect(io: &super::afxdp::TapIo, want: &[u8]) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = tokio::time::timeout_at(deadline, io.recv(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("no frame arrived within {TIMEOUT:?}"))?
+            .context("tap read")?;
+        if &buf[..n] == want {
+            return Ok(());
+        }
+    }
 }
 
 fn send_framed(sock: &UnixStream, frame: &[u8]) -> Result<()> {

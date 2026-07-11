@@ -9,8 +9,9 @@ description = "Single-host virtual machine lab orchestrator"
 # notably guest/cinit, which is musl-only and allows unsafe — must never be
 # swept into this package. ebpf/ is the BPF fast-path workspace (nightly +
 # bpf-linker, allows unsafe); only its committed objects under
-# src/net/fastpath/bpf/ are consumed here.
-exclude = ["/guest", "/ebpf"]
+# src/net/fastpath/bpf/ are consumed here. tap/ is the TAP-ioctl helper
+# (allows unsafe), consumed as a path dependency behind the ebpf feature.
+exclude = ["/guest", "/ebpf", "/tap"]
 
 [lib]
 name = "vmlab"
@@ -32,7 +33,7 @@ default = ["ebpf"]
 # The eBPF network fast path (PRD §9.1's substitutable backend): compiled in
 # by default; an empirical probe at daemon startup decides per-host whether a
 # kernel tier is actually used, falling back to the userspace fabric.
-ebpf = ["dep:aya"]
+ebpf = ["dep:aya", "dep:vmlab-tap", "dep:command-fds"]
 # Pulls in the HTTP stack for the `vmlab-web` binary. Kept optional so a plain
 # CLI build stays lean.
 web = [
@@ -85,7 +86,8 @@ zstd = "0.13"
 flate2 = "1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
-nix = { version = "0.29", features = ["process", "signal", "user", "fs"] }
+# `net` is for if_nametoindex (the afxdp tier's XDP map keys).
+nix = { version = "0.29", features = ["process", "signal", "user", "fs", "net"] }
 image = { version = "0.25", default-features = false, features = ["png", "pnm", "bmp"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tar = "0.4"
@@ -98,6 +100,10 @@ rustix = { version = "1.1.4", features = ["termios", "net"] }
 # The eBPF loader for the network fast path. Its userspace API is safe, so
 # the crate-level `unsafe_code = "deny"` holds.
 aya = { version = "0.14", optional = true }
+# TAP creation for the afxdp tier (the unsafe ioctls live in that crate).
+vmlab-tap = { path = "tap", optional = true }
+# Passes pre-opened tap fds to QEMU at spawn (dup2 shuffle in pre_exec).
+command-fds = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

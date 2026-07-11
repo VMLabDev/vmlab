@@ -846,14 +846,20 @@ impl LabRuntime {
         std::fs::create_dir_all(&vm.dirs.run)?;
         {
             let mut net = self.network.lock().await;
+            let mut attachments = Vec::with_capacity(vm.cfg.nics.len());
             for (i, nic) in vm.cfg.nics.iter().enumerate() {
                 let sock = vm.dirs.nic_sock(i);
                 let _ = std::fs::remove_file(&sock);
                 let seg = net
                     .segment_mut(nic_segment_name(nic))
                     .ok_or_else(|| anyhow!("unknown segment for nic {i}"))?;
-                seg.listen_nic(&sock, nic.isolated).await?;
+                let mac = *vm
+                    .macs
+                    .get(i)
+                    .ok_or_else(|| anyhow!("no persisted MAC for nic {i}"))?;
+                attachments.push(seg.attach_nic(&sock, mac, nic.isolated).await?);
             }
+            vm.set_nic_attachments(attachments).await;
         }
 
         let events_exit = self.events.clone();

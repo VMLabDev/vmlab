@@ -13,6 +13,7 @@ use ipnet::Ipv4Net;
 use crate::config::model::{Lab, MacAddr, Segment};
 use crate::net::dhcp::DhcpConfig;
 use crate::net::dns::DnsZone;
+use crate::net::fastpath::{self, FastpathTier, NicAttachment, SegmentXdp};
 use crate::net::gateway::{Gateway, GatewayConfig, gateway_mac};
 use crate::net::switch::{PortClass, Switch};
 
@@ -43,6 +44,9 @@ pub struct SegmentNet {
     /// NAT + L3 rule services (PRD §9.6–§9.9), wired alongside the gateway.
     pub services: Option<Arc<super::netservices::SegmentServices>>,
     listeners: Vec<tokio::task::JoinHandle<()>>,
+    /// The afxdp-tier datapath (host tap + XDP program), created lazily on
+    /// the first tap NIC when that tier is active.
+    xdp: Option<Arc<SegmentXdp>>,
 }
 
 /// Default MTU for NAT segments. The guest↔gateway link is an in-memory UNIX
@@ -72,6 +76,46 @@ impl SegmentNet {
             .with_context(|| format!("listening on {}", sock.display()))?;
         self.listeners.push(handle);
         Ok(())
+    }
+
+    /// Attach one VM NIC: a tap on the afxdp fast path when that tier is
+    /// active (falling back per NIC on any failure), else the stream-socket
+    /// listener QEMU connects to.
+    pub async fn attach_nic(
+        &mut self,
+        sock: &Path,
+        mac: MacAddr,
+        isolated: bool,
+    ) -> Result<NicAttachment> {
+        if fastpath::tier() == FastpathTier::AfXdp {
+            match self.attach_tap(mac, isolated) {
+                Ok(att) => return Ok(att),
+                Err(error) => tracing::warn!(
+                    segment = %self.name,
+                    "tap fast path failed ({error:#}); nic falls back to a stream socket"
+                ),
+            }
+        }
+        self.listen_nic(sock, isolated).await?;
+        Ok(NicAttachment::Stream {
+            sock: sock.to_path_buf(),
+        })
+    }
+
+    fn attach_tap(&mut self, mac: MacAddr, isolated: bool) -> Result<NicAttachment> {
+        let xdp = match &self.xdp {
+            Some(x) => x.clone(),
+            None => {
+                let x = SegmentXdp::new(&self.name, self.effective_mtu())?;
+                self.xdp = Some(x.clone());
+                x
+            }
+        };
+        Ok(NicAttachment::Tap(xdp.add_nic(
+            &self.switch,
+            mac,
+            isolated,
+        )?))
     }
 }
 
@@ -120,6 +164,7 @@ impl LabNetwork {
                     gateway: None,
                     services: None,
                     listeners: Vec::new(),
+                    xdp: None,
                 },
             );
         }
@@ -149,6 +194,7 @@ impl LabNetwork {
                     gateway: None,
                     services: None,
                     listeners: Vec::new(),
+                    xdp: None,
                 },
             );
         }

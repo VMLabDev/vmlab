@@ -16,17 +16,30 @@
 //! without privileges — those simply keep today's path.
 
 #[cfg(feature = "ebpf")]
+mod afxdp;
+#[cfg(feature = "ebpf")]
 mod probe;
 #[cfg(feature = "ebpf")]
 mod sockmap;
+#[cfg(feature = "ebpf")]
+pub use afxdp::{SegmentXdp, TapNic};
 #[cfg(feature = "ebpf")]
 pub use sockmap::SegmentOffload;
 #[cfg(not(feature = "ebpf"))]
 mod stub;
 #[cfg(not(feature = "ebpf"))]
-pub use stub::SegmentOffload;
+pub use stub::{SegmentOffload, SegmentXdp, TapNic};
 
 use std::sync::OnceLock;
+
+/// How one VM NIC attaches to its segment.
+pub enum NicAttachment {
+    /// A unix listener socket QEMU connects to (the default path).
+    Stream { sock: std::path::PathBuf },
+    /// A pre-opened tap device (afxdp tier). RAII: dropping detaches the
+    /// switch port and XDP state and releases the daemon's queue fd.
+    Tap(TapNic),
+}
 
 /// Which fast path this daemon uses for eligible switch traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +239,7 @@ fn probe_sockmap() -> Result<(), String> {
 
 #[cfg(feature = "ebpf")]
 fn probe_afxdp() -> Result<(), String> {
-    Err("afxdp tier not implemented yet".into())
+    probe::afxdp()
 }
 
 #[cfg(feature = "ebpf")]

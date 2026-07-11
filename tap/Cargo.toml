@@ -1,0 +1,13 @@
+# Minimal TAP-device creation for the afxdp network fast path. A separate
+# crate for the same reason as guest/cinit: TUNSETIFF and friends are raw
+# ioctls needing `unsafe`, which the main crate denies. Consumed as a path
+# dependency behind the `ebpf` feature.
+[package]
+name = "vmlab-tap"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "TAP device creation helper for vmlab's afxdp fast path"
+
+[dependencies]
+libc = "0.2"

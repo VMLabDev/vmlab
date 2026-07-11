@@ -10,6 +10,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::model::{self, MacAddr};
+use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, Proc, VmPaths};
 use crate::qga::GaClient;
 use crate::qmp::QmpClient;
@@ -120,6 +121,10 @@ pub struct VmInstance {
     /// See [`TemplateParts`] — std lock (never held across await).
     template: std::sync::RwLock<Arc<TemplateParts>>,
 
+    /// Per-NIC segment attachments for the current run, set by `start_vm`
+    /// before [`Self::start`]. Cleared in teardown — tap attachments are
+    /// RAII, so clearing detaches them.
+    nic_attachments: Mutex<Vec<NicAttachment>>,
     state: RwLock<PowerState>,
     /// The guest agent answers `guest-ping`. Set by the readiness poller.
     agent_up: RwLock<bool>,
@@ -154,6 +159,7 @@ impl VmInstance {
             cdroms,
             floppy,
             template: std::sync::RwLock::new(Arc::new(template)),
+            nic_attachments: Mutex::new(Vec::new()),
             state: RwLock::new(PowerState::Stopped),
             agent_up: RwLock::new(false),
             ready: RwLock::new(false),
@@ -174,6 +180,12 @@ impl VmInstance {
     /// Bind the template parts resolved by a deferred pull.
     pub fn set_template(&self, parts: TemplateParts) {
         *self.template.write().expect("template lock") = Arc::new(parts);
+    }
+
+    /// Install this run's NIC attachments (wired by `start_vm` just before
+    /// [`Self::start`]), one per configured NIC in declaration order.
+    pub async fn set_nic_attachments(&self, attachments: Vec<NicAttachment>) {
+        *self.nic_attachments.lock().await = attachments;
     }
 
     pub async fn state(&self) -> PowerState {
@@ -263,7 +275,7 @@ impl VmInstance {
         v
     }
 
-    fn build_paths(&self, t: &TemplateParts) -> Result<VmPaths> {
+    fn build_paths(&self, t: &TemplateParts, nics: Vec<qemu::NicSpec>) -> Result<VmPaths> {
         Ok(VmPaths {
             qmp_sock: self.dirs.qmp_sock(),
             qga_sock: self.dirs.qga_sock(),
@@ -277,17 +289,49 @@ impl VmInstance {
                 .collect(),
             cdroms: self.cdroms.clone(),
             floppy: self.floppy.clone(),
-            nics: self
-                .macs
-                .iter()
-                .enumerate()
-                .map(|(i, mac)| (*mac, self.dirs.nic_sock(i), self.nic_mtus.get(i).copied()))
-                .collect(),
+            nics,
             ovmf_vars: (t.resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf))
                 .then(|| self.dirs.ovmf_vars()),
             tpm_sock: t.resolved.tpm.then(|| self.dirs.tpm_sock()),
             serial_log: Some(self.dirs.logs.join("serial.log")),
         })
+    }
+
+    /// Per-NIC argv specs + the child fd mappings tap attachments need,
+    /// derived from the attachments `start_vm` installed for this run.
+    async fn nic_specs(&self) -> Result<(Vec<qemu::NicSpec>, Vec<qemu::process::ChildFd>)> {
+        let attachments = self.nic_attachments.lock().await;
+        if attachments.len() != self.macs.len() {
+            bail!(
+                "{}: {} nic attachment(s) wired for {} configured nic(s)",
+                self.cfg.name,
+                attachments.len(),
+                self.macs.len()
+            );
+        }
+        let mut specs = Vec::with_capacity(attachments.len());
+        let mut fds = Vec::new();
+        for (i, (mac, att)) in self.macs.iter().zip(attachments.iter()).enumerate() {
+            let mtu = self.nic_mtus.get(i).copied();
+            let backend = match att {
+                NicAttachment::Stream { sock } => qemu::NicBackend::Stream { sock: sock.clone() },
+                NicAttachment::Tap(tap) => {
+                    // Fixed, collision-free child numbers past stdio.
+                    let child_fd = 10 + i as i32;
+                    fds.push(qemu::process::ChildFd {
+                        parent: tap.qemu_fd().context("cloning tap fd for qemu")?,
+                        child: child_fd,
+                    });
+                    qemu::NicBackend::Tap { child_fd }
+                }
+            };
+            specs.push(qemu::NicSpec {
+                mac: *mac,
+                mtu,
+                backend,
+            });
+        }
+        Ok((specs, fds))
     }
 
     /// Spawn QEMU paused, connect QMP, then release the CPUs. The caller has
@@ -355,12 +399,19 @@ impl VmInstance {
                     t.resolved.arch
                 );
             }
-            let args = qemu::build_args(&self.lab, &t.resolved, &self.build_paths(&t)?, accel)?;
-            let proc = Proc::spawn(
+            let (nic_specs, nic_fds) = self.nic_specs().await?;
+            let args = qemu::build_args(
+                &self.lab,
+                &t.resolved,
+                &self.build_paths(&t, nic_specs)?,
+                accel,
+            )?;
+            let proc = Proc::spawn_with_fds(
                 &format!("qemu:{}", self.cfg.name),
                 &qemu::emulator_binary(&t.resolved.arch),
                 &args,
                 &self.dirs.logs.join("qemu.log"),
+                nic_fds,
             )
             .await?;
             *self.qemu.lock().await = Some(proc.clone());
@@ -461,6 +512,9 @@ impl VmInstance {
         if let Some(tpm) = self.swtpm.lock().await.take() {
             tpm.kill().await;
         }
+        // RAII: dropping tap attachments detaches their switch ports and
+        // XDP state; with QEMU gone, the kernel then destroys the taps.
+        self.nic_attachments.lock().await.clear();
         *self.qmp.lock().await = None;
         *self.qga.lock().await = None;
         *self.qemu.lock().await = None;

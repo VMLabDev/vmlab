@@ -52,3 +52,32 @@ impl PortTx {
         match self.never {}
     }
 }
+
+pub struct SegmentXdp {
+    never: Infallible,
+}
+
+pub struct TapNic {
+    never: Infallible,
+}
+
+impl SegmentXdp {
+    pub fn new(_segment: &str, _mtu: u16) -> anyhow::Result<Arc<SegmentXdp>> {
+        anyhow::bail!("vmlab was built without the `ebpf` feature")
+    }
+
+    pub fn add_nic(
+        self: &Arc<Self>,
+        _switch: &Arc<crate::net::switch::Switch>,
+        _mac: MacAddr,
+        _isolated: bool,
+    ) -> anyhow::Result<TapNic> {
+        match self.never {}
+    }
+}
+
+impl TapNic {
+    pub fn qemu_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        match self.never {}
+    }
+}

@@ -24,6 +24,13 @@ pub struct Proc {
     exited: watch::Receiver<Option<String>>,
 }
 
+/// A parent-held fd installed at a fixed descriptor number in the child —
+/// how pre-opened tap netdevs reach QEMU (`-netdev tap,fd=N`).
+pub struct ChildFd {
+    pub parent: std::os::fd::OwnedFd,
+    pub child: i32,
+}
+
 impl Proc {
     /// Spawn `binary` with `args`, stdout+stderr appended to `log_path`.
     pub async fn spawn(
@@ -31,6 +38,18 @@ impl Proc {
         binary: &str,
         args: &[String],
         log_path: &Path,
+    ) -> Result<Arc<Proc>> {
+        Self::spawn_with_fds(name, binary, args, log_path, Vec::new()).await
+    }
+
+    /// [`Proc::spawn`], additionally installing `fds` at their fixed
+    /// descriptor numbers in the child.
+    pub async fn spawn_with_fds(
+        name: &str,
+        binary: &str,
+        args: &[String],
+        log_path: &Path,
+        fds: Vec<ChildFd>,
     ) -> Result<Arc<Proc>> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -42,12 +61,33 @@ impl Proc {
             .with_context(|| format!("opening {}", log_path.display()))?;
         let log_err = log.try_clone()?;
 
-        let mut child = Command::new(binary)
-            .args(args)
+        let mut cmd = Command::new(binary);
+        cmd.args(args)
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(log_err)
-            .kill_on_drop(false)
+            .kill_on_drop(false);
+        #[cfg(feature = "ebpf")]
+        if !fds.is_empty() {
+            use command_fds::CommandFdExt as _;
+            let mappings = fds
+                .into_iter()
+                .map(|f| command_fds::FdMapping {
+                    parent_fd: f.parent,
+                    child_fd: f.child,
+                })
+                .collect();
+            cmd.as_std_mut()
+                .fd_mappings(mappings)
+                .map_err(|e| anyhow::anyhow!("child fd mapping: {e:?}"))?;
+        }
+        #[cfg(not(feature = "ebpf"))]
+        anyhow::ensure!(
+            fds.is_empty(),
+            "pre-opened netdev fds need the `ebpf` feature"
+        );
+
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning {binary} for {name}"))?;
 

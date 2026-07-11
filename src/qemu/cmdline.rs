@@ -25,10 +25,8 @@ pub struct VmPaths {
     pub cdroms: Vec<PathBuf>,
     /// Floppy attachment.
     pub floppy: Option<PathBuf>,
-    /// One unix socket per NIC, in declaration order: (MAC, socket, segment
-    /// MTU). The MTU drives `host_mtu=` on virtio NICs so the guest can use a
-    /// jumbo segment; `None`/1500 leaves the link at the default.
-    pub nics: Vec<(MacAddr, PathBuf, Option<u16>)>,
+    /// NIC attachments in declaration order.
+    pub nics: Vec<NicSpec>,
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
     /// the template in `firmware::UefiFirmware::vars_template`).
     pub ovmf_vars: Option<PathBuf>,
@@ -36,6 +34,27 @@ pub struct VmPaths {
     pub tpm_sock: Option<PathBuf>,
     /// Serial console log file.
     pub serial_log: Option<PathBuf>,
+}
+
+/// One NIC attachment for the argv builder.
+#[derive(Debug, Clone)]
+pub struct NicSpec {
+    pub mac: MacAddr,
+    /// Segment MTU; drives `host_mtu=` on virtio NICs so the guest can use
+    /// a jumbo segment. `None`/1500 leaves the link at the default.
+    pub mtu: Option<u16>,
+    pub backend: NicBackend,
+}
+
+/// How QEMU reaches the segment for one NIC.
+#[derive(Debug, Clone)]
+pub enum NicBackend {
+    /// Stream-socket netdev into the userspace switch (§9.1); the daemon
+    /// listens, QEMU connects.
+    Stream { sock: PathBuf },
+    /// Pre-opened tap fd inherited at this descriptor number (the afxdp
+    /// fast path; the daemon maps the fd in at spawn).
+    Tap { child_fd: i32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,27 +279,33 @@ pub fn build_args(
         );
     }
 
-    // NICs: stream-socket netdevs into the segment switch (§9.1). The
-    // daemon listens; QEMU connects.
-    for (i, (mac, sock, mtu)) in paths.nics.iter().enumerate() {
-        arg(
-            &mut a,
-            "netdev",
-            format!(
-                "stream,id=net{i},server=off,addr.type=unix,addr.path={}",
-                sock.display()
+    // NICs (§9.1): stream-socket netdevs into the segment switch (daemon
+    // listens, QEMU connects), or pre-opened tap fds on the afxdp fast path.
+    for (i, nic) in paths.nics.iter().enumerate() {
+        match &nic.backend {
+            NicBackend::Stream { sock } => arg(
+                &mut a,
+                "netdev",
+                format!(
+                    "stream,id=net{i},server=off,addr.type=unix,addr.path={}",
+                    sock.display()
+                ),
             ),
-        );
+            NicBackend::Tap { child_fd } => {
+                arg(&mut a, "netdev", format!("tap,id=net{i},fd={child_fd}"));
+            }
+        }
         // virtio-net negotiates a jumbo MTU with the guest via `host_mtu`;
         // e1000/pcnet don't support it reliably, so they stay at the default.
-        let host_mtu = mtu
+        let host_mtu = nic
+            .mtu
             .filter(|m| *m != 1500 && vm.nic_model.starts_with("virtio-net"))
             .map(|m| format!(",host_mtu={m}"))
             .unwrap_or_default();
         arg(
             &mut a,
             "device",
-            format!("{},netdev=net{i},mac={mac}{host_mtu}", vm.nic_model),
+            format!("{},netdev=net{i},mac={}{host_mtu}", vm.nic_model, nic.mac),
         );
     }
     if paths.nics.is_empty() {
@@ -417,11 +442,13 @@ mod tests {
             qga_sock: "/run/l/t/qga.sock".into(),
             vnc_sock: "/run/l/t/vnc.sock".into(),
             primary_disk: "/lab/.vmlab/t/disk0.qcow2".into(),
-            nics: vec![(
-                "52:54:00:00:00:01".parse().unwrap(),
-                PathBuf::from("/run/l/t/nic0.sock"),
-                None,
-            )],
+            nics: vec![NicSpec {
+                mac: "52:54:00:00:00:01".parse().unwrap(),
+                mtu: None,
+                backend: NicBackend::Stream {
+                    sock: PathBuf::from("/run/l/t/nic0.sock"),
+                },
+            }],
             ..Default::default()
         }
     }
@@ -468,6 +495,20 @@ mod tests {
     }
 
     #[test]
+    fn tap_backend_emits_fd_netdev() {
+        let vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        p.ovmf_vars = Some("/v".into());
+        p.nics[0].backend = NicBackend::Tap { child_fd: 10 };
+        p.nics[0].mtu = Some(9000);
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(s.contains("-netdev tap,id=net0,fd=10"), "{s}");
+        assert!(!s.contains("addr.type=unix"), "{s}");
+        // The virtio device line is backend-agnostic (host_mtu still works).
+        assert!(s.contains("netdev=net0,mac=52:54:00:00:00:01,host_mtu=9000"));
+    }
+
+    #[test]
     fn no_nics_means_nic_none() {
         let vm = resolved("linux-modern", "x86_64");
         let mut p = paths();
@@ -486,14 +527,14 @@ mod tests {
         assert!(vm.nic_model.starts_with("virtio-net"));
         let mut p = paths();
         p.ovmf_vars = Some("/v".into());
-        p.nics[0].2 = Some(9000);
+        p.nics[0].mtu = Some(9000);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(s.contains("host_mtu=9000"), "{s}");
 
         // 1500 is the default — no host_mtu emitted even on virtio.
         let mut p = paths();
         p.ovmf_vars = Some("/v".into());
-        p.nics[0].2 = Some(1500);
+        p.nics[0].mtu = Some(1500);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("host_mtu"), "{s}");
 
@@ -501,7 +542,7 @@ mod tests {
         let vm = resolved("windows-legacy", "x86_64");
         assert!(!vm.nic_model.starts_with("virtio-net"));
         let mut p = paths();
-        p.nics[0].2 = Some(9000);
+        p.nics[0].mtu = Some(9000);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("host_mtu"), "{s}");
     }
