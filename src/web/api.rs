@@ -191,6 +191,41 @@ pub async fn catalog_templates() -> HttpResponse {
     }
 }
 
+/// `DELETE /api/catalog/templates/{arch}/{name}/{version}` — remove one exact
+/// local-store entry. The exact metadata match is resolved before constructing
+/// any store path, so route parameters can never be used for path traversal.
+pub async fn delete_catalog_template(path: web::Path<(String, String, String)>) -> HttpResponse {
+    let (arch, name, version) = path.into_inner();
+    let result = web::block(move || {
+        let store = vmlab::template::TemplateStore::new(vmlab::paths::template_store_dir());
+        let template = store
+            .list()?
+            .into_iter()
+            .find(|t| t.arch == arch && t.name == name && t.version == version)
+            .ok_or_else(|| anyhow::anyhow!("template {arch}/{name}@{version} not found"))?;
+        store.remove(
+            &template.arch,
+            &template.name,
+            &template.version,
+            true,
+            &|_| None,
+        )?;
+        Ok::<_, anyhow::Error>(template)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(template)) => ok(json!({
+            "removed": format!("{}/{}@{}", template.arch, template.name, template.version),
+        })),
+        Ok(Err(e)) if format!("{e:#}").contains("not found") => {
+            HttpResponse::NotFound().json(json!({"error": format!("{e:#}")}))
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(json!({"error": format!("{e:#}")})),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
 /// `GET /api/catalog/profiles` — guest OS profile names for the editor's
 /// profile picker.
 pub async fn catalog_profiles() -> HttpResponse {

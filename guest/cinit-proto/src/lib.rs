@@ -26,7 +26,17 @@ use serde::{Deserialize, Serialize};
 ///     the host spawns one virtiofsd per volume and attaches a
 ///     vhost-user-fs device; CIFS (`tag` absent + `smb`) remains the
 ///     fallback when the host has no virtiofsd.
-pub const PROTO_VERSION: u32 = 4;
+/// v5: idle mode and the `idle` lifecycle event allow an exec-driven
+///     container micro-VM to run without an OCI workload process.
+pub const PROTO_VERSION: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMode {
+    #[default]
+    Workload,
+    Idle,
+}
 
 /// A volume mounted into the container root, over virtiofs or CIFS.
 ///
@@ -99,8 +109,12 @@ fn default_health_retries() -> u32 {
 pub struct ContainerSpec {
     /// Guest hostname (also written to /etc/hostname and /etc/hosts).
     pub hostname: String,
-    /// OCI entrypoint. The process argv is `entrypoint ++ cmd`; at least one
-    /// of the two must be non-empty.
+    /// Whether to start the OCI workload or remain available for exec only.
+    #[serde(default)]
+    pub mode: RuntimeMode,
+    /// OCI entrypoint. In workload mode the process argv is
+    /// `entrypoint ++ cmd` and at least one must be non-empty; idle mode
+    /// ignores both fields.
     #[serde(default)]
     pub entrypoint: Vec<String>,
     /// OCI cmd (arguments appended to the entrypoint).
@@ -155,6 +169,8 @@ pub enum CtlEvent {
     NetUp { ip: String },
     /// The container process is running.
     Started { pid: u32 },
+    /// Rootfs, volumes and networking are prepared in exec-driven idle mode.
+    Idle,
     /// Healthcheck state changed (first pass, or `retries` consecutive
     /// failures, or recovery after failures).
     Health { healthy: bool },
@@ -176,8 +192,8 @@ pub enum CtlCommand {
     /// Resize the interactive shell's PTY (the `vmlab.tty.0` port). Applies
     /// to the current session and is remembered for future ones.
     TtyResize { cols: u16, rows: u16 },
-    /// Re-emit current state as events (`boot`, then `net_up`/`started`/
-    /// `health` as applicable). Sent after an online snapshot restore, where
+    /// Re-emit current state as events (`boot`, then `net_up`, `started` or
+    /// `idle`, and `health` as applicable). Sent after an online snapshot restore, where
     /// the resumed guest would otherwise never repeat its lifecycle events.
     Resync,
 }
@@ -197,6 +213,7 @@ mod tests {
     fn container_spec_roundtrips() {
         let spec = ContainerSpec {
             hostname: "web1".into(),
+            mode: RuntimeMode::Workload,
             entrypoint: vec!["/docker-entrypoint.sh".into()],
             cmd: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
             env: vec![("PATH".into(), "/usr/bin".into()), ("A".into(), "b".into())],
@@ -241,6 +258,7 @@ mod tests {
         let spec: ContainerSpec =
             serde_json::from_str(r#"{ "hostname": "c1", "cmd": ["/bin/sh"] }"#).unwrap();
         assert_eq!(spec.hostname, "c1");
+        assert_eq!(spec.mode, RuntimeMode::Workload);
         assert!(spec.entrypoint.is_empty());
         assert_eq!(spec.cmd, vec!["/bin/sh"]);
         assert_eq!(spec.stop_grace_secs, 10);
@@ -269,7 +287,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
-            r#"{"event":"boot","proto_version":4}"#
+            r#"{"event":"boot","proto_version":5}"#
         );
         let ev = CtlEvent::NetUp {
             ip: "10.0.0.9".into(),
@@ -283,6 +301,10 @@ mod tests {
             serde_json::to_string(&ev).unwrap(),
             r#"{"event":"exited","code":137}"#
         );
+        assert_eq!(
+            serde_json::to_string(&CtlEvent::Idle).unwrap(),
+            r#"{"event":"idle"}"#
+        );
     }
 
     #[test]
@@ -293,6 +315,7 @@ mod tests {
                 ip: "1.2.3.4".into(),
             },
             CtlEvent::Started { pid: 42 },
+            CtlEvent::Idle,
             CtlEvent::Health { healthy: false },
             CtlEvent::Exited { code: -1 },
         ] {

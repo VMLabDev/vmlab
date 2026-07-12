@@ -109,6 +109,7 @@ WCL
 let ex_container = <<'WCL'
 container "web" {
   image      = "nginx:1.27"              // docker.io shorthand; @sha256:… pins
+  mode       = :workload                  // :workload (default) | :idle
   depends_on = ["db"]                    // VM or container names — one namespace
   restart    = "on-failure"              // "no" (default) | "on-failure" | "always"
   nic    { segment = "corp" ip = "10.50.0.20" }

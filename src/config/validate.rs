@@ -234,6 +234,29 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             ));
         }
         check_dns_label(&c.name, c.span, "container name", &mut issues);
+        if c.mode == ContainerMode::Idle {
+            if c.entrypoint.is_some() || c.command.is_some() {
+                issues.push(Issue::at(
+                    c.span,
+                    format!(
+                        "idle container \"{}\" cannot declare `entrypoint` or `command`",
+                        c.name
+                    ),
+                ));
+            }
+            if c.healthcheck.is_some() {
+                issues.push(Issue::at(
+                    c.span,
+                    format!("idle container \"{}\" cannot declare a healthcheck", c.name),
+                ));
+            }
+            if c.restart != RestartPolicy::No {
+                issues.push(Issue::at(
+                    c.span,
+                    format!("idle container \"{}\" must use restart = \"no\"", c.name),
+                ));
+            }
+        }
         check_nics(
             lab,
             &c.nics,
@@ -1187,6 +1210,29 @@ lab "l" {
 }"#,
         );
         assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    #[test]
+    fn idle_container_rules() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "alpine" mode = :idle } }"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+
+        for (extra, expected) in [
+            (r#"entrypoint = ["/bin/sh"]"#, "entrypoint"),
+            (r#"command = ["sleep", "infinity"]"#, "command"),
+            (r#"healthcheck { command = ["true"] }"#, "healthcheck"),
+            (r#"restart = "always""#, "restart"),
+        ] {
+            assert_any_err(
+                &format!(
+                    "import <vmlab.wcl>\nlab \"l\" {{ container \"c\" {{ image = \"alpine\" mode = :idle {extra} }} }}"
+                ),
+                expected,
+            );
+        }
     }
 
     #[test]

@@ -344,6 +344,9 @@ pub struct Container {
     /// the OCI image layer at pull time.
     pub image: ImageRef,
     pub image_span: Span,
+    /// Workload mode runs the OCI process; idle mode keeps only the
+    /// micro-VM and guest agent running for exec-driven use.
+    pub mode: ContainerMode,
     /// Entrypoint override (exec form); `None` = image default.
     pub entrypoint: Option<Vec<String>>,
     /// Cmd override (exec form); `None` = image default.
@@ -363,6 +366,14 @@ pub struct Container {
     pub volumes: Vec<Volume>,
     pub ports: Vec<PortMap>,
     pub healthcheck: Option<Healthcheck>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerMode {
+    #[default]
+    Workload,
+    Idle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

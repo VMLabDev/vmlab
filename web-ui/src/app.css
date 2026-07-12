@@ -109,6 +109,21 @@
 .log-count { color: var(--fg-3); font-size: var(--fs-xs); margin-left: auto; }
 
 /* Templates page. */
+.cached-template-heading { display: inline-flex; align-items: center; gap: var(--sp-2); }
+.cached-template-table { overflow-x: auto; }
+.cached-template-table .ftable th:nth-child(2) { width: 150px; }
+.cached-template-table .ftable th:nth-child(3) { width: 150px; }
+.cached-template-table .ftable th:nth-child(4) { width: 150px; }
+.cached-template-table .ftable th:last-child { width: 52px; }
+.cached-template-name { margin-right: var(--sp-2); font-weight: 600; color: var(--fg-1); }
+.cached-template-version { font-family: var(--font-mono); font-size: var(--fs-sm); }
+.cached-template-actions { text-align: right; white-space: nowrap; }
+.cached-template-state {
+  min-height: 76px; padding: var(--sp-5); display: flex; align-items: center; gap: var(--sp-2);
+  color: var(--fg-3); font-size: var(--fs-sm);
+}
+.cached-template-warning { color: var(--fg-2); line-height: 1.55; }
+.cached-template-warning code { color: var(--fg-1); font-family: var(--font-mono); }
 .registry-table { overflow-x: auto; }
 .registry-table .ftable th:nth-child(2) { width: 130px; }
 .registry-table .ftable th:nth-child(3) { width: 190px; }

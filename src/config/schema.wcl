@@ -214,12 +214,16 @@ type Nic {
 
 // OCI container, run in a micro-VM. Attaches to segments exactly like a VM;
 // no NICs = air-gapped (exec/copy/logs still work via the agent channel).
+symbol_set ContainerMode { workload idle }
+
 @block("container")
 type Container {
   @doc("Container name (DNS label); unique per lab — VMs and containers share one namespace; the inline block label")
   @inline(0) name: utf8
   @doc("OCI image reference, e.g. `nginx:1.27` or `ghcr.io/owner/app@sha256:…` (required)")
   image: utf8
+  @doc("Runtime mode: `:workload` (default) starts the OCI process; `:idle` keeps the micro-VM available for exec without running it")
+  mode: ContainerMode?
   @doc("Override the image entrypoint (exec form, e.g. [\"/bin/sh\", \"-c\"])")
   entrypoint: list<utf8>?
   @doc("Override the image cmd (exec form)")

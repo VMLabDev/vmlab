@@ -127,6 +127,7 @@ export interface ContainerModel {
   /** OCI image reference exactly as written. */
   image: string;
   image_span: Span | null;
+  mode: "workload" | "idle";
   entrypoint: string[] | null;
   command: string[] | null;
   workdir: string | null;
@@ -328,6 +329,7 @@ export function emptyContainer(name: string, image: string): ContainerModel {
     name,
     image,
     image_span: null,
+    mode: "workload",
     entrypoint: null,
     command: null,
     workdir: null,

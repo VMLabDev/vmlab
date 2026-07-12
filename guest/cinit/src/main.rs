@@ -13,8 +13,9 @@
 //!  7. mount CIFS volumes from the segment gateway (network must be up;
 //!     the fallback when the host has no virtiofsd)
 //!  8. start bundled qemu-ga in the init namespace (not the container root)
-//!  9. resolve user, build env, clone namespaces + exec container, emit `started`
-//! 10. reap children; when the container exits: emit `exited`, power off
+//!  9. in idle mode emit `idle` and wait for stop; otherwise resolve user,
+//!     build env, clone namespaces + exec the container, and emit `started`
+//! 10. reap children; when a workload container exits: emit `exited`, power off
 //!
 //! Any fatal init error prints to the console and powers off, so the host's
 //! missing-`exited` handling classifies the VM as crashed.
@@ -42,7 +43,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 
-use vmlab_cinit_proto::{ContainerSpec, CtlCommand, CtlEvent, PROTO_VERSION};
+use vmlab_cinit_proto::{ContainerSpec, CtlCommand, CtlEvent, PROTO_VERSION, RuntimeMode};
 
 use crate::util::{Result, power_off};
 
@@ -146,6 +147,38 @@ fn run() -> Result<()> {
 
     // -- guest agent ---------------------------------------------------------
     spawn_qemu_ga();
+
+    if spec.mode == RuntimeMode::Idle {
+        println!("vmlab-cinit: idle mode; OCI entrypoint and cmd are disabled");
+        ctl.emit(&CtlEvent::Idle);
+        let ctl_replay = ctl.clone();
+        ctl.spawn_dispatcher(move |cmd| match cmd {
+            CtlCommand::Stop { .. } => {
+                println!("vmlab-cinit: idle stop requested");
+                power_off();
+            }
+            CtlCommand::Resync => {
+                println!("vmlab-cinit: resync requested");
+                ctl_replay.resync();
+            }
+            CtlCommand::TtyResize { .. } => {}
+            CtlCommand::Spec { .. } => {
+                eprintln!("vmlab-cinit: warning: spec received after boot, ignoring");
+            }
+        });
+        loop {
+            match waitpid(None::<Pid>, None) {
+                Ok(status) => {
+                    if let Some((pid, code)) = reap::exit_code(&status) {
+                        eprintln!("vmlab-cinit: idle child {pid} exited with code {code}");
+                    }
+                }
+                Err(Errno::EINTR) => {}
+                Err(Errno::ECHILD) => thread::sleep(Duration::from_millis(100)),
+                Err(e) => return Err(format!("waitpid: {e}")),
+            }
+        }
+    }
 
     // -- container -----------------------------------------------------------
     let user = match &spec.user {

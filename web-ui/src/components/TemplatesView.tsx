@@ -21,11 +21,13 @@ import {
   buildTemplate,
   publishTemplate,
   dismissTemplateOp,
+  loadTemplates,
   showToast,
   type TemplateOp,
 } from "../store";
-import { templateRemote } from "../api";
-import type { TemplateInfo, RemoteStatus } from "../api";
+import { listStoreTemplates, removeStoreTemplate, templateRemote } from "../api";
+import type { TemplateInfo, RemoteStatus, StoreTemplate } from "../api";
+import { confirmDialog } from "./dialogs";
 import {
   addRegistry,
   containerRegistry,
@@ -57,6 +59,7 @@ export default function TemplatesView() {
         sub={`${state.templates.length} defined · ${registries().length} OCI ${registries().length === 1 ? "registry" : "registries"}`}
       />
       <div class="stack">
+        <CachedTemplates />
         <RegistryInventory uses={registries()} />
         <Show
           when={state.templates.length}
@@ -66,6 +69,114 @@ export default function TemplatesView() {
         </Show>
       </div>
     </Show>
+  );
+}
+
+function CachedTemplates() {
+  const [templates, { mutate, refetch }] = createResource(listStoreTemplates);
+  const [removing, setRemoving] = createSignal<string | null>(null);
+  const key = (template: StoreTemplate) =>
+    `${template.arch}/${template.name}@${template.version}`;
+  const created = (value: string) =>
+    new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
+
+  const remove = async (template: StoreTemplate) => {
+    const ref = key(template);
+    const confirmed = await confirmDialog({
+      title: `Remove ${template.name}@${template.version}?`,
+      body: (
+        <div class="cached-template-warning">
+          This permanently removes <code>{ref}</code> from this machine. Any linked clones that
+          still use this template may stop working.
+        </div>
+      ),
+      confirmLabel: "Remove template",
+      danger: true,
+    });
+    if (!confirmed) return;
+
+    setRemoving(ref);
+    try {
+      await removeStoreTemplate(template);
+      mutate((current) => current?.filter((item) => key(item) !== ref));
+      await loadTemplates();
+      showToast(`Removed ${ref}`);
+    } catch (error) {
+      showToast(String(error), "danger");
+    } finally {
+      setRemoving(null);
+    }
+  };
+
+  return (
+    <Card
+      title={
+        <span class="cached-template-heading">
+          Cached on this machine
+          <Show when={templates()}>
+            {(items) => <Badge tone="neutral">{items().length}</Badge>}
+          </Show>
+        </span>
+      }
+      padded={false}
+      action={
+        <IconButton
+          icon={RefreshCw}
+          label="Refresh cached templates"
+          disabled={templates.loading}
+          onClick={() => void refetch()}
+        />
+      }
+    >
+      <Show when={!templates.loading} fallback={<div class="cached-template-state"><Spinner /> Reading local template store…</div>}>
+        <Show
+          when={!templates.error}
+          fallback={<Alert tone="danger">Could not read the local template store: {String(templates.error)}</Alert>}
+        >
+          <Show
+            when={templates()?.length}
+            fallback={<div class="cached-template-state">No templates are cached on this machine.</div>}
+          >
+            <div class="cached-template-table">
+              <Table aria-label="Templates cached on this machine">
+                <thead>
+                  <tr>
+                    <th>Template</th>
+                    <th>Version</th>
+                    <th>Profile</th>
+                    <th>Cached</th>
+                    <th aria-label="Actions" />
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={templates()}>
+                    {(template) => (
+                      <tr>
+                        <td>
+                          <span class="cached-template-name">{template.name}</span>
+                          <Badge>{template.arch}</Badge>
+                        </td>
+                        <td class="cached-template-version">{template.version}</td>
+                        <td>{template.profile ?? "—"}</td>
+                        <td>{created(template.created)}</td>
+                        <td class="cached-template-actions">
+                          <IconButton
+                            icon={Trash2}
+                            label={`Remove ${key(template)}`}
+                            disabled={removing() !== null}
+                            onClick={() => void remove(template)}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </Table>
+            </div>
+          </Show>
+        </Show>
+      </Show>
+    </Card>
   );
 }
 

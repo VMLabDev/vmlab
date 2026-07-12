@@ -281,6 +281,7 @@ lab "l" {
   segment "s" { subnet = "10.1.1.0/24" }
   container "web" {
     image      = "ghcr.io/owner/web:2.1"
+    mode       = :workload
     entrypoint = ["/entry.sh"]
     command    = ["--serve"]
     workdir    = "/srv"
@@ -302,7 +303,7 @@ lab "l" {
       start_period = 30s
     }
   }
-  container "db" { image = "postgres:16" nic { segment = "s" } }
+  container "db" { image = "postgres:16" mode = :idle nic { segment = "s" } }
 }
 "#;
         let lf = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap();
@@ -312,6 +313,7 @@ lab "l" {
         let web = &lab.containers[0];
         assert_eq!(web.name, "web");
         assert_eq!(web.image.reference, "ghcr.io/owner/web:2.1");
+        assert_eq!(web.mode, ContainerMode::Workload);
         assert_eq!(
             web.entrypoint.as_deref(),
             Some(&["/entry.sh".to_string()][..])
@@ -347,6 +349,7 @@ lab "l" {
         assert_eq!(hc.start_period, std::time::Duration::from_secs(30));
 
         let db = &lab.containers[1];
+        assert_eq!(db.mode, ContainerMode::Idle);
         assert_eq!(db.restart, RestartPolicy::No);
         assert!(db.entrypoint.is_none());
         assert!(db.command.is_none());

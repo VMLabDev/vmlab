@@ -196,6 +196,10 @@ async fn main() -> ExitCode {
                 web::get().to(api::catalog_templates),
             )
             .route(
+                "/api/catalog/templates/{arch}/{name}/{version}",
+                web::delete().to(api::delete_catalog_template),
+            )
+            .route(
                 "/api/catalog/profiles",
                 web::get().to(api::catalog_profiles),
             )

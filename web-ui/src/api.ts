@@ -46,6 +46,7 @@ async function req(path: string, opts: RequestInit = {}): Promise<any> {
 
 const post = (path: string, body?: unknown) =>
   req(path, { method: "POST", body: body ? JSON.stringify(body) : undefined });
+const del = (path: string) => req(path, { method: "DELETE" });
 
 // --- auth -----------------------------------------------------------------
 
@@ -387,6 +388,10 @@ export interface CatalogMeta {
 }
 
 export const listStoreTemplates = (): Promise<StoreTemplate[]> => req("/api/catalog/templates");
+export const removeStoreTemplate = (template: StoreTemplate): Promise<{ removed: string }> =>
+  del(
+    `/api/catalog/templates/${encodeURIComponent(template.arch)}/${encodeURIComponent(template.name)}/${encodeURIComponent(template.version)}`,
+  );
 export const listProfiles = (): Promise<string[]> => req("/api/catalog/profiles");
 export const catalogMeta = (): Promise<CatalogMeta> => req("/api/catalog/meta");
 

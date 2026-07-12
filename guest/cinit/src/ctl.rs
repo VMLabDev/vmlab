@@ -46,7 +46,7 @@ struct Pending {
 }
 
 /// Lifecycle events remembered for [`Ctl::resync`]: after an online snapshot
-/// restore the resumed guest never repeats `net_up`/`started`/`health`, so
+/// restore the resumed guest never repeats `net_up`/`started`/`idle`/`health`, so
 /// the host asks for a replay instead.
 #[derive(Default)]
 struct Replay {
@@ -146,7 +146,7 @@ impl Ctl {
             let mut replay = self.replay.lock().unwrap();
             match ev {
                 CtlEvent::NetUp { .. } => replay.net_up = Some(ev.clone()),
-                CtlEvent::Started { .. } => replay.started = Some(ev.clone()),
+                CtlEvent::Started { .. } | CtlEvent::Idle => replay.started = Some(ev.clone()),
                 CtlEvent::Health { .. } => replay.health = Some(ev.clone()),
                 _ => {}
             }
@@ -205,8 +205,8 @@ impl Ctl {
     }
 
     /// Replay current state for a host that just (re)attached — sent after an
-    /// online snapshot restore: `boot`, then whichever of `net_up`/`started`/
-    /// `health` have happened.
+    /// online snapshot restore: `boot`, then whichever of `net_up`,
+    /// `started`/`idle`, and `health` have happened.
     pub fn resync(&self) {
         self.emit(&CtlEvent::Boot {
             proto_version: PROTO_VERSION,

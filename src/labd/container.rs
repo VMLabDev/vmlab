@@ -16,7 +16,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::{Mutex, RwLock};
 
-use vmlab_cinit_proto::{ContainerSpec, CtlCommand, CtlEvent, HealthSpec, SmbInfo, VolumeMount};
+use vmlab_cinit_proto::{
+    ContainerSpec, CtlCommand, CtlEvent, HealthSpec, RuntimeMode, SmbInfo, VolumeMount,
+};
 
 use super::container_ctl::CtlHandle;
 use super::vm::{PowerState, StopReason};
@@ -205,9 +207,14 @@ pub fn build_spec(cfg: &model::Container, image: &ImageConfig, hostname: &str) -
         }),
         None => img.healthcheck.as_ref().and_then(health_from_image),
     };
+    let mode = match cfg.mode {
+        model::ContainerMode::Workload => RuntimeMode::Workload,
+        model::ContainerMode::Idle => RuntimeMode::Idle,
+    };
 
     ContainerSpec {
         hostname: hostname.to_string(),
+        mode,
         entrypoint,
         cmd,
         env,
@@ -235,7 +242,9 @@ pub fn build_spec(cfg: &model::Container, image: &ImageConfig, hostname: &str) -
         // `ContainerInstance::spec_for_guest`) — never persisted.
         smb: None,
         nics: cfg.nics.len() as u32,
-        healthcheck,
+        healthcheck: (mode == RuntimeMode::Workload)
+            .then_some(healthcheck)
+            .flatten(),
     }
 }
 
@@ -740,8 +749,8 @@ impl ContainerInstance {
         Ok(())
     }
 
-    /// Track ctl events for the run: `started`, health transitions (with the
-    /// `on_health` callback), and the exit code for stop classification.
+    /// Track ctl events for the run: `started`/`idle`, health transitions
+    /// (with the `on_health` callback), and the exit code for classification.
     fn spawn_ctl_watcher(self: &Arc<Self>, ctl: &CtlHandle, cbs: &Arc<Callbacks>) {
         let me = self.clone();
         let cbs = cbs.clone();
@@ -759,7 +768,9 @@ impl ContainerInstance {
                             tracing::warn!("{}: spec send failed: {e:#}", me.cfg.name);
                         }
                     }
-                    Ok(CtlEvent::Started { .. }) => *me.started.write().await = true,
+                    Ok(CtlEvent::Started { .. } | CtlEvent::Idle) => {
+                        *me.started.write().await = true
+                    }
                     Ok(CtlEvent::Health { healthy }) => {
                         let prev = me.healthy.write().await.replace(healthy);
                         if prev != Some(healthy) {
@@ -775,7 +786,8 @@ impl ContainerInstance {
         });
     }
 
-    /// Readiness (PRD §7.4 shape): ctl `started`, then the healthcheck gate —
+    /// Readiness (PRD §7.4 shape): ctl `started`/`idle`, then the applicable
+    /// healthcheck or guest-agent gate —
     /// ready when the container process runs and (no healthcheck || first
     /// healthy report). Deliberately NOT gated on the bundled agent: the
     /// entrypoint runs regardless (docker semantics), and an agent hiccup
@@ -794,6 +806,19 @@ impl ContainerInstance {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            // Idle mode has no workload to prove liveness. Its control plane
+            // is the useful service, so readiness waits for qemu-ga instead.
+            if me.cfg.mode == model::ContainerMode::Idle {
+                loop {
+                    if me.state().await != PowerState::Running {
+                        return;
+                    }
+                    if *me.agent_up.read().await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             }
             // Phase 2: the healthcheck gate. (Running implies the image is
             // bound; a missing one just means no healthcheck gate.)
@@ -1300,6 +1325,7 @@ mod tests {
                 reference: "nginx".into(),
             },
             image_span: (0, 0),
+            mode: model::ContainerMode::Workload,
             entrypoint: None,
             command: None,
             workdir: None,
@@ -1370,6 +1396,27 @@ mod tests {
         let spec = build_spec(&cfg, &img, "c");
         assert_eq!(spec.entrypoint, vec!["/e"]);
         assert_eq!(spec.cmd, vec!["run"]);
+    }
+
+    #[test]
+    fn idle_spec_disables_image_healthcheck() {
+        let img = image(RuntimeDefaults {
+            entrypoint: vec!["/entry.sh".into()],
+            cmd: vec!["serve".into()],
+            healthcheck: Some(crate::oci::image::model::ImageHealthcheck {
+                test: vec!["CMD".into(), "true".into()],
+                interval: Some(30_000_000_000),
+                timeout: Some(30_000_000_000),
+                retries: Some(3),
+                start_period: Some(0),
+            }),
+            ..Default::default()
+        });
+        let mut cfg = container("c");
+        cfg.mode = model::ContainerMode::Idle;
+        let spec = build_spec(&cfg, &img, "c");
+        assert_eq!(spec.mode, RuntimeMode::Idle);
+        assert!(spec.healthcheck.is_none());
     }
 
     // ---- build_spec: env merge ----------------------------------------------

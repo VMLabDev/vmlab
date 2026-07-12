@@ -260,6 +260,37 @@ fn get_enum<T: Copy>(
     }
 }
 
+fn get_symbol_enum<T: Copy>(
+    b: &Block,
+    name: &str,
+    table: &[(&str, T)],
+    issues: &mut IssueList,
+) -> Option<T> {
+    let (value, span) = raw_value(b, name, issues)?;
+    let Value::Symbol(symbol) = value else {
+        issues.push(Issue::at(
+            span,
+            format!("`{name}` must be a symbol, got {value:?}"),
+        ));
+        return None;
+    };
+    match table.iter().find(|(key, _)| *key == symbol) {
+        Some((_, value)) => Some(*value),
+        None => {
+            let allowed = table
+                .iter()
+                .map(|(key, _)| format!(":{key}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            issues.push(Issue::at(
+                span,
+                format!("`{name}` must be one of {allowed}, got `:{symbol}`"),
+            ));
+            None
+        }
+    }
+}
+
 // ---- block extractors ------------------------------------------------------
 
 fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
@@ -804,6 +835,20 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
             return None;
         }
     };
+    let mode = if b.field("mode").is_some() {
+        get_symbol_enum(
+            b,
+            "mode",
+            &[
+                ("workload", ContainerMode::Workload),
+                ("idle", ContainerMode::Idle),
+            ],
+            issues,
+        )
+        .unwrap_or_default()
+    } else {
+        ContainerMode::Workload
+    };
     let restart = if b.field("restart").is_some() {
         get_enum(
             b,
@@ -824,6 +869,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         span,
         image,
         image_span,
+        mode,
         entrypoint: get_opt_str_list(b, "entrypoint", issues),
         command: get_opt_str_list(b, "command", issues),
         workdir: get_str(b, "workdir", issues).map(|(s, _)| s),

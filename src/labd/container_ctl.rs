@@ -97,7 +97,7 @@ impl CtlHandle {
                     CtlEvent::NetUp { ip } => {
                         *reader_inner.last_ip.write().await = Some(ip.clone());
                     }
-                    CtlEvent::Started { .. } => {
+                    CtlEvent::Started { .. } | CtlEvent::Idle => {
                         let _ = started_tx.send(true);
                     }
                     CtlEvent::Exited { code } => {

@@ -6,10 +6,10 @@
 use serde::Serialize;
 
 use super::model::{
-    BlockRule, Connect, Container, DiskBlock, DnsRecord, EnvVar, Firmware, Forward, Gpu, GpuMode,
-    Handler, Healthcheck, HostPort, L4Proto, Lab, LabFile, Media, MediaKind, Nic, PortMap,
-    Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share, ShareTransport,
-    SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
+    BlockRule, Connect, Container, ContainerMode, DiskBlock, DnsRecord, EnvVar, Firmware, Forward,
+    Gpu, GpuMode, Handler, Healthcheck, HostPort, L4Proto, Lab, LabFile, Media, MediaKind, Nic,
+    PortMap, Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share,
+    ShareTransport, SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
 };
 
 #[derive(Serialize)]
@@ -329,6 +329,7 @@ pub struct ContainerDto {
     /// OCI image reference exactly as written (`image = "…"`).
     pub image: String,
     pub image_span: Span,
+    pub mode: ContainerMode,
     pub entrypoint: Option<Vec<String>>,
     pub command: Option<Vec<String>>,
     pub workdir: Option<String>,
@@ -352,6 +353,7 @@ impl From<&Container> for ContainerDto {
             span: c.span,
             image: c.image.reference.clone(),
             image_span: c.image_span,
+            mode: c.mode,
             entrypoint: c.entrypoint.clone(),
             command: c.command.clone(),
             workdir: c.workdir.clone(),
