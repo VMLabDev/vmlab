@@ -935,9 +935,20 @@ pub async fn template_ops(state: web::Data<AppState>, lab: web::Path<String>) ->
 pub async fn template_remote(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
+    query: web::Query<TemplateSelector>,
 ) -> HttpResponse {
     let (lab, tpl) = path.into_inner();
-    template_call(&state, &lab, "template.remote", json!({"template": tpl})).await
+    let mut args = json!({"template": tpl});
+    if let Some(arch) = &query.arch {
+        args["arch"] = json!(arch);
+    }
+    template_call(&state, &lab, "template.remote", args).await
+}
+
+#[derive(Deserialize)]
+pub struct TemplateSelector {
+    #[serde(default)]
+    arch: Option<String>,
 }
 
 /// `POST /api/labs/{lab}/templates/{tpl}/build` — start a background build;
@@ -945,13 +956,20 @@ pub async fn template_remote(
 pub async fn template_build(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
+    body: web::Json<TemplateSelector>,
 ) -> HttpResponse {
     let (lab, tpl) = path.into_inner();
-    template_call(&state, &lab, "template.build", json!({"template": tpl})).await
+    let mut args = json!({"template": tpl});
+    if let Some(arch) = &body.arch {
+        args["arch"] = json!(arch);
+    }
+    template_call(&state, &lab, "template.build", args).await
 }
 
 #[derive(Deserialize)]
 pub struct PublishBody {
+    #[serde(default)]
+    arch: Option<String>,
     /// Local store version to push; omitted = newest.
     #[serde(default)]
     version: Option<String>,
@@ -966,6 +984,9 @@ pub async fn template_publish(
 ) -> HttpResponse {
     let (lab, tpl) = path.into_inner();
     let mut args = json!({"template": tpl});
+    if let Some(arch) = &body.arch {
+        args["arch"] = json!(arch);
+    }
     if let Some(v) = &body.version {
         args["version"] = json!(v);
     }

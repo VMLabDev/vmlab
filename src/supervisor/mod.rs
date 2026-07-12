@@ -432,18 +432,22 @@ impl Handler for SupervisorHandler {
             "template.remote" => {
                 let (_, root) = lab_root_args(&args)?;
                 let template = args["template"].as_str().ok_or("missing template")?;
-                templates::remote(root, template.to_string()).await
+                let arch = args["arch"].as_str().map(String::from);
+                templates::remote(root, template.to_string(), arch).await
             }
             "template.build" => {
                 let (lab, root) = lab_root_args(&args)?;
                 let template = args["template"].as_str().ok_or("missing template")?;
-                templates::start_build(sup.clone(), lab, root, template.to_string()).await
+                let arch = args["arch"].as_str().map(String::from);
+                templates::start_build(sup.clone(), lab, root, template.to_string(), arch).await
             }
             "template.push" => {
                 let (lab, root) = lab_root_args(&args)?;
                 let template = args["template"].as_str().ok_or("missing template")?;
+                let arch = args["arch"].as_str().map(String::from);
                 let version = args["version"].as_str().map(String::from);
-                templates::start_push(sup.clone(), lab, root, template.to_string(), version).await
+                templates::start_push(sup.clone(), lab, root, template.to_string(), arch, version)
+                    .await
             }
             "template.op_status" => {
                 let lab = args["lab"].as_str().ok_or("missing lab")?;

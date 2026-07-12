@@ -202,6 +202,7 @@ export interface RemoteStatus {
 /** A running build/push with its recent log (GET /templates/ops). */
 export interface TemplateOpStatus {
   template: string;
+  arch: string;
   kind: string;
   started: string;
   log_tail: string[];
@@ -211,16 +212,18 @@ export const listTemplates = (lab: string): Promise<TemplateInfo[]> =>
   req(`/api/labs/${encodeURIComponent(lab)}/templates`);
 export const templateOps = (lab: string): Promise<TemplateOpStatus[]> =>
   req(`/api/labs/${encodeURIComponent(lab)}/templates/ops`);
-export const templateRemote = (lab: string, tpl: string): Promise<RemoteStatus> =>
+export const templateRemote = (lab: string, tpl: string, arch?: string): Promise<RemoteStatus> =>
   req(
-    `/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/remote`,
+    `/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/remote${arch ? `?arch=${encodeURIComponent(arch)}` : ""}`,
   );
-export const buildTemplate = (lab: string, tpl: string) =>
-  post(`/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/build`, {});
-export const publishTemplate = (lab: string, tpl: string, version?: string) =>
+export const buildTemplate = (lab: string, tpl: string, arch?: string) =>
+  post(`/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/build`, {
+    arch,
+  });
+export const publishTemplate = (lab: string, tpl: string, arch?: string, version?: string) =>
   post(
     `/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/publish`,
-    { version },
+    { arch, version },
   );
 
 // --- config editing -------------------------------------------------------

@@ -41,6 +41,7 @@ export interface Pull {
 export interface TemplateOp {
   lab: string;
   template: string;
+  arch: string;
   kind: string; // "build" | "push"
   status: "running" | "done" | "error";
   log: string[];
@@ -230,9 +231,10 @@ async function resyncTemplateOps() {
         if (op && op.status === "running") next[key] = undefined as unknown as TemplateOp;
       }
       for (const op of ops) {
-        next[`${lab}/${op.template}`] = {
+        next[`${lab}/${op.arch}/${op.template}`] = {
           lab,
           template: op.template,
+          arch: op.arch,
           kind: op.kind,
           status: "running",
           log: op.log_tail.slice(),
@@ -423,20 +425,20 @@ export const deleteSnapshot = (vm: string, name: string) =>
   run("Snapshot deleted", () => api.deleteSnapshot(state.currentLab!, vm, name));
 
 /** Start a template build; progress arrives as template.op.* events. */
-export async function buildTemplate(tpl: string) {
+export async function buildTemplate(tpl: string, arch: string) {
   try {
-    await api.buildTemplate(state.currentLab!, tpl);
-    showToast(`Building ${tpl}`);
+    await api.buildTemplate(state.currentLab!, tpl, arch);
+    showToast(`Building ${arch}/${tpl}`);
   } catch (e) {
     showToast(`Failed: ${e}`);
   }
 }
 
 /** Push a stored template version (default: newest) to its registry. */
-export async function publishTemplate(tpl: string, version?: string) {
+export async function publishTemplate(tpl: string, arch: string, version?: string) {
   try {
-    await api.publishTemplate(state.currentLab!, tpl, version);
-    showToast(`Publishing ${tpl}`);
+    await api.publishTemplate(state.currentLab!, tpl, arch, version);
+    showToast(`Publishing ${arch}/${tpl}`);
   } catch (e) {
     showToast(`Failed: ${e}`);
   }
@@ -600,11 +602,13 @@ const MAX_OP_LOG = 500;
 
 function handleTemplateOpEvent(ev: DaemonEvent) {
   const template = ev.data?.template as string | undefined;
-  if (!ev.lab || !template) return;
-  const key = `${ev.lab}/${template}`;
+  const arch = ev.data?.arch as string | undefined;
+  if (!ev.lab || !template || !arch) return;
+  const key = `${ev.lab}/${arch}/${template}`;
   const fresh = (): TemplateOp => ({
     lab: ev.lab,
     template,
+    arch,
     kind: String(ev.data.kind ?? "build"),
     status: "running",
     log: [],
@@ -639,7 +643,7 @@ function handleTemplateOpEvent(ev: DaemonEvent) {
         version: ev.data.version,
       }));
       showToast(
-        `${ev.data.kind === "push" ? "Published" : "Built"} ${template}@${ev.data.version ?? ""}`,
+        `${ev.data.kind === "push" ? "Published" : "Built"} ${arch}/${template}@${ev.data.version ?? ""}`,
       );
       loadTemplates();
       break;
@@ -649,7 +653,7 @@ function handleTemplateOpEvent(ev: DaemonEvent) {
         status: "error" as const,
         error: String(ev.data.error ?? "operation failed"),
       }));
-      showToast(`Failed: ${template}`);
+      showToast(`Failed: ${arch}/${template}`);
       loadTemplates();
       break;
   }
@@ -666,7 +670,9 @@ export function currentTemplateOps(): TemplateOp[] {
   if (!lab) return [];
   return Object.values(state.templateOps)
     .filter((o): o is TemplateOp => !!o && o.lab === lab)
-    .sort((a, b) => a.template.localeCompare(b.template));
+    .sort((a, b) =>
+      a.template.localeCompare(b.template) || a.arch.localeCompare(b.arch),
+    );
 }
 
 /** Active template pulls for the current lab, newest-stable order by vm name. */

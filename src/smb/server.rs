@@ -194,15 +194,12 @@ fn clear_stale_pidfile(config: &SmbConfig) {
     if pid <= 0 {
         return;
     }
-    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-        Err(nix::errno::Errno::ESRCH) => {
-            if let Err(error) = std::fs::remove_file(&path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::debug!(path = %path.display(), %error, "failed to remove stale smbd pidfile");
-            }
-        }
-        _ => {}
+    if let Err(nix::errno::Errno::ESRCH) =
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+        && let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(path = %path.display(), %error, "failed to remove stale smbd pidfile");
     }
 }
 

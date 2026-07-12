@@ -24,22 +24,33 @@ struct OpState {
     log: VecDeque<String>,
 }
 
-/// Registry of in-flight template operations, keyed by `(lab, template)` —
+type OpKey = (String, String, String);
+
+/// Registry of in-flight template operations, keyed by `(lab, arch, template)` —
 /// one operation per template at a time (a push cannot race its own build),
 /// different templates may run concurrently.
 #[derive(Clone, Default)]
 pub struct TemplateOps {
-    inner: Arc<Mutex<HashMap<(String, String), OpState>>>,
+    inner: Arc<Mutex<HashMap<OpKey, OpState>>>,
 }
 
 impl TemplateOps {
     /// Claim `(lab, template)` for `kind`; the returned guard releases the
     /// claim on drop, so error and panic paths cannot wedge a template.
-    fn try_begin(&self, lab: &str, template: &str, kind: &'static str) -> Result<OpGuard, String> {
-        let key = (lab.to_string(), template.to_string());
+    fn try_begin(
+        &self,
+        lab: &str,
+        arch: &str,
+        template: &str,
+        kind: &'static str,
+    ) -> Result<OpGuard, String> {
+        let key = (lab.to_string(), arch.to_string(), template.to_string());
         let mut ops = self.inner.lock().unwrap();
         if let Some(op) = ops.get(&key) {
-            return Err(format!("{} already running for `{template}`", op.kind));
+            return Err(format!(
+                "{} already running for `{arch}/{template}`",
+                op.kind
+            ));
         }
         ops.insert(
             key.clone(),
@@ -55,9 +66,9 @@ impl TemplateOps {
         })
     }
 
-    fn append_log(&self, lab: &str, template: &str, line: &str) {
+    fn append_log(&self, lab: &str, arch: &str, template: &str, line: &str) {
         let mut ops = self.inner.lock().unwrap();
-        if let Some(op) = ops.get_mut(&(lab.to_string(), template.to_string())) {
+        if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
             if op.log.len() == LOG_CAP {
                 op.log.pop_front();
             }
@@ -66,9 +77,9 @@ impl TemplateOps {
     }
 
     /// The running operation for `(lab, template)`, as JSON for `template.list`.
-    fn op_of(&self, lab: &str, template: &str) -> Value {
+    fn op_of(&self, lab: &str, arch: &str, template: &str) -> Value {
         let ops = self.inner.lock().unwrap();
-        match ops.get(&(lab.to_string(), template.to_string())) {
+        match ops.get(&(lab.to_string(), arch.to_string(), template.to_string())) {
             Some(op) => json!({"kind": op.kind, "started": op.started.to_rfc3339()}),
             None => Value::Null,
         }
@@ -80,9 +91,10 @@ impl TemplateOps {
         let ops = self.inner.lock().unwrap();
         let mut rows: Vec<Value> = ops
             .iter()
-            .filter(|((l, _), _)| l == lab)
-            .map(|((_, template), op)| {
+            .filter(|((l, _, _), _)| l == lab)
+            .map(|((_, arch, template), op)| {
                 json!({
+                    "arch": arch,
                     "template": template,
                     "kind": op.kind,
                     "started": op.started.to_rfc3339(),
@@ -90,7 +102,12 @@ impl TemplateOps {
                 })
             })
             .collect();
-        rows.sort_by(|a, b| a["template"].as_str().cmp(&b["template"].as_str()));
+        rows.sort_by(|a, b| {
+            a["template"]
+                .as_str()
+                .cmp(&b["template"].as_str())
+                .then_with(|| a["arch"].as_str().cmp(&b["arch"].as_str()))
+        });
         Value::Array(rows)
     }
 }
@@ -98,7 +115,7 @@ impl TemplateOps {
 /// Releases a [`TemplateOps`] claim on drop.
 struct OpGuard {
     ops: TemplateOps,
-    key: (String, String),
+    key: OpKey,
 }
 
 impl Drop for OpGuard {
@@ -118,11 +135,20 @@ fn load_defs(root: &Path) -> Result<Vec<TemplateDef>, String> {
     Ok(tf.templates)
 }
 
-fn find_def(root: &Path, template: &str) -> Result<TemplateDef, String> {
-    load_defs(root)?
+fn find_def(root: &Path, template: &str, arch: Option<&str>) -> Result<TemplateDef, String> {
+    let mut matches = load_defs(root)?
         .into_iter()
-        .find(|d| d.name == template)
-        .ok_or_else(|| format!("no template named `{template}` in the lab config"))
+        .filter(|d| d.name == template && arch.is_none_or(|a| d.arch == a));
+    let first = matches.next().ok_or_else(|| match arch {
+        Some(arch) => format!("no template named `{arch}/{template}` in the lab config"),
+        None => format!("no template named `{template}` in the lab config"),
+    })?;
+    if arch.is_none() && matches.next().is_some() {
+        return Err(format!(
+            "template name `{template}` is ambiguous; specify its architecture"
+        ));
+    }
+    Ok(first)
 }
 
 /// `template.list`: the lab's template definitions joined with their local
@@ -152,7 +178,11 @@ pub async fn list(lab: String, root: PathBuf, ops: TemplateOps) -> Result<Value,
     let rows: Vec<Value> = entries
         .into_iter()
         .map(|mut e| {
-            e["op"] = ops.op_of(&lab, e["name"].as_str().unwrap_or_default());
+            e["op"] = ops.op_of(
+                &lab,
+                e["arch"].as_str().unwrap_or_default(),
+                e["name"].as_str().unwrap_or_default(),
+            );
             e
         })
         .collect();
@@ -161,12 +191,16 @@ pub async fn list(lab: String, root: PathBuf, ops: TemplateOps) -> Result<Value,
 
 /// `template.remote`: the concrete version tags (and their arches) published
 /// under the template's registry, newest first.
-pub async fn remote(root: PathBuf, template: String) -> Result<Value, String> {
+pub async fn remote(
+    root: PathBuf,
+    template: String,
+    arch: Option<String>,
+) -> Result<Value, String> {
     use futures::StreamExt as _;
 
     let def = {
         let template = template.clone();
-        tokio::task::spawn_blocking(move || find_def(&root, &template))
+        tokio::task::spawn_blocking(move || find_def(&root, &template, arch.as_deref()))
             .await
             .map_err(|e| e.to_string())??
     };
@@ -202,11 +236,12 @@ pub async fn start_build(
     lab: String,
     root: PathBuf,
     template: String,
+    arch: Option<String>,
 ) -> Result<Value, String> {
     let (def, profiles) = {
-        let (root, template) = (root.clone(), template.clone());
+        let (root, template, arch) = (root.clone(), template.clone(), arch.clone());
         tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let def = find_def(&root, &template)?;
+            let def = find_def(&root, &template, arch.as_deref())?;
             let profiles = crate::profiles::ProfileSet::load_default()
                 .map_err(|e| format!("loading profiles: {e:#}"))?;
             Ok((def, profiles))
@@ -214,15 +249,24 @@ pub async fn start_build(
         .await
         .map_err(|e| e.to_string())??
     };
+    let arch = def.arch.clone();
 
-    let guard = sup.template_ops.try_begin(&lab, &template, "build")?;
+    let guard = sup
+        .template_ops
+        .try_begin(&lab, &arch, &template, "build")?;
     sup.emit(Event::new(
         "template.op.start",
         &*lab,
-        json!({"template": template, "kind": "build"}),
+        json!({"template": template, "arch": arch, "kind": "build"}),
     ));
 
-    let log = op_sink(sup.clone(), lab.clone(), template.clone(), "build");
+    let log = op_sink(
+        sup.clone(),
+        lab.clone(),
+        arch.clone(),
+        template.clone(),
+        "build",
+    );
     tokio::spawn(async move {
         let _guard = guard;
         let store = TemplateStore::new(crate::paths::template_store_dir());
@@ -232,12 +276,12 @@ pub async fn start_build(
             Ok(meta) => sup.emit(Event::new(
                 "template.op.done",
                 &*lab,
-                json!({"template": template, "kind": "build", "version": meta.version}),
+                json!({"template": template, "arch": arch, "kind": "build", "version": meta.version}),
             )),
             Err(e) => sup.emit(Event::new(
                 "template.op.error",
                 &*lab,
-                json!({"template": template, "kind": "build", "error": format!("{e:#}")}),
+                json!({"template": template, "arch": arch, "kind": "build", "error": format!("{e:#}")}),
             )),
         }
     });
@@ -251,12 +295,13 @@ pub async fn start_push(
     lab: String,
     root: PathBuf,
     template: String,
+    arch: Option<String>,
     version: Option<String>,
 ) -> Result<Value, String> {
     let (resolved, repo) = {
-        let (root, template) = (root.clone(), template.clone());
+        let (root, template, arch) = (root.clone(), template.clone(), arch.clone());
         tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let def = find_def(&root, &template)?;
+            let def = find_def(&root, &template, arch.as_deref())?;
             let store = TemplateStore::new(crate::paths::template_store_dir());
             let resolved = store
                 .resolve(&def.arch, &def.name, version.as_deref())
@@ -273,29 +318,38 @@ pub async fn start_push(
         .map_err(|e| e.to_string())??
     };
     let version = resolved.meta.version.clone();
+    let arch = resolved.meta.arch.clone();
     let target = crate::oci::with_version_tag(&repo, &version).map_err(|e| format!("{e:#}"))?;
 
-    let guard = sup.template_ops.try_begin(&lab, &template, "push")?;
+    let guard = sup.template_ops.try_begin(&lab, &arch, &template, "push")?;
     sup.emit(Event::new(
         "template.op.start",
         &*lab,
-        json!({"template": template, "kind": "push", "version": version}),
+        json!({"template": template, "arch": arch, "kind": "push", "version": version}),
     ));
 
-    let log = op_sink(sup.clone(), lab.clone(), template.clone(), "push");
+    let log = op_sink(
+        sup.clone(),
+        lab.clone(),
+        arch.clone(),
+        template.clone(),
+        "push",
+    );
     let started_version = version.clone();
     tokio::spawn(async move {
         let _guard = guard;
-        let arch = resolved.meta.arch.clone();
+        let push_arch = resolved.meta.arch.clone();
         let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
-        log(format!("pushing {arch}/{template}@{version} to {target}\n"));
+        log(format!(
+            "pushing {push_arch}/{template}@{version} to {target}\n"
+        ));
         // No source-repo annotation: the daemon's cwd says nothing about the
         // template's git origin (the CLI detects it from the caller's cwd).
         let result = crate::template::oci_bridge::push(
             &resolved.dir,
             &target,
             host_cfg.oci_chunk_size,
-            &arch,
+            &push_arch,
             None,
             Some("latest"),
         )
@@ -304,7 +358,7 @@ pub async fn start_push(
             Ok(()) => sup.emit(Event::new(
                 "template.op.done",
                 &*lab,
-                json!({"template": template, "kind": "push", "version": version}),
+                json!({"template": template, "arch": arch, "kind": "push", "version": version}),
             )),
             Err(e) => {
                 let mut error = format!("{e:#}");
@@ -314,7 +368,7 @@ pub async fn start_push(
                 sup.emit(Event::new(
                     "template.op.error",
                     &*lab,
-                    json!({"template": template, "kind": "push", "error": error}),
+                    json!({"template": template, "arch": arch, "kind": "push", "error": error}),
                 ));
             }
         }
@@ -327,16 +381,17 @@ pub async fn start_push(
 fn op_sink(
     sup: Arc<Supervisor>,
     lab: String,
+    arch: String,
     template: String,
     kind: &'static str,
 ) -> crate::scripting::OutputSink {
     Arc::new(move |text: String| {
         for line in text.split('\n').filter(|l| !l.trim().is_empty()) {
-            sup.template_ops.append_log(&lab, &template, line);
+            sup.template_ops.append_log(&lab, &arch, &template, line);
             sup.emit(Event::new(
                 "template.op.log",
                 &*lab,
-                json!({"template": template, "kind": kind, "line": line}),
+                json!({"template": template, "arch": arch, "kind": kind, "line": line}),
             ));
         }
     })
@@ -349,50 +404,52 @@ mod tests {
     #[test]
     fn second_op_on_same_template_rejected() {
         let ops = TemplateOps::default();
-        let _guard = ops.try_begin("lab1", "base", "build").unwrap();
-        let Err(err) = ops.try_begin("lab1", "base", "push") else {
+        let _guard = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
+        let Err(err) = ops.try_begin("lab1", "x86_64", "base", "push") else {
             panic!("second claim should be rejected");
         };
         assert!(err.contains("build already running"), "{err}");
         // Other templates and other labs are unaffected.
-        ops.try_begin("lab1", "other", "build").unwrap();
-        ops.try_begin("lab2", "base", "build").unwrap();
+        ops.try_begin("lab1", "aarch64", "base", "build").unwrap();
+        ops.try_begin("lab1", "x86_64", "other", "build").unwrap();
+        ops.try_begin("lab2", "x86_64", "base", "build").unwrap();
     }
 
     #[test]
     fn guard_drop_releases_claim() {
         let ops = TemplateOps::default();
-        drop(ops.try_begin("lab1", "base", "build").unwrap());
-        ops.try_begin("lab1", "base", "push").unwrap();
+        drop(ops.try_begin("lab1", "x86_64", "base", "build").unwrap());
+        ops.try_begin("lab1", "x86_64", "base", "push").unwrap();
     }
 
     #[test]
     fn log_ring_caps_and_status_reports_tail() {
         let ops = TemplateOps::default();
-        let _guard = ops.try_begin("lab1", "base", "build").unwrap();
+        let _guard = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
         for i in 0..(LOG_CAP + 10) {
-            ops.append_log("lab1", "base", &format!("line {i}"));
+            ops.append_log("lab1", "x86_64", "base", &format!("line {i}"));
         }
         let status = ops.status("lab1");
         let rows = status.as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["template"], "base");
+        assert_eq!(rows[0]["arch"], "x86_64");
         assert_eq!(rows[0]["kind"], "build");
         let tail = rows[0]["log_tail"].as_array().unwrap();
         assert_eq!(tail.len(), LOG_CAP);
         assert_eq!(tail[0], "line 10");
         assert_eq!(tail[LOG_CAP - 1], format!("line {}", LOG_CAP + 9));
         // Logs to a template with no running op are dropped, not panics.
-        ops.append_log("lab1", "ghost", "ignored");
+        ops.append_log("lab1", "x86_64", "ghost", "ignored");
         assert!(ops.status("lab2").as_array().unwrap().is_empty());
     }
 
     #[test]
     fn op_of_reflects_running_state() {
         let ops = TemplateOps::default();
-        assert_eq!(ops.op_of("lab1", "base"), Value::Null);
-        let _guard = ops.try_begin("lab1", "base", "push").unwrap();
-        let op = ops.op_of("lab1", "base");
+        assert_eq!(ops.op_of("lab1", "x86_64", "base"), Value::Null);
+        let _guard = ops.try_begin("lab1", "x86_64", "base", "push").unwrap();
+        let op = ops.op_of("lab1", "x86_64", "base");
         assert_eq!(op["kind"], "push");
         assert!(op["started"].as_str().is_some());
     }
@@ -413,7 +470,7 @@ template "base" {
         )
         .unwrap();
         let ops = TemplateOps::default();
-        let _guard = ops.try_begin("lab1", "base", "build").unwrap();
+        let _guard = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
         let rows = list("lab1".into(), root.path().to_path_buf(), ops)
             .await
             .unwrap();
@@ -435,8 +492,27 @@ template "base" {
             "import <vmlab.wcl>\ntemplate \"base\" { arch = \"x86_64\" version = \"1\" source \"scratch\" { } }\n",
         )
         .unwrap();
-        assert!(find_def(root.path(), "base").is_ok());
-        let err = find_def(root.path(), "nope").unwrap_err();
+        assert!(find_def(root.path(), "base", None).is_ok());
+        let err = find_def(root.path(), "nope", None).unwrap_err();
         assert!(err.contains("no template named"), "{err}");
+    }
+
+    #[test]
+    fn find_def_requires_arch_for_duplicate_names() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(crate::paths::LAB_FILE),
+            r#"import <vmlab.wcl>
+template "base" { arch = "x86_64" version = "1" source "scratch" { } }
+template "base" { arch = "aarch64" version = "1" source "scratch" { } }
+"#,
+        )
+        .unwrap();
+        let err = find_def(root.path(), "base", None).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert_eq!(
+            find_def(root.path(), "base", Some("aarch64")).unwrap().arch,
+            "aarch64"
+        );
     }
 }

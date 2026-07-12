@@ -366,7 +366,7 @@ function RegistryInventory(p: { uses: RegistryEntry[] }) {
 }
 
 function TemplateCard(p: { t: TemplateInfo }) {
-  const key = () => `${state.currentLab}/${p.t.name}`;
+  const key = () => `${state.currentLab}/${p.t.arch}/${p.t.name}`;
   const op = (): TemplateOp | undefined => state.templateOps[key()];
   const running = () => op()?.status === "running" || p.t.op !== null;
   const [version, setVersion] = createSignal<string | null>(null);
@@ -375,7 +375,7 @@ function TemplateCard(p: { t: TemplateInfo }) {
 
   const publish = () => {
     const v = selected();
-    if (v) publishTemplate(p.t.name, v);
+    if (v) publishTemplate(p.t.name, p.t.arch, v);
   };
 
   return (
@@ -397,7 +397,7 @@ function TemplateCard(p: { t: TemplateInfo }) {
             variant="primary"
             icon={Play}
             disabled={running()}
-            onClick={() => buildTemplate(p.t.name)}
+            onClick={() => buildTemplate(p.t.name, p.t.arch)}
           >
             Build
           </Button>
@@ -452,8 +452,8 @@ function TemplateCard(p: { t: TemplateInfo }) {
 function RemotePanel(p: { t: TemplateInfo }) {
   const [tick, setTick] = createSignal(0);
   const [remote] = createResource(
-    () => (p.t.registry ? `${p.t.name}:${tick()}` : null),
-    (): Promise<RemoteStatus> => templateRemote(state.currentLab!, p.t.name),
+    () => (p.t.registry ? `${p.t.arch}/${p.t.name}:${tick()}` : null),
+    (): Promise<RemoteStatus> => templateRemote(state.currentLab!, p.t.name, p.t.arch),
   );
   return (
     <div>
