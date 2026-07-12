@@ -39,7 +39,7 @@ import {
   setEditor,
   storeTemplateFor,
 } from "../../editor/store";
-import { anyVmRunning, containerIsUp, vmIsUp } from "../../store";
+import { anyVmRunning } from "../../store";
 import { confirmDialog } from "../dialogs";
 import BlockForm from "./BlockForm";
 import BlockList from "./BlockList";
@@ -58,28 +58,13 @@ const mutate = (fn: (d: LabModel) => void) =>
 
 export default function Inspector(props: { onEditProvision: (path: string) => void }) {
   const sel = () => editor.selection;
-  const readOnly = () => {
-    const selection = sel();
-    if (selection.kind === "vm") {
-      const name = editor.draft?.vms[selection.index]?.name;
-      return name ? vmIsUp(name) : false;
-    }
-    if (selection.kind === "container") {
-      const name = editor.draft?.containers[selection.index]?.name;
-      return name ? containerIsUp(name) : false;
-    }
-    return (selection.kind === "segment" || selection.kind === "remote") && anyVmRunning();
-  };
-  const readOnlyMessage = () =>
-    sel().kind === "segment" || sel().kind === "remote"
-      ? "Networking is read-only while any machine is up."
-      : "Properties are read-only while this machine is up.";
+  const readOnly = () => anyVmRunning();
 
   return (
     <div class="inspector">
       <Show when={readOnly()}>
         <div class="inspector-lock" role="status">
-          {readOnlyMessage()}
+          Configuration is read-only while any VM or container is powered on.
         </div>
       </Show>
       <fieldset class="inspector-fields" disabled={readOnly()}>

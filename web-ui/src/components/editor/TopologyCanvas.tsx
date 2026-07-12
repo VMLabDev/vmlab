@@ -31,6 +31,7 @@ import {
   Router,
   Server,
   Square,
+  SquareTerminal,
   Trash2,
   Waypoints,
 } from "lucide-solid";
@@ -99,6 +100,7 @@ import {
   containerStart,
   containerStop,
   look,
+  showContainer,
   showVm,
   state,
   vmIsUp,
@@ -290,16 +292,27 @@ function NicIpEditor(props: {
   onChange: (value: string | null) => void;
   onGatewayChange: (enabled: boolean) => void;
 }) {
-  const [draft, setDraft] = createSignal(props.staticIp ?? props.assignedIp ?? "");
+  const [draft, setDraft] = createSignal(props.staticIp ?? "");
   const [open, setOpen] = createSignal(false);
   createEffect(() => {
-    const value = props.staticIp ?? props.assignedIp ?? "";
-    if (!open()) setDraft(value);
+    if (!open()) setDraft(props.staticIp ?? "");
   });
-  const error = () => props.validate(draft().trim());
+  const error = () => {
+    const value = draft().trim();
+    return value ? props.validate(value) : null;
+  };
   const mode = () => (props.gateway ? "GATEWAY" : props.staticIp ? "STATIC" : "AUTO");
   const address = () => props.staticIp ?? props.assignedIp ?? "awaiting address";
   const close = () => setOpen(false);
+  const canApply = () => {
+    const value = draft().trim();
+    return !props.disabled && (!value || (props.staticAllowed && !error()));
+  };
+  const apply = () => {
+    if (!canApply()) return;
+    props.onChange(draft().trim() || null);
+    close();
+  };
 
   return (
     <>
@@ -344,24 +357,26 @@ function NicIpEditor(props: {
             when={props.gateway}
             fallback={
               <>
-                <Button
-                  disabled={props.disabled}
-                  onClick={() => {
-                    props.onChange(null);
-                    setDraft(props.assignedIp ?? "");
-                    close();
-                  }}
-                >
-                  Use automatic address
-                </Button>
                 <Input
-                  label="Static address"
-                  placeholder="10.0.0.10"
+                  label="IP address"
+                  placeholder="Leave blank for automatic assignment"
                   value={draft()}
-                  disabled={props.disabled || !props.staticAllowed}
-                  error={!!draft().trim() && !!error()}
+                  disabled={props.disabled}
+                  error={
+                    !!draft().trim() && (!props.staticAllowed || !!error())
+                  }
                   onInput={(e) => setDraft(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      apply();
+                    }
+                  }}
                 />
+                <div class="topo-nic-ip-hint">
+                  Enter an address to make this NIC static. Leave it blank to use automatic
+                  assignment.
+                </div>
                 <Show when={!props.staticAllowed}>
                   <div class="topo-nic-ip-error">
                     Static addresses require a declared network segment.
@@ -372,15 +387,10 @@ function NicIpEditor(props: {
                 </Show>
                 <Button
                   variant="primary"
-                  disabled={
-                    props.disabled || !props.staticAllowed || !draft().trim() || !!error()
-                  }
-                  onClick={() => {
-                    props.onChange(draft().trim());
-                    close();
-                  }}
+                  disabled={!canApply()}
+                  onClick={apply}
                 >
-                  Apply static address
+                  Apply address
                 </Button>
                 <div class="topo-nic-gateway-card">
                   <div>
@@ -415,7 +425,7 @@ function NicIpEditor(props: {
                 disabled={props.disabled}
                 onClick={() => {
                   props.onGatewayChange(false);
-                  setDraft(props.assignedIp ?? "");
+                  setDraft("");
                   close();
                 }}
               >
@@ -1159,6 +1169,10 @@ export default function TopologyCanvas(props: {
    *  any number of VM/container targets. */
   function dependencyDown(e: PointerEvent, kind: MachineKind, index: number) {
     e.stopPropagation();
+    if (anyVmRunning()) {
+      select({ kind, index });
+      return;
+    }
     const w = world(e);
     setDependencyDrag({ kind, index, existing: null, moved: false, x: w.x, y: w.y });
   }
@@ -1169,6 +1183,7 @@ export default function TopologyCanvas(props: {
     link: { sourceKind: MachineKind; sourceIndex: number; targetName: string },
   ) {
     e.stopPropagation();
+    if (anyVmRunning()) return;
     const w = world(e);
     setDependencyDrag({
       kind: link.sourceKind,
@@ -1182,6 +1197,10 @@ export default function TopologyCanvas(props: {
 
   function provisionTargetDown(e: PointerEvent, provisionIndex: number) {
     e.stopPropagation();
+    if (anyVmRunning()) {
+      select({ kind: "provision", index: provisionIndex });
+      return;
+    }
     const point = world(e);
     setProvisionTargetDrag({ provisionIndex, existing: null, moved: false, ...point });
   }
@@ -1191,6 +1210,7 @@ export default function TopologyCanvas(props: {
     link: { provisionIndex: number; targetName: string },
   ) {
     e.stopPropagation();
+    if (anyVmRunning()) return;
     const point = world(e);
     setProvisionTargetDrag({
       provisionIndex: link.provisionIndex,
@@ -1202,6 +1222,7 @@ export default function TopologyCanvas(props: {
 
   function eventTargetDown(e: PointerEvent, handlerIndex: number) {
     e.stopPropagation();
+    if (anyVmRunning()) return;
     const point = world(e);
     setEventTargetDrag({ handlerIndex, existing: null, moved: false, ...point });
   }
@@ -1211,6 +1232,7 @@ export default function TopologyCanvas(props: {
     link: { handlerIndex: number; targetName: string },
   ) {
     e.stopPropagation();
+    if (anyVmRunning()) return;
     const point = world(e);
     setEventTargetDrag({
       handlerIndex: link.handlerIndex,
@@ -1602,6 +1624,7 @@ export default function TopologyCanvas(props: {
 
   async function onKey(e: KeyboardEvent) {
     if (e.key !== "Delete" && e.key !== "Backspace") return;
+    if (anyVmRunning()) return;
     const sel = editor.selection;
     if (sel.kind === "vm") {
       const vm = model().vms[sel.index];
@@ -2062,15 +2085,21 @@ export default function TopologyCanvas(props: {
     y: number;
     act: string;
     title: string;
+    disabled?: boolean;
     onClick: () => void;
     children: any;
   }) {
     return (
       <g
         class={`topo-console act-${props.act}`}
+        classList={{ disabled: props.disabled }}
         transform={`translate(${props.x} ${props.y})`}
+        aria-disabled={props.disabled ? "true" : undefined}
         onPointerDown={(e: PointerEvent) => e.stopPropagation()}
-        onClick={props.onClick}
+        onClick={(e: MouseEvent) => {
+          e.stopPropagation();
+          if (!props.disabled) props.onClick();
+        }}
       >
         <rect width="18" height="16" rx="4" />
         <g transform="translate(3.5 2.5)">{props.children}</g>
@@ -2121,10 +2150,22 @@ export default function TopologyCanvas(props: {
   return (
     <div class="topo-wrap">
       <div class="topo-toolbar">
-        <Button size="sm" icon={Monitor} onClick={() => addVm()}>
+        <Button
+          size="sm"
+          icon={Monitor}
+          onClick={() => addVm()}
+          disabled={anyVmRunning()}
+          title={anyVmRunning() ? "Configuration is locked while a machine is up" : undefined}
+        >
           Add VM
         </Button>
-        <Button size="sm" icon={Container} onClick={() => addContainer()}>
+        <Button
+          size="sm"
+          icon={Container}
+          onClick={() => addContainer()}
+          disabled={anyVmRunning()}
+          title={anyVmRunning() ? "Configuration is locked while a machine is up" : undefined}
+        >
           Add container
         </Button>
         <Button
@@ -2170,6 +2211,8 @@ export default function TopologyCanvas(props: {
           variant="ghost"
           icon={FilePenLine}
           onClick={props.onEditConfig}
+          disabled={anyVmRunning()}
+          title={anyVmRunning() ? "Configuration is locked while a machine is up" : undefined}
         >
           Edit vmlab.wcl
         </Button>
@@ -2338,12 +2381,14 @@ export default function TopologyCanvas(props: {
                 <Show when={!grabbed()}>
                   <g
                     class="topo-provision-link"
+                    classList={{ locked: anyVmRunning() }}
                     onPointerDown={(event: PointerEvent) => provisionLinkGrab(event, link)}
                   >
                     <path class="topo-provision-link-hit" d={path()}>
                       <title>
-                        {model().provisions[link.provisionIndex]?.script} applies to {link.targetName}
-                        — drag to re-home or remove
+                        {anyVmRunning()
+                          ? "Configuration is locked while a machine is up"
+                          : `${model().provisions[link.provisionIndex]?.script} applies to ${link.targetName} — drag to re-home or remove`}
                       </title>
                     </path>
                     <path
@@ -2383,11 +2428,14 @@ export default function TopologyCanvas(props: {
                 <Show when={!grabbed()}>
                   <g
                     class="topo-event-link"
+                    classList={{ locked: anyVmRunning() }}
                     onPointerDown={(event: PointerEvent) => eventLinkGrab(event, link)}
                   >
                     <path class="topo-event-link-hit" d={path()}>
                       <title>
-                        {handler()?.event} → {link.targetName} — drag to re-home or remove
+                        {anyVmRunning()
+                          ? "Configuration is locked while a machine is up"
+                          : `${handler()?.event} → ${link.targetName} — drag to re-home or remove`}
                       </title>
                     </path>
                     <path
@@ -2440,14 +2488,14 @@ export default function TopologyCanvas(props: {
                 <Show when={!grabbed()}>
                   <g
                     class="topo-dependency"
-                    classList={{ cycle: cycle() }}
+                    classList={{ cycle: cycle(), locked: anyVmRunning() }}
                     onPointerDown={(e: PointerEvent) => dependencyGrab(e, link)}
                   >
                     <path class="topo-dependency-hit" d={path()}>
                       <title>
-                        {cycle() ? "Dependency cycle: " : ""}
-                        {link.sourceName} depends on {link.targetName} — drag to re-home, or drag
-                        into empty space to remove
+                        {anyVmRunning()
+                          ? "Configuration is locked while a machine is up"
+                          : `${cycle() ? "Dependency cycle: " : ""}${link.sourceName} depends on ${link.targetName} — drag to re-home, or drag into empty space to remove`}
                       </title>
                     </path>
                     <path
@@ -3018,27 +3066,39 @@ export default function TopologyCanvas(props: {
                   </g>
                   <g
                     class="topo-provision-edit"
-                    transform={`translate(${p().x + PROVISION_W - 29} ${p().y + 8})`}
+                    classList={{ locked: anyVmRunning() }}
+                    transform={`translate(${p().x + PROVISION_W - 68} ${p().y + 8})`}
                     onPointerDown={(event: PointerEvent) => event.stopPropagation()}
                     onClick={(event: MouseEvent) => {
                       event.stopPropagation();
-                      props.onEditProvision(provision.script);
+                      if (!anyVmRunning()) props.onEditProvision(provision.script);
                     }}
                   >
                     <rect width="20" height="20" rx="5" />
                     <g transform="translate(4 4)"><FilePenLine size={12} /></g>
-                    <title>Edit provision script</title>
+                    <title>
+                      {anyVmRunning()
+                        ? "Configuration is locked while a machine is up"
+                        : "Edit provision script"}
+                    </title>
                   </g>
                   <g
                     class="topo-provision-port"
-                    classList={{ active: provisionTargetDrag()?.provisionIndex === index() }}
+                    classList={{
+                      active: provisionTargetDrag()?.provisionIndex === index(),
+                      locked: anyVmRunning(),
+                    }}
                     onPointerDown={(event: PointerEvent) => provisionTargetDown(event, index())}
                   >
                     <circle cx={p().x + PROVISION_W} cy={p().y + PROVISION_H / 2} r="5" />
                     <text x={p().x + PROVISION_W - 9} y={p().y + PROVISION_H / 2 - 9}>
                       TARGETS
                     </text>
-                    <title>Drag to a VM or container this script applies to</title>
+                    <title>
+                      {anyVmRunning()
+                        ? "Configuration is locked while a machine is up"
+                        : "Drag to a VM or container this script applies to"}
+                    </title>
                   </g>
                   <Show when={handlersForProvision(index()).length}>
                     <line
@@ -3078,7 +3138,10 @@ export default function TopologyCanvas(props: {
                           <Show when={targetable()}>
                             <g
                               class="topo-event-port"
-                              classList={{ active: eventTargetDrag()?.handlerIndex === handlerIndex }}
+                              classList={{
+                                active: eventTargetDrag()?.handlerIndex === handlerIndex,
+                                locked: anyVmRunning(),
+                              }}
                               onPointerDown={(event: PointerEvent) =>
                                 eventTargetDown(event, handlerIndex)
                               }
@@ -3088,7 +3151,11 @@ export default function TopologyCanvas(props: {
                                 cy={y() + SCRIPT_EVENT_ROW_H / 2}
                                 r="4.5"
                               />
-                              <title>Drag to scope {handler.event} to a compatible machine</title>
+                              <title>
+                                {anyVmRunning()
+                                  ? "Configuration is locked while a machine is up"
+                                  : `Drag to scope ${handler.event} to a compatible machine`}
+                              </title>
                             </g>
                           </Show>
                         </g>
@@ -3151,7 +3218,8 @@ export default function TopologyCanvas(props: {
                     <Monitor size={18} />
                   </g>
                   <text x={p().x + 34} y={p().y + 21} class="topo-vm-name">
-                    {vm.name}
+                    {vm.name.length > 16 ? `${vm.name.slice(0, 15)}…` : vm.name}
+                    <title>{vm.name}</title>
                   </text>
                   <text x={p().x + 34} y={p().y + 35} class="topo-vm-meta">
                     {vm.template === "scratch"
@@ -3174,8 +3242,8 @@ export default function TopologyCanvas(props: {
                   </g>
                   {/* power LED (live daemon state) */}
                   <circle
-                    cx={p().x + VM_W - 12}
-                    cy={p().y + 12}
+                    cx={p().x + 19}
+                    cy={p().y + 38}
                     r="4"
                     class={`topo-led ${ledTone(vm.name)}`}
                   >
@@ -3184,6 +3252,7 @@ export default function TopologyCanvas(props: {
                   <g
                     class="topo-dependency-port"
                     classList={{
+                      locked: anyVmRunning(),
                       active:
                         dependencyDrag()?.kind === "vm" && dependencyDrag()?.index === vi(),
                       target:
@@ -3196,12 +3265,16 @@ export default function TopologyCanvas(props: {
                     <text x={p().x + VM_W / 2 + 9} y={p().y + 3.5}>
                       DEP
                     </text>
-                    <title>Drag to a VM or container that this VM depends on</title>
+                    <title>
+                      {anyVmRunning()
+                        ? "Configuration is locked while a machine is up"
+                        : "Drag to a VM or container that this VM depends on"}
+                    </title>
                   </g>
-                  {/* power / restart / console buttons */}
+                  {/* Machine actions stay in a predictable top-right control bank. */}
                   <VmBtn
                     x={p().x + VM_W - 70}
-                    y={p().y + h() - 24}
+                    y={p().y + 8}
                     act="power"
                     title={vmRunning(vm.name) ? "Stop" : "Start"}
                     onClick={() => (vmRunning(vm.name) ? vmStop(vm.name) : vmStart(vm.name))}
@@ -3212,21 +3285,22 @@ export default function TopologyCanvas(props: {
                   </VmBtn>
                   <VmBtn
                     x={p().x + VM_W - 49}
-                    y={p().y + h() - 24}
+                    y={p().y + 8}
                     act="restart"
-                    title="Restart"
+                    title={vmRunning(vm.name) ? "Restart" : "Restart unavailable while powered off"}
+                    disabled={!vmRunning(vm.name)}
                     onClick={() => vmRestart(vm.name)}
                   >
                     <RotateCw size={11} />
                   </VmBtn>
                   <VmBtn
                     x={p().x + VM_W - 28}
-                    y={p().y + h() - 24}
+                    y={p().y + 8}
                     act="console"
                     title="Open the console"
                     onClick={() => showVm(vm.name)}
                   >
-                    <Monitor size={11} />
+                    <SquareTerminal size={11} />
                   </VmBtn>
                   <Index each={vm.nics}>
                     {(nic, i) => {
@@ -3263,7 +3337,7 @@ export default function TopologyCanvas(props: {
                             y={rowY() + 1}
                             staticIp={nic().ip}
                             assignedIp={runtime()?.ip ?? null}
-                            disabled={vmRunning(vm.name)}
+                            disabled={anyVmRunning()}
                             staticAllowed={!!nic().segment && !nic().nat}
                             gateway={nic().gateway}
                             gatewayAllowed={nicGatewayAllowed(nic())}
@@ -3302,9 +3376,8 @@ export default function TopologyCanvas(props: {
             }}
           </For>
 
-          {/* container nodes: same footprint as VMs, visually distinct —
-              container glyph, dashed outline, image reference as the meta
-              line, no console button (containers have no display) */}
+          {/* Container nodes share the VM action layout, but link to their
+              shell-oriented detail page instead of a display console. */}
           <For each={model().containers}>
             {(ctr, ci) => {
               const p = () => ctrPos(ctr.name);
@@ -3356,7 +3429,8 @@ export default function TopologyCanvas(props: {
                     <Container size={18} />
                   </g>
                   <text x={p().x + 34} y={p().y + 21} class="topo-vm-name">
-                    {ctr.name}
+                    {ctr.name.length > 16 ? `${ctr.name.slice(0, 15)}…` : ctr.name}
+                    <title>{ctr.name}</title>
                   </text>
                   <text x={p().x + 34} y={p().y + 35} class="topo-vm-meta">
                     {ctr.image || "(no image)"}
@@ -3376,8 +3450,8 @@ export default function TopologyCanvas(props: {
                   </g>
                   {/* power LED (live daemon state, incl. health) */}
                   <circle
-                    cx={p().x + VM_W - 12}
-                    cy={p().y + 12}
+                    cx={p().x + 19}
+                    cy={p().y + 38}
                     r="4"
                     class={`topo-led ${ctrLedTone(ctr.name)}`}
                   >
@@ -3386,6 +3460,7 @@ export default function TopologyCanvas(props: {
                   <g
                     class="topo-dependency-port"
                     classList={{
+                      locked: anyVmRunning(),
                       active:
                         dependencyDrag()?.kind === "container" &&
                         dependencyDrag()?.index === ci(),
@@ -3402,12 +3477,16 @@ export default function TopologyCanvas(props: {
                     <text x={p().x + VM_W / 2 + 9} y={p().y + 3.5}>
                       DEP
                     </text>
-                    <title>Drag to a VM or container that this container depends on</title>
+                    <title>
+                      {anyVmRunning()
+                        ? "Configuration is locked while a machine is up"
+                        : "Drag to a VM or container that this container depends on"}
+                    </title>
                   </g>
-                  {/* power / restart buttons — no console for containers */}
+                  {/* Power, restart, and shell actions mirror the VM card. */}
                   <VmBtn
-                    x={p().x + VM_W - 49}
-                    y={p().y + h() - 24}
+                    x={p().x + VM_W - 70}
+                    y={p().y + 8}
                     act="power"
                     title={ctrRunning(ctr.name) ? "Stop" : "Start"}
                     onClick={() =>
@@ -3419,13 +3498,25 @@ export default function TopologyCanvas(props: {
                     </Show>
                   </VmBtn>
                   <VmBtn
-                    x={p().x + VM_W - 28}
-                    y={p().y + h() - 24}
+                    x={p().x + VM_W - 49}
+                    y={p().y + 8}
                     act="restart"
-                    title="Restart"
+                    title={
+                      ctrRunning(ctr.name) ? "Restart" : "Restart unavailable while powered off"
+                    }
+                    disabled={!ctrRunning(ctr.name)}
                     onClick={() => containerRestart(ctr.name)}
                   >
                     <RotateCw size={11} />
+                  </VmBtn>
+                  <VmBtn
+                    x={p().x + VM_W - 28}
+                    y={p().y + 8}
+                    act="shell"
+                    title="Open the container shell"
+                    onClick={() => showContainer(ctr.name)}
+                  >
+                    <SquareTerminal size={11} />
                   </VmBtn>
                   <Index each={ctr.nics}>
                     {(nic, i) => {
@@ -3462,7 +3553,7 @@ export default function TopologyCanvas(props: {
                             y={rowY() + 1}
                             staticIp={nic().ip}
                             assignedIp={runtime()?.ip ?? null}
-                            disabled={ctrRunning(ctr.name)}
+                            disabled={anyVmRunning()}
                             staticAllowed={!!nic().segment && !nic().nat}
                             gateway={nic().gateway}
                             gatewayAllowed={nicGatewayAllowed(nic())}

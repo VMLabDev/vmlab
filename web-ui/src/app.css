@@ -248,6 +248,7 @@
 }
 .fmodal-panel:has(.topo-nic-ip-modal) { width: min(440px, calc(100vw - 32px)); }
 .topo-nic-ip-modal { display: flex; flex-direction: column; gap: var(--sp-4); }
+.topo-nic-ip-hint { color: var(--fg-3); font-size: var(--fs-xs); line-height: 1.45; }
 .topo-nic-ip-error { color: var(--danger-fg); font-size: var(--fs-xs); line-height: 1.35; }
 .topo-nic-gateway-card {
   display: flex; align-items: center; gap: var(--sp-4); padding: var(--sp-4);
@@ -383,6 +384,16 @@
 .topo-console .lucide { pointer-events: none; }
 .topo-console:hover { color: var(--accent); }
 .topo-console:hover rect { stroke: var(--accent); }
+.topo-console.disabled { color: var(--fg-3); cursor: not-allowed; opacity: 0.42; }
+.topo-console.disabled:hover { color: var(--fg-3); }
+.topo-console.disabled:hover rect { stroke: var(--border); }
+.topo-console.act-console,
+.topo-console.act-shell { color: var(--info-fg); }
+.topo-console.act-console rect,
+.topo-console.act-shell rect {
+  fill: color-mix(in oklab, var(--info-bg) 58%, var(--bg-1));
+  stroke: color-mix(in oklab, var(--info-fg) 65%, var(--border));
+}
 .topo-seg rect { fill: var(--bg-2); stroke: var(--border); stroke-width: 1.25; cursor: grab; }
 .topo-seg.selected rect { stroke: var(--accent); stroke-width: 2; }
 .topo-seg-name { fill: var(--fg-1); font-size: 12px; font-weight: 600; pointer-events: none; }
@@ -502,6 +513,16 @@
 .topo-dependency-port:hover circle,
 .topo-dependency-port.active circle { r: 7px; fill: var(--warning-fg); }
 .topo-dependency-port.target circle { stroke-width: 2.5; }
+.topo-dependency.locked .topo-dependency-hit,
+.topo-provision-link.locked .topo-provision-link-hit,
+.topo-event-link.locked .topo-event-link-hit { cursor: not-allowed; }
+.topo-dependency-port.locked,
+.topo-provision-port.locked,
+.topo-event-port.locked,
+.topo-provision-edit.locked { cursor: not-allowed; opacity: 0.48; }
+.topo-dependency-port.locked:hover circle,
+.topo-provision-port.locked:hover circle,
+.topo-event-port.locked:hover circle { fill: var(--bg-1); stroke-width: 1.5; }
 .topo-vm.dependency-target > rect:first-child {
   stroke: var(--warning-fg); stroke-width: 2; stroke-dasharray: 5 3;
 }

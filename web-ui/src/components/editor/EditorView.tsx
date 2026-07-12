@@ -50,6 +50,7 @@ export default function EditorView(props: { onEditConfig: () => void }) {
   }
 
   async function addProvisionNode() {
+    if (anyVmRunning()) return;
     const lab = editor.lab;
     const draft = editor.draft;
     if (!lab || !draft) return;
@@ -95,7 +96,16 @@ export default function EditorView(props: { onEditConfig: () => void }) {
             >
               Validate
             </Button>
-            <Button size="sm" onClick={saveDraft} disabled={disabled() || !dirty()}>
+            <Button
+              size="sm"
+              onClick={saveDraft}
+              disabled={disabled() || !dirty() || anyVmRunning()}
+              title={
+                anyVmRunning()
+                  ? "Stop all VMs and containers before saving configuration"
+                  : undefined
+              }
+            >
               Save
             </Button>
             <Button
@@ -151,7 +161,8 @@ export default function EditorView(props: { onEditConfig: () => void }) {
           <ProvisionScriptModal path={editingScript()} onClose={() => setEditingScript(null)} />
           <Show when={anyVmRunning()}>
             <Alert tone="warning">
-              Some machines are up — running machines and networking are read-only until they stop.
+              Configuration and topology connections are locked while any VM or container is
+              powered on. Runtime controls and canvas layout remain available.
             </Alert>
           </Show>
           <Show when={editor.issues.length}>
