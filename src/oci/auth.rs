@@ -321,7 +321,19 @@ pub fn store_login_at(
     let auth = BASE64.encode(format!("{username}:{password}"));
     root["auths"][registry] = serde_json::json!({ "auth": auth });
     let text = serde_json::to_string_pretty(&root).context("cannot serialise docker config")?;
-    std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, format!("{text}\n"))
+        .with_context(|| format!("cannot write {}", temp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode())
+            .unwrap_or(0o600);
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("cannot protect {}", temp.display()))?;
+    }
+    std::fs::rename(&temp, path).with_context(|| format!("cannot replace {}", path.display()))?;
     Ok(())
 }
 

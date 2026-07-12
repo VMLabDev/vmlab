@@ -211,6 +211,7 @@ const nicPairs = (n: NicModel): [string, FV][] => [
   ["segment", str(n.segment)],
   ["nat", flag(n.nat, false)],
   ["ip", str(n.ip)],
+  ["gateway", flag(n.gateway, false)],
   ["mac", str(n.mac)],
   ["isolated", flag(n.isolated, false)],
 ];
@@ -330,7 +331,10 @@ const sinkholePairs = (s: SinkholeModel): [string, FV][] => [
 
 const provisionPairs = (p: ProvisionModel): [string, FV][] => [["vms", list(p.vms)]];
 
-const handlerPairs = (h: HandlerModel): [string, FV][] => [["run", str(h.run)]];
+const handlerPairs = (h: HandlerModel): [string, FV][] => [
+  ["run", str(h.run)],
+  ["targets", list(h.targets)],
+];
 
 // --- add-spec builders --------------------------------------------------------
 

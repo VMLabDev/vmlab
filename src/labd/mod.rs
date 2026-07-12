@@ -22,6 +22,11 @@ use crate::proto::server::{Handler, Server, Streamer};
 use events::EventLog;
 use lab::LabRuntime;
 
+fn handler_matches(handler: &crate::config::model::Handler, event: &str, machine: &str) -> bool {
+    handler.event == event
+        && (handler.targets.is_empty() || handler.targets.iter().any(|name| name == machine))
+}
+
 /// Entry point for `vmlab __labd --lab <name> --root <dir>`.
 pub fn run(lab: String, root: PathBuf) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -108,15 +113,17 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         },
                     };
-                    for h in handlers.iter().filter(|h| h.event == ev.event) {
+                    // Container events carry the name under "container";
+                    // handlers read it from `event.vm` either way.
+                    let machine = ev.data["vm"]
+                        .as_str()
+                        .or_else(|| ev.data["container"].as_str())
+                        .unwrap_or_default();
+                    for h in handlers
+                        .iter()
+                        .filter(|handler| handler_matches(handler, &ev.event, machine))
+                    {
                         let script = runtime.root.join(&h.run);
-                        // Container events carry the name under "container";
-                        // handlers read it from `event.vm` either way (the
-                        // full payload is in `event.data`).
-                        let machine = ev.data["vm"]
-                            .as_str()
-                            .or_else(|| ev.data["container"].as_str())
-                            .unwrap_or_default();
                         let event = crate::scripting::EventData {
                             name: ev.event.clone(),
                             vm: machine.to_string(),
@@ -676,8 +683,10 @@ impl Handler for LabdHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::region_arg;
+    use super::{handler_matches, region_arg};
+    use crate::config::model::Handler;
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn region_arg_parses_and_validates() {
@@ -694,5 +703,20 @@ mod tests {
         );
         assert!(region_arg(&json!({"region": [1, 2, 3]})).is_err());
         assert!(region_arg(&json!({"region": "nope"})).is_err());
+    }
+
+    #[test]
+    fn event_handler_target_filter_is_optional_and_exact() {
+        let mut handler = Handler {
+            event: "vm.ready".into(),
+            run: PathBuf::from("handler.ws"),
+            targets: Vec::new(),
+            span: (0, 0),
+        };
+        assert!(handler_matches(&handler, "vm.ready", "a"));
+        handler.targets = vec!["a".into()];
+        assert!(handler_matches(&handler, "vm.ready", "a"));
+        assert!(!handler_matches(&handler, "vm.ready", "b"));
+        assert!(!handler_matches(&handler, "vm.stopped", "a"));
     }
 }

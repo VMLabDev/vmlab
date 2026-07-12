@@ -2,7 +2,8 @@
 // with a compact Revert/Validate/Save/Save & reload toolbar and
 // validation-issue surfacing. Embedded in the lab page's Overview tab.
 
-import { For, Show, createEffect, createMemo } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
+import * as api from "../../api";
 import { Alert, Button, Empty, Spinner, SplitPane } from "@forge/ui";
 import {
   anyVmRunning,
@@ -12,6 +13,7 @@ import {
 } from "../../store";
 import {
   editor,
+  addProvision,
   openEditor,
   pendingOps,
   reloadModel,
@@ -23,8 +25,10 @@ import {
 } from "../../editor/store";
 import Inspector from "./Inspector";
 import TopologyCanvas from "./TopologyCanvas";
+import ProvisionScriptModal from "./ProvisionScriptModal";
 
 export default function EditorView(props: { onEditConfig: () => void }) {
+  const [editingScript, setEditingScript] = createSignal<string | null>(null);
   createEffect(() => {
     const lab = state.currentLab;
     if (lab && state.view.kind === "lab") void openEditor(lab);
@@ -42,6 +46,26 @@ export default function EditorView(props: { onEditConfig: () => void }) {
       showToast("Lab reloaded");
     } catch (e) {
       showToast(`Reload failed: ${e instanceof Error ? e.message : e}`, "danger");
+    }
+  }
+
+  async function addProvisionNode() {
+    const lab = editor.lab;
+    const draft = editor.draft;
+    if (!lab || !draft) return;
+    const referenced = new Set(draft.provisions.map((provision) => provision.script));
+    try {
+      for (let number = 1; number < 10_000; number++) {
+        const path = `scripts/provision-${number}.ws`;
+        if (referenced.has(path)) continue;
+        if ((await api.getProvisionScript(lab, path)) !== null) continue;
+        addProvision(path);
+        setEditingScript(path);
+        return;
+      }
+      showToast("Could not allocate a provision script name", "danger");
+    } catch (error) {
+      showToast(`Could not add provision: ${error instanceof Error ? error.message : error}`, "danger");
     }
   }
 
@@ -113,11 +137,18 @@ export default function EditorView(props: { onEditConfig: () => void }) {
         <Show when={editor.draft && !editor.fallback}>
           <SplitPane
             class="editor-split"
-            first={<TopologyCanvas onEditConfig={props.onEditConfig} />}
-            second={<Inspector />}
+            first={
+              <TopologyCanvas
+                onEditConfig={props.onEditConfig}
+                onAddProvision={() => void addProvisionNode()}
+                onEditProvision={setEditingScript}
+              />
+            }
+            second={<Inspector onEditProvision={setEditingScript} />}
             initial={Math.max(480, window.innerWidth - 720)}
             min={320}
           />
+          <ProvisionScriptModal path={editingScript()} onClose={() => setEditingScript(null)} />
           <Show when={anyVmRunning()}>
             <Alert tone="warning">
               Some machines are up — running machines and networking are read-only until they stop.

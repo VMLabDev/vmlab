@@ -8,6 +8,8 @@ pub mod process;
 pub mod resolve;
 pub mod virtiofsd;
 
-pub use cmdline::{Accel, NicBackend, NicSpec, VmPaths, build_args, emulator_binary, pick_accel};
+pub use cmdline::{
+    Accel, NicBackend, NicSpec, VmPaths, build_args, emulator_binary, kvm_available, pick_accel,
+};
 pub use process::Proc;
 pub use resolve::{ResolvedVm, resolve_vm};

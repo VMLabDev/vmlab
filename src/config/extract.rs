@@ -566,6 +566,7 @@ fn extract_nic(b: &Block, issues: &mut IssueList) -> Nic {
             s.parse().map_err(|_| format!("malformed IP `{s}`"))
         })
         .map(|(v, _)| v),
+        gateway: get_bool(b, "gateway", issues).unwrap_or(false),
         mac: get_parsed(b, "mac", issues, |s| s.parse()).map(|(v, _)| v),
         isolated: get_bool(b, "isolated", issues).unwrap_or(false),
     }
@@ -688,6 +689,7 @@ fn extract_handler(b: &Block, issues: &mut IssueList) -> Option<Handler> {
     Some(Handler {
         event,
         run: PathBuf::from(run),
+        targets: get_str_list(b, "targets", issues),
         span: span_of(b),
     })
 }

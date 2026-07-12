@@ -481,6 +481,7 @@ pub struct NicDto {
     pub segment: Option<String>,
     pub nat: bool,
     pub ip: Option<String>,
+    pub gateway: bool,
     pub mac: Option<String>,
     pub isolated: bool,
 }
@@ -492,6 +493,7 @@ impl From<&Nic> for NicDto {
             segment: n.segment.clone(),
             nat: n.nat,
             ip: n.ip.map(|ip| ip.to_string()),
+            gateway: n.gateway,
             mac: n.mac.map(|m| m.to_string()),
             isolated: n.isolated,
         }
@@ -584,6 +586,7 @@ impl From<&Provision> for ProvisionDto {
 pub struct HandlerDto {
     pub event: String,
     pub run: String,
+    pub targets: Vec<String>,
     pub span: Span,
 }
 
@@ -592,6 +595,7 @@ impl From<&Handler> for HandlerDto {
         Self {
             event: h.event.clone(),
             run: h.run.display().to_string(),
+            targets: h.targets.clone(),
             span: h.span,
         }
     }
@@ -646,7 +650,7 @@ lab "dto-lab" {
   }
 
   provision "scripts/setup.ws" { vms = ["web01"] }
-  on "vm.crashed" { run = "scripts/dump.ws" }
+  on "vm.crashed" { run = "scripts/dump.ws" targets = ["web01"] }
 }
 "#;
 
@@ -682,5 +686,6 @@ lab "dto-lab" {
 
         assert_eq!(v["lab"]["provisions"][0]["vms"][0], "web01");
         assert_eq!(v["lab"]["handlers"][0]["event"], "vm.crashed");
+        assert_eq!(v["lab"]["handlers"][0]["targets"][0], "web01");
     }
 }

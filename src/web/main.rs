@@ -200,6 +200,11 @@ async fn main() -> ExitCode {
                 web::get().to(api::catalog_profiles),
             )
             .route("/api/catalog/meta", web::get().to(api::catalog_meta))
+            .route("/api/catalog/oci", web::get().to(api::catalog_oci))
+            .route("/api/registries", web::get().to(api::list_registries))
+            .route("/api/registries", web::post().to(api::add_registry))
+            .route("/api/registries", web::delete().to(api::remove_registry))
+            .route("/api/registries/login", web::post().to(api::registry_login))
             // Host capacity + server-side file picker for the visual editor.
             .route("/api/host", web::get().to(api::host_info))
             .route("/api/host/fs", web::get().to(api::host_fs))
@@ -269,6 +274,8 @@ async fn main() -> ExitCode {
             // Config editing (literal before the `{action}` catch-all).
             .route("/api/labs/{lab}/config", web::get().to(api::get_config))
             .route("/api/labs/{lab}/config", web::post().to(api::save_config))
+            .route("/api/labs/{lab}/scripts", web::get().to(api::get_script))
+            .route("/api/labs/{lab}/scripts", web::put().to(api::save_script))
             // The visual editor's structured model (literal before the
             // `{action}` catch-all).
             .route("/api/labs/{lab}/model", web::get().to(editor::get_model))

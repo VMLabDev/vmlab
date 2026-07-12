@@ -127,6 +127,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     let mut machine_names: HashSet<&str> = HashSet::new();
     let mut static_ips: HashMap<Ipv4Addr, Span> = HashMap::new();
     let mut macs: HashMap<MacAddr, Span> = HashMap::new();
+    let mut segment_gateways: HashMap<String, Span> = HashMap::new();
     for vm in &lab.vms {
         if !machine_names.insert(&vm.name) {
             issues.push(Issue::at(
@@ -140,7 +141,14 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         check_dns_label(&vm.name, vm.span, "vm name", &mut issues);
         check_vm_template(file, vm, ctx, &mut issues);
         check_vm_hardware(file, vm, ctx, &mut issues);
-        check_nics(lab, &vm.nics, &mut static_ips, &mut macs, &mut issues);
+        check_nics(
+            lab,
+            &vm.nics,
+            &mut static_ips,
+            &mut macs,
+            &mut segment_gateways,
+            &mut issues,
+        );
 
         for dep in &vm.depends_on {
             if !machine_exists(lab, dep) {
@@ -226,7 +234,14 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             ));
         }
         check_dns_label(&c.name, c.span, "container name", &mut issues);
-        check_nics(lab, &c.nics, &mut static_ips, &mut macs, &mut issues);
+        check_nics(
+            lab,
+            &c.nics,
+            &mut static_ips,
+            &mut macs,
+            &mut segment_gateways,
+            &mut issues,
+        );
 
         for dep in &c.depends_on {
             if !machine_exists(lab, dep) {
@@ -301,6 +316,53 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     EVENT_NAMES.join(", ")
                 ),
             ));
+        }
+        let target_kind = if h.event.starts_with("vm.") {
+            Some("vm")
+        } else if h.event.starts_with("container.") {
+            Some("container")
+        } else if h.event.starts_with("snapshot.") {
+            Some("machine")
+        } else {
+            None
+        };
+        if !h.targets.is_empty() && target_kind.is_none() {
+            issues.push(Issue::at(
+                h.span,
+                format!(
+                    "event \"{}\" is lab-wide and cannot declare targets",
+                    h.event
+                ),
+            ));
+        }
+        for target in &h.targets {
+            if !machine_exists(lab, target) {
+                issues.push(Issue::at(
+                    h.span,
+                    format!("event handler targets undefined vm/container \"{target}\""),
+                ));
+            } else if target_kind == Some("vm") && !lab.vms.iter().any(|vm| vm.name == *target) {
+                issues.push(Issue::at(
+                    h.span,
+                    format!(
+                        "event \"{}\" can target only VMs, not \"{target}\"",
+                        h.event
+                    ),
+                ));
+            } else if target_kind == Some("container")
+                && !lab
+                    .containers
+                    .iter()
+                    .any(|container| container.name == *target)
+            {
+                issues.push(Issue::at(
+                    h.span,
+                    format!(
+                        "event \"{}\" can target only containers, not \"{target}\"",
+                        h.event
+                    ),
+                ));
+            }
         }
     }
     for t in &file.templates {
@@ -505,6 +567,7 @@ fn check_nics(
     nics: &[Nic],
     static_ips: &mut HashMap<Ipv4Addr, Span>,
     macs: &mut HashMap<MacAddr, Span>,
+    segment_gateways: &mut HashMap<String, Span>,
     issues: &mut IssueList,
 ) {
     for nic in nics {
@@ -538,6 +601,66 @@ fn check_nics(
             (None, true) => None, // built-in NAT segment
         };
 
+        if nic.gateway {
+            match seg {
+                None => issues.push(Issue::at(
+                    nic.span,
+                    "`gateway = true` requires a declared segment and cannot be used with the \
+                     built-in NAT interface",
+                )),
+                Some(segment) => {
+                    if nic.ip.is_none() {
+                        issues.push(Issue::at(
+                            nic.span,
+                            format!(
+                                "gateway NIC on segment \"{}\" needs a static `ip`",
+                                segment.name
+                            ),
+                        ));
+                    }
+                    if let (Some(ip), Some(net)) = (nic.ip, segment.subnet)
+                        && ip != gateway_ip(net)
+                    {
+                        issues.push(Issue::at(
+                            nic.span,
+                            format!(
+                                "gateway NIC on segment \"{}\" must use the segment router address {}",
+                                segment.name,
+                                gateway_ip(net)
+                            ),
+                        ));
+                    }
+                    if segment.nat {
+                        issues.push(Issue::at(
+                            nic.span,
+                            format!(
+                                "segment \"{}\" has a machine gateway, so built-in `nat` must be disabled",
+                                segment.name
+                            ),
+                        ));
+                    }
+                    if segment.global {
+                        issues.push(Issue::at(
+                            nic.span,
+                            format!(
+                                "machine gateways are not supported on global segment \"{}\"",
+                                segment.name
+                            ),
+                        ));
+                    }
+                    if segment_gateways
+                        .insert(segment.name.clone(), nic.span)
+                        .is_some()
+                    {
+                        issues.push(Issue::at(
+                            nic.span,
+                            format!("segment \"{}\" has more than one gateway NIC", segment.name),
+                        ));
+                    }
+                }
+            }
+        }
+
         if let Some(ip) = nic.ip {
             match seg {
                 None => issues.push(Issue::at(
@@ -565,7 +688,7 @@ fn check_nics(
                             ));
                         } else if ip == net.network()
                             || ip == net.broadcast()
-                            || ip == gateway_ip(net)
+                            || (ip == gateway_ip(net) && !nic.gateway)
                         {
                             issues.push(Issue::at(
                                 nic.span,
@@ -807,6 +930,54 @@ lab "l" {
   vm "b" { template = "x86_64/t" nic { segment = "s" mac = "52:54:00:00:00:01" } }
 }"#,
             "duplicate MAC",
+        );
+    }
+
+    #[test]
+    fn machine_gateway_is_unique_static_and_disables_segment_nat() {
+        let valid = r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" }
+  vm "router" {
+    template = "x86_64/t"
+    nic { segment = "s" ip = "10.1.1.1" gateway = true }
+    nic { nat = true }
+  }
+}"#;
+        assert!(errs(valid).is_empty(), "valid machine gateway was rejected");
+
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" }
+  vm "a" { template = "x86_64/t" nic { segment = "s" ip = "10.1.1.1" gateway = true } }
+  container "b" { image = "alpine" nic { segment = "s" ip = "10.1.1.1" gateway = true } }
+}"#,
+            "more than one gateway",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" nat = true }
+  vm "a" { template = "x86_64/t" nic { segment = "s" ip = "10.1.1.1" gateway = true } }
+}"#,
+            "built-in `nat` must be disabled",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" }
+  vm "a" { template = "x86_64/t" nic { segment = "s" gateway = true } }
+}"#,
+            "needs a static `ip`",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" }
+  vm "a" { template = "x86_64/t" nic { segment = "s" ip = "10.1.1.10" gateway = true } }
+}"#,
+            "must use the segment router address 10.1.1.1",
         );
     }
 
@@ -1077,6 +1248,28 @@ lab "l" {
         assert!(
             !es.iter().any(|m| m.contains("unknown event")),
             "container.crashed should be bindable: {es:#?}"
+        );
+    }
+
+    #[test]
+    fn event_handler_targets_match_event_machine_kind() {
+        let source = r#"import <vmlab.wcl>
+lab "l" {
+  vm "v" { template = "x86_64/t" }
+  container "c" { image = "alpine" }
+  on "vm.ready" { run = "missing.ws" targets = ["c"] }
+  on "lab.up" { run = "missing.ws" targets = ["v"] }
+}"#;
+        let errors = errs(source);
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("can target only VMs"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("lab-wide and cannot declare targets"))
         );
     }
 

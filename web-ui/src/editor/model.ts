@@ -12,6 +12,7 @@ export interface NicModel {
   segment: string | null;
   nat: boolean;
   ip: string | null;
+  gateway: boolean;
   mac: string | null;
   isolated: boolean;
 }
@@ -223,6 +224,7 @@ export interface HandlerModel {
   span: Span | null;
   event: string;
   run: string;
+  targets: string[];
 }
 
 export interface LabModel {
@@ -281,7 +283,15 @@ export type ModelOp =
 // --- factories --------------------------------------------------------------
 
 export function emptyNic(segment: string | null): NicModel {
-  return { span: null, segment, nat: segment === null, ip: null, mac: null, isolated: false };
+  return {
+    span: null,
+    segment,
+    nat: segment === null,
+    ip: null,
+    gateway: false,
+    mac: null,
+    isolated: false,
+  };
 }
 
 export function emptyVm(name: string, template: string): VmModel {

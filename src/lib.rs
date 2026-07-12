@@ -18,6 +18,7 @@ pub mod paths;
 pub mod profiles;
 pub mod proto;
 mod qemu;
+pub use qemu::kvm_available;
 mod qga;
 mod qmp;
 mod scripting;

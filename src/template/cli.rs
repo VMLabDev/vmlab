@@ -45,6 +45,9 @@ pub enum TemplateCmd {
         /// Only show templates that have this arch
         #[arg(long)]
         arch: Option<String>,
+        /// Search VM templates or container images
+        #[arg(long, value_enum, default_value_t = CatalogKind::Vm)]
+        kind: CatalogKind,
         /// Emit a JSON array instead of a table
         #[arg(long)]
         json: bool,
@@ -121,10 +124,35 @@ pub enum TemplateCmd {
         #[arg(short, long)]
         password: String,
     },
+    /// Manage OCI namespaces shared by CLI and web search
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCmd,
+    },
 }
 
-/// Default namespace for `vmlab template search` (override with `--registry`).
-const DEFAULT_SEARCH_REGISTRY: &str = "ghcr.io/vmlabdev/vmlab-templates";
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum CatalogKind {
+    Vm,
+    Container,
+}
+
+#[derive(clap::Subcommand)]
+pub enum RegistryCmd {
+    /// List configured registry namespaces
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add or update a searchable namespace
+    Add {
+        namespace: String,
+        #[arg(long, value_enum, default_value_t = super::registries::RegistryUse::Both)]
+        use_for: super::registries::RegistryUse,
+    },
+    /// Remove a searchable namespace
+    Remove { namespace: String },
+}
 
 fn store() -> TemplateStore {
     TemplateStore::new(crate::paths::template_store_dir())
@@ -144,8 +172,9 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 query,
                 registry,
                 arch,
+                kind,
                 json,
-            } => search(query, registry, arch, json).await,
+            } => search(query, registry, arch, kind, json).await,
             TemplateCmd::Rm { reference, force } => rm(&reference, force),
             TemplateCmd::Clean {
                 filter,
@@ -171,6 +200,7 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 username,
                 password,
             } => login(&registry, &username, &password).await,
+            TemplateCmd::Registry { command } => registry_command(command),
         }
     })
 }
@@ -374,34 +404,38 @@ fn meta_json(t: &crate::template::meta::TemplateMeta) -> serde_json::Value {
     })
 }
 
-struct SearchRow {
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CatalogSearchRow {
     /// Leaf name (used for query matching).
-    name: String,
+    pub name: String,
     /// Full OCI repository path, e.g. ghcr.io/owner/group/name.
-    repo: String,
-    arches: Vec<String>,
-    version: String,
-    reference: String,
+    pub repo: String,
+    pub arches: Vec<String>,
+    pub version: String,
+    pub reference: String,
 }
 
-async fn search(
+/// Search one OCI registry namespace and resolve each matching repository's
+/// newest usable tag plus the architectures published by its manifest index.
+/// Shared by the CLI and the web editor's VM/container chooser.
+pub async fn search_catalog(
     query: Option<String>,
-    registry: Option<String>,
+    registry: String,
     arch: Option<String>,
-    json: bool,
-) -> Result<()> {
+    containers: bool,
+) -> Result<Vec<CatalogSearchRow>> {
     use futures::StreamExt as _;
 
-    let namespace = registry.unwrap_or_else(|| DEFAULT_SEARCH_REGISTRY.to_string());
-    let repos = crate::oci::list_repositories(&namespace)
+    let namespace = registry;
+    let repos = crate::oci::list_repositories_filtered(&namespace, query.as_deref())
         .await
         .with_context(|| format!("listing templates in {namespace}"))?;
     let ns_prefix = format!("{}/", namespace.trim_end_matches('/'));
 
     // Resolve each repo's latest version + arches concurrently.
-    let mut rows: Vec<SearchRow> = futures::stream::iter(repos.into_iter().map(|repo| {
+    let mut rows: Vec<CatalogSearchRow> = futures::stream::iter(repos.into_iter().map(|repo| {
         let ns_prefix = ns_prefix.clone();
-        async move { fetch_search_row(repo, &ns_prefix).await }
+        async move { fetch_search_row(repo, &ns_prefix, containers).await }
     }))
     .buffer_unordered(8)
     .filter_map(|row| async move { row })
@@ -409,31 +443,65 @@ async fn search(
     .await;
 
     let q = query.map(|s| s.to_lowercase());
+    let wanted_arch = arch;
     rows.retain(|r| {
         q.as_ref().is_none_or(|q| r.name.to_lowercase().contains(q))
-            && arch
+            && wanted_arch
                 .as_ref()
                 .is_none_or(|a| r.arches.iter().any(|x| x == a))
     });
     rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
+}
+
+async fn search(
+    query: Option<String>,
+    registry: Option<String>,
+    arch: Option<String>,
+    kind: CatalogKind,
+    json: bool,
+) -> Result<()> {
+    let containers = matches!(kind, CatalogKind::Container);
+    let namespaces = match registry {
+        Some(namespace) => vec![namespace],
+        None => super::registries::list()?
+            .into_iter()
+            .filter(|entry| {
+                if containers {
+                    entry.use_for.containers()
+                } else {
+                    entry.use_for.vms()
+                }
+            })
+            .map(|entry| entry.namespace)
+            .collect(),
+    };
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for namespace in &namespaces {
+        match search_catalog(query.clone(), namespace.clone(), arch.clone(), containers).await {
+            Ok(found) => rows.extend(found),
+            Err(error) => errors.push(format!("{namespace}: {error:#}")),
+        }
+    }
+    if rows.is_empty() && !errors.is_empty() {
+        bail!("{}", errors.join("\n"));
+    }
+    for error in errors {
+        eprintln!("warning: {error}");
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.repo.cmp(&b.repo)));
+    rows.dedup_by(|a, b| a.reference == b.reference);
 
     if json {
-        let entries: Vec<_> = rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "name": r.name,
-                    "reference": r.reference,
-                    "arches": r.arches,
-                    "version": r.version,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&entries)?);
+        println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
-        println!("no templates found in {namespace}");
+        println!(
+            "no results found in {} configured registries",
+            namespaces.len()
+        );
         return Ok(());
     }
     let name_w = rows.iter().map(|r| r.repo.len()).max().unwrap_or(0).max(8);
@@ -449,9 +517,55 @@ async fn search(
     Ok(())
 }
 
+fn registry_command(command: RegistryCmd) -> Result<()> {
+    match command {
+        RegistryCmd::List { json } => {
+            let entries = super::registries::list()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                println!("{:<52} USE", "NAMESPACE");
+                for entry in entries {
+                    let use_for = match entry.use_for {
+                        super::registries::RegistryUse::Vms => "vms",
+                        super::registries::RegistryUse::Containers => "containers",
+                        super::registries::RegistryUse::Both => "both",
+                    };
+                    println!("{:<52} {use_for}", entry.namespace);
+                }
+            }
+        }
+        RegistryCmd::Add { namespace, use_for } => {
+            let entry = super::registries::add(&namespace, use_for)?;
+            println!("added {}", entry.namespace);
+        }
+        RegistryCmd::Remove { namespace } => {
+            super::registries::remove(&namespace)?;
+            println!(
+                "removed {}",
+                super::registries::normalise_namespace(&namespace)?
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Resolve one repository's display name, latest version and arches. Returns
 /// `None` (skipping the repo) on any error or when it has no usable tag.
-async fn fetch_search_row(repo: String, ns_prefix: &str) -> Option<SearchRow> {
+fn oci_to_vmlab_arch(arch: String) -> Option<String> {
+    match arch.as_str() {
+        "amd64" => Some("x86_64".into()),
+        "arm64" => Some("aarch64".into()),
+        "riscv64" => Some(arch),
+        _ => None,
+    }
+}
+
+async fn fetch_search_row(
+    repo: String,
+    ns_prefix: &str,
+    containers: bool,
+) -> Option<CatalogSearchRow> {
     let name = repo.strip_prefix(ns_prefix).unwrap_or(&repo).to_string();
     let registry = crate::oci::Registry::new(&repo).ok()?;
     let tags = match registry.list_tags().await {
@@ -467,12 +581,30 @@ async fn fetch_search_row(repo: String, ns_prefix: &str) -> Option<SearchRow> {
         .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
         .cloned()
         .collect();
-    let tag = versions
+    let newest_version = versions
         .into_iter()
-        .max_by(|a, b| crate::template::store::compare_versions(a, b))
-        .or_else(|| tags.iter().find(|t| *t == "latest").cloned())?;
-    let arches = registry.index_arches(&tag).await.ok()?;
-    Some(SearchRow {
+        .max_by(|a, b| crate::template::store::compare_versions(a, b));
+    let latest = tags.iter().find(|t| *t == "latest").cloned();
+    let tag = if containers {
+        latest.or(newest_version)
+    } else {
+        newest_version.or(latest)
+    }
+    .or_else(|| tags.iter().max().cloned())?;
+    let mut arches = if containers {
+        registry
+            .index_platform_arches(&tag)
+            .await
+            .ok()?
+            .into_iter()
+            .filter_map(oci_to_vmlab_arch)
+            .collect()
+    } else {
+        registry.index_arches(&tag).await.ok()?
+    };
+    arches.sort();
+    arches.dedup();
+    Some(CatalogSearchRow {
         name,
         arches,
         version: tag.clone(),

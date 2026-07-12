@@ -10,6 +10,7 @@ pub mod cli;
 pub mod meta;
 pub mod oci_bridge;
 pub mod qimg;
+pub mod registries;
 pub mod store;
 
 pub use meta::{META_FILE, TemplateMeta};

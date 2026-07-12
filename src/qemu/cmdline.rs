@@ -79,12 +79,21 @@ pub fn qemu_arch(arch: &str) -> &str {
 /// the host arch; TCG otherwise — slow but functional, warn loudly (PRD §14).
 pub fn pick_accel(arch: &str) -> Accel {
     let host = std::env::consts::ARCH;
-    let kvm = Path::new("/dev/kvm").exists();
-    if kvm && qemu_arch(arch) == host {
+    if kvm_available() && qemu_arch(arch) == host {
         Accel::Kvm
     } else {
         Accel::Tcg
     }
+}
+
+/// Whether this process can open KVM with the read/write access QEMU needs.
+/// This catches container/device permission failures that a path check misses.
+pub fn kvm_available() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new("/dev/kvm"))
+        .is_ok()
 }
 
 pub fn emulator_binary(arch: &str) -> String {

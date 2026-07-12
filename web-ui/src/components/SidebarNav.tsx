@@ -32,17 +32,15 @@ export default function SidebarNav() {
       >
         {state.currentLab ?? "—"}
       </NavLink>
-      <Show when={state.templates.length > 0}>
-        <NavLink
-          href="#"
-          icon={Package}
-          active={state.view.kind === "templates"}
-          count={state.templates.length}
-          onClick={nav(showTemplates)}
-        >
-          templates
-        </NavLink>
-      </Show>
+      <NavLink
+        href="#"
+        icon={Package}
+        active={state.view.kind === "templates"}
+        count={state.templates.length}
+        onClick={nav(showTemplates)}
+      >
+        templates
+      </NavLink>
 
       <NavSection>Machines</NavSection>
       <For each={s()?.vms ?? []}>

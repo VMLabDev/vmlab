@@ -834,25 +834,23 @@ impl VmInstance {
         Ok(())
     }
 
-    /// First IPv4 address reported by the guest agent (excluding loopback),
-    /// or per-NIC when `nic` is given (PRD §10.3 vm.ip()).
-    pub async fn guest_ip(&self, nic: Option<usize>) -> Result<String> {
+    /// Per-NIC IPv4 addresses reported by the guest agent, matched to the
+    /// configured NIC order by resolved MAC address in one QGA request.
+    pub async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
         let qga = self.qga().await?;
         let ifaces = qga.network_interfaces(Duration::from_secs(5)).await?;
-        let want_mac = nic.and_then(|i| self.macs.get(i)).map(|m| m.to_string());
-        for iface in &ifaces {
-            if let Some(want) = &want_mac
-                && iface.hardware_address.as_deref() != Some(want.as_str())
-            {
-                continue;
-            }
-            for (addr, kind) in &iface.ips {
-                if kind == "ipv4" && !addr.starts_with("127.") {
-                    return Ok(addr.clone());
-                }
-            }
-        }
-        bail!("{}: no IPv4 address reported by agent", self.cfg.name)
+        let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
+        Ok(crate::qga::ipv4_by_mac(&ifaces, &macs))
+    }
+
+    /// First IPv4 address, or the address of a specific NIC (PRD §10.3).
+    pub async fn guest_ip(&self, nic: Option<usize>) -> Result<String> {
+        let ips = self.guest_ips().await?;
+        let ip = match nic {
+            Some(index) => ips.get(index).and_then(Clone::clone),
+            None => ips.into_iter().flatten().next(),
+        };
+        ip.ok_or_else(|| anyhow::anyhow!("{}: no IPv4 address reported by agent", self.cfg.name))
     }
 }
 

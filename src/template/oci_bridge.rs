@@ -44,3 +44,7 @@ pub async fn pull(
 pub async fn login(registry: &str, user: &str, pass: &str) -> Result<()> {
     crate::oci::login(registry, user, pass).await.map(|_| ())
 }
+
+pub fn has_credentials(registry: &str) -> bool {
+    crate::oci::has_credentials(registry)
+}

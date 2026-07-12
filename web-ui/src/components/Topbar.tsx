@@ -64,6 +64,21 @@ export default function Topbar() {
           </span>
         )}
       </Show>
+      {/* Host CPU virtualization. Cross-architecture guests still use TCG;
+          the tooltip keeps that distinction without crowding the topbar. */}
+      <Show when={state.hostLoaded}>
+        <span
+          title={
+            state.host?.acceleration === "kvm"
+              ? `KVM available — native ${state.host.arch} guests use hardware virtualization`
+              : "KVM unavailable — guests use slower TCG software emulation"
+          }
+        >
+          <Badge tone={state.host?.acceleration === "kvm" ? "success" : "warning"} dot>
+            {`cpu ${state.host?.acceleration ?? "tcg"}`}
+          </Badge>
+        </span>
+      </Show>
       <Badge tone={state.connected ? "success" : "neutral"} dot>
         {state.connected ? "connected" : "offline"}
       </Badge>

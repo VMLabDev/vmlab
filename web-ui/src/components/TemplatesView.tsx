@@ -1,40 +1,256 @@
-import { For, Show, createEffect, createResource, createSignal } from "solid-js";
+import { For, Show, createEffect, createMemo, createResource, createSignal, onMount } from "solid-js";
 import {
   Alert,
   Badge,
   Button,
   Card,
   Empty,
+  IconButton,
+  Input,
   ListBox,
+  Modal,
   PageHead,
+  Select,
   Spinner,
   StatusDot,
+  Table,
 } from "@forge/ui";
-import { Play, RefreshCw, Upload } from "lucide-solid";
+import { KeyRound, Play, Plus, RefreshCw, Trash2, Upload } from "lucide-solid";
 import {
   state,
   buildTemplate,
   publishTemplate,
   dismissTemplateOp,
+  showToast,
   type TemplateOp,
 } from "../store";
 import { templateRemote } from "../api";
 import type { TemplateInfo, RemoteStatus } from "../api";
+import {
+  addRegistry,
+  containerRegistry,
+  registryEntries,
+  refreshRegistries,
+  loginRegistry,
+  removeRegistry,
+  vmRegistry,
+  type RegistryEntry,
+} from "../registries";
 
 export default function TemplatesView() {
+  onMount(() => void refreshRegistries().catch((error) => showToast(String(error), "danger")));
+  const registries = createMemo(() =>
+    registryEntries([
+      ...state.templates.flatMap((t) => (t.registry ? [vmRegistry(t.registry)!] : [])).filter(Boolean),
+      ...(state.status?.vms ?? []).map((vm) => vmRegistry(vm.template)).filter(Boolean),
+      ...(state.status?.containers ?? []).map((c) => containerRegistry(c.image)).filter(Boolean),
+    ] as RegistryEntry[]),
+  );
+
   return (
     <Show
-      when={state.currentLab && state.templates.length}
-      fallback={<Empty title="No templates">No template blocks in this lab's vmlab.wcl.</Empty>}
+      when={state.currentLab}
+      fallback={<Empty title="No lab selected">Select a lab to view its templates.</Empty>}
     >
       <PageHead
         title="templates"
-        sub={`${state.templates.length} defined · built on this host, published to a registry`}
+        sub={`${state.templates.length} defined · ${registries().length} OCI ${registries().length === 1 ? "registry" : "registries"}`}
       />
       <div class="stack">
-        <For each={state.templates}>{(t) => <TemplateCard t={t} />}</For>
+        <RegistryInventory uses={registries()} />
+        <Show
+          when={state.templates.length}
+          fallback={<Empty title="No templates">No template blocks in this lab's vmlab.wcl.</Empty>}
+        >
+          <For each={state.templates}>{(t) => <TemplateCard t={t} />}</For>
+        </Show>
       </div>
     </Show>
+  );
+}
+
+function RegistryInventory(p: { uses: RegistryEntry[] }) {
+  const [adding, setAdding] = createSignal(false);
+  const [namespace, setNamespace] = createSignal("");
+  const [kind, setKind] = createSignal("both");
+  const [loginTarget, setLoginTarget] = createSignal<string | null>(null);
+  const [username, setUsername] = createSignal("");
+  const [password, setPassword] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const usage = (use: RegistryEntry) => {
+    if (use.vms && use.containers) return { label: "both", tone: "success" as const };
+    if (use.vms) return { label: "VMs", tone: "accent" as const };
+    return { label: "containers", tone: "info" as const };
+  };
+
+  return (
+    <Card
+      title="OCI registries"
+      padded={false}
+      action={
+        <Button size="sm" icon={Plus} onClick={() => setAdding(true)}>
+          Add registry
+        </Button>
+      }
+    >
+      <Show
+        when={p.uses.length}
+        fallback={<div class="registry-empty">No OCI registries are referenced by this lab.</div>}
+      >
+        <div class="registry-table">
+          <Table aria-label="OCI registries used by this lab">
+            <thead>
+              <tr>
+                <th>Registry</th>
+                <th>Used by</th>
+                <th>Authentication</th>
+                <th aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              <For each={p.uses}>
+                {(use) => (
+                  <tr>
+                    <td class="registry-host">{use.namespace}</td>
+                    <td>
+                      <Badge tone={usage(use).tone}>{usage(use).label}</Badge>
+                    </td>
+                    <td>
+                      <Badge tone={use.authenticated ? "success" : "neutral"}>
+                        {use.authenticated ? "credentials configured" : "public / anonymous"}
+                      </Badge>
+                    </td>
+                    <td class="registry-actions">
+                      <IconButton
+                        icon={KeyRound}
+                        label={`Configure credentials for ${use.namespace}`}
+                        onClick={() => {
+                          setUsername("");
+                          setPassword("");
+                          setLoginTarget(use.namespace);
+                        }}
+                      />
+                      <IconButton
+                        icon={Trash2}
+                        label={`Remove ${use.namespace}`}
+                        onClick={() =>
+                          void removeRegistry(use.namespace).catch((error) =>
+                            showToast(String(error), "danger"),
+                          )
+                        }
+                      />
+                    </td>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </Table>
+        </div>
+      </Show>
+      <Modal
+        open={adding()}
+        title="Add OCI registry"
+        onClose={() => setAdding(false)}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setAdding(false)}>Cancel</Button>
+            <Button
+              variant="primary"
+              disabled={busy() || !namespace().includes("/")}
+              onClick={() => {
+                setBusy(true);
+                void addRegistry({
+                  namespace: namespace(),
+                  vms: kind() === "vms" || kind() === "both",
+                  containers: kind() === "containers" || kind() === "both",
+                })
+                  .then(() => {
+                    setNamespace("");
+                    setAdding(false);
+                    showToast("Registry added to CLI and web settings");
+                  })
+                  .catch((error) => showToast(String(error), "danger"))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              Add registry
+            </Button>
+          </>
+        }
+      >
+        <div class="registry-add-form">
+          <Input
+            label="Registry namespace"
+            help="Include the owner or group whose repositories should be searched."
+            placeholder="ghcr.io/owner/templates"
+            value={namespace()}
+            onInput={(e) => setNamespace(e.currentTarget.value)}
+          />
+          <Select
+            label="Use for"
+            value={kind()}
+            options={[
+              { value: "both", label: "VMs and containers" },
+              { value: "vms", label: "VMs" },
+              { value: "containers", label: "Containers" },
+            ]}
+            onChange={setKind}
+          />
+        </div>
+      </Modal>
+      <Modal
+        open={loginTarget() !== null}
+        title="Registry credentials"
+        onClose={() => setLoginTarget(null)}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setLoginTarget(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              disabled={busy() || !username().trim() || !password()}
+              onClick={() => {
+                const target = loginTarget();
+                if (!target) return;
+                setBusy(true);
+                void loginRegistry(target, username().trim(), password())
+                  .then(() => {
+                    setPassword("");
+                    setLoginTarget(null);
+                    showToast("Registry credentials saved for CLI and web");
+                  })
+                  .catch((error) => showToast(String(error), "danger"))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              Verify and save
+            </Button>
+          </>
+        }
+      >
+        <div class="registry-add-form">
+          <div class="registry-credential-target">{loginTarget()}</div>
+          <Input
+            label="Username"
+            autocomplete="username"
+            value={username()}
+            onInput={(event) => setUsername(event.currentTarget.value)}
+          />
+          <Input
+            label="Password or access token"
+            type="password"
+            autocomplete="current-password"
+            value={password()}
+            onInput={(event) => setPassword(event.currentTarget.value)}
+          />
+          <div class="registry-credential-help">
+            Credentials are verified, then stored in Docker-compatible host credentials. The web
+            console never reads the saved password back.
+          </div>
+        </div>
+      </Modal>
+    </Card>
   );
 }
 

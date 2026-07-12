@@ -103,6 +103,31 @@ pub struct GaInterface {
     pub ips: Vec<(String, String)>,
 }
 
+/// Match the first non-loopback IPv4 address reported for each requested MAC.
+/// QGA and vmlab both render MACs case-insensitively; result order follows
+/// `macs`, which is the configuration's NIC declaration order.
+pub fn ipv4_by_mac(ifaces: &[GaInterface], macs: &[String]) -> Vec<Option<String>> {
+    macs.iter()
+        .map(|want| {
+            ifaces
+                .iter()
+                .find(|iface| {
+                    iface
+                        .hardware_address
+                        .as_deref()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(want))
+                })
+                .and_then(|iface| {
+                    iface
+                        .ips
+                        .iter()
+                        .find(|(address, kind)| kind == "ipv4" && !address.starts_with("127."))
+                        .map(|(address, _)| address.clone())
+                })
+        })
+        .collect()
+}
+
 /// Connection state. `needs_sync` is set on fresh connections and after
 /// any timeout: a late reply may still be in flight, so the next command
 /// must resynchronise the channel first. `pending_sync` holds the id of a

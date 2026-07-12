@@ -2,28 +2,86 @@
 //! (PRD §6.4 — `vmlab template search`).
 //!
 //! GHCR does **not** implement the OCI `/v2/_catalog` endpoint, so for
-//! `ghcr.io` we enumerate through the GitHub packages REST API; every other
-//! registry uses the standard catalog endpoint ([`Registry::list_catalog`]).
+//! `ghcr.io` we enumerate through GitHub Packages (the authenticated REST API
+//! or the public packages page); every other registry uses the standard
+//! catalog endpoint ([`Registry::list_catalog`]).
 
 use anyhow::{Context, Result, anyhow, bail};
+use regex::Regex;
 use serde::Deserialize;
 
 use super::Registry;
 use super::auth::{self, Credential};
 
-/// Full repository paths (`host/owner/.../name`) published under `namespace`
-/// (`host/owner[/group...]`). For `ghcr.io` this uses the GitHub packages API;
-/// other registries use OCI `/v2/_catalog`. Results are sorted.
-pub async fn list_repositories(namespace: &str) -> Result<Vec<String>> {
+/// Full repository paths (`host/owner/.../name`) published under `namespace`,
+/// optionally filtered by leaf name. GHCR uses GitHub Packages, Docker Hub
+/// uses its supported Hub API, and other registries use OCI `/v2/_catalog`.
+pub async fn list_repositories_filtered(
+    namespace: &str,
+    query: Option<&str>,
+) -> Result<Vec<String>> {
     let (host, owner, subpath) = split_namespace(namespace)?;
-    let mut repos = if host == "ghcr.io" || host.ends_with(".ghcr.io") {
+    let mut repos = if matches!(
+        host.as_str(),
+        "registry-1.docker.io" | "docker.io" | "index.docker.io"
+    ) {
+        list_docker_hub(&owner, &subpath, query).await?
+    } else if host == "ghcr.io" || host.ends_with(".ghcr.io") {
         list_ghcr(&host, &owner, &subpath).await?
     } else {
         list_via_catalog(namespace, &host, &owner, &subpath).await?
     };
+    if let Some(q) = query.map(str::to_lowercase).filter(|q| !q.is_empty()) {
+        repos.retain(|repo| {
+            repo.rsplit('/')
+                .next()
+                .is_some_and(|name| name.to_lowercase().contains(&q))
+        });
+    }
     repos.sort();
     repos.dedup();
     Ok(repos)
+}
+
+#[derive(Deserialize)]
+struct DockerHubRepositories {
+    #[serde(default)]
+    results: Vec<DockerHubRepository>,
+}
+
+#[derive(Deserialize)]
+struct DockerHubRepository {
+    name: String,
+}
+
+/// Docker Hub intentionally omits `_catalog`; its supported Hub API lists a
+/// namespace and accepts a partial-name filter.
+async fn list_docker_hub(owner: &str, subpath: &str, query: Option<&str>) -> Result<Vec<String>> {
+    if !subpath.is_empty() {
+        bail!("Docker Hub namespaces cannot contain a nested group (`{owner}/{subpath}`)");
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("vmlab-oci/1")
+        .build()
+        .context("cannot build Docker Hub client")?;
+    let mut request = client
+        .get(format!(
+            "https://hub.docker.com/v2/namespaces/{owner}/repositories"
+        ))
+        .query(&[("page_size", "100"), ("ordering", "name")]);
+    if let Some(q) = query.filter(|q| !q.is_empty()) {
+        request = request.query(&[("name", q)]);
+    }
+    let response = request.send().await.context("searching Docker Hub")?;
+    if !response.status().is_success() {
+        bail!("Docker Hub namespace search returned {}", response.status());
+    }
+    let page: DockerHubRepositories = response.json().await.context("parsing Docker Hub search")?;
+    Ok(page
+        .results
+        .into_iter()
+        .map(|repo| format!("registry-1.docker.io/{owner}/{}", repo.name))
+        .collect())
 }
 
 /// Split `host/owner[/group...]` into (host, owner, sub-path); sub-path may be
@@ -50,18 +108,19 @@ struct GhPackage {
 }
 
 async fn list_ghcr(host: &str, owner: &str, subpath: &str) -> Result<Vec<String>> {
-    let token = github_token(host)?;
     let client = reqwest::Client::builder()
         .user_agent("vmlab-oci/1")
         .build()
         .context("cannot build HTTP client")?;
 
-    // Container packages are owned by an org or a user; try org first.
-    let names = match fetch_packages(&client, &token, "orgs", owner).await? {
-        Some(n) => n,
-        None => fetch_packages(&client, &token, "users", owner)
-            .await?
-            .ok_or_else(|| anyhow!("no GitHub org or user named `{owner}`"))?,
+    // GitHub's package-list REST endpoint requires authentication even when
+    // every result is public. When no credential is configured, enumerate the
+    // public packages page instead; known public images can already be pulled
+    // from GHCR anonymously, so search should have the same behavior.
+    let names = if let Some(token) = github_token(host) {
+        fetch_for_owner(owner, |kind| fetch_packages(&client, &token, kind, owner)).await?
+    } else {
+        fetch_for_owner(owner, |kind| fetch_public_packages(&client, kind, owner)).await?
     };
 
     let prefix = if subpath.is_empty() {
@@ -74,6 +133,19 @@ async fn list_ghcr(host: &str, owner: &str, subpath: &str) -> Result<Vec<String>
         .filter(|n| n.starts_with(&prefix))
         .map(|n| format!("{host}/{owner}/{n}"))
         .collect())
+}
+
+async fn fetch_for_owner<F, Fut>(owner: &str, fetch: F) -> Result<Vec<String>>
+where
+    F: Fn(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Vec<String>>>>,
+{
+    match fetch("orgs").await? {
+        Some(names) => Ok(names),
+        None => fetch("users")
+            .await?
+            .ok_or_else(|| anyhow!("no GitHub org or user named `{owner}`")),
+    }
 }
 
 /// `Ok(Some(names))` on success, `Ok(None)` when the owner kind is a 404
@@ -119,25 +191,84 @@ async fn fetch_packages(
     Ok(Some(names))
 }
 
+/// Enumerate public packages from the same page GitHub serves to signed-out
+/// users. Unlike the Packages REST list endpoint, this does not require a PAT.
+async fn fetch_public_packages(
+    client: &reqwest::Client,
+    kind: &str,
+    owner: &str,
+) -> Result<Option<Vec<String>>> {
+    let mut names = Vec::new();
+    let mut url = Some(format!(
+        "https://github.com/{kind}/{owner}/packages?ecosystem=container"
+    ));
+
+    while let Some(u) = url.take() {
+        let response = client
+            .get(&u)
+            .send()
+            .await
+            .context("GitHub public packages request failed")?;
+        match response.status() {
+            reqwest::StatusCode::NOT_FOUND => return Ok(None),
+            status if !status.is_success() => {
+                bail!("GitHub public packages page returned {status}")
+            }
+            _ => {}
+        }
+        let body = response
+            .text()
+            .await
+            .context("reading GitHub public packages page")?;
+        let (page_names, next) = parse_public_packages_page(&body)?;
+        names.extend(page_names);
+        url = next.map(|next| {
+            if next.starts_with("https://") {
+                next
+            } else {
+                format!("https://github.com{next}")
+            }
+        });
+    }
+    Ok(Some(names))
+}
+
+fn parse_public_packages_page(body: &str) -> Result<(Vec<String>, Option<String>)> {
+    let package = Regex::new(
+        r#"title="([a-z0-9][a-z0-9._/-]*)"[^>]*href="/(?:orgs|users)/[^"/]+/packages/container/package/"#,
+    )
+    .expect("valid public package regex");
+    let next_after_href =
+        Regex::new(r#"href="([^"]+)"[^>]*rel="next""#).expect("valid pagination regex");
+    let next_before_href =
+        Regex::new(r#"rel="next"[^>]*href="([^"]+)""#).expect("valid pagination regex");
+    let names = package
+        .captures_iter(body)
+        .map(|capture| capture[1].to_string())
+        .collect();
+    let next = next_after_href
+        .captures(body)
+        .or_else(|| next_before_href.captures(body))
+        .map(|capture| capture[1].replace("&amp;", "&"));
+    Ok((names, next))
+}
+
 /// The GitHub token to list packages: the registry login's password (a PAT)
 /// if present, else `$GH_TOKEN` / `$GITHUB_TOKEN`.
-fn github_token(host: &str) -> Result<String> {
+fn github_token(host: &str) -> Option<String> {
     if let Ok(Credential::Basic { password, .. }) = auth::resolve(host)
         && !password.is_empty()
     {
-        return Ok(password);
+        return Some(password);
     }
     for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(t) = std::env::var(var)
             && !t.is_empty()
         {
-            return Ok(t);
+            return Some(t);
         }
     }
-    bail!(
-        "searching {host} needs a GitHub token — run `vmlab template login {host}` or set \
-         GH_TOKEN/GITHUB_TOKEN (needs `read:packages`)"
-    )
+    None
 }
 
 // ---- Generic OCI `/v2/_catalog` --------------------------------------------
@@ -208,5 +339,20 @@ mod tests {
             Some("https://api.github.com/x?page=2")
         );
         assert_eq!(next_link("<...>; rel=\"prev\"").as_deref(), None);
+    }
+
+    #[test]
+    fn parses_signed_out_github_packages_page() {
+        let html = r#"
+          <a title="vmlab-templates/alpine-3.23"
+             href="/orgs/VMLabDev/packages/container/package/vmlab-templates%2Falpine-3.23">Alpine</a>
+          <a href="/orgs/VMLabDev/packages?ecosystem=container&amp;page=2" rel="next">Next</a>
+        "#;
+        let (names, next) = parse_public_packages_page(html).unwrap();
+        assert_eq!(names, ["vmlab-templates/alpine-3.23"]);
+        assert_eq!(
+            next.as_deref(),
+            Some("/orgs/VMLabDev/packages?ecosystem=container&page=2")
+        );
     }
 }

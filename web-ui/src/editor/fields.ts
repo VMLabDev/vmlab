@@ -203,48 +203,6 @@ export const GPU_FIELDS: FieldDesc[] = [
   },
 ];
 
-// --- container ------------------------------------------------------------------
-// Image (with restart policy) and depends-on render as dedicated controls in
-// the container inspector; cpus/memory as sliders — these tables cover the
-// rest of the block's scalar surface plus its child collections.
-
-export const CONTAINER_GENERAL: FieldDesc[] = [
-  {
-    key: "restart",
-    label: "Restart",
-    doc: "Restart policy: `no` (default) | `on-failure` | `always`",
-    type: "enum",
-    options: ["no", "on-failure", "always"],
-    required: true,
-  },
-  {
-    key: "workdir",
-    label: "Working dir",
-    doc: "Working directory inside the container; image default if omitted",
-    type: "text",
-    placeholder: "/app",
-  },
-  {
-    key: "user",
-    label: "User",
-    doc: "User to run as: `uid[:gid]` or a name from the image; image default if omitted",
-    type: "text",
-    placeholder: "1000:1000",
-  },
-  {
-    key: "entrypoint",
-    label: "Entrypoint",
-    doc: "Override the image entrypoint (exec form, one argument per line)",
-    type: "lines",
-  },
-  {
-    key: "command",
-    label: "Command",
-    doc: "Override the image cmd (exec form, one argument per line)",
-    type: "lines",
-  },
-];
-
 export const ENV_FIELDS: FieldDesc[] = [
   {
     key: "name",
@@ -370,19 +328,7 @@ export const SEGMENT_GENERAL: FieldDesc[] = [
     type: "text",
     placeholder: "10.50.0.0/24",
   },
-  {
-    key: "global",
-    label: "Global",
-    doc: "Owned by the supervisor and shared across labs",
-    type: "flag",
-  },
   // mtu renders as a dedicated SliderRow in the segment inspector.
-  {
-    key: "routes_to",
-    label: "Routes to",
-    doc: "Other segments to route to — inter-segment routing opt-in",
-    type: "segrefs",
-  },
 ];
 
 export const SEGMENT_SERVICES: FieldDesc[] = [
@@ -391,56 +337,6 @@ export const SEGMENT_SERVICES: FieldDesc[] = [
     label: "DHCP",
     doc: "Enable DHCP (default true)",
     type: "flag",
-  },
-  {
-    key: "nat",
-    label: "NAT",
-    doc: "Enable NAT/internet egress for this segment (default false)",
-    type: "flag",
-  },
-];
-
-export const DNS_FIELDS: FieldDesc[] = [
-  {
-    key: "server",
-    label: "DNS server",
-    doc: "IPv4 of the DNS server to hand out via DHCP instead of the daemon",
-    type: "text",
-    placeholder: "10.50.0.10",
-  },
-  {
-    key: "enabled",
-    label: "Hand out DNS",
-    doc: "Hand out a DNS server at all (default true)",
-    type: "flag",
-  },
-];
-
-export const CONNECT_FIELDS: FieldDesc[] = [
-  {
-    key: "host",
-    label: "Peer host",
-    doc: "Remote supervisor `host[:port]` to bridge this segment with",
-    type: "text",
-    required: true,
-    placeholder: "otherhost:7700",
-  },
-];
-
-export const ROUTE_FIELDS: FieldDesc[] = [
-  {
-    key: "dest",
-    label: "Destination",
-    doc: "Destination CIDR, e.g. `10.60.0.0/24` (required)",
-    type: "text",
-    required: true,
-  },
-  {
-    key: "via",
-    label: "Via",
-    doc: "Gateway IPv4 the route points at (required)",
-    type: "text",
-    required: true,
   },
 ];
 
@@ -458,94 +354,6 @@ export const RECORD_FIELDS: FieldDesc[] = [
     doc: "IPv4 address the name resolves to (required)",
     type: "text",
     required: true,
-  },
-];
-
-export const FORWARD_FIELDS: FieldDesc[] = [
-  {
-    key: "host_port",
-    label: "Host port",
-    doc: "Host port to listen on (1–65535); unique across the lab",
-    type: "int",
-    required: true,
-    min: 1,
-    max: 65535,
-  },
-  {
-    key: "vm",
-    label: "VM",
-    doc: "Target VM; must be declared in this lab",
-    type: "vmref",
-    required: true,
-  },
-  {
-    key: "guest_port",
-    label: "Guest port",
-    doc: "Target port inside the guest",
-    type: "int",
-    required: true,
-    min: 1,
-    max: 65535,
-  },
-  {
-    key: "proto",
-    label: "Protocol",
-    doc: "`tcp` (default) | `udp` | `both`",
-    type: "enum",
-    options: ["tcp", "udp", "both"],
-    required: true,
-  },
-];
-
-export const BLOCK_RULE_FIELDS: FieldDesc[] = [
-  {
-    key: "cidr",
-    label: "CIDR",
-    doc: "IPv4 CIDR to drop traffic to/from (required)",
-    type: "text",
-    required: true,
-    placeholder: "0.0.0.0/0",
-  },
-  {
-    key: "proto",
-    label: "Protocol",
-    doc: "Protocol to scope the rule: `tcp` | `udp` | `icmp`",
-    type: "enum",
-    options: ["tcp", "udp", "icmp"],
-  },
-  {
-    key: "port",
-    label: "Port",
-    doc: "Port to scope the rule (1–65535); requires a protocol",
-    type: "int",
-    min: 1,
-    max: 65535,
-  },
-];
-
-export const REDIRECT_FIELDS: FieldDesc[] = [
-  {
-    key: "from",
-    label: "From",
-    doc: "Match destination as `ip[:port]` (required)",
-    type: "text",
-    required: true,
-    placeholder: "1.2.3.4:443",
-  },
-  {
-    key: "to",
-    label: "To",
-    doc: "Rewrite destination to `ip[:port]` (required)",
-    type: "text",
-    required: true,
-    placeholder: "10.0.0.5:8443",
-  },
-  {
-    key: "proto",
-    label: "Protocol",
-    doc: "Protocol to scope the rule: `tcp` | `udp`",
-    type: "enum",
-    options: ["tcp", "udp"],
   },
 ];
 
@@ -602,6 +410,12 @@ export const HANDLER_FIELDS: FieldDesc[] = [
     type: "text",
     required: true,
     placeholder: "scripts/on-crash.ws",
+  },
+  {
+    key: "targets",
+    label: "Target machines",
+    doc: "Optional VM/container names; empty handles every occurrence of the event",
+    type: "vmrefs",
   },
 ];
 

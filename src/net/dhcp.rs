@@ -61,9 +61,12 @@ const OPT_END: u8 = 255;
 #[derive(Debug, Clone)]
 pub struct DhcpConfig {
     pub subnet: Ipv4Net,
-    /// The gateway's IP — pushed as router and server identifier, excluded
-    /// from the dynamic pool.
+    /// The daemon gateway service's IP — used as the DHCP server identifier
+    /// and excluded from the dynamic pool.
     pub gateway: Ipv4Addr,
+    /// Default router advertised with DHCP option 3. Usually the daemon
+    /// gateway, but may be a designated VM/container NIC on the segment.
+    pub router: Ipv4Addr,
     /// The MAC the server's reply frames are sent from (the gateway MAC).
     pub server_mac: MacAddr,
     /// DNS server pushed via option 6; `None` omits the option entirely.
@@ -89,6 +92,7 @@ impl DhcpConfig {
         Self {
             subnet,
             gateway,
+            router: gateway,
             server_mac,
             dns_server: None,
             domain: None,
@@ -354,7 +358,7 @@ impl DhcpServer {
         if msg_type != DHCP_NAK {
             opt(&mut b, OPT_LEASE_TIME, &cfg.lease_secs.to_be_bytes());
             opt(&mut b, OPT_SUBNET_MASK, &cfg.subnet.netmask().octets());
-            opt(&mut b, OPT_ROUTER, &cfg.gateway.octets());
+            opt(&mut b, OPT_ROUTER, &cfg.router.octets());
             if let Some(dns) = cfg.dns_server {
                 opt(&mut b, OPT_DNS, &dns.octets());
             }
@@ -628,6 +632,18 @@ mod tests {
         assert!(!r.opts.contains_key(&OPT_CLASSLESS_ROUTES));
         // Default MTU is 1500 — option 26 is omitted.
         assert!(!r.opts.contains_key(&OPT_MTU));
+    }
+
+    #[test]
+    fn external_router_does_not_replace_dhcp_server_identity() {
+        let router = Ipv4Addr::new(10, 213, 1, 254);
+        let mut cfg = config();
+        cfg.router = router;
+        let mut server = DhcpServer::new(cfg);
+        let reply = parse_reply(&server.handle(&discover(mac(1))).expect("offer expected"));
+        assert_eq!(reply.opts[&OPT_ROUTER], router.octets().to_vec());
+        assert_eq!(reply.opts[&OPT_SERVER_ID], GW.octets().to_vec());
+        assert_eq!(reply.eth_src, GW_MAC);
     }
 
     #[test]

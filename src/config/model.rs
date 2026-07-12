@@ -239,6 +239,8 @@ pub struct Nic {
     pub segment: Option<String>,
     pub nat: bool,
     pub ip: Option<Ipv4Addr>,
+    /// Give this NIC the segment router identity (the first usable address).
+    pub gateway: bool,
     pub mac: Option<MacAddr>,
     pub isolated: bool,
 }
@@ -442,6 +444,8 @@ pub struct Provision {
 pub struct Handler {
     pub event: String,
     pub run: PathBuf,
+    /// Optional VM/container names. Empty binds the event lab-wide.
+    pub targets: Vec<String>,
     pub span: Span,
 }
 

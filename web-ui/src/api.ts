@@ -69,6 +69,8 @@ export interface Nic {
   segment: string | null;
   mac: string | null;
   static_ip: string | null;
+  /** Live IPv4 address reported for this interface, null while unknown/offline. */
+  ip: string | null;
 }
 export interface Vm {
   name: string;
@@ -277,6 +279,56 @@ export const validateConfig = (lab: string, content: string): Promise<void> =>
   putConfig(lab, content, true);
 export const saveConfig = (lab: string, content: string): Promise<void> =>
   putConfig(lab, content, false);
+
+export interface ScriptDoc {
+  path: string;
+  content: string;
+  rev: string;
+}
+
+export class ScriptStale extends Error {
+  constructor() {
+    super("Script changed on disk — reload it before saving");
+  }
+}
+
+const scriptUrl = (lab: string, path?: string) =>
+  `/api/labs/${encodeURIComponent(lab)}/scripts${path ? `?path=${encodeURIComponent(path)}` : ""}`;
+
+export async function getProvisionScript(lab: string, path: string): Promise<ScriptDoc | null> {
+  const headers: Record<string, string> = {};
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(scriptUrl(lab, path), { headers });
+  if (response.status === 401) {
+    clearToken();
+    throw new Unauthorized("authentication required");
+  }
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error ?? response.statusText);
+  }
+  return response.json();
+}
+
+export async function saveProvisionScript(
+  lab: string,
+  path: string,
+  content: string,
+  baseRev: string | null,
+): Promise<string> {
+  const result = await req(scriptUrl(lab), {
+    method: "PUT",
+    body: JSON.stringify({ path, content, base_rev: baseRev }),
+  }).catch((error) => {
+    if (error instanceof Error && error.message.includes("changed on disk")) {
+      throw new ScriptStale();
+    }
+    throw error;
+  });
+  return result.rev;
+}
 export const reloadLab = (lab: string): Promise<unknown> =>
   post(`/api/labs/${encodeURIComponent(lab)}/reload`);
 
@@ -338,10 +390,59 @@ export const listStoreTemplates = (): Promise<StoreTemplate[]> => req("/api/cata
 export const listProfiles = (): Promise<string[]> => req("/api/catalog/profiles");
 export const catalogMeta = (): Promise<CatalogMeta> => req("/api/catalog/meta");
 
-/** Host capacity for the editor's hardware sliders (GET /api/host). */
+export interface OciCatalogEntry {
+  name: string;
+  repo: string;
+  arches: string[];
+  version: string;
+  reference: string;
+}
+
+export const searchOciCatalog = (
+  registry: string,
+  query: string,
+  arch: string,
+  kind: "vm" | "container",
+): Promise<OciCatalogEntry[]> => {
+  const params = new URLSearchParams({ registry, q: query, arch, kind });
+  return req(`/api/catalog/oci?${params}`);
+};
+
+export interface RegistrySetting {
+  namespace: string;
+  vms: boolean;
+  containers: boolean;
+  authenticated: boolean;
+}
+
+export interface RegistrySettings {
+  entries: RegistrySetting[];
+  removed: string[];
+}
+
+export const listRegistries = (): Promise<RegistrySettings> => req("/api/registries");
+export const addRegistrySetting = (
+  namespace: string,
+  useFor: "vms" | "containers" | "both",
+): Promise<unknown> => post("/api/registries", { namespace, use_for: useFor });
+export const removeRegistrySetting = (namespace: string): Promise<unknown> =>
+  req("/api/registries", {
+    method: "DELETE",
+    body: JSON.stringify({ namespace }),
+  });
+export const loginRegistry = (
+  namespace: string,
+  username: string,
+  password: string,
+): Promise<{ authenticated: boolean }> =>
+  post("/api/registries/login", { namespace, username, password });
+
+/** Host capacity and virtualization acceleration (GET /api/host). */
 export interface HostInfo {
   cpus: number;
   memory: number; // bytes
+  acceleration: "kvm" | "tcg";
+  arch: string;
 }
 
 export const hostInfo = (): Promise<HostInfo> => req("/api/host");

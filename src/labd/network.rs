@@ -2,7 +2,7 @@
 //! allocation from the host pool, NIC listener sockets for QEMU stream
 //! netdevs. Gateway services (DHCP/DNS/NAT) attach per segment.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,7 +27,12 @@ pub struct SegmentNet {
     pub name: String,
     pub switch: Arc<Switch>,
     pub subnet: Ipv4Net,
+    /// Router address advertised to guests. In dedicated gateway mode this
+    /// belongs to the selected VM/container NIC.
     pub gateway_ip: Ipv4Addr,
+    /// Address retained by the daemon for DHCP/DNS/SMB. Normally identical
+    /// to `gateway_ip`; moved to a free host address when a machine owns it.
+    pub service_ip: Ipv4Addr,
     /// Declared config (None for the built-in NAT segment).
     pub config: Option<Segment>,
     /// NAT egress on (declared `nat = true`, or the built-in segment).
@@ -149,13 +154,16 @@ impl LabNetwork {
                 Some(s) => s,
                 None => alloc_auto()?,
             };
+            let gateway_ip = crate::config::validate::gateway_ip(subnet);
+            let service_ip = segment_service_ip(lab, &seg.name, subnet, gateway_ip)?;
             segments.insert(
                 seg.name.clone(),
                 SegmentNet {
                     name: seg.name.clone(),
                     switch: Switch::new(format!("{}/{}", lab.name, seg.name)),
                     subnet,
-                    gateway_ip: crate::config::validate::gateway_ip(subnet),
+                    gateway_ip,
+                    service_ip,
                     config: Some(seg.clone()),
                     nat: seg.nat,
                     dhcp: seg.dhcp,
@@ -186,6 +194,7 @@ impl LabNetwork {
                     switch: Switch::new(format!("{}/{}", lab.name, NAT_SEGMENT)),
                     subnet,
                     gateway_ip: crate::config::validate::gateway_ip(subnet),
+                    service_ip: crate::config::validate::gateway_ip(subnet),
                     config: None,
                     nat: true,
                     dhcp: true,
@@ -293,6 +302,11 @@ impl LabNetwork {
             }
             let gw_mac = gateway_mac(&lab.name, &seg.name);
             let mtu = seg.effective_mtu();
+            let router_ip = machine_nics(lab)
+                .flat_map(|(_, nics)| nics)
+                .find(|nic| nic.gateway && nic_segment_name(nic) == seg.name)
+                .and_then(|nic| nic.ip)
+                .unwrap_or(seg.gateway_ip);
 
             // -- DHCP -------------------------------------------------------
             let seg_dns = seg
@@ -302,13 +316,16 @@ impl LabNetwork {
                 .unwrap_or_default();
             let dns_enabled = !seg_dns.declared || seg_dns.enabled;
             let dhcp = if seg.dhcp {
-                let mut cfg = DhcpConfig::new(seg.subnet, seg.gateway_ip, gw_mac);
+                let mut cfg = DhcpConfig::new(seg.subnet, seg.service_ip, gw_mac);
+                // Dedicated gateway mode gives the router address to a
+                // VM/container. The daemon keeps DHCP/DNS on `service_ip`.
+                cfg.router = router_ip;
                 // DNS option (§9.5): segment override > daemon gateway;
                 // suppressed entirely with `dns { enabled = false }`.
                 cfg.dns_server = if !dns_enabled {
                     None
                 } else {
-                    Some(seg_dns.server.unwrap_or(seg.gateway_ip))
+                    Some(seg_dns.server.unwrap_or(seg.service_ip))
                 };
                 cfg.domain = Some(format!("{}.{}", lab.name, host.dns_suffix));
                 cfg.mtu = mtu;
@@ -371,7 +388,7 @@ impl LabNetwork {
                 GatewayConfig {
                     segment_name: seg.name.clone(),
                     lab_name: lab.name.clone(),
-                    gw_ip: seg.gateway_ip,
+                    gw_ip: seg.service_ip,
                     gw_mac,
                     dhcp,
                     dns,
@@ -462,6 +479,37 @@ fn host_resolver() -> Option<std::net::SocketAddr> {
 }
 
 /// Segment a NIC attaches to: its declared segment, or the built-in NAT
+/// Pick the daemon's service address. A dedicated machine gateway owns the
+/// traditional first host address, so DHCP/DNS/SMB move to the first otherwise
+/// unused host. The DHCP allocator excludes this address automatically.
+fn segment_service_ip(
+    lab: &Lab,
+    segment: &str,
+    subnet: Ipv4Net,
+    gateway_ip: Ipv4Addr,
+) -> Result<Ipv4Addr> {
+    let delegated = machine_nics(lab)
+        .flat_map(|(_, nics)| nics)
+        .any(|nic| nic.gateway && nic_segment_name(nic) == segment);
+    if !delegated {
+        return Ok(gateway_ip);
+    }
+    let used: HashSet<Ipv4Addr> = machine_nics(lab)
+        .flat_map(|(_, nics)| nics)
+        .filter(|nic| nic_segment_name(nic) == segment)
+        .filter_map(|nic| nic.ip)
+        .collect();
+    subnet
+        .hosts()
+        .find(|ip| *ip != gateway_ip && !used.contains(ip))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "segment \"{segment}\" has no free address for built-in DHCP/DNS services"
+            )
+        })
+}
+
+/// Segment a NIC attaches to: its declared segment, or the built-in NAT
 /// segment for `nat = true`.
 /// All machine NICs in the lab, `(name, nics)` per machine — VMs and
 /// containers attach to segments identically, so network assembly treats
@@ -506,6 +554,7 @@ lab "l" {
         let net = LabNetwork::build(&l).unwrap();
         assert_eq!(net.segments["corp"].subnet.to_string(), "10.50.0.0/24");
         assert_eq!(net.segments["corp"].gateway_ip.to_string(), "10.50.0.1");
+        assert_eq!(net.segments["corp"].service_ip.to_string(), "10.50.0.1");
         // dmz auto-allocated from the pool.
         let dmz = net.segments["dmz"].subnet;
         assert!(dmz.to_string().starts_with("10.213."));
@@ -513,6 +562,23 @@ lab "l" {
         let nat = &net.segments[NAT_SEGMENT];
         assert!(nat.nat);
         assert_ne!(nat.subnet, dmz);
+    }
+
+    #[test]
+    fn delegated_gateway_moves_daemon_services_off_router_address() {
+        let l = lab(r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.50.0.0/24" }
+  vm "router" {
+    template = "x86_64/t"
+    nic { segment = "lan" ip = "10.50.0.1" gateway = true }
+  }
+  container "reserved" { image = "alpine" nic { segment = "lan" ip = "10.50.0.2" } }
+}"#);
+        let net = LabNetwork::build(&l).unwrap();
+        let lan = &net.segments["lan"];
+        assert_eq!(lan.gateway_ip.to_string(), "10.50.0.1");
+        assert_eq!(lan.service_ip.to_string(), "10.50.0.3");
     }
 
     #[test]

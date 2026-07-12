@@ -36,7 +36,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-pub use catalog::list_repositories;
+pub use catalog::list_repositories_filtered;
 pub use client::{PullProgress, Registry, cached_registry_template, ensure_registry_template};
 // No in-crate consumer until the container-runtime wiring lands (`image` has
 // the matching module-level dead_code allow).
@@ -105,4 +105,10 @@ pub async fn login(registry: &str, username: &str, password: &str) -> Result<Pat
     }
 
     auth::store_login(registry, username, password)
+}
+
+/// Whether Docker-compatible config or a credential helper can resolve a
+/// non-anonymous credential for this registry host. Never exposes the secret.
+pub fn has_credentials(registry: &str) -> bool {
+    matches!(auth::resolve(registry), Ok(auth::Credential::Basic { .. }))
 }

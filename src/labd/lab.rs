@@ -569,7 +569,7 @@ impl LabRuntime {
                 for s in &mut shares {
                     s.host = resolve_share_host(&self.root, &s.host);
                 }
-                sharing.push((vm.name.clone(), seg.gateway_ip, shares));
+                sharing.push((vm.name.clone(), seg.service_ip, shares));
                 if !seg_ports.contains(&seg_name.to_string()) {
                     seg_ports.push(seg_name.to_string());
                 }
@@ -608,8 +608,8 @@ impl LabRuntime {
                         transport: crate::config::model::ShareTransport::Smb,
                     })
                     .collect();
-                sharing.push((name.clone(), seg.gateway_ip, shares));
-                volume_gateways.push((name.clone(), seg.gateway_ip));
+                sharing.push((name.clone(), seg.service_ip, shares));
+                volume_gateways.push((name.clone(), seg.service_ip));
                 if !seg_ports.contains(&seg_name.to_string()) {
                     seg_ports.push(seg_name.to_string());
                 }
@@ -667,7 +667,7 @@ impl LabRuntime {
                     use crate::config::model::{HostPort, RedirectRule};
                     rs.add_redirect(RedirectRule {
                         from: HostPort {
-                            ip: seg.gateway_ip,
+                            ip: seg.service_ip,
                             port: Some(445),
                         },
                         to: HostPort {
@@ -1580,11 +1580,14 @@ impl LabRuntime {
         for (name, vm) in &self.vms {
             let state = vm.state().await;
             let ready = vm.is_ready().await;
-            let ip = if ready {
-                vm.guest_ip(None).await.ok()
+            let assigned_ips = if ready {
+                vm.guest_ips()
+                    .await
+                    .unwrap_or_else(|_| vec![None; vm.cfg.nics.len()])
             } else {
-                None
+                vec![None; vm.cfg.nics.len()]
             };
+            let ip = assigned_ips.iter().flatten().next().cloned();
             // NICs in declaration order, paired with their resolved MACs — the
             // web UI groups machines by segment and shows MACs from this.
             let nics: Vec<Value> = vm
@@ -1597,6 +1600,7 @@ impl LabRuntime {
                         "segment": nic.segment,
                         "mac": vm.macs.get(i).map(|m| m.to_string()),
                         "static_ip": nic.ip.map(|a| a.to_string()),
+                        "ip": assigned_ips.get(i).and_then(Clone::clone),
                     })
                 })
                 .collect();
@@ -1617,7 +1621,14 @@ impl LabRuntime {
         for (name, c) in &self.containers {
             let state = c.state().await;
             let ready = c.is_ready().await;
-            let ip = if ready { c.guest_ip().await.ok() } else { None };
+            let assigned_ips = if ready {
+                c.guest_ips()
+                    .await
+                    .unwrap_or_else(|_| vec![None; c.cfg.nics.len()])
+            } else {
+                vec![None; c.cfg.nics.len()]
+            };
+            let ip = assigned_ips.iter().flatten().next().cloned();
             let nics: Vec<Value> = c
                 .cfg
                 .nics
@@ -1628,6 +1639,7 @@ impl LabRuntime {
                         "segment": nic.segment,
                         "mac": c.macs.get(i).map(|m| m.to_string()),
                         "static_ip": nic.ip.map(|a| a.to_string()),
+                        "ip": assigned_ips.get(i).and_then(Clone::clone),
                     })
                 })
                 .collect();

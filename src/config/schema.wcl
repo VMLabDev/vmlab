@@ -204,6 +204,8 @@ type Nic {
   nat: bool?
   @doc("Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique")
   ip: utf8?
+  @doc("Make this NIC the segment gateway; it must own the subnet's first usable address")
+  gateway: bool?
   @doc("Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise")
   mac: utf8?
   @doc("Port isolation: reach gateway/forwards but not segment neighbours")
@@ -359,6 +361,8 @@ type Handler {
   @inline(0) event: utf8
   @doc("Path to the handler `.ws` file; must exist and compile (required)")
   run: utf8
+  @doc("Optional VM/container names; empty handles every occurrence of the event")
+  targets: list<utf8>?
 }
 
 // Template definition, buildable with `vmlab template build`.

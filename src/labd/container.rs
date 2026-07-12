@@ -1134,25 +1134,39 @@ impl ContainerInstance {
         }
     }
 
-    /// First IPv4 address of the container: the ctl channel's `net_up`
-    /// report when available, else the guest agent's interface list
-    /// (excluding loopback) — mirroring the VM path.
-    pub async fn guest_ip(&self) -> Result<String> {
-        if let Some(ctl) = self.ctl.lock().await.clone()
+    /// Per-NIC IPv4 addresses. Prefer QGA's MAC-addressed interface list;
+    /// cinit's net-up report remains a first-NIC fallback during early boot.
+    pub async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
+        let mut ips = match self.qga().await {
+            Ok(qga) => match qga.network_interfaces(Duration::from_secs(5)).await {
+                Ok(ifaces) => {
+                    let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
+                    crate::qga::ipv4_by_mac(&ifaces, &macs)
+                }
+                Err(_) => vec![None; self.macs.len()],
+            },
+            Err(_) => vec![None; self.macs.len()],
+        };
+        if ips.first().is_some_and(Option::is_none)
+            && let Some(ctl) = self.ctl.lock().await.clone()
             && let Some(ip) = ctl.ip().await
         {
-            return Ok(ip);
+            ips[0] = Some(ip);
         }
-        let qga = self.qga().await?;
-        let ifaces = qga.network_interfaces(Duration::from_secs(5)).await?;
-        for iface in &ifaces {
-            for (addr, kind) in &iface.ips {
-                if kind == "ipv4" && !addr.starts_with("127.") {
-                    return Ok(addr.clone());
-                }
-            }
+        if ips.iter().any(Option::is_some) {
+            Ok(ips)
+        } else {
+            bail!("{}: no IPv4 address reported by agent", self.cfg.name)
         }
-        bail!("{}: no IPv4 address reported by agent", self.cfg.name)
+    }
+
+    pub async fn guest_ip(&self) -> Result<String> {
+        self.guest_ips()
+            .await?
+            .into_iter()
+            .flatten()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{}: no IPv4 address reported by agent", self.cfg.name))
     }
 
     /// Run a command *inside the container rootfs*: qemu-ga lives in the
@@ -1443,6 +1457,7 @@ mod tests {
                 segment: Some("lan".into()),
                 nat: false,
                 ip: None,
+                gateway: false,
                 mac: None,
                 isolated: false,
             },
@@ -1451,6 +1466,7 @@ mod tests {
                 segment: Some("dmz".into()),
                 nat: false,
                 ip: None,
+                gateway: false,
                 mac: None,
                 isolated: false,
             },

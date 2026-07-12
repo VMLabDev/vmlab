@@ -10,7 +10,9 @@ import { setNavGuard, showToast } from "../store";
 import { confirmDialog } from "../components/dialogs";
 import type {
   ContainerModel,
+  HandlerModel,
   LabModel,
+  ProvisionModel,
   Span,
   TemplateSummary,
   VmModel,
@@ -24,8 +26,14 @@ export type Selection =
   | { kind: "segment"; index: number }
   | { kind: "vm"; index: number }
   | { kind: "container"; index: number }
+  | { kind: "provision"; index: number }
   | { kind: "nat" }
   | { kind: "remote"; host: string };
+
+export interface HostPortDraft {
+  id: string;
+  hostPort: number;
+}
 
 interface EditorState {
   lab: string | null;
@@ -48,6 +56,9 @@ interface EditorState {
    *  block — pure UI state, persisted per lab in localStorage like node
    *  positions (an unattached node writes nothing to WCL). */
   remoteDrafts: string[];
+  /** Host sockets not yet attached to a machine. Once cabled they become a
+   *  normal segment forward or container port block in the WCL draft. */
+  hostPortDrafts: HostPortDraft[];
   catalog: {
     templates: StoreTemplate[];
     profiles: string[];
@@ -71,6 +82,7 @@ const [editor, setEditor] = createStore<EditorState>({
   busy: null,
   issues: [],
   remoteDrafts: [],
+  hostPortDrafts: [],
   catalog: { templates: [], profiles: [], meta: null, host: null },
 });
 
@@ -100,8 +112,112 @@ export async function openEditor(lab: string) {
     issues: [],
     selection: { kind: "lab" },
     remoteDrafts: loadRemoteDrafts(lab),
+    hostPortDrafts: loadHostPortDrafts(lab),
   });
   await Promise.all([reloadModel(lab), loadCatalogs()]);
+}
+
+// --- host port node -----------------------------------------------------------
+
+const hostPortsKey = (lab: string) => `vmlab.editor.host-ports.${lab}`;
+
+function loadHostPortDrafts(lab: string): HostPortDraft[] {
+  try {
+    const raw = localStorage.getItem(hostPortsKey(lab));
+    const list = raw ? (JSON.parse(raw) as unknown) : [];
+    if (!Array.isArray(list)) return [];
+    return list.filter(
+      (p): p is HostPortDraft =>
+        typeof p === "object" &&
+        p !== null &&
+        typeof (p as HostPortDraft).id === "string" &&
+        typeof (p as HostPortDraft).hostPort === "number",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistHostPortDrafts() {
+  if (!editor.lab) return;
+  try {
+    localStorage.setItem(hostPortsKey(editor.lab), JSON.stringify(editor.hostPortDrafts));
+  } catch {
+    /* quota — unattached visual sockets are best-effort */
+  }
+}
+
+export function addHostPort(): string {
+  const id = globalThis.crypto?.randomUUID?.() ?? `port-${Date.now()}`;
+  setEditor("hostPortDrafts", editor.hostPortDrafts.length, { id, hostPort: 0 });
+  persistHostPortDrafts();
+  return id;
+}
+
+export function setHostPortDraft(id: string, hostPort: number) {
+  const index = editor.hostPortDrafts.findIndex((p) => p.id === id);
+  if (index < 0) return;
+  setEditor("hostPortDrafts", index, "hostPort", hostPort);
+  persistHostPortDrafts();
+}
+
+export function removeHostPortDraft(id: string) {
+  setEditor(
+    "hostPortDrafts",
+    editor.hostPortDrafts.filter((p) => p.id !== id),
+  );
+  persistHostPortDrafts();
+}
+
+/** Attach an unbound host socket to a machine. Container mappings use their
+ *  native `port {}` block; VM mappings use a `forward {}` on the VM's first
+ *  declared segment NIC. Both guest ends start invalid at port 0 by design. */
+export function attachHostPort(id: string, kind: MachineKind, index: number): boolean {
+  const draft = editor.hostPortDrafts.find((p) => p.id === id);
+  const lab = editor.draft;
+  if (!draft || !lab) return false;
+
+  if (kind === "container") {
+    const container = lab.containers[index];
+    if (!container?.nics.length) {
+      showToast("Add a NIC before forwarding a host port to this container", "warning");
+      return false;
+    }
+    setEditor(
+      "draft",
+      "containers",
+      index,
+      "ports",
+      container.ports.length,
+      { span: null, host: draft.hostPort, container: 0, proto: "tcp" },
+    );
+  } else {
+    const vm = lab.vms[index];
+    const segmentName = vm?.nics.find((nic) => !nic.nat && nic.segment)?.segment;
+    const segmentIndex = lab.segments.findIndex((segment) => segment.name === segmentName);
+    if (!vm || segmentIndex < 0) {
+      showToast("A VM needs a segment NIC before a host port can be attached", "warning");
+      return false;
+    }
+    const forwards = lab.segments[segmentIndex].forwards;
+    setEditor(
+      "draft",
+      "segments",
+      segmentIndex,
+      "forwards",
+      forwards.length,
+      {
+        span: null,
+        host_port: draft.hostPort,
+        vm: vm.name,
+        guest_port: 0,
+        proto: "tcp",
+      },
+    );
+  }
+
+  removeHostPortDraft(id);
+  return true;
 }
 
 // --- remote-vmlab peer nodes ---------------------------------------------------
@@ -311,12 +427,42 @@ export function addSegment(): number {
   return index;
 }
 
+export function addProvision(script: string): number {
+  const draft = editor.draft;
+  if (!draft) return -1;
+  setEditor("draft", "provisions", draft.provisions.length, { span: null, script, vms: [] });
+  const index = editor.draft!.provisions.length - 1;
+  select({ kind: "provision", index });
+  return index;
+}
+
+export function removeProvision(index: number) {
+  setEditor(
+    "draft",
+    "provisions",
+    produce((provisions: ProvisionModel[]) => {
+      provisions.splice(index, 1);
+    }),
+  );
+  select({ kind: "lab" });
+}
+
 export function removeVm(index: number) {
   setEditor(
     "draft",
-    "vms",
-    produce((vms: VmModel[]) => {
-      vms.splice(index, 1);
+    produce((draft: LabModel | null) => {
+      const removed = draft?.vms[index]?.name;
+      if (!draft || !removed) return;
+      draft.vms.splice(index, 1);
+      for (const machine of [...draft.vms, ...draft.containers]) {
+        machine.depends_on = machine.depends_on.filter((name) => name !== removed);
+      }
+      for (const provision of draft.provisions) {
+        provision.vms = provision.vms.filter((name) => name !== removed);
+      }
+      for (const handler of draft.handlers) {
+        handler.targets = handler.targets.filter((name) => name !== removed);
+      }
     }),
   );
   select({ kind: "lab" });
@@ -325,9 +471,19 @@ export function removeVm(index: number) {
 export function removeContainer(index: number) {
   setEditor(
     "draft",
-    "containers",
-    produce((containers: ContainerModel[]) => {
-      containers.splice(index, 1);
+    produce((draft: LabModel | null) => {
+      const removed = draft?.containers[index]?.name;
+      if (!draft || !removed) return;
+      draft.containers.splice(index, 1);
+      for (const machine of [...draft.vms, ...draft.containers]) {
+        machine.depends_on = machine.depends_on.filter((name) => name !== removed);
+      }
+      for (const provision of draft.provisions) {
+        provision.vms = provision.vms.filter((name) => name !== removed);
+      }
+      for (const handler of draft.handlers) {
+        handler.targets = handler.targets.filter((name) => name !== removed);
+      }
     }),
   );
   select({ kind: "lab" });
@@ -348,6 +504,106 @@ export function removeSegment(index: number) {
  *  machine by kind + index into the matching draft collection. */
 export type MachineKind = "vm" | "container";
 
+/** Add a directional machine dependency. VM and container names share one
+ *  namespace, so either kind can depend on either kind. */
+export function addMachineDependency(kind: MachineKind, index: number, target: string) {
+  const draft = editor.draft;
+  const machine = kind === "vm" ? draft?.vms[index] : draft?.containers[index];
+  if (!draft || !machine || machine.name === target || machine.depends_on.includes(target)) return;
+  if (![...draft.vms, ...draft.containers].some((candidate) => candidate.name === target)) return;
+  if (kind === "vm") {
+    setEditor("draft", "vms", index, "depends_on", [...machine.depends_on, target]);
+  } else {
+    setEditor("draft", "containers", index, "depends_on", [...machine.depends_on, target]);
+  }
+}
+
+/** Remove one directional machine dependency. */
+export function removeMachineDependency(kind: MachineKind, index: number, target: string) {
+  const machine = kind === "vm" ? editor.draft?.vms[index] : editor.draft?.containers[index];
+  if (!machine) return;
+  const next = machine.depends_on.filter((name) => name !== target);
+  if (kind === "vm") setEditor("draft", "vms", index, "depends_on", next);
+  else setEditor("draft", "containers", index, "depends_on", next);
+}
+
+export function addProvisionTarget(index: number, target: string) {
+  const provision = editor.draft?.provisions[index];
+  if (!provision || provision.vms.includes(target) || !machineNames().includes(target)) return;
+  setEditor("draft", "provisions", index, "vms", [...provision.vms, target]);
+}
+
+export function removeProvisionTarget(index: number, target: string) {
+  const provision = editor.draft?.provisions[index];
+  if (!provision) return;
+  setEditor(
+    "draft",
+    "provisions",
+    index,
+    "vms",
+    provision.vms.filter((name) => name !== target),
+  );
+}
+
+export function addScriptEventHandler(script: string, event: string): number {
+  const draft = editor.draft;
+  if (!draft) return -1;
+  const existing = draft.handlers.findIndex(
+    (handler) => handler.run === script && handler.event === event,
+  );
+  if (existing >= 0) return existing;
+  setEditor("draft", "handlers", draft.handlers.length, {
+    span: null,
+    event,
+    run: script,
+    targets: [],
+  });
+  return editor.draft!.handlers.length - 1;
+}
+
+export function removeEventHandler(index: number) {
+  setEditor(
+    "draft",
+    "handlers",
+    produce((handlers: HandlerModel[]) => {
+      handlers.splice(index, 1);
+    }),
+  );
+}
+
+export function eventTargetKind(event: string): MachineKind | "machine" | null {
+  if (event.startsWith("vm.")) return "vm";
+  if (event.startsWith("container.")) return "container";
+  if (event.startsWith("snapshot.")) return "machine";
+  return null;
+}
+
+export function addEventHandlerTarget(index: number, kind: MachineKind, target: string) {
+  const handler = editor.draft?.handlers[index];
+  const accepts = handler ? eventTargetKind(handler.event) : null;
+  if (
+    !handler ||
+    accepts === null ||
+    (accepts !== "machine" && accepts !== kind) ||
+    handler.targets.includes(target)
+  ) {
+    return;
+  }
+  setEditor("draft", "handlers", index, "targets", [...handler.targets, target]);
+}
+
+export function removeEventHandlerTarget(index: number, target: string) {
+  const handler = editor.draft?.handlers[index];
+  if (!handler) return;
+  setEditor(
+    "draft",
+    "handlers",
+    index,
+    "targets",
+    handler.targets.filter((name) => name !== target),
+  );
+}
+
 /** The addressed machine's NIC list, or null when it doesn't exist. */
 function machineNics(kind: MachineKind, index: number) {
   const d = editor.draft;
@@ -364,6 +620,7 @@ export function addMachineNic(kind: MachineKind, index: number, segment: string 
     segment,
     nat: segment === null,
     ip: null,
+    gateway: false,
     mac: null,
     isolated: false,
   };
@@ -379,7 +636,7 @@ export function setMachineNicTarget(
   segment: string | null,
 ) {
   if (!machineNics(kind, index)?.[nicIndex]) return;
-  const patch = { segment, nat: segment === null };
+  const patch = { segment, nat: segment === null, gateway: false };
   if (kind === "vm") setEditor("draft", "vms", index, "nics", nicIndex, patch);
   else setEditor("draft", "containers", index, "nics", nicIndex, patch);
 }
@@ -388,9 +645,72 @@ export function setMachineNicTarget(
  *  loose port (no segment, no NAT) ready to be cabled somewhere else. */
 export function disconnectMachineNic(kind: MachineKind, index: number, nicIndex: number) {
   if (!machineNics(kind, index)?.[nicIndex]) return;
-  const patch = { segment: null, nat: false };
+  const patch = { segment: null, nat: false, gateway: false };
   if (kind === "vm") setEditor("draft", "vms", index, "nics", nicIndex, patch);
   else setEditor("draft", "containers", index, "nics", nicIndex, patch);
+}
+
+/** Designate one static NIC as its segment's router. The mutation is atomic:
+ *  one gateway wins across VMs and containers, and daemon NAT on that
+ *  segment is disabled so DHCP clients follow the selected machine. */
+export function setMachineNicGateway(
+  kind: MachineKind,
+  index: number,
+  nicIndex: number,
+  enabled: boolean,
+) {
+  setEditor(
+    "draft",
+    produce((draft: LabModel | null) => {
+      if (!draft) return;
+      const machine = kind === "vm" ? draft.vms[index] : draft.containers[index];
+      const nic = machine?.nics[nicIndex];
+      if (!nic) return;
+      if (!enabled) {
+        nic.gateway = false;
+        nic.ip = null;
+        return;
+      }
+      const segment = nic.segment;
+      if (!segment || nic.nat) return;
+      const segmentModel = draft.segments.find((candidate) => candidate.name === segment);
+      const routerIp = segmentModel?.subnet ? firstUsableAddress(segmentModel.subnet) : null;
+      if (!segmentModel || segmentModel.global || !routerIp) return;
+      for (const candidate of [...draft.vms, ...draft.containers]) {
+        for (const candidateNic of candidate.nics) {
+          if (candidateNic.segment === segment && candidateNic.gateway) {
+            candidateNic.gateway = false;
+            candidateNic.ip = null;
+          }
+        }
+      }
+      nic.gateway = true;
+      nic.ip = routerIp;
+      nic.nat = false;
+      segmentModel.nat = false;
+    }),
+  );
+}
+
+/** First usable IPv4 address in a CIDR, used by dedicated gateway mode. */
+function firstUsableAddress(cidr: string): string | null {
+  const [address, prefixText] = cidr.split("/");
+  const octets = address?.split(".").map(Number);
+  const prefix = Number(prefixText);
+  if (
+    octets?.length !== 4 ||
+    octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255) ||
+    !Number.isInteger(prefix) ||
+    prefix < 0 ||
+    prefix > 30
+  ) {
+    return null;
+  }
+  const ip =
+    (((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3]) >>> 0;
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  const router = ((ip & mask) + 1) >>> 0;
+  return [router >>> 24, (router >>> 16) & 255, (router >>> 8) & 255, router & 255].join(".");
 }
 
 /** Attach a new NIC on VM `vmIndex` (segment name, or null = NAT). */
@@ -434,6 +754,9 @@ function rewriteMachineRefs(d: LabModel, from: string, to: string) {
   }
   for (const p of d.provisions) {
     p.vms = p.vms.map((n) => (n === from ? to : n));
+  }
+  for (const handler of d.handlers) {
+    handler.targets = handler.targets.map((name) => (name === from ? to : name));
   }
   for (const s of d.segments) {
     for (const f of s.forwards) {
@@ -612,6 +935,9 @@ export function selectionForLine(line: number | null): Selection | null {
   }
   for (let i = 0; i < base.segments.length; i++) {
     if (contains(base.segments[i].span)) return { kind: "segment", index: i };
+  }
+  for (let i = 0; i < base.provisions.length; i++) {
+    if (contains(base.provisions[i].span)) return { kind: "provision", index: i };
   }
   return null;
 }

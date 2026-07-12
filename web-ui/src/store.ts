@@ -9,6 +9,7 @@ import * as api from "./api";
 import type {
   Container,
   FastpathInfo,
+  HostInfo,
   LabEntry,
   LabStatus,
   TemplateInfo,
@@ -62,6 +63,8 @@ interface State {
   templates: TemplateInfo[];
   templateOps: Record<string, TemplateOp>;
   fastpath: FastpathInfo | null;
+  host: HostInfo | null;
+  hostLoaded: boolean;
 }
 
 const [state, setState] = createStore<State>({
@@ -79,6 +82,8 @@ const [state, setState] = createStore<State>({
   templates: [],
   templateOps: {},
   fastpath: null,
+  host: null,
+  hostLoaded: false,
 });
 
 export { state };
@@ -131,6 +136,8 @@ export async function doLogout() {
     templates: [],
     templateOps: {},
     fastpath: null,
+    host: null,
+    hostLoaded: false,
   });
 }
 
@@ -138,6 +145,7 @@ async function afterLogin() {
   await loadLabs();
   connectEvents();
   loadFastpath();
+  loadHostInfo();
 }
 
 /** The daemon's network fast-path tier for the Topbar badge; a server
@@ -147,6 +155,17 @@ async function loadFastpath() {
     setState({ fastpath: await api.fastpathInfo() });
   } catch {
     setState({ fastpath: null });
+  }
+}
+
+/** Host virtualization capability for the persistent acceleration banner. */
+async function loadHostInfo() {
+  try {
+    setState({ host: await api.hostInfo() });
+  } catch {
+    setState({ host: null });
+  } finally {
+    setState({ hostLoaded: true });
   }
 }
 

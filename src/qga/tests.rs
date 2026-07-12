@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-use super::{GaClient, GaError};
+use super::{GaClient, GaError, GaInterface, ipv4_by_mac};
 
 const SHORT: Duration = Duration::from_millis(200);
 const LONG: Duration = Duration::from_secs(5);
@@ -487,5 +487,35 @@ async fn network_interfaces_parses_fixture() {
             ("10.0.0.7".to_string(), "ipv4".to_string()),
             ("fe80::1".to_string(), "ipv6".to_string()),
         ]
+    );
+}
+
+#[test]
+fn ipv4_addresses_follow_requested_mac_order() {
+    let interfaces = vec![
+        GaInterface {
+            name: "eth1".into(),
+            hardware_address: Some("52:54:00:00:00:02".into()),
+            ips: vec![
+                ("fe80::2".into(), "ipv6".into()),
+                ("10.20.0.22".into(), "ipv4".into()),
+            ],
+        },
+        GaInterface {
+            name: "eth0".into(),
+            hardware_address: Some("52:54:00:00:00:01".into()),
+            ips: vec![("10.10.0.11".into(), "ipv4".into())],
+        },
+    ];
+    assert_eq!(
+        ipv4_by_mac(
+            &interfaces,
+            &[
+                "52:54:00:00:00:01".into(),
+                "52:54:00:00:00:02".into(),
+                "52:54:00:00:00:03".into(),
+            ],
+        ),
+        vec![Some("10.10.0.11".into()), Some("10.20.0.22".into()), None,]
     );
 }

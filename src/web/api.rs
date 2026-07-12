@@ -4,6 +4,9 @@
 use actix_web::{HttpResponse, web};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
 use super::state::AppState;
 
@@ -228,6 +231,122 @@ pub async fn catalog_meta() -> HttpResponse {
             "start_period": 10,
         },
     }))
+}
+
+/// `GET /api/registries` — host-level OCI search settings shared with the CLI.
+pub async fn list_registries() -> HttpResponse {
+    match vmlab::template::registries::list() {
+        Ok(entries) => {
+            let rows: Vec<Value> = entries
+                .into_iter()
+                .map(|entry| {
+                    let host = vmlab::template::registries::host_of(&entry.namespace).unwrap_or("");
+                    json!({
+                        "namespace": entry.namespace,
+                        "vms": entry.use_for.vms(),
+                        "containers": entry.use_for.containers(),
+                        "authenticated": vmlab::template::oci_bridge::has_credentials(host),
+                    })
+                })
+                .collect();
+            let removed = vmlab::template::registries::removed().unwrap_or_default();
+            ok(json!({"entries": rows, "removed": removed}))
+        }
+        Err(error) => {
+            HttpResponse::InternalServerError().json(json!({"error": format!("{error:#}")}))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RegistryBody {
+    namespace: String,
+    use_for: vmlab::template::registries::RegistryUse,
+}
+
+pub async fn add_registry(body: web::Json<RegistryBody>) -> HttpResponse {
+    match vmlab::template::registries::add(&body.namespace, body.use_for) {
+        Ok(entry) => HttpResponse::Created().json(entry),
+        Err(error) => HttpResponse::BadRequest().json(json!({"error": format!("{error:#}")})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RegistryRemoveBody {
+    namespace: String,
+}
+
+pub async fn remove_registry(body: web::Json<RegistryRemoveBody>) -> HttpResponse {
+    match vmlab::template::registries::remove(&body.namespace) {
+        Ok(()) => HttpResponse::NoContent().finish(),
+        Err(error) => HttpResponse::BadRequest().json(json!({"error": format!("{error:#}")})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RegistryLoginBody {
+    namespace: String,
+    username: String,
+    password: String,
+}
+
+pub async fn registry_login(body: web::Json<RegistryLoginBody>) -> HttpResponse {
+    let namespace = match vmlab::template::registries::normalise_namespace(&body.namespace) {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            return HttpResponse::BadRequest().json(json!({"error": format!("{error:#}")}));
+        }
+    };
+    let host = match vmlab::template::registries::host_of(&namespace) {
+        Ok(host) => host,
+        Err(error) => {
+            return HttpResponse::BadRequest().json(json!({"error": format!("{error:#}")}));
+        }
+    };
+    if body.username.is_empty() || body.password.is_empty() {
+        return HttpResponse::BadRequest()
+            .json(json!({"error": "username and password/token are required"}));
+    }
+    match vmlab::template::oci_bridge::login(host, &body.username, &body.password).await {
+        Ok(()) => ok(json!({"authenticated": true})),
+        Err(error) => HttpResponse::BadRequest().json(json!({"error": format!("{error:#}")})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OciSearchQuery {
+    registry: String,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    arch: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// `GET /api/catalog/oci?registry=host/namespace&q=…&arch=…` — search a
+/// configured OCI namespace for VM templates or container images.
+pub async fn catalog_oci(q: web::Query<OciSearchQuery>) -> HttpResponse {
+    let registry = q.registry.trim().trim_end_matches('/').to_string();
+    if registry.is_empty() {
+        return HttpResponse::BadRequest().json(json!({"error": "registry is required"}));
+    }
+    let query =
+        q.q.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    let arch = q
+        .arch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let containers = q.kind.as_deref() == Some("container");
+    match vmlab::template::cli::search_catalog(query, registry, arch, containers).await {
+        Ok(rows) => ok(json!(rows)),
+        Err(e) => HttpResponse::BadGateway().json(json!({"error": format!("{e:#}")})),
+    }
 }
 
 /// `GET /api/labs/{lab}` — full lab status (vms + segments).
@@ -502,6 +621,214 @@ pub async fn save_config(
     }
 }
 
+const MAX_SCRIPT_BYTES: usize = 1024 * 1024;
+
+#[derive(Deserialize)]
+pub struct ScriptQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+pub struct ScriptBody {
+    path: String,
+    content: String,
+    /// SHA-256 returned by `GET`; `None` means create without overwriting.
+    base_rev: Option<String>,
+}
+
+fn script_rev(content: &str) -> String {
+    hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+/// Resolve a script path lexically beneath a lab root. Canonicalisation is
+/// intentionally not used: a newly-created file and its parent may not exist.
+fn lab_script_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(requested);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.extension().and_then(|e| e.to_str()) != Some("ws")
+        || relative
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err("script path must be a relative .ws file inside the lab".into());
+    }
+    Ok(root.join(relative))
+}
+
+fn ensure_safe_script_parent(root: &Path, parent: &Path) -> Result<PathBuf, String> {
+    let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| "script path escapes the lab".to_string())?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err("script path escapes the lab".into());
+        };
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("script directories cannot be symbolic links".into());
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!("{} is not a directory", current.display()));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|e| e.to_string())?;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let canonical_parent = std::fs::canonicalize(current).map_err(|e| e.to_string())?;
+    if !canonical_parent.starts_with(canonical_root) {
+        return Err("script path escapes the lab".into());
+    }
+    Ok(canonical_parent)
+}
+
+/// `GET /api/labs/{lab}/scripts?path=...` — read a lab-relative WScript.
+pub async fn get_script(
+    state: web::Data<AppState>,
+    lab: web::Path<String>,
+    query: web::Query<ScriptQuery>,
+) -> HttpResponse {
+    let root = match state.lab_root(&lab).await {
+        Ok(root) => root,
+        Err(e) => return fail(e),
+    };
+    let requested = query.path.clone();
+    let path = match lab_script_path(&root, &requested) {
+        Ok(path) => path,
+        Err(error) => return HttpResponse::BadRequest().json(json!({"error": error})),
+    };
+    let canonical_root = match tokio::fs::canonicalize(&root).await {
+        Ok(path) => path,
+        Err(e) => return HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    };
+    let canonical_path = match tokio::fs::canonicalize(&path).await {
+        Ok(path) if path.starts_with(&canonical_root) => path,
+        Ok(_) => {
+            return HttpResponse::BadRequest()
+                .json(json!({"error": "script path escapes the lab"}));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return HttpResponse::NotFound()
+                .json(json!({"error": format!("{}: not found", path.display())}));
+        }
+        Err(e) => return HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    };
+    match tokio::fs::read_to_string(&canonical_path).await {
+        Ok(content) if content.len() <= MAX_SCRIPT_BYTES => ok(json!({
+            "path": requested,
+            "rev": script_rev(&content),
+            "content": content,
+        })),
+        Ok(_) => HttpResponse::PayloadTooLarge()
+            .json(json!({"error": "script exceeds the 1 MiB editor limit"})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HttpResponse::NotFound()
+            .json(json!({"error": format!("{}: not found", path.display())})),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+enum ScriptSave {
+    Saved { rev: String },
+    Stale { rev: Option<String> },
+    Invalid(String),
+    Error(String),
+}
+
+/// `PUT /api/labs/{lab}/scripts` — revision-aware create/update. New files
+/// use `base_rev: null`; existing files are never overwritten that way.
+pub async fn save_script(
+    state: web::Data<AppState>,
+    lab: web::Path<String>,
+    body: web::Json<ScriptBody>,
+) -> HttpResponse {
+    let root = match state.lab_root(&lab).await {
+        Ok(root) => root,
+        Err(e) => return fail(e),
+    };
+    let body = body.into_inner();
+    if body.content.len() > MAX_SCRIPT_BYTES {
+        return HttpResponse::PayloadTooLarge()
+            .json(json!({"error": "script exceeds the 1 MiB editor limit"}));
+    }
+    let path = match lab_script_path(&root, &body.path) {
+        Ok(path) => path,
+        Err(error) => return HttpResponse::BadRequest().json(json!({"error": error})),
+    };
+    let content = body.content;
+    let base_rev = body.base_rev;
+    let outcome = web::block(move || {
+        let Some(parent) = path.parent() else {
+            return ScriptSave::Error("script has no parent directory".into());
+        };
+        let canonical_parent = match ensure_safe_script_parent(&root, parent) {
+            Ok(path) => path,
+            Err(e) => return ScriptSave::Invalid(e),
+        };
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return ScriptSave::Invalid("script path cannot be a symbolic link".into());
+        }
+        let safe_path = canonical_parent.join(path.file_name().expect("validated script filename"));
+        let existing = match std::fs::read_to_string(&safe_path) {
+            Ok(source) => Some(source),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return ScriptSave::Error(e.to_string()),
+        };
+        let current_rev = existing.as_deref().map(script_rev);
+        if current_rev != base_rev {
+            return ScriptSave::Stale { rev: current_rev };
+        }
+        let creating = base_rev.is_none();
+        let mut temp = match tempfile::NamedTempFile::new_in(&canonical_parent) {
+            Ok(file) => file,
+            Err(e) => return ScriptSave::Error(e.to_string()),
+        };
+        if let Err(e) = temp
+            .write_all(content.as_bytes())
+            .and_then(|_| temp.flush())
+        {
+            return ScriptSave::Error(e.to_string());
+        }
+        let persisted = if creating {
+            temp.persist_noclobber(&safe_path)
+        } else {
+            temp.persist(&safe_path)
+        };
+        if let Err(e) = persisted {
+            if creating && e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                return ScriptSave::Stale {
+                    rev: std::fs::read_to_string(&safe_path)
+                        .ok()
+                        .as_deref()
+                        .map(script_rev),
+                };
+            }
+            return ScriptSave::Error(e.error.to_string());
+        }
+        ScriptSave::Saved {
+            rev: script_rev(&content),
+        }
+    })
+    .await;
+    match outcome {
+        Ok(ScriptSave::Saved { rev }) => ok(json!({"ok": true, "rev": rev})),
+        Ok(ScriptSave::Stale { rev }) => {
+            HttpResponse::Conflict().json(json!({"error": "script changed on disk", "rev": rev}))
+        }
+        Ok(ScriptSave::Invalid(error)) => HttpResponse::BadRequest().json(json!({"error": error})),
+        Ok(ScriptSave::Error(error)) => {
+            HttpResponse::InternalServerError().json(json!({"error": error}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
 /// `POST /api/labs/{lab}/reload` — restart the lab daemon so it re-reads
 /// `vmlab.wcl`. Requires the lab to be down (the daemon can't re-adopt running
 /// VMs across a restart); responds 409 if any VM is still running.
@@ -627,7 +954,13 @@ pub async fn host_info() -> HttpResponse {
         .ok()
         .and_then(|s| parse_mem_total(&s))
         .unwrap_or(0);
-    ok(json!({"cpus": cpus, "memory": memory}))
+    let kvm = vmlab::kvm_available();
+    ok(json!({
+        "cpus": cpus,
+        "memory": memory,
+        "acceleration": if kvm { "kvm" } else { "tcg" },
+        "arch": std::env::consts::ARCH,
+    }))
 }
 
 /// `GET /api/fastpath` — the network fast-path tier the supervisor selected
@@ -731,6 +1064,18 @@ mod tests {
     use super::*;
     use actix_web::{App, test};
 
+    fn script_test_state(root: &Path) -> web::Data<AppState> {
+        web::Data::new(AppState::new(
+            super::super::state::AuthConfig {
+                enabled: false,
+                user: String::new(),
+                password_hash: String::new(),
+            },
+            Some(("lab".into(), root.to_path_buf())),
+            false,
+        ))
+    }
+
     #[actix_web::test]
     async fn mem_total_parses_meminfo() {
         let s = "MemTotal:       65670920 kB\nMemFree:        1234 kB\n";
@@ -784,5 +1129,93 @@ mod tests {
         let body: Value = test::read_body_json(resp).await;
         assert!(body["cpus"].as_u64().unwrap() >= 1);
         assert!(body["memory"].as_u64().unwrap() > 0);
+        assert!(matches!(body["acceleration"].as_str(), Some("kvm" | "tcg")));
+        assert_eq!(body["arch"], std::env::consts::ARCH);
+    }
+
+    #[actix_web::test]
+    async fn provision_script_create_read_and_stale_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = script_test_state(tmp.path());
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/api/labs/{lab}/scripts", web::get().to(get_script))
+                .route("/api/labs/{lab}/scripts", web::put().to(save_script)),
+        )
+        .await;
+
+        let create = test::TestRequest::put()
+            .uri("/api/labs/lab/scripts")
+            .set_json(json!({
+                "path": "scripts/provision-1.ws",
+                "content": "use vmlab\n",
+                "base_rev": null,
+            }))
+            .to_request();
+        let response = test::call_service(&app, create).await;
+        assert_eq!(response.status(), 200);
+        let created: Value = test::read_body_json(response).await;
+        let rev = created["rev"].as_str().unwrap().to_string();
+
+        let read = test::TestRequest::get()
+            .uri("/api/labs/lab/scripts?path=scripts%2Fprovision-1.ws")
+            .to_request();
+        let response = test::call_service(&app, read).await;
+        assert_eq!(response.status(), 200);
+        let document: Value = test::read_body_json(response).await;
+        assert_eq!(document["content"], "use vmlab\n");
+        assert_eq!(document["rev"], rev);
+
+        let stale = test::TestRequest::put()
+            .uri("/api/labs/lab/scripts")
+            .set_json(json!({
+                "path": "scripts/provision-1.ws",
+                "content": "changed",
+                "base_rev": "not-the-current-revision",
+            }))
+            .to_request();
+        let response = test::call_service(&app, stale).await;
+        assert_eq!(response.status(), 409);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("scripts/provision-1.ws")).unwrap(),
+            "use vmlab\n"
+        );
+    }
+
+    #[actix_web::test]
+    async fn provision_script_rejects_unsafe_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = script_test_state(tmp.path());
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/api/labs/{lab}/scripts", web::put().to(save_script)),
+        )
+        .await;
+        for path in ["../outside.ws", "/tmp/outside.ws", "scripts/not-wscript.sh"] {
+            let request = test::TestRequest::put()
+                .uri("/api/labs/lab/scripts")
+                .set_json(json!({"path": path, "content": "", "base_rev": null}))
+                .to_request();
+            let response = test::call_service(&app, request).await;
+            assert_eq!(response.status(), 400, "path {path}");
+        }
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), tmp.path().join("linked")).unwrap();
+            let request = test::TestRequest::put()
+                .uri("/api/labs/lab/scripts")
+                .set_json(json!({
+                    "path": "linked/escape.ws",
+                    "content": "",
+                    "base_rev": null,
+                }))
+                .to_request();
+            let response = test::call_service(&app, request).await;
+            assert_eq!(response.status(), 400);
+            assert!(!outside.path().join("escape.ws").exists());
+        }
     }
 }

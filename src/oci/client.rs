@@ -185,6 +185,39 @@ impl Registry {
         }
     }
 
+    /// OCI platform architectures for either a container image or a vmlab
+    /// template. Unlike `index_arches`, a plain manifest reads the standard
+    /// container config's `architecture` field rather than template metadata.
+    pub async fn index_platform_arches(&self, tag: &str) -> Result<Vec<String>> {
+        let repo = &self.reference.repository;
+        let top = self
+            .transport
+            .get_manifest(repo, tag)
+            .await?
+            .ok_or_else(|| anyhow!("{}/{repo}:{tag} not found", self.reference.host))?;
+        match parse_manifest_or_index(&top.body)? {
+            ManifestOrIndex::Index(index) => Ok(index
+                .manifests
+                .iter()
+                .filter_map(|d| {
+                    d.platform.as_ref().and_then(|p| {
+                        (p.os == "linux" && p.architecture != "unknown")
+                            .then(|| p.architecture.clone())
+                    })
+                })
+                .collect()),
+            ManifestOrIndex::Manifest(m) => {
+                let bytes = self.transport.get_blob(repo, &m.config.digest).await?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).context("parsing OCI image config")?;
+                let arch = value["architecture"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("OCI image config has no architecture"))?;
+                Ok(vec![arch.to_string()])
+            }
+        }
+    }
+
     /// Push a template directory (containing `disk.qcow2` + `template.wcl`)
     /// to the reference for the given `arch`. Chunks the disk, uploads each
     /// chunk blob (skipping any already present), uploads the config blob,

@@ -1,97 +1,43 @@
-// Template reference picker: the local store catalog as a Select, with
-// "scratch" and a free-text escape for OCI references / pinned versions.
-// Architecture lives inside the choice: store refs embed it (`arch/name`),
-// and the picker surfaces an arch select only for `scratch` / custom refs
-// (plus the profile select scratch requires). Picking a store template
-// clears both attrs — they inherit from the template.
-
-import { Show, createMemo, createSignal } from "solid-js";
-import { Input, Select } from "@forge/ui";
+import { Show } from "solid-js";
+import { Select } from "@forge/ui";
 import type { Option } from "@forge/ui";
 import { editor } from "../../editor/store";
+import ArtifactPicker from "./ArtifactPicker";
 
-const CUSTOM = " custom";
 const UNSET = " unset";
 
 export interface TemplatePickerProps {
   value: string;
   onChange: (v: string) => void;
-  arch: string | null;
   profile: string | null;
-  /** Sets the VM's `arch` / `profile` attrs (null = unset/inherited). */
   onMeta: (key: "arch" | "profile", v: string | null) => void;
 }
 
 export default function TemplatePicker(props: TemplatePickerProps) {
-  const known = createMemo(() => {
-    const seen = new Set<string>();
-    for (const t of editor.catalog.templates) seen.add(`${t.arch}/${t.name}`);
-    return [...seen].sort();
-  });
-
-  const isKnown = () => props.value === "scratch" || known().includes(props.value);
-  // Sticky once the user picks "custom…" so the Input doesn't vanish while
-  // they type a value that happens to hit a known name.
-  const [forceCustom, setForceCustom] = createSignal(false);
-  const custom = () => forceCustom() || (props.value !== "" && !isKnown());
-
-  const options = createMemo<Option[]>(() => [
-    ...known().map((v) => ({ value: v, label: v })),
-    { value: "scratch", label: "scratch (blank disk)" },
-    { value: CUSTOM, label: "custom reference…" },
-  ]);
-
-  // Scratch and registry refs can't inherit an arch (scratch also needs a
-  // profile); everything else gets both from the template.
-  const needsArch = () => props.value === "scratch" || custom();
-
   const optsWithUnset = (values: string[]): Option[] => [
     { value: UNSET, label: "(pick one)" },
     ...values.map((v) => ({ value: v, label: v })),
   ];
-
   return (
     <div class="template-picker">
-      <Select
-        label="Template"
-        help="`<arch>/<name>[@<version>]`, `scratch`, or an OCI registry ref"
-        options={options()}
-        value={custom() ? CUSTOM : props.value}
-        placeholder="pick a template"
-        onChange={(v) => {
-          if (v === CUSTOM) {
-            setForceCustom(true);
+      <ArtifactPicker
+        kind="vm"
+        value={props.value}
+        onSelect={(reference, arch, source) => {
+          props.onChange(reference);
+          if (source === "local" && reference !== "scratch") {
+            props.onMeta("arch", null);
+            props.onMeta("profile", null);
           } else {
-            setForceCustom(false);
-            props.onChange(v);
-            if (v !== "scratch") {
-              // A store template carries its own arch + profile.
-              props.onMeta("arch", null);
-              props.onMeta("profile", null);
-            }
+            props.onMeta("arch", arch);
+            if (reference !== "scratch") props.onMeta("profile", null);
           }
         }}
       />
-      <Show when={custom()}>
-        <Input
-          placeholder="ghcr.io/owner/name:1.0 or x86_64/name@1.2"
-          value={isKnown() ? "" : props.value}
-          onInput={(e) => props.onChange(e.currentTarget.value)}
-        />
-      </Show>
-      <Show when={needsArch()}>
-        <Select
-          label="Architecture"
-          help="Required for `scratch` and registry references"
-          options={optsWithUnset(editor.catalog.meta?.arches ?? [])}
-          value={props.arch ?? UNSET}
-          onChange={(v) => props.onMeta("arch", v === UNSET ? null : v)}
-        />
-      </Show>
       <Show when={props.value === "scratch"}>
         <Select
           label="Profile"
-          help="Guest OS profile (hardware defaults); required for `scratch`"
+          help="Guest OS profile (hardware defaults); required for scratch"
           options={optsWithUnset(editor.catalog.profiles)}
           value={props.profile ?? UNSET}
           onChange={(v) => props.onMeta("profile", v === UNSET ? null : v)}

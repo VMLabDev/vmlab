@@ -5,13 +5,15 @@
 
 import { For, Show, createMemo, createSignal } from "solid-js";
 import { produce } from "solid-js/store";
-import { Button, IconButton, Input, Modal, Tabs, Toggle } from "@forge/ui";
+import { Badge, Button, IconButton, Input, Modal, Select, Table, Tabs, Toggle } from "@forge/ui";
 import {
   ChevronDown,
   ChevronRight,
   Disc,
   FolderSearch,
+  FileCode2,
   HardDrive,
+  Plus,
   Trash2,
 } from "lucide-solid";
 import type { LabModel, SegmentModel, ShareModel, VolumeModel } from "../../editor/model";
@@ -21,9 +23,11 @@ import { formatByteSize, formatMemory, parseByteSize } from "../../editor/bytesi
 import {
   addMachineNic,
   addNic,
+  addScriptEventHandler,
   editor,
-  machineNames,
   removeContainer,
+  removeEventHandler,
+  removeProvision,
   removeRemote,
   removeSegment,
   removeVm,
@@ -33,7 +37,6 @@ import {
   renameVm,
   select,
   setEditor,
-  setSegmentPeer,
   storeTemplateFor,
 } from "../../editor/store";
 import { anyVmRunning, containerIsUp, vmIsUp } from "../../store";
@@ -43,7 +46,7 @@ import BlockList from "./BlockList";
 import FileBrowserModal from "./FileBrowserModal";
 import SliderRow from "./SliderRow";
 import TemplatePicker from "./TemplatePicker";
-import VmRefList from "./VmRefList";
+import ArtifactPicker from "./ArtifactPicker";
 
 const mutate = (fn: (d: LabModel) => void) =>
   setEditor(
@@ -53,7 +56,7 @@ const mutate = (fn: (d: LabModel) => void) =>
     }),
   );
 
-export default function Inspector() {
+export default function Inspector(props: { onEditProvision: (path: string) => void }) {
   const sel = () => editor.selection;
   const readOnly = () => {
     const selection = sel();
@@ -100,6 +103,14 @@ export default function Inspector() {
         <Show when={sel().kind === "segment" && editor.draft?.segments[(sel() as any).index]}>
           <SegmentInspector index={(sel() as { index: number }).index} />
         </Show>
+        <Show
+          when={sel().kind === "provision" && editor.draft?.provisions[(sel() as any).index]}
+        >
+          <ProvisionInspector
+            index={(sel() as { index: number }).index}
+            onEdit={props.onEditProvision}
+          />
+        </Show>
       </fieldset>
     </div>
   );
@@ -116,20 +127,15 @@ function LabInspector() {
         <span class="inspector-name">{lab().name}</span>
       </div>
       <BlockList
-        title="Provision scripts"
-        items={lab().provisions as any}
-        fields={F.PROVISION_FIELDS}
-        summary={(p) => p.script || "(script path)"}
-        onAdd={() => mutate((d) => d.provisions.push({ span: null, script: "", vms: [] }))}
-        onRemove={(i) => mutate((d) => void d.provisions.splice(i, 1))}
-        onSet={(i, key, v) => mutate((d) => ((d.provisions[i] as any)[key] = v))}
-      />
-      <BlockList
         title="Event handlers"
         items={lab().handlers as any}
         fields={F.HANDLER_FIELDS}
         summary={(h) => `${h.event || "(event)"} → ${h.run || "(script)"}`}
-        onAdd={() => mutate((d) => d.handlers.push({ span: null, event: "vm.ready", run: "" }))}
+        onAdd={() =>
+          mutate((d) =>
+            d.handlers.push({ span: null, event: "vm.ready", run: "", targets: [] }),
+          )
+        }
         onRemove={(i) => mutate((d) => void d.handlers.splice(i, 1))}
         onSet={(i, key, v) => mutate((d) => ((d.handlers[i] as any)[key] = v))}
       />
@@ -163,6 +169,119 @@ function LabInspector() {
   );
 }
 
+function ProvisionInspector(props: { index: number; onEdit: (path: string) => void }) {
+  const provision = () => editor.draft!.provisions[props.index];
+  const [newEvent, setNewEvent] = createSignal("vm.ready");
+  const handlers = createMemo(() =>
+    editor.draft!.handlers
+      .map((handler, index) => ({ handler, index }))
+      .filter(({ handler }) => handler.run === provision().script),
+  );
+  async function remove() {
+    if (
+      await confirmDialog({
+        title: `Delete provision "${provision().script}"?`,
+        body: "The provision block will be removed. Its script file will be preserved.",
+        confirmLabel: "Delete provision",
+        danger: true,
+      })
+    ) {
+      removeProvision(props.index);
+    }
+  }
+  return (
+    <>
+      <div class="inspector-head">
+        <span class="inspector-kind">provision</span>
+        <span class="inspector-name">#{props.index + 1}</span>
+        <Button variant="danger" size="sm" icon={Trash2} onClick={() => void remove()}>
+          Delete
+        </Button>
+      </div>
+      <div class="provision-inspector-path">{provision().script}</div>
+      <Badge tone={provision().vms.length ? "info" : "neutral"}>
+        {provision().vms.length ? `${provision().vms.length} targeted` : "LAB-WIDE"}
+      </Badge>
+      <Show when={provision().vms.length}>
+        <div class="remote-attached">
+          <For each={provision().vms}>
+            {(name) => (
+              <button
+                class="remote-attached-row"
+                onClick={() => {
+                  const vm = editor.draft!.vms.findIndex((candidate) => candidate.name === name);
+                  const container = editor.draft!.containers.findIndex(
+                    (candidate) => candidate.name === name,
+                  );
+                  if (vm >= 0) select({ kind: "vm", index: vm });
+                  else if (container >= 0) select({ kind: "container", index: container });
+                }}
+              >
+                {name}
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+      <Button icon={FileCode2} variant="primary" onClick={() => props.onEdit(provision().script)}>
+        Edit script
+      </Button>
+      <div class="inspector-section-title">Event handlers</div>
+      <div class="provision-event-add">
+        <Select
+          label="Event"
+          options={(editor.catalog.meta?.events ?? []).map((event) => ({ value: event, label: event }))}
+          value={newEvent()}
+          onChange={setNewEvent}
+        />
+        <Button
+          icon={Plus}
+          disabled={!newEvent() || handlers().some(({ handler }) => handler.event === newEvent())}
+          onClick={() => addScriptEventHandler(provision().script, newEvent())}
+        >
+          Add handler
+        </Button>
+      </div>
+      <Show
+        when={handlers().length}
+        fallback={<div class="inspector-note">No events are mapped to this script.</div>}
+      >
+        <div class="provision-event-list">
+          <For each={handlers()}>
+            {({ handler, index }) => (
+              <div class="provision-event-row">
+                <div>
+                  <strong>{handler.event}</strong>
+                  <span>
+                    {handler.targets.length
+                      ? `${handler.targets.length} targeted`
+                      : handler.event.startsWith("vm.")
+                        ? "all VMs"
+                        : handler.event.startsWith("container.")
+                          ? "all containers"
+                          : handler.event.startsWith("snapshot.")
+                            ? "all machines"
+                            : "global"}
+                  </span>
+                </div>
+                <IconButton
+                  icon={Trash2}
+                  label={`Remove ${handler.event} handler`}
+                  onClick={() => removeEventHandler(index)}
+                />
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
+      <div class="inspector-note">
+        Drag the TARGETS port on the canvas onto VMs or containers. With no targets, this script
+        runs lab-wide in the final provisioning pass.
+      </div>
+    </>
+  );
+}
+
 function NatInspector() {
   return (
     <>
@@ -182,7 +301,24 @@ function NatInspector() {
 
 // --- remote vmlab ---------------------------------------------------------------
 
+function splitPeerAddress(value: string): { hostname: string; port: string } {
+  const colon = value.lastIndexOf(":");
+  if (colon < 0) return { hostname: value, port: "" };
+  const port = value.slice(colon + 1);
+  // The runtime's current host[:port] syntax is hostname/IPv4-oriented. Only
+  // split a numeric suffix so a malformed/partial hostname is never silently
+  // rewritten while the user types.
+  return /^\d+$/.test(port)
+    ? { hostname: value.slice(0, colon), port }
+    : { hostname: value, port: "" };
+}
+
+function joinPeerAddress(hostname: string, port: string): string {
+  return port ? `${hostname}:${port}` : hostname;
+}
+
 function RemoteInspector(props: { host: string }) {
+  const address = createMemo(() => splitPeerAddress(props.host));
   const attached = () =>
     (editor.draft?.segments ?? [])
       .map((s, i) => ({ seg: s, index: i }))
@@ -203,15 +339,41 @@ function RemoteInspector(props: { host: string }) {
     <>
       <div class="inspector-head">
         <span class="inspector-kind">remote</span>
+        <span class="inspector-name">Remote vmlab</span>
+        <IconButton icon={Trash2} label="Delete remote vmlab" onClick={del} />
+      </div>
+      <div class="remote-address-fields">
         <Input
-          value={props.host}
-          placeholder="otherhost:13947"
-          error={!props.host.trim()}
+          label="IP / hostname"
+          value={address().hostname}
+          placeholder="otherhost"
+          error={!address().hostname.trim()}
           onInput={(e: InputEvent) =>
-            renameRemote(props.host, (e.currentTarget as HTMLInputElement).value)
+            renameRemote(
+              props.host,
+              joinPeerAddress((e.currentTarget as HTMLInputElement).value, address().port),
+            )
           }
         />
-        <IconButton icon={Trash2} label="Delete remote vmlab" onClick={del} />
+        <Input
+          label="Port"
+          type="number"
+          min="1"
+          max="65535"
+          value={address().port}
+          placeholder="13947"
+          help="Default: 13947"
+          error={
+            address().port !== "" &&
+            (Number(address().port) < 1 || Number(address().port) > 65535)
+          }
+          onInput={(e: InputEvent) =>
+            renameRemote(
+              props.host,
+              joinPeerAddress(address().hostname, (e.currentTarget as HTMLInputElement).value),
+            )
+          }
+        />
       </div>
       <div class="inspector-section-title">Bridged segments</div>
       <Show
@@ -299,16 +461,8 @@ function VmInspector(props: { index: number }) {
         <TemplatePicker
           value={vm().template}
           onChange={(v) => setField("template", v)}
-          arch={vm().arch}
           profile={vm().profile}
           onMeta={setField}
-        />
-        <VmRefList
-          label="Depends on"
-          doc="VM/container names to wait for before this one (no cycles)"
-          values={vm().depends_on}
-          candidates={machineNames().filter((n) => n !== vm().name)}
-          onChange={(v) => setField("depends_on", v)}
         />
       </Show>
       <Show when={tab() === "hardware"}>
@@ -605,9 +759,8 @@ function VmStorage(props: { index: number }) {
 
 // --- container ------------------------------------------------------------------
 
-/** Full-schema inspector for a `container {}` block: image + runtime knobs,
- *  the micro-VM's hardware sliders, NICs + port forwards, volumes, env vars,
- *  and the healthcheck. */
+/** Focused inspector for a `container {}` block: image, dependencies,
+ *  micro-VM hardware, networking, volumes, environment, and healthcheck. */
 function ContainerInspector(props: { index: number }) {
   const ctr = () => editor.draft!.containers[props.index];
   const [tab, setTab] = createSignal("general");
@@ -665,21 +818,10 @@ function ContainerInspector(props: { index: number }) {
         onChange={setTab}
       />
       <Show when={tab() === "general"}>
-        <Input
-          label="Image"
-          help="OCI image reference, e.g. `nginx:1.27` or `ghcr.io/owner/app@sha256:…` (required)"
-          placeholder="nginx:1.27"
+        <ArtifactPicker
+          kind="container"
           value={ctr().image}
-          error={!ctr().image.trim()}
-          onInput={(e) => setField("image", e.currentTarget.value)}
-        />
-        <BlockForm fields={F.CONTAINER_GENERAL} value={ctr() as any} onSet={setField} />
-        <VmRefList
-          label="Depends on"
-          doc="VM/container names to wait for before this one (no cycles)"
-          values={ctr().depends_on}
-          candidates={machineNames().filter((n) => n !== ctr().name)}
-          onChange={(v) => setField("depends_on", v)}
+          onSelect={(reference) => setField("image", reference)}
         />
       </Show>
       <Show when={tab() === "hardware"}>
@@ -855,6 +997,358 @@ function ContainerInspector(props: { index: number }) {
 
 // --- segment --------------------------------------------------------------------
 
+const SINKHOLE_MODES = [
+  { value: "nxdomain", label: "NXDOMAIN" },
+  { value: "zero", label: "0.0.0.0" },
+];
+
+function SegmentDnsTable(props: {
+  segment: SegmentModel;
+  setSegment: (fn: (segment: SegmentModel) => void) => void;
+}) {
+  const empty = () => props.segment.records.length === 0 && props.segment.sinkholes.length === 0;
+  return (
+    <div class="dns-editor">
+      <div class="dns-table">
+        <Table aria-label="DNS entries">
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Name / pattern</th>
+              <th>Answer / behavior</th>
+              <th aria-label="Actions" />
+            </tr>
+          </thead>
+          <tbody>
+            <For each={props.segment.records}>
+              {(record, index) => (
+                <tr>
+                  <td class="dns-type">
+                    <Badge>record</Badge>
+                  </td>
+                  <td>
+                    <Input
+                      aria-label="DNS record name"
+                      value={record.name}
+                      placeholder="host.example"
+                      error={!record.name.trim()}
+                      onInput={(e: InputEvent) =>
+                        props.setSegment(
+                          (s) =>
+                            (s.records[index()].name = (
+                              e.currentTarget as HTMLInputElement
+                            ).value),
+                        )
+                      }
+                    />
+                  </td>
+                  <td>
+                    <Input
+                      aria-label="DNS record IPv4 address"
+                      value={record.ip}
+                      placeholder="10.0.0.10"
+                      error={!record.ip.trim()}
+                      onInput={(e: InputEvent) =>
+                        props.setSegment(
+                          (s) =>
+                            (s.records[index()].ip = (e.currentTarget as HTMLInputElement).value),
+                        )
+                      }
+                    />
+                  </td>
+                  <td class="dns-actions">
+                    <IconButton
+                      icon={Trash2}
+                      label="Delete DNS record"
+                      onClick={() => props.setSegment((s) => void s.records.splice(index(), 1))}
+                    />
+                  </td>
+                </tr>
+              )}
+            </For>
+            <For each={props.segment.sinkholes}>
+              {(sinkhole, index) => (
+                <tr>
+                  <td class="dns-type">
+                    <Badge tone="warning">sinkhole</Badge>
+                  </td>
+                  <td>
+                    <Input
+                      aria-label="DNS sinkhole pattern"
+                      value={sinkhole.pattern}
+                      placeholder="*.telemetry.example"
+                      error={!sinkhole.pattern.trim()}
+                      onInput={(e: InputEvent) =>
+                        props.setSegment(
+                          (s) =>
+                            (s.sinkholes[index()].pattern = (
+                              e.currentTarget as HTMLInputElement
+                            ).value),
+                        )
+                      }
+                    />
+                  </td>
+                  <td>
+                    <Select
+                      aria-label="DNS sinkhole behavior"
+                      options={SINKHOLE_MODES}
+                      value={sinkhole.mode}
+                      onChange={(mode) =>
+                        props.setSegment((s) => (s.sinkholes[index()].mode = mode))
+                      }
+                    />
+                  </td>
+                  <td class="dns-actions">
+                    <IconButton
+                      icon={Trash2}
+                      label="Delete DNS sinkhole"
+                      onClick={() => props.setSegment((s) => void s.sinkholes.splice(index(), 1))}
+                    />
+                  </td>
+                </tr>
+              )}
+            </For>
+            <Show when={empty()}>
+              <tr class="dns-empty">
+                <td colSpan={4}>No static records or sinkholes.</td>
+              </tr>
+            </Show>
+          </tbody>
+        </Table>
+      </div>
+      <div class="dns-table-actions">
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={Plus}
+          onClick={() =>
+            props.setSegment((s) => s.records.push({ span: null, name: "", ip: "" }))
+          }
+        >
+          Add record
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={Plus}
+          onClick={() =>
+            props.setSegment((s) =>
+              s.sinkholes.push({ span: null, pattern: "", mode: "nxdomain" }),
+            )
+          }
+        >
+          Add sinkhole
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+const BLOCK_PROTOCOLS = [
+  { value: "", label: "any" },
+  { value: "tcp", label: "TCP" },
+  { value: "udp", label: "UDP" },
+  { value: "icmp", label: "ICMP" },
+];
+const REDIRECT_PROTOCOLS = BLOCK_PROTOCOLS.filter((option) => option.value !== "icmp");
+
+function SegmentRulesTables(props: {
+  segment: SegmentModel;
+  setSegment: (fn: (segment: SegmentModel) => void) => void;
+}) {
+  return (
+    <div class="rules-tables">
+      <div class="rules-table-section">
+        <div class="inspector-section-title">Block rules</div>
+        <div class="dns-table rules-table">
+          <Table aria-label="Network block rules">
+            <thead>
+              <tr>
+                <th>CIDR</th>
+                <th>Protocol</th>
+                <th>Port</th>
+                <th aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              <For each={props.segment.block_rules}>
+                {(rule, index) => (
+                  <tr>
+                    <td>
+                      <Input
+                        aria-label="Blocked CIDR"
+                        value={rule.cidr}
+                        placeholder="0.0.0.0/0"
+                        error={!rule.cidr.trim()}
+                        onInput={(e: InputEvent) =>
+                          props.setSegment(
+                            (s) =>
+                              (s.block_rules[index()].cidr = (
+                                e.currentTarget as HTMLInputElement
+                              ).value),
+                          )
+                        }
+                      />
+                    </td>
+                    <td>
+                      <Select
+                        aria-label="Blocked protocol"
+                        options={BLOCK_PROTOCOLS}
+                        value={rule.proto ?? ""}
+                        onChange={(proto) =>
+                          props.setSegment(
+                            (s) => (s.block_rules[index()].proto = proto || null),
+                          )
+                        }
+                      />
+                    </td>
+                    <td>
+                      <Input
+                        aria-label="Blocked port"
+                        type="number"
+                        min="1"
+                        max="65535"
+                        value={rule.port == null ? "" : String(rule.port)}
+                        placeholder="any"
+                        onInput={(e: InputEvent) => {
+                          const raw = (e.currentTarget as HTMLInputElement).value;
+                          props.setSegment(
+                            (s) => (s.block_rules[index()].port = raw === "" ? null : Number(raw)),
+                          );
+                        }}
+                      />
+                    </td>
+                    <td class="dns-actions">
+                      <IconButton
+                        icon={Trash2}
+                        label="Delete block rule"
+                        onClick={() =>
+                          props.setSegment((s) => void s.block_rules.splice(index(), 1))
+                        }
+                      />
+                    </td>
+                  </tr>
+                )}
+              </For>
+              <Show when={props.segment.block_rules.length === 0}>
+                <tr class="dns-empty">
+                  <td colSpan={4}>No block rules.</td>
+                </tr>
+              </Show>
+            </tbody>
+          </Table>
+        </div>
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={Plus}
+          onClick={() =>
+            props.setSegment((s) =>
+              s.block_rules.push({ span: null, cidr: "", proto: null, port: null }),
+            )
+          }
+        >
+          Add block rule
+        </Button>
+      </div>
+
+      <div class="rules-table-section">
+        <div class="inspector-section-title">Redirect rules</div>
+        <div class="dns-table rules-table">
+          <Table aria-label="Network redirect rules">
+            <thead>
+              <tr>
+                <th>From</th>
+                <th>To</th>
+                <th>Protocol</th>
+                <th aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              <For each={props.segment.redirect_rules}>
+                {(rule, index) => (
+                  <tr>
+                    <td>
+                      <Input
+                        aria-label="Redirect source"
+                        value={rule.from}
+                        placeholder="1.2.3.4:443"
+                        error={!rule.from.trim()}
+                        onInput={(e: InputEvent) =>
+                          props.setSegment(
+                            (s) =>
+                              (s.redirect_rules[index()].from = (
+                                e.currentTarget as HTMLInputElement
+                              ).value),
+                          )
+                        }
+                      />
+                    </td>
+                    <td>
+                      <Input
+                        aria-label="Redirect target"
+                        value={rule.to}
+                        placeholder="10.0.0.5:8443"
+                        error={!rule.to.trim()}
+                        onInput={(e: InputEvent) =>
+                          props.setSegment(
+                            (s) =>
+                              (s.redirect_rules[index()].to = (
+                                e.currentTarget as HTMLInputElement
+                              ).value),
+                          )
+                        }
+                      />
+                    </td>
+                    <td>
+                      <Select
+                        aria-label="Redirect protocol"
+                        options={REDIRECT_PROTOCOLS}
+                        value={rule.proto ?? ""}
+                        onChange={(proto) =>
+                          props.setSegment(
+                            (s) => (s.redirect_rules[index()].proto = proto || null),
+                          )
+                        }
+                      />
+                    </td>
+                    <td class="dns-actions">
+                      <IconButton
+                        icon={Trash2}
+                        label="Delete redirect rule"
+                        onClick={() =>
+                          props.setSegment((s) => void s.redirect_rules.splice(index(), 1))
+                        }
+                      />
+                    </td>
+                  </tr>
+                )}
+              </For>
+              <Show when={props.segment.redirect_rules.length === 0}>
+                <tr class="dns-empty">
+                  <td colSpan={4}>No redirect rules.</td>
+                </tr>
+              </Show>
+            </tbody>
+          </Table>
+        </div>
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={Plus}
+          onClick={() =>
+            props.setSegment((s) =>
+              s.redirect_rules.push({ span: null, from: "", to: "", proto: null }),
+            )
+          }
+        >
+          Add redirect rule
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function SegmentInspector(props: { index: number }) {
   const seg = () => editor.draft!.segments[props.index];
   const [tab, setTab] = createSignal("general");
@@ -892,7 +1386,7 @@ function SegmentInspector(props: { index: number }) {
       <Tabs
         tabs={[
           { id: "general", label: "General" },
-          { id: "services", label: "DHCP & NAT" },
+          { id: "services", label: "DHCP" },
           { id: "dns", label: "DNS" },
           { id: "rules", label: "Rules" },
         ]}
@@ -920,126 +1414,26 @@ function SegmentInspector(props: { index: number }) {
       </Show>
       <Show when={tab() === "services"}>
         <BlockForm fields={F.SEGMENT_SERVICES} value={seg() as any} onSet={setField} />
-        <div class="field-row">
-          <div class="field-row-label" title="DNS service override: hand out another server, or opt out">
-            DNS override
-          </div>
-          <div class="field-row-control">
-            <Toggle
-              checked={seg().dns.declared}
-              onChange={(on) => setSeg((s) => (s.dns.declared = on))}
-            />
-          </div>
-        </div>
-        <Show when={seg().dns.declared}>
-          <BlockForm
-            fields={F.DNS_FIELDS}
-            value={seg().dns as any}
-            onSet={(key, v) => setSeg((s) => ((s.dns as any)[key] = v))}
-          />
-        </Show>
-        <div class="field-row">
-          <div class="field-row-label" title="Cross-host segment peer over TCP (PSK from host config)">
-            Cross-host peer
-          </div>
-          <div class="field-row-control">
-            <Toggle
-              checked={seg().connect !== null}
-              // Attach also sets global = true (peering rides the shared
-              // switch); detach keeps global — same semantics as the canvas.
-              onChange={(on) => setSegmentPeer(props.index, on ? "" : null)}
-            />
-          </div>
-        </div>
-        <Show when={seg().connect}>
-          <BlockForm
-            fields={F.CONNECT_FIELDS}
-            value={seg().connect as any}
-            onSet={(key, v) => setSeg((s) => ((s.connect as any)[key] = v))}
-          />
-        </Show>
-        <BlockList
-          title="Guest routes (DHCP option 121)"
-          items={seg().routes as any}
-          fields={F.ROUTE_FIELDS}
-          summary={(r) => `${r.dest || "(dest)"} via ${r.via || "?"}`}
-          addLabel="Add route"
-          onAdd={() => setSeg((s) => s.routes.push({ span: null, dest: "", via: "" }))}
-          onRemove={(i) => setSeg((s) => void s.routes.splice(i, 1))}
-          onSet={(i, key, v) => setSeg((s) => ((s.routes[i] as any)[key] = v))}
+        <Input
+          label="DNS server"
+          help="Leave blank to use vmlab built-in DNS"
+          placeholder="Use vmlab built-in DNS"
+          value={seg().dns.server ?? ""}
+          onInput={(e: InputEvent) => {
+            const value = (e.currentTarget as HTMLInputElement).value;
+            setSeg((s) => {
+              s.dns.declared = value.trim() !== "";
+              s.dns.server = value.trim() || null;
+              s.dns.enabled = true;
+            });
+          }}
         />
       </Show>
       <Show when={tab() === "dns"}>
-        <BlockList
-          title="Static DNS records"
-          items={seg().records as any}
-          fields={F.RECORD_FIELDS}
-          summary={(r) => `${r.name || "(name)"} → ${r.ip || "?"}`}
-          addLabel="Add record"
-          onAdd={() => setSeg((s) => s.records.push({ span: null, name: "", ip: "" }))}
-          onRemove={(i) => setSeg((s) => void s.records.splice(i, 1))}
-          onSet={(i, key, v) => setSeg((s) => ((s.records[i] as any)[key] = v))}
-        />
-        <BlockList
-          title="DNS sinkholes"
-          items={seg().sinkholes as any}
-          fields={F.SINKHOLE_FIELDS}
-          summary={(s) => s.pattern || "(pattern)"}
-          addLabel="Add sinkhole"
-          onAdd={() =>
-            setSeg((s) => s.sinkholes.push({ span: null, pattern: "", mode: "nxdomain" }))
-          }
-          onRemove={(i) => setSeg((s) => void s.sinkholes.splice(i, 1))}
-          onSet={(i, key, v) => setSeg((s) => ((s.sinkholes[i] as any)[key] = v))}
-        />
+        <SegmentDnsTable segment={seg()} setSegment={setSeg} />
       </Show>
       <Show when={tab() === "rules"}>
-        <BlockList
-          title="Port forwards (host → guest)"
-          items={seg().forwards as any}
-          fields={F.FORWARD_FIELDS}
-          summary={(f) => `:${f.host_port || "?"} → ${f.vm || "?"}:${f.guest_port || "?"}`}
-          addLabel="Add forward"
-          onAdd={() =>
-            setSeg((s) =>
-              s.forwards.push({
-                span: null,
-                host_port: 8080,
-                vm: editor.draft!.vms[0]?.name ?? "",
-                guest_port: 80,
-                proto: "tcp",
-              }),
-            )
-          }
-          onRemove={(i) => setSeg((s) => void s.forwards.splice(i, 1))}
-          onSet={(i, key, v) => setSeg((s) => ((s.forwards[i] as any)[key] = v))}
-        />
-        <BlockList
-          title="Block rules"
-          items={seg().block_rules as any}
-          fields={F.BLOCK_RULE_FIELDS}
-          summary={(b) => `${b.cidr || "(cidr)"}${b.proto ? ` ${b.proto}` : ""}${b.port ? `:${b.port}` : ""}`}
-          addLabel="Add rule"
-          onAdd={() =>
-            setSeg((s) => s.block_rules.push({ span: null, cidr: "", proto: null, port: null }))
-          }
-          onRemove={(i) => setSeg((s) => void s.block_rules.splice(i, 1))}
-          onSet={(i, key, v) => setSeg((s) => ((s.block_rules[i] as any)[key] = v))}
-        />
-        <BlockList
-          title="Redirect rules (DNAT)"
-          items={seg().redirect_rules as any}
-          fields={F.REDIRECT_FIELDS}
-          summary={(r) => `${r.from || "(from)"} → ${r.to || "(to)"}`}
-          addLabel="Add redirect"
-          onAdd={() =>
-            setSeg((s) =>
-              s.redirect_rules.push({ span: null, from: "", to: "", proto: null }),
-            )
-          }
-          onRemove={(i) => setSeg((s) => void s.redirect_rules.splice(i, 1))}
-          onSet={(i, key, v) => setSeg((s) => ((s.redirect_rules[i] as any)[key] = v))}
-        />
+        <SegmentRulesTables segment={seg()} setSegment={setSeg} />
       </Show>
     </>
   );

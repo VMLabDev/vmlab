@@ -235,6 +235,22 @@ cli vmlab_cli {
       cli_switch s_tpl_import_overwrite { long = "--overwrite"  description = "Replace an existing store entry." }
       code_example { lang = "console"  code = "vmlab template import linux.tar.zst" }
     }
+    subcommand c_tpl_search {
+      name = "search"
+      description = "Search the configured OCI registries. Uses VM registries by default; --kind container searches image registries."
+      cli_arg a_tpl_search_query { name = "query"  description = "Case-insensitive repository-name filter."  required = false }
+      cli_switch s_tpl_search_registry { long = "--registry"  value_name = "NAMESPACE"  description = "Search only this namespace instead of shared registry settings." }
+      cli_switch s_tpl_search_arch { long = "--arch"  value_name = "ARCH"  description = "Only return artifacts supporting this architecture." }
+      cli_switch s_tpl_search_kind { long = "--kind"  value_name = "vm|container"  description = "Artifact kind to search (default vm)." }
+      code_example { lang = "console"  code = "vmlab template search alpine --arch x86_64\nvmlab template search nginx --kind container" }
+    }
+    subcommand c_tpl_registry {
+      name = "registry"
+      description = "Manage OCI namespace settings shared by the CLI and web console."
+      subcommand c_tpl_registry_list { name = "list"  description = "List searchable namespaces and their VM/container use."  code_example { lang = "console"  code = "vmlab template registry list --json" } }
+      subcommand c_tpl_registry_add { name = "add"  description = "Add or update a searchable namespace."  cli_arg a_tpl_registry_add_ns { name = "namespace"  description = "Registry owner/group namespace, e.g. ghcr.io/owner/templates." }  cli_switch s_tpl_registry_use { long = "--use-for"  value_name = "vms|containers|both"  description = "Which artifact selectors use this namespace." }  code_example { lang = "console"  code = "vmlab template registry add ghcr.io/owner/templates --use-for vms" } }
+      subcommand c_tpl_registry_remove { name = "remove"  description = "Remove a namespace from shared search settings."  cli_arg a_tpl_registry_remove_ns { name = "namespace"  description = "Namespace to remove." } }
+    }
     subcommand c_tpl_login {
       name = "login"
       description = "Log in to an OCI registry (persists to ~/.docker/config.json; existing docker logins are reused)."

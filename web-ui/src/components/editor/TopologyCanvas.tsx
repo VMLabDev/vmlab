@@ -1,10 +1,10 @@
-// The SVG topology canvas: segments as bus bars, VMs as boxes, NICs as
-// edges dropping onto the bars. One world-transform group gives pan/zoom;
+// The SVG topology canvas: segments as bus bars, machines as patch-panel
+// cards, and one shortest-side cable per declaration-ordered NIC. One world-transform group gives pan/zoom;
 // positions are cosmetic and live in localStorage (editor/layout.ts).
 //
 // Interactions: click = select (background = lab), drag node = move,
 // drag background = pan, wheel = zoom-to-cursor, Delete = remove selection.
-// Cabling: a NIC's port dot on the VM and its lit socket on the bar are two
+// Cabling: a NIC's side port on the machine and its lit socket on the bar are two
 // ends of the same cable — drag either onto a bar to re-home the NIC, or
 // onto empty space to unplug it (the NIC stays on the VM as a loose port).
 // Drag a bar's free socket onto a NIC dot to swap that NIC over, or onto
@@ -15,18 +15,23 @@
 // remove it the same way.
 
 import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
-import { Button } from "@forge/ui";
+import { Button, Input, Modal } from "@forge/ui";
 import {
   Container,
   Expand,
+  EthernetPort,
+  FileCode2,
   FlaskConical,
   FilePenLine,
   LayoutGrid,
   Monitor,
   Play,
+  Plus,
   RotateCw,
   Router,
+  Server,
   Square,
+  Trash2,
   Waypoints,
 } from "lucide-solid";
 import type { Layout, NodePos } from "../../editor/layout";
@@ -36,36 +41,54 @@ import {
   PORT_SPACING,
   PORT_X0,
   SEG_H,
-  VM_H,
+  NIC_ROW_H,
+  PROVISION_H,
+  PROVISION_W,
   VM_W,
   autoLayout,
   loadLayout,
   renameInLayout,
   saveLayout,
   segWidthFor,
+  machineCardHeight,
+  provisionLayoutKey,
 } from "../../editor/layout";
 import type { ContainerModel, LabModel, NicModel, VmModel } from "../../editor/model";
 import type { MachineKind } from "../../editor/store";
 import {
   addContainer,
+  addEventHandlerTarget,
+  addHostPort,
+  addMachineDependency,
   addMachineNic,
+  addProvisionTarget,
   addRemote,
   addSegment,
   addSegmentRoute,
   addVm,
   disconnectMachineNic,
   editor,
+  eventTargetKind,
+  attachHostPort,
   remoteHosts,
   removeContainer,
+  removeEventHandlerTarget,
+  removeMachineDependency,
+  removeProvision,
+  removeProvisionTarget,
   removeRemote,
   removeSegment,
   removeSegmentRoute,
   removeVm,
   select,
+  setEditor,
+  setHostPortDraft,
+  setMachineNicGateway,
   setMachineNicTarget,
   setSegmentNat,
   setSegmentPeer,
   storeTemplateFor,
+  removeHostPortDraft,
 } from "../../editor/store";
 import { formatMemory } from "../../editor/bytesize";
 import {
@@ -84,16 +107,50 @@ import {
   vmStop,
 } from "../../store";
 import { confirmDialog } from "../dialogs";
-import OsIcon from "./OsIcon";
 import { registerFxNode } from "../../fx";
 
 interface Drag {
-  kind: "vm" | "container" | "segment" | "nat" | "lab" | "remote";
+  kind: "vm" | "container" | "provision" | "segment" | "nat" | "remote" | "host";
   name: string;
   dx: number;
   dy: number;
   moved: boolean;
 }
+
+interface HostPortDrag {
+  draftId: string;
+  moved: boolean;
+  x: number;
+  y: number;
+}
+
+type HostPortEntry =
+  | {
+      key: string;
+      source: "draft";
+      draftId: string;
+      hostPort: number;
+      guestPort: null;
+      target: null;
+    }
+  | {
+      key: string;
+      source: "forward";
+      segmentIndex: number;
+      portIndex: number;
+      hostPort: number;
+      guestPort: number;
+      target: { kind: MachineKind; index: number; name: string } | null;
+    }
+  | {
+      key: string;
+      source: "container";
+      containerIndex: number;
+      portIndex: number;
+      hostPort: number;
+      guestPort: number;
+      target: { kind: "container"; index: number; name: string };
+    };
 
 /** Re-homing an existing NIC, grabbed by its machine port dot or lit socket. */
 interface ConnDrag {
@@ -132,12 +189,264 @@ interface LinkDrag {
   y: number;
 }
 
-export default function TopologyCanvas(props: { onEditConfig: () => void }) {
+/** A directional startup dependency being created or re-homed. */
+interface DependencyDrag {
+  kind: MachineKind;
+  index: number;
+  /** Target name when an existing arrow is being re-homed. */
+  existing: string | null;
+  moved: boolean;
+  x: number;
+  y: number;
+}
+
+interface ProvisionTargetDrag {
+  provisionIndex: number;
+  existing: string | null;
+  moved: boolean;
+  x: number;
+  y: number;
+}
+
+interface EventTargetDrag {
+  handlerIndex: number;
+  existing: string | null;
+  moved: boolean;
+  x: number;
+  y: number;
+}
+
+function PortNumberEditor(props: {
+  x: number;
+  y: number;
+  value: number;
+  valid: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange: (value: number) => void;
+}) {
+  let input!: HTMLInputElement;
+  const [draft, setDraft] = createSignal(String(props.value));
+  const [editing, setEditing] = createSignal(false);
+
+  // External changes (revert/reload, or another editor surface) update the
+  // chip, but never overwrite a value while the user is actively typing.
+  createEffect(() => {
+    const value = String(props.value);
+    if (!editing()) setDraft(value);
+  });
+
+  const commit = () => {
+    const raw = draft().trim();
+    const value = raw === "" ? 0 : Number(raw);
+    if (Number.isFinite(value)) props.onChange(value);
+    else setDraft(String(props.value));
+  };
+
+  return (
+    <foreignObject x={props.x} y={props.y} width="48" height="24" class="topo-port-editor">
+      <input
+        ref={input}
+        aria-label={props.label}
+        classList={{ invalid: !props.valid }}
+        type="number"
+        min="0"
+        max="65535"
+        disabled={props.disabled}
+        value={draft()}
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+        onFocus={() => setEditing(true)}
+        onInput={(e) => setDraft(e.currentTarget.value)}
+        onBlur={() => {
+          commit();
+          setEditing(false);
+        }}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter") {
+            e.preventDefault();
+            input.blur();
+          } else if (e.key === "Escape") {
+            setDraft(String(props.value));
+            input.blur();
+          }
+        }}
+      />
+    </foreignObject>
+  );
+}
+
+function NicIpEditor(props: {
+  x: number;
+  y: number;
+  staticIp: string | null;
+  assignedIp: string | null;
+  disabled: boolean;
+  staticAllowed: boolean;
+  gateway: boolean;
+  gatewayAllowed: boolean;
+  validate: (value: string) => string | null;
+  onChange: (value: string | null) => void;
+  onGatewayChange: (enabled: boolean) => void;
+}) {
+  const [draft, setDraft] = createSignal(props.staticIp ?? props.assignedIp ?? "");
+  const [open, setOpen] = createSignal(false);
+  createEffect(() => {
+    const value = props.staticIp ?? props.assignedIp ?? "";
+    if (!open()) setDraft(value);
+  });
+  const error = () => props.validate(draft().trim());
+  const mode = () => (props.gateway ? "GATEWAY" : props.staticIp ? "STATIC" : "AUTO");
+  const address = () => props.staticIp ?? props.assignedIp ?? "awaiting address";
+  const close = () => setOpen(false);
+
+  return (
+    <>
+      <foreignObject
+        x={props.x}
+        y={props.y}
+        width={124}
+        height={23}
+        class="topo-nic-ip-object"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <Button size="sm" variant="ghost" onClick={() => setOpen(true)}>
+          <span class="topo-nic-ip-label">
+            <span
+              class={`topo-nic-mode ${props.gateway ? "gateway" : props.staticIp ? "static" : "auto"}`}
+            >
+              {mode()}
+            </span>
+            <span classList={{ unknown: !props.staticIp && !props.assignedIp }}>{address()}</span>
+          </span>
+        </Button>
+      </foreignObject>
+      <Modal
+        open={open()}
+        title="IPv4 assignment"
+        onClose={close}
+        footer={
+          <Button variant="ghost" onClick={close}>
+            Close
+          </Button>
+        }
+      >
+        <div
+          class="topo-nic-ip-modal"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => e.stopPropagation()}
+          onKeyUp={(e) => e.stopPropagation()}
+        >
+          <Show
+            when={props.gateway}
+            fallback={
+              <>
+                <Button
+                  disabled={props.disabled}
+                  onClick={() => {
+                    props.onChange(null);
+                    setDraft(props.assignedIp ?? "");
+                    close();
+                  }}
+                >
+                  Use automatic address
+                </Button>
+                <Input
+                  label="Static address"
+                  placeholder="10.0.0.10"
+                  value={draft()}
+                  disabled={props.disabled || !props.staticAllowed}
+                  error={!!draft().trim() && !!error()}
+                  onInput={(e) => setDraft(e.currentTarget.value)}
+                />
+                <Show when={!props.staticAllowed}>
+                  <div class="topo-nic-ip-error">
+                    Static addresses require a declared network segment.
+                  </div>
+                </Show>
+                <Show when={props.staticAllowed && draft().trim() && error()}>
+                  {(message) => <div class="topo-nic-ip-error">{message()}</div>}
+                </Show>
+                <Button
+                  variant="primary"
+                  disabled={
+                    props.disabled || !props.staticAllowed || !draft().trim() || !!error()
+                  }
+                  onClick={() => {
+                    props.onChange(draft().trim());
+                    close();
+                  }}
+                >
+                  Apply static address
+                </Button>
+                <div class="topo-nic-gateway-card">
+                  <div>
+                    <strong>Dedicated gateway mode</strong>
+                    <span>
+                      Claims the segment router address and sends routed traffic to this machine.
+                    </span>
+                  </div>
+                  <Button
+                    variant="primary"
+                    disabled={props.disabled || !props.gatewayAllowed}
+                    onClick={() => {
+                      props.onGatewayChange(true);
+                      close();
+                    }}
+                  >
+                    Make gateway
+                  </Button>
+                </div>
+              </>
+            }
+          >
+            <div class="topo-nic-gateway-active">
+              <span class="topo-nic-mode gateway">GATEWAY</span>
+              <strong>{address()}</strong>
+              <p>
+                This NIC owns the segment router address. Automatic and ordinary static addressing
+                are disabled while gateway mode is active.
+              </p>
+              <Button
+                variant="danger"
+                disabled={props.disabled}
+                onClick={() => {
+                  props.onGatewayChange(false);
+                  setDraft(props.assignedIp ?? "");
+                  close();
+                }}
+              >
+                Leave gateway mode
+              </Button>
+            </div>
+          </Show>
+          <Show when={props.disabled}>
+            <div class="topo-nic-ip-error">Stop this machine before changing its address.</div>
+          </Show>
+        </div>
+      </Modal>
+    </>
+  );
+}
+
+export default function TopologyCanvas(props: {
+  onEditConfig: () => void;
+  onAddProvision: () => void;
+  onEditProvision: (path: string) => void;
+}) {
   let svg: SVGSVGElement | undefined;
   const model = () => editor.draft!;
   const lab = () => editor.lab!;
 
-  const [layout, setLayout] = createSignal<Layout>({ vms: {}, containers: {}, segments: {} });
+  const [layout, setLayout] = createSignal<Layout>({
+    vms: {},
+    containers: {},
+    segments: {},
+    provisions: {},
+  });
   const [view, setView] = createSignal({ tx: 0, ty: 0, k: 1 });
   const [drag, setDrag] = createSignal<Drag | null>(null);
   const [pan, setPan] = createSignal<{ sx: number; sy: number; tx: number; ty: number } | null>(
@@ -146,6 +455,12 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   const [connDrag, setConnDrag] = createSignal<ConnDrag | null>(null);
   const [socketDrag, setSocketDrag] = createSignal<SocketDrag | null>(null);
   const [linkDrag, setLinkDrag] = createSignal<LinkDrag | null>(null);
+  const [dependencyDrag, setDependencyDrag] = createSignal<DependencyDrag | null>(null);
+  const [provisionTargetDrag, setProvisionTargetDrag] = createSignal<ProvisionTargetDrag | null>(
+    null,
+  );
+  const [eventTargetDrag, setEventTargetDrag] = createSignal<EventTargetDrag | null>(null);
+  const [hostPortDrag, setHostPortDrag] = createSignal<HostPortDrag | null>(null);
 
   // (Re)seed layout whenever the lab or the set of node names changes.
   createEffect(() => {
@@ -154,6 +469,7 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       ...model().vms.map((v) => v.name),
       ...model().containers.map((c) => c.name),
       ...model().segments.map((s) => s.name),
+      ...model().provisions.map((provision) => provision.script),
     ];
     void names.length;
     const stored = loadLayout(l);
@@ -177,21 +493,197 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     return { x: (e.clientX - rect.left - tx) / k, y: (e.clientY - rect.top - ty) / k };
   };
 
-  const vmPos = (name: string): NodePos => layout().vms[name] ?? { x: 40, y: 40 };
-  const ctrPos = (name: string): NodePos => layout().containers[name] ?? { x: 40, y: 40 };
+  const vmPosIn = (l: Layout, name: string): NodePos => l.vms[name] ?? { x: 40, y: 40 };
+  const ctrPosIn = (l: Layout, name: string): NodePos => l.containers[name] ?? { x: 40, y: 40 };
+  const segPosIn = (l: Layout, name: string): NodePos => l.segments[name] ?? { x: 60, y: 200 };
+  const vmPos = (name: string): NodePos => vmPosIn(layout(), name);
+  const ctrPos = (name: string): NodePos => ctrPosIn(layout(), name);
+  const provisionKey = (index: number) => provisionLayoutKey(model(), index);
+  const provisionPosIn = (l: Layout, index: number): NodePos =>
+    l.provisions[provisionLayoutKey(model(), index)] ?? { x: 80, y: 360 };
+  const provisionPos = (index: number): NodePos => provisionPosIn(layout(), index);
   /** VMs and containers share the same node geometry on the canvas. */
   const machinePos = (kind: MachineKind, name: string): NodePos =>
     kind === "vm" ? vmPos(name) : ctrPos(name);
   const machinesOf = (kind: MachineKind): (VmModel | ContainerModel)[] =>
     kind === "vm" ? model().vms : model().containers;
-  const segPos = (name: string): NodePos => layout().segments[name] ?? { x: 60, y: 200 };
-  const natPos = (): NodePos =>
-    layout().nat ?? { x: 60, y: 200 + model().segments.length * 170 };
-  const labPos = (): NodePos => layout().lab ?? { x: 60, y: 30 };
+  const machineByName = (kind: MachineKind, name: string) =>
+    machinesOf(kind).find((machine) => machine.name === name);
+  const machineHeight = (kind: MachineKind, name: string) =>
+    machineCardHeight(machineByName(kind, name)?.nics.length ?? 0);
+  const machineRef = (name: string) => {
+    const vmIndex = model().vms.findIndex((machine) => machine.name === name);
+    if (vmIndex >= 0) return { kind: "vm" as const, index: vmIndex };
+    const containerIndex = model().containers.findIndex((machine) => machine.name === name);
+    return containerIndex >= 0
+      ? { kind: "container" as const, index: containerIndex }
+      : null;
+  };
 
-  /** The lab block's size (name-dependent width). */
-  const LAB_H = 64;
-  const labW = () => Math.max(220, 58 + model().name.length * 8);
+  /** Every machine has one fan-out socket for startup dependencies. */
+  const dependencyPort = (kind: MachineKind, name: string): NodePos => {
+    const p = machinePos(kind, name);
+    return { x: p.x + VM_W / 2, y: p.y };
+  };
+
+  /** Point where the dependency arrow meets the target card's nearest edge. */
+  function dependencyTarget(kind: MachineKind, name: string, from: NodePos): NodePos {
+    const p = machinePos(kind, name);
+    const halfW = VM_W / 2;
+    const halfH = machineHeight(kind, name) / 2;
+    const center = { x: p.x + halfW, y: p.y + halfH };
+    const dx = from.x - center.x;
+    const dy = from.y - center.y;
+    const ratio = Math.max(Math.abs(dx) / halfW, Math.abs(dy) / halfH, 0.0001);
+    return { x: center.x + dx / ratio, y: center.y + dy / ratio };
+  }
+
+  function dependencyPath(
+    sourceKind: MachineKind,
+    sourceName: string,
+    targetKind: MachineKind,
+    targetName: string,
+  ) {
+    const from = dependencyPort(sourceKind, sourceName);
+    const to = dependencyTarget(targetKind, targetName, from);
+    const distance = Math.hypot(to.x - from.x, to.y - from.y);
+    const bend = Math.min(72, Math.max(28, distance * 0.22));
+    const sourceControl = { x: from.x, y: from.y - bend };
+    const verticalTarget = Math.abs(to.y - from.y) >= Math.abs(to.x - from.x);
+    const targetControl = verticalTarget
+      ? { x: to.x, y: to.y + (to.y < from.y ? bend : -bend) }
+      : { x: to.x + (to.x < from.x ? bend : -bend), y: to.y };
+    return `M ${from.x} ${from.y} C ${sourceControl.x} ${sourceControl.y}, ${targetControl.x} ${targetControl.y}, ${to.x} ${to.y}`;
+  }
+
+  const dependencyLinks = createMemo(() => {
+    const links: {
+      sourceKind: MachineKind;
+      sourceIndex: number;
+      sourceName: string;
+      targetKind: MachineKind;
+      targetIndex: number;
+      targetName: string;
+    }[] = [];
+    for (const sourceKind of ["vm", "container"] as const) {
+      machinesOf(sourceKind).forEach((source, sourceIndex) => {
+        for (const targetName of source.depends_on) {
+          const target = machineRef(targetName);
+          if (target) {
+            links.push({
+              sourceKind,
+              sourceIndex,
+              sourceName: source.name,
+              targetKind: target.kind,
+              targetIndex: target.index,
+              targetName,
+            });
+          }
+        }
+      });
+    }
+    return links;
+  });
+
+  const provisionLinks = createMemo(() =>
+    model().provisions.flatMap((provision, provisionIndex) =>
+      provision.vms.flatMap((targetName) => {
+        const target = machineRef(targetName);
+        return target
+          ? [{ provisionIndex, targetName, targetKind: target.kind, targetIndex: target.index }]
+          : [];
+      }),
+    ),
+  );
+
+  const SCRIPT_EVENT_ROW_H = 24;
+  const handlersForProvision = (provisionIndex: number) => {
+    const script = model().provisions[provisionIndex]?.script;
+    return model().handlers
+      .map((handler, handlerIndex) => ({ handler, handlerIndex }))
+      .filter(({ handler }) => handler.run === script);
+  };
+  const provisionCardHeight = (index: number) =>
+    PROVISION_H + handlersForProvision(index).length * SCRIPT_EVENT_ROW_H;
+
+  const provisionPort = (index: number): NodePos => {
+    const position = provisionPos(index);
+    return { x: position.x + PROVISION_W, y: position.y + PROVISION_H / 2 };
+  };
+
+  function provisionLinkPath(index: number, targetKind: MachineKind, targetName: string): string {
+    const from = provisionPort(index);
+    const to = dependencyTarget(targetKind, targetName, from);
+    const bend = Math.max(34, Math.min(90, Math.abs(to.x - from.x) * 0.35));
+    return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - (to.x >= from.x ? bend : -bend)} ${to.y}, ${to.x} ${to.y}`;
+  }
+
+  const eventPort = (handlerIndex: number): NodePos | null => {
+    const handler = model().handlers[handlerIndex];
+    if (!handler || eventTargetKind(handler.event) === null) return null;
+    const provisionIndex = model().provisions.findIndex(
+      (provision) => provision.script === handler.run,
+    );
+    if (provisionIndex < 0) return null;
+    const row = handlersForProvision(provisionIndex).findIndex(
+      (entry) => entry.handlerIndex === handlerIndex,
+    );
+    const p = provisionPos(provisionIndex);
+    return {
+      x: p.x + PROVISION_W,
+      y: p.y + PROVISION_H + row * SCRIPT_EVENT_ROW_H + SCRIPT_EVENT_ROW_H / 2,
+    };
+  };
+
+  const eventLinks = createMemo(() =>
+    model().handlers.flatMap((handler, handlerIndex) =>
+      handler.targets.flatMap((targetName) => {
+        const target = machineRef(targetName);
+        return target && eventPort(handlerIndex)
+          ? [{ handlerIndex, targetName, targetKind: target.kind }]
+          : [];
+      }),
+    ),
+  );
+
+  function eventLinkPath(handlerIndex: number, targetKind: MachineKind, targetName: string) {
+    const from = eventPort(handlerIndex)!;
+    const to = dependencyTarget(targetKind, targetName, from);
+    const bend = Math.max(30, Math.min(82, Math.abs(to.x - from.x) * 0.32));
+    return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - (to.x >= from.x ? bend : -bend)} ${to.y}, ${to.x} ${to.y}`;
+  }
+
+  const dependencyKey = (source: string, target: string) => `${source}\0${target}`;
+
+  /** An edge source→target is cyclic exactly when target can reach source.
+   *  Labs are deliberately small, so a DFS per edge is clearer and less
+   *  error-prone than maintaining an incremental SCC index. */
+  const cyclicDependencies = createMemo(() => {
+    const adjacency = new Map<string, string[]>();
+    for (const machine of [...model().vms, ...model().containers]) {
+      adjacency.set(
+        machine.name,
+        machine.depends_on.filter((target) => machineRef(target) !== null),
+      );
+    }
+    const reaches = (from: string, target: string, seen = new Set<string>()): boolean => {
+      if (from === target) return true;
+      if (seen.has(from)) return false;
+      seen.add(from);
+      return (adjacency.get(from) ?? []).some((next) => reaches(next, target, seen));
+    };
+    const cyclic = new Set<string>();
+    for (const link of dependencyLinks()) {
+      if (reaches(link.targetName, link.sourceName)) {
+        cyclic.add(dependencyKey(link.sourceName, link.targetName));
+      }
+    }
+    return cyclic;
+  });
+  const segPos = (name: string): NodePos => segPosIn(layout(), name);
+  const natPosIn = (l: Layout): NodePos =>
+    l.nat ?? { x: 60, y: 200 + model().segments.length * 170 };
+  const natPos = (): NodePos => natPosIn(layout());
 
   // --- port assignment --------------------------------------------------------
   // Each bar (segment or the NAT bus) owns a bank of sockets; every attached
@@ -211,11 +703,12 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     key.startsWith(REMOTE_PREFIX) ? key.slice(REMOTE_PREFIX.length) : null;
   /** Remote-vmlab node footprint (fixed, like the WAN cloud). */
   const REMOTE_W = 170;
-  const remotePos = (host: string): NodePos =>
-    layout().remotes?.[host] ?? {
+  const remotePosIn = (l: Layout, host: string): NodePos =>
+    l.remotes?.[host] ?? {
       x: 60,
       y: 200 + (model().segments.length + 1) * 170 + Math.max(0, remoteHosts().indexOf(host)) * 90,
     };
+  const remotePos = (host: string): NodePos => remotePosIn(layout(), host);
 
   const ports = createMemo(() => {
     const byNic = new Map<string, number>(); // `${machine}:${nicIndex}` → socket index
@@ -249,14 +742,288 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       : remoteHostOf(key) !== null
         ? REMOTE_W
         : segWidthFor(barUsed(key));
+
+  /** Live enclosure around everything owned by the lab. NAT and remote peer
+   *  nodes intentionally stay outside: they are external endpoints. */
+  const computeLabBounds = (l: Layout) => {
+    const boxes: { x: number; y: number; w: number; h: number }[] = [];
+    const forwardedTo = (name: string) =>
+      model().segments.reduce(
+        (count, segment) => count + segment.forwards.filter((forward) => forward.vm === name).length,
+        0,
+      );
+    for (const vm of model().vms) {
+      const p = vmPosIn(l, vm.name);
+      boxes.push({
+        x: p.x,
+        y: p.y,
+        w: VM_W,
+        h: machineCardHeight(vm.nics.length) + 18 + forwardedTo(vm.name) * 18,
+      });
+    }
+    for (const ctr of model().containers) {
+      const p = ctrPosIn(l, ctr.name);
+      boxes.push({
+        x: p.x,
+        y: p.y,
+        w: VM_W,
+        h:
+          machineCardHeight(ctr.nics.length) +
+          18 +
+          (forwardedTo(ctr.name) + ctr.ports.length) * 18,
+      });
+    }
+    for (const seg of model().segments) {
+      const p = segPosIn(l, seg.name);
+      boxes.push({ x: p.x, y: p.y, w: barWidth(seg.name), h: SEG_H });
+    }
+    model().provisions.forEach((_, index) => {
+      const p = provisionPosIn(l, index);
+      boxes.push({ x: p.x, y: p.y, w: PROVISION_W, h: provisionCardHeight(index) });
+    });
+
+    const minWidth = Math.max(320, 188 + model().name.length * 8);
+    if (!boxes.length) return { x: 60, y: 30, width: minWidth, height: 92 };
+
+    // Service-port editors sit just outside machine boxes; the wider padding
+    // keeps those labels inside the enclosure too.
+    const pad = 70;
+    const header = 70;
+    const minX = Math.min(...boxes.map((b) => b.x));
+    const minY = Math.min(...boxes.map((b) => b.y));
+    const maxX = Math.max(...boxes.map((b) => b.x + b.w));
+    const maxY = Math.max(...boxes.map((b) => b.y + b.h));
+    const x = minX - pad;
+    const y = minY - header - 18;
+    return {
+      x,
+      y,
+      width: Math.max(minWidth, maxX - x + pad),
+      height: maxY - y + pad,
+    };
+  };
+  const labBounds = createMemo(() => computeLabBounds(layout()));
+
+  const HOST_W = 190;
+  const HOST_HEADER_H = 44;
+  const HOST_PORT_H = 34;
+
+  const hostPorts = createMemo<HostPortEntry[]>(() => {
+    const entries: HostPortEntry[] = editor.hostPortDrafts.map((port) => ({
+      key: `draft:${port.id}`,
+      source: "draft" as const,
+      draftId: port.id,
+      hostPort: port.hostPort,
+      guestPort: null,
+      target: null,
+    }));
+
+    const target = (name: string): HostPortEntry["target"] => {
+      const vm = model().vms.findIndex((machine) => machine.name === name);
+      if (vm >= 0) return { kind: "vm", index: vm, name };
+      const container = model().containers.findIndex((machine) => machine.name === name);
+      return container >= 0 ? { kind: "container", index: container, name } : null;
+    };
+
+    model().segments.forEach((segment, segmentIndex) => {
+      segment.forwards.forEach((forward, portIndex) => {
+        entries.push({
+          key: `forward:${segment.name}:${portIndex}`,
+          source: "forward",
+          segmentIndex,
+          portIndex,
+          hostPort: forward.host_port,
+          guestPort: forward.guest_port,
+          target: target(forward.vm),
+        });
+      });
+    });
+    model().containers.forEach((container, containerIndex) => {
+      container.ports.forEach((port, portIndex) => {
+        entries.push({
+          key: `container:${container.name}:${portIndex}`,
+          source: "container",
+          containerIndex,
+          portIndex,
+          hostPort: port.host,
+          guestPort: port.container,
+          target: { kind: "container", index: containerIndex, name: container.name },
+        });
+      });
+    });
+    return entries;
+  });
+
+  const hostPosIn = (l: Layout, bounds = computeLabBounds(l)): NodePos =>
+    l.host ?? { x: bounds.x + bounds.width + 90, y: bounds.y + 54 };
+  const hostPos = (): NodePos => hostPosIn(layout(), labBounds());
+  const hostHeight = () => HOST_HEADER_H + Math.max(1, hostPorts().length) * HOST_PORT_H + 10;
+
+  /** Move an external node by the shortest distance that clears the lab plus
+   *  breathing room. Existing positions only move when an expanding lab
+   *  collides with them; contraction never pulls them back. */
+  function pushExternalNodes(l: Layout): Layout {
+    const bounds = computeLabBounds(l);
+    const margin = 28;
+    const left = bounds.x - margin;
+    const top = bounds.y - margin;
+    const right = bounds.x + bounds.width + margin;
+    const bottom = bounds.y + bounds.height + margin;
+
+    const push = (pos: NodePos, width: number, height: number, topOffset = 0): NodePos => {
+      const rx = pos.x;
+      const ry = pos.y + topOffset;
+      if (rx + width <= left || rx >= right || ry + height <= top || ry >= bottom) return pos;
+      const candidates: NodePos[] = [
+        { x: left - width, y: pos.y },
+        { x: right, y: pos.y },
+        { x: pos.x, y: top - height - topOffset },
+        { x: pos.x, y: bottom - topOffset },
+      ];
+      return candidates.reduce((best, candidate) => {
+        const distance = (candidate.x - pos.x) ** 2 + (candidate.y - pos.y) ** 2;
+        const bestDistance = (best.x - pos.x) ** 2 + (best.y - pos.y) ** 2;
+        return distance < bestDistance ? candidate : best;
+      });
+    };
+
+    let out = l;
+    const nat = push(natPosIn(out), WAN_W, SEG_H + 26, -18);
+    if (nat.x !== natPosIn(out).x || nat.y !== natPosIn(out).y) out = { ...out, nat };
+
+    for (const remote of remoteHosts()) {
+      const before = remotePosIn(out, remote);
+      const after = push(before, REMOTE_W, SEG_H + 14, -14);
+      if (after.x !== before.x || after.y !== before.y) {
+        out = { ...out, remotes: { ...(out.remotes ?? {}), [remote]: after } };
+      }
+    }
+
+    const beforeHost = hostPosIn(out, bounds);
+    const afterHost = push(beforeHost, HOST_W, hostHeight());
+    if (afterHost.x !== beforeHost.x || afterHost.y !== beforeHost.y) {
+      out = { ...out, host: afterHost };
+    }
+    return out;
+  }
+  const hostPortY = (index: number) => hostPos().y + HOST_HEADER_H + index * HOST_PORT_H + 17;
+  const hostPortValid = (entry: HostPortEntry) =>
+    entry.hostPort > 0 &&
+    entry.hostPort <= 65535 &&
+    hostPorts().filter((candidate) => candidate.hostPort === entry.hostPort).length === 1 &&
+    entry.guestPort !== null &&
+    entry.guestPort > 0 &&
+    entry.guestPort <= 65535;
+
+  const machinePortOrdinal = (entry: HostPortEntry) => {
+    if (!entry.target) return 0;
+    return hostPorts()
+      .filter((candidate) => candidate.target?.name === entry.target!.name)
+      .findIndex((candidate) => candidate.key === entry.key);
+  };
+
+  const machineServicePort = (entry: HostPortEntry) => {
+    const target = entry.target!;
+    const p = machinePos(target.kind, target.name);
+    const hostIsLeft = hostPos().x + HOST_W / 2 < p.x + VM_W / 2;
+    return {
+      x: hostIsLeft ? p.x : p.x + VM_W,
+      y: p.y + machineHeight(target.kind, target.name) + 12 + machinePortOrdinal(entry) * 18,
+      side: hostIsLeft ? ("left" as const) : ("right" as const),
+    };
+  };
+
+  const hostSocket = (entry: HostPortEntry, index: number) => {
+    const target = entry.target;
+    const targetX = target ? machinePos(target.kind, target.name).x + VM_W / 2 : labBounds().x;
+    const side = targetX < hostPos().x + HOST_W / 2 ? "left" : "right";
+    return {
+      x: side === "left" ? hostPos().x : hostPos().x + HOST_W,
+      y: hostPortY(index),
+    };
+  };
+
+  function setHostEntryPort(entry: HostPortEntry, end: "host" | "guest", value: number) {
+    if (entry.source === "draft") {
+      if (end === "host") setHostPortDraft(entry.draftId, value);
+      return;
+    }
+    if (entry.source === "forward") {
+      setEditor(
+        "draft",
+        "segments",
+        entry.segmentIndex,
+        "forwards",
+        entry.portIndex,
+        end === "host" ? "host_port" : "guest_port",
+        value,
+      );
+      return;
+    }
+    setEditor(
+      "draft",
+      "containers",
+      entry.containerIndex,
+      "ports",
+      entry.portIndex,
+      end === "host" ? "host" : "container",
+      value,
+    );
+  }
+
+  function removeHostEntry(entry: HostPortEntry) {
+    if (entry.source === "draft") {
+      removeHostPortDraft(entry.draftId);
+    } else if (entry.source === "forward") {
+      const forwards = model().segments[entry.segmentIndex]?.forwards ?? [];
+      setEditor(
+        "draft",
+        "segments",
+        entry.segmentIndex,
+        "forwards",
+        forwards.filter((_, index) => index !== entry.portIndex),
+      );
+    } else {
+      const ports = model().containers[entry.containerIndex]?.ports ?? [];
+      setEditor(
+        "draft",
+        "containers",
+        entry.containerIndex,
+        "ports",
+        ports.filter((_, index) => index !== entry.portIndex),
+      );
+    }
+  }
   // The socket bank is exactly the connections plus a couple of spares.
   const barCapacity = (key: string) => barUsed(key) + MIN_FREE_PORTS;
   const socketX = (barX: number, idx: number) => barX + PORT_X0 + idx * PORT_SPACING;
-  const vmPortX = (vp: NodePos, nicIndex: number) => vp.x + 18 + nicIndex * 16;
   const barPos = (key: string): NodePos => {
     const host = remoteHostOf(key);
     return key === NAT_KEY ? natPos() : host !== null ? remotePos(host) : segPos(key);
   };
+
+  const nicRowY = (kind: MachineKind, name: string, nicIndex: number) =>
+    machinePos(kind, name).y + 48 + nicIndex * NIC_ROW_H + NIC_ROW_H / 2;
+
+  /** One port per NIC row. Its side is purely derived from the opposite
+   *  endpoint, so it flips live as either node moves and is never persisted. */
+  function machineNicPort(kind: MachineKind, name: string, nicIndex: number, nic: NicModel) {
+    const p = machinePos(kind, name);
+    let targetX = p.x + VM_W;
+    if (nic.nat) {
+      targetX = natPos().x + WAN_W / 2;
+    } else if (nic.segment) {
+      const socket = ports().byNic.get(`${name}:${nicIndex}`);
+      const bar = segPos(nic.segment);
+      targetX = socket === undefined ? bar.x + barWidth(nic.segment) / 2 : socketX(bar.x, socket);
+    }
+    const side = targetX < p.x + VM_W / 2 ? "left" : "right";
+    return {
+      x: side === "left" ? p.x : p.x + VM_W,
+      y: nicRowY(kind, name, nicIndex),
+      side,
+    } as const;
+  }
 
   // Interconnects: declared segment↔segment routes, segment↔WAN (nat), and
   // segment↔remote-vmlab peers (connect blocks).
@@ -343,8 +1110,8 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       machinesOf(kind).forEach((m) => {
         m.nics.forEach((nic, i) => {
           if (!nic.nat) return;
-          const mp = machinePos(kind, m.name);
-          used[closestWanSide(vmPortX(mp, i), mp.y + VM_H)] = true;
+          const port = machineNicPort(kind, m.name, i, nic);
+          used[closestWanSide(port.x, port.y)] = true;
         });
       });
     }
@@ -365,12 +1132,14 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
         ? vmPos(name)
         : kind === "container"
           ? ctrPos(name)
+          : kind === "provision"
+            ? provisionPos(model().provisions.findIndex((_, index) => provisionKey(index) === name))
           : kind === "segment"
             ? segPos(name)
-            : kind === "lab"
-              ? labPos()
-              : kind === "remote"
-                ? remotePos(name)
+            : kind === "remote"
+              ? remotePos(name)
+              : kind === "host"
+                ? hostPos()
                 : natPos();
     setDrag({ kind, name, dx: w.x - pos.x, dy: w.y - pos.y, moved: false });
   }
@@ -384,6 +1153,71 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     }
     const w = world(e);
     setConnDrag({ kind, index, nicIndex, moved: false, x: w.x, y: w.y });
+  }
+
+  /** Cable out from a machine's dependency socket. One socket fans out to
+   *  any number of VM/container targets. */
+  function dependencyDown(e: PointerEvent, kind: MachineKind, index: number) {
+    e.stopPropagation();
+    const w = world(e);
+    setDependencyDrag({ kind, index, existing: null, moved: false, x: w.x, y: w.y });
+  }
+
+  /** Re-home an existing dependency arrow; dropping it in empty space removes it. */
+  function dependencyGrab(
+    e: PointerEvent,
+    link: { sourceKind: MachineKind; sourceIndex: number; targetName: string },
+  ) {
+    e.stopPropagation();
+    const w = world(e);
+    setDependencyDrag({
+      kind: link.sourceKind,
+      index: link.sourceIndex,
+      existing: link.targetName,
+      moved: false,
+      x: w.x,
+      y: w.y,
+    });
+  }
+
+  function provisionTargetDown(e: PointerEvent, provisionIndex: number) {
+    e.stopPropagation();
+    const point = world(e);
+    setProvisionTargetDrag({ provisionIndex, existing: null, moved: false, ...point });
+  }
+
+  function provisionLinkGrab(
+    e: PointerEvent,
+    link: { provisionIndex: number; targetName: string },
+  ) {
+    e.stopPropagation();
+    const point = world(e);
+    setProvisionTargetDrag({
+      provisionIndex: link.provisionIndex,
+      existing: link.targetName,
+      moved: false,
+      ...point,
+    });
+  }
+
+  function eventTargetDown(e: PointerEvent, handlerIndex: number) {
+    e.stopPropagation();
+    const point = world(e);
+    setEventTargetDrag({ handlerIndex, existing: null, moved: false, ...point });
+  }
+
+  function eventLinkGrab(
+    e: PointerEvent,
+    link: { handlerIndex: number; targetName: string },
+  ) {
+    e.stopPropagation();
+    const point = world(e);
+    setEventTargetDrag({
+      handlerIndex: link.handlerIndex,
+      existing: link.targetName,
+      moved: false,
+      ...point,
+    });
   }
 
   /** Grab a bar socket: lit = re-home its NIC, free = cable out to a VM. */
@@ -405,6 +1239,13 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     if (anyVmRunning()) return;
     const w = world(e);
     setLinkDrag({ from, existing: null, moved: false, x: w.x, y: w.y });
+  }
+
+  function hostPortDown(e: PointerEvent, entry: HostPortEntry) {
+    e.stopPropagation();
+    if (anyVmRunning() || entry.source !== "draft") return;
+    const w = world(e);
+    setHostPortDrag({ draftId: entry.draftId, moved: false, x: w.x, y: w.y });
   }
 
   /** Grab an existing interconnect cable to re-home or remove it. */
@@ -460,14 +1301,20 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     for (const kind of ["vm", "container"] as const) {
       const machines = machinesOf(kind);
       for (let mi = 0; mi < machines.length; mi++) {
-        const mp = machinePos(kind, machines[mi].name);
-        const py = mp.y + VM_H;
+        const machine = machines[mi];
+        const mp = machinePos(kind, machine.name);
         for (let i = 0; i < machines[mi].nics.length; i++) {
-          const dx = x - vmPortX(mp, i);
-          const dy = y - py;
+          const port = machineNicPort(kind, machine.name, i, machine.nics[i]);
+          const dx = x - port.x;
+          const dy = y - port.y;
           if (dx * dx + dy * dy <= 100) return { kind, index: mi, nicIndex: i };
         }
-        if (x >= mp.x && x <= mp.x + VM_W && y >= mp.y && y <= mp.y + VM_H + 8) {
+        if (
+          x >= mp.x &&
+          x <= mp.x + VM_W &&
+          y >= mp.y &&
+          y <= mp.y + machineHeight(kind, machine.name) + 8
+        ) {
           return { kind, index: mi, nicIndex: null };
         }
       }
@@ -485,25 +1332,51 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       const w = world(e);
       const pos = { x: w.x - d.dx, y: w.y - d.dy };
       setDrag({ ...d, moved: true });
-      setLayout((l) =>
-        d.kind === "vm"
+      setLayout((l) => {
+        const next = d.kind === "vm"
           ? { ...l, vms: { ...l.vms, [d.name]: pos } }
           : d.kind === "container"
             ? { ...l, containers: { ...l.containers, [d.name]: pos } }
+            : d.kind === "provision"
+              ? { ...l, provisions: { ...l.provisions, [d.name]: pos } }
             : d.kind === "segment"
               ? { ...l, segments: { ...l.segments, [d.name]: pos } }
               : d.kind === "remote"
                 ? { ...l, remotes: { ...(l.remotes ?? {}), [d.name]: pos } }
-                : d.kind === "lab"
-                  ? { ...l, lab: pos }
-                  : { ...l, nat: pos },
-      );
+                : d.kind === "host"
+                  ? { ...l, host: pos }
+                  : { ...l, nat: pos };
+        return d.kind === "vm" ||
+          d.kind === "container" ||
+          d.kind === "provision" ||
+          d.kind === "segment"
+          ? pushExternalNodes(next)
+          : next;
+      });
       return;
     }
     const cd = connDrag();
     if (cd) {
       const w = world(e);
       setConnDrag({ ...cd, moved: true, x: w.x, y: w.y });
+      return;
+    }
+    const dd = dependencyDrag();
+    if (dd) {
+      const w = world(e);
+      setDependencyDrag({ ...dd, moved: true, x: w.x, y: w.y });
+      return;
+    }
+    const pd = provisionTargetDrag();
+    if (pd) {
+      const point = world(e);
+      setProvisionTargetDrag({ ...pd, moved: true, ...point });
+      return;
+    }
+    const ed = eventTargetDrag();
+    if (ed) {
+      const point = world(e);
+      setEventTargetDrag({ ...ed, moved: true, ...point });
       return;
     }
     const sd = socketDrag();
@@ -516,6 +1389,12 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     if (ld) {
       const w = world(e);
       setLinkDrag({ ...ld, moved: true, x: w.x, y: w.y });
+      return;
+    }
+    const hd = hostPortDrag();
+    if (hd) {
+      const w = world(e);
+      setHostPortDrag({ ...hd, moved: true, x: w.x, y: w.y });
       return;
     }
     const p = pan();
@@ -535,14 +1414,15 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
         } else if (d.kind === "container") {
           const i = model().containers.findIndex((c) => c.name === d.name);
           if (i >= 0) select({ kind: "container", index: i });
+        } else if (d.kind === "provision") {
+          const index = model().provisions.findIndex((_, i) => provisionKey(i) === d.name);
+          if (index >= 0) select({ kind: "provision", index });
         } else if (d.kind === "segment") {
           const i = model().segments.findIndex((s) => s.name === d.name);
           if (i >= 0) select({ kind: "segment", index: i });
-        } else if (d.kind === "lab") {
-          select({ kind: "lab" });
         } else if (d.kind === "remote") {
           select({ kind: "remote", host: d.name });
-        } else {
+        } else if (d.kind === "nat") {
           select({ kind: "nat" });
         }
       } else {
@@ -565,6 +1445,62 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       const bar = barAt(w.x, w.y);
       if (bar) setMachineNicTarget(cd.kind, cd.index, cd.nicIndex, bar === NAT_KEY ? null : bar);
       else disconnectMachineNic(cd.kind, cd.index, cd.nicIndex);
+      return;
+    }
+    const dd = dependencyDrag();
+    if (dd) {
+      setDependencyDrag(null);
+      if (!dd.moved) {
+        select({ kind: dd.kind, index: dd.index });
+        return;
+      }
+      const source = machinesOf(dd.kind)[dd.index];
+      if (!source) return;
+      const w = world(e);
+      const target = machineTargetAt(w.x, w.y);
+      const targetMachine = target ? machinesOf(target.kind)[target.index] : null;
+      const targetName = targetMachine?.name ?? null;
+
+      // Dropping an existing arrow back on the same target is a no-op. Any
+      // other drop first detaches its old end, then optionally attaches the
+      // new one. Self-dependencies are intentionally ignored.
+      if (dd.existing && targetName !== dd.existing) {
+        removeMachineDependency(dd.kind, dd.index, dd.existing);
+      }
+      if (targetName && targetName !== source.name) {
+        addMachineDependency(dd.kind, dd.index, targetName);
+      }
+      return;
+    }
+    const pd = provisionTargetDrag();
+    if (pd) {
+      setProvisionTargetDrag(null);
+      if (!pd.moved) {
+        select({ kind: "provision", index: pd.provisionIndex });
+        return;
+      }
+      const point = world(e);
+      const target = machineTargetAt(point.x, point.y);
+      const targetName = target ? machinesOf(target.kind)[target.index]?.name ?? null : null;
+      if (pd.existing && targetName !== pd.existing) {
+        removeProvisionTarget(pd.provisionIndex, pd.existing);
+      }
+      if (targetName) addProvisionTarget(pd.provisionIndex, targetName);
+      return;
+    }
+    const ed = eventTargetDrag();
+    if (ed) {
+      setEventTargetDrag(null);
+      if (!ed.moved) return;
+      const point = world(e);
+      const target = machineTargetAt(point.x, point.y);
+      const targetName = target ? machinesOf(target.kind)[target.index]?.name ?? null : null;
+      if (ed.existing && targetName !== ed.existing) {
+        removeEventHandlerTarget(ed.handlerIndex, ed.existing);
+      }
+      if (targetName && target) {
+        addEventHandlerTarget(ed.handlerIndex, target.kind, targetName);
+      }
       return;
     }
     const sd = socketDrag();
@@ -632,6 +1568,15 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       else if (drop) addSegmentRoute(from, drop);
       return;
     }
+    const hd = hostPortDrag();
+    if (hd) {
+      setHostPortDrag(null);
+      if (!hd.moved) return;
+      const w = world(e);
+      const target = machineTargetAt(w.x, w.y);
+      if (target) attachHostPort(hd.draftId, target.kind, target.index);
+      return;
+    }
     if (pan()) {
       const p = pan()!;
       const clicked = Math.abs(e.clientX - p.sx) < 4 && Math.abs(e.clientY - p.sy) < 4;
@@ -685,6 +1630,18 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       ) {
         removeSegment(sel.index);
       }
+    } else if (sel.kind === "provision") {
+      const provision = model().provisions[sel.index];
+      if (
+        provision &&
+        (await confirmDialog({
+          title: `Delete provision "${provision.script}"?`,
+          body: "The script file will be preserved.",
+          danger: true,
+        }))
+      ) {
+        removeProvision(sel.index);
+      }
     } else if (sel.kind === "remote") {
       if (anyVmRunning()) return;
       const host = sel.host;
@@ -701,7 +1658,7 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   }
 
   function arrange() {
-    const fresh = autoLayout(model(), { vms: {}, containers: {}, segments: {} });
+    const fresh = autoLayout(model(), { vms: {}, containers: {}, segments: {}, provisions: {} });
     setLayout(fresh);
     saveLayout(lab(), { ...fresh, view: view() });
   }
@@ -712,27 +1669,37 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     for (const v of model().vms) {
       const p = vmPos(v.name);
       xs.push(p.x, p.x + VM_W);
-      ys.push(p.y, p.y + VM_H);
+      ys.push(p.y, p.y + machineHeight("vm", v.name));
     }
     for (const c of model().containers) {
       const p = ctrPos(c.name);
       xs.push(p.x, p.x + VM_W);
-      ys.push(p.y, p.y + VM_H);
+      ys.push(p.y, p.y + machineHeight("container", c.name));
     }
     for (const s of model().segments) {
       const p = segPos(s.name);
       xs.push(p.x, p.x + barWidth(s.name));
       ys.push(p.y, p.y + SEG_H);
     }
+    model().provisions.forEach((_, index) => {
+      const p = provisionPos(index);
+      xs.push(p.x, p.x + PROVISION_W);
+      ys.push(p.y, p.y + provisionCardHeight(index));
+    });
     {
       const p = natPos();
       xs.push(p.x, p.x + barWidth(NAT_KEY));
       ys.push(p.y, p.y + SEG_H);
     }
     {
-      const p = labPos();
-      xs.push(p.x, p.x + labW());
-      ys.push(p.y, p.y + LAB_H);
+      const p = hostPos();
+      xs.push(p.x, p.x + HOST_W);
+      ys.push(p.y, p.y + hostHeight());
+    }
+    {
+      const b = labBounds();
+      xs.push(b.x, b.x + b.width);
+      ys.push(b.y, b.y + b.height);
     }
     for (const host of remoteHosts()) {
       const p = remotePos(host);
@@ -795,8 +1762,12 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   const cancelDrags = () => {
     setDrag(null);
     setConnDrag(null);
+    setDependencyDrag(null);
+    setProvisionTargetDrag(null);
+    setEventTargetDrag(null);
     setSocketDrag(null);
     setLinkDrag(null);
+    setHostPortDrag(null);
     setPan(null);
   };
   window.addEventListener("pointermove", move);
@@ -819,6 +1790,13 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
       : null;
   const selectedSeg = () =>
     editor.selection.kind === "segment" ? model().segments[editor.selection.index]?.name : null;
+  const selectedProvision = () =>
+    editor.selection.kind === "provision" ? editor.selection.index : null;
+  const eventDragAccepts = (kind: MachineKind) => {
+    const drag = eventTargetDrag();
+    const accepted = drag ? eventTargetKind(model().handlers[drag.handlerIndex]?.event ?? "") : null;
+    return accepted === "machine" || accepted === kind;
+  };
 
   /** The router-style socket bank straddling a bar's top and bottom edges.
    *  A used socket lights only the face its cable actually enters through
@@ -835,7 +1813,10 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
             if (!o) return null;
             const m = machinesOf(o.kind)[o.index];
             if (!m) return null;
-            return machinePos(o.kind, m.name).y + VM_H <= props.pos.y + SEG_H / 2;
+            const nic = m.nics[o.nicIndex];
+            return nic
+              ? machineNicPort(o.kind, m.name, o.nicIndex, nic).y <= props.pos.y + SEG_H / 2
+              : null;
           };
           const down = (e: PointerEvent, faceY: number) =>
             socketDown(e, props.barKey, i, cx(), faceY);
@@ -942,10 +1923,6 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     return `M ${a.x} ${a.y} L ${x} ${a.y} L ${x} ${b.y} L ${b.x} ${b.y}`;
   }
 
-  /** The strings the OS icon classifies a VM by. */
-  const osStringFor = (vm: VmModel) =>
-    `${vm.template} ${vm.profile ?? ""} ${storeTemplateFor(vm.template)?.profile ?? ""}`;
-
   // Live power state per VM / container (the daemon's view; absent = no daemon).
   const runtimeOf = (name: string) => state.status?.vms.find((v) => v.name === name);
   const vmRunning = (name: string) => {
@@ -976,6 +1953,88 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   };
   const machineRunning = (kind: MachineKind, name: string) =>
     kind === "vm" ? vmRunning(name) : ctrRunning(name);
+  const runtimeNic = (kind: MachineKind, name: string, nicIndex: number) =>
+    (kind === "vm" ? runtimeOf(name) : ctrRuntimeOf(name))?.nics[nicIndex] ?? null;
+
+  const ipv4Number = (value: string): number | null => {
+    const parts = value.split(".");
+    if (parts.length !== 4) return null;
+    const octets = parts.map(Number);
+    if (octets.some((part, index) => !/^\d+$/.test(parts[index]) || part < 0 || part > 255)) {
+      return null;
+    }
+    return (((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3]) >>> 0;
+  };
+
+  function staticIpError(
+    kind: MachineKind,
+    machineIndex: number,
+    nicIndex: number,
+    value: string,
+  ): string | null {
+    const ip = ipv4Number(value);
+    if (ip === null) return "Enter a valid IPv4 address.";
+    const machine = machinesOf(kind)[machineIndex];
+    const nic = machine?.nics[nicIndex];
+    if (!nic?.segment || nic.nat) return "Static addresses require a declared segment.";
+    const segment = model().segments.find((candidate) => candidate.name === nic.segment);
+    const [networkText, prefixText] = segment?.subnet?.split("/") ?? [];
+    const networkIp = networkText ? ipv4Number(networkText) : null;
+    const prefix = Number(prefixText);
+    if (networkIp === null || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+      return `${nic.segment} needs a valid subnet before assigning a static address.`;
+    }
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+    const network = (networkIp & mask) >>> 0;
+    const broadcast = (network | (~mask >>> 0)) >>> 0;
+    if (((ip & mask) >>> 0) !== network) return `${value} is outside ${segment!.subnet}.`;
+    if (
+      ip === network ||
+      ip === broadcast ||
+      (ip === ((network + 1) >>> 0) && !nic.gateway)
+    ) {
+      return "That address is reserved for the network, gateway, or broadcast.";
+    }
+    for (const candidateKind of ["vm", "container"] as const) {
+      for (const [candidateMachineIndex, candidate] of machinesOf(candidateKind).entries()) {
+        for (const [candidateNicIndex, candidateNic] of candidate.nics.entries()) {
+          if (
+            candidateNic.ip === value &&
+            !(
+              candidateKind === kind &&
+              candidateMachineIndex === machineIndex &&
+              candidateNicIndex === nicIndex
+            )
+          ) {
+            return `${value} is already assigned to another NIC.`;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function setNicStaticIp(
+    kind: MachineKind,
+    machineIndex: number,
+    nicIndex: number,
+    value: string | null,
+  ) {
+    if (value === null) setMachineNicGateway(kind, machineIndex, nicIndex, false);
+    if (kind === "vm") {
+      setEditor("draft", "vms", machineIndex, "nics", nicIndex, "ip", value);
+    } else {
+      setEditor("draft", "containers", machineIndex, "nics", nicIndex, "ip", value);
+    }
+  }
+
+  function nicGatewayAllowed(nic: NicModel) {
+    if (!nic.segment || nic.nat) return false;
+    const segment = model().segments.find((candidate) => candidate.name === nic.segment);
+    return !!segment?.subnet && !segment.global;
+  }
+  const hostPortLive = (entry: HostPortEntry) =>
+    !!entry.target && hostPortValid(entry) && machineRunning(entry.target.kind, entry.target.name);
 
   /** Live cross-host trunk state for a segment (daemon status; null-ish =
    *  unknown / no daemon / not global). */
@@ -1030,21 +2089,21 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
   ): string | null {
     const key = nic.nat ? NAT_KEY : nic.segment;
     if (!key) return null;
-    const vp = machinePos(kind, name);
-    const px = vmPortX(vp, nicIndex);
-    const py = vp.y + VM_H;
+    const port = machineNicPort(kind, name, nicIndex, nic);
+    const px = port.x;
+    const py = port.y;
     if (nic.nat) {
       const side = closestWanSide(px, py);
       const pt = wanPorts()[side];
       if (side === "left" || side === "right") {
-        // Drop to port height, then straight into the side port's face.
         const sx = side === "left" ? pt.x - PORT_SIZE / 2 : pt.x + PORT_SIZE / 2;
-        return `M ${px} ${py} L ${px} ${pt.y} L ${sx} ${pt.y}`;
+        const elbow = port.side === "left" ? px - 16 : px + 16;
+        return `M ${px} ${py} L ${elbow} ${py} L ${elbow} ${pt.y} L ${sx} ${pt.y}`;
       }
       const sy = side === "top" ? pt.y - PORT_SIZE / 2 : pt.y + PORT_SIZE / 2;
-      if (px === pt.x) return `M ${px} ${py} L ${px} ${sy}`;
-      const elbow = side === "top" ? sy - 14 : sy + 14;
-      return `M ${px} ${py} L ${px} ${elbow} L ${pt.x} ${elbow} L ${pt.x} ${sy}`;
+      const elbowX = port.side === "left" ? px - 16 : px + 16;
+      const elbowY = side === "top" ? sy - 14 : sy + 14;
+      return `M ${px} ${py} L ${elbowX} ${py} L ${elbowX} ${elbowY} L ${pt.x} ${elbowY} L ${pt.x} ${sy}`;
     }
     const bar = segPos(key);
     const socket = ports().byNic.get(`${name}:${nicIndex}`);
@@ -1054,9 +2113,9 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
     // edges, like through-ports on a patch panel).
     const fromAbove = py <= bar.y + SEG_H / 2;
     const sy = fromAbove ? bar.y - PORT_SIZE / 2 : bar.y + SEG_H + PORT_SIZE / 2;
-    if (px === sx) return `M ${px} ${py} L ${px} ${sy}`;
-    const elbow = fromAbove ? sy - 14 : sy + 14;
-    return `M ${px} ${py} L ${px} ${elbow} L ${sx} ${elbow} L ${sx} ${sy}`;
+    const leaveX = port.side === "left" ? px - 16 : px + 16;
+    const elbowY = fromAbove ? sy - 14 : sy + 14;
+    return `M ${px} ${py} L ${leaveX} ${py} L ${leaveX} ${elbowY} L ${sx} ${elbowY} L ${sx} ${sy}`;
   }
 
   return (
@@ -1067,6 +2126,15 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
         </Button>
         <Button size="sm" icon={Container} onClick={() => addContainer()}>
           Add container
+        </Button>
+        <Button
+          size="sm"
+          icon={FileCode2}
+          onClick={props.onAddProvision}
+          disabled={anyVmRunning()}
+          title={anyVmRunning() ? "Stop all machines before adding a provision script" : undefined}
+        >
+          Add provision
         </Button>
         <Button
           size="sm"
@@ -1096,6 +2164,15 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
         <Button size="sm" variant="ghost" icon={Expand} onClick={zoomFit} title="Zoom to fit">
           Fit
         </Button>
+        <Button
+          class="topo-edit-config"
+          size="sm"
+          variant="ghost"
+          icon={FilePenLine}
+          onClick={props.onEditConfig}
+        >
+          Edit vmlab.wcl
+        </Button>
       </div>
       <svg
         ref={svg}
@@ -1105,7 +2182,305 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
         onWheel={wheel}
         onKeyDown={onKey}
       >
+        <defs>
+          <marker
+            id="topo-dependency-arrow"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="7"
+            markerHeight="7"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" class="topo-dependency-arrowhead" />
+          </marker>
+          <marker
+            id="topo-dependency-arrow-cycle"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="7"
+            markerHeight="7"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" class="topo-dependency-arrowhead cycle" />
+          </marker>
+          <marker
+            id="topo-provision-arrow"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="7"
+            markerHeight="7"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" class="topo-provision-arrowhead" />
+          </marker>
+          <marker
+            id="topo-event-arrow"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="7"
+            markerHeight="7"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" class="topo-event-arrowhead" />
+          </marker>
+        </defs>
         <g transform={`translate(${view().tx} ${view().ty}) scale(${view().k})`}>
+          {/* The lab is a live enclosure, rendered first so every owned node
+              and cable remains above it. Its bounds follow node drags. */}
+          {(() => {
+            const b = labBounds;
+            return (
+              <g
+                class="topo-lab"
+                classList={{ selected: editor.selection.kind === "lab" }}
+                onPointerDown={(e: PointerEvent) => {
+                  e.stopPropagation();
+                  backgroundDown(e);
+                }}
+              >
+                <rect
+                  class="topo-lab-frame"
+                  x={b().x}
+                  y={b().y}
+                  width={b().width}
+                  height={b().height}
+                  rx="14"
+                />
+                <line
+                  class="topo-lab-divider"
+                  x1={b().x}
+                  y1={b().y + 52}
+                  x2={b().x + b().width}
+                  y2={b().y + 52}
+                />
+                <g
+                  class="topo-lab-glyph"
+                  transform={`translate(${b().x + 14} ${b().y + 17})`}
+                >
+                  <FlaskConical size={17} />
+                </g>
+                <text class="topo-lab-kind" x={b().x + 38} y={b().y + 18}>
+                  LAB
+                </text>
+                <text class="topo-lab-name" x={b().x + 38} y={b().y + 35}>
+                  {model().name}
+                </text>
+                <title>Lab contents: click to edit lab-wide properties</title>
+              </g>
+            );
+          })()}
+
+          {/* Host port forwards are a separate cable layer: host socket to a
+              service port on the target VM/container. Invalid port pairs stay
+              red until both ends are in the 1–65535 range. */}
+          <For each={hostPorts()}>
+            {(entry, index) => (
+              <Show when={entry.target} keyed>
+                {(_target) => {
+                  const a = () => hostSocket(entry, index());
+                  const b = () => machineServicePort(entry);
+                  const path = () => {
+                    const mid = (a().x + b().x) / 2;
+                    return `M ${a().x} ${a().y} L ${mid} ${a().y} L ${mid} ${b().y} L ${b().x} ${b().y}`;
+                  };
+                  return (
+                    <g
+                      class="topo-host-link"
+                      classList={{
+                        invalid: !hostPortValid(entry),
+                        live: hostPortLive(entry),
+                      }}
+                    >
+                      <path d={path()} class="topo-host-link-line" />
+                    </g>
+                  );
+                }}
+              </Show>
+            )}
+          </For>
+
+          <Show when={hostPortDrag()}>
+            {(hd) => {
+              const entry = () => hostPorts().find((port) => port.key === `draft:${hd().draftId}`);
+              const index = () => hostPorts().findIndex((port) => port.key === `draft:${hd().draftId}`);
+              return (
+                <Show when={entry()}>
+                  {(port) => {
+                    const a = () => hostSocket(port(), index());
+                    return (
+                      <path
+                        class="topo-host-link-draft"
+                        d={`M ${a().x} ${a().y} L ${hd().x} ${hd().y}`}
+                      />
+                    );
+                  }}
+                </Show>
+              );
+            }}
+          </Show>
+
+          <For each={provisionLinks()}>
+            {(link) => {
+              const grabbed = () => {
+                const drag = provisionTargetDrag();
+                return (
+                  drag?.provisionIndex === link.provisionIndex &&
+                  drag.existing === link.targetName
+                );
+              };
+              const path = () =>
+                provisionLinkPath(link.provisionIndex, link.targetKind, link.targetName);
+              return (
+                <Show when={!grabbed()}>
+                  <g
+                    class="topo-provision-link"
+                    onPointerDown={(event: PointerEvent) => provisionLinkGrab(event, link)}
+                  >
+                    <path class="topo-provision-link-hit" d={path()}>
+                      <title>
+                        {model().provisions[link.provisionIndex]?.script} applies to {link.targetName}
+                        — drag to re-home or remove
+                      </title>
+                    </path>
+                    <path
+                      class="topo-provision-link-line"
+                      d={path()}
+                      marker-end="url(#topo-provision-arrow)"
+                    />
+                  </g>
+                </Show>
+              );
+            }}
+          </For>
+
+          <Show when={provisionTargetDrag()}>
+            {(drag) => {
+              const from = () => provisionPort(drag().provisionIndex);
+              return (
+                <path
+                  class="topo-provision-link-draft"
+                  d={`M ${from().x} ${from().y} C ${from().x + 38} ${from().y}, ${drag().x - 38} ${drag().y}, ${drag().x} ${drag().y}`}
+                  marker-end="url(#topo-provision-arrow)"
+                />
+              );
+            }}
+          </Show>
+
+          <For each={eventLinks()}>
+            {(link) => {
+              const handler = () => model().handlers[link.handlerIndex];
+              const grabbed = () => {
+                const drag = eventTargetDrag();
+                return drag?.handlerIndex === link.handlerIndex && drag.existing === link.targetName;
+              };
+              const path = () =>
+                eventLinkPath(link.handlerIndex, link.targetKind, link.targetName);
+              return (
+                <Show when={!grabbed()}>
+                  <g
+                    class="topo-event-link"
+                    onPointerDown={(event: PointerEvent) => eventLinkGrab(event, link)}
+                  >
+                    <path class="topo-event-link-hit" d={path()}>
+                      <title>
+                        {handler()?.event} → {link.targetName} — drag to re-home or remove
+                      </title>
+                    </path>
+                    <path
+                      class="topo-event-link-line"
+                      d={path()}
+                      marker-end="url(#topo-event-arrow)"
+                    />
+                  </g>
+                </Show>
+              );
+            }}
+          </For>
+
+          <Show when={eventTargetDrag()}>
+            {(drag) => {
+              const from = () => eventPort(drag().handlerIndex)!;
+              return (
+                <path
+                  class="topo-event-link-draft"
+                  d={`M ${from().x} ${from().y} C ${from().x + 34} ${from().y}, ${drag().x - 34} ${drag().y}, ${drag().x} ${drag().y}`}
+                  marker-end="url(#topo-event-arrow)"
+                />
+              );
+            }}
+          </Show>
+
+          {/* Startup dependencies are deliberately a separate amber layer:
+              the arrow leaves the dependent machine and points at the VM or
+              container that must be ready first. */}
+          <For each={dependencyLinks()}>
+            {(link) => {
+              const cycle = () =>
+                cyclicDependencies().has(dependencyKey(link.sourceName, link.targetName));
+              const grabbed = () => {
+                const drag = dependencyDrag();
+                return (
+                  drag?.existing === link.targetName &&
+                  drag.kind === link.sourceKind &&
+                  drag.index === link.sourceIndex
+                );
+              };
+              const path = () =>
+                dependencyPath(
+                  link.sourceKind,
+                  link.sourceName,
+                  link.targetKind,
+                  link.targetName,
+                );
+              return (
+                <Show when={!grabbed()}>
+                  <g
+                    class="topo-dependency"
+                    classList={{ cycle: cycle() }}
+                    onPointerDown={(e: PointerEvent) => dependencyGrab(e, link)}
+                  >
+                    <path class="topo-dependency-hit" d={path()}>
+                      <title>
+                        {cycle() ? "Dependency cycle: " : ""}
+                        {link.sourceName} depends on {link.targetName} — drag to re-home, or drag
+                        into empty space to remove
+                      </title>
+                    </path>
+                    <path
+                      class="topo-dependency-line"
+                      d={path()}
+                      marker-end={
+                        cycle()
+                          ? "url(#topo-dependency-arrow-cycle)"
+                          : "url(#topo-dependency-arrow)"
+                      }
+                    />
+                  </g>
+                </Show>
+              );
+            }}
+          </For>
+
+          <Show when={dependencyDrag()}>
+            {(dd) => {
+              const source = () => machinesOf(dd().kind)[dd().index];
+              const from = () => dependencyPort(dd().kind, source().name);
+              return (
+                <Show when={source()}>
+                  <path
+                    class="topo-dependency-draft"
+                    d={`M ${from().x} ${from().y} C ${from().x} ${from().y - 32}, ${dd().x} ${dd().y - 24}, ${dd().x} ${dd().y}`}
+                    marker-end="url(#topo-dependency-arrow)"
+                  />
+                </Show>
+              );
+            }}
+          </Show>
+
           {/* NIC edges under the nodes (VMs and containers cable alike) */}
           <For each={["vm", "container"] as MachineKind[]}>
             {(mkind) => (
@@ -1137,15 +2512,6 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                           >
                             <path d={path()!} class="topo-edge-hit" />
                             <path d={path()!} class="topo-edge-line" />
-                            <Show when={nic().ip}>
-                              <text
-                                x={machinePos(mkind, m.name).x + 22 + i * 16}
-                                y={machinePos(mkind, m.name).y + VM_H + 16}
-                                class="topo-edge-label"
-                              >
-                                {nic().ip}
-                              </text>
-                            </Show>
                           </g>
                         </Show>
                       );
@@ -1203,12 +2569,13 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
           <Show when={connDrag()}>
             {(cd) => {
               const m = () => machinesOf(cd().kind)[cd().index];
-              const mp = () => machinePos(cd().kind, m().name);
+              const port = () =>
+                machineNicPort(cd().kind, m().name, cd().nicIndex, m().nics[cd().nicIndex]);
               return (
                 <Show when={m()}>
                   <path
                     class="topo-edge-draft"
-                    d={`M ${vmPortX(mp(), cd().nicIndex)} ${mp().y + VM_H} L ${cd().x} ${cd().y}`}
+                    d={`M ${port().x} ${port().y} L ${cd().x} ${cd().y}`}
                   />
                 </Show>
               );
@@ -1242,44 +2609,6 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
               );
             }}
           </Show>
-
-          {/* the lab block: click to edit lab-wide properties */}
-          <g
-            class="topo-lab"
-            classList={{ selected: editor.selection.kind === "lab" }}
-            onPointerDown={(e: PointerEvent) => nodeDown(e, "lab", "__lab__")}
-          >
-            <rect x={labPos().x} y={labPos().y} width={labW()} height={LAB_H} rx="10" />
-            <g
-              class="topo-lab-glyph"
-              transform={`translate(${labPos().x + 10} ${labPos().y + 11})`}
-            >
-              <FlaskConical size={17} />
-            </g>
-            <text class="topo-lab-kind" x={labPos().x + 34} y={labPos().y + 16}>
-              LAB
-            </text>
-            <text class="topo-lab-name" x={labPos().x + 34} y={labPos().y + 31}>
-              {model().name}
-            </text>
-            <g
-              class="topo-lab-edit"
-              transform={`translate(${labPos().x + 10} ${labPos().y + 41})`}
-              onPointerDown={(e: PointerEvent) => e.stopPropagation()}
-              onClick={(e: MouseEvent) => {
-                e.stopPropagation();
-                props.onEditConfig();
-              }}
-            >
-              <rect width="118" height="17" rx="4" />
-              <g transform="translate(5 3)">
-                <FilePenLine size={11} />
-              </g>
-              <text x="21" y="12">Edit vmlab.wcl</text>
-              <title>Open vmlab.wcl in the config editor</title>
-            </g>
-            <title>Lab-wide properties: provisions, event handlers, DNS</title>
-          </g>
 
           {/* segment bars */}
           <For each={model().segments}>
@@ -1520,10 +2849,263 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
             }}
           </For>
 
+          {/* Physical host: each row is a host-side listening port. New rows
+              begin at 0 and can be dragged onto a VM/container body. */}
+          <g
+            class="topo-host"
+            onPointerDown={(e: PointerEvent) => nodeDown(e, "host", "__host__")}
+          >
+            <rect
+              class="topo-host-box"
+              x={hostPos().x}
+              y={hostPos().y}
+              width={HOST_W}
+              height={hostHeight()}
+              rx="12"
+            />
+            <g
+              class="topo-host-glyph"
+              transform={`translate(${hostPos().x + 12} ${hostPos().y + 13})`}
+            >
+              <Server size={17} />
+            </g>
+            <text class="topo-host-kind" x={hostPos().x + 38} y={hostPos().y + 18}>
+              HOST
+            </text>
+            <text class="topo-host-name" x={hostPos().x + 38} y={hostPos().y + 34}>
+              this machine
+            </text>
+            <g
+                class="topo-host-add"
+                classList={{ locked: anyVmRunning() }}
+              transform={`translate(${hostPos().x + HOST_W - 28} ${hostPos().y + 11})`}
+              onPointerDown={(e: PointerEvent) => e.stopPropagation()}
+              onClick={(e: MouseEvent) => {
+                  e.stopPropagation();
+                  if (!anyVmRunning()) addHostPort();
+              }}
+            >
+              <rect width="20" height="20" rx="4" />
+              <g transform="translate(4 4)">
+                <Plus size={12} />
+              </g>
+              <title>Add host port</title>
+            </g>
+            <Show when={hostPorts().length} fallback={
+              <text class="topo-host-empty" x={hostPos().x + 12} y={hostPos().y + 65}>
+                Add a port, then drag its socket to a machine
+              </text>
+            }>
+              <For each={hostPorts()}>
+                {(entry, index) => {
+                  const socket = () => hostSocket(entry, index());
+                  const valid = () => hostPortValid(entry);
+                  return (
+                    <g>
+                      <line
+                        class="topo-host-row-line"
+                        x1={hostPos().x + 8}
+                        x2={hostPos().x + HOST_W - 8}
+                        y1={hostPortY(index()) - 17}
+                        y2={hostPortY(index()) - 17}
+                      />
+                      <rect
+                        class="topo-host-socket"
+                        classList={{
+                          invalid: !valid(),
+                          attached: entry.target !== null,
+                          live: hostPortLive(entry),
+                        }}
+                        x={socket().x - 5}
+                        y={socket().y - 5}
+                        width="10"
+                        height="10"
+                        rx="2"
+                        onPointerDown={(e: PointerEvent) => hostPortDown(e, entry)}
+                      >
+                        <title>
+                          {entry.source === "draft"
+                            ? "Drag this host port onto a VM or container"
+                            : "Attached host port"}
+                        </title>
+                      </rect>
+                      <PortNumberEditor
+                        x={hostPos().x + 18}
+                        y={hostPortY(index()) - 12}
+                        value={entry.hostPort}
+                        valid={valid()}
+                        disabled={anyVmRunning()}
+                        label="Host listening port"
+                        onChange={(value) => setHostEntryPort(entry, "host", value)}
+                      />
+                      <text
+                        class="topo-host-target"
+                        x={hostPos().x + 72}
+                        y={hostPortY(index()) + 4}
+                      >
+                        {entry.target?.name ?? "unattached"}
+                      </text>
+                      <g
+                        class="topo-host-remove"
+                        classList={{ locked: anyVmRunning() }}
+                        transform={`translate(${hostPos().x + HOST_W - 27} ${hostPortY(index()) - 10})`}
+                        onPointerDown={(e: PointerEvent) => e.stopPropagation()}
+                        onClick={(e: MouseEvent) => {
+                          e.stopPropagation();
+                          if (!anyVmRunning()) removeHostEntry(entry);
+                        }}
+                      >
+                        <rect width="18" height="18" rx="4" />
+                        <g transform="translate(4 4)">
+                          <Trash2 size={10} />
+                        </g>
+                        <title>Remove host port</title>
+                      </g>
+                    </g>
+                  );
+                }}
+              </For>
+            </Show>
+          </g>
+
+          {/* Provision scripts are lab-owned workflow nodes. Empty scope is
+              intentionally shown as LAB-WIDE rather than drawing an edge to
+              every machine. */}
+          <For each={model().provisions}>
+            {(provision, index) => {
+              const p = () => provisionPos(index());
+              const key = () => provisionKey(index());
+              const file = () => provision.script.split("/").pop() || provision.script;
+              const directory = () =>
+                provision.script.includes("/")
+                  ? provision.script.slice(0, provision.script.lastIndexOf("/"))
+                  : ".";
+              const badge = () =>
+                provision.vms.length ? `${provision.vms.length} TARGETED` : "LAB-WIDE";
+              return (
+                <g
+                  class="topo-provision"
+                  classList={{ selected: selectedProvision() === index() }}
+                  onPointerDown={(event: PointerEvent) => nodeDown(event, "provision", key())}
+                >
+                  <rect
+                    class="topo-provision-box"
+                    x={p().x}
+                    y={p().y}
+                    width={PROVISION_W}
+                    height={provisionCardHeight(index())}
+                    rx="10"
+                  />
+                  <g
+                    class="topo-provision-glyph"
+                    transform={`translate(${p().x + 12} ${p().y + 13})`}
+                  >
+                    <FileCode2 size={18} />
+                  </g>
+                  <text class="topo-provision-kind" x={p().x + 38} y={p().y + 16}>
+                    PROVISION #{index() + 1}
+                  </text>
+                  <text class="topo-provision-name" x={p().x + 38} y={p().y + 34}>
+                    {file().length > 23 ? `${file().slice(0, 22)}…` : file()}
+                    <title>{provision.script}</title>
+                  </text>
+                  <text class="topo-provision-path" x={p().x + 12} y={p().y + 53}>
+                    {directory().length > 24 ? `…${directory().slice(-23)}` : directory()}
+                  </text>
+                  <g class="topo-provision-badge">
+                    <rect x={p().x + 12} y={p().y + 59} width={badge().length * 5.2 + 12} height="13" rx="6.5" />
+                    <text x={p().x + 18} y={p().y + 68.5}>{badge()}</text>
+                  </g>
+                  <g
+                    class="topo-provision-edit"
+                    transform={`translate(${p().x + PROVISION_W - 29} ${p().y + 8})`}
+                    onPointerDown={(event: PointerEvent) => event.stopPropagation()}
+                    onClick={(event: MouseEvent) => {
+                      event.stopPropagation();
+                      props.onEditProvision(provision.script);
+                    }}
+                  >
+                    <rect width="20" height="20" rx="5" />
+                    <g transform="translate(4 4)"><FilePenLine size={12} /></g>
+                    <title>Edit provision script</title>
+                  </g>
+                  <g
+                    class="topo-provision-port"
+                    classList={{ active: provisionTargetDrag()?.provisionIndex === index() }}
+                    onPointerDown={(event: PointerEvent) => provisionTargetDown(event, index())}
+                  >
+                    <circle cx={p().x + PROVISION_W} cy={p().y + PROVISION_H / 2} r="5" />
+                    <text x={p().x + PROVISION_W - 9} y={p().y + PROVISION_H / 2 - 9}>
+                      TARGETS
+                    </text>
+                    <title>Drag to a VM or container this script applies to</title>
+                  </g>
+                  <Show when={handlersForProvision(index()).length}>
+                    <line
+                      class="topo-provision-event-divider"
+                      x1={p().x}
+                      x2={p().x + PROVISION_W}
+                      y1={p().y + PROVISION_H}
+                      y2={p().y + PROVISION_H}
+                    />
+                  </Show>
+                  <For each={handlersForProvision(index())}>
+                    {({ handler, handlerIndex }, row) => {
+                      const y = () => p().y + PROVISION_H + row() * SCRIPT_EVENT_ROW_H;
+                      const targetable = () => eventTargetKind(handler.event) !== null;
+                      const scope = () =>
+                        handler.targets.length
+                          ? `${handler.targets.length}`
+                          : handler.event.startsWith("vm.")
+                            ? "ALL VMS"
+                            : handler.event.startsWith("container.")
+                              ? "ALL CTRS"
+                              : handler.event.startsWith("snapshot.")
+                                ? "ALL"
+                                : "GLOBAL";
+                      return (
+                        <g class="topo-event-row">
+                          <rect
+                            x={p().x + 1}
+                            y={y()}
+                            width={PROVISION_W - 2}
+                            height={SCRIPT_EVENT_ROW_H}
+                          />
+                          <text x={p().x + 10} y={y() + 15.5}>{handler.event}</text>
+                          <text class="scope" x={p().x + PROVISION_W - 14} y={y() + 15.5}>
+                            {scope()}
+                          </text>
+                          <Show when={targetable()}>
+                            <g
+                              class="topo-event-port"
+                              classList={{ active: eventTargetDrag()?.handlerIndex === handlerIndex }}
+                              onPointerDown={(event: PointerEvent) =>
+                                eventTargetDown(event, handlerIndex)
+                              }
+                            >
+                              <circle
+                                cx={p().x + PROVISION_W}
+                                cy={y() + SCRIPT_EVENT_ROW_H / 2}
+                                r="4.5"
+                              />
+                              <title>Drag to scope {handler.event} to a compatible machine</title>
+                            </g>
+                          </Show>
+                        </g>
+                      );
+                    }}
+                  </For>
+                </g>
+              );
+            }}
+          </For>
+
           {/* VM nodes */}
           <For each={model().vms}>
             {(vm, vi) => {
               const p = () => vmPos(vm.name);
+              const h = () => machineCardHeight(vm.nics.length);
+              const footerY = () => p().y + h() - 30;
               const hw = () => {
                 const tpl = storeTemplateFor(vm.template);
                 const cpus = vm.cpus ?? tpl?.cpus ?? null;
@@ -1539,11 +3121,35 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                 <g
                   ref={gEl}
                   class="topo-vm"
-                  classList={{ selected: selectedVm() === vm.name, locked: vmIsUp(vm.name) }}
+                  classList={{
+                    selected: selectedVm() === vm.name,
+                    locked: vmIsUp(vm.name),
+                    "dependency-target":
+                      dependencyDrag() !== null &&
+                      !(dependencyDrag()!.kind === "vm" && dependencyDrag()!.index === vi()),
+                    "provision-target": provisionTargetDrag() !== null,
+                    "event-target": eventDragAccepts("vm"),
+                  }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "vm", vm.name)}
                 >
-                  <rect x={p().x} y={p().y} width={VM_W} height={VM_H} rx="10" />
-                  <OsIcon os={osStringFor(vm)} x={p().x + 10} y={p().y + 9} />
+                  <rect x={p().x} y={p().y} width={VM_W} height={h()} rx="10" />
+                  <line
+                    class="topo-machine-divider"
+                    x1={p().x}
+                    x2={p().x + VM_W}
+                    y1={p().y + 48}
+                    y2={p().y + 48}
+                  />
+                  <line
+                    class="topo-machine-divider"
+                    x1={p().x}
+                    x2={p().x + VM_W}
+                    y1={footerY()}
+                    y2={footerY()}
+                  />
+                  <g class="topo-vm-glyph" transform={`translate(${p().x + 10} ${p().y + 9})`}>
+                    <Monitor size={18} />
+                  </g>
                   <text x={p().x + 34} y={p().y + 21} class="topo-vm-name">
                     {vm.name}
                   </text>
@@ -1557,12 +3163,12 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                   <g class="topo-vm-badge">
                     <rect
                       x={p().x + 10}
-                      y={p().y + VM_H - 22}
+                      y={p().y + h() - 22}
                       width={badgeW()}
                       height="14"
                       rx="7"
                     />
-                    <text x={p().x + 16} y={p().y + VM_H - 11.5}>
+                    <text x={p().x + 16} y={p().y + h() - 11.5}>
                       {hw()}
                     </text>
                   </g>
@@ -1575,10 +3181,27 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                   >
                     <title>{ledLabel(vm.name)}</title>
                   </circle>
+                  <g
+                    class="topo-dependency-port"
+                    classList={{
+                      active:
+                        dependencyDrag()?.kind === "vm" && dependencyDrag()?.index === vi(),
+                      target:
+                        dependencyDrag() !== null &&
+                        !(dependencyDrag()!.kind === "vm" && dependencyDrag()!.index === vi()),
+                    }}
+                    onPointerDown={(e: PointerEvent) => dependencyDown(e, "vm", vi())}
+                  >
+                    <circle cx={p().x + VM_W / 2} cy={p().y} r="5" />
+                    <text x={p().x + VM_W / 2 + 9} y={p().y + 3.5}>
+                      DEP
+                    </text>
+                    <title>Drag to a VM or container that this VM depends on</title>
+                  </g>
                   {/* power / restart / console buttons */}
                   <VmBtn
                     x={p().x + VM_W - 70}
-                    y={p().y + VM_H - 24}
+                    y={p().y + h() - 24}
                     act="power"
                     title={vmRunning(vm.name) ? "Stop" : "Start"}
                     onClick={() => (vmRunning(vm.name) ? vmStop(vm.name) : vmStart(vm.name))}
@@ -1589,7 +3212,7 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                   </VmBtn>
                   <VmBtn
                     x={p().x + VM_W - 49}
-                    y={p().y + VM_H - 24}
+                    y={p().y + h() - 24}
                     act="restart"
                     title="Restart"
                     onClick={() => vmRestart(vm.name)}
@@ -1598,39 +3221,81 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                   </VmBtn>
                   <VmBtn
                     x={p().x + VM_W - 28}
-                    y={p().y + VM_H - 24}
+                    y={p().y + h() - 24}
                     act="console"
                     title="Open the console"
                     onClick={() => showVm(vm.name)}
                   >
                     <Monitor size={11} />
                   </VmBtn>
-                  {/* NIC port dots: cable ends — drag to re-home/unplug,
-                      and drop targets while cabling out from a bar. A NIC
-                      with no segment/NAT shows as a hollow loose port. */}
                   <Index each={vm.nics}>
-                    {(nic, i) => (
-                      <circle
-                        cx={p().x + 18 + i * 16}
-                        cy={p().y + VM_H}
-                        r={socketDrag() ? 7 : 4}
-                        class="topo-port"
-                        classList={{
-                          target: socketDrag() !== null,
-                          loose: !nic().segment && !nic().nat,
-                          locked: anyVmRunning(),
-                        }}
-                        onPointerDown={(e: PointerEvent) => dotDown(e, "vm", vi(), i)}
-                      >
-                        <title>
-                          {anyVmRunning()
-                            ? "Networking is read-only while a machine is up"
-                            : !nic().segment && !nic().nat
-                            ? "Unplugged NIC — drag onto a switch or the WAN to connect"
-                            : "Drag to another bar to move (empty space unplugs)"}
-                        </title>
-                      </circle>
-                    )}
+                    {(nic, i) => {
+                      const port = () => machineNicPort("vm", vm.name, i, nic());
+                      const runtime = () => runtimeNic("vm", vm.name, i);
+                      const rowY = () => p().y + 48 + i * NIC_ROW_H;
+                      const target = () => (nic().nat ? "NAT" : nic().segment ?? "unplugged");
+                      const compactTarget = () =>
+                        target().length > 6 ? `${target().slice(0, 5)}…` : target();
+                      return (
+                        <>
+                          <rect
+                            class="topo-nic-row-bg"
+                            x={p().x + 1}
+                            y={rowY()}
+                            width={VM_W - 2}
+                            height={NIC_ROW_H}
+                          />
+                          <g
+                            class="topo-nic-icon"
+                            transform={`translate(${p().x + 8} ${rowY() + 7})`}
+                          >
+                            <EthernetPort size={10} />
+                          </g>
+                          <text class="topo-nic-index" x={p().x + 21} y={rowY() + 16.5}>
+                            NIC {i}
+                          </text>
+                          <text class="topo-nic-target" x={p().x + 55} y={rowY() + 16.5}>
+                            {compactTarget()}
+                            <title>{target()}</title>
+                          </text>
+                          <NicIpEditor
+                            x={p().x + 110}
+                            y={rowY() + 1}
+                            staticIp={nic().ip}
+                            assignedIp={runtime()?.ip ?? null}
+                            disabled={vmRunning(vm.name)}
+                            staticAllowed={!!nic().segment && !nic().nat}
+                            gateway={nic().gateway}
+                            gatewayAllowed={nicGatewayAllowed(nic())}
+                            validate={(value) => staticIpError("vm", vi(), i, value)}
+                            onChange={(value) => setNicStaticIp("vm", vi(), i, value)}
+                            onGatewayChange={(enabled) =>
+                              setMachineNicGateway("vm", vi(), i, enabled)
+                            }
+                          />
+                          <circle
+                            cx={port().x}
+                            cy={port().y}
+                            r={socketDrag() ? 7 : 4}
+                            class="topo-port"
+                            classList={{
+                              target: socketDrag() !== null,
+                              loose: !nic().segment && !nic().nat,
+                              locked: anyVmRunning(),
+                            }}
+                            onPointerDown={(e: PointerEvent) => dotDown(e, "vm", vi(), i)}
+                          >
+                            <title>
+                              {anyVmRunning()
+                                ? "Networking is read-only while a machine is up"
+                                : !nic().segment && !nic().nat
+                                  ? "Unplugged NIC — drag onto a switch or the WAN to connect"
+                                  : "Drag to another bar to move (empty space unplugs)"}
+                            </title>
+                          </circle>
+                        </>
+                      );
+                    }}
                   </Index>
                 </g>
               );
@@ -1643,6 +3308,8 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
           <For each={model().containers}>
             {(ctr, ci) => {
               const p = () => ctrPos(ctr.name);
+              const h = () => machineCardHeight(ctr.nics.length);
+              const footerY = () => p().y + h() - 30;
               const hw = () => {
                 // Schema defaults: 1 vCPU, 256MiB micro-VM.
                 const cpus = ctr.cpus ?? 1;
@@ -1656,10 +3323,35 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                 <g
                   ref={gEl}
                   class="topo-vm topo-ctr"
-                  classList={{ selected: selectedCtr() === ctr.name, locked: containerIsUp(ctr.name) }}
+                  classList={{
+                    selected: selectedCtr() === ctr.name,
+                    locked: containerIsUp(ctr.name),
+                    "dependency-target":
+                      dependencyDrag() !== null &&
+                      !(
+                        dependencyDrag()!.kind === "container" &&
+                        dependencyDrag()!.index === ci()
+                      ),
+                    "provision-target": provisionTargetDrag() !== null,
+                    "event-target": eventDragAccepts("container"),
+                  }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "container", ctr.name)}
                 >
-                  <rect x={p().x} y={p().y} width={VM_W} height={VM_H} rx="10" />
+                  <rect x={p().x} y={p().y} width={VM_W} height={h()} rx="10" />
+                  <line
+                    class="topo-machine-divider"
+                    x1={p().x}
+                    x2={p().x + VM_W}
+                    y1={p().y + 48}
+                    y2={p().y + 48}
+                  />
+                  <line
+                    class="topo-machine-divider"
+                    x1={p().x}
+                    x2={p().x + VM_W}
+                    y1={footerY()}
+                    y2={footerY()}
+                  />
                   <g class="topo-ctr-glyph" transform={`translate(${p().x + 10} ${p().y + 9})`}>
                     <Container size={18} />
                   </g>
@@ -1673,12 +3365,12 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                   <g class="topo-vm-badge">
                     <rect
                       x={p().x + 10}
-                      y={p().y + VM_H - 22}
+                      y={p().y + h() - 22}
                       width={badgeW()}
                       height="14"
                       rx="7"
                     />
-                    <text x={p().x + 16} y={p().y + VM_H - 11.5}>
+                    <text x={p().x + 16} y={p().y + h() - 11.5}>
                       {hw()}
                     </text>
                   </g>
@@ -1691,10 +3383,31 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                   >
                     <title>{ctrLedLabel(ctr.name)}</title>
                   </circle>
+                  <g
+                    class="topo-dependency-port"
+                    classList={{
+                      active:
+                        dependencyDrag()?.kind === "container" &&
+                        dependencyDrag()?.index === ci(),
+                      target:
+                        dependencyDrag() !== null &&
+                        !(
+                          dependencyDrag()!.kind === "container" &&
+                          dependencyDrag()!.index === ci()
+                        ),
+                    }}
+                    onPointerDown={(e: PointerEvent) => dependencyDown(e, "container", ci())}
+                  >
+                    <circle cx={p().x + VM_W / 2} cy={p().y} r="5" />
+                    <text x={p().x + VM_W / 2 + 9} y={p().y + 3.5}>
+                      DEP
+                    </text>
+                    <title>Drag to a VM or container that this container depends on</title>
+                  </g>
                   {/* power / restart buttons — no console for containers */}
                   <VmBtn
                     x={p().x + VM_W - 49}
-                    y={p().y + VM_H - 24}
+                    y={p().y + h() - 24}
                     act="power"
                     title={ctrRunning(ctr.name) ? "Stop" : "Start"}
                     onClick={() =>
@@ -1707,41 +3420,117 @@ export default function TopologyCanvas(props: { onEditConfig: () => void }) {
                   </VmBtn>
                   <VmBtn
                     x={p().x + VM_W - 28}
-                    y={p().y + VM_H - 24}
+                    y={p().y + h() - 24}
                     act="restart"
                     title="Restart"
                     onClick={() => containerRestart(ctr.name)}
                   >
                     <RotateCw size={11} />
                   </VmBtn>
-                  {/* NIC port dots (no NICs = air-gapped) */}
                   <Index each={ctr.nics}>
-                    {(nic, i) => (
-                      <circle
-                        cx={p().x + 18 + i * 16}
-                        cy={p().y + VM_H}
-                        r={socketDrag() ? 7 : 4}
-                        class="topo-port"
-                        classList={{
-                          target: socketDrag() !== null,
-                          loose: !nic().segment && !nic().nat,
-                          locked: anyVmRunning(),
-                        }}
-                        onPointerDown={(e: PointerEvent) => dotDown(e, "container", ci(), i)}
-                      >
-                        <title>
-                          {anyVmRunning()
-                            ? "Networking is read-only while a machine is up"
-                            : !nic().segment && !nic().nat
-                            ? "Unplugged NIC — drag onto a switch or the WAN to connect"
-                            : "Drag to another bar to move (empty space unplugs)"}
-                        </title>
-                      </circle>
-                    )}
+                    {(nic, i) => {
+                      const port = () => machineNicPort("container", ctr.name, i, nic());
+                      const runtime = () => runtimeNic("container", ctr.name, i);
+                      const rowY = () => p().y + 48 + i * NIC_ROW_H;
+                      const target = () => (nic().nat ? "NAT" : nic().segment ?? "unplugged");
+                      const compactTarget = () =>
+                        target().length > 6 ? `${target().slice(0, 5)}…` : target();
+                      return (
+                        <>
+                          <rect
+                            class="topo-nic-row-bg"
+                            x={p().x + 1}
+                            y={rowY()}
+                            width={VM_W - 2}
+                            height={NIC_ROW_H}
+                          />
+                          <g
+                            class="topo-nic-icon"
+                            transform={`translate(${p().x + 8} ${rowY() + 7})`}
+                          >
+                            <EthernetPort size={10} />
+                          </g>
+                          <text class="topo-nic-index" x={p().x + 21} y={rowY() + 16.5}>
+                            NIC {i}
+                          </text>
+                          <text class="topo-nic-target" x={p().x + 55} y={rowY() + 16.5}>
+                            {compactTarget()}
+                            <title>{target()}</title>
+                          </text>
+                          <NicIpEditor
+                            x={p().x + 110}
+                            y={rowY() + 1}
+                            staticIp={nic().ip}
+                            assignedIp={runtime()?.ip ?? null}
+                            disabled={ctrRunning(ctr.name)}
+                            staticAllowed={!!nic().segment && !nic().nat}
+                            gateway={nic().gateway}
+                            gatewayAllowed={nicGatewayAllowed(nic())}
+                            validate={(value) => staticIpError("container", ci(), i, value)}
+                            onChange={(value) => setNicStaticIp("container", ci(), i, value)}
+                            onGatewayChange={(enabled) =>
+                              setMachineNicGateway("container", ci(), i, enabled)
+                            }
+                          />
+                          <circle
+                            cx={port().x}
+                            cy={port().y}
+                            r={socketDrag() ? 7 : 4}
+                            class="topo-port"
+                            classList={{
+                              target: socketDrag() !== null,
+                              loose: !nic().segment && !nic().nat,
+                              locked: anyVmRunning(),
+                            }}
+                            onPointerDown={(e: PointerEvent) =>
+                              dotDown(e, "container", ci(), i)
+                            }
+                          >
+                            <title>
+                              {anyVmRunning()
+                                ? "Networking is read-only while a machine is up"
+                                : !nic().segment && !nic().nat
+                                  ? "Unplugged NIC — drag onto a switch or the WAN to connect"
+                                  : "Drag to another bar to move (empty space unplugs)"}
+                            </title>
+                          </circle>
+                        </>
+                      );
+                    }}
                   </Index>
                 </g>
               );
             }}
+          </For>
+
+          {/* Clickable guest/container service-port numbers sit beside the
+              machine endpoint of each host-forward cable. */}
+          <For each={hostPorts()}>
+            {(entry) => (
+              <Show when={entry.target} keyed>
+                {(target) => {
+                  const p = () => machineServicePort(entry);
+                  const valid = () => hostPortValid(entry);
+                  return (
+                    <g
+                      class="topo-service-port"
+                      classList={{ invalid: !valid(), live: hostPortLive(entry) }}
+                    >
+                      <circle cx={p().x} cy={p().y} r="4" />
+                      <PortNumberEditor
+                        x={p().side === "left" ? p().x - 54 : p().x + 6}
+                        y={p().y - 12}
+                        value={entry.guestPort ?? 0}
+                        valid={valid()}
+                        disabled={anyVmRunning()}
+                        label={`${target.name} service port`}
+                        onChange={(value) => setHostEntryPort(entry, "guest", value)}
+                      />
+                    </g>
+                  );
+                }}
+              </Show>
+            )}
           </For>
         </g>
       </svg>
