@@ -19,7 +19,7 @@ module first_lab {
     ]
     related = [vmlab_wcl, labs, validate_checks]
     body {
-      p "vmlab ships as one binary plus your `vmlab.wcl`. Build it from source (`cargo install --locked --path .` in a clone of the repo) and confirm `vmlab --version` prints a version. The only host requirement is `/dev/kvm` — no bridges, no root."
+      p "vmlab ships as one binary plus your `vmlab.wcl`. Build it from source (`cargo install --locked --path .` in a clone of the repo) and confirm `vmlab --version` prints a version. KVM only requires `/dev/kvm`; optional eBPF network acceleration additionally uses `/dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`."
       p "A lab file is WCL: `import <vmlab.wcl>` brings in the schema, then a single `lab` block declares segments and VMs. The `template` below is an **OCI registry ref**, so you don't need to build anything first — the disk is pulled on first `up`. `vmlab validate` checks the whole model (schema, refs, subnets, dependency cycles) and is the habit to build: validate after every edit, before every `up`."
     }
     exercise minimal_lab {

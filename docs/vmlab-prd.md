@@ -565,7 +565,7 @@ Everything above was chosen to be WSL2-clean, but to state it once: KVM requires
 vmlab ships an official Docker/OCI **runtime image** (distinct from template artifacts, §6.4) containing the vmlab binary plus its full runtime dependency set: QEMU (system emulators for supported arches), OVMF/SeaBIOS firmware, swtpm, Tesseract, passt/slirp, and a VNC-capable toolchain. Published per release alongside the binary (e.g. `ghcr.io/<owner>/vmlab:<version>`).
 
 - **Acceleration.** With `--device /dev/kvm` the container runs KVM-accelerated like a native install. Without it, vmlab falls back to TCG with a loud warning — slow but functional, which matters for environments without KVM exposure.
-- **Privileges.** Because the network fabric is userspace, the container needs **no** `--privileged`, no extra capabilities, and no host network mode — `/dev/kvm` is the only host grant.
+- **Privileges.** The default userspace network fabric needs **no** `--privileged`, extra capabilities, or host network mode — `/dev/kvm` is the only grant for KVM acceleration. Opting into the eBPF fast path additionally grants `/dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`; probing still falls back to userspace when unavailable.
 - **State.** Documented volume mounts for the template store (`~/.local/share/vmlab/templates`) and the lab directory; everything else is container-ephemeral by design. Host access to guests rides vmlab port-forwards mapped out with ordinary `-p` flags.
 - **Entrypoint.** Defaults to the supervisor in the foreground (lab daemons are its children); `docker exec` (or a second container sharing the socket volume) drives the CLI. A one-shot mode (`vmlab up && vmlab script ...` then exit) suits CI.
 - **Primary use cases:** CI pipelines running full lab tests, trying vmlab without installing QEMU, and pinning a known-good QEMU version independent of the host distro.
@@ -650,10 +650,11 @@ shares served by the lab daemon at the segment gateway — the same
 bundled-`smbd` mechanism as §7.5 shared folders — mounted by cinit over
 CIFS once the network is up. No 9p device is ever attached (it would add a
 migration blocker and break online snapshots, §7.3). Ownership on volume
-files is mount-level, not per-file container uid/gid. This preserves the
-§14 guarantee verbatim: containers work inside the official image with
-**no** `--privileged`, no added capabilities — `/dev/kvm` only, TCG
-fallback without it.
+files is mount-level, not per-file container uid/gid. This preserves the §14
+baseline guarantee: containers work inside the official image with **no**
+`--privileged` or added capabilities — `/dev/kvm` only, with TCG fallback
+without it. The optional eBPF network fast path uses the additional grants
+documented in §14.
 
 **Networking.** A container NIC is a VM NIC: the same `-netdev stream` unix
 socket into the segment switch, the same DHCP lease/reservation, DNS

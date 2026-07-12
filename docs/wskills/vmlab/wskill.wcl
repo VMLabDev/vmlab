@@ -33,8 +33,9 @@ local store or pushed to and pulled from any OCI registry. Guest automation —
 power control, command execution, keystrokes, screen matching and OCR — is written
 in **wscript** provision scripts and event handlers. A two-tier daemon (the
 supervisor `vmlabd` plus one daemon per running lab) is auto-started by the CLI;
-the network fabric is entirely userspace, so vmlab runs unprivileged in containers
-and on WSL2 with only `/dev/kvm`.
+the baseline network fabric is entirely userspace, so vmlab runs unprivileged in
+containers and on WSL2 with only `/dev/kvm`. Optional eBPF acceleration on
+supported Linux hosts adds `/dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`.
 END
   tags = ["vmlab", "qemu", "kvm", "virtualization", "lab", "wcl", "wscript", "oci"]
   created    = "2026-06-21"

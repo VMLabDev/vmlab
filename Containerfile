@@ -1,21 +1,25 @@
 # Official vmlab runtime image (PRD §14): the `vmlab` CLI + the `vmlab-web` UI
 # server plus their full runtime dependency set. The userspace network fabric
-# means the container needs NO --privileged, no extra capabilities, and no host
-# network mode — `--device /dev/kvm` is the only host grant needed for
-# acceleration (without it, vmlab falls back to TCG with a loud warning).
+# means the container needs NO --privileged and no host network mode. KVM CPU
+# acceleration only needs `--device /dev/kvm` (without it, vmlab falls back to
+# TCG with a loud warning). The optional eBPF network fast path additionally
+# needs `--device /dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`.
 #
 # By default the container runs `vmlab-web` bound to 0.0.0.0:7878 (with
 # --no-auth) so the web UI is reachable through a published port with no login.
 # Set VMLAB_WEB_USER + VMLAB_WEB_PASSWORD to require a login instead — supplied
 # credentials take precedence over --no-auth:
 #
-#   docker run --rm -p 7878:7878 --device /dev/kvm \
+#   docker run --rm -p 7878:7878 --device /dev/kvm --device /dev/net/tun \
+#     --cap-add BPF --cap-add NET_ADMIN -e VMLAB_FASTPATH=auto \
 #     -e VMLAB_WEB_USER=admin -e VMLAB_WEB_PASSWORD=secret \
 #     -v "$PWD":/lab vmlab
 #
 # The CLI is still available by overriding the command:
 #
-#   docker run --rm --device /dev/kvm -v "$PWD":/lab vmlab vmlab up
+#   docker run --rm --device /dev/kvm --device /dev/net/tun \
+#     --cap-add BPF --cap-add NET_ADMIN -e VMLAB_FASTPATH=auto \
+#     -v "$PWD":/lab vmlab vmlab up
 #   docker exec <container> vmlab status
 #
 # Build:  docker build -t vmlab -f Containerfile .      (context = this dir)

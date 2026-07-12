@@ -17,14 +17,20 @@ services:
     image: vmlab:latest
     ports:
       - "7878:7878"
-    # KVM acceleration. Drop this line to run under TCG emulation (much slower).
+    # KVM acceleration plus the optional eBPF network fast path. vmlab probes
+    # AF_XDP at startup and falls back to userspace if it is unavailable.
     devices:
       - "/dev/kvm:/dev/kvm"
+      - "/dev/net/tun:/dev/net/tun"
+    cap_add:
+      - BPF
+      - NET_ADMIN
     # VMLAB_WEB_UP=0 leaves the lab stopped (start it from the UI). To require a
     # login, set both VMLAB_WEB_USER and VMLAB_WEB_PASSWORD (supplied credentials
     # take precedence over the image's --no-auth default):
     environment:
       VMLAB_WEB_UP: "0"
+      VMLAB_FASTPATH: "auto"
     #     VMLAB_WEB_USER: "${VMLAB_WEB_USER:?set a username}"
     #     VMLAB_WEB_PASSWORD: "${VMLAB_WEB_PASSWORD:?set a password}"
     volumes:

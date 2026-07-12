@@ -117,14 +117,17 @@ absent at daemon start.
 
 ```sh
 docker build -t vmlab -f Containerfile .
-docker run --rm -it --device /dev/kvm \
+docker run --rm -it --device /dev/kvm --device /dev/net/tun \
+  --cap-add BPF --cap-add NET_ADMIN -e VMLAB_FASTPATH=auto \
   -v ~/.local/share/vmlab/templates:/root/.local/share/vmlab/templates \
   -v "$PWD":/lab -w /lab vmlab vmlab up
 ```
 
-`--device /dev/kvm` is the only host grant required for acceleration; without
-it vmlab falls back to TCG (slow but functional). No `--privileged`, no extra
-capabilities, no host network mode.
+`--device /dev/kvm` is the only host grant required for KVM acceleration;
+without it vmlab falls back to TCG (slow but functional). The optional eBPF
+network fast path uses `/dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`, as shown
+above. No `--privileged` or host network mode is required, and an unavailable
+fast path falls back to the userspace fabric.
 
 [wcl]: https://github.com/wiltaylor/wcl
 [wscript]: https://github.com/Configweave/wscript

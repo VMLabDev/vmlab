@@ -31,6 +31,19 @@ volume.
 KVM acceleration uses the host's `/dev/kvm` (mapped in `compose.yaml`); remove
 that device mapping to fall back to slower TCG emulation.
 
+The Compose stack also enables vmlab's optional eBPF network fast path by
+mapping `/dev/net/tun` and adding only `CAP_BPF` and `CAP_NET_ADMIN`. It does
+not use privileged or host-network mode. `VMLAB_FASTPATH=auto` probes the AF_XDP
+tier at startup and falls back to the userspace fabric if the host cannot use
+it. Inspect the selected tier with:
+
+```sh
+docker compose exec vmlab-web vmlab fastpath
+```
+
+The available modes are `auto` (recommended), `afxdp` (force the AF_XDP probe),
+`sockmap` (evaluation only; currently slower than userspace), and `off`.
+
 ## Sharing files into your VMs
 
 Drop files in `docker/share/` on the host — it's bind-mounted to `/share` in
@@ -76,10 +89,13 @@ mount options via a provision.
 
 ```sh
 # Web UI (add -v "$PWD/share":/share to share host files into the VMs)
-docker run --rm -p 7878:7878 --device /dev/kvm \
+docker run --rm -p 7878:7878 --device /dev/kvm --device /dev/net/tun \
+  --cap-add BPF --cap-add NET_ADMIN -e VMLAB_FASTPATH=auto \
   -e VMLAB_WEB_USER=admin -e VMLAB_WEB_PASSWORD=secret \
   -v "$PWD":/lab -v "$PWD/share":/share vmlab:latest
 
 # CLI (override the default command)
-docker run --rm --device /dev/kvm -v "$PWD":/lab vmlab:latest vmlab up
+docker run --rm --device /dev/kvm --device /dev/net/tun \
+  --cap-add BPF --cap-add NET_ADMIN -e VMLAB_FASTPATH=auto \
+  -v "$PWD":/lab vmlab:latest vmlab up
 ```

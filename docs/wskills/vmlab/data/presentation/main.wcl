@@ -57,7 +57,7 @@ presentation nutshell {
       unit  = containers
       body {
         p "- The whole fabric is userspace — no bridges, no root, no capabilities"
-        p "- Runs in containers and on WSL2 with only `/dev/kvm`"
+        p "- Runs in containers and on WSL2 with `/dev/kvm`; optional eBPF acceleration uses narrowly scoped extra grants"
       }
       speaker_notes = "This is the differentiator against libvirt-style setups: nothing to configure on the host, nothing privileged."
     }
