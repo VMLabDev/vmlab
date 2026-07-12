@@ -12,7 +12,12 @@ import type { DesktopApi, DesktopStatus } from "@forge/desktop";
 import { Maximize, RotateCcw } from "lucide-solid";
 import { wsUrl } from "../api";
 
-export default function ConsoleScreen(props: { lab: string; vm: string; powered: boolean }) {
+export default function ConsoleScreen(props: {
+  lab: string;
+  vm: string;
+  powered: boolean;
+  endpoint?: string;
+}) {
   const [status, setStatus] = createSignal<DesktopStatus>("disconnected");
   let api: DesktopApi | undefined;
   let frame: HTMLDivElement | undefined;
@@ -49,13 +54,14 @@ export default function ConsoleScreen(props: { lab: string; vm: string; powered:
       </div>
       <div ref={frame}>
         <Show
-          when={props.powered ? `${props.lab}/${props.vm}` : null}
+          when={props.powered ? (props.endpoint ?? `${props.lab}/${props.vm}`) : null}
           keyed
           fallback={<Empty title={`${props.vm} is powered off`}>No framebuffer.</Empty>}
         >
           <DesktopViewer
             url={wsUrl(
-              `/api/desktop/vnc/${encodeURIComponent(props.lab)}/${encodeURIComponent(props.vm)}`,
+              props.endpoint ??
+                `/api/desktop/vnc/${encodeURIComponent(props.lab)}/${encodeURIComponent(props.vm)}`,
             )}
             autoConnect
             scale="fit"

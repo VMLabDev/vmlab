@@ -64,10 +64,51 @@ pub async fn vnc(
         .join(&vm)
         .join("vnc.sock");
 
+    serve_socket(req, body, sock, format!("{lab}/{vm}")).await
+}
+
+/// Console for the ephemeral VM used by an active template build. The socket
+/// path is resolved by the supervisor, never accepted from the browser.
+pub async fn template_vnc(
+    req: HttpRequest,
+    body: web::Payload,
+    path: web::Path<(String, String, String)>,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    let (lab, arch, template) = path.into_inner();
+    if !super::state::valid_name(&lab) {
+        return Ok(
+            HttpResponse::BadRequest().json(serde_json::json!({"error": "invalid lab name"}))
+        );
+    }
+    let value = match state
+        .supervisor_call(
+            "template.console_path",
+            serde_json::json!({"lab": lab, "arch": arch, "template": template}),
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(HttpResponse::Conflict().json(serde_json::json!({"error": error})));
+        }
+    };
+    let Some(path) = value.as_str() else {
+        return Ok(HttpResponse::InternalServerError()
+            .json(serde_json::json!({"error": "supervisor returned an invalid console path"})));
+    };
+    serve_socket(req, body, path.into(), format!("{arch}/{template} build")).await
+}
+
+async fn serve_socket(
+    req: HttpRequest,
+    body: web::Payload,
+    sock: std::path::PathBuf,
+    label: String,
+) -> Result<HttpResponse, Error> {
     if !sock.exists() {
-        return Ok(HttpResponse::Conflict().json(
-            serde_json::json!({"error": format!("{lab}/{vm} has no VNC socket (powered off?)")}),
-        ));
+        return Ok(HttpResponse::Conflict()
+            .json(serde_json::json!({"error": format!("{label} has no VNC socket")})));
     }
 
     let (response, session, msg_stream) = actix_ws::handle(&req, body)?;

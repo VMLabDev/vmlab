@@ -966,6 +966,26 @@ pub async fn template_build(
     template_call(&state, &lab, "template.build", args).await
 }
 
+/// `POST /api/labs/{lab}/templates/{tpl}/stop` — cancel the active build for
+/// the selected architecture.
+pub async fn template_stop(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    body: web::Json<TemplateSelector>,
+) -> HttpResponse {
+    let (lab, tpl) = path.into_inner();
+    let Some(arch) = &body.arch else {
+        return fail("missing arch".to_string());
+    };
+    template_call(
+        &state,
+        &lab,
+        "template.stop_build",
+        json!({"template": tpl, "arch": arch}),
+    )
+    .await
+}
+
 #[derive(Deserialize)]
 pub struct PublishBody {
     #[serde(default)]

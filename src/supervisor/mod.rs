@@ -441,6 +441,17 @@ impl Handler for SupervisorHandler {
                 let arch = args["arch"].as_str().map(String::from);
                 templates::start_build(sup.clone(), lab, root, template.to_string(), arch).await
             }
+            "template.stop_build" => {
+                let lab = args["lab"].as_str().ok_or("missing lab")?;
+                let template = args["template"].as_str().ok_or("missing template")?;
+                let arch = args["arch"].as_str().ok_or("missing arch")?;
+                templates::stop_build(
+                    sup.clone(),
+                    lab.to_string(),
+                    arch.to_string(),
+                    template.to_string(),
+                )
+            }
             "template.push" => {
                 let (lab, root) = lab_root_args(&args)?;
                 let template = args["template"].as_str().ok_or("missing template")?;
@@ -452,6 +463,13 @@ impl Handler for SupervisorHandler {
             "template.op_status" => {
                 let lab = args["lab"].as_str().ok_or("missing lab")?;
                 Ok(sup.template_ops.status(lab))
+            }
+            "template.console_path" => {
+                let lab = args["lab"].as_str().ok_or("missing lab")?;
+                let arch = args["arch"].as_str().ok_or("missing arch")?;
+                let template = args["template"].as_str().ok_or("missing template")?;
+                let path = sup.template_ops.console_path(lab, arch, template)?;
+                Ok(json!(path.to_string_lossy()))
             }
             "shutdown" => {
                 tracing::info!("supervisor shutdown requested");

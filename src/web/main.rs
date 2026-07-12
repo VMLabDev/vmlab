@@ -272,6 +272,10 @@ async fn main() -> ExitCode {
                 web::post().to(api::template_build),
             )
             .route(
+                "/api/labs/{lab}/templates/{tpl}/stop",
+                web::post().to(api::template_stop),
+            )
+            .route(
                 "/api/labs/{lab}/templates/{tpl}/publish",
                 web::post().to(api::template_publish),
             )
@@ -293,6 +297,10 @@ async fn main() -> ExitCode {
             // Live streams.
             .route("/api/events", web::get().to(events::events))
             .route("/api/desktop/vnc/{lab}/{vm}", web::get().to(desktop::vnc))
+            .route(
+                "/api/labs/{lab}/templates/{arch}/{template}/vnc",
+                web::get().to(desktop::template_vnc),
+            )
             // SPA + static assets.
             // The embedded documentation book (the vmlab wskill).
             .route("/help", web::get().to(help::root))

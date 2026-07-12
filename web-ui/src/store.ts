@@ -43,8 +43,9 @@ export interface TemplateOp {
   template: string;
   arch: string;
   kind: string; // "build" | "push"
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "cancelled";
   log: string[];
+  consoleReady?: boolean;
   version?: string;
   error?: string;
 }
@@ -238,6 +239,7 @@ async function resyncTemplateOps() {
           kind: op.kind,
           status: "running",
           log: op.log_tail.slice(),
+          consoleReady: op.console_ready,
         };
       }
       return next;
@@ -434,6 +436,16 @@ export async function buildTemplate(tpl: string, arch: string) {
   }
 }
 
+/** Stop one architecture's active template build. */
+export async function stopTemplateBuild(tpl: string, arch: string) {
+  try {
+    await api.stopTemplateBuild(state.currentLab!, tpl, arch);
+    showToast(`Stopping ${arch}/${tpl}`);
+  } catch (e) {
+    showToast(`Failed: ${e}`);
+  }
+}
+
 /** Push a stored template version (default: newest) to its registry. */
 export async function publishTemplate(tpl: string, arch: string, version?: string) {
   try {
@@ -621,7 +633,14 @@ function handleTemplateOpEvent(ev: DaemonEvent) {
         ...fresh(),
         version: ev.data.version,
         error: undefined,
+        consoleReady: false,
       });
+      break;
+    case "template.op.console":
+      setState("templateOps", key, (op) => ({
+        ...(op ?? fresh()),
+        consoleReady: true,
+      }));
       break;
     case "template.op.log": {
       const line = String(ev.data.line ?? "");
@@ -645,6 +664,15 @@ function handleTemplateOpEvent(ev: DaemonEvent) {
       showToast(
         `${ev.data.kind === "push" ? "Published" : "Built"} ${arch}/${template}@${ev.data.version ?? ""}`,
       );
+      loadTemplates();
+      break;
+    case "template.op.cancelled":
+      setState("templateOps", key, (op) => ({
+        ...(op ?? fresh()),
+        status: "cancelled" as const,
+        consoleReady: false,
+      }));
+      showToast(`Stopped ${arch}/${template}`);
       loadTemplates();
       break;
     case "template.op.error":

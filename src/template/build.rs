@@ -18,6 +18,16 @@ use super::store::TemplateStore;
 use crate::config::model::{ArtefactSource, TemplateDef, TemplateSource};
 use crate::scripting::OutputSink;
 
+/// Called once the build VM's VNC socket is accepting connections.
+pub type ConsoleReady = Arc<dyn Fn(PathBuf) + Send + Sync>;
+
+/// Optional controls supplied by an interactive build caller.
+#[derive(Default)]
+pub struct BuildControl {
+    pub console_ready: Option<ConsoleReady>,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
 /// Build `def` (from a parsed lab/template file rooted at `root`) and install
 /// the result into `store`. `log` streams progress. The build version is
 /// auto-incremented (PRD §6.4) unless `version_override` pins it.
@@ -28,10 +38,11 @@ pub async fn build_template(
     profiles: &crate::profiles::ProfileSet,
     log: OutputSink,
     version_override: Option<&str>,
+    control: BuildControl,
 ) -> Result<TemplateMeta> {
     let version = match version_override {
         Some(v) => v.to_string(),
-        None => next_version(def, store, &log).await?,
+        None => cancelable(&control.cancel, next_version(def, store, &log)).await?,
     };
     log(format!("building {}/{}@{}\n", def.arch, def.name, version));
 
@@ -51,7 +62,19 @@ pub async fn build_template(
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     let guard = WorkdirGuard(work.clone());
 
-    let result = run_build(def, root, &work, store, profiles, &log, &version).await;
+    let result = run_build(
+        def,
+        root,
+        &work,
+        store,
+        profiles,
+        &log,
+        BuildRun {
+            version: &version,
+            control,
+        },
+    )
+    .await;
     drop(guard); // always clean up the workdir
     result
 }
@@ -134,19 +157,20 @@ async fn run_build(
     store: &TemplateStore,
     profiles: &crate::profiles::ProfileSet,
     log: &OutputSink,
-    version: &str,
+    run: BuildRun<'_>,
 ) -> Result<TemplateMeta> {
+    let version = run.version;
     let disk_size = def.disk.unwrap_or(20 << 30);
     let build_vm = "build";
 
     // Resolve the source into the working primary disk.
     let (cdrom, seed_disk): (Option<PathBuf>, SeedDisk) = match &def.source {
         TemplateSource::Iso(src) => {
-            let iso = resolve_artefact(src, root, log).await?;
+            let iso = cancelable(&run.control.cancel, resolve_artefact(src, root, log)).await?;
             (Some(iso), SeedDisk::Blank(disk_size))
         }
         TemplateSource::Qcow2(src) => {
-            let img = resolve_artefact(src, root, log).await?;
+            let img = cancelable(&run.control.cancel, resolve_artefact(src, root, log)).await?;
             (None, SeedDisk::CopyFrom(img))
         }
         TemplateSource::Template { from, .. } => {
@@ -182,20 +206,32 @@ async fn run_build(
     // the (otherwise blank) scratch disk.
     let (events_tx, _) = tokio::sync::broadcast::channel(256);
     let event_log = Arc::new(crate::labd::events::EventLog::new(&lab_name, events_tx)?);
-    let runtime = crate::labd::lab::LabRuntime::build(labfile, event_log, profiles).await?;
+    let runtime = cancelable(
+        &run.control.cancel,
+        crate::labd::lab::LabRuntime::build(labfile, event_log, profiles),
+    )
+    .await?;
 
     let vm = runtime.vm(build_vm)?;
     let disk0 = vm.dirs.primary_disk();
     std::fs::create_dir_all(disk0.parent().unwrap())?;
     match &seed_disk {
         SeedDisk::Blank(size) => {
-            super::qimg::create_blank(&disk0, *size).await?;
+            cancelable(
+                &run.control.cancel,
+                super::qimg::create_blank(&disk0, *size),
+            )
+            .await?;
         }
         SeedDisk::CopyFrom(src) => {
             log(format!("seeding working disk from {}\n", src.display()));
             // Flatten/copy into a standalone working qcow2 (resized up to the
             // requested disk size if larger).
-            super::qimg::convert_to_qcow2(src, &disk0).await?;
+            cancelable(
+                &run.control.cancel,
+                super::qimg::convert_to_qcow2(src, &disk0),
+            )
+            .await?;
             if def.disk.is_some() {
                 let info = super::qimg::image_info(&disk0).await?;
                 if disk_size > info.virtual_size {
@@ -212,10 +248,32 @@ async fn run_build(
     if def.gui {
         crate::viewer::open_when_ready(vm.dirs.vnc_sock());
     }
-    runtime
-        .up(&[], log.clone())
-        .await
-        .context("build boot/provision failed")?;
+    let console_watch = run.control.console_ready.map(|ready| {
+        let sock = vm.dirs.vnc_sock();
+        tokio::spawn(async move {
+            loop {
+                if sock.exists() {
+                    ready(sock);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+    });
+    let up_result = tokio::select! {
+        result = runtime.up(&[], log.clone()) => Some(result),
+        () = run.control.cancel.cancelled() => None,
+    };
+    if let Some(watch) = console_watch {
+        watch.abort();
+    }
+    match up_result {
+        Some(result) => result.context("build boot/provision failed")?,
+        None => {
+            let _ = runtime.down(&[], true).await;
+            bail!("build cancelled");
+        }
+    }
 
     log("sealing: graceful shutdown\n".to_string());
     vm.stop(false).await.context("build VM did not shut down")?;
@@ -224,6 +282,10 @@ async fn run_build(
         std::time::Duration::from_secs(120),
     )
     .await?;
+
+    if run.control.cancel.is_cancelled() {
+        bail!("build cancelled");
+    }
 
     // Seal: flatten the working disk into a staging dir, then install.
     let staging = work.join("staging");
@@ -288,6 +350,24 @@ async fn run_build(
 enum SeedDisk {
     Blank(u64),
     CopyFrom(PathBuf),
+}
+
+struct BuildRun<'a> {
+    version: &'a str,
+    control: BuildControl,
+}
+
+async fn cancelable<T, E>(
+    cancel: &tokio_util::sync::CancellationToken,
+    future: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+    E: Into<anyhow::Error>,
+{
+    tokio::select! {
+        result = future => result.map_err(Into::into),
+        () = cancel.cancelled() => bail!("build cancelled"),
+    }
 }
 
 async fn resolve_artefact(src: &ArtefactSource, root: &Path, log: &OutputSink) -> Result<PathBuf> {

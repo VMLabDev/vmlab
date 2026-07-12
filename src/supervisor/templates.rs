@@ -22,6 +22,8 @@ struct OpState {
     kind: &'static str,
     started: chrono::DateTime<chrono::Utc>,
     log: VecDeque<String>,
+    console: Option<PathBuf>,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 type OpKey = (String, String, String);
@@ -52,17 +54,21 @@ impl TemplateOps {
                 op.kind
             ));
         }
+        let cancel = tokio_util::sync::CancellationToken::new();
         ops.insert(
             key.clone(),
             OpState {
                 kind,
                 started: chrono::Utc::now(),
                 log: VecDeque::new(),
+                console: None,
+                cancel: cancel.clone(),
             },
         );
         Ok(OpGuard {
             ops: self.clone(),
             key,
+            cancel,
         })
     }
 
@@ -74,6 +80,44 @@ impl TemplateOps {
             }
             op.log.push_back(line.to_string());
         }
+    }
+
+    fn set_console(&self, lab: &str, arch: &str, template: &str, path: PathBuf) {
+        let mut ops = self.inner.lock().unwrap();
+        if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
+            op.console = Some(path);
+        }
+    }
+
+    pub fn console_path(&self, lab: &str, arch: &str, template: &str) -> Result<PathBuf, String> {
+        let ops = self.inner.lock().unwrap();
+        let op = ops
+            .get(&(lab.to_string(), arch.to_string(), template.to_string()))
+            .ok_or_else(|| format!("no operation running for `{arch}/{template}`"))?;
+        let path = op
+            .console
+            .as_ref()
+            .ok_or_else(|| format!("console for `{arch}/{template}` is not ready"))?;
+        if !path.exists() {
+            return Err(format!(
+                "console for `{arch}/{template}` is no longer available"
+            ));
+        }
+        Ok(path.clone())
+    }
+
+    fn cancel_build(&self, lab: &str, arch: &str, template: &str) -> Result<(), String> {
+        let ops = self.inner.lock().unwrap();
+        let op = ops
+            .get(&(lab.to_string(), arch.to_string(), template.to_string()))
+            .ok_or_else(|| format!("no build running for `{arch}/{template}`"))?;
+        if op.kind != "build" {
+            return Err(format!(
+                "the operation running for `{arch}/{template}` is a push"
+            ));
+        }
+        op.cancel.cancel();
+        Ok(())
     }
 
     /// The running operation for `(lab, template)`, as JSON for `template.list`.
@@ -99,6 +143,7 @@ impl TemplateOps {
                     "kind": op.kind,
                     "started": op.started.to_rfc3339(),
                     "log_tail": op.log.iter().collect::<Vec<_>>(),
+                    "console_ready": op.console.as_ref().is_some_and(|path| path.exists()),
                 })
             })
             .collect();
@@ -116,6 +161,13 @@ impl TemplateOps {
 struct OpGuard {
     ops: TemplateOps,
     key: OpKey,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl OpGuard {
+    fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.clone()
+    }
 }
 
 impl Drop for OpGuard {
@@ -254,6 +306,7 @@ pub async fn start_build(
     let guard = sup
         .template_ops
         .try_begin(&lab, &arch, &template, "build")?;
+    let cancel = guard.cancel_token();
     sup.emit(Event::new(
         "template.op.start",
         &*lab,
@@ -270,13 +323,43 @@ pub async fn start_build(
     tokio::spawn(async move {
         let _guard = guard;
         let store = TemplateStore::new(crate::paths::template_store_dir());
-        let result =
-            crate::template::build::build_template(&def, &root, &store, &profiles, log, None).await;
+        let ready_sup = sup.clone();
+        let ready_lab = lab.clone();
+        let ready_arch = arch.clone();
+        let ready_template = template.clone();
+        let console_ready: crate::template::build::ConsoleReady = Arc::new(move |path| {
+            ready_sup
+                .template_ops
+                .set_console(&ready_lab, &ready_arch, &ready_template, path);
+            ready_sup.emit(Event::new(
+                "template.op.console",
+                &*ready_lab,
+                json!({"template": ready_template, "arch": ready_arch, "kind": "build"}),
+            ));
+        });
+        let result = crate::template::build::build_template(
+            &def,
+            &root,
+            &store,
+            &profiles,
+            log,
+            None,
+            crate::template::build::BuildControl {
+                console_ready: Some(console_ready),
+                cancel: cancel.clone(),
+            },
+        )
+        .await;
         match result {
             Ok(meta) => sup.emit(Event::new(
                 "template.op.done",
                 &*lab,
                 json!({"template": template, "arch": arch, "kind": "build", "version": meta.version}),
+            )),
+            Err(_) if cancel.is_cancelled() => sup.emit(Event::new(
+                "template.op.cancelled",
+                &*lab,
+                json!({"template": template, "arch": arch, "kind": "build"}),
             )),
             Err(e) => sup.emit(Event::new(
                 "template.op.error",
@@ -286,6 +369,17 @@ pub async fn start_build(
         }
     });
     Ok(json!({"started": true}))
+}
+
+/// Stop the active build for one exact architecture/template pair.
+pub fn stop_build(
+    sup: Arc<Supervisor>,
+    lab: String,
+    arch: String,
+    template: String,
+) -> Result<Value, String> {
+    sup.template_ops.cancel_build(&lab, &arch, &template)?;
+    Ok(json!({"stopping": true}))
 }
 
 /// `template.push`: kick off a background push of a locally stored version
@@ -423,6 +517,17 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_targets_one_build_architecture() {
+        let ops = TemplateOps::default();
+        let x86 = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
+        let arm = ops.try_begin("lab1", "aarch64", "base", "build").unwrap();
+
+        ops.cancel_build("lab1", "x86_64", "base").unwrap();
+        assert!(x86.cancel_token().is_cancelled());
+        assert!(!arm.cancel_token().is_cancelled());
+    }
+
+    #[test]
     fn log_ring_caps_and_status_reports_tail() {
         let ops = TemplateOps::default();
         let _guard = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
@@ -452,6 +557,24 @@ mod tests {
         let op = ops.op_of("lab1", "x86_64", "base");
         assert_eq!(op["kind"], "push");
         assert!(op["started"].as_str().is_some());
+    }
+
+    #[test]
+    fn console_is_exposed_only_while_ready_build_is_running() {
+        let ops = TemplateOps::default();
+        let guard = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
+        assert!(ops.console_path("lab1", "x86_64", "base").is_err());
+        assert_eq!(ops.status("lab1")[0]["console_ready"], false);
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vnc.sock");
+        std::fs::write(&socket, "test").unwrap();
+        ops.set_console("lab1", "x86_64", "base", socket.clone());
+        assert_eq!(ops.console_path("lab1", "x86_64", "base").unwrap(), socket);
+        assert_eq!(ops.status("lab1")[0]["console_ready"], true);
+
+        drop(guard);
+        assert!(ops.console_path("lab1", "x86_64", "base").is_err());
     }
 
     #[tokio::test]

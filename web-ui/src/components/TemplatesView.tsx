@@ -15,10 +15,11 @@ import {
   StatusDot,
   Table,
 } from "@forge/ui";
-import { KeyRound, Play, Plus, RefreshCw, Trash2, Upload } from "lucide-solid";
+import { KeyRound, Monitor, Play, Plus, RefreshCw, Square, Trash2, Upload } from "lucide-solid";
 import {
   state,
   buildTemplate,
+  stopTemplateBuild,
   publishTemplate,
   dismissTemplateOp,
   loadTemplates,
@@ -28,6 +29,7 @@ import {
 import { listStoreTemplates, removeStoreTemplate, templateRemote } from "../api";
 import type { TemplateInfo, RemoteStatus, StoreTemplate } from "../api";
 import { confirmDialog } from "./dialogs";
+import ConsoleScreen from "./ConsoleScreen";
 import {
   addRegistry,
   containerRegistry,
@@ -370,6 +372,7 @@ function TemplateCard(p: { t: TemplateInfo }) {
   const op = (): TemplateOp | undefined => state.templateOps[key()];
   const running = () => op()?.status === "running" || p.t.op !== null;
   const [version, setVersion] = createSignal<string | null>(null);
+  const [consoleOpen, setConsoleOpen] = createSignal(false);
   // Selected publish version, defaulting to the newest local build.
   const selected = () => version() ?? p.t.local_versions[0] ?? null;
 
@@ -377,6 +380,8 @@ function TemplateCard(p: { t: TemplateInfo }) {
     const v = selected();
     if (v) publishTemplate(p.t.name, p.t.arch, v);
   };
+  const consoleEndpoint = () =>
+    `/api/labs/${encodeURIComponent(state.currentLab!)}/templates/${encodeURIComponent(p.t.arch)}/${encodeURIComponent(p.t.name)}/vnc`;
 
   return (
     <Card
@@ -392,12 +397,33 @@ function TemplateCard(p: { t: TemplateInfo }) {
       }
       action={
         <span style={{ display: "inline-flex", gap: "8px" }}>
+          <Show when={op()?.kind === "build" && op()?.status === "running"}>
+            <Button
+              size="sm"
+              icon={Monitor}
+              disabled={!op()?.consoleReady}
+              onClick={() => setConsoleOpen(true)}
+              title={op()?.consoleReady ? "Attach to the build VM console" : "Console is starting"}
+            >
+              Console
+            </Button>
+            <Button
+              size="sm"
+              variant="danger"
+              icon={Square}
+              onClick={() => stopTemplateBuild(p.t.name, p.t.arch)}
+              title={`Stop the ${p.t.arch} build`}
+            >
+              Stop
+            </Button>
+          </Show>
           <Button
             size="sm"
             variant="primary"
             icon={Play}
             disabled={running()}
             onClick={() => buildTemplate(p.t.name, p.t.arch)}
+            title={`Build only the ${p.t.arch} variant`}
           >
             Build
           </Button>
@@ -445,6 +471,18 @@ function TemplateCard(p: { t: TemplateInfo }) {
       <Show when={op()}>
         <OpPanel op={op()!} opKey={key()} />
       </Show>
+      <Modal
+        open={consoleOpen()}
+        title={`${p.t.arch}/${p.t.name} build console`}
+        onClose={() => setConsoleOpen(false)}
+      >
+        <ConsoleScreen
+          lab={state.currentLab!}
+          vm={`${p.t.name} build`}
+          powered={op()?.status === "running" && !!op()?.consoleReady}
+          endpoint={consoleEndpoint()}
+        />
+      </Modal>
     </Card>
   );
 }
@@ -520,6 +558,8 @@ function OpPanel(p: { op: TemplateOp; opKey: string }) {
         return `${verb} running…`;
       case "done":
         return `${verb} finished${p.op.version ? ` — ${p.op.version}` : ""}`;
+      case "cancelled":
+        return `${verb} stopped`;
       default:
         return `${verb} failed`;
     }
@@ -529,7 +569,13 @@ function OpPanel(p: { op: TemplateOp; opKey: string }) {
       <div class="tpl-op-head">
         <StatusDot
           tone={
-            p.op.status === "running" ? "warning" : p.op.status === "done" ? "success" : "danger"
+            p.op.status === "running"
+              ? "warning"
+              : p.op.status === "done"
+                ? "success"
+                : p.op.status === "cancelled"
+                  ? "neutral"
+                  : "danger"
           }
         />
         <span>{label()}</span>

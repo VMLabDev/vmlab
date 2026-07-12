@@ -206,6 +206,7 @@ export interface TemplateOpStatus {
   kind: string;
   started: string;
   log_tail: string[];
+  console_ready: boolean;
 }
 
 export const listTemplates = (lab: string): Promise<TemplateInfo[]> =>
@@ -218,6 +219,10 @@ export const templateRemote = (lab: string, tpl: string, arch?: string): Promise
   );
 export const buildTemplate = (lab: string, tpl: string, arch?: string) =>
   post(`/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/build`, {
+    arch,
+  });
+export const stopTemplateBuild = (lab: string, tpl: string, arch: string) =>
+  post(`/api/labs/${encodeURIComponent(lab)}/templates/${encodeURIComponent(tpl)}/stop`, {
     arch,
   });
 export const publishTemplate = (lab: string, tpl: string, arch?: string, version?: string) =>

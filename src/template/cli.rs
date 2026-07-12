@@ -246,6 +246,7 @@ async fn build(file: Option<PathBuf>, only: Option<String>, version: Option<Stri
             &profiles,
             log.clone(),
             version.as_deref(),
+            crate::template::build::BuildControl::default(),
         )
         .await
         .with_context(|| format!("building {}/{}", def.arch, def.name))?;

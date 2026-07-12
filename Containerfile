@@ -54,6 +54,13 @@ WORKDIR /build
 COPY guest/ ./guest/
 RUN ./guest/build-asset.sh x86_64 aarch64
 
+# Bookworm ships the RISC-V QEMU system emulator but not its EDK2 package.
+# Pull the architecture-independent CODE/VARS blobs from Trixie while keeping
+# the runtime itself on Bookworm.
+FROM debian:trixie-slim AS riscv-firmware
+RUN apt-get update && apt-get install -y --no-install-recommends qemu-efi-riscv64 \
+    && rm -rf /var/lib/apt/lists/*
+
 # ---- help book ----------------------------------------------------------------
 # The vmlab wskill rendered to static HTML — embedded into vmlab-web as the
 # in-app /help. Keep WCL_REV in sync with the wcl_lang rev in Cargo.toml (and
@@ -87,9 +94,11 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         qemu-system-x86 \
         qemu-system-arm \
+        qemu-system-misc \
         qemu-utils \
         ovmf \
         seabios \
+        qemu-efi-aarch64 \
         swtpm \
         tesseract-ocr \
         passt \
@@ -100,6 +109,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         samba \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=riscv-firmware /usr/share/qemu-efi-riscv64/ /usr/share/qemu-efi-riscv64/
 
 # vmlab-web spawns the `vmlab` binary for the supervisor/lab daemons (it locates
 # it as a sibling), so both must sit in the same directory.
