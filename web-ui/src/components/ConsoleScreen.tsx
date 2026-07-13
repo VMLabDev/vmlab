@@ -11,12 +11,15 @@ import { DesktopViewer } from "@forge/desktop";
 import type { DesktopApi, DesktopStatus } from "@forge/desktop";
 import { Maximize, RotateCcw } from "lucide-solid";
 import { wsUrl } from "../api";
+import type { Pull } from "../store";
+import MachinePullStatus from "./MachinePullStatus";
 
 export default function ConsoleScreen(props: {
   lab: string;
   vm: string;
   powered: boolean;
   endpoint?: string;
+  pull?: Pull;
 }) {
   const [status, setStatus] = createSignal<DesktopStatus>("disconnected");
   let api: DesktopApi | undefined;
@@ -26,20 +29,24 @@ export default function ConsoleScreen(props: {
     if (!props.powered) setStatus("disconnected");
   });
 
-  const tone = (): StatusTone =>
-    status() === "ready"
-      ? "success"
-      : status() === "connecting"
-        ? "warning"
-        : status() === "error"
-          ? "danger"
-          : "neutral";
+  const tone = (): StatusTone => {
+    if (props.pull) return props.pull.status === "error" ? "danger" : "warning";
+    if (status() === "ready") return "success";
+    if (status() === "connecting") return "warning";
+    if (status() === "error") return "danger";
+    return "neutral";
+  };
+
+  const statusLabel = () => {
+    if (props.pull) return props.pull.status === "error" ? "download failed" : "preparing image";
+    return props.powered ? status() : "powered off";
+  };
 
   return (
     <div>
       <div class="console-strip">
         <StatusDot tone={tone()} />
-        <span>{props.powered ? status() : "powered off"}</span>
+        <span>{statusLabel()}</span>
         <div class="spacer" />
         <Show when={props.powered && (status() === "closed" || status() === "error")}>
           <Button size="sm" variant="ghost" icon={RotateCcw} onClick={() => api?.connect()}>
@@ -56,7 +63,16 @@ export default function ConsoleScreen(props: {
         <Show
           when={props.powered ? (props.endpoint ?? `${props.lab}/${props.vm}`) : null}
           keyed
-          fallback={<Empty title={`${props.vm} is powered off`}>No framebuffer.</Empty>}
+          fallback={
+            <Show
+              when={props.pull}
+              fallback={<Empty title={`${props.vm} is powered off`}>No framebuffer.</Empty>}
+            >
+              {(pull) => (
+                <MachinePullStatus machine={props.vm} kind="template" pull={pull()} />
+              )}
+            </Show>
+          }
         >
           <DesktopViewer
             url={wsUrl(

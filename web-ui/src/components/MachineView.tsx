@@ -15,6 +15,7 @@ import {
   osOf,
   archOf,
   fmtMem,
+  currentPullFor,
 } from "../store";
 import { vmSnapshots } from "../api";
 import { confirmDialog, promptDialog } from "./dialogs";
@@ -27,6 +28,7 @@ export default function MachineView() {
   // switching machines re-runs them rather than pinning to the first one.
   const vm = () => state.status?.vms.find((v) => v.name === state.view.vm);
   const on = () => vm()?.state === "running";
+  const pull = () => (vm() ? currentPullFor(vm()!.name) : undefined);
   const lk = () => {
     const v = vm();
     return v ? look(v) : { label: "", tone: "neutral" as const };
@@ -126,7 +128,12 @@ export default function MachineView() {
       </Show>
 
       <div class="vm-layout" style={{ display: tab() === "console" ? undefined : "none" }}>
-        <ConsoleScreen lab={state.currentLab!} vm={vm()!.name} powered={on()} />
+        <ConsoleScreen
+          lab={state.currentLab!}
+          vm={vm()!.name}
+          powered={on()}
+          pull={pull()}
+        />
         <div class="vm-side">
           <Card title="Machine">
             <KV k="Template" v={vm()!.template} />

@@ -14,9 +14,11 @@ import {
   containerRestart,
   containerStart,
   containerStop,
+  currentPullFor,
   state,
 } from "../store";
 import LogPanel from "./LogPanel";
+import MachinePullStatus from "./MachinePullStatus";
 import TerminalPanel from "./TerminalPanel";
 
 export default function ContainerView() {
@@ -24,6 +26,7 @@ export default function ContainerView() {
   // Accessors so the view tracks the selected container reactively.
   const ctr = () => state.status?.containers?.find((c) => c.name === state.view.vm);
   const on = () => ctr()?.state === "running";
+  const pull = () => (ctr() ? currentPullFor(ctr()!.name) : undefined);
   const lk = () => {
     const c = ctr();
     return c ? containerLook(c) : { label: "", tone: "neutral" as const };
@@ -109,7 +112,16 @@ export default function ContainerView() {
 
       <div class="vm-layout" style={{ display: tab() === "console" ? undefined : "none" }}>
         <div class="ctr-main">
-          <LogPanel lab={state.currentLab!} source={ctr()!.name} stream="console" plain />
+          <Show
+            when={pull()}
+            fallback={
+              <LogPanel lab={state.currentLab!} source={ctr()!.name} stream="console" plain />
+            }
+          >
+            {(activePull) => (
+              <MachinePullStatus machine={ctr()!.name} kind="image" pull={activePull()} />
+            )}
+          </Show>
         </div>
         <div class="vm-side">
           <Card title="Container">

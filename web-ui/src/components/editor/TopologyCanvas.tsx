@@ -18,6 +18,7 @@ import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup } f
 import { Button, Input, Modal } from "@forge/ui";
 import {
   Container,
+  Download,
   Expand,
   EthernetPort,
   FileCode2,
@@ -99,6 +100,7 @@ import {
   containerRestart,
   containerStart,
   containerStop,
+  currentPullFor,
   look,
   showContainer,
   showVm,
@@ -107,6 +109,7 @@ import {
   vmRestart,
   vmStart,
   vmStop,
+  type Pull,
 } from "../../store";
 import { confirmDialog } from "../dialogs";
 import { registerFxNode } from "../../fx";
@@ -216,6 +219,56 @@ interface EventTargetDrag {
   moved: boolean;
   x: number;
   y: number;
+}
+
+function pullLabel(pull: Pull): string {
+  if (pull.status === "error") return "Download failed";
+  if (pull.status === "checking") return "Resolving download…";
+  return `Downloading ${Math.round(Math.min(100, Math.max(0, pull.percent)))}%`;
+}
+
+/** Live pull feedback embedded in the machine header, where the user just
+ *  clicked Start. It replaces the passive power LED/template caption until
+ *  the pull settles, so a stopped runtime cannot look like a hung boot. */
+function MachinePullIndicator(props: { pull: Pull; x: number; y: number }) {
+  const failed = () => props.pull.status === "error";
+  const checking = () => props.pull.status === "checking";
+  const percent = () => Math.min(100, Math.max(0, props.pull.percent));
+  return (
+    <g class="topo-pull" classList={{ error: failed() }} role="status">
+      <g transform={`translate(${props.x + 13} ${props.y + 31})`} class="topo-pull-glyph">
+        <Download size={11} />
+      </g>
+      <text x={props.x + 30} y={props.y + 39} class="topo-pull-label">
+        {pullLabel(props.pull)}
+      </text>
+      <line
+        x1={props.x + 30}
+        x2={props.x + VM_W - 10}
+        y1={props.y + 44}
+        y2={props.y + 44}
+        class="topo-pull-track"
+      />
+      <line
+        x1={props.x + 30}
+        x2={
+          checking()
+            ? props.x + VM_W - 10
+            : props.x + 30 + ((VM_W - 40) * (failed() ? 100 : percent())) / 100
+        }
+        y1={props.y + 44}
+        y2={props.y + 44}
+        pathLength={checking() ? 100 : undefined}
+        class="topo-pull-bar"
+        classList={{ indeterminate: checking() }}
+      />
+      <title>
+        {failed()
+          ? `${pullLabel(props.pull)}: ${props.pull.error ?? "pull failed"}`
+          : `${pullLabel(props.pull)} — ${props.pull.reference}`}
+      </title>
+    </g>
+  );
 }
 
 function PortNumberEditor(props: {
@@ -3171,6 +3224,7 @@ export default function TopologyCanvas(props: {
           <For each={model().vms}>
             {(vm, vi) => {
               const p = () => vmPos(vm.name);
+              const pull = () => currentPullFor(vm.name);
               const h = () => machineCardHeight(vm.nics.length);
               const footerY = () => p().y + h() - 30;
               const hw = () => {
@@ -3191,6 +3245,8 @@ export default function TopologyCanvas(props: {
                   classList={{
                     selected: selectedVm() === vm.name,
                     locked: vmIsUp(vm.name),
+                    "is-pulling": !!pull() && pull()!.status !== "error",
+                    "pull-error": pull()?.status === "error",
                     "dependency-target":
                       dependencyDrag() !== null &&
                       !(dependencyDrag()!.kind === "vm" && dependencyDrag()!.index === vi()),
@@ -3221,12 +3277,32 @@ export default function TopologyCanvas(props: {
                     {vm.name.length > 16 ? `${vm.name.slice(0, 15)}…` : vm.name}
                     <title>{vm.name}</title>
                   </text>
-                  <text x={p().x + 34} y={p().y + 35} class="topo-vm-meta">
-                    {vm.template === "scratch"
-                      ? "scratch"
-                      : (vm.template.split("/").pop() ?? vm.template).split("@")[0] ||
-                        "(no template)"}
-                  </text>
+                  <Show
+                    when={pull()}
+                    fallback={
+                      <>
+                        <text x={p().x + 34} y={p().y + 35} class="topo-vm-meta">
+                          {vm.template === "scratch"
+                            ? "scratch"
+                            : (vm.template.split("/").pop() ?? vm.template).split("@")[0] ||
+                              "(no template)"}
+                        </text>
+                        {/* power LED (live daemon state) */}
+                        <circle
+                          cx={p().x + 19}
+                          cy={p().y + 38}
+                          r="4"
+                          class={`topo-led ${ledTone(vm.name)}`}
+                        >
+                          <title>{ledLabel(vm.name)}</title>
+                        </circle>
+                      </>
+                    }
+                  >
+                    {(activePull) => (
+                      <MachinePullIndicator pull={activePull()} x={p().x} y={p().y} />
+                    )}
+                  </Show>
                   {/* hardware badge */}
                   <g class="topo-vm-badge">
                     <rect
@@ -3240,15 +3316,6 @@ export default function TopologyCanvas(props: {
                       {hw()}
                     </text>
                   </g>
-                  {/* power LED (live daemon state) */}
-                  <circle
-                    cx={p().x + 19}
-                    cy={p().y + 38}
-                    r="4"
-                    class={`topo-led ${ledTone(vm.name)}`}
-                  >
-                    <title>{ledLabel(vm.name)}</title>
-                  </circle>
                   <g
                     class="topo-dependency-port"
                     classList={{
@@ -3276,7 +3343,14 @@ export default function TopologyCanvas(props: {
                     x={p().x + VM_W - 70}
                     y={p().y + 8}
                     act="power"
-                    title={vmRunning(vm.name) ? "Stop" : "Start"}
+                    title={
+                      pull()?.status !== "error" && pull()
+                        ? pullLabel(pull()!)
+                        : vmRunning(vm.name)
+                          ? "Stop"
+                          : "Start"
+                    }
+                    disabled={!!pull() && pull()!.status !== "error"}
                     onClick={() => (vmRunning(vm.name) ? vmStop(vm.name) : vmStart(vm.name))}
                   >
                     <Show when={vmRunning(vm.name)} fallback={<Play size={11} />}>
@@ -3381,6 +3455,7 @@ export default function TopologyCanvas(props: {
           <For each={model().containers}>
             {(ctr, ci) => {
               const p = () => ctrPos(ctr.name);
+              const pull = () => currentPullFor(ctr.name);
               const h = () => machineCardHeight(ctr.nics.length);
               const footerY = () => p().y + h() - 30;
               const hw = () => {
@@ -3399,6 +3474,8 @@ export default function TopologyCanvas(props: {
                   classList={{
                     selected: selectedCtr() === ctr.name,
                     locked: containerIsUp(ctr.name),
+                    "is-pulling": !!pull() && pull()!.status !== "error",
+                    "pull-error": pull()?.status === "error",
                     "dependency-target":
                       dependencyDrag() !== null &&
                       !(
@@ -3432,9 +3509,29 @@ export default function TopologyCanvas(props: {
                     {ctr.name.length > 16 ? `${ctr.name.slice(0, 15)}…` : ctr.name}
                     <title>{ctr.name}</title>
                   </text>
-                  <text x={p().x + 34} y={p().y + 35} class="topo-vm-meta">
-                    {ctr.image || "(no image)"}
-                  </text>
+                  <Show
+                    when={pull()}
+                    fallback={
+                      <>
+                        <text x={p().x + 34} y={p().y + 35} class="topo-vm-meta">
+                          {ctr.image || "(no image)"}
+                        </text>
+                        {/* power LED (live daemon state, incl. health) */}
+                        <circle
+                          cx={p().x + 19}
+                          cy={p().y + 38}
+                          r="4"
+                          class={`topo-led ${ctrLedTone(ctr.name)}`}
+                        >
+                          <title>{ctrLedLabel(ctr.name)}</title>
+                        </circle>
+                      </>
+                    }
+                  >
+                    {(activePull) => (
+                      <MachinePullIndicator pull={activePull()} x={p().x} y={p().y} />
+                    )}
+                  </Show>
                   {/* hardware badge */}
                   <g class="topo-vm-badge">
                     <rect
@@ -3448,15 +3545,6 @@ export default function TopologyCanvas(props: {
                       {hw()}
                     </text>
                   </g>
-                  {/* power LED (live daemon state, incl. health) */}
-                  <circle
-                    cx={p().x + 19}
-                    cy={p().y + 38}
-                    r="4"
-                    class={`topo-led ${ctrLedTone(ctr.name)}`}
-                  >
-                    <title>{ctrLedLabel(ctr.name)}</title>
-                  </circle>
                   <g
                     class="topo-dependency-port"
                     classList={{
@@ -3488,7 +3576,14 @@ export default function TopologyCanvas(props: {
                     x={p().x + VM_W - 70}
                     y={p().y + 8}
                     act="power"
-                    title={ctrRunning(ctr.name) ? "Stop" : "Start"}
+                    title={
+                      pull()?.status !== "error" && pull()
+                        ? pullLabel(pull()!)
+                        : ctrRunning(ctr.name)
+                          ? "Stop"
+                          : "Start"
+                    }
+                    disabled={!!pull() && pull()!.status !== "error"}
                     onClick={() =>
                       ctrRunning(ctr.name) ? containerStop(ctr.name) : containerStart(ctr.name)
                     }

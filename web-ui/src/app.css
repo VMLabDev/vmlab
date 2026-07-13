@@ -72,6 +72,46 @@
   margin-bottom: var(--sp-2);
 }
 .console-strip .spacer { flex: 1; }
+.console-pull-state {
+  min-height: 360px; height: 60vh; display: grid; place-items: center;
+  padding: clamp(var(--sp-4), 5vw, var(--sp-8));
+  border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+  background:
+    linear-gradient(color-mix(in oklab, var(--accent-bg) 18%, transparent), transparent 45%),
+    var(--bg-1);
+}
+.console-pull-panel { width: min(580px, 100%); display: flex; flex-direction: column; gap: var(--sp-5); }
+.console-pull-head { display: flex; align-items: flex-start; gap: var(--sp-4); }
+.console-pull-icon {
+  width: 46px; height: 46px; flex: 0 0 auto; display: grid; place-items: center;
+  color: var(--accent); background: var(--accent-bg); border: 1px solid var(--accent);
+  border-radius: var(--r-sm); animation: console-pull-pulse 1.5s ease-in-out infinite;
+}
+.console-pull-copy { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
+.console-pull-copy strong { color: var(--fg-0); font-size: var(--fs-lg); }
+.console-pull-copy > span:last-child { color: var(--fg-2); font-size: var(--fs-sm); line-height: 1.5; }
+.console-pull-kicker {
+  color: var(--accent); font: 700 var(--fs-xs)/1.2 var(--font-mono); letter-spacing: 0.08em;
+}
+.console-pull-foot {
+  display: flex; justify-content: space-between; gap: var(--sp-3);
+  color: var(--fg-3); font: var(--fs-xs)/1.4 var(--font-mono);
+}
+.console-pull-state.error {
+  background:
+    linear-gradient(color-mix(in oklab, var(--danger-bg) 28%, transparent), transparent 45%),
+    var(--bg-1);
+}
+.console-pull-state.error .console-pull-icon {
+  color: var(--danger-fg); background: var(--danger-bg); border-color: var(--danger); animation: none;
+}
+.console-pull-state.error .console-pull-kicker { color: var(--danger-fg); }
+@keyframes console-pull-pulse {
+  50% { box-shadow: 0 0 0 6px color-mix(in oklab, var(--accent) 10%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .console-pull-icon { animation: none; }
+}
 
 /* Key/value rows in the machine card (no forge description-list primitive). */
 .kv {
@@ -213,8 +253,29 @@
   fill: var(--bg-2); stroke: var(--border); stroke-width: 1.25; cursor: grab;
 }
 .topo-vm.selected > rect:first-child { stroke: var(--accent); stroke-width: 2; }
+.topo-vm.is-pulling > rect:first-child {
+  stroke: color-mix(in oklab, var(--accent) 76%, var(--border));
+  filter: drop-shadow(0 0 5px color-mix(in oklab, var(--accent) 24%, transparent));
+}
+.topo-vm.pull-error > rect:first-child { stroke: var(--danger); }
 .topo-vm-name { fill: var(--fg-0); font-size: 13px; font-weight: 600; pointer-events: none; }
 .topo-vm-meta { fill: var(--fg-3); font-size: 10px; pointer-events: none; }
+.topo-pull { pointer-events: none; color: var(--accent); }
+.topo-pull.error { color: var(--danger-fg); }
+.topo-pull-glyph { color: currentColor; animation: topo-pull-breathe 1.25s ease-in-out infinite; }
+.topo-pull.error .topo-pull-glyph { animation: none; }
+.topo-pull-label { fill: currentColor; font: 650 9px/1 var(--font-mono); }
+.topo-pull-track { stroke: var(--border-subtle); stroke-width: 2.5; stroke-linecap: round; }
+.topo-pull-bar { stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; }
+.topo-pull-bar.indeterminate {
+  stroke-dasharray: 24 76;
+  animation: topo-pull-scan 1.1s linear infinite;
+}
+@keyframes topo-pull-scan { to { stroke-dashoffset: -100; } }
+@keyframes topo-pull-breathe { 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) {
+  .topo-pull-glyph, .topo-pull-bar.indeterminate { animation: none; }
+}
 .topo-machine-divider { stroke: var(--border-subtle); stroke-width: 1; pointer-events: none; }
 .topo-nic-row-bg { fill: color-mix(in oklab, var(--bg-1) 58%, transparent); pointer-events: none; }
 .topo-nic-icon { color: var(--fg-3); pointer-events: none; }

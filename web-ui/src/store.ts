@@ -712,6 +712,12 @@ export function currentPulls(): Pull[] {
     .sort((a, b) => a.vm.localeCompare(b.vm));
 }
 
+/** The active template/image pull for one machine in the current lab. */
+export function currentPullFor(machine: string): Pull | undefined {
+  const lab = state.currentLab;
+  return lab ? state.pulls[`${lab}/${machine}`] : undefined;
+}
+
 // --- derived helpers (shared by views) ------------------------------------
 
 export interface StateLook {
