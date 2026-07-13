@@ -23,7 +23,12 @@ use crate::labd::vm::VmInstance;
 /// Where the agent lands inside the guest.
 const LINUX_BIN: &str = "/usr/local/lib/vmlab/vmlab-agent";
 const LINUX_UNIT: &str = "/etc/systemd/system/vmlab-agent.service";
-const WINDOWS_BIN: &str = r"C:\Program Files\vmlab\vmlab-agent.exe";
+// Deliberately space-free: QGA's guest-exec re-quotes argv tokens on Windows,
+// which mangles an embedded-quoted `binPath= "..."` (sc then registers a bad
+// path and StartService fails with error 87). A path without spaces lets
+// `binPath=` ride as a plain unquoted token, the form verified live.
+const WINDOWS_DIR: &str = r"C:\ProgramData\vmlab";
+const WINDOWS_BIN: &str = r"C:\ProgramData\vmlab\vmlab-agent.exe";
 
 const SYSTEMD_UNIT: &str = "\
 [Unit]
@@ -171,7 +176,7 @@ async fn install_windows(qga: &crate::qga::GaClient, asset: &AgentAsset) -> Resu
         "cmd.exe",
         &[
             "/c",
-            r#"if not exist "C:\Program Files\vmlab" mkdir "C:\Program Files\vmlab""#,
+            &format!("if not exist {WINDOWS_DIR} mkdir {WINDOWS_DIR}"),
         ],
     )
     .await?;
@@ -186,7 +191,8 @@ async fn install_windows(qga: &crate::qga::GaClient, asset: &AgentAsset) -> Resu
             &[
                 "create",
                 "vmlab-agent",
-                &format!("binPath= \"{WINDOWS_BIN}\""),
+                "binPath=",
+                WINDOWS_BIN,
                 "start=",
                 "auto",
             ],
@@ -203,7 +209,8 @@ async fn install_windows(qga: &crate::qga::GaClient, asset: &AgentAsset) -> Resu
             &[
                 "config",
                 "vmlab-agent",
-                &format!("binPath= \"{WINDOWS_BIN}\""),
+                "binPath=",
+                WINDOWS_BIN,
                 "start=",
                 "auto",
             ],
