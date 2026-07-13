@@ -4,6 +4,7 @@
 //! - [`qimg`] — async `qemu-img` wrappers (blank disks, linked clones, info).
 //! - [`store`] — the on-disk store at `~/.local/share/vmlab/templates`.
 
+pub mod agent_install;
 pub mod artefact;
 pub mod build;
 pub mod cli;

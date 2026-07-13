@@ -212,6 +212,30 @@ async fn run_build(
     )
     .await?;
 
+    // Bake the vmlab-agent right after boot, before any provision script —
+    // a final sysprep/generalize provision may shut the guest down, so
+    // post-provision would be too late. The verified asset version lands in
+    // the sealed metadata below.
+    let agent_version: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    {
+        let wants_agent = def.agent;
+        let arch = def.arch.clone();
+        let agent_version = agent_version.clone();
+        *runtime.pre_provision.write().expect("pre_provision lock") =
+            Some(Arc::new(move |vm, out| {
+                let arch = arch.clone();
+                let agent_version = agent_version.clone();
+                Box::pin(async move {
+                    let log = move |s: String| out(s);
+                    let version =
+                        super::agent_install::install(&vm, wants_agent, &arch, &log).await?;
+                    *agent_version.lock().expect("agent_version lock") = version;
+                    Ok(())
+                })
+            }));
+    }
+
     let vm = runtime.vm(build_vm)?;
     let disk0 = vm.dirs.primary_disk();
     std::fs::create_dir_all(disk0.parent().unwrap())?;
@@ -329,6 +353,7 @@ async fn run_build(
         registry: def.registry.clone(),
         sha256: Some(sha),
         first_boot_script,
+        agent_version: agent_version.lock().expect("agent_version lock").clone(),
     };
 
     store

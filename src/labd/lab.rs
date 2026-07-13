@@ -47,7 +47,22 @@ pub struct LabRuntime {
     /// Serialises pull runs (concurrent `up` + `pull` + `vm.start` must not
     /// double-download); the loser re-checks the pending list and no-ops.
     pull_lock: Mutex<()>,
+    /// Runs per VM after boot but before any provision script — template
+    /// builds install the vmlab-agent here, so it lands even when the last
+    /// provision generalizes/shuts the guest down (Windows sysprep). Std
+    /// lock: set once before `up`, cloned out, never held across await.
+    pub pre_provision: std::sync::RwLock<Option<PreProvisionHook>>,
 }
+
+/// See [`LabRuntime::pre_provision`].
+pub type PreProvisionHook = Arc<
+    dyn Fn(
+            Arc<VmInstance>,
+            crate::scripting::OutputSink,
+        ) -> futures::future::BoxFuture<'static, Result<()>>
+        + Send
+        + Sync,
+>;
 
 /// One outstanding deferred download.
 #[derive(Clone)]
@@ -163,6 +178,7 @@ impl LabRuntime {
             }
 
             let first_boot_script = meta.as_ref().and_then(|m| m.first_boot_script.clone());
+            let agent_version = meta.as_ref().and_then(|m| m.agent_version.clone());
             // Each NIC inherits its segment's effective MTU (jumbo on NAT/global
             // by default); drives `host_mtu=` on virtio NICs in the cmdline.
             let nic_mtus: Vec<u16> = vm_cfg
@@ -194,6 +210,7 @@ impl LabRuntime {
                     backing,
                     disk_size,
                     first_boot_script,
+                    agent_version,
                 },
             );
             vms.insert(vm_cfg.name.clone(), vm);
@@ -322,6 +339,7 @@ impl LabRuntime {
             profiles: profiles.clone(),
             pending_pulls: Mutex::new(pending),
             pull_lock: Mutex::new(()),
+            pre_provision: std::sync::RwLock::new(None),
         }))
     }
 
@@ -436,6 +454,7 @@ impl LabRuntime {
                     backing: Some(resolved.disk_path.clone()),
                     disk_size: None,
                     first_boot_script: resolved.meta.first_boot_script.clone(),
+                    agent_version: resolved.meta.agent_version.clone(),
                 });
                 Ok(())
             }
@@ -1249,6 +1268,12 @@ impl LabRuntime {
                     // can be considered ready (§6.1). A no-op for templates
                     // without one, so leaf-VM timing is unchanged.
                     me.run_first_boot(&n, &out).await?;
+                    // Pre-provision hook (template builds bake the
+                    // vmlab-agent here — see `LabRuntime::pre_provision`).
+                    let hook = me.pre_provision.read().expect("pre_provision lock").clone();
+                    if let Some(hook) = hook {
+                        hook(me.vm(&n)?.clone(), out.clone()).await?;
+                    }
                     // Only gate the wave on readiness when something later
                     // depends on this VM.
                     if me.has_dependents(&n) {
@@ -1615,6 +1640,9 @@ impl LabRuntime {
                 "cpus": vm.cfg.cpus,
                 "memory": vm.cfg.memory,
                 "nics": nics,
+                // The template carries a baked-in vmlab-agent (terminal
+                // support); null on vintage guests and pre-agent templates.
+                "agent_version": vm.template().agent_version,
             }));
         }
         let mut containers = Vec::new();

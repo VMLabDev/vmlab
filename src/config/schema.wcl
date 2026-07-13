@@ -404,6 +404,8 @@ type TemplateDef {
   qemu_args: list<utf8>?
   @doc("wscript run on first instantiation of a clone, before ready")
   first_boot: utf8?
+  @doc("Bake the vmlab-agent service into the image (default true)")
+  agent: bool?
   @doc("What the build starts from — exactly one of four forms (required)")
   @child("source")       source: TemplateSource
   @doc("ISO/floppy images attached to the build")

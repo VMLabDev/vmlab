@@ -45,6 +45,10 @@ pub struct TemplateMeta {
     /// Embedded wscript script (full source text) run the first time a VM is
     /// instantiated from this template, before it is reported ready (PRD §6.1).
     pub first_boot_script: Option<String>,
+    /// Version stamp of the vmlab-agent baked into the image by the template
+    /// build (`None` = template predates agent support: no interactive
+    /// terminal, exec/copy fall back to QGA).
+    pub agent_version: Option<String>,
 }
 
 impl TemplateMeta {
@@ -93,6 +97,9 @@ impl TemplateMeta {
         }
         if let Some(s) = &self.first_boot_script {
             let _ = writeln!(out, "  first_boot_script = {}", quote(s));
+        }
+        if let Some(a) = &self.agent_version {
+            let _ = writeln!(out, "  agent_version = {}", quote(a));
         }
         let _ = writeln!(out, "}}");
         out
@@ -168,6 +175,7 @@ fn extract(block: &Block) -> Result<TemplateMeta> {
         registry: get_str(block, "registry")?,
         sha256: get_str(block, "sha256")?,
         first_boot_script: get_str(block, "first_boot_script")?,
+        agent_version: get_str(block, "agent_version")?,
     })
 }
 
@@ -293,6 +301,7 @@ mod tests {
             first_boot_script: Some(
                 "use vmlab\nfn main(lab) {\n    let vm = lab.this_vm()\n}\n".into(),
             ),
+            agent_version: Some("agent=abc123".into()),
         }
     }
 
@@ -314,6 +323,7 @@ mod tests {
             registry: None,
             sha256: None,
             first_boot_script: None,
+            agent_version: None,
         }
     }
 

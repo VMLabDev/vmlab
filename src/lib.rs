@@ -4,6 +4,7 @@
 //! and `template` for the visual lab editor and its catalog pickers); the
 //! rest stays crate-internal and is reached via `crate::…` as before.
 
+pub mod agent_asset;
 pub mod cli;
 pub mod config;
 pub mod guest_asset;

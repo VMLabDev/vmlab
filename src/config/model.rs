@@ -485,6 +485,9 @@ pub struct TemplateDef {
     /// Wscript script (path relative to the template root) run the first time a VM
     /// is instantiated from this template, before it is reported ready (§6.1).
     pub first_boot: Option<PathBuf>,
+    /// Bake the vmlab-agent service into the image (default true; the escape
+    /// hatch for guests where the install step misbehaves).
+    pub agent: bool,
     pub source: TemplateSource,
     pub media: Vec<Media>,
     pub provisions: Vec<Provision>,

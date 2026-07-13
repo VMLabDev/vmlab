@@ -56,9 +56,14 @@ install:
 guest-build arch='x86_64 aarch64':
 	./guest/build-asset.sh {{arch}}
 
-# Build + install the guest asset into ~/.local/share/vmlab/guest
+# Build the vmlab-agent guest binaries (all targets; missing toolchains skip)
 [group('build')]
-guest-install: guest-build
+agent-build target='':
+	./guest/build-agent.sh {{target}}
+
+# Build + install the guest asset and agent binaries into ~/.local/share/vmlab/guest
+[group('build')]
+guest-install: guest-build agent-build
 	mkdir -p ~/.local/share/vmlab/guest
 	cp -r guest/dist/* ~/.local/share/vmlab/guest/
 

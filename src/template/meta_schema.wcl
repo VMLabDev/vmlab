@@ -27,4 +27,5 @@ type TemplateMeta {
   registry: utf8?     // full OCI repo this template publishes to
   sha256: utf8?       // hex digest of disk.qcow2
   first_boot_script: utf8?  // embedded wscript script run on first instantiation
+  agent_version: utf8?      // vmlab-agent stamp baked in by the template build
 }

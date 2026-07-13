@@ -49,6 +49,9 @@ pub struct TemplateConfig {
     /// Embedded first-boot wscript script source (PRD §6.1).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub first_boot_script: Option<String>,
+    /// vmlab-agent stamp baked into the image by the template build.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub agent_version: Option<String>,
 }
 
 impl TemplateConfig {
@@ -70,6 +73,7 @@ impl TemplateConfig {
             registry: meta.registry.clone(),
             sha256: meta.sha256.clone(),
             first_boot_script: meta.first_boot_script.clone(),
+            agent_version: meta.agent_version.clone(),
         }
     }
 
@@ -97,6 +101,7 @@ impl TemplateConfig {
             registry: self.registry,
             sha256: self.sha256,
             first_boot_script: self.first_boot_script,
+            agent_version: self.agent_version,
         })
     }
 
@@ -134,6 +139,7 @@ mod tests {
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),
             sha256: Some("ab".repeat(32)),
             first_boot_script: Some("use vmlab\nfn main(lab) { let vm = lab.this_vm() }\n".into()),
+            agent_version: Some("agent=abc123".into()),
         }
     }
 

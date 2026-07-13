@@ -118,6 +118,9 @@ pub struct TemplateParts {
     /// (None for scratch / templates without one). Run on first instantiation,
     /// before the VM is reported ready (PRD §6.1).
     pub first_boot_script: Option<String>,
+    /// vmlab-agent stamp the template build baked in (`None` = the template
+    /// predates agent support — no terminal; exec/copy fall back to QGA).
+    pub agent_version: Option<String>,
 }
 
 /// One share the guest mounts natively over virtiofs this run (§7.5) —

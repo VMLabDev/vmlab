@@ -1163,6 +1163,7 @@ mod tests {
             registry: None,
             sha256: None,
             first_boot_script: None,
+            agent_version: None,
         }
     }
 
@@ -1551,6 +1552,7 @@ mod tests {
             registry: None,
             sha256: None,
             first_boot_script: None,
+            agent_version: None,
         };
         std::fs::create_dir_all(store.root()).unwrap();
         let staging = tempfile::tempdir_in(store.root()).unwrap();
