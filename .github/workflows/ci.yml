@@ -56,6 +56,42 @@ jobs:
           pnpm build
       - run: just check
 
+  # The guest-side crates (cinit, agent, and their proto contracts) are
+  # standalone — never swept into the host build — so lint/test them and the
+  # agent's cross targets (musl, windows-gnu) explicitly. cargo check on the
+  # Windows target type-checks without needing a linker; the full binaries
+  # link in the Containerfile's guest stage.
+  guest-crates:
+    name: guest crates (cinit + agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, riscv64gc-unknown-linux-musl, x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            guest/cinit-proto
+            guest/cinit
+            guest/agent-proto
+            guest/agent
+      - name: Lint + test
+        run: |
+          for crate in cinit-proto cinit agent-proto agent; do
+            echo "::group::$crate"
+            cargo fmt --check --manifest-path "guest/$crate/Cargo.toml"
+            cargo clippy --all-targets --manifest-path "guest/$crate/Cargo.toml" -- -D warnings
+            cargo test --manifest-path "guest/$crate/Cargo.toml"
+            echo "::endgroup::"
+          done
+      - name: Cross-check agent targets
+        run: |
+          cargo clippy --target x86_64-pc-windows-gnu \
+            --manifest-path guest/agent/Cargo.toml -- -D warnings
+          ./guest/build-agent.sh linux-x86_64 linux-aarch64 linux-riscv64
+
   # The committed BPF fast-path objects (src/net/fastpath/bpf/) must match
   # the ebpf/ sources: rebuild with the pinned toolchain and byte-diff.
   # bpf-linker's LLVM proxy dlopens the pinned toolchain's libLLVM, so the

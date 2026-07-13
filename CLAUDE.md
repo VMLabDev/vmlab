@@ -30,6 +30,13 @@ PRD implemented (M1–M6). Module map under `src/`:
 - `guest_asset.rs` + `guest/` — the container micro-VM kernel/initramfs:
   `vmlab-cinit` (guest PID 1), `cinit-proto` (host↔init contract, shared
   crate), `build-asset.sh` (pinned Alpine, rootless build).
+- `agent_asset.rs` + `guest/agent`, `guest/agent-proto` — `vmlab-agent`, the
+  in-guest agent on the `vmlab.agent.0` virtio-serial port: interactive
+  terminals (PTY/ConPTY), streaming exec, file transfer, tail, metrics,
+  clipboard — no guest network involved. Baked into templates by
+  `template/agent_install.rs`; spawned by cinit inside container micro-VMs;
+  `labd/vm_agent.rs` is the host-side client; `build-agent.sh` builds the
+  per-target binaries (musl + windows-gnu).
 - `media/` — folder → ISO/floppy with content-addressed cache.
 - `vision/` — screenshot, template matching, OCR.
 - `net/` — userspace fabric: frame codecs, L2 switch, DHCP, DNS, gateway,

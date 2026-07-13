@@ -44,15 +44,18 @@ RUN pnpm build
 
 # ---- guest asset --------------------------------------------------------------
 # The container micro-VM kernel + initramfs (PRD §18): pinned Alpine linux-virt
-# + a static-musl vmlab-cinit, assembled rootlessly. Baked into the runtime
-# image so lab containers work offline, preserving the no-privileges promise.
+# + a static-musl vmlab-cinit and vmlab-agent, assembled rootlessly. Baked into
+# the runtime image so lab containers work offline, preserving the
+# no-privileges promise. The standalone agent binaries (dist/agent/…) are what
+# template builds bake into images; mingw cross-compiles the Windows one.
 FROM rust:1.92-bookworm AS guest
-RUN apt-get update && apt-get install -y --no-install-recommends cpio \
+RUN apt-get update && apt-get install -y --no-install-recommends cpio mingw-w64 \
     && rm -rf /var/lib/apt/lists/* \
-    && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+    && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+       riscv64gc-unknown-linux-musl x86_64-pc-windows-gnu
 WORKDIR /build
 COPY guest/ ./guest/
-RUN ./guest/build-asset.sh x86_64 aarch64
+RUN ./guest/build-asset.sh x86_64 aarch64 && ./guest/build-agent.sh
 
 # Bookworm ships the RISC-V QEMU system emulator but not its EDK2 package.
 # Pull the architecture-independent CODE/VARS blobs from Trixie while keeping
