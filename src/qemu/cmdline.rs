@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use vmlab_agent_proto::PORT_NAME as AGENT_PORT_NAME;
 
 use super::firmware;
 use super::resolve::ResolvedVm;
@@ -16,6 +17,9 @@ use crate::profiles::{DiskBus, FirmwareKind};
 pub struct VmPaths {
     pub qmp_sock: PathBuf,
     pub qga_sock: PathBuf,
+    /// vmlab-agent channel (`vmlab.agent.0`): interactive terminals,
+    /// streaming exec, file transfer, metrics — see `guest/agent-proto`.
+    pub agent_sock: PathBuf,
     pub vnc_sock: PathBuf,
     /// Primary disk qcow2 (linked clone or blank).
     pub primary_disk: PathBuf,
@@ -215,7 +219,9 @@ pub fn build_args(
     }
     // SeaBIOS is the QEMU default on x86 — nothing to add.
 
-    // Guest agent virtio-serial channel (§7.4).
+    // Guest agent virtio-serial channels (§7.4): QGA plus the vmlab-agent
+    // port (interactive terminals / exec / files — guest/agent-proto). Both
+    // ride one virtio-serial bus; QEMU listens, the daemon connects.
     if vm.agent_channel {
         arg(
             &mut a,
@@ -225,11 +231,24 @@ pub fn build_args(
                 paths.qga_sock.display()
             ),
         );
+        arg(
+            &mut a,
+            "chardev",
+            format!(
+                "socket,id=vagent0,path={},server=on,wait=off",
+                paths.agent_sock.display()
+            ),
+        );
         arg(&mut a, "device", "virtio-serial-pci".into());
         arg(
             &mut a,
             "device",
             "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0".into(),
+        );
+        arg(
+            &mut a,
+            "device",
+            format!("virtserialport,chardev=vagent0,name={}", AGENT_PORT_NAME),
         );
     }
 
@@ -489,6 +508,7 @@ mod tests {
         VmPaths {
             qmp_sock: "/run/l/t/qmp.sock".into(),
             qga_sock: "/run/l/t/qga.sock".into(),
+            agent_sock: "/run/l/t/agent.sock".into(),
             vnc_sock: "/run/l/t/vnc.sock".into(),
             primary_disk: "/lab/.vmlab/t/disk0.qcow2".into(),
             nics: vec![NicSpec {
@@ -550,6 +570,8 @@ mod tests {
         assert!(s.contains("tpm-tis,tpmdev=tpm0"));
         assert!(s.contains("virtio-vga"));
         assert!(s.contains("org.qemu.guest_agent.0"));
+        assert!(s.contains("socket,id=vagent0,path=/run/l/t/agent.sock"), "{s}");
+        assert!(s.contains("virtserialport,chardev=vagent0,name=vmlab.agent.0"), "{s}");
         assert!(s.contains("netdev=net0,mac=52:54:00:00:00:01"));
         assert!(s.contains("-vnc unix:/run/l/t/vnc.sock"));
         assert!(s.contains("usb-tablet"));
@@ -567,6 +589,18 @@ mod tests {
         assert!(s.contains("e1000,netdev=net0"));
         assert!(s.contains("-device VGA"));
         assert!(!s.contains("tpm"));
+    }
+
+    /// Vintage guests (`agent_channel = false`) get no virtio-serial bus at
+    /// all — neither the QGA port nor the vmlab-agent port.
+    #[test]
+    fn no_agent_channel_emits_no_virtio_serial() {
+        let mut vm = resolved("windows-legacy", "x86_64");
+        vm.agent_channel = false;
+        let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
+        assert!(!s.contains("virtserialport"), "{s}");
+        assert!(!s.contains("virtio-serial-pci"), "{s}");
+        assert!(!s.contains("vmlab.agent.0"), "{s}");
     }
 
     #[test]

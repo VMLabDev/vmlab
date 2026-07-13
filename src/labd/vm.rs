@@ -61,6 +61,15 @@ impl VmDirs {
     pub fn qga_sock(&self) -> PathBuf {
         self.run.join("qga.sock")
     }
+    /// vmlab-agent channel (`vmlab.agent.0`): terminals/exec/files/metrics.
+    pub fn agent_sock(&self) -> PathBuf {
+        self.run.join("agent.sock")
+    }
+    /// Host-side unix socket re-exposing one agent terminal session as a raw
+    /// byte pipe (what `vmlab shell` and the web terminal attach to).
+    pub fn term_session_sock(&self, id: u32) -> PathBuf {
+        self.run.join(format!("term-{id}.sock"))
+    }
     pub fn vnc_sock(&self) -> PathBuf {
         self.run.join("vnc.sock")
     }
@@ -340,6 +349,7 @@ impl VmInstance {
         Ok(VmPaths {
             qmp_sock: self.dirs.qmp_sock(),
             qga_sock: self.dirs.qga_sock(),
+            agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),
             primary_disk: self.dirs.primary_disk(),
             extra_disks: self

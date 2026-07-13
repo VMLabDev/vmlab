@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Single-host virtual machine lab orchestrator"
-# guest/ holds the micro-VM guest-side crates and build assets; only
-# guest/cinit-proto is consumed here (as a path dependency below). The rest —
-# notably guest/cinit, which is musl-only and allows unsafe — must never be
+# guest/ holds the micro-VM guest-side crates and build assets; only the
+# wire-contract crates guest/cinit-proto and guest/agent-proto are consumed
+# here (as path dependencies below). The rest — notably guest/cinit and
+# guest/agent, which build for guest targets and allow unsafe — must never be
 # swept into this package. ebpf/ is the BPF fast-path workspace (nightly +
 # bpf-linker, allows unsafe); only its committed objects under
 # src/net/fastpath/bpf/ are consumed here. tap/ is the TAP-ioctl helper
@@ -60,6 +61,9 @@ wscript = { git = "https://github.com/Configweave/wscript.git", rev = "fcd512362
 # containers in labs. Shared with the guest init (guest/cinit); plain serde,
 # so it builds for the host like any other dependency.
 vmlab-cinit-proto = { path = "guest/cinit-proto" }
+# Host <-> vmlab-agent contract (frame mux: terminals, exec, files, metrics)
+# for VMs and containers. Shared with the guest agent (guest/agent).
+vmlab-agent-proto = { path = "guest/agent-proto" }
 
 anyhow = "1"
 thiserror = "2"

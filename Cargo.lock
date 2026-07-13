@@ -2958,11 +2958,20 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "vmlab-agent-proto",
  "vmlab-cinit-proto",
  "vmlab-tap",
  "wcl_lang",
  "wscript",
  "zstd",
+]
+
+[[package]]
+name = "vmlab-agent-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

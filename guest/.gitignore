@@ -5,3 +5,5 @@ dist/
 # Standalone-crate build dirs (these crates are not workspace members).
 cinit/target/
 cinit-proto/target/
+agent/target/
+agent-proto/target/

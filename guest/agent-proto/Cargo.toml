@@ -1,0 +1,21 @@
+# The host <-> vmlab-agent wire contract. Deliberately tiny: the frame codec
+# and serde types only, so it builds for the host (a normal dependency of the
+# main `vmlab` crate), the static-musl Linux agent, and the Windows agent
+# alike.
+
+[package]
+name = "vmlab-agent-proto"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Host <-> guest agent (vmlab-agent) wire contract for vmlab VMs and containers"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "deny"
+
+# Standalone: not a member of any surrounding workspace.
+[workspace]
