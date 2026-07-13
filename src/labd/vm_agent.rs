@@ -128,6 +128,9 @@ const SESSION_QUEUE: usize = 2048;
 const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Inner {
+    /// The connection's runtime, so cleanup can be spawned from any thread
+    /// (scripts drop sessions on non-runtime threads).
+    rt: tokio::runtime::Handle,
     writer: Mutex<OwnedWriteHalf>,
     sessions: Mutex<HashMap<u32, SessionEntry>>,
     /// Waiters for `opened`/error replies to an `open_*` message, keyed by
@@ -165,6 +168,7 @@ impl AgentHandle {
 
         let token = format!("{:016x}", rand::random::<u64>());
         let inner = Arc::new(Inner {
+            rt: tokio::runtime::Handle::current(),
             writer: Mutex::new(write_half),
             sessions: Mutex::new(HashMap::new()),
             open_waiters: std::sync::Mutex::new(HashMap::new()),
@@ -557,6 +561,11 @@ impl AgentSession {
         self.handle.send_msg(&HostMsg::Eof { id: self.id }).await
     }
 
+    /// Resize this terminal session's PTY.
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.handle.resize(self.id, cols, rows).await
+    }
+
     /// Explicitly close (also implied by drop).
     pub async fn close(mut self) {
         self.forget().await;
@@ -584,7 +593,10 @@ impl Drop for AgentSession {
         let handle = self.handle.clone();
         let id = self.id;
         handle.inner.open_waiters.lock().unwrap().remove(&id);
-        tokio::spawn(async move {
+        // Spawned on the connection's own runtime: a drop on a non-runtime
+        // thread (script executors) must not panic.
+        let rt = handle.inner.rt.clone();
+        rt.spawn(async move {
             handle.inner.sessions.lock().await.remove(&id);
             let _ = handle.send_msg(&HostMsg::Close { id }).await;
         });

@@ -7,6 +7,7 @@
 pub mod interact;
 pub mod keymap;
 mod runner;
+pub mod terminal;
 
 use crate::sync::LockRecover;
 use std::path::PathBuf;
@@ -96,6 +97,43 @@ pub struct ExecResult {
     pub stderr: String,
 }
 
+/// One guest metrics sample (`vm.stats()` / `container.stats()`, via the
+/// vmlab-agent `metrics` feature).
+#[derive(Script, Clone)]
+pub struct GuestStats {
+    pub cpu_pct: f64,
+    pub mem_used: i64,
+    pub mem_total: i64,
+    pub disks: Vec<DiskStat>,
+}
+
+/// One mounted filesystem in [`GuestStats`].
+#[derive(Script, Clone)]
+pub struct DiskStat {
+    pub mount: String,
+    pub used: i64,
+    pub total: i64,
+}
+
+impl From<crate::labd::vm_agent::MetricsSnapshot> for GuestStats {
+    fn from(m: crate::labd::vm_agent::MetricsSnapshot) -> Self {
+        GuestStats {
+            cpu_pct: m.cpu_pct as f64,
+            mem_used: m.mem_used as i64,
+            mem_total: m.mem_total as i64,
+            disks: m
+                .disks
+                .into_iter()
+                .map(|d| DiskStat {
+                    mount: d.mount,
+                    used: d.used as i64,
+                    total: d.total as i64,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// An image/text match: location + score, usable to anchor a relative
 /// mouse click (PRD §10.3).
 #[derive(Script, Clone)]
@@ -145,6 +183,42 @@ pub struct EventData {
 
 fn estr(e: impl std::fmt::Display) -> String {
     format!("{e:#}")
+}
+
+/// `vm.exec` / `vm.exec_timeout`: the vmlab-agent transport when the guest
+/// has one, QGA otherwise. Same captured-output result either way.
+fn vm_exec(
+    v: &VmHandle,
+    cmd: String,
+    args: Vec<String>,
+    timeout: Duration,
+) -> Result<ExecResult, String> {
+    v.block(async {
+        if let Ok(agent) = v.vm.agent().await {
+            let mut argv = vec![cmd.clone()];
+            argv.extend(args.iter().cloned());
+            let r = agent
+                .exec(argv, vec![], None, None, timeout)
+                .await
+                .map_err(estr)?;
+            return Ok(ExecResult {
+                exit_code: r.exit_code as i64,
+                stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+            });
+        }
+        let qga = v.vm.qga().await.map_err(estr)?;
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let r = qga
+            .exec(&cmd, &arg_refs, true, timeout)
+            .await
+            .map_err(estr)?;
+        Ok(ExecResult {
+            exit_code: r.exit_code as i64,
+            stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+        })
+    })
 }
 
 impl VmHandle {
@@ -675,23 +749,13 @@ pub fn lab_module() -> Module {
                 }
             },
         )
-        // Guest agent (§10.3)
+        // Guest agent (§10.3). Exec and file transfer prefer the vmlab-agent
+        // channel (streamed, no polling, no base64); guests from pre-agent
+        // templates fall back to QGA transparently.
         .method(
             "exec",
             |v: &VmHandle, cmd: String, args: Vec<String>| -> Result<ExecResult, String> {
-                v.block(async {
-                    let qga = v.vm.qga().await.map_err(estr)?;
-                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                    let r = qga
-                        .exec(&cmd, &arg_refs, true, Duration::from_secs(120))
-                        .await
-                        .map_err(estr)?;
-                    Ok(ExecResult {
-                        exit_code: r.exit_code as i64,
-                        stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
-                    })
-                })
+                vm_exec(v, cmd, args, Duration::from_secs(120))
             },
         )
         .method(
@@ -701,31 +765,27 @@ pub fn lab_module() -> Module {
              args: Vec<String>,
              timeout_secs: i64|
              -> Result<ExecResult, String> {
-                v.block(async {
-                    let qga = v.vm.qga().await.map_err(estr)?;
-                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                    let r = qga
-                        .exec(
-                            &cmd,
-                            &arg_refs,
-                            true,
-                            Duration::from_secs(timeout_secs.max(1) as u64),
-                        )
-                        .await
-                        .map_err(estr)?;
-                    Ok(ExecResult {
-                        exit_code: r.exit_code as i64,
-                        stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
-                    })
-                })
+                vm_exec(
+                    v,
+                    cmd,
+                    args,
+                    Duration::from_secs(timeout_secs.max(1) as u64),
+                )
             },
         )
         .method(
             "copy_to",
             |v: &VmHandle, local: String, guest_path: String| -> Result<(), String> {
-                let data = std::fs::read(v.resolve_ref(&local)).map_err(estr)?;
+                let src = v.resolve_ref(&local);
                 v.block(async {
+                    if let Ok(agent) = v.vm.agent().await {
+                        agent
+                            .push_file(&src, &guest_path, None)
+                            .await
+                            .map_err(estr)?;
+                        return Ok(());
+                    }
+                    let data = tokio::fs::read(&src).await.map_err(estr)?;
                     let qga = v.vm.qga().await.map_err(estr)?;
                     qga.file_write(&guest_path, &data, Duration::from_secs(60))
                         .await
@@ -736,19 +796,52 @@ pub fn lab_module() -> Module {
         .method(
             "copy_from",
             |v: &VmHandle, guest_path: String, local: String| -> Result<(), String> {
-                let data = v.block(async {
-                    let qga = v.vm.qga().await.map_err(estr)?;
-                    qga.file_read(&guest_path, Duration::from_secs(60))
-                        .await
-                        .map_err(estr)
-                })?;
                 let out = v.resolve_ref(&local);
                 if let Some(parent) = out.parent() {
                     std::fs::create_dir_all(parent).map_err(estr)?;
                 }
-                std::fs::write(out, data).map_err(estr)
+                v.block(async {
+                    if let Ok(agent) = v.vm.agent().await {
+                        agent.pull_file(&guest_path, &out).await.map_err(estr)?;
+                        return Ok(());
+                    }
+                    let qga = v.vm.qga().await.map_err(estr)?;
+                    let data = qga
+                        .file_read(&guest_path, Duration::from_secs(60))
+                        .await
+                        .map_err(estr)?;
+                    tokio::fs::write(&out, data).await.map_err(estr)
+                })
             },
-        );
+        )
+        // Interactive terminal (send/expect; vmlab-agent `terminal` feature).
+        .method(
+            "terminal",
+            |v: &VmHandle| -> Result<terminal::TerminalHandle, String> {
+                let session = v.block(async {
+                    let agent = v.vm.agent().await.map_err(estr)?;
+                    agent
+                        .open_terminal(terminal::SCRIPT_COLS, terminal::SCRIPT_ROWS, None)
+                        .await
+                        .map_err(estr)
+                })?;
+                Ok(terminal::TerminalHandle::new(
+                    v.vm.cfg.name.clone(),
+                    v.rt.clone(),
+                    session,
+                ))
+            },
+        )
+        .method("stats", |v: &VmHandle| -> Result<GuestStats, String> {
+            v.block(async {
+                let agent = v.vm.agent().await.map_err(estr)?;
+                agent
+                    .stats(Duration::from_secs(10))
+                    .await
+                    .map(GuestStats::from)
+                    .map_err(estr)
+            })
+        });
 
     // -- Container (§16) -------------------------------------------------------
     m.ty::<ContainerHandle>()
@@ -949,7 +1042,68 @@ pub fn lab_module() -> Module {
             |c: &ContainerHandle, lines: i64| -> Result<String, String> {
                 c.container.logs(lines.max(0) as usize).map_err(estr)
             },
+        )
+        // Interactive terminal + metrics (vmlab-agent).
+        .method(
+            "terminal",
+            |c: &ContainerHandle| -> Result<terminal::TerminalHandle, String> {
+                let session = c.block(async {
+                    let agent = c.container.agent().await.map_err(estr)?;
+                    agent
+                        .open_terminal(terminal::SCRIPT_COLS, terminal::SCRIPT_ROWS, None)
+                        .await
+                        .map_err(estr)
+                })?;
+                Ok(terminal::TerminalHandle::new(
+                    c.container.cfg.name.clone(),
+                    c.rt.clone(),
+                    session,
+                ))
+            },
+        )
+        .method(
+            "stats",
+            |c: &ContainerHandle| -> Result<GuestStats, String> {
+                c.block(async {
+                    let agent = c.container.agent().await.map_err(estr)?;
+                    agent
+                        .stats(Duration::from_secs(10))
+                        .await
+                        .map(GuestStats::from)
+                        .map_err(estr)
+                })
+            },
         );
+
+    // -- Terminal sessions (send/expect) ---------------------------------------
+    m.ty::<terminal::TerminalHandle>()
+        .method(
+            "send",
+            |t: &terminal::TerminalHandle, text: String| -> Result<(), String> { t.send(&text) },
+        )
+        .method(
+            "send_line",
+            |t: &terminal::TerminalHandle, text: String| -> Result<(), String> {
+                t.send_line(&text)
+            },
+        )
+        .method("read", |t: &terminal::TerminalHandle| -> String {
+            t.read()
+        })
+        .method(
+            "expect",
+            |t: &terminal::TerminalHandle,
+             pattern: String,
+             timeout_secs: i64|
+             -> Result<String, String> { t.expect(&pattern, timeout_secs) },
+        )
+        .method(
+            "resize",
+            |t: &terminal::TerminalHandle, cols: i64, rows: i64| -> Result<(), String> {
+                t.resize(cols, rows)
+            },
+        )
+        .method("close", |t: &terminal::TerminalHandle| t.close());
 
     m
 }
@@ -961,6 +1115,8 @@ pub fn context() -> Context {
         .register_type::<ExecResult>()
         .register_type::<ScriptMatch>()
         .register_type::<EventData>()
+        .register_type::<GuestStats>()
+        .register_type::<DiskStat>()
 }
 
 /// Compile-check a script (used by `vmlab validate`, PRD §5.1).
@@ -1074,6 +1230,47 @@ fn main(lab: Lab) {
 }
 "#;
         check_script_source(src).expect("container API surface should type-check");
+    }
+
+    #[test]
+    fn terminal_api_compiles() {
+        // The send/expect terminal handle + metrics, on VMs and containers.
+        let src = r#"
+use vmlab
+
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    match vm.terminal() {
+        Ok(t) => {
+            let s = t.send_line("hostname")
+            match t.expect("box", 10) {
+                Ok(out) => lab.log("saw: " + out),
+                Err(e) => lab.log(e),
+            }
+            let raw = t.send("\u{3}")
+            lab.log(t.read())
+            let rz = t.resize(200, 50)
+            t.close()
+        }
+        Err(e) => lab.log("no terminal: " + e),
+    }
+    match vm.stats() {
+        Ok(s) => {
+            let cpu: float = s.cpu_pct
+            let mem: int = s.mem_used
+            for d in s.disks {
+                let usage: int = d.used
+                lab.log(d.mount)
+            }
+        }
+        Err(e) => lab.log(e),
+    }
+    let Ok(web) = lab.container("web") else { return }
+    let ct = web.terminal()
+    let cs = web.stats()
+}
+"#;
+        check_script_source(src).expect("terminal API surface should type-check");
     }
 
     #[test]
