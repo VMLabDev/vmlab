@@ -129,6 +129,10 @@ pub struct VirtiofsMount {
     pub readonly: bool,
 }
 
+/// What to tell a user whose guest has no answering vmlab-agent.
+const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the template likely predates \
+     agent support) — rebuild it with `vmlab template build`";
+
 pub struct VmInstance {
     pub lab: String,
     pub cfg: model::Vm,
@@ -167,6 +171,11 @@ pub struct VmInstance {
     virtiofs_mounts: Mutex<Vec<VirtiofsMount>>,
     qmp: Mutex<Option<QmpClient>>,
     qga: Mutex<Option<GaClient>>,
+    /// Lazy vmlab-agent connection (terminals/exec/files — §"agent channel").
+    agent: Mutex<Option<super::vm_agent::AgentHandle>>,
+    /// When the last agent handshake failed, so agent-less templates don't
+    /// pay the handshake timeout on every call that would prefer the agent.
+    agent_failed_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl VmInstance {
@@ -203,6 +212,8 @@ impl VmInstance {
             virtiofs_mounts: Mutex::new(Vec::new()),
             qmp: Mutex::new(None),
             qga: Mutex::new(None),
+            agent: Mutex::new(None),
+            agent_failed_at: Mutex::new(None),
         })
     }
 
@@ -294,6 +305,59 @@ impl VmInstance {
             .await
             .clone()
             .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
+    }
+
+    /// The vmlab-agent channel, connecting (with the token handshake) on
+    /// first use. A failed handshake is remembered briefly so agent-less
+    /// guests don't pay the timeout on every exec that would prefer the
+    /// agent transport.
+    pub async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
+        if self.state().await != PowerState::Running {
+            bail!("{}: not running", self.cfg.name);
+        }
+        if !self.template().resolved.agent_channel {
+            bail!(
+                "{}: this guest profile has no agent channel (vintage guest) — \
+                 no interactive terminal is possible",
+                self.cfg.name
+            );
+        }
+        let mut agent = self.agent.lock().await;
+        if let Some(handle) = agent.as_ref() {
+            // A guest reboot leaves this connection open but talking to a
+            // fresh agent instance; a ping tells live from stale/dead.
+            if handle.ping(Duration::from_secs(2)).await {
+                return Ok(handle.clone());
+            }
+            *agent = None;
+        }
+        {
+            let failed = self.agent_failed_at.lock().await;
+            if let Some(at) = *failed
+                && at.elapsed() < Duration::from_secs(30)
+            {
+                bail!("{}: {}", self.cfg.name, NO_AGENT_HINT);
+            }
+        }
+        match super::vm_agent::AgentHandle::connect(&self.dirs.agent_sock(), Duration::from_secs(5))
+            .await
+        {
+            Ok(handle) => {
+                *self.agent_failed_at.lock().await = None;
+                *agent = Some(handle.clone());
+                Ok(handle)
+            }
+            Err(e) => {
+                *self.agent_failed_at.lock().await = Some(std::time::Instant::now());
+                Err(anyhow!("{}: {e:#} — {}", self.cfg.name, NO_AGENT_HINT))
+            }
+        }
+    }
+
+    /// Drop the cached agent connection (teardown, snapshot restore).
+    pub async fn drop_agent(&self) {
+        *self.agent.lock().await = None;
+        *self.agent_failed_at.lock().await = None;
     }
 
     /// Create disks on first use (PRD §7.1): linked clone of the template,
@@ -647,6 +711,7 @@ impl VmInstance {
         self.nic_attachments.lock().await.clear();
         *self.qmp.lock().await = None;
         *self.qga.lock().await = None;
+        self.drop_agent().await;
         *self.qemu.lock().await = None;
     }
 
@@ -793,14 +858,18 @@ impl VmInstance {
             let nodes = disk_nodes(self.all_disk_paths().len());
             let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
             qmp.snapshot_load(name, "disk0", &refs).await?;
-            // Drop the agent connection BEFORE resuming: the rewound guest
+            // Drop the agent connections BEFORE resuming: the rewound guest
             // replays virtio-serial response bytes the host already
             // consumed, and qga responses carry no request ids — a stale
             // `{"return":…}` silently poisons a later exchange. With no
             // client attached QEMU discards the replayed bytes; reconnect
             // starts clean (best-effort: agentless guests have no channel
-            // to poison).
+            // to poison). The vmlab-agent channel gets the same treatment;
+            // its reconnect additionally re-handshakes with a fresh token,
+            // and the frame magic resyncs any mid-frame garbage — see
+            // guest/agent-proto. It reconnects lazily on next use.
             self.qga.lock().await.take();
+            self.drop_agent().await;
             qmp.cont().await?;
             tokio::time::sleep(Duration::from_millis(300)).await;
             if let Ok(c) = GaClient::connect(&self.dirs.qga_sock()).await {

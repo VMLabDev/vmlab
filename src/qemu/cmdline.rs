@@ -570,8 +570,14 @@ mod tests {
         assert!(s.contains("tpm-tis,tpmdev=tpm0"));
         assert!(s.contains("virtio-vga"));
         assert!(s.contains("org.qemu.guest_agent.0"));
-        assert!(s.contains("socket,id=vagent0,path=/run/l/t/agent.sock"), "{s}");
-        assert!(s.contains("virtserialport,chardev=vagent0,name=vmlab.agent.0"), "{s}");
+        assert!(
+            s.contains("socket,id=vagent0,path=/run/l/t/agent.sock"),
+            "{s}"
+        );
+        assert!(
+            s.contains("virtserialport,chardev=vagent0,name=vmlab.agent.0"),
+            "{s}"
+        );
         assert!(s.contains("netdev=net0,mac=52:54:00:00:00:01"));
         assert!(s.contains("-vnc unix:/run/l/t/vnc.sock"));
         assert!(s.contains("usb-tablet"));

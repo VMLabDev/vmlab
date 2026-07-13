@@ -574,89 +574,105 @@ pub fn cmd_container_shell(container_ref: &str) -> Result<()> {
                 path.display()
             );
         }
-        let mut sock = tokio::net::UnixStream::connect(&path)
-            .await
-            .with_context(|| format!("connecting {}", path.display()))?;
-
-        // Size the guest PTY to this terminal, now and on every SIGWINCH.
-        let send_size = |client: Client, container: String| async move {
-            if let Ok(ws) = rustix::termios::tcgetwinsize(std::io::stdout()) {
-                let _ = client
-                    .call(
-                        "container.tty_resize",
-                        json!({"container": container, "cols": ws.ws_col, "rows": ws.ws_row}),
-                    )
-                    .await;
-            }
+        let resize: super::tty_attach::ResizeFn = {
+            let (client, container) = (client.clone(), container.clone());
+            std::sync::Arc::new(move |cols, rows| {
+                let (client, container) = (client.clone(), container.clone());
+                Box::pin(async move {
+                    let _ = client
+                        .call(
+                            "container.tty_resize",
+                            json!({"container": container, "cols": cols, "rows": rows}),
+                        )
+                        .await;
+                })
+            })
         };
-        send_size(client.clone(), container.clone()).await;
-        {
-            let client = client.clone();
-            let container = container.clone();
-            tokio::spawn(async move {
-                let Ok(mut winch) =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-                else {
-                    return;
-                };
-                while winch.recv().await.is_some() {
-                    send_size(client.clone(), container.clone()).await;
-                }
-            });
-        }
+        super::tty_attach::attach_tty(
+            &path,
+            &format!("connected to \"{container}\" — escape character is ^]"),
+            resize,
+        )
+        .await
+    })
+}
 
-        println!("connected to \"{container}\" — escape character is ^]");
+/// `vmlab shell <vm>` — attach an interactive shell inside the VM over the
+/// vmlab-agent channel (root on Linux, SYSTEM PowerShell on Windows). Every
+/// attach opens a fresh session; concurrent shells are independent.
+pub fn cmd_shell(vm_ref: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        // Open at the real terminal size so the first prompt lays out right.
+        let (cols, rows) = rustix::termios::tcgetwinsize(std::io::stdout())
+            .map(|ws| (ws.ws_col, ws.ws_row))
+            .unwrap_or((80, 24));
+        let opened = client
+            .call("vm.tty_open", json!({"vm": vm, "cols": cols, "rows": rows}))
+            .await
+            .map_err(remote)?;
+        let session = opened["session"].as_u64().unwrap_or(0);
+        let path = std::path::PathBuf::from(opened["path"].as_str().unwrap_or_default());
+        let resize: super::tty_attach::ResizeFn = {
+            let (client, vm) = (client.clone(), vm.clone());
+            std::sync::Arc::new(move |cols, rows| {
+                let (client, vm) = (client.clone(), vm.clone());
+                Box::pin(async move {
+                    let _ = client
+                        .call(
+                            "vm.tty_resize",
+                            json!({"vm": vm, "session": session, "cols": cols, "rows": rows}),
+                        )
+                        .await;
+                })
+            })
+        };
+        super::tty_attach::attach_tty(
+            &path,
+            &format!("connected to \"{vm}\" — escape character is ^]"),
+            resize,
+        )
+        .await
+    })
+}
 
-        // Raw mode with restore-on-drop (covers errors and ^] alike).
-        struct RawGuard(rustix::termios::Termios);
-        impl Drop for RawGuard {
-            fn drop(&mut self) {
-                let _ = rustix::termios::tcsetattr(
-                    std::io::stdin(),
-                    rustix::termios::OptionalActions::Now,
-                    &self.0,
-                );
-            }
-        }
-        let saved = rustix::termios::tcgetattr(std::io::stdin()).context("not a terminal")?;
-        let mut raw = saved.clone();
-        raw.make_raw();
-        rustix::termios::tcsetattr(
-            std::io::stdin(),
-            rustix::termios::OptionalActions::Now,
-            &raw,
-        )?;
-        let _guard = RawGuard(saved);
+/// `vmlab tail <vm> <path>` — follow a file inside the guest (tail -F
+/// semantics over the agent channel; no network, no shell required).
+pub fn cmd_tail(vm_ref: &str, path: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        client
+            .call_streaming("vm.tail", json!({"vm": vm, "path": path}), |chunk| {
+                print!("{chunk}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            })
+            .await
+            .map_err(remote)?;
+        Ok(())
+    })
+}
 
-        let (mut rx, mut tx) = sock.split();
-        let mut stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut inbuf = [0u8; 4096];
-        let mut outbuf = [0u8; 4096];
-        loop {
-            tokio::select! {
-                n = tokio::io::AsyncReadExt::read(&mut stdin, &mut inbuf) => {
-                    let n = n?;
-                    if n == 0 { break; }
-                    // Ctrl-] detaches; bytes before it still go through.
-                    if let Some(esc) = inbuf[..n].iter().position(|&b| b == 0x1d) {
-                        if esc > 0 {
-                            tokio::io::AsyncWriteExt::write_all(&mut tx, &inbuf[..esc]).await?;
-                        }
-                        break;
-                    }
-                    tokio::io::AsyncWriteExt::write_all(&mut tx, &inbuf[..n]).await?;
-                }
-                n = tokio::io::AsyncReadExt::read(&mut rx, &mut outbuf) => {
-                    let n = n?;
-                    if n == 0 { break; } // container/QEMU gone
-                    tokio::io::AsyncWriteExt::write_all(&mut stdout, &outbuf[..n]).await?;
-                    tokio::io::AsyncWriteExt::flush(&mut stdout).await?;
-                }
-            }
+/// `vmlab eventlog <vm>` — follow the Windows event log over the agent
+/// channel.
+pub fn cmd_eventlog(vm_ref: &str, filter: Option<&str>) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let mut args = json!({"vm": vm});
+        if let Some(f) = filter {
+            args["filter"] = json!(f);
         }
-        drop(_guard);
-        println!();
+        client
+            .call_streaming("vm.eventlog", args, |chunk| {
+                print!("{chunk}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            })
+            .await
+            .map_err(remote)?;
         Ok(())
     })
 }
@@ -854,13 +870,28 @@ const CP_CHUNK: usize = 1 << 20;
 /// a guest through the agent, creating parent directories.
 pub fn cmd_cp(src: &str, dest: &str) -> Result<()> {
     // Split on the *first* colon: VM names contain none, guest paths may
-    // (e.g. box:C:/weave).
-    let Some((vm_part, guest_dest)) = dest.split_once(':') else {
-        bail!("malformed destination `{dest}` — usage: vmlab cp <src> <vm>:<path>");
-    };
-    if vm_part.is_empty() || guest_dest.is_empty() {
-        bail!("malformed destination `{dest}` — usage: vmlab cp <src> <vm>:<path>");
+    // (e.g. box:C:/weave). A guest ref on the destination is a push, on the
+    // source a pull.
+    if let Some((vm_part, guest_dest)) = dest.split_once(':')
+        && !vm_part.is_empty()
+        && !guest_dest.is_empty()
+    {
+        return cp_push(src, vm_part, guest_dest);
     }
+    if let Some((vm_part, guest_src)) = src.split_once(':')
+        && !vm_part.is_empty()
+        && !guest_src.is_empty()
+    {
+        return cp_pull(vm_part, guest_src, dest);
+    }
+    bail!(
+        "one side must be a guest ref — usage: vmlab cp <src> <vm>:<path> | vmlab cp <vm>:<path> <dest>"
+    );
+}
+
+/// Host → guest. The agent channel moves raw verified bytes; guests whose
+/// template predates the agent fall back to base64 QGA writes.
+fn cp_push(src: &str, vm_part: &str, guest_dest: &str) -> Result<()> {
     let src_path = std::path::Path::new(src);
     if !src_path.exists() {
         bail!("source {src} does not exist");
@@ -868,7 +899,14 @@ pub fn cmd_cp(src: &str, dest: &str) -> Result<()> {
     let (lab, vm) = split_vm_ref(vm_part)?;
     rt()?.block_on(async {
         let (_name, client) = lab_client_for(lab).await?;
-        // The guest OS decides the mkdir command and path separator.
+        if client
+            .call("vm.agent_info", json!({"vm": vm}))
+            .await
+            .is_ok()
+        {
+            return push_via_agent(&client, &vm, src_path, guest_dest).await;
+        }
+        // Legacy QGA path: the guest OS decides mkdir and path separators.
         let osinfo = client
             .call("vm.osinfo", json!({"vm": vm}))
             .await
@@ -886,6 +924,97 @@ pub fn cmd_cp(src: &str, dest: &str) -> Result<()> {
             }
             copy_file(&client, &vm, src_path, guest_dest).await
         }
+    })
+}
+
+/// Push one file or a tree over the agent channel (parent directories are
+/// created by the agent; digests verified end-to-end by the daemon).
+async fn push_via_agent(
+    client: &Client,
+    vm: &str,
+    src: &std::path::Path,
+    guest_dest: &str,
+) -> Result<()> {
+    fn mode_of(p: &std::path::Path) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
+    }
+    let push_one = |from: std::path::PathBuf, to: String| async move {
+        let args = json!({
+            "vm": vm, "from": from, "to": to, "mode": mode_of(&from),
+        });
+        let r = client.call("vm.push_file", args).await.map_err(remote)?;
+        Ok::<u64, anyhow::Error>(r["len"].as_u64().unwrap_or(0))
+    };
+    if src.is_dir() {
+        let mut total = 0u64;
+        let mut files = 0usize;
+        let mut stack = vec![src.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(src)?.to_string_lossy().replace('\\', "/");
+                    let sep = if guest_dest.ends_with('/') || guest_dest.ends_with('\\') {
+                        ""
+                    } else {
+                        "/"
+                    };
+                    total += push_one(
+                        abs_path(path.to_str().unwrap_or_default())?,
+                        format!("{guest_dest}{sep}{rel}"),
+                    )
+                    .await?;
+                    files += 1;
+                }
+            }
+        }
+        println!("pushed {files} file(s), {total} bytes to {vm}:{guest_dest}");
+    } else {
+        let n = push_one(
+            abs_path(src.to_str().unwrap_or_default())?,
+            guest_dest.to_string(),
+        )
+        .await?;
+        println!("pushed {n} bytes to {vm}:{guest_dest}");
+    }
+    Ok(())
+}
+
+/// Guest → host over the agent channel (needs an agent in the guest — the
+/// legacy QGA transport has no practical read path for large files).
+fn cp_pull(vm_part: &str, guest_src: &str, dest: &str) -> Result<()> {
+    let (lab, vm) = split_vm_ref(vm_part)?;
+    // Into an existing directory: keep the guest file's name.
+    let mut dest_path = std::path::PathBuf::from(dest);
+    if dest_path.is_dir() {
+        let name = guest_src
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|n| !n.is_empty())
+            .unwrap_or("pulled");
+        dest_path = dest_path.join(name);
+    }
+    let dest_abs = abs_path(dest_path.to_str().unwrap_or_default())?;
+    rt()?.block_on(async {
+        let (_name, client) = lab_client_for(lab).await?;
+        let r = client
+            .call(
+                "vm.pull_file",
+                json!({"vm": vm, "from": guest_src, "to": dest_abs}),
+            )
+            .await
+            .map_err(remote)?;
+        println!(
+            "pulled {} bytes to {}",
+            r["len"].as_u64().unwrap_or(0),
+            dest_path.display()
+        );
+        Ok(())
     })
 }
 

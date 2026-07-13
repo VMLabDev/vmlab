@@ -11,6 +11,7 @@ pub mod netservices;
 pub mod network;
 pub mod state;
 pub mod vm;
+pub mod vm_agent;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -409,7 +410,24 @@ impl Handler for LabdHandler {
                     .unwrap_or_default();
                 let timeout =
                     std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
-                let qga = lab.vm(&name).map_err(err)?.qga().await.map_err(err)?;
+                let vm = lab.vm(&name).map_err(err)?;
+                // Prefer the vmlab-agent transport (streamed, no 100ms QGA
+                // polling, no base64); fall back to QGA for guests whose
+                // template predates the agent.
+                if let Ok(agent) = vm.agent().await {
+                    let mut argv = vec![cmd.to_string()];
+                    argv.extend(cmd_args.iter().cloned());
+                    let result = agent
+                        .exec(argv, vec![], None, None, timeout)
+                        .await
+                        .map_err(err)?;
+                    return Ok(json!({
+                        "exit_code": result.exit_code,
+                        "stdout": String::from_utf8_lossy(&result.stdout),
+                        "stderr": String::from_utf8_lossy(&result.stderr),
+                    }));
+                }
+                let qga = vm.qga().await.map_err(err)?;
                 let arg_refs: Vec<&str> = cmd_args.iter().map(String::as_str).collect();
                 let result = qga
                     .exec(cmd, &arg_refs, true, timeout)
@@ -452,6 +470,164 @@ impl Handler for LabdHandler {
                     qga.file_write(dest, &bytes, timeout).await
                 };
                 result.map_err(|e| format!("{e}"))?;
+                Ok(json!(true))
+            }
+            // Interactive terminal over the vmlab-agent channel: opens a
+            // fresh session (multi-session — every attach gets its own
+            // shell), re-exposed as a raw-byte unix socket clients connect
+            // to directly; resize rides the agent's control channel.
+            "vm.tty_open" => {
+                let name = vm_arg(&args)?;
+                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
+                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
+                let vm = lab.vm(&name).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                let session = agent.open_terminal(cols, rows, None).await.map_err(err)?;
+                let id = session.id;
+                let path = vm.dirs.term_session_sock(id);
+                vm_agent::expose_terminal_socket(session, path.clone())
+                    .await
+                    .map_err(err)?;
+                Ok(json!({"session": id, "path": path}))
+            }
+            "vm.tty_resize" => {
+                let name = vm_arg(&args)?;
+                let session = args["session"].as_u64().ok_or("missing session")? as u32;
+                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
+                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
+                let vm = lab.vm(&name).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                agent.resize(session, cols, rows).await.map_err(err)?;
+                Ok(json!(true))
+            }
+            "vm.agent_info" => {
+                let vm = lab.vm(&vm_arg(&args)?).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                let info = agent.info();
+                Ok(json!({
+                    "version": info.agent_version,
+                    "os": info.os,
+                    "features": info.features,
+                }))
+            }
+            // Fast binary file transfer over the agent channel (host paths
+            // are the daemon's — the CLI resolves them absolute first).
+            "vm.push_file" => {
+                let name = vm_arg(&args)?;
+                let from = args["from"].as_str().ok_or("missing from")?;
+                let to = args["to"].as_str().ok_or("missing to")?;
+                let mode = args["mode"].as_u64().map(|m| m as u32);
+                let vm = lab.vm(&name).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                let (sha256, len) = agent
+                    .push_file(std::path::Path::new(from), to, mode)
+                    .await
+                    .map_err(err)?;
+                Ok(json!({"sha256": sha256, "len": len}))
+            }
+            "vm.pull_file" => {
+                let name = vm_arg(&args)?;
+                let from = args["from"].as_str().ok_or("missing from")?;
+                let to = args["to"].as_str().ok_or("missing to")?;
+                let vm = lab.vm(&name).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                let (sha256, len) = agent
+                    .pull_file(from, std::path::Path::new(to))
+                    .await
+                    .map_err(err)?;
+                Ok(json!({"sha256": sha256, "len": len}))
+            }
+            // Follow a guest file (tail -F semantics), streamed as chunks
+            // until the client hangs up or the VM stops.
+            "vm.tail" => {
+                let name = vm_arg(&args)?;
+                let path = args["path"].as_str().ok_or("missing path")?;
+                let vm = lab.vm(&name).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                let mut session = agent.open_tail(path.to_string()).await.map_err(err)?;
+                loop {
+                    tokio::select! {
+                        ev = session.recv() => match ev {
+                            Some(vm_agent::SessionEvent::Data(b)) => {
+                                _stream.chunk(String::from_utf8_lossy(&b).into_owned()).await;
+                            }
+                            Some(vm_agent::SessionEvent::Error(msg)) => return Err(msg),
+                            None => break,
+                            Some(_) => {}
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                            if vm.state().await != vm::PowerState::Running {
+                                break;
+                            }
+                        }
+                    }
+                }
+                session.close().await;
+                Ok(json!(true))
+            }
+            // Windows event log follow (agent `eventlog` feature).
+            "vm.eventlog" => {
+                let name = vm_arg(&args)?;
+                let filter = args["filter"].as_str().map(String::from);
+                let vm = lab.vm(&name).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                if !agent.has_feature(vmlab_agent_proto::features::EVENTLOG) {
+                    return Err(format!(
+                        "{name}: the guest agent has no event log (Windows-only feature)"
+                    ));
+                }
+                let mut session = agent.open_eventlog(filter).await.map_err(err)?;
+                loop {
+                    tokio::select! {
+                        ev = session.recv() => match ev {
+                            Some(vm_agent::SessionEvent::Data(b)) => {
+                                _stream.chunk(String::from_utf8_lossy(&b).into_owned()).await;
+                            }
+                            Some(vm_agent::SessionEvent::Error(msg)) => return Err(msg),
+                            None => break,
+                            Some(_) => {}
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                            if vm.state().await != vm::PowerState::Running {
+                                break;
+                            }
+                        }
+                    }
+                }
+                session.close().await;
+                Ok(json!(true))
+            }
+            // Latest guest metrics (subscribes the 2s sampler on first use).
+            "vm.stats" => {
+                let vm = lab.vm(&vm_arg(&args)?).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                let m = agent
+                    .stats(std::time::Duration::from_secs(10))
+                    .await
+                    .map_err(err)?;
+                Ok(json!({
+                    "cpu_pct": m.cpu_pct,
+                    "mem_used": m.mem_used,
+                    "mem_total": m.mem_total,
+                    "disks": m.disks.iter().map(|d| json!({
+                        "mount": d.mount, "used": d.used, "total": d.total,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            "vm.clipboard_get" => {
+                let vm = lab.vm(&vm_arg(&args)?).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                let text = agent
+                    .get_clipboard(std::time::Duration::from_secs(10))
+                    .await
+                    .map_err(err)?;
+                Ok(json!(text))
+            }
+            "vm.clipboard_set" => {
+                let text = args["text"].as_str().ok_or("missing text")?;
+                let vm = lab.vm(&vm_arg(&args)?).map_err(err)?;
+                let agent = vm.agent().await.map_err(err)?;
+                agent.set_clipboard(text.to_string()).await.map_err(err)?;
                 Ok(json!(true))
             }
             "vm.ip" => {

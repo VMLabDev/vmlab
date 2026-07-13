@@ -4,6 +4,7 @@
 pub mod console;
 pub mod daemon;
 pub mod lab;
+pub mod tty_attach;
 pub mod validate;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -106,12 +107,29 @@ pub enum Command {
         #[arg(last = true)]
         cmd: Vec<String>,
     },
-    /// Copy a host file or directory tree into a guest via the agent
+    /// Attach an interactive shell inside a VM (root / SYSTEM PowerShell
+    /// over virtio-serial — works with no guest network; Ctrl-] detaches)
+    Shell { vm: String },
+    /// Copy files between host and guest (either side may be <vm>:<path>;
+    /// parent directories are created)
     Cp {
-        /// Source path on the host
+        /// Source: a host path, or <vm>:<path> to pull from the guest
         src: String,
-        /// Destination as <vm>:<path> (parent directories are created)
+        /// Destination: <vm>:<path> to push, or a host path when pulling
         dest: String,
+    },
+    /// Follow a file inside a guest (tail -F over the agent channel)
+    Tail {
+        vm: String,
+        /// Guest file path
+        path: String,
+    },
+    /// Follow the Windows event log of a guest
+    Eventlog {
+        vm: String,
+        /// XPath filter (default: everything on the System channel)
+        #[arg(long)]
+        filter: Option<String>,
     },
     /// Print guest OS information (guest-get-osinfo) as JSON
     Osinfo { vm: String },
@@ -356,7 +374,10 @@ pub fn run() -> ExitCode {
             .map_err(anyhow::Error::from)
             .map(|()| println!("wrote {}", out.display())),
         Command::Exec { vm, timeout, cmd } => lab::cmd_exec(&vm, timeout, cmd),
+        Command::Shell { vm } => lab::cmd_shell(&vm),
         Command::Cp { src, dest } => lab::cmd_cp(&src, &dest),
+        Command::Tail { vm, path } => lab::cmd_tail(&vm, &path),
+        Command::Eventlog { vm, filter } => lab::cmd_eventlog(&vm, filter.as_deref()),
         Command::Osinfo { vm } => lab::cmd_osinfo(&vm),
         Command::Logs {
             target,
