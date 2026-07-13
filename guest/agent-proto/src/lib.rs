@@ -59,6 +59,33 @@ pub mod features {
     pub const EVENTLOG: &str = "eventlog";
 }
 
+/// How `vmlab-cinit` tells a container micro-VM's agent about the container
+/// it serves (written as JSON, passed via `vmlab-agent --container <path>`).
+/// Not host-visible — this is a guest-internal contract, but it lives here
+/// so cinit and the agent share one definition.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContainerConfig {
+    /// The merged container rootfs (cinit's overlay mount).
+    pub rootfs: String,
+    /// A process inside the container's PID+mount namespaces to `setns`
+    /// into for terminal/exec sessions. `None` in idle mode, where no
+    /// namespaces exist and a plain chroot into `rootfs` is the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setns_pid: Option<u32>,
+    /// Container environment (image env merged with lab overrides).
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Working directory inside the rootfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+}
+
+/// Initramfs layout shared by cinit and the agent: the static BusyBox that
+/// cinit injects into every container rootfs so distroless images still get
+/// a shell/toolbox (paths as seen *inside* the rootfs).
+pub const BUSYBOX_FALLBACK: &str = "/.vmlab/busybox";
+pub const BUSYBOX_BIN_DIR: &str = "/.vmlab/bin";
+
 const MAGIC: [u8; 4] = *b"VMLB";
 const HEADER_LEN: usize = 4 + 4 + 1 + 4;
 
@@ -255,7 +282,10 @@ pub enum HostMsg {
     /// Handshake. Sent on (re)connect; the agent replies with its own
     /// [`AgentMsg::Hello`] echoing `token`, and both sides discard channel
     /// state from before the exchange.
-    Hello { proto_version: u32, token: String },
+    Hello {
+        proto_version: u32,
+        token: String,
+    },
     /// Open an interactive shell on channel `id`. `command` overrides the
     /// agent's default shell (absolute argv).
     OpenTerminal {
@@ -266,7 +296,11 @@ pub enum HostMsg {
         command: Option<Vec<String>>,
     },
     /// Resize a terminal's PTY.
-    Resize { id: u32, cols: u16, rows: u16 },
+    Resize {
+        id: u32,
+        cols: u16,
+        rows: u16,
+    },
     /// Run `argv` (no PTY) on channel `id`: stdin = host DATA frames,
     /// stdout = guest DATA frames, stderr = guest DATA_ERR frames, exit via
     /// [`AgentMsg::Exited`].
@@ -280,7 +314,9 @@ pub enum HostMsg {
     },
     /// No more host->guest bytes on this channel (exec stdin EOF; end of a
     /// pushed file's bytes).
-    Eof { id: u32 },
+    Eof {
+        id: u32,
+    },
     /// Receive a file: host streams DATA frames, then [`HostMsg::Eof`]; the
     /// agent writes `path` (mode is Unix permission bits, ignored on
     /// Windows) and replies [`AgentMsg::FileDone`].
@@ -292,10 +328,16 @@ pub enum HostMsg {
     },
     /// Send a file: the agent streams `path` as DATA frames and finishes
     /// with [`AgentMsg::FileDone`].
-    OpenFilePull { id: u32, path: String },
+    OpenFilePull {
+        id: u32,
+        path: String,
+    },
     /// Follow a file (like `tail -F`): existing tail then live appends as
     /// DATA frames until closed. Survives rotation/truncation.
-    OpenTail { id: u32, path: String },
+    OpenTail {
+        id: u32,
+        path: String,
+    },
     /// Follow the Windows event log (XML-rendered events as DATA frames).
     /// `filter` is an XPath query, default `*` on the System channel.
     OpenEventLog {
@@ -304,17 +346,26 @@ pub enum HostMsg {
         filter: Option<String>,
     },
     /// Set the guest clipboard.
-    SetClipboard { text: String },
+    SetClipboard {
+        text: String,
+    },
     /// Ask for the guest clipboard; the agent replies [`AgentMsg::Clipboard`].
     GetClipboard,
     /// Start periodic [`AgentMsg::Metrics`].
-    SubscribeMetrics { interval_secs: u64 },
+    SubscribeMetrics {
+        interval_secs: u64,
+    },
     UnsubscribeMetrics,
     /// Grant the guest more send credit on a channel.
-    WindowAdjust { id: u32, bytes: u64 },
+    WindowAdjust {
+        id: u32,
+        bytes: u64,
+    },
     /// Tear down a channel (kills the terminal/exec process, stops a
     /// tail/transfer). The agent must not send further frames for `id`.
-    Close { id: u32 },
+    Close {
+        id: u32,
+    },
     Ping,
 }
 
@@ -333,13 +384,22 @@ pub enum AgentMsg {
     },
     /// A channel opened by the host is live (terminal spawned, exec started,
     /// file opened, tail/eventlog following).
-    Opened { id: u32 },
+    Opened {
+        id: u32,
+    },
     /// The channel's process ended (terminal shell exit, exec exit).
     /// `code` is the exit code, or `128 + signal` on Unix signal death.
-    Exited { id: u32, code: i32 },
+    Exited {
+        id: u32,
+        code: i32,
+    },
     /// A file transfer completed (both directions). `sha256` is the hex
     /// digest of the bytes written/read so the host can verify.
-    FileDone { id: u32, sha256: String, len: u64 },
+    FileDone {
+        id: u32,
+        sha256: String,
+        len: u64,
+    },
     /// Periodic sample after [`HostMsg::SubscribeMetrics`].
     Metrics {
         cpu_pct: f32,
@@ -349,9 +409,14 @@ pub enum AgentMsg {
     },
     /// Guest clipboard contents (reply to `get_clipboard`, or spontaneous on
     /// guest-side clipboard change).
-    Clipboard { text: String },
+    Clipboard {
+        text: String,
+    },
     /// Grant the host more send credit on a channel.
-    WindowAdjust { id: u32, bytes: u64 },
+    WindowAdjust {
+        id: u32,
+        bytes: u64,
+    },
     /// A channel failed (`id` set) or the agent hit a channel-less error.
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -583,7 +648,9 @@ mod tests {
                     total: 100,
                 }],
             },
-            AgentMsg::Clipboard { text: "clip".into() },
+            AgentMsg::Clipboard {
+                text: "clip".into(),
+            },
             AgentMsg::WindowAdjust { id: 2, bytes: 1 },
             AgentMsg::Error {
                 id: Some(9),

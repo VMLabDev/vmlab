@@ -28,7 +28,10 @@ use serde::{Deserialize, Serialize};
 ///     fallback when the host has no virtiofsd.
 /// v5: idle mode and the `idle` lifecycle event allow an exec-driven
 ///     container micro-VM to run without an OCI workload process.
-pub const PROTO_VERSION: u32 = 5;
+/// v6: the interactive shell moved to `vmlab-agent` on the `vmlab.agent.0`
+///     port (see `guest/agent-proto`); `tty_resize` and the `vmlab.tty.0`
+///     port are gone — this channel is pure lifecycle now.
+pub const PROTO_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -189,9 +192,6 @@ pub enum CtlCommand {
     /// Graceful stop: send the spec's stop signal, escalate to SIGKILL after
     /// `grace_secs`.
     Stop { grace_secs: u64 },
-    /// Resize the interactive shell's PTY (the `vmlab.tty.0` port). Applies
-    /// to the current session and is remembered for future ones.
-    TtyResize { cols: u16, rows: u16 },
     /// Re-emit current state as events (`boot`, then `net_up`, `started` or
     /// `idle`, and `health` as applicable). Sent after an online snapshot restore, where
     /// the resumed guest would otherwise never repeat its lifecycle events.
@@ -287,7 +287,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&ev).unwrap(),
-            r#"{"event":"boot","proto_version":5}"#
+            r#"{"event":"boot","proto_version":6}"#
         );
         let ev = CtlEvent::NetUp {
             ip: "10.0.0.9".into(),
@@ -329,16 +329,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&cmd).unwrap(),
             r#"{"cmd":"stop","grace_secs":7}"#
-        );
-        assert_eq!(roundtrip(&cmd), cmd);
-
-        let cmd = CtlCommand::TtyResize {
-            cols: 132,
-            rows: 43,
-        };
-        assert_eq!(
-            serde_json::to_string(&cmd).unwrap(),
-            r#"{"cmd":"tty_resize","cols":132,"rows":43}"#
         );
         assert_eq!(roundtrip(&cmd), cmd);
 

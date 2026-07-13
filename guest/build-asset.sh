@@ -4,6 +4,8 @@
 #
 # The initramfs contains:
 #   /init                 vmlab-cinit (static musl, built from guest/cinit)
+#   /vmlab-agent          the guest agent (terminals/exec/files over the
+#                         vmlab.agent.0 port; spawned by cinit — guest/agent)
 #   /bin/busybox (+sh)    busybox-static: sh, modprobe, ip, udhcpc, ifconfig...
 #   /etc/udhcpc/...       the udhcpc hook script cinit drives (see cinit net.rs)
 #   /sbin/mkfs.ext4       e2fsprogs (dynamic, against the bundled musl + libs)
@@ -108,8 +110,8 @@ fetch_pkg() {
   echo "$file"
 }
 
-build_cinit() {
-  local target="$1"
+build_guest_bin() {
+  local crate="$1" target="$2"
   rustup target list --installed | grep -qx "$target" \
     || die "rust target $target not installed — run: rustup target add $target"
   local -a extra_env=()
@@ -120,9 +122,9 @@ build_cinit() {
       extra_env+=("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld")
     fi
   fi
-  log "building vmlab-cinit for $target"
+  log "building $crate for $target"
   env "${extra_env[@]}" cargo build --release --target "$target" \
-    --manifest-path "$SCRIPT_DIR/cinit/Cargo.toml" \
+    --manifest-path "$SCRIPT_DIR/$crate/Cargo.toml" \
     || die "cargo build for $target failed"
 }
 
@@ -211,7 +213,8 @@ build_arch() {
   local arch="$1"
   local target
   target="$(rust_target_for "$arch")"
-  build_cinit "$target"
+  build_guest_bin cinit "$target"
+  build_guest_bin agent "$target"
 
   local work root extract kextract
   work="$(mktemp -d "${TMPDIR:-/tmp}/vmlab-guest-asset.XXXXXX")"
@@ -243,6 +246,9 @@ build_arch() {
 
   # /init: the static cinit binary.
   install -m 0755 "$SCRIPT_DIR/cinit/target/$target/release/vmlab-cinit" "$root/init"
+
+  # /vmlab-agent: terminals/exec/files over vmlab.agent.0 (spawned by cinit).
+  install -m 0755 "$SCRIPT_DIR/agent/target/$target/release/vmlab-agent" "$root/vmlab-agent"
 
   # busybox + the /bin/sh the udhcpc hook needs (cinit calls applets as
   # `busybox <applet>`, so no other symlinks are required).

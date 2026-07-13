@@ -1,8 +1,9 @@
-//! `GET /api/labs/{lab}/containers/{name}/tty` — the container's interactive
-//! shell (guest/cinit's `vmlab.tty.0` PTY, PRD §18) over a WebSocket. Binary
-//! frames are raw PTY bytes both ways; text frames carry control JSON —
-//! `{"resize": {"cols": N, "rows": M}}` is proxied to the lab daemon, which
-//! resizes the guest PTY over the ctl channel.
+//! Interactive-terminal WebSockets: `GET /api/labs/{lab}/containers/{name}/tty`
+//! and `GET /api/labs/{lab}/vms/{vm}/tty` — a shell inside the guest served
+//! by vmlab-agent (guest/agent-proto) over a per-session unix socket the
+//! daemon exposes. Binary frames are raw PTY bytes both ways; text frames
+//! carry control JSON — `{"resize": {"cols": N, "rows": M}}` is proxied to
+//! the lab daemon, which resizes the guest PTY over the agent channel.
 
 use actix_web::{Error, HttpRequest, HttpResponse, web};
 use actix_ws::AggregatedMessage;
@@ -13,30 +14,83 @@ use tokio::net::UnixStream;
 
 use super::state::AppState;
 
-pub async fn tty(
+/// Which daemon-side RPC pair serves this terminal.
+struct TtyTarget {
+    /// `container.tty_open` / `vm.tty_open` — returns `{session, path}`.
+    open: &'static str,
+    /// `container.tty_resize` / `vm.tty_resize`.
+    resize: &'static str,
+    /// The machine key in the RPC args (`container` / `vm`).
+    arg_key: &'static str,
+    name: String,
+}
+
+pub async fn container_tty(
     req: HttpRequest,
     body: web::Payload,
     path: web::Path<(String, String)>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
     let (lab, container) = path.into_inner();
-    if !super::state::valid_name(&lab) || !super::state::valid_name(&container) {
-        return Ok(
-            HttpResponse::BadRequest().json(json!({"error": "invalid lab or container name"}))
-        );
+    bridge(
+        req,
+        body,
+        state,
+        lab,
+        TtyTarget {
+            open: "container.tty_open",
+            resize: "container.tty_resize",
+            arg_key: "container",
+            name: container,
+        },
+    )
+    .await
+}
+
+pub async fn vm_tty(
+    req: HttpRequest,
+    body: web::Payload,
+    path: web::Path<(String, String)>,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    let (lab, vm) = path.into_inner();
+    bridge(
+        req,
+        body,
+        state,
+        lab,
+        TtyTarget {
+            open: "vm.tty_open",
+            resize: "vm.tty_resize",
+            arg_key: "vm",
+            name: vm,
+        },
+    )
+    .await
+}
+
+async fn bridge(
+    req: HttpRequest,
+    body: web::Payload,
+    state: web::Data<AppState>,
+    lab: String,
+    target: TtyTarget,
+) -> Result<HttpResponse, Error> {
+    if !super::state::valid_name(&lab) || !super::state::valid_name(&target.name) {
+        return Ok(HttpResponse::BadRequest().json(json!({"error": "invalid lab or machine name"})));
     }
-    // The daemon owns the socket path — ask it rather than recomputing.
-    let sock = match state
-        .lab_call(&lab, "container.tty_path", json!({"container": container}))
+    // Open a fresh terminal session; the daemon binds a per-session socket
+    // and hands back its path. Open failures (no agent in the guest, VM not
+    // running) surface as a conflict with the daemon's actionable message.
+    let opened = match state
+        .lab_call(&lab, target.open, json!({target.arg_key: target.name}))
         .await
     {
-        Ok(v) => std::path::PathBuf::from(v.as_str().unwrap_or_default()),
+        Ok(v) => v,
         Err(e) => return Ok(super::api::fail(e)),
     };
-    if !sock.exists() {
-        return Ok(HttpResponse::Conflict()
-            .json(json!({"error": format!("{lab}/{container} has no shell socket (stopped?)")})));
-    }
+    let session = opened["session"].as_u64().unwrap_or(0);
+    let sock = std::path::PathBuf::from(opened["path"].as_str().unwrap_or_default());
     let unix = match UnixStream::connect(&sock).await {
         Ok(u) => u,
         Err(e) => {
@@ -45,12 +99,12 @@ pub async fn tty(
         }
     };
 
-    let (response, session, msg_stream) = actix_ws::handle(&req, body)?;
+    let (response, session_ws, msg_stream) = actix_ws::handle(&req, body)?;
     let mut msg_stream = msg_stream.aggregate_continuations();
     let (mut unix_rx, mut unix_tx) = unix.into_split();
 
     // Guest PTY → browser.
-    let mut out = session.clone();
+    let mut out = session_ws.clone();
     actix_web::rt::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
@@ -67,8 +121,8 @@ pub async fn tty(
     });
 
     // Browser → guest PTY, resize control → daemon. Dropping the write half
-    // on exit closes our side; the guest keeps its shell for the next attach.
-    let mut pong = session.clone();
+    // on exit closes our side, which ends the agent session.
+    let mut pong = session_ws.clone();
     actix_web::rt::spawn(async move {
         while let Some(Ok(msg)) = msg_stream.next().await {
             match msg {
@@ -82,11 +136,12 @@ pub async fn tty(
                         && let Some(r) = v.get("resize")
                     {
                         let args = json!({
-                            "container": container,
+                            target.arg_key: target.name,
+                            "session": session,
                             "cols": r["cols"].as_u64().unwrap_or(80),
                             "rows": r["rows"].as_u64().unwrap_or(24),
                         });
-                        let _ = state.lab_call(&lab, "container.tty_resize", args).await;
+                        let _ = state.lab_call(&lab, target.resize, args).await;
                     }
                 }
                 AggregatedMessage::Ping(p) => {

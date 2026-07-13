@@ -744,21 +744,100 @@ impl Handler for LabdHandler {
                 }
                 Ok(json!(true))
             }
-            // Interactive shell (guest/cinit's `vmlab.tty.0` port): clients
-            // connect to the raw PTY socket; resize rides the ctl channel.
-            "container.tty_path" => {
-                let c = lab.container(&container_arg(&args)?).map_err(err)?;
-                Ok(json!(c.dirs.tty_sock()))
+            // Interactive shell over the vmlab-agent channel — the same
+            // session model as vm.tty_open (multi-session; every attach gets
+            // its own shell inside the container namespaces).
+            "container.tty_open" => {
+                let name = container_arg(&args)?;
+                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
+                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
+                let c = lab.container(&name).map_err(err)?;
+                let agent = c.agent().await.map_err(err)?;
+                let session = agent.open_terminal(cols, rows, None).await.map_err(err)?;
+                let id = session.id;
+                let path = c.dirs.term_session_sock(id);
+                vm_agent::expose_terminal_socket(session, path.clone())
+                    .await
+                    .map_err(err)?;
+                Ok(json!({"session": id, "path": path}))
             }
             "container.tty_resize" => {
+                let session = args["session"].as_u64().ok_or("missing session")? as u32;
                 let cols = args["cols"].as_u64().unwrap_or(80) as u16;
                 let rows = args["rows"].as_u64().unwrap_or(24) as u16;
                 let c = lab.container(&container_arg(&args)?).map_err(err)?;
-                let ctl = c.ctl().await.map_err(err)?;
-                ctl.send(&vmlab_cinit_proto::CtlCommand::TtyResize { cols, rows })
+                let agent = c.agent().await.map_err(err)?;
+                agent.resize(session, cols, rows).await.map_err(err)?;
+                Ok(json!(true))
+            }
+            "container.push_file" => {
+                let name = container_arg(&args)?;
+                let from = args["from"].as_str().ok_or("missing from")?;
+                let to = args["to"].as_str().ok_or("missing to")?;
+                let mode = args["mode"].as_u64().map(|m| m as u32);
+                let c = lab.container(&name).map_err(err)?;
+                let agent = c.agent().await.map_err(err)?;
+                let (sha256, len) = agent
+                    .push_file(std::path::Path::new(from), to, mode)
                     .await
                     .map_err(err)?;
+                Ok(json!({"sha256": sha256, "len": len}))
+            }
+            "container.pull_file" => {
+                let name = container_arg(&args)?;
+                let from = args["from"].as_str().ok_or("missing from")?;
+                let to = args["to"].as_str().ok_or("missing to")?;
+                let c = lab.container(&name).map_err(err)?;
+                let agent = c.agent().await.map_err(err)?;
+                let (sha256, len) = agent
+                    .pull_file(from, std::path::Path::new(to))
+                    .await
+                    .map_err(err)?;
+                Ok(json!({"sha256": sha256, "len": len}))
+            }
+            // Follow a file inside the container (tail -F semantics).
+            "container.tail" => {
+                let name = container_arg(&args)?;
+                let path = args["path"].as_str().ok_or("missing path")?;
+                let c = lab.container(&name).map_err(err)?;
+                let agent = c.agent().await.map_err(err)?;
+                let mut session = agent.open_tail(path.to_string()).await.map_err(err)?;
+                loop {
+                    tokio::select! {
+                        ev = session.recv() => match ev {
+                            Some(vm_agent::SessionEvent::Data(b)) => {
+                                _stream.chunk(String::from_utf8_lossy(&b).into_owned()).await;
+                            }
+                            Some(vm_agent::SessionEvent::Error(msg)) => return Err(msg),
+                            None => break,
+                            Some(_) => {}
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                            if c.state().await != vm::PowerState::Running {
+                                break;
+                            }
+                        }
+                    }
+                }
+                session.close().await;
                 Ok(json!(true))
+            }
+            // Micro-VM metrics (the whole VM is the container).
+            "container.stats" => {
+                let c = lab.container(&container_arg(&args)?).map_err(err)?;
+                let agent = c.agent().await.map_err(err)?;
+                let m = agent
+                    .stats(std::time::Duration::from_secs(10))
+                    .await
+                    .map_err(err)?;
+                Ok(json!({
+                    "cpu_pct": m.cpu_pct,
+                    "mem_used": m.mem_used,
+                    "mem_total": m.mem_total,
+                    "disks": m.disks.iter().map(|d| json!({
+                        "mount": d.mount, "used": d.used, "total": d.total,
+                    })).collect::<Vec<_>>(),
+                }))
             }
             "container.ip" => {
                 let ip = lab

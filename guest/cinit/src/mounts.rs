@@ -225,15 +225,16 @@ pub fn mount_rootfs_runtime() -> Result<()> {
 }
 
 /// Best-effort: copy the initramfs' static busybox into the overlay at
-/// [`crate::tty::BUSYBOX_FALLBACK`] so the interactive shell has something
-/// to exec even in a distroless image (tiny, and it lands in the scratch
-/// upper layer, never the read-only image). Failures only cost the fallback.
+/// [`vmlab_agent_proto::BUSYBOX_FALLBACK`] so the agent's interactive shell
+/// has something to exec even in a distroless image (tiny, and it lands in
+/// the scratch upper layer, never the read-only image). Failures only cost
+/// the fallback.
 pub fn install_shell_fallback() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     let dir = format!("{ROOTFS}/.vmlab");
     let dest = format!("{dir}/busybox");
-    let bin_dir = format!("{ROOTFS}{}", crate::tty::BUSYBOX_BIN_DIR);
+    let bin_dir = format!("{ROOTFS}{}", vmlab_agent_proto::BUSYBOX_BIN_DIR);
     let result = fs::create_dir_all(&dir)
         .and_then(|()| fs::copy("/bin/busybox", &dest).map(|_| ()))
         .and_then(|()| fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)))

@@ -312,13 +312,19 @@ impl Mux {
                 command,
             } => platform.open_terminal(self, id, cols, rows, command),
             HostMsg::Resize { id, cols, rows } => self.resize(id, cols, rows),
-            HostMsg::OpenExec { id, argv, env, cwd } => crate::exec::open(self, id, argv, env, cwd),
+            HostMsg::OpenExec { id, argv, env, cwd } => {
+                platform.open_exec(self, id, argv, env, cwd)
+            }
             HostMsg::Eof { id } => self.route_input(id, Input::Eof),
             HostMsg::OpenFilePush { id, path, mode } => {
-                crate::files::open_push(self, id, path, mode)
+                crate::files::open_push(self, id, platform.resolve_path(path), mode)
             }
-            HostMsg::OpenFilePull { id, path } => crate::files::open_pull(self, id, path),
-            HostMsg::OpenTail { id, path } => crate::tail::open(self, id, path),
+            HostMsg::OpenFilePull { id, path } => {
+                crate::files::open_pull(self, id, platform.resolve_path(path))
+            }
+            HostMsg::OpenTail { id, path } => {
+                crate::tail::open(self, id, platform.resolve_path(path))
+            }
             HostMsg::OpenEventLog { id, filter } => platform.open_eventlog(self, id, filter),
             HostMsg::SetClipboard { text } => platform.set_clipboard(self, text),
             HostMsg::GetClipboard => platform.get_clipboard(self),
@@ -341,6 +347,23 @@ pub trait Platform: Sync {
     /// the session, emit `Opened`, and emit `Exited` + remove when the shell
     /// ends.
     fn open_terminal(&self, mux: &Mux, id: u32, cols: u16, rows: u16, command: Option<Vec<String>>);
+    /// Streaming exec. The default spawns on the platform directly;
+    /// container mode reroutes through the namespace/chroot trampoline.
+    fn open_exec(
+        &self,
+        mux: &Mux,
+        id: u32,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+    ) {
+        crate::exec::open(mux, id, argv, env, cwd);
+    }
+    /// Map a host-supplied guest path (file transfer, tail) — container mode
+    /// resolves it inside the container rootfs.
+    fn resolve_path(&self, path: String) -> String {
+        path
+    }
     fn open_eventlog(&self, mux: &Mux, id: u32, filter: Option<String>);
     fn set_clipboard(&self, mux: &Mux, text: String);
     fn get_clipboard(&self, mux: &Mux);

@@ -28,7 +28,6 @@ mod mounts;
 mod net;
 mod reap;
 mod sig;
-mod tty;
 mod users;
 mod util;
 
@@ -72,6 +71,51 @@ fn wait_for_spec(ctl: &ctl::Ctl) -> Result<ContainerSpec> {
             Some(CtlCommand::Spec { spec }) => return Ok(spec),
             Some(CtlCommand::Stop { .. }) => return Err("stop requested before spec".into()),
             Some(_) | None => {}
+        }
+    }
+}
+
+/// Start `vmlab-agent --container` (interactive terminals, streaming exec,
+/// file transfer — the `vmlab.agent.0` port; see guest/agent-proto). The
+/// agent joins the workload namespaces per session via `setns_pid`; in idle
+/// mode there are none and sessions plainly chroot into the rootfs. Returns
+/// the agent's pid so callers can respawn it if it ever dies.
+fn spawn_agent(
+    spec: &ContainerSpec,
+    env: &[(String, String)],
+    setns_pid: Option<u32>,
+) -> Option<Pid> {
+    const AGENT: &str = "/vmlab-agent";
+    const CONFIG: &str = "/run/vmlab-agent.json";
+    if !std::path::Path::new(AGENT).exists() {
+        println!("vmlab-cinit: no vmlab-agent in initramfs, skipping");
+        return None;
+    }
+    let config = vmlab_agent_proto::ContainerConfig {
+        rootfs: mounts::ROOTFS.to_string(),
+        setns_pid,
+        env: env.to_vec(),
+        workdir: spec.workdir.clone(),
+    };
+    let json = match serde_json::to_string(&config) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("vmlab-cinit: warning: cannot serialise agent config: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = std::fs::write(CONFIG, json) {
+        eprintln!("vmlab-cinit: warning: cannot write {CONFIG}: {e}");
+        return None;
+    }
+    match Command::new(AGENT).args(["--container", CONFIG]).spawn() {
+        Ok(child) => {
+            println!("vmlab-cinit: vmlab-agent running (pid {})", child.id());
+            Some(Pid::from_raw(child.id() as i32))
+        }
+        Err(e) => {
+            eprintln!("vmlab-cinit: warning: vmlab-agent failed to start: {e}");
+            None
         }
     }
 }
@@ -150,6 +194,10 @@ fn run() -> Result<()> {
 
     if spec.mode == RuntimeMode::Idle {
         println!("vmlab-cinit: idle mode; OCI entrypoint and cmd are disabled");
+        // Terminals/exec in idle mode chroot into the prepared rootfs (no
+        // workload namespaces exist).
+        let idle_env = container::build_env(&spec, None);
+        let mut agent_pid = spawn_agent(&spec, &idle_env, None);
         ctl.emit(&CtlEvent::Idle);
         let ctl_replay = ctl.clone();
         ctl.spawn_dispatcher(move |cmd| match cmd {
@@ -161,7 +209,6 @@ fn run() -> Result<()> {
                 println!("vmlab-cinit: resync requested");
                 ctl_replay.resync();
             }
-            CtlCommand::TtyResize { .. } => {}
             CtlCommand::Spec { .. } => {
                 eprintln!("vmlab-cinit: warning: spec received after boot, ignoring");
             }
@@ -171,6 +218,10 @@ fn run() -> Result<()> {
                 Ok(status) => {
                     if let Some((pid, code)) = reap::exit_code(&status) {
                         eprintln!("vmlab-cinit: idle child {pid} exited with code {code}");
+                        if Some(Pid::from_raw(pid)) == agent_pid {
+                            thread::sleep(Duration::from_millis(500));
+                            agent_pid = spawn_agent(&spec, &idle_env, None);
+                        }
                     }
                 }
                 Err(Errno::EINTR) => {}
@@ -196,16 +247,37 @@ fn run() -> Result<()> {
 
     let process = container::spawn(&spec, user.as_ref(), &env)?;
     let child = process.pid;
-    // Interactive shell sessions join the workload's PID and mount
-    // namespaces, then chroot into its rootfs.
-    let tty = tty::Tty::start(&spec, &env, process.namespaces.clone(), reaper.clone());
+    // Interactive terminal/exec sessions (vmlab-agent) join the workload's
+    // PID and mount namespaces, then chroot into its rootfs. Respawned via
+    // the reaper if it ever dies.
+    if let Some(agent_pid) = spawn_agent(&spec, &env, Some(child.as_raw() as u32)) {
+        let spec = spec.clone();
+        let env = env.clone();
+        let reaper = reaper.clone();
+        let setns_pid = child.as_raw() as u32;
+        thread::spawn(move || {
+            let mut pid = agent_pid;
+            loop {
+                let exit = reaper.subscribe(pid.as_raw());
+                if exit.recv().is_err() {
+                    return;
+                }
+                eprintln!("vmlab-cinit: vmlab-agent died; respawning");
+                thread::sleep(Duration::from_millis(500));
+                match spawn_agent(&spec, &env, Some(setns_pid)) {
+                    Some(p) => pid = p,
+                    None => return,
+                }
+            }
+        });
+    }
     ctl.emit(&CtlEvent::Started {
         pid: child.as_raw() as u32,
     });
 
     // Host commands: Stop = graceful signal now, SIGKILL after the grace;
-    // TtyResize goes to the shell session's PTY; Resync replays lifecycle
-    // events after an online snapshot restore. A duplicate Spec is ignored.
+    // Resync replays lifecycle events after an online snapshot restore. A
+    // duplicate Spec is ignored.
     {
         let exited = exited.clone();
         let ctl_replay = ctl.clone();
@@ -222,7 +294,6 @@ fn run() -> Result<()> {
                     }
                 });
             }
-            CtlCommand::TtyResize { cols, rows } => tty.resize(cols, rows),
             CtlCommand::Resync => {
                 println!("vmlab-cinit: resync requested");
                 ctl_replay.resync();

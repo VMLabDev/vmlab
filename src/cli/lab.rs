@@ -557,23 +557,25 @@ pub fn cmd_container_ip(container_ref: &str) -> Result<()> {
 }
 
 /// `vmlab container shell` — attach an interactive shell running inside the
-/// container (guest/cinit's `vmlab.tty.0` PTY, PRD §18). The local terminal
-/// goes raw for the session; `Ctrl-]` detaches, like telnet.
+/// container (vmlab-agent over the `vmlab.agent.0` port, PRD §18). Every
+/// attach opens a fresh session; the local terminal goes raw; `Ctrl-]`
+/// detaches, like telnet.
 pub fn cmd_container_shell(container_ref: &str) -> Result<()> {
     rt()?.block_on(async {
         let (lab, container) = split_vm_ref(container_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
-        let path = client
-            .call("container.tty_path", json!({"container": container}))
+        let (cols, rows) = rustix::termios::tcgetwinsize(std::io::stdout())
+            .map(|ws| (ws.ws_col, ws.ws_row))
+            .unwrap_or((80, 24));
+        let opened = client
+            .call(
+                "container.tty_open",
+                json!({"container": container, "cols": cols, "rows": rows}),
+            )
             .await
             .map_err(remote)?;
-        let path = std::path::PathBuf::from(path.as_str().unwrap_or_default());
-        if !path.exists() {
-            anyhow::bail!(
-                "no shell socket for \"{container}\" ({}) — is the container running?",
-                path.display()
-            );
-        }
+        let session = opened["session"].as_u64().unwrap_or(0);
+        let path = std::path::PathBuf::from(opened["path"].as_str().unwrap_or_default());
         let resize: super::tty_attach::ResizeFn = {
             let (client, container) = (client.clone(), container.clone());
             std::sync::Arc::new(move |cols, rows| {
@@ -582,7 +584,8 @@ pub fn cmd_container_shell(container_ref: &str) -> Result<()> {
                     let _ = client
                         .call(
                             "container.tty_resize",
-                            json!({"container": container, "cols": cols, "rows": rows}),
+                            json!({"container": container, "session": session,
+                                   "cols": cols, "rows": rows}),
                         )
                         .await;
                 })

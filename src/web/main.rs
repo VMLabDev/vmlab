@@ -231,6 +231,8 @@ async fn main() -> ExitCode {
                 "/api/labs/{lab}/vms/{vm}/snapshots/{name}",
                 web::delete().to(api::snapshot_delete),
             )
+            // Interactive terminal inside the VM (vmlab-agent session).
+            .route("/api/labs/{lab}/vms/{vm}/tty", web::get().to(tty::vm_tty))
             .route(
                 "/api/labs/{lab}/vms/{vm}/{action}",
                 web::post().to(api::vm_action),
@@ -238,7 +240,7 @@ async fn main() -> ExitCode {
             // Container lifecycle (mirrors the VM actions).
             .route(
                 "/api/labs/{lab}/containers/{container}/tty",
-                web::get().to(tty::tty),
+                web::get().to(tty::container_tty),
             )
             .route(
                 "/api/labs/{lab}/containers/{container}/{action}",

@@ -42,6 +42,21 @@ use crate::mux::{Mux, Platform};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Container-mode entries first: they consume the rest of the argv.
+    #[cfg(unix)]
+    match args.first().map(String::as_str) {
+        // Exec trampoline for container sessions (see linux::nsexec_main).
+        Some("--nsexec") => linux::nsexec_main(&args[1..]),
+        // cinit spawns the agent with the container config it wrote.
+        Some("--container") => {
+            let Some(config) = args.get(1) else {
+                eprintln!("vmlab-agent: --container needs a config path");
+                std::process::exit(2);
+            };
+            run_with(linux::new_platform_container(config));
+        }
+        _ => {}
+    }
     let mut console = false;
     for a in &args {
         match a.as_str() {
@@ -78,7 +93,15 @@ fn main() {
 }
 
 fn run() -> ! {
-    let platform = platform_impl::new_platform();
+    run_with(platform_impl::new_platform())
+}
+
+#[cfg(unix)]
+type PlatformImpl = linux::LinuxPlatform;
+#[cfg(windows)]
+type PlatformImpl = windows::WindowsPlatform;
+
+fn run_with(platform: PlatformImpl) -> ! {
     let (mut port_r, port_w) = platform_impl::open_port();
     let mux = Mux::new(port_w);
     #[cfg(windows)]
