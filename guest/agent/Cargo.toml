@@ -1,0 +1,73 @@
+# vmlab-agent — the in-guest agent serving interactive terminals, streaming
+# exec, file transfer, tailing, metrics and clipboard over the vmlab.agent.0
+# virtio-serial port (guest/agent-proto). Baked into templates as a service
+# (systemd / Windows SCM) and spawned by cinit inside container micro-VMs.
+#
+# Built as a static binary per guest target (musl Linux, windows-gnu) by
+# ../build-agent.sh. Deliberately NOT part of the main crate's build: it is a
+# guest-only binary and (unlike the host crate) may use `unsafe` where the
+# PTY fork/exec and Win32 work demand it.
+
+[package]
+name = "vmlab-agent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "In-guest agent for vmlab VMs and container micro-VMs"
+
+[[bin]]
+name = "vmlab-agent"
+path = "src/main.rs"
+
+[dependencies]
+vmlab-agent-proto = { path = "../agent-proto" }
+serde_json = "1"
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = [
+    "process",
+    "signal",
+    "fs",
+    "term",
+    "ioctl",
+    "sched",
+    "user",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_EventLog",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+
+[lints.clippy]
+todo = "warn"
+dbg_macro = "warn"
+
+# Standalone: never built as part of the host crate.
+[workspace]
