@@ -9,9 +9,10 @@ import { Button, Empty, IconButton, StatusDot } from "@forge/ui";
 import type { StatusTone } from "@forge/ui";
 import { DesktopViewer } from "@forge/desktop";
 import type { DesktopApi, DesktopStatus } from "@forge/desktop";
-import { Maximize, RotateCcw } from "lucide-solid";
-import { wsUrl } from "../api";
+import { ClipboardCopy, ClipboardPaste, Maximize, RotateCcw } from "lucide-solid";
+import { vmClipboardGet, vmClipboardSet, wsUrl } from "../api";
 import type { Pull } from "../store";
+import { showToast } from "../store";
 import MachinePullStatus from "./MachinePullStatus";
 
 export default function ConsoleScreen(props: {
@@ -42,6 +43,27 @@ export default function ConsoleScreen(props: {
     return props.powered ? status() : "powered off";
   };
 
+  // Clipboard sync via the guest agent (needs a logged-on desktop session;
+  // errors explain themselves — e.g. headless guests have no clipboard).
+  const copyFromGuest = async () => {
+    try {
+      const { text } = await vmClipboardGet(props.lab, props.vm);
+      await navigator.clipboard.writeText(text);
+      showToast("Guest clipboard copied");
+    } catch (e) {
+      showToast(`Clipboard: ${e instanceof Error ? e.message : e}`, "danger");
+    }
+  };
+  const pasteToGuest = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      await vmClipboardSet(props.lab, props.vm, text);
+      showToast("Sent to guest clipboard");
+    } catch (e) {
+      showToast(`Clipboard: ${e instanceof Error ? e.message : e}`, "danger");
+    }
+  };
+
   return (
     <div>
       <div class="console-strip">
@@ -52,6 +74,18 @@ export default function ConsoleScreen(props: {
           <Button size="sm" variant="ghost" icon={RotateCcw} onClick={() => api?.connect()}>
             Reconnect
           </Button>
+        </Show>
+        <Show when={props.powered && !props.endpoint}>
+          <IconButton
+            icon={ClipboardCopy}
+            label="Copy guest clipboard"
+            onClick={copyFromGuest}
+          />
+          <IconButton
+            icon={ClipboardPaste}
+            label="Paste to guest clipboard"
+            onClick={pasteToGuest}
+          />
         </Show>
         <IconButton
           icon={Maximize}

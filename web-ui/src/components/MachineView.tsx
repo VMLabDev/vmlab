@@ -20,14 +20,18 @@ import {
 import { vmSnapshots } from "../api";
 import { confirmDialog, promptDialog } from "./dialogs";
 import ConsoleScreen from "./ConsoleScreen";
+import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
+import TerminalPanel from "./TerminalPanel";
 
 export default function MachineView() {
-  const [tab, setTab] = createSignal<"console" | "log">("console");
+  const [tab, setTab] = createSignal<"console" | "terminal" | "log">("console");
   // All of these are accessors so the view tracks the selected VM reactively —
   // switching machines re-runs them rather than pinning to the first one.
   const vm = () => state.status?.vms.find((v) => v.name === state.view.vm);
   const on = () => vm()?.state === "running";
+  // Terminal support: the template carries a baked-in vmlab-agent.
+  const hasAgent = () => Boolean(vm()?.agent_version);
   const pull = () => (vm() ? currentPullFor(vm()!.name) : undefined);
   const lk = () => {
     const v = vm();
@@ -117,15 +121,41 @@ export default function MachineView() {
       <Tabs
         tabs={[
           { id: "console", label: "Console" },
+          { id: "terminal", label: "Terminal" },
           { id: "log", label: "Log" },
         ]}
         active={tab()}
-        onChange={(id) => setTab(id as "console" | "log")}
+        onChange={(id) => setTab(id as "console" | "terminal" | "log")}
       />
 
       <Show when={tab() === "log"}>
         <LogPanel lab={state.currentLab!} source={vm()!.name} />
       </Show>
+
+      {/* display:none rather than unmount, so a started terminal session
+          survives switching tabs; stopping the VM tears it down. */}
+      <div style={{ display: tab() === "terminal" ? undefined : "none" }}>
+        <Show
+          when={on()}
+          fallback={<Empty title="Machine is powered off">Power it on to open a terminal.</Empty>}
+        >
+          <Show
+            when={hasAgent()}
+            fallback={
+              <Empty title="No terminal support">
+                This template predates the vmlab agent — rebuild it with `vmlab template build`
+                to enable interactive terminals.
+              </Empty>
+            }
+          >
+            <TerminalPanel
+              lab={state.currentLab!}
+              target={{ kind: "vm", name: vm()!.name }}
+              hint="Opens a shell inside the guest over virtio-serial — root on Linux, SYSTEM PowerShell on Windows. Works with no guest network."
+            />
+          </Show>
+        </Show>
+      </div>
 
       <div class="vm-layout" style={{ display: tab() === "console" ? undefined : "none" }}>
         <ConsoleScreen
@@ -144,6 +174,7 @@ export default function MachineView() {
             <KV k="MAC" v={vm()!.nics[0]?.mac ?? "—"} />
             <KV k="Segment" v={segments()} />
           </Card>
+          <GuestStats lab={state.currentLab!} kind="vm" name={vm()!.name} running={on()} />
           <Card
             title="Snapshots"
             action={

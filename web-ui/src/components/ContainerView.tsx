@@ -17,6 +17,7 @@ import {
   currentPullFor,
   state,
 } from "../store";
+import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
 import MachinePullStatus from "./MachinePullStatus";
 import TerminalPanel from "./TerminalPanel";
@@ -106,7 +107,12 @@ export default function ContainerView() {
           when={on()}
           fallback={<Empty title="Container is stopped">Start it to open a terminal.</Empty>}
         >
-          <TerminalPanel lab={state.currentLab!} container={ctr()!.name} />
+          <TerminalPanel
+            lab={state.currentLab!}
+            target={{ kind: "container", name: ctr()!.name }}
+            title="Recovery terminal"
+            hint="Opens a shell inside the container (busybox fallback for distroless images)."
+          />
         </Show>
       </div>
 
@@ -137,6 +143,7 @@ export default function ContainerView() {
               v={ctr()!.health == null ? "no probe" : ctr()!.health ? "healthy" : "unhealthy"}
             />
           </Card>
+          <GuestStats lab={state.currentLab!} kind="container" name={ctr()!.name} running={on()} />
         </div>
       </div>
     </Show>

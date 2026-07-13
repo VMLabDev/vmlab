@@ -1135,6 +1135,76 @@ pub async fn snapshot_restore(
     }
 }
 
+/// `GET /api/labs/{lab}/vms/{vm}/stats` — latest guest metrics from the
+/// vmlab-agent (CPU/memory/disks; 404-ish conflict for agent-less guests).
+pub async fn vm_stats(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (lab, vm) = path.into_inner();
+    match state.lab_call(&lab, "vm.stats", json!({"vm": vm})).await {
+        Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
+/// `GET /api/labs/{lab}/containers/{container}/stats` — micro-VM metrics.
+pub async fn container_stats(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (lab, container) = path.into_inner();
+    match state
+        .lab_call(&lab, "container.stats", json!({"container": container}))
+        .await
+    {
+        Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ClipboardBody {
+    pub text: String,
+}
+
+/// `GET /api/labs/{lab}/vms/{vm}/clipboard` — read the guest clipboard
+/// (agent `clipboard` feature; needs a logged-on desktop session).
+pub async fn vm_clipboard_get(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (lab, vm) = path.into_inner();
+    match state
+        .lab_call(&lab, "vm.clipboard_get", json!({"vm": vm}))
+        .await
+    {
+        Ok(v) => ok(json!({"text": v})),
+        Err(e) => fail(e),
+    }
+}
+
+/// `POST /api/labs/{lab}/vms/{vm}/clipboard` `{text}` — set the guest
+/// clipboard.
+pub async fn vm_clipboard_set(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    body: web::Json<ClipboardBody>,
+) -> HttpResponse {
+    let (lab, vm) = path.into_inner();
+    match state
+        .lab_call(
+            &lab,
+            "vm.clipboard_set",
+            json!({"vm": vm, "text": body.text}),
+        )
+        .await
+    {
+        Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

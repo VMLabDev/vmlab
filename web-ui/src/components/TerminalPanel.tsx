@@ -1,11 +1,12 @@
-// Recovery terminal into a container (PRD §18): an xterm.js terminal over
-// the /containers/{name}/tty WebSocket. Binary frames are raw PTY bytes both
+// Interactive terminal into a guest — a VM's vmlab-agent shell or a
+// container's recovery shell — over the /vms/{vm}/tty or
+// /containers/{name}/tty WebSocket. Binary frames are raw PTY bytes both
 // ways; resizes go as a JSON text frame, which the server proxies to the lab
-// daemon (→ TIOCSWINSZ on the guest PTY).
+// daemon (→ the agent resizes the guest PTY).
 //
-// The session opens on demand (a Start button), not on mount — it is a
-// troubleshooting surface, and an idle page shouldn't hold a PTY session in
-// the guest.
+// The session opens on demand (a Start button), not on mount — an idle page
+// shouldn't hold a PTY session in the guest. Every start/reconnect opens a
+// fresh session (multi-session: concurrent terminals are independent).
 
 import { Show, createSignal, onCleanup } from "solid-js";
 import { Terminal } from "@xterm/xterm";
@@ -15,7 +16,16 @@ import { Button, Card } from "@forge/ui";
 import { RotateCcw, TerminalSquare } from "lucide-solid";
 import * as api from "../api";
 
-export default function TerminalPanel(p: { lab: string; container: string }) {
+export type TerminalTarget =
+  | { kind: "vm"; name: string }
+  | { kind: "container"; name: string };
+
+export default function TerminalPanel(p: {
+  lab: string;
+  target: TerminalTarget;
+  title?: string;
+  hint?: string;
+}) {
   let host!: HTMLDivElement;
   const [started, setStarted] = createSignal(false);
   const [closed, setClosed] = createSignal(false);
@@ -24,14 +34,15 @@ export default function TerminalPanel(p: { lab: string; container: string }) {
   let fit: FitAddon | undefined;
   let observer: ResizeObserver | undefined;
 
+  const path = () =>
+    p.target.kind === "vm"
+      ? `/api/labs/${encodeURIComponent(p.lab)}/vms/${encodeURIComponent(p.target.name)}/tty`
+      : `/api/labs/${encodeURIComponent(p.lab)}/containers/${encodeURIComponent(p.target.name)}/tty`;
+
   const connect = () => {
     setClosed(false);
     ws?.close();
-    const sock = new WebSocket(
-      api.wsUrl(
-        `/api/labs/${encodeURIComponent(p.lab)}/containers/${encodeURIComponent(p.container)}/tty`,
-      ),
-    );
+    const sock = new WebSocket(api.wsUrl(path()));
     sock.binaryType = "arraybuffer";
     ws = sock;
     sock.onopen = () => {
@@ -82,7 +93,7 @@ export default function TerminalPanel(p: { lab: string; container: string }) {
 
   return (
     <Card
-      title="Recovery terminal"
+      title={p.title ?? "Terminal"}
       action={
         started() && closed() ? (
           <Button icon={RotateCcw} onClick={connect}>
@@ -97,7 +108,8 @@ export default function TerminalPanel(p: { lab: string; container: string }) {
             Start terminal
           </Button>
           <span class="ctr-term-hint">
-            Opens a shell inside the container (busybox fallback for distroless images).
+            {p.hint ??
+              "Opens a shell inside the guest over virtio-serial (no guest network needed)."}
           </span>
         </div>
       </Show>

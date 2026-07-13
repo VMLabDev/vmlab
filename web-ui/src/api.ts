@@ -85,6 +85,9 @@ export interface Vm {
   cpus: number | null;
   memory: number | null;
   nics: Nic[];
+  /** vmlab-agent stamp baked into the template — null means the template
+   *  predates agent support (no interactive terminal). */
+  agent_version?: string | null;
 }
 /** One container's runtime status (labd `status()` containers array). */
 export interface Container {
@@ -171,6 +174,26 @@ export const deleteSnapshot = (lab: string, vm: string, name: string) =>
   );
 export const takeSnapshot = (lab: string, name: string, vm?: string) =>
   post(`/api/labs/${encodeURIComponent(lab)}/snapshots`, { name, vm });
+
+/** One guest metrics sample (vmlab-agent `metrics` feature). */
+export interface GuestStats {
+  cpu_pct: number;
+  mem_used: number;
+  mem_total: number;
+  disks: { mount: string; used: number; total: number }[];
+}
+export const vmStats = (lab: string, vm: string): Promise<GuestStats> =>
+  req(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/stats`);
+export const containerStats = (lab: string, container: string): Promise<GuestStats> =>
+  req(
+    `/api/labs/${encodeURIComponent(lab)}/containers/${encodeURIComponent(container)}/stats`,
+  );
+export const vmClipboardGet = (lab: string, vm: string): Promise<{ text: string }> =>
+  req(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/clipboard`);
+export const vmClipboardSet = (lab: string, vm: string, text: string) =>
+  post(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/clipboard`, {
+    text,
+  });
 export const restoreSnapshot = (lab: string, name: string, vm?: string) =>
   post(
     `/api/labs/${encodeURIComponent(lab)}/snapshots/${encodeURIComponent(name)}/restore`,

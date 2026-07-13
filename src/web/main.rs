@@ -233,6 +233,23 @@ async fn main() -> ExitCode {
             )
             // Interactive terminal inside the VM (vmlab-agent session).
             .route("/api/labs/{lab}/vms/{vm}/tty", web::get().to(tty::vm_tty))
+            // Guest metrics + clipboard (vmlab-agent).
+            .route(
+                "/api/labs/{lab}/vms/{vm}/stats",
+                web::get().to(api::vm_stats),
+            )
+            .route(
+                "/api/labs/{lab}/vms/{vm}/clipboard",
+                web::get().to(api::vm_clipboard_get),
+            )
+            .route(
+                "/api/labs/{lab}/vms/{vm}/clipboard",
+                web::post().to(api::vm_clipboard_set),
+            )
+            .route(
+                "/api/labs/{lab}/containers/{container}/stats",
+                web::get().to(api::container_stats),
+            )
             .route(
                 "/api/labs/{lab}/vms/{vm}/{action}",
                 web::post().to(api::vm_action),
