@@ -178,6 +178,22 @@ impl Mux {
         Some((rx, credit))
     }
 
+    /// Install a session's kill hook after the fact — for sessions whose
+    /// cancel handle only exists once an OS call succeeds (Windows event-log
+    /// subscriptions). Runs the hook immediately if the session is already
+    /// gone.
+    #[cfg(windows)]
+    pub fn set_kill(&self, id: u32, kill: Box<dyn FnOnce() + Send>) {
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        match sessions.get_mut(&id) {
+            Some(s) => s.kill = Some(kill),
+            None => {
+                drop(sessions);
+                kill();
+            }
+        }
+    }
+
     /// Remove a session (host `close`, or the session finished on its own).
     /// Idempotent.
     pub fn remove(&self, id: u32) {

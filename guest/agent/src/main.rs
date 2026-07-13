@@ -42,11 +42,20 @@ use crate::mux::{Mux, Platform};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut console = false;
     for a in &args {
         match a.as_str() {
             "--daemonize" => {
                 #[cfg(unix)]
                 linux::daemonize();
+            }
+            // Windows: skip the SCM dispatcher and run in this console.
+            "--console" => console = true,
+            // Windows-internal: the user-session clipboard helper the
+            // service spawns (see windows/clipboard.rs).
+            #[cfg(windows)]
+            "--clipboard-helper" => {
+                windows::clipboard::helper_main();
             }
             "--version" => {
                 println!("vmlab-agent {}", env!("CARGO_PKG_VERSION"));
@@ -58,6 +67,13 @@ fn main() {
             }
         }
     }
+    #[cfg(windows)]
+    if !console {
+        // Runs `run` under the SCM, or directly when launched from a
+        // console (the dispatcher tells the two apart).
+        windows::service::dispatch(run);
+    }
+    let _ = console;
     run();
 }
 
@@ -65,6 +81,8 @@ fn run() -> ! {
     let platform = platform_impl::new_platform();
     let (mut port_r, port_w) = platform_impl::open_port();
     let mux = Mux::new(port_w);
+    #[cfg(windows)]
+    platform.start_clipboard(&mux);
     eprintln!(
         "vmlab-agent {} serving on {} (features: {})",
         env!("CARGO_PKG_VERSION"),
