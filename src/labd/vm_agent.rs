@@ -131,6 +131,12 @@ struct Inner {
     /// The connection's runtime, so cleanup can be spawned from any thread
     /// (scripts drop sessions on non-runtime threads).
     rt: tokio::runtime::Handle,
+    /// The reader task, aborted on shutdown/drop. Without this the task
+    /// stays blocked in `read()` holding the socket's read half — and
+    /// QEMU's `server=on` chardev serves ONE client at a time, so a
+    /// half-dead connection blocks every future connect (the post-restore
+    /// reconnect would queue in the listen backlog forever).
+    reader: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     writer: Mutex<OwnedWriteHalf>,
     sessions: Mutex<HashMap<u32, SessionEntry>>,
     /// Waiters for `opened`/error replies to an `open_*` message, keyed by
@@ -169,6 +175,7 @@ impl AgentHandle {
         let token = format!("{:016x}", rand::random::<u64>());
         let inner = Arc::new(Inner {
             rt: tokio::runtime::Handle::current(),
+            reader: std::sync::Mutex::new(None),
             writer: Mutex::new(write_half),
             sessions: Mutex::new(HashMap::new()),
             open_waiters: std::sync::Mutex::new(HashMap::new()),
@@ -184,10 +191,12 @@ impl AgentHandle {
             inner: inner.clone(),
         };
 
-        // Reader task: holds only a Weak so dropping every handle closes the
-        // connection and ends the task.
+        // Reader task: holds only a Weak so it never keeps the connection
+        // alive; the JoinHandle lets shutdown/drop abort it (which drops the
+        // read half and actually closes the socket — see `Inner::reader`).
         let weak = Arc::downgrade(&inner);
-        tokio::spawn(async move { reader_task(weak, read_half).await });
+        let task = tokio::spawn(async move { reader_task(weak, read_half).await });
+        *inner.reader.lock().unwrap() = Some(task);
 
         handle
             .send_msg(&HostMsg::Hello {
@@ -239,6 +248,29 @@ impl AgentHandle {
             .context("agent write")?;
         w.flush().await.context("agent flush")?;
         Ok(())
+    }
+
+    /// Tear the connection down now — both socket halves — and fail every
+    /// open session so consumers unblock. Used around snapshot restores and
+    /// when replacing a dead handle; dropping the last handle does the same
+    /// implicitly.
+    pub async fn shutdown(&self) {
+        if let Some(task) = self.inner.reader.lock().unwrap().take() {
+            task.abort();
+        }
+        // Close the write half explicitly: QEMU frees its one-client
+        // chardev slot only when *its* read side sees EOF, and session-held
+        // handle clones (an attached terminal, a lingering tail) would
+        // otherwise keep the socket half-open indefinitely, wedging every
+        // future connect in the listen backlog.
+        let _ = self.inner.writer.lock().await.shutdown().await;
+        // Dropping the entries drops their event senders, so session
+        // consumers' recv() sees end-of-stream and their pumps wind down.
+        let mut sessions = self.inner.sessions.lock().await;
+        for (_, entry) in sessions.drain() {
+            entry.credit.close();
+        }
+        self.inner.open_waiters.lock().unwrap().clear();
     }
 
     /// Liveness probe.
@@ -613,6 +645,16 @@ pub struct ExecOutput {
 
 /// A waiter for the `opened`/error reply to an `open_*` message.
 type OpenWaiter = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Last handle gone: abort the reader so its blocked `read()` drops
+        // the socket's read half (see the `reader` field for why).
+        if let Some(task) = self.reader.lock().unwrap().take() {
+            task.abort();
+        }
+    }
+}
 
 async fn reader_task(weak: Weak<Inner>, mut read_half: tokio::net::unix::OwnedReadHalf) {
     let mut decoder = FrameDecoder::new();
@@ -991,6 +1033,67 @@ mod tests {
             }
         });
         (dir, path)
+    }
+
+    /// QEMU's `server=on` chardev serves one client at a time: the next
+    /// connect only proceeds once the previous socket fully closes. Both
+    /// dropping the last handle and an explicit shutdown must free the slot
+    /// (the reader task must not keep the read half alive) — this is the
+    /// snapshot-restore reconnect path.
+    #[tokio::test]
+    async fn dropped_and_shutdown_handles_free_the_one_client_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        tokio::spawn(async move {
+            // Serve clients strictly sequentially, like QEMU.
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut dec = FrameDecoder::new();
+                let mut buf = [0u8; 4096];
+                'client: loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break 'client,
+                        Ok(n) => n,
+                    };
+                    dec.push(&buf[..n]);
+                    while let Some(f) = dec.next_frame() {
+                        if f.kind != FrameKind::Ctrl {
+                            continue;
+                        }
+                        if let Ok(HostMsg::Hello { token, .. }) =
+                            serde_json::from_slice::<HostMsg>(&f.payload)
+                        {
+                            let reply = encode_ctrl(&AgentMsg::Hello {
+                                proto_version: PROTO_VERSION,
+                                agent_version: "seq-mock".into(),
+                                os: "linux".into(),
+                                features: vec![],
+                                token,
+                            });
+                            let _ = stream.write_all(&reply).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        // First connection handshakes, then is dropped.
+        let first = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        drop(first);
+        // Second connect must not hang in the backlog behind the first.
+        let second = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        // Explicit shutdown (the restore path) frees the slot too, even
+        // with a session-held clone still alive.
+        let keep_alive = second.clone();
+        second.shutdown().await;
+        drop(second);
+        let third = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        assert_eq!(third.info().agent_version, "seq-mock");
+        drop(keep_alive);
     }
 
     #[tokio::test]

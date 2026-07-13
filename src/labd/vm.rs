@@ -332,7 +332,9 @@ impl VmInstance {
             if handle.ping(Duration::from_secs(2)).await {
                 return Ok(handle.clone());
             }
-            *agent = None;
+            if let Some(dead) = agent.take() {
+                dead.shutdown().await; // frees the chardev's one-client slot
+            }
         }
         {
             let failed = self.agent_failed_at.lock().await;
@@ -357,9 +359,13 @@ impl VmInstance {
         }
     }
 
-    /// Drop the cached agent connection (teardown, snapshot restore).
+    /// Drop the cached agent connection (teardown, snapshot restore). An
+    /// explicit shutdown, not just a drop: live sessions hold handle clones,
+    /// and a half-dead connection blocks QEMU's one-client chardev slot.
     pub async fn drop_agent(&self) {
-        *self.agent.lock().await = None;
+        if let Some(handle) = self.agent.lock().await.take() {
+            handle.shutdown().await;
+        }
         *self.agent_failed_at.lock().await = None;
     }
 

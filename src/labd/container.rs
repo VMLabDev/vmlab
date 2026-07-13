@@ -532,7 +532,9 @@ impl ContainerInstance {
             if handle.ping(Duration::from_secs(2)).await {
                 return Ok(handle.clone());
             }
-            *agent = None;
+            if let Some(dead) = agent.take() {
+                dead.shutdown().await; // frees the chardev's one-client slot
+            }
         }
         {
             let failed = self.agent_failed_at.lock().await;
@@ -993,7 +995,9 @@ impl ContainerInstance {
         *self.ctl.lock().await = None;
         *self.qmp.lock().await = None;
         *self.qga.lock().await = None;
-        *self.agent.lock().await = None;
+        if let Some(agent) = self.agent.lock().await.take() {
+            agent.shutdown().await;
+        }
         *self.agent_failed_at.lock().await = None;
         if let Some(proc) = self.qemu.lock().await.take()
             && proc.is_running()
@@ -1132,9 +1136,13 @@ impl ContainerInstance {
         // silently poisons a later exchange. With no client attached, QEMU
         // discards the replayed bytes; the reconnect below starts clean.
         // vmlab-agent gets the same treatment; its lazy reconnect
-        // re-handshakes with a fresh token (guest/agent-proto).
+        // re-handshakes with a fresh token (guest/agent-proto). Shutdown,
+        // not drop: live sessions hold handle clones, and a lingering
+        // connection blocks QEMU's one-client chardev slot.
         self.qga.lock().await.take();
-        *self.agent.lock().await = None;
+        if let Some(agent) = self.agent.lock().await.take() {
+            agent.shutdown().await;
+        }
         *self.agent_failed_at.lock().await = None;
         qmp.cont().await?;
         self.reconnect_agent_after_load().await;
