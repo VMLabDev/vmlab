@@ -63,6 +63,12 @@ pub struct VmHandle {
     pub(crate) last_pointer: Arc<std::sync::Mutex<(i64, i64)>>,
     /// Directory the running script lives in (see [`LabHandle::ref_base`]).
     pub(crate) ref_base: Arc<std::path::PathBuf>,
+    /// True when this handle targets the VM whose own first-boot provision
+    /// is the running script. Full readiness is unreachable until that script
+    /// returns (the poller defers the ready flag), so `is_ready`/`wait_ready`
+    /// on this handle mean agent-level readiness — a first-boot script that
+    /// reboots its guest can wait for it to come back.
+    pub(crate) first_boot_gated: bool,
 }
 
 /// A container handle (PRD §16, §18): the lifecycle/exec/ip/snapshot subset
@@ -349,6 +355,7 @@ pub fn lab_module() -> Module {
                     rt: l.rt.clone(),
                     last_pointer: Default::default(),
                     ref_base: l.ref_base.clone(),
+                    first_boot_gated: l.first_boot_vm.as_deref() == Some(name),
                 })
             },
         )
@@ -364,6 +371,7 @@ pub fn lab_module() -> Module {
                 rt: l.rt.clone(),
                 last_pointer: Default::default(),
                 ref_base: l.ref_base.clone(),
+                first_boot_gated: true,
             })
         })
         .method("vms", |l: &LabHandle| -> Vec<VmHandle> {
@@ -376,6 +384,7 @@ pub fn lab_module() -> Module {
                     rt: l.rt.clone(),
                     last_pointer: Default::default(),
                     ref_base: l.ref_base.clone(),
+                    first_boot_gated: l.first_boot_vm.as_deref() == Some(vm.cfg.name.as_str()),
                 })
                 .collect()
         })
@@ -537,14 +546,27 @@ pub fn lab_module() -> Module {
                 PowerState::Stopping => "stopping".into(),
             }
         })
+        // Readiness: inside the VM's own first-boot provision the ready flag
+        // is deferred until that script returns, so these mean "does the
+        // agent answer right now" there (see `VmHandle::first_boot_gated`) —
+        // a live signal the script can use to watch its own guest reboot —
+        // and full readiness everywhere else.
         .method("is_ready", |v: &VmHandle| -> bool {
-            v.block(v.vm.is_ready())
+            if v.first_boot_gated {
+                v.block(v.vm.agent_answering())
+            } else {
+                v.block(v.vm.is_ready())
+            }
         })
         .method(
             "wait_ready",
             |v: &VmHandle, timeout_secs: i64| -> Result<(), String> {
-                v.block(v.vm.wait_ready(Duration::from_secs(timeout_secs.max(0) as u64)))
-                    .map_err(estr)
+                let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
+                if v.first_boot_gated {
+                    v.block(v.vm.wait_agent_answering(timeout)).map_err(estr)
+                } else {
+                    v.block(v.vm.wait_ready(timeout)).map_err(estr)
+                }
             },
         )
         .method(

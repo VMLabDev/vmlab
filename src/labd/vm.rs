@@ -282,6 +282,35 @@ impl VmInstance {
         *self.agent_up.read().await
     }
 
+    /// Whether the guest agent answers a ping right now. Unlike the sticky
+    /// [`is_agent_up`] flag, this goes false while the guest is down or
+    /// mid-reboot — what a first-boot provision needs to watch its own guest
+    /// restart (QEMU stays up, so power state never changes).
+    pub async fn agent_answering(&self) -> bool {
+        match self.qga().await {
+            Ok(qga) => qga.ping(Duration::from_secs(2)).await,
+            Err(_) => false,
+        }
+    }
+
+    /// Wait until the guest agent answers a live ping (see
+    /// [`agent_answering`](Self::agent_answering)).
+    pub async fn wait_agent_answering(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.agent_answering().await {
+                return Ok(());
+            }
+            if self.state().await == PowerState::Stopped {
+                bail!("{} stopped while waiting for agent", self.cfg.name);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("{}: agent not answering after {timeout:?}", self.cfg.name);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     /// Mark the VM fully ready. Called by the orchestration layer once the
     /// first-boot provision (if any) has completed.
     pub async fn mark_ready(&self) {
