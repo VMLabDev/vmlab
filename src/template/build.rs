@@ -371,15 +371,12 @@ async fn run_build(
         // (provisions need the same guest agent it waited on); the cap only
         // bounds pathological cases so the seal can't hang.
         if let Some(task) = bake_task {
-            let version =
-                tokio::time::timeout(std::time::Duration::from_secs(60), task)
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "provisions finished but the vmlab-agent bake never completed"
-                        )
-                    })?
-                    .map_err(|e| anyhow::anyhow!("agent bake task panicked: {e}"))??;
+            let version = tokio::time::timeout(std::time::Duration::from_secs(60), task)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("provisions finished but the vmlab-agent bake never completed")
+                })?
+                .map_err(|e| anyhow::anyhow!("agent bake task panicked: {e}"))??;
             *agent_version.lock().expect("agent_version lock") = version;
         }
         log("sealing: graceful shutdown\n".to_string());
