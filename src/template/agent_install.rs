@@ -44,11 +44,17 @@ WantedBy=multi-user.target
 ";
 
 /// Install + verify; returns the asset's version stamp for the template
-/// metadata, or `None` when skipped (reason already logged).
+/// metadata, or `None` when skipped (reason already logged). `qga_wait` is
+/// how long to wait for the guest agent to first answer: a layered source
+/// already ships one (its first-boot pass bounds the wait), but a fresh
+/// install from ISO/scratch only gets QGA once the unattended installer has
+/// laid down the OS and its first-logon tooling — routinely 15–45 minutes
+/// for Windows.
 pub async fn install(
     vm: &Arc<VmInstance>,
     wants_agent: bool,
     arch: &str,
+    qga_wait: Duration,
     log: &(dyn Fn(String) + Sync),
 ) -> Result<Option<String>> {
     if !wants_agent {
@@ -61,7 +67,7 @@ pub async fn install(
     }
 
     // The hook runs right after boot: wait for QGA before driving it.
-    vm.wait_agent_up(Duration::from_secs(600))
+    vm.wait_agent_up(qga_wait)
         .await
         .context("waiting for the guest agent before the vmlab-agent install")?;
     let qga = vm.qga().await?;

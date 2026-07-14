@@ -221,7 +221,19 @@ async fn run_build(
     // Bake the vmlab-agent right after boot, before any provision script —
     // a final sysprep/generalize provision may shut the guest down, so
     // post-provision would be too late. The verified asset version lands in
-    // the sealed metadata below.
+    // the sealed metadata below. How long QGA can take to first answer
+    // depends on the source: a layered image boots an installed OS (its
+    // first-boot pass runs before this hook), but ISO/scratch builds only
+    // get QGA once the unattended installer has laid down the OS and its
+    // first-logon tooling — up to the better part of an hour for Windows.
+    let qga_wait = match &def.source {
+        TemplateSource::Template { .. } | TemplateSource::Qcow2(_) => {
+            std::time::Duration::from_secs(600)
+        }
+        TemplateSource::Iso(_) | TemplateSource::Scratch { .. } => {
+            std::time::Duration::from_secs(3600)
+        }
+    };
     let agent_version: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
     {
@@ -235,7 +247,8 @@ async fn run_build(
                 Box::pin(async move {
                     let log = move |s: String| out(s);
                     let version =
-                        super::agent_install::install(&vm, wants_agent, &arch, &log).await?;
+                        super::agent_install::install(&vm, wants_agent, &arch, qga_wait, &log)
+                            .await?;
                     *agent_version.lock().expect("agent_version lock") = version;
                     Ok(())
                 })
