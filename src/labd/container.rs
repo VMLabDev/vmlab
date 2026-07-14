@@ -588,7 +588,10 @@ impl ContainerInstance {
 
     async fn send_spec(&self, ctl: &CtlHandle) -> Result<()> {
         let spec = self.spec_for_guest().await?;
-        ctl.send(&CtlCommand::Spec { spec }).await
+        ctl.send(&CtlCommand::Spec {
+            spec: Box::new(spec),
+        })
+        .await
     }
 
     fn cpus(&self) -> u32 {

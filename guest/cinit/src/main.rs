@@ -68,7 +68,7 @@ fn wait_for_spec(ctl: &ctl::Ctl) -> Result<ContainerSpec> {
             proto_version: PROTO_VERSION,
         });
         match ctl.recv_command(Duration::from_secs(1)) {
-            Some(CtlCommand::Spec { spec }) => return Ok(spec),
+            Some(CtlCommand::Spec { spec }) => return Ok(*spec),
             Some(CtlCommand::Stop { .. }) => return Err("stop requested before spec".into()),
             Some(_) | None => {}
         }

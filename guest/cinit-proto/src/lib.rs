@@ -187,8 +187,10 @@ pub enum CtlEvent {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum CtlCommand {
     /// The container spec. Sent once the host sees `boot`; cinit blocks its
-    /// boot sequence until this arrives.
-    Spec { spec: ContainerSpec },
+    /// boot sequence until this arrives. Boxed to keep the enum small (the
+    /// spec dwarfs every other command); serde is transparent over the Box,
+    /// so the wire format is unchanged.
+    Spec { spec: Box<ContainerSpec> },
     /// Graceful stop: send the spec's stop signal, escalate to SIGKILL after
     /// `grace_secs`.
     Stop { grace_secs: u64 },
