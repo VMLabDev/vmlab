@@ -218,25 +218,54 @@ async fn run_build(
     )
     .await?;
 
-    // Bake the vmlab-agent right after boot, before any provision script —
-    // a final sysprep/generalize provision may shut the guest down, so
-    // post-provision would be too late. The verified asset version lands in
-    // the sealed metadata below. How long QGA can take to first answer
-    // depends on the source: a layered image boots an installed OS (its
-    // first-boot pass runs before this hook), but ISO/scratch builds only
-    // get QGA once the unattended installer has laid down the OS and its
-    // first-logon tooling — up to the better part of an hour for Windows.
-    let qga_wait = match &def.source {
-        TemplateSource::Template { .. } | TemplateSource::Qcow2(_) => {
-            std::time::Duration::from_secs(600)
-        }
-        TemplateSource::Iso(_) | TemplateSource::Scratch { .. } => {
-            std::time::Duration::from_secs(3600)
-        }
-    };
+    // Bake the vmlab-agent before any provision can shut the guest down (a
+    // sysprep/generalize finale makes post-provision too late). The verified
+    // asset version lands in the sealed metadata below. HOW the bake runs
+    // depends on the source:
+    //
+    // - Layered/qcow2: the image boots an installed OS, so QGA answers
+    //   promptly (bounded by a layered source's first-boot pass) — bake as a
+    //   blocking pre-provision hook, before any provision script.
+    // - ISO/scratch: the provisions themselves drive the installer from the
+    //   first keystroke, so a blocking hook deadlocks — it waits for QGA,
+    //   which only exists once the provisions have installed the OS. Bake
+    //   concurrently instead: watch for QGA in the background and install
+    //   the moment it answers (first-logon tooling lands minutes before any
+    //   sysprep finale). Sealing below requires the bake to have finished.
+    let vm = runtime.vm(build_vm)?;
     let agent_version: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
-    {
+    let bake_concurrent = matches!(
+        def.source,
+        TemplateSource::Iso(_) | TemplateSource::Scratch { .. }
+    );
+    let bake_task: Option<tokio::task::JoinHandle<Result<Option<String>>>> = if bake_concurrent {
+        let vm = vm.clone();
+        let arch = def.arch.clone();
+        let wants_agent = def.agent;
+        let out = log.clone();
+        Some(tokio::spawn(async move {
+            // Wait for `up` to actually start the VM (wait_agent_up treats
+            // Stopped as fatal), capped so a build that dies before boot
+            // doesn't strand this task.
+            let started = tokio::time::Instant::now();
+            while vm.state().await == crate::labd::vm::PowerState::Stopped {
+                if started.elapsed() > std::time::Duration::from_secs(600) {
+                    bail!("build VM never started");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let log = move |s: String| out(s);
+            super::agent_install::install(
+                &vm,
+                wants_agent,
+                &arch,
+                std::time::Duration::from_secs(3600),
+                &log,
+            )
+            .await
+        }))
+    } else {
         let wants_agent = def.agent;
         let arch = def.arch.clone();
         let agent_version = agent_version.clone();
@@ -246,16 +275,20 @@ async fn run_build(
                 let agent_version = agent_version.clone();
                 Box::pin(async move {
                     let log = move |s: String| out(s);
-                    let version =
-                        super::agent_install::install(&vm, wants_agent, &arch, qga_wait, &log)
-                            .await?;
+                    let version = super::agent_install::install(
+                        &vm,
+                        wants_agent,
+                        &arch,
+                        std::time::Duration::from_secs(600),
+                        &log,
+                    )
+                    .await?;
                     *agent_version.lock().expect("agent_version lock") = version;
                     Ok(())
                 })
             }));
-    }
-
-    let vm = runtime.vm(build_vm)?;
+        None
+    };
 
     // Carry the layered source's first-boot provision onto the build VM.
     // The build seeds the working disk directly (below) instead of cloning
@@ -333,6 +366,21 @@ async fn run_build(
         match up_result {
             Some(result) => result.context("build boot/provision failed")?,
             None => bail!("build cancelled"),
+        }
+        // A concurrent bake finished minutes ago in any successful build
+        // (provisions need the same guest agent it waited on); the cap only
+        // bounds pathological cases so the seal can't hang.
+        if let Some(task) = bake_task {
+            let version =
+                tokio::time::timeout(std::time::Duration::from_secs(60), task)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "provisions finished but the vmlab-agent bake never completed"
+                        )
+                    })?
+                    .map_err(|e| anyhow::anyhow!("agent bake task panicked: {e}"))??;
+            *agent_version.lock().expect("agent_version lock") = version;
         }
         log("sealing: graceful shutdown\n".to_string());
         vm.stop(false).await.context("build VM did not shut down")?;
