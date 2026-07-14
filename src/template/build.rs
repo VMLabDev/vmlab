@@ -163,7 +163,12 @@ async fn run_build(
     let disk_size = def.disk.unwrap_or(20 << 30);
     let build_vm = "build";
 
-    // Resolve the source into the working primary disk.
+    // Resolve the source into the working primary disk. A layered source's
+    // embedded first-boot provision must gate the build boot exactly as it
+    // gates a clone (PRD §6.1): a sysprep-generalized Windows source replays
+    // specialize/OOBE on this boot, and QGA answers while that is still
+    // running — sealing then would capture a half-specialized image.
+    let mut source_first_boot: Option<String> = None;
     let (cdrom, seed_disk): (Option<PathBuf>, SeedDisk) = match &def.source {
         TemplateSource::Iso(src) => {
             let iso = cancelable(&run.control.cancel, resolve_artefact(src, root, log)).await?;
@@ -189,6 +194,7 @@ async fn run_build(
                     arch_name_ver.2.as_deref(),
                 )
                 .context("resolving layered build source")?;
+            source_first_boot = resolved.meta.first_boot_script.clone();
             (None, SeedDisk::CopyFrom(resolved.disk_path))
         }
         TemplateSource::Scratch { .. } => (None, SeedDisk::Blank(disk_size)),
@@ -237,6 +243,22 @@ async fn run_build(
     }
 
     let vm = runtime.vm(build_vm)?;
+
+    // Carry the layered source's first-boot provision onto the build VM.
+    // The build seeds the working disk directly (below) instead of cloning
+    // through the store, so the script would otherwise be lost — and `up()`
+    // runs it before the agent bake and any build provisions.
+    if let Some(script) = source_first_boot {
+        let parts = vm.template();
+        vm.set_template(crate::labd::vm::TemplateParts {
+            resolved: parts.resolved.clone(),
+            backing: parts.backing.clone(),
+            disk_size: parts.disk_size,
+            first_boot_script: Some(script),
+            agent_version: parts.agent_version.clone(),
+        });
+    }
+
     let disk0 = vm.dirs.primary_disk();
     std::fs::create_dir_all(disk0.parent().unwrap())?;
     match &seed_disk {
@@ -291,21 +313,26 @@ async fn run_build(
     if let Some(watch) = console_watch {
         watch.abort();
     }
-    match up_result {
-        Some(result) => result.context("build boot/provision failed")?,
-        None => {
-            let _ = runtime.down(&[], true).await;
-            bail!("build cancelled");
+    // Through graceful shutdown as one fallible step: a failed boot,
+    // provision or seal must stop the build VM (QEMU/swtpm outlive the CLI
+    // otherwise), not just delete its workdir.
+    let booted = async {
+        match up_result {
+            Some(result) => result.context("build boot/provision failed")?,
+            None => bail!("build cancelled"),
         }
+        log("sealing: graceful shutdown\n".to_string());
+        vm.stop(false).await.context("build VM did not shut down")?;
+        vm.wait_state(
+            crate::labd::vm::PowerState::Stopped,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+    };
+    if let Err(e) = booted.await {
+        let _ = runtime.down(&[], true).await;
+        return Err(e);
     }
-
-    log("sealing: graceful shutdown\n".to_string());
-    vm.stop(false).await.context("build VM did not shut down")?;
-    vm.wait_state(
-        crate::labd::vm::PowerState::Stopped,
-        std::time::Duration::from_secs(120),
-    )
-    .await?;
 
     if run.control.cancel.is_cancelled() {
         bail!("build cancelled");
