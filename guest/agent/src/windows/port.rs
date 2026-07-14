@@ -15,7 +15,8 @@
 
 use std::ffi::c_void;
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -25,13 +26,13 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, WriteFile,
 };
-use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use vmlab_agent_proto::PORT_NAME;
 
@@ -52,49 +53,216 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// The one shared port handle. Closed when the last clone drops.
-struct PortHandle(HANDLE);
+/// The one shared port handle. Logically closed at most once (poisoning or
+/// the last clone dropping); `closed` also gates new I/O so nobody issues a
+/// syscall on a handle value the OS may have recycled.
+struct PortHandle {
+    raw: HANDLE,
+    closed: AtomicBool,
+}
 // SAFETY: the handle is used only through OVERLAPPED I/O calls that are safe
 // to issue concurrently from multiple threads.
 unsafe impl Send for PortHandle {}
 unsafe impl Sync for PortHandle {}
 
-impl Drop for PortHandle {
-    fn drop(&mut self) {
-        // SAFETY: we own the handle.
-        unsafe { CloseHandle(self.0) };
+impl PortHandle {
+    /// Idempotent close. Runs on a disposable thread when called from
+    /// `poison`: an in-flight request the vioserial driver cannot cancel
+    /// makes IRP_MJ_CLEANUP (and therefore CloseHandle) block until the host
+    /// finally drains it, and that must never hang an agent thread.
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            // SAFETY: first (and only) close of a handle we own.
+            unsafe { CloseHandle(self.raw) };
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
+impl Drop for PortHandle {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// The replaceable port connection shared by the reader and writer sides.
+///
+/// An online snapshot restore can leave the restored port connection dead
+/// while the device itself stays healthy (QGA on a sibling port keeps
+/// working): pending writes never complete and new I/O sees nothing. qemu-ga
+/// recovers by reopening its port on channel errors; this is the same
+/// policy. Either side may `poison` the current handle (cancel everything,
+/// close it on a disposable thread); only the reader `reopen`s, before its
+/// next read.
+struct PortShared {
+    handle: RwLock<Arc<PortHandle>>,
+    poisoned: AtomicBool,
+}
+
+impl PortShared {
+    fn current(&self) -> Arc<PortHandle> {
+        self.handle.read().expect("port handle lock").clone()
+    }
+
+    /// Abandon the current connection: cancel every pending I/O on it, mark
+    /// it closed for new I/O, and close it off-thread (see
+    /// [`PortHandle::close`]). The reader reopens on its next pass.
+    fn poison(&self, h: &Arc<PortHandle>) {
+        if !h.closed.swap(true, Ordering::SeqCst) {
+            // SAFETY: cancel all of this process's pending I/O on the handle;
+            // the raw value is still valid — the swap above is what retired
+            // it from new use, and the actual CloseHandle happens below.
+            unsafe { CancelIoEx(h.raw, std::ptr::null()) };
+            let h = h.clone();
+            thread::spawn(move || {
+                // SAFETY: first close was claimed by the swap; do it here.
+                unsafe { CloseHandle(h.raw) };
+            });
+        }
+        self.poisoned.store(true, Ordering::SeqCst);
+    }
+
+    /// Replace a poisoned handle with a freshly opened one, retrying until
+    /// the driver lets us back in (a stuck cleanup on the old handle keeps
+    /// the port exclusive until the host drains it — each host reconnect
+    /// attempt helps flush it through).
+    fn reopen(&self) {
+        let mut guard = self.handle.write().expect("port handle lock");
+        if !self.poisoned.load(Ordering::SeqCst) {
+            return; // someone else already reopened
+        }
+        let mut waited = 0u64;
+        loop {
+            let by_name = open_path(&format!("\\\\.\\Global\\{PORT_NAME}"));
+            let fresh = match by_name {
+                Ok(h) => Some(h),
+                Err(_) => open_by_enumeration(PORT_NAME),
+            };
+            if let Some(h) = fresh {
+                eprintln!("vmlab-agent: reopened port {PORT_NAME}");
+                *guard = h;
+                self.poisoned.store(false, Ordering::SeqCst);
+                return;
+            }
+            if waited.is_multiple_of(30) {
+                eprintln!("vmlab-agent: waiting to reopen port {PORT_NAME}");
+            }
+            thread::sleep(Duration::from_secs(2));
+            waited += 2;
+        }
+    }
+}
+
+/// How long a port write may pend before the connection is declared dead.
+/// The host drains the channel continuously when attached, so a stuck write
+/// means a detached/desynced host — not backpressure.
+const WRITE_STALL: u32 = 15_000;
+/// Reader wake-up cadence: each cycle re-checks for poisoning. Not a
+/// deadline — an idle healthy port just re-waits.
+const READ_CYCLE: u32 = 60_000;
+/// Grace for a cancelled request to come back before it is abandoned.
+const CANCEL_GRACE: u32 = 2_000;
+
 /// One side of the port (its own OVERLAPPED event; the handle is shared).
 pub struct PortIo {
-    handle: Arc<PortHandle>,
+    shared: Arc<PortShared>,
     event: HANDLE,
+    /// I/O staging buffer, heap-owned so an uncancelable request can be
+    /// abandoned (leaked) without freeing memory the driver may still write.
+    staging: Box<[u8]>,
 }
 // SAFETY: the event is owned by this side exclusively.
 unsafe impl Send for PortIo {}
 
+/// Outcome of waiting for one overlapped request.
+enum IoWait {
+    Done(usize),
+    Failed(std::io::Error),
+    /// Cancelled-but-never-completed: the caller must leak everything the
+    /// request references (staging buffer, OVERLAPPED, event).
+    Abandoned,
+}
+
 impl PortIo {
-    fn new(handle: Arc<PortHandle>) -> std::io::Result<Self> {
-        // SAFETY: plain event creation, manual-reset, non-signaled.
-        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        if event.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Self { handle, event })
+    fn new(shared: Arc<PortShared>) -> std::io::Result<Self> {
+        Ok(Self {
+            shared,
+            event: new_event()?,
+            staging: vec![0u8; 64 * 1024].into_boxed_slice(),
+        })
     }
 
-    fn finish(&self, ov: &mut OVERLAPPED, pending: bool) -> std::io::Result<usize> {
-        let mut done: u32 = 0;
-        if pending {
-            // SAFETY: ov/event live for the duration; bWait blocks until done.
-            let ok = unsafe { GetOverlappedResult(self.handle.0, ov, &mut done, 1) };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error());
+    /// Wait for a pending request with a per-cycle timeout. `stall_after`
+    /// cycles of `cycle_ms` with no completion poisons the connection and
+    /// cancels the request; a request that survives even cancellation is
+    /// abandoned.
+    fn wait_io(
+        &mut self,
+        h: &Arc<PortHandle>,
+        ov: &mut OVERLAPPED,
+        cycle_ms: u32,
+        stall_cycles: u32,
+    ) -> IoWait {
+        let mut cycles = 0u32;
+        loop {
+            // SAFETY: event is valid; ov outlives the request.
+            let wait = unsafe { WaitForSingleObject(self.event, cycle_ms) };
+            if wait == WAIT_OBJECT_0 {
+                let mut done: u32 = 0;
+                // SAFETY: request has signalled; collect without blocking.
+                let ok = unsafe { GetOverlappedResult(h.raw, ov, &mut done, 0) };
+                return if ok != 0 {
+                    IoWait::Done(done as usize)
+                } else {
+                    IoWait::Failed(std::io::Error::last_os_error())
+                };
             }
+            cycles += 1;
+            let poisoned = h.is_closed();
+            if !poisoned && cycles < stall_cycles {
+                continue; // idle, healthy: keep waiting
+            }
+            // Stalled (or externally poisoned): tear this connection down.
+            self.shared.poison(h);
+            // SAFETY: cancel just this request, then give it a moment.
+            unsafe { CancelIoEx(h.raw, ov) };
+            let wait = unsafe { WaitForSingleObject(self.event, CANCEL_GRACE) };
+            if wait == WAIT_OBJECT_0 {
+                let mut done: u32 = 0;
+                // SAFETY: completed (with data or as cancelled); collect it.
+                unsafe { GetOverlappedResult(h.raw, ov, &mut done, 0) };
+                return IoWait::Failed(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "port I/O stalled; connection reset",
+                ));
+            }
+            return IoWait::Abandoned;
         }
-        Ok(done as usize)
     }
+
+    /// Leak everything a still-pending request references and re-arm this
+    /// side with a fresh event + staging buffer.
+    fn abandon(&mut self, h: Arc<PortHandle>, ov: Box<OVERLAPPED>) {
+        eprintln!("vmlab-agent: abandoning a port request the driver would not cancel");
+        Box::leak(ov);
+        let staging = std::mem::replace(&mut self.staging, vec![0u8; 64 * 1024].into_boxed_slice());
+        Box::leak(staging);
+        std::mem::forget(h); // keep the file object referenced forever
+        // The old event stays with the leaked request.
+        self.event = new_event().expect("event creation");
+    }
+}
+
+fn new_event() -> std::io::Result<HANDLE> {
+    // SAFETY: plain event creation, manual-reset, non-signaled.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(event)
 }
 
 impl Drop for PortIo {
@@ -106,50 +274,102 @@ impl Drop for PortIo {
 
 impl Read for PortIo {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // SAFETY: buffer and OVERLAPPED outlive the call + wait.
-        unsafe {
-            let mut ov: OVERLAPPED = std::mem::zeroed();
-            ov.hEvent = self.event;
-            let mut done: u32 = 0;
-            let ok = ReadFile(
-                self.handle.0,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
+        if self.shared.poisoned.load(Ordering::SeqCst) {
+            // Reader owns recovery: replace the poisoned connection first.
+            self.shared.reopen();
+        }
+        let h = self.shared.current();
+        if h.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "port connection is being reset",
+            ));
+        }
+        let want = buf.len().min(self.staging.len());
+        // SAFETY: staging buffer and OVERLAPPED are heap-owned and leaked if
+        // the request cannot be cancelled; event is ours.
+        let mut ov: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+        ov.hEvent = self.event;
+        let mut done: u32 = 0;
+        // SAFETY: see above.
+        let ok = unsafe {
+            ReadFile(
+                h.raw,
+                self.staging.as_mut_ptr(),
+                want as u32,
                 &mut done,
-                &mut ov,
-            );
-            if ok != 0 {
-                return Ok(done as usize);
-            }
-            if GetLastError() != ERROR_IO_PENDING {
+                &mut *ov,
+            )
+        };
+        let n = if ok != 0 {
+            done as usize
+        } else {
+            // SAFETY: just called ReadFile.
+            if unsafe { GetLastError() } != ERROR_IO_PENDING {
                 return Err(std::io::Error::last_os_error());
             }
-            self.finish(&mut ov, true)
-        }
+            match self.wait_io(&h, &mut ov, READ_CYCLE, u32::MAX) {
+                IoWait::Done(n) => n,
+                IoWait::Failed(e) => return Err(e),
+                IoWait::Abandoned => {
+                    self.abandon(h, ov);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "port read abandoned; connection reset",
+                    ));
+                }
+            }
+        };
+        buf[..n].copy_from_slice(&self.staging[..n]);
+        Ok(n)
     }
 }
 
 impl Write for PortIo {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // SAFETY: buffer and OVERLAPPED outlive the call + wait.
-        unsafe {
-            let mut ov: OVERLAPPED = std::mem::zeroed();
-            ov.hEvent = self.event;
-            let mut done: u32 = 0;
-            let ok = WriteFile(
-                self.handle.0,
-                buf.as_ptr(),
-                buf.len() as u32,
+        let h = self.shared.current();
+        if h.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "port connection is being reset",
+            ));
+        }
+        let want = buf.len().min(self.staging.len());
+        self.staging[..want].copy_from_slice(&buf[..want]);
+        // SAFETY: staging buffer and OVERLAPPED are heap-owned and leaked if
+        // the request cannot be cancelled; event is ours.
+        let mut ov: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+        ov.hEvent = self.event;
+        let mut done: u32 = 0;
+        // SAFETY: see above.
+        let ok = unsafe {
+            WriteFile(
+                h.raw,
+                self.staging.as_ptr(),
+                want as u32,
                 &mut done,
-                &mut ov,
-            );
-            if ok != 0 {
-                return Ok(done as usize);
+                &mut *ov,
+            )
+        };
+        if ok != 0 {
+            return Ok(done as usize);
+        }
+        // SAFETY: just called WriteFile.
+        if unsafe { GetLastError() } != ERROR_IO_PENDING {
+            return Err(std::io::Error::last_os_error());
+        }
+        // One stall cycle: a write that pends WRITE_STALL is dead (see
+        // WRITE_STALL) — poison so the reader reopens.
+        match self.wait_io(&h, &mut ov, WRITE_STALL, 1) {
+            IoWait::Done(n) => Ok(n),
+            IoWait::Failed(e) => Err(e),
+            IoWait::Abandoned => {
+                self.abandon(h, ov);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "port write abandoned; connection reset",
+                ))
             }
-            if GetLastError() != ERROR_IO_PENDING {
-                return Err(std::io::Error::last_os_error());
-            }
-            self.finish(&mut ov, true)
         }
     }
 
@@ -175,7 +395,10 @@ fn open_path(path: &str) -> std::io::Result<Arc<PortHandle>> {
     if h == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(Arc::new(PortHandle(h)))
+    Ok(Arc::new(PortHandle {
+        raw: h,
+        closed: AtomicBool::new(false),
+    }))
 }
 
 /// Ask an open vioserial port for its name (vioser.h VIRTIO_PORT_INFO:
@@ -186,7 +409,7 @@ fn port_name(handle: &PortHandle) -> Option<String> {
     // SAFETY: buffered ioctl into a stack buffer.
     let ok = unsafe {
         DeviceIoControl(
-            handle.0,
+            handle.raw,
             IOCTL_GET_INFORMATION,
             std::ptr::null(),
             0,
@@ -302,7 +525,11 @@ pub fn open_port() -> (PortIo, PortIo) {
             Err(_) => open_by_enumeration(PORT_NAME),
         };
         if let Some(handle) = handle {
-            match (PortIo::new(handle.clone()), PortIo::new(handle)) {
+            let shared = Arc::new(PortShared {
+                handle: RwLock::new(handle),
+                poisoned: AtomicBool::new(false),
+            });
+            match (PortIo::new(shared.clone()), PortIo::new(shared)) {
                 (Ok(r), Ok(w)) => return (r, w),
                 _ => eprintln!("vmlab-agent: event creation failed"),
             }
