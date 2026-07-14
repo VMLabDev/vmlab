@@ -388,6 +388,14 @@ impl VmInstance {
         }
     }
 
+    /// Forget a recently failed agent handshake so the next [`agent`](Self::agent)
+    /// call reconnects immediately — used right after installing/starting the
+    /// agent. Unlike [`drop_agent`](Self::drop_agent) this never touches a live
+    /// handle another task may be using.
+    pub async fn clear_agent_failure(&self) {
+        *self.agent_failed_at.lock().await = None;
+    }
+
     /// Drop the cached agent connection (teardown, snapshot restore). An
     /// explicit shutdown, not just a drop: live sessions hold handle clones,
     /// and a half-dead connection blocks QEMU's one-client chardev slot.

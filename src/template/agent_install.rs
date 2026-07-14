@@ -102,25 +102,24 @@ pub async fn install(
     }
 
     // The service is running now — prove the channel end-to-end before the
-    // build proceeds (drop the handle afterwards; the template seals soon).
-    // Agent-first execs during a first-boot provision have usually just
-    // failed a handshake against the not-yet-installed agent, which
-    // `vm.agent()` remembers for 30 s — so clear that memory before each
+    // build seals. Agent-first execs (provisions, first-boot scripts) have
+    // usually just failed a handshake against the not-yet-installed agent,
+    // which `vm.agent()` remembers for 30 s — clear that memory before each
     // attempt, and give the freshly started service a moment to open the
-    // port.
+    // port. Never drop_agent here: a concurrent provision may be using the
+    // cached handle, and teardown at seal time cleans it up anyway.
     let mut verified: Result<()> = Err(anyhow::anyhow!("agent verification never ran"));
     for attempt in 0..12 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        vm.drop_agent().await; // also clears the failed-handshake memory
+        vm.clear_agent_failure().await;
         verified = vm.agent().await.map(|_| ());
         if verified.is_ok() {
             break;
         }
     }
     verified.context("the installed vmlab-agent did not answer its handshake")?;
-    vm.drop_agent().await;
     log("agent: installed and answering\n".into());
     Ok(Some(asset.version.clone()))
 }

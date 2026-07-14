@@ -203,15 +203,17 @@ fn vm_exec(
         if let Ok(agent) = v.vm.agent().await {
             let mut argv = vec![cmd.clone()];
             argv.extend(args.iter().cloned());
-            let r = agent
-                .exec(argv, vec![], None, None, timeout)
-                .await
-                .map_err(estr)?;
-            return Ok(ExecResult {
-                exit_code: r.exit_code as i64,
-                stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
-            });
+            // A transport-level error (the connection was replaced under us,
+            // or the command itself tore the agent down, e.g. a reboot)
+            // falls through to QGA like an agent-less guest rather than
+            // failing the script.
+            if let Ok(r) = agent.exec(argv, vec![], None, None, timeout).await {
+                return Ok(ExecResult {
+                    exit_code: r.exit_code as i64,
+                    stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+                });
+            }
         }
         let qga = v.vm.qga().await.map_err(estr)?;
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -800,11 +802,11 @@ pub fn lab_module() -> Module {
             |v: &VmHandle, local: String, guest_path: String| -> Result<(), String> {
                 let src = v.resolve_ref(&local);
                 v.block(async {
-                    if let Ok(agent) = v.vm.agent().await {
-                        agent
-                            .push_file(&src, &guest_path, None)
-                            .await
-                            .map_err(estr)?;
+                    // Transport-level agent errors fall through to QGA (see
+                    // vm_exec).
+                    if let Ok(agent) = v.vm.agent().await
+                        && agent.push_file(&src, &guest_path, None).await.is_ok()
+                    {
                         return Ok(());
                     }
                     let data = tokio::fs::read(&src).await.map_err(estr)?;
@@ -823,8 +825,11 @@ pub fn lab_module() -> Module {
                     std::fs::create_dir_all(parent).map_err(estr)?;
                 }
                 v.block(async {
-                    if let Ok(agent) = v.vm.agent().await {
-                        agent.pull_file(&guest_path, &out).await.map_err(estr)?;
+                    // Transport-level agent errors fall through to QGA (see
+                    // vm_exec).
+                    if let Ok(agent) = v.vm.agent().await
+                        && agent.pull_file(&guest_path, &out).await.is_ok()
+                    {
                         return Ok(());
                     }
                     let qga = v.vm.qga().await.map_err(estr)?;
