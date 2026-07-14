@@ -14,7 +14,7 @@ PROSE
       li "[Snapshots](fact_vm_snapshots) — take, restore, list and delete snapshots."
       li "[Keyboard & mouse](fact_vm_input) — send keys, type text, move/click/drag the mouse."
       li "[Screen, image matching & OCR](fact_vm_vision) — screenshot, wait-for-image, OCR and text matching."
-      li "[Guest agent](fact_vm_agent) — exec commands and copy files in and out."
+      li "[Guest agent](fact_vm_agent) — exec commands, copy files in and out, interactive send/expect terminals, and guest stats."
     }
     p "Fallible calls return `Result[..., string]`; the matched screen hits return a [Match](entity_match_type) and exec returns an [ExecResult](entity_exec_result_type)."
   }

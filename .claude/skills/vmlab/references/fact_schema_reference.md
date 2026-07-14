@@ -240,6 +240,7 @@ gpu { mode = "passthrough" address = "0000:01:00.0" }   // or mode = "virgl" | "
 | `segment` | `utf8` | no | Segment name to attach to; required unless `nat = true` |
 | `nat` | `bool` | no | Shorthand: attach to the per-lab built-in NAT segment |
 | `ip` | `utf8` | no | Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique |
+| `gateway` | `bool` | no | Make this NIC the segment gateway; it must own the subnet's first usable address |
 | `mac` | `utf8` | no | Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise |
 | `isolated` | `bool` | no | Port isolation: reach gateway/forwards but not segment neighbours |
 
@@ -274,7 +275,8 @@ disk "formatted" { from = "./payload/" }  // folder copied onto a fresh FAT file
 | `guest` | `utf8` | yes | Guest mount path, e.g. `/mnt/src` or `D:\data` (required) |
 | `readonly` | `bool` | no | Mount read-only (default false) |
 | `smb1` | `bool` | no | Enable the SMB1 dialect + auth relaxation for XP/2003-era guests |
-| `name` | `utf8` | no | SMB share name; derived from the guest path if omitted |
+| `name` | `utf8` | no | Share name; derived from the guest path if omitted |
+| `transport` | `utf8` | no | Transport: auto (default; virtiofs when host + guest support it, else SMB) \| virtiofs \| smb |
 
 Example:
 
@@ -300,9 +302,6 @@ media { kind = "floppy" from = "./drivers/"  label = "DRV" }
 ```
 
 ### `container` (in `lab`)
-
-OCI container, run in a micro-VM. Attaches to segments exactly like a VM;
-no NICs = air-gapped (exec/copy/logs still work via the agent channel).
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -353,6 +352,7 @@ Example:
 ```wcl
 container "web" {
   image      = "nginx:1.27"              // docker.io shorthand; @sha256:… pins
+  mode       = :workload                  // :workload (default) | :idle
   depends_on = ["db"]                    // VM or container names — one namespace
   restart    = "on-failure"              // "no" (default) | "on-failure" | "always"
   nic    { segment = "corp" ip = "10.50.0.20" }
@@ -370,6 +370,7 @@ container "web" {
 | `segment` | `utf8` | no | Segment name to attach to; required unless `nat = true` |
 | `nat` | `bool` | no | Shorthand: attach to the per-lab built-in NAT segment |
 | `ip` | `utf8` | no | Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique |
+| `gateway` | `bool` | no | Make this NIC the segment gateway; it must own the subnet's first usable address |
 | `mac` | `utf8` | no | Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise |
 | `isolated` | `bool` | no | Port isolation: reach gateway/forwards but not segment neighbours |
 
@@ -471,6 +472,7 @@ Event handler binding.
 | --- | --- | --- | --- |
 | `event` | `utf8` | yes | Event name to handle, e.g. `vm.crashed`; the inline block label |
 | `run` | `utf8` | yes | Path to the handler `.ws` file; must exist and compile (required) |
+| `targets` | `list<utf8>` | no | Optional VM/container names; empty handles every occurrence of the event |
 
 Example:
 
@@ -531,6 +533,7 @@ Template definition, buildable with `vmlab template build`.
 | `gui` | `bool` | no | Watch the build VM via a VNC viewer |
 | `qemu_args` | `list<utf8>` | no | Raw QEMU flags for the build VM — escape hatch |
 | `first_boot` | `utf8` | no | wscript run on first instantiation of a clone, before ready |
+| `agent` | `bool` | no | Bake the vmlab-agent service into the image (default true) |
 
 #### Child blocks
 
@@ -618,6 +621,7 @@ provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
 | `segment` | `utf8` | no | Segment name to attach to; required unless `nat = true` |
 | `nat` | `bool` | no | Shorthand: attach to the per-lab built-in NAT segment |
 | `ip` | `utf8` | no | Static IPv4 (becomes a DHCP reservation); must be in the subnet, unique |
+| `gateway` | `bool` | no | Make this NIC the segment gateway; it must own the subnet's first usable address |
 | `mac` | `utf8` | no | Fixed MAC, e.g. `52:54:00:ab:cd:ef`; generated and persisted otherwise |
 | `isolated` | `bool` | no | Port isolation: reach gateway/forwards but not segment neighbours |
 
@@ -655,7 +659,9 @@ disk "formatted" { from = "./payload/" }  // folder copied onto a fresh FAT file
 | `dns_upstream` | `utf8` | no | Upstream resolver `ip[:port]`; default: the host resolver |
 | `disk_low_percent` | `i64` | no | `host.disk_low` watchdog threshold percent (0–100); default 10 |
 | `psk` | `utf8` | no | Pre-shared key for cross-host segment links |
+| `trunk_port` | `i64` | no | TCP listen port for inbound cross-host segment trunks; default 13947 |
 | `viewer` | `utf8` | no | VNC viewer command; `{}` is replaced by the target |
+| `fastpath` | `utf8` | no | Network fast path: `auto` (probe; default), `off`, `sockmap`, or `afxdp` |
 | `oci_chunk_size` | `std.ByteSize` | no | OCI layer chunk size for template push; default `512MiB` |
 
 Example:

@@ -14,6 +14,6 @@ struct ExecResult { exit_code: int, stdout: string, stderr: string }
 
 - [Vm](../references/entity_vm_api.md)
 
-- [Vm: guest agent methods](../references/fact_vm_agent.md)
+- [Vm: guest agent methods (exec, files, terminal, stats)](../references/fact_vm_agent.md)
 
 [← Back to SKILL.md](../SKILL.md)

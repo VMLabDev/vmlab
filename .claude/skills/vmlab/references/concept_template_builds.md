@@ -13,6 +13,14 @@ sealed result is `~/.local/share/vmlab/templates/<arch>/<name>/<version>/`
 [Build a disk template](../references/process_build_template.md).
 
 
+Once QGA answers, the build also installs **vmlab-agent** into the image
+automatically (before provisions run) and records its version in the sealed
+meta as `agent_version` — that is what enables `vmlab shell`, agent file
+transfer, `tail`, `eventlog` and wscript `terminal()`/`stats()` on VMs cloned
+from the template. Templates built before the agent existed keep working with
+QGA-only exec/copy.
+
+
 ## Related
 
 - [Templates](../references/concept_templates.md)

@@ -16,6 +16,7 @@
 | scratch VM | A VM booted from a blank disk (`template = "scratch"`) with no template, requiring explicit `arch`, `profile` and `disk`. |  |
 | OCI artifact | How a template is stored in a registry: a non-runnable artifact (frozen media type) whose qcow2 is chunked into zstd layers. |  |
 | wscript | vmlab's statically typed, Rust-flavoured scripting language for guest automation. Compiled and type-checked at `vmlab validate` time. |  |
-| guest agent | The QEMU guest agent running inside a VM. `vm.is_ready()` / `vm.wait_ready()` test it; `vm.exec` / `copy_to` / `copy_from` use it. | QEMU guest agent |
+| guest agent | The QEMU guest agent (QGA) running inside a VM. `vm.is_ready()` / `vm.wait_ready()` test it; `vm.exec` / `copy_to` / `copy_from` fall back to it when the richer vmlab-agent is absent. | QEMU guest agent, QGA |
+| vmlab-agent | vmlab's first-party in-guest agent on the `vmlab.agent.0` virtio-serial port (no guest network). Baked into templates at build time (meta `agent_version`); powers `vmlab shell`/`cp`/`tail`/`eventlog`, wscript `terminal()`/`stats()`, and agent-first exec/copy with QGA fallback. Present in both full VMs and container micro-VMs. | agent channel |
 
 [← Back to SKILL.md](../SKILL.md)

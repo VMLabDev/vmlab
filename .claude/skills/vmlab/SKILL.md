@@ -139,7 +139,7 @@ The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for 
 
 - [Vm: screen, image matching & OCR methods](references/fact_vm_vision.md)
 
-- [Vm: guest agent methods](references/fact_vm_agent.md)
+- [Vm: guest agent methods (exec, files, terminal, stats)](references/fact_vm_agent.md)
 
 - [Segment](references/entity_seg_api.md)
 

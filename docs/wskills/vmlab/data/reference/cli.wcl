@@ -124,6 +124,12 @@ cli vmlab_cli {
       cli_arg a_ctr_ip { name = "container"  description = "Container name." }
       code_example { lang = "console"  code = "vmlab container ip web" }
     }
+    subcommand c_ctr_shell {
+      name = "shell"
+      description = "Attach an interactive shell inside the container's PID namespace (the workload is PID 1). Over the vmlab-agent virtio-serial channel — no container network needed. Ctrl-] detaches."
+      cli_arg a_ctr_shell { name = "container"  description = "Container name." }
+      code_example { lang = "console"  code = "vmlab container shell web" }
+    }
   }
 
   // ---- Snapshots ----
@@ -164,10 +170,41 @@ cli vmlab_cli {
 
   subcommand c_exec {
     name = "exec"
-    description = "Run a command in a guest via the guest agent and print its stdout/stderr."
+    description = "Run a command in a guest and print its stdout/stderr. Uses the vmlab-agent channel when the template carries the agent, QGA otherwise."
     cli_arg a_exec_vm  { name = "vm"   description = "VM name." }
     cli_arg a_exec_cmd { name = "cmd"  description = "Command and arguments, after `--`."  variadic = true }
     code_example { lang = "console"  code = "vmlab exec dc01 -- ipconfig /all" }
+  }
+
+  subcommand c_shell {
+    name = "shell"
+    description = "Attach an interactive shell inside a VM: root bash on Linux, SYSTEM PowerShell (ConPTY) on Windows. Rides the vmlab-agent virtio-serial channel, so it works with no guest network. Each attach is a fresh, independent session; Ctrl-] detaches. Needs a template built with the agent (`agent_version` in its meta)."
+    cli_arg a_shell_vm { name = "vm"  description = "VM name." }
+    code_example { lang = "console"  code = "vmlab shell dc01" }
+  }
+
+  subcommand c_cp {
+    name = "cp"
+    description = "Copy a file or directory between host and guest — either side may be `<vm>:<path>`. Parent directories are created. Agent transport (raw verified bytes) when available; base64-over-QGA fallback for agent-less templates."
+    cli_arg a_cp_src  { name = "src"   description = "Host path, or <vm>:<path> to pull from the guest." }
+    cli_arg a_cp_dest { name = "dest"  description = "<vm>:<path> to push, or a host path when pulling." }
+    code_example { lang = "console"  code = "vmlab cp payload.zip dc01:C:/temp/payload.zip\nvmlab cp dc01:C:/Windows/debug/netsetup.log ./netsetup.log" }
+  }
+
+  subcommand c_tail {
+    name = "tail"
+    description = "Follow a file inside a guest (`tail -F` semantics over the agent channel — survives rotation; no network, no shell required)."
+    cli_arg a_tail_vm   { name = "vm"    description = "VM name." }
+    cli_arg a_tail_path { name = "path"  description = "Guest file path." }
+    code_example { lang = "console"  code = "vmlab tail web /var/log/nginx/access.log" }
+  }
+
+  subcommand c_eventlog {
+    name = "eventlog"
+    description = "Follow the Windows event log of a guest over the agent channel."
+    cli_arg a_eventlog_vm { name = "vm"  description = "VM name (Windows guest)." }
+    cli_switch s_eventlog_filter { long = "--filter"  value_name = "XPATH"  description = "XPath filter (default: everything on the System channel)." }
+    code_example { lang = "console"  code = "vmlab eventlog dc01\nvmlab eventlog dc01 --filter \"*[System[(EventID=4624)]]\"" }
   }
 
   subcommand c_script {

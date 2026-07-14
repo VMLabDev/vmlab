@@ -15,5 +15,13 @@ sealed result is `~/.local/share/vmlab/templates/<arch>/<name>/<version>/`
 (`disk.qcow2` + `template.wcl`). The step-by-step runbook is
 [Build a disk template](process_build_template).
 PROSE
+    p <<PROSE
+Once QGA answers, the build also installs **vmlab-agent** into the image
+automatically (before provisions run) and records its version in the sealed
+meta as `agent_version` — that is what enables `vmlab shell`, agent file
+transfer, `tail`, `eventlog` and wscript `terminal()`/`stats()` on VMs cloned
+from the template. Templates built before the agent existed keep working with
+QGA-only exec/copy.
+PROSE
   }
 }

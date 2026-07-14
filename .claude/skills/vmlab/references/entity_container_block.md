@@ -26,6 +26,13 @@ container "web" {
 }
 ```
 
+```wcl
+container "toolbox" {
+  image = "ubuntu:24.04"
+  mode  = :idle                          // do not run the image entrypoint/cmd
+}
+```
+
 VM and container names share one namespace: DNS registration
 (`web.<lab>.<suffix>` and plain `web`), `depends_on` waves, segment
 `forward { to = "web:80" }` targets and provision scoping resolve across both
@@ -37,6 +44,11 @@ Readiness gates on the process starting plus the first passing healthcheck;
 `restart` respawns with backoff on exit. Containers are **not** snapshottable —
 they rebuild from image + volumes. Named volumes survive `down` and
 per-container destroy; lab `destroy` removes them.
+
+With `mode = :idle`, the root filesystem, volumes, networking and guest agent
+come up without starting the image entrypoint or command. Readiness gates on
+the agent instead, image healthchecks do not run, and commands can be launched
+with `vmlab container exec` or from provision scripts.
 
 
 ## Related

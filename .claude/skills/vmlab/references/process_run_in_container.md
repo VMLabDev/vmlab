@@ -2,11 +2,12 @@
 
 ## Purpose
 
-Run a lab unprivileged inside Docker/Podman with only /dev/kvm.
+Run a lab inside Docker/Podman with KVM and optional eBPF network acceleration.
 
 ## Prerequisites
 
 - The host exposes /dev/kvm (else vmlab falls back to slow TCG).
+- For eBPF acceleration, the host exposes /dev/net/tun and permits CAP_BPF + CAP_NET_ADMIN.
 - The vmlab image is built or pulled.
 
 ## Flowchart
@@ -31,16 +32,17 @@ Build with `just image` (or the command above), or skip building — every relea
 ### Step 2: Run a lab
 
 ```console
-$ docker run --rm -it --device /dev/kvm \
+$ docker run --rm -it --device /dev/kvm --device /dev/net/tun \
+    --cap-add BPF --cap-add NET_ADMIN -e VMLAB_FASTPATH=auto \
     -v ~/.local/share/vmlab/templates:/root/.local/share/vmlab/templates \
     -v "$PWD":/lab -w /lab vmlab vmlab up
 ```
 
 > [!TIP]
-> **Only /dev/kvm**
-> No --privileged, no extra capabilities, no host network mode — the fabric is entirely userspace.
+> **Least privilege**
+> No --privileged or host network mode. The eBPF path receives only /dev/net/tun, CAP_BPF, and CAP_NET_ADMIN; it falls back to userspace when unavailable.
 
-Mount the template store (persistent) and the lab directory, grant `--device /dev/kvm`, and run a vmlab verb (the command above overrides the default). By default the container serves the web UI (`vmlab-web` on :7878 — see the `docker compose` stack); for CLI use, override the command or drive a running container via `docker exec <ctr> vmlab ...`.
+Mount the template store (persistent) and the lab directory, grant `/dev/kvm`, and add `/dev/net/tun` plus `CAP_BPF` and `CAP_NET_ADMIN` when eBPF acceleration is wanted. Run a vmlab verb (the command above overrides the default). By default the container serves the web UI (`vmlab-web` on :7878 — see the `docker compose` stack); for CLI use, override the command or drive a running container via `docker exec <ctr> vmlab ...`.
 
 > [!TIP]
 > **Verification**

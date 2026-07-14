@@ -201,6 +201,18 @@ The container's DHCP lease (errors on an air-gapped container).
 vmlab container ip web
 ```
 
+### vmlab container shell
+
+Attach an interactive shell inside the container's PID namespace (the workload is PID 1). Over the vmlab-agent virtio-serial channel — no container network needed. Ctrl-\] detaches.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| container | required | Container name. |
+
+```console
+vmlab container shell web
+```
+
 ## vmlab snapshot
 
 Online (running: disk+RAM+device state) or offline (powered off: disk only) snapshots, per current power state. Restoring an online snapshot resumes running.
@@ -264,7 +276,7 @@ vmlab snapshot delete dc01 clean
 
 ## vmlab exec
 
-Run a command in a guest via the guest agent and print its stdout/stderr.
+Run a command in a guest and print its stdout/stderr. Uses the vmlab-agent channel when the template carries the agent, QGA otherwise.
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -273,6 +285,62 @@ Run a command in a guest via the guest agent and print its stdout/stderr.
 
 ```console
 vmlab exec dc01 -- ipconfig /all
+```
+
+## vmlab shell
+
+Attach an interactive shell inside a VM: root bash on Linux, SYSTEM PowerShell (ConPTY) on Windows. Rides the vmlab-agent virtio-serial channel, so it works with no guest network. Each attach is a fresh, independent session; Ctrl-\] detaches. Needs a template built with the agent (`agent_version` in its meta).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+
+```console
+vmlab shell dc01
+```
+
+## vmlab cp
+
+Copy a file or directory between host and guest — either side may be `<vm>:<path>`. Parent directories are created. Agent transport (raw verified bytes) when available; base64-over-QGA fallback for agent-less templates.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| src | required | Host path, or <vm>:<path> to pull from the guest. |
+| dest | required | <vm>:<path> to push, or a host path when pulling. |
+
+```console
+vmlab cp payload.zip dc01:C:/temp/payload.zip
+vmlab cp dc01:C:/Windows/debug/netsetup.log ./netsetup.log
+```
+
+## vmlab tail
+
+Follow a file inside a guest (`tail -F` semantics over the agent channel — survives rotation; no network, no shell required).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+| path | required | Guest file path. |
+
+```console
+vmlab tail web /var/log/nginx/access.log
+```
+
+## vmlab eventlog
+
+Follow the Windows event log of a guest over the agent channel.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name (Windows guest). |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --filter | XPATH | XPath filter (default: everything on the System channel). |
+
+```console
+vmlab eventlog dc01
+vmlab eventlog dc01 --filter "*[System[(EventID=4624)]]"
 ```
 
 ## vmlab script
@@ -399,6 +467,29 @@ Import a template archive into the store.
 ```console
 vmlab template import linux.tar.zst
 ```
+
+### vmlab template search
+
+Search the configured OCI registries. Uses VM registries by default; --kind container searches image registries.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| query | optional | Case-insensitive repository-name filter. |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --registry | NAMESPACE | Search only this namespace instead of shared registry settings. |
+| --arch | ARCH | Only return artifacts supporting this architecture. |
+| --kind | vm\|container | Artifact kind to search (default vm). |
+
+```console
+vmlab template search alpine --arch x86_64
+vmlab template search nginx --kind container
+```
+
+### vmlab template registry
+
+Manage OCI namespace settings shared by the CLI and web console.
 
 ### vmlab template login
 

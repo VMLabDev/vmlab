@@ -1,4 +1,11 @@
-# Vm: guest agent methods
+# Vm: guest agent methods (exec, files, terminal, stats)
+
+Exec and file copy prefer the **vmlab-agent** channel (a dedicated
+`vmlab.agent.0` virtio-serial port baked into templates — no guest network
+involved) and fall back to QGA for templates that predate the agent.
+Interactive terminals and stats are agent-only: they need a template whose
+meta carries `agent_version`.
+
 
 | Method | Returns | Notes |
 | --- | --- | --- |
@@ -6,8 +13,38 @@
 | `vm.exec_timeout(cmd, args, timeout_secs: int)` | `Result[ExecResult, string]` | Custom timeout |
 | `vm.copy_to(local: string, guest_path: string)` | `Result[unit, string]` | local relative to lab root; guest path absolute |
 | `vm.copy_from(guest_path: string, local: string)` | `Result[unit, string]` | Parent dirs created on host |
+| `vm.terminal()` | `Result[Term, string]` | Fresh interactive shell: root bash on Linux, SYSTEM PowerShell on Windows; 120×32 PTY |
+| `vm.stats()` | `Result[GuestStats, string]` | Live guest metrics sampled in the guest |
 
-Exec returns an [ExecResult](../references/entity_exec_result_type.md) (`exit_code`, `stdout`, `stderr`).
+Exec returns an [ExecResult](../references/entity_exec_result_type.md) (`exit_code`, `stdout`, `stderr`). `GuestStats` has `cpu_pct: float`, `mem_used`/`mem_total` (bytes) and `disks: List[DiskStat]` (`mount`, `used`, `total`). Containers expose the same `terminal()`/`stats()` (see [Container](../references/entity_container_api.md)).
+
+A `Term` handle is driven send/expect style. Output accumulates in a buffer;
+`expect` consumes through the end of the regex match and returns the consumed
+text, so successive expects walk the stream. The shell sees a real PTY —
+prompts, command echoes and ANSI escape sequences are all in the buffer, so
+match accordingly.
+
+
+| Method | Meaning |
+| --- | --- |
+| `send(text)` | Send raw bytes to the shell |
+| `send_line(text)` | `text` + carriage return (Enter for both POSIX shells and PowerShell) |
+| `expect(pattern: string, timeout_secs: int)` | Wait until the buffer matches the regex; returns the text through the end of the match. Timeout errors carry the unmatched tail |
+| `read()` | Drain whatever output is already queued, without waiting |
+| `resize(cols, rows)` | Resize the PTY |
+| `close()` | End the session (kills the shell); also implied on garbage collection |
+
+```wscript
+let vm = lab.vm("web").unwrap()
+let t = vm.terminal().unwrap()
+t.expect("\\$ ", 30).unwrap()          // wait for the first prompt
+t.send_line("systemctl is-active nginx")
+let out = t.expect("active|failed", 15).unwrap()
+t.close()
+
+let s = vm.stats().unwrap()
+lab.log("cpu " + s.cpu_pct + "%, mem " + s.mem_used + "/" + s.mem_total)
+```
 
 ## Related
 
