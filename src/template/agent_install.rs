@@ -43,6 +43,23 @@ RestartSec=2
 WantedBy=multi-user.target
 ";
 
+// No `need` dependencies: Alpine's cloud image leaves `localmount` out of
+// every runlevel, and OpenRC silently skips a service whose needs can't be
+// scheduled (the image's own cloud-init trio is skipped the same way). The
+// agent retries its port until the device exists, so ordering is soft.
+const OPENRC_INIT: &str = "\
+#!/sbin/openrc-run
+description=\"vmlab guest agent (terminals/exec/files over virtio-serial)\"
+command=\"/usr/local/lib/vmlab/vmlab-agent\"
+command_background=\"yes\"
+pidfile=\"/run/vmlab-agent.pid\"
+
+depend() {
+\tafter bootmisc
+}
+";
+const OPENRC_SCRIPT: &str = "/etc/init.d/vmlab-agent";
+
 /// Install + verify; returns the asset's version stamp for the template
 /// metadata, or `None` when skipped (reason already logged). `qga_wait` is
 /// how long to wait for the guest agent to first answer: a layered source
@@ -152,20 +169,21 @@ async fn install_linux(
     asset: &AgentAsset,
     log: &(dyn Fn(String) + Sync),
 ) -> Result<bool> {
-    // Only systemd guests get a service; anything else would need per-init
-    // integration that no shipped template requires.
-    let systemd = qga
-        .exec(
-            "test",
-            &["-d", "/run/systemd/system"],
-            true,
-            Duration::from_secs(30),
-        )
-        .await
-        .map(|r| r.exit_code == 0)
-        .unwrap_or(false);
-    if !systemd {
-        log("agent: skipped (guest has no systemd; no service to register)\n".into());
+    // A service needs init integration: systemd or OpenRC (Alpine). Anything
+    // else is skipped loudly.
+    let has = |path: &'static str, flag: &'static str| async move {
+        qga.exec("test", &[flag, path], true, Duration::from_secs(30))
+            .await
+            .map(|r| r.exit_code == 0)
+            .unwrap_or(false)
+    };
+    let systemd = has("/run/systemd/system", "-d").await;
+    let openrc = !systemd && has("/sbin/openrc-run", "-x").await;
+    if !systemd && !openrc {
+        log(
+            "agent: skipped (guest has neither systemd nor OpenRC; no service to register)\n"
+                .into(),
+        );
         return Ok(false);
     }
 
@@ -175,16 +193,55 @@ async fn install_linux(
         .await
         .context("agent install: uploading the binary")?;
     run(qga, "chmod", "chmod", &["0755", LINUX_BIN]).await?;
-    qga.file_write(LINUX_UNIT, SYSTEMD_UNIT.as_bytes(), upload)
-        .await
-        .context("agent install: writing the systemd unit")?;
-    run(
-        qga,
-        "systemctl enable --now",
-        "systemctl",
-        &["enable", "--now", "vmlab-agent.service"],
-    )
-    .await?;
+    if systemd {
+        qga.file_write(LINUX_UNIT, SYSTEMD_UNIT.as_bytes(), upload)
+            .await
+            .context("agent install: writing the systemd unit")?;
+        run(
+            qga,
+            "systemctl enable --now",
+            "systemctl",
+            &["enable", "--now", "vmlab-agent.service"],
+        )
+        .await?;
+    } else {
+        qga.file_write(OPENRC_SCRIPT, OPENRC_INIT.as_bytes(), upload)
+            .await
+            .context("agent install: writing the OpenRC service script")?;
+        run(qga, "chmod init script", "chmod", &["0755", OPENRC_SCRIPT]).await?;
+        run(
+            qga,
+            "rc-update add",
+            "rc-update",
+            &["add", "vmlab-agent", "default"],
+        )
+        .await?;
+        run(
+            qga,
+            "rc-service start",
+            "rc-service",
+            &["vmlab-agent", "start"],
+        )
+        .await?;
+        // OpenRC's deptree freshness check is whole-second granular, and
+        // everything above lands within one second: the pre-vmlab-agent
+        // runtime deptree (mtime-tied with /etc/init.d) gets persisted by
+        // savecache at the seal shutdown and every clone boot then restores
+        // it as "fresh" — the service silently never starts. Step out of
+        // the second, drop the stale caches, and regenerate the deptree so
+        // what savecache persists is correct.
+        run(
+            qga,
+            "refresh deptree",
+            "sh",
+            &[
+                "-c",
+                "sleep 1 && touch /etc/init.d /etc/init.d/vmlab-agent && \
+                 rm -f /lib/rc/cache/deptree /lib/rc/cache/depconfig && rc-update -u",
+            ],
+        )
+        .await?;
+    }
     Ok(true)
 }
 
