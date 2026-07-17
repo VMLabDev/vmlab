@@ -42,4 +42,13 @@ lab "demo" {
   container "container" {
     image = "hello-world"
   }
+  vm "TestWindows" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025:26100.1742.3"
+    arch = "x86_64"
+    cpus = 2
+    memory = 8GiB
+    nic {
+      segment = "lan"
+    }
+  }
 }
