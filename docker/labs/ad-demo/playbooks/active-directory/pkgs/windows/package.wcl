@@ -39,4 +39,9 @@ package "windows" {
     description = "Wait until Active Directory Domain Services answers domain queries on this DC"
     script = "resources/ad_ready.wscript"
   }
+
+  resource "appx_settle" {
+    description = "Settle the staged-AppX (LKG) reconciliation so the first console logon gets a working desktop"
+    script = "resources/appx_settle.wscript"
+  }
 }

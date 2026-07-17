@@ -50,6 +50,15 @@ playbook "Active Directory demo" {
       resource = "windows.ad_ready"
       requires = ["forest"]
     }
+
+    // The promotion reboot lands before anyone has logged on, so the first
+    // console logon would otherwise race the staged-AppX (LKG) reconciliation
+    // and fail-fast explorer.exe, permanently breaking that profile's shell.
+    step "shell-settle" {
+      description = "Settle staged AppX so the first console logon gets a working desktop"
+      resource = "windows.appx_settle"
+      requires = ["ad-ready"]
+    }
   }
 
   play "member-server" {
