@@ -123,6 +123,38 @@ const MAX_REBOOTS: u32 = 3;
 /// slow is fine, a hung guest must not wedge `up` forever… doubled — applies
 /// converge whole systems).
 const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Attempts for the guest push steps (binary + playbook folder). Windows can
+/// hold files briefly — a lingering config-weave process or the antivirus
+/// scanning a freshly written binary shows up as a "file in use" sharing
+/// violation — and the pushes are idempotent, so ride it out.
+const PUSH_ATTEMPTS: u32 = 5;
+
+/// Run an idempotent guest operation, retrying failures with backoff
+/// (3s → 6s → 12s → 15s, ~36s total across [`PUSH_ATTEMPTS`] attempts).
+/// Every retry is announced through `log` so streamed output shows what is
+/// being waited on. `op` returns owning futures (plain `FnMut`, not an async
+/// closure — lending closures trip rustc's higher-ranked `Send` inference
+/// and poison the whole `up` future at unrelated spawn sites).
+async fn retry_push<T, F>(what: &str, log: &impl Fn(&str), mut op: impl FnMut() -> F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let mut delay = Duration::from_secs(3);
+    for attempt in 1..PUSH_ATTEMPTS {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                log(&format!(
+                    "{what} failed ({e:#}) — retrying ({attempt}/{})",
+                    PUSH_ATTEMPTS - 1
+                ));
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(15));
+            }
+        }
+    }
+    op().await
+}
 
 fn guest_base(os: GuestOs) -> &'static str {
     match os {
@@ -587,26 +619,33 @@ async fn run_inner(
     }
     if need_push {
         log_line(&format!("pushing config-weave to {machine}"));
-        agent
-            .push_file(&host_bin, &guest_bin, Some(0o755))
-            .await
-            .with_context(|| format!("pushing config-weave into {machine}"))?;
-        let smoke = agent
-            .exec(
-                vec![guest_bin.clone(), "version".to_string()],
-                Vec::new(),
-                None,
-                None,
-                Duration::from_secs(30),
-            )
-            .await
-            .with_context(|| format!("config-weave version probe in {machine}"))?;
-        if smoke.exit_code != 0 {
-            bail!(
-                "config-weave version probe failed in {machine}: {}",
-                String::from_utf8_lossy(&smoke.stderr)
-            );
-        }
+        retry_push("config-weave binary push", &log_line, || {
+            let agent = agent.clone();
+            let host_bin = host_bin.clone();
+            let guest_bin = guest_bin.clone();
+            async move {
+                agent.push_file(&host_bin, &guest_bin, Some(0o755)).await?;
+                let smoke = agent
+                    .exec(
+                        vec![guest_bin, "version".to_string()],
+                        Vec::new(),
+                        None,
+                        None,
+                        Duration::from_secs(30),
+                    )
+                    .await?;
+                if smoke.exit_code != 0 {
+                    bail!(
+                        "version probe exited {}: {}",
+                        smoke.exit_code,
+                        String::from_utf8_lossy(&smoke.stderr)
+                    );
+                }
+                Ok(())
+            }
+        })
+        .await
+        .with_context(|| format!("pushing config-weave into {machine}"))?;
         lab.playbook_ops.set_pushed(machine, &host_sha);
     }
 
@@ -628,14 +667,23 @@ async fn run_inner(
             guest_dir.replace('/', "\\"),
         ],
     };
-    let _ = agent
-        .exec(rm, Vec::new(), None, None, Duration::from_secs(60))
-        .await; // absent dir is fine
     let src = lab.root.join(&pb.path);
-    let (files, bytes) = agent
-        .push_tree(&src, &guest_dir)
-        .await
-        .with_context(|| format!("pushing playbook {} into {machine}", pb.path.display()))?;
+    // The pre-clean rides inside the retry so a locked file that survived
+    // one rmdir gets another sweep before the next push attempt.
+    let (files, bytes) = retry_push("playbook folder push", &log_line, || {
+        let agent = agent.clone();
+        let rm = rm.clone();
+        let src = src.clone();
+        let guest_dir = guest_dir.clone();
+        async move {
+            let _ = agent
+                .exec(rm, Vec::new(), None, None, Duration::from_secs(60))
+                .await; // absent dir is fine
+            agent.push_tree(&src, &guest_dir).await
+        }
+    })
+    .await
+    .with_context(|| format!("pushing playbook {} into {machine}", pb.path.display()))?;
     log_line(&format!(
         "pushed {} ({files} files, {bytes} bytes)",
         pb.path.display()
@@ -805,6 +853,41 @@ mod tests {
         assert_eq!(guest_os_of(Some("windows-legacy")), GuestOs::Windows);
         assert_eq!(guest_os_of(Some("linux-modern")), GuestOs::Linux);
         assert_eq!(guest_os_of(None), GuestOs::Linux);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_push_retries_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let attempts = AtomicU32::new(0);
+        let logged = std::sync::Mutex::new(Vec::<String>::new());
+        let log = |line: &str| logged.lock().unwrap().push(line.to_string());
+        let result = retry_push("test op", &log, || async {
+            let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if n < 3 {
+                bail!("file in use")
+            }
+            Ok(n)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 3);
+        {
+            let lines = logged.lock().unwrap();
+            assert_eq!(lines.len(), 2, "{lines:#?}");
+            assert!(
+                lines[0].contains("test op failed") && lines[0].contains("1/4"),
+                "{lines:#?}"
+            );
+        }
+
+        // Exhausted attempts surface the final error.
+        let log2 = |_: &str| {};
+        let err = retry_push("test op", &log2, || async {
+            Err::<(), _>(anyhow!("still locked"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("still locked"), "{err}");
     }
 
     #[test]
