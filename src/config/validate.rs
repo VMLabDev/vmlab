@@ -328,6 +328,58 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             }
         }
     }
+    // -- playbooks ------------------------------------------------------
+    for p in &lab.playbooks {
+        if p.play.is_empty() {
+            issues.push(Issue::at(
+                p.span,
+                format!("playbook {} has an empty play name", p.path.display()),
+            ));
+        }
+        let dir = file.root.join(&p.path);
+        if !dir.is_dir() {
+            issues.push(Issue::at(
+                p.span,
+                format!("playbook {} is not a directory", p.path.display()),
+            ));
+        } else if !dir.join("playbook.wcl").is_file() {
+            issues.push(Issue::at(
+                p.span,
+                format!("playbook {} has no playbook.wcl", p.path.display()),
+            ));
+        }
+        for vm in &p.vms {
+            if !machine_exists(lab, vm) {
+                issues.push(Issue::at(
+                    p.span,
+                    format!("playbook targets undefined vm/container \"{vm}\""),
+                ));
+            }
+        }
+        // config-weave ships guest binaries only for x86_64; reject targets
+        // whose arch is statically known to differ. Unknown archs (registry
+        // templates without `arch`) are caught by the daemon's preflight.
+        let targeted = |vm: &Vm| p.vms.is_empty() || p.vms.iter().any(|n| n == &vm.name);
+        for vm in lab.vms.iter().filter(|vm| targeted(vm)) {
+            let arch = match &vm.template {
+                TemplateRef::Store { arch, .. } => Some(arch.as_str()),
+                _ => vm.arch.as_deref(),
+            };
+            if let Some(arch) = arch
+                && arch != "x86_64"
+            {
+                issues.push(Issue::at(
+                    p.span,
+                    format!(
+                        "playbook {} targets \"{}\" ({arch}) — config-weave ships binaries only for x86_64",
+                        p.path.display(),
+                        vm.name
+                    ),
+                ));
+            }
+        }
+    }
+
     for h in &lab.handlers {
         scripts.push((&h.run, h.span));
         if !EVENT_NAMES.contains(&h.event.as_str()) {
@@ -1353,6 +1405,100 @@ lab "l" {
   segment "s" { subnet = "10.1.1.0/24" }
   vm "a" { template = "x86_64/t" nic { segment = "s" ip = "10.1.1.10" } }
   vm "b" { template = "x86_64/t" depends_on = ["a"] nic { nat = true } }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    /// Validate against a root that actually contains `playbooks/base/playbook.wcl`.
+    fn errs_with_playbook_dir(src: &str) -> (Vec<String>, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("playbooks/base")).unwrap();
+        std::fs::write(root.path().join("playbooks/base/playbook.wcl"), "").unwrap();
+        let f = load_lab_source(src, "<test>", root.path()).expect("source should parse");
+        let es = validate(&f, &Permissive)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        (es, root)
+    }
+
+    #[test]
+    fn playbook_missing_dir() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" }
+  playbook "no/such/pb" { play = "base" }
+}"#,
+            "is not a directory",
+        );
+    }
+
+    #[test]
+    fn playbook_missing_playbook_wcl() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("pb")).unwrap();
+        let f = load_lab_source(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" }
+  playbook "pb" { play = "base" }
+}"#,
+            "<test>",
+            root.path(),
+        )
+        .expect("source should parse");
+        let es: Vec<String> = validate(&f, &Permissive)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        assert!(
+            es.iter().any(|m| m.contains("has no playbook.wcl")),
+            "expected playbook.wcl error, got: {es:#?}"
+        );
+    }
+
+    #[test]
+    fn playbook_unknown_target() {
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" }
+  playbook "playbooks/base" { play = "base" vms = ["ghost"] }
+}"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("targets undefined vm/container \"ghost\"")),
+            "expected undefined-target error, got: {es:#?}"
+        );
+    }
+
+    #[test]
+    fn playbook_non_x86_64_target() {
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "aarch64/t" }
+  playbook "playbooks/base" { play = "base" }
+}"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("binaries only for x86_64") && m.contains("aarch64")),
+            "expected arch error, got: {es:#?}"
+        );
+    }
+
+    #[test]
+    fn playbook_clean() {
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" }
+  vm "b" { template = "aarch64/t" }
+  playbook "playbooks/base" { play = "base" vms = ["a"] }
 }"#,
         );
         assert!(es.is_empty(), "expected clean validation, got: {es:#?}");

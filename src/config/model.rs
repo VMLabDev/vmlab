@@ -37,6 +37,7 @@ pub struct Lab {
     pub vms: Vec<Vm>,
     pub containers: Vec<Container>,
     pub provisions: Vec<Provision>,
+    pub playbooks: Vec<Playbook>,
     pub handlers: Vec<Handler>,
     pub records: Vec<DnsRecord>,
     pub sinkholes: Vec<SinkholeRule>,
@@ -451,6 +452,18 @@ pub struct Provision {
     pub span: Span,
 }
 
+/// config-weave playbook assignment: apply `play` from the playbook folder
+/// at `path` to the targeted machines on `up`, and on demand afterwards.
+#[derive(Debug, Clone)]
+pub struct Playbook {
+    /// Playbook folder, relative to the lab root.
+    pub path: PathBuf,
+    pub play: String,
+    /// Targeted VM/container names. Empty targets every machine.
+    pub vms: Vec<String>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct Handler {
     pub event: String,
@@ -540,6 +553,8 @@ pub const EVENT_NAMES: &[&str] = &[
     "snapshot.created",
     "snapshot.restored",
     "template.built",
+    "playbook.applied",
+    "playbook.failed",
     "host.disk_low",
 ];
 

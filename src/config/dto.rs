@@ -8,7 +8,7 @@ use serde::Serialize;
 use super::model::{
     BlockRule, Connect, Container, ContainerMode, DiskBlock, DnsRecord, EnvVar, Firmware, Forward,
     Gpu, GpuMode, Handler, Healthcheck, HostPort, L4Proto, Lab, LabFile, Media, MediaKind, Nic,
-    PortMap, Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share,
+    Playbook, PortMap, Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share,
     ShareTransport, SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
 };
 
@@ -38,6 +38,7 @@ pub struct LabDto {
     pub vms: Vec<VmDto>,
     pub containers: Vec<ContainerDto>,
     pub provisions: Vec<ProvisionDto>,
+    pub playbooks: Vec<PlaybookDto>,
     pub handlers: Vec<HandlerDto>,
     pub records: Vec<DnsRecordDto>,
     pub sinkholes: Vec<SinkholeDto>,
@@ -53,6 +54,7 @@ impl From<&Lab> for LabDto {
             vms: l.vms.iter().map(VmDto::from).collect(),
             containers: l.containers.iter().map(ContainerDto::from).collect(),
             provisions: l.provisions.iter().map(ProvisionDto::from).collect(),
+            playbooks: l.playbooks.iter().map(PlaybookDto::from).collect(),
             handlers: l.handlers.iter().map(HandlerDto::from).collect(),
             records: l.records.iter().map(DnsRecordDto::from).collect(),
             sinkholes: l.sinkholes.iter().map(SinkholeDto::from).collect(),
@@ -585,6 +587,25 @@ impl From<&Provision> for ProvisionDto {
 }
 
 #[derive(Serialize)]
+pub struct PlaybookDto {
+    pub path: String,
+    pub play: String,
+    pub vms: Vec<String>,
+    pub span: Span,
+}
+
+impl From<&Playbook> for PlaybookDto {
+    fn from(p: &Playbook) -> Self {
+        Self {
+            path: p.path.display().to_string(),
+            play: p.play.clone(),
+            vms: p.vms.clone(),
+            span: p.span,
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub struct HandlerDto {
     pub event: String,
     pub run: String,
@@ -652,6 +673,7 @@ lab "dto-lab" {
   }
 
   provision "scripts/setup.ws" { vms = ["web01"] }
+  playbook "playbooks/baseline" { play = "baseline" vms = ["web01"] }
   on "vm.crashed" { run = "scripts/dump.ws" targets = ["web01"] }
 }
 "#;
@@ -687,6 +709,11 @@ lab "dto-lab" {
         assert_eq!(vm["media"][0]["kind"], "iso");
 
         assert_eq!(v["lab"]["provisions"][0]["vms"][0], "web01");
+        let pb = &v["lab"]["playbooks"][0];
+        assert_eq!(pb["path"], "playbooks/baseline");
+        assert_eq!(pb["play"], "baseline");
+        assert_eq!(pb["vms"][0], "web01");
+        assert!(pb["span"][1].as_u64().unwrap() > 0);
         assert_eq!(v["lab"]["handlers"][0]["event"], "vm.crashed");
         assert_eq!(v["lab"]["handlers"][0]["targets"][0], "web01");
     }

@@ -303,6 +303,7 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
         vms: Vec::new(),
         containers: Vec::new(),
         provisions: Vec::new(),
+        playbooks: Vec::new(),
         handlers: Vec::new(),
         records: Vec::new(),
         sinkholes: Vec::new(),
@@ -327,6 +328,11 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
             "provision" => {
                 if let Some(p) = extract_provision(&child, issues) {
                     lab.provisions.push(p);
+                }
+            }
+            "playbook" => {
+                if let Some(p) = extract_playbook(&child, issues) {
+                    lab.playbooks.push(p);
                 }
             }
             "on" => {
@@ -709,6 +715,17 @@ fn extract_provision(b: &Block, issues: &mut IssueList) -> Option<Provision> {
     let script = label_name(b, "provision", issues)?;
     Some(Provision {
         script: PathBuf::from(script),
+        vms: get_str_list(b, "vms", issues),
+        span: span_of(b),
+    })
+}
+
+fn extract_playbook(b: &Block, issues: &mut IssueList) -> Option<Playbook> {
+    let path = label_name(b, "playbook", issues)?;
+    let (play, _) = get_str(b, "play", issues)?;
+    Some(Playbook {
+        path: PathBuf::from(path),
+        play,
         vms: get_str_list(b, "vms", issues),
         span: span_of(b),
     })

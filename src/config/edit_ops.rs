@@ -405,6 +405,28 @@ lab "demo" {
     }
 
     #[test]
+    fn add_block_playbook_round_trips() {
+        let lab = model();
+        let out = apply_ops(
+            SRC,
+            &[op(json!({"op": "add_block", "parent": lab.span, "block": {
+                "kind": "playbook",
+                "labels": ["playbooks/base"],
+                "fields": [
+                    {"name": "play", "value": "base"},
+                    {"name": "vms", "value": ["dc01"]},
+                ],
+            }}))],
+        )
+        .unwrap();
+        let re = reload(&out);
+        assert_eq!(re.playbooks.len(), 1);
+        assert_eq!(re.playbooks[0].path.display().to_string(), "playbooks/base");
+        assert_eq!(re.playbooks[0].play, "base");
+        assert_eq!(re.playbooks[0].vms, vec!["dc01".to_string()]);
+    }
+
+    #[test]
     fn add_block_container_with_nested_children() {
         let lab = model();
         let out = apply_ops(

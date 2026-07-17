@@ -28,6 +28,8 @@ type Lab {
   @children("container") containers: list<Container>
   @doc("wscript provision scripts run on `vmlab up`, in declaration order")
   @children("provision") provisions: list<Provision>
+  @doc("config-weave playbooks applied on `vmlab up`, interleaved with provisions in declaration order")
+  @children("playbook")  playbooks: list<Playbook>
   @doc("Lifecycle event handlers (failures are logged, never fatal)")
   @children("on")        handlers: list<Handler>
   @doc("Lab-wide static DNS entries (wildcards allowed)")
@@ -355,6 +357,18 @@ type Provision {
   @doc("Path to the `.ws` file; must exist and compile; the inline label")
   @inline(0) script: utf8
   @doc("VM names this script is scoped to (gates their `depends_on`)")
+  vms: list<utf8>?
+}
+
+// config-weave playbook applied on `vmlab up` (interleaved with provisions
+// in declaration order) and runnable on demand via `vmlab playbook check|apply`.
+@block("playbook")
+type Playbook {
+  @doc("Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label")
+  @inline(0) path: utf8
+  @doc("Play name inside the playbook to run (required)")
+  play: utf8
+  @doc("VM/container names this playbook targets; empty/absent = every machine")
   vms: list<utf8>?
 }
 
