@@ -27,6 +27,7 @@ import {
   editor,
   removeContainer,
   removeEventHandler,
+  removePlaybook,
   removeProvision,
   removeRemote,
   removeSegment,
@@ -56,7 +57,10 @@ const mutate = (fn: (d: LabModel) => void) =>
     }),
   );
 
-export default function Inspector(props: { onEditProvision: (path: string) => void }) {
+export default function Inspector(props: {
+  onEditProvision: (path: string) => void;
+  onEditPlaybook: (path: string) => void;
+}) {
   const sel = () => editor.selection;
   const readOnly = () => anyVmRunning();
 
@@ -96,7 +100,25 @@ export default function Inspector(props: { onEditProvision: (path: string) => vo
             onEdit={props.onEditProvision}
           />
         </Show>
+        <Show
+          when={sel().kind === "playbook" && editor.draft?.playbooks[(sel() as any).index]}
+        >
+          <PlaybookInspector index={(sel() as { index: number }).index} />
+        </Show>
       </fieldset>
+      {/* Outside the read-only fieldset on purpose: playbook FILES stay
+          editable while machines run — that is the edit→check dev loop. */}
+      <Show when={sel().kind === "playbook" && editor.draft?.playbooks[(sel() as any).index]}>
+        <Button
+          icon={FileCode2}
+          variant="primary"
+          onClick={() =>
+            props.onEditPlaybook(editor.draft!.playbooks[(sel() as any).index].path)
+          }
+        >
+          Open playbook editor
+        </Button>
+      </Show>
     </div>
   );
 }
@@ -262,6 +284,106 @@ function ProvisionInspector(props: { index: number; onEdit: (path: string) => vo
       <div class="inspector-note">
         Drag the TARGETS port on the canvas onto VMs or containers. With no targets, this script
         runs lab-wide in the final provisioning pass.
+      </div>
+    </>
+  );
+}
+
+function PlaybookInspector(props: { index: number }) {
+  const playbook = () => editor.draft!.playbooks[props.index];
+  const pathIssue = () => {
+    const p = playbook().path;
+    if (!p) return "Path is required";
+    if (p.startsWith("/")) return "Path must be relative to the lab root";
+    if (p.split("/").some((part) => part === "..")) return "Path cannot leave the lab root";
+    return null;
+  };
+  async function remove() {
+    if (
+      await confirmDialog({
+        title: `Delete playbook "${playbook().path}"?`,
+        body: "The playbook block will be removed. Its folder and files will be preserved.",
+        confirmLabel: "Delete playbook",
+        danger: true,
+      })
+    ) {
+      removePlaybook(props.index);
+    }
+  }
+  return (
+    <>
+      <div class="inspector-head">
+        <span class="inspector-kind">playbook</span>
+        <span class="inspector-name">#{props.index + 1}</span>
+        <Button variant="danger" size="sm" icon={Trash2} onClick={() => void remove()}>
+          Delete
+        </Button>
+      </div>
+      <Input
+        label="Folder"
+        value={playbook().path}
+        placeholder="playbooks/baseline"
+        error={pathIssue() !== null}
+        help={pathIssue() ?? "config-weave playbook folder, relative to the lab root"}
+        onInput={(e: InputEvent) =>
+          setEditor(
+            "draft",
+            "playbooks",
+            props.index,
+            "path",
+            (e.currentTarget as HTMLInputElement).value,
+          )
+        }
+      />
+      <Input
+        label="Play"
+        value={playbook().play}
+        placeholder="baseline"
+        error={!playbook().play}
+        help="The play inside the playbook to check/apply"
+        onInput={(e: InputEvent) =>
+          setEditor(
+            "draft",
+            "playbooks",
+            props.index,
+            "play",
+            (e.currentTarget as HTMLInputElement).value,
+          )
+        }
+      />
+      <Badge tone={playbook().vms.length ? "success" : "neutral"}>
+        {playbook().vms.length ? `${playbook().vms.length} targeted` : "ALL MACHINES"}
+      </Badge>
+      <Show when={playbook().vms.length}>
+        <div class="remote-attached">
+          <For each={playbook().vms}>
+            {(name) => (
+              <button
+                class="remote-attached-row"
+                onClick={() => {
+                  const vm = editor.draft!.vms.findIndex((candidate) => candidate.name === name);
+                  const container = editor.draft!.containers.findIndex(
+                    (candidate) => candidate.name === name,
+                  );
+                  if (vm >= 0) select({ kind: "vm", index: vm });
+                  else if (container >= 0) select({ kind: "container", index: container });
+                }}
+              >
+                {name}
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+      <Show when={playbook().span === null}>
+        <div class="inspector-note">
+          Save the lab config to declare this playbook — the folder editor can scaffold its
+          files afterwards.
+        </div>
+      </Show>
+      <div class="inspector-note">
+        Drag the TARGETS port on the canvas onto VMs or containers. With no targets, the play
+        applies to every machine on <code>up</code>.
       </div>
     </>
   );

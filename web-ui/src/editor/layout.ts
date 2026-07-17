@@ -21,6 +21,8 @@ export interface Layout {
   containers: Record<string, NodePos>;
   segments: Record<string, NodePos>;
   provisions: Record<string, NodePos>;
+  /** config-weave playbook nodes, keyed like provisions (path + occurrence). */
+  playbooks?: Record<string, NodePos>;
   /** Remote-vmlab peer nodes, keyed by the remote's `host[:port]` string
    *  (`""` = the not-yet-addressed placeholder). */
   remotes?: Record<string, NodePos>;
@@ -40,6 +42,8 @@ export function machineCardHeight(nicCount: number): number {
 
 export const PROVISION_W = 220;
 export const PROVISION_H = 78;
+export const PLAYBOOK_W = 220;
+export const PLAYBOOK_H = 78;
 
 /** Stable-enough cosmetic identity for provisions, including repeated paths. */
 export function provisionLayoutKey(model: LabModel, index: number): string {
@@ -48,6 +52,15 @@ export function provisionLayoutKey(model: LabModel, index: number): string {
     .slice(0, index)
     .filter((provision) => provision.script === script).length;
   return `${script}\0${occurrence}`;
+}
+
+/** Cosmetic identity for playbook nodes (same scheme as provisions). */
+export function playbookLayoutKey(model: LabModel, index: number): string {
+  const path = model.playbooks[index]?.path || "(new playbook)";
+  const occurrence = model.playbooks
+    .slice(0, index)
+    .filter((playbook) => playbook.path === path).length;
+  return `${path}\0${occurrence}`;
 }
 
 /** Minimum segment-bar width (room for the name + meta text); bars widen
@@ -77,13 +90,14 @@ export function loadLayout(lab: string): Layout {
       const layout = JSON.parse(raw) as Layout;
       layout.containers ??= {};
       layout.provisions ??= {};
+      layout.playbooks ??= {};
       layout.remotes ??= {};
       return layout;
     }
   } catch {
     /* corrupted layout: start fresh */
   }
-  return { vms: {}, containers: {}, segments: {}, provisions: {}, remotes: {} };
+  return { vms: {}, containers: {}, segments: {}, provisions: {}, playbooks: {}, remotes: {} };
 }
 
 export function saveLayout(lab: string, layout: Layout): void {
@@ -96,7 +110,7 @@ export function saveLayout(lab: string, layout: Layout): void {
 
 export function renameInLayout(
   layout: Layout,
-  kind: "vms" | "containers" | "segments" | "provisions" | "remotes",
+  kind: "vms" | "containers" | "segments" | "provisions" | "playbooks" | "remotes",
   from: string,
   to: string,
 ): Layout {
@@ -121,6 +135,7 @@ export function autoLayout(model: LabModel, existing: Layout): Layout {
     containers: { ...existing.containers },
     segments: { ...existing.segments },
     provisions: { ...(existing.provisions ?? {}) },
+    playbooks: { ...(existing.playbooks ?? {}) },
     remotes: { ...(existing.remotes ?? {}) },
     nat: existing.nat,
     host: existing.host,
@@ -183,6 +198,16 @@ export function autoLayout(model: LabModel, existing: Layout): Layout {
       out.provisions[key] = {
         x: 80 + index * (PROVISION_W + 28),
         y: firstBarY + model.segments.length * laneHeight + 90,
+      };
+    }
+  });
+  model.playbooks.forEach((_, index) => {
+    const key = playbookLayoutKey(model, index);
+    if (!out.playbooks![key]) {
+      out.playbooks![key] = {
+        // Their own row, below the provisions row.
+        x: 80 + index * (PLAYBOOK_W + 28),
+        y: firstBarY + model.segments.length * laneHeight + 90 + PLAYBOOK_H + 40,
       };
     }
   });

@@ -221,6 +221,14 @@ export interface ProvisionModel {
   vms: string[];
 }
 
+export interface PlaybookModel {
+  span: Span | null;
+  /** Playbook folder, relative to the lab root; the inline block label. */
+  path: string;
+  play: string;
+  vms: string[];
+}
+
 export interface HandlerModel {
   span: Span | null;
   event: string;
@@ -236,6 +244,7 @@ export interface LabModel {
   vms: VmModel[];
   containers: ContainerModel[];
   provisions: ProvisionModel[];
+  playbooks: PlaybookModel[];
   handlers: HandlerModel[];
   records: RecordModel[];
   sinkholes: SinkholeModel[];

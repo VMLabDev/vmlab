@@ -665,6 +665,50 @@
 .topo-vm.provision-target > rect:first-child {
   stroke: var(--info-fg); stroke-width: 2; stroke-dasharray: 5 3;
 }
+
+/* Playbook nodes: the provision card shape with the success accent
+   (config-weave = converge-to-green). */
+.topo-playbook-link.locked .topo-playbook-link-hit { cursor: not-allowed; }
+.topo-playbook-port.locked { cursor: not-allowed; opacity: 0.48; }
+.topo-playbook-port.locked:hover circle { fill: var(--bg-1); stroke-width: 1.5; }
+.topo-playbook-link-line,
+.topo-playbook-link-draft {
+  fill: none; stroke: var(--success-fg); stroke-width: 1.7; stroke-dasharray: 5 3;
+  pointer-events: none;
+}
+.topo-playbook-link-hit {
+  fill: none; stroke: transparent; stroke-width: 12; cursor: grab; pointer-events: stroke;
+}
+.topo-playbook-link:hover .topo-playbook-link-line { stroke-width: 2.5; }
+.topo-playbook-arrowhead { fill: var(--success-fg); }
+.topo-playbook .topo-playbook-box {
+  fill: color-mix(in oklab, var(--success-bg) 38%, var(--bg-2));
+  stroke: color-mix(in oklab, var(--success-fg) 55%, var(--border));
+  stroke-width: 1.25; cursor: grab;
+}
+.topo-playbook.selected .topo-playbook-box { stroke: var(--accent); stroke-width: 2; }
+.topo-playbook-glyph { color: var(--success-fg); pointer-events: none; }
+.topo-playbook-kind {
+  fill: var(--success-fg); font: 700 8px/1 var(--font-mono); letter-spacing: 0.09em;
+  pointer-events: none;
+}
+.topo-playbook-name { fill: var(--fg-0); font-size: 12px; font-weight: 650; pointer-events: none; }
+.topo-playbook-path { fill: var(--fg-3); font: 8px/1 var(--font-mono); pointer-events: none; }
+.topo-playbook-badge { pointer-events: none; }
+.topo-playbook-badge rect { fill: var(--bg-1); stroke: var(--border-subtle); }
+.topo-playbook-badge text { fill: var(--fg-2); font: 700 7px/1 var(--font-mono); letter-spacing: 0.06em; }
+.topo-playbook-edit { color: var(--fg-2); cursor: pointer; }
+.topo-playbook-edit rect { fill: var(--bg-1); stroke: var(--border-subtle); }
+.topo-playbook-edit:hover { color: var(--success-fg); }
+.topo-playbook-edit:hover rect { stroke: var(--success-fg); }
+.topo-playbook-port { color: var(--success-fg); cursor: crosshair; }
+.topo-playbook-port circle { fill: var(--bg-1); stroke: currentColor; stroke-width: 1.7; }
+.topo-playbook-port text {
+  fill: currentColor; text-anchor: end; font: 700 7px/1 var(--font-mono);
+  letter-spacing: 0.07em; pointer-events: none;
+}
+.topo-playbook-port:hover circle,
+.topo-playbook-port.active circle { fill: var(--success-fg); stroke-width: 3; }
 .topo-event-link-line,
 .topo-event-link-draft {
   fill: none; stroke: var(--accent); stroke-width: 1.7; stroke-dasharray: 2 3;

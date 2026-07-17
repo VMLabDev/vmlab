@@ -25,6 +25,7 @@ import type {
   NicModel,
   OpValue,
   PortMapModel,
+  PlaybookModel,
   ProvisionModel,
   HandlerModel,
   RecordModel,
@@ -331,6 +332,11 @@ const sinkholePairs = (s: SinkholeModel): [string, FV][] => [
 
 const provisionPairs = (p: ProvisionModel): [string, FV][] => [["vms", list(p.vms)]];
 
+const playbookPairs = (p: PlaybookModel): [string, FV][] => [
+  ["play", str(p.play)],
+  ["vms", list(p.vms)],
+];
+
 const handlerPairs = (h: HandlerModel): [string, FV][] => [
   ["run", str(h.run)],
   ["targets", list(h.targets)],
@@ -386,6 +392,11 @@ const provisionSpec = (p: ProvisionModel): BlockSpec => ({
   kind: "provision",
   labels: [p.script],
   fields: specFields(provisionPairs(p)),
+});
+const playbookSpec = (p: PlaybookModel): BlockSpec => ({
+  kind: "playbook",
+  labels: [p.path],
+  fields: specFields(playbookPairs(p)),
 });
 const handlerSpec = (h: HandlerModel): BlockSpec => ({
   kind: "on",
@@ -483,6 +494,11 @@ function diffProvision(ops: Ops, base: ProvisionModel, draft: ProvisionModel) {
   fieldDiffer(provisionPairs)(ops, base, draft);
 }
 
+function diffPlaybook(ops: Ops, base: PlaybookModel, draft: PlaybookModel) {
+  diffLabel(ops, base.span!, base.path, draft.path);
+  fieldDiffer(playbookPairs)(ops, base, draft);
+}
+
 function diffHandler(ops: Ops, base: HandlerModel, draft: HandlerModel) {
   diffLabel(ops, base.span!, base.event, draft.event);
   fieldDiffer(handlerPairs)(ops, base, draft);
@@ -545,6 +561,7 @@ export function buildOps(base: LabModel, draft: LabModel): ModelOp[] {
   diffChildren(ops, labSpan, base.vms, draft.vms, diffVm, vmSpec);
   diffChildren(ops, labSpan, base.containers, draft.containers, diffContainer, containerSpec);
   diffChildren(ops, labSpan, base.provisions, draft.provisions, diffProvision, provisionSpec);
+  diffChildren(ops, labSpan, base.playbooks, draft.playbooks, diffPlaybook, playbookSpec);
   diffChildren(ops, labSpan, base.handlers, draft.handlers, diffHandler, handlerSpec);
   diffChildren(ops, labSpan, base.records, draft.records, diffRecord, recordSpec);
   diffChildren(ops, labSpan, base.sinkholes, draft.sinkholes, diffSinkhole, sinkholeSpec);

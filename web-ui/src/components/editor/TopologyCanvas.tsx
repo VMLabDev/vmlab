@@ -24,6 +24,7 @@ import {
   FileCode2,
   FlaskConical,
   FilePenLine,
+  FolderCog,
   LayoutGrid,
   Monitor,
   Play,
@@ -44,6 +45,8 @@ import {
   PORT_X0,
   SEG_H,
   NIC_ROW_H,
+  PLAYBOOK_H,
+  PLAYBOOK_W,
   PROVISION_H,
   PROVISION_W,
   VM_W,
@@ -53,6 +56,7 @@ import {
   saveLayout,
   segWidthFor,
   machineCardHeight,
+  playbookLayoutKey,
   provisionLayoutKey,
 } from "../../editor/layout";
 import type { ContainerModel, LabModel, NicModel, VmModel } from "../../editor/model";
@@ -63,6 +67,7 @@ import {
   addHostPort,
   addMachineDependency,
   addMachineNic,
+  addPlaybookTarget,
   addProvisionTarget,
   addRemote,
   addSegment,
@@ -76,6 +81,8 @@ import {
   removeContainer,
   removeEventHandlerTarget,
   removeMachineDependency,
+  removePlaybook,
+  removePlaybookTarget,
   removeProvision,
   removeProvisionTarget,
   removeRemote,
@@ -115,7 +122,7 @@ import { confirmDialog } from "../dialogs";
 import { registerFxNode } from "../../fx";
 
 interface Drag {
-  kind: "vm" | "container" | "provision" | "segment" | "nat" | "remote" | "host";
+  kind: "vm" | "container" | "provision" | "playbook" | "segment" | "nat" | "remote" | "host";
   name: string;
   dx: number;
   dy: number;
@@ -207,6 +214,14 @@ interface DependencyDrag {
 
 interface ProvisionTargetDrag {
   provisionIndex: number;
+  existing: string | null;
+  moved: boolean;
+  x: number;
+  y: number;
+}
+
+interface PlaybookTargetDrag {
+  playbookIndex: number;
   existing: string | null;
   moved: boolean;
   x: number;
@@ -499,6 +514,8 @@ export default function TopologyCanvas(props: {
   onEditConfig: () => void;
   onAddProvision: () => void;
   onEditProvision: (path: string) => void;
+  onAddPlaybook: () => void;
+  onEditPlaybook: (path: string) => void;
 }) {
   let svg: SVGSVGElement | undefined;
   const model = () => editor.draft!;
@@ -509,6 +526,7 @@ export default function TopologyCanvas(props: {
     containers: {},
     segments: {},
     provisions: {},
+    playbooks: {},
   });
   const [view, setView] = createSignal({ tx: 0, ty: 0, k: 1 });
   const [drag, setDrag] = createSignal<Drag | null>(null);
@@ -522,6 +540,9 @@ export default function TopologyCanvas(props: {
   const [provisionTargetDrag, setProvisionTargetDrag] = createSignal<ProvisionTargetDrag | null>(
     null,
   );
+  const [playbookTargetDrag, setPlaybookTargetDrag] = createSignal<PlaybookTargetDrag | null>(
+    null,
+  );
   const [eventTargetDrag, setEventTargetDrag] = createSignal<EventTargetDrag | null>(null);
   const [hostPortDrag, setHostPortDrag] = createSignal<HostPortDrag | null>(null);
 
@@ -533,6 +554,7 @@ export default function TopologyCanvas(props: {
       ...model().containers.map((c) => c.name),
       ...model().segments.map((s) => s.name),
       ...model().provisions.map((provision) => provision.script),
+      ...model().playbooks.map((playbook) => playbook.path),
     ];
     void names.length;
     const stored = loadLayout(l);
@@ -565,6 +587,10 @@ export default function TopologyCanvas(props: {
   const provisionPosIn = (l: Layout, index: number): NodePos =>
     l.provisions[provisionLayoutKey(model(), index)] ?? { x: 80, y: 360 };
   const provisionPos = (index: number): NodePos => provisionPosIn(layout(), index);
+  const playbookKey = (index: number) => playbookLayoutKey(model(), index);
+  const playbookPosIn = (l: Layout, index: number): NodePos =>
+    (l.playbooks ?? {})[playbookLayoutKey(model(), index)] ?? { x: 80, y: 480 };
+  const playbookPos = (index: number): NodePos => playbookPosIn(layout(), index);
   /** VMs and containers share the same node geometry on the canvas. */
   const machinePos = (kind: MachineKind, name: string): NodePos =>
     kind === "vm" ? vmPos(name) : ctrPos(name);
@@ -676,6 +702,29 @@ export default function TopologyCanvas(props: {
 
   function provisionLinkPath(index: number, targetKind: MachineKind, targetName: string): string {
     const from = provisionPort(index);
+    const to = dependencyTarget(targetKind, targetName, from);
+    const bend = Math.max(34, Math.min(90, Math.abs(to.x - from.x) * 0.35));
+    return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - (to.x >= from.x ? bend : -bend)} ${to.y}, ${to.x} ${to.y}`;
+  }
+
+  const playbookLinks = createMemo(() =>
+    model().playbooks.flatMap((playbook, playbookIndex) =>
+      playbook.vms.flatMap((targetName) => {
+        const target = machineRef(targetName);
+        return target
+          ? [{ playbookIndex, targetName, targetKind: target.kind, targetIndex: target.index }]
+          : [];
+      }),
+    ),
+  );
+
+  const playbookPort = (index: number): NodePos => {
+    const position = playbookPos(index);
+    return { x: position.x + PLAYBOOK_W, y: position.y + PLAYBOOK_H / 2 };
+  };
+
+  function playbookLinkPath(index: number, targetKind: MachineKind, targetName: string): string {
+    const from = playbookPort(index);
     const to = dependencyTarget(targetKind, targetName, from);
     const bend = Math.max(34, Math.min(90, Math.abs(to.x - from.x) * 0.35));
     return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - (to.x >= from.x ? bend : -bend)} ${to.y}, ${to.x} ${to.y}`;
@@ -843,6 +892,10 @@ export default function TopologyCanvas(props: {
     model().provisions.forEach((_, index) => {
       const p = provisionPosIn(l, index);
       boxes.push({ x: p.x, y: p.y, w: PROVISION_W, h: provisionCardHeight(index) });
+    });
+    model().playbooks.forEach((_, index) => {
+      const p = playbookPosIn(l, index);
+      boxes.push({ x: p.x, y: p.y, w: PLAYBOOK_W, h: PLAYBOOK_H });
     });
 
     const minWidth = Math.max(320, 188 + model().name.length * 8);
@@ -1197,6 +1250,8 @@ export default function TopologyCanvas(props: {
           ? ctrPos(name)
           : kind === "provision"
             ? provisionPos(model().provisions.findIndex((_, index) => provisionKey(index) === name))
+          : kind === "playbook"
+            ? playbookPos(model().playbooks.findIndex((_, index) => playbookKey(index) === name))
           : kind === "segment"
             ? segPos(name)
             : kind === "remote"
@@ -1267,6 +1322,31 @@ export default function TopologyCanvas(props: {
     const point = world(e);
     setProvisionTargetDrag({
       provisionIndex: link.provisionIndex,
+      existing: link.targetName,
+      moved: false,
+      ...point,
+    });
+  }
+
+  function playbookTargetDown(e: PointerEvent, playbookIndex: number) {
+    e.stopPropagation();
+    if (anyVmRunning()) {
+      select({ kind: "playbook", index: playbookIndex });
+      return;
+    }
+    const point = world(e);
+    setPlaybookTargetDrag({ playbookIndex, existing: null, moved: false, ...point });
+  }
+
+  function playbookLinkGrab(
+    e: PointerEvent,
+    link: { playbookIndex: number; targetName: string },
+  ) {
+    e.stopPropagation();
+    if (anyVmRunning()) return;
+    const point = world(e);
+    setPlaybookTargetDrag({
+      playbookIndex: link.playbookIndex,
       existing: link.targetName,
       moved: false,
       ...point,
@@ -1414,6 +1494,8 @@ export default function TopologyCanvas(props: {
             ? { ...l, containers: { ...l.containers, [d.name]: pos } }
             : d.kind === "provision"
               ? { ...l, provisions: { ...l.provisions, [d.name]: pos } }
+            : d.kind === "playbook"
+              ? { ...l, playbooks: { ...(l.playbooks ?? {}), [d.name]: pos } }
             : d.kind === "segment"
               ? { ...l, segments: { ...l.segments, [d.name]: pos } }
               : d.kind === "remote"
@@ -1424,6 +1506,7 @@ export default function TopologyCanvas(props: {
         return d.kind === "vm" ||
           d.kind === "container" ||
           d.kind === "provision" ||
+          d.kind === "playbook" ||
           d.kind === "segment"
           ? pushExternalNodes(next)
           : next;
@@ -1446,6 +1529,12 @@ export default function TopologyCanvas(props: {
     if (pd) {
       const point = world(e);
       setProvisionTargetDrag({ ...pd, moved: true, ...point });
+      return;
+    }
+    const pbd = playbookTargetDrag();
+    if (pbd) {
+      const point = world(e);
+      setPlaybookTargetDrag({ ...pbd, moved: true, ...point });
       return;
     }
     const ed = eventTargetDrag();
@@ -1492,6 +1581,9 @@ export default function TopologyCanvas(props: {
         } else if (d.kind === "provision") {
           const index = model().provisions.findIndex((_, i) => provisionKey(i) === d.name);
           if (index >= 0) select({ kind: "provision", index });
+        } else if (d.kind === "playbook") {
+          const index = model().playbooks.findIndex((_, i) => playbookKey(i) === d.name);
+          if (index >= 0) select({ kind: "playbook", index });
         } else if (d.kind === "segment") {
           const i = model().segments.findIndex((s) => s.name === d.name);
           if (i >= 0) select({ kind: "segment", index: i });
@@ -1561,6 +1653,22 @@ export default function TopologyCanvas(props: {
         removeProvisionTarget(pd.provisionIndex, pd.existing);
       }
       if (targetName) addProvisionTarget(pd.provisionIndex, targetName);
+      return;
+    }
+    const pbd = playbookTargetDrag();
+    if (pbd) {
+      setPlaybookTargetDrag(null);
+      if (!pbd.moved) {
+        select({ kind: "playbook", index: pbd.playbookIndex });
+        return;
+      }
+      const point = world(e);
+      const target = machineTargetAt(point.x, point.y);
+      const targetName = target ? machinesOf(target.kind)[target.index]?.name ?? null : null;
+      if (pbd.existing && targetName !== pbd.existing) {
+        removePlaybookTarget(pbd.playbookIndex, pbd.existing);
+      }
+      if (targetName) addPlaybookTarget(pbd.playbookIndex, targetName);
       return;
     }
     const ed = eventTargetDrag();
@@ -1718,6 +1826,18 @@ export default function TopologyCanvas(props: {
       ) {
         removeProvision(sel.index);
       }
+    } else if (sel.kind === "playbook") {
+      const playbook = model().playbooks[sel.index];
+      if (
+        playbook &&
+        (await confirmDialog({
+          title: `Delete playbook "${playbook.path}"?`,
+          body: "The playbook folder and its files will be preserved.",
+          danger: true,
+        }))
+      ) {
+        removePlaybook(sel.index);
+      }
     } else if (sel.kind === "remote") {
       if (anyVmRunning()) return;
       const host = sel.host;
@@ -1734,7 +1854,13 @@ export default function TopologyCanvas(props: {
   }
 
   function arrange() {
-    const fresh = autoLayout(model(), { vms: {}, containers: {}, segments: {}, provisions: {} });
+    const fresh = autoLayout(model(), {
+      vms: {},
+      containers: {},
+      segments: {},
+      provisions: {},
+      playbooks: {},
+    });
     setLayout(fresh);
     saveLayout(lab(), { ...fresh, view: view() });
   }
@@ -1761,6 +1887,11 @@ export default function TopologyCanvas(props: {
       const p = provisionPos(index);
       xs.push(p.x, p.x + PROVISION_W);
       ys.push(p.y, p.y + provisionCardHeight(index));
+    });
+    model().playbooks.forEach((_, index) => {
+      const p = playbookPos(index);
+      xs.push(p.x, p.x + PLAYBOOK_W);
+      ys.push(p.y, p.y + PLAYBOOK_H);
     });
     {
       const p = natPos();
@@ -1840,6 +1971,7 @@ export default function TopologyCanvas(props: {
     setConnDrag(null);
     setDependencyDrag(null);
     setProvisionTargetDrag(null);
+    setPlaybookTargetDrag(null);
     setEventTargetDrag(null);
     setSocketDrag(null);
     setLinkDrag(null);
@@ -1868,6 +2000,8 @@ export default function TopologyCanvas(props: {
     editor.selection.kind === "segment" ? model().segments[editor.selection.index]?.name : null;
   const selectedProvision = () =>
     editor.selection.kind === "provision" ? editor.selection.index : null;
+  const selectedPlaybook = () =>
+    editor.selection.kind === "playbook" ? editor.selection.index : null;
   const eventDragAccepts = (kind: MachineKind) => {
     const drag = eventTargetDrag();
     const accepted = drag ? eventTargetKind(model().handlers[drag.handlerIndex]?.event ?? "") : null;
@@ -2232,6 +2366,15 @@ export default function TopologyCanvas(props: {
         </Button>
         <Button
           size="sm"
+          icon={FolderCog}
+          onClick={props.onAddPlaybook}
+          disabled={anyVmRunning()}
+          title={anyVmRunning() ? "Stop all machines before adding a playbook" : undefined}
+        >
+          Add playbook
+        </Button>
+        <Button
+          size="sm"
           icon={Waypoints}
           onClick={() => addSegment()}
           disabled={anyVmRunning()}
@@ -2311,6 +2454,17 @@ export default function TopologyCanvas(props: {
             orient="auto-start-reverse"
           >
             <path d="M 0 0 L 10 5 L 0 10 z" class="topo-provision-arrowhead" />
+          </marker>
+          <marker
+            id="topo-playbook-arrow"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="7"
+            markerHeight="7"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" class="topo-playbook-arrowhead" />
           </marker>
           <marker
             id="topo-event-arrow"
@@ -2463,6 +2617,55 @@ export default function TopologyCanvas(props: {
                   class="topo-provision-link-draft"
                   d={`M ${from().x} ${from().y} C ${from().x + 38} ${from().y}, ${drag().x - 38} ${drag().y}, ${drag().x} ${drag().y}`}
                   marker-end="url(#topo-provision-arrow)"
+                />
+              );
+            }}
+          </Show>
+
+          <For each={playbookLinks()}>
+            {(link) => {
+              const grabbed = () => {
+                const drag = playbookTargetDrag();
+                return (
+                  drag?.playbookIndex === link.playbookIndex &&
+                  drag.existing === link.targetName
+                );
+              };
+              const path = () =>
+                playbookLinkPath(link.playbookIndex, link.targetKind, link.targetName);
+              return (
+                <Show when={!grabbed()}>
+                  <g
+                    class="topo-playbook-link"
+                    classList={{ locked: anyVmRunning() }}
+                    onPointerDown={(event: PointerEvent) => playbookLinkGrab(event, link)}
+                  >
+                    <path class="topo-playbook-link-hit" d={path()}>
+                      <title>
+                        {anyVmRunning()
+                          ? "Configuration is locked while a machine is up"
+                          : `${model().playbooks[link.playbookIndex]?.path} applies to ${link.targetName} — drag to re-home or remove`}
+                      </title>
+                    </path>
+                    <path
+                      class="topo-playbook-link-line"
+                      d={path()}
+                      marker-end="url(#topo-playbook-arrow)"
+                    />
+                  </g>
+                </Show>
+              );
+            }}
+          </For>
+
+          <Show when={playbookTargetDrag()}>
+            {(drag) => {
+              const from = () => playbookPort(drag().playbookIndex);
+              return (
+                <path
+                  class="topo-playbook-link-draft"
+                  d={`M ${from().x} ${from().y} C ${from().x + 38} ${from().y}, ${drag().x - 38} ${drag().y}, ${drag().x} ${drag().y}`}
+                  marker-end="url(#topo-playbook-arrow)"
                 />
               );
             }}
@@ -3220,6 +3423,88 @@ export default function TopologyCanvas(props: {
             }}
           </For>
 
+          {/* config-weave playbook nodes: same lab-owned workflow shape as
+              provisions — a folder + play applied to targeted machines
+              (empty scope = ALL MACHINES). The pencil opens the playbook
+              folder editor; unlike provision scripts, playbook files stay
+              editable while machines run (the edit→check dev loop). */}
+          <For each={model().playbooks}>
+            {(playbook, index) => {
+              const p = () => playbookPos(index());
+              const key = () => playbookKey(index());
+              const folder = () => playbook.path.split("/").pop() || playbook.path;
+              const badge = () =>
+                playbook.vms.length ? `${playbook.vms.length} TARGETED` : "ALL MACHINES";
+              return (
+                <g
+                  class="topo-playbook"
+                  classList={{ selected: selectedPlaybook() === index() }}
+                  onPointerDown={(event: PointerEvent) => nodeDown(event, "playbook", key())}
+                >
+                  <rect
+                    class="topo-playbook-box"
+                    x={p().x}
+                    y={p().y}
+                    width={PLAYBOOK_W}
+                    height={PLAYBOOK_H}
+                    rx="10"
+                  />
+                  <g
+                    class="topo-playbook-glyph"
+                    transform={`translate(${p().x + 12} ${p().y + 13})`}
+                  >
+                    <FolderCog size={18} />
+                  </g>
+                  <text class="topo-playbook-kind" x={p().x + 38} y={p().y + 16}>
+                    PLAYBOOK #{index() + 1}
+                  </text>
+                  <text class="topo-playbook-name" x={p().x + 38} y={p().y + 34}>
+                    {folder().length > 23 ? `${folder().slice(0, 22)}…` : folder()}
+                    <title>{playbook.path}</title>
+                  </text>
+                  <text class="topo-playbook-path" x={p().x + 12} y={p().y + 53}>
+                    play {playbook.play.length > 19 ? `${playbook.play.slice(0, 18)}…` : playbook.play}
+                  </text>
+                  <g class="topo-playbook-badge">
+                    <rect x={p().x + 12} y={p().y + 59} width={badge().length * 5.2 + 12} height="13" rx="6.5" />
+                    <text x={p().x + 18} y={p().y + 68.5}>{badge()}</text>
+                  </g>
+                  <g
+                    class="topo-playbook-edit"
+                    transform={`translate(${p().x + PLAYBOOK_W - 68} ${p().y + 8})`}
+                    onPointerDown={(event: PointerEvent) => event.stopPropagation()}
+                    onClick={(event: MouseEvent) => {
+                      event.stopPropagation();
+                      props.onEditPlaybook(playbook.path);
+                    }}
+                  >
+                    <rect width="20" height="20" rx="5" />
+                    <g transform="translate(4 4)"><FilePenLine size={12} /></g>
+                    <title>Open the playbook folder editor</title>
+                  </g>
+                  <g
+                    class="topo-playbook-port"
+                    classList={{
+                      active: playbookTargetDrag()?.playbookIndex === index(),
+                      locked: anyVmRunning(),
+                    }}
+                    onPointerDown={(event: PointerEvent) => playbookTargetDown(event, index())}
+                  >
+                    <circle cx={p().x + PLAYBOOK_W} cy={p().y + PLAYBOOK_H / 2} r="5" />
+                    <text x={p().x + PLAYBOOK_W - 9} y={p().y + PLAYBOOK_H / 2 - 9}>
+                      TARGETS
+                    </text>
+                    <title>
+                      {anyVmRunning()
+                        ? "Configuration is locked while a machine is up"
+                        : "Drag to a VM or container this playbook applies to"}
+                    </title>
+                  </g>
+                </g>
+              );
+            }}
+          </For>
+
           {/* VM nodes */}
           <For each={model().vms}>
             {(vm, vi) => {
@@ -3250,7 +3535,7 @@ export default function TopologyCanvas(props: {
                     "dependency-target":
                       dependencyDrag() !== null &&
                       !(dependencyDrag()!.kind === "vm" && dependencyDrag()!.index === vi()),
-                    "provision-target": provisionTargetDrag() !== null,
+                    "provision-target": provisionTargetDrag() !== null || playbookTargetDrag() !== null,
                     "event-target": eventDragAccepts("vm"),
                   }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "vm", vm.name)}
@@ -3482,7 +3767,7 @@ export default function TopologyCanvas(props: {
                         dependencyDrag()!.kind === "container" &&
                         dependencyDrag()!.index === ci()
                       ),
-                    "provision-target": provisionTargetDrag() !== null,
+                    "provision-target": provisionTargetDrag() !== null || playbookTargetDrag() !== null,
                     "event-target": eventDragAccepts("container"),
                   }}
                   onPointerDown={(e: PointerEvent) => nodeDown(e, "container", ctr.name)}

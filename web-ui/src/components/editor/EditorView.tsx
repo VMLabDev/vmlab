@@ -8,11 +8,13 @@ import { Alert, Button, Empty, Spinner, SplitPane } from "@forge/ui";
 import {
   anyVmRunning,
   reloadLab as reloadCurrentLab,
+  showPlaybook,
   showToast,
   state,
 } from "../../store";
 import {
   editor,
+  addPlaybook,
   addProvision,
   openEditor,
   pendingOps,
@@ -68,6 +70,23 @@ export default function EditorView(props: { onEditConfig: () => void }) {
     } catch (error) {
       showToast(`Could not add provision: ${error instanceof Error ? error.message : error}`, "danger");
     }
+  }
+
+  function addPlaybookNode() {
+    if (anyVmRunning()) return;
+    const draft = editor.draft;
+    if (!draft) return;
+    // No disk probe: the file API only serves declared folders, so a name
+    // collision with an existing folder is harmless (the editor just shows
+    // that folder's files once the block is saved).
+    const referenced = new Set(draft.playbooks.map((playbook) => playbook.path));
+    for (let number = 1; number < 10_000; number++) {
+      const path = `playbooks/playbook-${number}`;
+      if (referenced.has(path)) continue;
+      addPlaybook(path);
+      return;
+    }
+    showToast("Could not allocate a playbook folder name", "danger");
   }
 
   return (
@@ -152,9 +171,13 @@ export default function EditorView(props: { onEditConfig: () => void }) {
                 onEditConfig={props.onEditConfig}
                 onAddProvision={() => void addProvisionNode()}
                 onEditProvision={setEditingScript}
+                onAddPlaybook={addPlaybookNode}
+                onEditPlaybook={showPlaybook}
               />
             }
-            second={<Inspector onEditProvision={setEditingScript} />}
+            second={
+              <Inspector onEditProvision={setEditingScript} onEditPlaybook={showPlaybook} />
+            }
             initial={Math.max(480, window.innerWidth - 720)}
             min={320}
           />

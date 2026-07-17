@@ -12,6 +12,7 @@ import type {
   ContainerModel,
   HandlerModel,
   LabModel,
+  PlaybookModel,
   ProvisionModel,
   Span,
   TemplateSummary,
@@ -27,6 +28,7 @@ export type Selection =
   | { kind: "vm"; index: number }
   | { kind: "container"; index: number }
   | { kind: "provision"; index: number }
+  | { kind: "playbook"; index: number }
   | { kind: "nat" }
   | { kind: "remote"; host: string };
 
@@ -447,6 +449,27 @@ export function removeProvision(index: number) {
   select({ kind: "lab" });
 }
 
+export function addPlaybook(path: string): number {
+  const draft = editor.draft;
+  if (!draft) return -1;
+  const play = path.split("/").pop() || "main";
+  setEditor("draft", "playbooks", draft.playbooks.length, { span: null, path, play, vms: [] });
+  const index = editor.draft!.playbooks.length - 1;
+  select({ kind: "playbook", index });
+  return index;
+}
+
+export function removePlaybook(index: number) {
+  setEditor(
+    "draft",
+    "playbooks",
+    produce((playbooks: PlaybookModel[]) => {
+      playbooks.splice(index, 1);
+    }),
+  );
+  select({ kind: "lab" });
+}
+
 export function removeVm(index: number) {
   setEditor(
     "draft",
@@ -459,6 +482,9 @@ export function removeVm(index: number) {
       }
       for (const provision of draft.provisions) {
         provision.vms = provision.vms.filter((name) => name !== removed);
+      }
+      for (const playbook of draft.playbooks) {
+        playbook.vms = playbook.vms.filter((name) => name !== removed);
       }
       for (const handler of draft.handlers) {
         handler.targets = handler.targets.filter((name) => name !== removed);
@@ -480,6 +506,9 @@ export function removeContainer(index: number) {
       }
       for (const provision of draft.provisions) {
         provision.vms = provision.vms.filter((name) => name !== removed);
+      }
+      for (const playbook of draft.playbooks) {
+        playbook.vms = playbook.vms.filter((name) => name !== removed);
       }
       for (const handler of draft.handlers) {
         handler.targets = handler.targets.filter((name) => name !== removed);
@@ -542,6 +571,24 @@ export function removeProvisionTarget(index: number, target: string) {
     index,
     "vms",
     provision.vms.filter((name) => name !== target),
+  );
+}
+
+export function addPlaybookTarget(index: number, target: string) {
+  const playbook = editor.draft?.playbooks[index];
+  if (!playbook || playbook.vms.includes(target) || !machineNames().includes(target)) return;
+  setEditor("draft", "playbooks", index, "vms", [...playbook.vms, target]);
+}
+
+export function removePlaybookTarget(index: number, target: string) {
+  const playbook = editor.draft?.playbooks[index];
+  if (!playbook) return;
+  setEditor(
+    "draft",
+    "playbooks",
+    index,
+    "vms",
+    playbook.vms.filter((name) => name !== target),
   );
 }
 
@@ -755,6 +802,9 @@ function rewriteMachineRefs(d: LabModel, from: string, to: string) {
   for (const p of d.provisions) {
     p.vms = p.vms.map((n) => (n === from ? to : n));
   }
+  for (const p of d.playbooks) {
+    p.vms = p.vms.map((n) => (n === from ? to : n));
+  }
   for (const handler of d.handlers) {
     handler.targets = handler.targets.map((name) => (name === from ? to : name));
   }
@@ -938,6 +988,9 @@ export function selectionForLine(line: number | null): Selection | null {
   }
   for (let i = 0; i < base.provisions.length; i++) {
     if (contains(base.provisions[i].span)) return { kind: "provision", index: i };
+  }
+  for (let i = 0; i < base.playbooks.length; i++) {
+    if (contains(base.playbooks[i].span)) return { kind: "playbook", index: i };
   }
   return null;
 }
