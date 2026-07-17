@@ -3,7 +3,7 @@
 // NOT read-only while machines run — editing playbook files and re-running
 // check/apply against a live guest IS the workflow this page exists for.
 
-import { Show, batch, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { Show, batch, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { CodeEditor } from "@forge/code";
 import { Alert, Button, Empty, PageHead, Spinner, SplitPane } from "@forge/ui";
@@ -91,17 +91,21 @@ export default function PlaybookEditorView() {
     return null;
   }
 
-  // (Re)load when the playbook path changes; reset per-folder state.
+  // (Re)load when the playbook path changes; reset per-folder state. Only
+  // `playbook()` may be tracked here — reading `files` untracked, or every
+  // cache write would re-trigger the reset (an infinite reload loop).
   createEffect(() => {
     void playbook();
     const generation = ++loadGeneration;
-    batch(() => {
-      setActive(null);
-      for (const key of Object.keys(files)) {
-        setFiles(key, undefined as unknown as OpenFile);
-      }
+    untrack(() => {
+      batch(() => {
+        setActive(null);
+        for (const key of Object.keys(files)) {
+          setFiles(key, undefined as unknown as OpenFile);
+        }
+      });
+      void loadTree(true).then(() => void generation);
     });
-    void loadTree(true).then(() => void generation);
   });
 
   async function openFile(path: string) {
@@ -343,7 +347,16 @@ export default function PlaybookEditorView() {
                   </Show>
                   <CodeEditor
                     value={activeFile()?.content ?? ""}
-                    onChange={(value) => active() && setFiles(active()!, "content", value)}
+                    onChange={(value) => {
+                      // CodeMirror also reports programmatic value swaps
+                      // (file switches) — only user edits on a loaded file
+                      // may touch the store, or the write lands on a
+                      // not-yet-cached entry and throws.
+                      const path = active();
+                      if (path && files[path] && files[path].content !== value) {
+                        setFiles(path, "content", value);
+                      }
+                    }}
                     language={language()}
                     height="calc(100vh - 220px)"
                   />
