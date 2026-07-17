@@ -21,10 +21,17 @@ use crate::scripting::OutputSink;
 /// Called once the build VM's VNC socket is accepting connections.
 pub type ConsoleReady = Arc<dyn Fn(PathBuf) + Send + Sync>;
 
+/// Called for every structured event the synthetic build lab emits whose
+/// kind starts with `playbook.` — the config-weave step stream (§10.4). The
+/// supervisor forwards these as `template.op.step` so build UIs can render
+/// per-step progress instead of opaque log lines.
+pub type BuildEvent = Arc<dyn Fn(crate::proto::Event) + Send + Sync>;
+
 /// Optional controls supplied by an interactive build caller.
 #[derive(Default)]
 pub struct BuildControl {
     pub console_ready: Option<ConsoleReady>,
+    pub on_event: Option<BuildEvent>,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -210,7 +217,27 @@ async fn run_build(
 
     // Build the runtime; then pre-seed the working disk before `up` creates
     // the (otherwise blank) scratch disk.
-    let (events_tx, _) = tokio::sync::broadcast::channel(256);
+    let (events_tx, _) = tokio::sync::broadcast::channel::<crate::proto::Event>(256);
+    // Bridge the synthetic lab's structured events out to the caller: the
+    // playbook engine narrates step progress as `playbook.op.*` (incl. the
+    // raw config-weave ndjson on `playbook.op.step`), which would otherwise
+    // be discarded with this receiver.
+    if let Some(on_event) = run.control.on_event.clone() {
+        let mut rx = events_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if ev.event.starts_with("playbook.") {
+                            on_event(ev);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
     let event_log = Arc::new(crate::labd::events::EventLog::new(&lab_name, events_tx)?);
     let runtime = cancelable(
         &run.control.cancel,
@@ -573,10 +600,39 @@ fn synth_lab(
         writeln!(s, " }}").unwrap();
     }
     writeln!(s, "  }}").unwrap();
-    // Build provision scripts run against the single build VM (§10.4).
-    for p in &def.provisions {
-        let script = root.join(&p.script);
-        writeln!(s, "  provision \"{}\" {{ }}", script.display()).unwrap();
+    // Build provision scripts and playbooks run against the single build VM
+    // (§10.4). The lab runtime interleaves them in the synthetic file's
+    // declaration order, so emit them ordered by their spans in the original
+    // template definition. Paths are rebased absolute: the synthetic lab's
+    // root is the throwaway work dir, not the template root.
+    enum Step<'a> {
+        Provision(&'a crate::config::model::Provision),
+        Playbook(&'a crate::config::model::Playbook),
+    }
+    let mut steps: Vec<(usize, Step)> = def
+        .provisions
+        .iter()
+        .map(|p| (p.span.0, Step::Provision(p)))
+        .chain(def.playbooks.iter().map(|p| (p.span.0, Step::Playbook(p))))
+        .collect();
+    steps.sort_by_key(|(at, _)| *at);
+    for (_, step) in steps {
+        match step {
+            Step::Provision(p) => {
+                let script = root.join(&p.script);
+                writeln!(s, "  provision \"{}\" {{ }}", script.display()).unwrap();
+            }
+            Step::Playbook(p) => {
+                let dir = root.join(&p.path);
+                writeln!(
+                    s,
+                    "  playbook \"{}\" {{ play = \"{}\" vms = [\"{vm}\"] }}",
+                    dir.display(),
+                    p.play
+                )
+                .unwrap();
+            }
+        }
     }
     writeln!(s, "}}").unwrap();
     Ok(s)
@@ -617,6 +673,33 @@ mod tests {
         ));
         let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
         assert!(wcl.contains("nic { nat = true }"), "{wcl}");
+    }
+
+    /// Template playbooks reach the synthetic build lab as `playbook` blocks
+    /// targeting the build VM, path rebased absolute, and interleaved with
+    /// provisions in declaration order (the up-queue replays that order).
+    #[test]
+    fn playbooks_carry_into_build_lab_in_declaration_order() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "  provision \"a.ws\" { }\n",
+            "  playbook \"pb\" { play = \"baseline\" }\n",
+            "  provision \"b.ws\" { }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
+        assert!(
+            wcl.contains("playbook \"/root/pb\" { play = \"baseline\" vms = [\"build\"] }"),
+            "{wcl}"
+        );
+        let a = wcl.find("/root/a.ws").expect("provision a");
+        let pb = wcl.find("/root/pb").expect("playbook");
+        let b = wcl.find("/root/b.ws").expect("provision b");
+        assert!(a < pb && pb < b, "declaration order lost:\n{wcl}");
+        crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
     }
 
     /// The synthetic build lab must satisfy the lab schema — `disk`/`memory`

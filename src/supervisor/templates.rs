@@ -22,6 +22,9 @@ struct OpState {
     kind: &'static str,
     started: chrono::DateTime<chrono::Utc>,
     log: VecDeque<String>,
+    /// Structured playbook progress (`playbook.op.*` from the synthetic build
+    /// lab, forwarded live as `template.op.step`), kept for resync.
+    steps: VecDeque<Value>,
     console: Option<PathBuf>,
     cancel: tokio_util::sync::CancellationToken,
 }
@@ -61,6 +64,7 @@ impl TemplateOps {
                 kind,
                 started: chrono::Utc::now(),
                 log: VecDeque::new(),
+                steps: VecDeque::new(),
                 console: None,
                 cancel: cancel.clone(),
             },
@@ -79,6 +83,16 @@ impl TemplateOps {
                 op.log.pop_front();
             }
             op.log.push_back(line.to_string());
+        }
+    }
+
+    fn append_step(&self, lab: &str, arch: &str, template: &str, step: Value) {
+        let mut ops = self.inner.lock().unwrap();
+        if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
+            if op.steps.len() == LOG_CAP {
+                op.steps.pop_front();
+            }
+            op.steps.push_back(step);
         }
     }
 
@@ -143,6 +157,7 @@ impl TemplateOps {
                     "kind": op.kind,
                     "started": op.started.to_rfc3339(),
                     "log_tail": op.log.iter().collect::<Vec<_>>(),
+                    "steps": op.steps.iter().collect::<Vec<_>>(),
                     "console_ready": op.console.as_ref().is_some_and(|path| path.exists()),
                 })
             })
@@ -337,6 +352,26 @@ pub async fn start_build(
                 json!({"template": ready_template, "arch": ready_arch, "kind": "build"}),
             ));
         });
+        // Forward the synthetic build lab's playbook step stream as
+        // `template.op.step` (live) and into the resync ring.
+        let step_sup = sup.clone();
+        let (step_lab, step_arch, step_template) = (lab.clone(), arch.clone(), template.clone());
+        let on_event: crate::template::build::BuildEvent = Arc::new(move |ev| {
+            let payload = json!({
+                "template": step_template,
+                "arch": step_arch,
+                "kind": "build",
+                "event": ev.event,
+                "data": ev.data,
+            });
+            step_sup.template_ops.append_step(
+                &step_lab,
+                &step_arch,
+                &step_template,
+                payload.clone(),
+            );
+            step_sup.emit(Event::new("template.op.step", &*step_lab, payload));
+        });
         let result = crate::template::build::build_template(
             &def,
             &root,
@@ -346,6 +381,7 @@ pub async fn start_build(
             None,
             crate::template::build::BuildControl {
                 console_ready: Some(console_ready),
+                on_event: Some(on_event),
                 cancel: cancel.clone(),
             },
         )

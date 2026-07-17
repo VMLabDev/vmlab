@@ -504,6 +504,10 @@ pub struct TemplateDef {
     pub source: TemplateSource,
     pub media: Vec<Media>,
     pub provisions: Vec<Provision>,
+    /// config-weave playbooks applied to the build VM, interleaved with
+    /// provisions in declaration order (§10.4); steps stream as structured
+    /// build progress.
+    pub playbooks: Vec<Playbook>,
     pub nics: Vec<Nic>,
     pub extra_disks: Vec<DiskBlock>,
 }

@@ -426,6 +426,8 @@ type TemplateDef {
   @children("media")     media: list<Media>
   @doc("Provision scripts that drive the build")
   @children("provision") provisions: list<Provision>
+  @doc("config-weave playbooks applied to the build VM, interleaved with provisions in declaration order; steps stream as structured build progress")
+  @children("playbook")  playbooks: list<Playbook>
   @doc("NICs for the build VM (optional; the build VM may be air-gapped)")
   @children("nic")       nics: list<Nic>
   @doc("Additional disks attached during the build")

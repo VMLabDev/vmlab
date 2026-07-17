@@ -229,6 +229,9 @@ export interface TemplateOpStatus {
   kind: string;
   started: string;
   log_tail: string[];
+  /** Raw forwarded `playbook.op.*` events from the build's playbooks
+   *  (the same payloads that ride `template.op.step`), for resync. */
+  steps?: { event?: string; data?: { cw?: unknown } }[];
   console_ready: boolean;
 }
 

@@ -208,6 +208,10 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
 async fn build(file: Option<PathBuf>, only: Option<String>, version: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let path = match file {
+        // Absolutize: a bare `-f vmlab.wcl` has an EMPTY parent(), which used
+        // to silently break every root-relative resolution (media, scripts,
+        // playbooks) once the build ran from its work dir.
+        Some(p) if p.is_relative() => cwd.join(p),
         Some(p) => p,
         None => crate::paths::find_lab_root(&cwd)?.join(crate::paths::LAB_FILE),
     };

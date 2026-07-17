@@ -1110,6 +1110,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let mut source = None;
     let mut media = Vec::new();
     let mut provisions = Vec::new();
+    let mut playbooks = Vec::new();
     let mut nics = Vec::new();
     let mut extra_disks = Vec::new();
     for child in b.blocks() {
@@ -1123,6 +1124,11 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
             "provision" => {
                 if let Some(p) = extract_provision(&child, issues) {
                     provisions.push(p);
+                }
+            }
+            "playbook" => {
+                if let Some(p) = extract_playbook(&child, issues) {
+                    playbooks.push(p);
                 }
             }
             "nic" => nics.push(extract_nic(&child, issues)),
@@ -1163,6 +1169,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         source,
         media,
         provisions,
+        playbooks,
         nics,
         extra_disks,
     })

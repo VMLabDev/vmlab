@@ -24,8 +24,10 @@ import {
   dismissTemplateOp,
   loadTemplates,
   showToast,
+  type PlaybookStep,
   type TemplateOp,
 } from "../store";
+import { stepTone } from "./PlaybookPanel";
 import { listStoreTemplates, removeStoreTemplate, templateRemote } from "../api";
 import type { TemplateInfo, RemoteStatus, StoreTemplate } from "../api";
 import { confirmDialog } from "./dialogs";
@@ -587,6 +589,24 @@ function OpPanel(p: { op: TemplateOp; opKey: string }) {
       </div>
       <Show when={p.op.error}>
         <Alert tone="danger">{p.op.error}</Alert>
+      </Show>
+      <Show when={p.op.steps?.length}>
+        <div class="pb-steps">
+          <For each={p.op.steps}>
+            {(step: PlaybookStep) => (
+              <div class="pb-step">
+                <Badge tone={stepTone(step.status)}>{step.status.replace(/_/g, " ")}</Badge>
+                <span class="pb-step-name">{step.name}</span>
+                <Show when={step.resource}>
+                  <span class="pb-step-resource">{step.resource}</span>
+                </Show>
+                <Show when={step.message}>
+                  <span class="pb-step-msg">{step.message}</span>
+                </Show>
+              </div>
+            )}
+          </For>
+        </div>
       </Show>
       <Show when={p.op.log.length}>
         <div class="tpl-log" ref={pane}>

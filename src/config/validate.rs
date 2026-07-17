@@ -527,6 +527,44 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        // Build playbooks target the synthetic "build" VM only; `vms` would
+        // silently dangle, and config-weave is x86_64-only (§10.4).
+        for p in &t.playbooks {
+            if p.play.is_empty() {
+                issues.push(Issue::at(
+                    p.span,
+                    format!("playbook {} has an empty play name", p.path.display()),
+                ));
+            }
+            let dir = file.root.join(&p.path);
+            if !dir.is_dir() {
+                issues.push(Issue::at(
+                    p.span,
+                    format!("playbook {} is not a directory", p.path.display()),
+                ));
+            } else if !dir.join("playbook.wcl").is_file() {
+                issues.push(Issue::at(
+                    p.span,
+                    format!("playbook {} has no playbook.wcl", p.path.display()),
+                ));
+            }
+            if !p.vms.is_empty() {
+                issues.push(Issue::at(
+                    p.span,
+                    "template playbooks always run on the build VM; drop `vms`",
+                ));
+            }
+            if t.arch != "x86_64" {
+                issues.push(Issue::at(
+                    p.span,
+                    format!(
+                        "playbook {} on a {} template — config-weave ships binaries only for x86_64",
+                        p.path.display(),
+                        t.arch
+                    ),
+                ));
+            }
+        }
     }
 
     issues

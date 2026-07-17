@@ -46,6 +46,9 @@ export interface TemplateOp {
   kind: string; // "build" | "push"
   status: "running" | "done" | "error" | "cancelled";
   log: string[];
+  /** config-weave step progress when the template def declares playbooks
+   *  (fed by template.op.step, same shape as a machine playbook run). */
+  steps?: PlaybookStep[];
   consoleReady?: boolean;
   version?: string;
   error?: string;
@@ -286,6 +289,12 @@ async function resyncTemplateOps() {
           kind: op.kind,
           status: "running",
           log: op.log_tail.slice(),
+          // Replay the buffered playbook events into a step list.
+          steps: (op.steps ?? []).reduce(
+            (acc: PlaybookStep[], e) =>
+              e.event === "playbook.op.step" ? applyCwEvent(acc, e.data?.cw) : acc,
+            [],
+          ),
           consoleReady: op.console_ready,
         };
       }
@@ -760,6 +769,17 @@ function handleTemplateOpEvent(ev: DaemonEvent) {
             ? [...base.log.slice(1), line]
             : [...base.log, line];
         return { ...base, log };
+      });
+      break;
+    }
+    case "template.op.step": {
+      // A forwarded playbook event from the build's synthetic lab; only the
+      // step stream (with config-weave's ndjson under data.cw) shapes the UI.
+      if (String(ev.data.event ?? "") !== "playbook.op.step") break;
+      const cw = (ev.data.data as { cw?: unknown } | undefined)?.cw;
+      setState("templateOps", key, (op) => {
+        const base = op ?? fresh();
+        return { ...base, steps: applyCwEvent(base.steps ?? [], cw) };
       });
       break;
     }
