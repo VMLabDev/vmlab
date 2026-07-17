@@ -73,6 +73,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
+    /// Run config-weave playbooks against lab machines
+    Playbook {
+        #[command(subcommand)]
+        cmd: PlaybookCmd,
+    },
     /// Manage the template store and OCI distribution
     Template {
         #[command(subcommand)]
@@ -308,6 +313,37 @@ pub enum SnapshotCmd {
     Delete { vm: String, name: String },
 }
 
+/// config-weave playbook runs (declared with `playbook {}` lab blocks).
+/// Exit codes mirror config-weave: 0 ok, 1 step error, 2 validation,
+/// 3 reboot still required after bounded retries.
+#[derive(Subcommand)]
+pub enum PlaybookCmd {
+    /// List the lab's playbook blocks and any in-flight runs
+    List,
+    /// Report drift without changing the guest (re-pushes the playbook first)
+    Check {
+        /// Machine ([lab/]name)
+        machine: String,
+        /// Playbook folder path, when several target this machine
+        #[arg(long)]
+        playbook: Option<String>,
+        /// Play name, when several target this machine
+        #[arg(long)]
+        play: Option<String>,
+    },
+    /// Push the playbook and converge the guest (auto-reboots on demand)
+    Apply {
+        /// Machine ([lab/]name)
+        machine: String,
+        /// Playbook folder path, when several target this machine
+        #[arg(long)]
+        playbook: Option<String>,
+        /// Play name, when several target this machine
+        #[arg(long)]
+        play: Option<String>,
+    },
+}
+
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -365,6 +401,19 @@ pub fn run() -> ExitCode {
             SnapshotCmd::Restore { name, vm } => lab::cmd_restore(vm, name),
             SnapshotCmd::List { vm } => lab::cmd_snapshots(&vm),
             SnapshotCmd::Delete { vm, name } => lab::cmd_snapshot_delete(&vm, name),
+        },
+        Command::Playbook { cmd } => match cmd {
+            PlaybookCmd::List => lab::cmd_playbook_list(),
+            PlaybookCmd::Check {
+                machine,
+                playbook,
+                play,
+            } => lab::cmd_playbook_run(&machine, playbook, play, false),
+            PlaybookCmd::Apply {
+                machine,
+                playbook,
+                play,
+            } => lab::cmd_playbook_run(&machine, playbook, play, true),
         },
         Command::Template { cmd } => crate::template::cli::cmd_template(cmd),
         Command::Console { vm, tcp } => console::cmd_console(&vm, tcp),

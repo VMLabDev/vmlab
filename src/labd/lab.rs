@@ -52,6 +52,11 @@ pub struct LabRuntime {
     /// provision generalizes/shuts the guest down (Windows sysprep). Std
     /// lock: set once before `up`, cloned out, never held across await.
     pub pre_provision: std::sync::RwLock<Option<PreProvisionHook>>,
+    /// Host config loaded once at build (config-weave binary dir, …).
+    pub host_cfg: crate::config::host::HostConfig,
+    /// In-flight config-weave runs, one per machine (`up` and on-demand
+    /// check/apply claim through the same registry).
+    pub playbook_ops: crate::labd::playbook::PlaybookOps,
 }
 
 /// See [`LabRuntime::pre_provision`].
@@ -340,6 +345,8 @@ impl LabRuntime {
             pending_pulls: Mutex::new(pending),
             pull_lock: Mutex::new(()),
             pre_provision: std::sync::RwLock::new(None),
+            host_cfg,
+            playbook_ops: crate::labd::playbook::PlaybookOps::default(),
         }))
     }
 
@@ -955,6 +962,48 @@ impl LabRuntime {
                 missing.join(", ")
             );
         }
+        self.preflight_playbooks(targets)
+    }
+
+    /// The config-weave guest binaries every playbook-targeted machine in
+    /// `targets` will need must exist on the host before anything boots.
+    /// Also the runtime arch gate for machines whose arch validation could
+    /// not see statically (registry templates, containers).
+    fn preflight_playbooks(&self, targets: &[String]) -> Result<()> {
+        use crate::labd::playbook;
+        let playbooks = &self.config.lab.playbooks;
+        if playbooks.is_empty() {
+            return Ok(());
+        }
+        let dir = playbook::default_bin_dir(self.host_cfg.config_weave_bin_dir.as_deref());
+        let mut errs: Vec<String> = Vec::new();
+        for name in targets {
+            let targeted = playbooks
+                .iter()
+                .any(|p| p.vms.is_empty() || p.vms.iter().any(|v| v == name));
+            if !targeted {
+                continue;
+            }
+            let (os, arch) = if let Some(c) = self.containers.get(name) {
+                (playbook::GuestOs::Linux, c.arch.clone())
+            } else {
+                let vm = self.vm(name)?;
+                let t = vm.template();
+                (
+                    playbook::guest_os_of(t.resolved.profile.as_deref()),
+                    t.resolved.arch.clone(),
+                )
+            };
+            if let Err(e) = playbook::weave_binary(&dir, os, &arch) {
+                let msg = format!("\"{name}\": {e}");
+                if !errs.contains(&msg) {
+                    errs.push(msg);
+                }
+            }
+        }
+        if !errs.is_empty() {
+            bail!("playbook preflight: {}", errs.join("; "));
+        }
         Ok(())
     }
 
@@ -1222,7 +1271,8 @@ impl LabRuntime {
 
         let mut remaining: Vec<String> = targets.clone();
         let mut done: HashSet<String> = HashSet::new();
-        let mut next_provision = 0usize;
+        let steps = merged_up_steps(&self.config.lab);
+        let mut next_step = 0usize;
         while !remaining.is_empty() {
             // A wave: every remaining machine whose deps (within the target
             // set) are all done.
@@ -1289,15 +1339,15 @@ impl LabRuntime {
             }
 
             // Between waves: run (in declaration order) every unrun
-            // provision scoped entirely to already-started VMs, so a VM
-            // depending on "dc01" starts only after dc01's provisions
-            // completed (§7.2).
-            self.run_provisions(&mut next_provision, &done, false, &output)
+            // provision/playbook scoped entirely to already-started VMs,
+            // so a VM depending on "dc01" starts only after dc01's
+            // configuration steps completed (§7.2).
+            self.run_up_steps(&steps, &mut next_step, &done, false, &targets, &output)
                 .await?;
         }
 
-        // Final pass: everything left, including unscoped scripts.
-        self.run_provisions(&mut next_provision, &done, true, &output)
+        // Final pass: everything left, including unscoped steps.
+        self.run_up_steps(&steps, &mut next_step, &done, true, &targets, &output)
             .await?;
 
         self.install_declared_forwards().await;
@@ -1374,40 +1424,93 @@ impl LabRuntime {
         }
     }
 
-    /// Run provision scripts in strict declaration order starting at
-    /// `*next`: a scoped script runs once all its VMs are started (waiting
-    /// for their readiness first); an unscoped script runs only in the
-    /// final pass. Stops at the first script that isn't eligible yet.
-    async fn run_provisions(
+    /// Run configuration steps (provision scripts and playbook applies —
+    /// one declaration-ordered queue, see [`merged_up_steps`]) in strict
+    /// order starting at `*next`: a scoped step runs once all its machines
+    /// are started (waiting for their readiness first); an unscoped step
+    /// runs only in the final pass. Stops at the first step that isn't
+    /// eligible yet.
+    async fn run_up_steps(
         self: &Arc<Self>,
+        steps: &[UpStep],
         next: &mut usize,
         started: &HashSet<String>,
         final_pass: bool,
+        targets: &[String],
         output: &crate::scripting::OutputSink,
     ) -> Result<()> {
-        let provisions = self.config.lab.provisions.clone();
-        while *next < provisions.len() {
-            let p = &provisions[*next];
-            let eligible = if p.vms.is_empty() {
+        while *next < steps.len() {
+            let step = &steps[*next];
+            let scoped = step.vms();
+            let eligible = if scoped.is_empty() {
                 final_pass
             } else {
-                p.vms.iter().all(|v| started.contains(v))
+                scoped.iter().all(|v| started.contains(v))
             };
             if !eligible {
                 return Ok(());
             }
-            for m in &p.vms {
+            for m in scoped {
                 if let Some(c) = self.containers.get(m) {
                     c.wait_ready(Duration::from_secs(300)).await?;
                 } else {
                     self.vm(m)?.wait_ready(Duration::from_secs(600)).await?;
                 }
             }
-            let script = self.root.join(&p.script);
-            output(format!("provision: {}\n", p.script.display()));
-            crate::scripting::run_script_file(self.clone(), &script, output.clone())
-                .await
-                .with_context(|| format!("provision {}", p.script.display()))?;
+            match step {
+                UpStep::Provision(p) => {
+                    let script = self.root.join(&p.script);
+                    output(format!("provision: {}\n", p.script.display()));
+                    crate::scripting::run_script_file(self.clone(), &script, output.clone())
+                        .await
+                        .with_context(|| format!("provision {}", p.script.display()))?;
+                }
+                UpStep::Playbook(p) => {
+                    // Unscoped playbooks apply to the machines this `up`
+                    // actually started (like unscoped provisions run once
+                    // everything targeted is up).
+                    let machines: Vec<&String> = if scoped.is_empty() {
+                        targets.iter().collect()
+                    } else {
+                        scoped.iter().collect()
+                    };
+                    for m in machines {
+                        if scoped.is_empty() {
+                            // Scoped machines were readiness-gated above;
+                            // final-pass targets still need the same gate.
+                            if let Some(c) = self.containers.get(m) {
+                                c.wait_ready(Duration::from_secs(300)).await?;
+                            } else {
+                                self.vm(m)?.wait_ready(Duration::from_secs(600)).await?;
+                            }
+                        }
+                        output(format!(
+                            "playbook: {} play {} → {m}\n",
+                            p.path.display(),
+                            p.play
+                        ));
+                        let outcome = crate::labd::playbook::run_playbook(
+                            self,
+                            m,
+                            p,
+                            crate::labd::playbook::PlaybookMode::Apply,
+                            output,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("playbook {} play {} on {m}", p.path.display(), p.play)
+                        })?;
+                        if outcome.exit_code != 0 {
+                            bail!(
+                                "playbook {} play {} on {m}: config-weave exited {}",
+                                p.path.display(),
+                                p.play,
+                                outcome.exit_code
+                            );
+                        }
+                    }
+                }
+            }
             *next += 1;
         }
         Ok(())
@@ -1957,5 +2060,74 @@ fn guest_os_hint(profile: Option<&str>) -> crate::smb::OsHint {
         Some("windows-legacy") => crate::smb::OsHint::WindowsXp,
         Some(p) if p.starts_with("windows") => crate::smb::OsHint::Windows,
         _ => crate::smb::OsHint::Linux,
+    }
+}
+
+/// One `up`-phase configuration step — provision scripts and playbook
+/// applies share a single declaration-ordered queue.
+enum UpStep {
+    Provision(crate::config::model::Provision),
+    Playbook(crate::config::model::Playbook),
+}
+
+impl UpStep {
+    /// The machines this step is scoped to (empty = unscoped).
+    fn vms(&self) -> &[String] {
+        match self {
+            UpStep::Provision(p) => &p.vms,
+            UpStep::Playbook(p) => &p.vms,
+        }
+    }
+}
+
+/// Provisions and playbooks merged back into file declaration order — the
+/// model keeps them in separate vecs; block byte spans recover the
+/// interleaving.
+fn merged_up_steps(lab: &crate::config::model::Lab) -> Vec<UpStep> {
+    let mut steps: Vec<UpStep> = lab
+        .provisions
+        .iter()
+        .cloned()
+        .map(UpStep::Provision)
+        .chain(lab.playbooks.iter().cloned().map(UpStep::Playbook))
+        .collect();
+    steps.sort_by_key(|s| match s {
+        UpStep::Provision(p) => p.span.0,
+        UpStep::Playbook(p) => p.span.0,
+    });
+    steps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn up_steps_interleave_by_declaration_order() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" }
+  provision "scripts/one.ws" { vms = ["a"] }
+  playbook "pb/base" { play = "base" vms = ["a"] }
+  provision "scripts/two.ws" { }
+}"#;
+        let lf = crate::config::load_lab_source(src, "<test>", std::path::Path::new("/tmp"))
+            .expect("parse");
+        let steps = merged_up_steps(&lf.lab);
+        let kinds: Vec<String> = steps
+            .iter()
+            .map(|s| match s {
+                UpStep::Provision(p) => format!("provision:{}", p.script.display()),
+                UpStep::Playbook(p) => format!("playbook:{}", p.path.display()),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "provision:scripts/one.ws",
+                "playbook:pb/base",
+                "provision:scripts/two.ws",
+            ]
+        );
     }
 }

@@ -49,6 +49,12 @@ pub fn labs_home() -> PathBuf {
     data_dir().join("labs")
 }
 
+/// `~/.local/share/config-weave/bin` — where config-weave's `just install`
+/// drops its guest binaries; the default lookup dir for playbook runs.
+pub fn config_weave_bin_dir() -> PathBuf {
+    xdg("XDG_DATA_HOME", ".local/share").join("config-weave/bin")
+}
+
 /// `~/.local/state/vmlab` — daemon state, logs, event history.
 pub fn state_dir() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("vmlab")

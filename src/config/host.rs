@@ -22,6 +22,9 @@ pub struct HostConfig {
     pub oci_chunk_size: u64,
     /// Network fast-path tier selection (§9.1 substitutable backend).
     pub fastpath: crate::net::fastpath::FastpathMode,
+    /// Directory holding config-weave guest binaries; `None` = env var /
+    /// XDG default (see `labd::playbook::resolve_bin_dir`).
+    pub config_weave_bin_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for HostConfig {
@@ -36,6 +39,7 @@ impl Default for HostConfig {
             viewer: None,
             oci_chunk_size: crate::oci::chunking::DEFAULT_CHUNK_SIZE,
             fastpath: crate::net::fastpath::FastpathMode::Auto,
+            config_weave_bin_dir: None,
         }
     }
 }
@@ -130,6 +134,7 @@ impl HostConfig {
                 anyhow!("host config: fastpath must be auto|off|sockmap|afxdp, got `{s}`")
             })?;
         }
+        cfg.config_weave_bin_dir = get_str("config_weave_bin_dir")?.map(std::path::PathBuf::from);
         if let Some(f) = block.field("oci_chunk_size") {
             match f.value() {
                 Ok(Value::I64(n)) if *n >= 0 => cfg.oci_chunk_size = *n as u64,

@@ -865,6 +865,105 @@ pub fn cmd_osinfo(vm_ref: &str) -> Result<()> {
     })
 }
 
+/// `vmlab playbook list` — the lab's playbook blocks with their resolved
+/// targets and any in-flight run.
+pub fn cmd_playbook_list() -> Result<()> {
+    rt()?.block_on(async {
+        let (_name, client) = lab_client_for(None).await?;
+        let list = client
+            .call("playbook.list", Value::Null)
+            .await
+            .map_err(remote)?;
+        let rows = list.as_array().cloned().unwrap_or_default();
+        if rows.is_empty() {
+            println!("no playbook blocks declared in this lab");
+            return Ok(());
+        }
+        for row in rows {
+            let machines: Vec<&str> = row["machines"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let scope = if row["vms"].as_array().is_none_or(Vec::is_empty) {
+                format!("all machines ({})", machines.join(", "))
+            } else {
+                machines.join(", ")
+            };
+            println!(
+                "{} play {} → {scope}",
+                row["path"].as_str().unwrap_or("?"),
+                row["play"].as_str().unwrap_or("?"),
+            );
+            if let Some(run) = row["running"].as_object() {
+                println!(
+                    "  {} running on {} since {}",
+                    run["kind"].as_str().unwrap_or("?"),
+                    run["machine"].as_str().unwrap_or("?"),
+                    run["started"].as_str().unwrap_or("?"),
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `vmlab playbook check|apply <machine>` — stream the run, then print the
+/// per-step report and propagate config-weave's exit code (3 = reboot still
+/// required, matching config-weave's own convention).
+pub fn cmd_playbook_run(
+    machine_ref: &str,
+    playbook: Option<String>,
+    play: Option<String>,
+    apply: bool,
+) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, machine) = split_vm_ref(machine_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let cmd = if apply {
+            "playbook.apply"
+        } else {
+            "playbook.check"
+        };
+        let result = client
+            .call_streaming(
+                cmd,
+                json!({"machine": machine, "playbook": playbook, "play": play}),
+                |chunk| print!("{chunk}"),
+            )
+            .await
+            .map_err(remote)?;
+
+        // Step table from the final --json report (when one came back).
+        if let Some(steps) = result["report"]["steps"].as_array() {
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for s in steps {
+                *counts
+                    .entry(s["status"].as_str().unwrap_or("?"))
+                    .or_default() += 1;
+            }
+            let summary: Vec<String> = counts
+                .iter()
+                .map(|(status, n)| format!("{n} {status}"))
+                .collect();
+            println!(
+                "{}: {}",
+                result["mode"].as_str().unwrap_or("?"),
+                summary.join(" · ")
+            );
+        }
+        let reboots = result["reboots"].as_u64().unwrap_or(0);
+        if reboots > 0 {
+            println!("rebooted {reboots} time(s)");
+        }
+        let code = result["exit_code"].as_i64().unwrap_or(0);
+        if code != 0 {
+            std::process::exit(code as i32);
+        }
+        Ok(())
+    })
+}
+
 /// Per-message payload for `vm.copy_in` (pre-base64). Modest chunks keep
 /// each JSON line small and each agent call inside its timeout.
 const CP_CHUNK: usize = 1 << 20;
@@ -938,52 +1037,22 @@ async fn push_via_agent(
     src: &std::path::Path,
     guest_dest: &str,
 ) -> Result<()> {
-    fn mode_of(p: &std::path::Path) -> Option<u32> {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .ok()
-            .map(|m| m.permissions().mode() & 0o777)
-    }
-    let push_one = |from: std::path::PathBuf, to: String| async move {
-        let args = json!({
-            "vm": vm, "from": from, "to": to, "mode": mode_of(&from),
-        });
+    let entries = crate::labd::vm_agent::walk_tree_for_push(src, guest_dest)?;
+    let single = !src.is_dir();
+    let mut total = 0u64;
+    let mut files = 0usize;
+    for (local, to, mode) in entries {
+        // The daemon opens the file itself, so hand it an absolute path.
+        let from = abs_path(local.to_str().unwrap_or_default())?;
+        let args = json!({"vm": vm, "from": from, "to": to, "mode": mode});
         let r = client.call("vm.push_file", args).await.map_err(remote)?;
-        Ok::<u64, anyhow::Error>(r["len"].as_u64().unwrap_or(0))
-    };
-    if src.is_dir() {
-        let mut total = 0u64;
-        let mut files = 0usize;
-        let mut stack = vec![src.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir)? {
-                let path = entry?.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else {
-                    let rel = path.strip_prefix(src)?.to_string_lossy().replace('\\', "/");
-                    let sep = if guest_dest.ends_with('/') || guest_dest.ends_with('\\') {
-                        ""
-                    } else {
-                        "/"
-                    };
-                    total += push_one(
-                        abs_path(path.to_str().unwrap_or_default())?,
-                        format!("{guest_dest}{sep}{rel}"),
-                    )
-                    .await?;
-                    files += 1;
-                }
-            }
-        }
-        println!("pushed {files} file(s), {total} bytes to {vm}:{guest_dest}");
+        total += r["len"].as_u64().unwrap_or(0);
+        files += 1;
+    }
+    if single {
+        println!("pushed {total} bytes to {vm}:{guest_dest}");
     } else {
-        let n = push_one(
-            abs_path(src.to_str().unwrap_or_default())?,
-            guest_dest.to_string(),
-        )
-        .await?;
-        println!("pushed {n} bytes to {vm}:{guest_dest}");
+        println!("pushed {files} file(s), {total} bytes to {vm}:{guest_dest}");
     }
     Ok(())
 }

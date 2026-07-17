@@ -27,4 +27,6 @@ type HostConfig {
   fastpath: utf8?
   @doc("OCI layer chunk size for template push; default `512MiB`")
   oci_chunk_size: std.ByteSize?
+  @doc("Directory holding config-weave guest binaries; default `~/.local/share/config-weave/bin`")
+  config_weave_bin_dir: utf8?
 }

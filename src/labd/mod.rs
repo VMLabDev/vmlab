@@ -9,6 +9,7 @@ pub mod events;
 pub mod lab;
 pub mod netservices;
 pub mod network;
+pub mod playbook;
 pub mod state;
 pub mod vm;
 pub mod vm_agent;
@@ -868,6 +869,80 @@ impl Handler for LabdHandler {
                 res.map_err(err)?;
                 Ok(json!(true))
             }
+            // config-weave playbooks (declared with `playbook {}` blocks):
+            // list the lab's assignments, and run check/apply on demand
+            // against one machine — the playbook folder is re-pushed each
+            // run, so this is the edit→check dev loop. Progress streams as
+            // chunks here and as `playbook.op.*` events for the web UI.
+            "playbook.list" => {
+                let machines: Vec<String> = lab
+                    .config
+                    .lab
+                    .vms
+                    .iter()
+                    .map(|v| v.name.clone())
+                    .chain(lab.config.lab.containers.iter().map(|c| c.name.clone()))
+                    .collect();
+                Ok(Value::Array(
+                    lab.config
+                        .lab
+                        .playbooks
+                        .iter()
+                        .map(|p| {
+                            let resolved: Vec<&String> = if p.vms.is_empty() {
+                                machines.iter().collect()
+                            } else {
+                                p.vms.iter().collect()
+                            };
+                            let running = resolved
+                                .iter()
+                                .map(|m| lab.playbook_ops.op_of(m))
+                                .find(|v| !v.is_null())
+                                .unwrap_or(Value::Null);
+                            json!({
+                                "path": p.path.display().to_string(),
+                                "play": p.play,
+                                "span": p.span,
+                                "vms": p.vms,
+                                "machines": resolved,
+                                "running": running,
+                            })
+                        })
+                        .collect(),
+                ))
+            }
+            "playbook.check" | "playbook.apply" => {
+                let machine = args["machine"]
+                    .as_str()
+                    .map(String::from)
+                    .ok_or_else(|| "missing machine".to_string())?;
+                let pb = playbook::resolve_playbook(
+                    &lab.config.lab,
+                    &machine,
+                    args["playbook"].as_str(),
+                    args["play"].as_str(),
+                )?
+                .clone();
+                let mode = if cmd == "playbook.apply" {
+                    playbook::PlaybookMode::Apply
+                } else {
+                    playbook::PlaybookMode::Check
+                };
+                let output = stream_sink(&self.lab, _stream);
+                let outcome = playbook::run_playbook(lab, &machine, &pb, mode, &output)
+                    .await
+                    .map_err(err)?;
+                Ok(json!({
+                    "machine": machine,
+                    "playbook": pb.path.display().to_string(),
+                    "play": pb.play,
+                    "mode": mode.verb(),
+                    "exit_code": outcome.exit_code,
+                    "reboots": outcome.reboots,
+                    "report": outcome.report.unwrap_or(Value::Null),
+                }))
+            }
+            "playbook.op_status" => Ok(lab.playbook_ops.status()),
             "snapshot.take" => {
                 let snap = args["name"].as_str().ok_or("missing name")?;
                 match args["vm"].as_str() {

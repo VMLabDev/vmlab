@@ -456,6 +456,19 @@ impl AgentHandle {
         }
     }
 
+    /// Push a host file or directory tree into the guest, returning
+    /// `(files, bytes)`. Guest paths join with `/` (works on Windows too).
+    pub async fn push_tree(&self, src: &Path, guest_dest: &str) -> Result<(usize, u64)> {
+        let entries = walk_tree_for_push(src, guest_dest)?;
+        let mut bytes = 0u64;
+        let files = entries.len();
+        for (local, remote, mode) in entries {
+            let (_sha, len) = self.push_file(&local, &remote, mode).await?;
+            bytes += len;
+        }
+        Ok((files, bytes))
+    }
+
     /// Pull a guest file to the host, returning the verified digest+size.
     pub async fn pull_file(&self, remote: &str, local: &Path) -> Result<(String, u64)> {
         use sha2::{Digest, Sha256};
@@ -856,6 +869,59 @@ pub async fn expose_terminal_socket(session: AgentSession, sock_path: PathBuf) -
     Ok(())
 }
 
+/// Enumerate a host file or directory tree for a guest push: one
+/// `(local file, guest path, unix mode bits)` triple per regular file.
+/// Guest paths join with `/` regardless of guest OS (the agent normalises).
+/// Symlinks are followed; a depth cap turns symlink cycles into an error
+/// instead of an unbounded walk.
+pub fn walk_tree_for_push(
+    src: &Path,
+    guest_dest: &str,
+) -> Result<Vec<(PathBuf, String, Option<u32>)>> {
+    const MAX_DEPTH: usize = 64;
+    fn mode_of(p: &Path) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
+    }
+    if !src.is_dir() {
+        return Ok(vec![(
+            src.to_path_buf(),
+            guest_dest.to_string(),
+            mode_of(src),
+        )]);
+    }
+    let sep = if guest_dest.ends_with('/') || guest_dest.ends_with('\\') {
+        ""
+    } else {
+        "/"
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![(src.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            bail!(
+                "tree under {} exceeds {MAX_DEPTH} directory levels (symlink cycle?)",
+                src.display()
+            );
+        }
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("reading directory {}", dir.display()))?
+        {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            } else {
+                let rel = path.strip_prefix(src)?.to_string_lossy().replace('\\', "/");
+                let mode = mode_of(&path);
+                out.push((path, format!("{guest_dest}{sep}{rel}"), mode));
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1236,5 +1302,32 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[test]
+    fn walk_tree_enumerates_files_with_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pkgs/nginx/resources")).unwrap();
+        std::fs::write(dir.path().join("playbook.wcl"), "x").unwrap();
+        let script = dir.path().join("pkgs/nginx/resources/conf.wscript");
+        std::fs::write(&script, "y").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let mut entries = walk_tree_for_push(dir.path(), "/weave/pb").unwrap();
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "/weave/pb/pkgs/nginx/resources/conf.wscript");
+        assert_eq!(entries[0].2, Some(0o750));
+        assert_eq!(entries[1].1, "/weave/pb/playbook.wcl");
+
+        // Trailing slash on the destination doesn't double up.
+        let entries = walk_tree_for_push(dir.path(), "/weave/pb/").unwrap();
+        assert!(entries.iter().all(|(_, to, _)| !to.contains("//")));
+
+        // A single file maps to the destination verbatim.
+        let single = walk_tree_for_push(&script, "C:/weave/x.wscript").unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].1, "C:/weave/x.wscript");
     }
 }
