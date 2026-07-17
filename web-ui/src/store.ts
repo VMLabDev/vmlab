@@ -12,13 +12,14 @@ import type {
   HostInfo,
   LabEntry,
   LabStatus,
+  PlaybookInfo,
   TemplateInfo,
   Vm,
   DaemonEvent,
 } from "./api";
 import { playDestroyRecreate } from "./fx";
 
-export type ViewKind = "lab" | "vm" | "container" | "templates";
+export type ViewKind = "lab" | "vm" | "container" | "templates" | "playbook";
 
 // A template or container-image download in progress, driven by the
 // template.pull.* / container.pull.* events the lab daemon streams while
@@ -50,6 +51,34 @@ export interface TemplateOp {
   error?: string;
 }
 
+// One config-weave step's live status, upserted from the run's ndjson
+// events (playbook.op.step). `status` uses config-weave's stable ids
+// (configured / already_configured / error / …) plus "pending" / "running".
+export interface PlaybookStep {
+  name: string;
+  resource?: string;
+  status: string;
+  message?: string | null;
+}
+
+// A config-weave check/apply running against one machine, driven by the
+// playbook.op.* events. Keyed by `lab/machine`; settled entries stay
+// visible until dismissed.
+export interface PlaybookOp {
+  lab: string;
+  machine: string;
+  playbook: string;
+  play: string;
+  kind: "check" | "apply";
+  status: "running" | "done" | "error";
+  log: string[];
+  steps: PlaybookStep[];
+  /** config-weave's exit code once settled (3 = reboot still required). */
+  exitCode?: number;
+  reboots?: number;
+  error?: string;
+}
+
 interface State {
   ready: boolean; // initial auth probe done
   authRequired: boolean;
@@ -58,12 +87,14 @@ interface State {
   labs: LabEntry[];
   currentLab: string | null;
   status: LabStatus | null;
-  view: { kind: ViewKind; vm: string | null };
+  view: { kind: ViewKind; vm: string | null; playbook: string | null };
   connected: boolean;
   error: string | null;
   pulls: Record<string, Pull>;
   templates: TemplateInfo[];
   templateOps: Record<string, TemplateOp>;
+  playbooks: PlaybookInfo[];
+  playbookOps: Record<string, PlaybookOp>;
   fastpath: FastpathInfo | null;
   host: HostInfo | null;
   hostLoaded: boolean;
@@ -77,12 +108,14 @@ const [state, setState] = createStore<State>({
   labs: [],
   currentLab: null,
   status: null,
-  view: { kind: "lab", vm: null },
+  view: { kind: "lab", vm: null, playbook: null },
   connected: false,
   error: null,
   pulls: {},
   templates: [],
   templateOps: {},
+  playbooks: [],
+  playbookOps: {},
   fastpath: null,
   host: null,
   hostLoaded: false,
@@ -137,6 +170,8 @@ export async function doLogout() {
     pulls: {},
     templates: [],
     templateOps: {},
+    playbooks: [],
+    playbookOps: {},
     fastpath: null,
     host: null,
     hostLoaded: false,
@@ -195,10 +230,17 @@ export function setNavGuard(guard: (() => Promise<boolean>) | null) {
 export async function selectLab(name: string) {
   if (name === state.currentLab) return;
   if (navGuard && !(await navGuard())) return;
-  setState({ currentLab: name, view: { kind: "lab", vm: null }, templates: [] });
+  setState({
+    currentLab: name,
+    view: { kind: "lab", vm: null, playbook: null },
+    templates: [],
+    playbooks: [],
+  });
   await refreshStatus();
   await loadTemplates();
   await resyncTemplateOps();
+  await loadPlaybooks();
+  await resyncPlaybookOps();
 }
 
 /** Load the lab's `template {}` definitions (drives the Templates page and
@@ -249,6 +291,53 @@ async function resyncTemplateOps() {
   }
 }
 
+/** Load the lab's `playbook {}` declarations (drives the machine pages'
+ *  Playbook tab and the designer's playbook nodes — none means the tab
+ *  stays hidden). */
+export async function loadPlaybooks() {
+  const lab = state.currentLab;
+  if (!lab) return;
+  try {
+    const playbooks = await api.listPlaybooks(lab);
+    if (state.currentLab === lab) setState({ playbooks });
+  } catch {
+    // Unparsable lab file: just hide the playbook UI.
+    if (state.currentLab === lab) setState({ playbooks: [] });
+  }
+}
+
+/** Re-fetch in-flight check/apply runs after a WS (re)connect or lab switch
+ *  (same merge semantics as [`resyncTemplateOps`]). */
+async function resyncPlaybookOps() {
+  const lab = state.currentLab;
+  if (!lab) return;
+  try {
+    const ops = await api.playbookOps(lab);
+    if (state.currentLab !== lab) return;
+    setState("playbookOps", (prev) => {
+      const next: Record<string, PlaybookOp> = {};
+      for (const [key, op] of Object.entries(prev)) {
+        if (op && op.status === "running") next[key] = undefined as unknown as PlaybookOp;
+      }
+      for (const op of ops) {
+        next[`${lab}/${op.machine}`] = {
+          lab,
+          machine: op.machine,
+          playbook: op.playbook,
+          play: op.play,
+          kind: op.kind,
+          status: "running",
+          log: op.log_tail.slice(),
+          steps: [],
+        };
+      }
+      return next;
+    });
+  } catch {
+    /* ignore — events still arrive */
+  }
+}
+
 export async function refreshStatus() {
   if (!state.currentLab) return;
   try {
@@ -267,17 +356,21 @@ function scheduleRefresh() {
 // --- navigation -----------------------------------------------------------
 
 export function showLab() {
-  setState("view", { kind: "lab", vm: null });
+  setState("view", { kind: "lab", vm: null, playbook: null });
 }
 export function showTemplates() {
-  setState("view", { kind: "templates", vm: null });
+  setState("view", { kind: "templates", vm: null, playbook: null });
   loadTemplates();
 }
 export function showVm(vm: string) {
-  setState("view", { kind: "vm", vm });
+  setState("view", { kind: "vm", vm, playbook: null });
 }
 export function showContainer(name: string) {
-  setState("view", { kind: "container", vm: name });
+  setState("view", { kind: "container", vm: name, playbook: null });
+}
+/** Open the playbook folder editor for a declared playbook path. */
+export function showPlaybook(path: string) {
+  setState("view", { kind: "playbook", vm: null, playbook: path });
 }
 /** Create a new lab, refresh the list, and jump to its page (the designer
  *  lives there under the stats). */
@@ -286,7 +379,7 @@ export async function createLabAndOpen(name: string, path?: string): Promise<voi
   const labs = await api.listLabs();
   setState({ labs });
   if (navGuard && !(await navGuard())) return;
-  setState({ currentLab: name, view: { kind: "lab", vm: null }, templates: [] });
+  setState({ currentLab: name, view: { kind: "lab", vm: null, playbook: null }, templates: [] });
   await refreshStatus();
   await loadTemplates();
 }
@@ -328,6 +421,7 @@ export async function reloadLab(): Promise<void> {
   await api.reloadLab(lab);
   await loadLabs();
   await refreshStatus();
+  await loadPlaybooks();
 }
 
 // --- destroy fx session (armed only by destroyLab; never by stop-all) ------
@@ -500,6 +594,7 @@ function connectEvents() {
     setState({ connected: true });
     // Events missed while disconnected are gone; re-sync running ops.
     resyncTemplateOps();
+    resyncPlaybookOps();
   };
   ws.onclose = () => {
     setState({ connected: false });
@@ -529,6 +624,11 @@ function handleEvent(ev: DaemonEvent) {
   // Template builds/pushes: tracked separately, no status refresh per log line.
   if (ev.event.startsWith("template.op.")) {
     handleTemplateOpEvent(ev);
+    return;
+  }
+  // config-weave runs: same treatment — no status refresh per step/log line.
+  if (ev.event.startsWith("playbook.op.")) {
+    handlePlaybookOpEvent(ev);
     return;
   }
   // Destroy fx: shatter each node as its machine powers off. Falls through —
@@ -690,6 +790,137 @@ function handleTemplateOpEvent(ev: DaemonEvent) {
 /** Drop a settled (done/error) operation from the Templates page. */
 export function dismissTemplateOp(key: string) {
   setState("templateOps", key, undefined as unknown as TemplateOp);
+}
+
+/** Fold one config-weave ndjson event into the live step list. */
+function applyCwEvent(steps: PlaybookStep[], cw: any): PlaybookStep[] {
+  const upsert = (name: string, patch: Partial<PlaybookStep>): PlaybookStep[] => {
+    const i = steps.findIndex((s) => s.name === name);
+    if (i < 0) return [...steps, { name, status: "running", ...patch }];
+    const next = steps.slice();
+    next[i] = { ...next[i], ...patch };
+    return next;
+  };
+  switch (cw?.event) {
+    case "run_started":
+      // The planned step list, all pending — later events fill statuses in.
+      return (cw.steps ?? []).map((s: any) => ({
+        name: String(s.name ?? "?"),
+        resource: s.resource ? String(s.resource) : undefined,
+        status: "pending",
+      }));
+    case "step_started":
+      return upsert(String(cw.name), { status: "running" });
+    case "step_phase":
+      return upsert(String(cw.name), { status: String(cw.phase ?? "running") });
+    case "step_finished":
+      return upsert(String(cw.name), {
+        status: String(cw.status ?? "?"),
+        message: cw.message ?? null,
+      });
+    case "step_resolved":
+      return upsert(String(cw.name), { status: String(cw.status ?? "?") });
+    default:
+      return steps;
+  }
+}
+
+function handlePlaybookOpEvent(ev: DaemonEvent) {
+  const machine = ev.data?.machine as string | undefined;
+  if (!ev.lab || !machine) return;
+  const key = `${ev.lab}/${machine}`;
+  const fresh = (): PlaybookOp => ({
+    lab: ev.lab,
+    machine,
+    playbook: String(ev.data.playbook ?? ""),
+    play: String(ev.data.play ?? ""),
+    kind: ev.data.mode === "apply" || ev.data.kind === "apply" ? "apply" : "check",
+    status: "running",
+    log: [],
+    steps: [],
+  });
+  switch (ev.event) {
+    case "playbook.op.start":
+      // Clear leftovers from a previous settled run on the same machine.
+      setState("playbookOps", key, { ...fresh(), exitCode: undefined, error: undefined });
+      break;
+    case "playbook.op.log": {
+      const line = String(ev.data.line ?? "");
+      setState("playbookOps", key, (op) => {
+        const base = op ?? fresh();
+        const log =
+          base.log.length >= MAX_OP_LOG ? [...base.log.slice(1), line] : [...base.log, line];
+        return { ...base, log };
+      });
+      break;
+    }
+    case "playbook.op.step":
+      setState("playbookOps", key, (op) => {
+        const base = op ?? fresh();
+        return { ...base, steps: applyCwEvent(base.steps, ev.data.cw) };
+      });
+      break;
+    case "playbook.op.done": {
+      const exitCode = Number(ev.data.exit_code ?? 0);
+      setState("playbookOps", key, (op) => ({
+        ...(op ?? fresh()),
+        status: "done" as const,
+        exitCode,
+        reboots: Number(ev.data.reboots ?? 0),
+      }));
+      const op = state.playbookOps[key];
+      const verb = op?.kind === "apply" ? "Apply" : "Check";
+      if (exitCode === 0) {
+        showToast(`${verb} finished on ${machine}`);
+      } else if (exitCode === 3) {
+        showToast(`${verb} on ${machine}: reboot still required`, "warning");
+      } else {
+        showToast(`${verb} on ${machine} exited ${exitCode}`, "danger");
+      }
+      break;
+    }
+    case "playbook.op.error":
+      setState("playbookOps", key, (op) => ({
+        ...(op ?? fresh()),
+        status: "error" as const,
+        error: String(ev.data.error ?? "run failed"),
+      }));
+      showToast(`Playbook run failed on ${machine}`, "danger");
+      break;
+  }
+}
+
+/** Drop a settled playbook run from a machine page. */
+export function dismissPlaybookOp(machine: string) {
+  const lab = state.currentLab;
+  if (!lab) return;
+  setState("playbookOps", `${lab}/${machine}`, undefined as unknown as PlaybookOp);
+}
+
+/** The declared playbooks targeting one machine (empty vms = everything). */
+export function playbooksFor(machine: string): PlaybookInfo[] {
+  return state.playbooks.filter((p) => p.vms.length === 0 || p.vms.includes(machine));
+}
+
+/** The live (or last settled, undismissed) run for one machine. */
+export function playbookOpFor(machine: string): PlaybookOp | undefined {
+  const lab = state.currentLab;
+  return lab ? state.playbookOps[`${lab}/${machine}`] : undefined;
+}
+
+/** Kick off a check/apply; progress and the verdict ride playbook.op.*. */
+export async function runPlaybookOn(
+  kind: "vms" | "containers",
+  machine: string,
+  action: "check" | "apply",
+  path?: string,
+  play?: string,
+) {
+  try {
+    await api.runPlaybook(state.currentLab!, kind, machine, action, path, play);
+  } catch (e) {
+    showToast(`Failed: ${e}`, "danger");
+  }
 }
 
 /** Build/push operations for the current lab, stable order by template. */

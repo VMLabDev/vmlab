@@ -4,9 +4,9 @@
 // terminal (an on-demand shell into the micro-VM) and Log (every log line
 // for this container, timestamped and stream-tagged).
 
-import { Show, createSignal } from "solid-js";
-import { Badge, Card, Empty, PageHead, Tabs } from "@forge/ui";
-import { RotateCcw } from "lucide-solid";
+import { For, Show, createSignal } from "solid-js";
+import { Badge, Card, Empty, IconButton, PageHead, Tabs } from "@forge/ui";
+import { RotateCcw, SquarePen } from "lucide-solid";
 import ActionButton from "./ActionButton";
 import PowerButton from "./PowerButton";
 import {
@@ -15,15 +15,18 @@ import {
   containerStart,
   containerStop,
   currentPullFor,
+  playbooksFor,
+  showPlaybook,
   state,
 } from "../store";
 import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
 import MachinePullStatus from "./MachinePullStatus";
+import PlaybookPanel from "./PlaybookPanel";
 import TerminalPanel from "./TerminalPanel";
 
 export default function ContainerView() {
-  const [tab, setTab] = createSignal<"console" | "terminal" | "log">("console");
+  const [tab, setTab] = createSignal<"console" | "terminal" | "log" | "playbook">("console");
   // Accessors so the view tracks the selected container reactively.
   const ctr = () => state.status?.containers?.find((c) => c.name === state.view.vm);
   const on = () => ctr()?.state === "running";
@@ -91,13 +94,25 @@ export default function ContainerView() {
           { id: "console", label: "Console" },
           { id: "terminal", label: "Recovery terminal" },
           { id: "log", label: "Log" },
+          ...(playbooksFor(ctr()!.name).length > 0
+            ? [{ id: "playbook", label: "Playbook" }]
+            : []),
         ]}
         active={tab()}
-        onChange={(id) => setTab(id as "console" | "terminal" | "log")}
+        onChange={(id) => setTab(id as "console" | "terminal" | "log" | "playbook")}
       />
 
       <Show when={tab() === "log"}>
         <LogPanel lab={state.currentLab!} source={ctr()!.name} />
+      </Show>
+
+      <Show when={tab() === "playbook"}>
+        <PlaybookPanel
+          lab={state.currentLab!}
+          kind="container"
+          name={ctr()!.name}
+          running={on()}
+        />
       </Show>
 
       {/* display:none rather than unmount, so a started terminal session
@@ -143,6 +158,30 @@ export default function ContainerView() {
               v={ctr()!.health == null ? "no probe" : ctr()!.health ? "healthy" : "unhealthy"}
             />
           </Card>
+          <Show when={playbooksFor(ctr()!.name).length > 0}>
+            <Card title="Playbooks">
+              <For each={playbooksFor(ctr()!.name)}>
+                {(pb) => (
+                  <div class="kv">
+                    <span class="kv-k pb-link" role="button" onClick={() => setTab("playbook")}>
+                      {pb.path}
+                    </span>
+                    <span
+                      class="kv-v"
+                      style={{ display: "inline-flex", gap: "6px", "align-items": "center" }}
+                    >
+                      {pb.play}
+                      <IconButton
+                        icon={SquarePen}
+                        label={`Edit ${pb.path}`}
+                        onClick={() => showPlaybook(pb.path)}
+                      />
+                    </span>
+                  </div>
+                )}
+              </For>
+            </Card>
+          </Show>
           <GuestStats lab={state.currentLab!} kind="container" name={ctr()!.name} running={on()} />
         </div>
       </div>

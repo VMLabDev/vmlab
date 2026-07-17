@@ -1,6 +1,6 @@
 import { For, Show, createResource, createSignal } from "solid-js";
-import { Badge, Button, Card, Empty, Icon, PageHead, Tabs } from "@forge/ui";
-import { Camera, RotateCcw } from "lucide-solid";
+import { Badge, Button, Card, Empty, Icon, IconButton, PageHead, Tabs } from "@forge/ui";
+import { Camera, RotateCcw, SquarePen } from "lucide-solid";
 import ActionButton from "./ActionButton";
 import PowerButton from "./PowerButton";
 import {
@@ -16,16 +16,19 @@ import {
   archOf,
   fmtMem,
   currentPullFor,
+  playbooksFor,
+  showPlaybook,
 } from "../store";
 import { vmSnapshots } from "../api";
 import { confirmDialog, promptDialog } from "./dialogs";
 import ConsoleScreen from "./ConsoleScreen";
 import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
+import PlaybookPanel from "./PlaybookPanel";
 import TerminalPanel from "./TerminalPanel";
 
 export default function MachineView() {
-  const [tab, setTab] = createSignal<"console" | "terminal" | "log">("console");
+  const [tab, setTab] = createSignal<"console" | "terminal" | "log" | "playbook">("console");
   // All of these are accessors so the view tracks the selected VM reactively —
   // switching machines re-runs them rather than pinning to the first one.
   const vm = () => state.status?.vms.find((v) => v.name === state.view.vm);
@@ -123,13 +126,20 @@ export default function MachineView() {
           { id: "console", label: "Console" },
           { id: "terminal", label: "Terminal" },
           { id: "log", label: "Log" },
+          ...(playbooksFor(vm()!.name).length > 0
+            ? [{ id: "playbook", label: "Playbook" }]
+            : []),
         ]}
         active={tab()}
-        onChange={(id) => setTab(id as "console" | "terminal" | "log")}
+        onChange={(id) => setTab(id as "console" | "terminal" | "log" | "playbook")}
       />
 
       <Show when={tab() === "log"}>
         <LogPanel lab={state.currentLab!} source={vm()!.name} />
+      </Show>
+
+      <Show when={tab() === "playbook"}>
+        <PlaybookPanel lab={state.currentLab!} kind="vm" name={vm()!.name} running={on()} />
       </Show>
 
       {/* display:none rather than unmount, so a started terminal session
@@ -174,6 +184,31 @@ export default function MachineView() {
             <KV k="MAC" v={vm()!.nics[0]?.mac ?? "—"} />
             <KV k="Segment" v={segments()} />
           </Card>
+          <Show when={playbooksFor(vm()!.name).length > 0}>
+            <Card title="Playbooks">
+              <For each={playbooksFor(vm()!.name)}>
+                {(pb) => (
+                  <div class="kv">
+                    <span
+                      class="kv-k pb-link"
+                      role="button"
+                      onClick={() => setTab("playbook")}
+                    >
+                      {pb.path}
+                    </span>
+                    <span class="kv-v" style={{ display: "inline-flex", gap: "6px", "align-items": "center" }}>
+                      {pb.play}
+                      <IconButton
+                        icon={SquarePen}
+                        label={`Edit ${pb.path}`}
+                        onClick={() => showPlaybook(pb.path)}
+                      />
+                    </span>
+                  </div>
+                )}
+              </For>
+            </Card>
+          </Show>
           <GuestStats lab={state.currentLab!} kind="vm" name={vm()!.name} running={on()} />
           <Card
             title="Snapshots"

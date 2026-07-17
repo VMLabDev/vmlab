@@ -222,6 +222,25 @@
   color: var(--fg-2); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
+/* Playbook run panel (machine pages). */
+.pb-panel { display: flex; flex-direction: column; gap: var(--sp-3); }
+.pb-controls { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.pb-current { font-size: var(--fs-sm); color: var(--fg-2); }
+.pb-steps {
+  display: flex; flex-direction: column; gap: var(--sp-1);
+  margin-top: var(--sp-2);
+}
+.pb-step {
+  display: flex; align-items: baseline; gap: var(--sp-2);
+  font-size: var(--fs-sm);
+}
+.pb-step-name { color: var(--fg-1); }
+.pb-step-resource { color: var(--fg-3); font-size: var(--fs-xs); font-family: var(--font-mono); }
+.pb-step-msg { color: var(--fg-3); font-size: var(--fs-xs); }
+.pb-summary { color: var(--fg-3); font-size: var(--fs-xs); margin-top: var(--sp-1); }
+.pb-link { cursor: pointer; }
+.pb-link:hover { color: var(--fg-1); text-decoration: underline; }
+
 /* Clickable table rows (network view). */
 .row-link { cursor: pointer; }
 .row-link:hover td { background: var(--bg-2); }

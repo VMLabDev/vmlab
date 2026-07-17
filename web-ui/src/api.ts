@@ -254,6 +254,93 @@ export const publishTemplate = (lab: string, tpl: string, arch?: string, version
     { arch, version },
   );
 
+// --- playbooks (config-weave) -----------------------------------------------
+
+/** One `playbook {}` block from the lab's vmlab.wcl (GET /playbooks). */
+export interface PlaybookInfo {
+  path: string;
+  play: string;
+  /** Targeted machine names; empty = every machine. */
+  vms: string[];
+}
+/** One node of a playbook folder listing (GET /playbooks/tree). */
+export interface PlaybookTreeEntry {
+  name: string;
+  /** Path relative to the playbook folder, `/`-separated. */
+  path: string;
+  dir: boolean;
+  size?: number | null;
+  children?: PlaybookTreeEntry[];
+}
+/** An in-flight check/apply with its recent log (GET /playbooks/ops). */
+export interface PlaybookOpStatus {
+  machine: string;
+  playbook: string;
+  play: string;
+  kind: "check" | "apply";
+  op_id: number;
+  started: string;
+  log_tail: string[];
+}
+
+const pbBase = (lab: string) => `/api/labs/${encodeURIComponent(lab)}/playbooks`;
+
+export const listPlaybooks = (lab: string): Promise<PlaybookInfo[]> => req(pbBase(lab));
+export const playbookOps = (lab: string): Promise<PlaybookOpStatus[]> =>
+  req(`${pbBase(lab)}/ops`);
+/** Kick off a check/apply. 200 = finished fast (body: the run result),
+ *  202 = detached; progress and the verdict arrive as playbook.op.* events. */
+export const runPlaybook = (
+  lab: string,
+  kind: "vms" | "containers",
+  machine: string,
+  action: "check" | "apply",
+  path?: string,
+  play?: string,
+) =>
+  post(
+    `/api/labs/${encodeURIComponent(lab)}/${kind}/${encodeURIComponent(machine)}/playbook/${action}`,
+    { path, play },
+  );
+export const playbookTree = (
+  lab: string,
+  playbook: string,
+): Promise<{ playbook: string; entries: PlaybookTreeEntry[] }> =>
+  req(`${pbBase(lab)}/tree?playbook=${encodeURIComponent(playbook)}`);
+export const scaffoldPlaybook = (lab: string, playbook: string) =>
+  post(`${pbBase(lab)}/scaffold`, { playbook });
+
+export async function getPlaybookFile(
+  lab: string,
+  playbook: string,
+  path: string,
+): Promise<ScriptDoc | null> {
+  const res = await rawFetch(
+    `${pbBase(lab)}/file?playbook=${encodeURIComponent(playbook)}&path=${encodeURIComponent(path)}`,
+  );
+  if (res.status === 404) return null;
+  return finish(res);
+}
+
+export async function savePlaybookFile(
+  lab: string,
+  playbook: string,
+  path: string,
+  content: string,
+  baseRev: string | null,
+): Promise<string> {
+  const result = await req(`${pbBase(lab)}/file`, {
+    method: "PUT",
+    body: JSON.stringify({ playbook, path, content, base_rev: baseRev }),
+  }).catch((error) => {
+    if (error instanceof Error && error.message.includes("changed on disk")) {
+      throw new ScriptStale();
+    }
+    throw error;
+  });
+  return result.rev;
+}
+
 // --- config editing -------------------------------------------------------
 
 export interface ConfigDoc {
