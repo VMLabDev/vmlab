@@ -302,11 +302,27 @@ export const runPlaybook = (
     `/api/labs/${encodeURIComponent(lab)}/${kind}/${encodeURIComponent(machine)}/playbook/${action}`,
     { path, play },
   );
-export const playbookTree = (
+/** Thrown by playbookTree: the status distinguishes "not declared" (403)
+ *  from "declared but the folder doesn't exist yet" (404 → offer scaffold). */
+export class PlaybookTreeError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export async function playbookTree(
   lab: string,
   playbook: string,
-): Promise<{ playbook: string; entries: PlaybookTreeEntry[] }> =>
-  req(`${pbBase(lab)}/tree?playbook=${encodeURIComponent(playbook)}`);
+): Promise<{ playbook: string; entries: PlaybookTreeEntry[] }> {
+  const res = await rawFetch(`${pbBase(lab)}/tree?playbook=${encodeURIComponent(playbook)}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new PlaybookTreeError(body.error ?? res.statusText, res.status);
+  }
+  return res.json();
+}
 export const scaffoldPlaybook = (lab: string, playbook: string) =>
   post(`${pbBase(lab)}/scaffold`, { playbook });
 

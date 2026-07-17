@@ -10,6 +10,7 @@ import TemplatesView from "./components/TemplatesView";
 import MachineView from "./components/MachineView";
 import ContainerView from "./components/ContainerView";
 import NewLabModal from "./components/NewLabModal";
+import PlaybookEditorView from "./components/PlaybookEditorView";
 
 export default function App() {
   onMount(init);
@@ -35,6 +36,9 @@ export default function App() {
           </Show>
           <Show when={state.view.kind === "container"}>
             <ContainerView />
+          </Show>
+          <Show when={state.view.kind === "playbook" && state.view.playbook}>
+            <PlaybookEditorView />
           </Show>
         </AppShell>
       </Show>

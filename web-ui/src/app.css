@@ -241,6 +241,39 @@
 .pb-link { cursor: pointer; }
 .pb-link:hover { color: var(--fg-1); text-decoration: underline; }
 
+/* Playbook folder editor (full-screen view). */
+.pb-editor-split { margin-top: var(--sp-3); }
+.pb-editor-pane { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.file-tree {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: var(--sp-2); overflow: auto;
+  font-size: var(--fs-sm);
+}
+.file-tree-row { display: flex; align-items: center; gap: var(--sp-1); }
+.file-tree-root {
+  color: var(--fg-3); font: 700 10px/1 var(--font-mono);
+  letter-spacing: 0.08em; text-transform: uppercase;
+  justify-content: space-between; padding: 0 var(--sp-1) var(--sp-1) var(--sp-1);
+}
+.file-tree-dir,
+.file-tree-file {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: none; border: 0; padding: 3px 6px; border-radius: var(--r-sm);
+  color: var(--fg-2); cursor: pointer; font: inherit; text-align: left;
+  min-width: 0; flex: 1;
+}
+.file-tree-dir:hover,
+.file-tree-file:hover { background: var(--bg-2); color: var(--fg-1); }
+.file-tree-file.selected { background: var(--bg-2); color: var(--fg-0); }
+.file-tree-file.muted { color: var(--fg-3); cursor: default; }
+.file-tree-file.muted:hover { background: none; }
+.file-tree-file span,
+.file-tree-dir span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-dirty {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--warning-fg); flex-shrink: 0;
+}
+
 /* Clickable table rows (network view). */
 .row-link { cursor: pointer; }
 .row-link:hover td { background: var(--bg-2); }
