@@ -750,7 +750,40 @@ async fn run_inner(
                     while vm.agent_answering().await && tokio::time::Instant::now() < grace {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
-                    vm.wait_agent_answering(Duration::from_secs(600)).await?;
+                    // Narrated come-back wait: a DC's first post-promotion
+                    // boot can be quiet for many minutes, which reads as a
+                    // hang without periodic output.
+                    let started = tokio::time::Instant::now();
+                    let deadline = started + Duration::from_secs(600);
+                    let mut next_note = started + Duration::from_secs(30);
+                    loop {
+                        if vm.agent_answering().await {
+                            break;
+                        }
+                        if vm.state().await == crate::labd::vm::PowerState::Stopped {
+                            bail!("{machine} stopped while rebooting for the playbook");
+                        }
+                        let now = tokio::time::Instant::now();
+                        if now >= deadline {
+                            bail!(
+                                "{machine}: guest did not come back within 600s of the reboot"
+                            );
+                        }
+                        if now >= next_note {
+                            log_line(&format!(
+                                "waiting for {machine} to come back ({}s)… — Windows can \
+                                 take a while here",
+                                started.elapsed().as_secs()
+                            ));
+                            next_note = now + Duration::from_secs(30);
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    log_line(&format!(
+                        "{machine} is back after {}s — re-running {}",
+                        started.elapsed().as_secs(),
+                        mode.verb()
+                    ));
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
