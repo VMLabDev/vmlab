@@ -28,7 +28,7 @@ lab "ad-demo" {
 
   # Forest root for corp.example.com (fixed address so it can serve DNS).
   vm "dc01" {
-    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025:26100.1742.3"
+    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025:26100.1742.4"
     arch = "x86_64"
     cpus = 2
     memory = 4GiB
@@ -38,7 +38,7 @@ lab "ad-demo" {
   # Member server. depends_on gates its start on dc01 being ready AND
   # dc01's playbook having converged (scoped steps run between waves).
   vm "srv01" {
-    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025:26100.1742.3"
+    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025:26100.1742.4"
     arch = "x86_64"
     cpus = 2
     memory = 4GiB
