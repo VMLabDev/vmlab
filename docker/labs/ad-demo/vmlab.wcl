@@ -11,9 +11,9 @@
 # with `vmlab playbook check|apply dc01|srv01` or the web UI's Playbook tab;
 # the playbook folder is re-pushed on every run.
 #
-# Requires the config-weave guest binaries on the host running vmlab — see
-# docker/config-weave/README.md for the Docker stack, or run config-weave's
-# `just install` for a local vmlab.
+# Requires the config-weave guest binaries on the host running vmlab. The
+# Docker image bakes them in; for a local vmlab run config-weave's
+# `just install` (or point $VMLAB_CONFIG_WEAVE_DIR at them).
 
 import <vmlab.wcl>
 

@@ -57,6 +57,21 @@ WORKDIR /build
 COPY guest/ ./guest/
 RUN ./guest/build-asset.sh x86_64 aarch64 && ./guest/build-agent.sh
 
+# ---- config-weave guest binaries ---------------------------------------------
+# The binaries vmlab pushes into guests for `playbook {}` blocks (see
+# docker/labs/ad-demo): static linux-musl + windows-gnu, both x86_64,
+# downloaded from config-weave's pinned GitHub release and checksum-verified.
+FROM debian:bookworm-slim AS config-weave
+ARG CONFIG_WEAVE_RELEASE=v0.1.0
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /dl
+RUN base="https://github.com/Configweave/config-weave/releases/download/${CONFIG_WEAVE_RELEASE}" \
+    && curl -fsSLO "$base/config-weave-linux-x86_64" \
+    && curl -fsSLO "$base/config-weave-windows-x86_64.exe" \
+    && curl -fsSLO "$base/SHA256SUMS" \
+    && sha256sum -c SHA256SUMS
+
 # Bookworm ships the RISC-V QEMU system emulator but not its EDK2 package.
 # Pull the architecture-independent CODE/VARS blobs from Trixie while keeping
 # the runtime itself on Bookworm.
@@ -123,6 +138,14 @@ COPY --from=builder /build/vmlab/target/release/vmlab-web /usr/local/bin/vmlab-w
 # Container micro-VM kernel + initramfs (PRD §18) — checked by
 # `ensure_guest_asset` at /usr/share/vmlab/guest/<arch>/.
 COPY --from=guest /build/guest/dist/ /usr/share/vmlab/guest/
+
+# config-weave guest binaries for `playbook {}` blocks, at vmlab's default
+# lookup path. Override with newer ones via $VMLAB_CONFIG_WEAVE_DIR or the
+# `config_weave_bin_dir` host-config setting.
+COPY --from=config-weave /dl/config-weave-linux-x86_64 \
+     /root/.local/share/config-weave/bin/config-weave-linux-x86_64
+COPY --from=config-weave /dl/config-weave-windows-x86_64.exe \
+     /root/.local/share/config-weave/bin/config-weave-windows-x86_64.exe
 
 # Documented volume mounts (PRD §14):
 #   /root/.local/share/vmlab/templates  — the template store

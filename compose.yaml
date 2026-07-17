@@ -39,12 +39,9 @@ services:
       # Extra sample labs, mounted into the managed labs home so they appear
       # in the web UI's lab picker alongside the default /lab. ad-demo is two
       # Windows Server 2025 VMs converged into an AD domain by config-weave
-      # playbooks (see docker/labs/ad-demo/ and docker/config-weave/README.md).
+      # playbooks (see docker/labs/ad-demo/); the config-weave guest binaries
+      # it needs are baked into the image.
       - ./docker/labs/ad-demo:/root/.local/share/vmlab/labs/ad-demo
-      # config-weave guest binaries for `playbook {}` blocks — drop the two
-      # release binaries in ./docker/config-weave (see its README). Read-only;
-      # playbook runs fail with a clear preflight error while it's empty.
-      - ./docker/config-weave:/root/.local/share/config-weave/bin:ro
       # Files you want visible inside the VMs. Drop them in ./docker/share on
       # the host; reference them from vmlab.wcl with host = "/share" (see the
       # sample). Unlike the working-data volume below this is meant to live on

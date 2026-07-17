@@ -63,12 +63,14 @@ each machine's **Playbook** tab, re-run `check`/`apply` from there (the
 playbook folder is re-pushed on every run), and open the playbook's file
 tree in the built-in editor from the designer's playbook node.
 
-Two prerequisites:
+The config-weave guest binaries are baked into the image, downloaded from
+the pinned [config-weave] GitHub release during `docker compose build`
+(`CONFIG_WEAVE_RELEASE` build arg in the Containerfile) and
+checksum-verified. To use newer binaries without rebuilding the image,
+mount a directory holding them and point `VMLAB_CONFIG_WEAVE_DIR` at it.
 
-1. Drop the config-weave guest binaries in `docker/config-weave/` — see
-   [docker/config-weave/README.md](config-weave/README.md).
-2. The Windows Server 2025 template (~12 GB) is pulled from ghcr on the
-   first `up`.
+One prerequisite: the Windows Server 2025 template (~12 GB) is pulled from
+ghcr on the first `up`.
 
 Bring it up from the UI (pick *ad-demo*, press *Start all*) or:
 
