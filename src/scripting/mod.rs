@@ -341,6 +341,13 @@ pub fn lab_module() -> Module {
         std::thread::sleep(Duration::from_millis(ms.max(0) as u64));
     });
 
+    // Host environment variable, or "" when unset. Lets build/provision
+    // scripts carry operator toggles (e.g. VMLAB_SKIP_UPDATES=1 for fast
+    // test template builds) without schema changes.
+    m.fn_("env", |name: &str| -> String {
+        std::env::var(name).unwrap_or_default()
+    });
+
     // -- Lab (§10.1) ---------------------------------------------------------
     m.ty::<LabHandle>()
         .method("name", |l: &LabHandle| l.runtime.name.clone())
