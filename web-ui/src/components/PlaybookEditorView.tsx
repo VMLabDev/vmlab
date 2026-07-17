@@ -81,6 +81,11 @@ export default function PlaybookEditorView() {
   }
 
   function firstEditable(entries: PlaybookTreeEntry[]): string | null {
+    // The playbook's entry point beats tree order (dirs sort first, which
+    // would otherwise land on some package resource file).
+    if (entries.some((entry) => !entry.dir && entry.path === "playbook.wcl")) {
+      return "playbook.wcl";
+    }
     for (const entry of entries) {
       if (!entry.dir && editable(entry.path)) return entry.path;
       if (entry.dir) {

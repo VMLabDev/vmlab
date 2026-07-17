@@ -264,30 +264,6 @@ impl AppState {
             Err(e) => Err(proto_err(e)),
         }
     }
-
-    /// Lab names to subscribe to / list: the cwd lab, every cached root
-    /// (labs created this session), plus every registry entry.
-    pub async fn lab_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
-        if let Some((name, _)) = &self.default_lab {
-            names.push(name.clone());
-        }
-        for (name, _) in self.known_roots().await {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        if let Ok(labs) = self.supervisor_call("status", Value::Null).await {
-            for l in labs.as_array().into_iter().flatten() {
-                if let Some(n) = l["name"].as_str()
-                    && !names.iter().any(|x| x == n)
-                {
-                    names.push(n.to_string());
-                }
-            }
-        }
-        names
-    }
 }
 
 fn prune(sessions: &mut HashMap<String, Instant>, ttl: Duration) {

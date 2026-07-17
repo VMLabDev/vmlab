@@ -68,36 +68,11 @@ pub async fn events(
             });
         }
 
-        // Each lab daemon that is already up. Best-effort and never blocks
-        // the forward loop below (no subscribing through `ensure`, which
-        // would spawn daemons just to watch them). Labs that come up later —
-        // including their `template.pull.*` progress events, which originate
-        // in the lab daemon's event log — are picked up via the supervisor's
-        // aggregate forwarding (`watch_lab_events`).
-        {
-            let state = state.clone();
-            let tx = tx.clone();
-            actix_web::rt::spawn(async move {
-                for lab in state.lab_names().await {
-                    let Some(client) = vmlab::cli::daemon::try_lab_daemon(&lab).await else {
-                        continue;
-                    };
-                    let Ok(mut events) = client.subscribe().await else {
-                        continue;
-                    };
-                    let tx = tx.clone();
-                    actix_web::rt::spawn(async move {
-                        while let Some(ev) = events.recv().await {
-                            if let Ok(s) = serde_json::to_string(&ev)
-                                && tx.send(s).await.is_err()
-                            {
-                                break;
-                            }
-                        }
-                    });
-                }
-            });
-        }
+        // No direct per-lab subscriptions: the supervisor watches every lab
+        // it starts or finds at its own startup (`watch_lab_events`) and
+        // forwards those streams into the aggregate above — a second, direct
+        // subscription would deliver every lab event twice (it did: playbook
+        // op logs showed each line duplicated).
         drop(tx);
 
         loop {
