@@ -26,7 +26,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW};
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
+    CREATE_NO_WINDOW, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 use vmlab_agent_proto::AgentMsg;
@@ -182,7 +182,9 @@ fn spawn_helper() {
             std::ptr::null(),
             std::ptr::null(),
             0,
-            0,
+            // The agent is a console-subsystem exe; without this the helper
+            // gets a visible console window on the user's desktop.
+            CREATE_NO_WINDOW,
             std::ptr::null(),
             std::ptr::null(),
             &si,
