@@ -14,6 +14,7 @@ mod editor;
 mod events;
 mod help;
 mod logs;
+mod playbooks;
 mod state;
 mod tty;
 
@@ -297,6 +298,40 @@ async fn main() -> ExitCode {
             .route(
                 "/api/labs/{lab}/templates/{tpl}/publish",
                 web::post().to(api::template_publish),
+            )
+            // Playbooks: run ops + the sandboxed folder editor (literal
+            // before the `{action}` catch-all).
+            .route(
+                "/api/labs/{lab}/playbooks",
+                web::get().to(playbooks::list_playbooks),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/ops",
+                web::get().to(playbooks::playbook_ops),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/tree",
+                web::get().to(playbooks::tree),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/file",
+                web::get().to(playbooks::get_file),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/file",
+                web::put().to(playbooks::save_file),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/scaffold",
+                web::post().to(playbooks::scaffold),
+            )
+            .route(
+                "/api/labs/{lab}/vms/{vm}/playbook/{action}",
+                web::post().to(playbooks::run_playbook),
+            )
+            .route(
+                "/api/labs/{lab}/containers/{container}/playbook/{action}",
+                web::post().to(playbooks::run_playbook),
             )
             // Config editing (literal before the `{action}` catch-all).
             .route("/api/labs/{lab}/config", web::get().to(api::get_config))
