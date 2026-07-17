@@ -268,6 +268,11 @@ struct OpState {
     op_id: u64,
     started: chrono::DateTime<chrono::Utc>,
     log: VecDeque<String>,
+    /// "running" while config-weave executes, "rebooting" while the guest
+    /// restarts between apply attempts (the UI's phase indicator).
+    phase: &'static str,
+    /// Reboot attempt this run is on (0 until the first reboot).
+    reboot_attempt: u32,
 }
 
 #[derive(Default)]
@@ -315,6 +320,8 @@ impl PlaybookOps {
                 op_id,
                 started: chrono::Utc::now(),
                 log: VecDeque::new(),
+                phase: "running",
+                reboot_attempt: 0,
             },
         );
         Ok((
@@ -324,6 +331,14 @@ impl PlaybookOps {
             },
             op_id,
         ))
+    }
+
+    fn set_phase(&self, machine: &str, phase: &'static str, reboot_attempt: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(op) = inner.ops.get_mut(machine) {
+            op.phase = phase;
+            op.reboot_attempt = reboot_attempt;
+        }
     }
 
     fn append_log(&self, machine: &str, line: &str) {
@@ -378,6 +393,9 @@ impl PlaybookOps {
                     "op_id": op.op_id,
                     "started": op.started.to_rfc3339(),
                     "log_tail": op.log.iter().collect::<Vec<_>>(),
+                    "phase": op.phase,
+                    "reboot_attempt": op.reboot_attempt,
+                    "reboot_max": MAX_REBOOTS,
                 })
             })
             .collect();
@@ -584,6 +602,17 @@ async fn run_inner(
         payload["line"] = Value::String(line.to_string());
         lab.events.emit("playbook.op.log", payload);
     };
+    // Explicit run phase ("running" ↔ "rebooting") so UIs can show a reboot
+    // as a reboot instead of a silent stall; mirrored into the op registry
+    // for reconnect resync.
+    let set_phase = |phase: &'static str, attempt: u32| {
+        lab.playbook_ops.set_phase(machine, phase, attempt);
+        let mut payload = base.clone();
+        payload["phase"] = Value::String(phase.to_string());
+        payload["attempt"] = attempt.into();
+        payload["max"] = MAX_REBOOTS.into();
+        lab.events.emit("playbook.op.phase", payload);
+    };
 
     let agent = mref.wait_agent(Duration::from_secs(300)).await?;
     // The profile-name heuristic decides before boot; the agent's handshake
@@ -739,6 +768,7 @@ async fn run_inner(
                     log_line(&format!(
                         "reboot required — restarting {machine} (attempt {reboots}/{MAX_REBOOTS})"
                     ));
+                    set_phase("rebooting", reboots);
                     vm.qga()
                         .await?
                         .shutdown("reboot", Duration::from_secs(10))
@@ -765,9 +795,7 @@ async fn run_inner(
                         }
                         let now = tokio::time::Instant::now();
                         if now >= deadline {
-                            bail!(
-                                "{machine}: guest did not come back within 600s of the reboot"
-                            );
+                            bail!("{machine}: guest did not come back within 600s of the reboot");
                         }
                         if now >= next_note {
                             log_line(&format!(
@@ -784,6 +812,7 @@ async fn run_inner(
                         started.elapsed().as_secs(),
                         mode.verb()
                     ));
+                    set_phase("running", reboots);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }

@@ -71,6 +71,11 @@ export interface PlaybookOp {
   play: string;
   kind: "check" | "apply";
   status: "running" | "done" | "error";
+  /** While running: config-weave executing vs the guest restarting between
+   *  apply attempts (playbook.op.phase events). */
+  phase: "running" | "rebooting";
+  rebootAttempt?: number;
+  rebootMax?: number;
   log: string[];
   steps: PlaybookStep[];
   /** config-weave's exit code once settled (3 = reboot still required). */
@@ -327,6 +332,9 @@ async function resyncPlaybookOps() {
           play: op.play,
           kind: op.kind,
           status: "running",
+          phase: op.phase ?? "running",
+          rebootAttempt: op.reboot_attempt,
+          rebootMax: op.reboot_max,
           log: op.log_tail.slice(),
           steps: [],
         };
@@ -836,6 +844,7 @@ function handlePlaybookOpEvent(ev: DaemonEvent) {
     play: String(ev.data.play ?? ""),
     kind: ev.data.mode === "apply" || ev.data.kind === "apply" ? "apply" : "check",
     status: "running",
+    phase: "running",
     log: [],
     steps: [],
   });
@@ -854,10 +863,21 @@ function handlePlaybookOpEvent(ev: DaemonEvent) {
       });
       break;
     }
+    case "playbook.op.phase":
+      setState("playbookOps", key, (op) => ({
+        ...(op ?? fresh()),
+        phase: ev.data.phase === "rebooting" ? ("rebooting" as const) : ("running" as const),
+        rebootAttempt: Number(ev.data.attempt ?? 0) || undefined,
+        rebootMax: Number(ev.data.max ?? 0) || undefined,
+      }));
+      break;
     case "playbook.op.step":
       setState("playbookOps", key, (op) => {
         const base = op ?? fresh();
-        return { ...base, steps: applyCwEvent(base.steps, ev.data.cw) };
+        // A fresh run_started (the re-run after a reboot) also means
+        // config-weave is executing again.
+        const phase = ev.data.cw?.event === "run_started" ? ("running" as const) : base.phase;
+        return { ...base, phase, steps: applyCwEvent(base.steps, ev.data.cw) };
       });
       break;
     case "playbook.op.done": {

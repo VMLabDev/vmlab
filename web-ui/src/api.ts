@@ -281,6 +281,10 @@ export interface PlaybookOpStatus {
   op_id: number;
   started: string;
   log_tail: string[];
+  /** "running" while config-weave executes, "rebooting" between attempts. */
+  phase?: "running" | "rebooting";
+  reboot_attempt?: number;
+  reboot_max?: number;
 }
 
 const pbBase = (lab: string) => `/api/labs/${encodeURIComponent(lab)}/playbooks`;
