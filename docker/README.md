@@ -44,6 +44,45 @@ docker compose exec vmlab-web vmlab fastpath
 The available modes are `auto` (recommended), `afxdp` (force the AF_XDP probe),
 `sockmap` (evaluation only; currently slower than userspace), and `off`.
 
+## The Active Directory demo lab (config-weave playbooks)
+
+Besides the default `/lab`, the Compose stack mounts `docker/labs/ad-demo`
+into the managed labs home, so **ad-demo** shows up in the web UI's lab
+picker. It demonstrates vmlab's `playbook {}` blocks — [config-weave]
+playbooks copied into the guests and applied during `up`:
+
+- `dc01` is promoted to the forest root of `corp.example.com` (AD DS role →
+  `Install-ADDSForest` → wait for AD to answer) and serves DNS for the
+  segment.
+- `srv01` declares `depends_on = ["dc01"]`, so it boots only after the DC's
+  playbook has converged, then joins the domain.
+
+Both plays end in reboot-required resources; vmlab reboots each guest and
+re-runs the apply until config-weave reports it converged. Watch it live on
+each machine's **Playbook** tab, re-run `check`/`apply` from there (the
+playbook folder is re-pushed on every run), and open the playbook's file
+tree in the built-in editor from the designer's playbook node.
+
+Two prerequisites:
+
+1. Drop the config-weave guest binaries in `docker/config-weave/` — see
+   [docker/config-weave/README.md](config-weave/README.md).
+2. The Windows Server 2025 template (~12 GB) is pulled from ghcr on the
+   first `up`.
+
+Bring it up from the UI (pick *ad-demo*, press *Start all*) or:
+
+```sh
+docker compose exec vmlab-web sh -c 'cd /root/.local/share/vmlab/labs/ad-demo && vmlab up'
+```
+
+The first `up` takes a while: two Windows clones specialize, then the DC
+promotion and the domain join each cross a reboot. Sign-in after: pick the
+VM's Console tab — `CORP\Administrator` / `vmlab123!` (demo credentials, set
+in `docker/labs/ad-demo/playbooks/active-directory/playbook.wcl`).
+
+[config-weave]: https://github.com/Configweave/config-weave
+
 ## Sharing files into your VMs
 
 Drop files in `docker/share/` on the host — it's bind-mounted to `/share` in

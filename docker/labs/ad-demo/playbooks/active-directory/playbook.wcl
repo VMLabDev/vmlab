@@ -1,0 +1,69 @@
+playbook "Active Directory demo" {
+  description = "Promote dc01 to the corp.example.com forest root and join srv01 to the domain"
+  version = "0.1.0"
+
+  vars {
+    domain  = "corp.example.com"
+    netbios = "CORP"
+    // DSRM (recovery mode) password set during promotion.
+    dsrm_password = "P@ssw0rd-DSRM!"
+    // The windows-server-2025 template's built-in Administrator password;
+    // after promotion that account is the domain's CORP\Administrator.
+    join_user     = "CORP\\Administrator"
+    join_password = "vmlab123!"
+  }
+
+  play "domain-controller" {
+    description = "Install AD DS, promote to the forest root, wait for AD to answer"
+
+    step "hostname" {
+      description = "Name the machine DC01 (clones boot with a generated name)"
+      resource = "windows.computer_name"
+      properties { name = "DC01" }
+    }
+
+    step "ad-role" {
+      description = "Install the AD-Domain-Services role"
+      resource = "windows.server_feature"
+      requires = ["hostname"]
+      properties {
+        name = "AD-Domain-Services"
+        include_management_tools = true
+      }
+    }
+
+    step "forest" {
+      description = "Promote to the first domain controller of a new forest"
+      resource = "windows.forest"
+      requires = ["ad-role"]
+      properties {
+        domain_name        = domain
+        netbios_name       = netbios
+        safe_mode_password = dsrm_password
+      }
+    }
+
+    // Runs on the re-apply after the promotion reboot: gates the play's
+    // success (and therefore srv01's boot) on AD actually answering.
+    step "ad-ready" {
+      description = "Wait until Active Directory answers domain queries"
+      resource = "windows.ad_ready"
+      requires = ["forest"]
+    }
+  }
+
+  play "member-server" {
+    description = "Join this server to the domain"
+
+    step "join" {
+      description = "Join corp.example.com as SRV01"
+      resource = "windows.domain_member"
+      properties {
+        domain_name         = domain
+        credential_user     = join_user
+        credential_password = join_password
+        new_name            = "SRV01"
+      }
+    }
+  }
+}

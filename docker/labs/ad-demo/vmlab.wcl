@@ -1,0 +1,58 @@
+# Active Directory demo lab: two Windows Server 2025 VMs converged by
+# config-weave playbooks (`playbooks/active-directory`).
+#
+#   dc01   — promoted to the forest root of corp.example.com (play
+#            "domain-controller"); serves DNS for the corp segment.
+#   srv01  — depends_on dc01, so it boots only after the DC's playbook
+#            has converged; joined to the domain (play "member-server").
+#
+# Both plays end in reboot-required resources — vmlab reboots the guest and
+# re-runs the apply until config-weave reports converged. After `up`, iterate
+# with `vmlab playbook check|apply dc01|srv01` or the web UI's Playbook tab;
+# the playbook folder is re-pushed on every run.
+#
+# Requires the config-weave guest binaries on the host running vmlab — see
+# docker/config-weave/README.md for the Docker stack, or run config-weave's
+# `just install` for a local vmlab.
+
+import <vmlab.wcl>
+
+lab "ad-demo" {
+
+  segment "corp" {
+    subnet = "10.90.0.0/24"
+    nat = true
+    # The forest root owns DNS for the domain; DHCP hands it to members.
+    dns { server = "10.90.0.10" }
+  }
+
+  # Forest root for corp.example.com (fixed address so it can serve DNS).
+  vm "dc01" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025:26100.1742.3"
+    arch = "x86_64"
+    cpus = 2
+    memory = 4GiB
+    nic { segment = "corp" ip = "10.90.0.10" }
+  }
+
+  # Member server. depends_on gates its start on dc01 being ready AND
+  # dc01's playbook having converged (scoped steps run between waves).
+  vm "srv01" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025:26100.1742.3"
+    arch = "x86_64"
+    cpus = 2
+    memory = 4GiB
+    depends_on = ["dc01"]
+    nic { segment = "corp" }
+  }
+
+  playbook "playbooks/active-directory" {
+    play = "domain-controller"
+    vms = ["dc01"]
+  }
+
+  playbook "playbooks/active-directory" {
+    play = "member-server"
+    vms = ["srv01"]
+  }
+}

@@ -1,0 +1,42 @@
+package "windows" {
+  description = "Windows Server resources for the AD demo (adapted from the config-weave stdlib)"
+
+  resource "server_feature" {
+    description = "Install or remove a Windows Server role/feature (Install-WindowsFeature)"
+    script = "resources/server_feature.wscript"
+    param "name"   { description = "Feature name, e.g. AD-Domain-Services" type = "string" required = true }
+    param "ensure" { description = "\"present\" or \"absent\"" type = "string" default = "present" }
+    param "include_management_tools" { description = "Also install the matching RSAT tools" type = "bool" default = false }
+  }
+
+  resource "forest" {
+    description = "Create a new AD forest (promote this server to the first domain controller)"
+    script = "resources/forest.wscript"
+    concurrency = "global"
+    param "domain_name"        { description = "Root domain FQDN, e.g. corp.example.com" type = "string" required = true }
+    param "safe_mode_password" { description = "DSRM (Directory Services Restore Mode) password — plaintext in the playbook" type = "string" required = true }
+    param "netbios_name"       { description = "NetBIOS domain name; empty = derived from the first label" type = "string" default = "" }
+    param "install_dns"        { description = "Install and configure the DNS Server role" type = "bool" default = true }
+  }
+
+  resource "domain_member" {
+    description = "Join this computer to an existing Active Directory domain"
+    script = "resources/domain_member.wscript"
+    concurrency = "global"
+    param "domain_name"         { description = "Domain FQDN to join" type = "string" required = true }
+    param "credential_user"     { description = "Account with join rights (UPN or DOMAIN\\user)" type = "string" required = true }
+    param "credential_password" { description = "Password for credential_user — plaintext in the playbook" type = "string" required = true }
+    param "new_name"            { description = "Rename the computer as part of the join; empty = keep current name" type = "string" default = "" }
+  }
+
+  resource "computer_name" {
+    description = "Set the Windows computer name (Rename-Computer; effective after a reboot)"
+    script = "resources/computer_name.wscript"
+    param "name" { description = "Desired computer name (NetBIOS, ≤15 chars)" type = "string" required = true }
+  }
+
+  resource "ad_ready" {
+    description = "Wait until Active Directory Domain Services answers domain queries on this DC"
+    script = "resources/ad_ready.wscript"
+  }
+}
