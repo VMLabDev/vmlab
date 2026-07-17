@@ -29,13 +29,20 @@ fn check(params: Value) -> Result[CheckResult, string] {
 }
 
 fn apply(params: Value) -> Result[ApplyResult, string] {
+    // Settle the stale staged packages, then hold until the DC is ~5 min
+    // past the promotion reboot: a profile-CREATING logon earlier than that
+    // permanently breaks the new profile's shell on 24H2 images sysprepped
+    // as Local System — the operator's first console logon must land on a
+    // warm machine.
     let script = "$ErrorActionPreference = 'Continue'; " +
         "$prov = (Get-AppxProvisionedPackage -Online).DisplayName; " +
         "Get-AppxPackage -AllUsers | Where-Object {{ -not $_.IsFramework -and -not $_.IsResourcePackage -and $prov -notcontains $_.Name -and -not ($_.PackageUserInformation | Where-Object InstallState -eq 'Installed') }} | ForEach-Object {{ try {{ Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction Stop }} catch {{ }} }}; " +
         "New-Item -Path 'HKLM:\\SOFTWARE\\vmlab' -Force | Out-Null; " +
         "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\vmlab' -Name 'AppxSettledPostPromo' -Value 1 -Type DWord; " +
+        "$up = [int]((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalSeconds; " +
+        "if ($up -lt 300) {{ Start-Sleep -Seconds (300 - $up) }}; " +
         "exit 0"
-    let opts = Value::Map(#{ "timeout": Value::Int(300) })
+    let opts = Value::Map(#{ "timeout": Value::Int(600) })
     let out = shell::powershell(script, opts)?
     if !out.success { return Err("AppX settle failed: " + out.stderr) }
     Ok(ApplyResult::Success)
