@@ -415,6 +415,31 @@ impl MachineRef {
         }
     }
 
+    /// [`Self::agent`], retrying transient handshake failures until
+    /// `timeout`. A machine can be momentarily agent-less while claiming to
+    /// be up — Windows first-boot ends in a settle reboot, and readiness is
+    /// sticky across guest reboots — so one failed handshake must not fail
+    /// the run. Hard failures (machine stopped, vintage guest with no agent
+    /// channel) surface immediately.
+    async fn wait_agent(&self, timeout: Duration) -> Result<AgentHandle> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match self.agent().await {
+                Ok(agent) => return Ok(agent),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if msg.contains("not running") || msg.contains("no agent channel") {
+                        return Err(e);
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
     fn arch(&self) -> String {
         match self {
             MachineRef::Vm(vm) => vm.template().resolved.arch.clone(),
@@ -528,7 +553,7 @@ async fn run_inner(
         lab.events.emit("playbook.op.log", payload);
     };
 
-    let agent = mref.agent().await?;
+    let agent = mref.wait_agent(Duration::from_secs(300)).await?;
     // The profile-name heuristic decides before boot; the agent's handshake
     // is authoritative once connected.
     let os = match agent.info().os.as_str() {
@@ -627,7 +652,7 @@ async fn run_inner(
     ];
     let mut reboots = 0u32;
     loop {
-        let agent = mref.agent().await?;
+        let agent = mref.wait_agent(Duration::from_secs(300)).await?;
         let on_line = |line: String| match serde_json::from_str::<Value>(&line) {
             Ok(cw) => {
                 if let Some(human) = render_cw_event(&cw) {
