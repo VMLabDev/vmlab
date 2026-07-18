@@ -23,9 +23,9 @@ vmlab falls back to slow TCG emulation with a loud warning. The optional eBPF
 network fast path additionally uses `/dev/net/tun`, `CAP_BPF`, and
 `CAP_NET_ADMIN`; it probes the host and falls back to userspace when unavailable.
 Neither mode needs `--privileged` or host networking. By default the container
-serves the web UI (`vmlab-web` on :7878 — see the `docker compose` stack); override
-the command for one-shot/CI CLI use, or drive a running container via
-`docker exec <ctr> vmlab ...`.
+serves the [web console](../references/concept_web_console.md) ([vmlab-web](../references/entity_vmlab_web.md) on
+:7878 — see the `docker compose` stack); override the command for one-shot/CI
+CLI use, or drive a running container via `docker exec <ctr> vmlab ...`.
 
 
 ## Related

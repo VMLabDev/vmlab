@@ -1,0 +1,42 @@
+# vmlab-web: the REST + WebSocket API
+
+Everything the [web console](../references/concept_web_console.md) does rides this API, so it
+can be scripted with plain HTTP. All `/api/*` routes sit behind the auth gate
+when auth is enabled: `POST /api/login` (`{"user","password"}`) returns a
+bearer token, `GET /api/auth` probes whether login is required, and
+`POST /api/logout` revokes the session. Lab, VM and container names appear in
+paths; `{action}` routes accept the verb in the path (e.g. `up`, `down`,
+`start`, `stop`).
+
+
+| Area | Endpoints |
+| --- | --- |
+| Labs | `GET/POST /api/labs` (list, create), `GET /api/labs/{lab}` (status), `POST /api/labs/{lab}/{action}` (up/down/destroy/…), `POST …/reload`, `GET …/dns`, `GET …/logs` |
+| VMs | `POST …/vms/{vm}/{action}`, `POST …/sendkeys`, `GET …/screenshot.png`, `GET …/stats`, `GET/POST …/clipboard`, `GET …/snapshots`, `DELETE …/snapshots/{name}` |
+| Containers | `POST …/containers/{c}/{action}`, `GET …/stats` (mirror the VM routes) |
+| Snapshots (lab-wide) | `POST …/snapshots` (take), `POST …/snapshots/{name}/restore` |
+| Templates | `GET …/templates`, `GET …/templates/ops`, `GET …/templates/{tpl}/remote`, `POST …/templates/{tpl}/build\|stop\|publish` |
+| Playbooks | `GET …/playbooks`, `GET …/playbooks/ops`, `POST …/playbooks/scaffold`, `POST …/vms/{vm}/playbook/{action}` and `…/containers/{c}/playbook/{action}` (check/apply); config-weave packages: `POST …/playbooks/pkg`, `POST …/playbooks/pkg/search`, `GET/POST …/playbooks/repos` |
+| Files tab | `GET …/files/tree`, `GET/PUT/DELETE …/files/file`, `POST …/files/mkdir`, `POST …/files/rename` — sandboxed to the lab directory |
+| Config & designer | `GET/POST …/config` (raw `vmlab.wcl`), `GET/PUT …/scripts`, `GET …/model` + `POST …/model/edit` (the designer's structured model + surgical edit ops) |
+| Catalogs & host | `GET /api/catalog/templates\|profiles\|meta\|oci`, `DELETE /api/catalog/templates/{arch}/{name}/{version}`, `GET/POST/DELETE /api/registries` + `POST /api/registries/login`, `GET /api/host`, `GET /api/host/fs`, `GET /api/fastpath` |
+| Live streams (WS) | `GET /api/events` (lab/daemon event feed), `GET /api/labs/{lab}/vms/{vm}/tty` and `…/containers/{c}/tty` (agent terminals), `GET /api/desktop/vnc/{lab}/{vm}` and `GET /api/labs/{lab}/templates/{arch}/{template}/vnc` (desktop protocol) |
+| Guest web pages | `POST /api/web/session` mints the path-scoped `vmlab_web` cookie; the proxy itself serves `/web/{lab}/{kind}/{machine}/{page}/…` outside the `/api/` gate |
+| Docs | `GET /help`, `GET /help/{path}` — this reference book, embedded |
+
+```console
+TOKEN=$(curl -s -X POST :7878/api/login \
+  -d '{"user":"admin","password":"…"}' | jq -r .token)
+curl -s -H "Authorization: Bearer $TOKEN" :7878/api/labs | jq .
+curl -s -X POST -H "Authorization: Bearer $TOKEN" :7878/api/labs/demo/up
+```
+
+## Related
+
+- [vmlab-web](../references/entity_vmlab_web.md)
+
+- [The web console](../references/concept_web_console.md)
+
+- [web {} block](../references/entity_web_block.md)
+
+[← Back to SKILL.md](../SKILL.md)

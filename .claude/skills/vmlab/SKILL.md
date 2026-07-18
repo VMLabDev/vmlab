@@ -15,9 +15,11 @@ metadata:
 
 A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript.
 
-**Upstream version:** `1.1`. If the real upstream has moved past this, the skill may be stale — bump `topic.version` and re-verify (see the update workflow).
+**Upstream version:** `1.2`. If the real upstream has moved past this, the skill may be stale — bump `topic.version` and re-verify (see the update workflow).
 
 vmlab orchestrates single-host VM labs: labs (VMs + virtual networks) are declared in WCL (`vmlab.wcl`), disk templates are built and stored locally or distributed via OCI registries, and automation is written in wscript scripts that drive guests (power, exec, keystrokes, screen matching, OCR).
+
+OCI containers join labs as micro-VM machines (`container {}`), config-weave playbooks converge guests declaratively (`playbook {}`), and the `vmlab-web` console (REST + WebSocket API, visual designer, guest web-page proxy) manages labs from the browser.
 
 A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by the CLI. This skill captures the full reference as data.
 
@@ -76,6 +78,7 @@ Everything for writing a `vmlab.wcl`: the lab and VM blocks, segment networking,
 - [Provisions & event handlers](references/concept_provisions.md)
 - [provision {} block](references/entity_provision_block.md)
 - [on "event" {} handler](references/entity_on_handler.md)
+- [web {} block](references/entity_web_block.md)
 - [The vmlab.wcl schema](references/fact_schema_reference.md)
 
 ### Templates & distribution
@@ -99,7 +102,7 @@ Build templates from installer media, boot scratch VMs, generate ISO/floppy medi
 
 _Drive guests with wscript provision scripts and event handlers._
 
-The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for automating guests — power, exec, keystrokes, screen matching and OCR.
+The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for automating guests — power, exec, keystrokes, screen matching and OCR — plus the vmlab-agent channel and declarative config-weave playbooks.
 
 - [wscript: overview](references/concept_wscript_overview.md)
 - [wscript: types & values](references/concept_wscript_types.md)
@@ -116,10 +119,25 @@ The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for 
 - [Vm: keyboard & mouse methods](references/fact_vm_input.md)
 - [Vm: screen, image matching & OCR methods](references/fact_vm_vision.md)
 - [Vm: guest agent methods (exec, files, terminal, stats)](references/fact_vm_agent.md)
+- [vmlab-agent](references/entity_vmlab_agent.md)
 - [Segment](references/entity_seg_api.md)
 - [Match](references/entity_match_type.md)
 - [ExecResult](references/entity_exec_result_type.md)
 - [Event](references/entity_event_type.md)
+- [Playbooks (config-weave)](references/concept_playbooks.md)
+- [playbook {} block](references/entity_playbook_block.md)
+
+### Web console
+
+_Manage labs from the browser: the vmlab-web server, the console UI, its API, and proxied guest web pages._
+
+Everything around `vmlab-web`: launching and securing the server, a tour of the console (designer, Files, machine consoles/terminals, templates, playbooks), the REST + WebSocket API, and `web {}` blocks that proxy guest HTTP UIs into the console.
+
+- [vmlab-web](references/entity_vmlab_web.md)
+- [The web console](references/concept_web_console.md)
+- [Serve the web console](references/process_serve_web_console.md)
+- [vmlab-web: the REST + WebSocket API](references/fact_web_api.md)
+- [web {} block](references/entity_web_block.md)
 
 ### Operations & hosting
 
@@ -134,6 +152,7 @@ How vmlab runs: the two-tier daemon, the optional host config, guest OS profiles
 - [Filesystem layout](references/fact_paths_table.md)
 - [Containers](references/concept_containers.md)
 - [WSL2](references/concept_wsl2.md)
+- [Network fast path (eBPF)](references/concept_fastpath.md)
 - [What `vmlab validate` checks](references/fact_validate_checks.md)
 - [The vmlab.wcl schema](references/fact_schema_reference.md)
 

@@ -5,7 +5,7 @@
 index ix_labs {
   name     = "Labs & networking"
   summary  = "Declare VMs and the virtual networks that connect them."
-  related  = [labs, vms, nic_block, networking, segment_block, segment_subblocks, shares, provisions, provision_block, on_handler, schema_reference]
+  related  = [labs, vms, nic_block, networking, segment_block, segment_subblocks, shares, provisions, provision_block, on_handler, web_block, schema_reference]
   audience = :both
   body {
     p "Everything for writing a `vmlab.wcl`: the lab and VM blocks, segment networking, SMB shares, and provision/event scripts."
@@ -25,17 +25,27 @@ index ix_templates {
 index ix_automation {
   name     = "Automation (wscript)"
   summary  = "Drive guests with wscript provision scripts and event handlers."
-  related  = [wscript_overview, wscript_types, wscript_functions, wscript_matching, wscript_modules, wscript_collections, wscript_strings, wscript_limits, lab_api, vm_api, vm_lifecycle, vm_snapshots, vm_input, vm_vision, vm_agent, seg_api, match_type, exec_result_type, event_type]
+  related  = [wscript_overview, wscript_types, wscript_functions, wscript_matching, wscript_modules, wscript_collections, wscript_strings, wscript_limits, lab_api, vm_api, vm_lifecycle, vm_snapshots, vm_input, vm_vision, vm_agent, vmlab_agent, seg_api, match_type, exec_result_type, event_type, playbooks, playbook_block]
   audience = :both
   body {
-    p "The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for automating guests — power, exec, keystrokes, screen matching and OCR."
+    p "The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for automating guests — power, exec, keystrokes, screen matching and OCR — plus the vmlab-agent channel and declarative config-weave playbooks."
+  }
+}
+
+index ix_web {
+  name     = "Web console"
+  summary  = "Manage labs from the browser: the vmlab-web server, the console UI, its API, and proxied guest web pages."
+  related  = [vmlab_web, web_console, serve_web_console, web_api, web_block]
+  audience = :both
+  body {
+    p "Everything around `vmlab-web`: launching and securing the server, a tour of the console (designer, Files, machine consoles/terminals, templates, playbooks), the REST + WebSocket API, and `web {}` blocks that proxy guest HTTP UIs into the console."
   }
 }
 
 index ix_operations {
   name     = "Operations & hosting"
   summary  = "Run vmlab: the CLI, daemons, host config, profiles, containers and WSL2."
-  related  = [daemon_model, host_config, profiles, profiles_table, paths_table, containers, wsl2, validate_checks, schema_reference]
+  related  = [daemon_model, host_config, profiles, profiles_table, paths_table, containers, wsl2, fastpath, validate_checks, schema_reference]
   audience = :both
   body {
     p "How vmlab runs: the two-tier daemon, the optional host config, guest OS profiles, and running unprivileged in containers or on WSL2. The CLI reference covers every verb."

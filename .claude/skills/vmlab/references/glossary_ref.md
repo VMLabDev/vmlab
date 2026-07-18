@@ -18,5 +18,12 @@
 | wscript | vmlab's statically typed, Rust-flavoured scripting language for guest automation. Compiled and type-checked at `vmlab validate` time. |  |
 | guest agent | The QEMU guest agent (QGA) running inside a VM. `vm.is_ready()` / `vm.wait_ready()` test it; `vm.exec` / `copy_to` / `copy_from` fall back to it when the richer vmlab-agent is absent. | QEMU guest agent, QGA |
 | vmlab-agent | vmlab's first-party in-guest agent on the `vmlab.agent.0` virtio-serial port (no guest network). Baked into templates at build time (meta `agent_version`); powers `vmlab shell`/`cp`/`tail`/`eventlog`, wscript `terminal()`/`stats()`, and agent-first exec/copy with QGA fallback. Present in both full VMs and container micro-VMs. | agent channel |
+| micro-VM | The tiny VM (pinned Alpine kernel + vmlab's purpose-built init) that each `container {}` runs inside, making an OCI container just another lab machine — same segments, DNS, snapshots and agent channel as full VMs (PRD §18). |  |
+| playbook | A config-weave configuration folder bound to lab machines (or a template build) with a `playbook {}` block. Applied on `vmlab up` interleaved with provisions, re-run with `vmlab playbook check\|apply` or the web console's Playbook tab. | config-weave playbook |
+| config-weave | The declarative guest-configuration system vmlab integrates for playbooks: plays converge package installs, files and services with drift detection, idempotent re-runs and automatic reboots. |  |
+| web console | The browser UI served by `vmlab-web`: lab overview, visual designer, Files/Logs editors, per-machine consoles and terminals, template builds, playbooks, and proxied guest web pages. | vmlab-web, console UI |
+| web page (guest) | An HTTP UI served inside a guest and declared with a `web {}` block; the web console proxies it into a same-origin iframe tab, injecting the guest app's login from the block's `auth {}`. |  |
+| fast path | Optional eBPF network acceleration above the userspace switch: the afxdp tier (chosen by `auto`) and the explicit-only sockmap tier. Probed at daemon startup; any failure falls back to userspace. `vmlab fastpath` shows the active tier. | eBPF fast path |
+| virtiofs | The shared-filesystem transport (vhost-user-fs) that `share {}` blocks and container volumes ride by default — no guest networking, snapshot-safe; SMB/CIFS is the fallback transport. |  |
 
 [← Back to SKILL.md](../SKILL.md)

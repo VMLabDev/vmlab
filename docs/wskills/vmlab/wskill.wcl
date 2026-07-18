@@ -24,18 +24,21 @@ schema_version = "1.3.0"
 topic vmlab {
   name    = "vmlab"
   summary = "A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript."
-  version = "1.1"
+  version = "1.2"
   description = <<END
 vmlab orchestrates single-host virtual-machine labs. A **lab** — a set of VMs plus
 the virtual networks that connect them — is declared in **WCL** (`vmlab.wcl`).
 Reusable disk **templates** are built from installer media and either kept in a
 local store or pushed to and pulled from any OCI registry. Guest automation —
 power control, command execution, keystrokes, screen matching and OCR — is written
-in **wscript** provision scripts and event handlers. A two-tier daemon (the
-supervisor `vmlabd` plus one daemon per running lab) is auto-started by the CLI;
-the baseline network fabric is entirely userspace, so vmlab runs unprivileged in
-containers and on WSL2 with only `/dev/kvm`. Optional eBPF acceleration on
-supported Linux hosts adds `/dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`.
+in **wscript** provision scripts and event handlers, with declarative
+**config-weave playbooks** alongside. OCI containers join labs as micro-VM
+machines, and the **vmlab-web** console manages everything from the browser.
+A two-tier daemon (the supervisor `vmlabd` plus one daemon per running lab) is
+auto-started by the CLI; the baseline network fabric is entirely userspace, so
+vmlab runs unprivileged in containers and on WSL2 with only `/dev/kvm`.
+Optional eBPF acceleration on supported Linux hosts adds `/dev/net/tun`,
+`CAP_BPF`, and `CAP_NET_ADMIN`.
 END
   tags = ["vmlab", "qemu", "kvm", "virtualization", "lab", "wcl", "wscript", "oci"]
   created    = "2026-06-21"
@@ -49,6 +52,7 @@ wcl.wskill::skill {
   summary {
     overview = [
       "vmlab orchestrates single-host VM labs: labs (VMs + virtual networks) are declared in WCL (`vmlab.wcl`), disk templates are built and stored locally or distributed via OCI registries, and automation is written in wscript scripts that drive guests (power, exec, keystrokes, screen matching, OCR).",
+      "OCI containers join labs as micro-VM machines (`container {}`), config-weave playbooks converge guests declaratively (`playbook {}`), and the `vmlab-web` console (REST + WebSocket API, visual designer, guest web-page proxy) manages labs from the browser.",
       "A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by the CLI. This skill captures the full reference as data.",
     ]
   }
@@ -87,17 +91,17 @@ artifact training { kind = :training      entry = "wdoc/training/main.wcl"      
 wcl.wskill::source vmlab_repo {
   kind         = "repo"
   locator      = "/home/wil/dev/vmlab"
-  covers       = "Source of truth for behaviour: src/config/schema.wcl (WCL schema), src/scripting/ (wscript host API), src/cli/, src/template/, src/profiles/shipped.wcl, examples/."
-  last_checked = "2026-06-21"
-  reflects_version = "1.0"
+  covers       = "Source of truth for behaviour: src/config/schema.wcl (WCL schema), src/scripting/ (wscript host API), src/cli/, src/template/, src/web/, src/profiles/shipped.wcl, examples/."
+  last_checked = "2026-07-19"
+  reflects_version = "main b809708"
 }
 
 wcl.wskill::source vmlab_cli_help {
   kind         = "cli"
   locator      = "vmlab --help"
-  covers       = "Subcommand help text for the full verb surface (lifecycle, vm, snapshot, exec, script, console, logs, template, daemon)."
-  last_checked = "2026-06-21"
-  reflects_version = "1.0"
+  covers       = "Subcommand help text for the full verb surface (lifecycle, pull, vm, container, lab, snapshot, playbook, exec/shell/cp/tail/eventlog/osinfo, script, console, logs, fastpath, template, daemon)."
+  last_checked = "2026-07-19"
+  reflects_version = "main b809708"
 }
 
 // ---- Cross-references to other wskills ----

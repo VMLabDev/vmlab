@@ -1,6 +1,6 @@
 fact vm_agent {
   title    = "Vm: guest agent methods (exec, files, terminal, stats)"
-  related  = [vm_api, exec_result_type]
+  related  = [vm_api, exec_result_type, vmlab_agent]
   audience = :both
   body {
     p <<PROSE

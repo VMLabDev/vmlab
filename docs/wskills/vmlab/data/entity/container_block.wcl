@@ -43,9 +43,11 @@ reachable with `vmlab container exec` / `cp` over the agent channel. The image
 digest resolved at first pull is pinned in lab state (never re-pulled
 implicitly); `vmlab container destroy` or editing `image =` clears the pin.
 Readiness gates on the process starting plus the first passing healthcheck;
-`restart` respawns with backoff on exit. Containers are **not** snapshottable —
-they rebuild from image + volumes. Named volumes survive `down` and
-per-container destroy; lab `destroy` removes them.
+`restart` respawns with backoff on exit. Containers snapshot with **full VM
+parity** — offline and online, standalone or as part of a lab-wide
+`vmlab snapshot` — and volumes ride virtiofs (CIFS fallback), like
+[shares](entity_shares). Named volumes survive `down` and per-container
+destroy; lab `destroy` removes them.
 
 With `mode = :idle`, the root filesystem, volumes, networking and guest agent
 come up without starting the image entrypoint or command. Readiness gates on

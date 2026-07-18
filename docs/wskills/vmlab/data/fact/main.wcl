@@ -8,6 +8,7 @@ import "./key_chords.wcl"
 import "./validate_checks.wcl"
 import "./oci_artifact.wcl"
 import "./segment_subblocks.wcl"
+import "./web_api.wcl"
 
 // Vm host-API method tables
 import "./vm_lifecycle.wcl"

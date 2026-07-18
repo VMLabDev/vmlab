@@ -42,7 +42,7 @@ $ docker run --rm -it --device /dev/kvm --device /dev/net/tun \
 > **Least privilege**
 > No --privileged or host network mode. The eBPF path receives only /dev/net/tun, CAP_BPF, and CAP_NET_ADMIN; it falls back to userspace when unavailable.
 
-Mount the template store (persistent) and the lab directory, grant `/dev/kvm`, and add `/dev/net/tun` plus `CAP_BPF` and `CAP_NET_ADMIN` when eBPF acceleration is wanted. Run a vmlab verb (the command above overrides the default). By default the container serves the web UI (`vmlab-web` on :7878 — see the `docker compose` stack); for CLI use, override the command or drive a running container via `docker exec <ctr> vmlab ...`.
+Mount the template store (persistent) and the lab directory, grant `/dev/kvm`, and add `/dev/net/tun` plus `CAP_BPF` and `CAP_NET_ADMIN` when eBPF acceleration is wanted. Run a vmlab verb (the command above overrides the default). By default the container serves the [web console](../references/concept_web_console.md) ([vmlab-web](../references/entity_vmlab_web.md) on :7878 — see the `docker compose` stack); for CLI use, override the command or drive a running container via `docker exec <ctr> vmlab ...`.
 
 > [!TIP]
 > **Verification**

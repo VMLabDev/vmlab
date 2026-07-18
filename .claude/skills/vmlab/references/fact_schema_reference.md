@@ -283,7 +283,7 @@ disk "formatted" { from = "./payload/" }  // folder copied onto a fresh FAT file
 Example:
 
 ```wcl
-share { host = "./src"  guest = "/mnt/src" }
+share { host = "./src"  guest = "/mnt/src" }         // transport auto: virtiofs, else SMB
 share { host = "~/data" guest = "D:\\data" readonly = true }
 share { host = "./old"  guest = "X:" smb1 = true }   // legacy dialect for XP/2003
 ```
@@ -316,6 +316,12 @@ media { kind = "floppy" from = "./drivers/"  label = "DRV" }
 | Slot | Accepts | Multiple | Description |
 | --- | --- | --- | --- |
 | `auth` | `auth` | no | Credentials the proxy injects so the guest app's own login never prompts |
+
+Example:
+
+```wcl
+web "admin" { port = 8080  path = "/manage" }   // proxied into the web console
+```
 
 ### `container` (in `lab`)
 
@@ -477,6 +483,12 @@ healthcheck {
 | --- | --- | --- | --- |
 | `auth` | `auth` | no | Credentials the proxy injects so the guest app's own login never prompts |
 
+Example:
+
+```wcl
+web "admin" { port = 8080  path = "/manage" }   // proxied into the web console
+```
+
 ### `provision` (in `lab`)
 
 Provision script run during `vmlab up`. Optional vms list scopes
@@ -504,6 +516,13 @@ in declaration order) and runnable on demand via `vmlab playbook check|apply`.
 | `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
 | `play` | `utf8` | yes | Play name inside the playbook to run (required) |
 | `vms` | `list<utf8>` | no | VM/container names this playbook targets; empty/absent = every machine |
+
+Example:
+
+```wcl
+playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
+playbook "playbooks/domain" { play = "member" }   // no vms = every machine
+```
 
 ### `on` (in `lab`)
 
@@ -666,6 +685,13 @@ in declaration order) and runnable on demand via `vmlab playbook check|apply`.
 | `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
 | `play` | `utf8` | yes | Play name inside the playbook to run (required) |
 | `vms` | `list<utf8>` | no | VM/container names this playbook targets; empty/absent = every machine |
+
+Example:
+
+```wcl
+playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
+playbook "playbooks/domain" { play = "member" }   // no vms = every machine
+```
 
 ### `nic` (in `template`)
 

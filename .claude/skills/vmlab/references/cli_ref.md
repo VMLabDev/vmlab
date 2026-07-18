@@ -1,6 +1,6 @@
 # vmlab — CLI reference
 
-The vmlab command-line interface: lab lifecycle, per-VM power, snapshots, guest execution and scripting, console and logs, template builds and OCI distribution, and the daemons.
+The vmlab command-line interface: lab lifecycle, per-VM and per-container control, snapshots, guest execution and scripting, playbooks, console and logs, template builds and OCI distribution, the network fast path, and the daemons.
 
 ## vmlab validate
 
@@ -39,6 +39,18 @@ Graceful stop (guest agent → ACPI → kill). Linked clones are retained.
 vmlab down
 ```
 
+## vmlab pull
+
+Download missing registry templates/images for the lab's machines without starting anything.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| machine… | optional | Optional machines to pull for; omit for all. |
+
+```console
+vmlab pull
+```
+
 ## vmlab destroy
 
 Stop the lab and DELETE its linked clones, lab-local state and dynamic network config. Destructive.
@@ -57,7 +69,7 @@ vmlab status
 
 ## vmlab vm
 
-Per-VM power control.
+Per-VM power control and interaction: power, screenshot, keys/mouse, OCR and image matching.
 
 ### vmlab vm start
 
@@ -97,6 +109,128 @@ Restart a single VM.
 
 ```console
 vmlab vm restart dc01
+```
+
+### vmlab vm destroy
+
+Destroy one VM: stop it and delete its clone (config retained; a later `up` rebuilds it).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+
+```console
+vmlab vm destroy dc01
+```
+
+### vmlab vm screenshot
+
+Capture a running VM's screen to a PNG file.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+| path | required | Output PNG path. |
+
+```console
+vmlab vm screenshot dc01 screen.png
+```
+
+### vmlab vm sendkeys
+
+Send a key chord (see the key-chord reference).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+| chord | required | Chord, e.g. `ctrl-alt-delete`. |
+
+```console
+vmlab vm sendkeys dc01 ctrl-alt-delete
+```
+
+### vmlab vm mouse-move
+
+Move the mouse pointer to absolute screen coordinates.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+| x | required | X coordinate. |
+| y | required | Y coordinate. |
+
+```console
+vmlab vm mouse-move dc01 640 400
+```
+
+### vmlab vm click
+
+Click a mouse button, optionally first moving to x,y (omit to click at the current position).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+| x | optional | Move here first (optional). |
+| y | optional | Move here first (optional). |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --button | left\|right\|middle | Button to click (default left). |
+
+```console
+vmlab vm click dc01 640 400
+vmlab vm click dc01 --button right
+```
+
+### vmlab vm drag
+
+Press, drag from x1,y1 to x2,y2, and release the left button.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+| x1 | required | Start X. |
+| y1 | required | Start Y. |
+| x2 | required | End X. |
+| y2 | required | End Y. |
+
+```console
+vmlab vm drag dc01 100 100 400 300
+```
+
+### vmlab vm ocr
+
+OCR the VM's screen (optionally a region) and print the recognised text.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --region | X Y W H | Restrict to a region (four values). |
+
+```console
+vmlab vm ocr dc01
+vmlab vm ocr dc01 --region 0 0 800 100
+```
+
+### vmlab vm find-image
+
+Search the screen for a template image; prints match coordinates.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+| image | required | Template image path (PNG/PPM). |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --threshold | 0.0–1.0 | Match threshold (default 0.9). |
+| --region | X Y W H | Restrict the search to a region (four values). |
+
+```console
+vmlab vm find-image dc01 ok-button.png
 ```
 
 ## vmlab container
@@ -213,13 +347,69 @@ Attach an interactive shell inside the container's PID namespace (the workload i
 vmlab container shell web
 ```
 
+## vmlab lab
+
+Manage running labs host-wide, by name (not the cwd's lab).
+
+### vmlab lab list
+
+List every tracked lab: name, state, and directory.
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --json | — | Emit a JSON array instead of a table. |
+
+```console
+vmlab lab list
+```
+
+### vmlab lab info
+
+Detailed status (VMs and segments) of a running lab.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| lab | required | Lab name. |
+
+```console
+vmlab lab info ad-demo
+```
+
+### vmlab lab stop
+
+Gracefully stop a running lab; clones retained.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| lab | required | Lab name. |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --force | — | Hard kill instead of the graceful ladder. |
+
+```console
+vmlab lab stop ad-demo
+```
+
+### vmlab lab destroy
+
+Stop a lab and DELETE its clones and local state. Destructive.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| lab | required | Lab name. |
+
+```console
+vmlab lab destroy ad-demo
+```
+
 ## vmlab snapshot
 
-Online (running: disk+RAM+device state) or offline (powered off: disk only) snapshots, per current power state. Restoring an online snapshot resumes running.
+Online (running: disk+RAM+device state) or offline (powered off: disk only) snapshots, per current power state. Restoring an online snapshot resumes running. Containers snapshot identically to VMs.
 
 ### vmlab snapshot create
 
-Create a snapshot. Omitting --vm snapshots every VM in the lab (best-effort, not coordinated).
+Create a snapshot. Omitting --vm snapshots every VM and container in the lab (best-effort, not coordinated).
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -272,6 +462,52 @@ Delete a VM's snapshot.
 
 ```console
 vmlab snapshot delete dc01 clean
+```
+
+## vmlab playbook
+
+Run config-weave playbooks (declared with `playbook {}` blocks) against lab machines. Exit codes mirror config-weave: 0 ok, 1 step error, 2 validation, 3 reboot still required after bounded retries.
+
+### vmlab playbook list
+
+List the lab's playbook declarations and any in-flight runs.
+
+```console
+vmlab playbook list
+```
+
+### vmlab playbook check
+
+Report drift without changing the guest (re-pushes the playbook first).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| machine | required | Machine (\[lab/\]name — VM or container). |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --playbook | PATH | Playbook folder, when several target this machine. |
+| --play | NAME | Play name, when several target this machine. |
+
+```console
+vmlab playbook check dc01
+```
+
+### vmlab playbook apply
+
+Push the playbook and converge the guest (auto-reboots when a step demands it).
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| machine | required | Machine (\[lab/\]name — VM or container). |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --playbook | PATH | Playbook folder, when several target this machine. |
+| --play | NAME | Play name, when several target this machine. |
+
+```console
+vmlab playbook apply dc01
 ```
 
 ## vmlab exec
@@ -343,6 +579,18 @@ vmlab eventlog dc01
 vmlab eventlog dc01 --filter "*[System[(EventID=4624)]]"
 ```
 
+## vmlab osinfo
+
+Print guest OS information (guest-get-osinfo) as JSON.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| vm | required | VM name. |
+
+```console
+vmlab osinfo dc01
+```
+
 ## vmlab script
 
 Run an ad-hoc wscript script against the running lab (entry point `fn main(lab: Lab)`).
@@ -405,6 +653,7 @@ Build the template {} blocks in a file (default ./vmlab.wcl). Name one to build 
 | Switch | Value | Description |
 | --- | --- | --- |
 | -f, --file | FILE | WCL file containing the template {} blocks (default ./vmlab.wcl). |
+| --version | VER | Pin an explicit version instead of auto-incrementing (single target only). |
 
 ```console
 vmlab template build
@@ -418,9 +667,11 @@ List templates in the store.
 | Switch | Value | Description |
 | --- | --- | --- |
 | --json | — | Emit the full metadata array (ref, sizes in bytes, RFC 3339 created). |
+| --remote | — | Also check each template's registry: adds a REMOTE column (yes/no/local). Needs network access. |
 
 ```console
 vmlab template list --json
+vmlab template list --remote
 ```
 
 ### vmlab template rm
@@ -437,6 +688,25 @@ Remove a template from the store. The exact version is required.
 
 ```console
 vmlab template rm x86_64/linux-modern@1.0
+```
+
+### vmlab template clean
+
+Prune superseded builds, keeping the latest per template. Dry-run unless --yes; builds still backing a clone are skipped unless --force.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| filter | optional | Limit to a family: `<arch>/<name>`, `<arch>/`, or `<name>`. Default: every template. |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --keep | N | Most-recent builds to keep per template (default 1). |
+| -y, --yes | — | Actually delete; without it, only prints what would be removed. |
+| --force | — | Also remove builds that still back existing clones. |
+
+```console
+vmlab template clean            # dry run
+vmlab template clean x86_64/linux-modern --yes
 ```
 
 ### vmlab template export
@@ -481,6 +751,7 @@ Search the configured OCI registries. Uses VM registries by default; --kind cont
 | --registry | NAMESPACE | Search only this namespace instead of shared registry settings. |
 | --arch | ARCH | Only return artifacts supporting this architecture. |
 | --kind | vm\|container | Artifact kind to search (default vm). |
+| --json | — | Emit a JSON array instead of a table. |
 
 ```console
 vmlab template search alpine --arch x86_64
@@ -510,12 +781,17 @@ vmlab template login ghcr.io -u myuser -p <token>
 
 ### vmlab template push
 
-Push a stored template to a registry as an OCI artifact (chunked, multi-arch capable).
+Push a stored template to a registry as an OCI artifact (chunked, multi-arch capable). Moves the `latest` tag (or `latest-prerelease` with --prerelease) and links the package to a source repo.
 
 | Argument | Required | Description |
 | --- | --- | --- |
 | <arch>/<name>\[@<ver>\] | required | Local store ref. |
-| registry/repo:tag | required | Remote registry ref. |
+| registry/repo:tag | optional | Remote registry ref; defaults to the template's own `registry` field. |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --source | URL | Source repository URL to link the package to (default: the cwd's git origin when it resolves to a web URL). |
+| --prerelease | — | Publish as a pre-release: move `latest-prerelease` instead of `latest`. |
 
 ```console
 vmlab template push x86_64/linux-modern@1.0 ghcr.io/owner/linux-modern:1.0
@@ -532,9 +808,18 @@ Pull a template from a registry into the store. --arch is required for multi-arc
 | Switch | Value | Description |
 | --- | --- | --- |
 | --arch | ARCH | Required when the remote is a multi-arch index. |
+| --overwrite | — | Overwrite an existing version in the store. |
 
 ```console
 vmlab template pull ghcr.io/owner/linux-modern:1.0 --arch x86_64
+```
+
+## vmlab fastpath
+
+Show which network fast-path tier is active (userspace / afxdp / sockmap) — and why the others are not.
+
+```console
+vmlab fastpath
 ```
 
 ## vmlab daemon

@@ -12,6 +12,12 @@ import "./template_block.wcl"
 import "./template_sources.wcl"
 import "./provision_block.wcl"
 import "./on_handler.wcl"
+import "./web_block.wcl"
+import "./playbook_block.wcl"
+
+// Tools & agents
+import "./vmlab_web.wcl"
+import "./vmlab_agent.wcl"
 
 // On-disk artifacts
 import "./vmlab_wcl.wcl"

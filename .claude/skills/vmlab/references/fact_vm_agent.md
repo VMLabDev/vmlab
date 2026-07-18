@@ -52,4 +52,6 @@ lab.log("cpu " + s.cpu_pct + "%, mem " + s.mem_used + "/" + s.mem_total)
 
 - [ExecResult](../references/entity_exec_result_type.md)
 
+- [vmlab-agent](../references/entity_vmlab_agent.md)
+
 [← Back to SKILL.md](../SKILL.md)

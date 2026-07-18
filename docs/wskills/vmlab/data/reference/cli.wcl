@@ -8,7 +8,7 @@
 cli vmlab_cli {
   name        = "vmlab"
   version     = "1.0"
-  description = "The vmlab command-line interface: lab lifecycle, per-VM power, snapshots, guest execution and scripting, console and logs, template builds and OCI distribution, and the daemons."
+  description = "The vmlab command-line interface: lab lifecycle, per-VM and per-container control, snapshots, guest execution and scripting, playbooks, console and logs, template builds and OCI distribution, the network fast path, and the daemons."
   audience    = :both
 
   // ---- Lab lifecycle ----
@@ -34,6 +34,13 @@ cli vmlab_cli {
     code_example { lang = "console"  code = "vmlab down" }
   }
 
+  subcommand c_pull {
+    name = "pull"
+    description = "Download missing registry templates/images for the lab's machines without starting anything."
+    cli_arg a_pull_machines { name = "machine"  description = "Optional machines to pull for; omit for all."  required = false  variadic = true }
+    code_example { lang = "console"  code = "vmlab pull" }
+  }
+
   subcommand c_destroy {
     name = "destroy"
     description = "Stop the lab and DELETE its linked clones, lab-local state and dynamic network config. Destructive."
@@ -50,7 +57,7 @@ cli vmlab_cli {
 
   subcommand c_vm {
     name = "vm"
-    description = "Per-VM power control."
+    description = "Per-VM power control and interaction: power, screenshot, keys/mouse, OCR and image matching."
     subcommand c_vm_start {
       name = "start"
       description = "Start a single VM."
@@ -69,6 +76,69 @@ cli vmlab_cli {
       description = "Restart a single VM."
       cli_arg a_vm_restart { name = "vm"  description = "VM name." }
       code_example { lang = "console"  code = "vmlab vm restart dc01" }
+    }
+    subcommand c_vm_destroy {
+      name = "destroy"
+      description = "Destroy one VM: stop it and delete its clone (config retained; a later `up` rebuilds it)."
+      cli_arg a_vm_destroy { name = "vm"  description = "VM name." }
+      code_example { lang = "console"  code = "vmlab vm destroy dc01" }
+    }
+    subcommand c_vm_screenshot {
+      name = "screenshot"
+      description = "Capture a running VM's screen to a PNG file."
+      cli_arg a_vm_shot     { name = "vm"    description = "VM name." }
+      cli_arg a_vm_shot_out { name = "path"  description = "Output PNG path." }
+      code_example { lang = "console"  code = "vmlab vm screenshot dc01 screen.png" }
+    }
+    subcommand c_vm_sendkeys {
+      name = "sendkeys"
+      description = "Send a key chord (see the key-chord reference)."
+      cli_arg a_vm_keys       { name = "vm"     description = "VM name." }
+      cli_arg a_vm_keys_chord { name = "chord"  description = "Chord, e.g. `ctrl-alt-delete`." }
+      code_example { lang = "console"  code = "vmlab vm sendkeys dc01 ctrl-alt-delete" }
+    }
+    subcommand c_vm_mouse_move {
+      name = "mouse-move"
+      description = "Move the mouse pointer to absolute screen coordinates."
+      cli_arg a_vm_mm   { name = "vm"  description = "VM name." }
+      cli_arg a_vm_mm_x { name = "x"   description = "X coordinate." }
+      cli_arg a_vm_mm_y { name = "y"   description = "Y coordinate." }
+      code_example { lang = "console"  code = "vmlab vm mouse-move dc01 640 400" }
+    }
+    subcommand c_vm_click {
+      name = "click"
+      description = "Click a mouse button, optionally first moving to x,y (omit to click at the current position)."
+      cli_arg a_vm_click   { name = "vm"  description = "VM name." }
+      cli_arg a_vm_click_x { name = "x"   description = "Move here first (optional)."  required = false }
+      cli_arg a_vm_click_y { name = "y"   description = "Move here first (optional)."  required = false }
+      cli_switch s_vm_click_button { long = "--button"  value_name = "left|right|middle"  description = "Button to click (default left)." }
+      code_example { lang = "console"  code = "vmlab vm click dc01 640 400\nvmlab vm click dc01 --button right" }
+    }
+    subcommand c_vm_drag {
+      name = "drag"
+      description = "Press, drag from x1,y1 to x2,y2, and release the left button."
+      cli_arg a_vm_drag    { name = "vm"  description = "VM name." }
+      cli_arg a_vm_drag_x1 { name = "x1"  description = "Start X." }
+      cli_arg a_vm_drag_y1 { name = "y1"  description = "Start Y." }
+      cli_arg a_vm_drag_x2 { name = "x2"  description = "End X." }
+      cli_arg a_vm_drag_y2 { name = "y2"  description = "End Y." }
+      code_example { lang = "console"  code = "vmlab vm drag dc01 100 100 400 300" }
+    }
+    subcommand c_vm_ocr {
+      name = "ocr"
+      description = "OCR the VM's screen (optionally a region) and print the recognised text."
+      cli_arg a_vm_ocr { name = "vm"  description = "VM name." }
+      cli_switch s_vm_ocr_region { long = "--region"  value_name = "X Y W H"  description = "Restrict to a region (four values)." }
+      code_example { lang = "console"  code = "vmlab vm ocr dc01\nvmlab vm ocr dc01 --region 0 0 800 100" }
+    }
+    subcommand c_vm_find_image {
+      name = "find-image"
+      description = "Search the screen for a template image; prints match coordinates."
+      cli_arg a_vm_fi     { name = "vm"     description = "VM name." }
+      cli_arg a_vm_fi_img { name = "image"  description = "Template image path (PNG/PPM)." }
+      cli_switch s_vm_fi_threshold { long = "--threshold"  value_name = "0.0–1.0"  description = "Match threshold (default 0.9)." }
+      cli_switch s_vm_fi_region    { long = "--region"  value_name = "X Y W H"  description = "Restrict the search to a region (four values)." }
+      code_example { lang = "console"  code = "vmlab vm find-image dc01 ok-button.png" }
     }
   }
 
@@ -132,14 +202,46 @@ cli vmlab_cli {
     }
   }
 
+  // ---- Running labs (host-wide) ----
+
+  subcommand c_lab {
+    name = "lab"
+    description = "Manage running labs host-wide, by name (not the cwd's lab)."
+    subcommand c_lab_list {
+      name = "list"
+      description = "List every tracked lab: name, state, and directory."
+      cli_switch s_lab_list_json { long = "--json"  description = "Emit a JSON array instead of a table." }
+      code_example { lang = "console"  code = "vmlab lab list" }
+    }
+    subcommand c_lab_info {
+      name = "info"
+      description = "Detailed status (VMs and segments) of a running lab."
+      cli_arg a_lab_info { name = "lab"  description = "Lab name." }
+      code_example { lang = "console"  code = "vmlab lab info ad-demo" }
+    }
+    subcommand c_lab_stop {
+      name = "stop"
+      description = "Gracefully stop a running lab; clones retained."
+      cli_arg a_lab_stop { name = "lab"  description = "Lab name." }
+      cli_switch s_lab_stop_force { long = "--force"  description = "Hard kill instead of the graceful ladder." }
+      code_example { lang = "console"  code = "vmlab lab stop ad-demo" }
+    }
+    subcommand c_lab_destroy {
+      name = "destroy"
+      description = "Stop a lab and DELETE its clones and local state. Destructive."
+      cli_arg a_lab_destroy { name = "lab"  description = "Lab name." }
+      code_example { lang = "console"  code = "vmlab lab destroy ad-demo" }
+    }
+  }
+
   // ---- Snapshots ----
 
   subcommand c_snapshot {
     name = "snapshot"
-    description = "Online (running: disk+RAM+device state) or offline (powered off: disk only) snapshots, per current power state. Restoring an online snapshot resumes running."
+    description = "Online (running: disk+RAM+device state) or offline (powered off: disk only) snapshots, per current power state. Restoring an online snapshot resumes running. Containers snapshot identically to VMs."
     subcommand c_snap_create {
       name = "create"
-      description = "Create a snapshot. Omitting --vm snapshots every VM in the lab (best-effort, not coordinated)."
+      description = "Create a snapshot. Omitting --vm snapshots every VM and container in the lab (best-effort, not coordinated)."
       cli_arg a_snap_create_name { name = "name"  description = "Snapshot name." }
       cli_switch s_snap_create_vm { long = "--vm"  value_name = "VM"  description = "Target a single VM; omit for the whole lab." }
       code_example { lang = "console"  code = "vmlab snapshot create clean --vm dc01" }
@@ -163,6 +265,34 @@ cli vmlab_cli {
       cli_arg a_snap_del_vm   { name = "vm"    description = "VM name." }
       cli_arg a_snap_del_name { name = "name"  description = "Snapshot name." }
       code_example { lang = "console"  code = "vmlab snapshot delete dc01 clean" }
+    }
+  }
+
+  // ---- Playbooks (config-weave) ----
+
+  subcommand c_playbook {
+    name = "playbook"
+    description = "Run config-weave playbooks (declared with `playbook {}` blocks) against lab machines. Exit codes mirror config-weave: 0 ok, 1 step error, 2 validation, 3 reboot still required after bounded retries."
+    subcommand c_pb_list {
+      name = "list"
+      description = "List the lab's playbook declarations and any in-flight runs."
+      code_example { lang = "console"  code = "vmlab playbook list" }
+    }
+    subcommand c_pb_check {
+      name = "check"
+      description = "Report drift without changing the guest (re-pushes the playbook first)."
+      cli_arg a_pb_check { name = "machine"  description = "Machine ([lab/]name — VM or container)." }
+      cli_switch s_pb_check_playbook { long = "--playbook"  value_name = "PATH"  description = "Playbook folder, when several target this machine." }
+      cli_switch s_pb_check_play     { long = "--play"      value_name = "NAME"  description = "Play name, when several target this machine." }
+      code_example { lang = "console"  code = "vmlab playbook check dc01" }
+    }
+    subcommand c_pb_apply {
+      name = "apply"
+      description = "Push the playbook and converge the guest (auto-reboots when a step demands it)."
+      cli_arg a_pb_apply { name = "machine"  description = "Machine ([lab/]name — VM or container)." }
+      cli_switch s_pb_apply_playbook { long = "--playbook"  value_name = "PATH"  description = "Playbook folder, when several target this machine." }
+      cli_switch s_pb_apply_play     { long = "--play"      value_name = "NAME"  description = "Play name, when several target this machine." }
+      code_example { lang = "console"  code = "vmlab playbook apply dc01" }
     }
   }
 
@@ -207,6 +337,13 @@ cli vmlab_cli {
     code_example { lang = "console"  code = "vmlab eventlog dc01\nvmlab eventlog dc01 --filter \"*[System[(EventID=4624)]]\"" }
   }
 
+  subcommand c_osinfo {
+    name = "osinfo"
+    description = "Print guest OS information (guest-get-osinfo) as JSON."
+    cli_arg a_osinfo_vm { name = "vm"  description = "VM name." }
+    code_example { lang = "console"  code = "vmlab osinfo dc01" }
+  }
+
   subcommand c_script {
     name = "script"
     description = "Run an ad-hoc wscript script against the running lab (entry point `fn main(lab: Lab)`)."
@@ -243,13 +380,15 @@ cli vmlab_cli {
       description = "Build the template {} blocks in a file (default ./vmlab.wcl). Name one to build just it."
       cli_arg a_tpl_build_name { name = "name"  description = "A single template to build; omit to build all."  required = false }
       cli_switch s_tpl_build_file { long = "--file"  short = "-f"  value_name = "FILE"  description = "WCL file containing the template {} blocks (default ./vmlab.wcl)." }
+      cli_switch s_tpl_build_version { long = "--version"  value_name = "VER"  description = "Pin an explicit version instead of auto-incrementing (single target only)." }
       code_example { lang = "console"  code = "vmlab template build\nvmlab template build -f templates.wcl linux-modern" }
     }
     subcommand c_tpl_list {
       name = "list"
       description = "List templates in the store."
       cli_switch s_tpl_list_json { long = "--json"  description = "Emit the full metadata array (ref, sizes in bytes, RFC 3339 created)." }
-      code_example { lang = "console"  code = "vmlab template list --json" }
+      cli_switch s_tpl_list_remote { long = "--remote"  description = "Also check each template's registry: adds a REMOTE column (yes/no/local). Needs network access." }
+      code_example { lang = "console"  code = "vmlab template list --json\nvmlab template list --remote" }
     }
     subcommand c_tpl_rm {
       name = "rm"
@@ -257,6 +396,15 @@ cli vmlab_cli {
       cli_arg a_tpl_rm_ref { name = "<arch>/<name>@<version>"  description = "Exact store ref including version." }
       cli_switch s_tpl_rm_force { long = "--force"  description = "Remove even if linked clones back it." }
       code_example { lang = "console"  code = "vmlab template rm x86_64/linux-modern@1.0" }
+    }
+    subcommand c_tpl_clean {
+      name = "clean"
+      description = "Prune superseded builds, keeping the latest per template. Dry-run unless --yes; builds still backing a clone are skipped unless --force."
+      cli_arg a_tpl_clean_filter { name = "filter"  description = "Limit to a family: `<arch>/<name>`, `<arch>/`, or `<name>`. Default: every template."  required = false }
+      cli_switch s_tpl_clean_keep  { long = "--keep"  value_name = "N"  description = "Most-recent builds to keep per template (default 1)." }
+      cli_switch s_tpl_clean_yes   { long = "--yes"  short = "-y"  description = "Actually delete; without it, only prints what would be removed." }
+      cli_switch s_tpl_clean_force { long = "--force"  description = "Also remove builds that still back existing clones." }
+      code_example { lang = "console"  code = "vmlab template clean            # dry run\nvmlab template clean x86_64/linux-modern --yes" }
     }
     subcommand c_tpl_export {
       name = "export"
@@ -279,6 +427,7 @@ cli vmlab_cli {
       cli_switch s_tpl_search_registry { long = "--registry"  value_name = "NAMESPACE"  description = "Search only this namespace instead of shared registry settings." }
       cli_switch s_tpl_search_arch { long = "--arch"  value_name = "ARCH"  description = "Only return artifacts supporting this architecture." }
       cli_switch s_tpl_search_kind { long = "--kind"  value_name = "vm|container"  description = "Artifact kind to search (default vm)." }
+      cli_switch s_tpl_search_json { long = "--json"  description = "Emit a JSON array instead of a table." }
       code_example { lang = "console"  code = "vmlab template search alpine --arch x86_64\nvmlab template search nginx --kind container" }
     }
     subcommand c_tpl_registry {
@@ -298,9 +447,11 @@ cli vmlab_cli {
     }
     subcommand c_tpl_push {
       name = "push"
-      description = "Push a stored template to a registry as an OCI artifact (chunked, multi-arch capable)."
+      description = "Push a stored template to a registry as an OCI artifact (chunked, multi-arch capable). Moves the `latest` tag (or `latest-prerelease` with --prerelease) and links the package to a source repo."
       cli_arg a_tpl_push_local  { name = "<arch>/<name>[@<ver>]"  description = "Local store ref." }
-      cli_arg a_tpl_push_remote { name = "registry/repo:tag"  description = "Remote registry ref." }
+      cli_arg a_tpl_push_remote { name = "registry/repo:tag"  description = "Remote registry ref; defaults to the template's own `registry` field."  required = false }
+      cli_switch s_tpl_push_source { long = "--source"  value_name = "URL"  description = "Source repository URL to link the package to (default: the cwd's git origin when it resolves to a web URL)." }
+      cli_switch s_tpl_push_prerelease { long = "--prerelease"  description = "Publish as a pre-release: move `latest-prerelease` instead of `latest`." }
       code_example { lang = "console"  code = "vmlab template push x86_64/linux-modern@1.0 ghcr.io/owner/linux-modern:1.0" }
     }
     subcommand c_tpl_pull {
@@ -308,8 +459,17 @@ cli vmlab_cli {
       description = "Pull a template from a registry into the store. --arch is required for multi-arch indexes."
       cli_arg a_tpl_pull_remote { name = "registry/repo:tag"  description = "Remote registry ref." }
       cli_switch s_tpl_pull_arch { long = "--arch"  value_name = "ARCH"  description = "Required when the remote is a multi-arch index." }
+      cli_switch s_tpl_pull_overwrite { long = "--overwrite"  description = "Overwrite an existing version in the store." }
       code_example { lang = "console"  code = "vmlab template pull ghcr.io/owner/linux-modern:1.0 --arch x86_64" }
     }
+  }
+
+  // ---- Network fast path ----
+
+  subcommand c_fastpath {
+    name = "fastpath"
+    description = "Show which network fast-path tier is active (userspace / afxdp / sockmap) — and why the others are not."
+    code_example { lang = "console"  code = "vmlab fastpath" }
   }
 
   // ---- Daemon (normally automatic) ----

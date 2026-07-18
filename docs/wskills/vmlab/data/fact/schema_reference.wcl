@@ -143,13 +143,30 @@ healthcheck {
 }
 WCL
 
+let ex_web = <<'WCL'
+web "admin" { port = 8080  path = "/manage" }   // proxied into the web console
+WCL
+
+let ex_auth = <<'WCL'
+auth { method = :basic  username = "admin" password = "s3cret" }
+auth { method = :bearer token = "eyJ…" }
+auth { method = :ntlm   username = "Administrator" password = "…" domain = "CORP" }
+auth { method = :form   username = "admin" password = "…"
+       login_path = "/login" login_body = "user={user}&pass={pass}" }
+WCL
+
+let ex_playbook = <<'WCL'
+playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
+playbook "playbooks/domain" { play = "member" }   // no vms = every machine
+WCL
+
 let ex_disk = <<'WCL'
 disk "data"      { size = 10GiB }         // extra blank disk
 disk "formatted" { from = "./payload/" }  // folder copied onto a fresh FAT filesystem
 WCL
 
 let ex_share = <<'WCL'
-share { host = "./src"  guest = "/mnt/src" }
+share { host = "./src"  guest = "/mnt/src" }         // transport auto: virtiofs, else SMB
 share { host = "~/data" guest = "D:\\data" readonly = true }
 share { host = "./old"  guest = "X:" smb1 = true }   // legacy dialect for XP/2003
 WCL
@@ -224,6 +241,9 @@ let example_for = fn(k: utf8) -> list<utf8> {
     "volume"      => [ex_volume],
     "port"        => [ex_port],
     "healthcheck" => [ex_healthcheck],
+    "web"       => [ex_web],
+    "auth"      => [ex_auth],
+    "playbook"  => [ex_playbook],
     "disk"      => [ex_disk],
     "share"     => [ex_share],
     "media"     => [ex_media],

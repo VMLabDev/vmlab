@@ -112,3 +112,48 @@ term g_vmlab_agent {
   aliases    = ["agent channel"]
   audience   = :both
 }
+
+term g_micro_vm {
+  term       = "micro-VM"
+  definition = "The tiny VM (pinned Alpine kernel + vmlab's purpose-built init) that each `container {}` runs inside, making an OCI container just another lab machine — same segments, DNS, snapshots and agent channel as full VMs (PRD §18)."
+  audience   = :both
+}
+
+term g_playbook {
+  term       = "playbook"
+  definition = "A config-weave configuration folder bound to lab machines (or a template build) with a `playbook {}` block. Applied on `vmlab up` interleaved with provisions, re-run with `vmlab playbook check|apply` or the web console's Playbook tab."
+  aliases    = ["config-weave playbook"]
+  audience   = :both
+}
+
+term g_config_weave {
+  term       = "config-weave"
+  definition = "The declarative guest-configuration system vmlab integrates for playbooks: plays converge package installs, files and services with drift detection, idempotent re-runs and automatic reboots."
+  audience   = :both
+}
+
+term g_web_console {
+  term       = "web console"
+  definition = "The browser UI served by `vmlab-web`: lab overview, visual designer, Files/Logs editors, per-machine consoles and terminals, template builds, playbooks, and proxied guest web pages."
+  aliases    = ["vmlab-web", "console UI"]
+  audience   = :both
+}
+
+term g_web_page {
+  term       = "web page (guest)"
+  definition = "An HTTP UI served inside a guest and declared with a `web {}` block; the web console proxies it into a same-origin iframe tab, injecting the guest app's login from the block's `auth {}`."
+  audience   = :both
+}
+
+term g_fastpath {
+  term       = "fast path"
+  definition = "Optional eBPF network acceleration above the userspace switch: the afxdp tier (chosen by `auto`) and the explicit-only sockmap tier. Probed at daemon startup; any failure falls back to userspace. `vmlab fastpath` shows the active tier."
+  aliases    = ["eBPF fast path"]
+  audience   = :both
+}
+
+term g_virtiofs {
+  term       = "virtiofs"
+  definition = "The shared-filesystem transport (vhost-user-fs) that `share {}` blocks and container volumes ride by default — no guest networking, snapshot-safe; SMB/CIFS is the fallback transport."
+  audience   = :both
+}
