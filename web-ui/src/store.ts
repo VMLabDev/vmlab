@@ -444,7 +444,8 @@ export async function reloadLab(): Promise<void> {
 // --- destroy fx session (armed only by destroyLab; never by stop-all) ------
 
 // While a session is armed, each machine's power-off shatters its topology
-// node into particles that reform (the lab definition survives a destroy).
+// node into particles, then fades it back in (the lab definition survives
+// a destroy).
 let destroyFx: { lab: string; fired: Set<string>; timer: number } | null = null;
 
 function fireDestroyFx(key: string) {

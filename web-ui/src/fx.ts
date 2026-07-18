@@ -15,7 +15,7 @@ export function registerFxNode(key: string, el: Element): () => void {
   };
 }
 
-/** Destroy feedback: shatter the node and let the particles reform it.
+/** Destroy feedback: shatter the node, then fade it back in.
  *  Fire-and-forget; skips silently when the canvas isn't showing the node. */
 export function playDestroyRecreate(key: string): void {
   const el = nodes.get(key);
@@ -31,5 +31,6 @@ export function playDestroyRecreate(key: string): void {
     duration: 550,
     holdMs: 150,
     particleSize: 3,
+    reappear: "fade",
   });
 }
