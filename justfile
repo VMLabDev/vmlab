@@ -258,10 +258,10 @@ peer-demo-stop:
 compose-up:
 	docker compose up --build
 
-# Rebuild the runtime image from the current tree (host + guest asset) and (re)start the stack detached; follow with `docker compose logs -f`
+# Stop the stack, rebuild the runtime image from the current tree (host + guest asset), and start it detached; follow with `docker compose logs -f`
 [group('web')]
-compose-rebuild:
-	docker compose up -d --build --force-recreate
+compose-rebuild: compose-down
+	docker compose up -d --build
 	@echo "web UI: http://localhost:7878"
 
 # Stop and remove the Docker web UI stack
