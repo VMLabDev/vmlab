@@ -28,10 +28,10 @@ index ix_architecture {
 index ix_labs {
   name     = "Labs & networking"
   summary  = "Declare machines and the virtual networks that connect them."
-  related  = [labs, vms, nic_block, shares, media, networking, segment_block, segment_subblocks]
+  related  = [labs, vms, container_block, nic_block, shares, media, networking, segment_block, segment_subblocks]
   audience = :both
   body {
-    p "The `vmlab.wcl` topology surface: the lab and VM blocks, shared folders and media, then the network fabric — segments, DHCP/DNS, routing, NAT and traffic rules."
+    p "The `vmlab.wcl` topology surface: the lab, VM and container blocks, shared folders and media, then the network fabric — segments, DHCP/DNS, routing, NAT and traffic rules."
   }
 }
 

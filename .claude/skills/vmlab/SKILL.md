@@ -88,10 +88,11 @@ The big picture first, then the daemon model and the on-disk layout — machine-
 
 _Declare machines and the virtual networks that connect them._
 
-The `vmlab.wcl` topology surface: the lab and VM blocks, shared folders and media, then the network fabric — segments, DHCP/DNS, routing, NAT and traffic rules.
+The `vmlab.wcl` topology surface: the lab, VM and container blocks, shared folders and media, then the network fabric — segments, DHCP/DNS, routing, NAT and traffic rules.
 
 - [lab {} block](references/entity_labs.md)
 - [vm {} block](references/entity_vms.md)
+- [container {} block](references/entity_container_block.md)
 - [nic {} block](references/entity_nic_block.md)
 - [share {} block](references/entity_shares.md)
 - [media {} block](references/entity_media.md)
