@@ -3426,8 +3426,8 @@ export default function TopologyCanvas(props: {
           {/* config-weave playbook nodes: same lab-owned workflow shape as
               provisions — a folder + play applied to targeted machines
               (empty scope = ALL MACHINES). The pencil opens the playbook
-              folder editor; unlike provision scripts, playbook files stay
-              editable while machines run (the edit→check dev loop). */}
+              in the Files tab; unlike provision scripts, playbook files
+              stay editable while machines run (the edit→check dev loop). */}
           <For each={model().playbooks}>
             {(playbook, index) => {
               const p = () => playbookPos(index());
@@ -3480,7 +3480,7 @@ export default function TopologyCanvas(props: {
                   >
                     <rect width="20" height="20" rx="5" />
                     <g transform="translate(4 4)"><FilePenLine size={12} /></g>
-                    <title>Open the playbook folder editor</title>
+                    <title>Edit the playbook in the Files tab</title>
                   </g>
                   <g
                     class="topo-playbook-port"

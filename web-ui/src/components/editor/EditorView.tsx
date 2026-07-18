@@ -8,10 +8,10 @@ import { Alert, Button, Empty, Spinner, SplitPane } from "@forge/ui";
 import {
   anyVmRunning,
   reloadLab as reloadCurrentLab,
-  showPlaybook,
   showToast,
   state,
 } from "../../store";
+import { editPlaybook } from "../FilesView";
 import {
   editor,
   addPlaybook,
@@ -172,11 +172,14 @@ export default function EditorView(props: { onEditConfig: () => void }) {
                 onAddProvision={() => void addProvisionNode()}
                 onEditProvision={setEditingScript}
                 onAddPlaybook={addPlaybookNode}
-                onEditPlaybook={showPlaybook}
+                onEditPlaybook={(p) => void editPlaybook(p)}
               />
             }
             second={
-              <Inspector onEditProvision={setEditingScript} onEditPlaybook={showPlaybook} />
+              <Inspector
+                onEditProvision={setEditingScript}
+                onEditPlaybook={(p) => void editPlaybook(p)}
+              />
             }
             initial={Math.max(480, window.innerWidth - 720)}
             min={320}

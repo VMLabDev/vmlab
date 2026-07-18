@@ -16,9 +16,9 @@ import {
   containerStop,
   currentPullFor,
   playbooksFor,
-  showPlaybook,
   state,
 } from "../store";
+import { canEditPlaybook, editPlaybook } from "./FilesView";
 import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
 import MachinePullStatus from "./MachinePullStatus";
@@ -171,11 +171,13 @@ export default function ContainerView() {
                       style={{ display: "inline-flex", gap: "6px", "align-items": "center" }}
                     >
                       {pb.play}
-                      <IconButton
-                        icon={SquarePen}
-                        label={`Edit ${pb.path}`}
-                        onClick={() => showPlaybook(pb.path)}
-                      />
+                      <Show when={canEditPlaybook(pb.path)}>
+                        <IconButton
+                          icon={SquarePen}
+                          label={`Edit ${pb.path}`}
+                          onClick={() => void editPlaybook(pb.path)}
+                        />
+                      </Show>
                     </span>
                   </div>
                 )}

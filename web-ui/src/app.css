@@ -250,6 +250,20 @@
   font-size: var(--fs-sm);
 }
 .file-tree-row { display: flex; align-items: center; gap: var(--sp-1); }
+.file-tree-actions { display: inline-flex; gap: 2px; margin-left: auto; }
+
+/* config-weave package modals (search picker + repo manager) */
+.pkg-search-form { display: flex; gap: var(--sp-2); align-items: flex-end; }
+.pkg-search-form > :first-child { flex: 1; }
+.pkg-hits { display: flex; flex-direction: column; gap: var(--sp-1); max-height: 50vh; overflow-y: auto; }
+.pkg-hit { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) 0; }
+.pkg-hit-name { font-weight: 600; white-space: nowrap; }
+.pkg-hit-desc { flex: 1; color: var(--fg-muted, inherit); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pkg-repos { display: flex; flex-direction: column; gap: var(--sp-1); }
+.pkg-repo { display: flex; align-items: center; gap: var(--sp-2); }
+.pkg-repo-name { font-weight: 600; white-space: nowrap; }
+.pkg-repo-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-muted, inherit); }
+.pkg-repo-add { display: grid; grid-template-columns: 1fr 2fr 1fr 1fr auto; gap: var(--sp-2); align-items: end; }
 .file-tree-root {
   color: var(--fg-3); font: 700 10px/1 var(--font-mono);
   letter-spacing: 0.08em; text-transform: uppercase;

@@ -309,60 +309,58 @@ export const runPlaybook = (
     `/api/labs/${encodeURIComponent(lab)}/${kind}/${encodeURIComponent(machine)}/playbook/${action}`,
     { path, play },
   );
-/** Thrown by playbookTree: the status distinguishes "not declared" (403)
- *  from "declared but the folder doesn't exist yet" (404 → offer scaffold). */
-export class PlaybookTreeError extends Error {
-  status: number;
-  constructor(message: string, status: number) {
-    super(message);
-    this.status = status;
-  }
-}
-
-export async function playbookTree(
-  lab: string,
-  playbook: string,
-): Promise<{ playbook: string; entries: PlaybookTreeEntry[] }> {
-  const res = await rawFetch(`${pbBase(lab)}/tree?playbook=${encodeURIComponent(playbook)}`);
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new PlaybookTreeError(body.error ?? res.statusText, res.status);
-  }
-  return res.json();
-}
+/** Create a declared playbook's folder + starter playbook.wcl if missing
+ *  (idempotent; 403 = not declared in vmlab.wcl). */
 export const scaffoldPlaybook = (lab: string, playbook: string) =>
   post(`${pbBase(lab)}/scaffold`, { playbook });
 
-export async function getPlaybookFile(
-  lab: string,
-  playbook: string,
-  path: string,
-): Promise<ScriptDoc | null> {
-  const res = await rawFetch(
-    `${pbBase(lab)}/file?playbook=${encodeURIComponent(playbook)}&path=${encodeURIComponent(path)}`,
-  );
-  if (res.status === 404) return null;
-  return finish(res);
+// --- config-weave packages (over a declared playbook folder) ----------------
+
+export interface PkgSearchHit {
+  repo: string;
+  package: string;
+  description: string;
+  installed: boolean;
+  installed_from: string | null;
 }
 
-export async function savePlaybookFile(
+export interface PkgRepo {
+  name: string;
+  url: string;
+  branch: string | null;
+  subdir: string | null;
+  /** "not synced", "dirty", or a short commit. */
+  cache: string;
+}
+
+/** `pkg add/remove/update` (update is always all packages). Slow ops (git
+ *  network sync) run synchronously server-side — keep a busy state up. */
+export const pkgAction = (
   lab: string,
   playbook: string,
-  path: string,
-  content: string,
-  baseRev: string | null,
-): Promise<string> {
-  const result = await req(`${pbBase(lab)}/file`, {
-    method: "PUT",
-    body: JSON.stringify({ playbook, path, content, base_rev: baseRev }),
-  }).catch((error) => {
-    if (error instanceof Error && error.message.includes("changed on disk")) {
-      throw new ScriptStale();
-    }
-    throw error;
-  });
-  return result.rev;
-}
+  action: "add" | "remove" | "update",
+  pkg?: string,
+): Promise<{ ok: boolean; output: string }> =>
+  post(`${pbBase(lab)}/pkg`, { playbook, action, package: pkg });
+
+export const pkgSearch = (lab: string, playbook: string, term: string): Promise<PkgSearchHit[]> =>
+  post(`${pbBase(lab)}/pkg/search`, { playbook, term });
+
+/** Registered package repos; seeds the stdlib repo when none exist. */
+export const pkgRepos = (
+  lab: string,
+  playbook: string,
+): Promise<{ repos: PkgRepo[]; seeded: boolean; warning: string | null }> =>
+  req(`${pbBase(lab)}/repos?playbook=${encodeURIComponent(playbook)}`);
+
+export const pkgRepoEdit = (
+  lab: string,
+  playbook: string,
+  action: "add" | "remove",
+  name: string,
+  opts?: { url?: string; branch?: string; subdir?: string },
+): Promise<{ ok: boolean; output: string }> =>
+  post(`${pbBase(lab)}/repos`, { playbook, action, name, ...opts });
 
 // --- lab files (Files tab) --------------------------------------------------
 

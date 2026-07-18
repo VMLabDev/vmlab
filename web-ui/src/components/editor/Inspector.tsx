@@ -116,7 +116,7 @@ export default function Inspector(props: {
             props.onEditPlaybook(editor.draft!.playbooks[(sel() as any).index].path)
           }
         >
-          Open playbook editor
+          Edit in Files tab
         </Button>
       </Show>
     </div>
@@ -377,8 +377,8 @@ function PlaybookInspector(props: { index: number }) {
       </Show>
       <Show when={playbook().span === null}>
         <div class="inspector-note">
-          Save the lab config to declare this playbook — the folder editor can scaffold its
-          files afterwards.
+          Save the lab config to declare this playbook — opening it in the Files tab scaffolds
+          its files afterwards.
         </div>
       </Show>
       <div class="inspector-note">

@@ -2,23 +2,23 @@
 // lab folder, vmlab.wcl included), and daemon Logs. "Edit config"
 // affordances land on the Files tab with vmlab.wcl opened.
 
-import { Show, createSignal } from "solid-js";
+import { Show } from "solid-js";
 import { Tabs } from "@forge/ui";
 import { state } from "../../store";
 import FilesView, { filesDirtyCount, openLabFile } from "../FilesView";
 import LogPanel from "../LogPanel";
 import EditorView from "./EditorView";
-
-const [tab, setTab] = createSignal<"design" | "files" | "logs">("design");
+import { labTab, setLabTab } from "./labTab";
+import type { LabTab } from "./labTab";
 
 export default function LabEditorView() {
   function onTab(id: string) {
-    setTab(id as "design" | "files" | "logs");
+    setLabTab(id as LabTab);
   }
 
   function editConfig() {
     openLabFile("vmlab.wcl");
-    setTab("files");
+    setLabTab("files");
   }
 
   return (
@@ -29,16 +29,16 @@ export default function LabEditorView() {
           { id: "files", label: filesDirtyCount() ? `Files (${filesDirtyCount()})` : "Files" },
           { id: "logs", label: "Logs" },
         ]}
-        active={tab()}
+        active={labTab()}
         onChange={onTab}
       />
-      <Show when={tab() === "design"}>
+      <Show when={labTab() === "design"}>
         <EditorView onEditConfig={editConfig} />
       </Show>
-      <Show when={tab() === "files"}>
+      <Show when={labTab() === "files"}>
         <FilesView />
       </Show>
-      <Show when={tab() === "logs" && state.currentLab}>
+      <Show when={labTab() === "logs" && state.currentLab}>
         <LogPanel lab={state.currentLab!} source="lab" />
       </Show>
     </div>

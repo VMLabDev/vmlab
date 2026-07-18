@@ -28,6 +28,9 @@ export interface FileTreeProps {
   onDelete?: (path: string) => void;
   /** Paths the menu may not rename/delete (e.g. vmlab.wcl). */
   canMutate?: (path: string) => boolean;
+  /** Extra per-row action buttons on directory rows (rendered after the
+   *  "+" button) — e.g. the Files tab's package actions. */
+  rowActions?: (entry: PlaybookTreeEntry) => JSX.Element | null;
 }
 
 export default function FileTree(props: FileTreeProps) {
@@ -89,6 +92,7 @@ export default function FileTree(props: FileTreeProps) {
                   onClick={() => props.onNewFile!(p.entry.path)}
                 />
               </Show>
+              {props.rowActions?.(p.entry)}
             </div>
           </MaybeMenu>
           <Show when={open()}>

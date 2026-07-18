@@ -19,7 +19,7 @@ import type {
 } from "./api";
 import { playDestroyRecreate } from "./fx";
 
-export type ViewKind = "lab" | "vm" | "container" | "templates" | "playbook";
+export type ViewKind = "lab" | "vm" | "container" | "templates";
 
 // A template or container-image download in progress, driven by the
 // template.pull.* / container.pull.* events the lab daemon streams while
@@ -95,7 +95,7 @@ interface State {
   labs: LabEntry[];
   currentLab: string | null;
   status: LabStatus | null;
-  view: { kind: ViewKind; vm: string | null; playbook: string | null };
+  view: { kind: ViewKind; vm: string | null };
   connected: boolean;
   error: string | null;
   pulls: Record<string, Pull>;
@@ -116,7 +116,7 @@ const [state, setState] = createStore<State>({
   labs: [],
   currentLab: null,
   status: null,
-  view: { kind: "lab", vm: null, playbook: null },
+  view: { kind: "lab", vm: null },
   connected: false,
   error: null,
   pulls: {},
@@ -248,7 +248,7 @@ export async function selectLab(name: string) {
   if (!(await navAllowed())) return;
   setState({
     currentLab: name,
-    view: { kind: "lab", vm: null, playbook: null },
+    view: { kind: "lab", vm: null },
     templates: [],
     playbooks: [],
   });
@@ -381,21 +381,17 @@ function scheduleRefresh() {
 // --- navigation -----------------------------------------------------------
 
 export function showLab() {
-  setState("view", { kind: "lab", vm: null, playbook: null });
+  setState("view", { kind: "lab", vm: null });
 }
 export function showTemplates() {
-  setState("view", { kind: "templates", vm: null, playbook: null });
+  setState("view", { kind: "templates", vm: null });
   loadTemplates();
 }
 export function showVm(vm: string) {
-  setState("view", { kind: "vm", vm, playbook: null });
+  setState("view", { kind: "vm", vm });
 }
 export function showContainer(name: string) {
-  setState("view", { kind: "container", vm: name, playbook: null });
-}
-/** Open the playbook folder editor for a declared playbook path. */
-export function showPlaybook(path: string) {
-  setState("view", { kind: "playbook", vm: null, playbook: path });
+  setState("view", { kind: "container", vm: name });
 }
 /** Create a new lab, refresh the list, and jump to its page (the designer
  *  lives there under the stats). */
@@ -404,7 +400,7 @@ export async function createLabAndOpen(name: string, path?: string): Promise<voi
   const labs = await api.listLabs();
   setState({ labs });
   if (!(await navAllowed())) return;
-  setState({ currentLab: name, view: { kind: "lab", vm: null, playbook: null }, templates: [] });
+  setState({ currentLab: name, view: { kind: "lab", vm: null }, templates: [] });
   await refreshStatus();
   await loadTemplates();
 }

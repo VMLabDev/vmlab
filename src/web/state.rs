@@ -58,6 +58,9 @@ pub struct AppState {
     login_failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     /// The lab discovered from the server's working directory at startup.
     pub default_lab: Option<(String, PathBuf)>,
+    /// Directory holding the host-side config-weave binaries (resolved once
+    /// from host config / env / XDG default). Tests point this at a stub.
+    pub weave_bin_dir: PathBuf,
     /// lab name → root directory (seeded from the cwd lab and the supervisor
     /// registry).
     roots: Mutex<HashMap<String, PathBuf>>,
@@ -81,9 +84,13 @@ impl AppState {
             .filter(|&secs| secs > 0)
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_SESSION_TTL);
+        let host_cfg = vmlab::config::host::HostConfig::load_default().unwrap_or_default();
+        let weave_bin_dir =
+            vmlab::weave_bin::default_bin_dir(host_cfg.config_weave_bin_dir.as_deref());
         Self {
             auth,
             trust_proxy,
+            weave_bin_dir,
             sessions: Mutex::new(HashMap::new()),
             session_ttl,
             login_failures: Mutex::new(HashMap::new()),

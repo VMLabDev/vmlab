@@ -14,14 +14,23 @@ import { For, Show, batch, createEffect, createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { CodeEditor } from "@forge/code";
 import type { CodeAnnotation } from "@forge/code";
-import { Alert, Button, Empty, Spinner, SplitPane } from "@forge/ui";
-import { FilePlus2, FolderPlus, Save } from "lucide-solid";
+import { Alert, Button, Empty, IconButton, Spinner, SplitPane } from "@forge/ui";
+import {
+  FilePlus2,
+  FolderPlus,
+  Library,
+  PackageMinus,
+  PackagePlus,
+  RefreshCw,
+  Save,
+} from "lucide-solid";
 import * as api from "../api";
 import type { ConfigIssue, PlaybookTreeEntry } from "../api";
 import {
   anyVmRunning,
   registerNavGuard,
   reloadLab as reloadCurrentLab,
+  showLab,
   showToast,
   state,
 } from "../store";
@@ -29,7 +38,10 @@ import { editorDirty, reloadModel } from "../editor/store";
 import { wclLanguage } from "../wcl-language";
 import { wscriptLanguage } from "../wscript-language";
 import { confirmDialog, promptDialog } from "./dialogs";
+import { setLabTab } from "./editor/labTab";
 import FileTree from "./FileTree";
+import { openPkgRepos } from "./PkgReposModal";
+import { openPkgSearch } from "./PkgSearchModal";
 
 const LAB_FILE = "vmlab.wcl";
 const extOf = (path: string) => path.split(".").pop() ?? "";
@@ -78,6 +90,153 @@ export function filesDirtyCount(): number {
  *  Files tab and calls this for "edit vmlab.wcl" affordances. */
 export function openLabFile(path: string) {
   setPendingOpen(path);
+}
+
+/** Refresh the lab file tree (safe from anywhere; no-op without a lab). */
+export async function reloadFilesTree() {
+  const current = state.currentLab;
+  if (!current) return;
+  try {
+    const result = await api.labFilesTree(current);
+    if (state.currentLab !== current) return;
+    setTree({ kind: "ok", entries: result.entries });
+  } catch (cause) {
+    if (state.currentLab !== current) return;
+    setTree({ kind: "error", message: msg(cause) });
+  }
+}
+
+/** A declared playbook folder is editable here only when it lies inside
+ *  the lab dir — outside ones run fine but the web sandbox can't touch
+ *  them (matching the backend's playbook_dir check). */
+export const canEditPlaybook = (path: string) =>
+  !path.startsWith("/") && !path.startsWith("../") && path !== "..";
+
+/** "Edit playbook" affordances land here: scaffold the declared folder if
+ *  it doesn't exist yet (idempotent), then open its playbook.wcl in the
+ *  Files tab. */
+export async function editPlaybook(path: string) {
+  const lab = state.currentLab;
+  if (!lab) return;
+  try {
+    await api.scaffoldPlaybook(lab, path);
+  } catch (cause) {
+    showToast(msg(cause), "danger");
+    return;
+  }
+  showLab();
+  setLabTab("files");
+  openLabFile(`${path}/playbook.wcl`);
+  void reloadFilesTree();
+}
+
+// --- config-weave package actions -------------------------------------------
+// Buttons live on the file tree rows of declared playbook folders: Add +
+// Update-all on the pkgs/ dir (Add falls back to the playbook root while
+// pkgs/ doesn't exist yet), Remove on each package dir under pkgs/.
+
+const [pkgBusy, setPkgBusy] = createSignal(false);
+
+type PkgCtx =
+  | { kind: "root"; playbook: string }
+  | { kind: "pkgs"; playbook: string }
+  | { kind: "pkg"; playbook: string; pkg: string };
+
+function pkgContext(entry: PlaybookTreeEntry): PkgCtx | null {
+  if (!entry.dir) return null;
+  for (const decl of state.playbooks) {
+    const root = decl.path;
+    if (!canEditPlaybook(root)) continue;
+    if (entry.path === root) {
+      const t = tree();
+      const hasPkgs = t.kind === "ok" && !!findEntry(t.entries, `${root}/pkgs`)?.dir;
+      return hasPkgs ? null : { kind: "root", playbook: root };
+    }
+    if (entry.path === `${root}/pkgs`) return { kind: "pkgs", playbook: root };
+    const prefix = `${root}/pkgs/`;
+    if (entry.path.startsWith(prefix) && !entry.path.slice(prefix.length).includes("/")) {
+      return { kind: "pkg", playbook: root, pkg: entry.path.slice(prefix.length) };
+    }
+  }
+  return null;
+}
+
+/** After the CLI changed files under `<playbook>/pkgs/`: refresh the tree
+ *  and drop clean open buffers there so they reload from disk. Dirty ones
+ *  stay — their next save 409s into the existing stale banner. */
+async function afterPkgChange(playbook: string) {
+  await reloadFilesTree();
+  const prefix = `${playbook}/pkgs/`;
+  const current = active();
+  batch(() => {
+    for (const key of Object.keys(files)) {
+      if (!key.startsWith(prefix)) continue;
+      const file = files[key];
+      if (!file || file.content !== file.savedContent) continue;
+      setFiles(key, undefined as unknown as OpenFile);
+    }
+  });
+  if (current?.startsWith(prefix) && !files[current]) {
+    const t = tree();
+    if (t.kind === "ok" && findEntry(t.entries, current)) setPendingOpen(current);
+    else setActive(null);
+  }
+}
+
+async function runPkgAction(
+  playbook: string,
+  action: "remove" | "update",
+  pkg: string | undefined,
+  doneToast: string,
+) {
+  const lab = state.currentLab;
+  if (!lab) return;
+  setPkgBusy(true);
+  try {
+    await api.pkgAction(lab, playbook, action, pkg);
+    showToast(doneToast);
+    await afterPkgChange(playbook);
+  } catch (cause) {
+    showToast(msg(cause), "danger");
+  } finally {
+    setPkgBusy(false);
+  }
+}
+
+async function removePkg(playbook: string, pkg: string) {
+  const prefix = `${playbook}/pkgs/${pkg}/`;
+  const dirtyUnder = [...dirtyPaths()].filter((p) => p.startsWith(prefix)).length;
+  const ok = await confirmDialog({
+    title: `Remove package ${pkg}?`,
+    body: [
+      `${playbook}/pkgs/${pkg} and its repo.wcl entry will be deleted.`,
+      dirtyUnder ? `${dirtyUnder} open file(s) with unsaved edits will be discarded.` : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    confirmLabel: "Remove",
+    danger: true,
+  });
+  if (!ok) return;
+  await runPkgAction(playbook, "remove", pkg, `Removed package ${pkg}`);
+}
+
+async function updateAllPkgs(playbook: string) {
+  const prefix = `${playbook}/pkgs/`;
+  const dirtyUnder = [...dirtyPaths()].filter((p) => p.startsWith(prefix)).length;
+  const ok = await confirmDialog({
+    title: "Update all packages?",
+    body: [
+      "config-weave re-syncs the repos and re-copies every installed package — local edits inside package folders are lost.",
+      dirtyUnder ? `${dirtyUnder} open file(s) with unsaved edits under pkgs/ will go stale.` : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    confirmLabel: "Update all",
+    danger: true,
+  });
+  if (!ok) return;
+  await runPkgAction(playbook, "update", undefined, "Packages updated");
 }
 
 registerNavGuard(async () => {
@@ -161,7 +320,7 @@ export default function FilesView() {
       }
       setTree({ kind: "loading" });
     });
-    void loadTree();
+    void reloadFilesTree();
   });
 
   // Deferred opens from openLabFile (Edit-config affordances).
@@ -171,18 +330,6 @@ export default function FilesView() {
     setPendingOpen(null);
     void openFile(want);
   });
-
-  async function loadTree() {
-    const current = lab();
-    try {
-      const result = await api.labFilesTree(current);
-      if (state.currentLab !== current) return;
-      setTree({ kind: "ok", entries: result.entries });
-    } catch (cause) {
-      if (state.currentLab !== current) return;
-      setTree({ kind: "error", message: msg(cause) });
-    }
-  }
 
   async function openFile(path: string) {
     setActive(path);
@@ -353,7 +500,7 @@ export default function FilesView() {
       const rev = await api.saveLabFile(lab(), clean, "", null);
       setFiles(clean, { content: "", savedContent: "", rev, stale: false });
       setActive(clean);
-      await loadTree();
+      await reloadFilesTree();
     } catch (cause) {
       showToast(msg(cause), "danger");
     }
@@ -374,7 +521,7 @@ export default function FilesView() {
     }
     try {
       await api.mkdirLab(lab(), clean);
-      await loadTree();
+      await reloadFilesTree();
     } catch (cause) {
       showToast(msg(cause), "danger");
     }
@@ -410,7 +557,7 @@ export default function FilesView() {
         if (current === path) setActive(clean);
         else if (current?.startsWith(prefix)) setActive(clean + current.slice(path.length));
       });
-      await loadTree();
+      await reloadFilesTree();
     } catch (cause) {
       showToast(msg(cause), "danger");
     }
@@ -445,7 +592,7 @@ export default function FilesView() {
         const current = active();
         if (current && (current === path || current.startsWith(prefix))) setActive(null);
       });
-      await loadTree();
+      await reloadFilesTree();
     } catch (cause) {
       showToast(msg(cause), "danger");
     }
@@ -456,6 +603,51 @@ export default function FilesView() {
     if (ext === "wcl") return wclLanguage;
     if (ext === "ws" || ext === "wscript") return wscriptLanguage;
     return undefined;
+  };
+
+  /** The declared playbook root whose playbook.wcl is active — shows the
+   *  Repos… toolbar button. */
+  const activePlaybookRoot = () => {
+    const current = active();
+    if (!current?.endsWith("/playbook.wcl")) return null;
+    const root = current.slice(0, -"/playbook.wcl".length);
+    const declared = state.playbooks.some((p) => p.path === root);
+    return declared && canEditPlaybook(root) ? root : null;
+  };
+
+  const pkgRowActions = (entry: PlaybookTreeEntry) => {
+    const ctx = pkgContext(entry);
+    if (!ctx) return null;
+    if (ctx.kind === "pkg") {
+      return (
+        <span class="file-tree-actions">
+          <IconButton
+            icon={PackageMinus}
+            label={`Remove package ${ctx.pkg}`}
+            disabled={pkgBusy()}
+            onClick={() => void removePkg(ctx.playbook, ctx.pkg)}
+          />
+        </span>
+      );
+    }
+    return (
+      <span class="file-tree-actions">
+        <IconButton
+          icon={PackagePlus}
+          label={`Add package to ${ctx.playbook}`}
+          disabled={pkgBusy()}
+          onClick={() => openPkgSearch(ctx.playbook, () => void afterPkgChange(ctx.playbook))}
+        />
+        <Show when={ctx.kind === "pkgs"}>
+          <IconButton
+            icon={RefreshCw}
+            label="Update all packages"
+            disabled={pkgBusy()}
+            onClick={() => void updateAllPkgs(ctx.playbook)}
+          />
+        </Show>
+      </span>
+    );
   };
 
   return (
@@ -492,6 +684,18 @@ export default function FilesView() {
             >
               Save & reload
             </Button>
+          </Show>
+          <Show when={activePlaybookRoot()}>
+            {(root) => (
+              <Button
+                size="sm"
+                icon={Library}
+                onClick={() => openPkgRepos(root(), () => void afterPkgChange(root()))}
+                title="Manage the playbook's package repositories"
+              >
+                Repos…
+              </Button>
+            )}
           </Show>
           <Button size="sm" icon={FilePlus2} onClick={() => void newFile("")}>
             New file
@@ -541,6 +745,7 @@ export default function FilesView() {
               onRename={(path) => void renamePath(path)}
               onDelete={(path) => void deletePath(path)}
               canMutate={(path) => path !== LAB_FILE}
+              rowActions={pkgRowActions}
             />
           }
           second={

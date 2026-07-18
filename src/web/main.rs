@@ -16,6 +16,7 @@ mod files;
 mod fsops;
 mod help;
 mod logs;
+mod pkgs;
 mod playbooks;
 mod state;
 mod tty;
@@ -301,8 +302,9 @@ async fn main() -> ExitCode {
                 "/api/labs/{lab}/templates/{tpl}/publish",
                 web::post().to(api::template_publish),
             )
-            // Playbooks: run ops + the sandboxed folder editor (literal
-            // before the `{action}` catch-all).
+            // Playbooks: declarations, run ops, scaffolding (literal
+            // before the `{action}` catch-all). Playbook files are edited
+            // through the Files tab API below.
             .route(
                 "/api/labs/{lab}/playbooks",
                 web::get().to(playbooks::list_playbooks),
@@ -312,20 +314,26 @@ async fn main() -> ExitCode {
                 web::get().to(playbooks::playbook_ops),
             )
             .route(
-                "/api/labs/{lab}/playbooks/tree",
-                web::get().to(playbooks::tree),
-            )
-            .route(
-                "/api/labs/{lab}/playbooks/file",
-                web::get().to(playbooks::get_file),
-            )
-            .route(
-                "/api/labs/{lab}/playbooks/file",
-                web::put().to(playbooks::save_file),
-            )
-            .route(
                 "/api/labs/{lab}/playbooks/scaffold",
                 web::post().to(playbooks::scaffold),
+            )
+            // config-weave package management over a declared playbook
+            // folder (Files tab pkg buttons + repos modal).
+            .route(
+                "/api/labs/{lab}/playbooks/pkg",
+                web::post().to(pkgs::pkg_action),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/pkg/search",
+                web::post().to(pkgs::pkg_search),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/repos",
+                web::get().to(pkgs::repos_list),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/repos",
+                web::post().to(pkgs::repos_edit),
             )
             .route(
                 "/api/labs/{lab}/vms/{vm}/playbook/{action}",

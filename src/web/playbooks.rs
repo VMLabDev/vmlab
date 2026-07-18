@@ -1,13 +1,14 @@
 //! Playbook endpoints: run config-weave check/apply against a machine
 //! (proxied to the lab daemon's `playbook.*` commands, progress via the
-//! `playbook.op.*` events), and a sandboxed file API over the playbook
-//! folders declared in `vmlab.wcl` — the web playbook editor's backend.
+//! `playbook.op.*` events), plus the declaration list and folder
+//! scaffolding. Playbook files themselves are edited through the lab
+//! Files tab (`files.rs`); package management lives in `pkgs.rs`, gated
+//! by [`playbook_dir`] below.
 //!
-//! Sandbox contract: the file API only ever touches folders that appear as
-//! `playbook "…"` blocks in the lab file (re-derived per request — the
-//! declarations are the sole authority), and only files with editable
-//! extensions inside them. Playbooks declared outside the lab root work at
-//! run time but are not editable here.
+//! Sandbox contract: only folders that appear as `playbook "…"` blocks in
+//! the lab file (re-derived per request — the declarations are the sole
+//! authority) are touched. Playbooks declared outside the lab root work at
+//! run time but are not editable or manageable here.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,23 +16,14 @@ use std::time::Duration;
 use actix_web::{HttpResponse, web};
 use serde::Deserialize;
 use serde_json::json;
-use std::io::Write;
 
 use super::api::fail;
-use super::fsops::{
-    FsError as PbDirError, MAX_FILE_BYTES, ensure_safe_parent, plain_relative, rev_of, walk_dir,
-};
+use super::fsops::{FsError as PbDirError, plain_relative};
 use super::state::AppState;
-
-const EDITABLE_EXTS: &[&str] = &["wcl", "wscript", "ws"];
 
 /// How long a run request waits for a fast verdict (validation errors,
 /// already-running conflicts) before detaching to the event stream.
 const RUN_DETACH_AFTER: Duration = Duration::from_millis(800);
-
-fn bad(msg: impl Into<String>) -> HttpResponse {
-    HttpResponse::BadRequest().json(json!({"error": msg.into()}))
-}
 
 // ---- declared playbooks (the sandbox authority) -----------------------------
 
@@ -62,7 +54,7 @@ fn declared_playbooks(root: &Path) -> Result<Vec<PlaybookDecl>, String> {
 /// existing folder to its canonical path (prefix-checked under the lab
 /// root). `NotFound` = declared but the folder doesn't exist yet — the
 /// editor offers scaffolding for that case.
-fn playbook_dir(root: &Path, playbook: &str) -> Result<PathBuf, PbDirError> {
+pub(crate) fn playbook_dir(root: &Path, playbook: &str) -> Result<PathBuf, PbDirError> {
     plain_relative(playbook, "playbook").map_err(PbDirError::BadRequest)?;
     let declared = declared_playbooks(root).map_err(PbDirError::Forbidden)?;
     if !declared.iter().any(|d| d.path == playbook) {
@@ -93,12 +85,6 @@ fn playbook_dir(root: &Path, playbook: &str) -> Result<PathBuf, PbDirError> {
         )));
     }
     Ok(dir)
-}
-
-fn editable(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EDITABLE_EXTS.contains(&e))
 }
 
 // ---- listing ----------------------------------------------------------------
@@ -170,223 +156,11 @@ pub async fn run_playbook(
     }
 }
 
-// ---- file API -----------------------------------------------------------------
+// ---- scaffolding ------------------------------------------------------------
 
 #[derive(Deserialize)]
-pub struct TreeQuery {
+pub struct ScaffoldBody {
     playbook: String,
-}
-
-/// `GET /api/labs/{lab}/playbooks/tree?playbook=…` — recursive listing of a
-/// declared playbook folder: dirs first, hidden entries skipped, capped.
-pub async fn tree(
-    state: web::Data<AppState>,
-    lab: web::Path<String>,
-    query: web::Query<TreeQuery>,
-) -> HttpResponse {
-    let root = match state.lab_root(&lab).await {
-        Ok(root) => root,
-        Err(e) => return fail(e),
-    };
-    let playbook = query.playbook.clone();
-    let outcome = web::block(move || {
-        let dir = playbook_dir(&root, &playbook)?;
-        let mut count = 0usize;
-        let entries =
-            walk_dir(&dir, Path::new(""), 0, &mut count).map_err(PbDirError::BadRequest)?;
-        Ok::<_, PbDirError>((playbook, entries))
-    })
-    .await;
-    match outcome {
-        Ok(Ok((playbook, entries))) => {
-            HttpResponse::Ok().json(json!({"playbook": playbook, "entries": entries}))
-        }
-        Ok(Err(PbDirError::BadRequest(e))) if e.contains("editor limit") => {
-            HttpResponse::PayloadTooLarge().json(json!({"error": e}))
-        }
-        Ok(Err(e)) => e.respond(),
-        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct FileQuery {
-    playbook: String,
-    path: String,
-}
-
-/// `GET /api/labs/{lab}/playbooks/file?playbook=…&path=…` — read one file.
-pub async fn get_file(
-    state: web::Data<AppState>,
-    lab: web::Path<String>,
-    query: web::Query<FileQuery>,
-) -> HttpResponse {
-    let root = match state.lab_root(&lab).await {
-        Ok(root) => root,
-        Err(e) => return fail(e),
-    };
-    let (playbook, rel) = (query.playbook.clone(), query.path.clone());
-    let outcome = web::block(move || {
-        let dir = playbook_dir(&root, &playbook)?;
-        let rel_path = plain_relative(&rel, "path").map_err(PbDirError::BadRequest)?;
-        if !editable(rel_path) {
-            return Err(PbDirError::BadRequest(format!(
-                "only {} files are editable",
-                EDITABLE_EXTS.join("/")
-            )));
-        }
-        let path = match std::fs::canonicalize(dir.join(rel_path)) {
-            Ok(p) if p.starts_with(&dir) => p,
-            Ok(_) => {
-                return Err(PbDirError::BadRequest(
-                    "path escapes the playbook folder".into(),
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(PbDirError::NotFound(format!("{rel}: not found")));
-            }
-            Err(e) => return Err(PbDirError::Io(e.to_string())),
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(content) if content.len() <= MAX_FILE_BYTES => Ok((rel, content)),
-            Ok(_) => Err(PbDirError::BadRequest(
-                "file exceeds the 1 MiB editor limit".into(),
-            )),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(PbDirError::NotFound(format!("{rel}: not found")))
-            }
-            Err(e) => Err(PbDirError::Io(e.to_string())),
-        }
-    })
-    .await;
-    match outcome {
-        Ok(Ok((rel, content))) => HttpResponse::Ok().json(json!({
-            "path": rel,
-            "rev": rev_of(&content),
-            "content": content,
-        })),
-        Ok(Err(e)) => e.respond(),
-        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct FileBody {
-    playbook: String,
-    path: String,
-    content: String,
-    /// SHA-256 returned by `GET`; `None` means create without overwriting.
-    base_rev: Option<String>,
-}
-
-enum FileSave {
-    Saved { rev: String },
-    Stale { rev: Option<String> },
-    Dir(PbDirError),
-    Invalid(String),
-    Error(String),
-}
-
-/// `PUT /api/labs/{lab}/playbooks/file` — revision-aware create/update,
-/// the `save_script` contract scoped to a declared playbook folder. Parent
-/// directories are created (symlink-refusing walk), so new files in new
-/// package subfolders need no separate mkdir.
-pub async fn save_file(
-    state: web::Data<AppState>,
-    lab: web::Path<String>,
-    body: web::Json<FileBody>,
-) -> HttpResponse {
-    let root = match state.lab_root(&lab).await {
-        Ok(root) => root,
-        Err(e) => return fail(e),
-    };
-    let body = body.into_inner();
-    if body.content.len() > MAX_FILE_BYTES {
-        return HttpResponse::PayloadTooLarge()
-            .json(json!({"error": "file exceeds the 1 MiB editor limit"}));
-    }
-    let outcome = web::block(move || {
-        let dir = match playbook_dir(&root, &body.playbook) {
-            Ok(d) => d,
-            Err(e) => return FileSave::Dir(e),
-        };
-        let rel = match plain_relative(&body.path, "path") {
-            Ok(p) => p.to_path_buf(),
-            Err(e) => return FileSave::Invalid(e),
-        };
-        if !editable(&rel) {
-            return FileSave::Invalid(format!(
-                "only {} files are editable",
-                EDITABLE_EXTS.join("/")
-            ));
-        }
-        let target = dir.join(&rel);
-        let Some(parent) = target.parent() else {
-            return FileSave::Invalid("path has no parent directory".into());
-        };
-        let canonical_parent = match ensure_safe_parent(&dir, parent) {
-            Ok(p) => p,
-            Err(e) => return FileSave::Invalid(e),
-        };
-        if std::fs::symlink_metadata(&target)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return FileSave::Invalid("path cannot be a symbolic link".into());
-        }
-        let safe_path = canonical_parent.join(target.file_name().expect("validated filename"));
-        let existing = match std::fs::read_to_string(&safe_path) {
-            Ok(source) => Some(source),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return FileSave::Error(e.to_string()),
-        };
-        let current_rev = existing.as_deref().map(rev_of);
-        if current_rev != body.base_rev {
-            return FileSave::Stale { rev: current_rev };
-        }
-        let creating = body.base_rev.is_none();
-        let mut temp = match tempfile::NamedTempFile::new_in(&canonical_parent) {
-            Ok(file) => file,
-            Err(e) => return FileSave::Error(e.to_string()),
-        };
-        if let Err(e) = temp
-            .write_all(body.content.as_bytes())
-            .and_then(|_| temp.flush())
-        {
-            return FileSave::Error(e.to_string());
-        }
-        let persisted = if creating {
-            temp.persist_noclobber(&safe_path)
-        } else {
-            temp.persist(&safe_path)
-        };
-        if let Err(e) = persisted {
-            if creating && e.error.kind() == std::io::ErrorKind::AlreadyExists {
-                return FileSave::Stale {
-                    rev: std::fs::read_to_string(&safe_path)
-                        .ok()
-                        .as_deref()
-                        .map(rev_of),
-                };
-            }
-            return FileSave::Error(e.error.to_string());
-        }
-        FileSave::Saved {
-            rev: rev_of(&body.content),
-        }
-    })
-    .await;
-    match outcome {
-        Ok(FileSave::Saved { rev }) => HttpResponse::Ok().json(json!({"ok": true, "rev": rev})),
-        Ok(FileSave::Stale { rev }) => {
-            HttpResponse::Conflict().json(json!({"error": "file changed on disk", "rev": rev}))
-        }
-        Ok(FileSave::Dir(e)) => e.respond(),
-        Ok(FileSave::Invalid(error)) => bad(error),
-        Ok(FileSave::Error(error)) => {
-            HttpResponse::InternalServerError().json(json!({"error": error}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
-    }
 }
 
 /// `POST /api/labs/{lab}/playbooks/scaffold` — create the declared folder
@@ -395,7 +169,7 @@ pub async fn save_file(
 pub async fn scaffold(
     state: web::Data<AppState>,
     lab: web::Path<String>,
-    body: web::Json<TreeQuery>,
+    body: web::Json<ScaffoldBody>,
 ) -> HttpResponse {
     let root = match state.lab_root(&lab).await {
         Ok(root) => root,
@@ -490,9 +264,6 @@ lab "lab" {
                 App::new()
                     .app_data(state_for($root))
                     .route("/api/labs/{lab}/playbooks", web::get().to(list_playbooks))
-                    .route("/api/labs/{lab}/playbooks/tree", web::get().to(tree))
-                    .route("/api/labs/{lab}/playbooks/file", web::get().to(get_file))
-                    .route("/api/labs/{lab}/playbooks/file", web::put().to(save_file))
                     .route(
                         "/api/labs/{lab}/playbooks/scaffold",
                         web::post().to(scaffold),
@@ -519,185 +290,6 @@ lab "lab" {
         assert_eq!(body[0]["play"], "base");
         assert_eq!(body[0]["vms"][0], "web01");
         assert_eq!(body[1]["vms"].as_array().unwrap().len(), 0);
-    }
-
-    #[actix_web::test]
-    async fn tree_rejects_undeclared_and_traversal() {
-        let tmp = playbook_lab();
-        std::fs::create_dir_all(tmp.path().join("other")).unwrap();
-        let app = app!(tmp.path());
-
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri("/api/labs/lab/playbooks/tree?playbook=other")
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 403);
-
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri("/api/labs/lab/playbooks/tree?playbook=..%2Fother")
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 400);
-
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri("/api/labs/lab/playbooks/tree?playbook=%2Fetc")
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 400);
-    }
-
-    #[actix_web::test]
-    async fn tree_lists_nested_dirs_first_hidden_skipped() {
-        let tmp = playbook_lab();
-        let app = app!(tmp.path());
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri("/api/labs/lab/playbooks/tree?playbook=playbooks%2Fbase")
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 200);
-        let body: Value = test::read_body_json(resp).await;
-        let entries = body["entries"].as_array().unwrap();
-        // dirs first: pkgs before playbook.wcl; .hidden skipped.
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["name"], "pkgs");
-        assert_eq!(entries[0]["dir"], true);
-        let pkg = &entries[0]["children"][0];
-        assert_eq!(pkg["name"], "example");
-        assert_eq!(pkg["children"][0]["path"], "pkgs/example/package.wcl");
-        assert_eq!(entries[1]["name"], "playbook.wcl");
-
-        // Declared but missing folder → 404 (scaffolding cue).
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri("/api/labs/lab/playbooks/tree?playbook=playbooks%2Fghost")
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 404);
-    }
-
-    #[actix_web::test]
-    async fn file_create_read_stale_and_extension_gate() {
-        let tmp = playbook_lab();
-        let app = app!(tmp.path());
-
-        // Create (base_rev: null) in a new subfolder.
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::put()
-                .uri("/api/labs/lab/playbooks/file")
-                .set_json(json!({
-                    "playbook": "playbooks/base",
-                    "path": "pkgs/redis/resources/svc.wscript",
-                    "content": "export fn check() {}\n",
-                    "base_rev": null,
-                }))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 200);
-        let created: Value = test::read_body_json(resp).await;
-        let rev = created["rev"].as_str().unwrap().to_string();
-
-        // Read it back.
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri("/api/labs/lab/playbooks/file?playbook=playbooks%2Fbase&path=pkgs%2Fredis%2Fresources%2Fsvc.wscript")
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 200);
-        let doc: Value = test::read_body_json(resp).await;
-        assert_eq!(doc["rev"].as_str().unwrap(), rev);
-
-        // Stale write (wrong base_rev) → 409 with the current rev.
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::put()
-                .uri("/api/labs/lab/playbooks/file")
-                .set_json(json!({
-                    "playbook": "playbooks/base",
-                    "path": "pkgs/redis/resources/svc.wscript",
-                    "content": "changed",
-                    "base_rev": "deadbeef",
-                }))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 409);
-        let conflict: Value = test::read_body_json(resp).await;
-        assert_eq!(conflict["rev"].as_str().unwrap(), rev);
-
-        // Duplicate create → 409 (noclobber).
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::put()
-                .uri("/api/labs/lab/playbooks/file")
-                .set_json(json!({
-                    "playbook": "playbooks/base",
-                    "path": "pkgs/redis/resources/svc.wscript",
-                    "content": "again",
-                    "base_rev": null,
-                }))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 409);
-
-        // Non-editable extension → 400.
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::put()
-                .uri("/api/labs/lab/playbooks/file")
-                .set_json(json!({
-                    "playbook": "playbooks/base",
-                    "path": "run.sh",
-                    "content": "#!/bin/sh",
-                    "base_rev": null,
-                }))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 400);
-    }
-
-    #[actix_web::test]
-    async fn save_refuses_symlinked_dirs() {
-        let tmp = playbook_lab();
-        // A symlinked dir inside the playbook pointing outside the lab.
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), tmp.path().join("playbooks/base/linked"))
-            .unwrap();
-        let app = app!(tmp.path());
-        let resp = test::call_service(
-            &app,
-            test::TestRequest::put()
-                .uri("/api/labs/lab/playbooks/file")
-                .set_json(json!({
-                    "playbook": "playbooks/base",
-                    "path": "linked/escape.wcl",
-                    "content": "x",
-                    "base_rev": null,
-                }))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(resp.status(), 400);
-        assert!(!outside.path().join("escape.wcl").exists());
     }
 
     #[actix_web::test]

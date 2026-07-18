@@ -17,10 +17,10 @@ import {
   fmtMem,
   currentPullFor,
   playbooksFor,
-  showPlaybook,
 } from "../store";
 import { vmSnapshots } from "../api";
 import { confirmDialog, promptDialog } from "./dialogs";
+import { canEditPlaybook, editPlaybook } from "./FilesView";
 import ConsoleScreen from "./ConsoleScreen";
 import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
@@ -198,11 +198,13 @@ export default function MachineView() {
                     </span>
                     <span class="kv-v" style={{ display: "inline-flex", gap: "6px", "align-items": "center" }}>
                       {pb.play}
-                      <IconButton
-                        icon={SquarePen}
-                        label={`Edit ${pb.path}`}
-                        onClick={() => showPlaybook(pb.path)}
-                      />
+                      <Show when={canEditPlaybook(pb.path)}>
+                        <IconButton
+                          icon={SquarePen}
+                          label={`Edit ${pb.path}`}
+                          onClick={() => void editPlaybook(pb.path)}
+                        />
+                      </Show>
                     </span>
                   </div>
                 )}

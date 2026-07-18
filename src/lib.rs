@@ -10,6 +10,13 @@ pub mod config;
 pub mod guest_asset;
 pub mod lab_init;
 mod labd;
+/// Host-side config-weave binary resolution, shared by labd and the web
+/// binary's package endpoints (`labd` itself stays crate-internal).
+pub mod weave_bin {
+    pub use crate::labd::playbook::{
+        ENV_BIN_DIR, GuestOs, default_bin_dir, resolve_bin_dir, weave_binary,
+    };
+}
 mod lifecycle;
 pub mod logs;
 mod media;
