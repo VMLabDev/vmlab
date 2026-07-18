@@ -7,12 +7,9 @@ to a small daemon tree, which owns the QEMU processes and everything around
 them.
 
 
-```text
-vmlab CLI ─┐                        ┌─ lab daemon "ad-demo" ── QEMU × N
-           ├─ unix-socket protocol ─┤     (one per running lab)
-vmlab-web ─┘        vmlabd          └─ lab daemon "scratch" ── QEMU × M
-                 (supervisor)
-```
+![diagram](../_wdoc/concept_architecture-diagram-1.svg)
+
+Both front ends speak the same unix-socket protocol to the supervisor; each running lab gets its own daemon, and each daemon owns its lab's QEMU processes.
 
 **Front ends.** The `vmlab` CLI and the [vmlab-web](../references/entity_vmlab_web.md) server
 are peers: both speak the same protocol, so anything the CLI does the web

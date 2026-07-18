@@ -9,13 +9,31 @@ Every vmlab feature hangs off one spine: front ends talk a JSON-lines protocol
 to a small daemon tree, which owns the QEMU processes and everything around
 them.
 PROSE
-    code "text" { source = <<'SRC'
-vmlab CLI ─┐                        ┌─ lab daemon "ad-demo" ── QEMU × N
-           ├─ unix-socket protocol ─┤     (one per running lab)
-vmlab-web ─┘        vmlabd          └─ lab daemon "scratch" ── QEMU × M
-                 (supervisor)
-SRC
+    diagram {
+      width     = 680
+      height    = 260
+      layout    = :layered
+      direction = :left_to_right
+      layer_gap = 60.0
+      node_gap  = 30.0
+      desc      = "vmlab CLI and vmlab-web talk over the unix-socket protocol to the vmlabd supervisor, which runs one lab daemon per running lab; each lab daemon owns that lab's QEMU processes."
+
+      process "vmlab CLI" { id = cli  width = 120.0  height = 44.0  class = ["wdoc-node"] }
+      process "vmlab-web" { id = web  width = 120.0  height = 44.0  class = ["wdoc-node"] }
+      process "vmlabd (supervisor)"     { id = sup   width = 160.0  height = 44.0  class = ["wdoc-process"] }
+      process "lab daemon \"ad-demo\"" { id = lab1  width = 170.0  height = 44.0  class = ["wdoc-process"] }
+      process "lab daemon \"scratch\"" { id = lab2  width = 170.0  height = 44.0  class = ["wdoc-process"] }
+      terminator "QEMU × N" { id = q1  width = 110.0  height = 44.0  class = ["wdoc-terminator"] }
+      terminator "QEMU × M" { id = q2  width = 110.0  height = 44.0  class = ["wdoc-terminator"] }
+
+      cli -> sup :flow
+      web -> sup :flow
+      sup -> lab1 :flow
+      sup -> lab2 :flow
+      lab1 -> q1 :flow
+      lab2 -> q2 :flow
     }
+    p "Both front ends speak the same unix-socket protocol to the supervisor; each running lab gets its own daemon, and each daemon owns its lab's QEMU processes."
     p <<'PROSE'
 **Front ends.** The `vmlab` CLI and the [vmlab-web](entity_vmlab_web) server
 are peers: both speak the same protocol, so anything the CLI does the web
