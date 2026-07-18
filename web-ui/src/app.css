@@ -275,6 +275,14 @@
 .web-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 1px solid var(--border, #333); border-radius: var(--radius-sm, 6px); background: #fff; display: none; }
 .web-frame.active { display: block; }
 
+/* Overview: launch cards for declared `web {}` pages, one card per page */
+.webpage-launch { cursor: pointer; }
+.webpage-launch:not(.off):hover .fcard,
+.webpage-launch:not(.off):focus-visible .fcard { border-color: var(--accent, #6ea8fe); }
+.webpage-launch.off { cursor: default; opacity: 0.55; }
+.webpage-sub { color: var(--fg-2); font-size: var(--fs-sm); }
+.webpage-addr { color: var(--fg-3); font-family: var(--font-mono); margin-left: 4px; }
+
 /* Inspector "Web" tab: one block per page with an optional nested auth form */
 .web-page-block { border: 1px solid var(--border, #333); border-radius: var(--radius-sm, 6px); padding: var(--sp-2); display: flex; flex-direction: column; gap: var(--sp-1); }
 .web-page-head { display: flex; align-items: center; gap: var(--sp-1); }

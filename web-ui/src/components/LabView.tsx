@@ -14,6 +14,7 @@ import {
 import {
   Camera,
   Download,
+  Globe,
   History,
   Play,
   Square,
@@ -38,6 +39,7 @@ import {
 import { confirmDialog, promptDialog } from "./dialogs";
 import ActionButton from "./ActionButton";
 import LabEditorView from "./editor/LabEditorView";
+import { openWebPage } from "./WebView";
 
 function fmtTime(t: string): string {
   if (!t) return "";
@@ -56,6 +58,22 @@ export default function LabView() {
   const total = () => (s()?.vms.length ?? 0) + containers().length;
   const vcpu = () => s()?.vms.reduce((a, v) => a + (v.cpus ?? 0), 0) ?? 0;
   const mem = () => s()?.vms.reduce((a, v) => a + (v.memory ?? 0), 0) ?? 0;
+  // Every declared `web {}` page across the lab, one launch card each.
+  const webPages = () =>
+    [
+      ...(s()?.vms ?? []).map((v) => ({
+        kind: "vms" as const,
+        machine: v.name,
+        up: v.state === "running" && !!v.ip,
+        pages: v.web ?? [],
+      })),
+      ...containers().map((c) => ({
+        kind: "containers" as const,
+        machine: c.name,
+        up: c.state === "running" && !!c.ip,
+        pages: c.web ?? [],
+      })),
+    ].flatMap((m) => m.pages.map((page) => ({ ...m, page })));
 
   const snapshotLab = async () => {
     const name = await promptDialog({
@@ -175,6 +193,45 @@ export default function LabView() {
             <Stat label="Segments" value={s() ? String(s()!.segments.length) : "—"} />
           </Card>
         </Grid>
+
+        <Show when={webPages().length > 0}>
+          <Grid>
+            <For each={webPages()}>
+              {(w) => (
+                <div
+                  class="webpage-launch"
+                  classList={{ off: !w.up }}
+                  role="button"
+                  tabindex="0"
+                  title={
+                    w.up
+                      ? `Open ${w.page.name}`
+                      : "Start the machine to open its web pages"
+                  }
+                  onClick={() =>
+                    w.up && openWebPage(state.currentLab!, w.kind, w.machine, w.page)
+                  }
+                  onKeyDown={(e) => {
+                    if (w.up && (e.key === "Enter" || e.key === " ")) {
+                      e.preventDefault();
+                      openWebPage(state.currentLab!, w.kind, w.machine, w.page);
+                    }
+                  }}
+                >
+                  <Card title={w.page.name} action={<Icon of={Globe} size={14} />}>
+                    <div class="webpage-sub">
+                      {w.machine}
+                      <span class="webpage-addr">
+                        :{w.page.port}
+                        {w.page.path !== "/" ? w.page.path : ""}
+                      </span>
+                    </div>
+                  </Card>
+                </div>
+              )}
+            </For>
+          </Grid>
+        </Show>
 
         <LabEditorView />
       </div>
