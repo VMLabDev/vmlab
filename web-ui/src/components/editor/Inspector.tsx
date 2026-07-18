@@ -1367,16 +1367,18 @@ function SegmentDnsTable(props: {
   );
 }
 
-// The runtime half of the DNS tab: names the daemon auto-registered for
-// VMs/containers (leases and static IPs) in this segment's live zone —
+// The runtime half of the DNS tab: names the daemon auto-registers for
+// VMs/containers (leases and static IPs) in this segment's zone —
 // read-only, badged `dynamic`; the editable statics above stay the
-// config's source of truth.
-function SegmentLiveDns(props: { segment: string }) {
+// config's source of truth. With no live zone (lab powered off) it falls
+// back to the registrations the draft config predicts, so the table is
+// useful before the first `up` too.
+function SegmentLiveDns(props: { segment: SegmentModel }) {
   // Gated on the console's status poll so opening the tab never spawns a
   // lab daemon. The source is the segment *name* (a stable string), so
   // status polling doesn't retrigger the fetch; refresh is manual.
   const [live, { refetch }] = createResource(
-    () => (state.status && state.currentLab === editor.lab ? props.segment : null),
+    () => (state.status && state.currentLab === editor.lab ? props.segment.name : null),
     async (segment): Promise<DnsLiveRecord[] | null> => {
       try {
         const table = await dnsTable(editor.lab!);
@@ -1387,19 +1389,55 @@ function SegmentLiveDns(props: { segment: string }) {
       }
     },
   );
+  // What the daemon WILL register, derived from the draft: both name forms
+  // per machine with a NIC here; DHCP addresses are unknown until lease.
+  const predicted = createMemo<DnsLiveRecord[]>(() => {
+    const d = editor.draft;
+    const dns = props.segment.dns;
+    if (!d || !editor.lab || (dns.declared && !dns.enabled)) return [];
+    const suffix = editor.catalog.host?.dns_suffix ?? "vmlab.internal";
+    const rows: DnsLiveRecord[] = [];
+    for (const m of [...d.vms, ...d.containers]) {
+      const nic = m.nics.find((n) => n.segment === props.segment.name);
+      if (!nic) continue;
+      const ip = nic.ip ?? "auto (DHCP)";
+      rows.push(
+        { name: `${m.name}.${editor.lab}.${suffix}`, ip, kind: "dynamic" },
+        { name: `${m.name}.${suffix}`, ip, kind: "dynamic" },
+      );
+    }
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+    return rows;
+  });
+  // Live rows win per name; config-predicted rows fill the gaps (all of
+  // them when the lab is powered off, the not-yet-leased machines when it
+  // is up).
+  const merged = createMemo(() => {
+    if (live.loading) return { rows: [] as DnsLiveRecord[], anyLive: false, anyPredicted: false };
+    const l = live() ?? [];
+    const seen = new Set(l.map((r) => r.name));
+    const add = predicted().filter((r) => !seen.has(r.name));
+    const rows = [...l, ...add].sort((a, b) => a.name.localeCompare(b.name));
+    return { rows, anyLive: l.length > 0, anyPredicted: add.length > 0 };
+  });
+  const rows = () => merged().rows;
   return (
-    <Show when={(live() ?? []).length > 0}>
+    <Show when={rows().length > 0}>
       <div class="dns-live-section">
         <div class="dns-live-header">
-          <div class="inspector-section-title">Live registrations</div>
-          <IconButton
-            icon={RefreshCw}
-            label="Refresh live DNS registrations"
-            onClick={() => refetch()}
-          />
+          <div class="inspector-section-title">
+            {merged().anyLive ? "Live registrations" : "Expected registrations"}
+          </div>
+          <Show when={merged().anyLive}>
+            <IconButton
+              icon={RefreshCw}
+              label="Refresh live DNS registrations"
+              onClick={() => refetch()}
+            />
+          </Show>
         </div>
         <div class="dns-table">
-          <Table aria-label="Live DNS registrations">
+          <Table aria-label="DNS registrations">
             <thead>
               <tr>
                 <th>Type</th>
@@ -1408,7 +1446,7 @@ function SegmentLiveDns(props: { segment: string }) {
               </tr>
             </thead>
             <tbody>
-              <For each={live()}>
+              <For each={rows()}>
                 {(record) => (
                   <tr>
                     <td class="dns-type">
@@ -1422,6 +1460,13 @@ function SegmentLiveDns(props: { segment: string }) {
             </tbody>
           </Table>
         </div>
+        <Show when={merged().anyPredicted}>
+          <div class="dns-live-note">
+            {merged().anyLive
+              ? "Entries not in the running zone yet are expected registrations; auto (DHCP) addresses are assigned at first lease."
+              : "Registered by the built-in DNS when the lab runs; auto (DHCP) addresses are assigned at first lease."}
+          </div>
+        </Show>
       </div>
     </Show>
   );
@@ -1727,7 +1772,7 @@ function SegmentInspector(props: { index: number }) {
         <fieldset class="inspector-fields" disabled={locked()}>
           <SegmentDnsTable segment={seg()} setSegment={setSeg} />
         </fieldset>
-        <SegmentLiveDns segment={seg().name} />
+        <SegmentLiveDns segment={seg()} />
       </Show>
       <Show when={tab() === "rules"}>
         <fieldset class="inspector-fields" disabled={locked()}>

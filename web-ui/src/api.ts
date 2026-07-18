@@ -672,6 +672,8 @@ export interface HostInfo {
   memory: number; // bytes
   acceleration: "kvm" | "tcg";
   arch: string;
+  /** Suffix guest names register under (host config, default vmlab.internal). */
+  dns_suffix: string;
 }
 
 export const hostInfo = (): Promise<HostInfo> => req("/api/host");

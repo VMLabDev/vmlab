@@ -1029,7 +1029,8 @@ pub struct RestoreBody {
 }
 
 /// `GET /api/host` — host capacity (CPU cores + total RAM) for the editor's
-/// hardware sliders.
+/// hardware sliders, plus the DNS suffix guest names register under (feeds
+/// the DNS tab's expected-registrations view when no lab daemon is up).
 pub async fn host_info() -> HttpResponse {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1040,11 +1041,15 @@ pub async fn host_info() -> HttpResponse {
         .and_then(|s| parse_mem_total(&s))
         .unwrap_or(0);
     let kvm = vmlab::kvm_available();
+    let dns_suffix = vmlab::config::host::HostConfig::load_default()
+        .map(|c| c.dns_suffix)
+        .unwrap_or_else(|_| "vmlab.internal".to_string());
     ok(json!({
         "cpus": cpus,
         "memory": memory,
         "acceleration": if kvm { "kvm" } else { "tcg" },
         "arch": std::env::consts::ARCH,
+        "dns_suffix": dns_suffix,
     }))
 }
 
