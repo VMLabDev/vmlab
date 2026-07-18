@@ -12,37 +12,12 @@ page index { start = true  title = "Welcome"
     p $"${d}"
   }
 
-  h2 "How this book is organised"
-  p <<'PROSE'
-The parts read in order as a course, and stand alone as a reference:
-
-1. **Getting started** — orientation and the everyday lifecycle. New here?
-   [Start here](concept_start_here).
-2. **How vmlab works** — [the architecture](concept_architecture): daemons,
-   clones, guest channels, on-disk layout.
-3. **Labs & networking** — the `vmlab.wcl` topology surface: machines,
-   segments, DHCP/DNS/NAT, shares.
-4. **Templates & distribution** — building sealed disk images and moving them
-   over OCI registries.
-5. **Lab containers** — OCI containers as micro-VM lab machines.
-6. **Automation** — the wscript language, the Lab/Vm/Segment API, and
-   provisions, event handlers and playbooks.
-7. **The web console** — managing everything from the browser.
-8. **Operations & hosting** — host config, profiles, running vmlab in
-   containers and on WSL2, the eBPF fast path.
-
-The appendix holds the complete `vmlab.wcl` schema and other lookup tables,
-followed by the CLI reference and the glossary. Every page cross-links its
-related notes both ways, the **Reference** button opens a map of every note,
-and search covers the whole book.
-PROSE
-
   wdoc_repeater { each = match len(artifacts) { 0 => [], _ => [true] }  as = :_af
     h2 "Artifacts"
     p  "The views this wskill ships — build them with `just render` (or the per-view recipes)."
     table {
       header = ["View", "Entry", "Output"]
-      rows = map(artifacts, fn(a: Artifact) -> list<utf8> {
+      rows = map(filter(artifacts, fn(a: Artifact) -> bool { a.kind != :training }), fn(a: Artifact) -> list<utf8> {
         [a.name ?? kind_text($"${a.kind}"), $"`${a.entry}`", match a.output { none => "—", o => $"`${o}`" }]
       })
     }
@@ -68,17 +43,6 @@ PROSE
       header = ["Name", "Relation", "Status"]
       rows = map(refs, fn(r: WskillRef) -> list<utf8> {
         [match r.url { none => r.name, u => $"[${r.name}](${u})" }, r.relation ?? "—", r.status]
-      })
-    }
-  }
-
-  wdoc_repeater { each = match len(sources) { 0 => [], _ => [true] }  as = :_s
-    h2 "Sources"
-    p "Sources drive the update workflow only — they are not topic content."
-    table {
-      header = ["ID", "Kind", "Locator", "Covers", "Last checked", "Reflects version"]
-      rows   = map(sources, fn(s: Source) -> list<utf8> {
-        [$"${s.id}", s.kind, s.locator, s.covers, s.last_checked ?? "—", s.reflects_version ?? "—"]
       })
     }
   }

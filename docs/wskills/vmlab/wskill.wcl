@@ -26,19 +26,13 @@ topic vmlab {
   summary = "A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript."
   version = "1.3"
   description = <<END
-vmlab orchestrates single-host virtual-machine labs. A **lab** — a set of VMs plus
-the virtual networks that connect them — is declared in **WCL** (`vmlab.wcl`).
-Reusable disk **templates** are built from installer media and either kept in a
-local store or pushed to and pulled from any OCI registry. Guest automation —
-power control, command execution, keystrokes, screen matching and OCR — is written
-in **wscript** provision scripts and event handlers, with declarative
-**config-weave playbooks** alongside. OCI containers join labs as micro-VM
-machines, and the **vmlab-web** console manages everything from the browser.
-A two-tier daemon (the supervisor `vmlabd` plus one daemon per running lab) is
-auto-started by the CLI; the baseline network fabric is entirely userspace, so
-vmlab runs unprivileged in containers and on WSL2 with only `/dev/kvm`.
-Optional eBPF acceleration on supported Linux hosts adds `/dev/net/tun`,
-`CAP_BPF`, and `CAP_NET_ADMIN`.
+vmlab exists so an entire lab environment — machines, networks, and the setup
+on them — can be recreated from one file with one command. Describe the lab in
+`vmlab.wcl` and `vmlab up` builds it: VMs cloned from reusable templates,
+containers as micro-VM machines, segments with DHCP/DNS/NAT, provisioning and
+playbooks applied — identically every time. Labs are disposable: snapshot,
+reset, destroy, rebuild. Everything runs unprivileged on QEMU/KVM with nothing
+but `/dev/kvm`.
 END
   tags = ["vmlab", "qemu", "kvm", "virtualization", "lab", "wcl", "wscript", "oci"]
   created    = "2026-06-21"

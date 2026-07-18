@@ -7,18 +7,18 @@
 
 index ix_start {
   name     = "Getting started"
-  summary  = "What vmlab is, the three artifacts you touch, and the everyday lifecycle."
-  related  = [start_here, vmlab_wcl, golden_path]
+  summary  = "What vmlab is and your first lab."
+  related  = [start_here]
   audience = :both
   body {
-    p "Orientation for newcomers: the lab file, templates and wscript in one screen, then the golden path from `validate` to `destroy`."
+    p "Getting started using VMLab: describe the lab in `vmlab.wcl`, bring it up with one command."
   }
 }
 
 index ix_architecture {
   name     = "How vmlab works"
   summary  = "The moving parts: daemons, QEMU processes, guest channels, and where state lives on disk."
-  related  = [architecture, daemon_model, paths_table, dot_vmlab, template_store]
+  related  = [architecture, daemon_model, paths_table, vmlab_wcl, dot_vmlab, template_store]
   audience = :both
   body {
     p "The big picture first, then the daemon model and the on-disk layout — machine-wide state versus each lab's disposable `.vmlab/`."
@@ -107,11 +107,11 @@ index ix_web {
 
 index ix_operations {
   name     = "Operations & hosting"
-  summary  = "Run vmlab anywhere: host config, profiles, containers, WSL2, and the network fast path."
-  related  = [host_config, profiles, profiles_table, containers, run_in_container, wsl2, fastpath, validate_checks]
+  summary  = "Run vmlab anywhere: the everyday lifecycle, host config, profiles, containers, WSL2, and the network fast path."
+  related  = [golden_path, host_config, profiles, profiles_table, containers, run_in_container, wsl2, fastpath, validate_checks]
   audience = :both
   body {
-    p "Host-side concerns: the optional host config, guest OS profiles, hosting vmlab itself in a container or on WSL2, eBPF acceleration, and what `vmlab validate` checks."
+    p "Running labs day to day — the full lifecycle runbook — plus host-side concerns: the optional host config, guest OS profiles, hosting vmlab itself in a container or on WSL2, eBPF acceleration, and what `vmlab validate` checks."
   }
 }
 

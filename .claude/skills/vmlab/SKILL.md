@@ -64,13 +64,11 @@ A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by 
 
 ### Getting started
 
-_What vmlab is, the three artifacts you touch, and the everyday lifecycle._
+_What vmlab is and your first lab._
 
-Orientation for newcomers: the lab file, templates and wscript in one screen, then the golden path from `validate` to `destroy`.
+Getting started using VMLab: describe the lab in `vmlab.wcl`, bring it up with one command.
 
 - [Start here](references/concept_start_here.md)
-- [vmlab.wcl](references/entity_vmlab_wcl.md)
-- [Bring a lab up and tear it down](references/process_golden_path.md)
 
 ### How vmlab works
 
@@ -81,6 +79,7 @@ The big picture first, then the daemon model and the on-disk layout — machine-
 - [How vmlab fits together](references/concept_architecture.md)
 - [Daemon model](references/concept_daemon_model.md)
 - [Filesystem layout](references/fact_paths_table.md)
+- [vmlab.wcl](references/entity_vmlab_wcl.md)
 - [.vmlab/](references/entity_dot_vmlab.md)
 - [Template store](references/entity_template_store.md)
 
@@ -187,10 +186,11 @@ Everything around `vmlab-web`: the console tour, launching and securing the serv
 
 ### Operations & hosting
 
-_Run vmlab anywhere: host config, profiles, containers, WSL2, and the network fast path._
+_Run vmlab anywhere: the everyday lifecycle, host config, profiles, containers, WSL2, and the network fast path._
 
-Host-side concerns: the optional host config, guest OS profiles, hosting vmlab itself in a container or on WSL2, eBPF acceleration, and what `vmlab validate` checks.
+Running labs day to day — the full lifecycle runbook — plus host-side concerns: the optional host config, guest OS profiles, hosting vmlab itself in a container or on WSL2, eBPF acceleration, and what `vmlab validate` checks.
 
+- [Bring a lab up and tear it down](references/process_golden_path.md)
 - [Host config](references/concept_host_config.md)
 - [Guest OS profiles](references/concept_profiles.md)
 - [Shipped guest OS profiles](references/fact_profiles_table.md)
