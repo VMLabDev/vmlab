@@ -16,6 +16,7 @@ import "../component/skill_md.wcl"  // skill_md_body (shared SKILL.md body, for 
 import "../component/concept.wcl"   // concept_body
 import "../component/entity.wcl"    // entity_body
 import "../component/fact.wcl"      // fact_body
+import "../component/research.wcl"  // research_body
 import "../component/process.wcl"   // process_body
 import "../component/type_index.wcl" // shared unit-index page component
 
@@ -47,6 +48,10 @@ let terms      = filter(terms,      fn(t: Term)      -> bool { in_book(t.audienc
 let all_indexes  = indexes
 let book_indexes = filter(all_indexes, fn(x: Index) -> bool { in_book(x.audience) })
 let procedures = filter(procedures, fn(p: Procedure) -> bool { in_book(p.audience) })
+// Research defaults to `:ai`, so the book shows a Research section only when a
+// finding opts in with `:book`/`:both`. Bound under a distinct name (not a
+// shadow) so pages/skill_links.wcl can filter the raw gathered list itself.
+let research_book = filter(research_units, fn(r: Research) -> bool { in_book(r.audience) })
 
 // Opt-in cli module (schema/cli.wcl): the book-filtered cli(s).
 let clis = filter(clis, fn(x: Cli) -> bool { in_book(x.audience) })
@@ -65,6 +70,7 @@ let all_units = flatten([
   map(entities,   fn(e: Entity)    -> UnitRef { { id: e.id, name: e.name,  href: $"entity_${e.id}",  related: e.related } }),
   map(facts,      fn(f: Fact)      -> UnitRef { { id: f.id, name: f.title, href: $"fact_${f.id}",    related: f.related } }),
   map(procedures, fn(p: Procedure) -> UnitRef { { id: p.id, name: p.title, href: $"process_${p.id}", related: p.related } }),
+  map(research_book, fn(r: Research) -> UnitRef { { id: r.id, name: r.topic, href: $"research_${r.id}", related: r.related } }),
 ])
 let referenced_by = fn(uid: identifier) -> list<UnitRef> {
   filter(all_units, fn(u: UnitRef) -> bool { list_contains(u.related, uid) })
@@ -86,7 +92,7 @@ site book {
   title            = $"${topic.name}"
   summary          = $"${topic.summary}"
   root             = true
-  theme            = :nord
+  theme            = :forge
   theme_toggle     = true
   search           = true
   toc {
@@ -127,6 +133,12 @@ site book {
     wdoc_repeater { each = match len(clis) { 0 => [], _ => [true] }  as = :_clg
       chapter "CLI Reference" { page = clis_page }
     }
+    // Research findings that opted into the book (`:book`/`:both` audience).
+    wdoc_repeater { each = match len(research_book) { 0 => [], _ => [true] }  as = :_rs
+      chapter "Research" {
+        wdoc_repeater { each = research_book  as = :r  chapter $"${r.topic}" { page = $"research_${r.id}" } }
+      }
+    }
     chapter "Glossary"       { page = glossary_page }
   }
   // The Reference catalogue (the force-directed graph of every unit) and the
@@ -160,6 +172,13 @@ wdoc_repeater { each = facts  as = :f
 wdoc_repeater { each = procedures  as = :pr
   page $"process_${pr.id}" { title = $"${pr.title}"
     process_body { unit = pr  all_units = all_units  backlinks = referenced_by(pr.id)  layout = "columns" }
+  }
+}
+
+// --- Research — one page per book-audience research finding ------------------
+wdoc_repeater { each = research_book  as = :r
+  page $"research_${r.id}" { title = $"${r.topic}"
+    research_body { unit = r  sources = sources  all_units = all_units  backlinks = referenced_by(r.id)  layout = "columns" }
   }
 }
 

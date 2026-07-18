@@ -1,6 +1,10 @@
 // wskill base schema — ships with the WSKILL skill scaffold.
 //
-// Schema version: 1.0.0 (mirror it in `schema_version` in wskill.wcl).
+// Schema version: 1.3.0 (mirror it in `schema_version` in wskill.wcl).
+// 1.3.0 is additive over 1.2.0: multiple skills per wskill (`skill` gains
+// optional name/description identity overrides; each extra skill pairs with
+// its own `:ai_skill` site) and shipped subagents (document-level wdoc
+// `agent` blocks, peers of the skills) — 1.2.0 data validates unchanged.
 //
 // DO NOT HAND-EDIT. Everything topic-specific belongs in `extensions.wcl`, and
 // the topic-owned vocabularies (entity kinds, artifact kinds) in `kinds.wcl` —
@@ -22,6 +26,7 @@
 namespace wcl.wskill
 
 import <wdoc.wcl>
+import <answer.wcl>      // @answerable + the `option` block for `question`s
 import "./kinds.wcl"     // topic-owned vocabularies (EntityKind, ArtifactKind)
 
 // ---------------------------------------------------------------------------
@@ -132,14 +137,39 @@ type Asset {
   @default([]) tags: list<utf8>
 }
 
+// NOTE on shipped agents: a wskill's Claude Code subagents are authored as
+// document-level wdoc `agent` blocks (peers of the `skill` blocks — an
+// agent belongs to the wskill, not to one of its skills; see AgentConfig
+// in wdoc's templates.wcl). The skill target writes each to
+// agents/<name>.md at the output root, beside the skill folder(s), and
+// installers copy them into a repo's .claude/agents/. The agent body is
+// the standing role constitution; the dispatching orchestrator's prompt
+// carries the per-task payload, so write it self-contained (a subagent
+// never sees the session's own prompt).
+//
+//   agent "topic-helper" {
+//     description = "Does one X task. Use when dispatching X work."
+//     tools = ["Read", "Bash"]        // empty/omitted = unrestricted
+//     model = "sonnet"                // omitted = inherit the session model
+//     body { p "You are …" }          // the whole system prompt
+//   }
+
 // Controls written into the generated SKILL.md frontmatter, plus the bundled
 // artifacts (script / asset children). A `skill` block kind is only possible
 // because the schema is namespaced (`wcl.wskill::skill`) — bare it would collide
 // with wdoc's own `skill` block. Defaults are absent-equivalent (empty list = no
 // pre-approval / no restriction; false = model may invoke), so they are safe to
-// always emit. Exactly one per wskill; the templates bind `let skill = head(skills)`.
+// always emit. A wskill ships ONE OR MORE skills: the templates bind the
+// primary as `let skill = head(skills)`; a further skill block sets `name`
+// (+ `description`) and pairs with its own `:ai_skill` site in the skill
+// template (each site renders into its own subfolder of out/skill).
 @block("skill")
 type Skill {
+  // Identity overrides — the PRIMARY skill omits both (the template derives
+  // name from the topic id and generates the reference-style description);
+  // every ADDITIONAL skill sets them (its install name and trigger text).
+  name:        utf8?
+  description: utf8?
   @default([])    allowed_tools:            list<utf8>   // → SKILL.md `allowed-tools`
   @default([])    disallowed_tools:         list<utf8>   // → `disallowed-tools`
   @default(false) disable_model_invocation: bool         // → `disable-model-invocation`
@@ -168,6 +198,82 @@ type Source {
   covers:           utf8         // free text: what this source is good for
   last_checked:     utf8?       // ISO date the agent last consulted it
   reflects_version: utf8?       // upstream version this source described when checked
+}
+
+// ---------------------------------------------------------------------------
+// Research (captured findings — dated, source-linked, rendered content)
+// ---------------------------------------------------------------------------
+
+// A research unit's lifecycle: :current (trustworthy as of `checked`) →
+// :stale (flagged for a re-check on the next update sweep) → :superseded
+// (kept for the record; `superseded_by` names the replacement unit).
+symbol_set ResearchStatus { current stale superseded }
+
+// A captured research finding — the durable output of an investigation: the
+// question asked, what was found, how fresh it is, and where the evidence
+// lives. Unlike `source` (a locator only, never rendered) a research unit IS
+// content: the skill projection writes it to references/research_<id>.md —
+// the fixed path an external consumer (e.g. a planning pipeline's researcher
+// agent) globs to reuse findings instead of re-investigating — and lists it
+// in references/index_research.md. Audience defaults to :ai (research is
+// captured for agents first; opt into the book with :both) — note this
+// deviates from the :book default the other content blocks use.
+@block("research")
+type Research {
+  @inline(0) id: identifier
+  topic:    utf8                          // headline (also the link text)
+  question: utf8?                         // what the investigation set out to answer
+  summary:  utf8                          // one-line finding, for the research index
+  @default(:current) status: ResearchStatus
+  checked:  utf8                          // ISO date the finding was last verified
+  applies_to: utf8?                       // subject/version the finding holds for (e.g. "bevy 0.18")
+  @default([]) source_ids: list<identifier> // backing `source` block ids
+  @default([]) locators:   list<utf8>     // ad-hoc evidence (URLs/paths) not worth a source block
+  superseded_by: identifier?              // replacement research unit, when :superseded
+  @default([]) related: list<identifier>  // ids of related units (any kind)
+  @default(:ai) audience: Audience        // :ai (default) | :book | :both
+  @default([]) tags: list<utf8>
+  // The findings — an addressable `body { …wdoc… }`, projected onto its page.
+  @child("body") body: WdocAddressableBody?
+}
+
+// ---------------------------------------------------------------------------
+// Open questions (update-workflow metadata, answered via answer mode)
+// ---------------------------------------------------------------------------
+
+// A question's lifecycle: :open (needs an answer) → :answered, or :dropped
+// when it is withdrawn/skipped.
+symbol_set QuestionStatus { open answered dropped }
+
+// How a choice question presents: one pick, several, or plain text. Free text
+// is ALWAYS also available — options accelerate, they never constrain.
+symbol_set QuestionKind { single_select multi_select free_text }
+
+// An open question about the topic, captured while authoring: an unclear
+// fact, a decision only the topic owner can make, a gap found during an
+// update sweep. Wired for guided answer mode via `@answerable` —
+// `wcl answer wskill.wcl` walks the :open ones in the terminal and writes
+// `answer` + `status` straight back into the data file, one question at a
+// time. When `kind` is omitted, a question with `option`
+// children behaves as :single_select and one without as :free_text.
+// Like `source`, a question is update-workflow metadata and never renders
+// as topic content: fold an :answered question's answer into real units on
+// the next sweep, then delete the block.
+@answerable(prompt = "question", response = "answer", status = "status",
+            pending = :open, resolved = :answered, skipped = :dropped)
+@block("question")
+type Question {
+  @inline(0) id: identifier
+  question: utf8                 // the prompt shown to the respondent
+  @default(:open) status: QuestionStatus
+  answer:   utf8?                // written by answer mode (or by hand)
+  kind:     QuestionKind?        // omit to infer from the presence of options
+  context:  utf8?                // why it's asked / what the answer unblocks
+  unit:     identifier?          // unit the answer should update, when known
+  // Choices, as `option <id> { label = … }` children (the answer stdlib's
+  // block; `label` falls back to the option's id).
+  @children("option") options: list<AnswerOption>
+  @default([]) tags: list<utf8>
 }
 
 // ---------------------------------------------------------------------------
@@ -400,14 +506,20 @@ type Procedure {
 type WSkillDoc {
   schema_version: utf8
 
-  // Exactly one topic and one skill block are expected. They are gathered
-  // as lists — not @child singles — because list elements resolve omitted
-  // optional fields to `none`, which a single @child block does not. Templates
-  // bind `let topic = head(topics)` / `let skill = head(skills)`.
+  // Exactly one topic block is expected; a wskill ships ONE OR MORE skills
+  // (each `skill` block pairs with an `:ai_skill` site in the skill
+  // template). They are gathered as lists — not @child singles — because
+  // list elements resolve omitted optional fields to `none`, which a single
+  // @child block does not. Templates bind `let topic = head(topics)` /
+  // `let skill = head(skills)` (the primary skill). Shipped agents are
+  // document-level wdoc `agent` blocks (peers of the skills) — the merged
+  // wdoc @document gathers those as `agents`.
   @children("topic") topics: list<Topic>
   @children("skill") skills: list<Skill>
 
   @children("source")     sources:    list<Source>
+  @children("research")   research_units: list<Research>
+  @children("question")   questions:  list<Question>
   @children("wskill_ref") refs:       list<WskillRef>
   @children("artifact")   artifacts:  list<Artifact>
 

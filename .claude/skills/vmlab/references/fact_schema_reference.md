@@ -17,6 +17,7 @@ A complete reference of the `vmlab.wcl` (and host `config.wcl`) schema, reflecte
 | `vms` | `vm` | yes | The VMs in this lab |
 | `containers` | `container` | yes | OCI containers in this lab, each run in a micro-VM |
 | `provisions` | `provision` | yes | wscript provision scripts run on `vmlab up`, in declaration order |
+| `playbooks` | `playbook` | yes | config-weave playbooks applied on `vmlab up`, interleaved with provisions in declaration order |
 | `handlers` | `on` | yes | Lifecycle event handlers (failures are logged, never fatal) |
 | `records` | `record` | yes | Lab-wide static DNS entries (wildcards allowed) |
 | `sinkholes` | `sinkhole` | yes | Lab-wide DNS sinkholes |
@@ -207,6 +208,7 @@ sinkhole { pattern = "*.telemetry.com" mode = "nxdomain" }   // or mode = "zero"
 | `extra_disks` | `disk` | yes | Additional disks beyond the primary disk |
 | `shares` | `share` | yes | SMB shared folders (require ≥1 NIC) |
 | `media` | `media` | yes | ISO/floppy images built from a folder |
+| `web` | `web` | yes | HTTP UIs served in the guest, proxied into the web console (require ≥1 NIC) |
 
 Example:
 
@@ -300,6 +302,20 @@ Example:
 media { kind = "iso"    from = "./unattend/" label = "CIDATA" }
 media { kind = "floppy" from = "./drivers/"  label = "DRV" }
 ```
+
+#### `web` (in `vm`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | `utf8` | yes | Page name (DNS label); unique per machine; the inline block label |
+| `port` | `i64` | yes | Guest TCP port serving the HTTP UI (1–65535) (required) |
+| `path` | `utf8` | no | Initial path opened in the console (default `/`) |
+
+#### Child blocks
+
+| Slot | Accepts | Multiple | Description |
+| --- | --- | --- | --- |
+| `auth` | `auth` | no | Credentials the proxy injects so the guest app's own login never prompts |
 
 ### `container` (in `lab`)
 
@@ -447,6 +463,20 @@ healthcheck {
 }
 ```
 
+#### `web` (in `container`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | `utf8` | yes | Page name (DNS label); unique per machine; the inline block label |
+| `port` | `i64` | yes | Guest TCP port serving the HTTP UI (1–65535) (required) |
+| `path` | `utf8` | no | Initial path opened in the console (default `/`) |
+
+#### Child blocks
+
+| Slot | Accepts | Multiple | Description |
+| --- | --- | --- | --- |
+| `auth` | `auth` | no | Credentials the proxy injects so the guest app's own login never prompts |
+
 ### `provision` (in `lab`)
 
 Provision script run during `vmlab up`. Optional vms list scopes
@@ -463,6 +493,17 @@ Example:
 provision "scripts/setup.ws" { }                     // runs on `vmlab up`, in order
 provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
 ```
+
+### `playbook` (in `lab`)
+
+config-weave playbook applied on `vmlab up` (interleaved with provisions
+in declaration order) and runnable on demand via `vmlab playbook check|apply`.
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
+| `play` | `utf8` | yes | Play name inside the playbook to run (required) |
+| `vms` | `list<utf8>` | no | VM/container names this playbook targets; empty/absent = every machine |
 
 ### `on` (in `lab`)
 
@@ -542,6 +583,7 @@ Template definition, buildable with `vmlab template build`.
 | `source` | `source` | no | What the build starts from — exactly one of four forms (required) |
 | `media` | `media` | yes | ISO/floppy images attached to the build |
 | `provisions` | `provision` | yes | Provision scripts that drive the build |
+| `playbooks` | `playbook` | yes | config-weave playbooks applied to the build VM, interleaved with provisions in declaration order; steps stream as structured build progress |
 | `nics` | `nic` | yes | NICs for the build VM (optional; the build VM may be air-gapped) |
 | `extra_disks` | `disk` | yes | Additional disks attached during the build |
 
@@ -614,6 +656,17 @@ provision "scripts/setup.ws" { }                     // runs on `vmlab up`, in o
 provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
 ```
 
+### `playbook` (in `template`)
+
+config-weave playbook applied on `vmlab up` (interleaved with provisions
+in declaration order) and runnable on demand via `vmlab playbook check|apply`.
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
+| `play` | `utf8` | yes | Play name inside the playbook to run (required) |
+| `vms` | `list<utf8>` | no | VM/container names this playbook targets; empty/absent = every machine |
+
 ### `nic` (in `template`)
 
 | Property | Type | Required | Description |
@@ -663,6 +716,7 @@ disk "formatted" { from = "./payload/" }  // folder copied onto a fresh FAT file
 | `viewer` | `utf8` | no | VNC viewer command; `{}` is replaced by the target |
 | `fastpath` | `utf8` | no | Network fast path: `auto` (probe; default), `off`, `sockmap`, or `afxdp` |
 | `oci_chunk_size` | `std.ByteSize` | no | OCI layer chunk size for template push; default `512MiB` |
+| `config_weave_bin_dir` | `utf8` | no | Directory holding config-weave guest binaries; default `~/.local/share/config-weave/bin` |
 
 Example:
 

@@ -1,15 +1,17 @@
 ---
 name: vmlab
 description: "Reference and processes for vmlab. A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript. Use when working with vmlab or answering questions about it."
-wskill_schema_version: 1.0.0
 allowed-tools:
   - Bash
   - Read
-disallowed-tools: []
 disable-model-invocation: false
+metadata:
+  wskill_schema_version: 1.3.0
 ---
 
 # vmlab
+
+<overview>
 
 A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript.
 
@@ -19,35 +21,42 @@ vmlab orchestrates single-host VM labs: labs (VMs + virtual networks) are declar
 
 A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by the CLI. This skill captures the full reference as data.
 
+</overview>
+
 ## Parameters
 
-Values to pass when invoking this skill — reference them as `$ARGUMENTS`, `$1`, `$2`, … in the prompt.
+<variables>
 
-| Parameter | Description | How to determine the value |
-| --- | --- | --- |
-| $ARGUMENTS | The vmlab topic, CLI subcommand, WCL attribute, or wscript API method to look up. | Take it from the user's request. If empty, summarise the reference and ask what they need. |
+- `${CLAUDE_SKILL_DIR}`: path to this skill's directory (its `scripts/`, `assets/`, and `references/` live here).
 
-<Boundary>
+- `$ARGUMENTS`: The vmlab topic, CLI subcommand, WCL attribute, or wscript API method to look up. How to determine: Take it from the user's request. If empty, summarise the reference and ask what they need.
 
-**Always:**
+</variables>
+
+<boundaries>
+
+<always>
 
 - Run `vmlab validate` after editing `vmlab.wcl` and before `vmlab up`.
-
 - For multi-step guest automation, write a wscript script (`vmlab script x.ws`) instead of chaining many `vmlab exec` calls.
-
 - Cite the exact reference page when answering.
 
-**Ask first:**
+</always>
+
+<ask>
 
 - Which lab or template is meant when multiple `vmlab.wcl` files or store versions are plausible targets.
 
-**Never:**
+</ask>
+
+<never>
 
 - Run `vmlab destroy` or `vmlab template rm` without explicit user say-so — both delete state (clones / store images).
-
 - Invent WCL attributes or wscript functions: everything that exists is in the reference; if it's not there, check `src/config/schema.wcl` or `src/scripting/mod.rs` before using it.
 
-</Boundary>
+</never>
+
+</boundaries>
 
 ## Reference
 
@@ -58,25 +67,15 @@ _Declare VMs and the virtual networks that connect them._
 Everything for writing a `vmlab.wcl`: the lab and VM blocks, segment networking, SMB shares, and provision/event scripts.
 
 - [lab {} block](references/entity_labs.md)
-
 - [vm {} block](references/entity_vms.md)
-
 - [nic {} block](references/entity_nic_block.md)
-
 - [Networking model](references/concept_networking.md)
-
 - [segment {} block](references/entity_segment_block.md)
-
 - [segment {} sub-blocks](references/fact_segment_subblocks.md)
-
 - [share {} block](references/entity_shares.md)
-
 - [Provisions & event handlers](references/concept_provisions.md)
-
 - [provision {} block](references/entity_provision_block.md)
-
 - [on "event" {} handler](references/entity_on_handler.md)
-
 - [The vmlab.wcl schema](references/fact_schema_reference.md)
 
 ### Templates & distribution
@@ -86,23 +85,14 @@ _Build reusable disk images and move them between machines._
 Build templates from installer media, boot scratch VMs, generate ISO/floppy media, and distribute templates over OCI registries.
 
 - [Templates](references/concept_templates.md)
-
 - [template {} block](references/entity_template_block.md)
-
 - [Template build flow](references/concept_template_builds.md)
-
 - [Linked clones](references/concept_linked_clones.md)
-
 - [source {} build source](references/entity_template_sources.md)
-
 - [Scratch VMs](references/concept_scratch_vms.md)
-
 - [media {} block](references/entity_media.md)
-
 - [OCI distribution](references/concept_oci.md)
-
 - [OCI artifact model](references/fact_oci_artifact.md)
-
 - [The vmlab.wcl schema](references/fact_schema_reference.md)
 
 ### Automation (wscript)
@@ -112,41 +102,23 @@ _Drive guests with wscript provision scripts and event handlers._
 The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for automating guests — power, exec, keystrokes, screen matching and OCR.
 
 - [wscript: overview](references/concept_wscript_overview.md)
-
 - [wscript: types & values](references/concept_wscript_types.md)
-
 - [wscript: functions & control flow](references/concept_wscript_functions.md)
-
 - [wscript: pattern matching & errors](references/concept_wscript_matching.md)
-
 - [wscript: modules & prelude](references/concept_wscript_modules.md)
-
 - [wscript: List & Map methods](references/fact_wscript_collections.md)
-
 - [wscript: string methods](references/fact_wscript_strings.md)
-
 - [wscript: not in v1](references/fact_wscript_limits.md)
-
 - [Lab](references/entity_lab_api.md)
-
 - [Vm](references/entity_vm_api.md)
-
 - [Vm: lifecycle & state methods](references/fact_vm_lifecycle.md)
-
 - [Vm: snapshot methods](references/fact_vm_snapshots.md)
-
 - [Vm: keyboard & mouse methods](references/fact_vm_input.md)
-
 - [Vm: screen, image matching & OCR methods](references/fact_vm_vision.md)
-
 - [Vm: guest agent methods (exec, files, terminal, stats)](references/fact_vm_agent.md)
-
 - [Segment](references/entity_seg_api.md)
-
 - [Match](references/entity_match_type.md)
-
 - [ExecResult](references/entity_exec_result_type.md)
-
 - [Event](references/entity_event_type.md)
 
 ### Operations & hosting
@@ -156,21 +128,13 @@ _Run vmlab: the CLI, daemons, host config, profiles, containers and WSL2._
 How vmlab runs: the two-tier daemon, the optional host config, guest OS profiles, and running unprivileged in containers or on WSL2. The CLI reference covers every verb.
 
 - [Daemon model](references/concept_daemon_model.md)
-
 - [Host config](references/concept_host_config.md)
-
 - [Guest OS profiles](references/concept_profiles.md)
-
 - [Shipped guest OS profiles](references/fact_profiles_table.md)
-
 - [Filesystem layout](references/fact_paths_table.md)
-
 - [Containers](references/concept_containers.md)
-
 - [WSL2](references/concept_wsl2.md)
-
 - [What `vmlab validate` checks](references/fact_validate_checks.md)
-
 - [The vmlab.wcl schema](references/fact_schema_reference.md)
 
 - [CLI reference](references/cli_ref.md) — every `vmlab` subcommand, its arguments and switches
@@ -184,9 +148,6 @@ How vmlab runs: the two-tier daemon, the optional host config, guest OS profiles
 Beyond this skill, the wskill ships these views — build them with `just render` in the wskill folder:
 
 - **book** (`wdoc/book/main.wcl`)
-
 - **ai skill** (`wdoc/skill/main.wcl`)
-
 - **presentation** — vmlab in a nutshell — an overview deck. (`wdoc/presentation/main.wcl`)
-
 - **training** — Learn vmlab — a hands-on lesson series. (`wdoc/training/main.wcl`)

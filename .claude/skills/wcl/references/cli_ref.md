@@ -73,6 +73,26 @@ Update the field at a dotted path with a new WCL expression, following imports t
 wcl set site.wcl service.web.port 9090u32
 ```
 
+## wcl answer
+
+Walk a document's pending `@answerable` interview questions (from `import <answer.wcl>`) and record the answers — arrow-key menus for choice questions, free text always available, each answer written back immediately through the validating edit pipeline.
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| file | required | Path to the WCL document (imports are followed; answers land in the declaring file). |
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --list | — | List the pending questions as JSON instead of prompting. |
+| --id | ID | Answer one question non-interactively: the question block's label. |
+| --text | TEXT | Free-text answer for `--id` (may combine with `--pick`). |
+| --pick | OPTION | Pick an option by its id for `--id` (repeatable). |
+| --skip | — | Skip the `--id` question: writes its declared skipped status. |
+
+```console
+wcl answer plan.wcl --id q_platforms --pick linux
+```
+
 ## wcl fmt
 
 Reformat to canonical form (comments and blank-line groupings preserved).
@@ -206,7 +226,7 @@ wcl wdoc pdf wdoc/book/main.wcl --out book.pdf
 
 ### wcl wdoc serve
 
-Build and serve a wdoc site locally with live reload.
+Build and serve a wdoc site locally with live reload. Watches for `.wcl` changes; press Enter in the console (or `POST /__wdoc_rebuild`) to rebuild. Browser editing lives in `wcl editor`.
 
 | Argument | Required | Description |
 | --- | --- | --- |
