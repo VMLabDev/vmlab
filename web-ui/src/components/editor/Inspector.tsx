@@ -16,8 +16,14 @@ import {
   Plus,
   Trash2,
 } from "lucide-solid";
-import type { LabModel, SegmentModel, ShareModel, VolumeModel } from "../../editor/model";
-import { HEALTHCHECK_DEFAULTS, uniqueName } from "../../editor/model";
+import type {
+  LabModel,
+  SegmentModel,
+  ShareModel,
+  VolumeModel,
+  WebPageModel,
+} from "../../editor/model";
+import { HEALTHCHECK_DEFAULTS, emptyWebAuth, emptyWebPage, uniqueName } from "../../editor/model";
 import * as F from "../../editor/fields";
 import { formatByteSize, formatMemory, parseByteSize } from "../../editor/bytesize";
 import {
@@ -521,6 +527,95 @@ function RemoteInspector(props: { host: string }) {
 const GIB = 1024 * 1024 * 1024;
 const MIB = 1024 * 1024;
 
+/** The "Web" tab shared by VM and container inspectors: a list of `web {}`
+ *  pages, each with an optional nested `auth {}` block whose fields switch on
+ *  the chosen method. `pages()` reads the live array; `edit` runs a mutation
+ *  against it. */
+function WebPagesTab(props: {
+  pages: () => WebPageModel[];
+  edit: (fn: (list: WebPageModel[]) => void) => void;
+}) {
+  return (
+    <div class="stack">
+      <For each={props.pages()}>
+        {(page, i) => (
+          <div class="web-page-block">
+            <div class="web-page-head">
+              <Input
+                value={page.name}
+                placeholder="page name"
+                title="Page name (DNS label); unique per machine"
+                onInput={(e) => props.edit((list) => (list[i()].name = e.currentTarget.value))}
+              />
+              <IconButton
+                icon={Trash2}
+                label={`Remove ${page.name || "page"}`}
+                onClick={() => props.edit((list) => list.splice(i(), 1))}
+              />
+            </div>
+            <BlockForm
+              fields={F.WEB_FIELDS}
+              value={page as any}
+              onSet={(key, v) => props.edit((list) => ((list[i()] as any)[key] = v))}
+            />
+            <div class="field-row">
+              <div class="field-row-label" title="Proxy-injected upstream credentials">
+                Upstream auth
+              </div>
+              <div class="field-row-control">
+                <Toggle
+                  checked={page.auth !== null}
+                  onChange={(on) =>
+                    props.edit((list) => (list[i()].auth = on ? emptyWebAuth() : null))
+                  }
+                />
+              </div>
+            </div>
+            <Show when={page.auth}>
+              <FieldRowMethod
+                value={page.auth!.method}
+                onChange={(m) => props.edit((list) => (list[i()].auth!.method = m))}
+              />
+              <BlockForm
+                fields={F.WEB_AUTH_FIELDS[page.auth!.method] ?? []}
+                value={page.auth as any}
+                onSet={(key, v) => props.edit((list) => ((list[i()].auth as any)[key] = v))}
+              />
+            </Show>
+          </div>
+        )}
+      </For>
+      <Button
+        size="sm"
+        icon={Plus}
+        onClick={() =>
+          props.edit((list) => list.push(emptyWebPage(uniqueName("page", list.map((p) => p.name)))))
+        }
+      >
+        Add web page
+      </Button>
+    </div>
+  );
+}
+
+/** The auth method Select, rendered as a labeled field row. */
+function FieldRowMethod(props: { value: string; onChange: (m: string) => void }) {
+  return (
+    <div class="field-row">
+      <div class="field-row-label" title={F.WEB_AUTH_METHOD.doc}>
+        {F.WEB_AUTH_METHOD.label}
+      </div>
+      <div class="field-row-control">
+        <Select
+          value={props.value}
+          options={(F.WEB_AUTH_METHOD.options ?? []).map((o) => ({ value: o, label: o }))}
+          onChange={props.onChange}
+        />
+      </div>
+    </div>
+  );
+}
+
 function VmInspector(props: { index: number }) {
   const vm = () => editor.draft!.vms[props.index];
   const [tab, setTab] = createSignal("general");
@@ -559,6 +654,7 @@ function VmInspector(props: { index: number }) {
           { id: "storage", label: "Storage" },
           { id: "network", label: "Network", count: vm().nics.length || undefined },
           { id: "sharing", label: "Shares" },
+          { id: "web", label: "Web", count: vm().web.length || undefined },
           { id: "overrides", label: "Overrides" },
         ]}
         active={tab()}
@@ -672,6 +768,12 @@ function VmInspector(props: { index: number }) {
           }
           onRemove={(i) => mutate((d) => void d.vms[props.index].shares.splice(i, 1))}
           onSet={(i, key, v) => mutate((d) => ((d.vms[props.index].shares[i] as any)[key] = v))}
+        />
+      </Show>
+      <Show when={tab() === "web"}>
+        <WebPagesTab
+          pages={() => vm().web}
+          edit={(fn) => mutate((d) => fn(d.vms[props.index].web))}
         />
       </Show>
       <Show when={tab() === "overrides"}>
@@ -920,6 +1022,7 @@ function ContainerInspector(props: { index: number }) {
           { id: "storage", label: "Volumes", count: ctr().volumes.length || undefined },
           { id: "env", label: "Env", count: ctr().env.length || undefined },
           { id: "health", label: "Health" },
+          { id: "web", label: "Web", count: ctr().web.length || undefined },
         ]}
         active={tab()}
         onChange={setTab}
@@ -1097,6 +1200,12 @@ function ContainerInspector(props: { index: number }) {
             onSet={setHealth}
           />
         </Show>
+      </Show>
+      <Show when={tab() === "web"}>
+        <WebPagesTab
+          pages={() => ctr().web}
+          edit={(fn) => mutate((d) => fn(d.containers[props.index].web))}
+        />
       </Show>
     </>
   );

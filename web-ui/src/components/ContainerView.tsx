@@ -6,7 +6,7 @@
 
 import { For, Show, createSignal } from "solid-js";
 import { Badge, Card, Empty, IconButton, PageHead, Tabs } from "@forge/ui";
-import { RotateCcw, SquarePen } from "lucide-solid";
+import { Globe, RotateCcw, SquarePen } from "lucide-solid";
 import ActionButton from "./ActionButton";
 import PowerButton from "./PowerButton";
 import {
@@ -19,6 +19,7 @@ import {
   state,
 } from "../store";
 import { canEditPlaybook, editPlaybook } from "./FilesView";
+import { openWebPage } from "./WebView";
 import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
 import MachinePullStatus from "./MachinePullStatus";
@@ -178,6 +179,33 @@ export default function ContainerView() {
                           onClick={() => void editPlaybook(pb.path)}
                         />
                       </Show>
+                    </span>
+                  </div>
+                )}
+              </For>
+            </Card>
+          </Show>
+          <Show when={(ctr()!.web ?? []).length > 0}>
+            <Card title="Web pages">
+              <For each={ctr()!.web ?? []}>
+                {(page) => (
+                  <div class="kv">
+                    <span class="kv-k">
+                      {page.name} <span class="muted">:{page.port}</span>
+                    </span>
+                    <span class="kv-v">
+                      <IconButton
+                        icon={Globe}
+                        label={
+                          on()
+                            ? `Open ${page.name}`
+                            : "Start the container to open its web pages"
+                        }
+                        disabled={!on() || !ctr()!.ip}
+                        onClick={() =>
+                          openWebPage(state.currentLab!, "containers", ctr()!.name, page)
+                        }
+                      />
                     </span>
                   </div>
                 )}

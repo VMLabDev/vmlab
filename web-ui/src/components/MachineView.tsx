@@ -1,6 +1,6 @@
 import { For, Show, createResource, createSignal } from "solid-js";
 import { Badge, Button, Card, Empty, Icon, IconButton, PageHead, Tabs } from "@forge/ui";
-import { Camera, RotateCcw, SquarePen } from "lucide-solid";
+import { Camera, Globe, RotateCcw, SquarePen } from "lucide-solid";
 import ActionButton from "./ActionButton";
 import PowerButton from "./PowerButton";
 import {
@@ -21,6 +21,7 @@ import {
 import { vmSnapshots } from "../api";
 import { confirmDialog, promptDialog } from "./dialogs";
 import { canEditPlaybook, editPlaybook } from "./FilesView";
+import { openWebPage } from "./WebView";
 import ConsoleScreen from "./ConsoleScreen";
 import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
@@ -205,6 +206,31 @@ export default function MachineView() {
                           onClick={() => void editPlaybook(pb.path)}
                         />
                       </Show>
+                    </span>
+                  </div>
+                )}
+              </For>
+            </Card>
+          </Show>
+          <Show when={(vm()!.web ?? []).length > 0}>
+            <Card title="Web pages">
+              <For each={vm()!.web ?? []}>
+                {(page) => (
+                  <div class="kv">
+                    <span class="kv-k">
+                      {page.name} <span class="muted">:{page.port}</span>
+                    </span>
+                    <span class="kv-v">
+                      <IconButton
+                        icon={Globe}
+                        label={
+                          on()
+                            ? `Open ${page.name}`
+                            : "Start the machine to open its web pages"
+                        }
+                        disabled={!on() || !vm()!.ip}
+                        onClick={() => openWebPage(state.currentLab!, "vms", vm()!.name, page)}
+                      />
                     </span>
                   </div>
                 )}

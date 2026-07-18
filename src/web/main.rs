@@ -20,6 +20,7 @@ mod pkgs;
 mod playbooks;
 mod state;
 mod tty;
+mod webpages;
 
 use std::net::IpAddr;
 use std::process::ExitCode;
@@ -375,6 +376,19 @@ async fn main() -> ExitCode {
             .route("/api/labs/{lab}/reload", web::post().to(api::reload_lab))
             .route("/api/labs/{lab}/{action}", web::post().to(api::lab_action))
             .route("/api/labs/{lab}", web::get().to(api::lab_status))
+            // Guest web-page proxy: the session-cookie minter is under the
+            // gated /api/ tree; the proxy itself lives outside /api/ (iframe
+            // subresources ride the path-scoped cookie) — before the SPA
+            // fallback.
+            .route("/api/web/session", web::post().to(webpages::web_session))
+            .route(
+                "/web/{lab}/{kind}/{machine}/{page}",
+                web::route().to(webpages::proxy_root),
+            )
+            .route(
+                "/web/{lab}/{kind}/{machine}/{page}/{tail:.*}",
+                web::route().to(webpages::proxy),
+            )
             // Live streams.
             .route("/api/events", web::get().to(events::events))
             .route("/api/desktop/vnc/{lab}/{vm}", web::get().to(desktop::vnc))

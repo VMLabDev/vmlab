@@ -225,6 +225,7 @@ pub struct Vm {
     pub extra_disks: Vec<DiskBlock>,
     pub shares: Vec<Share>,
     pub media: Vec<Media>,
+    pub web: Vec<WebPage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +368,7 @@ pub struct Container {
     pub volumes: Vec<Volume>,
     pub ports: Vec<PortMap>,
     pub healthcheck: Option<Healthcheck>,
+    pub web: Vec<WebPage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -430,6 +432,51 @@ pub struct Healthcheck {
     pub retries: u32,
     pub start_period: std::time::Duration,
     pub span: Span,
+}
+
+/// An HTTP UI served inside the guest, proxied into the web console.
+#[derive(Debug, Clone)]
+pub struct WebPage {
+    pub name: String,
+    pub span: Span,
+    pub port: u16,
+    /// Initial path opened in the console; always `/`-prefixed.
+    pub path: String,
+    pub auth: Option<WebAuth>,
+    pub auth_span: Option<Span>,
+}
+
+/// Credentials the proxy injects to the guest app so its own login never
+/// prompts the user. Serializes onto the `web.forward` proto reply (host
+/// unix socket only — never reaches the browser).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "method", rename_all = "lowercase")]
+pub enum WebAuth {
+    Basic {
+        username: String,
+        password: String,
+    },
+    Bearer {
+        token: String,
+    },
+    Header {
+        name: String,
+        value: String,
+    },
+    Ntlm {
+        username: String,
+        password: String,
+        domain: Option<String>,
+    },
+    Form {
+        username: String,
+        password: String,
+        login_path: String,
+        login_method: String,
+        login_body: String,
+        login_content_type: String,
+        fail_redirect: Option<String>,
+    },
 }
 
 /// OCI container image reference as written in config; syntax-checked here,

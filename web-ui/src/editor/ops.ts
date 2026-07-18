@@ -37,6 +37,8 @@ import type {
   Span,
   VmModel,
   VolumeModel,
+  WebAuthModel,
+  WebPageModel,
 } from "./model";
 import { HEALTHCHECK_DEFAULTS } from "./model";
 import { toUnitValue } from "./bytesize";
@@ -54,6 +56,7 @@ type FV =
   | { k: "intdef"; v: number; def: number }
   | { k: "secs"; v: number; def: number }
   | { k: "bytes"; v: number | null }
+  | { k: "sym"; v: string }
   | { k: "list"; v: string[] };
 
 const str = (v: string | null): FV => ({ k: "str", v: v?.trim() ? v : null });
@@ -64,6 +67,7 @@ const strdef = (v: string, def: string): FV => ({ k: "strdef", v, def });
 const intdef = (v: number, def: number): FV => ({ k: "intdef", v, def });
 const secs = (v: number, def: number): FV => ({ k: "secs", v, def });
 const bytes = (v: number | null): FV => ({ k: "bytes", v });
+const sym = (v: string): FV => ({ k: "sym", v });
 const list = (v: string[]): FV => ({ k: "list", v });
 
 /** Encode for the wire; null = "unset this field". */
@@ -86,6 +90,8 @@ function encode(f: FV): OpValue | null {
       return { num: f.v, unit: "s" };
     case "bytes":
       return f.v === null ? null : toUnitValue(f.v);
+    case "sym":
+      return { symbol: f.v };
     case "list":
       return f.v.length ? f.v : null;
   }
@@ -241,6 +247,26 @@ const gpuPairs = (g: GpuModel): [string, FV][] => [
   ["address", str(g.address)],
 ];
 
+const webPairs = (w: WebPageModel): [string, FV][] => [
+  ["port", int(w.port)],
+  ["path", strdef(w.path || "/", "/")],
+];
+
+const webAuthPairs = (a: WebAuthModel): [string, FV][] => [
+  ["method", sym(a.method)],
+  ["username", str(a.username)],
+  ["password", str(a.password)],
+  ["domain", str(a.domain)],
+  ["token", str(a.token)],
+  ["header", str(a.header)],
+  ["value", str(a.value)],
+  ["login_path", str(a.login_path)],
+  ["login_method", str(a.login_method)],
+  ["login_body", str(a.login_body)],
+  ["login_content_type", str(a.login_content_type)],
+  ["fail_redirect", str(a.fail_redirect)],
+];
+
 // --- container field tables ----------------------------------------------------
 
 const containerPairs = (c: ContainerModel): [string, FV][] => [
@@ -359,6 +385,16 @@ const mediaSpec = (m: MediaModel): BlockSpec => ({
   fields: specFields(mediaPairs(m)),
 });
 const gpuSpec = (g: GpuModel): BlockSpec => ({ kind: "gpu", fields: specFields(gpuPairs(g)) });
+const webAuthSpec = (a: WebAuthModel): BlockSpec => ({
+  kind: "auth",
+  fields: specFields(webAuthPairs(a)),
+});
+const webSpec = (w: WebPageModel): BlockSpec => ({
+  kind: "web",
+  labels: [w.name],
+  fields: specFields(webPairs(w)),
+  children: w.auth ? [webAuthSpec(w.auth)] : [],
+});
 const dnsSpec = (d: DnsModel): BlockSpec => ({ kind: "dns", fields: specFields(dnsPairs(d)) });
 const connectSpec = (c: ConnectModel): BlockSpec => ({
   kind: "connect",
@@ -425,6 +461,7 @@ function containerSpec(c: ContainerModel): BlockSpec {
   children.push(...c.volumes.map(volumeSpec));
   children.push(...c.ports.map(portSpec));
   if (c.healthcheck) children.push(healthcheckSpec(c.healthcheck));
+  children.push(...c.web.map(webSpec));
   return {
     kind: "container",
     labels: [c.name],
@@ -440,6 +477,7 @@ function vmSpec(v: VmModel): BlockSpec {
   children.push(...v.extra_disks.map(diskSpec));
   children.push(...v.shares.map(shareSpec));
   children.push(...v.media.map(mediaSpec));
+  children.push(...v.web.map(webSpec));
   return { kind: "vm", labels: [v.name], fields: specFields(vmPairs(v)), children };
 }
 
@@ -489,6 +527,15 @@ function diffDisk(ops: Ops, base: DiskModel, draft: DiskModel) {
   fieldDiffer(diskPairs)(ops, base, draft);
 }
 
+const diffWebAuth = fieldDiffer(webAuthPairs);
+
+function diffWeb(ops: Ops, base: WebPageModel, draft: WebPageModel) {
+  const span = base.span!;
+  diffLabel(ops, span, base.name, draft.name);
+  fieldDiffer(webPairs)(ops, base, draft);
+  diffChild(ops, span, base.auth, draft.auth, diffWebAuth, webAuthSpec);
+}
+
 function diffProvision(ops: Ops, base: ProvisionModel, draft: ProvisionModel) {
   diffLabel(ops, base.span!, base.script, draft.script);
   fieldDiffer(provisionPairs)(ops, base, draft);
@@ -518,6 +565,7 @@ function diffContainer(ops: Ops, base: ContainerModel, draft: ContainerModel) {
   diffChildren(ops, span, base.volumes, draft.volumes, diffVolume, volumeSpec);
   diffChildren(ops, span, base.ports, draft.ports, diffPort, portSpec);
   diffChild(ops, span, base.healthcheck, draft.healthcheck, diffHealthcheck, healthcheckSpec);
+  diffChildren(ops, span, base.web, draft.web, diffWeb, webSpec);
 }
 
 function diffVm(ops: Ops, base: VmModel, draft: VmModel) {
@@ -529,6 +577,7 @@ function diffVm(ops: Ops, base: VmModel, draft: VmModel) {
   diffChildren(ops, span, base.extra_disks, draft.extra_disks, diffDisk, diskSpec);
   diffChildren(ops, span, base.shares, draft.shares, diffShare, shareSpec);
   diffChildren(ops, span, base.media, draft.media, diffMedia, mediaSpec);
+  diffChildren(ops, span, base.web, draft.web, diffWeb, webSpec);
 }
 
 function diffSegment(ops: Ops, base: SegmentModel, draft: SegmentModel) {

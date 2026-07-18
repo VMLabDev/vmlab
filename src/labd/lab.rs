@@ -37,6 +37,10 @@ pub struct LabRuntime {
     /// container — removed and re-installed when a restart brings a new
     /// lease, so a forward never points at a stale IP.
     container_forwards: Mutex<std::collections::HashMap<String, Vec<(String, u64)>>>,
+    /// Loopback forwards backing proxied web pages, keyed by (machine, page).
+    /// Revalidated on each `web.forward` (lease IP compare) so restarts and
+    /// re-leases self-heal without hooking start events.
+    web_forwards: Mutex<std::collections::HashMap<(String, String), WebForward>>,
     /// Kept for post-pull re-resolution (deferred templates fold their meta
     /// into the hardware resolution only once pulled).
     profiles: ProfileSet,
@@ -57,6 +61,14 @@ pub struct LabRuntime {
     /// In-flight config-weave runs, one per machine (`up` and on-demand
     /// check/apply claim through the same registry).
     pub playbook_ops: crate::labd::playbook::PlaybookOps,
+}
+
+/// A live loopback forward backing a proxied web page.
+struct WebForward {
+    segment: String,
+    id: u64,
+    addr: std::net::SocketAddr,
+    guest_ip: std::net::Ipv4Addr,
 }
 
 /// See [`LabRuntime::pre_provision`].
@@ -341,6 +353,7 @@ impl LabRuntime {
             events,
             smb: Mutex::new(None),
             container_forwards: Mutex::new(std::collections::HashMap::new()),
+            web_forwards: Mutex::new(std::collections::HashMap::new()),
             profiles: profiles.clone(),
             pending_pulls: Mutex::new(pending),
             pull_lock: Mutex::new(()),
@@ -1213,6 +1226,130 @@ impl LabRuntime {
             .insert(name.to_string(), installed);
     }
 
+    /// Ensure a loopback forward exists for a declared web page and return
+    /// its bound host address, the guest IP, port, and the page's auth spec.
+    /// The forward is cached per (machine, page) and revalidated against the
+    /// current lease so restarts self-heal. Errors (unknown page, no lease,
+    /// no NAT) are surfaced to the proxy, which maps them to a 502.
+    pub async fn ensure_web_forward(
+        self: &Arc<Self>,
+        machine: &str,
+        page: &str,
+    ) -> Result<serde_json::Value> {
+        // Locate the declared page + the machine's runtime handle (VM or
+        // container share the namespace).
+        let (web, macs, ip_res) =
+            if let Some(v) = self.config.lab.vms.iter().find(|v| v.name == machine) {
+                let inst = self.vm(machine)?;
+                let web = v
+                    .web
+                    .iter()
+                    .find(|w| w.name == page)
+                    .ok_or_else(|| anyhow!("no web page \"{page}\" on \"{machine}\""))?;
+                let first_seg = v.nics.first().map(nic_segment_name).map(str::to_string);
+                (
+                    (web.clone(), first_seg),
+                    inst.macs.clone(),
+                    inst.guest_ip(None).await,
+                )
+            } else if let Some(c) = self
+                .config
+                .lab
+                .containers
+                .iter()
+                .find(|c| c.name == machine)
+            {
+                let inst = self.container(machine)?;
+                let web = c
+                    .web
+                    .iter()
+                    .find(|w| w.name == page)
+                    .ok_or_else(|| anyhow!("no web page \"{page}\" on \"{machine}\""))?;
+                let first_seg = c.nics.first().map(nic_segment_name).map(str::to_string);
+                (
+                    (web.clone(), first_seg),
+                    inst.macs.clone(),
+                    inst.guest_ip().await,
+                )
+            } else {
+                bail!("no machine \"{machine}\" in lab \"{}\"", self.name);
+            };
+        let (web, seg_name) = web;
+        let seg_name = seg_name.ok_or_else(|| {
+            anyhow!("web page \"{page}\" on \"{machine}\" needs a NIC to reach it over")
+        })?;
+        let ip = ip_res.map_err(|_| {
+            anyhow!("\"{machine}\" has no network lease yet — is it running and ready?")
+        })?;
+        let guest_ip: std::net::Ipv4Addr = ip
+            .parse()
+            .map_err(|_| anyhow!("machine \"{machine}\" has a non-IPv4 lease"))?;
+
+        let key = (machine.to_string(), page.to_string());
+        // Cache hit whose lease still matches → reuse the live forward.
+        {
+            let cache = self.web_forwards.lock().await;
+            if let Some(f) = cache.get(&key)
+                && f.guest_ip == guest_ip
+            {
+                return Ok(json!({
+                    "addr": f.addr.to_string(),
+                    "guest_ip": guest_ip.to_string(),
+                    "port": web.port,
+                    "auth": web.auth,
+                }));
+            }
+        }
+
+        let net = self.network.lock().await;
+        // Drop a stale forward (lease moved / machine restarted).
+        if let Some(old) = self.web_forwards.lock().await.remove(&key)
+            && let Some(s) = net
+                .segments
+                .get(&old.segment)
+                .and_then(|s| s.services.as_ref())
+        {
+            s.remove_forward(old.id);
+        }
+        let Some(services) = net
+            .segments
+            .get(&seg_name)
+            .and_then(|s| s.services.as_ref())
+        else {
+            bail!("segment \"{seg_name}\" has no services — is the lab up?");
+        };
+        // Prime the NAT engine with the lease MAC (see install_container_ports).
+        if let Some(mac) = macs.first() {
+            services.learn_mac(guest_ip, *mac);
+        }
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|e| anyhow!("web forward bind failed: {e}"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| anyhow!("web forward addr failed: {e}"))?;
+        let id = services
+            .add_forward_bound(listener, guest_ip, web.port)
+            .map_err(|e| {
+                anyhow!("web page \"{page}\" needs NAT/egress on segment \"{seg_name}\": {e}")
+            })?;
+        self.web_forwards.lock().await.insert(
+            key,
+            WebForward {
+                segment: seg_name,
+                id,
+                addr,
+                guest_ip,
+            },
+        );
+        Ok(json!({
+            "addr": addr.to_string(),
+            "guest_ip": guest_ip.to_string(),
+            "port": web.port,
+            "auth": web.auth,
+        }))
+    }
+
     /// `vmlab up [vm...]` (PRD §7.2, §10.4): start in depends_on waves and
     /// run provision scripts in declaration order. A dependency is
     /// satisfied when its VM is ready and the provisions scoped to it have
@@ -1732,6 +1869,15 @@ impl LabRuntime {
                     })
                 })
                 .collect();
+            // Declared web pages (no credentials — the browser only needs
+            // name/port/path to build launch links; the proxy fetches auth
+            // separately over the daemon socket).
+            let web: Vec<Value> = vm
+                .cfg
+                .web
+                .iter()
+                .map(|w| json!({"name": w.name, "port": w.port, "path": w.path}))
+                .collect();
             vms.push(json!({
                 "name": name,
                 "state": state,
@@ -1743,6 +1889,7 @@ impl LabRuntime {
                 "cpus": vm.cfg.cpus,
                 "memory": vm.cfg.memory,
                 "nics": nics,
+                "web": web,
                 // The template carries a baked-in vmlab-agent (terminal
                 // support); null on vintage guests and pre-agent templates.
                 "agent_version": vm.template().agent_version,
@@ -1774,6 +1921,12 @@ impl LabRuntime {
                     })
                 })
                 .collect();
+            let web: Vec<Value> = c
+                .cfg
+                .web
+                .iter()
+                .map(|w| json!({"name": w.name, "port": w.port, "path": w.path}))
+                .collect();
             containers.push(json!({
                 "name": name,
                 "state": state,
@@ -1786,6 +1939,7 @@ impl LabRuntime {
                 "restarts": c.restart_count(),
                 "exit_code": c.last_exit().await,
                 "nics": nics,
+                "web": web,
             }));
         }
         let net = self.network.lock().await;

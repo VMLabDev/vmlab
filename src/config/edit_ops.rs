@@ -225,6 +225,10 @@ fn json_to_expr(v: &Value) -> Result<Expr, String> {
             span: ast::Span::new(0, 0),
         }),
         Value::Object(map) => {
+            // Symbol literal for `symbol_set` fields: {"symbol": "ntlm"} → `:ntlm`.
+            if let Some(sym) = map.get("symbol").and_then(Value::as_str) {
+                return Ok(Expr::Symbol(sym.to_string()));
+            }
             let num = map.get("num").and_then(Value::as_i64);
             let unit = map.get("unit").and_then(Value::as_str);
             match (num, unit) {
@@ -233,7 +237,9 @@ fn json_to_expr(v: &Value) -> Result<Expr, String> {
                     unit: u.to_string(),
                     span: ast::Span::new(0, 0),
                 }),
-                _ => Err("object values must be {num: <int>, unit: <suffix>}".into()),
+                _ => Err(
+                    "object values must be {num: <int>, unit: <suffix>} or {symbol: <name>}".into(),
+                ),
             }
         }
         Value::Null => Err("null is not a value — use remove_field to unset".into()),
@@ -402,6 +408,43 @@ lab "demo" {
         assert_eq!(web.nics[0].segment.as_deref(), Some("corp"));
         assert_eq!(web.extra_disks.len(), 1);
         assert_eq!(web.extra_disks[0].name, "data");
+    }
+
+    #[test]
+    fn add_block_web_page_with_nested_auth() {
+        let lab = model();
+        let out = apply_ops(
+            SRC,
+            &[op(json!({"op": "add_block", "parent": lab.span, "block": {
+                "kind": "vm",
+                "labels": ["app01"],
+                "fields": [{"name": "template", "value": "x86_64/linux-modern"}],
+                "children": [
+                    {"kind": "nic", "fields": [{"name": "segment", "value": "corp"}]},
+                    {"kind": "web", "labels": ["iis"], "fields": [
+                        {"name": "port", "value": 80},
+                    ], "children": [
+                        {"kind": "auth", "fields": [
+                            {"name": "method", "value": {"symbol": "ntlm"}},
+                            {"name": "username", "value": "Administrator"},
+                            {"name": "password", "value": "pw"},
+                            {"name": "domain", "value": "CORP"},
+                        ]},
+                    ]},
+                ],
+            }}))],
+        )
+        .unwrap();
+        let re = reload(&out);
+        let vm = re.vms.iter().find(|v| v.name == "app01").unwrap();
+        assert_eq!(vm.web.len(), 1);
+        assert_eq!(vm.web[0].name, "iis");
+        assert_eq!(vm.web[0].port, 80);
+        assert!(matches!(
+            &vm.web[0].auth,
+            Some(crate::config::model::WebAuth::Ntlm { username, domain, .. })
+                if username == "Administrator" && domain.as_deref() == Some("CORP")
+        ));
     }
 
     #[test]

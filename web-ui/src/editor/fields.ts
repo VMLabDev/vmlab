@@ -281,6 +281,92 @@ export const PORT_FIELDS: FieldDesc[] = [
   },
 ];
 
+export const WEB_FIELDS: FieldDesc[] = [
+  {
+    key: "port",
+    label: "Guest port",
+    doc: "Guest TCP port serving the HTTP UI (1–65535) (required)",
+    type: "int",
+    required: true,
+    min: 1,
+    max: 65535,
+  },
+  {
+    key: "path",
+    label: "Initial path",
+    doc: "Initial path opened in the console (default `/`)",
+    type: "text",
+    placeholder: "/",
+  },
+];
+
+/** The auth `method` selector (drives which other fields show). */
+export const WEB_AUTH_METHOD: FieldDesc = {
+  key: "method",
+  label: "Method",
+  doc: "How the proxy authenticates to the guest app so its login never prompts",
+  type: "enum",
+  options: ["basic", "bearer", "header", "ntlm", "form"],
+  required: true,
+};
+
+/** Per-method credential fields (keyed by `method`). */
+export const WEB_AUTH_FIELDS: Record<string, FieldDesc[]> = {
+  basic: [
+    { key: "username", label: "Username", doc: "Basic-auth username", type: "text" },
+    { key: "password", label: "Password", doc: "Basic-auth password", type: "text" },
+  ],
+  bearer: [
+    { key: "token", label: "Token", doc: "Static bearer token", type: "text" },
+  ],
+  header: [
+    { key: "header", label: "Header name", doc: "e.g. `X-Api-Key`", type: "text" },
+    { key: "value", label: "Header value", doc: "The injected header value", type: "text" },
+  ],
+  ntlm: [
+    { key: "username", label: "Username", doc: "AD/IIS username", type: "text" },
+    { key: "password", label: "Password", doc: "AD/IIS password", type: "text" },
+    { key: "domain", label: "Domain", doc: "NTLM domain, e.g. `CORP` (optional)", type: "text" },
+  ],
+  form: [
+    { key: "username", label: "Username", doc: "Form-login username", type: "text" },
+    { key: "password", label: "Password", doc: "Form-login password", type: "text" },
+    {
+      key: "login_path",
+      label: "Login path",
+      doc: "Login request path, e.g. `/login` (required)",
+      type: "text",
+      placeholder: "/login",
+    },
+    {
+      key: "login_method",
+      label: "Login method",
+      doc: "`POST` (default) | `GET`",
+      type: "enum",
+      options: ["POST", "GET"],
+    },
+    {
+      key: "login_body",
+      label: "Login body",
+      doc: "Template; `{user}`/`{pass}` are substituted and escaped",
+      type: "text",
+      placeholder: "user={user}&password={pass}",
+    },
+    {
+      key: "login_content_type",
+      label: "Content type",
+      doc: "`application/x-www-form-urlencoded` (default) | `application/json`",
+      type: "text",
+    },
+    {
+      key: "fail_redirect",
+      label: "Fail redirect",
+      doc: "Redirect-Location substring meaning 'not logged in' (401/403 always retrigger)",
+      type: "text",
+    },
+  ],
+};
+
 export const HEALTHCHECK_FIELDS: FieldDesc[] = [
   {
     key: "command",

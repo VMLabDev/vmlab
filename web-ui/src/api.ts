@@ -73,6 +73,13 @@ export interface Nic {
   /** Live IPv4 address reported for this interface, null while unknown/offline. */
   ip: string | null;
 }
+/** A declared HTTP UI on a machine, launchable in the Web tab (no
+ *  credentials — the proxy fetches those separately). */
+export interface WebPage {
+  name: string;
+  port: number;
+  path: string;
+}
 export interface Vm {
   name: string;
   state: string;
@@ -85,6 +92,7 @@ export interface Vm {
   cpus: number | null;
   memory: number | null;
   nics: Nic[];
+  web?: WebPage[];
   /** vmlab-agent stamp baked into the template — null means the template
    *  predates agent support (no interactive terminal). */
   agent_version?: string | null;
@@ -104,6 +112,7 @@ export interface Container {
   restarts: number;
   exit_code: number | null;
   nics: Nic[];
+  web?: WebPage[];
 }
 export interface Segment {
   name: string;
@@ -744,6 +753,24 @@ async function finish(res: Response): Promise<any> {
     throw new Error(msg);
   }
   return res.json();
+}
+
+// --- guest web pages ------------------------------------------------------
+
+/** Mint the path-scoped `vmlab_web` cookie the iframe proxy rides (iframe
+ *  subresources can't carry the bearer token). Call after login. */
+export const mintWebSession = (): Promise<unknown> => post("/api/web/session", {});
+
+/** The same-origin proxy URL for a declared page, opened in an iframe. */
+export function webPageUrl(
+  lab: string,
+  kind: "vms" | "containers",
+  machine: string,
+  page: WebPage,
+): string {
+  const base = `/web/${encodeURIComponent(lab)}/${kind}/${encodeURIComponent(machine)}/${encodeURIComponent(page.name)}`;
+  const path = page.path.startsWith("/") ? page.path : `/${page.path}`;
+  return base + path;
 }
 
 // --- websockets -----------------------------------------------------------

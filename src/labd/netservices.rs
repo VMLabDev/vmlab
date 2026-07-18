@@ -212,6 +212,31 @@ impl SegmentServices {
         Ok(id)
     }
 
+    /// As [`Self::add_forward`] but TCP-only on an already-bound listener,
+    /// so the caller can bind `127.0.0.1:0` and read `local_addr()` before
+    /// the forward starts (the web-page proxy needs the ephemeral port).
+    pub fn add_forward_bound(
+        &self,
+        listener: tokio::net::TcpListener,
+        guest_ip: std::net::Ipv4Addr,
+        guest_port: u16,
+    ) -> Result<u64, String> {
+        let engine = self
+            .nat
+            .as_ref()
+            .ok_or("port forwarding requires NAT/egress on the segment")?
+            .clone();
+        use crate::net::nat::PortForwarder;
+        let handle = tokio::spawn(async move {
+            PortForwarder::serve_tcp(listener, engine, guest_ip, guest_port).await
+        });
+        let id = self
+            .next_forward_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.forwards.lock_recover().push((id, handle));
+        Ok(id)
+    }
+
     /// Tear down a forward spawned by [`Self::add_forward`]. Declared
     /// segment forwards live for the lab's lifetime; container `port {}`
     /// forwards are removed and re-installed when a restart changes the

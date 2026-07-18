@@ -1,6 +1,6 @@
 import { For, Show } from "solid-js";
 import { NavLink, NavSection, StatusDot } from "@forge/ui";
-import { LayoutGrid, Package } from "lucide-solid";
+import { Globe, LayoutGrid, Package } from "lucide-solid";
 import {
   archOf,
   containerLook,
@@ -9,8 +9,10 @@ import {
   showLab,
   showTemplates,
   showVm,
+  showWeb,
   state,
 } from "../store";
+import { openWebCount } from "./WebView";
 
 /** Wrap a view-switch action as an anchor click handler. */
 const nav = (go: () => void) => (e: MouseEvent) => {
@@ -41,6 +43,17 @@ export default function SidebarNav() {
       >
         templates
       </NavLink>
+      <Show when={openWebCount() > 0}>
+        <NavLink
+          href="#"
+          icon={Globe}
+          active={state.view.kind === "web"}
+          count={openWebCount()}
+          onClick={nav(showWeb)}
+        >
+          Web
+        </NavLink>
+      </Show>
 
       <NavSection>Machines</NavSection>
       <For each={s()?.vms ?? []}>

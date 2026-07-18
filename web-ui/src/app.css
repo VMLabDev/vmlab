@@ -264,6 +264,21 @@
 .pkg-repo-name { font-weight: 600; white-space: nowrap; }
 .pkg-repo-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-muted, inherit); }
 .pkg-repo-add { display: grid; grid-template-columns: 1fr 2fr 1fr 1fr auto; gap: var(--sp-2); align-items: end; }
+
+/* Web tab area: guest HTTP UIs proxied into iframes */
+.web-view { display: flex; flex-direction: column; height: calc(100vh - 120px); }
+.web-tabstrip { display: flex; gap: var(--sp-1); flex-wrap: wrap; padding-bottom: var(--sp-2); }
+.web-tab { display: inline-flex; align-items: center; gap: var(--sp-1); padding: 4px 6px 4px 10px; border: 1px solid var(--border, #333); border-radius: var(--radius-sm, 6px); cursor: pointer; font-size: 0.85rem; }
+.web-tab.active { border-color: var(--accent, #6ea8fe); background: var(--surface-2, rgba(110,168,254,0.12)); }
+.web-tab-title { white-space: nowrap; }
+.web-frames { position: relative; flex: 1; min-height: 0; }
+.web-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 1px solid var(--border, #333); border-radius: var(--radius-sm, 6px); background: #fff; display: none; }
+.web-frame.active { display: block; }
+
+/* Inspector "Web" tab: one block per page with an optional nested auth form */
+.web-page-block { border: 1px solid var(--border, #333); border-radius: var(--radius-sm, 6px); padding: var(--sp-2); display: flex; flex-direction: column; gap: var(--sp-1); }
+.web-page-head { display: flex; align-items: center; gap: var(--sp-1); }
+.web-page-head > :first-child { flex: 1; }
 .file-tree-root {
   color: var(--fg-3); font: 700 10px/1 var(--font-mono);
   letter-spacing: 0.08em; text-transform: uppercase;

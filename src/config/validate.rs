@@ -193,6 +193,14 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 ));
             }
         }
+        check_web_pages(
+            "vm",
+            &vm.name,
+            &vm.web,
+            vm.nics.is_empty(),
+            vm.span,
+            &mut issues,
+        );
         for m in &vm.media {
             check_media(&file.root, m, &mut issues);
         }
@@ -299,6 +307,15 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 ),
             ));
         }
+
+        check_web_pages(
+            "container",
+            &c.name,
+            &c.web,
+            c.nics.is_empty(),
+            c.span,
+            &mut issues,
+        );
 
         for v in &c.volumes {
             if let VolumeSource::Host(host) = &v.source {
@@ -930,6 +947,41 @@ fn check_disk_block(root: &Path, d: &DiskBlock, issues: &mut IssueList) {
 
 /// RFC-1035-ish label check for names that become DNS labels
 /// (`<vm>.<lab>.<suffix>`, §9.5).
+/// Validate a machine's declared web pages: names are DNS labels (they
+/// become URL path segments), unique per machine, and pages need a NIC (the
+/// proxy reaches them over a segment forward).
+fn check_web_pages(
+    kind: &str,
+    machine: &str,
+    web: &[WebPage],
+    nics_empty: bool,
+    machine_span: Span,
+    issues: &mut IssueList,
+) {
+    if !web.is_empty() && nics_empty {
+        issues.push(Issue::at(
+            machine_span,
+            format!(
+                "{kind} \"{machine}\" declares web pages but has no NICs — the proxy reaches \
+                 them over a segment forward"
+            ),
+        ));
+    }
+    let mut seen: std::collections::HashMap<&str, Span> = std::collections::HashMap::new();
+    for page in web {
+        check_dns_label(&page.name, page.span, "web page name", issues);
+        if seen.insert(&page.name, page.span).is_some() {
+            issues.push(Issue::at(
+                page.span,
+                format!(
+                    "duplicate web page \"{}\" on {kind} \"{machine}\"",
+                    page.name
+                ),
+            ));
+        }
+    }
+}
+
 fn check_dns_label(name: &str, span: Span, what: &str, issues: &mut IssueList) {
     let ok = !name.is_empty()
         && name.len() <= 63
@@ -1171,6 +1223,81 @@ lab "l" {
 }"#,
             "no NICs",
         );
+    }
+
+    #[test]
+    fn web_pages_need_nics_and_unique_names() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" web "ui" { port = 80 } } }"#,
+            "no NICs",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nic { nat = true }
+  web "ui" { port = 80 } web "ui" { port = 81 } } }"#,
+            "duplicate web page",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nic { nat = true } web "Bad Name" { port = 80 } } }"#,
+            "must be a DNS label",
+        );
+    }
+
+    /// Web-page extract issues (port range, defaults, auth method rules)
+    /// surface at parse.
+    #[test]
+    fn web_page_extract_rules() {
+        let parse_err = |src: &str| {
+            load_lab_source(src, "<test>", &std::env::temp_dir())
+                .expect_err("source should be rejected")
+                .issues
+                .iter()
+                .map(|i| i.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        assert!(
+            parse_err(
+                r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nic { nat = true } web "ui" { port = 99999 } } }"#
+            )
+            .contains("out of range"),
+        );
+        // ntlm requires username+password; a stray token is flagged.
+        let err = parse_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nic { nat = true }
+  web "ui" { port = 80 auth { method = :ntlm token = "x" } } } }"#,
+        );
+        assert!(err.contains("requires `username`"), "{err}");
+        assert!(err.contains("not used by auth method `:ntlm`"), "{err}");
+        // form requires login_path/login_body; bad login_method flagged.
+        let err = parse_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nic { nat = true }
+  web "ui" { port = 80 auth { method = :form username = "u" password = "p" login_method = "PUT" } } } }"#,
+        );
+        assert!(err.contains("login_method` must be GET or POST"), "{err}");
+        assert!(err.contains("requires `login_path`"), "{err}");
+    }
+
+    #[test]
+    fn web_page_defaults_and_auth_parse() {
+        let f = lab(r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nic { nat = true }
+  web "grafana" { port = 3000 }
+  web "iis" { port = 80 path = "start" auth { method = :basic username = "admin" password = "pw" } } } }"#);
+        let vm = &f.lab.vms[0];
+        assert_eq!(vm.web.len(), 2);
+        assert_eq!(vm.web[0].path, "/"); // default
+        assert_eq!(vm.web[1].path, "/start"); // /-prefixed
+        assert!(vm.web[0].auth.is_none());
+        assert!(matches!(
+            &vm.web[1].auth,
+            Some(crate::config::model::WebAuth::Basic { username, .. }) if username == "admin"
+        ));
     }
 
     /// Extract-stage share issues: bad transport values and the

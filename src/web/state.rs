@@ -38,6 +38,9 @@ pub fn valid_name(name: &str) -> bool {
         && !name.ends_with('-')
 }
 
+/// (lab, kind, machine, page) — the web-page proxy target cache key.
+pub type WebTargetKey = (String, String, String, String);
+
 pub struct AuthConfig {
     pub enabled: bool,
     pub user: String,
@@ -61,6 +64,10 @@ pub struct AppState {
     /// Directory holding the host-side config-weave binaries (resolved once
     /// from host config / env / XDG default). Tests point this at a stub.
     pub weave_bin_dir: PathBuf,
+    /// Resolved web-page proxy targets, keyed by (lab, kind, machine, page).
+    /// Populated lazily from `web.forward`; carries the per-page reqwest
+    /// client + upstream auth session. Tests seed this directly.
+    web_targets: Mutex<HashMap<WebTargetKey, std::sync::Arc<crate::webpages::WebTarget>>>,
     /// lab name → root directory (seeded from the cwd lab and the supervisor
     /// registry).
     roots: Mutex<HashMap<String, PathBuf>>,
@@ -98,7 +105,31 @@ impl AppState {
             roots: Mutex::new(roots),
             supervisor: Mutex::new(None),
             labs: Mutex::new(HashMap::new()),
+            web_targets: Mutex::new(HashMap::new()),
         }
+    }
+
+    // --- web-page proxy targets -------------------------------------------
+
+    /// Cached proxy target for a page, if resolved.
+    pub async fn web_target(
+        &self,
+        key: &WebTargetKey,
+    ) -> Option<std::sync::Arc<crate::webpages::WebTarget>> {
+        self.web_targets.lock().await.get(key).cloned()
+    }
+
+    pub async fn set_web_target(
+        &self,
+        key: WebTargetKey,
+        target: std::sync::Arc<crate::webpages::WebTarget>,
+    ) {
+        self.web_targets.lock().await.insert(key, target);
+    }
+
+    /// Drop a cached target (connect failure → force a fresh `web.forward`).
+    pub async fn invalidate_web_target(&self, key: &(String, String, String, String)) {
+        self.web_targets.lock().await.remove(key);
     }
 
     // --- sessions ---------------------------------------------------------

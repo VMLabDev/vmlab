@@ -196,6 +196,8 @@ type Vm {
   @children("share") shares: list<Share>
   @doc("ISO/floppy images built from a folder")
   @children("media") media: list<Media>
+  @doc("HTTP UIs served in the guest, proxied into the web console (require ≥1 NIC)")
+  @children("web")   web: list<WebPage>
 }
 
 @block("nic")
@@ -252,6 +254,8 @@ type Container {
   @children("port")     ports: list<PortMap>
   @doc("Health probe gating readiness; without one the container is ready once its process starts")
   @child("healthcheck") healthcheck: Healthcheck?
+  @doc("HTTP UIs served in the container, proxied into the web console (require ≥1 NIC)")
+  @children("web")      web: list<WebPage>
 }
 
 // Environment variable passed to the container process.
@@ -328,6 +332,53 @@ type Share {
   name: utf8?
   @doc("Transport: auto (default; virtiofs when host + guest support it, else SMB) | virtiofs | smb")
   transport: utf8?
+}
+
+// HTTP UI served inside the guest, launchable from the web console. The
+// proxy reaches it through a host→guest forward; declared on VMs and
+// containers alike.
+@block("web")
+type WebPage {
+  @doc("Page name (DNS label); unique per machine; the inline block label")
+  @inline(0) name: utf8
+  @doc("Guest TCP port serving the HTTP UI (1–65535) (required)")
+  port: i64
+  @doc("Initial path opened in the console (default `/`)")
+  path: utf8?
+  @doc("Credentials the proxy injects so the guest app's own login never prompts")
+  @child("auth") auth: WebAuth?
+}
+
+// How the proxy authenticates to the guest app on the user's behalf.
+// Credentials are plaintext, like everything else in lab config.
+symbol_set WebAuthMethod { basic bearer header ntlm form }
+
+@block("auth")
+type WebAuth {
+  @doc("Method: `:basic` | `:bearer` | `:header` | `:ntlm` (IIS/AD integrated) | `:form` (cookie capture) (required)")
+  method: WebAuthMethod
+  @doc("Username — `:basic`, `:ntlm`, `:form`")
+  username: utf8?
+  @doc("Password — `:basic`, `:ntlm`, `:form`")
+  password: utf8?
+  @doc("NTLM domain, e.g. `CORP` — `:ntlm` (optional)")
+  domain: utf8?
+  @doc("Static bearer token — `:bearer`")
+  token: utf8?
+  @doc("Header name, e.g. `X-Api-Key` — `:header`")
+  header: utf8?
+  @doc("Header value — `:header`")
+  value: utf8?
+  @doc("Login request path, e.g. `/login` — `:form` (required)")
+  login_path: utf8?
+  @doc("Login HTTP method: `POST` (default) | `GET` — `:form`")
+  login_method: utf8?
+  @doc("Login body template; `{user}`/`{pass}` are substituted and escaped — `:form` (required)")
+  login_body: utf8?
+  @doc("Login body content type: `application/x-www-form-urlencoded` (default) | `application/json` — `:form`")
+  login_content_type: utf8?
+  @doc("Redirect-Location substring that means 'not logged in' (401/403 always retrigger) — `:form`")
+  fail_redirect: utf8?
 }
 
 // ISO/floppy image built from a folder.

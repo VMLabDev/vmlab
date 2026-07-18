@@ -19,7 +19,7 @@ import type {
 } from "./api";
 import { playDestroyRecreate } from "./fx";
 
-export type ViewKind = "lab" | "vm" | "container" | "templates";
+export type ViewKind = "lab" | "vm" | "container" | "templates" | "web";
 
 // A template or container-image download in progress, driven by the
 // template.pull.* / container.pull.* events the lab daemon streams while
@@ -191,6 +191,8 @@ async function afterLogin() {
   connectEvents();
   loadFastpath();
   loadHostInfo();
+  // Mint the path-scoped cookie the web-page iframe proxy rides (best-effort).
+  void api.mintWebSession().catch(() => {});
 }
 
 /** The daemon's network fast-path tier for the Topbar badge; a server
@@ -389,6 +391,9 @@ export function showTemplates() {
 }
 export function showVm(vm: string) {
   setState("view", { kind: "vm", vm });
+}
+export function showWeb() {
+  setState("view", { kind: "web", vm: null });
 }
 export function showContainer(name: string) {
   setState("view", { kind: "container", vm: name });

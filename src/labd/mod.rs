@@ -642,6 +642,14 @@ impl Handler for LabdHandler {
                     .map_err(err)?;
                 Ok(json!(ip))
             }
+            // Ensure a loopback forward for a declared web page; the web
+            // server's proxy dials the returned addr. Reply carries the
+            // page's auth spec (host socket only — never to the browser).
+            "web.forward" => {
+                let machine = args["machine"].as_str().ok_or("missing machine")?;
+                let page = args["page"].as_str().ok_or("missing page")?;
+                lab.ensure_web_forward(machine, page).await.map_err(err)
+            }
             // Container lifecycle (mirrors the vm.* verbs; PRD §18).
             "container.start" => {
                 let name = container_arg(&args)?;

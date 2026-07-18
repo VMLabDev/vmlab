@@ -10,6 +10,7 @@ use super::model::{
     Gpu, GpuMode, Handler, Healthcheck, HostPort, L4Proto, Lab, LabFile, Media, MediaKind, Nic,
     Playbook, PortMap, Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share,
     ShareTransport, SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
+    WebAuth, WebPage,
 };
 
 #[derive(Serialize)]
@@ -291,6 +292,7 @@ pub struct VmDto {
     pub extra_disks: Vec<DiskDto>,
     pub shares: Vec<ShareDto>,
     pub media: Vec<MediaDto>,
+    pub web: Vec<WebPageDto>,
 }
 
 impl From<&Vm> for VmDto {
@@ -320,6 +322,7 @@ impl From<&Vm> for VmDto {
             extra_disks: v.extra_disks.iter().map(DiskDto::from).collect(),
             shares: v.shares.iter().map(ShareDto::from).collect(),
             media: v.media.iter().map(MediaDto::from).collect(),
+            web: v.web.iter().map(WebPageDto::from).collect(),
         }
     }
 }
@@ -346,6 +349,7 @@ pub struct ContainerDto {
     pub volumes: Vec<VolumeDto>,
     pub ports: Vec<PortMapDto>,
     pub healthcheck: Option<HealthcheckDto>,
+    pub web: Vec<WebPageDto>,
 }
 
 impl From<&Container> for ContainerDto {
@@ -369,7 +373,116 @@ impl From<&Container> for ContainerDto {
             volumes: c.volumes.iter().map(VolumeDto::from).collect(),
             ports: c.ports.iter().map(PortMapDto::from).collect(),
             healthcheck: c.healthcheck.as_ref().map(HealthcheckDto::from),
+            web: c.web.iter().map(WebPageDto::from).collect(),
         }
+    }
+}
+
+/// A declared web page plus its flattened auth spec — the designer edits
+/// `vmlab.wcl`, so credentials appear here (and only here on the browser
+/// path; runtime status omits them).
+#[derive(Serialize)]
+pub struct WebPageDto {
+    pub span: Span,
+    pub name: String,
+    pub port: u16,
+    pub path: String,
+    pub auth: Option<WebAuthDto>,
+    pub auth_span: Option<Span>,
+}
+
+impl From<&WebPage> for WebPageDto {
+    fn from(w: &WebPage) -> Self {
+        Self {
+            span: w.span,
+            name: w.name.clone(),
+            port: w.port,
+            path: w.path.clone(),
+            auth: w.auth.as_ref().map(WebAuthDto::from),
+            auth_span: w.auth_span,
+        }
+    }
+}
+
+/// Flat form of `WebAuth` for the designer (method-tagged; unused fields
+/// null). Not to be confused with the enum sent over the proto socket.
+#[derive(Serialize)]
+pub struct WebAuthDto {
+    pub method: &'static str,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub domain: Option<String>,
+    pub token: Option<String>,
+    pub header: Option<String>,
+    pub value: Option<String>,
+    pub login_path: Option<String>,
+    pub login_method: Option<String>,
+    pub login_body: Option<String>,
+    pub login_content_type: Option<String>,
+    pub fail_redirect: Option<String>,
+}
+
+impl From<&WebAuth> for WebAuthDto {
+    fn from(a: &WebAuth) -> Self {
+        let mut dto = WebAuthDto {
+            method: "",
+            username: None,
+            password: None,
+            domain: None,
+            token: None,
+            header: None,
+            value: None,
+            login_path: None,
+            login_method: None,
+            login_body: None,
+            login_content_type: None,
+            fail_redirect: None,
+        };
+        match a {
+            WebAuth::Basic { username, password } => {
+                dto.method = "basic";
+                dto.username = Some(username.clone());
+                dto.password = Some(password.clone());
+            }
+            WebAuth::Bearer { token } => {
+                dto.method = "bearer";
+                dto.token = Some(token.clone());
+            }
+            WebAuth::Header { name, value } => {
+                dto.method = "header";
+                dto.header = Some(name.clone());
+                dto.value = Some(value.clone());
+            }
+            WebAuth::Ntlm {
+                username,
+                password,
+                domain,
+            } => {
+                dto.method = "ntlm";
+                dto.username = Some(username.clone());
+                dto.password = Some(password.clone());
+                dto.domain = domain.clone();
+            }
+            WebAuth::Form {
+                username,
+                password,
+                login_path,
+                login_method,
+                login_body,
+                login_content_type,
+                fail_redirect,
+            } => {
+                dto.method = "form";
+                dto.username = Some(username.clone());
+                dto.password = Some(password.clone());
+                dto.login_path = Some(login_path.clone());
+                dto.login_method = Some(login_method.clone());
+                dto.login_body = Some(login_body.clone());
+                dto.login_content_type = Some(login_content_type.clone());
+                dto.fail_redirect = fail_redirect.clone();
+            }
+        }
+        dto
     }
 }
 

@@ -48,6 +48,33 @@ export interface GpuModel {
   address: string | null;
 }
 
+/** Upstream credentials the proxy injects (flat form of `auth {}`; unused
+ *  fields stay null per method). */
+export interface WebAuthModel {
+  span: Span | null;
+  method: string; // basic | bearer | header | ntlm | form
+  username: string | null;
+  password: string | null;
+  domain: string | null;
+  token: string | null;
+  header: string | null;
+  value: string | null;
+  login_path: string | null;
+  login_method: string | null;
+  login_body: string | null;
+  login_content_type: string | null;
+  fail_redirect: string | null;
+}
+
+export interface WebPageModel {
+  span: Span | null;
+  name: string;
+  port: number;
+  path: string;
+  auth: WebAuthModel | null;
+  auth_span?: Span | null;
+}
+
 export interface VmModel {
   span: Span | null;
   name: string;
@@ -74,6 +101,7 @@ export interface VmModel {
   extra_disks: DiskModel[];
   shares: ShareModel[];
   media: MediaModel[];
+  web: WebPageModel[];
 }
 
 // --- container children -------------------------------------------------------
@@ -142,6 +170,7 @@ export interface ContainerModel {
   volumes: VolumeModel[];
   ports: PortMapModel[];
   healthcheck: HealthcheckModel | null;
+  web: WebPageModel[];
 }
 
 export interface DnsModel {
@@ -273,7 +302,12 @@ export interface UnitValue {
   unit: string;
 }
 
-export type OpValue = string | number | boolean | string[] | UnitValue;
+/** A WCL symbol literal, e.g. `{symbol: "basic"}` → `:basic`. */
+export interface SymbolValue {
+  symbol: string;
+}
+
+export type OpValue = string | number | boolean | string[] | UnitValue | SymbolValue;
 
 export interface BlockSpec {
   kind: string;
@@ -329,6 +363,7 @@ export function emptyVm(name: string, template: string): VmModel {
     extra_disks: [],
     shares: [],
     media: [],
+    web: [],
   };
 }
 
@@ -352,6 +387,31 @@ export function emptyContainer(name: string, image: string): ContainerModel {
     volumes: [],
     ports: [],
     healthcheck: null,
+    web: [],
+  };
+}
+
+/** A new web-page block with sensible port default. */
+export function emptyWebPage(name: string): WebPageModel {
+  return { span: null, name, port: 80, path: "/", auth: null };
+}
+
+/** A new `auth {}` block for a page (basic by default). */
+export function emptyWebAuth(): WebAuthModel {
+  return {
+    span: null,
+    method: "basic",
+    username: null,
+    password: null,
+    domain: null,
+    token: null,
+    header: null,
+    value: null,
+    login_path: null,
+    login_method: null,
+    login_body: null,
+    login_content_type: null,
+    fail_redirect: null,
   };
 }
 

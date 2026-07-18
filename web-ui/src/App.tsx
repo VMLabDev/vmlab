@@ -12,6 +12,7 @@ import ContainerView from "./components/ContainerView";
 import NewLabModal from "./components/NewLabModal";
 import PkgReposModal from "./components/PkgReposModal";
 import PkgSearchModal from "./components/PkgSearchModal";
+import WebView from "./components/WebView";
 
 export default function App() {
   onMount(init);
@@ -37,6 +38,9 @@ export default function App() {
           </Show>
           <Show when={state.view.kind === "container"}>
             <ContainerView />
+          </Show>
+          <Show when={state.view.kind === "web"}>
+            <WebView />
           </Show>
         </AppShell>
       </Show>

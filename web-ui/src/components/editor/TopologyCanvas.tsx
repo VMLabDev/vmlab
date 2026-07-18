@@ -25,6 +25,7 @@ import {
   FlaskConical,
   FilePenLine,
   FolderCog,
+  Globe,
   LayoutGrid,
   Monitor,
   Play,
@@ -119,6 +120,7 @@ import {
   type Pull,
 } from "../../store";
 import { confirmDialog } from "../dialogs";
+import { openWebPage } from "../WebView";
 import { registerFxNode } from "../../fx";
 
 interface Drag {
@@ -3624,6 +3626,24 @@ export default function TopologyCanvas(props: {
                     </title>
                   </g>
                   {/* Machine actions stay in a predictable top-right control bank. */}
+                  <Show when={(vm.web ?? []).length > 0}>
+                    <VmBtn
+                      x={p().x + VM_W - 91}
+                      y={p().y + 8}
+                      act="console"
+                      title={
+                        vmRunning(vm.name)
+                          ? `Open ${vm.web[0].name}`
+                          : "Start the VM to open its web pages"
+                      }
+                      disabled={!vmRunning(vm.name)}
+                      onClick={() =>
+                        openWebPage(state.currentLab!, "vms", vm.name, vm.web[0])
+                      }
+                    >
+                      <Globe size={11} />
+                    </VmBtn>
+                  </Show>
                   <VmBtn
                     x={p().x + VM_W - 70}
                     y={p().y + 8}
@@ -3857,6 +3877,24 @@ export default function TopologyCanvas(props: {
                     </title>
                   </g>
                   {/* Power, restart, and shell actions mirror the VM card. */}
+                  <Show when={(ctr.web ?? []).length > 0}>
+                    <VmBtn
+                      x={p().x + VM_W - 91}
+                      y={p().y + 8}
+                      act="console"
+                      title={
+                        ctrRunning(ctr.name)
+                          ? `Open ${ctr.web[0].name}`
+                          : "Start the container to open its web pages"
+                      }
+                      disabled={!ctrRunning(ctr.name)}
+                      onClick={() =>
+                        openWebPage(state.currentLab!, "containers", ctr.name, ctr.web[0])
+                      }
+                    >
+                      <Globe size={11} />
+                    </VmBtn>
+                  </Show>
                   <VmBtn
                     x={p().x + VM_W - 70}
                     y={p().y + 8}

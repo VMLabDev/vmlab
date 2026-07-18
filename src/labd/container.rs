@@ -1430,6 +1430,7 @@ mod tests {
             volumes: vec![],
             ports: vec![],
             healthcheck: None,
+            web: vec![],
         }
     }
 

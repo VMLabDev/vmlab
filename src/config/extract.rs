@@ -683,6 +683,179 @@ fn extract_media(b: &Block, issues: &mut IssueList) -> Option<Media> {
     })
 }
 
+fn extract_web(b: &Block, issues: &mut IssueList) -> Option<WebPage> {
+    let name = label_name(b, "web", issues)?;
+    let span = span_of(b);
+    let (port, pspan) = get_int(b, "port", issues)?;
+    let Some(port) = u16::try_from(port).ok().filter(|&p| p > 0) else {
+        issues.push(Issue::at(
+            pspan,
+            format!("web page `{name}` port {port} out of range (1–65535)"),
+        ));
+        return None;
+    };
+    let path = match get_str(b, "path", issues) {
+        Some((p, _)) if !p.is_empty() => {
+            if p.starts_with('/') {
+                p
+            } else {
+                format!("/{p}")
+            }
+        }
+        _ => "/".to_string(),
+    };
+    let mut auth = None;
+    let mut auth_span = None;
+    for child in b.blocks() {
+        if child.kind() == "auth" {
+            auth_span = Some(span_of(&child));
+            auth = extract_web_auth(&child, &name, issues);
+        }
+    }
+    Some(WebPage {
+        name,
+        span,
+        port,
+        path,
+        auth,
+        auth_span,
+    })
+}
+
+/// Parse a `web`'s nested `auth {}` block into the typed method enum,
+/// enforcing per-method required fields and flagging fields the chosen
+/// method ignores (local-consistency checks, like `extract_share`).
+fn extract_web_auth(b: &Block, page: &str, issues: &mut IssueList) -> Option<WebAuth> {
+    let span = span_of(b);
+    #[derive(Clone, Copy)]
+    enum Method {
+        Basic,
+        Bearer,
+        Header,
+        Ntlm,
+        Form,
+    }
+    let method = get_symbol_enum(
+        b,
+        "method",
+        &[
+            ("basic", Method::Basic),
+            ("bearer", Method::Bearer),
+            ("header", Method::Header),
+            ("ntlm", Method::Ntlm),
+            ("form", Method::Form),
+        ],
+        issues,
+    )?;
+    let str_field = |b: &Block, f: &str| b.field(f).is_some();
+    // Fields each method uses; anything else set is a mistake worth flagging.
+    let used: &[&str] = match method {
+        Method::Basic => &["method", "username", "password"],
+        Method::Bearer => &["method", "token"],
+        Method::Header => &["method", "header", "value"],
+        Method::Ntlm => &["method", "username", "password", "domain"],
+        Method::Form => &[
+            "method",
+            "username",
+            "password",
+            "login_path",
+            "login_method",
+            "login_body",
+            "login_content_type",
+            "fail_redirect",
+        ],
+    };
+    const ALL: &[&str] = &[
+        "username",
+        "password",
+        "domain",
+        "token",
+        "header",
+        "value",
+        "login_path",
+        "login_method",
+        "login_body",
+        "login_content_type",
+        "fail_redirect",
+    ];
+    let method_name = match method {
+        Method::Basic => "basic",
+        Method::Bearer => "bearer",
+        Method::Header => "header",
+        Method::Ntlm => "ntlm",
+        Method::Form => "form",
+    };
+    for f in ALL {
+        if str_field(b, f) && !used.contains(f) {
+            issues.push(Issue::at(
+                span,
+                format!(
+                    "web page `{page}`: field `{f}` is not used by auth method `:{method_name}`"
+                ),
+            ));
+        }
+    }
+    let req = |b: &Block, f: &str, issues: &mut IssueList| -> Option<String> {
+        match get_str(b, f, issues) {
+            Some((s, _)) if !s.is_empty() => Some(s),
+            _ => {
+                issues.push(Issue::at(
+                    span,
+                    format!("web page `{page}`: auth method `:{method_name}` requires `{f}`"),
+                ));
+                None
+            }
+        }
+    };
+    let opt = |b: &Block, f: &str, issues: &mut IssueList| get_str(b, f, issues).map(|(s, _)| s);
+    match method {
+        Method::Basic => Some(WebAuth::Basic {
+            username: req(b, "username", issues)?,
+            password: req(b, "password", issues)?,
+        }),
+        Method::Bearer => Some(WebAuth::Bearer {
+            token: req(b, "token", issues)?,
+        }),
+        Method::Header => Some(WebAuth::Header {
+            name: req(b, "header", issues)?,
+            value: req(b, "value", issues)?,
+        }),
+        Method::Ntlm => Some(WebAuth::Ntlm {
+            username: req(b, "username", issues)?,
+            password: req(b, "password", issues)?,
+            domain: opt(b, "domain", issues),
+        }),
+        Method::Form => {
+            let login_method = match opt(b, "login_method", issues) {
+                None => "POST".to_string(),
+                Some(m) => {
+                    let up = m.to_ascii_uppercase();
+                    if up != "GET" && up != "POST" {
+                        issues.push(Issue::at(
+                            span,
+                            format!(
+                                "web page `{page}`: `login_method` must be GET or POST, got `{m}`"
+                            ),
+                        ));
+                    }
+                    up
+                }
+            };
+            let login_content_type = opt(b, "login_content_type", issues)
+                .unwrap_or_else(|| "application/x-www-form-urlencoded".to_string());
+            Some(WebAuth::Form {
+                username: req(b, "username", issues)?,
+                password: req(b, "password", issues)?,
+                login_path: req(b, "login_path", issues)?,
+                login_method,
+                login_body: req(b, "login_body", issues)?,
+                login_content_type,
+                fail_redirect: opt(b, "fail_redirect", issues),
+            })
+        }
+    }
+}
+
 fn extract_disk_block(b: &Block, issues: &mut IssueList) -> Option<DiskBlock> {
     let name = label_name(b, "disk", issues)?;
     Some(DiskBlock {
@@ -807,6 +980,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         extra_disks: Vec::new(),
         shares: Vec::new(),
         media: Vec::new(),
+        web: Vec::new(),
     };
     for child in b.blocks() {
         match child.kind() {
@@ -825,6 +999,11 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
             "media" => {
                 if let Some(m) = extract_media(&child, issues) {
                     vm.media.push(m);
+                }
+            }
+            "web" => {
+                if let Some(w) = extract_web(&child, issues) {
+                    vm.web.push(w);
                 }
             }
             _ => {}
@@ -908,6 +1087,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         volumes: Vec::new(),
         ports: Vec::new(),
         healthcheck: None,
+        web: Vec::new(),
     };
     for child in b.blocks() {
         match child.kind() {
@@ -928,6 +1108,11 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
                 }
             }
             "healthcheck" => c.healthcheck = extract_healthcheck(&child, issues),
+            "web" => {
+                if let Some(w) = extract_web(&child, issues) {
+                    c.web.push(w);
+                }
+            }
             _ => {}
         }
     }
