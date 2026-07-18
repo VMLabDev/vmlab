@@ -61,7 +61,7 @@ forge-core = { git = "https://github.com/wiltaylor/forge.git", rev = "c634d1bda8
 # (IIS/AD integrated auth) — pure Rust, no system SSPI/KDC. Tiny: we drive
 # the HTTP handshake, this computes the Type 1/3 messages.
 ntlmclient = { version = "0.2", optional = true }
-wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "89a49e42258e9d3e4ead31ca9de3d25f7ccfde19" }
+wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "d966f87d4a5a91206e185199262668309f108c52" }
 wscript = { git = "https://github.com/Configweave/wscript.git", rev = "fcd51236239225ea3e89a82fec44d30f7b871426" }
 # Host <-> micro-VM init contract (container.json + the ctl channel) for OCI
 # containers in labs. Shared with the guest init (guest/cinit); plain serde,

@@ -85,9 +85,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends qemu-efi-riscv6
 # deploy-site.yml) so the book renders with the wdoc version it was authored
 # against; the slow install layer is cached until the rev changes.
 FROM rust:1.92-bookworm AS help
-ARG WCL_REV=89a49e42258e9d3e4ead31ca9de3d25f7ccfde19
+ARG WCL_REV=d966f87d4a5a91206e185199262668309f108c52
 WORKDIR /build
-RUN cargo install --git https://github.com/wiltaylor/wcl.git --rev "$WCL_REV" --locked wcl
+# WCL_EDITOR_UI_SKIP: the book render only needs `wcl wdoc`; skipping the
+# `wcl editor` frontend avoids needing pnpm in this stage.
+RUN WCL_EDITOR_UI_SKIP=1 cargo install --git https://github.com/wiltaylor/wcl.git --rev "$WCL_REV" --locked wcl
 COPY docs/ ./docs/
 # The wskill's schema-reference fact reflects the live vmlab schema.
 COPY src/config/schema.wcl src/config/host_schema.wcl ./src/config/

@@ -19,7 +19,7 @@ env:
   CARGO_TERM_COLOR: always
   # Pin the wcl CLI to the same rev vmlab uses for wcl_lang in Cargo.toml, so
   # the site renders with the wdoc version it was authored against.
-  WCL_REV: cc63fcca0412082399e4e80a78caf6d6b18bb44e
+  WCL_REV: d966f87d4a5a91206e185199262668309f108c52
 
 jobs:
   deploy:
@@ -46,7 +46,9 @@ jobs:
 
       - name: Install wcl CLI
         if: steps.wcl-cache.outputs.cache-hit != 'true'
-        run: cargo install --git https://github.com/wiltaylor/wcl.git --rev ${{ env.WCL_REV }} --locked wcl
+        # The site render only needs `wcl wdoc`; skip the `wcl editor`
+        # frontend build so the runner doesn't need pnpm.
+        run: WCL_EDITOR_UI_SKIP=1 cargo install --git https://github.com/wiltaylor/wcl.git --rev ${{ env.WCL_REV }} --locked wcl
 
       - uses: taiki-e/install-action@just
 
