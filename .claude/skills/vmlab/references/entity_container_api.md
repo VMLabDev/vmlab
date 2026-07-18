@@ -38,6 +38,8 @@ fn main(lab: Lab) {
 
 ## Related
 
+- [Lab containers](../references/concept_lab_containers.md)
+
 - [Lab](../references/entity_lab_api.md)
 
 - [Vm](../references/entity_vm_api.md)

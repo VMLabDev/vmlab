@@ -1,0 +1,45 @@
+concept lab_containers {
+  name     = "Lab containers"
+  summary  = "OCI containers as first-class lab machines: each runs in a micro-VM, sharing the VM namespace, segments, snapshots and agent channel (PRD §18)."
+  related  = [container_block, container_api, architecture, shares, oci, vmlab_agent]
+  audience = :both
+  body {
+    p <<PROSE
+Labs often need infrastructure that already ships as a container image — a
+database, a web app, a build service. Rather than bolt a container runtime
+onto the host, vmlab runs each declared container inside its own **micro-VM**:
+a pinned Alpine kernel plus a purpose-built init that unpacks the OCI image as
+the root filesystem and supervises the workload. That one design choice buys
+full machine parity with zero extra privileges:
+
+- **One namespace.** VM and container names share DNS, `depends_on` waves,
+  `forward { to = … }` targets and provision scoping. To the rest of the lab
+  a container is just another machine on the segment.
+- **Full snapshot parity.** Offline and online snapshots, standalone or
+  lab-wide, identical to VMs.
+- **The same automation.** The [vmlab-agent](entity_vmlab_agent) runs inside
+  the micro-VM, so `vmlab container exec`/`shell`, wscript
+  [`Container` handles](entity_container_api), playbooks and file copy all
+  work — network or no network.
+- **Volumes & ports.** Named or bind volumes ride virtiofs (CIFS fallback),
+  and `port {}` blocks are sugar for segment forwards.
+PROSE
+    code "wcl" { source = <<'SRC'
+container "db" {
+  image = "postgres:17"
+  nic    { segment = "corp" }
+  env    { name = "POSTGRES_PASSWORD" value = "lab" }
+  volume { name = "pgdata" target = "/var/lib/postgresql/data" }
+}
+SRC
+    }
+    p <<PROSE
+Declare one with a [`container {}` block](entity_container_block); drive it
+with `vmlab container <verb>`, the wscript
+[`Container` API](entity_container_api), or its page in the web console.
+Images pull from any registry (digest-pinned in lab state), and `mode = :idle`
+boots the environment without starting the workload — handy as a toolbox
+machine.
+PROSE
+  }
+}

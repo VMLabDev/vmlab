@@ -2,7 +2,7 @@ procedure golden_path {
   title   = "Bring a lab up and tear it down"
   purpose = "The everyday lifecycle: validate, boot with provisions, inspect, stop."
   preconditions = ["A vmlab.wcl exists (found by walking up from cwd).", "Referenced templates are in the store or are pullable registry refs."]
-  related = [labs, vms, provisions, validate_checks]
+  related = [start_here, labs, vms, provisions, validate_checks]
   audience = :both
 
   step validate { n = 1

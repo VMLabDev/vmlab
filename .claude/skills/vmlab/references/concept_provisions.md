@@ -33,6 +33,8 @@ fn handle(event: Event, lab: Lab) {
 
 ## Related
 
+- [Automating labs](../references/concept_automation_overview.md)
+
 - [lab {} block](../references/entity_labs.md)
 
 - [provision {} block](../references/entity_provision_block.md)

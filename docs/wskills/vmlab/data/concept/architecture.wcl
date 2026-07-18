@@ -1,0 +1,55 @@
+concept architecture {
+  name     = "How vmlab fits together"
+  summary  = "The big picture: front ends, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the three guest channels."
+  related  = [daemon_model, networking, templates, linked_clones, vmlab_agent, vmlab_web, paths_table, dot_vmlab, template_store]
+  audience = :both
+  body {
+    p <<PROSE
+Every vmlab feature hangs off one spine: front ends talk a JSON-lines protocol
+to a small daemon tree, which owns the QEMU processes and everything around
+them.
+PROSE
+    code "text" { source = <<'SRC'
+vmlab CLI ─┐                        ┌─ lab daemon "ad-demo" ── QEMU × N
+           ├─ unix-socket protocol ─┤     (one per running lab)
+vmlab-web ─┘        vmlabd          └─ lab daemon "scratch" ── QEMU × M
+                 (supervisor)
+SRC
+    }
+    p <<'PROSE'
+**Front ends.** The `vmlab` CLI and the [vmlab-web](entity_vmlab_web) server
+are peers: both speak the same protocol, so anything the CLI does the web
+console can do. Daemons auto-start on first use — there is no setup step.
+
+**The daemon tier.** The supervisor `vmlabd` tracks the host-wide lab
+registry and global concerns; one **lab daemon** per running lab owns that
+lab's QEMU processes, its network fabric, snapshots, events and shared
+folders. A lab daemon crashing affects only its lab — see
+[the daemon model](concept_daemon_model).
+
+**Machines.** Each VM is a QEMU process booted from a
+[linked clone](concept_linked_clones) — a copy-on-write qcow2 over a sealed
+[template](concept_templates) in the store. Lab containers are the same
+picture in miniature: the OCI image becomes the root filesystem of a tiny
+micro-VM, so "everything is a machine" holds for networking, snapshots and
+automation alike.
+
+**Networking.** The fabric is userspace by default — the lab daemon *is* the
+switch, DHCP server, DNS server, router and NAT for its segments — which is
+why vmlab runs unprivileged ([networking model](concept_networking)); eBPF
+tiers accelerate it where the host allows.
+
+**Guest channels.** Three doors into a running guest, all daemon-owned: QMP
+(power, device control), the QEMU guest agent (fallback exec/copy), and
+[vmlab-agent](entity_vmlab_agent) — the first-party agent carrying shells,
+file transfer, metrics and playbooks over virtio-serial with no guest
+network.
+
+**Where things live.** Machine-wide state (the template store, daemon
+sockets, host config) sits under the user's home directories
+([paths](fact_paths_table), [template store](entity_template_store)); each
+lab keeps its disposable working data in its own
+[`.vmlab/`](entity_dot_vmlab) beside `vmlab.wcl`.
+PROSE
+  }
+}

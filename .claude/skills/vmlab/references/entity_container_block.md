@@ -55,6 +55,8 @@ with `vmlab container exec` or from provision scripts.
 
 ## Related
 
+- [Lab containers](../references/concept_lab_containers.md)
+
 - [lab {} block](../references/entity_labs.md)
 
 - [vm {} block](../references/entity_vms.md)

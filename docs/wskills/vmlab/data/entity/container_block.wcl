@@ -2,7 +2,7 @@ entity container_block {
   name     = "container {} block"
   kind     = :wcl_block
   summary  = "Declares an OCI container in a lab: image reference, env/volumes/ports/healthcheck, restart policy — run in a micro-VM on the same segments as VMs."
-  related  = [labs, vms, nic_block, segment_block, container_api]
+  related  = [lab_containers, labs, vms, nic_block, segment_block, container_api]
   audience = :both
   body {
     p <<PROSE

@@ -17,6 +17,8 @@ Manual control: `vmlab daemon start | stop | status`.
 
 ## Related
 
+- [How vmlab fits together](../references/concept_architecture.md)
+
 - [lab {} block](../references/entity_labs.md)
 
 - [Host config](../references/concept_host_config.md)

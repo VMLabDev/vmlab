@@ -36,6 +36,8 @@ including config-weave package search/add buttons and a repos manager.
 
 ## Related
 
+- [Automating labs](../references/concept_automation_overview.md)
+
 - [playbook {} block](../references/entity_playbook_block.md)
 
 - [Provisions & event handlers](../references/concept_provisions.md)

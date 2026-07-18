@@ -1,7 +1,7 @@
 concept provisions {
   name     = "Provisions & event handlers"
   summary  = "provision {} scripts run on `vmlab up` (failure is fatal); on \"event\" {} handlers react to lifecycle events (failure is logged)."
-  related  = [labs, provision_block, on_handler, wscript_overview, wscript_matching, events]
+  related  = [automation_overview, labs, provision_block, on_handler, wscript_overview, wscript_matching, events]
   audience = :both
   body {
     p <<PROSE

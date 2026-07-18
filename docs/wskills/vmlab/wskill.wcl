@@ -24,7 +24,7 @@ schema_version = "1.3.0"
 topic vmlab {
   name    = "vmlab"
   summary = "A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript."
-  version = "1.2"
+  version = "1.3"
   description = <<END
 vmlab orchestrates single-host virtual-machine labs. A **lab** — a set of VMs plus
 the virtual networks that connect them — is declared in **WCL** (`vmlab.wcl`).

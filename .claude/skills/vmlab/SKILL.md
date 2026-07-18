@@ -15,7 +15,7 @@ metadata:
 
 A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript.
 
-**Upstream version:** `1.2`. If the real upstream has moved past this, the skill may be stale — bump `topic.version` and re-verify (see the update workflow).
+**Upstream version:** `1.3`. If the real upstream has moved past this, the skill may be stale — bump `topic.version` and re-verify (see the update workflow).
 
 vmlab orchestrates single-host VM labs: labs (VMs + virtual networks) are declared in WCL (`vmlab.wcl`), disk templates are built and stored locally or distributed via OCI registries, and automation is written in wscript scripts that drive guests (power, exec, keystrokes, screen matching, OCR).
 
@@ -62,48 +62,81 @@ A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by 
 
 ## Reference
 
+### Getting started
+
+_What vmlab is, the three artifacts you touch, and the everyday lifecycle._
+
+Orientation for newcomers: the lab file, templates and wscript in one screen, then the golden path from `validate` to `destroy`.
+
+- [Start here](references/concept_start_here.md)
+- [vmlab.wcl](references/entity_vmlab_wcl.md)
+- [Bring a lab up and tear it down](references/process_golden_path.md)
+
+### How vmlab works
+
+_The moving parts: daemons, QEMU processes, guest channels, and where state lives on disk._
+
+The big picture first, then the daemon model and the on-disk layout — machine-wide state versus each lab's disposable `.vmlab/`.
+
+- [How vmlab fits together](references/concept_architecture.md)
+- [Daemon model](references/concept_daemon_model.md)
+- [Filesystem layout](references/fact_paths_table.md)
+- [.vmlab/](references/entity_dot_vmlab.md)
+- [Template store](references/entity_template_store.md)
+
 ### Labs & networking
 
-_Declare VMs and the virtual networks that connect them._
+_Declare machines and the virtual networks that connect them._
 
-Everything for writing a `vmlab.wcl`: the lab and VM blocks, segment networking, SMB shares, and provision/event scripts.
+The `vmlab.wcl` topology surface: the lab and VM blocks, shared folders and media, then the network fabric — segments, DHCP/DNS, routing, NAT and traffic rules.
 
 - [lab {} block](references/entity_labs.md)
 - [vm {} block](references/entity_vms.md)
 - [nic {} block](references/entity_nic_block.md)
+- [share {} block](references/entity_shares.md)
+- [media {} block](references/entity_media.md)
 - [Networking model](references/concept_networking.md)
 - [segment {} block](references/entity_segment_block.md)
 - [segment {} sub-blocks](references/fact_segment_subblocks.md)
-- [share {} block](references/entity_shares.md)
-- [Provisions & event handlers](references/concept_provisions.md)
-- [provision {} block](references/entity_provision_block.md)
-- [on "event" {} handler](references/entity_on_handler.md)
-- [web {} block](references/entity_web_block.md)
-- [The vmlab.wcl schema](references/fact_schema_reference.md)
 
 ### Templates & distribution
 
 _Build reusable disk images and move them between machines._
 
-Build templates from installer media, boot scratch VMs, generate ISO/floppy media, and distribute templates over OCI registries.
+Templates end to end: what they are, declaring and building them, how clones boot from them, scratch VMs, and pushing/pulling over OCI registries.
 
 - [Templates](references/concept_templates.md)
 - [template {} block](references/entity_template_block.md)
-- [Template build flow](references/concept_template_builds.md)
-- [Linked clones](references/concept_linked_clones.md)
 - [source {} build source](references/entity_template_sources.md)
+- [Template build flow](references/concept_template_builds.md)
+- [Build a disk template](references/process_build_template.md)
+- [Linked clones](references/concept_linked_clones.md)
 - [Scratch VMs](references/concept_scratch_vms.md)
-- [media {} block](references/entity_media.md)
 - [OCI distribution](references/concept_oci.md)
 - [OCI artifact model](references/fact_oci_artifact.md)
-- [The vmlab.wcl schema](references/fact_schema_reference.md)
+- [Distribute a template over an OCI registry](references/process_distribute_oci.md)
 
-### Automation (wscript)
+### Lab containers
 
-_Drive guests with wscript provision scripts and event handlers._
+_OCI containers as first-class lab machines, each in its own micro-VM._
 
-The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for automating guests — power, exec, keystrokes, screen matching and OCR — plus the vmlab-agent channel and declarative config-weave playbooks.
+The container story (PRD §18): why micro-VMs, the `container {}` block, and the wscript `Container` handle.
 
+- [Lab containers](references/concept_lab_containers.md)
+- [container {} block](references/entity_container_block.md)
+- [Container](references/entity_container_api.md)
+
+### Automation
+
+_Drive guests: provision scripts, event handlers, playbooks, and the wscript language + API underneath._
+
+Start with the overview — which of the four automation surfaces fits which job — then the wscript language, the host API, and the provision/event/playbook machinery.
+
+- [Automating labs](references/concept_automation_overview.md)
+
+#### The wscript language
+
+_The statically typed scripting language: types, functions, matching, modules, stdlib._
 - [wscript: overview](references/concept_wscript_overview.md)
 - [wscript: types & values](references/concept_wscript_types.md)
 - [wscript: functions & control flow](references/concept_wscript_functions.md)
@@ -112,6 +145,10 @@ The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for 
 - [wscript: List & Map methods](references/fact_wscript_collections.md)
 - [wscript: string methods](references/fact_wscript_strings.md)
 - [wscript: not in v1](references/fact_wscript_limits.md)
+
+#### The vmlab API
+
+_The Lab / Vm / Segment handles and their method groups, plus the result types._
 - [Lab](references/entity_lab_api.md)
 - [Vm](references/entity_vm_api.md)
 - [Vm: lifecycle & state methods](references/fact_vm_lifecycle.md)
@@ -123,38 +160,53 @@ The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for 
 - [Segment](references/entity_seg_api.md)
 - [Match](references/entity_match_type.md)
 - [ExecResult](references/entity_exec_result_type.md)
+
+#### Provisions, events & playbooks
+
+_The declared automation: provision scripts on `up`, lifecycle event handlers, and config-weave playbooks._
+- [Provisions & event handlers](references/concept_provisions.md)
+- [provision {} block](references/entity_provision_block.md)
+- [on "event" {} handler](references/entity_on_handler.md)
 - [Event](references/entity_event_type.md)
+- [Lifecycle events](references/fact_events.md)
 - [Playbooks (config-weave)](references/concept_playbooks.md)
 - [playbook {} block](references/entity_playbook_block.md)
 
-### Web console
+### The web console
 
 _Manage labs from the browser: the vmlab-web server, the console UI, its API, and proxied guest web pages._
 
-Everything around `vmlab-web`: launching and securing the server, a tour of the console (designer, Files, machine consoles/terminals, templates, playbooks), the REST + WebSocket API, and `web {}` blocks that proxy guest HTTP UIs into the console.
+Everything around `vmlab-web`: the console tour, launching and securing the server, the REST + WebSocket API, and `web {}` blocks that proxy guest HTTP UIs into the console.
 
-- [vmlab-web](references/entity_vmlab_web.md)
 - [The web console](references/concept_web_console.md)
+- [vmlab-web](references/entity_vmlab_web.md)
 - [Serve the web console](references/process_serve_web_console.md)
 - [vmlab-web: the REST + WebSocket API](references/fact_web_api.md)
 - [web {} block](references/entity_web_block.md)
 
 ### Operations & hosting
 
-_Run vmlab: the CLI, daemons, host config, profiles, containers and WSL2._
+_Run vmlab anywhere: host config, profiles, containers, WSL2, and the network fast path._
 
-How vmlab runs: the two-tier daemon, the optional host config, guest OS profiles, and running unprivileged in containers or on WSL2. The CLI reference covers every verb.
+Host-side concerns: the optional host config, guest OS profiles, hosting vmlab itself in a container or on WSL2, eBPF acceleration, and what `vmlab validate` checks.
 
-- [Daemon model](references/concept_daemon_model.md)
 - [Host config](references/concept_host_config.md)
 - [Guest OS profiles](references/concept_profiles.md)
 - [Shipped guest OS profiles](references/fact_profiles_table.md)
-- [Filesystem layout](references/fact_paths_table.md)
-- [Containers](references/concept_containers.md)
+- [Running vmlab in a container](references/concept_containers.md)
+- [Run vmlab in a container](references/process_run_in_container.md)
 - [WSL2](references/concept_wsl2.md)
 - [Network fast path (eBPF)](references/concept_fastpath.md)
 - [What `vmlab validate` checks](references/fact_validate_checks.md)
+
+### Appendix: reference tables
+
+_The full vmlab.wcl schema and other lookup tables._
+
+Lookup material: the complete reflected `vmlab.wcl` schema (every block and attribute) and the key-chord names. The CLI reference and glossary follow as their own chapters.
+
 - [The vmlab.wcl schema](references/fact_schema_reference.md)
+- [Keyboard chord names](references/fact_key_chords.md)
 
 - [CLI reference](references/cli_ref.md) — every `vmlab` subcommand, its arguments and switches
 

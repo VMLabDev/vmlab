@@ -50,7 +50,7 @@ Mount the template store (persistent) and the lab directory, grant `/dev/kvm`, a
 
 ## Related
 
-- [Containers](../references/concept_containers.md)
+- [Running vmlab in a container](../references/concept_containers.md)
 
 - [WSL2](../references/concept_wsl2.md)
 

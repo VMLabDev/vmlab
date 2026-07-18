@@ -29,7 +29,7 @@ and `CAP_NET_ADMIN` to enable acceleration — see
 
 - [Networking model](../references/concept_networking.md)
 
-- [Containers](../references/concept_containers.md)
+- [Running vmlab in a container](../references/concept_containers.md)
 
 - [Host config](../references/concept_host_config.md)
 

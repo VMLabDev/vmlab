@@ -1,7 +1,7 @@
 concept daemon_model {
   name     = "Daemon model"
   summary  = "A two-tier daemon: the supervisor vmlabd (one per user) plus one lab daemon per running lab, auto-started by the CLI."
-  related  = [labs, host_config, networking]
+  related  = [architecture, labs, host_config, networking]
   audience = :both
   body {
     p <<PROSE

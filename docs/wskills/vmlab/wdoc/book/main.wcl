@@ -140,6 +140,14 @@ site book {
       }
     }
     chapter "Glossary"       { page = glossary_page }
+    // The A–Z catalogue: the per-kind "everything" listing pages, so every
+    // unit is reachable from the nav even outside its part.
+    chapter "Catalogue" {
+      chapter "All concepts"  { page = concepts_page }
+      chapter "All entities"  { page = entities_page }
+      chapter "All facts"     { page = facts_page }
+      chapter "All processes" { page = processes_page }
+    }
   }
   // The Reference catalogue (the force-directed graph of every unit) and the
   // Skill preview both live behind a pinned sidebar button.

@@ -1,0 +1,37 @@
+concept automation_overview {
+  name     = "Automating labs"
+  summary  = "The four automation surfaces — provision scripts, event handlers, playbooks, and ad-hoc drives — and how to pick between them."
+  related  = [provisions, playbooks, wscript_overview, lab_api, vm_api, vmlab_agent]
+  audience = :both
+  body {
+    p <<'PROSE'
+Everything in a lab can be automated, but there are four distinct surfaces —
+choose by *when* the automation runs and *what shape* it takes:
+
+| Surface | Runs | Shape | Reach for it when |
+| --- | --- | --- | --- |
+| [Provision scripts](concept_provisions) (`provision {}`) | On `vmlab up`, in declaration order | Imperative [wscript](concept_wscript_overview) | Sequenced setup: install, configure, reboot, verify |
+| [Event handlers](entity_on_handler) (`on "event" {}`) | When a lifecycle event fires | Imperative wscript | Reactions: collect dumps on `vm.crashed`, alert on disk-low |
+| [Playbooks](concept_playbooks) (`playbook {}`) | On `up` (interleaved with provisions) and on demand | Declarative config-weave | Desired-state config: packages, files, services, domain joins — with drift check |
+| Ad-hoc | Whenever you run it | `vmlab script x.ws`, or one-shot `exec` / `shell` / `cp` | Experiments, debugging, one-off tasks |
+
+The imperative surfaces all land in the same place: a wscript `main(lab)`
+holding a [`Lab` handle](entity_lab_api), from which
+[`Vm`](entity_vm_api) and [`Container`](entity_container_api) handles expose
+power, exec, file transfer, terminals, snapshots, keystrokes, screen matching
+and OCR. Multi-step guest work belongs in a script, not a chain of
+`vmlab exec` calls — scripts get send/expect terminals, retries and real
+control flow.
+
+Underneath, guest access rides the [vmlab-agent](entity_vmlab_agent) channel
+(virtio-serial, no guest network needed), falling back to the QEMU guest
+agent on templates that predate it. Vision-based automation (screen matching,
+OCR) needs no agent at all — it reads the display, which is what makes even
+vintage guests scriptable.
+
+The surfaces compose: a typical lab declares playbooks for steady-state
+config, provisions for the sequenced glue playbooks can't express, and a
+crash handler or two — then you poke at the result with `vmlab shell`.
+PROSE
+  }
+}

@@ -2,7 +2,7 @@ entity container_api {
   name     = "Container"
   kind     = :api_object
   summary  = "A container handle obtained from lab.container(name): lifecycle, snapshots, exec, file copy, logs, health, interactive terminal and stats — the VM API minus display/input."
-  related  = [lab_api, vm_api, container_block, exec_result_type, vm_agent]
+  related  = [lab_containers, lab_api, vm_api, container_block, exec_result_type, vm_agent]
   audience = :both
   body {
     p <<PROSE

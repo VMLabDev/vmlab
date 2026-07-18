@@ -63,6 +63,8 @@ Use `vmlab down` for a graceful stop that retains clones. Use `vmlab destroy` on
 
 ## Related
 
+- [Start here](../references/concept_start_here.md)
+
 - [lab {} block](../references/entity_labs.md)
 
 - [vm {} block](../references/entity_vms.md)

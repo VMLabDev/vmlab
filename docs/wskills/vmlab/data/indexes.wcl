@@ -1,53 +1,126 @@
-// Indexes — curated landing pages that group the reference by task area. Each gets
-// its own top-level menu entry (between Overview and Reference). `related` resolves
-// to a link list. Ids prefixed `ix_` to stay globally unique.
+// Indexes — the book's part structure. Declaration order = part order in the
+// book sidebar AND section order in SKILL.md; `related` order = reading order
+// within a part. Each part opens with an orientation unit pinned first (index
+// bodies render in SKILL.md only, so book-visible intros must be real units).
+// One level of child indexes is supported (used by Automation). Ids prefixed
+// `ix_` to stay globally unique.
+
+index ix_start {
+  name     = "Getting started"
+  summary  = "What vmlab is, the three artifacts you touch, and the everyday lifecycle."
+  related  = [start_here, vmlab_wcl, golden_path]
+  audience = :both
+  body {
+    p "Orientation for newcomers: the lab file, templates and wscript in one screen, then the golden path from `validate` to `destroy`."
+  }
+}
+
+index ix_architecture {
+  name     = "How vmlab works"
+  summary  = "The moving parts: daemons, QEMU processes, guest channels, and where state lives on disk."
+  related  = [architecture, daemon_model, paths_table, dot_vmlab, template_store]
+  audience = :both
+  body {
+    p "The big picture first, then the daemon model and the on-disk layout — machine-wide state versus each lab's disposable `.vmlab/`."
+  }
+}
 
 index ix_labs {
   name     = "Labs & networking"
-  summary  = "Declare VMs and the virtual networks that connect them."
-  related  = [labs, vms, nic_block, networking, segment_block, segment_subblocks, shares, provisions, provision_block, on_handler, web_block, schema_reference]
+  summary  = "Declare machines and the virtual networks that connect them."
+  related  = [labs, vms, nic_block, shares, media, networking, segment_block, segment_subblocks]
   audience = :both
   body {
-    p "Everything for writing a `vmlab.wcl`: the lab and VM blocks, segment networking, SMB shares, and provision/event scripts."
+    p "The `vmlab.wcl` topology surface: the lab and VM blocks, shared folders and media, then the network fabric — segments, DHCP/DNS, routing, NAT and traffic rules."
   }
 }
 
 index ix_templates {
   name     = "Templates & distribution"
   summary  = "Build reusable disk images and move them between machines."
-  related  = [templates, template_block, template_builds, linked_clones, template_sources, scratch_vms, media, oci, oci_artifact, schema_reference]
+  related  = [templates, template_block, template_sources, template_builds, build_template, linked_clones, scratch_vms, oci, oci_artifact, distribute_oci]
   audience = :both
   body {
-    p "Build templates from installer media, boot scratch VMs, generate ISO/floppy media, and distribute templates over OCI registries."
+    p "Templates end to end: what they are, declaring and building them, how clones boot from them, scratch VMs, and pushing/pulling over OCI registries."
+  }
+}
+
+index ix_containers {
+  name     = "Lab containers"
+  summary  = "OCI containers as first-class lab machines, each in its own micro-VM."
+  related  = [lab_containers, container_block, container_api]
+  audience = :both
+  body {
+    p "The container story (PRD §18): why micro-VMs, the `container {}` block, and the wscript `Container` handle."
   }
 }
 
 index ix_automation {
-  name     = "Automation (wscript)"
-  summary  = "Drive guests with wscript provision scripts and event handlers."
-  related  = [wscript_overview, wscript_types, wscript_functions, wscript_matching, wscript_modules, wscript_collections, wscript_strings, wscript_limits, lab_api, vm_api, vm_lifecycle, vm_snapshots, vm_input, vm_vision, vm_agent, vmlab_agent, seg_api, match_type, exec_result_type, event_type, playbooks, playbook_block]
+  name     = "Automation"
+  summary  = "Drive guests: provision scripts, event handlers, playbooks, and the wscript language + API underneath."
+  related  = [automation_overview]
   audience = :both
   body {
-    p "The wscript language essentials and the vmlab host API (Lab / Vm / Segment) for automating guests — power, exec, keystrokes, screen matching and OCR — plus the vmlab-agent channel and declarative config-weave playbooks."
+    p "Start with the overview — which of the four automation surfaces fits which job — then the wscript language, the host API, and the provision/event/playbook machinery."
+  }
+
+  index ix_wscript {
+    name     = "The wscript language"
+    summary  = "The statically typed scripting language: types, functions, matching, modules, stdlib."
+    related  = [wscript_overview, wscript_types, wscript_functions, wscript_matching, wscript_modules, wscript_collections, wscript_strings, wscript_limits]
+    audience = :both
+    body {
+      p "The language itself, independent of vmlab's API: syntax, the type system, Option/Result matching, modules, and the collection/string stdlib."
+    }
+  }
+
+  index ix_api {
+    name     = "The vmlab API"
+    summary  = "The Lab / Vm / Segment handles and their method groups, plus the result types."
+    related  = [lab_api, vm_api, vm_lifecycle, vm_snapshots, vm_input, vm_vision, vm_agent, vmlab_agent, seg_api, match_type, exec_result_type]
+    audience = :both
+    body {
+      p "What a script can do with a running lab: lifecycle, snapshots, keystrokes, screen matching and OCR, agent exec/terminals, and live segment rules."
+    }
+  }
+
+  index ix_events {
+    name     = "Provisions, events & playbooks"
+    summary  = "The declared automation: provision scripts on `up`, lifecycle event handlers, and config-weave playbooks."
+    related  = [provisions, provision_block, on_handler, event_type, events, playbooks, playbook_block]
+    audience = :both
+    body {
+      p "The `vmlab.wcl` side of automation: `provision {}`, `on \"event\" {}` with the event table, and declarative playbooks."
+    }
   }
 }
 
 index ix_web {
-  name     = "Web console"
+  name     = "The web console"
   summary  = "Manage labs from the browser: the vmlab-web server, the console UI, its API, and proxied guest web pages."
-  related  = [vmlab_web, web_console, serve_web_console, web_api, web_block]
+  related  = [web_console, vmlab_web, serve_web_console, web_api, web_block]
   audience = :both
   body {
-    p "Everything around `vmlab-web`: launching and securing the server, a tour of the console (designer, Files, machine consoles/terminals, templates, playbooks), the REST + WebSocket API, and `web {}` blocks that proxy guest HTTP UIs into the console."
+    p "Everything around `vmlab-web`: the console tour, launching and securing the server, the REST + WebSocket API, and `web {}` blocks that proxy guest HTTP UIs into the console."
   }
 }
 
 index ix_operations {
   name     = "Operations & hosting"
-  summary  = "Run vmlab: the CLI, daemons, host config, profiles, containers and WSL2."
-  related  = [daemon_model, host_config, profiles, profiles_table, paths_table, containers, wsl2, fastpath, validate_checks, schema_reference]
+  summary  = "Run vmlab anywhere: host config, profiles, containers, WSL2, and the network fast path."
+  related  = [host_config, profiles, profiles_table, containers, run_in_container, wsl2, fastpath, validate_checks]
   audience = :both
   body {
-    p "How vmlab runs: the two-tier daemon, the optional host config, guest OS profiles, and running unprivileged in containers or on WSL2. The CLI reference covers every verb."
+    p "Host-side concerns: the optional host config, guest OS profiles, hosting vmlab itself in a container or on WSL2, eBPF acceleration, and what `vmlab validate` checks."
+  }
+}
+
+index ix_appendix {
+  name     = "Appendix: reference tables"
+  summary  = "The full vmlab.wcl schema and other lookup tables."
+  related  = [schema_reference, key_chords]
+  audience = :both
+  body {
+    p "Lookup material: the complete reflected `vmlab.wcl` schema (every block and attribute) and the key-chord names. The CLI reference and glossary follow as their own chapters."
   }
 }

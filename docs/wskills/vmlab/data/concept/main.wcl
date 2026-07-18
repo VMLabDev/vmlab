@@ -1,4 +1,8 @@
 // concept — one import per entry (ideas / mental models).
+import "./start_here.wcl"
+import "./architecture.wcl"
+import "./lab_containers.wcl"
+import "./automation_overview.wcl"
 import "./networking.wcl"
 import "./provisions.wcl"
 import "./templates.wcl"

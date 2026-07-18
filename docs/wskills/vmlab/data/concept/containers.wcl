@@ -1,7 +1,7 @@
 concept containers {
-  name     = "Containers"
-  summary  = "vmlab runs in Docker/Podman with /dev/kvm; optional eBPF networking adds /dev/net/tun, CAP_BPF and CAP_NET_ADMIN."
-  related  = [daemon_model, networking, wsl2]
+  name     = "Running vmlab in a container"
+  summary  = "Hosting vmlab itself in Docker/Podman with /dev/kvm; optional eBPF networking adds /dev/net/tun, CAP_BPF and CAP_NET_ADMIN. (For OCI containers as lab machines, see Lab containers.)"
+  related  = [daemon_model, networking, wsl2, lab_containers]
   audience = :both
   body {
     p <<PROSE

@@ -1,7 +1,7 @@
 concept playbooks {
   name     = "Playbooks (config-weave)"
   summary  = "Declarative guest configuration via config-weave: playbook {} blocks apply on `vmlab up` interleaved with provisions, re-run on demand with `vmlab playbook check|apply`, and drive template builds."
-  related  = [playbook_block, provisions, template_builds, web_console]
+  related  = [automation_overview, playbook_block, provisions, template_builds, web_console]
   audience = :both
   body {
     p <<PROSE

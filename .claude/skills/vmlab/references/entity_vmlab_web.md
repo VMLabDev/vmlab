@@ -51,6 +51,6 @@ book at `/help`, which the console's Help button opens as an in-app tab.
 
 - [Daemon model](../references/concept_daemon_model.md)
 
-- [Containers](../references/concept_containers.md)
+- [Running vmlab in a container](../references/concept_containers.md)
 
 [← Back to SKILL.md](../SKILL.md)

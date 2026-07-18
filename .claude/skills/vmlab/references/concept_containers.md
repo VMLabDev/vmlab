@@ -1,6 +1,6 @@
-# Containers
+# Running vmlab in a container
 
-_vmlab runs in Docker/Podman with /dev/kvm; optional eBPF networking adds /dev/net/tun, CAP_BPF and CAP_NET_ADMIN._
+_Hosting vmlab itself in Docker/Podman with /dev/kvm; optional eBPF networking adds /dev/net/tun, CAP_BPF and CAP_NET_ADMIN. (For OCI containers as lab machines, see Lab containers.)_
 
 vmlab runs unprivileged. The container image is defined by `Containerfile`; WCL and
 wscript are git dependencies (fetched during the build), so the \*\*build context is
@@ -35,5 +35,7 @@ CLI use, or drive a running container via `docker exec <ctr> vmlab ...`.
 - [Networking model](../references/concept_networking.md)
 
 - [WSL2](../references/concept_wsl2.md)
+
+- [Lab containers](../references/concept_lab_containers.md)
 
 [← Back to SKILL.md](../SKILL.md)

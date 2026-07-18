@@ -1,25 +1,41 @@
-// Book Overview — the start page (topic header, metadata, related skills, sources).
+// Book Overview — the start page: what vmlab is, how the book is organised,
+// then the wskill metadata (artifacts, related skills, sources).
 //
 // Imported by book/main.wcl; resolves that file's `let`s (`topic`) and the
 // gathered document lists (`refs`, `sources`). Not standalone-checkable — it is
 // only valid as part of the book document.
 
-page index { start = true
-  h1 $"${topic.name}"
+page index { start = true  title = "Welcome"
+  h1 $"${topic.name} — the reference"
   callout "Summary" { class = ["info"]  body = $"${topic.summary}" }
-  table {
-    header = ["", ""]
-    rows = [
-      ["Version", topic.version ?? "—"],
-      ["Created", topic.created],
-      ["Last updated", topic.updated ?? "—"],
-      ["Maintainer", match topic.maintainer_entity { none => topic.maintainer ?? "—", id => $"[${topic.maintainer ?? "maintainer"}](entity_${id})" }],
-    ]
-  }
   wdoc_repeater { each = match topic.description { none => [], d => [d] }  as = :d
     p $"${d}"
   }
 
+  h2 "How this book is organised"
+  p <<'PROSE'
+The parts read in order as a course, and stand alone as a reference:
+
+1. **Getting started** — orientation and the everyday lifecycle. New here?
+   [Start here](concept_start_here).
+2. **How vmlab works** — [the architecture](concept_architecture): daemons,
+   clones, guest channels, on-disk layout.
+3. **Labs & networking** — the `vmlab.wcl` topology surface: machines,
+   segments, DHCP/DNS/NAT, shares.
+4. **Templates & distribution** — building sealed disk images and moving them
+   over OCI registries.
+5. **Lab containers** — OCI containers as micro-VM lab machines.
+6. **Automation** — the wscript language, the Lab/Vm/Segment API, and
+   provisions, event handlers and playbooks.
+7. **The web console** — managing everything from the browser.
+8. **Operations & hosting** — host config, profiles, running vmlab in
+   containers and on WSL2, the eBPF fast path.
+
+The appendix holds the complete `vmlab.wcl` schema and other lookup tables,
+followed by the CLI reference and the glossary. Every page cross-links its
+related notes both ways, the **Reference** button opens a map of every note,
+and search covers the whole book.
+PROSE
 
   wdoc_repeater { each = match len(artifacts) { 0 => [], _ => [true] }  as = :_af
     h2 "Artifacts"
@@ -30,6 +46,17 @@ page index { start = true
         [a.name ?? kind_text($"${a.kind}"), $"`${a.entry}`", match a.output { none => "—", o => $"`${o}`" }]
       })
     }
+  }
+
+  h2 "About this wskill"
+  table {
+    header = ["", ""]
+    rows = [
+      ["Version", topic.version ?? "—"],
+      ["Created", topic.created],
+      ["Last updated", topic.updated ?? "—"],
+      ["Maintainer", match topic.maintainer_entity { none => topic.maintainer ?? "—", id => $"[${topic.maintainer ?? "maintainer"}](entity_${id})" }],
+    ]
   }
 
   h2 "Related skills"

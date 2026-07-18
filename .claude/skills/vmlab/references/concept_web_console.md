@@ -34,7 +34,7 @@ managed lab directory; existing labs opened from disk are edited in place.
 
 - [Playbooks (config-weave)](../references/concept_playbooks.md)
 
-- [Containers](../references/concept_containers.md)
+- [Running vmlab in a container](../references/concept_containers.md)
 
 - [Templates](../references/concept_templates.md)
 

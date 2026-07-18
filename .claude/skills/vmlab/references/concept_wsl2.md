@@ -12,7 +12,7 @@ grows as `.vmlab/` clones grow, so the `host.disk_low` watchdog matters more her
 
 ## Related
 
-- [Containers](../references/concept_containers.md)
+- [Running vmlab in a container](../references/concept_containers.md)
 
 - [Networking model](../references/concept_networking.md)
 
