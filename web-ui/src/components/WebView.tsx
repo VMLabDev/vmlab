@@ -12,10 +12,6 @@ import { showWeb } from "../store";
 
 interface WebTab {
   id: string;
-  lab: string;
-  kind: "vms" | "containers";
-  machine: string;
-  page: string;
   title: string;
   src: string;
   /** Bumped to force the iframe to reload. */
@@ -38,22 +34,24 @@ export function openWebPage(
   page: WebPage,
 ) {
   const id = `${lab}/${kind}/${machine}/${page.name}`;
-  if (!tabs().some((t) => t.id === id)) {
-    setTabs([
-      ...tabs(),
-      {
-        id,
-        lab,
-        kind,
-        machine,
-        page: page.name,
-        title: `${machine} · ${page.name}`,
-        src: api.webPageUrl(lab, kind, machine, page),
-        nonce: 0,
-      },
-    ]);
+  openTab({
+    id,
+    title: `${machine} · ${page.name}`,
+    src: api.webPageUrl(lab, kind, machine, page),
+    nonce: 0,
+  });
+}
+
+/** Open (or focus) the in-app help book as a Web tab. */
+export function openHelpTab() {
+  openTab({ id: "help", title: "Help", src: "/help/", nonce: 0 });
+}
+
+function openTab(tab: WebTab) {
+  if (!tabs().some((t) => t.id === tab.id)) {
+    setTabs([...tabs(), tab]);
   }
-  setActiveId(id);
+  setActiveId(tab.id);
   showWeb();
 }
 

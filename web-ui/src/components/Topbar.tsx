@@ -4,6 +4,7 @@ import { applyTheme } from "@forge/tokens";
 import { Check, CircleHelp, LogOut, Moon, Plus } from "lucide-solid";
 import { doLogout, selectLab, showLab, state } from "../store";
 import { openNewLabModal } from "./NewLabModal";
+import { openHelpTab } from "./WebView";
 
 function fastpathHint(fp: NonNullable<typeof state.fastpath>): string {
   const skipped = Object.entries(fp.reasons).map(([tier, why]) => `${tier}: ${why}`);
@@ -82,12 +83,9 @@ export default function Topbar() {
       <Badge tone={state.connected ? "success" : "neutral"} dot>
         {state.connected ? "connected" : "offline"}
       </Badge>
-      {/* The embedded wskill book (or the hosted docs when not bundled). */}
-      <IconButton
-        icon={CircleHelp}
-        label="Help"
-        onClick={() => window.open("/help/", "_blank", "noopener")}
-      />
+      {/* The embedded wskill book (or the hosted docs when not bundled),
+          opened as an in-app Web tab. */}
+      <IconButton icon={CircleHelp} label="Help" onClick={openHelpTab} />
       <IconButton icon={Moon} label="Toggle dark/light" onClick={toggleTheme} />
       <Show when={state.authRequired}>
         <IconButton
