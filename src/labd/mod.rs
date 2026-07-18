@@ -237,6 +237,7 @@ impl Handler for LabdHandler {
         match cmd {
             "ping" => Ok(json!("pong")),
             "status" => Ok(lab.status().await),
+            "dns.table" => Ok(lab.dns_table().await),
             "up" => {
                 let output = stream_sink(&self.lab, _stream);
                 lab.up(&vms_arg(&args), output).await.map_err(err)?;

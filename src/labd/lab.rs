@@ -18,6 +18,7 @@ use super::vm::{PowerState, StopReason, VmDirs, VmInstance};
 use crate::config::LabFile;
 use crate::config::model::TemplateRef;
 use crate::profiles::ProfileSet;
+use crate::sync::LockRecover;
 use crate::template::TemplateStore;
 
 pub struct LabRuntime {
@@ -1982,6 +1983,27 @@ impl LabRuntime {
             "containers": containers,
             "segments": segments,
         })
+    }
+
+    /// Live per-segment DNS zone snapshots (`dns.table`). Segments without a
+    /// local DNS zone — global (supervisor-gatewayed) or `dns { enabled =
+    /// false }` — are omitted.
+    pub async fn dns_table(&self) -> Value {
+        let net = self.network.lock().await;
+        let mut segments: Vec<(String, Value)> = Vec::new();
+        for seg in net.segments.values() {
+            let Some(zone) = seg.gateway.as_ref().and_then(|g| g.dns_zone()) else {
+                continue;
+            };
+            let snapshot = zone.lock_recover().snapshot();
+            segments.push((seg.name.clone(), json!(snapshot)));
+        }
+        segments.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let segments: Vec<Value> = segments
+            .into_iter()
+            .map(|(name, zone)| json!({ "segment": name, "zone": zone }))
+            .collect();
+        json!({ "segments": segments })
     }
 
     // ---- snapshots (PRD §7.3; containers §18) --------------------------------

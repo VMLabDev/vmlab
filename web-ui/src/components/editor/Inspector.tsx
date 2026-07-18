@@ -3,7 +3,7 @@
 // collection. All edits mutate the editor draft; nothing touches disk
 // until Save builds the op batch.
 
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { For, Show, createMemo, createResource, createSignal } from "solid-js";
 import { produce } from "solid-js/store";
 import { Badge, Button, IconButton, Input, Modal, Select, Table, Tabs, Toggle } from "@forge/ui";
 import {
@@ -14,6 +14,7 @@ import {
   FileCode2,
   HardDrive,
   Plus,
+  RefreshCw,
   Trash2,
 } from "lucide-solid";
 import type {
@@ -46,7 +47,9 @@ import {
   setEditor,
   storeTemplateFor,
 } from "../../editor/store";
-import { anyVmRunning } from "../../store";
+import { anyVmRunning, state } from "../../store";
+import { dnsTable } from "../../api";
+import type { DnsLiveRecord } from "../../api";
 import { confirmDialog } from "../dialogs";
 import BlockForm from "./BlockForm";
 import BlockList from "./BlockList";
@@ -95,9 +98,6 @@ export default function Inspector(props: {
         >
           <ContainerInspector index={(sel() as { index: number }).index} />
         </Show>
-        <Show when={sel().kind === "segment" && editor.draft?.segments[(sel() as any).index]}>
-          <SegmentInspector index={(sel() as { index: number }).index} />
-        </Show>
         <Show
           when={sel().kind === "provision" && editor.draft?.provisions[(sel() as any).index]}
         >
@@ -112,6 +112,13 @@ export default function Inspector(props: {
           <PlaybookInspector index={(sel() as { index: number }).index} />
         </Show>
       </fieldset>
+      {/* Outside the read-only fieldset on purpose: the segment tabs stay
+          navigable while machines run so the DNS tab's live registrations
+          (runtime state, only meaningful while up) are reachable; it locks
+          its own fields per tab. */}
+      <Show when={sel().kind === "segment" && editor.draft?.segments[(sel() as any).index]}>
+        <SegmentInspector index={(sel() as { index: number }).index} />
+      </Show>
       {/* Outside the read-only fieldset on purpose: playbook FILES stay
           editable while machines run — that is the edit→check dev loop. */}
       <Show when={sel().kind === "playbook" && editor.draft?.playbooks[(sel() as any).index]}>
@@ -1360,6 +1367,66 @@ function SegmentDnsTable(props: {
   );
 }
 
+// The runtime half of the DNS tab: names the daemon auto-registered for
+// VMs/containers (leases and static IPs) in this segment's live zone —
+// read-only, badged `dynamic`; the editable statics above stay the
+// config's source of truth.
+function SegmentLiveDns(props: { segment: string }) {
+  // Gated on the console's status poll so opening the tab never spawns a
+  // lab daemon. The source is the segment *name* (a stable string), so
+  // status polling doesn't retrigger the fetch; refresh is manual.
+  const [live, { refetch }] = createResource(
+    () => (state.status && state.currentLab === editor.lab ? props.segment : null),
+    async (segment): Promise<DnsLiveRecord[] | null> => {
+      try {
+        const table = await dnsTable(editor.lab!);
+        const zone = table.segments.find((s) => s.segment === segment)?.zone;
+        return zone?.records.filter((r) => r.kind === "dynamic") ?? null;
+      } catch {
+        return null;
+      }
+    },
+  );
+  return (
+    <Show when={(live() ?? []).length > 0}>
+      <div class="dns-live-section">
+        <div class="dns-live-header">
+          <div class="inspector-section-title">Live registrations</div>
+          <IconButton
+            icon={RefreshCw}
+            label="Refresh live DNS registrations"
+            onClick={() => refetch()}
+          />
+        </div>
+        <div class="dns-table">
+          <Table aria-label="Live DNS registrations">
+            <thead>
+              <tr>
+                <th>Type</th>
+                <th>Name</th>
+                <th>Address</th>
+              </tr>
+            </thead>
+            <tbody>
+              <For each={live()}>
+                {(record) => (
+                  <tr>
+                    <td class="dns-type">
+                      <Badge tone="info">dynamic</Badge>
+                    </td>
+                    <td class="dns-live-name">{record.name}</td>
+                    <td>{record.ip}</td>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </Table>
+        </div>
+      </div>
+    </Show>
+  );
+}
+
 const BLOCK_PROTOCOLS = [
   { value: "", label: "any" },
   { value: "tcp", label: "TCP" },
@@ -1586,19 +1653,26 @@ function SegmentInspector(props: { index: number }) {
   const setSeg = (fn: (s: SegmentModel) => void) =>
     mutate((d) => fn(d.segments[props.index]));
 
+  // This inspector renders outside the shared read-only fieldset so its
+  // tabs stay navigable while machines run (the DNS tab shows runtime
+  // state); each tab's config surface locks itself instead.
+  const locked = () => anyVmRunning();
+
   return (
     <>
-      <div class="inspector-head">
-        <span class="inspector-kind">segment</span>
-        <Input
-          value={seg().name}
-          onInput={(e) => renameSegment(props.index, e.currentTarget.value)}
-          title="Segment name (DNS label); references update automatically"
-        />
-        <Button variant="danger" size="sm" icon={Trash2} onClick={remove}>
-          Delete
-        </Button>
-      </div>
+      <fieldset class="inspector-fields" disabled={locked()}>
+        <div class="inspector-head">
+          <span class="inspector-kind">segment</span>
+          <Input
+            value={seg().name}
+            onInput={(e) => renameSegment(props.index, e.currentTarget.value)}
+            title="Segment name (DNS label); references update automatically"
+          />
+          <Button variant="danger" size="sm" icon={Trash2} onClick={remove}>
+            Delete
+          </Button>
+        </div>
+      </fieldset>
       <Tabs
         tabs={[
           { id: "general", label: "General" },
@@ -1610,46 +1684,55 @@ function SegmentInspector(props: { index: number }) {
         onChange={setTab}
       />
       <Show when={tab() === "general"}>
-        <BlockForm fields={F.SEGMENT_GENERAL} value={seg() as any} onSet={setField} />
-        <SliderRow
-          label="MTU"
-          doc="Link MTU (576–65535); default jumbo (9000) on NAT segments, else 1500"
-          value={seg().mtu}
-          fallback={seg().nat ? 9000 : 1500}
-          min={576}
-          max={65535}
-          step={1}
-          fmt={(v) => String(v)}
-          parse={(t) => {
-            const n = parseInt(t, 10);
-            return Number.isFinite(n) ? n : null;
-          }}
-          unsetLabel="default"
-          onChange={(v) => setField("mtu", v)}
-        />
+        <fieldset class="inspector-fields" disabled={locked()}>
+          <BlockForm fields={F.SEGMENT_GENERAL} value={seg() as any} onSet={setField} />
+          <SliderRow
+            label="MTU"
+            doc="Link MTU (576–65535); default jumbo (9000) on NAT segments, else 1500"
+            value={seg().mtu}
+            fallback={seg().nat ? 9000 : 1500}
+            min={576}
+            max={65535}
+            step={1}
+            fmt={(v) => String(v)}
+            parse={(t) => {
+              const n = parseInt(t, 10);
+              return Number.isFinite(n) ? n : null;
+            }}
+            unsetLabel="default"
+            onChange={(v) => setField("mtu", v)}
+          />
+        </fieldset>
       </Show>
       <Show when={tab() === "services"}>
-        <BlockForm fields={F.SEGMENT_SERVICES} value={seg() as any} onSet={setField} />
-        <Input
-          label="DNS server"
-          help="Leave blank to use vmlab built-in DNS"
-          placeholder="Use vmlab built-in DNS"
-          value={seg().dns.server ?? ""}
-          onInput={(e: InputEvent) => {
-            const value = (e.currentTarget as HTMLInputElement).value;
-            setSeg((s) => {
-              s.dns.declared = value.trim() !== "";
-              s.dns.server = value.trim() || null;
-              s.dns.enabled = true;
-            });
-          }}
-        />
+        <fieldset class="inspector-fields" disabled={locked()}>
+          <BlockForm fields={F.SEGMENT_SERVICES} value={seg() as any} onSet={setField} />
+          <Input
+            label="DNS server"
+            help="Leave blank to use vmlab built-in DNS"
+            placeholder="Use vmlab built-in DNS"
+            value={seg().dns.server ?? ""}
+            onInput={(e: InputEvent) => {
+              const value = (e.currentTarget as HTMLInputElement).value;
+              setSeg((s) => {
+                s.dns.declared = value.trim() !== "";
+                s.dns.server = value.trim() || null;
+                s.dns.enabled = true;
+              });
+            }}
+          />
+        </fieldset>
       </Show>
       <Show when={tab() === "dns"}>
-        <SegmentDnsTable segment={seg()} setSegment={setSeg} />
+        <fieldset class="inspector-fields" disabled={locked()}>
+          <SegmentDnsTable segment={seg()} setSegment={setSeg} />
+        </fieldset>
+        <SegmentLiveDns segment={seg().name} />
       </Show>
       <Show when={tab() === "rules"}>
-        <SegmentRulesTables segment={seg()} setSegment={setSeg} />
+        <fieldset class="inspector-fields" disabled={locked()}>
+          <SegmentRulesTables segment={seg()} setSegment={setSeg} />
+        </fieldset>
       </Show>
     </>
   );

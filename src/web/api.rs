@@ -392,6 +392,15 @@ pub async fn lab_status(state: web::Data<AppState>, lab: web::Path<String>) -> H
     }
 }
 
+/// `GET /api/labs/{lab}/dns` — live per-segment DNS zone snapshots
+/// (auto-registered guest records tagged `dynamic`, statics, sinkholes).
+pub async fn lab_dns_table(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
+    match state.lab_call(&lab, "dns.table", Value::Null).await {
+        Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
 /// Optional `?force=true` on the stop-shaped actions: force-kill instead of
 /// the graceful ladder (`down`, `*.stop`, and the stop half of `*.restart`).
 #[derive(Deserialize)]

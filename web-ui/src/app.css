@@ -911,6 +911,13 @@
 .dns-actions { text-align: center; }
 .dns-empty td { color: var(--fg-3); text-align: center; padding: var(--sp-4) !important; }
 .dns-table-actions { display: flex; align-items: center; gap: var(--sp-1); flex-wrap: wrap; }
+/* Read-only live-registration rows (runtime zone contents): no trailing
+   actions column, so the last header keeps its natural width. */
+.dns-live-section { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.dns-live-header { display: flex; align-items: center; justify-content: space-between; }
+.dns-live-section .dns-table .ftable th:last-child { width: auto; }
+.dns-live-section .dns-table .ftable td { padding: 6px 7px; }
+.dns-live-name { overflow-wrap: anywhere; }
 .rules-tables { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
 .rules-table-section { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); min-width: 0; width: 100%; }
 .rules-table-section .rules-table { width: 100%; }

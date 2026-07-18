@@ -17,6 +17,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
 use tracing::debug;
 
 use crate::config::model::{MacAddr, SinkholeMode};
@@ -56,6 +57,21 @@ pub enum DnsAnswer {
     Forward,
 }
 
+/// Provenance of an exact record: auto-registered by the daemon (guest
+/// name → lease/static-IP, PRD §9.5) or declared statically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordKind {
+    Dynamic,
+    Static,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecordEntry {
+    ip: Ipv4Addr,
+    kind: RecordKind,
+}
+
 #[derive(Debug, Clone)]
 struct WildcardRecord {
     id: u64,
@@ -80,7 +96,7 @@ pub struct DnsZone {
     /// Upstream resolver for unmatched queries; `None` means NXDOMAIN.
     pub upstream: Option<SocketAddr>,
     /// Exact FQDN → address (auto-registrations and exact static entries).
-    records: HashMap<String, Ipv4Addr>,
+    records: HashMap<String, RecordEntry>,
     /// `*.suffix` static entries.
     wildcards: Vec<WildcardRecord>,
     sinkholes: Vec<SinkholeEntry>,
@@ -144,7 +160,13 @@ impl DnsZone {
     /// suffix appended; replaces any previous registration of the name.
     pub fn register(&mut self, name: &str, ip: Ipv4Addr) {
         let fqdn = self.fqdn(name);
-        self.records.insert(fqdn, ip);
+        self.records.insert(
+            fqdn,
+            RecordEntry {
+                ip,
+                kind: RecordKind::Dynamic,
+            },
+        );
     }
 
     /// Remove an auto-registered record. Returns whether it existed.
@@ -165,7 +187,13 @@ impl DnsZone {
         if p.starts_with("*.") {
             self.wildcards.push(WildcardRecord { id, pattern: p, ip });
         } else {
-            self.records.insert(p.clone(), ip);
+            self.records.insert(
+                p.clone(),
+                RecordEntry {
+                    ip,
+                    kind: RecordKind::Static,
+                },
+            );
             self.rule_names.insert(id, p);
         }
         id
@@ -219,8 +247,8 @@ impl DnsZone {
             };
         }
 
-        if let Some(&ip) = self.records.get(&name) {
-            return DnsAnswer::A(ip);
+        if let Some(entry) = self.records.get(&name) {
+            return DnsAnswer::A(entry.ip);
         }
 
         let mut best: Option<(&WildcardRecord, (usize, bool))> = None;
@@ -242,6 +270,78 @@ impl DnsZone {
             DnsAnswer::Nxdomain
         }
     }
+
+    /// Serializable copy of the zone's contents for display surfaces (the
+    /// web console's live DNS table). Records sorted by name — the map's
+    /// iteration order is unstable.
+    pub fn snapshot(&self) -> DnsZoneSnapshot {
+        let mut records: Vec<DnsRecordEntry> = self
+            .records
+            .iter()
+            .map(|(name, e)| DnsRecordEntry {
+                name: name.clone(),
+                ip: e.ip,
+                kind: e.kind,
+            })
+            .collect();
+        records.sort_by(|a, b| a.name.cmp(&b.name));
+        DnsZoneSnapshot {
+            suffix: self.suffix.clone(),
+            records,
+            wildcards: self
+                .wildcards
+                .iter()
+                .map(|w| DnsWildcardEntry {
+                    id: w.id,
+                    pattern: w.pattern.clone(),
+                    ip: w.ip,
+                })
+                .collect(),
+            sinkholes: self
+                .sinkholes
+                .iter()
+                .map(|s| DnsSinkholeSnapshot {
+                    id: s.id,
+                    pattern: s.pattern.clone(),
+                    mode: s.mode,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One exact record in a [`DnsZoneSnapshot`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsRecordEntry {
+    pub name: String,
+    pub ip: Ipv4Addr,
+    pub kind: RecordKind,
+}
+
+/// One `*.`-wildcard static entry in a [`DnsZoneSnapshot`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsWildcardEntry {
+    pub id: u64,
+    pub pattern: String,
+    pub ip: Ipv4Addr,
+}
+
+/// One sinkhole rule in a [`DnsZoneSnapshot`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsSinkholeSnapshot {
+    pub id: u64,
+    pub pattern: String,
+    pub mode: SinkholeMode,
+}
+
+/// Point-in-time, serializable view of a [`DnsZone`] (see
+/// [`DnsZone::snapshot`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsZoneSnapshot {
+    pub suffix: String,
+    pub records: Vec<DnsRecordEntry>,
+    pub wildcards: Vec<DnsWildcardEntry>,
+    pub sinkholes: Vec<DnsSinkholeSnapshot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +805,62 @@ mod tests {
             DnsAnswer::A(ip(10))
         );
         assert_eq!(z.lookup("ping.TELEMETRY.example.com"), DnsAnswer::Zero);
+    }
+
+    #[test]
+    fn snapshot_tags_provenance() {
+        let mut z = DnsZone::new("vmlab.internal");
+        z.register("web.demo", ip(20));
+        z.set_static("intranet.corp", ip(5));
+        let wild_id = z.set_static("*.corp", ip(6));
+        let sink_id = z.add_sinkhole("*.telemetry.example", SinkholeMode::Nxdomain);
+
+        let snap = z.snapshot();
+        assert_eq!(snap.suffix, "vmlab.internal");
+        // Sorted by name; the registered name carries the suffix.
+        assert_eq!(
+            snap.records
+                .iter()
+                .map(|r| (r.name.as_str(), r.ip, r.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("intranet.corp", ip(5), RecordKind::Static),
+                ("web.demo.vmlab.internal", ip(20), RecordKind::Dynamic),
+            ]
+        );
+        assert_eq!(snap.wildcards.len(), 1);
+        assert_eq!(snap.wildcards[0].id, wild_id);
+        assert_eq!(snap.wildcards[0].pattern, "*.corp");
+        assert_eq!(snap.sinkholes.len(), 1);
+        assert_eq!(snap.sinkholes[0].id, sink_id);
+        assert_eq!(snap.sinkholes[0].mode, SinkholeMode::Nxdomain);
+
+        // Wire shape: kinds/modes lowercase, IPs dotted strings.
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["records"][0]["kind"], "static");
+        assert_eq!(json["records"][1]["kind"], "dynamic");
+        assert_eq!(json["records"][1]["ip"], "10.213.1.20");
+        assert_eq!(json["sinkholes"][0]["mode"], "nxdomain");
+    }
+
+    /// A static exact entry and an auto-registration share one map slot:
+    /// last writer wins, and the kind follows it (pre-existing overwrite
+    /// semantics, now visible).
+    #[test]
+    fn snapshot_static_overwrites_dynamic_kind() {
+        let mut z = DnsZone::new("vmlab.internal");
+        z.register("x", ip(1));
+        z.set_static("x.vmlab.internal", ip(2));
+        let snap = z.snapshot();
+        assert_eq!(snap.records.len(), 1);
+        assert_eq!(snap.records[0].ip, ip(2));
+        assert_eq!(snap.records[0].kind, RecordKind::Static);
+
+        z.register("x", ip(3));
+        let snap = z.snapshot();
+        assert_eq!(snap.records.len(), 1);
+        assert_eq!(snap.records[0].ip, ip(3));
+        assert_eq!(snap.records[0].kind, RecordKind::Dynamic);
     }
 
     // -- server / wire format ----------------------------------------------------

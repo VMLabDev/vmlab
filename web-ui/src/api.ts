@@ -139,10 +139,28 @@ export interface Snapshot {
   online: boolean;
   taken_at?: string;
 }
+/** One exact record in a live DNS zone snapshot (`dns.table`). */
+export interface DnsLiveRecord {
+  name: string;
+  ip: string;
+  /** dynamic = auto-registered guest name; static = declared entry. */
+  kind: "dynamic" | "static";
+}
+export interface DnsSegmentZone {
+  segment: string;
+  zone: {
+    suffix: string;
+    records: DnsLiveRecord[];
+    wildcards: { id: number; pattern: string; ip: string }[];
+    sinkholes: { id: number; pattern: string; mode: string }[];
+  };
+}
 
 export const listLabs = (): Promise<LabEntry[]> => req("/api/labs");
 export const labStatus = (lab: string): Promise<LabStatus> =>
   req(`/api/labs/${encodeURIComponent(lab)}`);
+export const dnsTable = (lab: string): Promise<{ segments: DnsSegmentZone[] }> =>
+  req(`/api/labs/${encodeURIComponent(lab)}/dns`);
 // `force` applies to the stop-shaped actions (down / stop / restart's stop
 // half): kill instead of the graceful ladder.
 const forceQs = (force?: boolean) => (force ? "?force=true" : "");
