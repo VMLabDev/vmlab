@@ -12,6 +12,8 @@ mod auth;
 mod desktop;
 mod editor;
 mod events;
+mod files;
+mod fsops;
 mod help;
 mod logs;
 mod playbooks;
@@ -332,6 +334,23 @@ async fn main() -> ExitCode {
             .route(
                 "/api/labs/{lab}/containers/{container}/playbook/{action}",
                 web::post().to(playbooks::run_playbook),
+            )
+            // Lab Files tab: the whole-lab-dir file API (literal before the
+            // `{action}` catch-all).
+            .route("/api/labs/{lab}/files/tree", web::get().to(files::tree))
+            .route("/api/labs/{lab}/files/file", web::get().to(files::get_file))
+            .route(
+                "/api/labs/{lab}/files/file",
+                web::put().to(files::save_file),
+            )
+            .route(
+                "/api/labs/{lab}/files/file",
+                web::delete().to(files::delete),
+            )
+            .route("/api/labs/{lab}/files/mkdir", web::post().to(files::mkdir))
+            .route(
+                "/api/labs/{lab}/files/rename",
+                web::post().to(files::rename),
             )
             // Config editing (literal before the `{action}` catch-all).
             .route("/api/labs/{lab}/config", web::get().to(api::get_config))

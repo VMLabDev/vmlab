@@ -1,27 +1,24 @@
-// The lab page's tabbed body: the visual Overview and daemon Logs. Raw
-// vmlab.wcl editing opens from the lab card in a modal so it remains close
-// to the object it configures.
+// The lab page's tabbed body: the visual Overview, the Files tab (the whole
+// lab folder, vmlab.wcl included), and daemon Logs. "Edit config"
+// affordances land on the Files tab with vmlab.wcl opened.
 
 import { Show, createSignal } from "solid-js";
-import { Modal, Tabs } from "@forge/ui";
-import { editorDirty, reloadModel } from "../../editor/store";
+import { Tabs } from "@forge/ui";
 import { state } from "../../store";
-import ConfigView from "../ConfigView";
+import FilesView, { filesDirtyCount, openLabFile } from "../FilesView";
 import LogPanel from "../LogPanel";
 import EditorView from "./EditorView";
 
-const [tab, setTab] = createSignal<"design" | "logs">("design");
+const [tab, setTab] = createSignal<"design" | "files" | "logs">("design");
 
 export default function LabEditorView() {
-  const [configOpen, setConfigOpen] = createSignal(false);
-
   function onTab(id: string) {
-    setTab(id as "design" | "logs");
+    setTab(id as "design" | "files" | "logs");
   }
 
-  function closeConfig() {
-    setConfigOpen(false);
-    if (!editorDirty()) void reloadModel();
+  function editConfig() {
+    openLabFile("vmlab.wcl");
+    setTab("files");
   }
 
   return (
@@ -29,21 +26,20 @@ export default function LabEditorView() {
       <Tabs
         tabs={[
           { id: "design", label: "Overview" },
+          { id: "files", label: filesDirtyCount() ? `Files (${filesDirtyCount()})` : "Files" },
           { id: "logs", label: "Logs" },
         ]}
         active={tab()}
         onChange={onTab}
       />
       <Show when={tab() === "design"}>
-        <EditorView onEditConfig={() => setConfigOpen(true)} />
+        <EditorView onEditConfig={editConfig} />
+      </Show>
+      <Show when={tab() === "files"}>
+        <FilesView />
       </Show>
       <Show when={tab() === "logs" && state.currentLab}>
         <LogPanel lab={state.currentLab!} source="lab" />
-      </Show>
-      <Show when={configOpen()}>
-        <Modal open title="Edit vmlab.wcl" onClose={closeConfig}>
-          <ConfigView />
-        </Modal>
       </Show>
     </div>
   );

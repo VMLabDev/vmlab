@@ -228,16 +228,24 @@ export async function loadLabs() {
   }
 }
 
-/** Guard consulted before switching labs (the visual editor registers one
- *  while it holds unsaved edits). Returns false to cancel the switch. */
-let navGuard: (() => Promise<boolean>) | null = null;
-export function setNavGuard(guard: (() => Promise<boolean>) | null) {
-  navGuard = guard;
+/** Guards consulted before switching labs (the visual editor and the Files
+ *  tab each register one for their unsaved edits). Any guard returning
+ *  false cancels the switch. */
+const navGuards = new Set<() => Promise<boolean>>();
+export function registerNavGuard(guard: () => Promise<boolean>): () => void {
+  navGuards.add(guard);
+  return () => navGuards.delete(guard);
+}
+async function navAllowed(): Promise<boolean> {
+  for (const guard of navGuards) {
+    if (!(await guard())) return false;
+  }
+  return true;
 }
 
 export async function selectLab(name: string) {
   if (name === state.currentLab) return;
-  if (navGuard && !(await navGuard())) return;
+  if (!(await navAllowed())) return;
   setState({
     currentLab: name,
     view: { kind: "lab", vm: null, playbook: null },
@@ -395,7 +403,7 @@ export async function createLabAndOpen(name: string, path?: string): Promise<voi
   await api.createLab(name, path);
   const labs = await api.listLabs();
   setState({ labs });
-  if (navGuard && !(await navGuard())) return;
+  if (!(await navAllowed())) return;
   setState({ currentLab: name, view: { kind: "lab", vm: null, playbook: null }, templates: [] });
   await refreshStatus();
   await loadTemplates();

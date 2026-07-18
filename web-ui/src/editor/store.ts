@@ -6,7 +6,7 @@ import { createStore, produce } from "solid-js/store";
 import * as api from "../api";
 import type { CatalogMeta, ConfigIssue, HostInfo, StoreTemplate } from "../api";
 import { StaleRev, ValidationError } from "../api";
-import { setNavGuard, showToast } from "../store";
+import { registerNavGuard, showToast } from "../store";
 import { confirmDialog } from "../components/dialogs";
 import type {
   ContainerModel,
@@ -953,7 +953,7 @@ export function storeTemplateFor(ref: string): StoreTemplate | undefined {
 // Lab switches consult this guard so an unsaved draft is never silently
 // dropped (the draft itself survives view switches — it dies only when a
 // different lab's model loads over it).
-setNavGuard(async () => {
+registerNavGuard(async () => {
   if (!editorDirty()) return true;
   return confirmDialog({
     title: "Discard unsaved lab changes?",

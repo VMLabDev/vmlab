@@ -364,6 +364,64 @@ export async function savePlaybookFile(
   return result.rev;
 }
 
+// --- lab files (Files tab) --------------------------------------------------
+
+/** One file from GET /files/file: text docs carry content+rev; binary or
+ *  oversized files carry only metadata for a placeholder. */
+export interface LabFileDoc {
+  path: string;
+  rev?: string;
+  content?: string;
+  binary?: boolean;
+  tooLarge?: boolean;
+  size?: number;
+}
+
+/** Thrown by deleteLabPath when a non-empty directory needs `recursive`. */
+export class DirNotEmpty extends Error {}
+
+const filesBase = (lab: string) => `/api/labs/${encodeURIComponent(lab)}/files`;
+
+export const labFilesTree = (lab: string): Promise<{ entries: PlaybookTreeEntry[] }> =>
+  req(`${filesBase(lab)}/tree`);
+
+export const getLabFile = (lab: string, path: string): Promise<LabFileDoc> =>
+  req(`${filesBase(lab)}/file?path=${encodeURIComponent(path)}`);
+
+export async function saveLabFile(
+  lab: string,
+  path: string,
+  content: string,
+  baseRev: string | null,
+): Promise<string> {
+  const result = await req(`${filesBase(lab)}/file`, {
+    method: "PUT",
+    body: JSON.stringify({ path, content, base_rev: baseRev }),
+  }).catch((error) => {
+    if (error instanceof Error && error.message.includes("changed on disk")) {
+      throw new ScriptStale();
+    }
+    throw error;
+  });
+  return result.rev;
+}
+
+export const mkdirLab = (lab: string, path: string) => post(`${filesBase(lab)}/mkdir`, { path });
+
+export const renameLabPath = (lab: string, from: string, to: string) =>
+  post(`${filesBase(lab)}/rename`, { from, to });
+
+export async function deleteLabPath(lab: string, path: string, recursive = false): Promise<void> {
+  await del(
+    `${filesBase(lab)}/file?path=${encodeURIComponent(path)}&recursive=${recursive}`,
+  ).catch((error) => {
+    if (error instanceof Error && error.message.includes("is not empty")) {
+      throw new DirNotEmpty(error.message);
+    }
+    throw error;
+  });
+}
+
 // --- config editing -------------------------------------------------------
 
 export interface ConfigDoc {
