@@ -564,6 +564,14 @@ pub fn lab_module() -> Module {
                 }
             },
         )
+        // The live agent probe, ungated: goes false while the guest is down
+        // or mid-reboot even though the sticky ready flag stays set. What a
+        // build provision needs to watch an in-guest reboot it requested
+        // (`is_ready` outside first-boot is the sticky flag and never drops
+        // while QEMU runs).
+        .method("agent_answering", |v: &VmHandle| -> bool {
+            v.block(v.vm.agent_answering())
+        })
         .method(
             "wait_shutdown",
             |v: &VmHandle, timeout_secs: i64| -> Result<(), String> {
