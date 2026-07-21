@@ -11,7 +11,9 @@
 @document
 type VmlabDoc {
   @children("lab")      labs: list<Lab>
-  @children("template") templates: list<TemplateDef>
+  // Field name avoids colliding with wdoc.Site's `templates` when the wskill
+  // docs merge this schema with wdoc's.
+  @children("template") template_defs: list<TemplateDef>
 }
 
 @block("lab")
