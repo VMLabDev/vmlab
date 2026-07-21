@@ -1,77 +1,37 @@
-//! Bake the vmlab-agent service into a template image during the build —
-//! after the build VM boots, before any provision script runs (so the
-//! install survives a final sysprep/generalize provision that shuts the
-//! guest down). Runs over QGA: upload the per-OS/arch binary
-//! ([`crate::agent_asset`]), register it as a service (systemd unit /
-//! Windows SCM), start it, and verify the agent actually answers on the
-//! `vmlab.agent.0` channel before letting provisions proceed.
+//! Verify the vmlab-agent baked into a template build. The install itself
+//! is guest-driven: the build attaches the VMLAB bootstrap ISO
+//! ([`super::bootstrap`]) and the template's unattended-install hook
+//! (cloud-init runcmd / subiquity late-commands / autounattend
+//! FirstLogonCommands) runs its install script. This side only proves the
+//! channel end-to-end — wait for the agent's handshake on `vmlab.agent.0` —
+//! and returns the staged asset's version stamp for the sealed metadata.
 //!
 //! Skips are non-fatal (logged loudly): templates opting out (`agent =
-//! false`), vintage guests without an agent channel, non-systemd Linux, or
-//! a missing agent binary for the target (riscv64/windows are best-effort
-//! builds). The sealed metadata records `agent_version` only on a verified
-//! install, so degradation messaging downstream stays truthful.
+//! false`) and vintage guests without an agent channel. The sealed metadata
+//! records `agent_version` only on a verified handshake, so degradation
+//! messaging downstream stays truthful.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
-use crate::agent_asset::{AgentAsset, AgentOs, ensure_agent_asset};
+use super::bootstrap::StagedGuestIso;
+use crate::agent_asset::AgentOs;
 use crate::labd::vm::VmInstance;
 
-/// Where the agent lands inside the guest.
-const LINUX_BIN: &str = "/usr/local/lib/vmlab/vmlab-agent";
-const LINUX_UNIT: &str = "/etc/systemd/system/vmlab-agent.service";
-// Deliberately space-free: QGA's guest-exec re-quotes argv tokens on Windows,
-// which mangles an embedded-quoted `binPath= "..."` (sc then registers a bad
-// path and StartService fails with error 87). A path without spaces lets
-// `binPath=` ride as a plain unquoted token, the form verified live.
-const WINDOWS_DIR: &str = r"C:\ProgramData\vmlab";
-const WINDOWS_BIN: &str = r"C:\ProgramData\vmlab\vmlab-agent.exe";
-
-const SYSTEMD_UNIT: &str = "\
-[Unit]
-Description=vmlab guest agent (terminals/exec/files over virtio-serial)
-
-[Service]
-ExecStart=/usr/local/lib/vmlab/vmlab-agent
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-";
-
-// No `need` dependencies: Alpine's cloud image leaves `localmount` out of
-// every runlevel, and OpenRC silently skips a service whose needs can't be
-// scheduled (the image's own cloud-init trio is skipped the same way). The
-// agent retries its port until the device exists, so ordering is soft.
-const OPENRC_INIT: &str = "\
-#!/sbin/openrc-run
-description=\"vmlab guest agent (terminals/exec/files over virtio-serial)\"
-command=\"/usr/local/lib/vmlab/vmlab-agent\"
-command_background=\"yes\"
-pidfile=\"/run/vmlab-agent.pid\"
-
-depend() {
-\tafter bootmisc
-}
-";
-const OPENRC_SCRIPT: &str = "/etc/init.d/vmlab-agent";
-
-/// Install + verify; returns the asset's version stamp for the template
-/// metadata, or `None` when skipped (reason already logged). `qga_wait` is
-/// how long to wait for the guest agent to first answer: a layered source
-/// already ships one (its first-boot pass bounds the wait), but a fresh
-/// install from ISO/scratch only gets QGA once the unattended installer has
-/// laid down the OS and its first-logon tooling — routinely 15–45 minutes
-/// for Windows.
-pub async fn install(
+/// Wait for the agent handshake; returns the staged asset's version stamp
+/// (by the handshake's OS flavour), or `None` when verification was skipped
+/// (reason already logged). `wait` is how long to keep probing: a
+/// layered/qcow2 source starts the agent within its first boot, but a fresh
+/// install from ISO only gets one once the unattended installer has laid
+/// down the OS and run its first-logon hooks — routinely 15–45 minutes for
+/// Windows.
+pub async fn verify(
     vm: &Arc<VmInstance>,
     wants_agent: bool,
-    arch: &str,
-    qga_wait: Duration,
+    staged: Option<&StagedGuestIso>,
+    wait: Duration,
     log: &(dyn Fn(String) + Sync),
 ) -> Result<Option<String>> {
     if !wants_agent {
@@ -82,232 +42,47 @@ pub async fn install(
         log("agent: skipped (guest profile has no agent channel)\n".into());
         return Ok(None);
     }
+    let staged = staged.context("agent verification without a staged bootstrap ISO")?;
 
-    // The hook runs right after boot: wait for QGA before driving it.
-    vm.wait_agent_up(qga_wait)
-        .await
-        .context("waiting for the guest agent before the vmlab-agent install")?;
-    let qga = vm.qga().await?;
-    let osinfo = qga.get_osinfo(Duration::from_secs(30)).await?;
-    let os = if osinfo["id"].as_str() == Some("mswindows") {
+    // Probe until the freshly installed service answers. Earlier agent-first
+    // execs may have failed a handshake against the not-yet-installed agent,
+    // which `vm.agent()` remembers for 30 s — clear that memory before each
+    // attempt. Never drop_agent here: a concurrent provision may be using
+    // the cached handle, and teardown at seal time cleans it up anyway.
+    let deadline = tokio::time::Instant::now() + wait;
+    let handle = loop {
+        vm.clear_agent_failure().await;
+        match vm.agent().await {
+            Ok(handle) => break handle,
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e).context(
+                        "the guest-installed vmlab-agent never answered its handshake \
+                         (did the template's unattended install run the VMLAB ISO's \
+                         install script?)",
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    };
+
+    let info = handle.info();
+    let os = if info.os == "windows" {
         AgentOs::Windows
     } else {
         AgentOs::Linux
     };
-
-    let asset = match ensure_agent_asset(os, arch) {
-        Ok(a) => a,
-        Err(e) => {
-            log(format!(
-                "agent: skipped — no binary for this guest: {e:#}\n"
-            ));
-            return Ok(None);
-        }
-    };
-
+    // The staged stamp identifies what the ISO carried; the handshake's own
+    // version is the fallback if the flavour somehow wasn't staged.
+    let version = staged
+        .version_for(os)
+        .map(str::to_string)
+        .unwrap_or(info.agent_version);
     log(format!(
-        "agent: installing vmlab-agent ({}-{arch}, {})\n",
+        "agent: verified ({} {}, agent answering)\n",
         os.key(),
-        asset.version
+        version
     ));
-    let installed = match os {
-        AgentOs::Linux => install_linux(&qga, &asset, log).await?,
-        AgentOs::Windows => install_windows(&qga, &asset).await?,
-    };
-    if !installed {
-        return Ok(None);
-    }
-
-    // The service is running now — prove the channel end-to-end before the
-    // build seals. Agent-first execs (provisions, first-boot scripts) have
-    // usually just failed a handshake against the not-yet-installed agent,
-    // which `vm.agent()` remembers for 30 s — clear that memory before each
-    // attempt, and give the freshly started service a moment to open the
-    // port. Never drop_agent here: a concurrent provision may be using the
-    // cached handle, and teardown at seal time cleans it up anyway.
-    let mut verified: Result<()> = Err(anyhow::anyhow!("agent verification never ran"));
-    for attempt in 0..12 {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-        vm.clear_agent_failure().await;
-        verified = vm.agent().await.map(|_| ());
-        if verified.is_ok() {
-            break;
-        }
-    }
-    verified.context("the installed vmlab-agent did not answer its handshake")?;
-    log("agent: installed and answering\n".into());
-    Ok(Some(asset.version.clone()))
-}
-
-/// One QGA exec that must succeed (exit 0).
-async fn run(
-    qga: &crate::qga::GaClient,
-    what: &str,
-    cmd: &str,
-    args: &[&str],
-) -> Result<crate::qga::ExecResult> {
-    let out = qga
-        .exec(cmd, args, true, Duration::from_secs(120))
-        .await
-        .with_context(|| format!("agent install: {what}"))?;
-    if out.exit_code != 0 {
-        bail!(
-            "agent install: {what} failed (exit {}): {}{}",
-            out.exit_code,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-    }
-    Ok(out)
-}
-
-/// Returns whether the service was actually installed (`false` = skipped).
-async fn install_linux(
-    qga: &crate::qga::GaClient,
-    asset: &AgentAsset,
-    log: &(dyn Fn(String) + Sync),
-) -> Result<bool> {
-    // A service needs init integration: systemd or OpenRC (Alpine). Anything
-    // else is skipped loudly.
-    let has = |path: &'static str, flag: &'static str| async move {
-        qga.exec("test", &[flag, path], true, Duration::from_secs(30))
-            .await
-            .map(|r| r.exit_code == 0)
-            .unwrap_or(false)
-    };
-    let systemd = has("/run/systemd/system", "-d").await;
-    let openrc = !systemd && has("/sbin/openrc-run", "-x").await;
-    if !systemd && !openrc {
-        log(
-            "agent: skipped (guest has neither systemd nor OpenRC; no service to register)\n"
-                .into(),
-        );
-        return Ok(false);
-    }
-
-    run(qga, "mkdir", "mkdir", &["-p", "/usr/local/lib/vmlab"]).await?;
-    let upload = Duration::from_secs(300);
-    qga.file_write(LINUX_BIN, &asset.read()?, upload)
-        .await
-        .context("agent install: uploading the binary")?;
-    run(qga, "chmod", "chmod", &["0755", LINUX_BIN]).await?;
-    if systemd {
-        qga.file_write(LINUX_UNIT, SYSTEMD_UNIT.as_bytes(), upload)
-            .await
-            .context("agent install: writing the systemd unit")?;
-        run(
-            qga,
-            "systemctl enable --now",
-            "systemctl",
-            &["enable", "--now", "vmlab-agent.service"],
-        )
-        .await?;
-    } else {
-        qga.file_write(OPENRC_SCRIPT, OPENRC_INIT.as_bytes(), upload)
-            .await
-            .context("agent install: writing the OpenRC service script")?;
-        run(qga, "chmod init script", "chmod", &["0755", OPENRC_SCRIPT]).await?;
-        run(
-            qga,
-            "rc-update add",
-            "rc-update",
-            &["add", "vmlab-agent", "default"],
-        )
-        .await?;
-        run(
-            qga,
-            "rc-service start",
-            "rc-service",
-            &["vmlab-agent", "start"],
-        )
-        .await?;
-        // OpenRC's deptree freshness check is whole-second granular, and
-        // everything above lands within one second: the pre-vmlab-agent
-        // runtime deptree (mtime-tied with /etc/init.d) gets persisted by
-        // savecache at the seal shutdown and every clone boot then restores
-        // it as "fresh" — the service silently never starts. Step out of
-        // the second, drop the stale caches, and regenerate the deptree so
-        // what savecache persists is correct.
-        run(
-            qga,
-            "refresh deptree",
-            "sh",
-            &[
-                "-c",
-                "sleep 1 && touch /etc/init.d /etc/init.d/vmlab-agent && \
-                 rm -f /lib/rc/cache/deptree /lib/rc/cache/depconfig && rc-update -u",
-            ],
-        )
-        .await?;
-    }
-    Ok(true)
-}
-
-async fn install_windows(qga: &crate::qga::GaClient, asset: &AgentAsset) -> Result<bool> {
-    run(
-        qga,
-        "mkdir",
-        "cmd.exe",
-        &[
-            "/c",
-            &format!("if not exist {WINDOWS_DIR} mkdir {WINDOWS_DIR}"),
-        ],
-    )
-    .await?;
-    qga.file_write(WINDOWS_BIN, &asset.read()?, Duration::from_secs(300))
-        .await
-        .context("agent install: uploading the binary")?;
-    // `sc create` fails when the service exists (layered template rebuilds);
-    // reconfigure instead.
-    let create = qga
-        .exec(
-            "sc.exe",
-            &[
-                "create",
-                "vmlab-agent",
-                "binPath=",
-                WINDOWS_BIN,
-                "start=",
-                "auto",
-            ],
-            true,
-            Duration::from_secs(120),
-        )
-        .await
-        .context("agent install: sc create")?;
-    if create.exit_code != 0 {
-        run(
-            qga,
-            "sc config",
-            "sc.exe",
-            &[
-                "config",
-                "vmlab-agent",
-                "binPath=",
-                WINDOWS_BIN,
-                "start=",
-                "auto",
-            ],
-        )
-        .await?;
-    }
-    // Auto-restart on failure, forever.
-    run(
-        qga,
-        "sc failure",
-        "sc.exe",
-        &[
-            "failure",
-            "vmlab-agent",
-            "reset=",
-            "86400",
-            "actions=",
-            "restart/5000/restart/5000/restart/5000",
-        ],
-    )
-    .await?;
-    run(qga, "sc start", "sc.exe", &["start", "vmlab-agent"]).await?;
-    Ok(true)
+    Ok(Some(version))
 }

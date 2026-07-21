@@ -12,10 +12,9 @@
 //!  6. loopback + DHCP per NIC (busybox udhcpc — see net.rs), emit `net_up`
 //!  7. mount CIFS volumes from the segment gateway (network must be up;
 //!     the fallback when the host has no virtiofsd)
-//!  8. start bundled qemu-ga in the init namespace (not the container root)
-//!  9. in idle mode emit `idle` and wait for stop; otherwise resolve user,
+//!  8. in idle mode emit `idle` and wait for stop; otherwise resolve user,
 //!     build env, clone namespaces + exec the container, and emit `started`
-//! 10. reap children; when a workload container exits: emit `exited`, power off
+//!  9. reap children; when a workload container exits: emit `exited`, power off
 //!
 //! Any fatal init error prints to the console and powers off, so the host's
 //! missing-`exited` handling classifies the VM as crashed.
@@ -120,29 +119,6 @@ fn spawn_agent(
     }
 }
 
-fn spawn_qemu_ga() {
-    const QEMU_GA: &str = "/usr/bin/qemu-ga";
-    if !std::path::Path::new(QEMU_GA).exists() {
-        println!("vmlab-cinit: no qemu-ga in initramfs, skipping");
-        return;
-    }
-    let Some(port) = ctl::find_virtio_port("org.qemu.guest_agent.0") else {
-        println!("vmlab-cinit: no guest-agent virtio port, skipping qemu-ga");
-        return;
-    };
-    // Runs in the init namespace (not the container root) as a plain child;
-    // if it ever dies, the main reap loop collects it.
-    match Command::new(QEMU_GA)
-        .args(["-m", "virtio-serial", "-p"])
-        .arg(&port)
-        .args(["-t", "/run"])
-        .spawn()
-    {
-        Ok(child) => println!("vmlab-cinit: qemu-ga running (pid {})", child.id()),
-        Err(e) => eprintln!("vmlab-cinit: warning: qemu-ga failed to start: {e}"),
-    }
-}
-
 fn run() -> Result<()> {
     // -- filesystems ---------------------------------------------------------
     mounts::mount_early()?;
@@ -188,9 +164,6 @@ fn run() -> Result<()> {
             mounts::mount_volume(smb, &vol.share, &vol.target, vol.read_only)?;
         }
     }
-
-    // -- guest agent ---------------------------------------------------------
-    spawn_qemu_ga();
 
     if spec.mode == RuntimeMode::Idle {
         println!("vmlab-cinit: idle mode; OCI entrypoint and cmd are disabled");
@@ -317,7 +290,7 @@ fn run() -> Result<()> {
 
     // -- reap loop (main thread) ---------------------------------------------
     // Sole waitpid(-1) caller: routes non-container exits (healthcheck runs,
-    // a dying qemu-ga) through the reaper, breaks when the container is done.
+    // a dying vmlab-agent) through the reaper, breaks when the container is done.
     let code = loop {
         match waitpid(None::<Pid>, None) {
             Ok(status) => {

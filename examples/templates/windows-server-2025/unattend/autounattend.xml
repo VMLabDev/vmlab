@@ -134,8 +134,8 @@
         </Password>
       </AutoLogon>
 
-      <!-- Post-install drive letters shift (C: disk, D: DVD, E: UNATTEND
-           usually) so probe a few. The guest agent goes last: the build's
+      <!-- Post-install drive letters shift (C: disk, D: DVD, E: UNATTEND,
+           F: VMLAB usually) so probe a few. The agent goes last: the build's
            provision script treats "agent responding" as install complete. -->
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add"
@@ -153,8 +153,8 @@
         <SynchronousCommand wcm:action="add"
             xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
           <Order>3</Order>
-          <CommandLine>cmd /c for %d in (D E F G) do if exist %d:\qemu-ga-x86_64.msi start /wait msiexec.exe /i %d:\qemu-ga-x86_64.msi /qn /norestart</CommandLine>
-          <Description>QEMU guest agent (signals build completion)</Description>
+          <CommandLine>cmd /c for %d in (D E F G H) do if exist %d:\install.cmd call %d:\install.cmd</CommandLine>
+          <Description>vmlab guest agent (signals build completion)</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
     </component>

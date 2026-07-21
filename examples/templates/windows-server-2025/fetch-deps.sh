@@ -2,8 +2,8 @@
 # Pull the virtio-win bits the unattended install needs into unattend/:
 #   unattend/drivers/{viostor,netkvm}/   boot-critical virtio drivers (WinPE)
 #   unattend/virtio-win-gt-x64.msi       full guest driver/tool package
-#   unattend/qemu-ga-x86_64.msi          QEMU guest agent
 # These are redistributable binaries and stay out of git (.gitignore).
+# (The vmlab guest agent rides in on the auto-attached VMLAB ISO.)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -41,5 +41,4 @@ for drv in viostor NetKVM; do
 done
 
 cp "$tmp/virtio-win-gt-x64.msi" unattend/
-cp "$tmp/guest-agent/qemu-ga-x86_64.msi" unattend/
 echo "MSIs staged into unattend/"

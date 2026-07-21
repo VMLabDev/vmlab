@@ -300,7 +300,7 @@ cli vmlab_cli {
 
   subcommand c_exec {
     name = "exec"
-    description = "Run a command in a guest and print its stdout/stderr. Uses the vmlab-agent channel when the template carries the agent, QGA otherwise."
+    description = "Run a command in a guest and print its stdout/stderr over the vmlab-agent channel."
     cli_arg a_exec_vm  { name = "vm"   description = "VM name." }
     cli_arg a_exec_cmd { name = "cmd"  description = "Command and arguments, after `--`."  variadic = true }
     code_example { lang = "console"  code = "vmlab exec dc01 -- ipconfig /all" }
@@ -315,7 +315,7 @@ cli vmlab_cli {
 
   subcommand c_cp {
     name = "cp"
-    description = "Copy a file or directory between host and guest — either side may be `<vm>:<path>`. Parent directories are created. Agent transport (raw verified bytes) when available; base64-over-QGA fallback for agent-less templates."
+    description = "Copy a file or directory between host and guest — either side may be `<vm>:<path>`. Parent directories are created. Agent transport: raw digest-verified bytes."
     cli_arg a_cp_src  { name = "src"   description = "Host path, or <vm>:<path> to pull from the guest." }
     cli_arg a_cp_dest { name = "dest"  description = "<vm>:<path> to push, or a host path when pulling." }
     code_example { lang = "console"  code = "vmlab cp payload.zip dc01:C:/temp/payload.zip\nvmlab cp dc01:C:/Windows/debug/netsetup.log ./netsetup.log" }

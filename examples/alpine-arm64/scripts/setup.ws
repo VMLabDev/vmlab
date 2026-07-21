@@ -1,6 +1,6 @@
 // Provision for the alpine-arm64 lab: wait for the (TCG-emulated) guest,
 // then prove it is really aarch64 and reachable. `wait_ready` blocks until
-// the QEMU guest agent answers, so a long timeout covers the slow TCG boot.
+// the vmlab guest agent answers, so a long timeout covers the slow TCG boot.
 
 use vmlab
 

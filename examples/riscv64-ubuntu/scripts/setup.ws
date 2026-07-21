@@ -1,6 +1,6 @@
 // Provision for the riscv64-ubuntu lab: wait for the (TCG-emulated) guest,
 // then prove it is really riscv64 and reachable. `wait_ready` blocks until
-// the QEMU guest agent answers, so a long timeout covers the slow TCG boot.
+// the vmlab guest agent answers, so a long timeout covers the slow TCG boot.
 
 use vmlab
 

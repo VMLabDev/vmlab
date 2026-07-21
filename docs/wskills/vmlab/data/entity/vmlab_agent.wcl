@@ -24,17 +24,18 @@ PROSE
       ]
     }
     p <<'PROSE'
-**How it gets into guests.** Template builds bake the agent as a service when
-the template's `agent` field is true (the default): Linux gets a
-systemd unit (or OpenRC on Alpine), Windows a service under
-`C:\ProgramData\vmlab`. The install is verified live on the channel before the
-image is sealed, and only then is `agent_version` recorded in template meta —
+**How it gets into guests.** Template builds auto-attach a **VMLAB bootstrap
+ISO** (agent binaries + install script) when the template's `agent` field is
+true (the default); the guest's own unattended-install hook (cloud-init
+runcmd, installer late-commands, autounattend first-logon) runs the script:
+Linux gets a systemd unit (or OpenRC on Alpine), Windows a service under
+`C:\ProgramData\vmlab`. The handshake is verified live on the channel before
+the image is sealed, and only then is `agent_version` recorded in template meta —
 the marker that unlocks agent-only features for clones. Container micro-VMs
-get the agent injected by the init at boot, no baking needed. For templates
-that predate the agent (or `agent = false`, vintage guests, non-systemd
-Linux), exec and file copy fall back to the QEMU guest agent; terminals,
-stats, tail and clipboard are agent-only. `vm.wait_ready()` on an agent-baked
-template means agent-level readiness.
+get the agent injected by the init at boot, no baking needed. With `agent = false` or on
+vintage guests (no agent channel), there is no exec/copy transport at all —
+only screen-driven automation — and the VM never reports ready.
+`vm.wait_ready()` means agent-level readiness.
 PROSE
   }
 }

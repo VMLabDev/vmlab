@@ -47,7 +47,7 @@ pub struct TemplateMeta {
     pub first_boot_script: Option<String>,
     /// Version stamp of the vmlab-agent baked into the image by the template
     /// build (`None` = template predates agent support: no interactive
-    /// terminal, exec/copy fall back to QGA).
+    /// terminal, no exec/copy).
     pub agent_version: Option<String>,
 }
 

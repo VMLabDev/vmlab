@@ -48,7 +48,7 @@ impl Reaper {
                 let _ = tx.send(code);
             }
             None => {
-                // A child nobody waits on (qemu-ga, a stale udhcpc). Parked
+                // A child nobody waits on (a stale udhcpc). Parked
                 // entries are bounded by how few processes a micro-VM runs.
                 inner.unclaimed.insert(pid, code);
             }

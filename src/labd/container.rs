@@ -27,7 +27,6 @@ use crate::oci::image::model::{ImageConfig, ImageHealthcheck};
 use crate::oci::image::pull::PulledImage;
 use crate::qemu::container::ContainerVmPaths;
 use crate::qemu::{self, Proc};
-use crate::qga::GaClient;
 use crate::qmp::QmpClient;
 
 /// Scratch (overlay upper layer) qcow2 virtual size. Sparse — real usage is
@@ -41,10 +40,6 @@ const DEFAULT_MEMORY: u64 = 256 << 20;
 /// What to tell a user whose container has no answering vmlab-agent.
 const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the guest boot asset predates \
      it) — rebuild with guest/build-asset.sh and reinstall";
-
-/// PATH handed to `exec` when the merged spec env carries none (matches
-/// cinit's fallback in guest/cinit/src/container.rs).
-const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Consecutive rapid failures (runs shorter than [`RAPID_RUN`]) after which
 /// the restart policy gives up.
@@ -83,9 +78,6 @@ impl ContainerDirs {
 
     pub fn qmp_sock(&self) -> PathBuf {
         self.run.join("qmp.sock")
-    }
-    pub fn qga_sock(&self) -> PathBuf {
-        self.run.join("qga.sock")
     }
     pub fn ctl_sock(&self) -> PathBuf {
         self.run.join("ctl.sock")
@@ -365,7 +357,7 @@ pub struct ContainerInstance {
     virtiofs_active: AtomicBool,
 
     state: RwLock<PowerState>,
-    /// The bundled qemu-ga answers `guest-ping`.
+    /// The bundled vmlab-agent answers its handshake.
     agent_up: RwLock<bool>,
     /// cinit reported the container process running (ctl `started`).
     started: RwLock<bool>,
@@ -384,12 +376,11 @@ pub struct ContainerInstance {
     last_exit: RwLock<Option<i32>>,
     qemu: Mutex<Option<Arc<Proc>>>,
     qmp: Mutex<Option<QmpClient>>,
-    qga: Mutex<Option<GaClient>>,
     ctl: Mutex<Option<CtlHandle>>,
     /// Lazy vmlab-agent connection (terminals/exec/files — same channel as
     /// full VMs; the agent is spawned by cinit inside the micro-VM).
     agent: Mutex<Option<super::vm_agent::AgentHandle>>,
-    /// When the last agent handshake failed (old guest assets), so the QGA
+    /// When the last agent handshake failed (old guest assets), so exec
     /// fallback paths don't pay the timeout repeatedly.
     agent_failed_at: Mutex<Option<std::time::Instant>>,
 }
@@ -432,7 +423,6 @@ impl ContainerInstance {
             last_exit: RwLock::new(None),
             qemu: Mutex::new(None),
             qmp: Mutex::new(None),
-            qga: Mutex::new(None),
             ctl: Mutex::new(None),
             agent: Mutex::new(None),
             agent_failed_at: Mutex::new(None),
@@ -505,14 +495,6 @@ impl ContainerInstance {
             .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
     }
 
-    pub async fn qga(&self) -> Result<GaClient> {
-        self.qga
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
-    }
-
     pub async fn ctl(&self) -> Result<CtlHandle> {
         self.ctl
             .lock()
@@ -556,6 +538,35 @@ impl ContainerInstance {
                 *self.agent_failed_at.lock().await = Some(std::time::Instant::now());
                 Err(anyhow!("{}: {e:#} — {}", self.cfg.name, NO_AGENT_HINT))
             }
+        }
+    }
+
+    /// Whether the vmlab-agent answers right now, sharing (and populating)
+    /// the cached handle — the container mirror of `VmInstance::agent_probe`
+    /// (short handshake timeout, bypasses the failed-handshake cache, never
+    /// leaves a half-dead connection on the one-client chardev).
+    async fn agent_probe(&self) -> bool {
+        if self.state().await != PowerState::Running {
+            return false;
+        }
+        let mut agent = self.agent.lock().await;
+        if let Some(handle) = agent.as_ref() {
+            if handle.ping(Duration::from_secs(2)).await {
+                return true;
+            }
+            if let Some(dead) = agent.take() {
+                dead.shutdown().await;
+            }
+        }
+        match super::vm_agent::AgentHandle::connect(&self.dirs.agent_sock(), Duration::from_secs(2))
+            .await
+        {
+            Ok(handle) => {
+                *self.agent_failed_at.lock().await = None;
+                *agent = Some(handle);
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -620,7 +631,6 @@ impl ContainerInstance {
                 .map(|(i, mac)| (*mac, self.dirs.nic_sock(i), self.nic_mtus.get(i).copied()))
                 .collect(),
             qmp_sock: self.dirs.qmp_sock(),
-            qga_sock: self.dirs.qga_sock(),
             ctl_sock: self.dirs.ctl_sock(),
             agent_sock: self.dirs.agent_sock(),
             serial_log: self.dirs.console_log(),
@@ -777,7 +787,7 @@ impl ContainerInstance {
             qmp.cont().await?;
             *self.qmp.lock().await = Some(qmp);
 
-            // QEMU creates the ctl/qga sockets at startup; retry briefly in
+            // QEMU creates the ctl socket at startup; retry briefly in
             // case we won the race.
             let ctl = connect_ctl_retry(&self.dirs.ctl_sock(), &proc).await?;
             *self.ctl.lock().await = Some(ctl.clone());
@@ -785,7 +795,6 @@ impl ContainerInstance {
             // port is usually already open); the ctl watcher re-answers
             // every `boot` announcement in case this one raced the guest.
             self.send_spec(&ctl).await?;
-            *self.qga.lock().await = Some(GaClient::connect(&self.dirs.qga_sock()).await?);
 
             Ok::<_, anyhow::Error>((proc, ctl))
         };
@@ -867,7 +876,8 @@ impl ContainerInstance {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             // Idle mode has no workload to prove liveness. Its control plane
-            // is the useful service, so readiness waits for qemu-ga instead.
+            // is the useful service, so readiness waits for the vmlab-agent
+            // instead.
             if me.cfg.mode == model::ContainerMode::Idle {
                 loop {
                     if me.state().await != PowerState::Running {
@@ -910,10 +920,7 @@ impl ContainerInstance {
                 if me.state().await != PowerState::Running {
                     return;
                 }
-                let qga = { me.qga.lock().await.clone() };
-                if let Some(qga) = qga
-                    && qga.ping(Duration::from_secs(2)).await
-                {
+                if me.agent_probe().await {
                     *me.agent_up.write().await = true;
                     return;
                 }
@@ -997,7 +1004,6 @@ impl ContainerInstance {
     async fn teardown(&self) {
         *self.ctl.lock().await = None;
         *self.qmp.lock().await = None;
-        *self.qga.lock().await = None;
         if let Some(agent) = self.agent.lock().await.take() {
             agent.shutdown().await;
         }
@@ -1058,10 +1064,31 @@ impl ContainerInstance {
                 .await;
         }
 
-        // Rung 2: guest-agent shutdown.
-        if let Ok(qga) = self.qga().await {
-            let _ = qga.shutdown("powerdown", Duration::from_secs(5)).await;
-            if proc.wait_exit(Duration::from_secs(15)).await.is_ok() {
+        // Rung 2: guest-agent shutdown. The state is already Stopping so
+        // `agent()`'s Running gate can't be used: take the cached handle, or
+        // make one quick connect attempt. The agent's initramfs fallback is
+        // the raw reboot(2) syscall — exactly what a micro-VM needs.
+        {
+            let agent = { self.agent.lock().await.clone() };
+            let agent = match agent {
+                Some(a) => Some(a),
+                None => super::vm_agent::AgentHandle::connect(
+                    &self.dirs.agent_sock(),
+                    Duration::from_secs(2),
+                )
+                .await
+                .ok(),
+            };
+            if let Some(agent) = agent
+                && agent
+                    .shutdown_guest(
+                        super::vm_agent::ShutdownMode::Powerdown,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_ok()
+                && proc.wait_exit(Duration::from_secs(15)).await.is_ok()
+            {
                 return self
                     .wait_state(PowerState::Stopped, Duration::from_secs(10))
                     .await;
@@ -1133,16 +1160,13 @@ impl ContainerInstance {
         let qmp = self.qmp().await?;
         qmp.stop().await?;
         qmp.snapshot_load(name, "scratch", &["scratch"]).await?;
-        // Drop the agent connections BEFORE resuming: the rewound guest
-        // replays virtio-serial response bytes the host already consumed,
-        // and qga responses carry no request ids — a stale `{"return":…}`
-        // silently poisons a later exchange. With no client attached, QEMU
-        // discards the replayed bytes; the reconnect below starts clean.
-        // vmlab-agent gets the same treatment; its lazy reconnect
-        // re-handshakes with a fresh token (guest/agent-proto). Shutdown,
+        // Drop the agent connection BEFORE resuming: the rewound guest
+        // replays virtio-serial response bytes the host already consumed.
+        // With no client attached, QEMU discards the replayed bytes; the
+        // reconnect below re-handshakes with a fresh token, and the frame
+        // magic resyncs any mid-frame garbage (guest/agent-proto). Shutdown,
         // not drop: live sessions hold handle clones, and a lingering
         // connection blocks QEMU's one-client chardev slot.
-        self.qga.lock().await.take();
         if let Some(agent) = self.agent.lock().await.take() {
             agent.shutdown().await;
         }
@@ -1155,34 +1179,23 @@ impl ContainerInstance {
         Ok(())
     }
 
-    /// Re-establish the guest-agent connection after an online restore
+    /// Re-establish the vmlab-agent connection after an online restore
     /// (see [`Self::restore_online`] for why it was dropped), giving the
     /// resumed guest a moment to flush its replayed output into the void
-    /// first, then pinging (bounded) so restore hands back a container
+    /// first, then probing (bounded) so restore hands back a container
     /// whose exec/cp surface demonstrably works.
     async fn reconnect_agent_after_load(&self) {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        {
-            let mut qga = self.qga.lock().await;
-            match GaClient::connect(&self.dirs.qga_sock()).await {
-                Ok(c) => *qga = Some(c),
-                Err(e) => {
-                    tracing::warn!(
-                        "{}: agent reconnect after restore failed: {e:#}",
-                        self.cfg.name
-                    );
-                    return;
-                }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if self.agent_probe().await {
+                return;
             }
-        }
-        if let Ok(qga) = self.qga().await {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            while !qga.ping(Duration::from_secs(2)).await {
-                if tokio::time::Instant::now() > deadline {
-                    tracing::warn!("{}: agent not answering after restore", self.cfg.name);
-                    break;
-                }
+            if tokio::time::Instant::now() > deadline {
+                tracing::warn!("{}: agent not answering after restore", self.cfg.name);
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -1230,14 +1243,15 @@ impl ContainerInstance {
         }
     }
 
-    /// Per-NIC IPv4 addresses. Prefer QGA's MAC-addressed interface list;
-    /// cinit's net-up report remains a first-NIC fallback during early boot.
+    /// Per-NIC IPv4 addresses. Prefer the agent's MAC-addressed interface
+    /// list; cinit's net-up report remains a first-NIC fallback during early
+    /// boot.
     pub async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
-        let mut ips = match self.qga().await {
-            Ok(qga) => match qga.network_interfaces(Duration::from_secs(5)).await {
+        let mut ips = match self.agent().await {
+            Ok(agent) => match agent.net_interfaces(Duration::from_secs(5)).await {
                 Ok(ifaces) => {
                     let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
-                    crate::qga::ipv4_by_mac(&ifaces, &macs)
+                    super::vm_agent::ipv4_by_mac(&ifaces, &macs)
                 }
                 Err(_) => vec![None; self.macs.len()],
             },
@@ -1265,74 +1279,32 @@ impl ContainerInstance {
             .ok_or_else(|| anyhow::anyhow!("{}: no IPv4 address reported by agent", self.cfg.name))
     }
 
-    /// Run a command *inside the container*. Preferred transport is the
-    /// vmlab-agent channel (streamed, properly joins the container
-    /// namespaces); guests booted from an old asset fall back to qemu-ga,
-    /// where the command is wrapped as
-    /// `/bin/busybox chroot /rootfs <cmd> <args…>` with the container's
-    /// merged environment (plus a PATH fallback matching cinit's).
+    /// Run a command *inside the container* over the vmlab-agent channel
+    /// (streamed; the agent joins the container namespaces itself).
     pub async fn exec(
         &self,
         cmd: &str,
         args: &[&str],
         timeout: Duration,
-    ) -> Result<crate::qga::ExecResult> {
-        if let Ok(agent) = self.agent().await {
-            let mut argv = vec![cmd.to_string()];
-            argv.extend(args.iter().map(ToString::to_string));
-            let out = agent.exec(argv, vec![], None, None, timeout).await?;
-            return Ok(crate::qga::ExecResult {
-                exit_code: out.exit_code,
-                stdout: out.stdout,
-                stderr: out.stderr,
-            });
-        }
-        let qga = self.qga().await?;
-        let parts = self.image_parts()?;
-        let mut wrapped: Vec<&str> = vec!["chroot", "/rootfs", cmd];
-        wrapped.extend_from_slice(args);
-        let mut env: Vec<String> = parts
-            .spec
-            .env
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
-        if !parts.spec.env.iter().any(|(k, _)| k == "PATH") {
-            env.push(DEFAULT_PATH.to_string());
-        }
-        Ok(qga
-            .exec_env("/bin/busybox", &wrapped, &env, true, timeout)
-            .await?)
+    ) -> Result<super::vm_agent::ExecOutput> {
+        let agent = self.agent().await?;
+        let mut argv = vec![cmd.to_string()];
+        argv.extend(args.iter().map(ToString::to_string));
+        agent.exec(argv, vec![], None, None, timeout).await
     }
 
     /// Copy a host file into the container rootfs (guest paths are
-    /// container-relative; both transports resolve them under `/rootfs`).
-    pub async fn copy_to(&self, host: &Path, guest_path: &str, timeout: Duration) -> Result<()> {
-        if let Ok(agent) = self.agent().await {
-            agent.push_file(host, guest_path, None).await?;
-            return Ok(());
-        }
-        let data = tokio::fs::read(host)
-            .await
-            .with_context(|| format!("reading {}", host.display()))?;
-        let qga = self.qga().await?;
-        qga.file_write(&rootfs_path(guest_path), &data, timeout)
-            .await?;
+    /// container-relative; the agent resolves them under the rootfs).
+    pub async fn copy_to(&self, host: &Path, guest_path: &str, _timeout: Duration) -> Result<()> {
+        let agent = self.agent().await?;
+        agent.push_file(host, guest_path, None).await?;
         Ok(())
     }
 
     /// Copy a file out of the container rootfs to the host.
-    pub async fn copy_from(&self, guest_path: &str, host: &Path, timeout: Duration) -> Result<()> {
-        if let Ok(agent) = self.agent().await {
-            agent.pull_file(guest_path, host).await?;
-            return Ok(());
-        }
-        let qga = self.qga().await?;
-        let data = qga.file_read(&rootfs_path(guest_path), timeout).await?;
-        if let Some(parent) = host.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(host, data).with_context(|| format!("writing {}", host.display()))?;
+    pub async fn copy_from(&self, guest_path: &str, host: &Path, _timeout: Duration) -> Result<()> {
+        let agent = self.agent().await?;
+        agent.pull_file(guest_path, host).await?;
         Ok(())
     }
 
@@ -1351,12 +1323,6 @@ impl ContainerInstance {
         let start = all.len().saturating_sub(lines);
         Ok(all[start..].join("\n"))
     }
-}
-
-/// Map a container-relative guest path to where the agent (which runs in
-/// the init namespace) sees it.
-fn rootfs_path(guest_path: &str) -> String {
-    format!("/rootfs/{}", guest_path.trim_start_matches('/'))
 }
 
 /// Write a JSON document atomically (temp file + rename) so cinit can never
@@ -1799,7 +1765,6 @@ mod tests {
             dirs.logs
         );
         assert_eq!(dirs.qmp_sock(), dirs.run.join("qmp.sock"));
-        assert_eq!(dirs.qga_sock(), dirs.run.join("qga.sock"));
         assert_eq!(dirs.ctl_sock(), dirs.run.join("ctl.sock"));
         assert_eq!(dirs.nic_sock(1), dirs.run.join("nic1.sock"));
         assert_eq!(dirs.vfs_sock(0), dirs.run.join("vfs0.sock"));
@@ -1844,15 +1809,6 @@ mod tests {
     }
 
     // ---- misc ------------------------------------------------------------------
-
-    #[test]
-    fn rootfs_path_prefixes() {
-        assert_eq!(
-            rootfs_path("/etc/nginx/nginx.conf"),
-            "/rootfs/etc/nginx/nginx.conf"
-        );
-        assert_eq!(rootfs_path("relative/file"), "/rootfs/relative/file");
-    }
 
     #[test]
     fn json_writes_are_atomic_and_readable() {

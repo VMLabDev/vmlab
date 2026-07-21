@@ -512,7 +512,7 @@ vmlab playbook apply dc01
 
 ## vmlab exec
 
-Run a command in a guest and print its stdout/stderr. Uses the vmlab-agent channel when the template carries the agent, QGA otherwise.
+Run a command in a guest and print its stdout/stderr over the vmlab-agent channel.
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -537,7 +537,7 @@ vmlab shell dc01
 
 ## vmlab cp
 
-Copy a file or directory between host and guest — either side may be `<vm>:<path>`. Parent directories are created. Agent transport (raw verified bytes) when available; base64-over-QGA fallback for agent-less templates.
+Copy a file or directory between host and guest — either side may be `<vm>:<path>`. Parent directories are created. Agent transport: raw digest-verified bytes.
 
 | Argument | Required | Description |
 | --- | --- | --- |

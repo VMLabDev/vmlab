@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 
 /// Version of this contract. The agent reports it in [`AgentMsg::Hello`]; the
 /// host refuses to drive an agent speaking a different version.
-pub const PROTO_VERSION: u32 = 1;
+///
+/// v2: `net_info`, `os_info` and `shutdown` are baseline (the host relies on
+/// them for IP discovery, readiness metadata and the graceful stop ladder).
+pub const PROTO_VERSION: u32 = 2;
 
 /// The virtio-serial port name the agent serves on (both full VMs and
 /// container micro-VMs).
@@ -356,6 +359,18 @@ pub enum HostMsg {
         interval_secs: u64,
     },
     UnsubscribeMetrics,
+    /// Ask for the guest's network interfaces; the agent replies
+    /// [`AgentMsg::NetInfo`].
+    NetInfo,
+    /// Ask for structured OS information; the agent replies
+    /// [`AgentMsg::OsInfo`].
+    OsInfo,
+    /// Shut the guest down. The agent replies [`AgentMsg::ShuttingDown`]
+    /// *before* executing (the reply may be the last bytes on the wire); the
+    /// host must treat a vanishing connection after this as success.
+    Shutdown {
+        mode: ShutdownMode,
+    },
     /// Grant the guest more send credit on a channel.
     WindowAdjust {
         id: u32,
@@ -412,6 +427,18 @@ pub enum AgentMsg {
     Clipboard {
         text: String,
     },
+    /// Reply to [`HostMsg::NetInfo`].
+    NetInfo {
+        interfaces: Vec<NetInterface>,
+    },
+    /// Reply to [`HostMsg::OsInfo`].
+    OsInfo {
+        info: OsInfo,
+    },
+    /// Ack of [`HostMsg::Shutdown`], sent just before the agent executes it.
+    ShuttingDown {
+        mode: ShutdownMode,
+    },
     /// Grant the host more send credit on a channel.
     WindowAdjust {
         id: u32,
@@ -433,6 +460,51 @@ pub struct DiskUsage {
     pub mount: String,
     pub used: u64,
     pub total: u64,
+}
+
+/// How [`HostMsg::Shutdown`] should bring the guest down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownMode {
+    /// Power the guest off.
+    Powerdown,
+    Reboot,
+    /// Stop the OS without powering off. Guests without a distinct halt
+    /// (Windows) treat this as `Powerdown`.
+    Halt,
+}
+
+/// One guest NIC in [`AgentMsg::NetInfo`]. Loopback is excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetInterface {
+    pub name: String,
+    /// Lowercase colon-separated MAC, absent for interfaces without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// Dotted-quad IPv4 addresses (no prefix length).
+    #[serde(default)]
+    pub ipv4: Vec<String>,
+    /// IPv6 addresses (no prefix length, no zone).
+    #[serde(default)]
+    pub ipv6: Vec<String>,
+}
+
+/// Reply payload of [`AgentMsg::OsInfo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsInfo {
+    /// Machine-readable OS id: os-release `ID` on Linux, `"windows"` on
+    /// Windows.
+    pub id: String,
+    /// Human-readable OS name (os-release `PRETTY_NAME` / registry
+    /// `ProductName`).
+    pub name: String,
+    /// OS version string (os-release `VERSION_ID` / Windows display version).
+    pub version: String,
+    /// Kernel release (`uname -r` / `major.minor.build`).
+    pub kernel: String,
+    /// Machine architecture (`uname -m` style: `x86_64`, `aarch64`, …).
+    pub arch: String,
+    pub hostname: String,
 }
 
 #[cfg(test)]
@@ -610,6 +682,11 @@ mod tests {
             HostMsg::GetClipboard,
             HostMsg::SubscribeMetrics { interval_secs: 5 },
             HostMsg::UnsubscribeMetrics,
+            HostMsg::NetInfo,
+            HostMsg::OsInfo,
+            HostMsg::Shutdown {
+                mode: ShutdownMode::Reboot,
+            },
             HostMsg::WindowAdjust {
                 id: 4,
                 bytes: 65536,
@@ -651,6 +728,27 @@ mod tests {
             AgentMsg::Clipboard {
                 text: "clip".into(),
             },
+            AgentMsg::NetInfo {
+                interfaces: vec![NetInterface {
+                    name: "eth0".into(),
+                    mac: Some("52:54:00:12:34:56".into()),
+                    ipv4: vec!["10.0.0.15".into()],
+                    ipv6: vec!["fe80::5054:ff:fe12:3456".into()],
+                }],
+            },
+            AgentMsg::OsInfo {
+                info: OsInfo {
+                    id: "ubuntu".into(),
+                    name: "Ubuntu 24.04.2 LTS".into(),
+                    version: "24.04".into(),
+                    kernel: "6.8.0-45-generic".into(),
+                    arch: "x86_64".into(),
+                    hostname: "vm0".into(),
+                },
+            },
+            AgentMsg::ShuttingDown {
+                mode: ShutdownMode::Powerdown,
+            },
             AgentMsg::WindowAdjust { id: 2, bytes: 1 },
             AgentMsg::Error {
                 id: Some(9),
@@ -684,6 +782,17 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AgentMsg::Opened { id: 3 }).unwrap(),
             r#"{"event":"opened","id":3}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&HostMsg::Shutdown {
+                mode: ShutdownMode::Powerdown
+            })
+            .unwrap(),
+            r#"{"cmd":"shutdown","mode":"powerdown"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&HostMsg::NetInfo).unwrap(),
+            r#"{"cmd":"net_info"}"#
         );
     }
 

@@ -27,7 +27,7 @@ template "linux-modern" {
 }
 ```
 
-Declare `arch`, `version`, `profile` and the working `disk` size, exactly one `source` block, any build media/disks/NIC, and a provision script that drives the installer and installs the QEMU guest agent.
+Declare `arch`, `version`, `profile` and the working `disk` size, exactly one `source` block, any build media/disks/NIC, and a provision script that drives the installer. The vmlab guest agent installs itself from the auto-attached VMLAB bootstrap ISO via the template's unattended-install hook.
 
 ### Step 2: Build
 

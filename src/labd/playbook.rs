@@ -769,9 +769,12 @@ async fn run_inner(
                         "reboot required — restarting {machine} (attempt {reboots}/{MAX_REBOOTS})"
                     ));
                     set_phase("rebooting", reboots);
-                    vm.qga()
+                    vm.agent()
                         .await?
-                        .shutdown("reboot", Duration::from_secs(10))
+                        .shutdown_guest(
+                            crate::labd::vm_agent::ShutdownMode::Reboot,
+                            Duration::from_secs(10),
+                        )
                         .await
                         .map_err(|e| anyhow!("rebooting {machine}: {e}"))?;
                     // Wait for the agent to actually drop before waiting for

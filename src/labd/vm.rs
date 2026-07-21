@@ -12,7 +12,6 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, Proc, VmPaths};
-use crate::qga::GaClient;
 use crate::qmp::QmpClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -57,9 +56,6 @@ impl VmDirs {
 
     pub fn qmp_sock(&self) -> PathBuf {
         self.run.join("qmp.sock")
-    }
-    pub fn qga_sock(&self) -> PathBuf {
-        self.run.join("qga.sock")
     }
     /// vmlab-agent channel (`vmlab.agent.0`): terminals/exec/files/metrics.
     pub fn agent_sock(&self) -> PathBuf {
@@ -119,7 +115,7 @@ pub struct TemplateParts {
     /// before the VM is reported ready (PRD §6.1).
     pub first_boot_script: Option<String>,
     /// vmlab-agent stamp the template build baked in (`None` = the template
-    /// predates agent support — no terminal; exec/copy fall back to QGA).
+    /// predates agent support — no terminal, exec, copy or readiness).
     pub agent_version: Option<String>,
 }
 
@@ -173,7 +169,6 @@ pub struct VmInstance {
     /// (see `LabRuntime::mount_shares`).
     virtiofs_mounts: Mutex<Vec<VirtiofsMount>>,
     qmp: Mutex<Option<QmpClient>>,
-    qga: Mutex<Option<GaClient>>,
     /// Lazy vmlab-agent connection (terminals/exec/files — §"agent channel").
     agent: Mutex<Option<super::vm_agent::AgentHandle>>,
     /// When the last agent handshake failed, so agent-less templates don't
@@ -214,7 +209,6 @@ impl VmInstance {
             virtiofsd: Mutex::new(Vec::new()),
             virtiofs_mounts: Mutex::new(Vec::new()),
             qmp: Mutex::new(None),
-            qga: Mutex::new(None),
             agent: Mutex::new(None),
             agent_failed_at: Mutex::new(None),
         })
@@ -287,10 +281,7 @@ impl VmInstance {
     /// mid-reboot — what a first-boot provision needs to watch its own guest
     /// restart (QEMU stays up, so power state never changes).
     pub async fn agent_answering(&self) -> bool {
-        match self.qga().await {
-            Ok(qga) => qga.ping(Duration::from_secs(2)).await,
-            Err(_) => false,
-        }
+        self.agent_probe().await
     }
 
     /// Wait until the guest agent answers a live ping (see
@@ -325,14 +316,6 @@ impl VmInstance {
 
     pub async fn qmp(&self) -> Result<QmpClient> {
         self.qmp
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
-    }
-
-    pub async fn qga(&self) -> Result<GaClient> {
-        self.qga
             .lock()
             .await
             .clone()
@@ -385,6 +368,37 @@ impl VmInstance {
                 *self.agent_failed_at.lock().await = Some(std::time::Instant::now());
                 Err(anyhow!("{}: {e:#} — {}", self.cfg.name, NO_AGENT_HINT))
             }
+        }
+    }
+
+    /// Whether the vmlab-agent answers right now, sharing (and populating)
+    /// the cached handle. Bypasses the failed-handshake cache — pollers need
+    /// prompt discovery, not exec-path backoff — with a short handshake
+    /// timeout, and never leaves a half-dead connection behind (QEMU's
+    /// chardev serves one client; a wedged socket would block every future
+    /// connect).
+    async fn agent_probe(&self) -> bool {
+        if self.state().await != PowerState::Running || !self.template().resolved.agent_channel {
+            return false;
+        }
+        let mut agent = self.agent.lock().await;
+        if let Some(handle) = agent.as_ref() {
+            if handle.ping(Duration::from_secs(2)).await {
+                return true;
+            }
+            if let Some(dead) = agent.take() {
+                dead.shutdown().await;
+            }
+        }
+        match super::vm_agent::AgentHandle::connect(&self.dirs.agent_sock(), Duration::from_secs(2))
+            .await
+        {
+            Ok(handle) => {
+                *self.agent_failed_at.lock().await = None;
+                *agent = Some(handle);
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -458,7 +472,6 @@ impl VmInstance {
     ) -> Result<VmPaths> {
         Ok(VmPaths {
             qmp_sock: self.dirs.qmp_sock(),
-            qga_sock: self.dirs.qga_sock(),
             agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),
             primary_disk: self.dirs.primary_disk(),
@@ -668,7 +681,6 @@ impl VmInstance {
 
             qmp.cont().await?;
             *self.qmp.lock().await = Some(qmp);
-            *self.qga.lock().await = Some(GaClient::connect(&self.dirs.qga_sock()).await?);
 
             Ok::<_, anyhow::Error>((proc, guest_shutdown))
         };
@@ -710,11 +722,11 @@ impl VmInstance {
             on_exit(reason, status);
         });
 
-        // Readiness poller: the guest agent answering `guest-ping` makes the VM
-        // "agent up" (PRD §2, §7.4). When the template has no pending first-boot
-        // provision, agent-up is also full readiness, so set both and fire
-        // on_ready. Otherwise leave `ready` for the orchestration layer to flip
-        // once the first-boot provision completes.
+        // Readiness poller: the vmlab-agent answering its handshake makes the
+        // VM "agent up" (PRD §2, §7.4). When the template has no pending
+        // first-boot provision, agent-up is also full readiness, so set both
+        // and fire on_ready. Otherwise leave `ready` for the orchestration
+        // layer to flip once the first-boot provision completes.
         let me = self.clone();
         tokio::spawn(async move {
             let defer_ready = me.first_boot_pending();
@@ -722,10 +734,7 @@ impl VmInstance {
                 if me.state().await != PowerState::Running {
                     return;
                 }
-                let qga = { me.qga.lock().await.clone() };
-                if let Some(qga) = qga
-                    && qga.ping(Duration::from_secs(2)).await
-                {
+                if me.agent_probe().await {
                     *me.agent_up.write().await = true;
                     if !defer_ready {
                         *me.ready.write().await = true;
@@ -756,7 +765,6 @@ impl VmInstance {
         // XDP state; with QEMU gone, the kernel then destroys the taps.
         self.nic_attachments.lock().await.clear();
         *self.qmp.lock().await = None;
-        *self.qga.lock().await = None;
         self.drop_agent().await;
         *self.qemu.lock().await = None;
     }
@@ -779,12 +787,33 @@ impl VmInstance {
                 .await;
         }
 
-        // Rung 1: guest agent shutdown.
-        if self.is_agent_up().await
-            && let Ok(qga) = self.qga().await
-        {
-            let _ = qga.shutdown("powerdown", Duration::from_secs(5)).await;
-            if proc.wait_exit(Duration::from_secs(30)).await.is_ok() {
+        // Rung 1: guest agent shutdown. The state is already Stopping so
+        // `agent()`'s Running gate can't be used: take the cached handle, or
+        // make one quick connect attempt on guests with an agent channel.
+        if self.is_agent_up().await {
+            let agent = { self.agent.lock().await.clone() };
+            let agent = match agent {
+                Some(a) => Some(a),
+                None if self.template().resolved.agent_channel => {
+                    super::vm_agent::AgentHandle::connect(
+                        &self.dirs.agent_sock(),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .ok()
+                }
+                None => None,
+            };
+            if let Some(agent) = agent
+                && agent
+                    .shutdown_guest(
+                        super::vm_agent::ShutdownMode::Powerdown,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .is_ok()
+                && proc.wait_exit(Duration::from_secs(30)).await.is_ok()
+            {
                 return self
                     .wait_state(PowerState::Stopped, Duration::from_secs(10))
                     .await;
@@ -904,23 +933,14 @@ impl VmInstance {
             let nodes = disk_nodes(self.all_disk_paths().len());
             let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
             qmp.snapshot_load(name, "disk0", &refs).await?;
-            // Drop the agent connections BEFORE resuming: the rewound guest
+            // Drop the agent connection BEFORE resuming: the rewound guest
             // replays virtio-serial response bytes the host already
-            // consumed, and qga responses carry no request ids — a stale
-            // `{"return":…}` silently poisons a later exchange. With no
-            // client attached QEMU discards the replayed bytes; reconnect
-            // starts clean (best-effort: agentless guests have no channel
-            // to poison). The vmlab-agent channel gets the same treatment;
-            // its reconnect additionally re-handshakes with a fresh token,
-            // and the frame magic resyncs any mid-frame garbage — see
-            // guest/agent-proto. It reconnects lazily on next use.
-            self.qga.lock().await.take();
+            // consumed. With no client attached QEMU discards the replayed
+            // bytes; the lazy reconnect on next use re-handshakes with a
+            // fresh token, and the frame magic resyncs any mid-frame
+            // garbage — see guest/agent-proto.
             self.drop_agent().await;
             qmp.cont().await?;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if let Ok(c) = GaClient::connect(&self.dirs.qga_sock()).await {
-                *self.qga.lock().await = Some(c);
-            }
             Ok(())
         } else {
             // Offline: power off if needed, apply, stay off.
@@ -960,12 +980,12 @@ impl VmInstance {
     }
 
     /// Per-NIC IPv4 addresses reported by the guest agent, matched to the
-    /// configured NIC order by resolved MAC address in one QGA request.
+    /// configured NIC order by resolved MAC address in one agent request.
     pub async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
-        let qga = self.qga().await?;
-        let ifaces = qga.network_interfaces(Duration::from_secs(5)).await?;
+        let agent = self.agent().await?;
+        let ifaces = agent.net_interfaces(Duration::from_secs(5)).await?;
         let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
-        Ok(crate::qga::ipv4_by_mac(&ifaces, &macs))
+        Ok(super::vm_agent::ipv4_by_mac(&ifaces, &macs))
     }
 
     /// First IPv4 address, or the address of a specific NIC (PRD §10.3).

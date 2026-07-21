@@ -173,8 +173,8 @@ async fn run_build(
     // Resolve the source into the working primary disk. A layered source's
     // embedded first-boot provision must gate the build boot exactly as it
     // gates a clone (PRD §6.1): a sysprep-generalized Windows source replays
-    // specialize/OOBE on this boot, and QGA answers while that is still
-    // running — sealing then would capture a half-specialized image.
+    // specialize/OOBE on this boot, and the agent answers while that is
+    // still running — sealing then would capture a half-specialized image.
     let mut source_first_boot: Option<String> = None;
     let (cdrom, seed_disk): (Option<PathBuf>, SeedDisk) = match &def.source {
         TemplateSource::Iso(src) => {
@@ -207,9 +207,34 @@ async fn run_build(
         TemplateSource::Scratch { .. } => (None, SeedDisk::Blank(disk_size)),
     };
 
+    // Stage the VMLAB bootstrap ISO (agent binaries + install scripts): the
+    // guest's own unattended install runs it, so the agent exists before any
+    // host channel does. Skipped when the template opts out or the profile
+    // has no agent channel (vintage guests would just carry a dead ISO).
+    let profile_channel = profiles
+        .get(def.profile.as_deref().unwrap_or("linux-generic"))
+        .map(|p| p.agent_channel)
+        .unwrap_or(true);
+    let wants_agent = def.agent && profile_channel;
+    let staged: Option<Arc<super::bootstrap::StagedGuestIso>> = if wants_agent {
+        Some(Arc::new(super::bootstrap::stage_guest_iso_dir(
+            work, &def.arch,
+        )?))
+    } else {
+        None
+    };
+
     // Synthesize a one-VM scratch lab for the build.
     let lab_name = format!("build-{}", def.name);
-    let lab_wcl = synth_lab(def, &lab_name, build_vm, cdrom.as_deref(), root)?;
+    let lab_wcl = synth_lab(
+        def,
+        &lab_name,
+        build_vm,
+        cdrom.as_deref(),
+        root,
+        staged.as_ref().map(|s| s.dir.as_path()),
+        true,
+    )?;
     std::fs::write(work.join("vmlab.wcl"), &lab_wcl)?;
 
     let labfile = crate::config::load_lab_source(&lab_wcl, "<build>", work)
@@ -245,36 +270,37 @@ async fn run_build(
     )
     .await?;
 
-    // Bake the vmlab-agent before any provision can shut the guest down (a
-    // sysprep/generalize finale makes post-provision too late). The verified
-    // asset version lands in the sealed metadata below. HOW the bake runs
-    // depends on the source:
+    // Verify the vmlab-agent before the build seals. The install itself is
+    // guest-driven from the VMLAB ISO staged above; this side only waits for
+    // the agent's handshake and records the verified version. HOW the wait
+    // runs depends on the source:
     //
-    // - Layered/qcow2: the image boots an installed OS, so QGA answers
-    //   promptly (bounded by a layered source's first-boot pass) — bake as a
-    //   blocking pre-provision hook, before any provision script.
+    // - Layered/qcow2: the image boots an installed OS whose unattended hook
+    //   (or an already-baked agent) answers promptly (bounded by a layered
+    //   source's first-boot pass) — verify as a blocking pre-provision hook,
+    //   before any provision script.
     // - ISO/scratch: the provisions themselves drive the installer from the
-    //   first keystroke, so a blocking hook deadlocks — it waits for QGA,
-    //   which only exists once the provisions have installed the OS. Bake
-    //   concurrently instead: watch for QGA in the background and install
-    //   the moment it answers (first-logon tooling lands minutes before any
-    //   sysprep finale). Sealing below requires the bake to have finished.
+    //   first keystroke, so a blocking hook deadlocks — the agent only
+    //   exists once the unattended installer has laid down the OS. Verify
+    //   concurrently instead: watch for the handshake in the background.
+    //   Installers that power off from a live environment (subiquity) never
+    //   hand one over — those builds get a verification boot below.
     let vm = runtime.vm(build_vm)?;
     let agent_version: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let bake_concurrent = matches!(
+    let verify_concurrent = matches!(
         def.source,
         TemplateSource::Iso(_) | TemplateSource::Scratch { .. }
     );
-    let bake_task: Option<tokio::task::JoinHandle<Result<Option<String>>>> = if bake_concurrent {
+    let verify_task: Option<tokio::task::JoinHandle<Result<Option<String>>>> = if verify_concurrent
+    {
         let vm = vm.clone();
-        let arch = def.arch.clone();
         let wants_agent = def.agent;
+        let staged = staged.clone();
         let out = log.clone();
         Some(tokio::spawn(async move {
-            // Wait for `up` to actually start the VM (wait_agent_up treats
-            // Stopped as fatal), capped so a build that dies before boot
-            // doesn't strand this task.
+            // Wait for `up` to actually start the VM, capped so a build that
+            // dies before boot doesn't strand this task.
             let started = tokio::time::Instant::now();
             while vm.state().await == crate::labd::vm::PowerState::Stopped {
                 if started.elapsed() > std::time::Duration::from_secs(600) {
@@ -283,10 +309,10 @@ async fn run_build(
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             let log = move |s: String| out(s);
-            super::agent_install::install(
+            super::agent_install::verify(
                 &vm,
                 wants_agent,
-                &arch,
+                staged.as_deref(),
                 std::time::Duration::from_secs(3600),
                 &log,
             )
@@ -294,18 +320,18 @@ async fn run_build(
         }))
     } else {
         let wants_agent = def.agent;
-        let arch = def.arch.clone();
+        let staged = staged.clone();
         let agent_version = agent_version.clone();
         *runtime.pre_provision.write().expect("pre_provision lock") =
             Some(Arc::new(move |vm, out| {
-                let arch = arch.clone();
+                let staged = staged.clone();
                 let agent_version = agent_version.clone();
                 Box::pin(async move {
                     let log = move |s: String| out(s);
-                    let version = super::agent_install::install(
+                    let version = super::agent_install::verify(
                         &vm,
                         wants_agent,
-                        &arch,
+                        staged.as_deref(),
                         std::time::Duration::from_secs(600),
                         &log,
                     )
@@ -394,17 +420,32 @@ async fn run_build(
             Some(result) => result.context("build boot/provision failed")?,
             None => bail!("build cancelled"),
         }
-        // A concurrent bake finished minutes ago in any successful build
-        // (provisions need the same guest agent it waited on); the cap only
-        // bounds pathological cases so the seal can't hang.
-        if let Some(task) = bake_task {
-            let version = tokio::time::timeout(std::time::Duration::from_secs(60), task)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("provisions finished but the vmlab-agent bake never completed")
-                })?
-                .map_err(|e| anyhow::anyhow!("agent bake task panicked: {e}"))??;
-            *agent_version.lock().expect("agent_version lock") = version;
+        // In a live-handshake build (Windows FirstLogonCommands run while
+        // the VM is still up) the concurrent verify finished minutes ago —
+        // give a near-complete one a short grace. An installer that powered
+        // the VM off from a throwaway live session (subiquity) can never
+        // complete it: the agent is installed into the target but has not
+        // run yet, so abort and boot the installed system for verification
+        // below.
+        let mut verify_boot = false;
+        if let Some(task) = verify_task {
+            let grace = if vm.state().await == crate::labd::vm::PowerState::Stopped {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_secs(60)
+            };
+            let abort = task.abort_handle();
+            match tokio::time::timeout(grace, task).await {
+                Ok(joined) => {
+                    let version = joined
+                        .map_err(|e| anyhow::anyhow!("agent verify task panicked: {e}"))??;
+                    *agent_version.lock().expect("agent_version lock") = version;
+                }
+                Err(_) => {
+                    abort.abort();
+                    verify_boot = wants_agent;
+                }
+            }
         }
         log("sealing: graceful shutdown\n".to_string());
         vm.stop(false).await.context("build VM did not shut down")?;
@@ -412,15 +453,85 @@ async fn run_build(
             crate::labd::vm::PowerState::Stopped,
             std::time::Duration::from_secs(120),
         )
-        .await
+        .await?;
+        Ok(verify_boot)
     };
-    if let Err(e) = booted.await {
-        let _ = runtime.down(&[], true).await;
-        return Err(e);
-    }
+    let needs_verify_boot = match booted.await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = runtime.down(&[], true).await;
+            return Err(e);
+        }
+    };
 
     if run.control.cancel.is_cancelled() {
         bail!("build cancelled");
+    }
+
+    // Free the build runtime's sockets/watchers before any verification
+    // boot reuses the same lab dirs; keep the event log for the final emit.
+    let events = runtime.events.clone();
+    drop(runtime);
+
+    // Boot the installed system once — same workdir and disk, no installer
+    // media, no provisions — verify the agent handshake, and shut down
+    // again. Only reached when the installer could not hand a live
+    // handshake (see above); this also means every sealed ISO build was
+    // verified against the *installed* OS, never the live installer
+    // session.
+    if needs_verify_boot {
+        log("agent: verification boot (installer sealed without a live handshake)\n".to_string());
+        let verify_wcl = synth_lab(def, &lab_name, build_vm, None, root, None, false)?;
+        let labfile = crate::config::load_lab_source(&verify_wcl, "<verify>", work)
+            .map_err(|e| anyhow::anyhow!("internal verification lab invalid: {e:?}"))?;
+        let (events_tx, _) = tokio::sync::broadcast::channel::<crate::proto::Event>(256);
+        let event_log = Arc::new(crate::labd::events::EventLog::new(&lab_name, events_tx)?);
+        let runtime2 = cancelable(
+            &run.control.cancel,
+            crate::labd::lab::LabRuntime::build(labfile, event_log, profiles),
+        )
+        .await?;
+        let vm2 = runtime2.vm(build_vm)?;
+        let verified = async {
+            let up = tokio::select! {
+                result = runtime2.up(&[], log.clone()) => Some(result),
+                () = run.control.cancel.cancelled() => None,
+            };
+            match up {
+                Some(result) => result.context("verification boot failed")?,
+                None => bail!("build cancelled"),
+            }
+            let vlog = {
+                let out = log.clone();
+                move |s: String| out(s)
+            };
+            let version = super::agent_install::verify(
+                vm2,
+                def.agent,
+                staged.as_deref(),
+                std::time::Duration::from_secs(900),
+                &vlog,
+            )
+            .await?;
+            log("sealing: graceful shutdown (verification boot)\n".to_string());
+            vm2.stop(false)
+                .await
+                .context("verification boot VM did not shut down")?;
+            vm2.wait_state(
+                crate::labd::vm::PowerState::Stopped,
+                std::time::Duration::from_secs(120),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(version)
+        }
+        .await;
+        match verified {
+            Ok(version) => *agent_version.lock().expect("agent_version lock") = version,
+            Err(e) => {
+                let _ = runtime2.down(&[], true).await;
+                return Err(e);
+            }
+        }
     }
 
     // Seal: flatten the working disk into a staging dir, then install.
@@ -475,7 +586,7 @@ async fn run_build(
         "installed {}/{}@{}\n",
         meta.arch, meta.name, meta.version
     ));
-    runtime.events.emit(
+    events.emit(
         "template.built",
         serde_json::json!({
             "arch": meta.arch, "name": meta.name, "version": meta.version,
@@ -534,12 +645,17 @@ fn source_origin(source: &TemplateSource) -> Option<String> {
 
 /// Render the synthetic build lab. The build VM is a `scratch` VM (so there
 /// is no template layer); its disk is pre-seeded after the runtime builds.
+/// `guest_iso` attaches the VMLAB bootstrap ISO folder as extra media.
+/// `with_steps = false` renders the verification-boot variant: no media at
+/// all and no provisions/playbooks — just boot the installed disk.
 fn synth_lab(
     def: &TemplateDef,
     lab_name: &str,
     vm: &str,
     cdrom: Option<&Path>,
     root: &Path,
+    guest_iso: Option<&Path>,
+    with_steps: bool,
 ) -> Result<String> {
     use std::fmt::Write;
     let mut s = String::from("import <vmlab.wcl>\n\n");
@@ -581,23 +697,34 @@ fn synth_lab(
         }
     }
     // Media (driver/answer-file ISOs/floppies, §6.3) carry over, resolved
-    // relative to the original file's root.
-    for m in &def.media {
-        let kind = match m.kind {
-            crate::config::model::MediaKind::Iso => "iso",
-            crate::config::model::MediaKind::Floppy => "floppy",
-        };
-        let from = root.join(&m.from);
-        write!(
-            s,
-            "    media {{ kind = \"{kind}\" from = \"{}\"",
-            from.display()
-        )
-        .unwrap();
-        if let Some(l) = &m.label {
-            write!(s, " label = \"{l}\"").unwrap();
+    // relative to the original file's root. The verification boot carries
+    // none: the whole point is booting the installed disk alone.
+    if with_steps {
+        for m in &def.media {
+            let kind = match m.kind {
+                crate::config::model::MediaKind::Iso => "iso",
+                crate::config::model::MediaKind::Floppy => "floppy",
+            };
+            let from = root.join(&m.from);
+            write!(
+                s,
+                "    media {{ kind = \"{kind}\" from = \"{}\"",
+                from.display()
+            )
+            .unwrap();
+            if let Some(l) = &m.label {
+                write!(s, " label = \"{l}\"").unwrap();
+            }
+            writeln!(s, " }}").unwrap();
         }
-        writeln!(s, " }}").unwrap();
+        if let Some(gi) = guest_iso {
+            writeln!(
+                s,
+                "    media {{ kind = \"iso\" from = \"{}\" label = \"VMLAB\" }}",
+                gi.display()
+            )
+            .unwrap();
+        }
     }
     writeln!(s, "  }}").unwrap();
     // Build provision scripts and playbooks run against the single build VM
@@ -609,12 +736,15 @@ fn synth_lab(
         Provision(&'a crate::config::model::Provision),
         Playbook(&'a crate::config::model::Playbook),
     }
-    let mut steps: Vec<(usize, Step)> = def
-        .provisions
-        .iter()
-        .map(|p| (p.span.0, Step::Provision(p)))
-        .chain(def.playbooks.iter().map(|p| (p.span.0, Step::Playbook(p))))
-        .collect();
+    let mut steps: Vec<(usize, Step)> = if with_steps {
+        def.provisions
+            .iter()
+            .map(|p| (p.span.0, Step::Provision(p)))
+            .chain(def.playbooks.iter().map(|p| (p.span.0, Step::Playbook(p))))
+            .collect()
+    } else {
+        Vec::new()
+    };
     steps.sort_by_key(|(at, _)| *at);
     for (_, step) in steps {
         match step {
@@ -659,7 +789,7 @@ mod tests {
             "  nic { nat = true }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
         assert!(wcl.contains("nic { nat = true }"), "{wcl}");
     }
 
@@ -671,7 +801,7 @@ mod tests {
             "  source \"scratch\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
         assert!(wcl.contains("nic { nat = true }"), "{wcl}");
     }
 
@@ -689,7 +819,7 @@ mod tests {
             "  provision \"b.ws\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
         assert!(
             wcl.contains("playbook \"/root/pb\" { play = \"baseline\" vms = [\"build\"] }"),
             "{wcl}"
@@ -715,9 +845,57 @@ mod tests {
             "  source \"scratch\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
         crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+    }
+
+    /// The VMLAB bootstrap ISO folder rides in as extra media; the
+    /// verification-boot variant (`with_steps = false`) drops all media and
+    /// steps so the installed disk boots alone.
+    #[test]
+    fn guest_iso_media_and_verification_variant() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "  media { kind = \"iso\" from = \"./cloudinit/\" label = \"CIDATA\" }\n",
+            "  provision \"a.ws\" { }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(
+            &d,
+            "build-t",
+            "build",
+            None,
+            Path::new("/root"),
+            Some(Path::new("/work/guest-iso")),
+            true,
+        )
+        .unwrap();
+        assert!(
+            wcl.contains("media { kind = \"iso\" from = \"/work/guest-iso\" label = \"VMLAB\" }"),
+            "{wcl}"
+        );
+        assert!(wcl.contains("CIDATA"), "{wcl}");
+        crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+
+        let verify = synth_lab(
+            &d,
+            "build-t",
+            "build",
+            None,
+            Path::new("/root"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!verify.contains("media"), "{verify}");
+        assert!(!verify.contains("provision"), "{verify}");
+        assert!(verify.contains("nic { nat = true }"), "{verify}");
+        crate::config::load_lab_source(&verify, "<verify>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("verification lab must parse: {e:?}\n{verify}"));
     }
 
     /// `first_boot` parses to the script path; it is build-time-only, so the
@@ -736,7 +914,7 @@ mod tests {
             d.first_boot.as_deref(),
             Some(Path::new("scripts/firstboot.ws"))
         );
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root")).unwrap();
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
         assert!(!wcl.contains("firstboot.ws"), "{wcl}");
     }
 }

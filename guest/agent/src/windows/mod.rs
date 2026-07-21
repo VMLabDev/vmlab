@@ -9,12 +9,13 @@ pub mod eventlog;
 pub mod metrics;
 pub mod port;
 pub mod service;
+pub mod sysinfo;
 
 pub use conpty::kill_process;
 pub use metrics::{cpu_pct, cpu_sample, disk_sample, mem_sample};
 pub use port::open_port;
 
-use vmlab_agent_proto::features;
+use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode, features};
 
 use crate::mux::Mux;
 
@@ -73,5 +74,24 @@ impl crate::mux::Platform for WindowsPlatform {
 
     fn get_clipboard(&self, mux: &Mux) {
         clipboard::get(mux);
+    }
+
+    fn net_info(&self) -> Result<Vec<NetInterface>, String> {
+        sysinfo::net_info()
+    }
+
+    fn os_info(&self) -> Result<OsInfo, String> {
+        sysinfo::os_info()
+    }
+
+    fn shutdown(&self, mux: &Mux, mode: ShutdownMode) {
+        let mux = mux.clone();
+        std::thread::spawn(move || {
+            // Let the ShuttingDown ack drain to the host first.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Err(e) = sysinfo::shutdown(mode) {
+                mux.send_error(None, format!("shutdown: {e}"));
+            }
+        });
     }
 }

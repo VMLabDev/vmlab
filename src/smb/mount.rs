@@ -1,7 +1,7 @@
 //! Guest-side mount command generation (PRD §7.5 "Guest mounting").
 //!
 //! These functions only *build* command strings. The daemon executes them in
-//! the guest via the QEMU guest agent (`qga`), or — for XP/2003 guests with no
+//! the guest via the vmlab guest agent, or — for XP/2003 guests with no
 //! agent — drives them through the screen-automation keystroke surface
 //! (§10.3). Nothing here touches a guest.
 //!

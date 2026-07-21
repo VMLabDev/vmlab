@@ -1,10 +1,9 @@
 # Vm: guest agent methods (exec, files, terminal, stats)
 
-Exec and file copy prefer the **vmlab-agent** channel (a dedicated
-`vmlab.agent.0` virtio-serial port baked into templates — no guest network
-involved) and fall back to QGA for templates that predate the agent.
-Interactive terminals and stats are agent-only: they need a template whose
-meta carries `agent_version`.
+Exec, file copy, interactive terminals and stats all run over the
+**vmlab-agent** channel (a dedicated `vmlab.agent.0` virtio-serial port baked
+into templates — no guest network involved): they need a template whose meta
+carries `agent_version`.
 
 
 | Method | Returns | Notes |

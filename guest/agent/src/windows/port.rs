@@ -93,8 +93,8 @@ impl Drop for PortHandle {
 /// The replaceable port connection shared by the reader and writer sides.
 ///
 /// An online snapshot restore can leave the restored port connection dead
-/// while the device itself stays healthy (QGA on a sibling port keeps
-/// working): pending writes never complete and new I/O sees nothing. qemu-ga
+/// while the device itself stays healthy (a sibling port keeps working):
+/// pending writes never complete and new I/O sees nothing. qemu-ga
 /// recovers by reopening its port on channel errors; this is the same
 /// policy. Either side may `poison` the current handle (cancel everything,
 /// close it on a disposable thread); only the reader `reopen`s, before its

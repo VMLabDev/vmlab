@@ -1,6 +1,6 @@
 // Provision for the alpine-registry lab: wait for the guest (which boots from
 // a template pulled on-demand from the OCI registry), then prove it is up and
-// reachable. `wait_ready` blocks until the QEMU guest agent answers.
+// reachable. `wait_ready` blocks until the vmlab guest agent answers.
 
 use vmlab
 

@@ -191,8 +191,8 @@ fn estr(e: impl std::fmt::Display) -> String {
     format!("{e:#}")
 }
 
-/// `vm.exec` / `vm.exec_timeout`: the vmlab-agent transport when the guest
-/// has one, QGA otherwise. Same captured-output result either way.
+/// `vm.exec` / `vm.exec_timeout` over the vmlab-agent transport (streamed,
+/// captured output).
 fn vm_exec(
     v: &VmHandle,
     cmd: String,
@@ -200,25 +200,11 @@ fn vm_exec(
     timeout: Duration,
 ) -> Result<ExecResult, String> {
     v.block(async {
-        if let Ok(agent) = v.vm.agent().await {
-            let mut argv = vec![cmd.clone()];
-            argv.extend(args.iter().cloned());
-            // A transport-level error (the connection was replaced under us,
-            // or the command itself tore the agent down, e.g. a reboot)
-            // falls through to QGA like an agent-less guest rather than
-            // failing the script.
-            if let Ok(r) = agent.exec(argv, vec![], None, None, timeout).await {
-                return Ok(ExecResult {
-                    exit_code: r.exit_code as i64,
-                    stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
-                });
-            }
-        }
-        let qga = v.vm.qga().await.map_err(estr)?;
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let r = qga
-            .exec(&cmd, &arg_refs, true, timeout)
+        let agent = v.vm.agent().await.map_err(estr)?;
+        let mut argv = vec![cmd];
+        argv.extend(args);
+        let r = agent
+            .exec(argv, vec![], None, None, timeout)
             .await
             .map_err(estr)?;
         Ok(ExecResult {
@@ -782,7 +768,7 @@ pub fn lab_module() -> Module {
         )
         // Guest agent (§10.3). Exec and file transfer prefer the vmlab-agent
         // channel (streamed, no polling, no base64); guests from pre-agent
-        // templates fall back to QGA transparently.
+        // templates have no exec transport at all.
         .method(
             "exec",
             |v: &VmHandle, cmd: String, args: Vec<String>| -> Result<ExecResult, String> {
@@ -809,17 +795,11 @@ pub fn lab_module() -> Module {
             |v: &VmHandle, local: String, guest_path: String| -> Result<(), String> {
                 let src = v.resolve_ref(&local);
                 v.block(async {
-                    // Transport-level agent errors fall through to QGA (see
-                    // vm_exec).
-                    if let Ok(agent) = v.vm.agent().await
-                        && agent.push_file(&src, &guest_path, None).await.is_ok()
-                    {
-                        return Ok(());
-                    }
-                    let data = tokio::fs::read(&src).await.map_err(estr)?;
-                    let qga = v.vm.qga().await.map_err(estr)?;
-                    qga.file_write(&guest_path, &data, Duration::from_secs(60))
+                    let agent = v.vm.agent().await.map_err(estr)?;
+                    agent
+                        .push_file(&src, &guest_path, None)
                         .await
+                        .map(|_| ())
                         .map_err(estr)
                 })
             },
@@ -832,19 +812,12 @@ pub fn lab_module() -> Module {
                     std::fs::create_dir_all(parent).map_err(estr)?;
                 }
                 v.block(async {
-                    // Transport-level agent errors fall through to QGA (see
-                    // vm_exec).
-                    if let Ok(agent) = v.vm.agent().await
-                        && agent.pull_file(&guest_path, &out).await.is_ok()
-                    {
-                        return Ok(());
-                    }
-                    let qga = v.vm.qga().await.map_err(estr)?;
-                    let data = qga
-                        .file_read(&guest_path, Duration::from_secs(60))
+                    let agent = v.vm.agent().await.map_err(estr)?;
+                    agent
+                        .pull_file(&guest_path, &out)
                         .await
-                        .map_err(estr)?;
-                    tokio::fs::write(&out, data).await.map_err(estr)
+                        .map(|_| ())
+                        .map_err(estr)
                 })
             },
         )

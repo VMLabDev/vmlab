@@ -413,66 +413,34 @@ impl Handler for LabdHandler {
                 let timeout =
                     std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
                 let vm = lab.vm(&name).map_err(err)?;
-                // Prefer the vmlab-agent transport (streamed, no 100ms QGA
-                // polling, no base64); fall back to QGA for guests whose
-                // template predates the agent.
-                if let Ok(agent) = vm.agent().await {
-                    let mut argv = vec![cmd.to_string()];
-                    argv.extend(cmd_args.iter().cloned());
-                    let result = agent
-                        .exec(argv, vec![], None, None, timeout)
-                        .await
-                        .map_err(err)?;
-                    return Ok(json!({
-                        "exit_code": result.exit_code,
-                        "stdout": String::from_utf8_lossy(&result.stdout),
-                        "stderr": String::from_utf8_lossy(&result.stderr),
-                    }));
-                }
-                let qga = vm.qga().await.map_err(err)?;
-                let arg_refs: Vec<&str> = cmd_args.iter().map(String::as_str).collect();
-                let result = qga
-                    .exec(cmd, &arg_refs, true, timeout)
+                let agent = vm.agent().await.map_err(err)?;
+                let mut argv = vec![cmd.to_string()];
+                argv.extend(cmd_args);
+                let result = agent
+                    .exec(argv, vec![], None, None, timeout)
                     .await
-                    .map_err(|e| format!("{e}"))?;
+                    .map_err(err)?;
                 Ok(json!({
                     "exit_code": result.exit_code,
                     "stdout": String::from_utf8_lossy(&result.stdout),
                     "stderr": String::from_utf8_lossy(&result.stderr),
                 }))
             }
-            // Guest OS identification (PRD §12: vmlab osinfo, vmlab cp).
+            // Guest OS identification (PRD §12: vmlab osinfo).
             "vm.osinfo" => {
                 let name = vm_arg(&args)?;
                 let timeout =
                     std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(30));
-                let qga = lab.vm(&name).map_err(err)?.qga().await.map_err(err)?;
-                qga.get_osinfo(timeout).await.map_err(|e| format!("{e}"))
-            }
-            // Guest-agent file write (PRD §12: vmlab cp). `append` lets the
-            // CLI move large files in several modest JSON-line messages
-            // instead of one giant one.
-            "vm.copy_in" => {
-                let name = vm_arg(&args)?;
-                let dest = args["dest"].as_str().ok_or("missing dest")?;
-                let data = args["data"].as_str().ok_or("missing data")?;
-                let append = args["append"].as_bool().unwrap_or(false);
-                let bytes = {
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .map_err(|e| format!("invalid base64 data: {e}"))?
-                };
-                let timeout =
-                    std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
-                let qga = lab.vm(&name).map_err(err)?.qga().await.map_err(err)?;
-                let result = if append {
-                    qga.file_append(dest, &bytes, timeout).await
-                } else {
-                    qga.file_write(dest, &bytes, timeout).await
-                };
-                result.map_err(|e| format!("{e}"))?;
-                Ok(json!(true))
+                let agent = lab.vm(&name).map_err(err)?.agent().await.map_err(err)?;
+                let info = agent.osinfo(timeout).await.map_err(err)?;
+                Ok(json!({
+                    "id": info.id,
+                    "name": info.name,
+                    "version": info.version,
+                    "kernel": info.kernel,
+                    "arch": info.arch,
+                    "hostname": info.hostname,
+                }))
             }
             // Interactive terminal over the vmlab-agent channel: opens a
             // fresh session (multi-session — every attach gets its own

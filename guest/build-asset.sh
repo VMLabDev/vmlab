@@ -8,11 +8,8 @@
 #                         vmlab.agent.0 port; spawned by cinit — guest/agent)
 #   /bin/busybox (+sh)    busybox-static: sh, modprobe, ip, udhcpc, ifconfig...
 #   /etc/udhcpc/...       the udhcpc hook script cinit drives (see cinit net.rs)
-#   /sbin/mkfs.ext4       e2fsprogs (dynamic, against the bundled musl + libs)
-#   /usr/bin/qemu-ga      Alpine qemu-guest-agent + its full .so closure (the
-#                         closure — glib, pcre2, libintl, ... — is pinned
-#                         explicitly below rather than resolved at build time,
-#                         so every byte in the image is checksum-verified)
+#   /sbin/mkfs.ext4       e2fsprogs (dynamic, against the bundled musl + its
+#                         pinned .so closure — every byte checksum-verified)
 #   /lib/modules/...      trimmed module tree (squashfs/overlay/ext4/cifs/virtio
 #                         + deps from modules.dep), loaded via /etc/vmlab-modules
 #
@@ -37,16 +34,7 @@ PACKAGES=(
   "main|libcom_err|1.47.2-r2|bb138d264fbf92ae95b355b43b0cf2ab59ce4abcb0594024bb687e3eecc490a4|f0f5ea8a160fe0ff6d0b18eff222f80a6a83eb1ca6abb913db7a902d5bd25c43"
   "main|libblkid|2.41-r9|e82d3a09cd31de5d051b726c7f9081b8e0bd4d5159e368f3834a273b040c0adc|24b7016cb609ca653f787406de13576561f0f293beaf063dbd194fec13addef0"
   "main|libuuid|2.41-r9|063219dac6aedcf18d4531e17bb0f8a5a511bf64d4f71a5cf7cbb0b5ff04d81b|81ff69d3a6a7d0cb5ccd6a799bf775597df28efe490cbaff3b1f531f6a46bc2e"
-  "main|libmount|2.41-r9|e8012b56a1da9804f56dd2f1ff47b7745db5cc538d148259332cfcc1c881a16e|aa7e09aa526ffef46aca603862cbaa9b46942ce8ee441becde800ba2bdcbc594"
   "main|libeconf|0.6.3-r0|fe4fbf324f84f7c8b475cfc708c5505aa630bced7b5f6289bf5ca36d9b587829|cdd4311aff72d53056134468b68a68f22829f995627b434d2f88960884319de9"
-  "main|glib|2.84.4-r0|f9ec9e7d1f348fe2a87a124261f560909d1a4ac3020964c4ec372ff50f8ffad5|339817d41dc00fd898e8a24dc4a36b8e04608c3fd8642ecc97b00b6f5581e8bc"
-  "main|libffi|3.4.8-r0|9a75cb9024693c1e52c3d8d7c9afb7c79e6e20f6c08df28effdb8dd816095083|9391f60a14c146655deaf65115563bc8dcd749cf0f93ec567e6443f2ed7d3bfc"
-  "main|libintl|0.24.1-r0|1e9900a63a851e790b28d201d5c11872a5ff74322fd998c06ac952c6a2ed1ce4|17bacc149386d7dcb2ed4488afddc2dba644081cbc134b5839fbbe5e1b875bf9"
-  "main|pcre2|10.46-r0|cfb8ad103a101fa6a31769e50e188dab9c60124705682d01b3de268795db58ad|62fdc4a3d6b48ca211cf6480c5da55664b489ec2b192ca8942e5b1d60ebe9496"
-  "main|zlib|1.3.2-r0|1f3d5f463f490dad3a68097376711bfe5e8156e9e8daff3070513aa4378cdeca|7a39a917e4dab3c7a45537210ee5b5f17bf75f5e7777809a20cddd0afe074187"
-  "main|numactl|2.0.18-r0|1a6d27d89c567ab20d548d72bb338b9274fceefdce4f3f7dd0dfec94f9d47666|ccf946ba49b04da45f8b7a71e51bca68d5201a4139a588901023cf3186c6e5ab"
-  "main|liburing|2.9-r0|d8220b52497635bef2b6526c921c70a0275352c6fc6c4090ef1abaee17d2788f|fd94adf963411e907d62e644fe184f672bef95dd1568c55642ae77421be93621"
-  "community|qemu-guest-agent|10.0.0-r1|c5c5ef9e80cf65d5f21060f1072a531082c4b692180418ab55bd3d38f1c08a97|18e3c96b169125017f63345632f71337bb2d3b32da2f2988195098db4d523fb1"
 )
 
 # Modules cinit needs (deps resolved from modules.dep below). virtio core,
@@ -257,15 +245,12 @@ build_arch() {
   write_udhcpc_script "$root"
 
   # mkfs.ext4 (+ config) and every shared library the pinned packages carry:
-  # the musl loader in /lib and the dependency closure of mkfs.ext4/qemu-ga.
+  # the musl loader in /lib and the dependency closure of mkfs.ext4
+  # (libext2fs/libe2p/libcom_err/libblkid→libeconf/libuuid, readelf-verified).
   cp -a "$extract/sbin/mke2fs" "$extract/sbin/mkfs.ext4" "$root/sbin/"
   cp -a "$extract/etc/mke2fs.conf" "$root/etc/"
   cp -a "$extract/lib/." "$root/lib/"
   find "$extract/usr/lib" -maxdepth 1 -name '*.so*' -exec cp -a {} "$root/usr/lib/" \;
-
-  # qemu-ga: primary control is the vmlab.ctl.0 channel; the agent rides
-  # along for exec/file-copy parity with full VMs.
-  install -m 0755 "$extract/usr/bin/qemu-ga" "$root/usr/bin/qemu-ga"
 
   # -- kernel + trimmed module tree -------------------------------------------
   local kver kmoddir vmlinuz

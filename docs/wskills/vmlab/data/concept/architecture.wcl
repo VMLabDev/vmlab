@@ -13,13 +13,13 @@ PROSE
       width     = 680
       height    = 260
       layout    = :layered
-      direction = :left_to_right
+      direction = :top_to_bottom
       layer_gap = 60.0
       node_gap  = 30.0
       desc      = "vmlab CLI and vmlab-web talk over the unix-socket protocol to the vmlabd supervisor, which runs one lab daemon per running lab; each lab daemon owns that lab's QEMU processes."
 
-      process "vmlab CLI" { id = cli  width = 120.0  height = 44.0  class = ["wdoc-node"] }
-      process "vmlab-web" { id = web  width = 120.0  height = 44.0  class = ["wdoc-node"] }
+      process "vmlab CLI" { id = cli  width = 120.0  height = 44.0  class = ["wdoc-process"] }
+      process "vmlab-web" { id = web  width = 120.0  height = 44.0  class = ["wdoc-process"] }
       process "vmlabd (supervisor)"     { id = sup   width = 160.0  height = 44.0  class = ["wdoc-process"] }
       process "lab daemon \"ad-demo\"" { id = lab1  width = 170.0  height = 44.0  class = ["wdoc-process"] }
       process "lab daemon \"scratch\"" { id = lab2  width = 170.0  height = 44.0  class = ["wdoc-process"] }
@@ -57,10 +57,10 @@ switch, DHCP server, DNS server, router and NAT for its segments — which is
 why vmlab runs unprivileged ([networking model](concept_networking)); eBPF
 tiers accelerate it where the host allows.
 
-**Guest channels.** Three doors into a running guest, all daemon-owned: QMP
-(power, device control), the QEMU guest agent (fallback exec/copy), and
-[vmlab-agent](entity_vmlab_agent) — the first-party agent carrying shells,
-file transfer, metrics and playbooks over virtio-serial with no guest
+**Guest channels.** Two doors into a running guest, both daemon-owned: QMP
+(power, device control) and [vmlab-agent](entity_vmlab_agent) — the
+first-party agent carrying readiness, shells, exec, file transfer, metrics,
+IP/OS reporting, shutdown and playbooks over virtio-serial with no guest
 network.
 
 **Where things live.** Machine-wide state (the template store, daemon

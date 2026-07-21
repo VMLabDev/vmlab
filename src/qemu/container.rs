@@ -6,11 +6,10 @@
 //! The guest side of this contract is FROZEN in `guest/` (see
 //! `guest/cinit/src/cmdline.rs` and `guest/build-asset.sh`): direct kernel
 //! boot with `vmlab.root=`/`vmlab.scratch=` naming the first two virtio-blk
-//! devices, and three virtio-serial ports — `org.qemu.guest_agent.0`
-//! (qemu-ga), `vmlab.ctl.0` (the ndjson ctl channel,
-//! [`crate::labd::container_ctl`], which also delivers the spec) and
-//! `vmlab.agent.0` (vmlab-agent: terminals/exec/files — the same channel
-//! full VMs carry; guest/agent-proto). Deliberately NO 9p device — it would add a
+//! devices, and two virtio-serial ports — `vmlab.ctl.0` (the ndjson ctl
+//! channel, [`crate::labd::container_ctl`], which also delivers the spec)
+//! and `vmlab.agent.0` (vmlab-agent: terminals/exec/files — the same
+//! channel full VMs carry; guest/agent-proto). Deliberately NO 9p device — it would add a
 //! migration blocker and break online snapshots. Volumes attach as
 //! vhost-user-fs devices instead (one virtiofsd per volume, spawned by
 //! labd with `--migration-mode` so its state rides the snapshot), which
@@ -43,7 +42,6 @@ pub struct ContainerVmPaths {
     /// attach unchanged.
     pub nics: Vec<(MacAddr, PathBuf, Option<u16>)>,
     pub qmp_sock: PathBuf,
-    pub qga_sock: PathBuf,
     /// The `vmlab.ctl.0` channel socket (QEMU listens; the host connects).
     pub ctl_sock: PathBuf,
     /// The `vmlab.agent.0` channel socket (vmlab-agent: terminals, exec,
@@ -171,18 +169,10 @@ pub(crate) fn build_container_args_with_accel(
     a.push("-monitor".into());
     a.push("none".into());
 
-    // One virtio-serial bus, three ports: the guest agent, the vmlab ctl
-    // channel and the vmlab-agent channel (terminals/exec/files — the same
-    // vmlab.agent.0 as full VMs). QEMU owns all three sockets
-    // (server=on,wait=off); the host connects as a client.
-    arg(
-        &mut a,
-        "chardev",
-        format!(
-            "socket,id=qga0,path={},server=on,wait=off",
-            paths.qga_sock.display()
-        ),
-    );
+    // One virtio-serial bus, two ports: the vmlab ctl channel and the
+    // vmlab-agent channel (terminals/exec/files — the same vmlab.agent.0 as
+    // full VMs). QEMU owns both sockets (server=on,wait=off); the host
+    // connects as a client.
     arg(
         &mut a,
         "chardev",
@@ -200,11 +190,6 @@ pub(crate) fn build_container_args_with_accel(
         ),
     );
     arg(&mut a, "device", "virtio-serial-pci".into());
-    arg(
-        &mut a,
-        "device",
-        "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0".into(),
-    );
     arg(
         &mut a,
         "device",
@@ -302,7 +287,6 @@ mod tests {
                 None,
             )],
             qmp_sock: "/run/l/web/qmp.sock".into(),
-            qga_sock: "/run/l/web/qga.sock".into(),
             ctl_sock: "/run/l/web/ctl.sock".into(),
             agent_sock: "/run/l/web/agent.sock".into(),
             serial_log: "/logs/l/web/console.log".into(),
@@ -345,10 +329,6 @@ mod tests {
         );
         assert!(s.contains("-monitor none"), "{s}");
         assert!(
-            s.contains("socket,id=qga0,path=/run/l/web/qga.sock,server=on,wait=off"),
-            "{s}"
-        );
-        assert!(
             s.contains("socket,id=ctl0,path=/run/l/web/ctl.sock,server=on,wait=off"),
             "{s}"
         );
@@ -357,10 +337,6 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("-device virtio-serial-pci"), "{s}");
-        assert!(
-            s.contains("virtserialport,chardev=qga0,name=org.qemu.guest_agent.0"),
-            "{s}"
-        );
         assert!(
             s.contains("virtserialport,chardev=ctl0,name=vmlab.ctl.0"),
             "{s}"

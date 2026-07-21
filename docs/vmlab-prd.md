@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-vmlab is a single-host virtual machine lab orchestrator. It defines **labs** — named groups of VMs and virtual networks — declaratively in WCL, builds and manages reusable **templates** (the Vagrant-box analogue), and drives lab automation through **wscript scripts** that can interact with guests at every level: power state, snapshots, keystrokes and mouse input, screenshot capture with image matching and OCR, and command execution and file transfer via the QEMU guest agent.
+vmlab is a single-host virtual machine lab orchestrator. It defines **labs** — named groups of VMs and virtual networks — declaratively in WCL, builds and manages reusable **templates** (the Vagrant-box analogue), and drives lab automation through **wscript scripts** that can interact with guests at every level: power state, snapshots, keystrokes and mouse input, screenshot capture with image matching and OCR, and command execution and file transfer via the vmlab guest agent (`vmlab-agent`, a virtio-serial channel).
 
 A two-tier daemon system owns all runtime state: a per-user **supervisor** manages lab lifecycle, the template store, and cross-lab/cross-host networking, and spawns one **lab daemon** per running lab that owns that lab's QEMU processes, network fabric, and state — so labs are fault- and contention-isolated from each other. The CLI is a client of both tiers; wscript scripts are written against a clean lab/VM API and are never aware of the daemons' existence.
 
@@ -43,7 +43,7 @@ vmlab targets QEMU/KVM exclusively, driven directly over QMP — no libvirt. Hos
 | **Provision script** | A wscript script listed in `vmlab.wcl`, run during `vmlab up` after its VMs are ready. Receives a lab handle. |
 | **Handler** | A wscript function bound to a daemon event (lifecycle, error, disk-space) for a lab or VM. |
 | **Guest OS profile** | A named bundle of hardware defaults (firmware, machine type, devices) applied to a VM or template. |
-| **Ready** | A VM is *ready* when its QEMU guest agent responds. A lab is *up* when all VMs are ready and all provision scripts have completed. |
+| **Ready** | A VM is *ready* when its vmlab guest agent answers its handshake. A lab is *up* when all VMs are ready and all provision scripts have completed. |
 
 ---
 
@@ -77,7 +77,7 @@ vmlab is a two-tier daemon system: one **supervisor** per user, one **lab daemon
 - **Lab daemon.** One per running lab, owning everything lab-scoped: that lab's QEMU processes, QMP and guest-agent channels, lab-local segments and their DHCP/DNS/routing/rules, clones and snapshots, lab state, and lab events (forwarded up to the supervisor's aggregate stream). A lab daemon's failure is contained to its lab; other labs and the supervisor are unaffected.
 - **CLI.** Connects to the supervisor for discovery and host-scoped verbs (template store, `status` across labs, daemon control), then talks **directly** to the relevant lab daemon's socket for lab-scoped operations — no proxying in the hot path.
 - **wscript runtime.** Executes **inside the lab daemon** — it must react to events and co-locating it with the lab's state and event stream keeps everything in one place. The script-facing contract is unchanged: scripts get the lab/VM API (§10) and remain daemon-unaware.
-- **QEMU.** One process per VM, launched by its lab daemon with `-qmp`, a guest-agent virtio-serial channel, VNC display, and one stream-socket netdev per NIC into the lab daemon's switch.
+- **QEMU.** One process per VM, launched by its lab daemon with `-qmp`, the `vmlab.agent.0` virtio-serial channel, VNC display, and one stream-socket netdev per NIC into the lab daemon's switch.
 
 ### 3.1 Sockets and protocols
 
@@ -216,7 +216,7 @@ Templates are defined in `template {}` blocks — in a dedicated WCL file or alo
   - `scratch` (§6.5) — blank disk; the build's attached installer media and provision script do everything.
 - **Hardware** — disk size, profile, and any §5.2 attributes; these are recorded into the template's metadata and become the inheritance layer for VMs.
 - **Media** — additional ISO/floppy attachments for the build, including images built from folders (§6.3) — unattend files, driver media, agent installers.
-- **Provision scripts** — the same wscript machinery as labs (§10): the build boots the source, the script drives the installer with keystrokes/screen matching, installs the guest agent, configures, and seals.
+- **Provision scripts** — the same wscript machinery as labs (§10): the build boots the source, the script drives the installer with keystrokes/screen matching, configures, and seals. The vmlab guest agent is installed by the guest's own unattended-install hook from the auto-attached VMLAB bootstrap ISO, and the build verifies its handshake before sealing.
 
 Build flow: create working qcow2 → boot per template hardware → run build provision scripts → graceful shutdown → move qcow2 + metadata into the store under `<arch>/<name>/<version>/`. A failed build leaves nothing in the store.
 
@@ -275,7 +275,7 @@ Snapshots use **qcow2-internal snapshots wherever the mechanism supports the cas
 
 ### 7.4 Guest agent
 
-The QEMU guest agent is the channel for: readiness detection, command execution with captured stdout/stderr/exit code, file copy in both directions, graceful shutdown, and IP address reporting. Templates are expected to install the agent during build; the windows profiles' build flow should make agent installation a documented, scriptable step. A VM without an agent still works for screen-driven automation but never reports **ready** — provision scripts targeting it must rely on screen/time waits.
+The vmlab guest agent (`vmlab-agent`, one multiplexed virtio-serial channel — `vmlab.agent.0`) is the channel for: readiness detection, interactive terminals, streaming command execution with captured stdout/stderr/exit code, digest-verified file transfer in both directions, log tailing, metrics, clipboard, structured OS info, per-NIC IP address reporting, and graceful shutdown/reboot. Template builds stage the agent binaries plus an install script on an auto-attached **VMLAB bootstrap ISO**; the template's unattended-install hook (cloud-init runcmd, installer late-commands, autounattend first-logon) runs the script, and the build verifies the agent's handshake before sealing. A VM without an agent still works for screen-driven automation but never reports **ready** — provision scripts targeting it must rely on screen/time waits.
 
 ### 7.5 Shared folders
 
@@ -316,7 +316,7 @@ Share contents are outside snapshot scope on both transports (§7.3).
 
 The PRD permits shipping 2 first and replacing with 1 later — including a hybrid where the embedded server handles SMB2 shares and `smb1` shares route to smbd; the user surface must not change between strategies.
 
-**XP-era caveat, stated honestly:** the QEMU guest agent is unlikely to be available for XP/2003 guests (modern virtio-win and qemu-ga builds dropped that era), so vmlab's automatic agent-driven mounting won't apply. For those guests the mount is performed by the provision script through the screen-automation surface (§10.3 keystrokes — `net use X: \\<gateway>\<share> /user:...`), which is exactly the kind of guest those APIs exist for. The docs should include this as a worked example.
+**XP-era caveat, stated honestly:** the vmlab guest agent does not target XP/2003-era guests (no virtio-serial drivers, ancient toolchains), so vmlab's automatic agent-driven mounting won't apply. For those guests the mount is performed by the provision script through the screen-automation surface (§10.3 keystrokes — `net use X: \\<gateway>\<share> /user:...`), which is exactly the kind of guest those APIs exist for. The docs should include this as a worked example.
 
 **Constraints, stated plainly:**
 
@@ -574,7 +574,7 @@ vmlab ships an official Docker/OCI **runtime image** (distinct from template art
 
 ## 15. Suggested milestones
 
-1. **M1 — Core lifecycle:** supervisor + lab daemon split with socket protocol, WCL schema + validate, template store (import existing qcow2 only), linked clones, start/stop, QMP, guest agent exec/copy, single NAT'd zero-config segment, logs.
+1. **M1 — Core lifecycle:** supervisor + lab daemon split with socket protocol, WCL schema + validate, template store (import existing qcow2 only), linked clones, start/stop, QMP, guest-agent exec/copy, single NAT'd zero-config segment, logs.
 2. **M2 — Automation surface:** wscript host module (lifecycle, exec, keys, screenshot, image match, waits), provision scripts, `run`, snapshots both modes.
 3. **M3 — Network fabric:** named segments, DHCP + reservations + option 121, DNS + registration + forwarding, port forwards, console/VNC.
 4. **M4 — Template builds + shares:** ISO sources w/ URL+hash, media building, build scripts, export/import, profiles complete incl. legacy, SMB shared folders (smbd backend acceptable initially per §7.5).
@@ -634,7 +634,7 @@ volumes, which are network-mounted (validation error, mirroring §7.5).
 
 **Architecture.** Every container runs in a **micro-VM**: a pinned Alpine
 `linux-virt` kernel + purpose-built initramfs (`vmlab-cinit` as PID 1,
-bundling `qemu-ga`), booted directly with `-kernel/-initrd`, 1 vCPU / 256 MiB
+spawning `vmlab-agent`), booted directly with `-kernel/-initrd`, 1 vCPU / 256 MiB
 by default. The image's layers are flattened (whiteout-aware, tar-level, no
 host privileges) into a squashfs mounted read-only, with a per-container
 scratch qcow2 as the overlayfs writable layer. Config reaches the guest as a

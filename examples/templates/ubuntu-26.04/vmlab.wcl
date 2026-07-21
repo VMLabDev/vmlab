@@ -2,7 +2,7 @@
 // cloud image + cloud-init (simpler than the 24.04 subiquity ISO install).
 // The qcow2 is downloaded and sha256-verified into the artefact cache;
 // cloudinit/ is packed into a CIDATA ISO (NoCloud datasource) that creates
-// the vmlab login and installs the QEMU guest agent on first boot.
+// the vmlab login and installs the vmlab guest agent on first boot.
 //
 //   vmlab template build        (run from this directory)
 //

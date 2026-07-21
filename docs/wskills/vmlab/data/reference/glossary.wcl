@@ -101,14 +101,14 @@ term g_wscript {
 
 term g_guest_agent {
   term       = "guest agent"
-  definition = "The QEMU guest agent (QGA) running inside a VM. `vm.is_ready()` / `vm.wait_ready()` test it; `vm.exec` / `copy_to` / `copy_from` fall back to it when the richer vmlab-agent is absent."
-  aliases    = ["QEMU guest agent", "QGA"]
+  definition = "The in-guest vmlab-agent. `vm.is_ready()` / `vm.wait_ready()` test it; `vm.exec` / `copy_to` / `copy_from` run over it."
+  aliases    = ["vmlab guest agent"]
   audience   = :both
 }
 
 term g_vmlab_agent {
   term       = "vmlab-agent"
-  definition = "vmlab's first-party in-guest agent on the `vmlab.agent.0` virtio-serial port (no guest network). Baked into templates at build time (meta `agent_version`); powers `vmlab shell`/`cp`/`tail`/`eventlog`, wscript `terminal()`/`stats()`, and agent-first exec/copy with QGA fallback. Present in both full VMs and container micro-VMs."
+  definition = "vmlab's first-party in-guest agent on the `vmlab.agent.0` virtio-serial port (no guest network). Installed by the guest's own unattended-install hook from the auto-attached VMLAB bootstrap ISO at build time (meta `agent_version`); powers readiness, `vmlab shell`/`cp`/`tail`/`eventlog`/`ip`/`osinfo`, wscript `terminal()`/`stats()`, exec/copy, and graceful shutdown/reboot. Present in both full VMs and container micro-VMs."
   aliases    = ["agent channel"]
   audience   = :both
 }

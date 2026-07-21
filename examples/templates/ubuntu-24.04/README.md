@@ -17,7 +17,7 @@ What happens (`scripts/install.ws` narrates it in the build log):
 2. The script answers subiquity's "Continue with autoinstall?" prompt via
    OCR + keystrokes.
 3. Autoinstall partitions the disk, creates user `vmlab` (password
-   `vmlab`), installs `qemu-guest-agent`, and powers the VM off.
+   `vmlab`), installs the vmlab guest agent (from the auto-attached VMLAB ISO), and powers the VM off.
 4. vmlab flattens and seals the disk into the store.
 
 Point-release bumps: update `version`, the ISO filename, and `sha256`

@@ -841,12 +841,13 @@ impl LabRuntime {
         if steps.is_empty() {
             return;
         }
-        let Ok(qga) = vm.qga().await else {
+        let Ok(agent) = vm.agent().await else {
             tracing::warn!("{vm_name}: no agent, cannot auto-mount shares");
             return;
         };
         for step in steps {
-            let args: Vec<&str> = step.args.iter().map(String::as_str).collect();
+            let mut argv = vec![step.command.clone()];
+            argv.extend(step.args.iter().cloned());
             // Early after boot Windows can't run the mount yet: the agent
             // briefly fails to spawn children, then `net use` returns
             // error 67 until the SMB client service is up (observed ~3-4
@@ -857,8 +858,8 @@ impl LabRuntime {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 }
                 let started = std::time::Instant::now();
-                match qga
-                    .exec(&step.command, &args, true, Duration::from_secs(30))
+                match agent
+                    .exec(argv.clone(), vec![], None, None, Duration::from_secs(30))
                     .await
                 {
                     Ok(r) if r.exit_code == 0 => {

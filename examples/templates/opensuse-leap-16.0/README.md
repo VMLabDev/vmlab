@@ -16,7 +16,7 @@ What happens (`scripts/install.ws` narrates it in the build log):
 1. The build VM boots the cloud image with `cloudinit/` attached as a
    `CIDATA` volume (NoCloud datasource).
 2. cloud-init creates user `vmlab` (password `vmlab`, passwordless sudo),
-   installs `qemu-guest-agent`, enables it, and disables cloud-init for
+   installs the vmlab guest agent (from the auto-attached VMLAB ISO), enables it, and disables cloud-init for
    subsequent boots.
 3. The script waits for the guest agent to respond and cloud-init to finish.
 4. vmlab powers the VM off and seals the disk into the store.

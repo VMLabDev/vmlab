@@ -16,10 +16,12 @@ autoinstall:
   ssh:
     install-server: true
     allow-pw: true
-  packages:
-    - qemu-guest-agent
+  # Install the vmlab guest agent from the VMLAB bootstrap ISO into the
+  # target (offline: copied + enabled; it starts on the installed system's
+  # first boot — the build verifies it with an extra boot after sealing the
+  # install).
   late-commands:
-    - curtin in-target -- systemctl enable qemu-guest-agent.service
+    - sh -c 'mkdir -p /media/vmlab && mount -o ro LABEL=VMLAB /media/vmlab && /media/vmlab/install.sh --root /target && umount /media/vmlab'
   # Power off instead of rebooting back into the installer ISO; the build
   # seals the disk once the VM is down.
   shutdown: poweroff

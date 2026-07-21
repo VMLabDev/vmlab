@@ -16,8 +16,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use vmlab_agent_proto::{
-    AgentMsg, Frame, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD, PROTO_VERSION, encode_ctrl,
-    encode_frame,
+    AgentMsg, Frame, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD, NetInterface, OsInfo,
+    PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame,
 };
 
 /// Host→guest bytes for one session, fed by the reader dispatch and drained
@@ -332,6 +332,20 @@ impl Mux {
                 crate::metrics::subscribe(self, interval_secs)
             }
             HostMsg::UnsubscribeMetrics => crate::metrics::unsubscribe(),
+            HostMsg::NetInfo => match platform.net_info() {
+                Ok(interfaces) => self.send_ctrl(&AgentMsg::NetInfo { interfaces }),
+                Err(e) => self.send_error(None, format!("net_info: {e}")),
+            },
+            HostMsg::OsInfo => match platform.os_info() {
+                Ok(info) => self.send_ctrl(&AgentMsg::OsInfo { info }),
+                Err(e) => self.send_error(None, format!("os_info: {e}")),
+            },
+            HostMsg::Shutdown { mode } => {
+                // Ack before executing: the reply may be the last bytes this
+                // guest ever puts on the wire.
+                self.send_ctrl(&AgentMsg::ShuttingDown { mode });
+                platform.shutdown(self, mode);
+            }
             HostMsg::WindowAdjust { id, bytes } => self.grant(id, bytes),
             HostMsg::Close { id } => self.remove(id),
             HostMsg::Ping => self.send_ctrl(&AgentMsg::Pong),
@@ -367,6 +381,14 @@ pub trait Platform: Sync {
     fn open_eventlog(&self, mux: &Mux, id: u32, filter: Option<String>);
     fn set_clipboard(&self, mux: &Mux, text: String);
     fn get_clipboard(&self, mux: &Mux);
+    /// The guest's network interfaces (loopback excluded).
+    fn net_info(&self) -> Result<Vec<NetInterface>, String>;
+    /// Structured OS information.
+    fn os_info(&self) -> Result<OsInfo, String>;
+    /// Bring the guest down. The `ShuttingDown` ack is already queued;
+    /// implementations delay briefly so it flushes, and report failure via
+    /// `mux` if the OS refuses.
+    fn shutdown(&self, mux: &Mux, mode: ShutdownMode);
 }
 
 /// Standard guest→host output pump: read chunks from `src`, respect the
@@ -413,6 +435,25 @@ mod tests {
         fn get_clipboard(&self, mux: &Mux) {
             mux.send_error(None, "unsupported");
         }
+        fn net_info(&self) -> Result<Vec<NetInterface>, String> {
+            Ok(vec![NetInterface {
+                name: "eth0".into(),
+                mac: Some("52:54:00:00:00:01".into()),
+                ipv4: vec!["10.0.0.2".into()],
+                ipv6: vec![],
+            }])
+        }
+        fn os_info(&self) -> Result<OsInfo, String> {
+            Ok(OsInfo {
+                id: "test".into(),
+                name: "Test OS".into(),
+                version: "1".into(),
+                kernel: "0.0".into(),
+                arch: "x86_64".into(),
+                hostname: "testhost".into(),
+            })
+        }
+        fn shutdown(&self, _: &Mux, _: ShutdownMode) {}
     }
 
     /// A Write that forwards every produced frame to a channel for
@@ -477,6 +518,46 @@ mod tests {
         let (mux, rx) = capture_mux();
         mux.handle_msg(HostMsg::Ping, &NullPlatform);
         assert_eq!(next_ctrl(&rx), AgentMsg::Pong);
+    }
+
+    #[test]
+    fn net_info_replies_with_interfaces() {
+        let (mux, rx) = capture_mux();
+        mux.handle_msg(HostMsg::NetInfo, &NullPlatform);
+        match next_ctrl(&rx) {
+            AgentMsg::NetInfo { interfaces } => {
+                assert_eq!(interfaces.len(), 1);
+                assert_eq!(interfaces[0].name, "eth0");
+            }
+            other => panic!("expected net_info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn os_info_replies_with_info() {
+        let (mux, rx) = capture_mux();
+        mux.handle_msg(HostMsg::OsInfo, &NullPlatform);
+        match next_ctrl(&rx) {
+            AgentMsg::OsInfo { info } => assert_eq!(info.id, "test"),
+            other => panic!("expected os_info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutdown_acks_before_executing() {
+        let (mux, rx) = capture_mux();
+        mux.handle_msg(
+            HostMsg::Shutdown {
+                mode: ShutdownMode::Reboot,
+            },
+            &NullPlatform,
+        );
+        assert_eq!(
+            next_ctrl(&rx),
+            AgentMsg::ShuttingDown {
+                mode: ShutdownMode::Reboot
+            }
+        );
     }
 
     #[test]

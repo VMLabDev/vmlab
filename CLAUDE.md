@@ -23,7 +23,7 @@ PRD implemented (M1–M6). Module map under `src/`:
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
   firmware lookup, process management; `container.rs` builds the micro-VM
   argv for lab containers (§18).
-- `qmp/`, `qga/` — QMP and guest-agent clients.
+- `qmp/` — the QMP client.
 - `template/` — store, qemu-img, builds, artefact cache, store/OCI CLI.
 - `oci/image/` — standard container-image pull: docker/OCI manifests,
   layer flatten (whiteouts → squashfs via sqfstar), digest-addressed cache.

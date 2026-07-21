@@ -20,7 +20,7 @@ What happens (`scripts/install.ws` narrates it in the build log):
    the virtio storage/net drivers in WinPE, partitions UEFI/GPT, installs
    **Standard Evaluation (Desktop Experience)**, sets `Administrator` /
    `vmlab123!`, and on first logon installs the virtio guest tools and the
-   QEMU guest agent.
+   vmlab guest agent (from the auto-attached VMLAB ISO).
 3. The script waits for the guest agent — that's the "install finished"
    signal — then vmlab shuts the VM down and seals the disk.
 

@@ -6,19 +6,22 @@ _A build resolves the source, boots a synthesised one-VM lab, runs the provision
 content-addressed under `~/.cache/vmlab/artefacts/`), creates a working qcow2,
 synthesises a one-VM lab from the template definition, boots it per the hardware
 profile, runs the provision scripts (full wscript API — keystrokes, screen matching,
-exec; the script should install the QEMU guest agent), shuts down gracefully,
+exec), shuts down gracefully,
 flattens and seals into the store. **A failed build leaves nothing behind.** The
 sealed result is `~/.local/share/vmlab/templates/<arch>/<name>/<version>/`
 (`disk.qcow2` + `template.wcl`). The step-by-step runbook is
 [Build a disk template](../references/process_build_template.md).
 
 
-Once QGA answers, the build also installs **vmlab-agent** into the image
-automatically (before provisions run) and records its version in the sealed
-meta as `agent_version` — that is what enables `vmlab shell`, agent file
-transfer, `tail`, `eventlog` and wscript `terminal()`/`stats()` on VMs cloned
-from the template. Templates built before the agent existed keep working with
-QGA-only exec/copy.
+The build auto-attaches a **VMLAB bootstrap ISO** carrying the vmlab-agent
+binaries plus an install script; the template's own unattended-install hook
+(cloud-init runcmd, installer late-commands, autounattend first-logon) runs
+it, and the build verifies the agent's handshake before sealing — recording
+the version in the sealed meta as `agent_version`. That is what enables
+readiness, `vmlab shell`, agent file transfer, `tail`, `eventlog` and wscript
+`terminal()`/`stats()` on VMs cloned from the template. Installers that power
+off from a live session (Ubuntu's subiquity) get one extra verification boot
+of the installed system before sealing.
 
 
 ## Related

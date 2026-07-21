@@ -2,7 +2,7 @@
 // to Leap. Built from the official Minimal-VM cloud image + cloud-init. The
 // qcow2 is downloaded and sha256-verified into the artefact cache; cloudinit/
 // is packed into a CIDATA ISO (NoCloud datasource) that creates the vmlab
-// login and installs the QEMU guest agent on first boot. SeaBIOS — cloud
+// login and installs the vmlab guest agent on first boot. SeaBIOS — cloud
 // images boot BIOS.
 //
 //   vmlab template build        (run from this directory)

@@ -33,10 +33,10 @@ switch, DHCP server, DNS server, router and NAT for its segments — which is
 why vmlab runs unprivileged ([networking model](../references/concept_networking.md)); eBPF
 tiers accelerate it where the host allows.
 
-**Guest channels.** Three doors into a running guest, all daemon-owned: QMP
-(power, device control), the QEMU guest agent (fallback exec/copy), and
-[vmlab-agent](../references/entity_vmlab_agent.md) — the first-party agent carrying shells,
-file transfer, metrics and playbooks over virtio-serial with no guest
+**Guest channels.** Two doors into a running guest, both daemon-owned: QMP
+(power, device control) and [vmlab-agent](../references/entity_vmlab_agent.md) — the
+first-party agent carrying readiness, shells, exec, file transfer, metrics,
+IP/OS reporting, shutdown and playbooks over virtio-serial with no guest
 network.
 
 **Where things live.** Machine-wide state (the template store, daemon

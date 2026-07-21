@@ -62,9 +62,19 @@ pub fn ensure_agent_asset(os: AgentOs, arch: &str) -> Result<AgentAsset> {
     find_in(&candidate_dirs(), os, arch)
 }
 
+/// Find the agent binary for a guest `os` + `arch` under explicit base
+/// directories (the bootstrap-ISO staging tests inject their own).
+pub(crate) fn ensure_agent_asset_in(
+    dirs: &[PathBuf],
+    os: AgentOs,
+    arch: &str,
+) -> Result<AgentAsset> {
+    find_in(dirs, os, arch)
+}
+
 /// The base directories searched, in priority order (same roots as the
 /// micro-VM boot asset).
-fn candidate_dirs() -> Vec<PathBuf> {
+pub(crate) fn candidate_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(dir) = env::var_os("VMLAB_GUEST_ASSET_DIR").filter(|d| !d.is_empty()) {
         dirs.push(PathBuf::from(dir));

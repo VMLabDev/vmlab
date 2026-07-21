@@ -22,7 +22,10 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, chdir, chroot, dup2, execve, fork, setsid};
 use std::os::unix::fs::PermissionsExt;
 
-use vmlab_agent_proto::{AgentMsg, DiskUsage, FrameKind, PORT_NAME, RecvWindow, features};
+use vmlab_agent_proto::{
+    AgentMsg, DiskUsage, FrameKind, NetInterface, OsInfo, PORT_NAME, RecvWindow, ShutdownMode,
+    features,
+};
 
 use crate::mux::{Input, Mux, pump_out};
 
@@ -379,6 +382,153 @@ impl crate::mux::Platform for LinuxPlatform {
             },
             None => mux.send_error(None, "clipboard: no display session reachable"),
         }
+    }
+
+    fn net_info(&self) -> Result<Vec<NetInterface>, String> {
+        net_info()
+    }
+
+    fn os_info(&self) -> Result<OsInfo, String> {
+        Ok(os_info())
+    }
+
+    fn shutdown(&self, mux: &Mux, mode: ShutdownMode) {
+        let mux = mux.clone();
+        thread::spawn(move || {
+            // Let the ShuttingDown ack drain to the host first.
+            thread::sleep(Duration::from_millis(200));
+            if let Err(e) = run_shutdown(mode) {
+                mux.send_error(None, format!("shutdown: {e}"));
+            }
+        });
+    }
+}
+
+/// Guest NICs via getifaddrs: link-layer, IPv4 and IPv6 entries for one
+/// interface are merged into one [`NetInterface`]. Loopback is excluded.
+fn net_info() -> Result<Vec<NetInterface>, String> {
+    let addrs = nix::ifaddrs::getifaddrs().map_err(|e| e.to_string())?;
+    let mut out: Vec<NetInterface> = Vec::new();
+    for ifa in addrs {
+        if ifa
+            .flags
+            .contains(nix::net::if_::InterfaceFlags::IFF_LOOPBACK)
+        {
+            continue;
+        }
+        let entry = match out.iter_mut().find(|i| i.name == ifa.interface_name) {
+            Some(e) => e,
+            None => {
+                out.push(NetInterface {
+                    name: ifa.interface_name.clone(),
+                    mac: None,
+                    ipv4: Vec::new(),
+                    ipv6: Vec::new(),
+                });
+                out.last_mut().unwrap()
+            }
+        };
+        let Some(addr) = ifa.address else { continue };
+        if let Some(link) = addr.as_link_addr() {
+            if let Some(mac) = link.addr()
+                && mac != [0u8; 6]
+            {
+                entry.mac = Some(
+                    mac.iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(":"),
+                );
+            }
+        } else if let Some(sin) = addr.as_sockaddr_in() {
+            entry.ipv4.push(sin.ip().to_string());
+        } else if let Some(sin6) = addr.as_sockaddr_in6() {
+            entry.ipv6.push(sin6.ip().to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Structured OS info from /etc/os-release + uname. Infallible: an initramfs
+/// without os-release (container micro-VMs) still answers with the kernel's
+/// view.
+fn os_info() -> OsInfo {
+    let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let field = |key: &str| {
+        os_release
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let uts = uname();
+    OsInfo {
+        id: field("ID").unwrap_or_else(|| "linux".into()),
+        name: field("PRETTY_NAME")
+            .or_else(|| field("NAME"))
+            .unwrap_or_else(|| "Linux".into()),
+        version: field("VERSION_ID").unwrap_or_default(),
+        kernel: uts.0,
+        arch: uts.1,
+        hostname: uts.2,
+    }
+}
+
+/// (kernel release, machine arch, hostname) via uname(2).
+fn uname() -> (String, String, String) {
+    // SAFETY: plain uname(2) into a zeroed struct.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return (String::new(), String::new(), String::new());
+    }
+    let s = |f: &[libc::c_char]| {
+        // SAFETY: uname NUL-terminates every field.
+        unsafe { std::ffi::CStr::from_ptr(f.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    (s(&uts.release), s(&uts.machine), s(&uts.nodename))
+}
+
+/// Bring the guest down: ask the init system so services stop cleanly, and
+/// fall back to the raw reboot(2) syscall — which is the *only* path in a
+/// container micro-VM's initramfs (no init system; the agent is cinit's
+/// child and runs with CAP_SYS_BOOT).
+fn run_shutdown(mode: ShutdownMode) -> Result<(), String> {
+    let argv: &[&str] = if Path::new("/run/systemd/system").exists() {
+        match mode {
+            ShutdownMode::Powerdown => &["systemctl", "poweroff"],
+            ShutdownMode::Reboot => &["systemctl", "reboot"],
+            ShutdownMode::Halt => &["systemctl", "halt"],
+        }
+    } else if Path::new("/sbin/openrc-shutdown").exists() {
+        match mode {
+            ShutdownMode::Powerdown => &["/sbin/openrc-shutdown", "-p", "now"],
+            ShutdownMode::Reboot => &["/sbin/openrc-shutdown", "-r", "now"],
+            ShutdownMode::Halt => &["/sbin/openrc-shutdown", "-H", "now"],
+        }
+    } else {
+        &[]
+    };
+    if !argv.is_empty()
+        && let Ok(status) = Command::new(argv[0]).args(&argv[1..]).status()
+        && status.success()
+    {
+        return Ok(());
+    }
+    // SAFETY: sync then reboot(2); nothing to clean up — the guest is going
+    // down.
+    unsafe { libc::sync() };
+    let cmd = match mode {
+        ShutdownMode::Powerdown => libc::LINUX_REBOOT_CMD_POWER_OFF,
+        ShutdownMode::Reboot => libc::LINUX_REBOOT_CMD_RESTART,
+        ShutdownMode::Halt => libc::LINUX_REBOOT_CMD_HALT,
+    };
+    // SAFETY: see above.
+    if unsafe { libc::reboot(cmd) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
     }
 }
 
@@ -814,7 +964,7 @@ impl ClipboardTool {
 }
 
 /// Detach from the launching terminal/agent: double-fork + setsid + stdio to
-/// /dev/null. Used for hand-launches over QGA during development; the
+/// /dev/null. Used for manual hand-launches during development; the
 /// systemd service runs in the foreground.
 pub fn daemonize() {
     // SAFETY: standard double-fork; parents _exit immediately.
@@ -867,6 +1017,16 @@ mod tests {
         for d in &disks {
             assert!(d.total >= d.used, "{}", d.mount);
         }
+    }
+
+    #[test]
+    fn net_and_os_info_sample_the_build_host() {
+        let ifaces = net_info().unwrap();
+        assert!(ifaces.iter().all(|i| i.name != "lo"));
+        let info = os_info();
+        assert!(!info.kernel.is_empty());
+        assert!(!info.arch.is_empty());
+        assert_ne!(info.id, "");
     }
 
     #[test]

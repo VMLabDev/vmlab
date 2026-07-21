@@ -3,7 +3,8 @@
 // `autoinstall` on the kernel command line, asks for confirmation first —
 // answer it, then wait for the installer to power the VM off
 // (`shutdown: poweroff` in cloudinit/user-data). The sealed image carries
-// qemu-guest-agent, so lab clones come up "ready".
+// the vmlab guest agent (installed offline from the VMLAB ISO; the build
+// verifies it with one extra boot), so lab clones come up "ready".
 
 use vmlab
 

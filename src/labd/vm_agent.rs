@@ -2,7 +2,7 @@
 //! `vmlab.agent.0` virtio-serial port carrying framed, multiplexed channels
 //! — terminals, streaming exec, file transfer, tails, metrics, clipboard.
 //! QEMU owns the socket (`server=on,wait=off`); the daemon connects as the
-//! single client, like the QGA client does, and re-exposes each terminal
+//! single client and re-exposes each terminal
 //! session as a per-session unix socket that is a dumb raw byte pipe (what
 //! `vmlab shell` and the web terminal attach to).
 //!
@@ -30,6 +30,7 @@ use vmlab_agent_proto::{
     AgentMsg, DiskUsage, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
     PROTO_VERSION, RecvWindow, encode_ctrl, encode_frame,
 };
+pub use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
 
 /// What the agent said about itself in the handshake.
 #[derive(Debug, Clone)]
@@ -151,6 +152,12 @@ struct Inner {
     metrics: watch::Sender<Option<MetricsSnapshot>>,
     /// Incremented per clipboard report, with the text.
     clipboard: watch::Sender<(u64, String)>,
+    /// Incremented per net_info reply, with the interfaces.
+    net_info: watch::Sender<(u64, Vec<NetInterface>)>,
+    /// Incremented per os_info reply, with the info.
+    os_info: watch::Sender<(u64, Option<OsInfo>)>,
+    /// Incremented per shutting_down ack.
+    shutting_down: watch::Sender<u64>,
     /// Whether `subscribe_metrics` has been sent on this connection.
     metrics_subscribed: AtomicBool,
     token: String,
@@ -184,6 +191,9 @@ impl AgentHandle {
             pong: watch::Sender::new(0),
             metrics: watch::Sender::new(None),
             clipboard: watch::Sender::new((0, String::new())),
+            net_info: watch::Sender::new((0, Vec::new())),
+            os_info: watch::Sender::new((0, None)),
+            shutting_down: watch::Sender::new(0),
             metrics_subscribed: AtomicBool::new(false),
             token,
         });
@@ -534,6 +544,44 @@ impl AgentHandle {
         }
     }
 
+    /// The guest's network interfaces (loopback excluded).
+    pub async fn net_interfaces(&self, timeout: Duration) -> Result<Vec<NetInterface>> {
+        let mut rx = self.inner.net_info.subscribe();
+        rx.mark_unchanged();
+        self.send_msg(&HostMsg::NetInfo).await?;
+        tokio::time::timeout(timeout, rx.changed())
+            .await
+            .map_err(|_| anyhow!("agent sent no net_info within {timeout:?}"))?
+            .map_err(|_| anyhow!("agent channel closed"))?;
+        let (_, interfaces) = rx.borrow().clone();
+        Ok(interfaces)
+    }
+
+    /// Structured guest OS information.
+    pub async fn osinfo(&self, timeout: Duration) -> Result<OsInfo> {
+        let mut rx = self.inner.os_info.subscribe();
+        rx.mark_unchanged();
+        self.send_msg(&HostMsg::OsInfo).await?;
+        tokio::time::timeout(timeout, rx.changed())
+            .await
+            .map_err(|_| anyhow!("agent sent no os_info within {timeout:?}"))?
+            .map_err(|_| anyhow!("agent channel closed"))?;
+        let (_, info) = rx.borrow().clone();
+        info.ok_or_else(|| anyhow!("agent sent no os_info"))
+    }
+
+    /// Ask the guest to shut down. The agent acks and then the whole
+    /// connection may vanish before any further bytes arrive, so a missing
+    /// ack within `timeout` still counts as success — only a failed *send*
+    /// is an error (the guest never got the request).
+    pub async fn shutdown_guest(&self, mode: ShutdownMode, timeout: Duration) -> Result<()> {
+        let mut rx = self.inner.shutting_down.subscribe();
+        rx.mark_unchanged();
+        self.send_msg(&HostMsg::Shutdown { mode }).await?;
+        let _ = tokio::time::timeout(timeout, rx.changed()).await;
+        Ok(())
+    }
+
     pub async fn set_clipboard(&self, text: String) -> Result<()> {
         self.send_msg(&HostMsg::SetClipboard { text }).await
     }
@@ -774,6 +822,19 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             let seq = inner.clipboard.borrow().0 + 1;
             let _ = inner.clipboard.send((seq, text));
         }
+        AgentMsg::NetInfo { interfaces } => {
+            let seq = inner.net_info.borrow().0 + 1;
+            let _ = inner.net_info.send((seq, interfaces));
+        }
+        AgentMsg::OsInfo { info } => {
+            let seq = inner.os_info.borrow().0 + 1;
+            let _ = inner.os_info.send((seq, Some(info)));
+        }
+        AgentMsg::ShuttingDown { mode } => {
+            tracing::debug!("agent acked shutdown ({mode:?})");
+            let seq = *inner.shutting_down.borrow() + 1;
+            let _ = inner.shutting_down.send(seq);
+        }
         AgentMsg::Pong => {
             let seq = *inner.pong.borrow() + 1;
             let _ = inner.pong.send(seq);
@@ -867,6 +928,31 @@ pub async fn expose_terminal_socket(session: AgentSession, sock_path: PathBuf) -
         let _ = std::fs::remove_file(&sock_path);
     });
     Ok(())
+}
+
+/// Match the first non-loopback IPv4 address reported for each requested
+/// MAC. MACs compare case-insensitively; result order follows `macs`, which
+/// is the configuration's NIC declaration order.
+pub fn ipv4_by_mac(interfaces: &[NetInterface], macs: &[String]) -> Vec<Option<String>> {
+    macs.iter()
+        .map(|want| {
+            interfaces
+                .iter()
+                .find(|iface| {
+                    iface
+                        .mac
+                        .as_deref()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(want))
+                })
+                .and_then(|iface| {
+                    iface
+                        .ipv4
+                        .iter()
+                        .find(|address| !address.starts_with("127."))
+                        .cloned()
+                })
+        })
+        .collect()
 }
 
 /// Enumerate a host file or directory tree for a guest push: one
@@ -1082,6 +1168,33 @@ mod tests {
                                     })
                                     .await;
                                 }
+                                HostMsg::NetInfo => {
+                                    send(AgentMsg::NetInfo {
+                                        interfaces: vec![NetInterface {
+                                            name: "eth0".into(),
+                                            mac: Some("52:54:00:AA:BB:01".into()),
+                                            ipv4: vec!["10.0.0.15".into()],
+                                            ipv6: vec![],
+                                        }],
+                                    })
+                                    .await;
+                                }
+                                HostMsg::OsInfo => {
+                                    send(AgentMsg::OsInfo {
+                                        info: OsInfo {
+                                            id: "mocklinux".into(),
+                                            name: "Mock Linux".into(),
+                                            version: "1.0".into(),
+                                            kernel: "6.0.0".into(),
+                                            arch: "x86_64".into(),
+                                            hostname: "mock0".into(),
+                                        },
+                                    })
+                                    .await;
+                                }
+                                HostMsg::Shutdown { mode } => {
+                                    send(AgentMsg::ShuttingDown { mode }).await;
+                                }
                                 _ => {}
                             }
                         }
@@ -1258,6 +1371,31 @@ mod tests {
         let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
         assert_eq!(len, 10_000);
         assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn net_osinfo_and_shutdown_round_trip() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+
+        let ifaces = agent.net_interfaces(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(ifaces.len(), 1);
+        assert_eq!(ifaces[0].ipv4, vec!["10.0.0.15".to_string()]);
+        // MAC matching is case-insensitive and follows declaration order.
+        let ips = ipv4_by_mac(
+            &ifaces,
+            &["aa:aa:aa:aa:aa:aa".into(), "52:54:00:aa:bb:01".into()],
+        );
+        assert_eq!(ips, vec![None, Some("10.0.0.15".to_string())]);
+
+        let info = agent.osinfo(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(info.id, "mocklinux");
+        assert_eq!(info.hostname, "mock0");
+
+        agent
+            .shutdown_guest(ShutdownMode::Powerdown, Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

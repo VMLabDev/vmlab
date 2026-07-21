@@ -1,7 +1,7 @@
 //! Client for the container micro-VM's ctl channel — the `vmlab.ctl.0`
 //! virtio-serial port carrying newline-delimited JSON (see
 //! `guest/cinit-proto`). QEMU owns the socket (`server=on,wait=off`); the
-//! host connects as a client, like the QGA client does.
+//! host connects as a client, like the vmlab-agent client does.
 //!
 //! A background reader task parses incoming lines into
 //! [`vmlab_cinit_proto::CtlEvent`]s, fans them out on a broadcast channel,
@@ -180,7 +180,7 @@ mod tests {
     const SHORT: Duration = Duration::from_millis(200);
 
     /// Bind the socket (as QEMU would) and hand the accepted connection to
-    /// `serve`, mirroring the QGA client's mock-server tests.
+    /// `serve`, mirroring the vmlab-agent client's mock-server tests.
     async fn spawn_mock<F, Fut>(serve: F) -> (tempfile::TempDir, PathBuf)
     where
         F: FnOnce(UnixStream) -> Fut + Send + 'static,
