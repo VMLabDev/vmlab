@@ -10,8 +10,8 @@ use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
 
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS, HANDLE, LUID};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-    GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
+    IP_ADAPTER_ADDRESSES_LH,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6};
 use windows_sys::Win32::Security::{
@@ -209,9 +209,8 @@ fn hostname() -> String {
     let mut buf = [0u16; 256];
     let mut len = buf.len() as u32;
     // SAFETY: wide buffer out-param with in/out length.
-    let ok = unsafe {
-        GetComputerNameExW(ComputerNamePhysicalDnsHostname, buf.as_mut_ptr(), &mut len)
-    };
+    let ok =
+        unsafe { GetComputerNameExW(ComputerNamePhysicalDnsHostname, buf.as_mut_ptr(), &mut len) };
     if ok == 0 {
         return String::new();
     }
