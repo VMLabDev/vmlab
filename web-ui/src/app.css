@@ -612,6 +612,7 @@
 }
 .remote-attached { display: flex; flex-direction: column; gap: 4px; margin: 4px 0 10px; }
 .remote-attached-row {
+  display: flex; align-items: center; gap: 6px;
   text-align: left; padding: 5px 9px; border: 1px solid var(--border-subtle);
   border-radius: 6px; background: var(--bg-1); color: var(--fg-1); cursor: pointer;
   font: inherit; font-size: 12px;
@@ -779,6 +780,20 @@
 }
 .topo-playbook-port:hover circle,
 .topo-playbook-port.active circle { fill: var(--success-fg); stroke-width: 3; }
+.topo-play-placeholder { fill: var(--fg-3); font: italic 8px/1 var(--font-mono); pointer-events: none; }
+.topo-play-row > rect {
+  fill: color-mix(in oklab, var(--success-bg) 26%, var(--bg-1)); pointer-events: none;
+}
+.topo-play-row > text {
+  fill: var(--fg-1); font: 600 8px/1 var(--font-mono); pointer-events: none;
+}
+.topo-play-row > text.scope {
+  fill: var(--fg-3); text-anchor: end; font-size: 7px; letter-spacing: 0.05em;
+}
+.topo-play-row.inactive > rect { fill: var(--bg-1); }
+.topo-play-row.inactive > text { fill: var(--fg-3); }
+.topo-play-row.warn > text:not(.scope) { fill: var(--warning-fg); }
+.topo-play-row.selected > rect { stroke: var(--accent); stroke-width: 1.5; }
 .topo-event-link-line,
 .topo-event-link-draft {
   fill: none; stroke: var(--accent); stroke-width: 1.7; stroke-dasharray: 2 3;
@@ -862,6 +877,19 @@
 }
 .inspector-name { font-weight: 600; }
 .inspector-note { color: var(--fg-3); font-size: var(--fs-sm); }
+.inspector-note.inspector-warn { color: var(--warning-fg); }
+.inspector-subhead {
+  color: var(--fg-2); font-size: var(--fs-xs); font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase; margin-top: 6px;
+}
+.inspector-row { display: flex; align-items: flex-end; gap: 6px; }
+.inspector-row > :first-child { flex: 1; }
+.inspector-backlink {
+  background: none; border: none; padding: 0; text-align: left; cursor: pointer;
+  color: var(--fg-3); font-size: var(--fs-sm); font-family: var(--font-mono);
+}
+.inspector-backlink:hover { color: var(--accent); }
+.remote-attached-row .badge { margin-left: auto; }
 .inspector-fields {
   min-width: 0; margin: 0; padding: 0; border: 0;
   display: flex; flex-direction: column; gap: var(--sp-4);

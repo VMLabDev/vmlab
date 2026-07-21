@@ -4,7 +4,7 @@
 
 import { createStore, produce } from "solid-js/store";
 import * as api from "../api";
-import type { CatalogMeta, ConfigIssue, HostInfo, StoreTemplate } from "../api";
+import type { CatalogMeta, ConfigIssue, HostInfo, PlaysInfo, StoreTemplate } from "../api";
 import { StaleRev, ValidationError } from "../api";
 import { registerNavGuard, showToast } from "../store";
 import { confirmDialog } from "../components/dialogs";
@@ -28,7 +28,8 @@ export type Selection =
   | { kind: "vm"; index: number }
   | { kind: "container"; index: number }
   | { kind: "provision"; index: number }
-  | { kind: "playbook"; index: number }
+  /** A playbook folder node (`play` unset) or one play card inside it. */
+  | { kind: "playbook"; path: string; play?: string }
   | { kind: "nat" }
   | { kind: "remote"; host: string };
 
@@ -61,6 +62,15 @@ interface EditorState {
   /** Host sockets not yet attached to a machine. Once cabled they become a
    *  normal segment forward or container port block in the WCL draft. */
   hostPortDrafts: HostPortDraft[];
+  /** Playbook folder nodes with no `playbook {}` blocks yet — a node whose
+   *  plays are all unconnected writes nothing to WCL. Persisted per lab in
+   *  localStorage like remoteDrafts. */
+  playbookDrafts: string[];
+  /** Enumerated plays per playbook folder path (GET /playbooks/plays). */
+  playbookPlays: Record<string, PlaysInfo | "loading">;
+  /** Hand-typed play cards (per path) for folders that aren't scaffolded
+   *  yet — visual only until connected/toggled, like playbookDrafts. */
+  playbookPlayDrafts: Record<string, string[]>;
   catalog: {
     templates: StoreTemplate[];
     profiles: string[];
@@ -85,6 +95,9 @@ const [editor, setEditor] = createStore<EditorState>({
   issues: [],
   remoteDrafts: [],
   hostPortDrafts: [],
+  playbookDrafts: [],
+  playbookPlays: {},
+  playbookPlayDrafts: {},
   catalog: { templates: [], profiles: [], meta: null, host: null },
 });
 
@@ -115,6 +128,9 @@ export async function openEditor(lab: string) {
     selection: { kind: "lab" },
     remoteDrafts: loadRemoteDrafts(lab),
     hostPortDrafts: loadHostPortDrafts(lab),
+    playbookDrafts: loadPlaybookDrafts(lab),
+    playbookPlays: {},
+    playbookPlayDrafts: {},
   });
   await Promise.all([reloadModel(lab), loadCatalogs()]);
 }
@@ -361,6 +377,7 @@ export async function reloadModel(lab = editor.lab): Promise<void> {
       draft: deepClone(doc.lab),
       templatesInFile: doc.templates,
     });
+    fetchAllPlays();
   } catch (e) {
     if (editor.lab !== lab) return;
     const msg =
@@ -449,17 +466,176 @@ export function removeProvision(index: number) {
   select({ kind: "lab" });
 }
 
-export function addPlaybook(path: string): number {
-  const draft = editor.draft;
-  if (!draft) return -1;
-  const play = path.split("/").pop() || "main";
-  setEditor("draft", "playbooks", draft.playbooks.length, { span: null, path, play, vms: [] });
-  const index = editor.draft!.playbooks.length - 1;
-  select({ kind: "playbook", index });
-  return index;
+// --- playbook folder nodes -----------------------------------------------------
+//
+// The canvas shows one node per playbook *folder* with a card per play; the
+// WCL stays one `playbook {}` block per (path, play). A block exists iff its
+// card has targets or is toggled all-machines — an unconnected play is simply
+// not run (never an implicit empty-vms "all machines" block).
+
+const playbooksKey = (lab: string) => `vmlab.editor.playbooks.${lab}`;
+
+function loadPlaybookDrafts(lab: string): string[] {
+  try {
+    const raw = localStorage.getItem(playbooksKey(lab));
+    const list = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(list) ? list.filter((p) => typeof p === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
-export function removePlaybook(index: number) {
+function persistPlaybookDrafts() {
+  if (!editor.lab) return;
+  try {
+    localStorage.setItem(playbooksKey(editor.lab), JSON.stringify(editor.playbookDrafts));
+  } catch {
+    /* quota — cosmetic data, ignore */
+  }
+}
+
+/** Fetch (or refresh) the play enumeration for one folder path. */
+export async function fetchPlays(path: string) {
+  const lab = editor.lab;
+  if (!lab || !path) return;
+  if (!editor.playbookPlays[path]) setEditor("playbookPlays", path, "loading");
+  try {
+    const info = await api.listPlaybookPlays(lab, path);
+    if (editor.lab !== lab) return;
+    setEditor("playbookPlays", path, info);
+  } catch {
+    // Bad path (still being typed) or transport error — treat as unscanned.
+    if (editor.lab !== lab) return;
+    setEditor("playbookPlays", path, {
+      exists: false,
+      playbook: null,
+      plays: [],
+      error: null,
+    });
+  }
+}
+
+/** Refresh play enumerations for every folder the draft references. */
+function fetchAllPlays() {
+  const paths = new Set([
+    ...(editor.draft?.playbooks ?? []).map((p) => p.path),
+    ...editor.playbookDrafts,
+  ]);
+  for (const path of paths) void fetchPlays(path);
+}
+
+/** One play row inside a playbook folder node. */
+export interface PlayCard {
+  play: string;
+  description: string | null;
+  /** Canonical block index in draft.playbooks, or null when unreferenced. */
+  blockIndex: number | null;
+  targets: string[];
+  /** Block exists with an empty vms list — runs on every machine. */
+  allMachines: boolean;
+  /** Referenced in vmlab.wcl but not defined in the folder's playbook.wcl. */
+  missingFromFolder: boolean;
+  /** Extra blocks sharing this (path, play) — flagged, mergeable. */
+  duplicateBlockIndexes: number[];
+}
+
+export interface PlaybookGroup {
+  path: string;
+  cards: PlayCard[];
+  /** Raw enumeration state for warnings (undefined = not fetched yet). */
+  plays: PlaysInfo | "loading" | undefined;
+}
+
+/** The designer's playbook nodes: distinct folder paths from the draft's
+ *  blocks plus unattached drafts, each carrying a card per play (enumerated
+ *  from the folder, in file order, then block-only plays flagged). */
+export function playbookGroups(): PlaybookGroup[] {
+  const draft = editor.draft;
+  if (!draft) return [];
+  const paths = [
+    ...new Set([...draft.playbooks.map((p) => p.path), ...editor.playbookDrafts]),
+  ];
+  return paths.map((path) => {
+    const info = editor.playbookPlays[path];
+    const scanned = typeof info === "object" && info.exists && !info.error;
+    const cards: PlayCard[] = (typeof info === "object" ? info.plays : []).map((p) => ({
+      play: p.name,
+      description: p.description,
+      blockIndex: null,
+      targets: [],
+      allMachines: false,
+      missingFromFolder: false,
+      duplicateBlockIndexes: [],
+    }));
+    for (const play of editor.playbookPlayDrafts[path] ?? []) {
+      if (cards.some((c) => c.play === play)) continue;
+      cards.push({
+        play,
+        description: null,
+        blockIndex: null,
+        targets: [],
+        allMachines: false,
+        missingFromFolder: false,
+        duplicateBlockIndexes: [],
+      });
+    }
+    draft.playbooks.forEach((block, index) => {
+      if (block.path !== path) return;
+      let card = cards.find((c) => c.play === block.play);
+      if (!card) {
+        card = {
+          play: block.play,
+          description: null,
+          blockIndex: null,
+          targets: [],
+          allMachines: false,
+          // Only a completed scan can say the play is genuinely absent.
+          missingFromFolder: scanned,
+          duplicateBlockIndexes: [],
+        };
+        cards.push(card);
+      }
+      if (card.blockIndex === null) {
+        card.blockIndex = index;
+        card.targets = block.vms;
+        card.allMachines = block.vms.length === 0;
+      } else {
+        card.duplicateBlockIndexes.push(index);
+      }
+    });
+    return { path, cards, plays: info };
+  });
+}
+
+export function playbookGroup(path: string): PlaybookGroup | undefined {
+  return playbookGroups().find((group) => group.path === path);
+}
+
+/** Hand-add a play card (inspector "Add play") — visual only until it is
+ *  connected to a machine or toggled all-machines. */
+export function addPlaybookPlayDraft(path: string, play: string) {
+  if (!play || playbookGroup(path)?.cards.some((card) => card.play === play)) return;
+  setEditor("playbookPlayDrafts", path, [
+    ...(editor.playbookPlayDrafts[path] ?? []),
+    play,
+  ]);
+}
+
+/** Toolbar: create a folder node (draft-only — no block until a play is
+ *  connected or toggled all-machines), selected on its path field. */
+export function addPlaybook(path: string) {
+  if (!playbookGroups().some((group) => group.path === path)) {
+    setEditor("playbookDrafts", editor.playbookDrafts.length, path);
+    persistPlaybookDrafts();
+  }
+  select({ kind: "playbook", path });
+  void fetchPlays(path);
+}
+
+/** Remove one `playbook {}` block, keeping the folder node on the canvas as
+ *  a draft when its last block goes. */
+function removePlaybookBlock(index: number) {
+  const path = editor.draft?.playbooks[index]?.path;
   setEditor(
     "draft",
     "playbooks",
@@ -467,7 +643,150 @@ export function removePlaybook(index: number) {
       playbooks.splice(index, 1);
     }),
   );
+  if (
+    path !== undefined &&
+    !editor.draft?.playbooks.some((p) => p.path === path) &&
+    !editor.playbookDrafts.includes(path)
+  ) {
+    setEditor("playbookDrafts", editor.playbookDrafts.length, path);
+    persistPlaybookDrafts();
+  }
+}
+
+/** Delete the whole folder node: every block with that path + the draft entry. */
+export function removePlaybookFolder(path: string) {
+  setEditor(
+    "draft",
+    produce((d: LabModel | null) => {
+      if (!d) return;
+      d.playbooks = d.playbooks.filter((p) => p.path !== path);
+    }),
+  );
+  setEditor(
+    "playbookDrafts",
+    editor.playbookDrafts.filter((p) => p !== path),
+  );
+  setEditor("playbookPlayDrafts", path, undefined!);
+  persistPlaybookDrafts();
   select({ kind: "lab" });
+}
+
+/** First connection of an unreferenced play: create its block. */
+export function addPlaybookPlay(path: string, play: string, target: string) {
+  const draft = editor.draft;
+  if (!draft || !machineNames().includes(target)) return;
+  setEditor("draft", "playbooks", draft.playbooks.length, {
+    span: null,
+    path,
+    play,
+    vms: [target],
+  });
+}
+
+/** Detach one target; the block dies with its last edge (empty vms means
+ *  "all machines" in WCL — never left behind implicitly). */
+export function removePlaybookCardTarget(blockIndex: number, target: string) {
+  const playbook = editor.draft?.playbooks[blockIndex];
+  if (!playbook) return;
+  const next = playbook.vms.filter((name) => name !== target);
+  if (next.length === 0) removePlaybookBlock(blockIndex);
+  else setEditor("draft", "playbooks", blockIndex, "vms", next);
+}
+
+/** Remove every block for one (path, play) — the play stops running; the
+ *  folder node stays on the canvas. */
+export function removePlaybookPlay(path: string, play: string) {
+  setEditor(
+    "draft",
+    produce((d: LabModel | null) => {
+      if (!d) return;
+      d.playbooks = d.playbooks.filter((p) => p.path !== path || p.play !== play);
+    }),
+  );
+  if (
+    !editor.draft?.playbooks.some((p) => p.path === path) &&
+    !editor.playbookDrafts.includes(path)
+  ) {
+    setEditor("playbookDrafts", editor.playbookDrafts.length, path);
+    persistPlaybookDrafts();
+  }
+}
+
+/** Explicit "run on every machine": block with an empty vms list. Turning
+ *  it off removes a target-less block (the play stops running). */
+export function setPlaybookAllMachines(path: string, play: string, on: boolean) {
+  const draft = editor.draft;
+  if (!draft) return;
+  const index = draft.playbooks.findIndex((p) => p.path === path && p.play === play);
+  if (on) {
+    if (index >= 0) setEditor("draft", "playbooks", index, "vms", []);
+    else {
+      setEditor("draft", "playbooks", draft.playbooks.length, {
+        span: null,
+        path,
+        play,
+        vms: [],
+      });
+    }
+  } else if (index >= 0 && draft.playbooks[index].vms.length === 0) {
+    removePlaybookBlock(index);
+  }
+}
+
+/** Re-path a folder node: rewrite every block in the group, the draft entry,
+ *  the selection, and refresh the enumeration. Renaming onto an existing
+ *  node merges. */
+export function renamePlaybookPath(from: string, to: string) {
+  if (from === to || !to) return;
+  setEditor(
+    "draft",
+    produce((d: LabModel | null) => {
+      if (!d) return;
+      for (const p of d.playbooks) {
+        if (p.path === from) p.path = to;
+      }
+    }),
+  );
+  setEditor(
+    "playbookDrafts",
+    editor.playbookDrafts.filter((p) => p !== from && p !== to).concat(
+      // Keep a draft entry only while no block references the new path.
+      editor.draft?.playbooks.some((p) => p.path === to) ? [] : [to],
+    ),
+  );
+  const playDrafts = editor.playbookPlayDrafts[from];
+  if (playDrafts) {
+    setEditor("playbookPlayDrafts", from, undefined!);
+    setEditor("playbookPlayDrafts", to, [
+      ...new Set([...(editor.playbookPlayDrafts[to] ?? []), ...playDrafts]),
+    ]);
+  }
+  persistPlaybookDrafts();
+  if (editor.selection.kind === "playbook" && editor.selection.path === from) {
+    select({ kind: "playbook", path: to, play: editor.selection.play });
+  }
+  // Renames arrive one keystroke at a time from the inspector — debounce
+  // the enumeration fetch until typing settles.
+  clearTimeout(renameFetchTimer);
+  renameFetchTimer = setTimeout(() => void fetchPlays(to), 400);
+}
+
+let renameFetchTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Collapse duplicate (path, play) blocks: union their targets into the
+ *  first block and drop the extras. */
+export function mergePlaybookDuplicates(path: string, play: string) {
+  setEditor(
+    "draft",
+    produce((d: LabModel | null) => {
+      if (!d) return;
+      const dupes = d.playbooks.filter((p) => p.path === path && p.play === play);
+      const first = dupes[0];
+      if (!first || dupes.length < 2) return;
+      first.vms = [...new Set(dupes.flatMap((p) => p.vms))];
+      d.playbooks = d.playbooks.filter((p) => p === first || p.path !== path || p.play !== play);
+    }),
+  );
 }
 
 export function removeVm(index: number) {
@@ -578,18 +897,6 @@ export function addPlaybookTarget(index: number, target: string) {
   const playbook = editor.draft?.playbooks[index];
   if (!playbook || playbook.vms.includes(target) || !machineNames().includes(target)) return;
   setEditor("draft", "playbooks", index, "vms", [...playbook.vms, target]);
-}
-
-export function removePlaybookTarget(index: number, target: string) {
-  const playbook = editor.draft?.playbooks[index];
-  if (!playbook) return;
-  setEditor(
-    "draft",
-    "playbooks",
-    index,
-    "vms",
-    playbook.vms.filter((name) => name !== target),
-  );
 }
 
 export function addScriptEventHandler(script: string, event: string): number {
@@ -921,6 +1228,8 @@ export async function saveDraft(): Promise<boolean> {
         conflict: false,
       });
     }
+    // A save may have scaffolded playbook folders — refresh the play lists.
+    fetchAllPlays();
     showToast("Config saved");
     return true;
   } catch (e) {
@@ -990,7 +1299,9 @@ export function selectionForLine(line: number | null): Selection | null {
     if (contains(base.provisions[i].span)) return { kind: "provision", index: i };
   }
   for (let i = 0; i < base.playbooks.length; i++) {
-    if (contains(base.playbooks[i].span)) return { kind: "playbook", index: i };
+    if (contains(base.playbooks[i].span)) {
+      return { kind: "playbook", path: base.playbooks[i].path, play: base.playbooks[i].play };
+    }
   }
   return null;
 }

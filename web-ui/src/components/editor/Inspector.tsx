@@ -30,12 +30,18 @@ import { formatByteSize, formatMemory, parseByteSize } from "../../editor/bytesi
 import {
   addMachineNic,
   addNic,
+  addPlaybookPlayDraft,
   addScriptEventHandler,
   editor,
+  mergePlaybookDuplicates,
+  playbookGroup,
   removeContainer,
   removeEventHandler,
-  removePlaybook,
+  removePlaybookFolder,
+  removePlaybookPlay,
   removeProvision,
+  renamePlaybookPath,
+  setPlaybookAllMachines,
   removeRemote,
   removeSegment,
   removeVm,
@@ -106,10 +112,11 @@ export default function Inspector(props: {
             onEdit={props.onEditProvision}
           />
         </Show>
-        <Show
-          when={sel().kind === "playbook" && editor.draft?.playbooks[(sel() as any).index]}
-        >
-          <PlaybookInspector index={(sel() as { index: number }).index} />
+        <Show when={sel().kind === "playbook"}>
+          <PlaybookInspector
+            path={(sel() as { path: string }).path}
+            play={(sel() as { play?: string }).play}
+          />
         </Show>
       </fieldset>
       {/* Outside the read-only fieldset on purpose: the segment tabs stay
@@ -121,13 +128,11 @@ export default function Inspector(props: {
       </Show>
       {/* Outside the read-only fieldset on purpose: playbook FILES stay
           editable while machines run — that is the edit→check dev loop. */}
-      <Show when={sel().kind === "playbook" && editor.draft?.playbooks[(sel() as any).index]}>
+      <Show when={sel().kind === "playbook"}>
         <Button
           icon={FileCode2}
           variant="primary"
-          onClick={() =>
-            props.onEditPlaybook(editor.draft!.playbooks[(sel() as any).index].path)
-          }
+          onClick={() => props.onEditPlaybook((sel() as { path: string }).path)}
         >
           Edit in Files tab
         </Button>
@@ -302,103 +307,264 @@ function ProvisionInspector(props: { index: number; onEdit: (path: string) => vo
   );
 }
 
-function PlaybookInspector(props: { index: number }) {
-  const playbook = () => editor.draft!.playbooks[props.index];
+function PlaybookInspector(props: { path: string; play?: string }) {
+  const group = () => playbookGroup(props.path);
+  const card = () =>
+    props.play !== undefined
+      ? group()?.cards.find((candidate) => candidate.play === props.play)
+      : undefined;
+  return (
+    <Show
+      when={props.play !== undefined && card()}
+      fallback={<PlaybookFolderInspector path={props.path} />}
+    >
+      <PlayCardInspector path={props.path} play={props.play!} />
+    </Show>
+  );
+}
+
+function playCardBadge(card: {
+  allMachines: boolean;
+  targets: string[];
+  blockIndex: number | null;
+}) {
+  return card.allMachines
+    ? { tone: "success" as const, label: "all machines" }
+    : card.targets.length
+      ? { tone: "success" as const, label: `${card.targets.length} targeted` }
+      : { tone: "neutral" as const, label: "not run" };
+}
+
+function PlaybookFolderInspector(props: { path: string }) {
+  const group = () => playbookGroup(props.path);
+  const plays = () => group()?.plays;
+  const [newPlay, setNewPlay] = createSignal("");
   const pathIssue = () => {
-    const p = playbook().path;
+    const p = props.path;
     if (!p) return "Path is required";
     if (p.startsWith("/")) return "Path must be relative to the lab root";
     if (p.split("/").some((part) => part === "..")) return "Path cannot leave the lab root";
     return null;
   };
+  const blockCount = () =>
+    editor.draft?.playbooks.filter((playbook) => playbook.path === props.path).length ?? 0;
   async function remove() {
     if (
       await confirmDialog({
-        title: `Delete playbook "${playbook().path}"?`,
-        body: "The playbook block will be removed. Its folder and files will be preserved.",
+        title: `Delete playbook "${props.path}"?`,
+        body: blockCount()
+          ? `${blockCount()} playbook block(s) will be removed from vmlab.wcl. The folder and its files will be preserved.`
+          : "The folder and its files will be preserved.",
         confirmLabel: "Delete playbook",
         danger: true,
       })
     ) {
-      removePlaybook(props.index);
+      removePlaybookFolder(props.path);
     }
+  }
+  function addPlay() {
+    const play = newPlay().trim();
+    if (!play) return;
+    addPlaybookPlayDraft(props.path, play);
+    setNewPlay("");
+    select({ kind: "playbook", path: props.path, play });
   }
   return (
     <>
       <div class="inspector-head">
         <span class="inspector-kind">playbook</span>
-        <span class="inspector-name">#{props.index + 1}</span>
+        <span class="inspector-name">{props.path.split("/").pop() || props.path}</span>
         <Button variant="danger" size="sm" icon={Trash2} onClick={() => void remove()}>
           Delete
         </Button>
       </div>
       <Input
         label="Folder"
-        value={playbook().path}
+        value={props.path}
         placeholder="playbooks/baseline"
         error={pathIssue() !== null}
         help={pathIssue() ?? "config-weave playbook folder, relative to the lab root"}
         onInput={(e: InputEvent) =>
-          setEditor(
-            "draft",
-            "playbooks",
-            props.index,
-            "path",
-            (e.currentTarget as HTMLInputElement).value,
-          )
+          renamePlaybookPath(props.path, (e.currentTarget as HTMLInputElement).value)
         }
       />
-      <Input
-        label="Play"
-        value={playbook().play}
-        placeholder="baseline"
-        error={!playbook().play}
-        help="The play inside the playbook to check/apply"
-        onInput={(e: InputEvent) =>
-          setEditor(
-            "draft",
-            "playbooks",
-            props.index,
-            "play",
-            (e.currentTarget as HTMLInputElement).value,
-          )
+      <Show
+        when={typeof plays() === "object" && (plays() as { error: string | null }).error}
+        keyed
+      >
+        {(error) => (
+          <div class="inspector-note inspector-warn">
+            playbook.wcl could not be scanned: {error}
+          </div>
+        )}
+      </Show>
+      <div class="inspector-subhead">Plays</div>
+      <Show
+        when={group()?.cards.length}
+        fallback={
+          <div class="inspector-note">
+            {plays() === "loading" || plays() === undefined
+              ? "Scanning playbook.wcl…"
+              : "No plays yet — add one below; the folder is scaffolded on save."}
+          </div>
         }
-      />
-      <Badge tone={playbook().vms.length ? "success" : "neutral"}>
-        {playbook().vms.length ? `${playbook().vms.length} targeted` : "ALL MACHINES"}
-      </Badge>
-      <Show when={playbook().vms.length}>
+      >
         <div class="remote-attached">
-          <For each={playbook().vms}>
-            {(name) => (
-              <button
-                class="remote-attached-row"
-                onClick={() => {
-                  const vm = editor.draft!.vms.findIndex((candidate) => candidate.name === name);
-                  const container = editor.draft!.containers.findIndex(
-                    (candidate) => candidate.name === name,
-                  );
-                  if (vm >= 0) select({ kind: "vm", index: vm });
-                  else if (container >= 0) select({ kind: "container", index: container });
-                }}
-              >
-                {name}
-              </button>
-            )}
+          <For each={group()?.cards ?? []}>
+            {(playCard) => {
+              const badge = () => playCardBadge(playCard);
+              return (
+                <button
+                  class="remote-attached-row"
+                  onClick={() =>
+                    select({ kind: "playbook", path: props.path, play: playCard.play })
+                  }
+                >
+                  {playCard.play}
+                  {playCard.missingFromFolder || playCard.duplicateBlockIndexes.length
+                    ? " ⚠"
+                    : ""}
+                  <Badge tone={badge().tone}>{badge().label}</Badge>
+                </button>
+              );
+            }}
           </For>
         </div>
       </Show>
-      <Show when={playbook().span === null}>
+      <div class="inspector-row">
+        <Input
+          label="Add play"
+          value={newPlay()}
+          placeholder="baseline"
+          onInput={(e: InputEvent) => setNewPlay((e.currentTarget as HTMLInputElement).value)}
+          onKeyDown={(e: KeyboardEvent) => {
+            if (e.key === "Enter") addPlay();
+          }}
+        />
+        <Button size="sm" icon={Plus} onClick={addPlay}>
+          Add
+        </Button>
+      </div>
+      <Show when={typeof plays() === "object" && !(plays() as { exists: boolean }).exists}>
         <div class="inspector-note">
-          Save the lab config to declare this playbook — opening it in the Files tab scaffolds
-          its files afterwards.
+          The folder has no playbook.wcl yet — save the lab config, then open it in the Files
+          tab to scaffold its files.
         </div>
       </Show>
       <div class="inspector-note">
-        Drag the TARGETS port on the canvas onto VMs or containers. With no targets, the play
-        applies to every machine on <code>up</code>.
+        Each play wears its own TARGETS port on the canvas — drag it onto the VMs or
+        containers that play converges. A play with no connections does not run.
       </div>
     </>
+  );
+}
+
+function PlayCardInspector(props: { path: string; play: string }) {
+  const group = () => playbookGroup(props.path);
+  const card = () => group()?.cards.find((candidate) => candidate.play === props.play);
+  async function stopRunning() {
+    if (
+      await confirmDialog({
+        title: `Stop running play "${props.play}"?`,
+        body: "Removes its playbook block from vmlab.wcl. The files are preserved.",
+        confirmLabel: "Stop running",
+        danger: true,
+      })
+    ) {
+      removePlaybookPlay(props.path, props.play);
+    }
+  }
+  async function toggleAllMachines(on: boolean) {
+    const targets = card()?.targets ?? [];
+    if (
+      on &&
+      targets.length &&
+      !(await confirmDialog({
+        title: "Run on all machines?",
+        body: `The ${targets.length} explicit target(s) will be replaced by an all-machines scope.`,
+        confirmLabel: "Run on all",
+      }))
+    ) {
+      return;
+    }
+    setPlaybookAllMachines(props.path, props.play, on);
+  }
+  return (
+    <Show when={card()} keyed>
+      {(playCard) => (
+        <>
+          <div class="inspector-head">
+            <span class="inspector-kind">play</span>
+            <span class="inspector-name">{props.play}</span>
+            <Show when={playCard.blockIndex !== null}>
+              <Button variant="danger" size="sm" icon={Trash2} onClick={() => void stopRunning()}>
+                Stop
+              </Button>
+            </Show>
+          </div>
+          <button
+            class="inspector-backlink"
+            onClick={() => select({ kind: "playbook", path: props.path })}
+          >
+            ← {props.path}
+          </button>
+          <Show when={playCard.description}>
+            <div class="inspector-note">{playCard.description}</div>
+          </Show>
+          <Show when={playCard.missingFromFolder}>
+            <div class="inspector-note inspector-warn">
+              This play is referenced in vmlab.wcl but not defined in the folder's
+              playbook.wcl.
+            </div>
+          </Show>
+          <Show when={playCard.duplicateBlockIndexes.length}>
+            <div class="inspector-note inspector-warn">
+              {playCard.duplicateBlockIndexes.length + 1} playbook blocks declare this play.
+              <Button
+                size="sm"
+                onClick={() => mergePlaybookDuplicates(props.path, props.play)}
+              >
+                Merge targets
+              </Button>
+            </div>
+          </Show>
+          <Toggle
+            checked={playCard.allMachines}
+            onChange={(on: boolean) => void toggleAllMachines(on)}
+          >
+            Run on all machines
+          </Toggle>
+          <Badge tone={playCardBadge(playCard).tone}>{playCardBadge(playCard).label}</Badge>
+          <Show when={playCard.targets.length}>
+            <div class="remote-attached">
+              <For each={playCard.targets}>
+                {(name) => (
+                  <button
+                    class="remote-attached-row"
+                    onClick={() => {
+                      const vm = editor.draft!.vms.findIndex(
+                        (candidate) => candidate.name === name,
+                      );
+                      const container = editor.draft!.containers.findIndex(
+                        (candidate) => candidate.name === name,
+                      );
+                      if (vm >= 0) select({ kind: "vm", index: vm });
+                      else if (container >= 0) select({ kind: "container", index: container });
+                    }}
+                  >
+                    {name}
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
+          <div class="inspector-note">
+            Drag this play's port on the canvas onto VMs or containers. Deleting its last
+            connection stops the play (unless "all machines" is on).
+          </div>
+        </>
+      )}
+    </Show>
   );
 }
 

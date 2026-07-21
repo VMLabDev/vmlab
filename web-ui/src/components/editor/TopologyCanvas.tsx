@@ -46,8 +46,9 @@ import {
   PORT_X0,
   SEG_H,
   NIC_ROW_H,
-  PLAYBOOK_H,
+  PLAYBOOK_HEADER_H,
   PLAYBOOK_W,
+  PLAY_ROW_H,
   PROVISION_H,
   PROVISION_W,
   VM_W,
@@ -57,7 +58,9 @@ import {
   saveLayout,
   segWidthFor,
   machineCardHeight,
+  playbookCardHeight,
   playbookLayoutKey,
+  playbookPos as storedPlaybookPos,
   provisionLayoutKey,
 } from "../../editor/layout";
 import type { ContainerModel, LabModel, NicModel, VmModel } from "../../editor/model";
@@ -68,6 +71,7 @@ import {
   addHostPort,
   addMachineDependency,
   addMachineNic,
+  addPlaybookPlay,
   addPlaybookTarget,
   addProvisionTarget,
   addRemote,
@@ -82,8 +86,10 @@ import {
   removeContainer,
   removeEventHandlerTarget,
   removeMachineDependency,
-  removePlaybook,
-  removePlaybookTarget,
+  removePlaybookCardTarget,
+  removePlaybookFolder,
+  removePlaybookPlay,
+  playbookGroups,
   removeProvision,
   removeProvisionTarget,
   removeRemote,
@@ -222,8 +228,12 @@ interface ProvisionTargetDrag {
   y: number;
 }
 
+/** Cabling one play card of a playbook folder node to a machine. */
 interface PlaybookTargetDrag {
-  playbookIndex: number;
+  path: string;
+  play: string;
+  /** Canonical block index, or null when the play isn't referenced yet. */
+  blockIndex: number | null;
   existing: string | null;
   moved: boolean;
   x: number;
@@ -589,10 +599,11 @@ export default function TopologyCanvas(props: {
   const provisionPosIn = (l: Layout, index: number): NodePos =>
     l.provisions[provisionLayoutKey(model(), index)] ?? { x: 80, y: 360 };
   const provisionPos = (index: number): NodePos => provisionPosIn(layout(), index);
-  const playbookKey = (index: number) => playbookLayoutKey(model(), index);
-  const playbookPosIn = (l: Layout, index: number): NodePos =>
-    (l.playbooks ?? {})[playbookLayoutKey(model(), index)] ?? { x: 80, y: 480 };
-  const playbookPos = (index: number): NodePos => playbookPosIn(layout(), index);
+  /** One node per playbook folder path (blocks grouped, plus drafts). */
+  const pbGroups = createMemo(() => playbookGroups());
+  const playbookNodePosIn = (l: Layout, path: string): NodePos =>
+    storedPlaybookPos(l, path) ?? { x: 80, y: 480 };
+  const playbookNodePos = (path: string): NodePos => playbookNodePosIn(layout(), path);
   /** VMs and containers share the same node geometry on the canvas. */
   const machinePos = (kind: MachineKind, name: string): NodePos =>
     kind === "vm" ? vmPos(name) : ctrPos(name);
@@ -709,24 +720,48 @@ export default function TopologyCanvas(props: {
     return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - (to.x >= from.x ? bend : -bend)} ${to.y}, ${to.x} ${to.y}`;
   }
 
+  /** One edge per (playbook block, target) — drawn from the play's card row. */
   const playbookLinks = createMemo(() =>
-    model().playbooks.flatMap((playbook, playbookIndex) =>
+    model().playbooks.flatMap((playbook, blockIndex) =>
       playbook.vms.flatMap((targetName) => {
         const target = machineRef(targetName);
         return target
-          ? [{ playbookIndex, targetName, targetKind: target.kind, targetIndex: target.index }]
+          ? [
+              {
+                path: playbook.path,
+                play: playbook.play,
+                blockIndex,
+                targetName,
+                targetKind: target.kind,
+                targetIndex: target.index,
+              },
+            ]
           : [];
       }),
     ),
   );
 
-  const playbookPort = (index: number): NodePos => {
-    const position = playbookPos(index);
-    return { x: position.x + PLAYBOOK_W, y: position.y + PLAYBOOK_H / 2 };
+  /** Output port of one play card: right edge, centred on its row. */
+  const playCardPort = (path: string, play: string): NodePos => {
+    const position = playbookNodePos(path);
+    const cards = pbGroups().find((group) => group.path === path)?.cards ?? [];
+    const row = Math.max(
+      0,
+      cards.findIndex((card) => card.play === play),
+    );
+    return {
+      x: position.x + PLAYBOOK_W,
+      y: position.y + PLAYBOOK_HEADER_H + row * PLAY_ROW_H + PLAY_ROW_H / 2,
+    };
   };
 
-  function playbookLinkPath(index: number, targetKind: MachineKind, targetName: string): string {
-    const from = playbookPort(index);
+  function playbookLinkPath(
+    path: string,
+    play: string,
+    targetKind: MachineKind,
+    targetName: string,
+  ): string {
+    const from = playCardPort(path, play);
     const to = dependencyTarget(targetKind, targetName, from);
     const bend = Math.max(34, Math.min(90, Math.abs(to.x - from.x) * 0.35));
     return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - (to.x >= from.x ? bend : -bend)} ${to.y}, ${to.x} ${to.y}`;
@@ -895,10 +930,10 @@ export default function TopologyCanvas(props: {
       const p = provisionPosIn(l, index);
       boxes.push({ x: p.x, y: p.y, w: PROVISION_W, h: provisionCardHeight(index) });
     });
-    model().playbooks.forEach((_, index) => {
-      const p = playbookPosIn(l, index);
-      boxes.push({ x: p.x, y: p.y, w: PLAYBOOK_W, h: PLAYBOOK_H });
-    });
+    for (const group of pbGroups()) {
+      const p = playbookNodePosIn(l, group.path);
+      boxes.push({ x: p.x, y: p.y, w: PLAYBOOK_W, h: playbookCardHeight(group.cards.length) });
+    }
 
     const minWidth = Math.max(320, 188 + model().name.length * 8);
     if (!boxes.length) return { x: 60, y: 30, width: minWidth, height: 92 };
@@ -1253,7 +1288,7 @@ export default function TopologyCanvas(props: {
           : kind === "provision"
             ? provisionPos(model().provisions.findIndex((_, index) => provisionKey(index) === name))
           : kind === "playbook"
-            ? playbookPos(model().playbooks.findIndex((_, index) => playbookKey(index) === name))
+            ? playbookNodePos(name)
           : kind === "segment"
             ? segPos(name)
             : kind === "remote"
@@ -1330,25 +1365,32 @@ export default function TopologyCanvas(props: {
     });
   }
 
-  function playbookTargetDown(e: PointerEvent, playbookIndex: number) {
+  function playbookTargetDown(
+    e: PointerEvent,
+    path: string,
+    play: string,
+    blockIndex: number | null,
+  ) {
     e.stopPropagation();
     if (anyVmRunning()) {
-      select({ kind: "playbook", index: playbookIndex });
+      select({ kind: "playbook", path, play });
       return;
     }
     const point = world(e);
-    setPlaybookTargetDrag({ playbookIndex, existing: null, moved: false, ...point });
+    setPlaybookTargetDrag({ path, play, blockIndex, existing: null, moved: false, ...point });
   }
 
   function playbookLinkGrab(
     e: PointerEvent,
-    link: { playbookIndex: number; targetName: string },
+    link: { path: string; play: string; blockIndex: number; targetName: string },
   ) {
     e.stopPropagation();
     if (anyVmRunning()) return;
     const point = world(e);
     setPlaybookTargetDrag({
-      playbookIndex: link.playbookIndex,
+      path: link.path,
+      play: link.play,
+      blockIndex: link.blockIndex,
       existing: link.targetName,
       moved: false,
       ...point,
@@ -1584,8 +1626,7 @@ export default function TopologyCanvas(props: {
           const index = model().provisions.findIndex((_, i) => provisionKey(i) === d.name);
           if (index >= 0) select({ kind: "provision", index });
         } else if (d.kind === "playbook") {
-          const index = model().playbooks.findIndex((_, i) => playbookKey(i) === d.name);
-          if (index >= 0) select({ kind: "playbook", index });
+          select({ kind: "playbook", path: d.name });
         } else if (d.kind === "segment") {
           const i = model().segments.findIndex((s) => s.name === d.name);
           if (i >= 0) select({ kind: "segment", index: i });
@@ -1661,16 +1702,25 @@ export default function TopologyCanvas(props: {
     if (pbd) {
       setPlaybookTargetDrag(null);
       if (!pbd.moved) {
-        select({ kind: "playbook", index: pbd.playbookIndex });
+        select({ kind: "playbook", path: pbd.path, play: pbd.play });
         return;
       }
       const point = world(e);
       const target = machineTargetAt(point.x, point.y);
       const targetName = target ? machinesOf(target.kind)[target.index]?.name ?? null : null;
-      if (pbd.existing && targetName !== pbd.existing) {
-        removePlaybookTarget(pbd.playbookIndex, pbd.existing);
+      // Detaching the last edge deletes the play's block (an unconnected
+      // play is "not run" — never an implicit empty-vms all-machines block).
+      if (pbd.existing && targetName !== pbd.existing && pbd.blockIndex !== null) {
+        removePlaybookCardTarget(pbd.blockIndex, pbd.existing);
       }
-      if (targetName) addPlaybookTarget(pbd.playbookIndex, targetName);
+      if (targetName) {
+        // Re-resolve: the detach above may have removed/shifted the block.
+        const blockIndex = model().playbooks.findIndex(
+          (playbook) => playbook.path === pbd.path && playbook.play === pbd.play,
+        );
+        if (blockIndex >= 0) addPlaybookTarget(blockIndex, targetName);
+        else addPlaybookPlay(pbd.path, pbd.play, targetName);
+      }
       return;
     }
     const ed = eventTargetDrag();
@@ -1829,16 +1879,30 @@ export default function TopologyCanvas(props: {
         removeProvision(sel.index);
       }
     } else if (sel.kind === "playbook") {
-      const playbook = model().playbooks[sel.index];
-      if (
-        playbook &&
-        (await confirmDialog({
-          title: `Delete playbook "${playbook.path}"?`,
+      if (sel.play !== undefined) {
+        // A play card: only its block(s) go — the folder node stays.
+        const hasBlock = model().playbooks.some(
+          (playbook) => playbook.path === sel.path && playbook.play === sel.play,
+        );
+        if (
+          hasBlock &&
+          (await confirmDialog({
+            title: `Stop running play "${sel.play}"?`,
+            body: "Removes its playbook block from vmlab.wcl; the files are preserved.",
+            danger: true,
+          }))
+        ) {
+          removePlaybookPlay(sel.path, sel.play);
+          select({ kind: "playbook", path: sel.path });
+        }
+      } else if (
+        await confirmDialog({
+          title: `Delete playbook "${sel.path}"?`,
           body: "The playbook folder and its files will be preserved.",
           danger: true,
-        }))
+        })
       ) {
-        removePlaybook(sel.index);
+        removePlaybookFolder(sel.path);
       }
     } else if (sel.kind === "remote") {
       if (anyVmRunning()) return;
@@ -1890,11 +1954,11 @@ export default function TopologyCanvas(props: {
       xs.push(p.x, p.x + PROVISION_W);
       ys.push(p.y, p.y + provisionCardHeight(index));
     });
-    model().playbooks.forEach((_, index) => {
-      const p = playbookPos(index);
+    for (const group of pbGroups()) {
+      const p = playbookNodePos(group.path);
       xs.push(p.x, p.x + PLAYBOOK_W);
-      ys.push(p.y, p.y + PLAYBOOK_H);
-    });
+      ys.push(p.y, p.y + playbookCardHeight(group.cards.length));
+    }
     {
       const p = natPos();
       xs.push(p.x, p.x + barWidth(NAT_KEY));
@@ -1950,6 +2014,33 @@ export default function TopologyCanvas(props: {
     lastNames = names;
   });
 
+  // Same trick for playbook folder nodes: an inspector keystroke is one
+  // path rename — migrate the stored position so the node doesn't jump.
+  let lastPlaybookPaths: string[] = [];
+  createEffect(() => {
+    const paths = pbGroups().map((group) => group.path);
+    if (lastPlaybookPaths.length === paths.length) {
+      const changed = paths.findIndex((p, i) => p !== lastPlaybookPaths[i]);
+      if (changed >= 0 && paths.filter((p, i) => p !== lastPlaybookPaths[i]).length === 1) {
+        setLayout((l) => {
+          // Normalize a legacy per-block key first so the position survives.
+          const legacy = `${lastPlaybookPaths[changed]}\0${0}`;
+          const map = { ...(l.playbooks ?? {}) };
+          if (!map[lastPlaybookPaths[changed]] && map[legacy]) {
+            map[lastPlaybookPaths[changed]] = map[legacy];
+          }
+          return renameInLayout(
+            { ...l, playbooks: map },
+            "playbooks",
+            lastPlaybookPaths[changed],
+            paths[changed],
+          );
+        });
+      }
+    }
+    lastPlaybookPaths = [...paths];
+  });
+
   // Same trick for remote nodes: an inspector keystroke is one host rename —
   // migrate its stored position so the node doesn't jump mid-edit.
   let lastRemotes: string[] = [];
@@ -2003,7 +2094,9 @@ export default function TopologyCanvas(props: {
   const selectedProvision = () =>
     editor.selection.kind === "provision" ? editor.selection.index : null;
   const selectedPlaybook = () =>
-    editor.selection.kind === "playbook" ? editor.selection.index : null;
+    editor.selection.kind === "playbook" ? editor.selection.path : null;
+  const selectedPlay = () =>
+    editor.selection.kind === "playbook" ? (editor.selection.play ?? null) : null;
   const eventDragAccepts = (kind: MachineKind) => {
     const drag = eventTargetDrag();
     const accepted = drag ? eventTargetKind(model().handlers[drag.handlerIndex]?.event ?? "") : null;
@@ -2629,12 +2722,13 @@ export default function TopologyCanvas(props: {
               const grabbed = () => {
                 const drag = playbookTargetDrag();
                 return (
-                  drag?.playbookIndex === link.playbookIndex &&
+                  drag?.path === link.path &&
+                  drag.play === link.play &&
                   drag.existing === link.targetName
                 );
               };
               const path = () =>
-                playbookLinkPath(link.playbookIndex, link.targetKind, link.targetName);
+                playbookLinkPath(link.path, link.play, link.targetKind, link.targetName);
               return (
                 <Show when={!grabbed()}>
                   <g
@@ -2646,7 +2740,7 @@ export default function TopologyCanvas(props: {
                       <title>
                         {anyVmRunning()
                           ? "Configuration is locked while a machine is up"
-                          : `${model().playbooks[link.playbookIndex]?.path} applies to ${link.targetName} — drag to re-home or remove`}
+                          : `${link.path} play "${link.play}" applies to ${link.targetName} — drag to re-home or remove`}
                       </title>
                     </path>
                     <path
@@ -2662,7 +2756,7 @@ export default function TopologyCanvas(props: {
 
           <Show when={playbookTargetDrag()}>
             {(drag) => {
-              const from = () => playbookPort(drag().playbookIndex);
+              const from = () => playCardPort(drag().path, drag().play);
               return (
                 <path
                   class="topo-playbook-link-draft"
@@ -3425,30 +3519,40 @@ export default function TopologyCanvas(props: {
             }}
           </For>
 
-          {/* config-weave playbook nodes: same lab-owned workflow shape as
-              provisions — a folder + play applied to targeted machines
-              (empty scope = ALL MACHINES). The pencil opens the playbook
-              in the Files tab; unlike provision scripts, playbook files
-              stay editable while machines run (the edit→check dev loop). */}
-          <For each={model().playbooks}>
-            {(playbook, index) => {
-              const p = () => playbookPos(index());
-              const key = () => playbookKey(index());
-              const folder = () => playbook.path.split("/").pop() || playbook.path;
-              const badge = () =>
-                playbook.vms.length ? `${playbook.vms.length} TARGETED` : "ALL MACHINES";
+          {/* config-weave playbook folder nodes: one node per folder with a
+              card row per play (enumerated from the folder's playbook.wcl;
+              block-only plays flagged). Each row wears its own TARGETS
+              port — edges belong to plays, not the folder; a play with no
+              edges is simply not run. The pencil opens the folder in the
+              Files tab; unlike provision scripts, playbook files stay
+              editable while machines run (the edit→check dev loop). */}
+          <For each={pbGroups()}>
+            {(group) => {
+              const p = () => playbookNodePos(group.path);
+              const folder = () => group.path.split("/").pop() || group.path;
+              const height = () => playbookCardHeight(group.cards.length);
+              const placeholder = () =>
+                group.plays === "loading" || group.plays === undefined
+                  ? "scanning playbook.wcl…"
+                  : group.plays.error
+                    ? "playbook.wcl has a syntax error"
+                    : !group.plays.exists
+                      ? "no playbook.wcl yet — save to scaffold"
+                      : "no plays defined";
               return (
                 <g
                   class="topo-playbook"
-                  classList={{ selected: selectedPlaybook() === index() }}
-                  onPointerDown={(event: PointerEvent) => nodeDown(event, "playbook", key())}
+                  classList={{ selected: selectedPlaybook() === group.path }}
+                  onPointerDown={(event: PointerEvent) =>
+                    nodeDown(event, "playbook", group.path)
+                  }
                 >
                   <rect
                     class="topo-playbook-box"
                     x={p().x}
                     y={p().y}
                     width={PLAYBOOK_W}
-                    height={PLAYBOOK_H}
+                    height={height()}
                     rx="10"
                   />
                   <g
@@ -3458,50 +3562,107 @@ export default function TopologyCanvas(props: {
                     <FolderCog size={18} />
                   </g>
                   <text class="topo-playbook-kind" x={p().x + 38} y={p().y + 16}>
-                    PLAYBOOK #{index() + 1}
+                    PLAYBOOK
                   </text>
                   <text class="topo-playbook-name" x={p().x + 38} y={p().y + 34}>
                     {folder().length > 23 ? `${folder().slice(0, 22)}…` : folder()}
-                    <title>{playbook.path}</title>
+                    <title>{group.path}</title>
                   </text>
-                  <text class="topo-playbook-path" x={p().x + 12} y={p().y + 53}>
-                    play {playbook.play.length > 19 ? `${playbook.play.slice(0, 18)}…` : playbook.play}
-                  </text>
-                  <g class="topo-playbook-badge">
-                    <rect x={p().x + 12} y={p().y + 59} width={badge().length * 5.2 + 12} height="13" rx="6.5" />
-                    <text x={p().x + 18} y={p().y + 68.5}>{badge()}</text>
-                  </g>
                   <g
                     class="topo-playbook-edit"
-                    transform={`translate(${p().x + PLAYBOOK_W - 68} ${p().y + 8})`}
+                    transform={`translate(${p().x + PLAYBOOK_W - 28} ${p().y + 8})`}
                     onPointerDown={(event: PointerEvent) => event.stopPropagation()}
                     onClick={(event: MouseEvent) => {
                       event.stopPropagation();
-                      props.onEditPlaybook(playbook.path);
+                      props.onEditPlaybook(group.path);
                     }}
                   >
                     <rect width="20" height="20" rx="5" />
                     <g transform="translate(4 4)"><FilePenLine size={12} /></g>
                     <title>Edit the playbook in the Files tab</title>
                   </g>
-                  <g
-                    class="topo-playbook-port"
-                    classList={{
-                      active: playbookTargetDrag()?.playbookIndex === index(),
-                      locked: anyVmRunning(),
-                    }}
-                    onPointerDown={(event: PointerEvent) => playbookTargetDown(event, index())}
-                  >
-                    <circle cx={p().x + PLAYBOOK_W} cy={p().y + PLAYBOOK_H / 2} r="5" />
-                    <text x={p().x + PLAYBOOK_W - 9} y={p().y + PLAYBOOK_H / 2 - 9}>
-                      TARGETS
+                  <line
+                    class="topo-provision-event-divider"
+                    x1={p().x}
+                    x2={p().x + PLAYBOOK_W}
+                    y1={p().y + PLAYBOOK_HEADER_H}
+                    y2={p().y + PLAYBOOK_HEADER_H}
+                  />
+                  <Show when={!group.cards.length}>
+                    <text
+                      class="topo-play-placeholder"
+                      x={p().x + 10}
+                      y={p().y + PLAYBOOK_HEADER_H + 16.5}
+                    >
+                      {placeholder()}
                     </text>
-                    <title>
-                      {anyVmRunning()
-                        ? "Configuration is locked while a machine is up"
-                        : "Drag to a VM or container this playbook applies to"}
-                    </title>
-                  </g>
+                  </Show>
+                  <For each={group.cards}>
+                    {(card, row) => {
+                      const y = () => p().y + PLAYBOOK_HEADER_H + row() * PLAY_ROW_H;
+                      const scope = () =>
+                        card.allMachines
+                          ? "ALL MACHINES"
+                          : card.targets.length
+                            ? `${card.targets.length}`
+                            : "NOT RUN";
+                      const warn = () =>
+                        card.missingFromFolder
+                          ? "referenced in vmlab.wcl but not defined in playbook.wcl"
+                          : card.duplicateBlockIndexes.length
+                            ? "duplicate playbook blocks in vmlab.wcl — merge in the inspector"
+                            : null;
+                      const dragActive = () => {
+                        const drag = playbookTargetDrag();
+                        return drag?.path === group.path && drag.play === card.play;
+                      };
+                      return (
+                        <g
+                          class="topo-play-row"
+                          classList={{
+                            selected:
+                              selectedPlaybook() === group.path &&
+                              selectedPlay() === card.play,
+                            inactive: card.blockIndex === null,
+                            warn: warn() !== null,
+                          }}
+                        >
+                          <rect
+                            x={p().x + 1}
+                            y={y()}
+                            width={PLAYBOOK_W - 2}
+                            height={PLAY_ROW_H}
+                          />
+                          <text x={p().x + 10} y={y() + 16.5}>
+                            {card.play.length > 22 ? `${card.play.slice(0, 21)}…` : card.play}
+                            {warn() ? " ⚠" : ""}
+                          </text>
+                          <text class="scope" x={p().x + PLAYBOOK_W - 14} y={y() + 16.5}>
+                            {scope()}
+                          </text>
+                          <title>{warn() ?? card.description ?? `play ${card.play}`}</title>
+                          <g
+                            class="topo-playbook-port"
+                            classList={{ active: dragActive(), locked: anyVmRunning() }}
+                            onPointerDown={(event: PointerEvent) =>
+                              playbookTargetDown(event, group.path, card.play, card.blockIndex)
+                            }
+                          >
+                            <circle
+                              cx={p().x + PLAYBOOK_W}
+                              cy={y() + PLAY_ROW_H / 2}
+                              r="4.5"
+                            />
+                            <title>
+                              {anyVmRunning()
+                                ? "Configuration is locked while a machine is up"
+                                : `Drag to a VM or container play "${card.play}" applies to`}
+                            </title>
+                          </g>
+                        </g>
+                      );
+                    }}
+                  </For>
                 </g>
               );
             }}

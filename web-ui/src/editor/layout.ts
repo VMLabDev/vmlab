@@ -43,7 +43,15 @@ export function machineCardHeight(nicCount: number): number {
 export const PROVISION_W = 220;
 export const PROVISION_H = 78;
 export const PLAYBOOK_W = 220;
-export const PLAYBOOK_H = 78;
+/** Folder-node header footprint before the per-play card rows. */
+export const PLAYBOOK_HEADER_H = 46;
+export const PLAY_ROW_H = 26;
+const PLAYBOOK_FOOT_H = 10;
+/** Node height for a folder with `cardCount` play cards (min one row —
+ *  an empty/unscanned folder still shows a placeholder row). */
+export function playbookCardHeight(cardCount: number): number {
+  return PLAYBOOK_HEADER_H + Math.max(1, cardCount) * PLAY_ROW_H + PLAYBOOK_FOOT_H;
+}
 
 /** Stable-enough cosmetic identity for provisions, including repeated paths. */
 export function provisionLayoutKey(model: LabModel, index: number): string {
@@ -54,13 +62,17 @@ export function provisionLayoutKey(model: LabModel, index: number): string {
   return `${script}\0${occurrence}`;
 }
 
-/** Cosmetic identity for playbook nodes (same scheme as provisions). */
-export function playbookLayoutKey(model: LabModel, index: number): string {
-  const path = model.playbooks[index]?.path || "(new playbook)";
-  const occurrence = model.playbooks
-    .slice(0, index)
-    .filter((playbook) => playbook.path === path).length;
-  return `${path}\0${occurrence}`;
+/** Cosmetic identity for playbook folder nodes — the bare path (one node
+ *  per folder). [`playbookPos`] also consults the legacy per-block
+ *  `path\0occurrence` key so saved layouts keep their positions. */
+export function playbookLayoutKey(path: string): string {
+  return path || "(new playbook)";
+}
+
+/** Stored position for a playbook folder node, with legacy-key fallback. */
+export function playbookPos(layout: Layout, path: string): NodePos | undefined {
+  const map = layout.playbooks ?? {};
+  return map[playbookLayoutKey(path)] ?? map[`${playbookLayoutKey(path)}\0${0}`];
 }
 
 /** Minimum segment-bar width (room for the name + meta text); bars widen
@@ -201,13 +213,13 @@ export function autoLayout(model: LabModel, existing: Layout): Layout {
       };
     }
   });
-  model.playbooks.forEach((_, index) => {
-    const key = playbookLayoutKey(model, index);
-    if (!out.playbooks![key]) {
+  [...new Set(model.playbooks.map((playbook) => playbook.path))].forEach((path, index) => {
+    const key = playbookLayoutKey(path);
+    if (!playbookPos(out, path)) {
       out.playbooks![key] = {
         // Their own row, below the provisions row.
         x: 80 + index * (PLAYBOOK_W + 28),
-        y: firstBarY + model.segments.length * laneHeight + 90 + PLAYBOOK_H + 40,
+        y: firstBarY + model.segments.length * laneHeight + 90 + PROVISION_H + 40,
       };
     }
   });

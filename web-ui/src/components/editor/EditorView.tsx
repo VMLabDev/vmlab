@@ -79,7 +79,10 @@ export default function EditorView(props: { onEditConfig: () => void }) {
     // No disk probe: the file API only serves declared folders, so a name
     // collision with an existing folder is harmless (the editor just shows
     // that folder's files once the block is saved).
-    const referenced = new Set(draft.playbooks.map((playbook) => playbook.path));
+    const referenced = new Set([
+      ...draft.playbooks.map((playbook) => playbook.path),
+      ...editor.playbookDrafts,
+    ]);
     for (let number = 1; number < 10_000; number++) {
       const path = `playbooks/playbook-${number}`;
       if (referenced.has(path)) continue;

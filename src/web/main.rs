@@ -315,6 +315,10 @@ async fn main() -> ExitCode {
                 web::get().to(playbooks::playbook_ops),
             )
             .route(
+                "/api/labs/{lab}/playbooks/plays",
+                web::get().to(playbooks::list_plays),
+            )
+            .route(
                 "/api/labs/{lab}/playbooks/scaffold",
                 web::post().to(playbooks::scaffold),
             )

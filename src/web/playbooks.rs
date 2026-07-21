@@ -108,6 +108,105 @@ pub async fn list_playbooks(state: web::Data<AppState>, lab: web::Path<String>) 
     }
 }
 
+#[derive(Deserialize)]
+pub struct PlaysQuery {
+    path: String,
+}
+
+/// Syntactic scan of a folder's `playbook.wcl` for its `play` blocks.
+/// Deliberately schema-free (`parse_for_edit`) — config-weave semantics
+/// stay in the guest; the designer only needs the play names. Unlike
+/// [`playbook_dir`] this does not require the folder to be declared in
+/// vmlab.wcl: the designer asks about draft nodes before any save.
+fn enumerate_plays(root: &Path, path: &str) -> Result<serde_json::Value, PbDirError> {
+    plain_relative(path, "playbook").map_err(PbDirError::BadRequest)?;
+    let missing = json!({"exists": false, "playbook": null, "plays": [], "error": null});
+    let canonical_root = std::fs::canonicalize(root).map_err(|e| PbDirError::Io(e.to_string()))?;
+    let dir = match std::fs::canonicalize(root.join(path)) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(missing),
+        Err(e) => return Err(PbDirError::Io(e.to_string())),
+    };
+    if !dir.starts_with(&canonical_root) {
+        return Err(PbDirError::Forbidden(
+            "playbook folder lies outside the lab root".into(),
+        ));
+    }
+    let source = match std::fs::read_to_string(dir.join("playbook.wcl")) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(missing),
+        Err(e) => return Err(PbDirError::Io(e.to_string())),
+    };
+    let src = match wcl_lang::parse_for_edit(&source, "playbook.wcl") {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(json!({
+                "exists": true, "playbook": null, "plays": [],
+                "error": e.to_string(),
+            }));
+        }
+    };
+
+    fn str_label(b: &wcl_lang::ast::Block) -> Option<&str> {
+        match b.labels.first() {
+            Some(wcl_lang::ast::Expr::Utf8(s)) => Some(s),
+            _ => None,
+        }
+    }
+    let mut playbook_name = None;
+    let mut plays = Vec::new();
+    for item in &src.items {
+        let wcl_lang::ast::Item::Block(b) = item else {
+            continue;
+        };
+        if b.kind != "playbook" {
+            continue;
+        }
+        playbook_name = playbook_name.or_else(|| str_label(b).map(str::to_string));
+        for inner in &b.items {
+            let wcl_lang::ast::Item::Block(p) = inner else {
+                continue;
+            };
+            if p.kind != "play" {
+                continue;
+            }
+            let Some(name) = str_label(p) else { continue };
+            let description = p.items.iter().find_map(|i| match i {
+                wcl_lang::ast::Item::Field(f) if f.name == "description" => match &f.expr {
+                    wcl_lang::ast::Expr::Utf8(s) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            });
+            plays.push(json!({"name": name, "description": description}));
+        }
+    }
+    Ok(json!({
+        "exists": true, "playbook": playbook_name, "plays": plays,
+        "error": null,
+    }))
+}
+
+/// `GET /api/labs/{lab}/playbooks/plays?path=…` — the plays defined in a
+/// folder's `playbook.wcl`, for the designer's per-play cards.
+pub async fn list_plays(
+    state: web::Data<AppState>,
+    lab: web::Path<String>,
+    query: web::Query<PlaysQuery>,
+) -> HttpResponse {
+    let root = match state.lab_root(&lab).await {
+        Ok(root) => root,
+        Err(e) => return fail(e),
+    };
+    let q = query.into_inner();
+    let out = web::block(move || enumerate_plays(&root, &q.path)).await;
+    match out {
+        Ok(Ok(v)) => HttpResponse::Ok().json(v),
+        Ok(Err(e)) => e.respond(),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
 /// `GET /api/labs/{lab}/playbooks/ops` — in-flight runs with log tails
 /// (the reconnect resync source, mirroring `template.op_status`).
 pub async fn playbook_ops(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
@@ -236,7 +335,16 @@ lab "lab" {
         )
         .unwrap();
         std::fs::create_dir_all(tmp.path().join("playbooks/base/pkgs/example")).unwrap();
-        std::fs::write(tmp.path().join("playbooks/base/playbook.wcl"), "x").unwrap();
+        std::fs::write(
+            tmp.path().join("playbooks/base/playbook.wcl"),
+            r#"playbook "base" {
+  description = "test playbook"
+  play "base" { description = "converge the base" }
+  play "extra" {}
+}
+"#,
+        )
+        .unwrap();
         std::fs::write(
             tmp.path().join("playbooks/base/pkgs/example/package.wcl"),
             "y",
@@ -264,6 +372,7 @@ lab "lab" {
                 App::new()
                     .app_data(state_for($root))
                     .route("/api/labs/{lab}/playbooks", web::get().to(list_playbooks))
+                    .route("/api/labs/{lab}/playbooks/plays", web::get().to(list_plays))
                     .route(
                         "/api/labs/{lab}/playbooks/scaffold",
                         web::post().to(scaffold),
@@ -290,6 +399,104 @@ lab "lab" {
         assert_eq!(body[0]["play"], "base");
         assert_eq!(body[0]["vms"][0], "web01");
         assert_eq!(body[1]["vms"].as_array().unwrap().len(), 0);
+    }
+
+    #[actix_web::test]
+    async fn plays_enumerates_folder_file() {
+        let tmp = playbook_lab();
+        let app = app!(tmp.path());
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/labs/lab/playbooks/plays?path=playbooks/base")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["exists"], true);
+        assert_eq!(body["playbook"], "base");
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["plays"][0]["name"], "base");
+        assert_eq!(body["plays"][0]["description"], "converge the base");
+        assert_eq!(body["plays"][1]["name"], "extra");
+        assert_eq!(body["plays"][1]["description"], Value::Null);
+    }
+
+    #[actix_web::test]
+    async fn plays_missing_and_undeclared_folders() {
+        let tmp = playbook_lab();
+        let app = app!(tmp.path());
+        // Declared but the folder doesn't exist yet.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/labs/lab/playbooks/plays?path=playbooks/ghost")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["exists"], false);
+        assert_eq!(body["plays"].as_array().unwrap().len(), 0);
+
+        // Undeclared draft paths are fine too — same missing shape.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/labs/lab/playbooks/plays?path=playbooks/draft")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["exists"], false);
+    }
+
+    #[actix_web::test]
+    async fn plays_unparsable_file_reports_error() {
+        let tmp = playbook_lab();
+        std::fs::write(
+            tmp.path().join("playbooks/base/playbook.wcl"),
+            "playbook \"broken {",
+        )
+        .unwrap();
+        let app = app!(tmp.path());
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/labs/lab/playbooks/plays?path=playbooks/base")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["exists"], true);
+        assert!(!body["error"].as_str().unwrap().is_empty());
+        assert_eq!(body["plays"].as_array().unwrap().len(), 0);
+    }
+
+    #[actix_web::test]
+    async fn plays_rejects_escaping_paths() {
+        let tmp = playbook_lab();
+        let app = app!(tmp.path());
+        for path in ["../outside", "/etc", "a/../.."] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!(
+                        "/api/labs/lab/playbooks/plays?path={}",
+                        urlencoding(path)
+                    ))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 400, "{path}");
+        }
+    }
+
+    fn urlencoding(s: &str) -> String {
+        s.replace('/', "%2F").replace("..", "%2E%2E")
     }
 
     #[actix_web::test]

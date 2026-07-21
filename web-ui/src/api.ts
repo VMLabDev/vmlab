@@ -293,6 +293,16 @@ export interface PlaybookInfo {
   /** Targeted machine names; empty = every machine. */
   vms: string[];
 }
+/** The plays defined in a folder's playbook.wcl (GET /playbooks/plays). */
+export interface PlaysInfo {
+  /** False when the folder or its playbook.wcl doesn't exist yet. */
+  exists: boolean;
+  /** The playbook block's name label, when parsable. */
+  playbook: string | null;
+  plays: { name: string; description: string | null }[];
+  /** Parse failure message — the file exists but couldn't be scanned. */
+  error: string | null;
+}
 /** One node of a playbook folder listing (GET /playbooks/tree). */
 export interface PlaybookTreeEntry {
   name: string;
@@ -320,6 +330,10 @@ export interface PlaybookOpStatus {
 const pbBase = (lab: string) => `/api/labs/${encodeURIComponent(lab)}/playbooks`;
 
 export const listPlaybooks = (lab: string): Promise<PlaybookInfo[]> => req(pbBase(lab));
+/** Enumerate the plays in a folder's playbook.wcl (works for undeclared
+ *  draft paths; `exists: false` when the folder isn't scaffolded yet). */
+export const listPlaybookPlays = (lab: string, path: string): Promise<PlaysInfo> =>
+  req(`${pbBase(lab)}/plays?path=${encodeURIComponent(path)}`);
 export const playbookOps = (lab: string): Promise<PlaybookOpStatus[]> =>
   req(`${pbBase(lab)}/ops`);
 /** Kick off a check/apply. 200 = finished fast (body: the run result),
