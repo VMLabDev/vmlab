@@ -3,18 +3,18 @@
 //! supervisor's aggregate), the lab's event-history file, and the tracing
 //! log.
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde_json::Value;
 
+use crate::logs::AppendLog;
 use crate::proto::Event;
 use crate::sync::LockRecover;
 
 pub struct EventLog {
     lab: String,
-    file: Mutex<std::fs::File>,
+    file: Mutex<AppendLog>,
     tx: tokio::sync::broadcast::Sender<Event>,
 }
 
@@ -28,17 +28,10 @@ impl EventLog {
     }
 
     pub fn new(lab: &str, tx: tokio::sync::broadcast::Sender<Event>) -> anyhow::Result<Self> {
-        let path = Self::history_path(lab);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
         Ok(Self {
             lab: lab.to_string(),
-            file: Mutex::new(file),
+            // Rotating: event history is append-only for the life of a lab.
+            file: Mutex::new(AppendLog::open(Self::history_path(lab))),
             tx,
         })
     }
@@ -50,7 +43,7 @@ impl EventLog {
             // `lock_recover`, not `if let Ok(..)`: a panic anywhere else in the
             // daemon while this lock was held would otherwise silently end
             // event history for the rest of the daemon's life.
-            let _ = writeln!(self.file.lock_recover(), "{line}");
+            self.file.lock_recover().write_line(&line);
         }
         let _ = self.tx.send(ev);
     }
@@ -66,15 +59,10 @@ mod tests {
         // Redirect state dir via env is global; instead test the file side
         // through a custom path by constructing manually.
         let path = tmp.path().join("events.jsonl");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
         let log = EventLog {
             lab: "t".into(),
-            file: Mutex::new(file),
+            file: Mutex::new(AppendLog::open(path.clone())),
             tx,
         };
         log.emit("vm.ready", serde_json::json!({"vm": "a"}));

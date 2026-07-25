@@ -174,12 +174,18 @@ impl LabRuntime {
 
             // media {} blocks: ISO/floppy images built from folders,
             // content-addressed in .vmlab/media (PRD §6.3).
-            let media_cache = crate::media::MediaCache::new(lab_local.join("media"));
+            let media_dir = lab_local.join("media");
             for m in &vm_cfg.media {
                 let src = root.join(&m.from);
-                let built = media_cache
-                    .ensure(m.kind, &src, m.label.as_deref())
-                    .with_context(|| format!("building media for vm \"{}\"", vm_cfg.name))?;
+                // xorriso/mtools under a blocking task: building an ISO from a
+                // folder takes seconds, and this runs on the daemon's runtime.
+                let (kind, label, dir) = (m.kind, m.label.clone(), media_dir.clone());
+                let built = tokio::task::spawn_blocking(move || {
+                    crate::media::MediaCache::new(dir).ensure(kind, &src, label.as_deref())
+                })
+                .await
+                .map_err(|e| anyhow!("media build task: {e}"))?
+                .with_context(|| format!("building media for vm \"{}\"", vm_cfg.name))?;
                 match m.kind {
                     crate::config::model::MediaKind::Iso => cdroms.push(built),
                     crate::config::model::MediaKind::Floppy => {
@@ -1784,13 +1790,10 @@ impl LabRuntime {
         }
         // Removes clones, container overlays, AND named volumes — destroy is
         // the lab-scoped volume lifecycle boundary (PRD §12).
-        if self.lab_local.exists() {
-            std::fs::remove_dir_all(&self.lab_local)
-                .with_context(|| format!("removing {}", self.lab_local.display()))?;
-        }
+        remove_tree(&self.lab_local).await?;
         let run_dir = crate::paths::lab_runtime_dir(&self.name);
-        let _ = std::fs::remove_dir_all(run_dir.join("vms"));
-        let _ = std::fs::remove_dir_all(run_dir.join("containers"));
+        let _ = remove_tree(&run_dir.join("vms")).await;
+        let _ = remove_tree(&run_dir.join("containers")).await;
         Ok(())
     }
 
@@ -1808,11 +1811,8 @@ impl LabRuntime {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if vm.dirs.local.exists() {
-            std::fs::remove_dir_all(&vm.dirs.local)
-                .with_context(|| format!("removing {}", vm.dirs.local.display()))?;
-        }
-        let _ = std::fs::remove_dir_all(&vm.dirs.run);
+        remove_tree(&vm.dirs.local).await?;
+        let _ = remove_tree(&vm.dirs.run).await;
         self.events
             .emit("vm.destroyed", json!({"vm": name.to_string()}));
         Ok(())
@@ -1833,11 +1833,8 @@ impl LabRuntime {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if container.dirs.local.exists() {
-            std::fs::remove_dir_all(&container.dirs.local)
-                .with_context(|| format!("removing {}", container.dirs.local.display()))?;
-        }
-        let _ = std::fs::remove_dir_all(&container.dirs.run);
+        remove_tree(&container.dirs.local).await?;
+        let _ = remove_tree(&container.dirs.run).await;
         {
             let mut state = self.state.lock().await;
             let c = state.container_mut(name);
@@ -2211,6 +2208,22 @@ impl LabRuntime {
 /// Resolve a share's host path for smb.conf: `~` against $HOME, relative
 /// paths against the lab root — smbd's cwd is not the lab's, so a literal
 /// `./shared` would canonicalize to `/shared` and fail every tree connect.
+/// Delete a directory tree off the runtime. A lab's clones are tens of GB of
+/// qcow2; doing this inline froze the daemon's whole reactor — the network
+/// fabric, QMP and agent channels, and the protocol server with it — for as
+/// long as the unlink took. Missing is success.
+async fn remove_tree(dir: &std::path::Path) -> Result<()> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if !dir.exists() {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))
+    })
+    .await
+    .map_err(|e| anyhow!("remove task: {e}"))?
+}
+
 fn resolve_share_host(root: &std::path::Path, host: &std::path::Path) -> PathBuf {
     if let Ok(rest) = host.strip_prefix("~")
         && let Some(home) = std::env::var_os("HOME")

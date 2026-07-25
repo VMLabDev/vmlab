@@ -189,16 +189,10 @@ fn stream_sink(lab: &Arc<LabRuntime>, stream: &Streamer) -> crate::scripting::Ou
         .join(&lab.name)
         .join("lab.log");
     tokio::spawn(async move {
-        use std::io::Write;
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .ok();
+        // Rotating: provision output is appended for the life of the lab.
+        let mut log = crate::logs::AppendLog::open(log_path);
         while let Some(line) = rx.recv().await {
-            if let Some(f) = log.as_mut() {
-                let _ = write!(f, "{line}");
-            }
+            log.write(&line);
             streamer.chunk(line).await;
         }
     });

@@ -504,25 +504,37 @@ impl Registry {
             });
         }
 
-        // 5. Assemble + verify the whole-image digest.
+        // 5 + 6. Decompress the chunks into the disk image, verify the
+        // whole-image digest, and install into the store (staging must be on
+        // the same FS as the store; the caller passes a work_dir under the
+        // store root). Record the disk digest if absent.
+        //
+        // All of this is multi-GB CPU and disk work — a Windows template is
+        // tens of GB — so it runs on a blocking thread. Inline, it stalled the
+        // caller's whole runtime: for a lab daemon that means the network
+        // fabric, QMP and agent channels frozen for the length of the install.
         let staging = work_dir.join("staging");
         std::fs::create_dir_all(&staging)
             .with_context(|| format!("cannot create {}", staging.display()))?;
-        let disk = staging.join(DISK_FILE);
-        chunking::assemble(&chunk_paths, &disk)?;
         let whole = manifest
             .whole_digest()
-            .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?;
-        chunking::verify_whole(&disk, whole)?;
-
-        // 6. Install into the store (staging must be on the same FS as the
-        // store; the caller is expected to pass a work_dir under the store
-        // root). Record the disk digest if absent.
-        let mut meta = meta;
-        if meta.sha256.is_none() {
-            meta.sha256 = Some(crate::template::store::sha256_file(&disk)?);
-        }
-        dest_store.install(&staging, &meta, overwrite)?;
+            .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
+            .to_string();
+        let store = dest_store.clone();
+        let staging_for_task = staging.clone();
+        let meta = tokio::task::spawn_blocking(move || -> Result<TemplateMeta> {
+            let disk = staging_for_task.join(DISK_FILE);
+            chunking::assemble(&chunk_paths, &disk)?;
+            chunking::verify_whole(&disk, &whole)?;
+            let mut meta = meta;
+            if meta.sha256.is_none() {
+                meta.sha256 = Some(crate::template::store::sha256_file(&disk)?);
+            }
+            store.install(&staging_for_task, &meta, overwrite)?;
+            Ok(meta)
+        })
+        .await
+        .map_err(|e| anyhow!("template install task: {e}"))??;
         tracing::info!(
             reference = %self.reference.canonical(),
             arch = %meta.arch,

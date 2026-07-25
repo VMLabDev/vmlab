@@ -110,24 +110,26 @@ async fn seed(
     stream: String,
     path: PathBuf,
 ) -> Tail {
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let offset = content.len() as u64;
+    // Read the backlog from the end rather than slurping the file: a serial log
+    // can be tens of MB and this runs per file, per stream connection, on the
+    // single web worker.
+    let (mut lines, offset) = vmlab::logs::tail_with_len(&path, BACKLOG + 1);
     // Backlog lines have no per-line timestamp; stamp them with the file's last
     // modification time so they sort near when they were actually written
     // (close to boot for a quiet serial log, ~now for a busy one).
     let at = file_mtime(&path).unwrap_or_else(Utc::now);
-    // Split the trailing incomplete line (no newline yet) from the complete
-    // part so we don't emit a half-written line and then duplicate it later.
-    let (complete, partial) = match content.rfind('\n') {
-        Some(i) => (&content[..=i], &content[i + 1..]),
-        None => ("", content.as_str()),
+    // A file not ending in a newline has a half-written last line: hold it back
+    // as the partial so it isn't emitted now and duplicated when it completes.
+    let ends_complete = ends_with_newline(&path, offset);
+    let partial = if ends_complete {
+        String::new()
+    } else {
+        lines.pop().unwrap_or_default()
     };
-    let lines: Vec<&str> = complete.lines().collect();
     let start = lines.len().saturating_sub(BACKLOG);
     for line in &lines[start..] {
         let _ = send(session, &source, &stream, line, at).await;
     }
-    let partial = partial.to_string();
     Tail {
         source,
         stream,
@@ -135,6 +137,24 @@ async fn seed(
         offset,
         partial,
     }
+}
+
+/// Does the file's last byte terminate a line? One 1-byte read, so the seed
+/// never has to hold the file in memory to answer it.
+fn ends_with_newline(path: &Path, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return true;
+    };
+    if f.seek(SeekFrom::Start(len - 1)).is_err() {
+        return true;
+    }
+    let mut last = [0u8; 1];
+    std::io::Read::read_exact(&mut f, &mut last)
+        .map(|_| last[0] == b'\n')
+        .unwrap_or(true)
 }
 
 /// Read any bytes appended to `t` since last time, emit the complete lines, and

@@ -1250,14 +1250,14 @@ pub fn cmd_logs(
     let color = format == crate::cli::LogFormat::Pretty && std::io::stdout().is_terminal();
 
     for path in &existing {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let all: Vec<&str> = content.lines().collect();
-        let start = all.len().saturating_sub(lines);
+        // Tail from the end — a serial log can be tens of MB and only the last
+        // `lines` are wanted.
+        let tail = crate::logs::tail(path, lines);
         if existing.len() > 1 {
             println!("==> {} <==", path.display());
         }
         let ev = is_events(path);
-        for line in &all[start..] {
+        for line in &tail {
             println!("{}", format_log_line(line, ev, format, color));
         }
     }

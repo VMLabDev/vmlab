@@ -9,6 +9,7 @@
 //!   - `vms/<vm>/{serial,qemu,swtpm}.log` — raw per-VM text
 //!   - `containers/<name>/console.log` — micro-VM kernel + container stdout/stderr
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -17,6 +18,89 @@ use crate::proto::Event;
 
 /// The synthetic source name for lab-level (non-VM) logs.
 pub const LAB_SOURCE: &str = "lab";
+
+/// Size at which the logs vmlab appends to itself (`events.jsonl`, `lab.log`)
+/// roll over to `<name>.1`. They used to grow without bound for the life of a
+/// lab — a long-running lab with chatty provisions could leave hundreds of MB
+/// behind, and every reader (`vmlab logs`, the web log stream) paid for it.
+pub const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// An append-only log file that rolls over at [`MAX_LOG_BYTES`], keeping one
+/// previous generation as `<name>.1`.
+///
+/// Size is tracked as bytes written rather than stat'd per line. A file that
+/// cannot be opened leaves the handle empty and writes become no-ops: log
+/// history is best-effort and must never take a daemon down.
+pub struct AppendLog {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    size: u64,
+    max: u64,
+}
+
+impl AppendLog {
+    pub fn open(path: PathBuf) -> Self {
+        Self::open_with_max(path, MAX_LOG_BYTES)
+    }
+
+    fn open_with_max(path: PathBuf, max: u64) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+        let size = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Self {
+            path,
+            file,
+            size,
+            max,
+        }
+    }
+
+    /// Append raw text (callers include their own newlines).
+    pub fn write(&mut self, text: &str) {
+        if self.size >= self.max {
+            self.rotate();
+        }
+        if let Some(f) = self.file.as_mut()
+            && f.write_all(text.as_bytes()).is_ok()
+        {
+            self.size += text.len() as u64;
+        }
+    }
+
+    /// Append one line, adding the newline.
+    pub fn write_line(&mut self, line: &str) {
+        self.write(line);
+        self.write("\n");
+    }
+
+    fn rotate(&mut self) {
+        self.file = None; // close before renaming
+        let previous = self.path.with_extension(match self.path.extension() {
+            Some(ext) => format!("{}.1", ext.to_string_lossy()),
+            None => "1".to_string(),
+        });
+        if std::fs::rename(&self.path, &previous).is_err() {
+            // Couldn't roll over (read-only dir, say): keep appending to the
+            // current file rather than losing the log entirely.
+            let reopened = Self::open_with_max(std::mem::take(&mut self.path), self.max);
+            *self = reopened;
+            self.max = u64::MAX;
+            return;
+        }
+        let reopened = Self::open_with_max(std::mem::take(&mut self.path), self.max);
+        *self = reopened;
+    }
+}
 
 /// One parsed log line, tagged with where it came from. Raw lines (serial/qemu/
 /// swtpm/lab) pass through verbatim with no timestamp; `events.jsonl` lines are
@@ -158,13 +242,57 @@ pub fn parse_line(source: &str, stream: &str, raw: &str) -> LogEntry {
     }
 }
 
-/// The last `n` lines of a file (empty if it can't be read). Reads the whole
-/// file then slices, matching the CLI's `cmd_logs` behaviour.
+/// How far back [`tail`] will read looking for `n` lines. A serial log can be
+/// tens of MB; reading it whole to print 200 lines is what this avoids.
+const TAIL_SCAN_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// The last `n` lines of a file (empty if it can't be read), read from the end
+/// rather than by slurping the whole file.
 pub fn tail(path: &Path, n: usize) -> Vec<String> {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    let all: Vec<&str> = content.lines().collect();
+    tail_with_len(path, n).0
+}
+
+/// [`tail`] plus the file length the lines were read at, so a follower can pick
+/// up exactly where the backlog ended without a second stat.
+pub fn tail_with_len(path: &Path, n: usize) -> (Vec<String>, u64) {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (Vec::new(), 0);
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if n == 0 || len == 0 {
+        return (Vec::new(), len);
+    }
+    // Walk backwards in growing chunks until we have enough newlines (one more
+    // than requested, so the first line isn't a fragment) or run out of budget.
+    let mut window = 64 * 1024u64;
+    let (text, from) = loop {
+        let start = len.saturating_sub(window);
+        let mut buf = vec![0u8; (len - start) as usize];
+        if f.seek(SeekFrom::Start(start)).is_err() {
+            return (Vec::new(), len);
+        }
+        if std::io::Read::read_exact(&mut f, &mut buf).is_err() {
+            return (Vec::new(), len);
+        }
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let enough = text.matches('\n').count() > n;
+        if enough || start == 0 || window >= TAIL_SCAN_LIMIT {
+            break (text, start);
+        }
+        window = (window * 8).min(TAIL_SCAN_LIMIT);
+    };
+    // A partial first line (we started mid-file) is dropped.
+    let body = if from > 0 {
+        match text.find('\n') {
+            Some(i) => &text[i + 1..],
+            None => "",
+        }
+    } else {
+        text.as_str()
+    };
+    let all: Vec<&str> = body.lines().collect();
     let start = all.len().saturating_sub(n);
-    all[start..].iter().map(|s| s.to_string()).collect()
+    (all[start..].iter().map(|s| s.to_string()).collect(), len)
 }
 
 #[cfg(test)]
@@ -254,5 +382,62 @@ mod tests {
         assert_eq!(tail(&p, 2), vec!["4".to_string(), "5".to_string()]);
         assert_eq!(tail(&p, 99).len(), 5);
         assert!(tail(&dir.join("missing.log"), 5).is_empty());
+        // A file with no trailing newline still yields its last line.
+        std::fs::write(&p, "a\nb").unwrap();
+        assert_eq!(tail(&p, 1), vec!["b".to_string()]);
+        assert_eq!(tail(&p, 0).len(), 0);
+    }
+
+    /// The backwards read must agree with a whole-file slice, including when
+    /// the file is far bigger than the first scan window.
+    #[test]
+    fn tail_matches_whole_file_slicing_past_the_scan_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.log");
+        let mut content = String::new();
+        for i in 0..200_000 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(&p, &content).unwrap();
+        let every: Vec<&str> = content.lines().collect();
+        let expected: Vec<String> = every[every.len() - 50..]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (got, len) = tail_with_len(&p, 50);
+        assert_eq!(got, expected);
+        assert_eq!(len, content.len() as u64);
+    }
+
+    #[test]
+    fn append_log_rotates_at_its_cap_keeping_one_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lab.log");
+        let mut log = AppendLog::open_with_max(p.clone(), 32);
+        for i in 0..12 {
+            log.write_line(&format!("line {i} padding"));
+        }
+        let previous = tmp.path().join("lab.log.1");
+        assert!(previous.is_file(), "previous generation kept");
+        // The live file holds the most recent lines and stays near the cap.
+        let live = std::fs::read_to_string(&p).unwrap();
+        assert!(live.contains("line 11"), "{live}");
+        assert!(
+            std::fs::metadata(&p).unwrap().len() <= 64,
+            "live log stays bounded"
+        );
+        // Exactly one old generation exists — no .2, .3, … pile-up.
+        let rolled = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("lab.log."))
+            .count();
+        assert_eq!(rolled, 1);
+    }
+
+    #[test]
+    fn append_log_survives_an_unwritable_path() {
+        let mut log = AppendLog::open(PathBuf::from("/definitely/not/a/writable/path/x.log"));
+        log.write_line("dropped, not panicked");
     }
 }
