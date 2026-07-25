@@ -186,21 +186,52 @@ pub async fn spawn_swtpm(
     Proc::spawn(&format!("swtpm:{vm_name}"), "swtpm", &args, log_path).await
 }
 
-/// Does this raw `/proc/<pid>/cmdline` (NUL-separated argv) belong to a VM in
-/// `lab`? Matches our QEMU `-name vmlab:<lab>/<vm>` marker (see cmdline.rs).
-/// The trailing `/` keeps `foo` from matching `foobar`'s VMs.
-fn cmdline_is_lab_qemu(cmdline: &[u8], lab: &str) -> bool {
-    let marker = format!("vmlab:{lab}/");
-    cmdline
-        .split(|b| *b == 0)
-        .any(|arg| arg.starts_with(marker.as_bytes()))
+/// The argv fragments that identify a process as belonging to `lab`:
+///
+/// - our QEMU/micro-VM `-name vmlab:<lab>/<machine>` marker (see cmdline.rs);
+///   the trailing `/` keeps `foo` from matching `foobar`'s VMs,
+/// - the lab's runtime directory, which appears in every helper's argv as a
+///   socket or state path (`swtpm --ctrl …/swtpm.sock`, `virtiofsd
+///   --socket-path …/virtiofs0.sock`),
+/// - the lab's SMB state directory, which is how `smbd -s <…>/smb/smb.conf`
+///   is recognised — it carries no runtime-dir path (needs `root`).
+///
+/// All three are unique to one lab, so a match can't hit an unrelated process.
+fn lab_process_markers(lab: &str, root: Option<&Path>) -> Vec<String> {
+    let mut markers = vec![
+        format!("vmlab:{lab}/"),
+        format!("{}/", crate::paths::lab_runtime_dir(lab).display()),
+    ];
+    if let Some(root) = root {
+        let smb = crate::paths::lab_local_dir(root).join("smb");
+        markers.push(smb.display().to_string());
+    }
+    markers
 }
 
-/// SIGKILL any QEMU processes belonging to `lab`, identified by the
-/// `-name vmlab:<lab>/<vm>` marker in their argv. Returns how many were
-/// signalled. Used to reap VMs orphaned by a lab daemon that died without
-/// stopping them — there is no `Proc` handle left, so we scan `/proc`.
-pub fn kill_lab_orphans(lab: &str) -> usize {
+/// Does this raw `/proc/<pid>/cmdline` (NUL-separated argv) belong to `lab`?
+fn cmdline_matches(cmdline: &[u8], markers: &[String]) -> bool {
+    cmdline.split(|b| *b == 0).any(|arg| {
+        markers.iter().any(|m| {
+            arg.starts_with(m.as_bytes())
+                // Helpers carry the path mid-argument (`dir=…`, `type=unixio,path=…`).
+                || arg
+                    .windows(m.len())
+                    .any(|w| w == m.as_bytes())
+        })
+    })
+}
+
+/// SIGKILL every process belonging to `lab` — QEMU **and** its helpers (swtpm,
+/// virtiofsd, smbd). Returns how many were signalled.
+///
+/// Used to reap what a lab daemon orphaned by dying without stopping anything:
+/// there is no `Proc` handle left, so we scan `/proc` for the lab's markers.
+/// Pass the lab's `root` when known so the lab's `smbd` is covered too — an
+/// orphaned smbd holds its port against the next `up`.
+pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
+    let markers = lab_process_markers(lab, root);
+    let us = std::process::id();
     let mut killed = 0;
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return 0;
@@ -213,10 +244,13 @@ pub fn kill_lab_orphans(lab: &str) -> usize {
         else {
             continue;
         };
+        if pid as u32 == us {
+            continue; // our own argv can name the lab (`vmlab __labd --lab …`)
+        }
         let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
             continue;
         };
-        if cmdline_is_lab_qemu(&cmdline, lab) {
+        if cmdline_matches(&cmdline, &markers) {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGKILL,
@@ -275,38 +309,86 @@ mod tests {
 
     #[test]
     fn lab_qemu_cmdline_matching() {
+        let markers = lab_process_markers("mylab", None);
         // Real-ish argv: NUL-separated, with the -name marker.
         let cmd = b"qemu-system-x86_64\0-name\0vmlab:mylab/web\0-machine\0q35\0";
-        assert!(cmdline_is_lab_qemu(cmd, "mylab"));
+        assert!(cmdline_matches(cmd, &markers));
         // A different lab must not match.
-        assert!(!cmdline_is_lab_qemu(cmd, "other"));
+        assert!(!cmdline_matches(cmd, &lab_process_markers("other", None)));
         // Prefix collision: `my` must not match `mylab`'s VMs.
-        assert!(!cmdline_is_lab_qemu(cmd, "my"));
+        assert!(!cmdline_matches(cmd, &lab_process_markers("my", None)));
         // No marker at all.
-        assert!(!cmdline_is_lab_qemu(b"sleep\x0030\x00", "mylab"));
+        assert!(!cmdline_matches(b"sleep\x0030\x00", &markers));
+    }
+
+    /// The helpers a crashed daemon orphans carry the lab's paths mid-argument,
+    /// not as an argv prefix — that is how they are recognised.
+    #[test]
+    fn helper_cmdline_matching() {
+        let root = std::path::Path::new("/labs/mylab");
+        let markers = lab_process_markers("mylab", Some(root));
+        let run = crate::paths::lab_runtime_dir("mylab");
+        let smb = crate::paths::lab_local_dir(root).join("smb");
+
+        let swtpm = format!(
+            "swtpm\0socket\0--tpm2\0--ctrl\0type=unixio,path={}/vms/web/swtpm.sock\0",
+            run.display()
+        );
+        assert!(cmdline_matches(swtpm.as_bytes(), &markers), "swtpm");
+
+        let vfsd = format!(
+            "virtiofsd\0--socket-path\0{}/vms/web/virtiofs0.sock\0--shared-dir\0/srv\0",
+            run.display()
+        );
+        assert!(cmdline_matches(vfsd.as_bytes(), &markers), "virtiofsd");
+
+        let smbd = format!("smbd\0-F\0-s\0{}/smb.conf\0", smb.display());
+        assert!(cmdline_matches(smbd.as_bytes(), &markers), "smbd");
+
+        // Another lab's helpers are untouched.
+        let other = lab_process_markers("otherlab", Some(std::path::Path::new("/labs/otherlab")));
+        for argv in [&swtpm, &vfsd, &smbd] {
+            assert!(!cmdline_matches(argv.as_bytes(), &other), "{argv}");
+        }
     }
 
     #[test]
-    fn kill_lab_orphans_reaps_marked_process() {
+    fn kill_lab_orphans_reaps_qemu_and_helpers() {
         use std::os::unix::process::CommandExt;
-        // Spawn a real process carrying our QEMU `-name` marker as argv[0]
-        // (the binary is still `sleep`, so it just blocks).
+        // Two real processes: one carrying the QEMU `-name` marker as argv[0],
+        // one carrying the lab's runtime path the way a helper does (the binary
+        // is `sleep` either way, so both just block).
         let lab = "orphan-reap-test";
-        let mut child = std::process::Command::new("sleep")
-            .arg("600")
-            .arg0(format!("vmlab:{lab}/vm0"))
-            .spawn()
-            .unwrap();
-        // Let /proc settle, then reap it by lab name.
+        let run = crate::paths::lab_runtime_dir(lab);
+        // Both block on an unread stdin pipe the test holds — no nested child,
+        // so a reaped process leaves nothing behind. `; :` keeps the shell from
+        // exec'ing the builtin away and losing our argv markers.
+        let blocker = |arg0: String, marker: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("read line; :")
+                .arg(marker)
+                .arg0(arg0)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let mut qemu = blocker(format!("vmlab:{lab}/vm0"), "-name".into());
+        let mut helper = blocker(
+            "swtpm".into(),
+            format!("type=unixio,path={}/vms/vm0/swtpm.sock", run.display()),
+        );
+        // Let /proc settle, then reap both by lab name.
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let killed = kill_lab_orphans(lab);
-        let status = child.wait().unwrap();
-        assert_eq!(killed, 1, "expected exactly one process reaped");
+        let killed = kill_lab_orphans(lab, None);
+        let (qemu_status, helper_status) = (qemu.wait().unwrap(), helper.wait().unwrap());
+        assert_eq!(killed, 2, "expected the VM and its helper reaped");
+        assert!(!qemu_status.success(), "qemu should have been signalled");
         assert!(
-            !status.success(),
-            "process should have been killed by signal"
+            !helper_status.success(),
+            "helper should have been signalled"
         );
         // A different lab name reaps nothing.
-        assert_eq!(kill_lab_orphans("some-other-lab"), 0);
+        assert_eq!(kill_lab_orphans("some-other-lab", None), 0);
     }
 }

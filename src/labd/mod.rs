@@ -149,9 +149,28 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     }
 
     tracing::info!("lab daemon for {lab} listening on {}", sock.display());
-    futures::future::pending::<()>().await;
+    // A termination signal runs the same teardown as the `shutdown` command:
+    // the machines this daemon owns have no other manager, so exiting without
+    // stopping them would orphan QEMU, swtpm, virtiofsd and smbd.
+    crate::lifecycle::termination_signal().await;
+    tracing::info!("lab daemon for {lab} caught a termination signal; stopping the lab");
+    teardown(&runtime, &tasks).await;
     drop(server);
     Ok(())
+}
+
+/// Everything a lab daemon must do before its process goes away: stop the
+/// machines it owns (PRD §3 — nothing else manages them), reap the SMB server,
+/// release global-segment references so the supervisor can free shared
+/// switches (§9.2), and cancel + join background tasks so nothing dies
+/// mid-flight.
+async fn teardown(lab: &Arc<LabRuntime>, tasks: &crate::lifecycle::TaskGroup) {
+    let _ = lab.down(&[], false).await;
+    if let Some(mut smb) = lab.smb.lock().await.take() {
+        smb.stop();
+    }
+    lab.network.lock().await.detach_globals().await;
+    tasks.shutdown(std::time::Duration::from_secs(5)).await;
 }
 
 struct LabdHandler {
@@ -962,22 +981,10 @@ impl Handler for LabdHandler {
                 tracing::info!("lab daemon shutdown requested");
                 let lab = lab.clone();
                 let tasks = self.tasks.clone();
+                // Spawned so this command's response reaches the caller before
+                // the process goes away.
                 tokio::spawn(async move {
-                    // A lab daemon going away must not orphan QEMU processes
-                    // it can no longer manage (PRD §3: the daemon owns them),
-                    // and must release its global-segment references so the
-                    // supervisor can reap shared switches (§9.2).
-                    let _ = lab.down(&[], false).await;
-                    // Stop the lab's SMB server cleanly.
-                    if let Some(mut smb) = lab.smb.lock().await.take() {
-                        smb.stop();
-                    }
-                    lab.network.lock().await.detach_globals().await;
-                    // Cancel + join the daemon's background tasks (watchdog,
-                    // handler dispatch, in-flight handler scripts — the
-                    // `down` above may have spawned some for its final
-                    // events), so exit doesn't kill work mid-flight.
-                    tasks.shutdown(std::time::Duration::from_secs(5)).await;
+                    teardown(&lab, &tasks).await;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     std::process::exit(0);
                 });

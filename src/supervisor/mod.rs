@@ -109,10 +109,27 @@ async fn run_async() -> Result<()> {
     );
     tasks.adopt("disk-watchdog", watchdog);
 
-    // Run until killed; the `shutdown` command exits the process directly.
-    futures::future::pending::<()>().await;
+    // A termination signal runs the same teardown as the `shutdown` command,
+    // so a `systemctl stop` or host shutdown releases the lab daemons (which
+    // in turn stop their VMs) instead of leaving them running unmanaged.
+    crate::lifecycle::termination_signal().await;
+    tracing::info!("vmlabd caught a termination signal; releasing labs");
+    teardown(&supervisor, &tasks).await;
     drop(server);
     Ok(())
+}
+
+/// Release every lab daemon (each stops its own machines) and join the
+/// supervisor's background tasks.
+async fn teardown(sup: &Arc<Supervisor>, tasks: &crate::lifecycle::TaskGroup) {
+    let names: Vec<String> = {
+        let reg = sup.registry.lock().await;
+        reg.labs().iter().map(|l| l.name.clone()).collect()
+    };
+    for name in names {
+        let _ = sup.release_lab(&name).await;
+    }
+    tasks.shutdown(std::time::Duration::from_secs(5)).await;
 }
 
 impl Supervisor {
@@ -122,10 +139,25 @@ impl Supervisor {
 
     /// Reconnect registry entries from a previous supervisor run: lab
     /// daemons survive a supervisor restart; dead ones are marked failed.
+    ///
+    /// Also the one place stale entries are pruned. A `failed` entry is kept so
+    /// the user sees that the lab crashed, but once its lab file is gone the
+    /// entry is only noise in `vmlab status` and the web lab list — those
+    /// accumulate forever otherwise.
     async fn adopt_existing_labs(self: &Arc<Self>) {
         let entries: Vec<LabEntry> = self.registry.lock().await.labs().to_vec();
         for entry in entries {
             if entry.state != LabState::Running {
+                if !entry.root.join(crate::paths::LAB_FILE).is_file() {
+                    tracing::info!(
+                        "dropping registry entry for {} — {} is gone",
+                        entry.name,
+                        entry.root.display()
+                    );
+                    let mut reg = self.registry.lock().await;
+                    reg.remove(&entry.name);
+                    reg.save();
+                }
                 continue;
             }
             let sock = crate::paths::lab_socket(&entry.name);
@@ -228,7 +260,11 @@ impl Supervisor {
         tokio::spawn(async move {
             let mut child = child;
             let status = child.wait().await;
-            let expected = {
+            // Clean exit code = the daemon completed its own teardown, whether
+            // we asked for it (`Stopping`) or a signal did. Only a non-zero or
+            // signalled exit is a crash.
+            let exited_cleanly = status.as_ref().is_ok_and(|s| s.success());
+            let expected = exited_cleanly || {
                 let reg = sup.registry.lock().await;
                 reg.get(&lab_name)
                     .map(|e| e.state == LabState::Stopping)
@@ -294,11 +330,15 @@ impl Supervisor {
 
     async fn release_lab(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let sock = crate::paths::lab_socket(name);
+        // Captured before the entry can be removed — the orphan reaper needs it
+        // to recognise this lab's smbd.
+        let root;
         {
             let mut reg = self.registry.lock().await;
-            if reg.get(name).is_none() {
+            let Some(entry) = reg.get(name) else {
                 return Ok(());
-            }
+            };
+            root = entry.root.clone();
             reg.set_state(name, LabState::Stopping);
             reg.save();
         }
@@ -309,11 +349,13 @@ impl Supervisor {
         if let Ok(client) = Client::connect(&sock).await {
             let _ = client.call("shutdown", Value::Null).await;
         } else {
-            // The daemon is gone and can't have stopped its VMs. Reap any QEMU
-            // processes it orphaned, then drop the registry entry.
-            let killed = crate::qemu::process::kill_lab_orphans(name);
+            // The daemon is gone and can't have stopped anything it owned. Reap
+            // the QEMU processes AND the helpers it orphaned (swtpm, virtiofsd,
+            // smbd — an orphaned smbd holds its port against the next `up`),
+            // then drop the registry entry.
+            let killed = crate::qemu::process::kill_lab_orphans(name, Some(&root));
             if killed > 0 {
-                tracing::warn!("reaped {killed} orphaned QEMU process(es) for lab {name}");
+                tracing::warn!("reaped {killed} orphaned process(es) for lab {name}");
             }
             let mut reg = self.registry.lock().await;
             reg.remove(name);
@@ -476,17 +518,10 @@ impl Handler for SupervisorHandler {
                 tracing::info!("supervisor shutdown requested");
                 let sup = sup.clone();
                 let tasks = self.tasks.clone();
+                // Spawned so this command's response reaches the caller before
+                // the process goes away.
                 tokio::spawn(async move {
-                    let names: Vec<String> = {
-                        let reg = sup.registry.lock().await;
-                        reg.labs().iter().map(|l| l.name.clone()).collect()
-                    };
-                    for name in names {
-                        let _ = sup.release_lab(&name).await;
-                    }
-                    // Cancel + join the supervisor's background tasks
-                    // (disk watchdog) so exit is deterministic.
-                    tasks.shutdown(std::time::Duration::from_secs(5)).await;
+                    teardown(&sup, &tasks).await;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     std::process::exit(0);
                 });

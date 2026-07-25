@@ -79,6 +79,50 @@ impl Default for TaskGroup {
     }
 }
 
+/// Resolve on the first SIGTERM, SIGINT or SIGHUP.
+///
+/// Both daemons used to run until the `shutdown` command called
+/// `process::exit`, so a `systemctl stop`, a host shutdown, a `pkill vmlab` or
+/// a closed terminal skipped every bit of teardown and left QEMU, swtpm,
+/// virtiofsd and smbd running with nothing managing them. Awaiting this instead
+/// of `future::pending()` routes those signals through the same teardown.
+///
+/// If a handler cannot be installed at all, this never resolves — the daemon
+/// then behaves exactly as it did before, exiting only via `shutdown`.
+pub async fn termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut streams = Vec::new();
+        for kind in [
+            SignalKind::terminate(),
+            SignalKind::interrupt(),
+            SignalKind::hangup(),
+        ] {
+            match signal(kind) {
+                Ok(s) => streams.push(s),
+                Err(e) => tracing::warn!("cannot install {kind:?} handler: {e}"),
+            }
+        }
+        if streams.is_empty() {
+            std::future::pending::<()>().await;
+            return;
+        }
+        let waits: Vec<_> = streams
+            .iter_mut()
+            .map(|s| {
+                Box::pin(s.recv()) as std::pin::Pin<Box<dyn Future<Output = Option<()>> + Send>>
+            })
+            .collect();
+        futures::future::select_all(waits).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

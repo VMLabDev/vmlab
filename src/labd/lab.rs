@@ -1429,12 +1429,17 @@ impl LabRuntime {
                 bail!("dependency deadlock among: {}", remaining.join(", "));
             }
 
-            let mut handles = Vec::new();
+            // A JoinSet, not loose handles: when one machine in the wave fails
+            // the rest are aborted on the spot. Detached tasks used to keep
+            // booting VMs and running first-boot scripts long after `up`
+            // returned its error, so the reported state and the real state
+            // diverged.
+            let mut wave_tasks = tokio::task::JoinSet::new();
             for name in &wave {
                 let me = self.clone();
                 let n = name.clone();
                 let out = output.clone();
-                handles.push(tokio::spawn(async move {
+                wave_tasks.spawn(async move {
                     if me.containers.contains_key(&n) {
                         me.start_container(&n).await?;
                         // Only gate the wave on readiness when something
@@ -1469,12 +1474,22 @@ impl LabRuntime {
                         me.vm(&n)?.wait_ready(Duration::from_secs(600)).await?;
                     }
                     Ok::<_, anyhow::Error>(n)
-                }));
+                });
             }
-            for h in handles {
-                let n = h.await.map_err(|e| anyhow!("join: {e}"))??;
-                done.insert(n.clone());
-                remaining.retain(|x| x != &n);
+            while let Some(joined) = wave_tasks.join_next().await {
+                let started = match joined {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
+                        wave_tasks.abort_all();
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        wave_tasks.abort_all();
+                        return Err(anyhow!("join: {e}"));
+                    }
+                };
+                done.insert(started.clone());
+                remaining.retain(|x| x != &started);
             }
 
             // Between waves: run (in declaration order) every unrun

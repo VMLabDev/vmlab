@@ -106,7 +106,14 @@ pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
     rt()?.block_on(async {
         let (name, _root) = current_lab()?;
         let Some(client) = daemon::try_lab_daemon(&name).await else {
-            println!("lab \"{name}\" is not running");
+            // No daemon — but a daemon that died without stopping its machines
+            // leaves QEMU (and swtpm/virtiofsd/smbd) running with the guest
+            // disks open, and `down` is exactly where a user asks for that to
+            // stop. Releasing the lab makes the supervisor reap them.
+            if let Ok(sup) = daemon::ensure_supervisor().await {
+                let _ = sup.call("lab.release", json!({"name": name})).await;
+            }
+            println!("lab \"{name}\" is not running (any orphaned processes were reaped)");
             return Ok(());
         };
         client
