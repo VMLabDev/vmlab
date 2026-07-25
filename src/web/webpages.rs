@@ -814,6 +814,15 @@ async fn map_response(
             builder.insert_header((name.as_str(), v));
         }
     }
+    // The guest's own framing/CSP headers were dropped above (they would stop
+    // the console embedding the page at all); replace them with ours. The real
+    // isolation is the console's `sandbox` attribute on the iframe — this keeps
+    // anything *else* from framing the proxy, and stops a guest page navigating
+    // the top-level console window out from under the user.
+    builder.insert_header((
+        header::CONTENT_SECURITY_POLICY,
+        "frame-ancestors 'self'; sandbox allow-scripts allow-forms allow-popups allow-downloads",
+    ));
     builder.body(out_body)
 }
 
@@ -1092,7 +1101,17 @@ mod tests {
         .await;
         assert_eq!(resp.status(), 200);
         assert!(resp.headers().get("x-frame-options").is_none());
-        assert!(resp.headers().get("content-security-policy").is_none());
+        // The guest's CSP is dropped (it would block framing entirely) and
+        // replaced with ours: the guest page is sandboxed into an opaque origin
+        // so it cannot script the console that frames it.
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(csp.contains("frame-ancestors 'self'"), "{csp}");
+        assert!(csp.contains("sandbox allow-scripts"), "{csp}");
+        assert!(!csp.contains("allow-same-origin"), "{csp}");
         let body = test::read_body(resp).await;
         let text = String::from_utf8_lossy(&body);
         assert!(

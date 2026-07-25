@@ -18,6 +18,18 @@ interface WebTab {
   nonce: number;
 }
 
+/** Guest pages are untrusted: whatever a lab machine serves is framed here, so
+ *  it gets an opaque origin (no `allow-same-origin`). Without this a page could
+ *  reach `window.parent` — the console's DOM and its API token — because the
+ *  proxy serves it from the console's own origin. The server sends the same
+ *  sandbox as a CSP directive, so opening a proxy URL directly is covered too;
+ *  this attribute is what protects the console itself.
+ *
+ *  Cost: a guest app can't use `document.cookie` or `localStorage` from script.
+ *  Server-set session cookies still work (they ride the HTTP response), as does
+ *  the console's own `vmlab_web` gate cookie. */
+const GUEST_SANDBOX = "allow-scripts allow-forms allow-popups allow-downloads";
+
 const [tabs, setTabs] = createSignal<WebTab[]>([]);
 const [activeId, setActiveId] = createSignal<string | null>(null);
 
@@ -115,6 +127,7 @@ export default function WebView() {
                 classList={{ active: tab.id === activeId() }}
                 src={frameSrc(tab)}
                 title={tab.title}
+                sandbox={tab.id === "help" ? undefined : GUEST_SANDBOX}
               />
             )}
           </For>
