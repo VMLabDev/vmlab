@@ -26,7 +26,7 @@ MIRROR="${VMLAB_ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 
 # Pinned packages: repo|name|version|sha256(x86_64)|sha256(aarch64)
 PACKAGES=(
-  "main|linux-virt|6.12.95-r0|b4f49a5454dfecc406e92591d8deb4f7203b7c64e7531f8cd217f2e76371a4cb|3606bf25a62c8c9d3e6aa27a018e644f03d5b6cb0b3a3dea155e873bcc3689d4"
+  "main|linux-virt|6.12.96-r0|67d914fa2eb371a03cfe81c5d668080fe57017d3857be69b2091f5a2a812d36b|73517bf65e443f9ed0d9af426794e191c187cf9ae71606a2135d5d3a2d839f57"
   "main|busybox-static|1.37.0-r20|488ad6efd04b5a722719e79f8e0dcc2c24afd6758867af3ce41b04839e60c74b|ee469aee2958feffd7f64dd96655704025ff60af614f77a1d7323dc237c34da2"
   "main|musl|1.2.5-r12|4990a5e0ba312e478f94cfe431a70efef1538004eb361c8ae424516848be45bb|ac281d1e7f9e9c447c51e309317b975f48be6edaf3ab91ae73b959cf86703782"
   "main|e2fsprogs|1.47.2-r2|4e59067f388ba8338dca3babd5784799d2d434eb6c19076d17ff96e50fbb1a49|3f57194ef8a75326d95ea2ab72ef92a82349230b1686c988c09e7ee869a1d24f"
@@ -89,8 +89,23 @@ fetch_pkg() {
   local file="$CACHE_DIR/${arch}--${name}-${ver}.apk"
   if [[ ! -f "$file" ]]; then
     log "fetching $name-$ver ($arch)"
-    curl -fsSL -o "$file.tmp" "$MIRROR/v$ALPINE_VERSION/$repo/$arch/$name-$ver.apk" \
-      || die "download failed: $name-$ver ($arch)"
+    local url="$MIRROR/v$ALPINE_VERSION/$repo/$arch/$name-$ver.apk"
+    if ! curl -fsSL -o "$file.tmp" "$url"; then
+      rm -f "$file.tmp"
+      # An Alpine release repo only ever carries the *current* build of each
+      # package, so a pin here rots as soon as upstream rebuilds it — a plain
+      # "404" leaves the reader guessing. Say what happened, and what to pin to.
+      local available
+      available="$(curl -fsSL "$MIRROR/v$ALPINE_VERSION/$repo/$arch/" 2>/dev/null \
+        | grep -oE "$name-[0-9][^\"]*\.apk" | sort -u | tr '\n' ' ')"
+      if [[ -n "$available" ]]; then
+        die "$name-$ver ($arch) is gone from the mirror — the pin has been
+     superseded. Available now: ${available% }
+     Re-pin the PACKAGES entry above (version + both sha256s):
+       curl -fsSL $MIRROR/v$ALPINE_VERSION/$repo/<arch>/<new>.apk | sha256sum"
+      fi
+      die "download failed: $url"
+    fi
     mv "$file.tmp" "$file"
   fi
   echo "$sha  $file" | sha256sum -c --quiet - >/dev/null 2>&1 \
