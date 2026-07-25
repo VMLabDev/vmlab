@@ -17,14 +17,20 @@
 //! active:   SYN_SENT   ───────────────↗
 //! ```
 //!
-//! Simplifications, all backed by the PRD's performance non-goal: in-order
-//! acceptance only (out-of-order segments are dropped and dup-ACKed; the
-//! peer retransmits), go-back-N retransmission of the first unacked segment
-//! on a fixed 1 s RTO with at most 5 tries, no TIME_WAIT, no window
-//! scaling, no SACK, no zero-window probes (a flow stuck on a closed guest
-//! window falls to the 5-minute idle reset), RST on anything unexpected.
+//! Simplifications, all backed by the PRD's performance non-goal: go-back-N
+//! retransmission of the first unacked segment on a fixed 1 s RTO with at most
+//! 5 tries, no TIME_WAIT, no window scaling, no SACK, no zero-window probes (a
+//! flow stuck on a closed guest window falls to the 5-minute idle reset), RST
+//! on anything unexpected.
+//!
+//! Segments arriving ahead of `rcv_nxt` ARE buffered (up to one window per
+//! flow) and stitched in when the hole fills. Dropping them and dup-ACKing —
+//! the original behaviour — cost the guest its entire in-flight window for
+//! every single loss, and the userspace switch drops frames whenever a port's
+//! egress queue fills, so bulk guest→host transfers collapsed into a
+//! retransmit crawl.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -59,6 +65,10 @@ const ACTIVE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const WINDOW: u16 = 0xFFFF;
 /// In-memory pipe capacity backing [`GuestStream`].
 const DUPLEX_CAPACITY: usize = 64 * 1024;
+/// Guest data held per flow while waiting for a missing segment. One advertised
+/// window's worth: past that the guest cannot legally have more in flight, so a
+/// bigger buffer would only hold data we will never be able to stitch up.
+const OOO_MAX_BYTES: usize = WINDOW as usize;
 
 /// Identity of a vTCP flow as seen from the guest side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -302,6 +312,11 @@ struct Flow {
     /// Effective MSS: min(our clamp, guest's SYN option).
     mss: usize,
     unacked: VecDeque<TxSeg>,
+    /// Guest segments that arrived ahead of `rcv_nxt`, keyed by sequence
+    /// number, held until the hole in front of them fills.
+    ooo: BTreeMap<u32, Vec<u8>>,
+    /// Bytes currently held in `ooo`, capped at [`OOO_MAX_BYTES`].
+    ooo_bytes: usize,
     retries: u32,
     rto_at: Option<Instant>,
     last_activity: Instant,
@@ -324,6 +339,8 @@ impl Flow {
             peer_wnd: u32::from(syn.window),
             mss: syn.mss.map_or(clamp, |m| clamp.min(usize::from(m))),
             unacked: VecDeque::new(),
+            ooo: BTreeMap::new(),
+            ooo_bytes: 0,
             retries: 0,
             rto_at: None,
             last_activity: Instant::now(),
@@ -346,6 +363,8 @@ impl Flow {
             peer_wnd: 0,
             mss: clamp,
             unacked: VecDeque::new(),
+            ooo: BTreeMap::new(),
+            ooo_bytes: 0,
             retries: 0,
             rto_at: None,
             last_activity: Instant::now(),
@@ -511,10 +530,20 @@ impl Flow {
                         return false;
                     }
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(fresh.len() as u32);
+                    // This segment may have filled a hole: drain whatever of
+                    // the out-of-order queue is now contiguous.
+                    if !self.drain_ooo(wr, wr_open).await {
+                        return false;
+                    }
                 }
                 need_ack = true; // fresh data or pure duplicate: (re-)ACK
             } else {
-                // Out of order (future): drop, dup-ACK; the guest resends.
+                // Ahead of rcv_nxt: hold it until the hole fills. Dropping it
+                // (and only dup-ACKing) cost the guest its whole in-flight
+                // window per loss — with the switch dropping frames whenever a
+                // port queue fills, that collapsed bulk guest→host transfers
+                // to a retransmit crawl.
+                self.queue_ooo(seg.seq, &seg.payload);
                 need_ack = true;
             }
         }
@@ -536,6 +565,65 @@ impl Flow {
             self.send_ack().await;
         }
         true
+    }
+
+    /// Hold a segment that arrived ahead of `rcv_nxt`. Overlapping or duplicate
+    /// entries are replaced by the longer one; the oldest entry is dropped when
+    /// the buffer is full, degrading to the previous drop-and-dup-ACK behaviour
+    /// rather than growing without bound.
+    fn queue_ooo(&mut self, seq: u32, payload: &[u8]) {
+        if payload.len() > OOO_MAX_BYTES {
+            return;
+        }
+        match self.ooo.get(&seq) {
+            Some(existing) if existing.len() >= payload.len() => return,
+            Some(existing) => self.ooo_bytes -= existing.len(),
+            None => {}
+        }
+        self.ooo.insert(seq, payload.to_vec());
+        self.ooo_bytes += payload.len();
+        while self.ooo_bytes > OOO_MAX_BYTES {
+            let Some((&oldest, _)) = self.ooo.iter().next() else {
+                break;
+            };
+            if let Some(dropped) = self.ooo.remove(&oldest) {
+                self.ooo_bytes -= dropped.len();
+            }
+        }
+    }
+
+    /// Write out every queued segment that is now contiguous with `rcv_nxt`,
+    /// trimming any overlap. Returns `false` when the flow must die.
+    async fn drain_ooo<W: AsyncWrite + Unpin>(&mut self, wr: &mut W, wr_open: &mut bool) -> bool {
+        loop {
+            // Forget anything that ends at or before rcv_nxt — already written.
+            let stale: Vec<u32> = self
+                .ooo
+                .iter()
+                .filter(|(seq, payload)| {
+                    seq_le(seq.wrapping_add(payload.len() as u32), self.rcv_nxt)
+                })
+                .map(|(seq, _)| *seq)
+                .collect();
+            for seq in stale {
+                if let Some(payload) = self.ooo.remove(&seq) {
+                    self.ooo_bytes -= payload.len();
+                }
+            }
+            // What's left starting at or before rcv_nxt therefore extends past
+            // it: it continues the stream.
+            let Some(&seq) = self.ooo.keys().find(|&&seq| seq_le(seq, self.rcv_nxt)) else {
+                return true;
+            };
+            let payload = self.ooo.remove(&seq).expect("key just found");
+            self.ooo_bytes -= payload.len();
+            let fresh = &payload[self.rcv_nxt.wrapping_sub(seq) as usize..];
+            if *wr_open && wr.write_all(fresh).await.is_err() {
+                self.send_rst().await;
+                return false;
+            }
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(fresh.len() as u32);
+        }
     }
 
     fn closed_both_ways(&self) -> bool {

@@ -280,6 +280,224 @@ async fn vtcp_passive_echo_roundtrip() {
     }
 }
 
+/// A segment arriving ahead of the stream is held and stitched in when the hole
+/// fills — the guest must not have to resend it. Delivered 1-3-2, the host sees
+/// one ordered stream and the ACK jumps past all three the moment 2 lands.
+#[tokio::test]
+async fn vtcp_reassembles_out_of_order_segments() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dst_addr = listener.local_addr().unwrap();
+    let sink = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        received
+    });
+
+    let dst = (Ipv4Addr::LOCALHOST, dst_addr.port());
+    let (engine, mut rx) = engine();
+    let sport = 40_020;
+    let isn = 7_000u32;
+
+    guest_tcp(
+        &engine,
+        sport,
+        dst,
+        isn,
+        0,
+        TCP_SYN,
+        b"",
+        &[2, 4, 0x05, 0xB4],
+    )
+    .await;
+    let synack = recv_tcp(&mut rx).await;
+    let g_ack = synack.seq.wrapping_add(1);
+    let base = isn.wrapping_add(1);
+    guest_tcp(&engine, sport, dst, base, g_ack, TCP_ACK, b"", &[]).await;
+
+    let (a, b, c) = ([b'a'; 100], [b'b'; 100], [b'c'; 100]);
+    let send = async |seq: u32, payload: &[u8]| {
+        guest_tcp(
+            &engine,
+            sport,
+            dst,
+            seq,
+            g_ack,
+            TCP_ACK | TCP_PSH,
+            payload,
+            &[],
+        )
+        .await;
+    };
+
+    // 1: in order.
+    send(base, &a).await;
+    let ack = recv_tcp(&mut rx).await;
+    assert_eq!(ack.ack, base.wrapping_add(100));
+
+    // 3: ahead of the stream — dup-ACK, and (the fix) buffered rather than
+    // discarded.
+    send(base.wrapping_add(200), &c).await;
+    let ack = recv_tcp(&mut rx).await;
+    assert_eq!(
+        ack.ack,
+        base.wrapping_add(100),
+        "a future segment must not advance the ack"
+    );
+
+    // 2: fills the hole. The ack must now cover segment 3 as well, which only
+    // holds if it was still buffered.
+    send(base.wrapping_add(100), &b).await;
+    let ack = recv_tcp(&mut rx).await;
+    assert_eq!(
+        ack.ack,
+        base.wrapping_add(300),
+        "the buffered segment was stitched in without a retransmit"
+    );
+
+    let fin_seq = base.wrapping_add(300);
+    guest_tcp(
+        &engine,
+        sport,
+        dst,
+        fin_seq,
+        g_ack,
+        TCP_ACK | TCP_FIN,
+        b"",
+        &[],
+    )
+    .await;
+    loop {
+        if recv_tcp(&mut rx).await.ack == fin_seq.wrapping_add(1) {
+            break;
+        }
+    }
+
+    let received = timeout(Duration::from_secs(10), sink)
+        .await
+        .expect("host never saw the stream")
+        .expect("sink task failed");
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&a);
+    expected.extend_from_slice(&b);
+    expected.extend_from_slice(&c);
+    assert_eq!(received, expected, "bytes arrive in stream order");
+}
+
+/// More future segments than the per-flow buffer allows must not grow it without
+/// bound: the excess is dropped like before, and the flow still completes once
+/// the guest retransmits.
+#[tokio::test]
+async fn vtcp_out_of_order_buffer_is_bounded() {
+    const SEGMENT: usize = 1400;
+    // Two windows' worth of future segments, none of them contiguous with the
+    // stream until the very end.
+    const FUTURE_SEGMENTS: usize = (2 * 0xFFFF) / SEGMENT;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dst_addr = listener.local_addr().unwrap();
+    let sink = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        received.len()
+    });
+
+    let dst = (Ipv4Addr::LOCALHOST, dst_addr.port());
+    let (engine, mut rx) = engine();
+    let sport = 40_021;
+    let isn = 8_000u32;
+
+    guest_tcp(
+        &engine,
+        sport,
+        dst,
+        isn,
+        0,
+        TCP_SYN,
+        b"",
+        &[2, 4, 0x05, 0xB4],
+    )
+    .await;
+    let synack = recv_tcp(&mut rx).await;
+    let g_ack = synack.seq.wrapping_add(1);
+    let base = isn.wrapping_add(1);
+    guest_tcp(&engine, sport, dst, base, g_ack, TCP_ACK, b"", &[]).await;
+
+    let payload = vec![b'x'; SEGMENT];
+    // Skip segment 0 entirely, then flood the future.
+    for i in 1..=FUTURE_SEGMENTS {
+        guest_tcp(
+            &engine,
+            sport,
+            dst,
+            base.wrapping_add((i * SEGMENT) as u32),
+            g_ack,
+            TCP_ACK | TCP_PSH,
+            &payload,
+            &[],
+        )
+        .await;
+        let _ = recv_tcp(&mut rx).await; // dup-ACK each time
+    }
+
+    // Now the missing first segment. Whatever is still buffered gets stitched
+    // in; the rest the guest would retransmit. Either way the flow lives and the
+    // ack advances past the hole.
+    guest_tcp(
+        &engine,
+        sport,
+        dst,
+        base,
+        g_ack,
+        TCP_ACK | TCP_PSH,
+        &payload,
+        &[],
+    )
+    .await;
+    let ack = recv_tcp(&mut rx).await;
+    assert!(
+        ack.ack != base && seq_after(ack.ack, base),
+        "ack advanced past the filled hole (got {}, base {base})",
+        ack.ack
+    );
+    let delivered = ack.ack.wrapping_sub(base) as usize;
+    assert!(
+        delivered <= (FUTURE_SEGMENTS + 1) * SEGMENT,
+        "never acks more than was actually sent"
+    );
+
+    // Close from the guest at whatever the engine has acked, then confirm the
+    // host received exactly that much.
+    let fin_seq = ack.ack;
+    guest_tcp(
+        &engine,
+        sport,
+        dst,
+        fin_seq,
+        g_ack,
+        TCP_ACK | TCP_FIN,
+        b"",
+        &[],
+    )
+    .await;
+    loop {
+        if recv_tcp(&mut rx).await.ack == fin_seq.wrapping_add(1) {
+            break;
+        }
+    }
+    let received = timeout(Duration::from_secs(10), sink)
+        .await
+        .expect("host never saw the stream")
+        .expect("sink task failed");
+    assert_eq!(received, delivered, "acked bytes all reached the host");
+}
+
+/// `a` strictly after `b` in sequence space.
+fn seq_after(a: u32, b: u32) -> bool {
+    a != b && b.wrapping_sub(a) >= 0x8000_0000
+}
+
 #[tokio::test]
 async fn vtcp_passive_bulk_upload_is_complete_and_stall_free() {
     const SIZE: usize = 10 * 1024 * 1024;

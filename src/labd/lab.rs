@@ -1979,6 +1979,11 @@ impl LabRuntime {
             } else {
                 Value::Null
             };
+            // Switch counters ride along: a non-zero drop count is the signal
+            // that a segment is shedding frames under load (a port's egress
+            // queue filling), which otherwise only shows up as mysteriously
+            // slow guest transfers.
+            let sw = seg.switch.stats();
             segments.push(json!({
                 "name": seg.name,
                 "subnet": seg.subnet.to_string(),
@@ -1988,6 +1993,10 @@ impl LabRuntime {
                 "global": seg.global,
                 "connect": seg.peer,
                 "peer_connected": peer_connected,
+                "frames_forwarded": sw.frames_forwarded,
+                "frames_flooded": sw.frames_flooded,
+                "frames_dropped": sw.frames_dropped,
+                "frames_offloaded": sw.frames_offloaded,
             }));
         }
         json!({

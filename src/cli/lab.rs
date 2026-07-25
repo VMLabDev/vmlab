@@ -216,8 +216,8 @@ fn print_status(status: &Value) {
     if let Some(segments) = status["segments"].as_array() {
         println!();
         println!(
-            "  {:<16} {:<18} {:<15} {:<8} PEER",
-            "SEGMENT", "SUBNET", "GATEWAY", "NAT/DHCP"
+            "  {:<16} {:<18} {:<15} {:<8} {:<10} PEER",
+            "SEGMENT", "SUBNET", "GATEWAY", "NAT/DHCP", "DROPPED"
         );
         for s in segments {
             // PEER: the cross-host trunk state (PRD §9.2) — the configured
@@ -229,8 +229,12 @@ fn print_status(status: &Value) {
                 (None, Some(true)) => "connected".to_string(),
                 _ => "-".to_string(),
             };
+            // DROPPED: switch frames shed on this segment. Anything other than
+            // 0 means the fabric is losing frames under load — the thing that
+            // makes guest transfers mysteriously slow.
+            let dropped = s["frames_dropped"].as_u64().unwrap_or(0);
             println!(
-                "  {:<16} {:<18} {:<15} {:<8} {peer}",
+                "  {:<16} {:<18} {:<15} {:<8} {:<10} {peer}",
                 s["name"].as_str().unwrap_or("?"),
                 s["subnet"].as_str().unwrap_or("?"),
                 s["gateway"].as_str().unwrap_or("?"),
@@ -247,6 +251,7 @@ fn print_status(status: &Value) {
                         "off"
                     }
                 ),
+                dropped,
             );
         }
     }
