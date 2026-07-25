@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use super::Supervisor;
 use crate::config::model::TemplateDef;
 use crate::proto::Event;
+use crate::sync::LockRecover;
 use crate::template::TemplateStore;
 
 /// Kept log lines per running operation (replayed via `template.op_status`).
@@ -50,7 +51,7 @@ impl TemplateOps {
         kind: &'static str,
     ) -> Result<OpGuard, String> {
         let key = (lab.to_string(), arch.to_string(), template.to_string());
-        let mut ops = self.inner.lock().unwrap();
+        let mut ops = self.inner.lock_recover();
         if let Some(op) = ops.get(&key) {
             return Err(format!(
                 "{} already running for `{arch}/{template}`",
@@ -77,7 +78,7 @@ impl TemplateOps {
     }
 
     fn append_log(&self, lab: &str, arch: &str, template: &str, line: &str) {
-        let mut ops = self.inner.lock().unwrap();
+        let mut ops = self.inner.lock_recover();
         if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
             if op.log.len() == LOG_CAP {
                 op.log.pop_front();
@@ -87,7 +88,7 @@ impl TemplateOps {
     }
 
     fn append_step(&self, lab: &str, arch: &str, template: &str, step: Value) {
-        let mut ops = self.inner.lock().unwrap();
+        let mut ops = self.inner.lock_recover();
         if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
             if op.steps.len() == LOG_CAP {
                 op.steps.pop_front();
@@ -97,14 +98,14 @@ impl TemplateOps {
     }
 
     fn set_console(&self, lab: &str, arch: &str, template: &str, path: PathBuf) {
-        let mut ops = self.inner.lock().unwrap();
+        let mut ops = self.inner.lock_recover();
         if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
             op.console = Some(path);
         }
     }
 
     pub fn console_path(&self, lab: &str, arch: &str, template: &str) -> Result<PathBuf, String> {
-        let ops = self.inner.lock().unwrap();
+        let ops = self.inner.lock_recover();
         let op = ops
             .get(&(lab.to_string(), arch.to_string(), template.to_string()))
             .ok_or_else(|| format!("no operation running for `{arch}/{template}`"))?;
@@ -121,7 +122,7 @@ impl TemplateOps {
     }
 
     fn cancel_build(&self, lab: &str, arch: &str, template: &str) -> Result<(), String> {
-        let ops = self.inner.lock().unwrap();
+        let ops = self.inner.lock_recover();
         let op = ops
             .get(&(lab.to_string(), arch.to_string(), template.to_string()))
             .ok_or_else(|| format!("no build running for `{arch}/{template}`"))?;
@@ -136,7 +137,7 @@ impl TemplateOps {
 
     /// The running operation for `(lab, template)`, as JSON for `template.list`.
     fn op_of(&self, lab: &str, arch: &str, template: &str) -> Value {
-        let ops = self.inner.lock().unwrap();
+        let ops = self.inner.lock_recover();
         match ops.get(&(lab.to_string(), arch.to_string(), template.to_string())) {
             Some(op) => json!({"kind": op.kind, "started": op.started.to_rfc3339()}),
             None => Value::Null,
@@ -146,7 +147,7 @@ impl TemplateOps {
     /// All running operations for `lab` with their log tails
     /// (`template.op_status` — reconnecting UIs resync from this).
     pub fn status(&self, lab: &str) -> Value {
-        let ops = self.inner.lock().unwrap();
+        let ops = self.inner.lock_recover();
         let mut rows: Vec<Value> = ops
             .iter()
             .filter(|((l, _, _), _)| l == lab)
@@ -187,7 +188,7 @@ impl OpGuard {
 
 impl Drop for OpGuard {
     fn drop(&mut self) {
-        self.ops.inner.lock().unwrap().remove(&self.key);
+        self.ops.inner.lock_recover().remove(&self.key);
     }
 }
 

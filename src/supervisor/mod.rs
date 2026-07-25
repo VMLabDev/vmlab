@@ -39,7 +39,8 @@ pub fn run() -> Result<()> {
 
 async fn run_async() -> Result<()> {
     let runtime_dir = crate::paths::runtime_dir();
-    crate::paths::ensure_dir(&runtime_dir)?;
+    // Private: this directory holds every control and VNC socket on the host.
+    crate::paths::ensure_private_dir(&runtime_dir)?;
     crate::paths::ensure_dir(&crate::paths::state_dir())?;
 
     let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
@@ -185,7 +186,7 @@ impl Supervisor {
         // `template.pull.*` progress events through its event log (which
         // `watch_lab_events` below forwards into the aggregate feed).
 
-        crate::paths::ensure_dir(sock.parent().expect("lab socket has parent"))
+        crate::paths::ensure_private_dir(sock.parent().expect("lab socket has parent"))
             .map_err(|e| e.to_string())?;
         let exe = crate::paths::self_exe().map_err(|e| e.to_string())?;
         let log_path = crate::paths::state_dir().join(format!("labd-{name}.log"));

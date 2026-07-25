@@ -155,10 +155,57 @@ fn short_hash(p: &Path) -> String {
     hex::encode(&digest[..6])
 }
 
-/// Ensure a directory exists with private permissions.
+/// Ensure a directory exists.
 pub fn ensure_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("cannot create directory {}", dir.display()))?;
+    Ok(())
+}
+
+/// Ensure a directory exists, owned by us and reachable only by us (0700).
+///
+/// Used for everything under [`runtime_dir`]: the control sockets there are a
+/// full-privilege interface — a client that can connect runs scripts in the
+/// lab, reads and writes guest files, and makes the daemon write to any path
+/// the user can. With `XDG_RUNTIME_DIR` set the directory is already private,
+/// but the WSL/Docker fallback is `/tmp/vmlab-<uid>`, where the default mode
+/// would leave the sockets (and the per-VM VNC sockets beside them) reachable
+/// by every local user. So: create private, tighten an existing directory, and
+/// refuse one owned by somebody else — a pre-created `/tmp` squat.
+///
+/// Deliberately *not* applied to the data/state/template directories: those are
+/// legitimately shared or bind-mounted in some deployments, and they hold no
+/// control interface.
+pub fn ensure_private_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+        // Created private in one step, so there is no window where a fresh
+        // `/tmp/vmlab-<uid>` is world-traversable.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("cannot create directory {}", dir.display()))?;
+
+        let meta = std::fs::metadata(dir)
+            .with_context(|| format!("cannot stat directory {}", dir.display()))?;
+        let us = nix::unistd::Uid::effective().as_raw();
+        if meta.uid() != us {
+            bail!(
+                "{} is owned by uid {}, not {us} — refusing to put control sockets there",
+                dir.display(),
+                meta.uid()
+            );
+        }
+        if meta.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("cannot restrict {} to 0700", dir.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    ensure_dir(dir)?;
     Ok(())
 }
 

@@ -70,15 +70,14 @@ pub(crate) fn walk_dir(
             continue;
         }
         // Symlinks are not followed: a link to a big/hostile tree must not
-        // widen the listing (writes reject them independently).
-        let meta = entry.metadata().map_err(|e| e.to_string())?;
-        let is_symlink = std::fs::symlink_metadata(entry.path())
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(true);
-        if is_symlink {
+        // widen the listing (writes reject them independently). Checked with
+        // `symlink_metadata` BEFORE any stat that follows the link — a dangling
+        // symlink must be skipped, not fail the whole listing.
+        let link_meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        if link_meta.file_type().is_symlink() {
             continue;
         }
-        names.push((name, meta.is_dir()));
+        names.push((name, link_meta.is_dir()));
     }
     names.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut out = Vec::new();
@@ -139,4 +138,51 @@ pub(crate) fn ensure_safe_parent(base: &Path, parent: &Path) -> Result<PathBuf, 
         return Err("path escapes the sandbox".into());
     }
     Ok(canonical_parent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_relative_rejects_traversal_and_roots() {
+        assert!(plain_relative("a/b.txt", "path").is_ok());
+        for bad in ["", "/abs", "../up", "a/../b", "./a"] {
+            assert!(plain_relative(bad, "path").is_err(), "{bad:?}");
+        }
+    }
+
+    /// A dangling symlink must be skipped like any other link — it used to
+    /// fail the whole listing, because the size stat ran before the link check.
+    #[test]
+    #[cfg(unix)]
+    fn walk_skips_symlinks_including_broken_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.txt"), b"hi").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink("nowhere", tmp.path().join("broken")).unwrap();
+        std::os::unix::fs::symlink("real.txt", tmp.path().join("alias")).unwrap();
+        std::fs::write(tmp.path().join(".hidden"), b"x").unwrap();
+
+        let mut count = 0;
+        let entries = walk_dir(tmp.path(), Path::new(""), 0, &mut count).expect("listing succeeds");
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["sub", "real.txt"], "dirs first, links skipped");
+    }
+
+    #[test]
+    fn walk_caps_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut deep = tmp.path().to_path_buf();
+        for i in 0..(MAX_TREE_DEPTH + 2) {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let mut count = 0;
+        let err = walk_dir(tmp.path(), Path::new(""), 0, &mut count).unwrap_err();
+        assert!(err.contains("editor limit"), "{err}");
+    }
 }

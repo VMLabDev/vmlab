@@ -5,11 +5,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
 
 use super::{Event, Message};
+
+/// Longest request line the server will buffer. Requests are small JSON
+/// objects; anything approaching this is a broken or hostile client, and an
+/// unbounded `read_line` would let it grow the daemon's memory at will.
+const MAX_REQ_LINE: usize = 1 << 20;
 
 /// Sink for incremental output of a long-running command. Dropping it is
 /// fine — chunks are best-effort.
@@ -58,11 +63,20 @@ impl Server {
         handler: Arc<dyn Handler>,
         events: broadcast::Sender<Event>,
     ) -> std::io::Result<Server> {
+        // The socket is a full-privilege interface (scripts, guest files,
+        // daemon-side writes), so both the directory holding it and the socket
+        // itself are owner-only — `bind` would otherwise honour the umask and
+        // leave it connectable by any local user.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::paths::ensure_private_dir(parent).map_err(std::io::Error::other)?;
         }
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let events_accept = events.clone();
         let handle = tokio::spawn(async move {
             loop {
@@ -98,13 +112,48 @@ impl Drop for Server {
     }
 }
 
+/// Read one `\n`-terminated line, refusing to buffer more than
+/// [`MAX_REQ_LINE`] bytes. `Ok(None)` is EOF; an over-long line ends the
+/// connection (the stream is desynchronised at that point anyway).
+async fn read_capped_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        // A BufReader hands back at most its capacity, so `line` grows in
+        // bounded steps and the check below runs before it can balloon.
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8(line)?))
+            };
+        }
+        let newline_at = available.iter().position(|b| *b == b'\n');
+        let take = newline_at.unwrap_or(available.len());
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take + usize::from(newline_at.is_some()));
+        anyhow::ensure!(
+            line.len() <= MAX_REQ_LINE,
+            "request line exceeds {MAX_REQ_LINE} bytes"
+        );
+        if newline_at.is_some() {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(String::from_utf8(line)?));
+        }
+    }
+}
+
 async fn serve_conn(
     stream: UnixStream,
     handler: Arc<dyn Handler>,
     events: broadcast::Sender<Event>,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
 
     // All outbound traffic for this connection funnels through one channel so
     // responses, stream chunks, and events interleave without tearing.
@@ -124,7 +173,7 @@ async fn serve_conn(
 
     let mut event_pump: Option<tokio::task::JoinHandle<()>> = None;
 
-    while let Some(line) = lines.next_line().await? {
+    while let Some(line) = read_capped_line(&mut reader).await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -211,4 +260,79 @@ async fn serve_conn(
     }
     writer.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Echo;
+
+    #[async_trait::async_trait]
+    impl Handler for Echo {
+        async fn handle(&self, cmd: &str, _args: Value, _s: &Streamer) -> Result<Value, String> {
+            Ok(Value::String(cmd.to_string()))
+        }
+    }
+
+    /// The control socket is a full-privilege interface: owner-only socket in
+    /// an owner-only directory, whatever the umask.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_restricts_socket_and_directory_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("run/labs/demo");
+        let sock = dir.join("control.sock");
+        let server = Server::bind(&sock, Arc::new(Echo)).await.unwrap();
+
+        let sock_mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(sock_mode, 0o600, "socket mode {sock_mode:o}");
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "directory mode {dir_mode:o}");
+        drop(server);
+    }
+
+    /// A directory owned by somebody else must never be used for sockets.
+    #[test]
+    #[cfg(unix)]
+    fn foreign_owned_socket_directory_is_refused() {
+        // /tmp itself is root-owned on any normal host — the exact shape of the
+        // `/tmp/vmlab-<uid>` squat this guards against.
+        if nix::unistd::Uid::effective().is_root() {
+            eprintln!("SKIP: running as root, every directory passes the owner check");
+            return;
+        }
+        let err = crate::paths::ensure_private_dir(std::path::Path::new("/tmp")).unwrap_err();
+        assert!(err.to_string().contains("owned by uid"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_handles_split_crlf_and_eof() {
+        let mut r = BufReader::new(std::io::Cursor::new(b"one\r\ntwo\nthree".to_vec()));
+        assert_eq!(
+            read_capped_line(&mut r).await.unwrap().as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            read_capped_line(&mut r).await.unwrap().as_deref(),
+            Some("two")
+        );
+        // A trailing fragment with no newline is still delivered, then EOF.
+        assert_eq!(
+            read_capped_line(&mut r).await.unwrap().as_deref(),
+            Some("three")
+        );
+        assert_eq!(read_capped_line(&mut r).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn capped_line_reader_refuses_an_oversized_line() {
+        let mut wire = vec![b'x'; MAX_REQ_LINE + 1];
+        wire.push(b'\n');
+        let mut r = BufReader::new(std::io::Cursor::new(wire));
+        let err = read_capped_line(&mut r).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
 }

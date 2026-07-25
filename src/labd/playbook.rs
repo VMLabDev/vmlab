@@ -19,6 +19,7 @@ use crate::config::model::{Lab, Playbook};
 use crate::labd::lab::LabRuntime;
 use crate::labd::vm_agent::{AgentHandle, SessionEvent};
 use crate::scripting::OutputSink;
+use crate::sync::LockRecover;
 
 /// Guest OS family — picks the config-weave binary and path scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,7 +303,7 @@ impl PlaybookOps {
         play: &str,
         kind: &'static str,
     ) -> Result<(OpGuard, u64), String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         if let Some(op) = inner.ops.get(machine) {
             return Err(format!(
                 "{} of {} play {} already running for \"{machine}\"",
@@ -334,7 +335,7 @@ impl PlaybookOps {
     }
 
     fn set_phase(&self, machine: &str, phase: &'static str, reboot_attempt: u32) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         if let Some(op) = inner.ops.get_mut(machine) {
             op.phase = phase;
             op.reboot_attempt = reboot_attempt;
@@ -342,7 +343,7 @@ impl PlaybookOps {
     }
 
     fn append_log(&self, machine: &str, line: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock_recover();
         if let Some(op) = inner.ops.get_mut(machine) {
             if op.log.len() == LOG_CAP {
                 op.log.pop_front();
@@ -352,7 +353,7 @@ impl PlaybookOps {
     }
 
     fn pushed_sha(&self, machine: &str) -> Option<String> {
-        self.inner.lock().unwrap().pushed.get(machine).cloned()
+        self.inner.lock_recover().pushed.get(machine).cloned()
     }
 
     fn set_pushed(&self, machine: &str, sha: &str) {
@@ -365,7 +366,7 @@ impl PlaybookOps {
 
     /// The running op for `machine` (`playbook.list` decoration).
     pub fn op_of(&self, machine: &str) -> Value {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock_recover();
         match inner.ops.get(machine) {
             Some(op) => json!({
                 "machine": machine,
@@ -380,7 +381,7 @@ impl PlaybookOps {
     /// All in-flight runs with log tails (`playbook.op_status` — the resync
     /// source for reconnecting UIs).
     pub fn status(&self) -> Value {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock_recover();
         let mut rows: Vec<Value> = inner
             .ops
             .iter()
@@ -412,7 +413,7 @@ struct OpGuard {
 
 impl Drop for OpGuard {
     fn drop(&mut self) {
-        self.ops.inner.lock().unwrap().ops.remove(&self.machine);
+        self.ops.inner.lock_recover().ops.remove(&self.machine);
     }
 }
 

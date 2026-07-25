@@ -32,6 +32,8 @@ use vmlab_agent_proto::{
 };
 pub use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
 
+use crate::sync::LockRecover;
+
 /// What the agent said about itself in the handshake.
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -88,7 +90,7 @@ impl SendCredit {
         loop {
             let notified = self.notify.notified();
             {
-                let mut g = self.avail.lock().unwrap();
+                let mut g = self.avail.lock_recover();
                 if self.closed.load(Ordering::SeqCst) {
                     return 0;
                 }
@@ -103,7 +105,7 @@ impl SendCredit {
     }
 
     fn grant(&self, bytes: u64) {
-        let mut g = self.avail.lock().unwrap();
+        let mut g = self.avail.lock_recover();
         *g = g.saturating_add(bytes);
         self.notify.notify_waiters();
     }
@@ -206,7 +208,7 @@ impl AgentHandle {
         // read half and actually closes the socket — see `Inner::reader`).
         let weak = Arc::downgrade(&inner);
         let task = tokio::spawn(async move { reader_task(weak, read_half).await });
-        *inner.reader.lock().unwrap() = Some(task);
+        *inner.reader.lock_recover() = Some(task);
 
         handle
             .send_msg(&HostMsg::Hello {
@@ -265,7 +267,7 @@ impl AgentHandle {
     /// when replacing a dead handle; dropping the last handle does the same
     /// implicitly.
     pub async fn shutdown(&self) {
-        if let Some(task) = self.inner.reader.lock().unwrap().take() {
+        if let Some(task) = self.inner.reader.lock_recover().take() {
             task.abort();
         }
         // Close the write half explicitly: QEMU frees its one-client
@@ -280,7 +282,7 @@ impl AgentHandle {
         for (_, entry) in sessions.drain() {
             entry.credit.close();
         }
-        self.inner.open_waiters.lock().unwrap().clear();
+        self.inner.open_waiters.lock_recover().clear();
     }
 
     /// Liveness probe.
@@ -685,7 +687,7 @@ impl Drop for AgentSession {
         }
         let handle = self.handle.clone();
         let id = self.id;
-        handle.inner.open_waiters.lock().unwrap().remove(&id);
+        handle.inner.open_waiters.lock_recover().remove(&id);
         // Spawned on the connection's own runtime: a drop on a non-runtime
         // thread (script executors) must not panic.
         let rt = handle.inner.rt.clone();
@@ -711,7 +713,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         // Last handle gone: abort the reader so its blocked `read()` drops
         // the socket's read half (see the `reader` field for why).
-        if let Some(task) = self.reader.lock().unwrap().take() {
+        if let Some(task) = self.reader.lock_recover().take() {
             task.abort();
         }
     }
@@ -749,7 +751,7 @@ async fn reader_task(weak: Weak<Inner>, mut read_half: tokio::net::unix::OwnedRe
         for (_, entry) in sessions.drain() {
             entry.credit.close();
         }
-        inner.open_waiters.lock().unwrap().clear();
+        inner.open_waiters.lock_recover().clear();
     }
 }
 
@@ -780,12 +782,12 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             }));
         }
         AgentMsg::Opened { id } => {
-            if let Some(w) = inner.open_waiters.lock().unwrap().remove(&id) {
+            if let Some(w) = inner.open_waiters.lock_recover().remove(&id) {
                 let _ = w.send(Ok(()));
             }
         }
         AgentMsg::Error { id: Some(id), msg } => {
-            let waiter = inner.open_waiters.lock().unwrap().remove(&id);
+            let waiter = inner.open_waiters.lock_recover().remove(&id);
             match waiter {
                 Some(w) => {
                     let _ = w.send(Err(msg));

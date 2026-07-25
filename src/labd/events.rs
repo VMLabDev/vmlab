@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use serde_json::Value;
 
 use crate::proto::Event;
+use crate::sync::LockRecover;
 
 pub struct EventLog {
     lab: String,
@@ -45,10 +46,11 @@ impl EventLog {
     pub fn emit(&self, event: &str, data: Value) {
         let ev = Event::new(event, self.lab.clone(), data);
         tracing::info!(event = %ev.event, data = %ev.data, "event");
-        if let Ok(line) = serde_json::to_string(&ev)
-            && let Ok(mut f) = self.file.lock()
-        {
-            let _ = writeln!(f, "{line}");
+        if let Ok(line) = serde_json::to_string(&ev) {
+            // `lock_recover`, not `if let Ok(..)`: a panic anywhere else in the
+            // daemon while this lock was held would otherwise silently end
+            // event history for the rest of the daemon's life.
+            let _ = writeln!(self.file.lock_recover(), "{line}");
         }
         let _ = self.tx.send(ev);
     }
