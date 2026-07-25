@@ -427,3 +427,100 @@ async fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Args` with everything off — the shape the tests vary one field at a
+    /// time. Env fallbacks are deliberately not exercised: reading them is
+    /// process-global, and the flag path is the same code.
+    fn args(bind: &str) -> Args {
+        Args {
+            bind: bind.parse().unwrap(),
+            port: 7878,
+            auth: false,
+            no_auth: false,
+            user: None,
+            password: None,
+            password_hash: None,
+            up: false,
+            trust_proxy: false,
+        }
+    }
+
+    #[test]
+    fn loopback_with_no_credentials_runs_open() {
+        let cfg = build_auth(&args("127.0.0.1")).expect("loopback needs no credentials");
+        assert!(!cfg.enabled);
+    }
+
+    /// The secure default: exposing the console to the network with no login is
+    /// refused unless the operator says so explicitly.
+    #[test]
+    fn non_loopback_with_no_credentials_is_refused_unless_opted_in() {
+        let Err(err) = build_auth(&args("0.0.0.0")) else {
+            panic!("a public bind with no credentials must be refused");
+        };
+        assert!(err.contains("refused by default"), "{err}");
+
+        let mut opted_in = args("0.0.0.0");
+        opted_in.no_auth = true;
+        assert!(!build_auth(&opted_in).unwrap().enabled);
+    }
+
+    /// Credentials win over `--no-auth`: a config that supplies both is asking
+    /// for auth, and silently running open would be the dangerous reading.
+    #[test]
+    fn credentials_enable_auth_even_with_no_auth_set() {
+        let mut a = args("0.0.0.0");
+        a.no_auth = true;
+        a.user = Some("admin".into());
+        a.password = Some("hunter2".into());
+        let cfg = build_auth(&a).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.user, "admin");
+        // The plaintext password is hashed at startup, never stored as given.
+        assert!(
+            cfg.password_hash.starts_with("$argon2"),
+            "{}",
+            cfg.password_hash
+        );
+        assert!(!cfg.password_hash.contains("hunter2"));
+    }
+
+    #[test]
+    fn a_precomputed_hash_is_used_verbatim_and_beats_a_plaintext_password() {
+        let mut a = args("127.0.0.1");
+        a.user = Some("admin".into());
+        a.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$c2FsdA$hash".into());
+        a.password = Some("ignored".into());
+        let cfg = build_auth(&a).unwrap();
+        assert_eq!(cfg.password_hash, "$argon2id$v=19$m=1,t=1,p=1$c2FsdA$hash");
+    }
+
+    /// `--auth` without credentials must fail loudly rather than come up open.
+    #[test]
+    fn auth_without_credentials_is_an_error() {
+        let mut a = args("127.0.0.1");
+        a.auth = true;
+        let Err(err) = build_auth(&a) else {
+            panic!("--auth without credentials must be an error");
+        };
+        assert!(err.contains("--auth requires"), "{err}");
+    }
+
+    /// A username with no password is not credentials — it must not silently
+    /// enable auth with an empty hash (which would accept nothing) or run open
+    /// on a public bind.
+    #[test]
+    fn a_username_alone_is_not_credentials() {
+        let mut a = args("127.0.0.1");
+        a.user = Some("admin".into());
+        assert!(!build_auth(&a).unwrap().enabled, "loopback stays open");
+
+        let mut public = args("0.0.0.0");
+        public.user = Some("admin".into());
+        assert!(build_auth(&public).is_err(), "public bind still refused");
+    }
+}

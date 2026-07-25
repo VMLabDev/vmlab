@@ -12,13 +12,11 @@ pub struct QmpEvent {
     pub data: Value,
     /// Host-side timestamp QEMU attached to the event. No consumer reads
     /// it today; carried so the event mirrors the wire format.
-    #[allow(dead_code)]
     pub timestamp: EventTimestamp,
 }
 
 /// Timestamp attached to QMP events (`{"seconds": ..., "microseconds": ...}`).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[allow(dead_code)]
 pub struct EventTimestamp {
     #[serde(default)]
     pub seconds: i64,

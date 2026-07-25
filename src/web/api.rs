@@ -6,8 +6,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
+use super::fsops::{ensure_safe_parent, plain_relative};
 use super::state::AppState;
 
 /// Map a daemon error string to an HTTP response.
@@ -686,50 +687,16 @@ fn script_rev(content: &str) -> String {
 
 /// Resolve a script path lexically beneath a lab root. Canonicalisation is
 /// intentionally not used: a newly-created file and its parent may not exist.
+///
+/// The relative-shape check is [`plain_relative`] — one implementation of the
+/// path sandbox, shared with the Files tab — plus the `.ws` extension rule.
 fn lab_script_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
-    let relative = Path::new(requested);
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative.extension().and_then(|e| e.to_str()) != Some("ws")
-        || relative
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_)))
-    {
+    let relative = plain_relative(requested, "script path")
+        .map_err(|_| "script path must be a relative .ws file inside the lab".to_string())?;
+    if relative.extension().and_then(|e| e.to_str()) != Some("ws") {
         return Err("script path must be a relative .ws file inside the lab".into());
     }
     Ok(root.join(relative))
-}
-
-fn ensure_safe_script_parent(root: &Path, parent: &Path) -> Result<PathBuf, String> {
-    let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
-    let relative = parent
-        .strip_prefix(root)
-        .map_err(|_| "script path escapes the lab".to_string())?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            return Err("script path escapes the lab".into());
-        };
-        current.push(part);
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err("script directories cannot be symbolic links".into());
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(format!("{} is not a directory", current.display()));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current).map_err(|e| e.to_string())?;
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    let canonical_parent = std::fs::canonicalize(current).map_err(|e| e.to_string())?;
-    if !canonical_parent.starts_with(canonical_root) {
-        return Err("script path escapes the lab".into());
-    }
-    Ok(canonical_parent)
 }
 
 /// `GET /api/labs/{lab}/scripts?path=...` — read a lab-relative WScript.
@@ -810,7 +777,8 @@ pub async fn save_script(
         let Some(parent) = path.parent() else {
             return ScriptSave::Error("script has no parent directory".into());
         };
-        let canonical_parent = match ensure_safe_script_parent(&root, parent) {
+        // Same symlink-refusing walk the Files tab uses — one implementation.
+        let canonical_parent = match ensure_safe_parent(&root, parent) {
             Ok(path) => path,
             Err(e) => return ScriptSave::Invalid(e),
         };

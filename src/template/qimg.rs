@@ -40,7 +40,6 @@ pub struct ImageInfo {
     #[serde(rename = "virtual-size")]
     pub virtual_size: u64,
     /// Bytes actually allocated on the host (the sparseness test reads it).
-    #[allow(dead_code)]
     #[serde(rename = "actual-size")]
     pub actual_size: u64,
     /// Backing image, present for linked clones.

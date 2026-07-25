@@ -181,7 +181,6 @@ impl QmpClient {
     /// [`QmpError::Closed`]. Affects every clone of this client.
     /// (Production drops the last clone instead — see `Drop` on `Inner` —
     /// but the tests close explicitly to assert in-flight behaviour.)
-    #[allow(dead_code)]
     pub async fn close(&self) {
         let task = self.inner.reader_task.lock_recover().take();
         if let Some(task) = task {
@@ -218,7 +217,6 @@ impl QmpClient {
 
     /// Query the VM run state (`query-status`). (The daemon watches run
     /// state via events; the QMP tests poll through this.)
-    #[allow(dead_code)]
     pub async fn query_status(&self) -> Result<RunState, QmpError> {
         let value = self.execute("query-status", None).await?;
         let status = value

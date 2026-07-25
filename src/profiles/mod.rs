@@ -59,7 +59,6 @@ pub struct Profile {
     /// Human-readable summary from the profile's WCL `description`. Nothing
     /// surfaces it yet (there is no `profile list` verb); parsed for schema
     /// parity.
-    #[allow(dead_code)]
     pub description: Option<String>,
     pub machine: Option<Machine>,
     pub firmware: Option<FirmwareKind>,

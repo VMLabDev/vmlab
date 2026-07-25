@@ -41,6 +41,21 @@ web-ui-check:
 [group('check')]
 check: lint fmt-check test web-ui-check
 
+# Format check, lint and test one guest-side crate
+[group('check')]
+guest-crate-check crate:
+	cargo fmt --check --manifest-path guest/{{crate}}/Cargo.toml
+	cargo clippy --all-targets --manifest-path guest/{{crate}}/Cargo.toml -- -D warnings
+	cargo test --manifest-path guest/{{crate}}/Cargo.toml
+
+# Check every guest-side crate (standalone workspaces `check` never touches)
+[group('check')]
+guest-check: (guest-crate-check 'cinit-proto') (guest-crate-check 'cinit') (guest-crate-check 'agent-proto') (guest-crate-check 'agent')
+
+# Everything CI gates on: check + guest crates + BPF objects (needs `ebpf-tools`)
+[group('check')]
+check-all: check guest-check ebpf-verify
+
 # Build the official runtime container image: `vmlab` CLI + `vmlab-web` (PRD §14)
 [group('build')]
 image tag='vmlab:latest':

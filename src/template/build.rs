@@ -643,6 +643,27 @@ fn source_origin(source: &TemplateSource) -> Option<String> {
     }
 }
 
+/// Quote a value for a WCL string literal. Every path, label and name below
+/// comes from a template definition (or a work-dir path), so a `"` or `\` in
+/// one would otherwise produce a file that fails to parse — a confusing error a
+/// long way from its cause.
+fn wcl_str(value: impl std::fmt::Display) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for c in raw.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Render the synthetic build lab. The build VM is a `scratch` VM (so there
 /// is no template layer); its disk is pre-seeded after the runtime builds.
 /// `guest_iso` attaches the VMLAB bootstrap ISO folder as extra media.
@@ -659,12 +680,12 @@ fn synth_lab(
 ) -> Result<String> {
     use std::fmt::Write;
     let mut s = String::from("import <vmlab.wcl>\n\n");
-    writeln!(s, "lab \"{lab_name}\" {{").unwrap();
-    writeln!(s, "  vm \"{vm}\" {{").unwrap();
+    writeln!(s, "lab {} {{", wcl_str(lab_name)).unwrap();
+    writeln!(s, "  vm {} {{", wcl_str(vm)).unwrap();
     writeln!(s, "    template = \"scratch\"").unwrap();
-    writeln!(s, "    arch     = \"{}\"", def.arch).unwrap();
+    writeln!(s, "    arch     = {}", wcl_str(&def.arch)).unwrap();
     let profile = def.profile.as_deref().unwrap_or("linux-generic");
-    writeln!(s, "    profile  = \"{profile}\"").unwrap();
+    writeln!(s, "    profile  = {}", wcl_str(profile)).unwrap();
     // Bare integers: `disk`/`memory` are std.ByteSize in the schema, which
     // takes byte counts or size literals — never quoted strings.
     let disk = def.disk.unwrap_or(20 << 30);
@@ -676,7 +697,7 @@ fn synth_lab(
         writeln!(s, "    memory   = {mem}").unwrap();
     }
     if let Some(c) = cdrom {
-        writeln!(s, "    cdrom    = \"{}\"", c.display()).unwrap();
+        writeln!(s, "    cdrom    = {}", wcl_str(c.display())).unwrap();
     }
     if def.gui {
         writeln!(s, "    gui      = true").unwrap();
@@ -691,7 +712,7 @@ fn synth_lab(
         for n in &def.nics {
             let mut attrs = String::from("nat = true");
             if let Some(mac) = &n.mac {
-                write!(attrs, " mac = \"{mac}\"").unwrap();
+                write!(attrs, " mac = {}", wcl_str(mac)).unwrap();
             }
             writeln!(s, "    nic {{ {attrs} }}").unwrap();
         }
@@ -708,20 +729,21 @@ fn synth_lab(
             let from = root.join(&m.from);
             write!(
                 s,
-                "    media {{ kind = \"{kind}\" from = \"{}\"",
-                from.display()
+                "    media {{ kind = {} from = {}",
+                wcl_str(kind),
+                wcl_str(from.display())
             )
             .unwrap();
             if let Some(l) = &m.label {
-                write!(s, " label = \"{l}\"").unwrap();
+                write!(s, " label = {}", wcl_str(l)).unwrap();
             }
             writeln!(s, " }}").unwrap();
         }
         if let Some(gi) = guest_iso {
             writeln!(
                 s,
-                "    media {{ kind = \"iso\" from = \"{}\" label = \"VMLAB\" }}",
-                gi.display()
+                "    media {{ kind = \"iso\" from = {} label = \"VMLAB\" }}",
+                wcl_str(gi.display())
             )
             .unwrap();
         }
@@ -750,15 +772,16 @@ fn synth_lab(
         match step {
             Step::Provision(p) => {
                 let script = root.join(&p.script);
-                writeln!(s, "  provision \"{}\" {{ }}", script.display()).unwrap();
+                writeln!(s, "  provision {} {{ }}", wcl_str(script.display())).unwrap();
             }
             Step::Playbook(p) => {
                 let dir = root.join(&p.path);
                 writeln!(
                     s,
-                    "  playbook \"{}\" {{ play = \"{}\" vms = [\"{vm}\"] }}",
-                    dir.display(),
-                    p.play
+                    "  playbook {} {{ play = {} vms = [{}] }}",
+                    wcl_str(dir.display()),
+                    wcl_str(&p.play),
+                    wcl_str(vm)
                 )
                 .unwrap();
             }
@@ -770,12 +793,37 @@ fn synth_lab(
 
 #[cfg(test)]
 mod tests {
-    use super::synth_lab;
+    use super::{synth_lab, wcl_str};
     use std::path::Path;
 
     fn def(source: &str) -> crate::config::model::TemplateDef {
         let tf = crate::config::load_template_source(source, "<test>", Path::new("/root")).unwrap();
         tf.templates.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn wcl_strings_escape_quotes_and_backslashes() {
+        assert_eq!(wcl_str("plain"), "\"plain\"");
+        assert_eq!(wcl_str(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(wcl_str(r"C:\drivers"), r#""C:\\drivers""#);
+        assert_eq!(wcl_str("two\nlines"), "\"two\\nlines\"");
+    }
+
+    /// A media label containing a quote used to emit a lab file that failed to
+    /// parse, a long way from the value that caused it.
+    #[test]
+    fn a_quote_in_a_label_still_produces_a_parseable_lab() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "  media { kind = \"iso\" from = \"drivers\" label = \"say \\\"hi\\\"\" }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        assert!(wcl.contains(r#"label = "say \"hi\"""#), "{wcl}");
+        crate::config::load_lab_source(&wcl, "<synth>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic lab must parse: {e:?}\n{wcl}"));
     }
 
     /// A template-declared NIC must reach the synthetic build lab (it used
