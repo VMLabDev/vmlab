@@ -212,13 +212,11 @@ export default function PkgReposModal() {
           />
           <Input
             label="Branch"
-            help="Remote default when empty"
             value={branch()}
             onInput={(e) => setBranch(e.currentTarget.value)}
           />
           <Input
             label="Subdir"
-            help="Directory holding the packages; checkout root when empty"
             placeholder="pkgs"
             value={subdir()}
             onInput={(e) => setSubdir(e.currentTarget.value)}
@@ -226,6 +224,12 @@ export default function PkgReposModal() {
           <Button variant="primary" disabled={!addReady()} onClick={() => void addRepo()}>
             {busy() ? "Working…" : "Add repo"}
           </Button>
+        </div>
+        {/* Same reason as the search form: per-field help would leave the
+            fields that carry it taller than the rest of the row. */}
+        <div class="inspector-note">
+          Branch and Subdir are optional — the remote default branch and the checkout root
+          are used when empty; Subdir names the directory holding the packages.
         </div>
       </div>
     </Modal>

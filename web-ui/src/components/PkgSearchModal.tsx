@@ -101,7 +101,6 @@ export default function PkgSearchModal() {
         >
           <Input
             label="Search"
-            help="Matches package names and descriptions across the registered repos"
             placeholder="e.g. nginx"
             value={term()}
             onInput={(e) => setTerm(e.currentTarget.value)}
@@ -110,6 +109,11 @@ export default function PkgSearchModal() {
             {searching() ? "Searching…" : "Search"}
           </Button>
         </form>
+        {/* Below the row, not as field help: help text sits inside the field
+            column and would push the button off the input's line. */}
+        <div class="inspector-note">
+          Matches package names and descriptions across the registered repos.
+        </div>
         <Show when={searching()}>
           <div class="editor-loading">
             <Spinner /> syncing package repos…
