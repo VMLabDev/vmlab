@@ -157,7 +157,8 @@ WCL
 
 let ex_playbook = <<'WCL'
 playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
-playbook "playbooks/domain" { play = "member" }   // no vms = every machine
+playbook "playbooks/domain" { play = "member" all_machines = true }  // every machine
+playbook "playbooks/draft"  { play = "wip" }      // no targets: declared, never runs
 WCL
 
 let ex_disk = <<'WCL'
@@ -181,7 +182,7 @@ gpu { mode = "passthrough" address = "0000:01:00.0" }   // or mode = "virgl" | "
 WCL
 
 let ex_provision = <<'WCL'
-provision "scripts/setup.ws" { }                     // runs on `vmlab up`, in order
+provision "scripts/setup.ws" { lab_wide = true }     // runs once, after every machine is up
 provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
 WCL
 

@@ -1001,7 +1001,7 @@ impl LabRuntime {
         for name in targets {
             let targeted = playbooks
                 .iter()
-                .any(|p| p.vms.is_empty() || p.vms.iter().any(|v| v == name));
+                .any(|p| p.all_machines || p.vms.iter().any(|v| v == name));
             if !targeted {
                 continue;
             }
@@ -1416,7 +1416,12 @@ impl LabRuntime {
 
         let mut remaining: Vec<String> = targets.clone();
         let mut done: HashSet<String> = HashSet::new();
-        let steps = merged_up_steps(&self.config.lab);
+        let (steps, skipped) = merged_up_steps(&self.config.lab);
+        for step in &skipped {
+            output(format!(
+                "{step}: no targets (no `vms`, no lab-wide flag) — skipped\n"
+            ));
+        }
         let mut next_step = 0usize;
         while !remaining.is_empty() {
             // A wave: every remaining machine whose deps (within the target
@@ -1587,9 +1592,9 @@ impl LabRuntime {
     /// Run configuration steps (provision scripts and playbook applies —
     /// one declaration-ordered queue, see [`merged_up_steps`]) in strict
     /// order starting at `*next`: a scoped step runs once all its machines
-    /// are started (waiting for their readiness first); an unscoped step
-    /// runs only in the final pass. Stops at the first step that isn't
-    /// eligible yet.
+    /// are started (waiting for their readiness first); a lab-wide step
+    /// (`lab_wide`/`all_machines`) runs only in the final pass. Stops at the
+    /// first step that isn't eligible yet.
     async fn run_up_steps(
         self: &Arc<Self>,
         steps: &[UpStep],
@@ -1626,9 +1631,9 @@ impl LabRuntime {
                         .with_context(|| format!("provision {}", p.script.display()))?;
                 }
                 UpStep::Playbook(p) => {
-                    // Unscoped playbooks apply to the machines this `up`
-                    // actually started (like unscoped provisions run once
-                    // everything targeted is up).
+                    // `all_machines` playbooks apply to the machines this
+                    // `up` actually started (like lab-wide provisions run
+                    // once everything targeted is up).
                     let machines: Vec<&String> = if scoped.is_empty() {
                         targets.iter().collect()
                     } else {
@@ -2285,19 +2290,40 @@ enum UpStep {
 }
 
 impl UpStep {
-    /// The machines this step is scoped to (empty = unscoped).
+    /// The machines this step is scoped to; empty means lab-wide (the block
+    /// opted in with `lab_wide`/`all_machines`, so it runs in the final
+    /// pass). Steps that name nothing never get here — [`merged_up_steps`]
+    /// drops them.
     fn vms(&self) -> &[String] {
         match self {
             UpStep::Provision(p) => &p.vms,
             UpStep::Playbook(p) => &p.vms,
         }
     }
+
+    /// Whether the step runs at all: an explicit `vms` scope, or the
+    /// block's lab-wide opt-in. Neither = declared but inert.
+    fn runs(&self) -> bool {
+        match self {
+            UpStep::Provision(p) => !p.vms.is_empty() || p.lab_wide,
+            UpStep::Playbook(p) => !p.vms.is_empty() || p.all_machines,
+        }
+    }
+
+    /// How the step names itself in `up` output.
+    fn describe(&self) -> String {
+        match self {
+            UpStep::Provision(p) => format!("provision {}", p.script.display()),
+            UpStep::Playbook(p) => format!("playbook {} play {}", p.path.display(), p.play),
+        }
+    }
 }
 
 /// Provisions and playbooks merged back into file declaration order — the
 /// model keeps them in separate vecs; block byte spans recover the
-/// interleaving.
-fn merged_up_steps(lab: &crate::config::model::Lab) -> Vec<UpStep> {
+/// interleaving. Steps that target nothing are dropped here (and announced
+/// by the caller) so the run loop only ever sees scoped or lab-wide work.
+fn merged_up_steps(lab: &crate::config::model::Lab) -> (Vec<UpStep>, Vec<String>) {
     let mut steps: Vec<UpStep> = lab
         .provisions
         .iter()
@@ -2309,7 +2335,13 @@ fn merged_up_steps(lab: &crate::config::model::Lab) -> Vec<UpStep> {
         UpStep::Provision(p) => p.span.0,
         UpStep::Playbook(p) => p.span.0,
     });
-    steps
+    let skipped = steps
+        .iter()
+        .filter(|s| !s.runs())
+        .map(UpStep::describe)
+        .collect();
+    steps.retain(UpStep::runs);
+    (steps, skipped)
 }
 
 #[cfg(test)]
@@ -2323,11 +2355,11 @@ lab "l" {
   vm "a" { template = "x86_64/t" }
   provision "scripts/one.ws" { vms = ["a"] }
   playbook "pb/base" { play = "base" vms = ["a"] }
-  provision "scripts/two.ws" { }
+  provision "scripts/two.ws" { lab_wide = true }
 }"#;
         let lf = crate::config::load_lab_source(src, "<test>", std::path::Path::new("/tmp"))
             .expect("parse");
-        let steps = merged_up_steps(&lf.lab);
+        let (steps, _skipped) = merged_up_steps(&lf.lab);
         let kinds: Vec<String> = steps
             .iter()
             .map(|s| match s {
@@ -2342,6 +2374,28 @@ lab "l" {
                 "playbook:pb/base",
                 "provision:scripts/two.ws",
             ]
+        );
+    }
+
+    /// Steps that name no machines and take no lab-wide opt-in are declared
+    /// but never queued — `up` announces them instead of running them.
+    #[test]
+    fn up_steps_drop_target_less_blocks() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" }
+  provision "scripts/idle.ws" { }
+  playbook "pb/idle" { play = "base" }
+  playbook "pb/live" { play = "base" all_machines = true }
+}"#;
+        let lf = crate::config::load_lab_source(src, "<test>", std::path::Path::new("/tmp"))
+            .expect("parse");
+        let (steps, skipped) = merged_up_steps(&lf.lab);
+        let kinds: Vec<String> = steps.iter().map(UpStep::describe).collect();
+        assert_eq!(kinds, vec!["playbook pb/live play base"]);
+        assert_eq!(
+            skipped,
+            vec!["provision scripts/idle.ws", "playbook pb/idle play base"]
         );
     }
 }

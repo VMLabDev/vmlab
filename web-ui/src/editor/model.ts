@@ -248,6 +248,9 @@ export interface ProvisionModel {
   span: Span | null;
   script: string;
   vms: string[];
+  /** Run once for the whole lab in the final pass; without this or `vms`
+   *  the script is declared but never runs. */
+  lab_wide: boolean;
 }
 
 export interface PlaybookModel {
@@ -256,6 +259,9 @@ export interface PlaybookModel {
   path: string;
   play: string;
   vms: string[];
+  /** Target every VM and container; without this or `vms` the playbook is
+   *  declared but never runs. */
+  all_machines: boolean;
 }
 
 export interface HandlerModel {

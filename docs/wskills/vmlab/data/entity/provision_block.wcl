@@ -5,12 +5,13 @@ entity provision_block {
   related  = [provisions, on_handler, wscript_overview, labs]
   audience = :both
   body {
-    p "A `provision {}` block runs a wscript file on `vmlab up`, in declaration order."
+    p "A `provision {}` block runs a wscript file on `vmlab up`, in declaration order. Targeting is explicit: name the VMs in `vms`, or take the whole-lab opt-in with `lab_wide = true`."
     code "wcl" { source = <<'SRC'
-provision "scripts/setup.ws" { }                     // runs on `vmlab up`, in order
+provision "scripts/setup.ws" { lab_wide = true }     // runs once, after every machine is up
 provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on on these VMs
+provision "scripts/todo.ws"  { }                     // neither: declared, never runs
 SRC
     }
-    p "**Provision failures fail `vmlab up`.** A scoped provision (`vms = [...]`) gates `depends_on` on those VMs: dependents wait for the provision to finish."
+    p "**Provision failures fail `vmlab up`.** A scoped provision (`vms = [...]`) gates `depends_on` on those VMs: dependents wait for the provision to finish. `vms` and `lab_wide` are mutually exclusive; a block with neither is declared but skipped (`up` says so), which is the state a half-written provision sits in. Inside a `template {}` neither applies — build provisions always run on the build VM."
   }
 }

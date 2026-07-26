@@ -356,11 +356,15 @@ const sinkholePairs = (s: SinkholeModel): [string, FV][] => [
   ["mode", strdef(s.mode || "nxdomain", "nxdomain")],
 ];
 
-const provisionPairs = (p: ProvisionModel): [string, FV][] => [["vms", list(p.vms)]];
+const provisionPairs = (p: ProvisionModel): [string, FV][] => [
+  ["vms", list(p.vms)],
+  ["lab_wide", flag(p.lab_wide, false)],
+];
 
 const playbookPairs = (p: PlaybookModel): [string, FV][] => [
   ["play", str(p.play)],
   ["vms", list(p.vms)],
+  ["all_machines", flag(p.all_machines, false)],
 ];
 
 const handlerPairs = (h: HandlerModel): [string, FV][] => [

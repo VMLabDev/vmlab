@@ -290,8 +290,10 @@ export const publishTemplate = (lab: string, tpl: string, arch?: string, version
 export interface PlaybookInfo {
   path: string;
   play: string;
-  /** Targeted machine names; empty = every machine. */
+  /** Targeted machine names; empty with no `all_machines` = runs nowhere. */
   vms: string[];
+  /** Declared with `all_machines = true` — targets every machine. */
+  all_machines: boolean;
 }
 /** The plays defined in a folder's playbook.wcl (GET /playbooks/plays). */
 export interface PlaysInfo {
@@ -350,10 +352,12 @@ export const runPlaybook = (
     `/api/labs/${encodeURIComponent(lab)}/${kind}/${encodeURIComponent(machine)}/playbook/${action}`,
     { path, play },
   );
-/** Create a declared playbook's folder + starter playbook.wcl if missing
- *  (idempotent; 403 = not declared in vmlab.wcl). */
-export const scaffoldPlaybook = (lab: string, playbook: string) =>
-  post(`${pbBase(lab)}/scaffold`, { playbook });
+/** Create a playbook folder + starter playbook.wcl + empty pkgs/ if missing
+ *  (idempotent). Works before the folder is declared in vmlab.wcl — the
+ *  designer scaffolds first, then writes the block. `play` names the starter
+ *  play. */
+export const scaffoldPlaybook = (lab: string, playbook: string, play?: string) =>
+  post(`${pbBase(lab)}/scaffold`, { playbook, play });
 
 // --- config-weave packages (over a declared playbook folder) ----------------
 

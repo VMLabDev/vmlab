@@ -498,11 +498,12 @@ the script for depends_on satisfaction.
 | --- | --- | --- | --- |
 | `script` | `utf8` | yes | Path to the `.ws` file; must exist and compile; the inline label |
 | `vms` | `list<utf8>` | no | VM names this script is scoped to (gates their `depends_on`) |
+| `lab_wide` | `bool` | no | Run once for the whole lab, after every machine is up; mutually exclusive with `vms`. Without either the script is declared but never runs |
 
 Example:
 
 ```wcl
-provision "scripts/setup.ws" { }                     // runs on `vmlab up`, in order
+provision "scripts/setup.ws" { lab_wide = true }     // runs once, after every machine is up
 provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
 ```
 
@@ -515,13 +516,15 @@ in declaration order) and runnable on demand via `vmlab playbook check|apply`.
 | --- | --- | --- | --- |
 | `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
 | `play` | `utf8` | yes | Play name inside the playbook to run (required) |
-| `vms` | `list<utf8>` | no | VM/container names this playbook targets; empty/absent = every machine |
+| `vms` | `list<utf8>` | no | VM/container names this playbook targets; without either this or `all_machines` the playbook is declared but never runs |
+| `all_machines` | `bool` | no | Target every VM and container in the lab; mutually exclusive with `vms` |
 
 Example:
 
 ```wcl
 playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
-playbook "playbooks/domain" { play = "member" }   // no vms = every machine
+playbook "playbooks/domain" { play = "member" all_machines = true }  // every machine
+playbook "playbooks/draft"  { play = "wip" }      // no targets: declared, never runs
 ```
 
 ### `on` (in `lab`)
@@ -667,11 +670,12 @@ the script for depends_on satisfaction.
 | --- | --- | --- | --- |
 | `script` | `utf8` | yes | Path to the `.ws` file; must exist and compile; the inline label |
 | `vms` | `list<utf8>` | no | VM names this script is scoped to (gates their `depends_on`) |
+| `lab_wide` | `bool` | no | Run once for the whole lab, after every machine is up; mutually exclusive with `vms`. Without either the script is declared but never runs |
 
 Example:
 
 ```wcl
-provision "scripts/setup.ws" { }                     // runs on `vmlab up`, in order
+provision "scripts/setup.ws" { lab_wide = true }     // runs once, after every machine is up
 provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
 ```
 
@@ -684,13 +688,15 @@ in declaration order) and runnable on demand via `vmlab playbook check|apply`.
 | --- | --- | --- | --- |
 | `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
 | `play` | `utf8` | yes | Play name inside the playbook to run (required) |
-| `vms` | `list<utf8>` | no | VM/container names this playbook targets; empty/absent = every machine |
+| `vms` | `list<utf8>` | no | VM/container names this playbook targets; without either this or `all_machines` the playbook is declared but never runs |
+| `all_machines` | `bool` | no | Target every VM and container in the lab; mutually exclusive with `vms` |
 
 Example:
 
 ```wcl
 playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
-playbook "playbooks/domain" { play = "member" }   // no vms = every machine
+playbook "playbooks/domain" { play = "member" all_machines = true }  // every machine
+playbook "playbooks/draft"  { play = "wip" }      // no targets: declared, never runs
 ```
 
 ### `nic` (in `template`)

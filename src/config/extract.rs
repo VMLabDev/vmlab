@@ -889,6 +889,7 @@ fn extract_provision(b: &Block, issues: &mut IssueList) -> Option<Provision> {
     Some(Provision {
         script: PathBuf::from(script),
         vms: get_str_list(b, "vms", issues),
+        lab_wide: get_bool(b, "lab_wide", issues).unwrap_or(false),
         span: span_of(b),
     })
 }
@@ -900,6 +901,7 @@ fn extract_playbook(b: &Block, issues: &mut IssueList) -> Option<Playbook> {
         path: PathBuf::from(path),
         play,
         vms: get_str_list(b, "vms", issues),
+        all_machines: get_bool(b, "all_machines", issues).unwrap_or(false),
         span: span_of(b),
     })
 }

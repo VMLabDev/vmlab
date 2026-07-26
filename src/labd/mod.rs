@@ -879,7 +879,7 @@ impl Handler for LabdHandler {
                         .playbooks
                         .iter()
                         .map(|p| {
-                            let resolved: Vec<&String> = if p.vms.is_empty() {
+                            let resolved: Vec<&String> = if p.all_machines {
                                 machines.iter().collect()
                             } else {
                                 p.vms.iter().collect()
@@ -894,6 +894,7 @@ impl Handler for LabdHandler {
                                 "play": p.play,
                                 "span": p.span,
                                 "vms": p.vms,
+                                "all_machines": p.all_machines,
                                 "machines": resolved,
                                 "running": running,
                             })

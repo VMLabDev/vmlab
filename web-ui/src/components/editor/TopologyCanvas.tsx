@@ -3381,7 +3381,11 @@ export default function TopologyCanvas(props: {
                   ? provision.script.slice(0, provision.script.lastIndexOf("/"))
                   : ".";
               const badge = () =>
-                provision.vms.length ? `${provision.vms.length} TARGETED` : "LAB-WIDE";
+                provision.vms.length
+                  ? `${provision.vms.length} TARGETED`
+                  : provision.lab_wide
+                    ? "LAB-WIDE"
+                    : "NOT RUN";
               return (
                 <g
                   class="topo-provision"
@@ -3605,7 +3609,7 @@ export default function TopologyCanvas(props: {
                           ? "ALL MACHINES"
                           : card.targets.length
                             ? `${card.targets.length}`
-                            : "NOT RUN";
+                            : "NO TARGETS";
                       const warn = () =>
                         card.missingFromFolder
                           ? "referenced in vmlab.wcl but not defined in playbook.wcl"

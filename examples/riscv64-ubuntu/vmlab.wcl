@@ -33,5 +33,5 @@ lab "riscv64-ubuntu" {
     nic { segment = "lan" }                        // dynamic DHCP lease
   }
 
-  provision "scripts/setup.ws" { }
+  provision "scripts/setup.ws" { lab_wide = true }
 }

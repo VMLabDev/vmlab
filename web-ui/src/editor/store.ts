@@ -449,7 +449,14 @@ export function addSegment(): number {
 export function addProvision(script: string): number {
   const draft = editor.draft;
   if (!draft) return -1;
-  setEditor("draft", "provisions", draft.provisions.length, { span: null, script, vms: [] });
+  // Lab-wide by default: a script you just added should run. Cabling it to
+  // machines narrows the scope (and clears the flag).
+  setEditor("draft", "provisions", draft.provisions.length, {
+    span: null,
+    script,
+    vms: [],
+    lab_wide: true,
+  });
   const index = editor.draft!.provisions.length - 1;
   select({ kind: "provision", index });
   return index;
@@ -469,9 +476,11 @@ export function removeProvision(index: number) {
 // --- playbook folder nodes -----------------------------------------------------
 //
 // The canvas shows one node per playbook *folder* with a card per play; the
-// WCL stays one `playbook {}` block per (path, play). A block exists iff its
-// card has targets or is toggled all-machines — an unconnected play is simply
-// not run (never an implicit empty-vms "all machines" block).
+// WCL stays one `playbook {}` block per (path, play). A block with neither
+// `vms` nor `all_machines` is legal and inert — it declares the play without
+// running it, which is what "Add playbook" writes before anything is cabled.
+// Folder nodes with no block at all (`editor.playbookDrafts`) only linger for
+// configs written before that.
 
 const playbooksKey = (lab: string) => `vmlab.editor.playbooks.${lab}`;
 
@@ -531,7 +540,7 @@ export interface PlayCard {
   /** Canonical block index in draft.playbooks, or null when unreferenced. */
   blockIndex: number | null;
   targets: string[];
-  /** Block exists with an empty vms list — runs on every machine. */
+  /** Block opted into `all_machines` — runs on every machine. */
   allMachines: boolean;
   /** Referenced in vmlab.wcl but not defined in the folder's playbook.wcl. */
   missingFromFolder: boolean;
@@ -598,7 +607,7 @@ export function playbookGroups(): PlaybookGroup[] {
       if (card.blockIndex === null) {
         card.blockIndex = index;
         card.targets = block.vms;
-        card.allMachines = block.vms.length === 0;
+        card.allMachines = block.all_machines;
       } else {
         card.duplicateBlockIndexes.push(index);
       }
@@ -621,8 +630,8 @@ export function addPlaybookPlayDraft(path: string, play: string) {
   ]);
 }
 
-/** Toolbar: create a folder node (draft-only — no block until a play is
- *  connected or toggled all-machines), selected on its path field. */
+/** Create a folder node with no block behind it (legacy path — kept for
+ *  configs whose folders were added before "Add playbook" declared them). */
 export function addPlaybook(path: string) {
   if (!playbookGroups().some((group) => group.path === path)) {
     setEditor("playbookDrafts", editor.playbookDrafts.length, path);
@@ -632,25 +641,23 @@ export function addPlaybook(path: string) {
   void fetchPlays(path);
 }
 
-/** Remove one `playbook {}` block, keeping the folder node on the canvas as
- *  a draft when its last block goes. */
-function removePlaybookBlock(index: number) {
-  const path = editor.draft?.playbooks[index]?.path;
-  setEditor(
-    "draft",
-    "playbooks",
-    produce((playbooks: PlaybookModel[]) => {
-      playbooks.splice(index, 1);
-    }),
-  );
-  if (
-    path !== undefined &&
-    !editor.draft?.playbooks.some((p) => p.path === path) &&
-    !editor.playbookDrafts.includes(path)
-  ) {
-    setEditor("playbookDrafts", editor.playbookDrafts.length, path);
-    persistPlaybookDrafts();
+/** Toolbar "Add playbook": declare `playbook "<path>" { play = "<play>" }`
+ *  for a folder that was just scaffolded on disk. The block targets nothing
+ *  until a machine is cabled to its card, so it is inert on `up`. */
+export function addPlaybookWithPlay(path: string, play: string) {
+  const draft = editor.draft;
+  if (!draft) return;
+  if (!draft.playbooks.some((p) => p.path === path && p.play === play)) {
+    setEditor("draft", "playbooks", draft.playbooks.length, {
+      span: null,
+      path,
+      play,
+      vms: [],
+      all_machines: false,
+    });
   }
+  select({ kind: "playbook", path });
+  void fetchPlays(path);
 }
 
 /** Delete the whole folder node: every block with that path + the draft entry. */
@@ -680,17 +687,22 @@ export function addPlaybookPlay(path: string, play: string, target: string) {
     path,
     play,
     vms: [target],
+    all_machines: false,
   });
 }
 
-/** Detach one target; the block dies with its last edge (empty vms means
- *  "all machines" in WCL — never left behind implicitly). */
+/** Detach one target. The block survives its last edge — with no `vms` and
+ *  no `all_machines` it is declared but not run; "Stop" deletes it. */
 export function removePlaybookCardTarget(blockIndex: number, target: string) {
   const playbook = editor.draft?.playbooks[blockIndex];
   if (!playbook) return;
-  const next = playbook.vms.filter((name) => name !== target);
-  if (next.length === 0) removePlaybookBlock(blockIndex);
-  else setEditor("draft", "playbooks", blockIndex, "vms", next);
+  setEditor(
+    "draft",
+    "playbooks",
+    blockIndex,
+    "vms",
+    playbook.vms.filter((name) => name !== target),
+  );
 }
 
 /** Remove every block for one (path, play) — the play stops running; the
@@ -712,24 +724,24 @@ export function removePlaybookPlay(path: string, play: string) {
   }
 }
 
-/** Explicit "run on every machine": block with an empty vms list. Turning
- *  it off removes a target-less block (the play stops running). */
+/** Explicit "run on every machine": the block's `all_machines` flag, which
+ *  replaces any per-machine targets. Turning it off leaves the block
+ *  declared but target-less (so it stops running). */
 export function setPlaybookAllMachines(path: string, play: string, on: boolean) {
   const draft = editor.draft;
   if (!draft) return;
   const index = draft.playbooks.findIndex((p) => p.path === path && p.play === play);
-  if (on) {
-    if (index >= 0) setEditor("draft", "playbooks", index, "vms", []);
-    else {
-      setEditor("draft", "playbooks", draft.playbooks.length, {
-        span: null,
-        path,
-        play,
-        vms: [],
-      });
-    }
-  } else if (index >= 0 && draft.playbooks[index].vms.length === 0) {
-    removePlaybookBlock(index);
+  if (index >= 0) {
+    setEditor("draft", "playbooks", index, "all_machines", on);
+    if (on) setEditor("draft", "playbooks", index, "vms", []);
+  } else if (on) {
+    setEditor("draft", "playbooks", draft.playbooks.length, {
+      span: null,
+      path,
+      play,
+      vms: [],
+      all_machines: true,
+    });
   }
 }
 
@@ -783,7 +795,9 @@ export function mergePlaybookDuplicates(path: string, play: string) {
       const dupes = d.playbooks.filter((p) => p.path === path && p.play === play);
       const first = dupes[0];
       if (!first || dupes.length < 2) return;
-      first.vms = [...new Set(dupes.flatMap((p) => p.vms))];
+      // An all-machines block subsumes the others' explicit targets.
+      first.all_machines = dupes.some((p) => p.all_machines);
+      first.vms = first.all_machines ? [] : [...new Set(dupes.flatMap((p) => p.vms))];
       d.playbooks = d.playbooks.filter((p) => p === first || p.path !== path || p.play !== play);
     }),
   );
@@ -878,7 +892,18 @@ export function removeMachineDependency(kind: MachineKind, index: number, target
 export function addProvisionTarget(index: number, target: string) {
   const provision = editor.draft?.provisions[index];
   if (!provision || provision.vms.includes(target) || !machineNames().includes(target)) return;
+  // `vms` and `lab_wide` are mutually exclusive; scoping wins.
+  setEditor("draft", "provisions", index, "lab_wide", false);
   setEditor("draft", "provisions", index, "vms", [...provision.vms, target]);
+}
+
+/** Explicit "runs once for the whole lab". Setting it drops any per-machine
+ *  scope (the two are mutually exclusive); clearing it leaves a script that
+ *  is declared but not run until it is cabled to machines. */
+export function setProvisionLabWide(index: number, on: boolean) {
+  if (!editor.draft?.provisions[index]) return;
+  setEditor("draft", "provisions", index, "lab_wide", on);
+  if (on) setEditor("draft", "provisions", index, "vms", []);
 }
 
 export function removeProvisionTarget(index: number, target: string) {
@@ -896,6 +921,8 @@ export function removeProvisionTarget(index: number, target: string) {
 export function addPlaybookTarget(index: number, target: string) {
   const playbook = editor.draft?.playbooks[index];
   if (!playbook || playbook.vms.includes(target) || !machineNames().includes(target)) return;
+  // `vms` and `all_machines` are mutually exclusive; naming a machine wins.
+  setEditor("draft", "playbooks", index, "all_machines", false);
   setEditor("draft", "playbooks", index, "vms", [...playbook.vms, target]);
 }
 

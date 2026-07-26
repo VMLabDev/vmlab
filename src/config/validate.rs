@@ -336,6 +336,15 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     let mut scripts: Vec<(&PathBuf, Span)> = Vec::new();
     for p in &lab.provisions {
         scripts.push((&p.script, p.span));
+        if p.lab_wide && !p.vms.is_empty() {
+            issues.push(Issue::at(
+                p.span,
+                format!(
+                    "provision {} sets `lab_wide` and `vms` — pick one",
+                    p.script.display()
+                ),
+            ));
+        }
         for vm in &p.vms {
             if !machine_exists(lab, vm) {
                 issues.push(Issue::at(
@@ -365,6 +374,15 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 format!("playbook {} has no playbook.wcl", p.path.display()),
             ));
         }
+        if p.all_machines && !p.vms.is_empty() {
+            issues.push(Issue::at(
+                p.span,
+                format!(
+                    "playbook {} sets `all_machines` and `vms` — pick one",
+                    p.path.display()
+                ),
+            ));
+        }
         for vm in &p.vms {
             if !machine_exists(lab, vm) {
                 issues.push(Issue::at(
@@ -376,7 +394,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         // config-weave ships guest binaries only for x86_64; reject targets
         // whose arch is statically known to differ. Unknown archs (registry
         // templates without `arch`) are caught by the daemon's preflight.
-        let targeted = |vm: &Vm| p.vms.is_empty() || p.vms.iter().any(|n| n == &vm.name);
+        let targeted = |vm: &Vm| p.all_machines || p.vms.iter().any(|n| n == &vm.name);
         for vm in lab.vms.iter().filter(|vm| targeted(vm)) {
             let arch = match &vm.template {
                 TemplateRef::Store { arch, .. } => Some(arch.as_str()),
@@ -544,6 +562,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        // Build provisions and playbooks always run against the synthetic
+        // "build" VM, so the lab-level targeting knobs have nothing to name.
+        for p in &t.provisions {
+            if p.lab_wide {
+                issues.push(Issue::at(
+                    p.span,
+                    "template provisions always run on the build VM; drop `lab_wide`",
+                ));
+            }
+        }
         // Build playbooks target the synthetic "build" VM only; `vms` would
         // silently dangle, and config-weave is x86_64-only (§10.4).
         for p in &t.playbooks {
@@ -569,6 +597,12 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 issues.push(Issue::at(
                     p.span,
                     "template playbooks always run on the build VM; drop `vms`",
+                ));
+            }
+            if p.all_machines {
+                issues.push(Issue::at(
+                    p.span,
+                    "template playbooks always run on the build VM; drop `all_machines`",
                 ));
             }
             if t.arch != "x86_64" {
@@ -1646,13 +1680,87 @@ lab "l" {
             r#"import <vmlab.wcl>
 lab "l" {
   vm "a" { template = "aarch64/t" }
-  playbook "playbooks/base" { play = "base" }
+  playbook "playbooks/base" { play = "base" all_machines = true }
 }"#,
         );
         assert!(
             es.iter()
                 .any(|m| m.contains("binaries only for x86_64") && m.contains("aarch64")),
             "expected arch error, got: {es:#?}"
+        );
+    }
+
+    /// Without `vms` or `all_machines` a playbook targets nothing, so even a
+    /// lab config-weave could never converge validates clean.
+    #[test]
+    fn playbook_without_targets_is_inert() {
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "aarch64/t" }
+  playbook "playbooks/base" { play = "base" }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    #[test]
+    fn targeting_flags_conflict_with_vms() {
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" }
+  provision "scripts/setup.ws" { vms = ["a"] lab_wide = true }
+  playbook "playbooks/base" { play = "base" vms = ["a"] all_machines = true }
+}"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("sets `lab_wide` and `vms` — pick one")),
+            "expected provision conflict error, got: {es:#?}"
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("sets `all_machines` and `vms` — pick one")),
+            "expected playbook conflict error, got: {es:#?}"
+        );
+    }
+
+    /// Template-level steps always run on the build VM, so the lab-level
+    /// targeting knobs are rejected there.
+    #[test]
+    fn template_steps_reject_targeting_flags() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("scripts")).unwrap();
+        std::fs::write(root.path().join("scripts/install.ws"), "").unwrap();
+        std::fs::create_dir_all(root.path().join("pb")).unwrap();
+        std::fs::write(root.path().join("pb/playbook.wcl"), "").unwrap();
+        let f = load_lab_source(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" } }
+template "t" {
+  arch = "x86_64"
+  version = "1"
+  source "scratch" { }
+  disk = 10GiB
+  provision "scripts/install.ws" { lab_wide = true }
+  playbook "pb" { play = "base" all_machines = true }
+}"#,
+            "<test>",
+            root.path(),
+        )
+        .expect("source should parse");
+        let es: Vec<String> = validate(&f, &Permissive)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        assert!(
+            es.iter().any(|m| m.contains("drop `lab_wide`")),
+            "expected template provision error, got: {es:#?}"
+        );
+        assert!(
+            es.iter().any(|m| m.contains("drop `all_machines`")),
+            "expected template playbook error, got: {es:#?}"
         );
     }
 

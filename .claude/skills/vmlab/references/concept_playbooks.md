@@ -25,6 +25,11 @@ Exit codes mirror config-weave: `0` converged/clean, `1` step error,
 `--playbook <path>` / `--play <name>` disambiguate when several target one
 machine.
 
+Targets are always explicit: `vms = [...]` names machines, `all_machines = true`
+takes every one of them, and a block with neither is declared but never runs —
+which is what the designer's **Add playbook** writes, so a new playbook can be
+edited before it is pointed at anything.
+
 Playbooks also run inside [template builds](../references/concept_template_builds.md): a
 `template {}` may declare `playbook {}` blocks that apply to the build VM,
 again interleaved with provisions, with steps streaming as structured build

@@ -95,7 +95,7 @@ pub fn resolve_playbook<'a>(
     let matches: Vec<&Playbook> = lab
         .playbooks
         .iter()
-        .filter(|p| p.vms.is_empty() || p.vms.iter().any(|v| v == machine))
+        .filter(|p| p.all_machines || p.vms.iter().any(|v| v == machine))
         .filter(|p| playbook.is_none_or(|f| p.path.display().to_string() == f))
         .filter(|p| play.is_none_or(|f| p.play == f))
         .collect();
@@ -1024,12 +1024,19 @@ mod tests {
             entries
                 .iter()
                 .map(|(path, play, vms)| {
-                    let vms = vms
-                        .iter()
-                        .map(|v| format!("\"{v}\""))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("  playbook \"{path}\" {{ play = \"{play}\" vms = [{vms}] }}\n")
+                    // No names = the every-machine opt-in (an empty `vms`
+                    // list on its own targets nothing).
+                    let scope = if vms.is_empty() {
+                        "all_machines = true".to_string()
+                    } else {
+                        let vms = vms
+                            .iter()
+                            .map(|v| format!("\"{v}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("vms = [{vms}]")
+                    };
+                    format!("  playbook \"{path}\" {{ play = \"{play}\" {scope} }}\n")
                 })
                 .collect::<String>()
         );
@@ -1041,7 +1048,7 @@ mod tests {
     #[test]
     fn resolve_playbook_scoping_and_ambiguity() {
         let lab = lab_with_playbooks(&[("pb/a", "base", &["web01"]), ("pb/b", "base", &[])]);
-        // db01 only matches the unscoped block.
+        // db01 only matches the all-machines block.
         let p = resolve_playbook(&lab, "db01", None, None).unwrap();
         assert_eq!(p.path.display().to_string(), "pb/b");
         // web01 matches both → ambiguous without a filter.
@@ -1052,6 +1059,22 @@ mod tests {
         assert_eq!(p.path.display().to_string(), "pb/a");
         // Unknown machine target.
         let err = resolve_playbook(&lab, "ghost", Some("pb/a"), None).unwrap_err();
+        assert!(err.contains("no playbook targets"), "{err}");
+    }
+
+    /// A block with neither `vms` nor `all_machines` is declared but inert —
+    /// it must not be picked up by `playbook check|apply <machine>`.
+    #[test]
+    fn resolve_playbook_ignores_target_less_blocks() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  vm "web01" { template = "x86_64/t" }
+  playbook "pb/idle" { play = "base" }
+}"#;
+        let lab = crate::config::load_lab_source(src, "<test>", Path::new("/tmp"))
+            .expect("parse")
+            .lab;
+        let err = resolve_playbook(&lab, "web01", None, None).unwrap_err();
         assert!(err.contains("no playbook targets"), "{err}");
     }
 }

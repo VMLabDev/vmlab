@@ -896,8 +896,10 @@ pub fn cmd_playbook_list() -> Result<()> {
                 .as_array()
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            let scope = if row["vms"].as_array().is_none_or(Vec::is_empty) {
+            let scope = if row["all_machines"] == Value::Bool(true) {
                 format!("all machines ({})", machines.join(", "))
+            } else if machines.is_empty() {
+                "no targets — declared but not run".to_string()
             } else {
                 machines.join(", ")
             };

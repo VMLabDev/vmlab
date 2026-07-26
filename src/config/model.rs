@@ -495,7 +495,11 @@ impl std::fmt::Display for ImageRef {
 #[derive(Debug, Clone)]
 pub struct Provision {
     pub script: PathBuf,
+    /// VMs this script is scoped to (gates their `depends_on`).
     pub vms: Vec<String>,
+    /// Run once for the whole lab in the final pass. Without this or `vms`
+    /// the script is declared but never runs.
+    pub lab_wide: bool,
     pub span: Span,
 }
 
@@ -506,8 +510,11 @@ pub struct Playbook {
     /// Playbook folder, relative to the lab root.
     pub path: PathBuf,
     pub play: String,
-    /// Targeted VM/container names. Empty targets every machine.
+    /// Targeted VM/container names. Without these or `all_machines` the
+    /// playbook is declared but never runs.
     pub vms: Vec<String>,
+    /// Target every machine in the lab.
+    pub all_machines: bool,
     pub span: Span,
 }
 

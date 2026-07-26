@@ -686,6 +686,7 @@ impl From<&Media> for MediaDto {
 pub struct ProvisionDto {
     pub script: String,
     pub vms: Vec<String>,
+    pub lab_wide: bool,
     pub span: Span,
 }
 
@@ -694,6 +695,7 @@ impl From<&Provision> for ProvisionDto {
         Self {
             script: p.script.display().to_string(),
             vms: p.vms.clone(),
+            lab_wide: p.lab_wide,
             span: p.span,
         }
     }
@@ -704,6 +706,7 @@ pub struct PlaybookDto {
     pub path: String,
     pub play: String,
     pub vms: Vec<String>,
+    pub all_machines: bool,
     pub span: Span,
 }
 
@@ -713,6 +716,7 @@ impl From<&Playbook> for PlaybookDto {
             path: p.path.display().to_string(),
             play: p.play.clone(),
             vms: p.vms.clone(),
+            all_machines: p.all_machines,
             span: p.span,
         }
     }

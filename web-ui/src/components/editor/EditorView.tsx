@@ -14,7 +14,6 @@ import {
 import { editPlaybook } from "../FilesView";
 import {
   editor,
-  addPlaybook,
   addProvision,
   openEditor,
   pendingOps,
@@ -28,9 +27,11 @@ import {
 import Inspector from "./Inspector";
 import TopologyCanvas from "./TopologyCanvas";
 import ProvisionScriptModal from "./ProvisionScriptModal";
+import NewPlaybookModal from "./NewPlaybookModal";
 
 export default function EditorView(props: { onEditConfig: () => void }) {
   const [editingScript, setEditingScript] = createSignal<string | null>(null);
+  const [addingPlaybook, setAddingPlaybook] = createSignal(false);
   createEffect(() => {
     const lab = state.currentLab;
     if (lab && state.view.kind === "lab") void openEditor(lab);
@@ -73,23 +74,8 @@ export default function EditorView(props: { onEditConfig: () => void }) {
   }
 
   function addPlaybookNode() {
-    if (anyVmRunning()) return;
-    const draft = editor.draft;
-    if (!draft) return;
-    // No disk probe: the file API only serves declared folders, so a name
-    // collision with an existing folder is harmless (the editor just shows
-    // that folder's files once the block is saved).
-    const referenced = new Set([
-      ...draft.playbooks.map((playbook) => playbook.path),
-      ...editor.playbookDrafts,
-    ]);
-    for (let number = 1; number < 10_000; number++) {
-      const path = `playbooks/playbook-${number}`;
-      if (referenced.has(path)) continue;
-      addPlaybook(path);
-      return;
-    }
-    showToast("Could not allocate a playbook folder name", "danger");
+    if (anyVmRunning() || !editor.draft) return;
+    setAddingPlaybook(true);
   }
 
   return (
@@ -188,6 +174,7 @@ export default function EditorView(props: { onEditConfig: () => void }) {
             min={320}
           />
           <ProvisionScriptModal path={editingScript()} onClose={() => setEditingScript(null)} />
+          <NewPlaybookModal open={addingPlaybook()} onClose={() => setAddingPlaybook(false)} />
           <Show when={anyVmRunning()}>
             <Alert tone="warning">
               Configuration and topology connections are locked while any VM or container is

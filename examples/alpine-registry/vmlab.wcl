@@ -31,5 +31,5 @@ lab "alpine-registry" {
     nic { segment = "lan" }                        // dynamic DHCP lease
   }
 
-  provision "scripts/setup.ws" { }
+  provision "scripts/setup.ws" { lab_wide = true }
 }

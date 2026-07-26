@@ -154,7 +154,7 @@ lab "ad-lab" {
     nic { segment = "dmz" }
   }
 
-  provision "scripts/setup.ws" { }            # runs on `vmlab up`, in listed order
+  provision "scripts/setup.ws" { lab_wide = true }   # runs on `vmlab up`, in listed order
 
   on "vm.crashed"    run "scripts/collect-dumps.ws"
   on "host.disk_low" run "scripts/alert.ws"
@@ -163,7 +163,9 @@ lab "ad-lab" {
 
 ### 5.1 Validation
 
-`vmlab validate` (and implicitly every other verb) evaluates the lab file against the vmlab WCL schema and fails before any side effect on errors including: unknown attributes, missing templates, undeclared segment references, static IPs outside their segment's subnet, duplicate static IPs/MACs, dependency cycles in `depends_on`, missing script files, archless or malformed template references, `scratch` VMs missing `arch`/`profile`/`disk`, and wscript compilation errors in all referenced scripts. The goal mirrors Config Weave: validation catches everything that can be caught without touching QEMU.
+Configuration steps state their targets explicitly: a `provision {}` names VMs in `vms` (which also gates their `depends_on`) or takes `lab_wide = true` to run once after every machine is up; a `playbook {}` names `vms` or takes `all_machines = true`. The two are mutually exclusive on each block, and a block with neither is declared but never runs — `up` reports it as skipped.
+
+`vmlab validate` (and implicitly every other verb) evaluates the lab file against the vmlab WCL schema and fails before any side effect on errors including: unknown attributes, missing templates, undeclared segment references, static IPs outside their segment's subnet, duplicate static IPs/MACs, dependency cycles in `depends_on`, missing script files, archless or malformed template references, `scratch` VMs missing `arch`/`profile`/`disk`, conflicting targeting (`vms` together with `lab_wide`/`all_machines`), and wscript compilation errors in all referenced scripts. The goal mirrors Config Weave: validation catches everything that can be caught without touching QEMU.
 
 ### 5.2 VM hardware surface
 

@@ -9,7 +9,9 @@ and [the event handler block](../references/entity_on_handler.md) for the declar
 
 **Provision failures fail `vmlab up`**; **handler failures are logged, never fatal.**
 A scoped provision (`vms = [...]`) gates `depends_on` on those VMs: dependents wait
-for the provision to finish. See [the event list](../references/fact_events.md) for every event name.
+for the provision to finish; `lab_wide = true` instead runs the script once after
+every machine is up. A provision with neither is declared but skipped (announced in
+`up` output). See [the event list](../references/fact_events.md) for every event name.
 
 
 ## Examples

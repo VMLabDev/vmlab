@@ -18,5 +18,5 @@ lab "peer-b" {
     nic { segment = "wan" }
   }
 
-  provision "scripts/setup.ws" { }
+  provision "scripts/setup.ws" { lab_wide = true }
 }

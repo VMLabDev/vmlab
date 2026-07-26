@@ -42,6 +42,7 @@ import {
   removeProvision,
   renamePlaybookPath,
   setPlaybookAllMachines,
+  setProvisionLabWide,
   removeRemote,
   removeSegment,
   removeVm,
@@ -224,9 +225,26 @@ function ProvisionInspector(props: { index: number; onEdit: (path: string) => vo
         </Button>
       </div>
       <div class="provision-inspector-path">{provision().script}</div>
-      <Badge tone={provision().vms.length ? "info" : "neutral"}>
-        {provision().vms.length ? `${provision().vms.length} targeted` : "LAB-WIDE"}
+      <Badge
+        tone={provision().vms.length || provision().lab_wide ? "info" : "neutral"}
+      >
+        {provision().vms.length
+          ? `${provision().vms.length} targeted`
+          : provision().lab_wide
+            ? "LAB-WIDE"
+            : "not run"}
       </Badge>
+      <Toggle
+        checked={provision().lab_wide}
+        onChange={(on: boolean) => setProvisionLabWide(props.index, on)}
+      >
+        Run lab-wide
+      </Toggle>
+      <div class="inspector-note">
+        Lab-wide scripts run once, after every machine is up. Cable the script to
+        machines instead to scope it (that also gates their <code>depends_on</code>).
+        With neither, the script is declared but never runs.
+      </div>
       <Show when={provision().vms.length}>
         <div class="remote-attached">
           <For each={provision().vms}>
@@ -332,7 +350,7 @@ function playCardBadge(card: {
     ? { tone: "success" as const, label: "all machines" }
     : card.targets.length
       ? { tone: "success" as const, label: `${card.targets.length} targeted` }
-      : { tone: "neutral" as const, label: "not run" };
+      : { tone: "neutral" as const, label: "no targets" };
 }
 
 function PlaybookFolderInspector(props: { path: string }) {
@@ -405,7 +423,7 @@ function PlaybookFolderInspector(props: { path: string }) {
           <div class="inspector-note">
             {plays() === "loading" || plays() === undefined
               ? "Scanning playbook.wcl…"
-              : "No plays yet — add one below; the folder is scaffolded on save."}
+              : "No plays yet — add one below, or write them in playbook.wcl."}
           </div>
         }
       >
@@ -447,13 +465,14 @@ function PlaybookFolderInspector(props: { path: string }) {
       </div>
       <Show when={typeof plays() === "object" && !(plays() as { exists: boolean }).exists}>
         <div class="inspector-note">
-          The folder has no playbook.wcl yet — save the lab config, then open it in the Files
-          tab to scaffold its files.
+          The folder has no playbook.wcl yet — "Edit playbook files" creates it and opens it
+          in the Files tab.
         </div>
       </Show>
       <div class="inspector-note">
         Each play wears its own TARGETS port on the canvas — drag it onto the VMs or
-        containers that play converges. A play with no connections does not run.
+        containers that play converges. A play with no targets is declared in vmlab.wcl but
+        never runs.
       </div>
     </>
   );

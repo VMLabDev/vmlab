@@ -8,7 +8,10 @@
 //! Sandbox contract: only folders that appear as `playbook "…"` blocks in
 //! the lab file (re-derived per request — the declarations are the sole
 //! authority) are touched. Playbooks declared outside the lab root work at
-//! run time but are not editable or manageable here.
+//! run time but are not editable or manageable here. The two endpoints the
+//! designer uses on brand-new folders — [`list_plays`] and [`scaffold`] —
+//! are the exception: they accept any lexically clean path inside the lab
+//! root, because the designer creates a playbook before declaring it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -31,6 +34,7 @@ struct PlaybookDecl {
     path: String,
     play: String,
     vms: Vec<String>,
+    all_machines: bool,
 }
 
 /// Parse the lab's `vmlab.wcl` and return its playbook declarations. Works
@@ -46,6 +50,7 @@ fn declared_playbooks(root: &Path) -> Result<Vec<PlaybookDecl>, String> {
             path: p.path.display().to_string(),
             play: p.play.clone(),
             vms: p.vms.clone(),
+            all_machines: p.all_machines,
         })
         .collect())
 }
@@ -100,7 +105,12 @@ pub async fn list_playbooks(state: web::Data<AppState>, lab: web::Path<String>) 
         Ok(Ok(decls)) => HttpResponse::Ok().json(
             decls
                 .iter()
-                .map(|d| json!({"path": d.path, "play": d.play, "vms": d.vms}))
+                .map(|d| {
+                    json!({
+                        "path": d.path, "play": d.play, "vms": d.vms,
+                        "all_machines": d.all_machines,
+                    })
+                })
                 .collect::<Vec<_>>(),
         ),
         Ok(Err(e)) => HttpResponse::UnprocessableEntity().json(json!({"error": e})),
@@ -260,11 +270,55 @@ pub async fn run_playbook(
 #[derive(Deserialize)]
 pub struct ScaffoldBody {
     playbook: String,
+    /// Play name for the starter file; falls back to the declared block's
+    /// play, then `main`.
+    play: Option<String>,
 }
 
-/// `POST /api/labs/{lab}/playbooks/scaffold` — create the declared folder
-/// with a starter `playbook.wcl`, for playbook blocks added in the designer
-/// before any files exist.
+/// Folder segment and play names are interpolated into the skeleton's WCL
+/// string literals, so keep them boring.
+fn plain_name(value: &str, what: &str) -> Result<(), PbDirError> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    {
+        return Err(PbDirError::BadRequest(format!(
+            "{what} \"{value}\" must be letters, digits, dot, dash or underscore"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a not-yet-existing folder inside the lab: the nearest existing
+/// ancestor is canonicalized and prefix-checked, so symlinked parents can't
+/// carry the scaffold outside the lab root.
+fn new_dir_in_lab(root: &Path, rel: &str) -> Result<PathBuf, PbDirError> {
+    let canonical_root = std::fs::canonicalize(root).map_err(|e| PbDirError::Io(e.to_string()))?;
+    let target = root.join(rel);
+    let mut existing = target.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| PbDirError::BadRequest("playbook path escapes the lab".into()))?;
+    }
+    let anchor = std::fs::canonicalize(existing).map_err(|e| PbDirError::Io(e.to_string()))?;
+    if !anchor.starts_with(&canonical_root) {
+        return Err(PbDirError::Forbidden(
+            "playbook folder lies outside the lab root".into(),
+        ));
+    }
+    Ok(target)
+}
+
+/// `POST /api/labs/{lab}/playbooks/scaffold` — create the folder with a
+/// starter `playbook.wcl` and an empty `pkgs/` (config-weave ignores
+/// non-package entries there, and the Files tab hangs its package buttons off
+/// that row). Unlike the editing endpoints this does not require the folder
+/// to be declared in vmlab.wcl: the designer scaffolds a new playbook
+/// *before* writing its block (and `list_plays` already answers for
+/// undeclared paths for the same reason). The write power is the same as the
+/// Files tab's, and stays inside the lab root.
 pub async fn scaffold(
     state: web::Data<AppState>,
     lab: web::Path<String>,
@@ -275,39 +329,45 @@ pub async fn scaffold(
         Err(e) => return fail(e),
     };
     let body = body.into_inner();
-    let outcome = web::block(move || {
-        // Declared (and lexically clean) but allowed to not exist yet.
-        match playbook_dir(&root, &body.playbook) {
-            Ok(_) | Err(PbDirError::NotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-        let decls = declared_playbooks(&root).map_err(PbDirError::Forbidden)?;
-        let play = decls
-            .iter()
-            .find(|d| d.path == body.playbook)
-            .map(|d| d.play.clone())
-            .unwrap_or_else(|| "main".to_string());
-        let dir = root.join(&body.playbook);
-        std::fs::create_dir_all(&dir).map_err(|e| PbDirError::Io(e.to_string()))?;
-        let target = dir.join("playbook.wcl");
-        if target.exists() {
-            return Ok(body.playbook);
-        }
+    let outcome = web::block(move || -> Result<(String, bool), PbDirError> {
+        plain_relative(&body.playbook, "playbook").map_err(PbDirError::BadRequest)?;
         let name = body
             .playbook
             .rsplit('/')
             .next()
             .unwrap_or(&body.playbook)
             .to_string();
+        plain_name(&name, "playbook folder name")?;
+        let play = match body.play.clone() {
+            Some(play) => play,
+            None => declared_playbooks(&root)
+                .map_err(PbDirError::Forbidden)?
+                .iter()
+                .find(|d| d.path == body.playbook)
+                .map(|d| d.play.clone())
+                .unwrap_or_else(|| "main".to_string()),
+        };
+        plain_name(&play, "play name")?;
+        let dir = new_dir_in_lab(&root, &body.playbook)?;
+        std::fs::create_dir_all(&dir).map_err(|e| PbDirError::Io(e.to_string()))?;
+        let target = dir.join("playbook.wcl");
+        if target.exists() {
+            return Ok((body.playbook, false));
+        }
         let skeleton = format!(
             "playbook \"{name}\" {{\n  description = \"Describe what this playbook converges\"\n  version = \"0.1.0\"\n\n  play \"{play}\" {{\n    description = \"A starter play\"\n  }}\n}}\n"
         );
         std::fs::write(&target, skeleton).map_err(|e| PbDirError::Io(e.to_string()))?;
-        Ok(body.playbook)
+        // Only for a folder we just scaffolded: an existing playbook that
+        // keeps its packages elsewhere shouldn't grow a stray empty dir.
+        std::fs::create_dir_all(dir.join("pkgs")).map_err(|e| PbDirError::Io(e.to_string()))?;
+        Ok((body.playbook, true))
     })
     .await;
     match outcome {
-        Ok(Ok(playbook)) => HttpResponse::Ok().json(json!({"ok": true, "playbook": playbook})),
+        Ok(Ok((playbook, created))) => {
+            HttpResponse::Ok().json(json!({"ok": true, "playbook": playbook, "created": created}))
+        }
         Ok(Err(e)) => e.respond(),
         Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
     }
@@ -398,7 +458,9 @@ lab "lab" {
         assert_eq!(body[0]["path"], "playbooks/base");
         assert_eq!(body[0]["play"], "base");
         assert_eq!(body[0]["vms"][0], "web01");
+        assert_eq!(body[0]["all_machines"], false);
         assert_eq!(body[1]["vms"].as_array().unwrap().len(), 0);
+        assert_eq!(body[1]["all_machines"], false);
     }
 
     #[actix_web::test]
@@ -515,16 +577,68 @@ lab "lab" {
         let content =
             std::fs::read_to_string(tmp.path().join("playbooks/ghost/playbook.wcl")).unwrap();
         assert!(content.contains("play \"base\""), "{content}");
+    }
 
-        // Undeclared folder cannot be scaffolded.
+    /// The designer scaffolds before it declares, so an undeclared path with
+    /// an explicit play name is the normal "Add playbook" case.
+    #[actix_web::test]
+    async fn scaffold_creates_undeclared_folder_with_named_play() {
+        let tmp = playbook_lab();
+        let app = app!(tmp.path());
         let resp = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/api/labs/lab/playbooks/scaffold")
-                .set_json(json!({"playbook": "playbooks/rogue"}))
+                .set_json(json!({"playbook": "playbooks/fresh", "play": "bootstrap"}))
                 .to_request(),
         )
         .await;
-        assert_eq!(resp.status(), 403);
+        assert_eq!(resp.status(), 200);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["created"], true);
+        let content =
+            std::fs::read_to_string(tmp.path().join("playbooks/fresh/playbook.wcl")).unwrap();
+        assert!(content.contains("playbook \"fresh\""), "{content}");
+        assert!(content.contains("play \"bootstrap\""), "{content}");
+        // Ready for `Add package` in the Files tab.
+        assert!(tmp.path().join("playbooks/fresh/pkgs").is_dir());
+
+        // Idempotent: a second call leaves the file alone.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/labs/lab/playbooks/scaffold")
+                .set_json(json!({"playbook": "playbooks/fresh", "play": "other"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["created"], false);
+        let again =
+            std::fs::read_to_string(tmp.path().join("playbooks/fresh/playbook.wcl")).unwrap();
+        assert_eq!(again, content);
+    }
+
+    #[actix_web::test]
+    async fn scaffold_rejects_escaping_paths_and_odd_names() {
+        let tmp = playbook_lab();
+        let app = app!(tmp.path());
+        for body in [
+            json!({"playbook": "../escape"}),
+            json!({"playbook": "playbooks/we\"ird"}),
+            json!({"playbook": "playbooks/fine", "play": "we\"ird"}),
+        ] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/labs/lab/playbooks/scaffold")
+                    .set_json(body.clone())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 400, "{body}");
+        }
+        assert!(!tmp.path().join("playbooks/fine").exists());
     }
 }

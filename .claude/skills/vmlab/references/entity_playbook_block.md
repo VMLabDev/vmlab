@@ -6,9 +6,13 @@ Binds a config-weave playbook folder to lab machines (or a template build): the 
 
 A `playbook {}` block is valid inside `lab {}` and inside `template {}`. The
 inline label is the playbook folder (containing `playbook.wcl`), relative to
-the lab root; `play` names the play inside it (required), and `vms` scopes the
-target machines — VM and container names in one namespace, empty or absent
-meaning every machine.
+the lab root; `play` names the play inside it (required), and `vms` names the
+target machines — VM and container names in one namespace. Use
+`all_machines = true` for every machine in the lab; the two are mutually
+exclusive, and a block with neither is declared but never runs (handy for a
+playbook you are still writing — the designer's **Add playbook** creates
+exactly that). Inside a `template {}` both are rejected: build playbooks
+always run on the build VM.
 
 
 ```wcl

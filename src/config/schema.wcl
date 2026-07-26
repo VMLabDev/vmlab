@@ -411,6 +411,8 @@ type Provision {
   @inline(0) script: utf8
   @doc("VM names this script is scoped to (gates their `depends_on`)")
   vms: list<utf8>?
+  @doc("Run once for the whole lab, after every machine is up; mutually exclusive with `vms`. Without either the script is declared but never runs")
+  lab_wide: bool?
 }
 
 // config-weave playbook applied on `vmlab up` (interleaved with provisions
@@ -421,8 +423,10 @@ type Playbook {
   @inline(0) path: utf8
   @doc("Play name inside the playbook to run (required)")
   play: utf8
-  @doc("VM/container names this playbook targets; empty/absent = every machine")
+  @doc("VM/container names this playbook targets; without either this or `all_machines` the playbook is declared but never runs")
   vms: list<utf8>?
+  @doc("Target every VM and container in the lab; mutually exclusive with `vms`")
+  all_machines: bool?
 }
 
 // Event handler binding.
