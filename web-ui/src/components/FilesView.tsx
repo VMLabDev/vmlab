@@ -14,7 +14,7 @@ import { For, Show, batch, createEffect, createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { CodeEditor } from "@forge/code";
 import type { CodeAnnotation } from "@forge/code";
-import { Alert, Button, Empty, IconButton, Spinner, SplitPane } from "@forge/ui";
+import { Alert, Button, Empty, IconButton, Spinner, SplitPane, ToggleGroup } from "@forge/ui";
 import {
   FilePlus2,
   FolderPlus,
@@ -40,6 +40,7 @@ import { wscriptLanguage } from "../wscript-language";
 import { confirmDialog, promptDialog } from "./dialogs";
 import { setLabTab } from "./editor/labTab";
 import FileTree from "./FileTree";
+import PlaybookDesigner from "./playbook/PlaybookDesigner";
 import { openPkgRepos } from "./PkgReposModal";
 import { openPkgSearch } from "./PkgSearchModal";
 
@@ -69,6 +70,9 @@ const [files, setFiles] = createStore<Record<string, OpenFile>>({});
 const [active, setActive] = createSignal<string | null>(null);
 const [pendingOpen, setPendingOpen] = createSignal<string | null>(null);
 const [issues, setIssues] = createSignal<ConfigIssue[]>([]);
+/** Designer-or-code, per playbook file — remembered across tab switches so a
+ *  deliberate trip to the code view survives navigating away. */
+const [viewMode, setViewMode] = createStore<Record<string, "design" | "code">>({});
 let loadedLab: string | null = null;
 
 function dirtyPaths(): Set<string> {
@@ -317,6 +321,9 @@ export default function FilesView() {
       setIssues([]);
       for (const key of Object.keys(files)) {
         setFiles(key, undefined as unknown as OpenFile);
+      }
+      for (const key of Object.keys(viewMode)) {
+        setViewMode(key, undefined as unknown as "design");
       }
       setTree({ kind: "loading" });
     });
@@ -605,6 +612,20 @@ export default function FilesView() {
     return undefined;
   };
 
+  /** Any playbook.wcl inside the lab — the designer works on undeclared
+   *  folders too (it reads the folder's own packages, not vmlab.wcl). */
+  const activePlaybookFile = () => {
+    const current = active();
+    if (!current?.endsWith("/playbook.wcl")) return null;
+    const file = files[current];
+    if (!file || file.binary || file.tooLarge) return null;
+    return canEditPlaybook(current.slice(0, -"/playbook.wcl".length)) ? current : null;
+  };
+
+  /** Designer unless this file was deliberately switched to code. */
+  const playbookMode = () => viewMode[active() ?? ""] ?? "design";
+  const showDesigner = () => !!activePlaybookFile() && playbookMode() === "design";
+
   /** The declared playbook root whose playbook.wcl is active — shows the
    *  Repos… toolbar button. */
   const activePlaybookRoot = () => {
@@ -684,6 +705,18 @@ export default function FilesView() {
             >
               Save & reload
             </Button>
+          </Show>
+          <Show when={activePlaybookFile()}>
+            <ToggleGroup
+              value={playbookMode()}
+              options={[
+                { value: "design", label: "Designer" },
+                { value: "code", label: "Code" },
+              ]}
+              onChange={(mode: string) =>
+                setViewMode(active()!, mode === "code" ? "code" : "design")
+              }
+            />
           </Show>
           <Show when={activePlaybookRoot()}>
             {(root) => (
@@ -793,22 +826,42 @@ export default function FilesView() {
                         </span>
                       </Alert>
                     </Show>
-                    <CodeEditor
-                      value={activeFile()?.content ?? ""}
-                      onChange={(value) => {
-                        // CodeMirror also reports programmatic value swaps
-                        // (file switches) — only user edits on a loaded file
-                        // may touch the store.
-                        const path = active();
-                        if (path && files[path] && files[path].content !== value) {
-                          setFiles(path, "content", value);
-                        }
-                      }}
-                      readOnly={configReadOnly()}
-                      language={language()}
-                      annotations={annotations()}
-                      height="max(calc(100vh - 380px), 320px)"
-                    />
+                    <Show
+                      when={!showDesigner()}
+                      fallback={
+                        <PlaybookDesigner
+                          path={active()!}
+                          content={activeFile()?.content ?? ""}
+                          onChange={(source) => {
+                            const path = active();
+                            if (path && files[path] && files[path].content !== source) {
+                              setFiles(path, "content", source);
+                            }
+                          }}
+                          onShowCode={() => setViewMode(active()!, "code")}
+                          onAddPackages={(folder) =>
+                            openPkgSearch(folder, () => void afterPkgChange(folder))
+                          }
+                        />
+                      }
+                    >
+                      <CodeEditor
+                        value={activeFile()?.content ?? ""}
+                        onChange={(value) => {
+                          // CodeMirror also reports programmatic value swaps
+                          // (file switches) — only user edits on a loaded file
+                          // may touch the store.
+                          const path = active();
+                          if (path && files[path] && files[path].content !== value) {
+                            setFiles(path, "content", value);
+                          }
+                        }}
+                        readOnly={configReadOnly()}
+                        language={language()}
+                        annotations={annotations()}
+                        height="max(calc(100vh - 380px), 320px)"
+                      />
+                    </Show>
                     <Show when={configReadOnly()}>
                       <Alert tone="warning">
                         Config is read-only while any VM or container is up. Stop all machines to

@@ -252,6 +252,56 @@
 .file-tree-row { display: flex; align-items: center; gap: var(--sp-1); }
 .file-tree-actions { display: inline-flex; gap: 2px; margin-left: auto; }
 
+/* Playbook designer (Files tab, Designer view of a playbook.wcl) */
+.pb-designer { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.pb-designer-split { height: max(calc(100vh - 380px), 320px); }
+.pb-tree {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: var(--sp-2); height: 100%; overflow: auto; font-size: var(--fs-sm);
+}
+.pb-tree-row {
+  display: flex; align-items: center; gap: var(--sp-1);
+  padding: 3px var(--sp-2); border-radius: var(--r-sm);
+  border-top: 1px solid transparent; border-bottom: 1px solid transparent;
+  cursor: pointer; user-select: none;
+}
+.pb-tree-row:hover { background: var(--bg-2); }
+.pb-tree-row.selected { background: var(--accent-bg); color: var(--fg-0); }
+.pb-tree-head { font-weight: 600; }
+.pb-tree-play { font-weight: 600; }
+.pb-tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pb-tree-detail {
+  color: var(--fg-3); font: var(--fs-xs)/1.2 var(--font-mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pb-tree-bullet { color: var(--fg-3); width: 12px; text-align: center; font-size: 10px; }
+.pb-tree-caret {
+  background: none; border: 0; padding: 0; cursor: pointer;
+  color: var(--fg-2); display: inline-flex; align-items: center;
+}
+.pb-tree-actions { display: inline-flex; gap: 2px; margin-left: auto; }
+.pb-tree-group {
+  display: flex; align-items: center; gap: var(--sp-1);
+  margin-top: var(--sp-2); padding: 0 var(--sp-2);
+}
+.pb-tree-group-label {
+  color: var(--fg-3); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.06em;
+}
+.pb-tree-empty { color: var(--fg-3); font-size: var(--fs-xs); padding: 2px var(--sp-2); }
+/* Drop feedback: a line where the item lands, a frame when it goes inside. */
+.pb-tree-row.pb-drop-before { border-top-color: var(--accent); }
+.pb-tree-row.pb-drop-after { border-bottom-color: var(--accent); }
+.pb-tree-row.pb-drop-inside { outline: 1px dashed var(--accent); outline-offset: -1px; }
+.pb-inspector {
+  height: 100%; overflow-y: auto; padding: var(--sp-3);
+  display: flex; flex-direction: column; gap: var(--sp-3);
+}
+.pb-prop { display: flex; align-items: flex-end; gap: var(--sp-1); }
+.pb-prop-field { flex: 1; min-width: 0; }
+.pb-prop-actions { display: inline-flex; gap: 2px; padding-bottom: 2px; }
+.pb-prop-bool { display: grid; gap: 4px; }
+.pb-prop-bool-label { font-size: 12px; color: var(--fg-1); font-weight: 500; }
+
 /* config-weave package modals (search picker + repo manager) */
 .pkg-search-form { display: flex; gap: var(--sp-2); align-items: flex-end; }
 .pkg-search-form > :first-child { flex: 1; }

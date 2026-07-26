@@ -359,6 +359,140 @@ export const runPlaybook = (
 export const scaffoldPlaybook = (lab: string, playbook: string, play?: string) =>
   post(`${pbBase(lab)}/scaffold`, { playbook, play });
 
+// --- playbook designer (config-weave DocJson) --------------------------------
+//
+// The shapes below mirror config-weave's `docjson` crate exactly; vmlab only
+// passes them through. `_orig` is the block's on-disk name: extraction sets
+// it, the forms edit `name` freely, and rendering matches blocks by `_orig` so
+// a rename keeps the comments attached to it. Never invent or drop it.
+
+/** A leaf value: a plain literal (typed widget) or raw WCL expression source
+ *  ("fx" mode — how a property references a var or gather result). */
+export type Val = { lit: string | number | boolean | null } | { expr: string };
+
+/** One `key = value` entry of a schemaless block (vars, properties, params). */
+export interface Kv {
+  key: string;
+  value: Val;
+}
+
+export interface GatherDoc {
+  name: string;
+  _orig?: string;
+  description?: string;
+  /** `"package.gatherer"`. */
+  from: string;
+  params: Kv[];
+}
+
+export interface StepDoc {
+  name: string;
+  _orig?: string;
+  description: string;
+  /** `"package.resource"`. */
+  resource: string;
+  /** Raw WCL expression source. */
+  condition?: string;
+  requires: string[];
+  concurrency?: string;
+  properties: Kv[];
+}
+
+export interface ContainerDoc {
+  name: string;
+  _orig?: string;
+  description: string;
+  condition?: string;
+  items: PlayItemDoc[];
+}
+
+/** Steps and step folders interleave in declaration order. */
+export type PlayItemDoc = { step: StepDoc } | { container: ContainerDoc };
+
+export interface PlayDoc {
+  name: string;
+  _orig?: string;
+  description: string;
+  /** Undefined = the schema default (true). */
+  parallel?: boolean;
+  items: PlayItemDoc[];
+}
+
+export interface PlaybookDoc {
+  name: string;
+  description: string;
+  version?: string;
+  gathers: GatherDoc[];
+  vars: Kv[];
+  plays: PlayDoc[];
+}
+
+/** One declared parameter of a resource or gatherer. */
+export interface ParamDoc {
+  name: string;
+  description: string;
+  /** string | int | float | bool | list | map | symbol. */
+  type: string;
+  required?: boolean;
+  default?: Val;
+}
+
+export interface ResourceDoc {
+  name: string;
+  description: string;
+  script: string;
+  /** Undefined = the schema default ("parallel"). */
+  concurrency?: string;
+  params: ParamDoc[];
+}
+
+export interface GathererDoc {
+  name: string;
+  description: string;
+  script: string;
+  params: ParamDoc[];
+}
+
+export interface PackageDoc {
+  name: string;
+  description: string;
+  resources: ResourceDoc[];
+  gatherers: GathererDoc[];
+}
+
+export interface CatalogInfo {
+  packages: PackageDoc[];
+  /** Packages that could not be read — surfaced, never silently dropped. */
+  errors: { package: string; error?: string; diags?: unknown }[];
+}
+
+/** config-weave reports these as plain strings; the object form is tolerated
+ *  in case a future build carries spans alongside the text. */
+export type DocDiag = string | { message?: string; rendered?: string };
+export type InspectResult =
+  | { ok: true; doc: PlaybookDoc }
+  | { ok: false; diags?: DocDiag[] };
+export type RenderResult = { ok: true; source: string } | { ok: false; diags?: DocDiag[] };
+
+/** Source text → the structural document the designer edits. `ok: false`
+ *  means the file uses something the document model can't represent — show
+ *  the diagnostics and fall back to the code view. */
+export const inspectPlaybookDoc = (lab: string, source: string): Promise<InspectResult> =>
+  post(`${pbBase(lab)}/doc/inspect`, { source });
+
+/** Edited document + the text it was read from → new WCL source. Passing the
+ *  original text is what preserves comments. */
+export const renderPlaybookDoc = (
+  lab: string,
+  baseSource: string,
+  doc: PlaybookDoc,
+): Promise<RenderResult> => post(`${pbBase(lab)}/doc/render`, { base_source: baseSource, doc });
+
+/** Resources + gatherers (with their parameters) from the playbook's
+ *  installed packages, for the resource picker and property form. */
+export const playbookCatalog = (lab: string, path: string): Promise<CatalogInfo> =>
+  req(`${pbBase(lab)}/catalog?path=${encodeURIComponent(path)}`);
+
 // --- config-weave packages (over a declared playbook folder) ----------------
 
 export interface PkgSearchHit {

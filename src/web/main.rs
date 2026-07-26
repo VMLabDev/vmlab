@@ -17,6 +17,7 @@ mod fsops;
 mod help;
 mod logs;
 mod pkgs;
+mod playbook_doc;
 mod playbooks;
 mod state;
 mod tty;
@@ -321,6 +322,21 @@ async fn main() -> ExitCode {
             .route(
                 "/api/labs/{lab}/playbooks/scaffold",
                 web::post().to(playbooks::scaffold),
+            )
+            // The Files tab's playbook designer: config-weave's DocJson
+            // pipeline (source ⇄ structural document) plus the installed
+            // packages' resource/parameter declarations.
+            .route(
+                "/api/labs/{lab}/playbooks/doc/inspect",
+                web::post().to(playbook_doc::inspect),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/doc/render",
+                web::post().to(playbook_doc::render),
+            )
+            .route(
+                "/api/labs/{lab}/playbooks/catalog",
+                web::get().to(playbook_doc::catalog),
             )
             // config-weave package management over a declared playbook
             // folder (Files tab pkg buttons + repos modal).
