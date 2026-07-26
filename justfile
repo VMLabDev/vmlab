@@ -268,15 +268,24 @@ peer-demo-stop:
 			"$root/target/debug/vmlab" daemon stop >/dev/null 2>&1 || true
 	done
 
+# Print the newest config-weave release tag. Prereleases included — that is
+# where its new features land, and the API's /releases/latest skips them.
+# Resolved host-side so the tag lands in the image's build args: baking it
+# into the cache key is what makes a new release rebuild that layer.
+[private]
+config-weave-tag:
+	@body="$(curl -fsSL https://api.github.com/repos/Configweave/config-weave/releases)"; \
+		printf '%s\n' "$body" | grep -m1 '"tag_name"' | cut -d'"' -f4
+
 # Build + start the Docker web UI stack (serves the UI on :7878)
 [group('web')]
 compose-up:
-	docker compose up --build
+	CONFIG_WEAVE_RELEASE="$(just config-weave-tag)" docker compose up --build
 
-# Stop the stack, rebuild the runtime image from the current tree (host + guest asset), and start it detached; follow with `docker compose logs -f`
+# Stop the stack, rebuild the runtime image from the current tree (host + guest asset, newest config-weave), and start it detached; follow with `docker compose logs -f`
 [group('web')]
 compose-rebuild: compose-down
-	docker compose up -d --build
+	CONFIG_WEAVE_RELEASE="$(just config-weave-tag)" docker compose up -d --build
 	@echo "web UI: http://localhost:7878"
 
 # Stop and remove the Docker web UI stack

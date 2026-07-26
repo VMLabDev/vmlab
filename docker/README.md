@@ -63,11 +63,15 @@ each machine's **Playbook** tab, re-run `check`/`apply` from there (the
 playbook folder is re-pushed on every run), and open the playbook's file
 tree in the built-in editor from the designer's playbook node.
 
-The config-weave guest binaries are baked into the image, downloaded from
-the pinned [config-weave] GitHub release during `docker compose build`
-(`CONFIG_WEAVE_RELEASE` build arg in the Containerfile) and
-checksum-verified. To use newer binaries without rebuilding the image,
-mount a directory holding them and point `VMLAB_CONFIG_WEAVE_DIR` at it.
+The config-weave guest binaries are baked into the image, downloaded during
+`docker compose build` and checksum-verified. The build takes config-weave's
+newest release by default — prereleases included, since that is where its new
+features land — and records the tag it used at
+`/usr/share/vmlab/config-weave-release` in the image. Pin a specific one with
+the `CONFIG_WEAVE_RELEASE` build arg (`CONFIG_WEAVE_RELEASE=v0.2.0-alpha just
+compose-rebuild`, or the same as a `--build-arg`). To use newer binaries
+without rebuilding the image, mount a directory holding them and point
+`VMLAB_CONFIG_WEAVE_DIR` at it.
 
 One prerequisite: the Windows Server 2025 template (~12 GB) is pulled from
 ghcr on the first `up`.

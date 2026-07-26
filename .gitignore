@@ -16,3 +16,7 @@ docker/lab/.vmlab/
 
 # `just peer-demo` scratch homes (two isolated vmlab instances).
 /.vmlab-peer-demo/
+
+# config-weave's package-repo clones, written beside a playbook whenever
+# `pkg search|add` runs (the sample labs under docker/ are real playbooks).
+.repo-cache/

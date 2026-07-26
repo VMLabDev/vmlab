@@ -14,6 +14,13 @@ services:
     build:
       context: .
       dockerfile: Containerfile
+      args:
+        # Which config-weave release to bake in. `just compose-up` /
+        # `compose-rebuild` set this to the newest tag so a fresh release
+        # invalidates the layer; a plain `docker compose build` leaves it as
+        # `latest`, which the Containerfile resolves at build time (but may
+        # reuse a cached layer until something else changes).
+        CONFIG_WEAVE_RELEASE: "${CONFIG_WEAVE_RELEASE:-latest}"
     image: vmlab:latest
     ports:
       - "7878:7878"

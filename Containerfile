@@ -62,15 +62,28 @@ RUN ./guest/build-asset.sh x86_64 aarch64 && ./guest/build-agent.sh
 # docker/labs/ad-demo): static linux-musl + windows-gnu, both x86_64,
 # downloaded from config-weave's pinned GitHub release and checksum-verified.
 FROM debian:bookworm-slim AS config-weave
-ARG CONFIG_WEAVE_RELEASE=v0.1.0
+# `latest` = whatever config-weave released most recently; pass a tag to pin.
+# Resolved from the full release list, not the API's /releases/latest, which
+# skips prereleases — config-weave ships its new features as `-alpha` tags
+# (v0.1.0 is the newest non-prerelease and has no `pkg` subcommand at all).
+ARG CONFIG_WEAVE_RELEASE=latest
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /dl
-RUN base="https://github.com/Configweave/config-weave/releases/download/${CONFIG_WEAVE_RELEASE}" \
-    && curl -fsSLO "$base/config-weave-linux-x86_64" \
-    && curl -fsSLO "$base/config-weave-windows-x86_64.exe" \
-    && curl -fsSLO "$base/SHA256SUMS" \
-    && sha256sum -c SHA256SUMS
+RUN set -eu; \
+    tag="${CONFIG_WEAVE_RELEASE}"; \
+    if [ -z "$tag" ] || [ "$tag" = latest ]; then \
+        body="$(curl -fsSL https://api.github.com/repos/Configweave/config-weave/releases)"; \
+        tag="$(printf '%s\n' "$body" | grep -m1 '"tag_name"' | cut -d'"' -f4)"; \
+        [ -n "$tag" ] || { echo "cannot resolve the latest config-weave release" >&2; exit 1; }; \
+    fi; \
+    echo "config-weave release: $tag"; \
+    base="https://github.com/Configweave/config-weave/releases/download/$tag"; \
+    curl -fsSLO "$base/config-weave-linux-x86_64"; \
+    curl -fsSLO "$base/config-weave-windows-x86_64.exe"; \
+    curl -fsSLO "$base/SHA256SUMS"; \
+    sha256sum -c SHA256SUMS; \
+    printf '%s\n' "$tag" > VERSION
 
 # Bookworm ships the RISC-V QEMU system emulator but not its EDK2 package.
 # Pull the architecture-independent CODE/VARS blobs from Trixie while keeping
@@ -86,6 +99,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends qemu-efi-riscv6
 # against; the slow install layer is cached until the rev changes.
 FROM rust:1.92-bookworm AS help
 ARG WCL_REV=d966f87d4a5a91206e185199262668309f108c52
+# libgit2's TLS stack gives up part-way through the (large, slow) wcl fetch
+# inside buildkit — "SSL error: unknown error; class=Ssl (16)", reported as
+# "revision … not found". Shelling out to the git CLI is cargo's own advice
+# for exactly that failure, and retries survive a flaky link.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_NET_RETRY=5
 WORKDIR /build
 # WCL_EDITOR_UI_SKIP: the book render only needs `wcl wdoc`; skipping the
 # `wcl editor` frontend avoids needing pnpm in this stage.
@@ -97,6 +115,9 @@ RUN wcl wdoc build docs/wskills/vmlab/wdoc/book/main.wcl --out docs/help
 
 # ---- builder ----------------------------------------------------------------
 FROM rust:1.92-bookworm AS builder
+# Same git-over-CLI treatment as the help stage: this is the layer that fetches
+# wcl_lang + wscript + forge for the real build.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_NET_RETRY=5
 WORKDIR /build/vmlab
 COPY . .
 # Supply the built web assets + help book so rust-embed bakes them into
@@ -110,7 +131,8 @@ RUN cargo build --release --features web --bin vmlab --bin vmlab-web
 # ---- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim
 # QEMU system emulators, firmware, swtpm, OCR, NAT, ISO/floppy tooling, SMB
-# server (PRD §14).
+# server (PRD §14). git is config-weave's: `pkg search|add` clones the package
+# repos through it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         qemu-system-x86 \
         qemu-system-arm \
@@ -128,6 +150,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dosfstools \
         samba \
         ca-certificates \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=riscv-firmware /usr/share/qemu-efi-riscv64/ /usr/share/qemu-efi-riscv64/
@@ -144,10 +167,15 @@ COPY --from=guest /build/guest/dist/ /usr/share/vmlab/guest/
 # config-weave guest binaries for `playbook {}` blocks, at vmlab's default
 # lookup path. Override with newer ones via $VMLAB_CONFIG_WEAVE_DIR or the
 # `config_weave_bin_dir` host-config setting.
-COPY --from=config-weave /dl/config-weave-linux-x86_64 \
+# --chmod: curl leaves the downloads at 0644. The guest push path chmods after
+# transfer, but the Linux binary is also run *here* — `pkg search|add` from the
+# Files tab shells out to it — so it has to be executable in the image.
+COPY --from=config-weave --chmod=0755 /dl/config-weave-linux-x86_64 \
      /root/.local/share/config-weave/bin/config-weave-linux-x86_64
-COPY --from=config-weave /dl/config-weave-windows-x86_64.exe \
+COPY --from=config-weave --chmod=0755 /dl/config-weave-windows-x86_64.exe \
      /root/.local/share/config-weave/bin/config-weave-windows-x86_64.exe
+# Which release those came from — `config-weave version` lags its tags.
+COPY --from=config-weave /dl/VERSION /usr/share/vmlab/config-weave-release
 
 # Documented volume mounts (PRD §14):
 #   /root/.local/share/vmlab/templates  — the template store
