@@ -1011,6 +1011,7 @@
 
 /* new-lab dialog + picker */
 .newlab-error { color: var(--danger-fg); font-size: var(--fs-sm); }
+.newlab-preset { display: flex; flex-direction: column; gap: var(--sp-2); }
 .template-picker { display: flex; flex-direction: column; gap: var(--sp-2); }
 .artifact-picker { min-width: 0; }
 .artifact-current {

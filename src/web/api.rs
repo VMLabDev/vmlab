@@ -91,9 +91,12 @@ pub struct CreateLabBody {
     /// home (`~/.local/share/vmlab/labs/<name>`).
     #[serde(default)]
     path: Option<String>,
+    /// What the lab starts out as: `empty` (default) or `starter`.
+    #[serde(default)]
+    preset: vmlab::lab_init::LabPreset,
 }
 
-/// `POST /api/labs` `{name, path?}` — scaffold a new lab: create the
+/// `POST /api/labs` `{name, path?, preset?}` — scaffold a new lab: create the
 /// directory, write an initial `vmlab.wcl`, and register the root so every
 /// other lab-addressed endpoint resolves it immediately.
 pub async fn create_lab(
@@ -133,8 +136,10 @@ pub async fn create_lab(
         None => vmlab::paths::labs_home().join(&name),
     };
 
-    let (create_name, create_dir) = (name.clone(), dir.clone());
-    match web::block(move || vmlab::lab_init::create_lab_dir(&create_name, &create_dir)).await {
+    let (create_name, create_dir, preset) = (name.clone(), dir.clone(), body.preset);
+    match web::block(move || vmlab::lab_init::create_lab_dir(&create_name, &create_dir, preset))
+        .await
+    {
         Ok(Ok(())) => {
             state.register_root(&name, dir.clone()).await;
             HttpResponse::Created().json(json!({

@@ -740,8 +740,14 @@ export class StaleRev extends Error {
   }
 }
 
-export const createLab = (name: string, path?: string): Promise<{ name: string; root: string }> =>
-  post("/api/labs", { name, path });
+/** What a new lab starts out as: empty, or a NAT'd segment + one alpine VM. */
+export type LabPreset = "empty" | "starter";
+
+export const createLab = (
+  name: string,
+  path?: string,
+  preset?: LabPreset,
+): Promise<{ name: string; root: string }> => post("/api/labs", { name, path, preset });
 
 /** One template in the local store (GET /api/catalog/templates). */
 export interface StoreTemplate {

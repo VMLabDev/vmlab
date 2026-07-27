@@ -429,8 +429,12 @@ export function showContainer(name: string) {
 }
 /** Create a new lab, refresh the list, and jump to its page (the designer
  *  lives there under the stats). */
-export async function createLabAndOpen(name: string, path?: string): Promise<void> {
-  await api.createLab(name, path);
+export async function createLabAndOpen(
+  name: string,
+  path?: string,
+  preset?: api.LabPreset,
+): Promise<void> {
+  await api.createLab(name, path, preset);
   const labs = await api.listLabs();
   setState({ labs });
   if (!(await navAllowed())) return;

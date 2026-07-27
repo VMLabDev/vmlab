@@ -1,9 +1,10 @@
-// The "New lab" dialog: name (DNS label) + optional custom location.
-// Mounted once in App (like <Dialogs/>); open it from anywhere with
+// The "New lab" dialog: starting point, name (DNS label) + optional custom
+// location. Mounted once in App (like <Dialogs/>); open it from anywhere with
 // openNewLabModal().
 
 import { Show, createSignal } from "solid-js";
-import { Button, Input, Modal, Toggle } from "@forge/ui";
+import { Button, Input, Modal, Toggle, ToggleGroup } from "@forge/ui";
+import type { LabPreset } from "../api";
 import { createLabAndOpen } from "../store";
 
 const [open, setOpen] = createSignal(false);
@@ -15,6 +16,7 @@ export function openNewLabModal() {
 const NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 
 export default function NewLabModal() {
+  const [preset, setPreset] = createSignal<LabPreset>("empty");
   const [name, setName] = createSignal("");
   const [custom, setCustom] = createSignal(false);
   const [path, setPath] = createSignal("");
@@ -27,6 +29,7 @@ export default function NewLabModal() {
 
   function close() {
     setOpen(false);
+    setPreset("empty");
     setName("");
     setPath("");
     setCustom(false);
@@ -38,7 +41,7 @@ export default function NewLabModal() {
     setBusy(true);
     setError(null);
     try {
-      await createLabAndOpen(name(), custom() ? path() : undefined);
+      await createLabAndOpen(name(), custom() ? path() : undefined, preset());
       close();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -64,6 +67,21 @@ export default function NewLabModal() {
       }
     >
       <div class="stack">
+        <div class="newlab-preset">
+          <ToggleGroup
+            value={preset()}
+            options={[
+              { value: "empty", label: "Empty lab" },
+              { value: "starter", label: "Starter lab" },
+            ]}
+            onChange={(v: string) => setPreset(v === "starter" ? "starter" : "empty")}
+          />
+          <div class="inspector-note">
+            {preset() === "starter"
+              ? "A “lan” segment with NAT egress and one alpine VM attached to it — ready to start."
+              : "Nothing but the lab itself. Add segments and VMs in the designer."}
+          </div>
+        </div>
         <Input
           label="Name"
           help="A DNS label: lowercase letters, digits, hyphens (≤63 chars)"
