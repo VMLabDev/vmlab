@@ -257,14 +257,20 @@ impl Handler for LabdHandler {
                 Ok(json!(true))
             }
             // Download any pending templates/images without starting anything
-            // (the web UI's "Download templates" button, `vmlab pull`). The
-            // exact code path `up` runs first — same progress events.
+            // (`vmlab pull`). The exact code path `up` runs first — same
+            // progress events.
             "pull" => {
                 let output = stream_sink(&self.lab, _stream);
                 lab.ensure_pulled(&vms_arg(&args), Some(&output))
                     .await
                     .map_err(err)?;
                 Ok(json!(true))
+            }
+            // Abort one machine's running download (Templates page); whatever
+            // is waiting on it fails with "download cancelled".
+            "pull.cancel" => {
+                let machine = args["machine"].as_str().ok_or("missing machine")?;
+                Ok(json!(lab.cancel_pull(machine)))
             }
             // Ad-hoc script against the lab (PRD §12: vmlab script).
             "run" => {

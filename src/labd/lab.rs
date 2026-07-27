@@ -52,6 +52,11 @@ pub struct LabRuntime {
     /// Serialises pull runs (concurrent `up` + `pull` + `vm.start` must not
     /// double-download); the loser re-checks the pending list and no-ops.
     pull_lock: Mutex<()>,
+    /// The download running right now, keyed by machine: last progress
+    /// snapshot (`status` resyncs the web UI from it) plus the handle that
+    /// `cancel_pull` aborts. Std lock — the progress callback is sync and
+    /// nothing awaits while it is held.
+    active_pulls: std::sync::Mutex<BTreeMap<String, ActivePull>>,
     /// Runs per VM after boot but before any provision script — template
     /// builds install the vmlab-agent here, so it lands even when the last
     /// provision generalizes/shuts the guest down (Windows sysprep). Std
@@ -87,6 +92,49 @@ pub type PreProvisionHook = Arc<
 enum PendingPull {
     Template { reference: String, arch: String },
     Image { reference: String },
+}
+
+fn pull_percent(bytes_done: u64, bytes_total: u64) -> u32 {
+    bytes_done
+        .saturating_mul(100)
+        .checked_div(bytes_total)
+        .unwrap_or(0) as u32
+}
+
+/// The field a `<kind>.pull.*` event names its machine under: VM downloads
+/// say `vm`, container downloads say `container`.
+fn pull_subject(kind: &str) -> &'static str {
+    if kind == "template" {
+        "vm"
+    } else {
+        "container"
+    }
+}
+
+/// The error a cancelled download fails with. A distinct type so the pull
+/// paths can tell a cancellation from a transport failure and leave the
+/// `.error` event unsent — `.cancelled` already went out.
+#[derive(Debug)]
+struct PullCancelled;
+
+impl std::fmt::Display for PullCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("download cancelled")
+    }
+}
+
+impl std::error::Error for PullCancelled {}
+
+/// A download in progress, as reported by `status` and cancelled by
+/// `cancel_pull`.
+struct ActivePull {
+    /// "template" (VM disk from a registry) or "image" (container image).
+    kind: &'static str,
+    reference: String,
+    bytes_done: u64,
+    bytes_total: u64,
+    percent: u32,
+    abort: tokio::task::AbortHandle,
 }
 
 impl LabRuntime {
@@ -364,6 +412,7 @@ impl LabRuntime {
             profiles: profiles.clone(),
             pending_pulls: Mutex::new(pending),
             pull_lock: Mutex::new(()),
+            active_pulls: std::sync::Mutex::new(BTreeMap::new()),
             pre_provision: std::sync::RwLock::new(None),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
@@ -415,6 +464,71 @@ impl LabRuntime {
         Ok(())
     }
 
+    /// Abort one machine's in-flight download; false when it isn't
+    /// downloading (already finished, or never started). The pending entry
+    /// stays, so a later `up`/`pull` retries from scratch — chunks already
+    /// fetched live in the store's `.oci-pull` work dir and are cleaned up by
+    /// the next successful pull.
+    ///
+    /// Cancelling only interrupts the download. The final assemble+install
+    /// runs on a blocking thread that cannot be interrupted, so a cancel that
+    /// lands during install still leaves a fully verified template behind.
+    pub fn cancel_pull(&self, machine: &str) -> bool {
+        match self.active_pulls.lock_recover().get(machine) {
+            Some(pull) => {
+                pull.abort.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Register `task` as `machine`'s active download, await it, and clear the
+    /// entry. An abort from [`Self::cancel_pull`] surfaces as a
+    /// `<kind>.pull.cancelled` event and an error, so whatever needed the
+    /// download fails with a reason the caller can show.
+    async fn join_pull<T>(
+        self: &Arc<Self>,
+        machine: &str,
+        kind: &'static str,
+        reference: &str,
+        task: tokio::task::JoinHandle<Result<T>>,
+    ) -> Result<T> {
+        self.active_pulls.lock_recover().insert(
+            machine.to_string(),
+            ActivePull {
+                kind,
+                reference: reference.to_string(),
+                bytes_done: 0,
+                bytes_total: 0,
+                percent: 0,
+                abort: task.abort_handle(),
+            },
+        );
+        let joined = task.await;
+        self.active_pulls.lock_recover().remove(machine);
+        match joined {
+            Ok(result) => result,
+            Err(e) if e.is_cancelled() => {
+                self.events.emit(
+                    &format!("{kind}.pull.cancelled"),
+                    json!({ pull_subject(kind): machine, "reference": reference }),
+                );
+                Err(anyhow::Error::new(PullCancelled))
+            }
+            Err(e) => bail!("{kind} download task: {e}"),
+        }
+    }
+
+    /// Keep the machine's progress snapshot current for `status` resync.
+    fn note_pull_progress(&self, machine: &str, bytes_done: u64, bytes_total: u64, percent: u32) {
+        if let Some(pull) = self.active_pulls.lock_recover().get_mut(machine) {
+            pull.bytes_done = bytes_done;
+            pull.bytes_total = bytes_total;
+            pull.percent = percent;
+        }
+    }
+
     /// Pull one registry template, then bind the resolved parts (hardware
     /// re-resolution with the template meta, backing disk, first-boot script)
     /// into the VM instance.
@@ -433,31 +547,31 @@ impl LabRuntime {
         if let Some(out) = output {
             out(format!("pull: {reference} ({arch})\n"));
         }
-        let events = self.events.clone();
+        // The download runs as its own task so `cancel_pull` can abort it.
+        let me = Arc::clone(self);
         let vm_s = vm_name.to_string();
         let ref_s = reference.to_string();
-        let mut progress = move |p: crate::oci::PullProgress| {
-            let percent = p
-                .bytes_done
-                .saturating_mul(100)
-                .checked_div(p.bytes_total)
-                .unwrap_or(0) as u32;
-            events.emit(
-                "template.pull.progress",
-                json!({
-                    "vm": vm_s,
-                    "reference": ref_s,
-                    "chunk": p.chunk,
-                    "chunks": p.chunks,
-                    "bytes_done": p.bytes_done,
-                    "bytes_total": p.bytes_total,
-                    "percent": percent,
-                }),
-            );
-        };
-        let result =
-            crate::oci::ensure_registry_template(reference, arch, &store, &mut progress).await;
-        drop(progress);
+        let arch_s = arch.to_string();
+        let task = tokio::spawn(async move {
+            let mut progress = |p: crate::oci::PullProgress| {
+                let percent = pull_percent(p.bytes_done, p.bytes_total);
+                me.note_pull_progress(&vm_s, p.bytes_done, p.bytes_total, percent);
+                me.events.emit(
+                    "template.pull.progress",
+                    json!({
+                        "vm": vm_s,
+                        "reference": ref_s,
+                        "chunk": p.chunk,
+                        "chunks": p.chunks,
+                        "bytes_done": p.bytes_done,
+                        "bytes_total": p.bytes_total,
+                        "percent": percent,
+                    }),
+                );
+            };
+            crate::oci::ensure_registry_template(&ref_s, &arch_s, &store, &mut progress).await
+        });
+        let result = self.join_pull(vm_name, "template", reference, task).await;
         match result {
             Ok(resolved) => {
                 self.events.emit(
@@ -486,10 +600,13 @@ impl LabRuntime {
                 Ok(())
             }
             Err(e) => {
-                self.events.emit(
-                    "template.pull.error",
-                    json!({"vm": vm_name, "reference": reference, "error": format!("{e:#}")}),
-                );
+                // A cancellation already reported itself as `.cancelled`.
+                if !e.is::<PullCancelled>() {
+                    self.events.emit(
+                        "template.pull.error",
+                        json!({"vm": vm_name, "reference": reference, "error": format!("{e:#}")}),
+                    );
+                }
                 Err(e.context(format!("pulling template for vm \"{vm_name}\"")))
             }
         }
@@ -512,31 +629,30 @@ impl LabRuntime {
         if let Some(out) = output {
             out(format!("pull: {reference}\n"));
         }
-        let events = self.events.clone();
+        // As in `pull_template`: a task of its own, so it can be cancelled.
+        let me = Arc::clone(self);
         let cn_s = name.to_string();
         let ref_s = reference.to_string();
-        let mut progress = move |p: crate::oci::image::ImagePullProgress| {
-            let percent = p
-                .bytes_done
-                .saturating_mul(100)
-                .checked_div(p.bytes_total)
-                .unwrap_or(0) as u32;
-            events.emit(
-                "container.pull.progress",
-                json!({
-                    "container": cn_s,
-                    "reference": ref_s,
-                    "layer": p.layer,
-                    "layers": p.layers,
-                    "bytes_done": p.bytes_done,
-                    "bytes_total": p.bytes_total,
-                    "percent": percent,
-                }),
-            );
-        };
-        let result =
-            crate::oci::image::ensure_container_image(reference, arch, &cache, &mut progress).await;
-        drop(progress);
+        let task = tokio::spawn(async move {
+            let mut progress = |p: crate::oci::image::ImagePullProgress| {
+                let percent = pull_percent(p.bytes_done, p.bytes_total);
+                me.note_pull_progress(&cn_s, p.bytes_done, p.bytes_total, percent);
+                me.events.emit(
+                    "container.pull.progress",
+                    json!({
+                        "container": cn_s,
+                        "reference": ref_s,
+                        "layer": p.layer,
+                        "layers": p.layers,
+                        "bytes_done": p.bytes_done,
+                        "bytes_total": p.bytes_total,
+                        "percent": percent,
+                    }),
+                );
+            };
+            crate::oci::image::ensure_container_image(&ref_s, arch, &cache, &mut progress).await
+        });
+        let result = self.join_pull(name, "container", reference, task).await;
         match result {
             Ok(image) => {
                 self.events.emit(
@@ -558,10 +674,12 @@ impl LabRuntime {
                 Ok(())
             }
             Err(e) => {
-                self.events.emit(
-                    "container.pull.error",
-                    json!({"container": name, "reference": reference, "error": format!("{e:#}")}),
-                );
+                if !e.is::<PullCancelled>() {
+                    self.events.emit(
+                        "container.pull.error",
+                        json!({"container": name, "reference": reference, "error": format!("{e:#}")}),
+                    );
+                }
                 Err(e.context(format!("pulling image for container \"{name}\"")))
             }
         }
@@ -2004,12 +2122,41 @@ impl LabRuntime {
                 "frames_offloaded": sw.frames_offloaded,
             }));
         }
+        // In-flight downloads, so a page load mid-pull still shows progress
+        // (the events only reach clients that were already connected).
+        let pulls: Vec<Value> = self
+            .active_pulls
+            .lock_recover()
+            .iter()
+            .map(|(machine, pull)| {
+                json!({
+                    "machine": machine,
+                    "kind": pull.kind,
+                    "reference": pull.reference,
+                    "bytes_done": pull.bytes_done,
+                    "bytes_total": pull.bytes_total,
+                    "percent": pull.percent,
+                })
+            })
+            .collect();
         json!({
             "lab": self.name,
             "vms": vms,
             "containers": containers,
             "segments": segments,
+            "provisioned": self.provisioned(),
+            "pulls": pulls,
         })
+    }
+
+    /// Whether this lab has materialised anything a destroy would remove:
+    /// clones, container overlays or named volumes. Not `.vmlab` itself —
+    /// that directory is created the moment the daemon opens the lab, so it
+    /// says nothing; the per-machine dirs appear only once a machine starts.
+    fn provisioned(&self) -> bool {
+        self.vms.values().any(|vm| vm.dirs.local.exists())
+            || self.containers.values().any(|c| c.dirs.local.exists())
+            || self.lab_local.join("volumes").exists()
     }
 
     /// Live per-segment DNS zone snapshots (`dns.table`). Segments without a

@@ -140,6 +140,45 @@ function specFields(pairs: [string, FV][]): { name: string; value: OpValue }[] {
 
 const key = (s: Span) => `${s[0]}:${s[1]}`;
 
+// --- placeholder rows --------------------------------------------------------
+//
+// The inspector's Add buttons push a blank row for the user to fill in, and
+// the designer writes vmlab.wcl a moment later without being asked. A block
+// that is missing a field the backend needs (`record` with no name/ip, `on`
+// with no run, …) parses back to nothing, so writing it early would strand a
+// bare block in the file and make the row vanish from under the user. Such a
+// block stays a pending edit until it is complete.
+//
+// Groups are read as "any name in the group must be present"; presence means
+// the value survived specFields, i.e. it isn't empty or a schema default.
+// Mirrors the required fields in src/config/extract.rs.
+const REQUIRED_FIELDS: Record<string, string[][]> = {
+  vm: [["template"]],
+  container: [["image"]],
+  record: [["name"], ["ip"]],
+  on: [["run"]],
+  sinkhole: [["pattern"]],
+  share: [["host"], ["guest"]],
+  env: [["name"], ["value"]],
+  volume: [["target"], ["host", "name"]],
+  healthcheck: [["command"]],
+  block: [["cidr"]],
+  redirect: [["from"], ["to"]],
+  route: [["dest"], ["via"]],
+  forward: [["host_port"], ["to"]],
+  media: [["kind"], ["from"]],
+  connect: [["host"]],
+};
+
+/** Whether a new block carries enough to survive the round trip. */
+function writable(spec: BlockSpec): boolean {
+  if (spec.labels?.some((l) => !l.trim())) return false;
+  const present = new Set(spec.fields?.map((f) => f.name) ?? []);
+  return (REQUIRED_FIELDS[spec.kind] ?? []).every((group) =>
+    group.some((name) => present.has(name)),
+  );
+}
+
 interface HasSpan {
   span: Span | null;
 }
@@ -164,9 +203,14 @@ function diffChildren<T extends HasSpan>(
       const b = baseBySpan.get(key(d.span));
       if (b) diffOne(ops, b, d);
     } else {
-      ops.adds.push({ op: "add_block", parent, block: spec(d) });
+      addBlock(ops, parent, spec(d));
     }
   }
+}
+
+/** Queue an add, unless the block is still a placeholder (see `writable`). */
+function addBlock(ops: Ops, parent: Span, block: BlockSpec) {
+  if (writable(block)) ops.adds.push({ op: "add_block", parent, block });
 }
 
 /** Optional single child block (gpu / dns / connect). */
@@ -181,14 +225,14 @@ function diffChild<T extends HasSpan>(
   if (base?.span && !draft) {
     ops.removes.push({ op: "remove_block", block: base.span });
   } else if (!base && draft) {
-    ops.adds.push({ op: "add_block", parent, block: spec(draft) });
+    addBlock(ops, parent, spec(draft));
   } else if (base && draft) {
     if (draft.span && base.span && key(draft.span) === key(base.span)) {
       diffOne(ops, base, draft);
     } else if (base.span) {
       // Replaced wholesale (removed then re-added in the editor).
       ops.removes.push({ op: "remove_block", block: base.span });
-      ops.adds.push({ op: "add_block", parent, block: spec(draft) });
+      addBlock(ops, parent, spec(draft));
     }
   }
 }
@@ -470,7 +514,8 @@ function containerSpec(c: ContainerModel): BlockSpec {
     kind: "container",
     labels: [c.name],
     fields: specFields(containerPairs(c)),
-    children,
+    // A machine can be added with placeholder rows already in it.
+    children: children.filter(writable),
   };
 }
 
@@ -482,7 +527,12 @@ function vmSpec(v: VmModel): BlockSpec {
   children.push(...v.shares.map(shareSpec));
   children.push(...v.media.map(mediaSpec));
   children.push(...v.web.map(webSpec));
-  return { kind: "vm", labels: [v.name], fields: specFields(vmPairs(v)), children };
+  return {
+    kind: "vm",
+    labels: [v.name],
+    fields: specFields(vmPairs(v)),
+    children: children.filter(writable),
+  };
 }
 
 function segmentSpec(s: SegmentModel): BlockSpec {
@@ -495,7 +545,12 @@ function segmentSpec(s: SegmentModel): BlockSpec {
   children.push(...s.block_rules.map(blockRuleSpec));
   children.push(...s.redirect_rules.map(redirectSpec));
   children.push(...s.sinkholes.map(sinkholeSpec));
-  return { kind: "segment", labels: [s.name], fields: specFields(segmentPairs(s)), children };
+  return {
+    kind: "segment",
+    labels: [s.name],
+    fields: specFields(segmentPairs(s)),
+    children: children.filter(writable),
+  };
 }
 
 // --- per-block diffs ----------------------------------------------------------

@@ -23,13 +23,13 @@ export type ViewKind = "lab" | "vm" | "container" | "templates" | "web";
 
 // A template or container-image download in progress, driven by the
 // template.pull.* / container.pull.* events the lab daemon streams while
-// pulling on up/start or via the "Download templates" button (issue #1).
+// pulling on up/start (issue #1).
 // Keyed by `lab/vm` (`vm` = machine name).
 export interface Pull {
   lab: string;
   vm: string;
   reference: string;
-  status: "checking" | "pulling" | "error";
+  status: "checking" | "pulling" | "error" | "cancelled";
   percent: number;
   bytesDone: number;
   bytesTotal: number;
@@ -370,8 +370,37 @@ export async function refreshStatus() {
   try {
     const status = await api.labStatus(state.currentLab);
     setState({ status, error: null });
+    adoptActivePulls(status);
   } catch (e) {
     setState({ error: String(e) });
+  }
+}
+
+/** Seed `state.pulls` from the daemon's live download list, so a page loaded
+ *  mid-download still shows progress (the `*.pull.*` events only reach clients
+ *  that were already connected). Errored/cancelled entries are the client's
+ *  own until dismissed, so they are left alone. */
+function adoptActivePulls(status: api.LabStatus) {
+  const active = status.pulls ?? [];
+  for (const pull of active) {
+    const key = `${status.lab}/${pull.machine}`;
+    if (state.pulls[key]?.status === "error" || state.pulls[key]?.status === "cancelled") continue;
+    setState("pulls", key, {
+      lab: status.lab,
+      vm: pull.machine,
+      reference: pull.reference,
+      status: pull.bytes_total > 0 ? "pulling" : "checking",
+      percent: pull.percent,
+      bytesDone: pull.bytes_done,
+      bytesTotal: pull.bytes_total,
+    });
+  }
+  // Anything the daemon no longer lists has finished; its `.done`/`.error`
+  // event may have fired while this client was away.
+  const live = new Set(active.map((pull) => `${status.lab}/${pull.machine}`));
+  for (const [key, pull] of Object.entries(state.pulls)) {
+    if (!pull || pull.lab !== status.lab || live.has(key)) continue;
+    if (pull.status === "pulling" || pull.status === "checking") clearPull(key);
   }
 }
 
@@ -408,15 +437,6 @@ export async function createLabAndOpen(name: string, path?: string): Promise<voi
   setState({ currentLab: name, view: { kind: "lab", vm: null }, templates: [] });
   await refreshStatus();
   await loadTemplates();
-}
-
-/** True when some machine's template/image still needs downloading — shows
- *  the "Download templates" button on the lab overview. */
-export function needsPull(): boolean {
-  return (
-    (state.status?.vms ?? []).some((v) => v.template_cached === false) ||
-    (state.status?.containers ?? []).some((c) => c.image_cached === false)
-  );
 }
 
 /** True if any VM or container in the current lab is not stopped (gates a
@@ -502,10 +522,22 @@ const f = (force?: boolean) => (force ? "Force stopping" : "Stopping");
 
 export const startAll = () =>
   run("Starting lab", () => api.labAction(state.currentLab!, "up"));
-/** Download missing templates/images without starting anything; progress
- *  arrives as template.pull.* / container.pull.* events (PullPanel). */
-export const pullLab = () =>
-  run("Templates downloaded", () => api.labAction(state.currentLab!, "pull"));
+/** Stop one machine's download (Templates page). The daemon emits
+ *  `*.pull.cancelled`, which settles the row. */
+export async function cancelPull(machine: string) {
+  const lab = state.currentLab;
+  if (!lab) return;
+  try {
+    const res = await api.cancelPull(lab, machine);
+    if (!res.cancelled) {
+      showToast(`${machine} is not downloading any more`, "info");
+      scheduleRefresh();
+    }
+  } catch (e) {
+    showToast(`Failed: ${e}`, "danger");
+  }
+}
+
 export const stopAll = (force?: boolean) =>
   run(`${f(force)} lab`, () => api.labAction(state.currentLab!, "down", force));
 // Not via run(): the fx session must be armed BEFORE the await — the
@@ -726,6 +758,11 @@ function handlePullEvent(ev: DaemonEvent) {
         p ? { ...p, status: "error" as const, error: String(ev.data.error ?? "pull failed") } : p,
       );
       // Leave the error visible briefly, then drop it.
+      setTimeout(() => clearPull(key), 6000);
+      scheduleRefresh();
+      break;
+    case "cancelled":
+      setState("pulls", key, (p) => (p ? { ...p, status: "cancelled" as const } : p));
       setTimeout(() => clearPull(key), 6000);
       scheduleRefresh();
       break;

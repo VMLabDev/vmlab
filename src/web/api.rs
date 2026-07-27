@@ -227,6 +227,98 @@ pub async fn delete_catalog_template(path: web::Path<(String, String, String)>) 
     }
 }
 
+/// `POST /api/catalog/templates/{arch}/{name}/{version}/verify` — hash the
+/// stored `disk.qcow2` and compare it with the digest its registry publishes
+/// (the Templates page's Check button). Templates with no registry are
+/// checked against the digest recorded when they were built or installed.
+///
+/// Hashing reads the whole image, so a big Windows template takes minutes;
+/// the response is the result, there is no progress stream.
+pub async fn verify_catalog_template(path: web::Path<(String, String, String)>) -> HttpResponse {
+    let (arch, name, version) = path.into_inner();
+    // Resolve through the store's own listing, so route parameters never
+    // reach a path (same reasoning as delete_catalog_template).
+    let resolved = web::block({
+        let (arch, name, version) = (arch.clone(), name.clone(), version.clone());
+        move || {
+            let store = vmlab::template::TemplateStore::new(vmlab::paths::template_store_dir());
+            let found = store
+                .list()?
+                .into_iter()
+                .find(|t| t.arch == arch && t.name == name && t.version == version)
+                .ok_or_else(|| anyhow::anyhow!("template {arch}/{name}@{version} not found"))?;
+            store.resolve(&found.arch, &found.name, Some(&found.version))
+        }
+    })
+    .await;
+    let resolved = match resolved {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) if format!("{e:#}").contains("not found") => {
+            return HttpResponse::NotFound().json(json!({"error": format!("{e:#}")}));
+        }
+        Ok(Err(e)) => {
+            return HttpResponse::InternalServerError().json(json!({"error": format!("{e:#}")}));
+        }
+        Err(e) => return HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    };
+
+    // Ask the registry what it publishes for this exact version. A registry
+    // that can't be reached is reported, not fatal: the local hash is still
+    // worth comparing against the recorded one.
+    let mut remote: Option<String> = None;
+    let mut remote_error: Option<String> = None;
+    if let Some(repo) = resolved.meta.registry.clone() {
+        match vmlab::oci_registry::with_version_tag(&repo, &resolved.meta.version)
+            .and_then(|reference| vmlab::oci_registry::Registry::new(&reference))
+        {
+            Ok(registry) => match registry.published_disk_digest(Some(&arch)).await {
+                Ok(Some(digest)) => remote = Some(strip_sha256(&digest)),
+                Ok(None) => {
+                    remote_error = Some("the published manifest records no image digest".into());
+                }
+                Err(e) => remote_error = Some(format!("{e:#}")),
+            },
+            Err(e) => remote_error = Some(format!("{e:#}")),
+        }
+    }
+
+    let disk = resolved.disk_path.clone();
+    let local = match web::block(move || vmlab::template::store::sha256_file(&disk)).await {
+        Ok(Ok(hex)) => hex,
+        Ok(Err(e)) => {
+            return HttpResponse::InternalServerError().json(json!({"error": format!("{e:#}")}));
+        }
+        Err(e) => return HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    };
+    let recorded = resolved.meta.sha256.as_deref().map(strip_sha256);
+    // Registry digest first: it is the published truth. Without one, the
+    // recorded digest still catches local corruption.
+    let (expected, source) = match (&remote, &recorded) {
+        (Some(digest), _) => (Some(digest.clone()), "registry"),
+        (None, Some(digest)) => (Some(digest.clone()), "recorded"),
+        (None, None) => (None, "none"),
+    };
+    ok(json!({
+        "template": format!("{arch}/{name}@{version}"),
+        "local": local,
+        "expected": expected,
+        "source": source,
+        "registry": resolved.meta.registry,
+        "recorded": recorded,
+        "remote_error": remote_error,
+        "matches": expected.as_deref().map(|e| e.eq_ignore_ascii_case(&local)),
+    }))
+}
+
+/// Digests travel as `sha256:<hex>` on the wire and bare hex in template
+/// metadata; compare them in one form.
+fn strip_sha256(digest: &str) -> String {
+    digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .to_ascii_lowercase()
+}
+
 /// `GET /api/catalog/profiles` — guest OS profile names for the editor's
 /// profile picker.
 pub async fn catalog_profiles() -> HttpResponse {
@@ -411,9 +503,9 @@ pub struct ForceQuery {
 }
 
 /// `POST /api/labs/{lab}/{action}` where action ∈ up|down|destroy|pull.
-/// `pull` downloads any missing templates/images without starting machines
-/// (the overview's "Download templates" button); like `up`, the response
-/// blocks until done while `template.pull.*` events drive the UI.
+/// `pull` downloads any missing templates/images without starting machines;
+/// like `up`, the response blocks until done while `template.pull.*` events
+/// drive the UI.
 pub async fn lab_action(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
@@ -431,6 +523,23 @@ pub async fn lab_action(
     };
     match state.lab_call(&lab, cmd, args).await {
         Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
+/// `POST /api/labs/{lab}/pulls/{machine}/cancel` — abort the download running
+/// for one machine (the Templates page's Cancel button). `{"cancelled": false}`
+/// when it wasn't downloading; whatever was waiting on the download fails.
+pub async fn cancel_pull(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let (lab, machine) = path.into_inner();
+    match state
+        .lab_call(&lab, "pull.cancel", json!({"machine": machine}))
+        .await
+    {
+        Ok(v) => ok(json!({"cancelled": v.as_bool().unwrap_or(false)})),
         Err(e) => fail(e),
     }
 }

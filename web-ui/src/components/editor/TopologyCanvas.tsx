@@ -3541,7 +3541,7 @@ export default function TopologyCanvas(props: {
                   : group.plays.error
                     ? "playbook.wcl has a syntax error"
                     : !group.plays.exists
-                      ? "no playbook.wcl yet — save to scaffold"
+                      ? "no playbook.wcl yet — add it in the Files tab"
                       : "no plays defined";
               return (
                 <g

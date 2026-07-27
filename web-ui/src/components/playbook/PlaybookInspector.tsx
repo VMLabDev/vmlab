@@ -199,8 +199,10 @@ function GatherFields(props: PlaybookInspectorProps & { index: number }) {
           <RefField
             label="Gatherer"
             help={decl()?.description}
+            emptyHint="This playbook's packages declare no gatherers"
             value={g().from}
             options={gathererRefs(props.catalog)}
+            error={!g().from}
             disabled={props.disabled}
             onChange={(v) => props.mutate((d) => (d.gathers[props.index].from = v))}
           />
@@ -398,6 +400,7 @@ function StepFields(
       <RefField
         label="Resource"
         help={decl()?.description}
+        emptyHint="This playbook's packages declare no resources"
         value={props.step.resource}
         options={refs()}
         error={!props.step.resource}
@@ -410,7 +413,8 @@ function StepFields(
       />
       <Show when={!refs().length}>
         <div class="inspector-note">
-          No packages installed in this playbook yet.{" "}
+          Nothing to pick: this playbook has no packages, or the ones it has only declare
+          gatherers.{" "}
           <Button size="sm" onClick={() => props.onAddPackages()}>
             Add a package
           </Button>

@@ -6,11 +6,19 @@
 // gather result (`path = marker_a`). FieldRow's contract is a plain value, and
 // its segref/vmref kinds reach into the lab editor store.
 
-import { Show, createMemo } from "solid-js";
+import { Show, createMemo, createSignal } from "solid-js";
 import { IconButton, Input, Select, Textarea, Toggle } from "@forge/ui";
 import { FunctionSquare, Trash2 } from "lucide-solid";
 import type { ParamDoc, Val } from "../../api";
-import { isExpr, litFor, valText } from "../../playbook/doc";
+import {
+  isExpr,
+  isSymbolLiteral,
+  litFor,
+  symbolChoices,
+  symbolToken,
+  symbolVal,
+  valText,
+} from "../../playbook/doc";
 
 export interface PropertyFieldProps {
   /** The declared parameter, when there is one — its description, type,
@@ -31,8 +39,16 @@ export interface PropertyFieldProps {
 
 export default function PropertyField(props: PropertyFieldProps) {
   const type = () => props.param?.type ?? "string";
-  const expr = () => isExpr(props.value);
   const required = () => props.param?.required === true && props.param?.default === undefined;
+
+  /** Symbols ride as expression source (`{expr: ":present"}`) even when the
+   *  user is picking from a list, so "is this expression mode?" can't be read
+   *  off the value alone — the fx button says so explicitly. */
+  const [forced, setForced] = createSignal(false);
+  const symbol = () => type() === "symbol";
+  const choices = createMemo(() => symbolChoices(props.param));
+  const picking = () => symbol() && choices().length > 0 && isSymbolLiteral(props.value);
+  const expr = () => forced() || (isExpr(props.value) && !picking());
 
   const help = createMemo(() => {
     const parts: string[] = [];
@@ -51,11 +67,28 @@ export default function PropertyField(props: PropertyFieldProps) {
 
   const label = () => `${props.name}${required() ? " *" : ""}`;
 
+  /** The declared symbols, plus whatever the file already says — a value the
+   *  package's prose doesn't name is still the file's, so it stays pickable. */
+  const symbolOptions = createMemo(() => {
+    const current = symbolToken(props.value);
+    const values = choices().includes(current) || !current ? choices() : [...choices(), current];
+    return [
+      { value: "", label: required() ? "— pick one —" : "— unset —" },
+      ...values.map((v) => ({ value: v, label: `:${v}` })),
+    ];
+  });
+
   /** Switching modes keeps the text, so a literal can be promoted to an
    *  expression (and back) without retyping it. */
   function toggleExpr() {
     const text = valText(props.value);
-    props.onChange(expr() ? litFor(type(), text) : { expr: text });
+    if (expr()) {
+      setForced(false);
+      props.onChange(litFor(type(), text));
+    } else {
+      setForced(true);
+      props.onChange({ expr: text });
+    }
   }
 
   return (
@@ -95,16 +128,30 @@ export default function PropertyField(props: PropertyFieldProps) {
             <Show
               when={type() !== "symbol"}
               fallback={
-                <Input
-                  label={label()}
-                  help={help() || "A WCL symbol, written :name"}
-                  value={valText(props.value)}
-                  disabled={props.disabled}
-                  placeholder=":present"
-                  onInput={(e: InputEvent) =>
-                    props.onChange({ lit: (e.currentTarget as HTMLInputElement).value })
+                <Show
+                  when={picking()}
+                  fallback={
+                    <Input
+                      label={label()}
+                      help={help() || "A WCL symbol, written :name"}
+                      value={valText(props.value)}
+                      disabled={props.disabled}
+                      placeholder=":present"
+                      onInput={(e: InputEvent) =>
+                        props.onChange(symbolVal((e.currentTarget as HTMLInputElement).value))
+                      }
+                    />
                   }
-                />
+                >
+                  <Select
+                    label={label()}
+                    help={help()}
+                    value={symbolToken(props.value)}
+                    disabled={props.disabled}
+                    options={symbolOptions()}
+                    onChange={(v: string) => props.onChange(symbolVal(v))}
+                  />
+                </Show>
               }
             >
               <Input
@@ -170,48 +217,52 @@ export function ListPropertyField(props: {
   );
 }
 
-/** A reference picker that still accepts hand-typed values — the catalogue is
- *  empty until packages are installed, and a playbook may legitimately name a
- *  resource whose package isn't installed here yet. */
+/** A picker over what the installed packages declare (`pkg.resource`,
+ *  `pkg.gatherer`).
+ *
+ *  Always a dropdown, never a text box: the point of the panel is to show what
+ *  is actually available. A value the catalogue doesn't know — a package that
+ *  isn't installed here, or one that has been removed — stays in the list,
+ *  marked, so opening a playbook can never quietly drop what the file says. */
 export function RefField(props: {
   label: string;
   help?: string;
   value: string;
   options: string[];
+  /** Shown when nothing is installed to pick from. */
+  emptyHint?: string;
   disabled?: boolean;
   error?: boolean;
   onChange: (value: string) => void;
 }) {
   const known = () => props.options.includes(props.value);
+  const orphan = () => !!props.value && !known();
+
+  const options = () => [
+    {
+      value: "",
+      label: props.options.length ? "— pick one —" : "— nothing to pick —",
+      disabled: true,
+    },
+    ...props.options.map((o) => ({ value: o, label: o })),
+    ...(orphan() ? [{ value: props.value, label: `${props.value} — not installed here` }] : []),
+  ];
+
+  const help = () => {
+    if (orphan()) return `${props.value} is not among this playbook's packages`;
+    if (!props.options.length) return props.emptyHint ?? "Install a package to pick from";
+    return props.help;
+  };
+
   return (
-    <Show
-      when={props.options.length && (known() || !props.value)}
-      fallback={
-        <Input
-          label={props.label}
-          help={props.help ?? "package.name"}
-          value={props.value}
-          error={props.error}
-          disabled={props.disabled}
-          placeholder="linux_files.file"
-          onInput={(e: InputEvent) =>
-            props.onChange((e.currentTarget as HTMLInputElement).value)
-          }
-        />
-      }
-    >
-      <Select
-        label={props.label}
-        help={props.help}
-        value={props.value}
-        error={props.error}
-        disabled={props.disabled}
-        options={[
-          { value: "", label: "— pick one —" },
-          ...props.options.map((o) => ({ value: o, label: o })),
-        ]}
-        onChange={(v: string) => props.onChange(v)}
-      />
-    </Show>
+    <Select
+      label={props.label}
+      help={help()}
+      value={props.value}
+      error={props.error || orphan()}
+      disabled={props.disabled}
+      options={options()}
+      onChange={(v: string) => props.onChange(v)}
+    />
   );
 }

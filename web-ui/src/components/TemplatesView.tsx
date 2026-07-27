@@ -15,7 +15,17 @@ import {
   StatusDot,
   Table,
 } from "@forge/ui";
-import { KeyRound, Monitor, Play, Plus, RefreshCw, Square, Trash2, Upload } from "lucide-solid";
+import {
+  KeyRound,
+  Monitor,
+  Play,
+  Plus,
+  RefreshCw,
+  ShieldCheck,
+  Square,
+  Trash2,
+  Upload,
+} from "lucide-solid";
 import {
   state,
   buildTemplate,
@@ -28,10 +38,16 @@ import {
   type TemplateOp,
 } from "../store";
 import { stepTone } from "./PlaybookPanel";
-import { listStoreTemplates, removeStoreTemplate, templateRemote } from "../api";
-import type { TemplateInfo, RemoteStatus, StoreTemplate } from "../api";
+import {
+  listStoreTemplates,
+  removeStoreTemplate,
+  templateRemote,
+  verifyStoreTemplate,
+} from "../api";
+import type { TemplateInfo, RemoteStatus, StoreTemplate, TemplateCheck } from "../api";
 import { confirmDialog } from "./dialogs";
 import ConsoleScreen from "./ConsoleScreen";
+import PullPanel from "./PullPanel";
 import {
   addRegistry,
   containerRegistry,
@@ -63,6 +79,7 @@ export default function TemplatesView() {
         sub={`${state.templates.length} defined · ${registries().length} OCI ${registries().length === 1 ? "registry" : "registries"}`}
       />
       <div class="stack">
+        <PullPanel />
         <CachedTemplates />
         <RegistryInventory uses={registries()} />
         <Show
@@ -79,10 +96,44 @@ export default function TemplatesView() {
 function CachedTemplates() {
   const [templates, { mutate, refetch }] = createResource(listStoreTemplates);
   const [removing, setRemoving] = createSignal<string | null>(null);
+  // Verification is per row: the ref being hashed, and every result so far.
+  const [checking, setChecking] = createSignal<string | null>(null);
+  const [checks, setChecks] = createSignal<Record<string, TemplateCheck>>({});
   const key = (template: StoreTemplate) =>
     `${template.arch}/${template.name}@${template.version}`;
   const created = (value: string) =>
     new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
+
+  // Hashing reads the whole disk (minutes for a Windows image), so only one
+  // check runs at a time and the row says what it is comparing against.
+  const check = async (template: StoreTemplate) => {
+    const ref = key(template);
+    setChecking(ref);
+    try {
+      const result = await verifyStoreTemplate(template);
+      setChecks((current) => ({ ...current, [ref]: result }));
+      if (result.matches === true) {
+        showToast(`${ref} matches its ${result.source === "registry" ? "registry" : "recorded"} digest`);
+      } else if (result.matches === false) {
+        showToast(`${ref} does NOT match — the local image differs`, "danger");
+      } else {
+        showToast(`${ref}: nothing to compare against`, "info");
+      }
+    } catch (error) {
+      showToast(String(error), "danger");
+    } finally {
+      setChecking(null);
+    }
+  };
+
+  const checkLabel = (result: TemplateCheck | undefined) => {
+    if (!result) return null;
+    if (result.matches === true) {
+      return { tone: "success" as const, text: `matches ${result.source}` };
+    }
+    if (result.matches === false) return { tone: "danger" as const, text: "differs" };
+    return { tone: "warning" as const, text: "no reference digest" };
+  };
 
   const remove = async (template: StoreTemplate) => {
     const ref = key(template);
@@ -149,6 +200,7 @@ function CachedTemplates() {
                     <th>Version</th>
                     <th>Profile</th>
                     <th>Cached</th>
+                    <th>Integrity</th>
                     <th aria-label="Actions" />
                   </tr>
                 </thead>
@@ -163,7 +215,31 @@ function CachedTemplates() {
                         <td class="cached-template-version">{template.version}</td>
                         <td>{template.profile ?? "—"}</td>
                         <td>{created(template.created)}</td>
+                        <td>
+                          <Show
+                            when={checking() !== key(template)}
+                            fallback={
+                              <span class="cached-template-state">
+                                <Spinner /> hashing…
+                              </span>
+                            }
+                          >
+                            <Show when={checkLabel(checks()[key(template)])} fallback="—">
+                              {(label) => (
+                                <span title={checkDetail(checks()[key(template)]!)}>
+                                  <Badge tone={label().tone}>{label().text}</Badge>
+                                </span>
+                              )}
+                            </Show>
+                          </Show>
+                        </td>
                         <td class="cached-template-actions">
+                          <IconButton
+                            icon={ShieldCheck}
+                            label={`Check ${key(template)} against its registry`}
+                            disabled={checking() !== null}
+                            onClick={() => void check(template)}
+                          />
                           <IconButton
                             icon={Trash2}
                             label={`Remove ${key(template)}`}
@@ -182,6 +258,16 @@ function CachedTemplates() {
       </Show>
     </Card>
   );
+}
+
+/** Hover text for a check result: the digests, and why a registry digest is
+ *  missing when it is. */
+function checkDetail(result: TemplateCheck): string {
+  const lines = [`local     ${result.local}`];
+  if (result.expected) lines.push(`${result.source.padEnd(9)} ${result.expected}`);
+  if (result.remote_error) lines.push(`registry unreadable: ${result.remote_error}`);
+  else if (!result.registry) lines.push("no registry recorded — built locally");
+  return lines.join("\n");
 }
 
 function RegistryInventory(p: { uses: RegistryEntry[] }) {

@@ -206,6 +206,10 @@ async fn main() -> ExitCode {
                 web::delete().to(api::delete_catalog_template),
             )
             .route(
+                "/api/catalog/templates/{arch}/{name}/{version}/verify",
+                web::post().to(api::verify_catalog_template),
+            )
+            .route(
                 "/api/catalog/profiles",
                 web::get().to(api::catalog_profiles),
             )
@@ -395,6 +399,10 @@ async fn main() -> ExitCode {
             )
             .route("/api/labs/{lab}/reload", web::post().to(api::reload_lab))
             .route("/api/labs/{lab}/dns", web::get().to(api::lab_dns_table))
+            .route(
+                "/api/labs/{lab}/pulls/{machine}/cancel",
+                web::post().to(api::cancel_pull),
+            )
             .route("/api/labs/{lab}/{action}", web::post().to(api::lab_action))
             .route("/api/labs/{lab}", web::get().to(api::lab_status))
             // Guest web-page proxy: the session-cookie minter is under the

@@ -1,44 +1,21 @@
 import { For, Show, createResource, createSignal } from "solid-js";
-import {
-  Button,
-  Card,
-  Empty,
-  Grid,
-  Icon,
-  Modal,
-  PageHead,
-  Progress,
-  Spinner,
-  Stat,
-} from "@forge/ui";
-import {
-  Camera,
-  Download,
-  Globe,
-  History,
-  Play,
-  Square,
-  Trash2,
-} from "lucide-solid";
+import { Button, Card, Empty, Grid, Icon, Modal, PageHead, Spinner, Stat } from "@forge/ui";
+import { Camera, Globe, History, Play, Square, Trash2 } from "lucide-solid";
 import {
   state,
   startAll,
   stopAll,
   destroyLab,
-  pullLab,
-  needsPull,
   takeSnapshot,
   restoreSnapshot,
   deleteLabSnapshot,
   labSnapshotList,
   fmtMem,
-  fmtBytes,
-  currentPulls,
-  type Pull,
 } from "../store";
 import { confirmDialog, promptDialog } from "./dialogs";
 import ActionButton from "./ActionButton";
 import LabEditorView from "./editor/LabEditorView";
+import PullPanel from "./PullPanel";
 import { openWebPage } from "./WebView";
 
 function fmtTime(t: string): string {
@@ -49,7 +26,6 @@ function fmtTime(t: string): string {
 
 export default function LabView() {
   const s = () => state.status;
-  const pulls = () => currentPulls();
   // "Machines" spans VMs and containers (they share one lab namespace).
   const containers = () => s()?.containers ?? [];
   const running = () =>
@@ -129,14 +105,6 @@ export default function LabView() {
         }
         actions={
           <>
-            <Show when={needsPull()}>
-              <ActionButton
-                label="Download templates"
-                busyLabel="Downloading…"
-                icon={Download}
-                onClick={pullLab}
-              />
-            </Show>
             <ActionButton
               label="Start all"
               busyLabel="Starting…"
@@ -159,7 +127,17 @@ export default function LabView() {
             <Button icon={History} onClick={() => setRestoreOpen(true)}>
               Restore
             </Button>
-            <Button variant="danger" icon={Trash2} onClick={destroy}>
+            <Button
+              variant="danger"
+              icon={Trash2}
+              onClick={destroy}
+              disabled={!s()?.provisioned}
+              title={
+                s()?.provisioned
+                  ? undefined
+                  : "Nothing to destroy — this lab has no clones or lab-local state yet"
+              }
+            >
               Destroy
             </Button>
           </>
@@ -167,9 +145,7 @@ export default function LabView() {
       />
 
       <div class="stack">
-        <Show when={pulls().length}>
-          <PullPanel pulls={pulls()} />
-        </Show>
+        <PullPanel />
 
         <Grid>
           <Card>
@@ -284,31 +260,3 @@ export default function LabView() {
   );
 }
 
-function PullPanel(p: { pulls: Pull[] }) {
-  return (
-    <Card title="Downloading templates">
-      <div class="pull-list">
-        <For each={p.pulls}>
-          {(pl) => (
-            <div>
-              <Progress
-                label={`${pl.vm} — ${pl.reference}`}
-                value={pl.status === "error" ? 100 : pl.percent}
-                indeterminate={pl.status === "checking"}
-                tone={pl.status === "error" ? "danger" : "accent"}
-                showValue={pl.status === "pulling"}
-              />
-              <div class="pull-sub" classList={{ "is-error": pl.status === "error" }}>
-                {pl.status === "error"
-                  ? pl.error
-                  : pl.status === "checking"
-                    ? "Resolving template…"
-                    : `${fmtBytes(pl.bytesDone)} / ${fmtBytes(pl.bytesTotal)}`}
-              </div>
-            </div>
-          )}
-        </For>
-      </div>
-    </Card>
-  );
-}

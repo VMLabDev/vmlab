@@ -128,11 +128,25 @@ export interface Segment {
    *  unreachable. Drives the remote-vmlab node's LED. */
   peer_connected?: boolean | null;
 }
+/** A registry download running right now, for resync: the `*.pull.*` events
+ *  only reach clients that were connected when they fired. */
+export interface ActivePull {
+  machine: string;
+  kind: "template" | "image";
+  reference: string;
+  bytes_done: number;
+  bytes_total: number;
+  percent: number;
+}
 export interface LabStatus {
   lab: string;
   vms: Vm[];
   containers: Container[];
   segments: Segment[];
+  /** The lab has clones, container overlays or named volumes on disk — i.e.
+   *  destroy has something to remove. */
+  provisioned?: boolean;
+  pulls?: ActivePull[];
 }
 export interface Snapshot {
   name: string;
@@ -170,6 +184,10 @@ export const labAction = (
   force?: boolean,
 ) =>
   post(`/api/labs/${encodeURIComponent(lab)}/${action}${forceQs(force)}`);
+/** Abort the download running for one machine; whatever is waiting on it
+ *  (an `up`, a `pull`) fails with "download cancelled". */
+export const cancelPull = (lab: string, machine: string): Promise<{ cancelled: boolean }> =>
+  post(`/api/labs/${encodeURIComponent(lab)}/pulls/${encodeURIComponent(machine)}/cancel`);
 export const vmAction = (
   lab: string,
   vm: string,
@@ -763,11 +781,33 @@ export interface CatalogMeta {
   };
 }
 
+/** Result of hashing a stored image and comparing it with its registry
+ *  (POST /api/catalog/templates/…/verify). `matches` is null when there is
+ *  nothing to compare against. */
+export interface TemplateCheck {
+  template: string;
+  local: string;
+  expected: string | null;
+  /** Where `expected` came from: the registry manifest, the digest recorded
+   *  at install/build time, or nothing at all. */
+  source: "registry" | "recorded" | "none";
+  registry: string | null;
+  recorded: string | null;
+  /** Why the registry digest couldn't be read (offline, no auth, …). */
+  remote_error: string | null;
+  matches: boolean | null;
+}
+
 export const listStoreTemplates = (): Promise<StoreTemplate[]> => req("/api/catalog/templates");
 export const removeStoreTemplate = (template: StoreTemplate): Promise<{ removed: string }> =>
-  del(
-    `/api/catalog/templates/${encodeURIComponent(template.arch)}/${encodeURIComponent(template.name)}/${encodeURIComponent(template.version)}`,
-  );
+  del(storeTemplatePath(template));
+/** Hash the stored disk and compare it with the registry's digest. Reads the
+ *  whole image, so this can take minutes on a large template. */
+export const verifyStoreTemplate = (template: StoreTemplate): Promise<TemplateCheck> =>
+  post(`${storeTemplatePath(template)}/verify`);
+
+const storeTemplatePath = (t: StoreTemplate) =>
+  `/api/catalog/templates/${encodeURIComponent(t.arch)}/${encodeURIComponent(t.name)}/${encodeURIComponent(t.version)}`;
 export const listProfiles = (): Promise<string[]> => req("/api/catalog/profiles");
 export const catalogMeta = (): Promise<CatalogMeta> => req("/api/catalog/meta");
 

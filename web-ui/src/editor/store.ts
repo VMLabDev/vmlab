@@ -6,7 +6,7 @@ import { createStore, produce } from "solid-js/store";
 import * as api from "../api";
 import type { CatalogMeta, ConfigIssue, HostInfo, PlaysInfo, StoreTemplate } from "../api";
 import { StaleRev, ValidationError } from "../api";
-import { registerNavGuard, showToast } from "../store";
+import { anyVmRunning, registerNavGuard, showToast } from "../store";
 import { confirmDialog } from "../components/dialogs";
 import type {
   ContainerModel,
@@ -1204,17 +1204,14 @@ export function renameSegment(index: number, to: string) {
   );
 }
 
-// --- save / validate ----------------------------------------------------------
+// --- save ---------------------------------------------------------------------
 
-export function revertDraft() {
-  if (!editor.baseline) return;
-  setEditor({ draft: deepClone(editor.baseline), issues: [], conflict: false });
-}
-
-function onSaveError(e: unknown) {
+function onSaveError(e: unknown, auto = false) {
   if (e instanceof ValidationError) {
     setEditor("issues", e.issues);
-    showToast(`${e.issues.length} validation issue(s)`, "danger");
+    // Autosave fires mid-edit, so a transient invalid state (a half-typed
+    // name) is normal — the issues panel is enough, a toast would be noise.
+    if (!auto) showToast(`${e.issues.length} validation issue(s)`, "danger");
   } else if (e instanceof StaleRev) {
     setEditor("conflict", true);
     showToast("Config changed on disk — reload the editor", "danger");
@@ -1223,48 +1220,123 @@ function onSaveError(e: unknown) {
   }
 }
 
-export async function validateDraft() {
+let inFlight: Promise<boolean> | null = null;
+
+/** Write the pending ops to vmlab.wcl. Writes are serialised: a batch is
+ *  addressed by the spans the previous one returned, so two in parallel would
+ *  collide on the rev. `auto` keeps the autosave path silent. */
+export function saveDraft(opts: { auto?: boolean } = {}): Promise<boolean> {
+  const next = (inFlight ?? Promise.resolve(true)).then(() => writeDraft(opts));
+  inFlight = next;
+  return next;
+}
+
+async function writeDraft(opts: { auto?: boolean }): Promise<boolean> {
   const lab = editor.lab;
-  if (!lab || !editor.rev) return;
-  setEditor("busy", "validate");
+  if (!lab || !editor.rev) return false;
+  if (!editorDirty()) return true;
+  setEditor("busy", "save");
+  const sent = pendingOps();
   try {
-    await api.editLabModel(lab, editor.rev, pendingOps(), true);
-    setEditor("issues", []);
-    showToast("Config is valid");
+    const res = await api.editLabModel(lab, editor.rev, sent, false);
+    if (res.lab && res.rev) {
+      const fresh = res.lab;
+      setEditor({
+        rev: res.rev,
+        source: res.source ?? editor.source,
+        baseline: fresh,
+        templatesInFile: res.templates ?? editor.templatesInFile,
+        issues: [],
+        conflict: false,
+      });
+      // Edits can land while the write is in flight (autosave saves as you
+      // type), so carry the draft's values forward and only refresh its
+      // spans — a wholesale adopt would revert those keystrokes. Spans are
+      // the edit address for the next batch (see ops.ts), so if the shapes
+      // have diverged (a block added/removed mid-flight) the only safe move
+      // is to take the server's model whole.
+      const rebased = deepClone(editor.draft);
+      setEditor("draft", rebased && rebaseSpans(rebased, fresh) ? rebased : deepClone(fresh));
+      // If the write moved nothing, the draft holds a value that doesn't
+      // round-trip through WCL — carrying it forward would autosave the same
+      // batch forever, so defer to the server's model.
+      if (same(pendingOps(), sent)) setEditor("draft", deepClone(fresh));
+    }
+    // Declaring a playbook comes with a scaffolded folder — enumerate it.
+    if (sent.some((op) => op.op === "add_block" && op.block.kind === "playbook")) {
+      fetchAllPlays();
+    }
+    if (!opts.auto) showToast("Config saved");
+    return true;
   } catch (e) {
-    onSaveError(e);
+    onSaveError(e, opts.auto);
+    return false;
   } finally {
     setEditor("busy", null);
   }
 }
 
-export async function saveDraft(): Promise<boolean> {
-  const lab = editor.lab;
-  if (!lab || !editor.rev) return false;
-  setEditor("busy", "save");
-  try {
-    const res = await api.editLabModel(lab, editor.rev, pendingOps(), false);
-    if (res.lab && res.rev) {
-      setEditor({
-        rev: res.rev,
-        source: res.source ?? editor.source,
-        baseline: res.lab,
-        draft: deepClone(res.lab),
-        templatesInFile: res.templates ?? editor.templatesInFile,
-        issues: [],
-        conflict: false,
-      });
-    }
-    // A save may have scaffolded playbook folders — refresh the play lists.
-    fetchAllPlays();
-    showToast("Config saved");
-    return true;
-  } catch (e) {
-    onSaveError(e);
-    return false;
-  } finally {
-    setEditor("busy", null);
+/** Copy every span from a freshly saved model onto the live draft, matching
+ *  blocks positionally (the saved model was rendered from the draft we sent,
+ *  so the collections line up). False when the shapes diverge — the caller
+ *  then adopts the fresh model wholesale. */
+function rebaseSpans(draft: unknown, fresh: unknown): boolean {
+  if (Array.isArray(draft) && Array.isArray(fresh)) {
+    // Scalar lists (depends_on, qemu_args, …) hold no spans.
+    if (!draft.some(isNode) && !fresh.some(isNode)) return true;
+    // Different block counts: a block was added or removed mid-flight, so
+    // position no longer identifies a block and a span could land on the
+    // wrong one.
+    if (draft.length !== fresh.length) return false;
+    return draft.every((item, i) => rebaseSpans(item, fresh[i]));
   }
+  // A block on one side only (`gpu {}` added or dropped mid-flight) needs no
+  // span: the draft's copy is new (span null → an add) or the removal is
+  // addressed by the baseline's span.
+  if (!isNode(draft) || !isNode(fresh)) return true;
+  const d = draft as Record<string, unknown>;
+  for (const [key, value] of Object.entries(fresh as Record<string, unknown>)) {
+    if (key === "span" || key.endsWith("_span")) d[key] = value;
+    else if (!rebaseSpans(d[key], value)) return false;
+  }
+  return true;
+}
+
+/** Objects and arrays carry spans; scalars, null and undefined never do. */
+const isNode = (v: unknown): boolean => typeof v === "object" && v !== null;
+
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+// --- autosave -----------------------------------------------------------------
+
+// Trailing-edge only: inspector fields write to the draft on every keystroke,
+// so this coalesces a burst of typing into one write of vmlab.wcl.
+const AUTOSAVE_DEBOUNCE_MS = 500;
+let autoSaveTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Queue a write of the pending edits. Called for every draft mutation (see
+ *  the effect in EditorView) — the Overview designer has no Save button. */
+export function scheduleAutoSave() {
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(() => {
+    if (autoSaveBlocked() || !editorDirty()) return;
+    void saveDraft({ auto: true });
+  }, AUTOSAVE_DEBOUNCE_MS);
+}
+
+function autoSaveBlocked(): boolean {
+  // Running lab = config locked; conflict/fallback = the file underneath the
+  // draft isn't ours to write until the user resolves it.
+  return anyVmRunning() || editor.conflict || !!editor.fallback;
+}
+
+/** Write pending edits now, skipping the debounce (lab switch, lab reload).
+ *  False when the edits couldn't be written — they stay in the draft. */
+export async function flushPendingSave(): Promise<boolean> {
+  clearTimeout(autoSaveTimer);
+  if (!editorDirty()) return true;
+  if (autoSaveBlocked()) return false;
+  return saveDraft({ auto: true });
 }
 
 /** Names usable as references in the draft (pickers). */
@@ -1286,14 +1358,15 @@ export function storeTemplateFor(ref: string): StoreTemplate | undefined {
   return (version && candidates.find((t) => t.version === version)) || candidates[0];
 }
 
-// Lab switches consult this guard so an unsaved draft is never silently
-// dropped (the draft itself survives view switches — it dies only when a
-// different lab's model loads over it).
+// Lab switches consult this guard: flush the debounce so edits made in the
+// last half second still land (the draft itself survives view switches — it
+// dies only when a different lab's model loads over it). A draft that still
+// won't write is invalid or locked, and that needs a decision.
 registerNavGuard(async () => {
-  if (!editorDirty()) return true;
+  if (await flushPendingSave()) return true;
   return confirmDialog({
     title: "Discard unsaved lab changes?",
-    body: "The designer has edits that haven't been saved.",
+    body: "The designer has edits that couldn't be written to vmlab.wcl.",
     confirmLabel: "Discard",
     danger: true,
   });

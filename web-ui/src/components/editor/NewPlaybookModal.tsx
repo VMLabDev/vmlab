@@ -77,7 +77,8 @@ export default function NewPlaybookModal(props: { open: boolean; onClose: () => 
       await api.scaffoldPlaybook(lab, folder, name);
       addPlaybookWithPlay(folder, name);
       close();
-      if (await saveDraft()) {
+      // Silent: this modal's own toast reports the result.
+      if (await saveDraft({ auto: true })) {
         // The declaration list gates the Files tab's package buttons — pick
         // the new folder up without waiting for a lab reload.
         void loadPlaybooks();

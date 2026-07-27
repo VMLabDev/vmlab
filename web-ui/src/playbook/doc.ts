@@ -240,9 +240,58 @@ export function litFor(type: string, text: string): Val {
     }
     case "bool":
       return { lit: text === "true" };
+    case "symbol":
+      return symbolVal(text);
     default:
       return { lit: text };
   }
+}
+
+// --- symbols -----------------------------------------------------------------
+//
+// A `symbol` param is written `:present`. WCL has no JSON literal for that, so
+// it rides as raw expression source both ways: inspecting `ensure = :present`
+// yields `{expr: ":present"}`, and rendering that writes the symbol back.
+
+const SYMBOL_RE = /^:[A-Za-z_][A-Za-z0-9_-]*$/;
+
+/** A value that is just a symbol (or a bare string standing in for one) —
+ *  as opposed to a real expression like `os.family == "linux"`. */
+export function isSymbolLiteral(v: Val | undefined): boolean {
+  if (!v) return true;
+  if (isExpr(v)) return SYMBOL_RE.test(v.expr.trim());
+  return typeof v.lit === "string";
+}
+
+/** The bare token of a symbol value, however it is written. */
+export function symbolToken(v: Val | undefined): string {
+  if (!v) return "";
+  const text = isExpr(v) ? v.expr.trim() : String(litOf(v) ?? "");
+  return text.startsWith(":") ? text.slice(1) : text;
+}
+
+export const symbolVal = (token: string): Val => {
+  const bare = token.trim().replace(/^:/, "");
+  return bare ? { expr: `:${bare}` } : { lit: "" };
+};
+
+/** The values a `symbol` param accepts. config-weave declares `symbol` as a
+ *  coarse type with no value set — it validates like a string — so the
+ *  package's own description is the only statement of what is allowed, and the
+ *  convention its packages follow is to name them there as `:token`
+ *  ("Desired state: :present or :absent"). The declared default is folded in
+ *  so a param whose prose omits it still offers it. */
+export function symbolChoices(param: ParamDoc | undefined): string[] {
+  if (!param || param.type !== "symbol") return [];
+  const out: string[] = [];
+  const add = (token: string) => {
+    if (token && !out.includes(token)) out.push(token);
+  };
+  for (const match of (param.description ?? "").matchAll(/:([A-Za-z_][A-Za-z0-9_-]*)/g)) {
+    add(match[1]);
+  }
+  add(symbolToken(param.default));
+  return out;
 }
 
 export const kvGet = (kvs: Kv[], key: string): Kv | undefined => kvs.find((kv) => kv.key === key);

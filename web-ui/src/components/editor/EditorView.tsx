@@ -1,6 +1,7 @@
-// The visual lab designer: topology canvas + inspector in a split pane,
-// with a compact Revert/Validate/Save/Save & reload toolbar and
-// validation-issue surfacing. Embedded in the lab page's Overview tab.
+// The visual lab designer: topology canvas + inspector in a split pane, a
+// status line + Reload lab toolbar, and validation-issue surfacing. Embedded
+// in the lab page's Overview tab. There is no Save button — every edit is
+// written to vmlab.wcl on a short debounce (see scheduleAutoSave).
 
 import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
 import * as api from "../../api";
@@ -15,14 +16,13 @@ import { editPlaybook } from "../FilesView";
 import {
   editor,
   addProvision,
+  flushPendingSave,
   openEditor,
   pendingOps,
   reloadModel,
-  revertDraft,
-  saveDraft,
+  scheduleAutoSave,
   select,
   selectionForLine,
-  validateDraft,
 } from "../../editor/store";
 import Inspector from "./Inspector";
 import TopologyCanvas from "./TopologyCanvas";
@@ -37,14 +37,31 @@ export default function EditorView(props: { onEditConfig: () => void }) {
     if (lab && state.view.kind === "lab") void openEditor(lab);
   });
 
+  // buildOps re-runs on every draft change (a fresh array each time), so this
+  // memo is the one place that sees all edits — canvas, inspector or store.
   const ops = createMemo(() => (editor.draft && editor.baseline ? pendingOps() : []));
   const dirty = () => ops().length > 0;
-  const disabled = () => editor.busy !== null || !editor.draft;
+  createEffect(() => {
+    if (ops().length) scheduleAutoSave();
+  });
+
+  const status = () => {
+    if (editor.busy === "save") return "saving…";
+    if (!dirty()) return anyVmRunning() ? "locked — machines running" : "saved";
+    const pending = `${ops().length} unsaved change(s)`;
+    if (anyVmRunning()) return `${pending} — locked while machines are running`;
+    return editor.issues.length
+      ? `${pending} — ${editor.issues.length} validation issue(s)`
+      : pending;
+  };
 
   async function saveReload() {
-    if (!(await saveDraft())) return;
+    if (!(await flushPendingSave())) {
+      showToast("Fix the validation issues before reloading", "danger");
+      return;
+    }
     try {
-      showToast("Saved — reloading lab…", "info");
+      showToast("Reloading lab…", "info");
       await reloadCurrentLab();
       showToast("Lab reloaded");
     } catch (e) {
@@ -84,50 +101,21 @@ export default function EditorView(props: { onEditConfig: () => void }) {
         <div class="editor-toolbar">
           <span class="editor-path">
             {editor.path || "—"}
-            {dirty() ? ` · ${ops().length} pending change(s)` : ""}
+            {` · ${status()}`}
           </span>
           <div class="editor-actions">
             <Button
               size="sm"
-              variant="ghost"
-              onClick={revertDraft}
-              disabled={disabled() || !dirty()}
-              title="Discard edits (back to the last saved state)"
-            >
-              Revert
-            </Button>
-            <Button
-              size="sm"
-              onClick={validateDraft}
-              disabled={disabled() || !dirty()}
-              title="Validate the pending changes without saving"
-            >
-              Validate
-            </Button>
-            <Button
-              size="sm"
-              onClick={saveDraft}
-              disabled={disabled() || !dirty() || anyVmRunning()}
-              title={
-                anyVmRunning()
-                  ? "Stop all VMs and containers before saving configuration"
-                  : undefined
-              }
-            >
-              Save
-            </Button>
-            <Button
-              size="sm"
               variant="primary"
               onClick={saveReload}
-              disabled={disabled() || anyVmRunning()}
+              disabled={!editor.draft || editor.busy !== null || anyVmRunning()}
               title={
                 anyVmRunning()
                   ? "Stop all VMs and containers before reloading"
-                  : "Save and restart the lab to apply changes"
+                  : "Restart the lab so config changes take effect"
               }
             >
-              Save & reload
+              Reload lab
             </Button>
           </div>
         </div>

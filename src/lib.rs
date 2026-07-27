@@ -22,6 +22,11 @@ pub mod logs;
 mod media;
 mod net;
 mod oci;
+/// The OCI registry surface `vmlab-web` needs: looking up what a template's
+/// registry publishes, to check a stored image against it.
+pub mod oci_registry {
+    pub use crate::oci::{Registry, with_version_tag};
+}
 pub mod paths;
 pub mod profiles;
 pub mod proto;

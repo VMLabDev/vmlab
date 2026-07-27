@@ -1,7 +1,7 @@
 // The property panel beside the canvas: renders the selected block's full
 // schema surface as descriptor-driven forms, including every child
-// collection. All edits mutate the editor draft; nothing touches disk
-// until Save builds the op batch.
+// collection. All edits mutate the editor draft, which is written to
+// vmlab.wcl on a short debounce (see scheduleAutoSave).
 
 import { For, Show, createMemo, createResource, createSignal } from "solid-js";
 import { produce } from "solid-js/store";
@@ -818,7 +818,7 @@ function VmInspector(props: { index: number }) {
     if (
       await confirmDialog({
         title: `Delete VM "${vm().name}"?`,
-        body: "Removed from the config on the next save.",
+        body: "Removed from vmlab.wcl right away.",
         danger: true,
       })
     ) {
@@ -1172,7 +1172,7 @@ function ContainerInspector(props: { index: number }) {
     if (
       await confirmDialog({
         title: `Delete container "${ctr().name}"?`,
-        body: "Removed from the config on the next save.",
+        body: "Removed from vmlab.wcl right away.",
         danger: true,
       })
     ) {
