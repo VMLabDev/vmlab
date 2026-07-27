@@ -8,7 +8,13 @@ import { Show, createEffect, createSignal } from "solid-js";
 import { Button, Input, Modal } from "@forge/ui";
 import * as api from "../../api";
 import { loadPlaybooks, showToast } from "../../store";
-import { addPlaybookWithPlay, editor, playbookGroups, saveDraft } from "../../editor/store";
+import {
+  addPlaybookWithPlay,
+  draftPlaybooks,
+  editor,
+  playbookGroups,
+  saveDraft,
+} from "../../editor/store";
 
 /** Folder segment and play names land inside WCL string literals — the
  *  backend enforces the same shape. */
@@ -17,7 +23,7 @@ const NAME_RE = /^[A-Za-z0-9._-]+$/;
 /** First `playbooks/playbook-N` not already on the canvas. */
 export function nextPlaybookPath(): string {
   const taken = new Set([
-    ...(editor.draft?.playbooks ?? []).map((playbook) => playbook.path),
+    ...draftPlaybooks().map((block) => block.model.path),
     ...editor.playbookDrafts,
   ]);
   for (let number = 1; number < 10_000; number++) {

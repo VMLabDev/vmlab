@@ -2,17 +2,21 @@
 
 _wcl block_
 
-Names a wscript file that runs on `vmlab up`; scoping it to VMs gates their depends_on.
+Names a wscript file that runs on `vmlab up`, declared inside the vm/container it configures.
 
-A `provision {}` block runs a wscript file on `vmlab up`, in declaration order. Targeting is explicit: name the VMs in `vms`, or take the whole-lab opt-in with `lab_wide = true`.
+A `provision {}` block runs a wscript file on `vmlab up`. It is declared **inside** the `vm {}` or `container {}` it belongs to — that machine is its target, so there is nothing to name. It runs once, after that machine is ready, at its position among the machine's steps.
 
 ```wcl
-provision "scripts/setup.ws" { lab_wide = true }     // runs once, after every machine is up
-provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on on these VMs
-provision "scripts/todo.ws"  { }                     // neither: declared, never runs
+vm "dc01" {
+  template = "x86_64/windows-server-2025"
+
+  provision "scripts/setup.ws" { }              // 1st, once dc01 is ready
+  playbook  "playbooks/domain" { play = "dc" }  // 2nd
+  provision "scripts/verify.ws" { }             // 3rd, sees the converged guest
+}
 ```
 
-**Provision failures fail `vmlab up`.** A scoped provision (`vms = [...]`) gates `depends_on` on those VMs: dependents wait for the provision to finish. `vms` and `lab_wide` are mutually exclusive; a block with neither is declared but skipped (`up` says so), which is the state a half-written provision sits in. Inside a `template {}` neither applies — build provisions always run on the build VM.
+**Provision failures fail `vmlab up`.** A machine's steps gate `depends_on`: anything depending on `dc01` starts only after dc01's provisions and playbooks have finished. Inside the script, `lab.this_vm()` returns the owning VM (containers have no VM handle, so it is unavailable there), while `lab.vm("name")` reaches any other machine — a script that stands up a DC and then joins a member is still one script, declared on whichever machine should gate it. The same block inside a `template {}` runs on the build VM.
 
 ## Related
 
@@ -23,5 +27,7 @@ provision "scripts/todo.ws"  { }                     // neither: declared, never
 - [wscript: overview](../references/concept_wscript_overview.md)
 
 - [lab {} block](../references/entity_labs.md)
+
+- [playbook {} block](../references/entity_playbook_block.md)
 
 [← Back to SKILL.md](../SKILL.md)

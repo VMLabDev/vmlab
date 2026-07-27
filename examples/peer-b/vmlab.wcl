@@ -16,7 +16,7 @@ lab "peer-b" {
     arch     = "x86_64"
     memory   = 1GiB
     nic { segment = "wan" }
-  }
 
-  provision "scripts/setup.ws" { lab_wide = true }
+    provision "scripts/setup.ws" { }   // runs once this VM is ready
+  }
 }

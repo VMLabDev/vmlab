@@ -6,9 +6,10 @@ Where wscript provisions \*drive\* a guest imperatively, a **playbook** declares
 what the guest should look like and lets [config-weave](https://github.com/Configweave)
 converge it — package installs, files, services, domain joins — with drift
 detection and idempotent re-runs. vmlab integrates config-weave natively:
-[`playbook {}` blocks](../references/entity_playbook_block.md) in a `lab {}` are applied during
-`vmlab up`, interleaved with `provision {}` blocks in declaration order, so
-imperative and declarative steps can hand off to each other. Playbooks push
+[`playbook {}` blocks](../references/entity_playbook_block.md) declared inside a `vm {}` or
+`container {}` are applied during `vmlab up`, interleaved with that machine's
+`provision {}` blocks in declaration order, so imperative and declarative steps
+can hand off to each other. Playbooks push
 over the vmlab-agent channel, so they need agent-baked templates and work with
 no guest network; guest reboots demanded by a step (Windows feature installs,
 domain joins) are handled automatically.
@@ -22,13 +23,15 @@ vmlab playbook apply dc01           # converge; auto-reboots when a step demands
 
 Exit codes mirror config-weave: `0` converged/clean, `1` step error,
 `2` validation failure, `3` reboot still required after bounded retries.
-`--playbook <path>` / `--play <name>` disambiguate when several target one
-machine.
+`--playbook <path>` / `--play <name>` disambiguate when a machine declares
+several.
 
-Targets are always explicit: `vms = [...]` names machines, `all_machines = true`
-takes every one of them, and a block with neither is declared but never runs —
-which is what the designer's **Add playbook** writes, so a new playbook can be
-edited before it is pointed at anything.
+Targeting is structural: the machine that declares the block is the one the
+play converges. That is also where its **variables** live — \`var "name"
+{ value = "…" }` children become `--var name=value\` for that machine's run
+only, so one play can converge several machines with different hostnames,
+credentials or paths. The designer's play card lists every targeted machine
+with an editable variable list under each.
 
 Playbooks also run inside [template builds](../references/concept_template_builds.md): a
 `template {}` may declare `playbook {}` blocks that apply to the build VM,

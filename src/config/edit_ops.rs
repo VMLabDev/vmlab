@@ -447,26 +447,69 @@ lab "demo" {
         ));
     }
 
+    /// A playbook is added inside the VM it configures, carrying its `var`
+    /// children in one op.
     #[test]
-    fn add_block_playbook_round_trips() {
+    fn add_block_playbook_with_vars_round_trips() {
         let lab = model();
+        let dc01 = lab.vms.iter().find(|v| v.name == "dc01").unwrap().span;
         let out = apply_ops(
             SRC,
-            &[op(json!({"op": "add_block", "parent": lab.span, "block": {
+            &[op(json!({"op": "add_block", "parent": dc01, "block": {
                 "kind": "playbook",
                 "labels": ["playbooks/base"],
-                "fields": [
-                    {"name": "play", "value": "base"},
-                    {"name": "vms", "value": ["dc01"]},
+                "fields": [{"name": "play", "value": "base"}],
+                "children": [
+                    {"kind": "var", "labels": ["domain"],
+                     "fields": [{"name": "value", "value": "corp.example.com"}]},
+                    {"kind": "var", "labels": ["new_name"],
+                     "fields": [{"name": "value", "value": "DC01"}]},
                 ],
             }}))],
         )
         .unwrap();
         let re = reload(&out);
-        assert_eq!(re.playbooks.len(), 1);
-        assert_eq!(re.playbooks[0].path.display().to_string(), "playbooks/base");
-        assert_eq!(re.playbooks[0].play, "base");
-        assert_eq!(re.playbooks[0].vms, vec!["dc01".to_string()]);
+        let vm = re.vms.iter().find(|v| v.name == "dc01").unwrap();
+        assert_eq!(vm.playbooks.len(), 1);
+        let pb = &vm.playbooks[0];
+        assert_eq!(pb.path.display().to_string(), "playbooks/base");
+        assert_eq!(pb.play, "base");
+        let vars: Vec<(&str, &str)> = pb
+            .vars
+            .iter()
+            .map(|v| (v.name.as_str(), v.value.as_str()))
+            .collect();
+        assert_eq!(
+            vars,
+            vec![("domain", "corp.example.com"), ("new_name", "DC01")]
+        );
+    }
+
+    /// A `var` row is addressed by its own span once it exists, so editing a
+    /// value is a `set_field` and not a rewrite of the playbook block.
+    #[test]
+    fn set_field_on_nested_var() {
+        let src = r#"import <vmlab.wcl>
+lab "demo" {
+  vm "dc01" {
+    template = "x86_64/t"
+    playbook "pb/base" { play = "base" var "domain" { value = "old" } }
+  }
+}"#;
+        let lab = load_lab_source(src, "<test>", Path::new("/tmp"))
+            .unwrap()
+            .lab;
+        let var = lab.vms[0].playbooks[0].vars[0].span;
+        let out = apply_ops(
+            src,
+            &[op(json!({"op": "set_field", "block": var,
+                        "name": "value", "value": "new"}))],
+        )
+        .unwrap();
+        let re = load_lab_source(&out, "<test>", Path::new("/tmp"))
+            .unwrap()
+            .lab;
+        assert_eq!(re.vms[0].playbooks[0].vars[0].value, "new");
     }
 
     #[test]

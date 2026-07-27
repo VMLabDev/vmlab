@@ -16,8 +16,6 @@ A complete reference of the `vmlab.wcl` (and host `config.wcl`) schema, reflecte
 | `segments` | `segment` | yes | Virtual L2 network segments in this lab |
 | `vms` | `vm` | yes | The VMs in this lab |
 | `containers` | `container` | yes | OCI containers in this lab, each run in a micro-VM |
-| `provisions` | `provision` | yes | wscript provision scripts run on `vmlab up`, in declaration order |
-| `playbooks` | `playbook` | yes | config-weave playbooks applied on `vmlab up`, interleaved with provisions in declaration order |
 | `handlers` | `on` | yes | Lifecycle event handlers (failures are logged, never fatal) |
 | `records` | `record` | yes | Lab-wide static DNS entries (wildcards allowed) |
 | `sinkholes` | `sinkhole` | yes | Lab-wide DNS sinkholes |
@@ -209,6 +207,8 @@ sinkhole { pattern = "*.telemetry.com" mode = "nxdomain" }   // or mode = "zero"
 | `shares` | `share` | yes | SMB shared folders (require ≥1 NIC) |
 | `media` | `media` | yes | ISO/floppy images built from a folder |
 | `web` | `web` | yes | HTTP UIs served in the guest, proxied into the web console (require ≥1 NIC) |
+| `provisions` | `provision` | yes | wscript provision scripts run on `vmlab up` once this VM is ready, interleaved with its playbooks in declaration order |
+| `playbooks` | `playbook` | yes | config-weave playbooks applied to this VM on `vmlab up`, interleaved with its provisions in declaration order |
 
 Example:
 
@@ -321,6 +321,87 @@ Example:
 
 ```wcl
 web "admin" { port = 8080  path = "/manage" }   // proxied into the web console
+```
+
+##### `auth` (in `web`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `method` | `WebAuthMethod` | yes | Method: `:basic` \| `:bearer` \| `:header` \| `:ntlm` (IIS/AD integrated) \| `:form` (cookie capture) (required) |
+| `username` | `utf8` | no | Username — `:basic`, `:ntlm`, `:form` |
+| `password` | `utf8` | no | Password — `:basic`, `:ntlm`, `:form` |
+| `domain` | `utf8` | no | NTLM domain, e.g. `CORP` — `:ntlm` (optional) |
+| `token` | `utf8` | no | Static bearer token — `:bearer` |
+| `header` | `utf8` | no | Header name, e.g. `X-Api-Key` — `:header` |
+| `value` | `utf8` | no | Header value — `:header` |
+| `login_path` | `utf8` | no | Login request path, e.g. `/login` — `:form` (required) |
+| `login_method` | `utf8` | no | Login HTTP method: `POST` (default) \| `GET` — `:form` |
+| `login_body` | `utf8` | no | Login body template; `{user}`/`{pass}` are substituted and escaped — `:form` (required) |
+| `login_content_type` | `utf8` | no | Login body content type: `application/x-www-form-urlencoded` (default) \| `application/json` — `:form` |
+| `fail_redirect` | `utf8` | no | Redirect-Location substring that means 'not logged in' (401/403 always retrigger) — `:form` |
+
+Example:
+
+```wcl
+auth { method = :basic  username = "admin" password = "s3cret" }
+auth { method = :bearer token = "eyJ…" }
+auth { method = :ntlm   username = "Administrator" password = "…" domain = "CORP" }
+auth { method = :form   username = "admin" password = "…"
+       login_path = "/login" login_body = "user={user}&pass={pass}" }
+```
+
+#### `provision` (in `vm`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `script` | `utf8` | yes | Path to the `.ws` file; must exist and compile; the inline label |
+
+Example:
+
+```wcl
+// Declared inside the vm/container it configures; runs once that machine is
+// ready, at this position among its steps.
+provision "scripts/setup.ws" { }
+```
+
+#### `playbook` (in `vm`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
+| `play` | `utf8` | yes | Play name inside the playbook to run (required) |
+
+#### Child blocks
+
+| Slot | Accepts | Multiple | Description |
+| --- | --- | --- | --- |
+| `vars` | `var` | yes | Variable overrides passed to config-weave for this machine's run |
+
+Example:
+
+```wcl
+// Declared inside the vm/container it converges.
+playbook "playbooks/domain" { play = "dc" }
+playbook "playbooks/domain" {
+  play = "member"
+  var "domain"      { value = "corp.example.com" }
+  var "member_name" { value = "APP01" }   // --var, this machine only
+}
+```
+
+##### `var` (in `playbook`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | `utf8` | yes | Variable name; must be a WCL identifier; the inline block label |
+| `value` | `utf8` | yes | Value, passed through verbatim — config-weave reads it as a WCL expression where it can (`3` is an int, `true` a bool) and as a string otherwise (required) |
+
+Example:
+
+```wcl
+var "domain"  { value = "corp.example.com" }  // --var domain=corp.example.com
+var "retries" { value = "3" }                 // config-weave reads this as an int
+var "tag"     { value = "\"3\"" }               // quoted: forced to a string
 ```
 
 ### `container` (in `lab`)
@@ -489,42 +570,85 @@ Example:
 web "admin" { port = 8080  path = "/manage" }   // proxied into the web console
 ```
 
-### `provision` (in `lab`)
-
-Provision script run during `vmlab up`. Optional vms list scopes
-the script for depends_on satisfaction.
+##### `auth` (in `web`)
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `script` | `utf8` | yes | Path to the `.ws` file; must exist and compile; the inline label |
-| `vms` | `list<utf8>` | no | VM names this script is scoped to (gates their `depends_on`) |
-| `lab_wide` | `bool` | no | Run once for the whole lab, after every machine is up; mutually exclusive with `vms`. Without either the script is declared but never runs |
+| `method` | `WebAuthMethod` | yes | Method: `:basic` \| `:bearer` \| `:header` \| `:ntlm` (IIS/AD integrated) \| `:form` (cookie capture) (required) |
+| `username` | `utf8` | no | Username — `:basic`, `:ntlm`, `:form` |
+| `password` | `utf8` | no | Password — `:basic`, `:ntlm`, `:form` |
+| `domain` | `utf8` | no | NTLM domain, e.g. `CORP` — `:ntlm` (optional) |
+| `token` | `utf8` | no | Static bearer token — `:bearer` |
+| `header` | `utf8` | no | Header name, e.g. `X-Api-Key` — `:header` |
+| `value` | `utf8` | no | Header value — `:header` |
+| `login_path` | `utf8` | no | Login request path, e.g. `/login` — `:form` (required) |
+| `login_method` | `utf8` | no | Login HTTP method: `POST` (default) \| `GET` — `:form` |
+| `login_body` | `utf8` | no | Login body template; `{user}`/`{pass}` are substituted and escaped — `:form` (required) |
+| `login_content_type` | `utf8` | no | Login body content type: `application/x-www-form-urlencoded` (default) \| `application/json` — `:form` |
+| `fail_redirect` | `utf8` | no | Redirect-Location substring that means 'not logged in' (401/403 always retrigger) — `:form` |
 
 Example:
 
 ```wcl
-provision "scripts/setup.ws" { lab_wide = true }     // runs once, after every machine is up
-provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
+auth { method = :basic  username = "admin" password = "s3cret" }
+auth { method = :bearer token = "eyJ…" }
+auth { method = :ntlm   username = "Administrator" password = "…" domain = "CORP" }
+auth { method = :form   username = "admin" password = "…"
+       login_path = "/login" login_body = "user={user}&pass={pass}" }
 ```
 
-### `playbook` (in `lab`)
+#### `provision` (in `container`)
 
-config-weave playbook applied on `vmlab up` (interleaved with provisions
-in declaration order) and runnable on demand via `vmlab playbook check|apply`.
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `script` | `utf8` | yes | Path to the `.ws` file; must exist and compile; the inline label |
+
+Example:
+
+```wcl
+// Declared inside the vm/container it configures; runs once that machine is
+// ready, at this position among its steps.
+provision "scripts/setup.ws" { }
+```
+
+#### `playbook` (in `container`)
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
 | `play` | `utf8` | yes | Play name inside the playbook to run (required) |
-| `vms` | `list<utf8>` | no | VM/container names this playbook targets; without either this or `all_machines` the playbook is declared but never runs |
-| `all_machines` | `bool` | no | Target every VM and container in the lab; mutually exclusive with `vms` |
+
+#### Child blocks
+
+| Slot | Accepts | Multiple | Description |
+| --- | --- | --- | --- |
+| `vars` | `var` | yes | Variable overrides passed to config-weave for this machine's run |
 
 Example:
 
 ```wcl
-playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
-playbook "playbooks/domain" { play = "member" all_machines = true }  // every machine
-playbook "playbooks/draft"  { play = "wip" }      // no targets: declared, never runs
+// Declared inside the vm/container it converges.
+playbook "playbooks/domain" { play = "dc" }
+playbook "playbooks/domain" {
+  play = "member"
+  var "domain"      { value = "corp.example.com" }
+  var "member_name" { value = "APP01" }   // --var, this machine only
+}
+```
+
+##### `var` (in `playbook`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | `utf8` | yes | Variable name; must be a WCL identifier; the inline block label |
+| `value` | `utf8` | yes | Value, passed through verbatim — config-weave reads it as a WCL expression where it can (`3` is an int, `true` a bool) and as a string otherwise (required) |
+
+Example:
+
+```wcl
+var "domain"  { value = "corp.example.com" }  // --var domain=corp.example.com
+var "retries" { value = "3" }                 // config-weave reads this as an int
+var "tag"     { value = "\"3\"" }               // quoted: forced to a string
 ```
 
 ### `on` (in `lab`)
@@ -663,40 +787,65 @@ media { kind = "floppy" from = "./drivers/"  label = "DRV" }
 
 ### `provision` (in `template`)
 
-Provision script run during `vmlab up`. Optional vms list scopes
-the script for depends_on satisfaction.
+Provision script run during `vmlab up`, declared inside the `vm`/`container`
+it configures (or inside a `template`, for the build VM). It runs once, after
+that machine is ready, at its position among the machine's steps.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `script` | `utf8` | yes | Path to the `.ws` file; must exist and compile; the inline label |
-| `vms` | `list<utf8>` | no | VM names this script is scoped to (gates their `depends_on`) |
-| `lab_wide` | `bool` | no | Run once for the whole lab, after every machine is up; mutually exclusive with `vms`. Without either the script is declared but never runs |
 
 Example:
 
 ```wcl
-provision "scripts/setup.ws" { lab_wide = true }     // runs once, after every machine is up
-provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
+// Declared inside the vm/container it configures; runs once that machine is
+// ready, at this position among its steps.
+provision "scripts/setup.ws" { }
 ```
 
 ### `playbook` (in `template`)
 
-config-weave playbook applied on `vmlab up` (interleaved with provisions
-in declaration order) and runnable on demand via `vmlab playbook check|apply`.
+config-weave playbook applied on `vmlab up` (interleaved with the machine's
+provisions in declaration order) and runnable on demand via
+`vmlab playbook check|apply`. Declared inside the `vm`/`container` it
+converges, or inside a `template` for the build VM.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `path` | `utf8` | yes | Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label |
 | `play` | `utf8` | yes | Play name inside the playbook to run (required) |
-| `vms` | `list<utf8>` | no | VM/container names this playbook targets; without either this or `all_machines` the playbook is declared but never runs |
-| `all_machines` | `bool` | no | Target every VM and container in the lab; mutually exclusive with `vms` |
+
+#### Child blocks
+
+| Slot | Accepts | Multiple | Description |
+| --- | --- | --- | --- |
+| `vars` | `var` | yes | Variable overrides passed to config-weave for this machine's run |
 
 Example:
 
 ```wcl
-playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
-playbook "playbooks/domain" { play = "member" all_machines = true }  // every machine
-playbook "playbooks/draft"  { play = "wip" }      // no targets: declared, never runs
+// Declared inside the vm/container it converges.
+playbook "playbooks/domain" { play = "dc" }
+playbook "playbooks/domain" {
+  play = "member"
+  var "domain"      { value = "corp.example.com" }
+  var "member_name" { value = "APP01" }   // --var, this machine only
+}
+```
+
+#### `var` (in `playbook`)
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | `utf8` | yes | Variable name; must be a WCL identifier; the inline block label |
+| `value` | `utf8` | yes | Value, passed through verbatim — config-weave reads it as a WCL expression where it can (`3` is an int, `true` a bool) and as a string otherwise (required) |
+
+Example:
+
+```wcl
+var "domain"  { value = "corp.example.com" }  // --var domain=corp.example.com
+var "retries" { value = "3" }                 // config-weave reads this as an int
+var "tag"     { value = "\"3\"" }               // quoted: forced to a string
 ```
 
 ### `nic` (in `template`)

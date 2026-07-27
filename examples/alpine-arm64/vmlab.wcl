@@ -28,7 +28,7 @@ lab "alpine-arm64" {
     template = "aarch64/alpine-3.23"
     memory   = 1GiB
     nic { segment = "lan" }                        // dynamic DHCP lease
-  }
 
-  provision "scripts/setup.ws" { lab_wide = true }
+    provision "scripts/setup.ws" { }   // runs once this VM is ready
+  }
 }

@@ -1110,16 +1110,11 @@ impl LabRuntime {
     /// not see statically (registry templates, containers).
     fn preflight_playbooks(&self, targets: &[String]) -> Result<()> {
         use crate::labd::playbook;
-        let playbooks = &self.config.lab.playbooks;
-        if playbooks.is_empty() {
-            return Ok(());
-        }
+        let lab = &self.config.lab;
         let dir = playbook::default_bin_dir(self.host_cfg.config_weave_bin_dir.as_deref());
         let mut errs: Vec<String> = Vec::new();
         for name in targets {
-            let targeted = playbooks
-                .iter()
-                .any(|p| p.all_machines || p.vms.iter().any(|v| v == name));
+            let targeted = playbook::playbooks_of(lab, name).is_some_and(|p| !p.is_empty());
             if !targeted {
                 continue;
             }
@@ -1534,12 +1529,21 @@ impl LabRuntime {
 
         let mut remaining: Vec<String> = targets.clone();
         let mut done: HashSet<String> = HashSet::new();
-        let (steps, skipped) = merged_up_steps(&self.config.lab);
-        for step in &skipped {
-            output(format!(
-                "{step}: no targets (no `vms`, no lab-wide flag) — skipped\n"
-            ));
-        }
+        // Steps belong to their machine, so a partial `up` only runs the
+        // steps of the machines it started — anything else would stall the
+        // queue on a machine that is never coming up.
+        let mut steps = merged_up_steps(&self.config.lab);
+        steps.retain(|s| {
+            let in_scope = targets.contains(&s.machine);
+            if !in_scope {
+                output(format!(
+                    "{}: \"{}\" is not in this `up` — skipped\n",
+                    s.describe(),
+                    s.machine
+                ));
+            }
+            in_scope
+        });
         let mut next_step = 0usize;
         while !remaining.is_empty() {
             // A wave: every remaining machine whose deps (within the target
@@ -1622,15 +1626,15 @@ impl LabRuntime {
             }
 
             // Between waves: run (in declaration order) every unrun
-            // provision/playbook scoped entirely to already-started VMs,
-            // so a VM depending on "dc01" starts only after dc01's
-            // configuration steps completed (§7.2).
-            self.run_up_steps(&steps, &mut next_step, &done, false, &targets, &output)
+            // provision/playbook whose machine has already started, so a VM
+            // depending on "dc01" starts only after dc01's configuration
+            // steps completed (§7.2).
+            self.run_up_steps(&steps, &mut next_step, &done, &output)
                 .await?;
         }
 
-        // Final pass: everything left, including unscoped steps.
-        self.run_up_steps(&steps, &mut next_step, &done, true, &targets, &output)
+        // Final pass: the last wave's steps.
+        self.run_up_steps(&steps, &mut next_step, &done, &output)
             .await?;
 
         self.install_declared_forwards().await;
@@ -1709,88 +1713,65 @@ impl LabRuntime {
 
     /// Run configuration steps (provision scripts and playbook applies —
     /// one declaration-ordered queue, see [`merged_up_steps`]) in strict
-    /// order starting at `*next`: a scoped step runs once all its machines
-    /// are started (waiting for their readiness first); a lab-wide step
-    /// (`lab_wide`/`all_machines`) runs only in the final pass. Stops at the
-    /// first step that isn't eligible yet.
+    /// order starting at `*next`. A step runs once the machine that declares
+    /// it has started, waiting for its readiness first; the queue stops at
+    /// the first step whose machine isn't up yet.
     async fn run_up_steps(
         self: &Arc<Self>,
         steps: &[UpStep],
         next: &mut usize,
         started: &HashSet<String>,
-        final_pass: bool,
-        targets: &[String],
         output: &crate::scripting::OutputSink,
     ) -> Result<()> {
         while *next < steps.len() {
             let step = &steps[*next];
-            let scoped = step.vms();
-            let eligible = if scoped.is_empty() {
-                final_pass
-            } else {
-                scoped.iter().all(|v| started.contains(v))
-            };
-            if !eligible {
+            let m = &step.machine;
+            if !started.contains(m) {
                 return Ok(());
             }
-            for m in scoped {
-                if let Some(c) = self.containers.get(m) {
-                    c.wait_ready(Duration::from_secs(300)).await?;
-                } else {
-                    self.vm(m)?.wait_ready(Duration::from_secs(600)).await?;
-                }
+            let container = self.containers.contains_key(m);
+            if container {
+                self.containers[m]
+                    .wait_ready(Duration::from_secs(300))
+                    .await?;
+            } else {
+                self.vm(m)?.wait_ready(Duration::from_secs(600)).await?;
             }
-            match step {
-                UpStep::Provision(p) => {
+            match &step.kind {
+                UpStepKind::Provision(p) => {
                     let script = self.root.join(&p.script);
-                    output(format!("provision: {}\n", p.script.display()));
-                    crate::scripting::run_script_file(self.clone(), &script, output.clone())
+                    output(format!("provision: {} → {m}\n", p.script.display()));
+                    // The script reaches its own machine with `lab.this_vm()`;
+                    // containers have no VM handle, so they don't bind one.
+                    let owner = (!container).then(|| crate::scripting::ScriptOwner::provision(m));
+                    crate::scripting::run_script_file(self.clone(), &script, owner, output.clone())
                         .await
                         .with_context(|| format!("provision {}", p.script.display()))?;
                 }
-                UpStep::Playbook(p) => {
-                    // `all_machines` playbooks apply to the machines this
-                    // `up` actually started (like lab-wide provisions run
-                    // once everything targeted is up).
-                    let machines: Vec<&String> = if scoped.is_empty() {
-                        targets.iter().collect()
-                    } else {
-                        scoped.iter().collect()
-                    };
-                    for m in machines {
-                        if scoped.is_empty() {
-                            // Scoped machines were readiness-gated above;
-                            // final-pass targets still need the same gate.
-                            if let Some(c) = self.containers.get(m) {
-                                c.wait_ready(Duration::from_secs(300)).await?;
-                            } else {
-                                self.vm(m)?.wait_ready(Duration::from_secs(600)).await?;
-                            }
-                        }
-                        output(format!(
-                            "playbook: {} play {} → {m}\n",
+                UpStepKind::Playbook(p) => {
+                    output(format!(
+                        "playbook: {} play {} → {m}\n",
+                        p.path.display(),
+                        p.play
+                    ));
+                    let outcome = crate::labd::playbook::run_playbook(
+                        self,
+                        m,
+                        p,
+                        crate::labd::playbook::PlaybookMode::Apply,
+                        output,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("playbook {} play {} on {m}", p.path.display(), p.play)
+                    })?;
+                    if outcome.exit_code != 0 {
+                        bail!(
+                            "playbook {} play {} on {m}: config-weave exited {}",
                             p.path.display(),
-                            p.play
-                        ));
-                        let outcome = crate::labd::playbook::run_playbook(
-                            self,
-                            m,
-                            p,
-                            crate::labd::playbook::PlaybookMode::Apply,
-                            output,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!("playbook {} play {} on {m}", p.path.display(), p.play)
-                        })?;
-                        if outcome.exit_code != 0 {
-                            bail!(
-                                "playbook {} play {} on {m}: config-weave exited {}",
-                                p.path.display(),
-                                p.play,
-                                outcome.exit_code
-                            );
-                        }
+                            p.play,
+                            outcome.exit_code
+                        );
                     }
                 }
             }
@@ -1837,7 +1818,7 @@ impl LabRuntime {
             script,
             &label,
             vm.dirs.local.clone(),
-            Some(name.to_string()),
+            Some(crate::scripting::ScriptOwner::first_boot(name)),
             output.clone(),
         );
         tokio::time::timeout(Duration::from_secs(1800), run)
@@ -2429,120 +2410,145 @@ fn guest_os_hint(profile: Option<&str>) -> crate::smb::OsHint {
     }
 }
 
-/// One `up`-phase configuration step — provision scripts and playbook
-/// applies share a single declaration-ordered queue.
-enum UpStep {
+/// What one `up`-phase configuration step does.
+enum UpStepKind {
     Provision(crate::config::model::Provision),
     Playbook(crate::config::model::Playbook),
 }
 
+/// One `up`-phase configuration step: a `provision`/`playbook` block declared
+/// inside `machine`, which is therefore its target.
+struct UpStep {
+    machine: String,
+    kind: UpStepKind,
+}
+
 impl UpStep {
-    /// The machines this step is scoped to; empty means lab-wide (the block
-    /// opted in with `lab_wide`/`all_machines`, so it runs in the final
-    /// pass). Steps that name nothing never get here — [`merged_up_steps`]
-    /// drops them.
-    fn vms(&self) -> &[String] {
-        match self {
-            UpStep::Provision(p) => &p.vms,
-            UpStep::Playbook(p) => &p.vms,
-        }
-    }
-
-    /// Whether the step runs at all: an explicit `vms` scope, or the
-    /// block's lab-wide opt-in. Neither = declared but inert.
-    fn runs(&self) -> bool {
-        match self {
-            UpStep::Provision(p) => !p.vms.is_empty() || p.lab_wide,
-            UpStep::Playbook(p) => !p.vms.is_empty() || p.all_machines,
-        }
-    }
-
     /// How the step names itself in `up` output.
     fn describe(&self) -> String {
-        match self {
-            UpStep::Provision(p) => format!("provision {}", p.script.display()),
-            UpStep::Playbook(p) => format!("playbook {} play {}", p.path.display(), p.play),
+        match &self.kind {
+            UpStepKind::Provision(p) => format!("provision {}", p.script.display()),
+            UpStepKind::Playbook(p) => format!("playbook {} play {}", p.path.display(), p.play),
         }
     }
 }
 
-/// Provisions and playbooks merged back into file declaration order — the
-/// model keeps them in separate vecs; block byte spans recover the
-/// interleaving. Steps that target nothing are dropped here (and announced
-/// by the caller) so the run loop only ever sees scoped or lab-wide work.
-fn merged_up_steps(lab: &crate::config::model::Lab) -> (Vec<UpStep>, Vec<String>) {
-    let mut steps: Vec<UpStep> = lab
-        .provisions
-        .iter()
-        .cloned()
-        .map(UpStep::Provision)
-        .chain(lab.playbooks.iter().cloned().map(UpStep::Playbook))
-        .collect();
-    steps.sort_by_key(|s| match s {
-        UpStep::Provision(p) => p.span.0,
-        UpStep::Playbook(p) => p.span.0,
-    });
-    let skipped = steps
-        .iter()
-        .filter(|s| !s.runs())
-        .map(UpStep::describe)
-        .collect();
-    steps.retain(UpStep::runs);
-    (steps, skipped)
+/// Every machine's configuration steps in file declaration order — within a
+/// machine that is the order its blocks were written, and across machines the
+/// order the machine blocks appear. Block byte spans recover both, since the
+/// model keeps provisions and playbooks in separate vecs.
+fn merged_up_steps(lab: &crate::config::model::Lab) -> Vec<UpStep> {
+    let mut steps: Vec<(usize, UpStep)> = Vec::new();
+    let mut collect = |machine: &str,
+                       provisions: &[crate::config::model::Provision],
+                       playbooks: &[crate::config::model::Playbook]| {
+        for p in provisions {
+            steps.push((
+                p.span.0,
+                UpStep {
+                    machine: machine.to_string(),
+                    kind: UpStepKind::Provision(p.clone()),
+                },
+            ));
+        }
+        for p in playbooks {
+            steps.push((
+                p.span.0,
+                UpStep {
+                    machine: machine.to_string(),
+                    kind: UpStepKind::Playbook(p.clone()),
+                },
+            ));
+        }
+    };
+    for vm in &lab.vms {
+        collect(&vm.name, &vm.provisions, &vm.playbooks);
+    }
+    for c in &lab.containers {
+        collect(&c.name, &c.provisions, &c.playbooks);
+    }
+    steps.sort_by_key(|(at, _)| *at);
+    steps.into_iter().map(|(_, s)| s).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn up_steps_interleave_by_declaration_order() {
-        let src = r#"import <vmlab.wcl>
-lab "l" {
-  vm "a" { template = "x86_64/t" }
-  provision "scripts/one.ws" { vms = ["a"] }
-  playbook "pb/base" { play = "base" vms = ["a"] }
-  provision "scripts/two.ws" { lab_wide = true }
-}"#;
+    fn step_labels(src: &str) -> Vec<String> {
         let lf = crate::config::load_lab_source(src, "<test>", std::path::Path::new("/tmp"))
             .expect("parse");
-        let (steps, _skipped) = merged_up_steps(&lf.lab);
-        let kinds: Vec<String> = steps
+        merged_up_steps(&lf.lab)
             .iter()
-            .map(|s| match s {
-                UpStep::Provision(p) => format!("provision:{}", p.script.display()),
-                UpStep::Playbook(p) => format!("playbook:{}", p.path.display()),
-            })
-            .collect();
+            .map(|s| format!("{} → {}", s.describe(), s.machine))
+            .collect()
+    }
+
+    /// Within a machine, steps run in the order its blocks were written.
+    #[test]
+    fn up_steps_interleave_by_declaration_order() {
+        let steps = step_labels(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    provision "scripts/one.ws" { }
+    playbook "pb/base" { play = "base" }
+    provision "scripts/two.ws" { }
+  }
+}"#,
+        );
         assert_eq!(
-            kinds,
+            steps,
             vec![
-                "provision:scripts/one.ws",
-                "playbook:pb/base",
-                "provision:scripts/two.ws",
+                "provision scripts/one.ws → a",
+                "playbook pb/base play base → a",
+                "provision scripts/two.ws → a",
             ]
         );
     }
 
-    /// Steps that name no machines and take no lab-wide opt-in are declared
-    /// but never queued — `up` announces them instead of running them.
+    /// Across machines, steps follow the order the machine blocks appear —
+    /// including containers, which share the queue with VMs.
     #[test]
-    fn up_steps_drop_target_less_blocks() {
-        let src = r#"import <vmlab.wcl>
+    fn up_steps_order_across_machines() {
+        let steps = step_labels(
+            r#"import <vmlab.wcl>
 lab "l" {
-  vm "a" { template = "x86_64/t" }
-  provision "scripts/idle.ws" { }
-  playbook "pb/idle" { play = "base" }
-  playbook "pb/live" { play = "base" all_machines = true }
-}"#;
-        let lf = crate::config::load_lab_source(src, "<test>", std::path::Path::new("/tmp"))
-            .expect("parse");
-        let (steps, skipped) = merged_up_steps(&lf.lab);
-        let kinds: Vec<String> = steps.iter().map(UpStep::describe).collect();
-        assert_eq!(kinds, vec!["playbook pb/live play base"]);
+  vm "a" {
+    template = "x86_64/t"
+    playbook "pb/base" { play = "base" }
+  }
+  container "c" {
+    image = "nginx"
+    provision "scripts/c.ws" { }
+  }
+  vm "b" {
+    template = "x86_64/t"
+    provision "scripts/b.ws" { }
+  }
+}"#,
+        );
         assert_eq!(
-            skipped,
-            vec!["provision scripts/idle.ws", "playbook pb/idle play base"]
+            steps,
+            vec![
+                "playbook pb/base play base → a",
+                "provision scripts/c.ws → c",
+                "provision scripts/b.ws → b",
+            ]
+        );
+    }
+
+    /// A machine with no steps contributes none — there is no such thing as
+    /// a declared-but-target-less block any more.
+    #[test]
+    fn up_steps_empty_without_blocks() {
+        assert!(
+            step_labels(
+                r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" } }"#,
+            )
+            .is_empty()
         );
     }
 }

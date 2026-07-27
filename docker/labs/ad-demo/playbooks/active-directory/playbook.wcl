@@ -2,6 +2,8 @@ playbook "Active Directory demo" {
   description = "Promote dc01 to the corp.example.com forest root and join srv01 to the domain"
   version = "0.1.0"
 
+  // Defaults for every run. vmlab overrides them per machine with
+  // `--var name=value`, declared as `var {}` blocks inside each vm.
   vars {
     domain  = "corp.example.com"
     netbios = "CORP"
@@ -11,6 +13,8 @@ playbook "Active Directory demo" {
     // after promotion that account is the domain's CORP\Administrator.
     join_user     = "CORP\\Administrator"
     join_password = "vmlab123!"
+    // Overridden per member server so one play can join several machines.
+    member_name = "SRV01"
   }
 
   play "domain-controller" {
@@ -65,13 +69,13 @@ playbook "Active Directory demo" {
     description = "Join this server to the domain"
 
     step "join" {
-      description = "Join corp.example.com as SRV01"
+      description = "Join the domain under this machine's member_name"
       resource = "windows.domain_member"
       properties {
         domain_name         = domain
         credential_user     = join_user
         credential_password = join_password
-        new_name            = "SRV01"
+        new_name            = member_name
       }
     }
   }

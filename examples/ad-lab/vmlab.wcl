@@ -21,6 +21,9 @@ lab "ad-lab" {
     cpus     = 4
     memory   = 8GiB
     nic { segment = "corp" ip = "10.50.0.10" }
+
+    // Runs once dc01 is ready; anything depending on dc01 waits for it.
+    provision "scripts/setup.ws" { }
   }
 
   vm "client01" {
@@ -33,8 +36,6 @@ lab "ad-lab" {
     template = "x86_64/linux-modern"
     nic { nat = true }
   }
-
-  provision "scripts/setup.ws" { vms = ["dc01"] }
 
   on "vm.crashed"    { run = "scripts/collect-dumps.ws" }
   on "host.disk_low" { run = "scripts/alert.ws" }

@@ -136,6 +136,14 @@ lab "ad-lab" {
   vm "buildbox"  {
     template = "x86_64/linux-modern"
     nic { nat = true }                 # internet egress only, no segment to declare
+
+    # Configuration steps live in the machine they configure, and run in the
+    # order they appear here once it is ready.
+    provision "scripts/setup.ws" { }
+    playbook "playbooks/baseline" {
+      play = "baseline"
+      var "tz" { value = "UTC" }       # --var tz=UTC, for this machine only
+    }
   }
 
   vm "airgapped" { template = "x86_64/windows-11" }    # no nic blocks = no network at all
@@ -154,8 +162,6 @@ lab "ad-lab" {
     nic { segment = "dmz" }
   }
 
-  provision "scripts/setup.ws" { lab_wide = true }   # runs on `vmlab up`, in listed order
-
   on "vm.crashed"    run "scripts/collect-dumps.ws"
   on "host.disk_low" run "scripts/alert.ws"
 }
@@ -163,9 +169,9 @@ lab "ad-lab" {
 
 ### 5.1 Validation
 
-Configuration steps state their targets explicitly: a `provision {}` names VMs in `vms` (which also gates their `depends_on`) or takes `lab_wide = true` to run once after every machine is up; a `playbook {}` names `vms` or takes `all_machines = true`. The two are mutually exclusive on each block, and a block with neither is declared but never runs — `up` reports it as skipped.
+Configuration steps target structurally: `provision {}` and `playbook {}` are declared *inside* the `vm {}` or `container {}` they configure, so the machine is the target and there is nothing to cross-reference. A machine's steps run in the order its blocks appear, once it is ready; across machines they follow the order the machine blocks appear, with `depends_on` gating when each becomes eligible. A `playbook {}` may carry `var "<name>" { value = "…" }` children, passed to config-weave as `--var name=value` for that machine's run only — the mechanism for giving one play different settings per machine.
 
-`vmlab validate` (and implicitly every other verb) evaluates the lab file against the vmlab WCL schema and fails before any side effect on errors including: unknown attributes, missing templates, undeclared segment references, static IPs outside their segment's subnet, duplicate static IPs/MACs, dependency cycles in `depends_on`, missing script files, archless or malformed template references, `scratch` VMs missing `arch`/`profile`/`disk`, conflicting targeting (`vms` together with `lab_wide`/`all_machines`), and wscript compilation errors in all referenced scripts. The goal mirrors Config Weave: validation catches everything that can be caught without touching QEMU.
+`vmlab validate` (and implicitly every other verb) evaluates the lab file against the vmlab WCL schema and fails before any side effect on errors including: unknown attributes, missing templates, undeclared segment references, static IPs outside their segment's subnet, duplicate static IPs/MACs, dependency cycles in `depends_on`, missing script files, archless or malformed template references, `scratch` VMs missing `arch`/`profile`/`disk`, playbook variable names that are not WCL identifiers or are set twice on one block, and wscript compilation errors in all referenced scripts. The goal mirrors Config Weave: validation catches everything that can be caught without touching QEMU.
 
 ### 5.2 VM hardware surface
 
@@ -516,8 +522,8 @@ All blocking calls take timeouts and return wscript `Result`s; an error propagat
 
 ### 10.4 Execution model
 
-- Provision scripts listed in `vmlab.wcl` run in declaration order during `up`, after the VMs they reference are started per `depends_on`. A script orchestrating multiple VMs (stand up DC → wait → join member) is the expected normal case.
-- Any script is also invocable ad hoc: `vmlab script scripts/whatever.ws`.
+- Provision scripts are declared inside the `vm {}`/`container {}` they belong to and run during `up` in declaration order, once that machine is ready (per `depends_on`). A script orchestrating multiple VMs (stand up DC → wait → join member) is the expected normal case — it reaches the others through the lab handle, and `lab.this_vm()` gives it the machine that declared it.
+- Any script is also invocable ad hoc: `vmlab script scripts/whatever.ws` (no owning machine, so `this_vm()` is unavailable).
 - Event handlers receive `(event: Value, lab)` — the one dynamic escape hatch, consistent with Config Weave's boundary model.
 - Template build scripts get the same API scoped to the single build VM (a lab handle containing one VM).
 
@@ -629,7 +635,7 @@ configuration: `env {}` variables, `volume {}` binds and named volumes,
 `entrypoint`/`command`/`workdir`/`user` overrides, `port {}` host forwards, a
 `healthcheck {}`, a `restart` policy, and `nic {}` blocks identical to VM NICs.
 VM and container names share one namespace: DNS, `depends_on` waves,
-`forward { to = "name:port" }` targets, and provision scoping all resolve
+`forward { to = "name:port" }` targets, and configuration steps all resolve
 across both kinds. A container with no NICs is valid — air-gapped, still
 reachable via `exec`/`cp` over the agent channel — unless it declares
 volumes, which are network-mounted (validation error, mirroring §7.5).

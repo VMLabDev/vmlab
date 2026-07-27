@@ -31,26 +31,37 @@ const RUN_DETACH_AFTER: Duration = Duration::from_millis(800);
 // ---- declared playbooks (the sandbox authority) -----------------------------
 
 struct PlaybookDecl {
+    /// The VM/container whose block declares this play.
+    machine: String,
     path: String,
     play: String,
-    vms: Vec<String>,
-    all_machines: bool,
+    vars: Vec<(String, String)>,
 }
 
-/// Parse the lab's `vmlab.wcl` and return its playbook declarations. Works
-/// with the lab daemon down — file editing must not require a running lab.
+/// Parse the lab's `vmlab.wcl` and return its playbook declarations — one per
+/// `playbook {}` block, inside the machine that runs it. Works with the lab
+/// daemon down: file editing must not require a running lab.
 fn declared_playbooks(root: &Path) -> Result<Vec<PlaybookDecl>, String> {
     let file =
         vmlab::config::load_lab_root(root).map_err(|e| format!("{:?}", miette::Report::new(e)))?;
-    Ok(file
-        .lab
-        .playbooks
+    let lab = &file.lab;
+    let machines = lab
+        .vms
         .iter()
-        .map(|p| PlaybookDecl {
-            path: p.path.display().to_string(),
-            play: p.play.clone(),
-            vms: p.vms.clone(),
-            all_machines: p.all_machines,
+        .map(|v| (&v.name, &v.playbooks))
+        .chain(lab.containers.iter().map(|c| (&c.name, &c.playbooks)));
+    Ok(machines
+        .flat_map(|(machine, playbooks)| {
+            playbooks.iter().map(move |p| PlaybookDecl {
+                machine: machine.clone(),
+                path: p.path.display().to_string(),
+                play: p.play.clone(),
+                vars: p
+                    .vars
+                    .iter()
+                    .map(|v| (v.name.clone(), v.value.clone()))
+                    .collect(),
+            })
         })
         .collect())
 }
@@ -107,8 +118,10 @@ pub async fn list_playbooks(state: web::Data<AppState>, lab: web::Path<String>) 
                 .iter()
                 .map(|d| {
                     json!({
-                        "path": d.path, "play": d.play, "vms": d.vms,
-                        "all_machines": d.all_machines,
+                        "machine": d.machine, "path": d.path, "play": d.play,
+                        "vars": d.vars.iter()
+                            .map(|(name, value)| json!({"name": name, "value": value}))
+                            .collect::<Vec<_>>(),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -387,9 +400,14 @@ mod tests {
             tmp.path().join("vmlab.wcl"),
             r#"import <vmlab.wcl>
 lab "lab" {
-  vm "web01" { template = "x86_64/t" }
-  playbook "playbooks/base" { play = "base" vms = ["web01"] }
-  playbook "playbooks/ghost" { play = "base" }
+  vm "web01" {
+    template = "x86_64/t"
+    playbook "playbooks/base" {
+      play = "base"
+      var "domain" { value = "corp.example.com" }
+    }
+    playbook "playbooks/ghost" { play = "base" }
+  }
 }
 "#,
         )
@@ -455,12 +473,13 @@ lab "lab" {
         .await;
         assert_eq!(resp.status(), 200);
         let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body[0]["machine"], "web01");
         assert_eq!(body[0]["path"], "playbooks/base");
         assert_eq!(body[0]["play"], "base");
-        assert_eq!(body[0]["vms"][0], "web01");
-        assert_eq!(body[0]["all_machines"], false);
-        assert_eq!(body[1]["vms"].as_array().unwrap().len(), 0);
-        assert_eq!(body[1]["all_machines"], false);
+        assert_eq!(body[0]["vars"][0]["name"], "domain");
+        assert_eq!(body[0]["vars"][0]["value"], "corp.example.com");
+        assert_eq!(body[1]["path"], "playbooks/ghost");
+        assert_eq!(body[1]["vars"].as_array().unwrap().len(), 0);
     }
 
     #[actix_web::test]

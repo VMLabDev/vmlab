@@ -36,8 +36,6 @@ pub struct Lab {
     pub segments: Vec<Segment>,
     pub vms: Vec<Vm>,
     pub containers: Vec<Container>,
-    pub provisions: Vec<Provision>,
-    pub playbooks: Vec<Playbook>,
     pub handlers: Vec<Handler>,
     pub records: Vec<DnsRecord>,
     pub sinkholes: Vec<SinkholeRule>,
@@ -226,6 +224,9 @@ pub struct Vm {
     pub shares: Vec<Share>,
     pub media: Vec<Media>,
     pub web: Vec<WebPage>,
+    /// Configuration steps for this VM, in declaration order (§10).
+    pub provisions: Vec<Provision>,
+    pub playbooks: Vec<Playbook>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +370,9 @@ pub struct Container {
     pub ports: Vec<PortMap>,
     pub healthcheck: Option<Healthcheck>,
     pub web: Vec<WebPage>,
+    /// Configuration steps for this container, in declaration order (§10).
+    pub provisions: Vec<Provision>,
+    pub playbooks: Vec<Playbook>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -492,29 +496,33 @@ impl std::fmt::Display for ImageRef {
     }
 }
 
+/// wscript run once during `up`, after the machine that declares it is ready.
 #[derive(Debug, Clone)]
 pub struct Provision {
     pub script: PathBuf,
-    /// VMs this script is scoped to (gates their `depends_on`).
-    pub vms: Vec<String>,
-    /// Run once for the whole lab in the final pass. Without this or `vms`
-    /// the script is declared but never runs.
-    pub lab_wide: bool,
     pub span: Span,
 }
 
-/// config-weave playbook assignment: apply `play` from the playbook folder
-/// at `path` to the targeted machines on `up`, and on demand afterwards.
+/// config-weave playbook assignment: apply `play` from the playbook folder at
+/// `path` to the machine that declares it — on `up`, and on demand afterwards.
 #[derive(Debug, Clone)]
 pub struct Playbook {
     /// Playbook folder, relative to the lab root.
     pub path: PathBuf,
     pub play: String,
-    /// Targeted VM/container names. Without these or `all_machines` the
-    /// playbook is declared but never runs.
-    pub vms: Vec<String>,
-    /// Target every machine in the lab.
-    pub all_machines: bool,
+    /// `--var name=value` overrides for this machine's run, in declaration
+    /// order.
+    pub vars: Vec<PlaybookVar>,
+    pub span: Span,
+}
+
+/// One variable override passed to config-weave as `--var name=value`.
+#[derive(Debug, Clone)]
+pub struct PlaybookVar {
+    pub name: String,
+    /// Passed through verbatim; config-weave parses it as a WCL expression
+    /// where it can and falls back to a string.
+    pub value: String,
     pub span: Span,
 }
 

@@ -453,8 +453,10 @@ mod tests {
             tmp.path().join("vmlab.wcl"),
             r#"import <vmlab.wcl>
 lab "lab" {
-  vm "web01" { template = "x86_64/t" }
-  playbook "playbooks/base" { play = "base" vms = ["web01"] }
+  vm "web01" {
+    template = "x86_64/t"
+    playbook "playbooks/base" { play = "base" }
+  }
 }
 "#,
         )

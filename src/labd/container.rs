@@ -1397,6 +1397,8 @@ mod tests {
             ports: vec![],
             healthcheck: None,
             web: vec![],
+            provisions: vec![],
+            playbooks: vec![],
         }
     }
 

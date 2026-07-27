@@ -24,6 +24,9 @@ lab "demo" {
       host = "/share"
       guest = "/mnt/share"
     }
+
+    # Prepares the alpine guest for the /share mount (cifs-utils + mkdir).
+    provision "provision.ws" { }
   }
 
   vm "alpine2" {
@@ -35,10 +38,6 @@ lab "demo" {
     }
   }
 
-  # Prepares the alpine guest for the /share mount (cifs-utils + mkdir).
-  provision "provision.ws" {
-    vms = ["alpine"]
-  }
   container "container" {
     image = "hello-world"
   }

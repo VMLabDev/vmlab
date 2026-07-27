@@ -304,14 +304,15 @@ export const publishTemplate = (lab: string, tpl: string, arch?: string, version
 
 // --- playbooks (config-weave) -----------------------------------------------
 
-/** One `playbook {}` block from the lab's vmlab.wcl (GET /playbooks). */
+/** One `playbook {}` block from the lab's vmlab.wcl (GET /playbooks). The
+ *  block lives inside the machine it converges, so each row names one. */
 export interface PlaybookInfo {
+  /** The vm/container declaring this block — the machine it runs on. */
+  machine: string;
   path: string;
   play: string;
-  /** Targeted machine names; empty with no `all_machines` = runs nowhere. */
-  vms: string[];
-  /** Declared with `all_machines = true` — targets every machine. */
-  all_machines: boolean;
+  /** `--var name=value` overrides for this machine's run. */
+  vars: { name: string; value: string }[];
 }
 /** The plays defined in a folder's playbook.wcl (GET /playbooks/plays). */
 export interface PlaysInfo {

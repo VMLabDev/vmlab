@@ -21,6 +21,8 @@ lab "ad-lab" {
     template = "x86_64/windows-server-2025"
     cpus = 4  memory = 8GiB
     nic { segment = "corp" ip = "10.50.0.10" }    // static → DHCP reservation
+
+    provision "scripts/setup.ws" { }              // runs once dc01 is ready
   }
   vm "client01" {
     template   = "x86_64/windows-11@26100.1"      // version pin
@@ -32,7 +34,6 @@ lab "ad-lab" {
     nic { nat = true }
   }
 
-  provision "scripts/setup.ws" { vms = ["dc01"] }
   on "vm.crashed"    { run = "scripts/collect-dumps.ws" }
   on "host.disk_low" { run = "scripts/alert.ws" }
 }

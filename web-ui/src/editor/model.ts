@@ -102,6 +102,9 @@ export interface VmModel {
   shares: ShareModel[];
   media: MediaModel[];
   web: WebPageModel[];
+  /** Configuration steps for this VM, in declaration order. */
+  provisions: ProvisionModel[];
+  playbooks: PlaybookModel[];
 }
 
 // --- container children -------------------------------------------------------
@@ -171,6 +174,9 @@ export interface ContainerModel {
   ports: PortMapModel[];
   healthcheck: HealthcheckModel | null;
   web: WebPageModel[];
+  /** Configuration steps for this container, in declaration order. */
+  provisions: ProvisionModel[];
+  playbooks: PlaybookModel[];
 }
 
 export interface DnsModel {
@@ -244,24 +250,27 @@ export interface SegmentModel {
   sinkholes: SinkholeModel[];
 }
 
+/** A `provision {}` block inside the vm/container it configures. */
 export interface ProvisionModel {
   span: Span | null;
   script: string;
-  vms: string[];
-  /** Run once for the whole lab in the final pass; without this or `vms`
-   *  the script is declared but never runs. */
-  lab_wide: boolean;
 }
 
+/** A `playbook {}` block inside the vm/container it converges. */
 export interface PlaybookModel {
   span: Span | null;
   /** Playbook folder, relative to the lab root; the inline block label. */
   path: string;
   play: string;
-  vms: string[];
-  /** Target every VM and container; without this or `vms` the playbook is
-   *  declared but never runs. */
-  all_machines: boolean;
+  /** `--var name=value` overrides for this machine's run. */
+  vars: PlaybookVarModel[];
+}
+
+/** One variable override; the name is the inline block label. */
+export interface PlaybookVarModel {
+  span: Span | null;
+  name: string;
+  value: string;
 }
 
 export interface HandlerModel {
@@ -278,8 +287,6 @@ export interface LabModel {
   segments: SegmentModel[];
   vms: VmModel[];
   containers: ContainerModel[];
-  provisions: ProvisionModel[];
-  playbooks: PlaybookModel[];
   handlers: HandlerModel[];
   records: RecordModel[];
   sinkholes: SinkholeModel[];
@@ -370,6 +377,8 @@ export function emptyVm(name: string, template: string): VmModel {
     shares: [],
     media: [],
     web: [],
+    provisions: [],
+    playbooks: [],
   };
 }
 
@@ -394,7 +403,19 @@ export function emptyContainer(name: string, image: string): ContainerModel {
     ports: [],
     healthcheck: null,
     web: [],
+    provisions: [],
+    playbooks: [],
   };
+}
+
+/** A new `playbook {}` block on a machine, targeting one play. */
+export function emptyPlaybook(path: string, play: string): PlaybookModel {
+  return { span: null, path, play, vars: [] };
+}
+
+/** A blank variable row, filled in by the inspector. */
+export function emptyPlaybookVar(): PlaybookVarModel {
+  return { span: null, name: "", value: "" };
 }
 
 /** A new web-page block with sensible port default. */

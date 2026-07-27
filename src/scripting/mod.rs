@@ -21,7 +21,7 @@ use crate::labd::lab::LabRuntime;
 use crate::labd::vm::{PowerState, VmInstance};
 use crate::vision;
 
-pub use runner::{OutputSink, run_event_handler, run_script_file, run_script_source};
+pub use runner::{OutputSink, ScriptOwner, run_event_handler, run_script_file, run_script_source};
 
 /// Convention: reference images resolve relative to the lab root, typically
 /// `images/` beside vmlab.wcl (PRD §10.3).
@@ -44,9 +44,22 @@ pub struct LabHandle {
     /// reference crops next to itself (the build runs from a separate work
     /// dir, where `runtime.root` points, so that base would not find them).
     pub(crate) ref_base: Arc<std::path::PathBuf>,
-    /// For a template first-boot provision: the VM the script targets, fetched
-    /// with `lab.this_vm()`. `None` for ordinary provisions/handlers.
-    pub(crate) first_boot_vm: Option<String>,
+    /// The VM this script belongs to, fetched with `lab.this_vm()`: the
+    /// machine whose `provision {}` block declared it, or the VM a template
+    /// first-boot provision runs against. `None` for handlers and
+    /// `vmlab script`.
+    pub(crate) owner: Option<runner::ScriptOwner>,
+}
+
+impl LabHandle {
+    /// Whether `name` is the VM whose first-boot provision is the running
+    /// script — the only case where full readiness is unreachable and
+    /// `is_ready`/`wait_ready` must mean agent-level readiness.
+    fn owns_first_boot(&self, name: &str) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|o| o.first_boot && o.vm == name)
+    }
 }
 
 /// A VM handle (PRD §10.3).
@@ -350,23 +363,23 @@ pub fn lab_module() -> Module {
                     rt: l.rt.clone(),
                     last_pointer: Default::default(),
                     ref_base: l.ref_base.clone(),
-                    first_boot_gated: l.first_boot_vm.as_deref() == Some(name),
+                    first_boot_gated: l.owns_first_boot(name),
                 })
             },
         )
         .method("this_vm", |l: &LabHandle| -> Result<VmHandle, String> {
-            let name = l
-                .first_boot_vm
-                .as_deref()
-                .ok_or("this_vm() is only available inside a template first-boot provision")?;
-            let vm = l.runtime.vm(name).map_err(estr)?.clone();
+            let owner = l.owner.as_ref().ok_or(
+                "this_vm() is only available inside a vm's own provision or a template \
+                 first-boot script",
+            )?;
+            let vm = l.runtime.vm(&owner.vm).map_err(estr)?.clone();
             Ok(VmHandle {
                 vm,
                 runtime: l.runtime.clone(),
                 rt: l.rt.clone(),
                 last_pointer: Default::default(),
                 ref_base: l.ref_base.clone(),
-                first_boot_gated: true,
+                first_boot_gated: owner.first_boot,
             })
         })
         .method("vms", |l: &LabHandle| -> Vec<VmHandle> {
@@ -379,7 +392,7 @@ pub fn lab_module() -> Module {
                     rt: l.rt.clone(),
                     last_pointer: Default::default(),
                     ref_base: l.ref_base.clone(),
-                    first_boot_gated: l.first_boot_vm.as_deref() == Some(vm.cfg.name.as_str()),
+                    first_boot_gated: l.owns_first_boot(&vm.cfg.name),
                 })
                 .collect()
         })

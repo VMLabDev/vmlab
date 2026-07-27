@@ -748,12 +748,12 @@ fn synth_lab(
             .unwrap();
         }
     }
-    writeln!(s, "  }}").unwrap();
     // Build provision scripts and playbooks run against the single build VM
-    // (§10.4). The lab runtime interleaves them in the synthetic file's
-    // declaration order, so emit them ordered by their spans in the original
-    // template definition. Paths are rebased absolute: the synthetic lab's
-    // root is the throwaway work dir, not the template root.
+    // (§10.4), so they are emitted inside its block — the lab runtime
+    // interleaves a machine's steps in declaration order, so keep them ordered
+    // by their spans in the original template definition. Paths are rebased
+    // absolute: the synthetic lab's root is the throwaway work dir, not the
+    // template root.
     enum Step<'a> {
         Provision(&'a crate::config::model::Provision),
         Playbook(&'a crate::config::model::Playbook),
@@ -772,21 +772,31 @@ fn synth_lab(
         match step {
             Step::Provision(p) => {
                 let script = root.join(&p.script);
-                writeln!(s, "  provision {} {{ }}", wcl_str(script.display())).unwrap();
+                writeln!(s, "    provision {} {{ }}", wcl_str(script.display())).unwrap();
             }
             Step::Playbook(p) => {
                 let dir = root.join(&p.path);
-                writeln!(
+                write!(
                     s,
-                    "  playbook {} {{ play = {} vms = [{}] }}",
+                    "    playbook {} {{ play = {}",
                     wcl_str(dir.display()),
                     wcl_str(&p.play),
-                    wcl_str(vm)
                 )
                 .unwrap();
+                for v in &p.vars {
+                    write!(
+                        s,
+                        " var {} {{ value = {} }}",
+                        wcl_str(&v.name),
+                        wcl_str(&v.value)
+                    )
+                    .unwrap();
+                }
+                writeln!(s, " }}").unwrap();
             }
         }
     }
+    writeln!(s, "  }}").unwrap();
     writeln!(s, "}}").unwrap();
     Ok(s)
 }
@@ -853,9 +863,9 @@ mod tests {
         assert!(wcl.contains("nic { nat = true }"), "{wcl}");
     }
 
-    /// Template playbooks reach the synthetic build lab as `playbook` blocks
-    /// targeting the build VM, path rebased absolute, and interleaved with
-    /// provisions in declaration order (the up-queue replays that order).
+    /// Template steps reach the synthetic build lab nested inside the build
+    /// VM, paths rebased absolute, in declaration order (the up-queue replays
+    /// that order), with each playbook's variables carried along.
     #[test]
     fn playbooks_carry_into_build_lab_in_declaration_order() {
         let d = def(concat!(
@@ -863,21 +873,29 @@ mod tests {
             "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
             "  source \"scratch\" { }\n",
             "  provision \"a.ws\" { }\n",
-            "  playbook \"pb\" { play = \"baseline\" }\n",
+            "  playbook \"pb\" { play = \"baseline\" var \"tz\" { value = \"UTC\" } }\n",
             "  provision \"b.ws\" { }\n",
             "}\n"
         ));
         let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
         assert!(
-            wcl.contains("playbook \"/root/pb\" { play = \"baseline\" vms = [\"build\"] }"),
+            wcl.contains(
+                "playbook \"/root/pb\" { play = \"baseline\" var \"tz\" { value = \"UTC\" } }"
+            ),
             "{wcl}"
         );
         let a = wcl.find("/root/a.ws").expect("provision a");
         let pb = wcl.find("/root/pb").expect("playbook");
         let b = wcl.find("/root/b.ws").expect("provision b");
         assert!(a < pb && pb < b, "declaration order lost:\n{wcl}");
-        crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        let build = &lf.lab.vms[0];
+        assert_eq!(build.name, "build");
+        assert_eq!(build.provisions.len(), 2);
+        assert_eq!(build.playbooks.len(), 1);
+        assert_eq!(build.playbooks[0].vars[0].name, "tz");
+        assert_eq!(build.playbooks[0].vars[0].value, "UTC");
     }
 
     /// The synthetic build lab must satisfy the lab schema — `disk`/`memory`

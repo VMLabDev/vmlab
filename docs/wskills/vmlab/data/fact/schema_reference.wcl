@@ -156,9 +156,19 @@ auth { method = :form   username = "admin" password = "…"
 WCL
 
 let ex_playbook = <<'WCL'
-playbook "playbooks/domain" { play = "dc"     vms = ["dc01"] }
-playbook "playbooks/domain" { play = "member" all_machines = true }  // every machine
-playbook "playbooks/draft"  { play = "wip" }      // no targets: declared, never runs
+// Declared inside the vm/container it converges.
+playbook "playbooks/domain" { play = "dc" }
+playbook "playbooks/domain" {
+  play = "member"
+  var "domain"      { value = "corp.example.com" }
+  var "member_name" { value = "APP01" }   // --var, this machine only
+}
+WCL
+
+let ex_var = <<'WCL'
+var "domain"  { value = "corp.example.com" }  // --var domain=corp.example.com
+var "retries" { value = "3" }                 // config-weave reads this as an int
+var "tag"     { value = "\"3\"" }               // quoted: forced to a string
 WCL
 
 let ex_disk = <<'WCL'
@@ -182,8 +192,9 @@ gpu { mode = "passthrough" address = "0000:01:00.0" }   // or mode = "virgl" | "
 WCL
 
 let ex_provision = <<'WCL'
-provision "scripts/setup.ws" { lab_wide = true }     // runs once, after every machine is up
-provision "scripts/join.ws"  { vms = ["client01"] }  // scoped: gates depends_on
+// Declared inside the vm/container it configures; runs once that machine is
+// ready, at this position among its steps.
+provision "scripts/setup.ws" { }
 WCL
 
 let ex_on = <<'WCL'
@@ -245,6 +256,7 @@ let example_for = fn(k: utf8) -> list<utf8> {
     "web"       => [ex_web],
     "auth"      => [ex_auth],
     "playbook"  => [ex_playbook],
+    "var"       => [ex_var],
     "disk"      => [ex_disk],
     "share"     => [ex_share],
     "media"     => [ex_media],
@@ -288,6 +300,15 @@ fact schema_reference {
           wdoc_repeater { each = example_for(blk_kind(n2))  as = :ex
             p "Example:"
             code "wcl" { source = ex }
+          }
+          // Deepest tier: a playbook's `var`, a web page's `auth`.
+          wdoc_repeater { each = nested_blocks(n2)  as = :n3
+            h5 $"`${blk_kind(n3)}` (in `${blk_kind(n2)}`)"
+            type_table { type = n3 }
+            wdoc_repeater { each = example_for(blk_kind(n3))  as = :ex
+              p "Example:"
+              code "wcl" { source = ex }
+            }
           }
         }
       }

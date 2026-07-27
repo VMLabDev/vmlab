@@ -73,7 +73,7 @@ term g_profile {
 
 term g_provision_scope {
   term       = "scoped provision"
-  definition = "A `provision \"x\" { vms = [...] }`: it runs against those VMs and gates `depends_on` on them, so dependents wait for it."
+  definition = "A `provision \"x\" { }` block inside a `vm`/`container`: it runs once that machine is ready and gates `depends_on` on it, so dependents wait for it."
   aliases    = []
   audience   = :both
 }

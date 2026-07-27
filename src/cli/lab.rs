@@ -877,8 +877,8 @@ pub fn cmd_osinfo(vm_ref: &str) -> Result<()> {
     })
 }
 
-/// `vmlab playbook list` — the lab's playbook blocks with their resolved
-/// targets and any in-flight run.
+/// `vmlab playbook list` — every machine's playbook blocks, with their
+/// variable overrides and any in-flight run.
 pub fn cmd_playbook_list() -> Result<()> {
     rt()?.block_on(async {
         let (_name, client) = lab_client_for(None).await?;
@@ -892,27 +892,23 @@ pub fn cmd_playbook_list() -> Result<()> {
             return Ok(());
         }
         for row in rows {
-            let machines: Vec<&str> = row["machines"]
-                .as_array()
-                .map(|a| a.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            let scope = if row["all_machines"] == Value::Bool(true) {
-                format!("all machines ({})", machines.join(", "))
-            } else if machines.is_empty() {
-                "no targets — declared but not run".to_string()
-            } else {
-                machines.join(", ")
-            };
             println!(
-                "{} play {} → {scope}",
+                "{} → {} play {}",
+                row["machine"].as_str().unwrap_or("?"),
                 row["path"].as_str().unwrap_or("?"),
                 row["play"].as_str().unwrap_or("?"),
             );
+            for var in row["vars"].as_array().unwrap_or(&Vec::new()) {
+                println!(
+                    "  var {}={}",
+                    var["name"].as_str().unwrap_or("?"),
+                    var["value"].as_str().unwrap_or(""),
+                );
+            }
             if let Some(run) = row["running"].as_object() {
                 println!(
-                    "  {} running on {} since {}",
+                    "  {} running since {}",
                     run["kind"].as_str().unwrap_or("?"),
-                    run["machine"].as_str().unwrap_or("?"),
                     run["started"].as_str().unwrap_or("?"),
                 );
             }

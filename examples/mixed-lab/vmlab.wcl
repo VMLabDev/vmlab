@@ -37,6 +37,9 @@ lab "mixed-lab" {
       host = "./shared"
       guest = "S:"
     }  # auto-mounted when ready
+
+    # Runs once winsrv is ready; nix01 depends on it, so it waits.
+    provision "scripts/setup.ws" { }
   }
 
   vm "nix01" {
@@ -64,10 +67,6 @@ lab "mixed-lab" {
       command = ["curl", "-fsS", "http://localhost/"]
       interval = 5s
     }
-  }
-
-  provision "scripts/setup.ws" {
-    vms = ["winsrv"]
   }
 
   on "vm.crashed" {

@@ -302,8 +302,6 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
         segments: Vec::new(),
         vms: Vec::new(),
         containers: Vec::new(),
-        provisions: Vec::new(),
-        playbooks: Vec::new(),
         handlers: Vec::new(),
         records: Vec::new(),
         sinkholes: Vec::new(),
@@ -323,16 +321,6 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
             "container" => {
                 if let Some(c) = extract_container(&child, issues) {
                     lab.containers.push(c);
-                }
-            }
-            "provision" => {
-                if let Some(p) = extract_provision(&child, issues) {
-                    lab.provisions.push(p);
-                }
-            }
-            "playbook" => {
-                if let Some(p) = extract_playbook(&child, issues) {
-                    lab.playbooks.push(p);
                 }
             }
             "on" => {
@@ -888,8 +876,6 @@ fn extract_provision(b: &Block, issues: &mut IssueList) -> Option<Provision> {
     let script = label_name(b, "provision", issues)?;
     Some(Provision {
         script: PathBuf::from(script),
-        vms: get_str_list(b, "vms", issues),
-        lab_wide: get_bool(b, "lab_wide", issues).unwrap_or(false),
         span: span_of(b),
     })
 }
@@ -897,11 +883,28 @@ fn extract_provision(b: &Block, issues: &mut IssueList) -> Option<Provision> {
 fn extract_playbook(b: &Block, issues: &mut IssueList) -> Option<Playbook> {
     let path = label_name(b, "playbook", issues)?;
     let (play, _) = get_str(b, "play", issues)?;
-    Some(Playbook {
+    let mut pb = Playbook {
         path: PathBuf::from(path),
         play,
-        vms: get_str_list(b, "vms", issues),
-        all_machines: get_bool(b, "all_machines", issues).unwrap_or(false),
+        vars: Vec::new(),
+        span: span_of(b),
+    };
+    for child in b.blocks() {
+        if child.kind() == "var"
+            && let Some(v) = extract_playbook_var(&child, issues)
+        {
+            pb.vars.push(v);
+        }
+    }
+    Some(pb)
+}
+
+fn extract_playbook_var(b: &Block, issues: &mut IssueList) -> Option<PlaybookVar> {
+    let name = label_name(b, "var", issues)?;
+    let (value, _) = get_str(b, "value", issues)?;
+    Some(PlaybookVar {
+        name,
+        value,
         span: span_of(b),
     })
 }
@@ -983,6 +986,8 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         shares: Vec::new(),
         media: Vec::new(),
         web: Vec::new(),
+        provisions: Vec::new(),
+        playbooks: Vec::new(),
     };
     for child in b.blocks() {
         match child.kind() {
@@ -1006,6 +1011,16 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
             "web" => {
                 if let Some(w) = extract_web(&child, issues) {
                     vm.web.push(w);
+                }
+            }
+            "provision" => {
+                if let Some(p) = extract_provision(&child, issues) {
+                    vm.provisions.push(p);
+                }
+            }
+            "playbook" => {
+                if let Some(p) = extract_playbook(&child, issues) {
+                    vm.playbooks.push(p);
                 }
             }
             _ => {}
@@ -1090,6 +1105,8 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         ports: Vec::new(),
         healthcheck: None,
         web: Vec::new(),
+        provisions: Vec::new(),
+        playbooks: Vec::new(),
     };
     for child in b.blocks() {
         match child.kind() {
@@ -1113,6 +1130,16 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
             "web" => {
                 if let Some(w) = extract_web(&child, issues) {
                     c.web.push(w);
+                }
+            }
+            "provision" => {
+                if let Some(p) = extract_provision(&child, issues) {
+                    c.provisions.push(p);
+                }
+            }
+            "playbook" => {
+                if let Some(p) = extract_playbook(&child, issues) {
+                    c.playbooks.push(p);
                 }
             }
             _ => {}

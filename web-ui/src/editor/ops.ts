@@ -26,6 +26,7 @@ import type {
   OpValue,
   PortMapModel,
   PlaybookModel,
+  PlaybookVarModel,
   ProvisionModel,
   HandlerModel,
   RecordModel,
@@ -160,6 +161,8 @@ const REQUIRED_FIELDS: Record<string, string[][]> = {
   sinkhole: [["pattern"]],
   share: [["host"], ["guest"]],
   env: [["name"], ["value"]],
+  playbook: [["play"]],
+  var: [["value"]],
   volume: [["target"], ["host", "name"]],
   healthcheck: [["command"]],
   block: [["cidr"]],
@@ -400,16 +403,13 @@ const sinkholePairs = (s: SinkholeModel): [string, FV][] => [
   ["mode", strdef(s.mode || "nxdomain", "nxdomain")],
 ];
 
-const provisionPairs = (p: ProvisionModel): [string, FV][] => [
-  ["vms", list(p.vms)],
-  ["lab_wide", flag(p.lab_wide, false)],
-];
+// A provision block is nothing but its label (the script path).
+const provisionPairs = (_p: ProvisionModel): [string, FV][] => [];
 
-const playbookPairs = (p: PlaybookModel): [string, FV][] => [
-  ["play", str(p.play)],
-  ["vms", list(p.vms)],
-  ["all_machines", flag(p.all_machines, false)],
-];
+const playbookPairs = (p: PlaybookModel): [string, FV][] => [["play", str(p.play)]];
+
+// The variable name is the block label, so only the value is a field.
+const varPairs = (v: PlaybookVarModel): [string, FV][] => [["value", str(v.value)]];
 
 const handlerPairs = (h: HandlerModel): [string, FV][] => [
   ["run", str(h.run)],
@@ -477,10 +477,17 @@ const provisionSpec = (p: ProvisionModel): BlockSpec => ({
   labels: [p.script],
   fields: specFields(provisionPairs(p)),
 });
+const varSpec = (v: PlaybookVarModel): BlockSpec => ({
+  kind: "var",
+  labels: [v.name],
+  fields: specFields(varPairs(v)),
+});
 const playbookSpec = (p: PlaybookModel): BlockSpec => ({
   kind: "playbook",
   labels: [p.path],
   fields: specFields(playbookPairs(p)),
+  // Half-filled variable rows wait for a name/value before being written.
+  children: p.vars.map(varSpec).filter(writable),
 });
 const handlerSpec = (h: HandlerModel): BlockSpec => ({
   kind: "on",
@@ -510,6 +517,8 @@ function containerSpec(c: ContainerModel): BlockSpec {
   children.push(...c.ports.map(portSpec));
   if (c.healthcheck) children.push(healthcheckSpec(c.healthcheck));
   children.push(...c.web.map(webSpec));
+  children.push(...c.provisions.map(provisionSpec));
+  children.push(...c.playbooks.map(playbookSpec));
   return {
     kind: "container",
     labels: [c.name],
@@ -527,6 +536,8 @@ function vmSpec(v: VmModel): BlockSpec {
   children.push(...v.shares.map(shareSpec));
   children.push(...v.media.map(mediaSpec));
   children.push(...v.web.map(webSpec));
+  children.push(...v.provisions.map(provisionSpec));
+  children.push(...v.playbooks.map(playbookSpec));
   return {
     kind: "vm",
     labels: [v.name],
@@ -600,9 +611,16 @@ function diffProvision(ops: Ops, base: ProvisionModel, draft: ProvisionModel) {
   fieldDiffer(provisionPairs)(ops, base, draft);
 }
 
+function diffVar(ops: Ops, base: PlaybookVarModel, draft: PlaybookVarModel) {
+  diffLabel(ops, base.span!, base.name, draft.name);
+  fieldDiffer(varPairs)(ops, base, draft);
+}
+
 function diffPlaybook(ops: Ops, base: PlaybookModel, draft: PlaybookModel) {
-  diffLabel(ops, base.span!, base.path, draft.path);
+  const span = base.span!;
+  diffLabel(ops, span, base.path, draft.path);
   fieldDiffer(playbookPairs)(ops, base, draft);
+  diffChildren(ops, span, base.vars, draft.vars, diffVar, varSpec);
 }
 
 function diffHandler(ops: Ops, base: HandlerModel, draft: HandlerModel) {
@@ -625,6 +643,18 @@ function diffContainer(ops: Ops, base: ContainerModel, draft: ContainerModel) {
   diffChildren(ops, span, base.ports, draft.ports, diffPort, portSpec);
   diffChild(ops, span, base.healthcheck, draft.healthcheck, diffHealthcheck, healthcheckSpec);
   diffChildren(ops, span, base.web, draft.web, diffWeb, webSpec);
+  diffSteps(ops, span, base, draft);
+}
+
+/** A machine's configuration steps — both kinds live inside it now. */
+function diffSteps(
+  ops: Ops,
+  span: Span,
+  base: { provisions: ProvisionModel[]; playbooks: PlaybookModel[] },
+  draft: { provisions: ProvisionModel[]; playbooks: PlaybookModel[] },
+) {
+  diffChildren(ops, span, base.provisions, draft.provisions, diffProvision, provisionSpec);
+  diffChildren(ops, span, base.playbooks, draft.playbooks, diffPlaybook, playbookSpec);
 }
 
 function diffVm(ops: Ops, base: VmModel, draft: VmModel) {
@@ -637,6 +667,7 @@ function diffVm(ops: Ops, base: VmModel, draft: VmModel) {
   diffChildren(ops, span, base.shares, draft.shares, diffShare, shareSpec);
   diffChildren(ops, span, base.media, draft.media, diffMedia, mediaSpec);
   diffChildren(ops, span, base.web, draft.web, diffWeb, webSpec);
+  diffSteps(ops, span, base, draft);
 }
 
 function diffSegment(ops: Ops, base: SegmentModel, draft: SegmentModel) {
@@ -668,8 +699,6 @@ export function buildOps(base: LabModel, draft: LabModel): ModelOp[] {
   diffChildren(ops, labSpan, base.segments, draft.segments, diffSegment, segmentSpec);
   diffChildren(ops, labSpan, base.vms, draft.vms, diffVm, vmSpec);
   diffChildren(ops, labSpan, base.containers, draft.containers, diffContainer, containerSpec);
-  diffChildren(ops, labSpan, base.provisions, draft.provisions, diffProvision, provisionSpec);
-  diffChildren(ops, labSpan, base.playbooks, draft.playbooks, diffPlaybook, playbookSpec);
   diffChildren(ops, labSpan, base.handlers, draft.handlers, diffHandler, handlerSpec);
   diffChildren(ops, labSpan, base.records, draft.records, diffRecord, recordSpec);
   diffChildren(ops, labSpan, base.sinkholes, draft.sinkholes, diffSinkhole, sinkholeSpec);

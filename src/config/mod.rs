@@ -192,6 +192,11 @@ lab "ad-lab" {
   vm "buildbox" {
     template = "x86_64/linux-modern"
     nic { nat = true }
+    provision "scripts/setup.ws" { }
+    playbook "playbooks/base" {
+      play = "baseline"
+      var "tz" { value = "UTC" }
+    }
   }
 
   vm "airgapped" { template = "x86_64/windows-11" }
@@ -210,8 +215,6 @@ lab "ad-lab" {
     nic { segment = "dmz" }
   }
 
-  provision "scripts/setup.ws" { }
-
   on "vm.crashed"    { run = "scripts/collect-dumps.ws" }
   on "host.disk_low" { run = "scripts/alert.ws" }
 }
@@ -224,8 +227,20 @@ lab "ad-lab" {
         assert_eq!(lab.name, "ad-lab");
         assert_eq!(lab.segments.len(), 2);
         assert_eq!(lab.vms.len(), 6);
-        assert_eq!(lab.provisions.len(), 1);
         assert_eq!(lab.handlers.len(), 2);
+
+        // Configuration steps live inside the machine they configure.
+        let buildbox = lab.vms.iter().find(|v| v.name == "buildbox").unwrap();
+        assert_eq!(buildbox.provisions.len(), 1);
+        assert_eq!(
+            buildbox.provisions[0].script.display().to_string(),
+            "scripts/setup.ws"
+        );
+        assert_eq!(buildbox.playbooks.len(), 1);
+        assert_eq!(buildbox.playbooks[0].play, "baseline");
+        assert_eq!(buildbox.playbooks[0].vars.len(), 1);
+        assert_eq!(buildbox.playbooks[0].vars[0].name, "tz");
+        assert_eq!(buildbox.playbooks[0].vars[0].value, "UTC");
 
         let corp = &lab.segments[0];
         assert_eq!(corp.name, "corp");

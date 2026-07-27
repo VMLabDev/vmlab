@@ -16,6 +16,7 @@ import { editPlaybook } from "../FilesView";
 import {
   editor,
   addProvision,
+  draftProvisions,
   flushPendingSave,
   openEditor,
   pendingOps,
@@ -74,13 +75,26 @@ export default function EditorView(props: { onEditConfig: () => void }) {
     const lab = editor.lab;
     const draft = editor.draft;
     if (!lab || !draft) return;
-    const referenced = new Set(draft.provisions.map((provision) => provision.script));
+    // A provision block lives inside the machine it configures: use the
+    // selected machine, else the first one declared.
+    const sel = editor.selection;
+    const machine =
+      sel.kind === "vm"
+        ? draft.vms[sel.index]?.name
+        : sel.kind === "container"
+          ? draft.containers[sel.index]?.name
+          : (draft.vms[0]?.name ?? draft.containers[0]?.name);
+    if (!machine) {
+      showToast("Add a VM or container first — a provision runs on one", "danger");
+      return;
+    }
+    const referenced = new Set(draftProvisions().map((p) => p.model.script));
     try {
       for (let number = 1; number < 10_000; number++) {
         const path = `scripts/provision-${number}.ws`;
         if (referenced.has(path)) continue;
         if ((await api.getProvisionScript(lab, path)) !== null) continue;
-        addProvision(path);
+        addProvision(path, machine);
         setEditingScript(path);
         return;
       }

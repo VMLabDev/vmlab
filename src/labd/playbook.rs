@@ -83,7 +83,19 @@ pub fn guest_os_of(profile: Option<&str>) -> GuestOs {
     }
 }
 
-/// The single playbook block targeting `machine`, optionally narrowed by
+/// The `playbook {}` blocks declared inside `machine`, in declaration order.
+/// `None` when the lab has no such VM or container.
+pub fn playbooks_of<'a>(lab: &'a Lab, machine: &str) -> Option<&'a [Playbook]> {
+    if let Some(vm) = lab.vms.iter().find(|v| v.name == machine) {
+        return Some(&vm.playbooks);
+    }
+    lab.containers
+        .iter()
+        .find(|c| c.name == machine)
+        .map(|c| c.playbooks.as_slice())
+}
+
+/// The single playbook block `machine` declares, optionally narrowed by
 /// playbook path and/or play name. Errors name the candidates so callers
 /// can disambiguate.
 pub fn resolve_playbook<'a>(
@@ -92,15 +104,15 @@ pub fn resolve_playbook<'a>(
     playbook: Option<&str>,
     play: Option<&str>,
 ) -> Result<&'a Playbook, String> {
-    let matches: Vec<&Playbook> = lab
-        .playbooks
+    let declared =
+        playbooks_of(lab, machine).ok_or_else(|| format!("no vm or container \"{machine}\""))?;
+    let matches: Vec<&Playbook> = declared
         .iter()
-        .filter(|p| p.all_machines || p.vms.iter().any(|v| v == machine))
         .filter(|p| playbook.is_none_or(|f| p.path.display().to_string() == f))
         .filter(|p| play.is_none_or(|f| p.play == f))
         .collect();
     match matches.len() {
-        0 => Err(format!("no playbook targets \"{machine}\"")),
+        0 => Err(format!("\"{machine}\" declares no matching playbook")),
         1 => Ok(matches[0]),
         _ => {
             let candidates: Vec<String> = matches
@@ -108,7 +120,7 @@ pub fn resolve_playbook<'a>(
                 .map(|p| format!("{} play {}", p.path.display(), p.play))
                 .collect();
             Err(format!(
-                "machine \"{machine}\" is targeted by {} playbooks — pass playbook/play \
+                "machine \"{machine}\" declares {} playbooks — pass playbook/play \
                  to pick one (candidates: {})",
                 matches.len(),
                 candidates.join(", ")
@@ -720,14 +732,17 @@ async fn run_inner(
     ));
 
     // Run, rebooting and re-running while apply says "reboot required".
-    let argv = vec![
-        guest_bin,
-        mode.verb().to_string(),
-        guest_dir,
-        pb.play.clone(),
-        "--json".to_string(),
-        "--events-ndjson".to_string(),
-    ];
+    let argv = run_argv(&guest_bin, &guest_dir, pb, mode);
+    if !pb.vars.is_empty() {
+        log_line(&format!(
+            "variables: {}",
+            pb.vars
+                .iter()
+                .map(|v| format!("{}={}", v.name, v.value))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
     let mut reboots = 0u32;
     loop {
         let agent = mref.wait_agent(Duration::from_secs(300)).await?;
@@ -828,6 +843,26 @@ async fn run_inner(
             report,
         });
     }
+}
+
+/// The guest command line for one run. Each declared variable becomes a
+/// `--var name=value` in declaration order; the value is passed through
+/// verbatim (no shell is involved), so config-weave applies its usual rule —
+/// parse it as a WCL expression where it can, string otherwise.
+fn run_argv(guest_bin: &str, guest_dir: &str, pb: &Playbook, mode: PlaybookMode) -> Vec<String> {
+    let mut argv = vec![
+        guest_bin.to_string(),
+        mode.verb().to_string(),
+        guest_dir.to_string(),
+        pb.play.clone(),
+        "--json".to_string(),
+        "--events-ndjson".to_string(),
+    ];
+    for var in &pb.vars {
+        argv.push("--var".to_string());
+        argv.push(format!("{}={}", var.name, var.value));
+    }
+    argv
 }
 
 /// Streaming exec: stderr lines go to `on_line` as they arrive (the ndjson
@@ -1018,63 +1053,108 @@ mod tests {
         assert!(parse_report("").is_none());
     }
 
-    fn lab_with_playbooks(entries: &[(&str, &str, &[&str])]) -> Lab {
-        let src = format!(
-            "import <vmlab.wcl>\nlab \"l\" {{\n  vm \"web01\" {{ template = \"x86_64/t\" }}\n  vm \"db01\" {{ template = \"x86_64/t\" }}\n{}}}\n",
-            entries
-                .iter()
-                .map(|(path, play, vms)| {
-                    // No names = the every-machine opt-in (an empty `vms`
-                    // list on its own targets nothing).
-                    let scope = if vms.is_empty() {
-                        "all_machines = true".to_string()
-                    } else {
-                        let vms = vms
-                            .iter()
-                            .map(|v| format!("\"{v}\""))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("vms = [{vms}]")
-                    };
-                    format!("  playbook \"{path}\" {{ play = \"{play}\" {scope} }}\n")
-                })
-                .collect::<String>()
-        );
-        crate::config::load_lab_source(&src, "<test>", Path::new("/tmp"))
+    fn lab(src: &str) -> Lab {
+        crate::config::load_lab_source(src, "<test>", Path::new("/tmp"))
             .expect("parse")
             .lab
     }
 
     #[test]
     fn resolve_playbook_scoping_and_ambiguity() {
-        let lab = lab_with_playbooks(&[("pb/a", "base", &["web01"]), ("pb/b", "base", &[])]);
-        // db01 only matches the all-machines block.
+        let lab = lab(r#"import <vmlab.wcl>
+lab "l" {
+  vm "web01" {
+    template = "x86_64/t"
+    playbook "pb/a" { play = "base" }
+    playbook "pb/b" { play = "base" }
+  }
+  vm "db01" {
+    template = "x86_64/t"
+    playbook "pb/b" { play = "base" }
+  }
+  container "cache" {
+    image = "redis"
+    playbook "pb/c" { play = "base" }
+  }
+}"#);
+        // One block, no filter needed.
         let p = resolve_playbook(&lab, "db01", None, None).unwrap();
         assert_eq!(p.path.display().to_string(), "pb/b");
-        // web01 matches both → ambiguous without a filter.
+        // Containers declare theirs the same way.
+        let p = resolve_playbook(&lab, "cache", None, None).unwrap();
+        assert_eq!(p.path.display().to_string(), "pb/c");
+        // web01 declares two → ambiguous without a filter…
         let err = resolve_playbook(&lab, "web01", None, None).unwrap_err();
-        assert!(err.contains("2 playbooks"), "{err}");
+        assert!(err.contains("declares 2 playbooks"), "{err}");
         // …and unambiguous with one.
         let p = resolve_playbook(&lab, "web01", Some("pb/a"), None).unwrap();
         assert_eq!(p.path.display().to_string(), "pb/a");
-        // Unknown machine target.
-        let err = resolve_playbook(&lab, "ghost", Some("pb/a"), None).unwrap_err();
-        assert!(err.contains("no playbook targets"), "{err}");
+        // A machine with no blocks, and a machine that doesn't exist.
+        let err = resolve_playbook(&lab, "ghost", None, None).unwrap_err();
+        assert!(err.contains("no vm or container"), "{err}");
     }
 
-    /// A block with neither `vms` nor `all_machines` is declared but inert —
-    /// it must not be picked up by `playbook check|apply <machine>`.
     #[test]
-    fn resolve_playbook_ignores_target_less_blocks() {
-        let src = r#"import <vmlab.wcl>
-lab "l" {
-  vm "web01" { template = "x86_64/t" }
-  playbook "pb/idle" { play = "base" }
-}"#;
-        let lab = crate::config::load_lab_source(src, "<test>", Path::new("/tmp"))
-            .expect("parse")
-            .lab;
+    fn resolve_playbook_needs_a_declared_block() {
+        let lab = lab(r#"import <vmlab.wcl>
+lab "l" { vm "web01" { template = "x86_64/t" } }"#);
         let err = resolve_playbook(&lab, "web01", None, None).unwrap_err();
-        assert!(err.contains("no playbook targets"), "{err}");
+        assert!(err.contains("declares no matching playbook"), "{err}");
+    }
+
+    /// Variables become repeated `--var name=value` in declaration order,
+    /// after the flags — passed verbatim, since there is no shell in between.
+    #[test]
+    fn argv_carries_vars_in_declaration_order() {
+        let lab = lab(r#"import <vmlab.wcl>
+lab "l" {
+  vm "srv01" {
+    template = "x86_64/t"
+    playbook "pb/ad" {
+      play = "member-server"
+      var "domain"   { value = "corp.example.com" }
+      var "new_name" { value = "SRV01" }
+      var "retries"  { value = "3" }
+    }
+  }
+}"#);
+        let pb = resolve_playbook(&lab, "srv01", None, None).unwrap();
+        let argv = run_argv(
+            "/weave/config-weave",
+            "/weave/playbooks/pb__ad",
+            pb,
+            PlaybookMode::Apply,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/weave/config-weave",
+                "apply",
+                "/weave/playbooks/pb__ad",
+                "member-server",
+                "--json",
+                "--events-ndjson",
+                "--var",
+                "domain=corp.example.com",
+                "--var",
+                "new_name=SRV01",
+                "--var",
+                "retries=3",
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_without_vars_is_unchanged() {
+        let lab = lab(r#"import <vmlab.wcl>
+lab "l" {
+  vm "srv01" { template = "x86_64/t" playbook "pb/ad" { play = "base" } }
+}"#);
+        let pb = resolve_playbook(&lab, "srv01", None, None).unwrap();
+        let argv = run_argv("cw", "/d", pb, PlaybookMode::Check);
+        assert_eq!(
+            argv,
+            vec!["cw", "check", "/d", "base", "--json", "--events-ndjson"]
+        );
     }
 }

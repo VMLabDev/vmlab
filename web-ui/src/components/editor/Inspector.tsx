@@ -27,22 +27,30 @@ import type {
 import { HEALTHCHECK_DEFAULTS, emptyWebAuth, emptyWebPage, uniqueName } from "../../editor/model";
 import * as F from "../../editor/fields";
 import { formatByteSize, formatMemory, parseByteSize } from "../../editor/bytesize";
+import type { PlayCard, PlayTarget } from "../../editor/store";
 import {
   addMachineNic,
   addNic,
   addPlaybookPlayDraft,
+  addPlaybookVar,
   addScriptEventHandler,
+  draftPlaybooks,
+  draftProvisions,
   editor,
   mergePlaybookDuplicates,
+  playCard,
   playbookGroup,
+  provisionAt,
   removeContainer,
   removeEventHandler,
   removePlaybookFolder,
   removePlaybookPlay,
+  removePlaybookTarget,
+  removePlaybookVar,
   removeProvision,
   renamePlaybookPath,
-  setPlaybookAllMachines,
-  setProvisionLabWide,
+  setPlaybookVarName,
+  setPlaybookVarValue,
   removeRemote,
   removeSegment,
   removeVm,
@@ -106,9 +114,13 @@ export default function Inspector(props: {
           <ContainerInspector index={(sel() as { index: number }).index} />
         </Show>
         <Show
-          when={sel().kind === "provision" && editor.draft?.provisions[(sel() as any).index]}
+          when={
+            sel().kind === "provision" &&
+            provisionAt((sel() as any).machine, (sel() as any).index)
+          }
         >
           <ProvisionInspector
+            machine={(sel() as { machine: string }).machine}
             index={(sel() as { index: number }).index}
             onEdit={props.onEditProvision}
           />
@@ -195,8 +207,20 @@ function LabInspector() {
   );
 }
 
-function ProvisionInspector(props: { index: number; onEdit: (path: string) => void }) {
-  const provision = () => editor.draft!.provisions[props.index];
+/** Jump to a machine's inspector by name. */
+function selectMachine(name: string) {
+  const vm = editor.draft!.vms.findIndex((candidate) => candidate.name === name);
+  if (vm >= 0) return select({ kind: "vm", index: vm });
+  const container = editor.draft!.containers.findIndex((candidate) => candidate.name === name);
+  if (container >= 0) select({ kind: "container", index: container });
+}
+
+function ProvisionInspector(props: {
+  machine: string;
+  index: number;
+  onEdit: (path: string) => void;
+}) {
+  const provision = () => provisionAt(props.machine, props.index)!.model;
   const [newEvent, setNewEvent] = createSignal("vm.ready");
   const handlers = createMemo(() =>
     editor.draft!.handlers
@@ -207,12 +231,12 @@ function ProvisionInspector(props: { index: number; onEdit: (path: string) => vo
     if (
       await confirmDialog({
         title: `Delete provision "${provision().script}"?`,
-        body: "The provision block will be removed. Its script file will be preserved.",
+        body: `The block will be removed from "${props.machine}". Its script file will be preserved.`,
         confirmLabel: "Delete provision",
         danger: true,
       })
     ) {
-      removeProvision(props.index);
+      removeProvision(props.machine, props.index);
     }
   }
   return (
@@ -225,47 +249,16 @@ function ProvisionInspector(props: { index: number; onEdit: (path: string) => vo
         </Button>
       </div>
       <div class="provision-inspector-path">{provision().script}</div>
-      <Badge
-        tone={provision().vms.length || provision().lab_wide ? "info" : "neutral"}
-      >
-        {provision().vms.length
-          ? `${provision().vms.length} targeted`
-          : provision().lab_wide
-            ? "LAB-WIDE"
-            : "not run"}
-      </Badge>
-      <Toggle
-        checked={provision().lab_wide}
-        onChange={(on: boolean) => setProvisionLabWide(props.index, on)}
-      >
-        Run lab-wide
-      </Toggle>
-      <div class="inspector-note">
-        Lab-wide scripts run once, after every machine is up. Cable the script to
-        machines instead to scope it (that also gates their <code>depends_on</code>).
-        With neither, the script is declared but never runs.
+      <div class="remote-attached">
+        <button class="remote-attached-row" onClick={() => selectMachine(props.machine)}>
+          {props.machine}
+        </button>
       </div>
-      <Show when={provision().vms.length}>
-        <div class="remote-attached">
-          <For each={provision().vms}>
-            {(name) => (
-              <button
-                class="remote-attached-row"
-                onClick={() => {
-                  const vm = editor.draft!.vms.findIndex((candidate) => candidate.name === name);
-                  const container = editor.draft!.containers.findIndex(
-                    (candidate) => candidate.name === name,
-                  );
-                  if (vm >= 0) select({ kind: "vm", index: vm });
-                  else if (container >= 0) select({ kind: "container", index: container });
-                }}
-              >
-                {name}
-              </button>
-            )}
-          </For>
-        </div>
-      </Show>
+      <div class="inspector-note">
+        Runs once, on <strong>{props.machine}</strong>, after it is ready — at this block's
+        position among that machine's steps. Reorder it against the machine's other
+        provisions and playbooks to change when it runs.
+      </div>
       <Button icon={FileCode2} variant="primary" onClick={() => props.onEdit(provision().script)}>
         Edit script
       </Button>
@@ -317,10 +310,6 @@ function ProvisionInspector(props: { index: number; onEdit: (path: string) => vo
           </For>
         </div>
       </Show>
-      <div class="inspector-note">
-        Drag the TARGETS port on the canvas onto VMs or containers. With no targets, this script
-        runs lab-wide in the final provisioning pass.
-      </div>
     </>
   );
 }
@@ -341,16 +330,10 @@ function PlaybookInspector(props: { path: string; play?: string }) {
   );
 }
 
-function playCardBadge(card: {
-  allMachines: boolean;
-  targets: string[];
-  blockIndex: number | null;
-}) {
-  return card.allMachines
-    ? { tone: "success" as const, label: "all machines" }
-    : card.targets.length
-      ? { tone: "success" as const, label: `${card.targets.length} targeted` }
-      : { tone: "neutral" as const, label: "no targets" };
+function playCardBadge(card: PlayCard) {
+  return card.targets.length
+    ? { tone: "success" as const, label: `${card.targets.length} targeted` }
+    : { tone: "neutral" as const, label: "no targets" };
 }
 
 function PlaybookFolderInspector(props: { path: string }) {
@@ -365,13 +348,13 @@ function PlaybookFolderInspector(props: { path: string }) {
     return null;
   };
   const blockCount = () =>
-    editor.draft?.playbooks.filter((playbook) => playbook.path === props.path).length ?? 0;
+    draftPlaybooks().filter((block) => block.model.path === props.path).length;
   async function remove() {
     if (
       await confirmDialog({
         title: `Delete playbook "${props.path}"?`,
         body: blockCount()
-          ? `${blockCount()} playbook block(s) will be removed from vmlab.wcl. The folder and its files will be preserved.`
+          ? `${blockCount()} playbook block(s) will be removed from the machines that run them. The folder and its files will be preserved.`
           : "The folder and its files will be preserved.",
         confirmLabel: "Delete playbook",
         danger: true,
@@ -439,7 +422,8 @@ function PlaybookFolderInspector(props: { path: string }) {
                   }
                 >
                   {playCard.play}
-                  {playCard.missingFromFolder || playCard.duplicateBlockIndexes.length
+                  {playCard.missingFromFolder ||
+                  playCard.targets.some((t) => t.duplicateIndexes.length)
                     ? " ⚠"
                     : ""}
                   <Badge tone={badge().tone}>{badge().label}</Badge>
@@ -471,8 +455,8 @@ function PlaybookFolderInspector(props: { path: string }) {
       </Show>
       <div class="inspector-note">
         Each play wears its own TARGETS port on the canvas — drag it onto the VMs or
-        containers that play converges. A play with no targets is declared in vmlab.wcl but
-        never runs.
+        containers that play converges. Cabling a machine declares the{" "}
+        <code>playbook</code> block inside it, where that machine's variables live.
       </div>
     </>
   );
@@ -493,21 +477,6 @@ function PlayCardInspector(props: { path: string; play: string }) {
       removePlaybookPlay(props.path, props.play);
     }
   }
-  async function toggleAllMachines(on: boolean) {
-    const targets = card()?.targets ?? [];
-    if (
-      on &&
-      targets.length &&
-      !(await confirmDialog({
-        title: "Run on all machines?",
-        body: `The ${targets.length} explicit target(s) will be replaced by an all-machines scope.`,
-        confirmLabel: "Run on all",
-      }))
-    ) {
-      return;
-    }
-    setPlaybookAllMachines(props.path, props.play, on);
-  }
   return (
     <Show when={card()} keyed>
       {(playCard) => (
@@ -515,7 +484,7 @@ function PlayCardInspector(props: { path: string; play: string }) {
           <div class="inspector-head">
             <span class="inspector-kind">play</span>
             <span class="inspector-name">{props.play}</span>
-            <Show when={playCard.blockIndex !== null}>
+            <Show when={playCard.targets.length}>
               <Button variant="danger" size="sm" icon={Trash2} onClick={() => void stopRunning()}>
                 Stop
               </Button>
@@ -536,54 +505,120 @@ function PlayCardInspector(props: { path: string; play: string }) {
               playbook.wcl.
             </div>
           </Show>
-          <Show when={playCard.duplicateBlockIndexes.length}>
-            <div class="inspector-note inspector-warn">
-              {playCard.duplicateBlockIndexes.length + 1} playbook blocks declare this play.
-              <Button
-                size="sm"
-                onClick={() => mergePlaybookDuplicates(props.path, props.play)}
-              >
-                Merge targets
-              </Button>
-            </div>
-          </Show>
-          <Toggle
-            checked={playCard.allMachines}
-            onChange={(on: boolean) => void toggleAllMachines(on)}
-          >
-            Run on all machines
-          </Toggle>
           <Badge tone={playCardBadge(playCard).tone}>{playCardBadge(playCard).label}</Badge>
-          <Show when={playCard.targets.length}>
-            <div class="remote-attached">
-              <For each={playCard.targets}>
-                {(name) => (
-                  <button
-                    class="remote-attached-row"
-                    onClick={() => {
-                      const vm = editor.draft!.vms.findIndex(
-                        (candidate) => candidate.name === name,
-                      );
-                      const container = editor.draft!.containers.findIndex(
-                        (candidate) => candidate.name === name,
-                      );
-                      if (vm >= 0) select({ kind: "vm", index: vm });
-                      else if (container >= 0) select({ kind: "container", index: container });
-                    }}
-                  >
-                    {name}
-                  </button>
-                )}
-              </For>
-            </div>
+          <Show
+            when={playCard.targets.length}
+            fallback={
+              <div class="inspector-note">
+                No machine runs this play yet — drag its port on the canvas onto a VM or
+                container.
+              </div>
+            }
+          >
+            <div class="inspector-subhead">Targets &amp; variables</div>
+            <For each={playCard.targets}>
+              {(target) => <PlayTargetVars path={props.path} play={props.play} target={target} />}
+            </For>
           </Show>
           <div class="inspector-note">
-            Drag this play's port on the canvas onto VMs or containers. Deleting its last
-            connection stops the play (unless "all machines" is on).
+            Each target's variables are passed to config-weave as{" "}
+            <code>--var name=value</code> for that machine's run only. Values go through
+            verbatim: <code>3</code> is a number and <code>true</code> a boolean; quote them
+            (<code>"3"</code>) to force text.
           </div>
         </>
       )}
     </Show>
+  );
+}
+
+/** One targeted machine: a jump-link header, its variable rows, and an add
+ *  button. This is where a play gets per-VM settings. */
+function PlayTargetVars(props: { path: string; play: string; target: PlayTarget }) {
+  const [open, setOpen] = createSignal(true);
+  // Re-read through the store so edits stay reactive: `props.target` is a
+  // snapshot from the card, its `index` the stable address.
+  const target = () =>
+    playCard(props.path, props.play)?.targets.find(
+      (t) => t.machine === props.target.machine,
+    ) ?? props.target;
+  const vars = () => target().vars;
+  const duplicateName = (name: string, index: number) =>
+    !!name && vars().some((v, i) => i !== index && v.name === name);
+  return (
+    <div class="play-target">
+      <div class="play-target-head">
+        <IconButton
+          icon={open() ? ChevronDown : ChevronRight}
+          label={open() ? "Collapse" : "Expand"}
+          onClick={() => setOpen(!open())}
+        />
+        <button class="remote-attached-row" onClick={() => selectMachine(target().machine)}>
+          {target().machine}
+        </button>
+        <Badge tone={vars().length ? "info" : "neutral"}>
+          {vars().length ? `${vars().length} var(s)` : "no vars"}
+        </Badge>
+        <IconButton
+          icon={Trash2}
+          label={`Stop running ${props.play} on ${target().machine}`}
+          onClick={() => removePlaybookTarget(props.path, props.play, target().machine)}
+        />
+      </div>
+      <Show when={target().duplicateIndexes.length}>
+        <div class="inspector-note inspector-warn">
+          {target().duplicateIndexes.length + 1} blocks on {target().machine} declare this play.
+          <Button
+            size="sm"
+            onClick={() => mergePlaybookDuplicates(props.path, props.play, target().machine)}
+          >
+            Merge variables
+          </Button>
+        </div>
+      </Show>
+      <Show when={open()}>
+        <For each={vars()}>
+          {(v, index) => (
+            <div class="inspector-row">
+              <Input
+                label="Name"
+                value={v.name}
+                placeholder="new_name"
+                error={duplicateName(v.name, index())}
+                help={duplicateName(v.name, index()) ? "Already set on this machine" : undefined}
+                onInput={(e: InputEvent) =>
+                  setPlaybookVarName(
+                    target(),
+                    index(),
+                    (e.currentTarget as HTMLInputElement).value,
+                  )
+                }
+              />
+              <Input
+                label="Value"
+                value={v.value}
+                placeholder="SRV01"
+                onInput={(e: InputEvent) =>
+                  setPlaybookVarValue(
+                    target(),
+                    index(),
+                    (e.currentTarget as HTMLInputElement).value,
+                  )
+                }
+              />
+              <IconButton
+                icon={Trash2}
+                label={`Remove variable ${v.name || index() + 1}`}
+                onClick={() => removePlaybookVar(target(), index())}
+              />
+            </div>
+          )}
+        </For>
+        <Button size="sm" icon={Plus} onClick={() => addPlaybookVar(target())}>
+          Add variable
+        </Button>
+      </Show>
+    </div>
   );
 }
 
@@ -723,6 +758,57 @@ const MIB = 1024 * 1024;
  *  pages, each with an optional nested `auth {}` block whose fields switch on
  *  the chosen method. `pages()` reads the live array; `edit` runs a mutation
  *  against it. */
+/** A machine's `provision {}` / `playbook {}` blocks, in the order they run.
+ *  Rows jump to the block's own inspector — playbook variables are edited on
+ *  the play card, where every target is visible side by side. */
+function StepsTab(props: { machine: string }) {
+  const steps = createMemo(() => {
+    const provisions = draftProvisions()
+      .filter((p) => p.machine === props.machine)
+      .map((p) => ({
+        label: p.model.script,
+        detail: "provision",
+        onOpen: () => select({ kind: "provision", machine: props.machine, index: p.index }),
+      }));
+    const playbooks = draftPlaybooks()
+      .filter((p) => p.machine === props.machine)
+      .map((p) => ({
+        label: `${p.model.path} · ${p.model.play}`,
+        detail: p.model.vars.length ? `playbook · ${p.model.vars.length} var(s)` : "playbook",
+        onOpen: () =>
+          select({ kind: "playbook", path: p.model.path, play: p.model.play }),
+      }));
+    return [...provisions, ...playbooks];
+  });
+  return (
+    <Show
+      when={steps().length}
+      fallback={
+        <div class="inspector-note">
+          No configuration steps. Cable a playbook's play to this machine on the canvas, or
+          add a provision script — both run once this machine is ready, in the order they
+          appear in its block.
+        </div>
+      }
+    >
+      <div class="remote-attached">
+        <For each={steps()}>
+          {(step) => (
+            <button class="remote-attached-row" onClick={step.onOpen}>
+              {step.label}
+              <Badge tone="neutral">{step.detail}</Badge>
+            </button>
+          )}
+        </For>
+      </div>
+      <div class="inspector-note">
+        Steps run in declaration order once this machine is ready — reorder the blocks in
+        vmlab.wcl to change it.
+      </div>
+    </Show>
+  );
+}
+
 function WebPagesTab(props: {
   pages: () => WebPageModel[];
   edit: (fn: (list: WebPageModel[]) => void) => void;
@@ -847,6 +933,11 @@ function VmInspector(props: { index: number }) {
           { id: "network", label: "Network", count: vm().nics.length || undefined },
           { id: "sharing", label: "Shares" },
           { id: "web", label: "Web", count: vm().web.length || undefined },
+          {
+            id: "steps",
+            label: "Steps",
+            count: vm().provisions.length + vm().playbooks.length || undefined,
+          },
           { id: "overrides", label: "Overrides" },
         ]}
         active={tab()}
@@ -967,6 +1058,9 @@ function VmInspector(props: { index: number }) {
           pages={() => vm().web}
           edit={(fn) => mutate((d) => fn(d.vms[props.index].web))}
         />
+      </Show>
+      <Show when={tab() === "steps"}>
+        <StepsTab machine={vm().name} />
       </Show>
       <Show when={tab() === "overrides"}>
         <div class="inspector-note">
@@ -1215,6 +1309,11 @@ function ContainerInspector(props: { index: number }) {
           { id: "env", label: "Env", count: ctr().env.length || undefined },
           { id: "health", label: "Health" },
           { id: "web", label: "Web", count: ctr().web.length || undefined },
+          {
+            id: "steps",
+            label: "Steps",
+            count: ctr().provisions.length + ctr().playbooks.length || undefined,
+          },
         ]}
         active={tab()}
         onChange={setTab}
@@ -1398,6 +1497,9 @@ function ContainerInspector(props: { index: number }) {
           pages={() => ctr().web}
           edit={(fn) => mutate((d) => fn(d.containers[props.index].web))}
         />
+      </Show>
+      <Show when={tab() === "steps"}>
+        <StepsTab machine={ctr().name} />
       </Show>
     </>
   );

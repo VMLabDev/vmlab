@@ -71,9 +71,7 @@ import {
   addHostPort,
   addMachineDependency,
   addMachineNic,
-  addPlaybookPlay,
   addPlaybookTarget,
-  addProvisionTarget,
   addRemote,
   addSegment,
   addSegmentRoute,
@@ -86,12 +84,15 @@ import {
   removeContainer,
   removeEventHandlerTarget,
   removeMachineDependency,
-  removePlaybookCardTarget,
+  removePlaybookTarget,
   removePlaybookFolder,
   removePlaybookPlay,
   playbookGroups,
   removeProvision,
-  removeProvisionTarget,
+  draftProvisions,
+  draftPlaybooks,
+  moveProvision,
+  provisionAt,
   removeRemote,
   removeSegment,
   removeSegmentRoute,
@@ -232,8 +233,6 @@ interface ProvisionTargetDrag {
 interface PlaybookTargetDrag {
   path: string;
   play: string;
-  /** Canonical block index, or null when the play isn't referenced yet. */
-  blockIndex: number | null;
   existing: string | null;
   moved: boolean;
   x: number;
@@ -565,8 +564,8 @@ export default function TopologyCanvas(props: {
       ...model().vms.map((v) => v.name),
       ...model().containers.map((c) => c.name),
       ...model().segments.map((s) => s.name),
-      ...model().provisions.map((provision) => provision.script),
-      ...model().playbooks.map((playbook) => playbook.path),
+      ...draftProvisions().map((p) => `${p.machine}/${p.model.script}`),
+      ...draftPlaybooks().map((p) => p.model.path),
     ];
     void names.length;
     const stored = loadLayout(l);
@@ -687,20 +686,26 @@ export default function TopologyCanvas(props: {
     return links;
   });
 
+  /** One edge per provision block, to the machine that declares it. */
   const provisionLinks = createMemo(() =>
-    model().provisions.flatMap((provision, provisionIndex) =>
-      provision.vms.flatMap((targetName) => {
-        const target = machineRef(targetName);
-        return target
-          ? [{ provisionIndex, targetName, targetKind: target.kind, targetIndex: target.index }]
-          : [];
-      }),
-    ),
+    draftProvisions().flatMap((entry, provisionIndex) => {
+      const target = machineRef(entry.machine);
+      return target
+        ? [
+            {
+              provisionIndex,
+              targetName: entry.machine,
+              targetKind: target.kind,
+              targetIndex: target.index,
+            },
+          ]
+        : [];
+    }),
   );
 
   const SCRIPT_EVENT_ROW_H = 24;
   const handlersForProvision = (provisionIndex: number) => {
-    const script = model().provisions[provisionIndex]?.script;
+    const script = draftProvisions()[provisionIndex]?.model.script;
     return model().handlers
       .map((handler, handlerIndex) => ({ handler, handlerIndex }))
       .filter(({ handler }) => handler.run === script);
@@ -720,25 +725,23 @@ export default function TopologyCanvas(props: {
     return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - (to.x >= from.x ? bend : -bend)} ${to.y}, ${to.x} ${to.y}`;
   }
 
-  /** One edge per (playbook block, target) — drawn from the play's card row. */
+  /** One edge per playbook block, from the play's card row to the machine
+   *  that declares it. */
   const playbookLinks = createMemo(() =>
-    model().playbooks.flatMap((playbook, blockIndex) =>
-      playbook.vms.flatMap((targetName) => {
-        const target = machineRef(targetName);
-        return target
-          ? [
-              {
-                path: playbook.path,
-                play: playbook.play,
-                blockIndex,
-                targetName,
-                targetKind: target.kind,
-                targetIndex: target.index,
-              },
-            ]
-          : [];
-      }),
-    ),
+    draftPlaybooks().flatMap((entry) => {
+      const target = machineRef(entry.machine);
+      return target
+        ? [
+            {
+              path: entry.model.path,
+              play: entry.model.play,
+              targetName: entry.machine,
+              targetKind: target.kind,
+              targetIndex: target.index,
+            },
+          ]
+        : [];
+    }),
   );
 
   /** Output port of one play card: right edge, centred on its row. */
@@ -770,8 +773,8 @@ export default function TopologyCanvas(props: {
   const eventPort = (handlerIndex: number): NodePos | null => {
     const handler = model().handlers[handlerIndex];
     if (!handler || eventTargetKind(handler.event) === null) return null;
-    const provisionIndex = model().provisions.findIndex(
-      (provision) => provision.script === handler.run,
+    const provisionIndex = draftProvisions().findIndex(
+      (entry) => entry.model.script === handler.run,
     );
     if (provisionIndex < 0) return null;
     const row = handlersForProvision(provisionIndex).findIndex(
@@ -926,7 +929,7 @@ export default function TopologyCanvas(props: {
       const p = segPosIn(l, seg.name);
       boxes.push({ x: p.x, y: p.y, w: barWidth(seg.name), h: SEG_H });
     }
-    model().provisions.forEach((_, index) => {
+    draftProvisions().forEach((_, index) => {
       const p = provisionPosIn(l, index);
       boxes.push({ x: p.x, y: p.y, w: PROVISION_W, h: provisionCardHeight(index) });
     });
@@ -1286,7 +1289,7 @@ export default function TopologyCanvas(props: {
         : kind === "container"
           ? ctrPos(name)
           : kind === "provision"
-            ? provisionPos(model().provisions.findIndex((_, index) => provisionKey(index) === name))
+            ? provisionPos(draftProvisions().findIndex((_, index) => provisionKey(index) === name))
           : kind === "playbook"
             ? playbookNodePos(name)
           : kind === "segment"
@@ -1340,10 +1343,16 @@ export default function TopologyCanvas(props: {
     });
   }
 
+  /** Select the provision node at a flat index (its machine + position). */
+  function selectProvisionNode(provisionIndex: number) {
+    const entry = draftProvisions()[provisionIndex];
+    if (entry) select({ kind: "provision", machine: entry.machine, index: entry.index });
+  }
+
   function provisionTargetDown(e: PointerEvent, provisionIndex: number) {
     e.stopPropagation();
     if (anyVmRunning()) {
-      select({ kind: "provision", index: provisionIndex });
+      selectProvisionNode(provisionIndex);
       return;
     }
     const point = world(e);
@@ -1369,7 +1378,6 @@ export default function TopologyCanvas(props: {
     e: PointerEvent,
     path: string,
     play: string,
-    blockIndex: number | null,
   ) {
     e.stopPropagation();
     if (anyVmRunning()) {
@@ -1377,12 +1385,12 @@ export default function TopologyCanvas(props: {
       return;
     }
     const point = world(e);
-    setPlaybookTargetDrag({ path, play, blockIndex, existing: null, moved: false, ...point });
+    setPlaybookTargetDrag({ path, play, existing: null, moved: false, ...point });
   }
 
   function playbookLinkGrab(
     e: PointerEvent,
-    link: { path: string; play: string; blockIndex: number; targetName: string },
+    link: { path: string; play: string; targetName: string },
   ) {
     e.stopPropagation();
     if (anyVmRunning()) return;
@@ -1390,7 +1398,6 @@ export default function TopologyCanvas(props: {
     setPlaybookTargetDrag({
       path: link.path,
       play: link.play,
-      blockIndex: link.blockIndex,
       existing: link.targetName,
       moved: false,
       ...point,
@@ -1623,8 +1630,8 @@ export default function TopologyCanvas(props: {
           const i = model().containers.findIndex((c) => c.name === d.name);
           if (i >= 0) select({ kind: "container", index: i });
         } else if (d.kind === "provision") {
-          const index = model().provisions.findIndex((_, i) => provisionKey(i) === d.name);
-          if (index >= 0) select({ kind: "provision", index });
+          const entry = draftProvisions().find((_, i) => provisionKey(i) === d.name);
+          if (entry) select({ kind: "provision", machine: entry.machine, index: entry.index });
         } else if (d.kind === "playbook") {
           select({ kind: "playbook", path: d.name });
         } else if (d.kind === "segment") {
@@ -1686,16 +1693,16 @@ export default function TopologyCanvas(props: {
     if (pd) {
       setProvisionTargetDrag(null);
       if (!pd.moved) {
-        select({ kind: "provision", index: pd.provisionIndex });
+        selectProvisionNode(pd.provisionIndex);
         return;
       }
       const point = world(e);
       const target = machineTargetAt(point.x, point.y);
       const targetName = target ? machinesOf(target.kind)[target.index]?.name ?? null : null;
-      if (pd.existing && targetName !== pd.existing) {
-        removeProvisionTarget(pd.provisionIndex, pd.existing);
-      }
-      if (targetName) addProvisionTarget(pd.provisionIndex, targetName);
+      // A provision runs on exactly one machine, so dropping its edge on
+      // another machine moves the block; dropping on empty canvas keeps it.
+      const entry = draftProvisions()[pd.provisionIndex];
+      if (entry && targetName) moveProvision(entry.machine, entry.index, targetName);
       return;
     }
     const pbd = playbookTargetDrag();
@@ -1708,19 +1715,12 @@ export default function TopologyCanvas(props: {
       const point = world(e);
       const target = machineTargetAt(point.x, point.y);
       const targetName = target ? machinesOf(target.kind)[target.index]?.name ?? null : null;
-      // Detaching the last edge deletes the play's block (an unconnected
-      // play is "not run" — never an implicit empty-vms all-machines block).
-      if (pbd.existing && targetName !== pbd.existing && pbd.blockIndex !== null) {
-        removePlaybookCardTarget(pbd.blockIndex, pbd.existing);
+      // Detaching an edge removes that machine's block — an unconnected
+      // play is simply not declared anywhere.
+      if (pbd.existing && targetName !== pbd.existing) {
+        removePlaybookTarget(pbd.path, pbd.play, pbd.existing);
       }
-      if (targetName) {
-        // Re-resolve: the detach above may have removed/shifted the block.
-        const blockIndex = model().playbooks.findIndex(
-          (playbook) => playbook.path === pbd.path && playbook.play === pbd.play,
-        );
-        if (blockIndex >= 0) addPlaybookTarget(blockIndex, targetName);
-        else addPlaybookPlay(pbd.path, pbd.play, targetName);
-      }
+      if (targetName) addPlaybookTarget(pbd.path, pbd.play, targetName);
       return;
     }
     const ed = eventTargetDrag();
@@ -1867,22 +1867,22 @@ export default function TopologyCanvas(props: {
         removeSegment(sel.index);
       }
     } else if (sel.kind === "provision") {
-      const provision = model().provisions[sel.index];
+      const entry = provisionAt(sel.machine, sel.index);
       if (
-        provision &&
+        entry &&
         (await confirmDialog({
-          title: `Delete provision "${provision.script}"?`,
-          body: "The script file will be preserved.",
+          title: `Delete provision "${entry.model.script}"?`,
+          body: `The block will be removed from "${sel.machine}"; the script file is preserved.`,
           danger: true,
         }))
       ) {
-        removeProvision(sel.index);
+        removeProvision(sel.machine, sel.index);
       }
     } else if (sel.kind === "playbook") {
       if (sel.play !== undefined) {
         // A play card: only its block(s) go — the folder node stays.
-        const hasBlock = model().playbooks.some(
-          (playbook) => playbook.path === sel.path && playbook.play === sel.play,
+        const hasBlock = draftPlaybooks().some(
+          (block) => block.model.path === sel.path && block.model.play === sel.play,
         );
         if (
           hasBlock &&
@@ -1949,7 +1949,7 @@ export default function TopologyCanvas(props: {
       xs.push(p.x, p.x + barWidth(s.name));
       ys.push(p.y, p.y + SEG_H);
     }
-    model().provisions.forEach((_, index) => {
+    draftProvisions().forEach((_, index) => {
       const p = provisionPos(index);
       xs.push(p.x, p.x + PROVISION_W);
       ys.push(p.y, p.y + provisionCardHeight(index));
@@ -2091,8 +2091,16 @@ export default function TopologyCanvas(props: {
       : null;
   const selectedSeg = () =>
     editor.selection.kind === "segment" ? model().segments[editor.selection.index]?.name : null;
-  const selectedProvision = () =>
-    editor.selection.kind === "provision" ? editor.selection.index : null;
+  /** Flat canvas index of the selected provision node (the selection
+   *  addresses it as machine + per-machine index). */
+  const selectedProvision = () => {
+    const sel = editor.selection;
+    if (sel.kind !== "provision") return null;
+    const at = draftProvisions().findIndex(
+      (entry) => entry.machine === sel.machine && entry.index === sel.index,
+    );
+    return at < 0 ? null : at;
+  };
   const selectedPlaybook = () =>
     editor.selection.kind === "playbook" ? editor.selection.path : null;
   const selectedPlay = () =>
@@ -2690,7 +2698,7 @@ export default function TopologyCanvas(props: {
                       <title>
                         {anyVmRunning()
                           ? "Configuration is locked while a machine is up"
-                          : `${model().provisions[link.provisionIndex]?.script} applies to ${link.targetName} — drag to re-home or remove`}
+                          : `${draftProvisions()[link.provisionIndex]?.model.script} runs on ${link.targetName} — drag to re-home`}
                       </title>
                     </path>
                     <path
@@ -3368,24 +3376,17 @@ export default function TopologyCanvas(props: {
             </Show>
           </g>
 
-          {/* Provision scripts are lab-owned workflow nodes. Empty scope is
-              intentionally shown as LAB-WIDE rather than drawing an edge to
-              every machine. */}
-          <For each={model().provisions}>
-            {(provision, index) => {
+          {/* One node per `provision {}` block; its edge goes to the machine
+              that declares it. */}
+          <For each={draftProvisions()}>
+            {(entry, index) => {
+              const script = () => entry.model.script;
               const p = () => provisionPos(index());
               const key = () => provisionKey(index());
-              const file = () => provision.script.split("/").pop() || provision.script;
+              const file = () => script().split("/").pop() || script();
               const directory = () =>
-                provision.script.includes("/")
-                  ? provision.script.slice(0, provision.script.lastIndexOf("/"))
-                  : ".";
-              const badge = () =>
-                provision.vms.length
-                  ? `${provision.vms.length} TARGETED`
-                  : provision.lab_wide
-                    ? "LAB-WIDE"
-                    : "NOT RUN";
+                script().includes("/") ? script().slice(0, script().lastIndexOf("/")) : ".";
+              const badge = () => entry.machine.toUpperCase();
               return (
                 <g
                   class="topo-provision"
@@ -3411,7 +3412,7 @@ export default function TopologyCanvas(props: {
                   </text>
                   <text class="topo-provision-name" x={p().x + 38} y={p().y + 34}>
                     {file().length > 23 ? `${file().slice(0, 22)}…` : file()}
-                    <title>{provision.script}</title>
+                    <title>{script()}</title>
                   </text>
                   <text class="topo-provision-path" x={p().x + 12} y={p().y + 53}>
                     {directory().length > 24 ? `…${directory().slice(-23)}` : directory()}
@@ -3427,7 +3428,7 @@ export default function TopologyCanvas(props: {
                     onPointerDown={(event: PointerEvent) => event.stopPropagation()}
                     onClick={(event: MouseEvent) => {
                       event.stopPropagation();
-                      if (!anyVmRunning()) props.onEditProvision(provision.script);
+                      if (!anyVmRunning()) props.onEditProvision(script());
                     }}
                   >
                     <rect width="20" height="20" rx="5" />
@@ -3605,16 +3606,12 @@ export default function TopologyCanvas(props: {
                     {(card, row) => {
                       const y = () => p().y + PLAYBOOK_HEADER_H + row() * PLAY_ROW_H;
                       const scope = () =>
-                        card.allMachines
-                          ? "ALL MACHINES"
-                          : card.targets.length
-                            ? `${card.targets.length}`
-                            : "NO TARGETS";
+                        card.targets.length ? `${card.targets.length}` : "NO TARGETS";
                       const warn = () =>
                         card.missingFromFolder
                           ? "referenced in vmlab.wcl but not defined in playbook.wcl"
-                          : card.duplicateBlockIndexes.length
-                            ? "duplicate playbook blocks in vmlab.wcl — merge in the inspector"
+                          : card.targets.some((t) => t.duplicateIndexes.length)
+                            ? "a machine declares this play twice — merge in the inspector"
                             : null;
                       const dragActive = () => {
                         const drag = playbookTargetDrag();
@@ -3627,7 +3624,7 @@ export default function TopologyCanvas(props: {
                             selected:
                               selectedPlaybook() === group.path &&
                               selectedPlay() === card.play,
-                            inactive: card.blockIndex === null,
+                            inactive: card.targets.length === 0,
                             warn: warn() !== null,
                           }}
                         >
@@ -3649,7 +3646,7 @@ export default function TopologyCanvas(props: {
                             class="topo-playbook-port"
                             classList={{ active: dragActive(), locked: anyVmRunning() }}
                             onPointerDown={(event: PointerEvent) =>
-                              playbookTargetDown(event, group.path, card.play, card.blockIndex)
+                              playbookTargetDown(event, group.path, card.play)
                             }
                           >
                             <circle

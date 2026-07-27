@@ -988,10 +988,9 @@ export function dismissPlaybookOp(machine: string) {
   setState("playbookOps", `${lab}/${machine}`, undefined as unknown as PlaybookOp);
 }
 
-/** The declared playbooks targeting one machine (`all_machines`, or named
- *  in `vms` — a block with neither targets nothing). */
+/** The playbook blocks this machine declares — the plays that converge it. */
 export function playbooksFor(machine: string): PlaybookInfo[] {
-  return state.playbooks.filter((p) => p.all_machines || p.vms.includes(machine));
+  return state.playbooks.filter((p) => p.machine === machine);
 }
 
 /** The live (or last settled, undismissed) run for one machine. */

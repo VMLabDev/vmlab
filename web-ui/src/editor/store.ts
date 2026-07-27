@@ -13,13 +13,22 @@ import type {
   HandlerModel,
   LabModel,
   PlaybookModel,
+  PlaybookVarModel,
   ProvisionModel,
   Span,
   TemplateSummary,
   VmModel,
   SegmentModel,
 } from "./model";
-import { deepClone, emptyContainer, emptySegment, emptyVm, uniqueName } from "./model";
+import {
+  deepClone,
+  emptyContainer,
+  emptyPlaybook,
+  emptyPlaybookVar,
+  emptySegment,
+  emptyVm,
+  uniqueName,
+} from "./model";
 import { buildOps } from "./ops";
 
 export type Selection =
@@ -27,7 +36,9 @@ export type Selection =
   | { kind: "segment"; index: number }
   | { kind: "vm"; index: number }
   | { kind: "container"; index: number }
-  | { kind: "provision"; index: number }
+  /** A `provision {}` block, addressed by its machine and its position in
+   *  that machine's list. */
+  | { kind: "provision"; machine: string; index: number }
   /** A playbook folder node (`play` unset) or one play card inside it. */
   | { kind: "playbook"; path: string; play?: string }
   | { kind: "nat" }
@@ -446,41 +457,135 @@ export function addSegment(): number {
   return index;
 }
 
-export function addProvision(script: string): number {
+// --- per-machine configuration steps -------------------------------------------
+//
+// `provision {}` and `playbook {}` blocks live inside the vm/container they
+// configure — the machine IS the target, and a machine's steps run in the
+// order its blocks appear. The canvas still draws one node per script/folder,
+// so these helpers flatten every machine's steps into one addressable list.
+
+/** One configuration step with the machine that declares it. */
+export interface StepRef<T> {
+  /** Machine name — the step's target. */
+  machine: string;
+  kind: MachineKind;
+  /** Index of the machine in `draft.vms` / `draft.containers`. */
+  machineIndex: number;
+  /** Index of the step within that machine's list. */
+  index: number;
+  model: T;
+}
+
+function machineEntries(): { name: string; kind: MachineKind; index: number }[] {
   const draft = editor.draft;
-  if (!draft) return -1;
-  // Lab-wide by default: a script you just added should run. Cabling it to
-  // machines narrows the scope (and clears the flag).
-  setEditor("draft", "provisions", draft.provisions.length, {
+  if (!draft) return [];
+  return [
+    ...draft.vms.map((v, index) => ({ name: v.name, kind: "vm" as const, index })),
+    ...draft.containers.map((c, index) => ({
+      name: c.name,
+      kind: "container" as const,
+      index,
+    })),
+  ];
+}
+
+function stepsOf(kind: MachineKind, index: number) {
+  const draft = editor.draft;
+  return kind === "vm" ? draft?.vms[index] : draft?.containers[index];
+}
+
+const collectionKey = (kind: MachineKind) => (kind === "vm" ? "vms" : "containers");
+
+/** Every `provision {}` block in the lab, with its owning machine. */
+export function draftProvisions(): StepRef<ProvisionModel>[] {
+  return machineEntries().flatMap((m) =>
+    (stepsOf(m.kind, m.index)?.provisions ?? []).map((model, index) => ({
+      machine: m.name,
+      kind: m.kind,
+      machineIndex: m.index,
+      index,
+      model,
+    })),
+  );
+}
+
+/** Every `playbook {}` block in the lab, with its owning machine. */
+export function draftPlaybooks(): StepRef<PlaybookModel>[] {
+  return machineEntries().flatMap((m) =>
+    (stepsOf(m.kind, m.index)?.playbooks ?? []).map((model, index) => ({
+      machine: m.name,
+      kind: m.kind,
+      machineIndex: m.index,
+      index,
+      model,
+    })),
+  );
+}
+
+/** Resolve a `{machine, index}` provision selection against the draft. */
+export function provisionAt(machine: string, index: number): StepRef<ProvisionModel> | undefined {
+  return draftProvisions().find((p) => p.machine === machine && p.index === index);
+}
+
+/** Add a provision script to one machine and select it. */
+export function addProvision(script: string, machine: string): number {
+  const m = machineEntries().find((entry) => entry.name === machine);
+  if (!m) return -1;
+  const list = stepsOf(m.kind, m.index)?.provisions ?? [];
+  const index = list.length;
+  setEditor("draft", collectionKey(m.kind), m.index, "provisions", index, {
     span: null,
     script,
-    vms: [],
-    lab_wide: true,
   });
-  const index = editor.draft!.provisions.length - 1;
-  select({ kind: "provision", index });
+  select({ kind: "provision", machine, index });
   return index;
 }
 
-export function removeProvision(index: number) {
+/** Re-home a provision block: it runs on exactly one machine, so dragging
+ *  its edge to another machine moves the block rather than adding a target. */
+export function moveProvision(machine: string, index: number, to: string) {
+  if (machine === to) return;
+  const from = provisionAt(machine, index);
+  const dest = machineEntries().find((entry) => entry.name === to);
+  if (!from || !dest) return;
+  const script = from.model.script;
+  removeProvisionBlock(machine, index);
+  const list = stepsOf(dest.kind, dest.index)?.provisions ?? [];
+  setEditor("draft", collectionKey(dest.kind), dest.index, "provisions", list.length, {
+    span: null,
+    script,
+  });
+  select({ kind: "provision", machine: to, index: list.length });
+}
+
+/** Splice one provision out of its machine, leaving the selection alone. */
+function removeProvisionBlock(machine: string, index: number) {
+  const m = machineEntries().find((entry) => entry.name === machine);
+  if (!m) return;
   setEditor(
     "draft",
+    collectionKey(m.kind),
+    m.index,
     "provisions",
     produce((provisions: ProvisionModel[]) => {
       provisions.splice(index, 1);
     }),
   );
+}
+
+export function removeProvision(machine: string, index: number) {
+  removeProvisionBlock(machine, index);
   select({ kind: "lab" });
 }
 
 // --- playbook folder nodes -----------------------------------------------------
 //
 // The canvas shows one node per playbook *folder* with a card per play; the
-// WCL stays one `playbook {}` block per (path, play). A block with neither
-// `vms` nor `all_machines` is legal and inert — it declares the play without
-// running it, which is what "Add playbook" writes before anything is cabled.
-// Folder nodes with no block at all (`editor.playbookDrafts`) only linger for
-// configs written before that.
+// WCL stays one `playbook {}` block per (machine, path, play), living inside
+// the machine that runs it. A play cabled to nothing has no block anywhere, so
+// its folder node survives as a draft entry (`editor.playbookDrafts`) and its
+// play as a draft card (`editor.playbookPlayDrafts`) — that is what
+// "Add playbook" writes before anything is cabled.
 
 const playbooksKey = (lab: string) => `vmlab.editor.playbooks.${lab}`;
 
@@ -527,25 +632,34 @@ export async function fetchPlays(path: string) {
 /** Refresh play enumerations for every folder the draft references. */
 function fetchAllPlays() {
   const paths = new Set([
-    ...(editor.draft?.playbooks ?? []).map((p) => p.path),
+    ...draftPlaybooks().map((p) => p.model.path),
     ...editor.playbookDrafts,
   ]);
   for (const path of paths) void fetchPlays(path);
 }
 
-/** One play row inside a playbook folder node. */
+/** One play row inside a playbook folder node. Its targets are the machines
+ *  that declare a block for this (folder, play) — one block each, so a target
+ *  carries that machine's own variable overrides. */
 export interface PlayCard {
   play: string;
   description: string | null;
-  /** Canonical block index in draft.playbooks, or null when unreferenced. */
-  blockIndex: number | null;
-  targets: string[];
-  /** Block opted into `all_machines` — runs on every machine. */
-  allMachines: boolean;
+  targets: PlayTarget[];
   /** Referenced in vmlab.wcl but not defined in the folder's playbook.wcl. */
   missingFromFolder: boolean;
-  /** Extra blocks sharing this (path, play) — flagged, mergeable. */
-  duplicateBlockIndexes: number[];
+}
+
+/** One machine running a play, and the block that says so. */
+export interface PlayTarget {
+  machine: string;
+  kind: MachineKind;
+  machineIndex: number;
+  /** Index of the block in that machine's `playbooks` list. */
+  index: number;
+  vars: PlaybookVarModel[];
+  /** Extra blocks on the same machine for this (folder, play) — flagged and
+   *  mergeable; a machine only ever needs one. */
+  duplicateIndexes: number[];
 }
 
 export interface PlaybookGroup {
@@ -559,69 +673,61 @@ export interface PlaybookGroup {
  *  blocks plus unattached drafts, each carrying a card per play (enumerated
  *  from the folder, in file order, then block-only plays flagged). */
 export function playbookGroups(): PlaybookGroup[] {
-  const draft = editor.draft;
-  if (!draft) return [];
-  const paths = [
-    ...new Set([...draft.playbooks.map((p) => p.path), ...editor.playbookDrafts]),
-  ];
+  if (!editor.draft) return [];
+  const blocks = draftPlaybooks();
+  const paths = [...new Set([...blocks.map((b) => b.model.path), ...editor.playbookDrafts])];
   return paths.map((path) => {
     const info = editor.playbookPlays[path];
     const scanned = typeof info === "object" && info.exists && !info.error;
-    const cards: PlayCard[] = (typeof info === "object" ? info.plays : []).map((p) => ({
-      play: p.name,
-      description: p.description,
-      blockIndex: null,
+    const card = (play: string, description: string | null, missing: boolean): PlayCard => ({
+      play,
+      description,
       targets: [],
-      allMachines: false,
-      missingFromFolder: false,
-      duplicateBlockIndexes: [],
-    }));
-    for (const play of editor.playbookPlayDrafts[path] ?? []) {
-      if (cards.some((c) => c.play === play)) continue;
-      cards.push({
-        play,
-        description: null,
-        blockIndex: null,
-        targets: [],
-        allMachines: false,
-        missingFromFolder: false,
-        duplicateBlockIndexes: [],
-      });
-    }
-    draft.playbooks.forEach((block, index) => {
-      if (block.path !== path) return;
-      let card = cards.find((c) => c.play === block.play);
-      if (!card) {
-        card = {
-          play: block.play,
-          description: null,
-          blockIndex: null,
-          targets: [],
-          allMachines: false,
-          // Only a completed scan can say the play is genuinely absent.
-          missingFromFolder: scanned,
-          duplicateBlockIndexes: [],
-        };
-        cards.push(card);
-      }
-      if (card.blockIndex === null) {
-        card.blockIndex = index;
-        card.targets = block.vms;
-        card.allMachines = block.all_machines;
-      } else {
-        card.duplicateBlockIndexes.push(index);
-      }
+      missingFromFolder: missing,
     });
+    const cards: PlayCard[] = (typeof info === "object" ? info.plays : []).map((p) =>
+      card(p.name, p.description, false),
+    );
+    for (const play of editor.playbookPlayDrafts[path] ?? []) {
+      if (!cards.some((c) => c.play === play)) cards.push(card(play, null, false));
+    }
+    for (const block of blocks) {
+      if (block.model.path !== path) continue;
+      let row = cards.find((c) => c.play === block.model.play);
+      if (!row) {
+        // Only a completed scan can say the play is genuinely absent.
+        row = card(block.model.play, null, scanned);
+        cards.push(row);
+      }
+      const existing = row.targets.find((t) => t.machine === block.machine);
+      if (existing) {
+        existing.duplicateIndexes.push(block.index);
+      } else {
+        row.targets.push({
+          machine: block.machine,
+          kind: block.kind,
+          machineIndex: block.machineIndex,
+          index: block.index,
+          vars: block.model.vars,
+          duplicateIndexes: [],
+        });
+      }
+    }
     return { path, cards, plays: info };
   });
+}
+
+/** The card for one (folder, play), if the designer knows about it. */
+export function playCard(path: string, play: string): PlayCard | undefined {
+  return playbookGroup(path)?.cards.find((c) => c.play === play);
 }
 
 export function playbookGroup(path: string): PlaybookGroup | undefined {
   return playbookGroups().find((group) => group.path === path);
 }
 
-/** Hand-add a play card (inspector "Add play") — visual only until it is
- *  connected to a machine or toggled all-machines. */
+/** Hand-add a play card (inspector "Add play") — visual only until a machine
+ *  is cabled to it. */
 export function addPlaybookPlayDraft(path: string, play: string) {
   if (!play || playbookGroup(path)?.cards.some((card) => card.play === play)) return;
   setEditor("playbookPlayDrafts", path, [
@@ -641,34 +747,50 @@ export function addPlaybook(path: string) {
   void fetchPlays(path);
 }
 
-/** Toolbar "Add playbook": declare `playbook "<path>" { play = "<play>" }`
- *  for a folder that was just scaffolded on disk. The block targets nothing
- *  until a machine is cabled to its card, so it is inert on `up`. */
+/** Toolbar "Add playbook": remember a folder that was just scaffolded on
+ *  disk, along with the play to show. Nothing reaches vmlab.wcl until a
+ *  machine is cabled to the play's card — the machine is what declares it. */
 export function addPlaybookWithPlay(path: string, play: string) {
-  const draft = editor.draft;
-  if (!draft) return;
-  if (!draft.playbooks.some((p) => p.path === path && p.play === play)) {
-    setEditor("draft", "playbooks", draft.playbooks.length, {
-      span: null,
-      path,
-      play,
-      vms: [],
-      all_machines: false,
-    });
+  if (!editor.draft) return;
+  if (!editor.playbookDrafts.includes(path)) {
+    setEditor("playbookDrafts", editor.playbookDrafts.length, path);
+    persistPlaybookDrafts();
   }
+  addPlaybookPlayDraft(path, play);
   select({ kind: "playbook", path });
   void fetchPlays(path);
 }
 
-/** Delete the whole folder node: every block with that path + the draft entry. */
-export function removePlaybookFolder(path: string) {
-  setEditor(
-    "draft",
-    produce((d: LabModel | null) => {
-      if (!d) return;
-      d.playbooks = d.playbooks.filter((p) => p.path !== path);
-    }),
+/** Every machine's blocks for one folder path, newest last. */
+function blocksForPath(path: string, play?: string) {
+  return draftPlaybooks().filter(
+    (b) => b.model.path === path && (play === undefined || b.model.play === play),
   );
+}
+
+/** Drop a set of blocks, removing the highest indexes first so the earlier
+ *  ones stay addressable while we splice. */
+function dropBlocks(blocks: StepRef<PlaybookModel>[]) {
+  const ordered = [...blocks].sort(
+    (a, b) => b.machineIndex - a.machineIndex || b.index - a.index,
+  );
+  for (const block of ordered) {
+    setEditor(
+      "draft",
+      collectionKey(block.kind),
+      block.machineIndex,
+      "playbooks",
+      produce((list: PlaybookModel[]) => {
+        list.splice(block.index, 1);
+      }),
+    );
+  }
+}
+
+/** Delete the whole folder node: every machine's blocks for that path, plus
+ *  the draft entry. */
+export function removePlaybookFolder(path: string) {
+  dropBlocks(blocksForPath(path));
   setEditor(
     "playbookDrafts",
     editor.playbookDrafts.filter((p) => p !== path),
@@ -678,92 +800,66 @@ export function removePlaybookFolder(path: string) {
   select({ kind: "lab" });
 }
 
-/** First connection of an unreferenced play: create its block. */
-export function addPlaybookPlay(path: string, play: string, target: string) {
-  const draft = editor.draft;
-  if (!draft || !machineNames().includes(target)) return;
-  setEditor("draft", "playbooks", draft.playbooks.length, {
-    span: null,
-    path,
-    play,
-    vms: [target],
-    all_machines: false,
-  });
-}
-
-/** Detach one target. The block survives its last edge — with no `vms` and
- *  no `all_machines` it is declared but not run; "Stop" deletes it. */
-export function removePlaybookCardTarget(blockIndex: number, target: string) {
-  const playbook = editor.draft?.playbooks[blockIndex];
-  if (!playbook) return;
+/** Cable a play to a machine: declare the block inside that machine. */
+export function addPlaybookTarget(path: string, play: string, target: string) {
+  const m = machineEntries().find((entry) => entry.name === target);
+  if (!m) return;
+  const list = stepsOf(m.kind, m.index)?.playbooks ?? [];
+  if (list.some((p) => p.path === path && p.play === play)) return;
   setEditor(
     "draft",
+    collectionKey(m.kind),
+    m.index,
     "playbooks",
-    blockIndex,
-    "vms",
-    playbook.vms.filter((name) => name !== target),
+    list.length,
+    emptyPlaybook(path, play),
   );
 }
 
-/** Remove every block for one (path, play) — the play stops running; the
- *  folder node stays on the canvas. */
-export function removePlaybookPlay(path: string, play: string) {
-  setEditor(
-    "draft",
-    produce((d: LabModel | null) => {
-      if (!d) return;
-      d.playbooks = d.playbooks.filter((p) => p.path !== path || p.play !== play);
-    }),
-  );
-  if (
-    !editor.draft?.playbooks.some((p) => p.path === path) &&
-    !editor.playbookDrafts.includes(path)
-  ) {
+/** Uncable one machine: its block for this play (and any duplicates) goes.
+ *  The folder node stays on the canvas as a draft entry. */
+export function removePlaybookTarget(path: string, play: string, target: string) {
+  dropBlocks(blocksForPath(path, play).filter((b) => b.machine === target));
+  keepFolderNode(path);
+}
+
+/** A folder with no blocks left would vanish from the canvas — keep it as a
+ *  draft node so the user can re-cable it. */
+function keepFolderNode(path: string) {
+  if (!blocksForPath(path).length && !editor.playbookDrafts.includes(path)) {
     setEditor("playbookDrafts", editor.playbookDrafts.length, path);
     persistPlaybookDrafts();
   }
 }
 
-/** Explicit "run on every machine": the block's `all_machines` flag, which
- *  replaces any per-machine targets. Turning it off leaves the block
- *  declared but target-less (so it stops running). */
-export function setPlaybookAllMachines(path: string, play: string, on: boolean) {
-  const draft = editor.draft;
-  if (!draft) return;
-  const index = draft.playbooks.findIndex((p) => p.path === path && p.play === play);
-  if (index >= 0) {
-    setEditor("draft", "playbooks", index, "all_machines", on);
-    if (on) setEditor("draft", "playbooks", index, "vms", []);
-  } else if (on) {
-    setEditor("draft", "playbooks", draft.playbooks.length, {
-      span: null,
-      path,
-      play,
-      vms: [],
-      all_machines: true,
-    });
-  }
+/** Remove every block for one (path, play) — the play stops running
+ *  everywhere; the folder node stays on the canvas. */
+export function removePlaybookPlay(path: string, play: string) {
+  dropBlocks(blocksForPath(path, play));
+  keepFolderNode(path);
 }
 
-/** Re-path a folder node: rewrite every block in the group, the draft entry,
+/** Re-path a folder node: rewrite every machine's blocks, the draft entry,
  *  the selection, and refresh the enumeration. Renaming onto an existing
  *  node merges. */
 export function renamePlaybookPath(from: string, to: string) {
   if (from === to || !to) return;
-  setEditor(
-    "draft",
-    produce((d: LabModel | null) => {
-      if (!d) return;
-      for (const p of d.playbooks) {
-        if (p.path === from) p.path = to;
-      }
-    }),
-  );
+  for (const block of blocksForPath(from)) {
+    setEditor(
+      "draft",
+      collectionKey(block.kind),
+      block.machineIndex,
+      "playbooks",
+      block.index,
+      "path",
+      to,
+    );
+  }
   setEditor(
     "playbookDrafts",
     editor.playbookDrafts.filter((p) => p !== from && p !== to).concat(
       // Keep a draft entry only while no block references the new path.
-      editor.draft?.playbooks.some((p) => p.path === to) ? [] : [to],
+      blocksForPath(to).length ? [] : [to],
     ),
   );
   const playDrafts = editor.playbookPlayDrafts[from];
@@ -785,22 +881,70 @@ export function renamePlaybookPath(from: string, to: string) {
 
 let renameFetchTimer: ReturnType<typeof setTimeout> | undefined;
 
-/** Collapse duplicate (path, play) blocks: union their targets into the
- *  first block and drop the extras. */
-export function mergePlaybookDuplicates(path: string, play: string) {
+/** Collapse a machine's duplicate blocks for one (path, play): merge their
+ *  variables into the first (earlier blocks win on a name clash, matching
+ *  the order config-weave would see) and drop the extras. */
+export function mergePlaybookDuplicates(path: string, play: string, machine: string) {
+  const dupes = blocksForPath(path, play).filter((b) => b.machine === machine);
+  const first = dupes[0];
+  if (!first || dupes.length < 2) return;
+  const merged: PlaybookVarModel[] = [];
+  for (const block of dupes) {
+    for (const v of block.model.vars) {
+      if (!merged.some((existing) => existing.name === v.name)) merged.push({ ...v, span: null });
+    }
+  }
+  dropBlocks(dupes.slice(1));
   setEditor(
     "draft",
-    produce((d: LabModel | null) => {
-      if (!d) return;
-      const dupes = d.playbooks.filter((p) => p.path === path && p.play === play);
-      const first = dupes[0];
-      if (!first || dupes.length < 2) return;
-      // An all-machines block subsumes the others' explicit targets.
-      first.all_machines = dupes.some((p) => p.all_machines);
-      first.vms = first.all_machines ? [] : [...new Set(dupes.flatMap((p) => p.vms))];
-      d.playbooks = d.playbooks.filter((p) => p === first || p.path !== path || p.play !== play);
-    }),
+    collectionKey(first.kind),
+    first.machineIndex,
+    "playbooks",
+    first.index,
+    "vars",
+    merged,
   );
+}
+
+// --- playbook variables ---------------------------------------------------------
+
+/** Mutate one machine's `playbook {}` variable list in place. */
+function withVars(target: PlayTarget, f: (vars: PlaybookVarModel[]) => void) {
+  setEditor(
+    "draft",
+    collectionKey(target.kind),
+    target.machineIndex,
+    "playbooks",
+    target.index,
+    "vars",
+    produce(f),
+  );
+}
+
+/** Append a blank variable row for the user to fill in. It stays a pending
+ *  edit until it has both a name and a value (see `writable` in ops.ts). */
+export function addPlaybookVar(target: PlayTarget) {
+  withVars(target, (vars) => {
+    vars.push(emptyPlaybookVar());
+  });
+}
+
+export function setPlaybookVarName(target: PlayTarget, index: number, name: string) {
+  withVars(target, (vars) => {
+    if (vars[index]) vars[index].name = name;
+  });
+}
+
+export function setPlaybookVarValue(target: PlayTarget, index: number, value: string) {
+  withVars(target, (vars) => {
+    if (vars[index]) vars[index].value = value;
+  });
+}
+
+export function removePlaybookVar(target: PlayTarget, index: number) {
+  withVars(target, (vars) => {
+    vars.splice(index, 1);
+  });
 }
 
 export function removeVm(index: number) {
@@ -809,15 +953,10 @@ export function removeVm(index: number) {
     produce((draft: LabModel | null) => {
       const removed = draft?.vms[index]?.name;
       if (!draft || !removed) return;
+      // The machine's own provision/playbook blocks go with it.
       draft.vms.splice(index, 1);
       for (const machine of [...draft.vms, ...draft.containers]) {
         machine.depends_on = machine.depends_on.filter((name) => name !== removed);
-      }
-      for (const provision of draft.provisions) {
-        provision.vms = provision.vms.filter((name) => name !== removed);
-      }
-      for (const playbook of draft.playbooks) {
-        playbook.vms = playbook.vms.filter((name) => name !== removed);
       }
       for (const handler of draft.handlers) {
         handler.targets = handler.targets.filter((name) => name !== removed);
@@ -833,15 +972,10 @@ export function removeContainer(index: number) {
     produce((draft: LabModel | null) => {
       const removed = draft?.containers[index]?.name;
       if (!draft || !removed) return;
+      // The container's own provision/playbook blocks go with it.
       draft.containers.splice(index, 1);
       for (const machine of [...draft.vms, ...draft.containers]) {
         machine.depends_on = machine.depends_on.filter((name) => name !== removed);
-      }
-      for (const provision of draft.provisions) {
-        provision.vms = provision.vms.filter((name) => name !== removed);
-      }
-      for (const playbook of draft.playbooks) {
-        playbook.vms = playbook.vms.filter((name) => name !== removed);
       }
       for (const handler of draft.handlers) {
         handler.targets = handler.targets.filter((name) => name !== removed);
@@ -889,42 +1023,6 @@ export function removeMachineDependency(kind: MachineKind, index: number, target
   else setEditor("draft", "containers", index, "depends_on", next);
 }
 
-export function addProvisionTarget(index: number, target: string) {
-  const provision = editor.draft?.provisions[index];
-  if (!provision || provision.vms.includes(target) || !machineNames().includes(target)) return;
-  // `vms` and `lab_wide` are mutually exclusive; scoping wins.
-  setEditor("draft", "provisions", index, "lab_wide", false);
-  setEditor("draft", "provisions", index, "vms", [...provision.vms, target]);
-}
-
-/** Explicit "runs once for the whole lab". Setting it drops any per-machine
- *  scope (the two are mutually exclusive); clearing it leaves a script that
- *  is declared but not run until it is cabled to machines. */
-export function setProvisionLabWide(index: number, on: boolean) {
-  if (!editor.draft?.provisions[index]) return;
-  setEditor("draft", "provisions", index, "lab_wide", on);
-  if (on) setEditor("draft", "provisions", index, "vms", []);
-}
-
-export function removeProvisionTarget(index: number, target: string) {
-  const provision = editor.draft?.provisions[index];
-  if (!provision) return;
-  setEditor(
-    "draft",
-    "provisions",
-    index,
-    "vms",
-    provision.vms.filter((name) => name !== target),
-  );
-}
-
-export function addPlaybookTarget(index: number, target: string) {
-  const playbook = editor.draft?.playbooks[index];
-  if (!playbook || playbook.vms.includes(target) || !machineNames().includes(target)) return;
-  // `vms` and `all_machines` are mutually exclusive; naming a machine wins.
-  setEditor("draft", "playbooks", index, "all_machines", false);
-  setEditor("draft", "playbooks", index, "vms", [...playbook.vms, target]);
-}
 
 export function addScriptEventHandler(script: string, event: string): number {
   const draft = editor.draft;
@@ -1125,19 +1223,14 @@ export function setSegmentNat(index: number, on: boolean) {
 }
 
 /** Rewrite every name reference shared by VMs and containers (depends_on
- *  spans both, provisions and forwards target machines by name). */
+ *  spans both, handlers and forwards target machines by name). Configuration
+ *  steps need no rewrite — they live inside the machine they target. */
 function rewriteMachineRefs(d: LabModel, from: string, to: string) {
   for (const vm of d.vms) {
     vm.depends_on = vm.depends_on.map((n) => (n === from ? to : n));
   }
   for (const c of d.containers) {
     c.depends_on = c.depends_on.map((n) => (n === from ? to : n));
-  }
-  for (const p of d.provisions) {
-    p.vms = p.vms.map((n) => (n === from ? to : n));
-  }
-  for (const p of d.playbooks) {
-    p.vms = p.vms.map((n) => (n === from ? to : n));
   }
   for (const handler of d.handlers) {
     handler.targets = handler.targets.map((name) => (name === from ? to : name));
@@ -1386,22 +1479,34 @@ export function selectionForLine(line: number | null): Selection | null {
     offset += lines[i].length + 1;
   }
   const contains = (span: Span | null) => span && offset >= span[0] && offset < span[1];
-  for (let i = 0; i < base.vms.length; i++) {
-    if (contains(base.vms[i].span)) return { kind: "vm", index: i };
-  }
-  for (let i = 0; i < base.containers.length; i++) {
-    if (contains(base.containers[i].span)) return { kind: "container", index: i };
+  // Configuration steps sit inside their machine's span, so they are checked
+  // first — the innermost block that contains the line wins.
+  const machines: { name: string; sel: Selection; model: VmModel | ContainerModel }[] = [
+    ...base.vms.map((model, index) => ({
+      name: model.name,
+      sel: { kind: "vm", index } as Selection,
+      model: model as VmModel | ContainerModel,
+    })),
+    ...base.containers.map((model, index) => ({
+      name: model.name,
+      sel: { kind: "container", index } as Selection,
+      model: model as VmModel | ContainerModel,
+    })),
+  ];
+  for (const m of machines) {
+    if (!contains(m.model.span)) continue;
+    for (let i = 0; i < m.model.provisions.length; i++) {
+      if (contains(m.model.provisions[i].span)) {
+        return { kind: "provision", machine: m.name, index: i };
+      }
+    }
+    for (const pb of m.model.playbooks) {
+      if (contains(pb.span)) return { kind: "playbook", path: pb.path, play: pb.play };
+    }
+    return m.sel;
   }
   for (let i = 0; i < base.segments.length; i++) {
     if (contains(base.segments[i].span)) return { kind: "segment", index: i };
-  }
-  for (let i = 0; i < base.provisions.length; i++) {
-    if (contains(base.provisions[i].span)) return { kind: "provision", index: i };
-  }
-  for (let i = 0; i < base.playbooks.length; i++) {
-    if (contains(base.playbooks[i].span)) {
-      return { kind: "playbook", path: base.playbooks[i].path, play: base.playbooks[i].play };
-    }
   }
   return null;
 }

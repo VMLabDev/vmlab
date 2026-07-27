@@ -8,9 +8,9 @@ use serde::Serialize;
 use super::model::{
     BlockRule, Connect, Container, ContainerMode, DiskBlock, DnsRecord, EnvVar, Firmware, Forward,
     Gpu, GpuMode, Handler, Healthcheck, HostPort, L4Proto, Lab, LabFile, Media, MediaKind, Nic,
-    Playbook, PortMap, Provision, RedirectRule, RestartPolicy, Route, Segment, SegmentDns, Share,
-    ShareTransport, SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
-    WebAuth, WebPage,
+    Playbook, PlaybookVar, PortMap, Provision, RedirectRule, RestartPolicy, Route, Segment,
+    SegmentDns, Share, ShareTransport, SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume,
+    VolumeSource, WebAuth, WebPage,
 };
 
 #[derive(Serialize)]
@@ -38,8 +38,6 @@ pub struct LabDto {
     pub segments: Vec<SegmentDto>,
     pub vms: Vec<VmDto>,
     pub containers: Vec<ContainerDto>,
-    pub provisions: Vec<ProvisionDto>,
-    pub playbooks: Vec<PlaybookDto>,
     pub handlers: Vec<HandlerDto>,
     pub records: Vec<DnsRecordDto>,
     pub sinkholes: Vec<SinkholeDto>,
@@ -54,8 +52,6 @@ impl From<&Lab> for LabDto {
             segments: l.segments.iter().map(SegmentDto::from).collect(),
             vms: l.vms.iter().map(VmDto::from).collect(),
             containers: l.containers.iter().map(ContainerDto::from).collect(),
-            provisions: l.provisions.iter().map(ProvisionDto::from).collect(),
-            playbooks: l.playbooks.iter().map(PlaybookDto::from).collect(),
             handlers: l.handlers.iter().map(HandlerDto::from).collect(),
             records: l.records.iter().map(DnsRecordDto::from).collect(),
             sinkholes: l.sinkholes.iter().map(SinkholeDto::from).collect(),
@@ -293,6 +289,8 @@ pub struct VmDto {
     pub shares: Vec<ShareDto>,
     pub media: Vec<MediaDto>,
     pub web: Vec<WebPageDto>,
+    pub provisions: Vec<ProvisionDto>,
+    pub playbooks: Vec<PlaybookDto>,
 }
 
 impl From<&Vm> for VmDto {
@@ -323,6 +321,8 @@ impl From<&Vm> for VmDto {
             shares: v.shares.iter().map(ShareDto::from).collect(),
             media: v.media.iter().map(MediaDto::from).collect(),
             web: v.web.iter().map(WebPageDto::from).collect(),
+            provisions: v.provisions.iter().map(ProvisionDto::from).collect(),
+            playbooks: v.playbooks.iter().map(PlaybookDto::from).collect(),
         }
     }
 }
@@ -350,6 +350,8 @@ pub struct ContainerDto {
     pub ports: Vec<PortMapDto>,
     pub healthcheck: Option<HealthcheckDto>,
     pub web: Vec<WebPageDto>,
+    pub provisions: Vec<ProvisionDto>,
+    pub playbooks: Vec<PlaybookDto>,
 }
 
 impl From<&Container> for ContainerDto {
@@ -374,6 +376,8 @@ impl From<&Container> for ContainerDto {
             ports: c.ports.iter().map(PortMapDto::from).collect(),
             healthcheck: c.healthcheck.as_ref().map(HealthcheckDto::from),
             web: c.web.iter().map(WebPageDto::from).collect(),
+            provisions: c.provisions.iter().map(ProvisionDto::from).collect(),
+            playbooks: c.playbooks.iter().map(PlaybookDto::from).collect(),
         }
     }
 }
@@ -685,8 +689,6 @@ impl From<&Media> for MediaDto {
 #[derive(Serialize)]
 pub struct ProvisionDto {
     pub script: String,
-    pub vms: Vec<String>,
-    pub lab_wide: bool,
     pub span: Span,
 }
 
@@ -694,8 +696,6 @@ impl From<&Provision> for ProvisionDto {
     fn from(p: &Provision) -> Self {
         Self {
             script: p.script.display().to_string(),
-            vms: p.vms.clone(),
-            lab_wide: p.lab_wide,
             span: p.span,
         }
     }
@@ -705,8 +705,7 @@ impl From<&Provision> for ProvisionDto {
 pub struct PlaybookDto {
     pub path: String,
     pub play: String,
-    pub vms: Vec<String>,
-    pub all_machines: bool,
+    pub vars: Vec<PlaybookVarDto>,
     pub span: Span,
 }
 
@@ -715,9 +714,25 @@ impl From<&Playbook> for PlaybookDto {
         Self {
             path: p.path.display().to_string(),
             play: p.play.clone(),
-            vms: p.vms.clone(),
-            all_machines: p.all_machines,
+            vars: p.vars.iter().map(PlaybookVarDto::from).collect(),
             span: p.span,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct PlaybookVarDto {
+    pub name: String,
+    pub value: String,
+    pub span: Span,
+}
+
+impl From<&PlaybookVar> for PlaybookVarDto {
+    fn from(v: &PlaybookVar) -> Self {
+        Self {
+            name: v.name.clone(),
+            value: v.value.clone(),
+            span: v.span,
         }
     }
 }
@@ -787,10 +802,14 @@ lab "dto-lab" {
     disk "data" { size = 10GiB }
     share { host = "./files" guest = "C:/files" }
     media { kind = "iso" from = "./extra/" }
+
+    provision "scripts/setup.ws" { }
+    playbook "playbooks/baseline" {
+      play = "baseline"
+      var "domain" { value = "corp.example.com" }
+    }
   }
 
-  provision "scripts/setup.ws" { vms = ["web01"] }
-  playbook "playbooks/baseline" { play = "baseline" vms = ["web01"] }
   on "vm.crashed" { run = "scripts/dump.ws" targets = ["web01"] }
 }
 "#;
@@ -825,11 +844,14 @@ lab "dto-lab" {
         assert_eq!(vm["shares"][0]["guest"], "C:/files");
         assert_eq!(vm["media"][0]["kind"], "iso");
 
-        assert_eq!(v["lab"]["provisions"][0]["vms"][0], "web01");
-        let pb = &v["lab"]["playbooks"][0];
+        // Configuration steps hang off the machine they configure.
+        assert_eq!(vm["provisions"][0]["script"], "scripts/setup.ws");
+        let pb = &vm["playbooks"][0];
         assert_eq!(pb["path"], "playbooks/baseline");
         assert_eq!(pb["play"], "baseline");
-        assert_eq!(pb["vms"][0], "web01");
+        assert_eq!(pb["vars"][0]["name"], "domain");
+        assert_eq!(pb["vars"][0]["value"], "corp.example.com");
+        assert!(pb["vars"][0]["span"][1].as_u64().unwrap() > 0);
         assert!(pb["span"][1].as_u64().unwrap() > 0);
         assert_eq!(v["lab"]["handlers"][0]["event"], "vm.crashed");
         assert_eq!(v["lab"]["handlers"][0]["targets"][0], "web01");

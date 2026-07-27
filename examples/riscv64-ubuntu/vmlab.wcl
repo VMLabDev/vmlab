@@ -31,7 +31,7 @@ lab "riscv64-ubuntu" {
     template = "riscv64/ubuntu-24.04"
     memory   = 2GiB
     nic { segment = "lan" }                        // dynamic DHCP lease
-  }
 
-  provision "scripts/setup.ws" { lab_wide = true }
+    provision "scripts/setup.ws" { }   // runs once this VM is ready
+  }
 }

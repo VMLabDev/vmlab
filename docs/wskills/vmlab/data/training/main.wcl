@@ -286,7 +286,7 @@ module automation_course {
     ]
     related = [provisions, wscript_overview, lab_api, vm_api]
     body {
-      p "A `provision \"scripts/setup.ws\" { }` block runs its script after `vmlab up` boots the VMs (scope it with `vms = [\"dc01\"]` to run only when those VMs come up). The script's `fn main(lab: Lab)` receives the running lab; `lab.vm(\"alp\")?` yields a VM handle whose `wait_ready(secs)` blocks until the guest agent answers and whose `exec` runs guest commands with a typed `ExecResult` back."
+      p "A `provision \"scripts/setup.ws\" { }` block, declared inside the `vm {}` it belongs to, runs its script once `vmlab up` has that machine ready. The script's `fn main(lab: Lab)` receives the running lab; `lab.vm(\"alp\")?` yields a VM handle whose `wait_ready(secs)` blocks until the guest agent answers and whose `exec` runs guest commands with a typed `ExecResult` back."
       p "This replaces chains of `vmlab exec` calls: one script, real control flow, real error handling."
     }
     exercise setup_ws {

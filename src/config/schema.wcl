@@ -28,10 +28,6 @@ type Lab {
   @children("vm")        vms: list<Vm>
   @doc("OCI containers in this lab, each run in a micro-VM")
   @children("container") containers: list<Container>
-  @doc("wscript provision scripts run on `vmlab up`, in declaration order")
-  @children("provision") provisions: list<Provision>
-  @doc("config-weave playbooks applied on `vmlab up`, interleaved with provisions in declaration order")
-  @children("playbook")  playbooks: list<Playbook>
   @doc("Lifecycle event handlers (failures are logged, never fatal)")
   @children("on")        handlers: list<Handler>
   @doc("Lab-wide static DNS entries (wildcards allowed)")
@@ -200,6 +196,10 @@ type Vm {
   @children("media") media: list<Media>
   @doc("HTTP UIs served in the guest, proxied into the web console (require ≥1 NIC)")
   @children("web")   web: list<WebPage>
+  @doc("wscript provision scripts run on `vmlab up` once this VM is ready, interleaved with its playbooks in declaration order")
+  @children("provision") provisions: list<Provision>
+  @doc("config-weave playbooks applied to this VM on `vmlab up`, interleaved with its provisions in declaration order")
+  @children("playbook")  playbooks: list<Playbook>
 }
 
 @block("nic")
@@ -258,6 +258,10 @@ type Container {
   @child("healthcheck") healthcheck: Healthcheck?
   @doc("HTTP UIs served in the container, proxied into the web console (require ≥1 NIC)")
   @children("web")      web: list<WebPage>
+  @doc("wscript provision scripts run on `vmlab up` once this container is ready, interleaved with its playbooks in declaration order")
+  @children("provision") provisions: list<Provision>
+  @doc("config-weave playbooks applied to this container on `vmlab up`, interleaved with its provisions in declaration order")
+  @children("playbook")  playbooks: list<Playbook>
 }
 
 // Environment variable passed to the container process.
@@ -403,30 +407,37 @@ type Gpu {
   address: utf8?
 }
 
-// Provision script run during `vmlab up`. Optional vms list scopes
-// the script for depends_on satisfaction.
+// Provision script run during `vmlab up`, declared inside the `vm`/`container`
+// it configures (or inside a `template`, for the build VM). It runs once, after
+// that machine is ready, at its position among the machine's steps.
 @block("provision")
 type Provision {
   @doc("Path to the `.ws` file; must exist and compile; the inline label")
   @inline(0) script: utf8
-  @doc("VM names this script is scoped to (gates their `depends_on`)")
-  vms: list<utf8>?
-  @doc("Run once for the whole lab, after every machine is up; mutually exclusive with `vms`. Without either the script is declared but never runs")
-  lab_wide: bool?
 }
 
-// config-weave playbook applied on `vmlab up` (interleaved with provisions
-// in declaration order) and runnable on demand via `vmlab playbook check|apply`.
+// config-weave playbook applied on `vmlab up` (interleaved with the machine's
+// provisions in declaration order) and runnable on demand via
+// `vmlab playbook check|apply`. Declared inside the `vm`/`container` it
+// converges, or inside a `template` for the build VM.
 @block("playbook")
 type Playbook {
   @doc("Playbook folder (contains `playbook.wcl`), relative to the lab root; the inline label")
   @inline(0) path: utf8
   @doc("Play name inside the playbook to run (required)")
   play: utf8
-  @doc("VM/container names this playbook targets; without either this or `all_machines` the playbook is declared but never runs")
-  vms: list<utf8>?
-  @doc("Target every VM and container in the lab; mutually exclusive with `vms`")
-  all_machines: bool?
+  @doc("Variable overrides passed to config-weave for this machine's run")
+  @children("var") vars: list<PlaybookVar>
+}
+
+// One `--var name=value` override for the play, scoped to the machine whose
+// `playbook` block declares it.
+@block("var")
+type PlaybookVar {
+  @doc("Variable name; must be a WCL identifier; the inline block label")
+  @inline(0) name: utf8
+  @doc("Value, passed through verbatim — config-weave reads it as a WCL expression where it can (`3` is an int, `true` a bool) and as a string otherwise (required)")
+  value: utf8
 }
 
 // Event handler binding.

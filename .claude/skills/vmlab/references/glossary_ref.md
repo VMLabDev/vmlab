@@ -12,7 +12,7 @@
 | supervisor | The per-user daemon `vmlabd`, auto-started by the CLI. Owns the lab registry, global segments, store writes and host watchdogs. | vmlabd |
 | lab daemon | The per-lab daemon spawned by the supervisor on `vmlab up`. Owns QEMU, the network fabric, snapshots and the wscript runtime. |  |
 | profile | A named set of hardware defaults (machine, firmware, TPM, disk bus, NIC, display, CPUs/memory) chosen with `profile = "..."`. | guest OS profile |
-| scoped provision | A `provision "x" { vms = [...] }`: it runs against those VMs and gates `depends_on` on them, so dependents wait for it. |  |
+| scoped provision | A `provision "x" { }` block inside a `vm`/`container`: it runs once that machine is ready and gates `depends_on` on it, so dependents wait for it. |  |
 | scratch VM | A VM booted from a blank disk (`template = "scratch"`) with no template, requiring explicit `arch`, `profile` and `disk`. |  |
 | OCI artifact | How a template is stored in a registry: a non-runnable artifact (frozen media type) whose qcow2 is chunked into zstd layers. |  |
 | wscript | vmlab's statically typed, Rust-flavoured scripting language for guest automation. Compiled and type-checked at `vmlab validate` time. |  |

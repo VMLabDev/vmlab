@@ -53,12 +53,29 @@ export function playbookCardHeight(cardCount: number): number {
   return PLAYBOOK_HEADER_H + Math.max(1, cardCount) * PLAY_ROW_H + PLAYBOOK_FOOT_H;
 }
 
-/** Stable-enough cosmetic identity for provisions, including repeated paths. */
+/** Every machine's `provision {}` blocks, flattened in the same order the
+ *  store's `draftProvisions()` yields them (VMs then containers) — the flat
+ *  index is what the canvas and saved layouts address. */
+export function flatProvisions(model: LabModel): { machine: string; script: string }[] {
+  return [...model.vms, ...model.containers].flatMap((m) =>
+    m.provisions.map((p) => ({ machine: m.name, script: p.script })),
+  );
+}
+
+/** Distinct playbook folder paths declared anywhere in the lab. */
+export function flatPlaybookPaths(model: LabModel): string[] {
+  return [
+    ...new Set(
+      [...model.vms, ...model.containers].flatMap((m) => m.playbooks.map((p) => p.path)),
+    ),
+  ];
+}
+
+/** Stable-enough cosmetic identity for provisions, including repeated scripts. */
 export function provisionLayoutKey(model: LabModel, index: number): string {
-  const script = model.provisions[index]?.script || "(new provision)";
-  const occurrence = model.provisions
-    .slice(0, index)
-    .filter((provision) => provision.script === script).length;
+  const all = flatProvisions(model);
+  const script = all[index]?.script || "(new provision)";
+  const occurrence = all.slice(0, index).filter((p) => p.script === script).length;
   return `${script}\0${occurrence}`;
 }
 
@@ -204,7 +221,7 @@ export function autoLayout(model: LabModel, existing: Layout): Layout {
   for (const container of model.containers) {
     place(out.containers, container.name, container.nics[0], container.nics.length);
   }
-  model.provisions.forEach((_, index) => {
+  flatProvisions(model).forEach((_, index) => {
     const key = provisionLayoutKey(model, index);
     if (!out.provisions[key]) {
       out.provisions[key] = {
@@ -213,7 +230,7 @@ export function autoLayout(model: LabModel, existing: Layout): Layout {
       };
     }
   });
-  [...new Set(model.playbooks.map((playbook) => playbook.path))].forEach((path, index) => {
+  flatPlaybookPaths(model).forEach((path, index) => {
     const key = playbookLayoutKey(path);
     if (!playbookPos(out, path)) {
       out.playbooks![key] = {

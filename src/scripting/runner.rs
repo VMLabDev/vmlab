@@ -16,6 +16,36 @@ use crate::labd::lab::LabRuntime;
 /// Where script log output goes (lab log + live CLI stream, PRD §10.1).
 pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
 
+/// The VM a script belongs to — the one it reaches with `lab.this_vm()`.
+/// Set for a `provision {}` block declared inside a `vm {}` and for a
+/// template's first-boot script; absent for handlers and `vmlab script`.
+#[derive(Debug, Clone)]
+pub struct ScriptOwner {
+    pub vm: String,
+    /// The script is that VM's template first-boot provision, which runs
+    /// before the VM is allowed to reach full readiness — so `is_ready` /
+    /// `wait_ready` on it mean agent-level readiness instead.
+    pub first_boot: bool,
+}
+
+impl ScriptOwner {
+    /// A machine-scoped `provision {}` block: the VM is fully up already.
+    pub fn provision(vm: impl Into<String>) -> Self {
+        Self {
+            vm: vm.into(),
+            first_boot: false,
+        }
+    }
+
+    /// A template first-boot provision.
+    pub fn first_boot(vm: impl Into<String>) -> Self {
+        Self {
+            vm: vm.into(),
+            first_boot: true,
+        }
+    }
+}
+
 impl SegmentHandle {
     pub(crate) fn with_zone<T>(
         &self,
@@ -40,27 +70,30 @@ impl SegmentHandle {
 
 /// Run a script file's `main(lab)` against the lab. Blocking errors out of
 /// the script fail the run (and therefore `vmlab up`, PRD §10.3).
+/// `owner`, when set, is the VM the script reaches with `lab.this_vm()` — the
+/// machine whose `provision {}` block declared it.
 pub async fn run_script_file(
     runtime: Arc<LabRuntime>,
     script: &Path,
+    owner: Option<ScriptOwner>,
     output: OutputSink,
 ) -> Result<()> {
     let source =
         std::fs::read_to_string(script).with_context(|| format!("reading {}", script.display()))?;
     let name = script.display().to_string();
-    run_script_source(runtime, source, &name, script_dir(script), None, output).await
+    run_script_source(runtime, source, &name, script_dir(script), owner, output).await
 }
 
 /// Run a `main(lab)` script from in-memory source (a template's embedded
 /// first-boot provision, or a file via [`run_script_file`]). `ref_base` roots
-/// relative reference-image/screenshot paths; `target_vm`, when set, is the VM
-/// the script reaches with `lab.this_vm()`.
+/// relative reference-image/screenshot paths; `owner`, when set, is the VM the
+/// script reaches with `lab.this_vm()`.
 pub async fn run_script_source(
     runtime: Arc<LabRuntime>,
     source: String,
     name: &str,
     ref_base: std::path::PathBuf,
-    target_vm: Option<String>,
+    owner: Option<ScriptOwner>,
     output: OutputSink,
 ) -> Result<()> {
     let name = name.to_string();
@@ -78,7 +111,7 @@ pub async fn run_script_source(
             rt,
             output,
             ref_base,
-            first_boot_vm: target_vm,
+            owner,
         };
         vm.call_unit::<_, ()>(&unit, "main", (lab,))
             .map_err(|e| anyhow!("{name}: {}", run_error(e)))
@@ -117,7 +150,7 @@ pub async fn run_event_handler(
             rt,
             output,
             ref_base,
-            first_boot_vm: None,
+            owner: None,
         };
         vm.call_unit::<_, ()>(&unit, "handle", (event, lab))
             .map_err(|e| anyhow!("{name}: {}", run_error(e)))

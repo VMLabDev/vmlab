@@ -277,7 +277,7 @@ impl Handler for LabdHandler {
                 let script = args["script"].as_str().ok_or("missing script")?;
                 let path = lab.root.join(script);
                 let output = stream_sink(&self.lab, _stream);
-                crate::scripting::run_script_file(lab.clone(), &path, output)
+                crate::scripting::run_script_file(lab.clone(), &path, None, output)
                     .await
                     .map_err(err)?;
                 Ok(json!(true))
@@ -871,38 +871,28 @@ impl Handler for LabdHandler {
             // run, so this is the edit→check dev loop. Progress streams as
             // chunks here and as `playbook.op.*` events for the web UI.
             "playbook.list" => {
-                let machines: Vec<String> = lab
-                    .config
-                    .lab
+                // One row per (machine, playbook block) — the blocks live
+                // inside the machine they configure.
+                let cfg = &lab.config.lab;
+                let machines = cfg
                     .vms
                     .iter()
-                    .map(|v| v.name.clone())
-                    .chain(lab.config.lab.containers.iter().map(|c| c.name.clone()))
-                    .collect();
+                    .map(|v| (&v.name, &v.playbooks))
+                    .chain(cfg.containers.iter().map(|c| (&c.name, &c.playbooks)));
                 Ok(Value::Array(
-                    lab.config
-                        .lab
-                        .playbooks
-                        .iter()
-                        .map(|p| {
-                            let resolved: Vec<&String> = if p.all_machines {
-                                machines.iter().collect()
-                            } else {
-                                p.vms.iter().collect()
-                            };
-                            let running = resolved
-                                .iter()
-                                .map(|m| lab.playbook_ops.op_of(m))
-                                .find(|v| !v.is_null())
-                                .unwrap_or(Value::Null);
-                            json!({
-                                "path": p.path.display().to_string(),
-                                "play": p.play,
-                                "span": p.span,
-                                "vms": p.vms,
-                                "all_machines": p.all_machines,
-                                "machines": resolved,
-                                "running": running,
+                    machines
+                        .flat_map(|(machine, playbooks)| {
+                            playbooks.iter().map(move |p| {
+                                json!({
+                                    "machine": machine,
+                                    "path": p.path.display().to_string(),
+                                    "play": p.play,
+                                    "span": p.span,
+                                    "vars": p.vars.iter()
+                                        .map(|v| json!({"name": v.name, "value": v.value}))
+                                        .collect::<Vec<_>>(),
+                                    "running": lab.playbook_ops.op_of(machine),
+                                })
                             })
                         })
                         .collect(),

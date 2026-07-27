@@ -332,86 +332,44 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
 
     check_dependency_cycles(lab, &mut issues);
 
-    // -- scripts ------------------------------------------------------------
+    // -- per-machine configuration steps ------------------------------------
+    // `provision`/`playbook` blocks live inside the vm/container they
+    // configure; the machine is the target, so there is nothing to
+    // cross-reference here beyond the folders and scripts themselves.
     let mut scripts: Vec<(&PathBuf, Span)> = Vec::new();
-    for p in &lab.provisions {
-        scripts.push((&p.script, p.span));
-        if p.lab_wide && !p.vms.is_empty() {
-            issues.push(Issue::at(
-                p.span,
-                format!(
-                    "provision {} sets `lab_wide` and `vms` — pick one",
-                    p.script.display()
-                ),
-            ));
+    for vm in &lab.vms {
+        for p in &vm.provisions {
+            scripts.push((&p.script, p.span));
         }
-        for vm in &p.vms {
-            if !machine_exists(lab, vm) {
-                issues.push(Issue::at(
-                    p.span,
-                    format!("provision scopes undefined vm/container \"{vm}\""),
-                ));
-            }
-        }
-    }
-    // -- playbooks ------------------------------------------------------
-    for p in &lab.playbooks {
-        if p.play.is_empty() {
-            issues.push(Issue::at(
-                p.span,
-                format!("playbook {} has an empty play name", p.path.display()),
-            ));
-        }
-        let dir = file.root.join(&p.path);
-        if !dir.is_dir() {
-            issues.push(Issue::at(
-                p.span,
-                format!("playbook {} is not a directory", p.path.display()),
-            ));
-        } else if !dir.join("playbook.wcl").is_file() {
-            issues.push(Issue::at(
-                p.span,
-                format!("playbook {} has no playbook.wcl", p.path.display()),
-            ));
-        }
-        if p.all_machines && !p.vms.is_empty() {
-            issues.push(Issue::at(
-                p.span,
-                format!(
-                    "playbook {} sets `all_machines` and `vms` — pick one",
-                    p.path.display()
-                ),
-            ));
-        }
-        for vm in &p.vms {
-            if !machine_exists(lab, vm) {
-                issues.push(Issue::at(
-                    p.span,
-                    format!("playbook targets undefined vm/container \"{vm}\""),
-                ));
-            }
-        }
-        // config-weave ships guest binaries only for x86_64; reject targets
+        // config-weave ships guest binaries only for x86_64; reject machines
         // whose arch is statically known to differ. Unknown archs (registry
         // templates without `arch`) are caught by the daemon's preflight.
-        let targeted = |vm: &Vm| p.all_machines || p.vms.iter().any(|n| n == &vm.name);
-        for vm in lab.vms.iter().filter(|vm| targeted(vm)) {
-            let arch = match &vm.template {
-                TemplateRef::Store { arch, .. } => Some(arch.as_str()),
-                _ => vm.arch.as_deref(),
-            };
+        let arch = match &vm.template {
+            TemplateRef::Store { arch, .. } => Some(arch.as_str()),
+            _ => vm.arch.as_deref(),
+        };
+        for p in &vm.playbooks {
+            check_playbook(p, &file.root, &mut issues);
             if let Some(arch) = arch
                 && arch != "x86_64"
             {
                 issues.push(Issue::at(
                     p.span,
                     format!(
-                        "playbook {} targets \"{}\" ({arch}) — config-weave ships binaries only for x86_64",
+                        "playbook {} runs on \"{}\" ({arch}) — config-weave ships binaries only for x86_64",
                         p.path.display(),
                         vm.name
                     ),
                 ));
             }
+        }
+    }
+    for c in &lab.containers {
+        for p in &c.provisions {
+            scripts.push((&p.script, p.span));
+        }
+        for p in &c.playbooks {
+            check_playbook(p, &file.root, &mut issues);
         }
     }
 
@@ -562,49 +520,10 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
-        // Build provisions and playbooks always run against the synthetic
-        // "build" VM, so the lab-level targeting knobs have nothing to name.
-        for p in &t.provisions {
-            if p.lab_wide {
-                issues.push(Issue::at(
-                    p.span,
-                    "template provisions always run on the build VM; drop `lab_wide`",
-                ));
-            }
-        }
-        // Build playbooks target the synthetic "build" VM only; `vms` would
-        // silently dangle, and config-weave is x86_64-only (§10.4).
+        // Build playbooks run on the synthetic "build" VM, and config-weave
+        // is x86_64-only (§10.4).
         for p in &t.playbooks {
-            if p.play.is_empty() {
-                issues.push(Issue::at(
-                    p.span,
-                    format!("playbook {} has an empty play name", p.path.display()),
-                ));
-            }
-            let dir = file.root.join(&p.path);
-            if !dir.is_dir() {
-                issues.push(Issue::at(
-                    p.span,
-                    format!("playbook {} is not a directory", p.path.display()),
-                ));
-            } else if !dir.join("playbook.wcl").is_file() {
-                issues.push(Issue::at(
-                    p.span,
-                    format!("playbook {} has no playbook.wcl", p.path.display()),
-                ));
-            }
-            if !p.vms.is_empty() {
-                issues.push(Issue::at(
-                    p.span,
-                    "template playbooks always run on the build VM; drop `vms`",
-                ));
-            }
-            if p.all_machines {
-                issues.push(Issue::at(
-                    p.span,
-                    "template playbooks always run on the build VM; drop `all_machines`",
-                ));
-            }
+            check_playbook(p, &file.root, &mut issues);
             if t.arch != "x86_64" {
                 issues.push(Issue::at(
                     p.span,
@@ -719,6 +638,66 @@ fn check_vm_hardware(
     {
         issues.push(Issue::at(vm.span, format!("unknown profile \"{p}\"")));
     }
+}
+
+/// Structural checks shared by every `playbook {}` block, wherever it is
+/// declared: the play is named, the folder is a real playbook, and the
+/// variables can survive the trip to config-weave's `--var KEY=VALUE`.
+fn check_playbook(p: &Playbook, root: &Path, issues: &mut IssueList) {
+    if p.play.is_empty() {
+        issues.push(Issue::at(
+            p.span,
+            format!("playbook {} has an empty play name", p.path.display()),
+        ));
+    }
+    let dir = root.join(&p.path);
+    if !dir.is_dir() {
+        issues.push(Issue::at(
+            p.span,
+            format!("playbook {} is not a directory", p.path.display()),
+        ));
+    } else if !dir.join("playbook.wcl").is_file() {
+        issues.push(Issue::at(
+            p.span,
+            format!("playbook {} has no playbook.wcl", p.path.display()),
+        ));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for var in &p.vars {
+        // config-weave binds each override as a `let <name> = …`, so the name
+        // has to be a WCL identifier or the run fails inside the guest.
+        if !is_wcl_identifier(&var.name) {
+            issues.push(Issue::at(
+                var.span,
+                format!(
+                    "playbook variable \"{}\" is not a valid identifier (letters, digits and \
+                     underscores, not starting with a digit)",
+                    var.name
+                ),
+            ));
+        }
+        if !seen.insert(var.name.as_str()) {
+            issues.push(Issue::at(
+                var.span,
+                format!(
+                    "playbook {} play {} sets variable \"{}\" twice",
+                    p.path.display(),
+                    p.play,
+                    var.name
+                ),
+            ));
+        }
+    }
+}
+
+/// Mirrors config-weave's own `is_identifier` gate on `--var` keys.
+fn is_wcl_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// `name` resolves against the unified VM + container namespace.
@@ -1243,7 +1222,7 @@ lab "l" {
     #[test]
     fn missing_script() {
         assert_err(
-            "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" }\n  provision \"no/such/script.ws\" { } }",
+            "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\"\n  provision \"no/such/script.ws\" { } } }",
             "does not exist",
         );
     }
@@ -1627,8 +1606,7 @@ lab "l" {
         assert_err(
             r#"import <vmlab.wcl>
 lab "l" {
-  vm "a" { template = "x86_64/t" }
-  playbook "no/such/pb" { play = "base" }
+  vm "a" { template = "x86_64/t" playbook "no/such/pb" { play = "base" } }
 }"#,
             "is not a directory",
         );
@@ -1641,8 +1619,7 @@ lab "l" {
         let f = load_lab_source(
             r#"import <vmlab.wcl>
 lab "l" {
-  vm "a" { template = "x86_64/t" }
-  playbook "pb" { play = "base" }
+  vm "a" { template = "x86_64/t" playbook "pb" { play = "base" } }
 }"#,
             "<test>",
             root.path(),
@@ -1659,28 +1636,14 @@ lab "l" {
     }
 
     #[test]
-    fn playbook_unknown_target() {
+    fn playbook_non_x86_64_machine() {
         let (es, _root) = errs_with_playbook_dir(
             r#"import <vmlab.wcl>
 lab "l" {
-  vm "a" { template = "x86_64/t" }
-  playbook "playbooks/base" { play = "base" vms = ["ghost"] }
-}"#,
-        );
-        assert!(
-            es.iter()
-                .any(|m| m.contains("targets undefined vm/container \"ghost\"")),
-            "expected undefined-target error, got: {es:#?}"
-        );
-    }
-
-    #[test]
-    fn playbook_non_x86_64_target() {
-        let (es, _root) = errs_with_playbook_dir(
-            r#"import <vmlab.wcl>
-lab "l" {
-  vm "a" { template = "aarch64/t" }
-  playbook "playbooks/base" { play = "base" all_machines = true }
+  vm "a" {
+    template = "aarch64/t"
+    playbook "playbooks/base" { play = "base" }
+  }
 }"#,
         );
         assert!(
@@ -1690,46 +1653,39 @@ lab "l" {
         );
     }
 
-    /// Without `vms` or `all_machines` a playbook targets nothing, so even a
-    /// lab config-weave could never converge validates clean.
+    /// Variable names become `let` bindings inside config-weave, so a name it
+    /// could not bind is caught here rather than in the guest.
     #[test]
-    fn playbook_without_targets_is_inert() {
+    fn playbook_var_name_and_duplicate_rules() {
         let (es, _root) = errs_with_playbook_dir(
             r#"import <vmlab.wcl>
 lab "l" {
-  vm "a" { template = "aarch64/t" }
-  playbook "playbooks/base" { play = "base" }
-}"#,
-        );
-        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+  vm "a" {
+    template = "x86_64/t"
+    playbook "playbooks/base" {
+      play = "base"
+      var "new-name" { value = "A" }
+      var "domain"   { value = "corp.example.com" }
+      var "domain"   { value = "other.example.com" }
     }
-
-    #[test]
-    fn targeting_flags_conflict_with_vms() {
-        let (es, _root) = errs_with_playbook_dir(
-            r#"import <vmlab.wcl>
-lab "l" {
-  vm "a" { template = "x86_64/t" }
-  provision "scripts/setup.ws" { vms = ["a"] lab_wide = true }
-  playbook "playbooks/base" { play = "base" vms = ["a"] all_machines = true }
+  }
 }"#,
         );
         assert!(
             es.iter()
-                .any(|m| m.contains("sets `lab_wide` and `vms` — pick one")),
-            "expected provision conflict error, got: {es:#?}"
+                .any(|m| m.contains("\"new-name\" is not a valid identifier")),
+            "expected identifier error, got: {es:#?}"
         );
         assert!(
             es.iter()
-                .any(|m| m.contains("sets `all_machines` and `vms` — pick one")),
-            "expected playbook conflict error, got: {es:#?}"
+                .any(|m| m.contains("sets variable \"domain\" twice")),
+            "expected duplicate-var error, got: {es:#?}"
         );
     }
 
-    /// Template-level steps always run on the build VM, so the lab-level
-    /// targeting knobs are rejected there.
+    /// Template playbooks reach the build VM and may carry variables too.
     #[test]
-    fn template_steps_reject_targeting_flags() {
+    fn template_playbook_vars_validate() {
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(root.path().join("scripts")).unwrap();
         std::fs::write(root.path().join("scripts/install.ws"), "").unwrap();
@@ -1743,8 +1699,8 @@ template "t" {
   version = "1"
   source "scratch" { }
   disk = 10GiB
-  provision "scripts/install.ws" { lab_wide = true }
-  playbook "pb" { play = "base" all_machines = true }
+  provision "scripts/install.ws" { }
+  playbook "pb" { play = "base" var "1bad" { value = "x" } }
 }"#,
             "<test>",
             root.path(),
@@ -1755,12 +1711,9 @@ template "t" {
             .map(|i| i.message)
             .collect();
         assert!(
-            es.iter().any(|m| m.contains("drop `lab_wide`")),
-            "expected template provision error, got: {es:#?}"
-        );
-        assert!(
-            es.iter().any(|m| m.contains("drop `all_machines`")),
-            "expected template playbook error, got: {es:#?}"
+            es.iter()
+                .any(|m| m.contains("\"1bad\" is not a valid identifier")),
+            "expected identifier error, got: {es:#?}"
         );
     }
 
@@ -1769,9 +1722,15 @@ template "t" {
         let (es, _root) = errs_with_playbook_dir(
             r#"import <vmlab.wcl>
 lab "l" {
-  vm "a" { template = "x86_64/t" }
+  vm "a" {
+    template = "x86_64/t"
+    playbook "playbooks/base" {
+      play = "base"
+      var "domain"   { value = "corp.example.com" }
+      var "new_name" { value = "A" }
+    }
+  }
   vm "b" { template = "aarch64/t" }
-  playbook "playbooks/base" { play = "base" vms = ["a"] }
 }"#,
         );
         assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
