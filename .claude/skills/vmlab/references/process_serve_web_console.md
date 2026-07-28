@@ -33,11 +33,11 @@ Start `vmlab-web` from the lab directory ([flags](../references/entity_vmlab_web
 
 ### Step 2: Open the console and pick a lab
 
-Browse to the printed URL and sign in if prompted. The topbar's lab switcher lists running and managed labs — pick one, or **New lab…** to scaffold a fresh managed lab in the designer. Opening the working-directory lab shows its overview: machine cards, power controls, events, and launch cards for declared [guest web pages](../references/entity_web_block.md).
+Browse to the printed URL and sign in if prompted. The topbar's lab switcher lists running and managed labs — pick one, or **New lab…** to scaffold a fresh managed lab, choosing an \*empty\* lab or a \*starter\* one (a `lan` segment plus an Alpine VM from the public registry) that boots as-is. Opening the working-directory lab shows its overview: machine cards, power controls, events, and launch cards for declared [guest web pages](../references/entity_web_block.md).
 
 ### Step 3: Work in the console
 
-Edit topology in the lab editor's **Overview** (designer canvas + inspector), files in **Files**, and watch **Logs**. Machine pages give the live desktop (**Console**), an agent shell (**Terminal**), guest metrics and clipboard; the **Templates** page builds and publishes templates with live build consoles; **Playbook** tabs run config-weave check/apply. The [tour](../references/concept_web_console.md) maps every tab.
+Edit topology in the lab editor's **Overview** (designer canvas + inspector; edits autosave, no Save button), files in **Files** — where `playbook.wcl` opens in its own visual designer — and watch **Logs**. Machine pages give the live desktop (**Console**), an agent shell (**Terminal**), guest metrics and clipboard; the **Templates** page builds, checks and publishes templates with live build consoles; **Playbook** tabs run config-weave check/apply. The [tour](../references/concept_web_console.md) maps every tab.
 
 > [!TIP]
 > **Verification**

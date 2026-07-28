@@ -11,13 +11,13 @@ vm "name" {
   template = "x86_64/linux-modern"   // "<arch>/<name>[@<version>]", "scratch", or registry ref
   arch     = "x86_64"                // REQUIRED for scratch and registry references
   profile  = "linux-modern"          // guest OS profile (hardware defaults)
-  gui      = true                    // open QEMU's own display window; headless fallback
+  gui      = true                    // open a VNC viewer on `up`; the VM always runs headless
   cpus     = 4
   memory   = 8GiB
   disk     = 80GiB                   // primary disk size — scratch VMs only
   cdrom    = "./isos/drivers.iso"    // paths relative to lab root
   floppy   = "./unattend.img"
-  depends_on  = ["dc01"]             // wait for these VMs (and their scoped provisions) first
+  depends_on  = ["dc01"]             // wait for these machines and their whole step list first
   nested      = true                 // nested virtualisation
   display     = "virtio-gpu"
   firmware    = "ovmf"               // "ovmf" | "seabios"
@@ -34,15 +34,24 @@ vm "name" {
   disk "data"      { size = 10GiB }               // extra blank disk
   disk "formatted" { from = "./folder/" }         // folder copied onto a fresh FAT filesystem
 
-  share { host = "./src"  guest = "/mnt/src" }                  // SMB, auto-mounted when ready
+  share { host = "./src"  guest = "/mnt/src" }                  // virtiofs or SMB, auto-mounted
   share { host = "~/data" guest = "D:\\data" readonly = true }  // drive letter on Windows
   share { host = "./old"  guest = "X:" smb1 = true }            // legacy dialect for XP/2003
 
   media { kind = "iso" from = "./unattend/" label = "UNATTEND" }   // folder → ISO/floppy
+
+  // The machine's own setup, applied on `up` in declaration order.
+  playbook  "playbooks/base"    { play = "member" }   // declarative, config-weave
+  provision "scripts/setup.ws"  { }                   // imperative, wscript
+  web "admin" { port = 8080 }                         // proxied into the web console
 }
 ```
 
-Extra `disk {}` and a `gpu {}` block are declared inline; networking is per-`nic {}` (see [the NIC block](../references/entity_nic_block.md)). A VM must have a NIC on a segment if it declares any shares (validation error otherwise).
+Extra `disk {}` and a `gpu {}` block are declared inline; networking is per-`nic {}` (see [the NIC block](../references/entity_nic_block.md)).
+
+The setup that runs on a machine is declared **inside** it: [`provision {}`](../references/entity_provision_block.md), [`playbook {}`](../references/entity_playbook_block.md) and [`web {}`](../references/entity_web_block.md) are children of the `vm {}` (and of `container {}`), applied in declaration order. There is no lab-level provision list.
+
+A VM must have a NIC on a segment if it declares any SMB share — including the default `transport = "auto"`, which can still fall back to SMB at start. `transport = "virtiofs"` needs no networking at all.
 
 ## Related
 

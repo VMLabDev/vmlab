@@ -1,6 +1,6 @@
 concept architecture {
   name     = "How vmlab fits together"
-  summary  = "The big picture: front ends, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the three guest channels."
+  summary  = "The big picture: front ends, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the two guest channels."
   related  = [daemon_model, networking, templates, linked_clones, vmlab_agent, vmlab_web, paths_table, dot_vmlab, template_store]
   audience = :both
   body {

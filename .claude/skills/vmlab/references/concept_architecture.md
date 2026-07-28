@@ -1,6 +1,6 @@
 # How vmlab fits together
 
-_The big picture: front ends, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the three guest channels._
+_The big picture: front ends, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the two guest channels._
 
 Every vmlab feature hangs off one spine: front ends talk a JSON-lines protocol
 to a small daemon tree, which owns the QEMU processes and everything around

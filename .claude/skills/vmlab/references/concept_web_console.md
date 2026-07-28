@@ -11,19 +11,42 @@ toggle and sign-out.
 
 | Where | What you do there |
 | --- | --- |
-| Lab overview | Power the lab up/down, watch per-machine state and events, and launch declared guest web pages from their cards |
-| Lab editor — Overview | The visual designer: an SVG topology canvas (VMs, containers, segments, routers, playbook nodes) with a full-schema inspector; edits are span-addressed surgical rewrites of `vmlab.wcl` |
-| Lab editor — Files | Whole-lab-directory tree editor (create/edit/rename/delete any lab file), including playbook folders with config-weave package buttons and a repos modal |
+| Lab overview | Power the lab up/down, watch per-machine state and events, and launch declared guest web pages from their cards; in-flight registry pulls show as rows with their own **Cancel** |
+| Lab editor — Overview | The visual designer: an SVG topology canvas (VMs, containers, segments, routers, playbook nodes) with a full-schema inspector; edits are span-addressed surgical rewrites of `vmlab.wcl`, autosaved as you go |
+| Lab editor — Files | Whole-lab-directory tree editor (create/edit/rename/delete any lab file), including playbook folders with config-weave package buttons and a repos modal; `playbook.wcl` opens in a visual designer with a **Designer \| Code** toggle |
 | Lab editor — Logs | The lab's JSON-line event stream, live |
 | Machine page | Tabs: **Console** (live VNC desktop), **Terminal** (vmlab-agent shell), **Log**, and **Playbook** when one targets the machine; plus screenshot, key/clipboard and metrics widgets |
 | Container page | Same shape: **Console**, **Recovery terminal**, **Log**, **Playbook** |
-| Templates | Build templates with live progress consoles (VNC into the build VM), stop builds, and publish/pull against OCI registries |
-| Web | Aggregate tab of all open [guest web pages](../references/entity_web_block.md), proxied into same-origin iframes |
+| Templates | Build templates with live progress consoles (VNC into the build VM), stop builds, **Check** a stored template's integrity, cancel a running pull, and publish/pull against OCI registries |
+| Web | Aggregate tab of all open [guest web pages](../references/entity_web_block.md), proxied into sandboxed iframes |
 | Segment inspector — DNS | Live DNS registrations while the lab runs; expected registrations when it is powered off |
 
+## The playbook designer
+
+`playbook.wcl` files get the same treatment `vmlab.wcl` does. The **Designer**
+view (the default; per-file, toggled to **Code** when you want the text) shows
+the playbook as a tree — playbook → gathers / vars / plays → steps — with a
+per-play card and a property panel driven by the resource each step declares,
+so the available fields come from the resource type rather than from memory.
+Each field has an `fx` toggle to switch between a literal value and a
+config-weave expression, and the editor runs pre-flight diagnostics against the
+document so mistakes surface before an apply.
+
+
+## Editing and creating labs
+
 Everything the console does goes through the [REST + WebSocket API](../references/fact_web_api.md),
-so it can also be scripted directly. The designer's **New lab…** flow scaffolds a
-managed lab directory; existing labs opened from disk are edited in place.
+so it can also be scripted directly.
+
+The designer has no Save button: edits debounce-autosave into `vmlab.wcl`, and
+the toolbar reports the state — \*saved\*, \*N unsaved change(s)\*, or \*locked —
+machines running\* (a running lab is not edited underneath itself).
+
+**New lab…** offers two presets. An **empty lab** gives you a bare `lab {}` to
+build up; a **starter lab** generates a working one — a `lan` segment with
+`nat = true` and an Alpine VM on the public registry ref — so a fresh install
+can boot something immediately. Existing labs opened from disk are edited in
+place.
 
 
 ## Related

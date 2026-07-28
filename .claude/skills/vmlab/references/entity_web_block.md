@@ -2,7 +2,7 @@
 
 _wcl block_
 
-Declares an HTTP UI served inside a guest, proxied into the web console as a same-origin iframe tab — with the guest app's own login handled by the proxy.
+Declares an HTTP UI served inside a guest, proxied into the web console as a sandboxed iframe tab — with the guest app's own login handled by the proxy.
 
 A `web {}` block on a `vm {}` or `container {}` (which must have at least one
 NIC) publishes a guest-served HTTP UI to the [web console](../references/concept_web_console.md):
@@ -41,9 +41,19 @@ redirect target that means "not logged in"). Credentials are plaintext in the
 lab config, like everything else there.
 
 Console access to `/web/*` is guarded separately by a path-scoped cookie the
-UI mints per session — see the [API reference](../references/fact_web_api.md). Deliberately out
-of scope in v1: WebSockets/SSE and SPAs that build absolute URLs in JS; the
-proxy suits admin-style UIs, not bulk downloads.
+UI mints per session — see the [API reference](../references/fact_web_api.md).
+
+Guest pages are **sandboxed away from the console origin**: the iframe carries
+`sandbox="allow-scripts allow-forms allow-popups allow-downloads"` with no
+`allow-same-origin`, and the proxy sends its own
+`Content-Security-Policy: frame-ancestors 'self'; sandbox …`. A hostile guest
+page therefore cannot reach the console's session. The cost is real and
+visible: because the page runs in an opaque origin, guest script gets no
+`document.cookie` and no `localStorage`, so apps that need either will
+misbehave in the tab (open them directly through the forward instead).
+
+Deliberately out of scope in v1: WebSockets/SSE and SPAs that build absolute
+URLs in JS; the proxy suits admin-style UIs, not bulk downloads.
 
 
 ## Related

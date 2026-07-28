@@ -14,6 +14,9 @@ fact validate_checks {
         ["Dependencies", "No `depends_on` cycles"],
         ["Scripts", "Provision/handler files exist AND compile (full wscript type-check)"],
         ["Scratch VMs", "Have `arch` + `profile` + `disk`"],
+        ["Events", "Every `on` event name is known, and `targets` is only declared on machine-scoped events (`vm.*` / `container.*` / `snapshot.*`)"],
+        ["Playbooks", "The folder and its `playbook.wcl` exist; `var` names are WCL identifiers, and no name is declared twice within one `playbook` block"],
+        ["Shares", "A machine declaring an SMB-capable share (`transport` `smb` or the default `auto`) has a NIC on a segment"],
       ]
     }
   }

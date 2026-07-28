@@ -7,7 +7,7 @@ Events fire `on "<event>" {}` handlers and arrive in `fn handle(event: Event, la
 | `vm.starting` | A VM has begun booting |
 | `vm.ready` | The guest agent is responding |
 | `vm.stopped` | A VM powered off cleanly |
-| `vm.crashed` | A VM died unexpectedly (includes closing a `gui` window) |
+| `vm.crashed` | A VM died unexpectedly (closing a `gui` viewer does not — the VM keeps running) |
 | `container.starting` | A container's micro-VM has begun booting |
 | `container.ready` | The container process started (and its healthcheck passed, when declared) |
 | `container.stopped` | A container stopped for good (carries `exit_code`) |
@@ -18,6 +18,8 @@ Events fire `on "<event>" {}` handlers and arrive in `fn handle(event: Event, la
 | `snapshot.created` | A snapshot was taken |
 | `snapshot.restored` | A snapshot was restored |
 | `template.built` | A template build sealed into the store |
+| `playbook.applied` | A playbook converged on a machine |
+| `playbook.failed` | A playbook apply failed |
 | `lab.daemon_crashed` | A lab daemon died (no auto-restart) |
 | `host.disk_low` | Free disk fell below `disk_low_percent` |
 

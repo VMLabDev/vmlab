@@ -280,7 +280,7 @@ module automation_course {
     title   = "Your first provision script"
     summary = "A `provision` block that waits for the guest and configures it through the typed API."
     objectives = [
-      "Attach a `provision` script to the lab",
+      "Attach a `provision` script to the machine it configures",
       "Use `lab.vm(…)`, `wait_ready`, and `exec` from wscript",
       "Understand when provisions run (after boot, in declaration order)",
     ]

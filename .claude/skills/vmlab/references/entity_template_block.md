@@ -18,7 +18,7 @@ template "linux-modern" {
   cpus    = 4                  // optional hardware overrides (also memory, display,
   memory  = 8GiB               // firmware, tpm, secure_boot, nested, qemu_args)
   disk    = 20GiB              // working disk size for the build
-  gui     = true               // watch the build VM's screen in a QEMU window
+  gui     = true               // open a VNC viewer to watch the build VM
 
   source "iso" { url = "https://releases.ubuntu.com/.../x.iso" sha256 = "abc123..." }
 

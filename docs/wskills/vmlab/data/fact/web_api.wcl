@@ -15,15 +15,16 @@ PROSE
     table {
       header = ["Area", "Endpoints"]
       rows = [
-        ["Labs", "`GET/POST /api/labs` (list, create), `GET /api/labs/{lab}` (status), `POST /api/labs/{lab}/{action}` (up/down/destroy/…), `POST …/reload`, `GET …/dns`, `GET …/logs`"],
+        ["Labs", "`GET/POST /api/labs` (list, create — the create body takes `preset`: `\"empty\"` (default) or `\"starter\"`; anything else is a 400), `GET /api/labs/{lab}` (status), `POST /api/labs/{lab}/{action}` (up/down/destroy/…), `POST …/reload`, `GET …/dns`, `GET …/logs`, `POST …/pulls/{machine}/cancel` (abort an in-flight registry pull)"],
         ["VMs", "`POST …/vms/{vm}/{action}`, `POST …/sendkeys`, `GET …/screenshot.png`, `GET …/stats`, `GET/POST …/clipboard`, `GET …/snapshots`, `DELETE …/snapshots/{name}`"],
         ["Containers", "`POST …/containers/{c}/{action}`, `GET …/stats` (mirror the VM routes)"],
         ["Snapshots (lab-wide)", "`POST …/snapshots` (take), `POST …/snapshots/{name}/restore`"],
         ["Templates", "`GET …/templates`, `GET …/templates/ops`, `GET …/templates/{tpl}/remote`, `POST …/templates/{tpl}/build|stop|publish`"],
-        ["Playbooks", "`GET …/playbooks`, `GET …/playbooks/ops`, `POST …/playbooks/scaffold`, `POST …/vms/{vm}/playbook/{action}` and `…/containers/{c}/playbook/{action}` (check/apply); config-weave packages: `POST …/playbooks/pkg`, `POST …/playbooks/pkg/search`, `GET/POST …/playbooks/repos`"],
+        ["Playbooks", "`GET …/playbooks`, `GET …/playbooks/ops`, `GET …/playbooks/plays` (every play the lab's folders declare), `POST …/playbooks/scaffold` (takes the play name; the folder need not be declared yet, and names that would break the skeleton's WCL literals are rejected), `POST …/vms/{vm}/playbook/{action}` and `…/containers/{c}/playbook/{action}` (check/apply); config-weave packages: `POST …/playbooks/pkg`, `POST …/playbooks/pkg/search`, `GET/POST …/playbooks/repos`"],
+        ["Playbook designer", "`POST …/playbooks/doc/inspect` and `POST …/playbooks/doc/render` (config-weave's DocJson pipeline: source ⇄ structural document), `GET …/playbooks/catalog` (installed packages' resource + parameter declarations, which drive the property panels)"],
         ["Files tab", "`GET …/files/tree`, `GET/PUT/DELETE …/files/file`, `POST …/files/mkdir`, `POST …/files/rename` — sandboxed to the lab directory"],
         ["Config & designer", "`GET/POST …/config` (raw `vmlab.wcl`), `GET/PUT …/scripts`, `GET …/model` + `POST …/model/edit` (the designer's structured model + surgical edit ops)"],
-        ["Catalogs & host", "`GET /api/catalog/templates|profiles|meta|oci`, `DELETE /api/catalog/templates/{arch}/{name}/{version}`, `GET/POST/DELETE /api/registries` + `POST /api/registries/login`, `GET /api/host`, `GET /api/host/fs`, `GET /api/fastpath`"],
+        ["Catalogs & host", "`GET /api/catalog/templates|profiles|meta|oci`, `DELETE /api/catalog/templates/{arch}/{name}/{version}`, `POST /api/catalog/templates/{arch}/{name}/{version}/verify` (the Templates page's **Check**), `GET/POST/DELETE /api/registries` + `POST /api/registries/login`, `GET /api/host`, `GET /api/host/fs`, `GET /api/fastpath`"],
         ["Live streams (WS)", "`GET /api/events` (lab/daemon event feed), `GET /api/labs/{lab}/vms/{vm}/tty` and `…/containers/{c}/tty` (agent terminals), `GET /api/desktop/vnc/{lab}/{vm}` and `GET /api/labs/{lab}/templates/{arch}/{template}/vnc` (desktop protocol)"],
         ["Guest web pages", "`POST /api/web/session` mints the path-scoped `vmlab_web` cookie; the proxy itself serves `/web/{lab}/{kind}/{machine}/{page}/…` outside the `/api/` gate"],
         ["Docs", "`GET /help`, `GET /help/{path}` — this reference book, embedded"],

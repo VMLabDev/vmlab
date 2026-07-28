@@ -50,7 +50,7 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
 
   lp_hero "Orchestrate virtual machine labs from your terminal." {
     badge    = "Declarative VM labs · QEMU/KVM"
-    lede     = "vmlab turns a single `vmlab.wcl` into a running fleet of VMs — machines, networks, and provisioning, wired automatically. Boot, snapshot, and tear down complex topologies with one command."
+    lede     = "vmlab turns a single `vmlab.wcl` into a running fleet of machines — VMs, containers, networks and provisioning, wired automatically. Boot, snapshot, and tear down complex topologies with one command."
     footnote = "Open source · MIT · Linux, or Windows 11 via WSL 2 or Docker"
     lp_cta "Get started"         { href = "#start"  primary = true }
     lp_cta "Read the reference"  { href = "./wskills/vmlab/" }
@@ -60,7 +60,7 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
     id      = taste
     eyebrow = "A taste"
     heading = "From a single file to a running lab in one command."
-    body    = "The lab is the file: segments with built-in DHCP, DNS and NAT, VMs booting linked clones of a template — pulled from an OCI registry on first `up` if it isn't local. `vmlab validate` type-checks the whole lab (wscript included) before anything boots."
+    body    = "The lab is the file: segments with built-in DHCP, DNS and NAT, VMs booting linked clones of a template — pulled from an OCI registry on first `up` if it isn't local — and OCI containers running as micro-VMs on the same wire. `vmlab validate` type-checks the whole lab (wscript included) before anything boots."
     code wcl {
       filename = "vmlab.wcl"
       source = <<'WCL'
@@ -76,11 +76,17 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
 
           vm "alp" {
             template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+            arch     = "x86_64"                            // multi-arch ref: pick one
             memory   = 1GiB
             nic { segment = "lan" }
+
+            provision "scripts/setup.ws" { }   // wscript, typed & checked
           }
 
-          provision "scripts/setup.ws" { }   // wscript, typed & checked
+          container "web" {                    // an OCI image, run as a micro-VM
+            image = "nginx:1.27"
+            nic { segment = "lan" }
+          }
         }
         WCL
     }
@@ -110,7 +116,7 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
     }
     lp_feature "Guests without networking" {
       icon = "lucide.refresh-cw"
-      body = "Run commands and copy files over the QEMU guest agent — no network path to the VM required, so automation works before the guest is even configured."
+      body = "vmlab's own guest agent rides a virtio-serial port, so exec, file copy, shells and readiness never touch the guest's network — automation works before the guest is even configured, and in both VMs and containers."
     }
     lp_feature "OCI distribution" {
       icon = "lucide.package"
@@ -128,6 +134,18 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
       icon = "lucide.boxes"
       body = "Build a sealed qcow2 template once from installer media; labs boot copy-on-write clones, so templates stay immutable and labs stay small on disk."
     }
+    lp_feature "Containers as lab machines" {
+      icon = "lucide.container"
+      body = "A `container {}` block runs an OCI image in its own micro-VM: same segments, same DNS, same snapshots and the same agent as a VM — a real kernel boundary, not a namespace."
+    }
+    lp_feature "Playbook convergence" {
+      icon = "lucide.list-checks"
+      body = "Declare [config-weave](https://github.com/Configweave/config-weave) playbooks inside the machine they converge. `vmlab up` applies them, reboots when a step demands it, and `vmlab playbook check` reports drift without changing anything."
+    }
+    lp_feature "Browser console" {
+      icon = "lucide.monitor"
+      body = "`vmlab-web` serves the whole lab from one port: live desktops, terminals, a visual topology designer, a file editor, playbook authoring and log streams — over the same API the CLI uses."
+    }
   }
 
   lp_cards {
@@ -142,7 +160,7 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
     id      = start
     eyebrow = "Getting started"
     title   = "Install it and boot your first lab."
-    lede    = "Needs `/dev/kvm` (on WSL 2 enable nested virtualisation). Or skip the install and run the container image with only `--device /dev/kvm`: `docker run --rm -it --device /dev/kvm ghcr.io/vmlabdev/vmlab`."
+    lede    = "Needs `/dev/kvm` (on WSL 2 enable nested virtualisation). Or skip the install and run the container image, which starts the web console on port 7878: `docker run --rm -p 7878:7878 --device /dev/kvm ghcr.io/vmlabdev/vmlab`. Append a command to get the CLI instead."
 
     lp_step "Install the CLI"                { command = "curl -fsSL https://vmlab.io/install.sh | sh" }
     lp_step "Write a lab, then validate it"  { command = "vmlab validate" }

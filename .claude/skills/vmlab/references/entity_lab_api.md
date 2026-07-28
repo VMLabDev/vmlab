@@ -9,6 +9,7 @@ The lab handle passed to fn main(lab: Lab) / fn handle(event, lab) — find VMs,
 | `lab.name()` | `string` | Lab name from vmlab.wcl |
 | `lab.log(msg: string)` | `unit` | Lab log + live CLI stream |
 | `lab.vm(name: string)` | `Result[Vm, string]` | Err if not defined |
+| `lab.this_vm()` | `Result[Vm, string]` | The machine this script is declared on — the normal way a nested `provision {}` names its own guest. Err outside a machine's own provision or a template first-boot script |
 | `lab.vms()` | `List[Vm]` | All VMs |
 | `lab.container(name: string)` | `Result[Container, string]` | Err if not defined |
 | `lab.containers()` | `List[Container]` | All containers |

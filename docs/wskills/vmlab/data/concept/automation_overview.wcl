@@ -24,10 +24,11 @@ and OCR. Multi-step guest work belongs in a script, not a chain of
 control flow.
 
 Underneath, guest access rides the [vmlab-agent](entity_vmlab_agent) channel
-(virtio-serial, no guest network needed), falling back to the QEMU guest
-agent on templates that predate it. Vision-based automation (screen matching,
-OCR) needs no agent at all — it reads the display, which is what makes even
-vintage guests scriptable.
+(virtio-serial, no guest network needed). There is no fallback: a guest
+without the agent has no exec, no file copy and no readiness — which is why
+templates built before the agent must be rebuilt. Vision-based automation
+(screen matching, OCR) needs no agent at all — it reads the display, which is
+what makes even vintage guests scriptable.
 
 The surfaces compose: a typical lab declares playbooks for steady-state
 config, provisions for the sequenced glue playbooks can't express, and a

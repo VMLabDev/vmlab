@@ -339,7 +339,7 @@ cli vmlab_cli {
 
   subcommand c_osinfo {
     name = "osinfo"
-    description = "Print guest OS information (guest-get-osinfo) as JSON."
+    description = "Print the guest OS identification the agent reports, as JSON: `id` (os-release `ID`, or `windows`), `name`, `version`, `kernel`, `arch`, `hostname`."
     cli_arg a_osinfo_vm { name = "vm"  description = "VM name." }
     code_example { lang = "console"  code = "vmlab osinfo dc01" }
   }
@@ -363,11 +363,12 @@ cli vmlab_cli {
 
   subcommand c_logs {
     name = "logs"
-    description = "Print JSON-line logs: lab events, or one VM's QEMU/serial output."
+    description = "Print logs: lab events, or one VM's QEMU/serial output."
     cli_arg a_logs_target { name = "[lab/][vm]"  description = "Lab events (default) or a specific VM's logs."  required = false }
     cli_switch s_logs_follow { long = "--follow"  short = "-f"  description = "Follow the log as it grows." }
     cli_switch s_logs_lines  { long = "--lines"   short = "-n"  value_name = "N"  description = "Lines of history (default 100)." }
-    code_example { lang = "console"  code = "vmlab logs -f\nvmlab logs dc01 -n 50" }
+    cli_switch s_logs_output { long = "--output"  short = "-o"  value_name = "FORMAT"  description = "`pretty` (default; human-readable, colorized on a TTY) or `jsonl` for the raw JSON lines." }
+    code_example { lang = "console"  code = "vmlab logs -f\nvmlab logs dc01 -n 50\nvmlab logs -o jsonl | jq ." }
   }
 
   // ---- Templates: store + builds + OCI ----

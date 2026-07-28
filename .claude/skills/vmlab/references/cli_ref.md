@@ -581,7 +581,7 @@ vmlab eventlog dc01 --filter "*[System[(EventID=4624)]]"
 
 ## vmlab osinfo
 
-Print guest OS information (guest-get-osinfo) as JSON.
+Print the guest OS identification the agent reports, as JSON: `id` (os-release `ID`, or `windows`), `name`, `version`, `kernel`, `arch`, `hostname`.
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -622,7 +622,7 @@ vmlab console dc01 --tcp
 
 ## vmlab logs
 
-Print JSON-line logs: lab events, or one VM's QEMU/serial output.
+Print logs: lab events, or one VM's QEMU/serial output.
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -632,10 +632,12 @@ Print JSON-line logs: lab events, or one VM's QEMU/serial output.
 | --- | --- | --- |
 | -f, --follow | — | Follow the log as it grows. |
 | -n, --lines | N | Lines of history (default 100). |
+| -o, --output | FORMAT | `pretty` (default; human-readable, colorized on a TTY) or `jsonl` for the raw JSON lines. |
 
 ```console
 vmlab logs -f
 vmlab logs dc01 -n 50
+vmlab logs -o jsonl | jq .
 ```
 
 ## vmlab template

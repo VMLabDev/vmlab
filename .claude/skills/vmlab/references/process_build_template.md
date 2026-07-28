@@ -23,7 +23,7 @@ template "linux-modern" {
   source "iso" { url = "https://.../x.iso" sha256 = "abc123..." }
   media { kind = "iso" from = "./cloudinit/" label = "CIDATA" }
   nic { nat = true }
-  provision "scripts/install.ws" { }   // drives the installer; installs the guest agent
+  provision "scripts/install.ws" { }   // drives the installer, then verifies the agent
 }
 ```
 

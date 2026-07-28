@@ -108,7 +108,7 @@ term g_guest_agent {
 
 term g_vmlab_agent {
   term       = "vmlab-agent"
-  definition = "vmlab's first-party in-guest agent on the `vmlab.agent.0` virtio-serial port (no guest network). Installed by the guest's own unattended-install hook from the auto-attached VMLAB bootstrap ISO at build time (meta `agent_version`); powers readiness, `vmlab shell`/`cp`/`tail`/`eventlog`/`ip`/`osinfo`, wscript `terminal()`/`stats()`, exec/copy, and graceful shutdown/reboot. Present in both full VMs and container micro-VMs."
+  definition = "vmlab's first-party in-guest agent on the `vmlab.agent.0` virtio-serial port (no guest network). Installed by the guest's own unattended-install hook from the auto-attached VMLAB bootstrap ISO at build time (meta `agent_version`); powers readiness, `vmlab exec`/`shell`/`cp`/`tail`/`eventlog`/`osinfo`, wscript `terminal()`/`stats()`, and graceful shutdown/reboot. Present in both full VMs and container micro-VMs."
   aliases    = ["agent channel"]
   audience   = :both
 }
@@ -141,7 +141,7 @@ term g_web_console {
 
 term g_web_page {
   term       = "web page (guest)"
-  definition = "An HTTP UI served inside a guest and declared with a `web {}` block; the web console proxies it into a same-origin iframe tab, injecting the guest app's login from the block's `auth {}`."
+  definition = "An HTTP UI served inside a guest and declared with a `web {}` block; the web console proxies it into a sandboxed (opaque-origin) iframe tab, injecting the guest app's login from the block's `auth {}`."
   audience   = :both
 }
 

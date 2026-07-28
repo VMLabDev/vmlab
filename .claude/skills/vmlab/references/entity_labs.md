@@ -16,9 +16,9 @@ directory. Every WCL file in a lab starts with `import <vmlab.wcl>`.
 import <vmlab.wcl>
 
 lab "demo" {
-  gui = true                  // lab-wide default: show each guest's screen in a
-                              // QEMU window (VM `gui` overrides; silently headless
-                              // when no display server is available)
+  gui = true                  // lab-wide default: open a VNC viewer on each guest
+                              // when `vmlab up` runs interactively (VM `gui`
+                              // overrides; skipped when there is no display)
   vm "box" {
     template = "x86_64/linux-modern"
     memory   = 2GiB
@@ -27,8 +27,9 @@ lab "demo" {
 }
 ```
 
-Closing a `gui` window kills that VM (QEMU semantics) — it surfaces as
-`vm.crashed`. The VNC socket (`vmlab console`) is available either way.
+VMs always run headless; `gui` only decides whether the CLI opens a viewer for
+you. Closing the viewer merely disconnects — the VM keeps running, and you can
+reattach any time with `vmlab console`.
 
 
 ## Examples

@@ -26,8 +26,10 @@ SRC
     }
     p <<PROSE
 Share contents live on the host and are **outside snapshot scope**. The SMB
-path requires a NIC on a segment (validation error otherwise); virtiofs works
-without guest networking. On Windows the agent mounts as SYSTEM (visible to
+path requires a NIC on a segment, and so does the default `transport = "auto"`
+(it can still fall back to SMB at VM start) — a validation error otherwise.
+Only an explicit `transport = "virtiofs"` shares into a machine with no NICs at
+all. On Windows the agent mounts as SYSTEM (visible to
 provisions and `vmlab exec`); with SMB, interactive users double-click the
 auto-dropped `vmlab-shares` desktop script once to authenticate their own
 session. Container `volume {}` blocks ride the same virtiofs transport (CIFS

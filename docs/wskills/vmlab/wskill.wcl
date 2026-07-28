@@ -24,7 +24,7 @@ schema_version = "1.3.0"
 topic vmlab {
   name    = "vmlab"
   summary = "A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript."
-  version = "1.3"
+  version = "1.4"
   description = <<END
 vmlab exists so an entire lab environment — machines, networks, and the setup
 on them — can be recreated from one file with one command. Describe the lab in
@@ -86,16 +86,16 @@ wcl.wskill::source vmlab_repo {
   kind         = "repo"
   locator      = "/home/wil/dev/vmlab"
   covers       = "Source of truth for behaviour: src/config/schema.wcl (WCL schema), src/scripting/ (wscript host API), src/cli/, src/template/, src/web/, src/profiles/shipped.wcl, examples/."
-  last_checked = "2026-07-19"
-  reflects_version = "main b809708"
+  last_checked = "2026-07-28"
+  reflects_version = "main b6b1c49"
 }
 
 wcl.wskill::source vmlab_cli_help {
   kind         = "cli"
   locator      = "vmlab --help"
   covers       = "Subcommand help text for the full verb surface (lifecycle, pull, vm, container, lab, snapshot, playbook, exec/shell/cp/tail/eventlog/osinfo, script, console, logs, fastpath, template, daemon)."
-  last_checked = "2026-07-19"
-  reflects_version = "main b809708"
+  last_checked = "2026-07-28"
+  reflects_version = "main b6b1c49"
 }
 
 // ---- Cross-references to other wskills ----

@@ -2,7 +2,7 @@
 
 _software_
 
-vmlab's first-party in-guest agent on the vmlab.agent.0 virtio-serial port: terminals, exec, file transfer, tail, event logs, clipboard and metrics — no guest network involved.
+vmlab's first-party in-guest agent on the vmlab.agent.0 virtio-serial port: terminals, exec, file transfer, tail, event logs, clipboard, metrics, network/OS identification and graceful shutdown — no guest network involved.
 
 `vmlab-agent` runs inside guests and talks to the host over a dedicated
 `vmlab.agent.0` virtio-serial port, so everything it offers works on
@@ -10,7 +10,9 @@ air-gapped machines and never depends on guest networking. One channel
 multiplexes: interactive **terminals** (a real PTY — root shell on Linux,
 SYSTEM PowerShell via ConPTY on Windows), streaming **exec**, \*\*file
 push/pull**, **tail** (`tail -F` semantics), the Windows **event log\*\*,
-**clipboard** get/set, and subscribed **guest metrics**. Both full VMs and
+**clipboard** get/set, subscribed **guest metrics**, and the identification and
+control calls the daemon needs — **net_info** (guest IPs without DHCP),
+**os_info** (see `vmlab osinfo`) and **shutdown**/reboot. Both full VMs and
 container micro-VMs carry it; playbooks push over the same channel.
 
 
