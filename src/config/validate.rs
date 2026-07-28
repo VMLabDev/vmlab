@@ -162,12 +162,21 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             }
         }
 
-        if !vm.shares.is_empty() && vm.nics.is_empty() {
+        // virtiofs is a vhost-user device, so it needs no guest networking. Every
+        // other transport lands on SMB, which is reachable only over a segment
+        // (PRD §7.5) — and `auto` can still fall back to it at VM start.
+        if vm.nics.is_empty()
+            && vm
+                .shares
+                .iter()
+                .any(|s| s.transport != ShareTransport::Virtiofs)
+        {
             issues.push(Issue::at(
                 vm.span,
                 format!(
-                    "vm \"{}\" declares shares but has no NICs — shares are reachable only over \
-                     a segment (PRD §7.5)",
+                    "vm \"{}\" declares shares but has no NICs — SMB shares are reachable only \
+                     over a segment (PRD §7.5); set `transport = \"virtiofs\"` to share without \
+                     one",
                     vm.name
                 ),
             ));
@@ -1229,12 +1238,37 @@ lab "l" {
 
     #[test]
     fn shares_need_nics() {
+        // Default transport is `auto`, which can still land on SMB at VM start.
         assert_err(
             r#"import <vmlab.wcl>
 lab "l" {
   vm "a" { template = "x86_64/t" share { host = "." guest = "/mnt/x" } }
 }"#,
             "no NICs",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t"
+    share { host = "." guest = "/mnt/x" transport = "smb" } }
+}"#,
+            "no NICs",
+        );
+    }
+
+    #[test]
+    fn virtiofs_shares_do_not_need_nics() {
+        // vhost-user-fs is a local device — no segment involved (PRD §7.5).
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t"
+    share { host = "." guest = "/mnt/x" transport = "virtiofs" } }
+}"#,
+        );
+        assert!(
+            !es.iter().any(|m| m.contains("no NICs")),
+            "virtiofs share should not require a NIC, got: {es:#?}"
         );
     }
 
