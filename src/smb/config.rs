@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Per-VM SMB credential. vmlab generates these automatically and plumbs them
 /// into the guest mount. Persisted per lab under `.vmlab/smb/creds` (0600)

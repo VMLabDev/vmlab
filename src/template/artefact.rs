@@ -162,9 +162,9 @@ async fn verify_file(path: &Path, expected_hex: &str) -> Result<()> {
     let path = path.to_path_buf();
     let expected = expected_hex.to_ascii_lowercase();
     let actual = tokio::task::spawn_blocking(move || -> Result<String> {
-        let mut f = std::fs::File::open(&path)?;
+        let f = std::fs::File::open(&path)?;
         let mut hasher = Sha256::new();
-        std::io::copy(&mut f, &mut hasher)?;
+        crate::hashing::feed(f, &mut hasher)?;
         Ok(hex::encode(hasher.finalize()))
     })
     .await??;

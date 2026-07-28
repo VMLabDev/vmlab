@@ -8,6 +8,7 @@ pub mod agent_asset;
 pub mod cli;
 pub mod config;
 pub mod guest_asset;
+mod hashing;
 pub mod lab_init;
 mod labd;
 /// Host-side config-weave binary resolution, shared by labd and the web

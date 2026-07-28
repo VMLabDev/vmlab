@@ -194,7 +194,7 @@ pub fn verify_whole(path: &Path, expected: &str) -> Result<()> {
     let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut reader = BufReader::with_capacity(COPY_BUF, file);
     let mut hasher = Sha256::new();
-    std::io::copy(&mut reader, &mut hasher)
+    crate::hashing::feed(&mut reader, &mut hasher)
         .with_context(|| format!("cannot hash {}", path.display()))?;
     let got = hex::encode(hasher.finalize());
     if got != want {

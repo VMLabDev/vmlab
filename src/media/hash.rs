@@ -6,7 +6,6 @@
 //! file without changing it does not invalidate the cache (PRD §6.3).
 
 use std::fs;
-use std::io;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -54,7 +53,7 @@ pub fn folder_digest(src_folder: &Path) -> Result<[u8; 32]> {
             hasher.update(entry.rel.as_bytes());
             hasher.update([0u8]);
             hasher.update(len.to_le_bytes());
-            io::copy(&mut file, &mut hasher)
+            crate::hashing::feed(&mut file, &mut hasher)
                 .with_context(|| format!("hashing contents of {}", abs.display()))?;
         }
     }

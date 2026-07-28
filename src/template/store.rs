@@ -308,7 +308,7 @@ impl TemplateStore {
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
+    crate::hashing::feed(&mut file, &mut hasher)
         .with_context(|| format!("cannot hash {}", path.display()))?;
     Ok(hex::encode(hasher.finalize()))
 }
