@@ -28,7 +28,7 @@ jobs:
       contents: read
       deployments: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,7 +39,7 @@ jobs:
       # (slow) cargo install on subsequent deploys.
       - name: Cache wcl CLI
         id: wcl-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wcl
           key: wcl-${{ env.WCL_REV }}
@@ -62,7 +62,7 @@ jobs:
         run: cp install.sh docs/_site/
 
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

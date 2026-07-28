@@ -32,7 +32,7 @@
 # Build the SolidJS web UI; the output is embedded into vmlab-web (rust-embed).
 # pnpm (via corepack, pinned by web-ui's packageManager field): the @forge/*
 # deps are git-subdir deps, which npm cannot install.
-FROM node:22-bookworm-slim AS web
+FROM node:24-bookworm-slim AS web
 WORKDIR /web
 RUN corepack enable
 # No lockfile on purpose (see web-ui/.gitignore) — fresh resolution extracts
@@ -48,7 +48,7 @@ RUN pnpm build
 # the runtime image so lab containers work offline, preserving the
 # no-privileges promise. The standalone agent binaries (dist/agent/…) are what
 # template builds bake into images; mingw cross-compiles the Windows one.
-FROM rust:1.92-bookworm AS guest
+FROM rust:1.97-bookworm AS guest
 RUN apt-get update && apt-get install -y --no-install-recommends cpio mingw-w64 \
     && rm -rf /var/lib/apt/lists/* \
     && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
@@ -61,7 +61,7 @@ RUN ./guest/build-asset.sh x86_64 aarch64 && ./guest/build-agent.sh
 # The binaries vmlab pushes into guests for `playbook {}` blocks (see
 # docker/labs/ad-demo): static linux-musl + windows-gnu, both x86_64,
 # downloaded from config-weave's pinned GitHub release and checksum-verified.
-FROM debian:bookworm-slim AS config-weave
+FROM debian:trixie-slim AS config-weave
 # `latest` = whatever config-weave released most recently; pass a tag to pin.
 # Resolved from the full release list, not the API's /releases/latest, which
 # skips prereleases — config-weave ships its new features as `-alpha` tags
@@ -85,19 +85,12 @@ RUN set -eu; \
     sha256sum -c SHA256SUMS; \
     printf '%s\n' "$tag" > VERSION
 
-# Bookworm ships the RISC-V QEMU system emulator but not its EDK2 package.
-# Pull the architecture-independent CODE/VARS blobs from Trixie while keeping
-# the runtime itself on Bookworm.
-FROM debian:trixie-slim AS riscv-firmware
-RUN apt-get update && apt-get install -y --no-install-recommends qemu-efi-riscv64 \
-    && rm -rf /var/lib/apt/lists/*
-
 # ---- help book ----------------------------------------------------------------
 # The vmlab wskill rendered to static HTML — embedded into vmlab-web as the
 # in-app /help. Keep WCL_REV in sync with the wcl_lang rev in Cargo.toml (and
 # deploy-site.yml) so the book renders with the wdoc version it was authored
 # against; the slow install layer is cached until the rev changes.
-FROM rust:1.92-bookworm AS help
+FROM rust:1.97-bookworm AS help
 ARG WCL_REV=ecf0390703ef56436fe3074ca098fe6865495a4d
 # libgit2's TLS stack gives up part-way through the (large, slow) wcl fetch
 # inside buildkit — "SSL error: unknown error; class=Ssl (16)", reported as
@@ -114,7 +107,7 @@ COPY src/config/schema.wcl src/config/host_schema.wcl ./src/config/
 RUN wcl wdoc build docs/wskills/vmlab/wdoc/book/main.wcl --out docs/help
 
 # ---- builder ----------------------------------------------------------------
-FROM rust:1.92-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 # Same git-over-CLI treatment as the help stage: this is the layer that fetches
 # wcl_lang + wscript + forge for the real build.
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_NET_RETRY=5
@@ -129,7 +122,7 @@ COPY --from=help /build/docs/help ./docs/help
 RUN cargo build --release --features web --bin vmlab --bin vmlab-web
 
 # ---- runtime ----------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 # QEMU system emulators, firmware, swtpm, OCR, NAT, ISO/floppy tooling, SMB
 # server (PRD §14). git is config-weave's: `pkg search|add` clones the package
 # repos through it.
@@ -141,6 +134,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ovmf \
         seabios \
         qemu-efi-aarch64 \
+        qemu-efi-riscv64 \
         swtpm \
         tesseract-ocr \
         passt \
@@ -152,8 +146,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
     && rm -rf /var/lib/apt/lists/*
-
-COPY --from=riscv-firmware /usr/share/qemu-efi-riscv64/ /usr/share/qemu-efi-riscv64/
 
 # vmlab-web spawns the `vmlab` binary for the supervisor/lab daemons (it locates
 # it as a sibling), so both must sit in the same directory.

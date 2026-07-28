@@ -14,7 +14,7 @@ jobs:
     name: fmt + lint + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # vmlab's tests probe the host for the tools it drives — QEMU emulators +
       # firmware (x86 OVMF, aarch64 AAVMF, riscv EDK2), swtpm, the ISO/floppy
       # builders (xorriso/mtools), the SMB server, and tesseract for OCR — so
@@ -39,12 +39,12 @@ jobs:
       # No lockfile on purpose — pnpm installs FROM a lockfile fetch path: git
       # deps as the raw monorepo (web-ui/.gitignore); fresh resolution is
       # correct, and the @forge revs are pinned in package.json.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
       # --store-dir: pnpm/action-setup's default store lives under its own
       # node_modules; the @forge git deps then build inside a node_modules
       # path, where TypeScript's wildcard matching silently skips source files
@@ -65,7 +65,7 @@ jobs:
     name: guest crates (cinit + agent)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -101,7 +101,7 @@ jobs:
     name: ebpf objects match source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # ebpf/rust-toolchain.toml selects the pinned nightly automatically;
       # install it (with rust-src) up front so cargo doesn't have to.
       - name: Install pinned ebpf toolchain
@@ -131,7 +131,7 @@ jobs:
       prerelease: ${{ steps.calc.outputs.prerelease }}
       do_release: ${{ steps.calc.outputs.do_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: calc
@@ -218,16 +218,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: linux-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
       - uses: Swatinem/rust-cache@v2
         with:
           key: build-${{ matrix.target }}
@@ -252,7 +252,7 @@ jobs:
           V="${{ needs.version.outputs.version }}"
           cp "target/${{ matrix.target }}/release/vmlab" "vmlab-$V-${{ matrix.suffix }}"
           cp "target/${{ matrix.target }}/release/vmlab-web" "vmlab-web-$V-${{ matrix.suffix }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
           # Matches both vmlab-<v>-<suffix> and vmlab-web-<v>-<suffix>.
@@ -269,10 +269,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           # Only the staged binaries — not the image job's .dockerbuild record.
@@ -284,7 +284,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "v$V"
           git push origin "v$V"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
@@ -307,7 +307,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Stamp version
         run: |
           V="${{ needs.version.outputs.version }}"
@@ -315,13 +315,13 @@ jobs:
       - name: Image ref (lowercase owner)
         id: img
         run: echo "ref=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vmlab" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         # Skip the .dockerbuild build-record artifact (the release job would
         # otherwise try to download it).
         env:
