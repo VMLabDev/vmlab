@@ -1,5 +1,9 @@
+# Every workspace's build dir: the main crate plus the standalone ones
+# (ebpf/, tap/, guest/cinit, guest/agent, and the two proto crates).
 /target
 /ebpf/target
+/tap/target
+/guest/*/target
 /.vmlab
 *.wscripti
 examples/**/.vmlab/
