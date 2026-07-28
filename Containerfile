@@ -98,7 +98,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends qemu-efi-riscv6
 # deploy-site.yml) so the book renders with the wdoc version it was authored
 # against; the slow install layer is cached until the rev changes.
 FROM rust:1.92-bookworm AS help
-ARG WCL_REV=d966f87d4a5a91206e185199262668309f108c52
+ARG WCL_REV=ecf0390703ef56436fe3074ca098fe6865495a4d
 # libgit2's TLS stack gives up part-way through the (large, slow) wcl fetch
 # inside buildkit — "SSL error: unknown error; class=Ssl (16)", reported as
 # "revision … not found". Shelling out to the git CLI is cargo's own advice
