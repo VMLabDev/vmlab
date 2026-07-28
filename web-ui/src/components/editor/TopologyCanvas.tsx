@@ -40,6 +40,7 @@ import {
 } from "lucide-solid";
 import type { Layout, NodePos } from "../../editor/layout";
 import {
+  KEY_NUL,
   MIN_FREE_PORTS,
   PORT_SIZE,
   PORT_SPACING,
@@ -805,7 +806,7 @@ export default function TopologyCanvas(props: {
     return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - (to.x >= from.x ? bend : -bend)} ${to.y}, ${to.x} ${to.y}`;
   }
 
-  const dependencyKey = (source: string, target: string) => `${source}\0${target}`;
+  const dependencyKey = (source: string, target: string) => `${source}${KEY_NUL}${target}`;
 
   /** An edge source→target is cyclic exactly when target can reach source.
    *  Labs are deliberately small, so a DFS per edge is clearer and less
@@ -2024,7 +2025,7 @@ export default function TopologyCanvas(props: {
       if (changed >= 0 && paths.filter((p, i) => p !== lastPlaybookPaths[i]).length === 1) {
         setLayout((l) => {
           // Normalize a legacy per-block key first so the position survives.
-          const legacy = `${lastPlaybookPaths[changed]}\0${0}`;
+          const legacy = `${lastPlaybookPaths[changed]}${KEY_NUL}0`;
           const map = { ...(l.playbooks ?? {}) };
           if (!map[lastPlaybookPaths[changed]] && map[legacy]) {
             map[lastPlaybookPaths[changed]] = map[legacy];

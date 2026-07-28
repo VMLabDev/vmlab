@@ -71,17 +71,24 @@ export function flatPlaybookPaths(model: LabModel): string[] {
   ];
 }
 
+/** Layout keys join their parts with a NUL, built here rather than written as
+ *  a `\0` escape: rolldown (vite 8) folds a constant `${0}` interpolation into
+ *  the preceding literal, so `\0${0}` becomes `\00` — an octal escape, which
+ *  is a syntax error in a template string and takes the whole bundle down.
+ *  Upstream bug; this constant is immune to it. */
+export const KEY_NUL = String.fromCharCode(0);
+
 /** Stable-enough cosmetic identity for provisions, including repeated scripts. */
 export function provisionLayoutKey(model: LabModel, index: number): string {
   const all = flatProvisions(model);
   const script = all[index]?.script || "(new provision)";
   const occurrence = all.slice(0, index).filter((p) => p.script === script).length;
-  return `${script}\0${occurrence}`;
+  return `${script}${KEY_NUL}${occurrence}`;
 }
 
 /** Cosmetic identity for playbook folder nodes — the bare path (one node
  *  per folder). [`playbookPos`] also consults the legacy per-block
- *  `path\0occurrence` key so saved layouts keep their positions. */
+ *  `path<NUL>occurrence` key so saved layouts keep their positions. */
 export function playbookLayoutKey(path: string): string {
   return path || "(new playbook)";
 }
@@ -89,7 +96,7 @@ export function playbookLayoutKey(path: string): string {
 /** Stored position for a playbook folder node, with legacy-key fallback. */
 export function playbookPos(layout: Layout, path: string): NodePos | undefined {
   const map = layout.playbooks ?? {};
-  return map[playbookLayoutKey(path)] ?? map[`${playbookLayoutKey(path)}\0${0}`];
+  return map[playbookLayoutKey(path)] ?? map[`${playbookLayoutKey(path)}${KEY_NUL}0`];
 }
 
 /** Minimum segment-bar width (room for the name + meta text); bars widen
