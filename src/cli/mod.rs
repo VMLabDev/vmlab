@@ -136,7 +136,7 @@ pub enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Print guest OS information (guest-get-osinfo) as JSON
+    /// Print guest OS information, as reported by the guest agent, as JSON
     Osinfo { vm: String },
     /// Tail or dump JSON-line logs for the lab or one VM
     Logs {
