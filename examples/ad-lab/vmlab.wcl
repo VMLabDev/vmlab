@@ -33,7 +33,8 @@ lab "ad-lab" {
   }
 
   vm "buildbox" {
-    template = "x86_64/linux-modern"
+    template = "ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04"
+    arch     = "x86_64"
     nic { nat = true }
   }
 

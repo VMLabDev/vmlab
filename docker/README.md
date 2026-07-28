@@ -107,13 +107,16 @@ vm "winsrv" {
 }
 ```
 
-vmlab serves the directory over SMB and auto-mounts it in the guest once the
-guest agent responds. The `host` path is absolute, so it's used as-is; a
-relative `host = "./sub"` would instead resolve against the lab directory
-(`/lab`).
+vmlab auto-mounts the directory in the guest once the guest agent responds.
+The default `transport = "auto"` picks **virtiofs** when the host has a
+`virtiofsd` and the guest profile advertises the client, and otherwise serves
+the folder over **SMB**; force either with `transport = "virtiofs"` / `"smb"`.
+The `host` path is absolute, so it's used as-is; a relative `host = "./sub"`
+would instead resolve against the lab directory (`/lab`).
 
-**Guest prerequisites (Linux only).** Windows mounts the share natively. A
-Linux guest needs two things the mount step does *not* provide for you:
+**Guest prerequisites (SMB, Linux only).** Windows mounts the share natively,
+and virtiofs needs nothing extra. A Linux guest falling back to SMB needs two
+things the mount step does *not* provide for you:
 
 - `cifs-utils` installed (the `mount.cifs` helper — kernel CIFS alone isn't
   enough), and

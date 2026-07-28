@@ -1,17 +1,29 @@
 # vmlab
 
 A single-host virtual machine lab orchestrator. Define **labs** — named
-groups of VMs and virtual networks — declaratively in [WCL][wcl], build and
-manage reusable **templates**, and drive automation through [wscript][wscript]
-scripts that interact with guests at every level: power state, snapshots,
-keystrokes and mouse input, screenshot capture with image matching and OCR,
-and command execution and file transfer via the QEMU guest agent.
+groups of VMs, containers and virtual networks — declaratively in [WCL][wcl],
+build and manage reusable **templates**, and drive automation through
+[wscript][wscript] scripts that interact with guests at every level: power
+state, snapshots, keystrokes and mouse input, screenshot capture with image
+matching and OCR, and command execution and file transfer over vmlab's own
+in-guest agent.
 
 vmlab targets QEMU/KVM exclusively, driven directly over QMP — no libvirt.
 Hosts are Linux, with **WSL2 supported as a first-class host environment**.
+Guests can be x86_64, aarch64 or riscv64, natively accelerated or emulated.
 
 See [`docs/vmlab-prd.md`](docs/vmlab-prd.md) for the full product
 requirements; it is the source of truth for design and scope.
+
+## Install
+
+```sh
+curl -fsSL https://vmlab.io/install.sh | sh -s -- --pre   # vmlab is pre-release only for now
+```
+
+This drops `vmlab` and `vmlab-web` into `~/.local/bin`. Or build from source
+(see [Building](#building)), or skip installing entirely and use the
+[container image](#container-image).
 
 ## Architecture
 
@@ -28,15 +40,20 @@ Two-tier daemon system (PRD §3):
 The CLI is a client of both tiers. wscript scripts are written against a clean
 lab/VM API and are never aware of the daemons.
 
+There are exactly two doors into a running guest: **QMP** (power, devices,
+screen) and **vmlab-agent** (exec, files, terminals, readiness) — see
+[The guest agent](#the-guest-agent).
+
 ## Quick start
 
 ```sh
-# A minimal lab: one Linux VM with internet egress.
+# A minimal lab: one Linux VM with internet egress, pulled from a registry.
 cat > vmlab.wcl <<'EOF'
 import <vmlab.wcl>
 lab "demo" {
   vm "box" {
-    template = "x86_64/linux-modern"
+    template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+    arch     = "x86_64"        # registry refs are multi-arch — pick one
     memory   = 2GiB
     nic { nat = true }
   }
@@ -44,65 +61,171 @@ lab "demo" {
 EOF
 
 vmlab validate     # full schema + semantic validation, no side effects
-vmlab up           # create clones, boot, run provision scripts
-vmlab status       # VM/segment state, IPs, ready flags
+vmlab up           # pull the template, create clones, boot, run the setup steps
+vmlab status       # machine/segment state, IPs, ready flags
 vmlab exec box -- uname -a
 vmlab down         # graceful stop; clones retained
 vmlab destroy      # stop + delete clones and lab-local state
 ```
 
+Templates can equally be built locally and referenced from the store as
+`<arch>/<name>[@<version>]` — see `vmlab template build`.
+
+## Machines
+
+A lab holds two kinds of machine, on the same segments and with the same DNS,
+snapshots and agent channel:
+
+```wcl
+vm "dc01" {                                    # a full VM from a disk template
+  template = "x86_64/windows-server-2025"
+  nic { segment = "corp" ip = "10.50.0.10" }
+}
+
+container "web" {                              # an OCI image, run in a micro-VM
+  image = "nginx:1.27"                         # PRD §18
+  nic { segment = "corp" }
+  port { host = 18080 container = 80 }
+}
+```
+
+Containers are not namespaces on the host: each runs in its own micro-VM
+(pinned Alpine kernel + vmlab's own init), so a container has a real kernel
+boundary and snapshots like a VM does.
+
+## Setting guests up
+
+Setup steps are declared **inside** the machine they configure and applied in
+declaration order on `vmlab up`:
+
+```wcl
+vm "srv01" {
+  template = "x86_64/windows-server-2025"
+  nic { segment = "corp" }
+
+  playbook "playbooks/domain" {                # declarative (config-weave)
+    play = "member"
+    var "domain" { value = "corp.example.com" }
+  }
+  provision "scripts/finish.ws" { }            # imperative (wscript)
+}
+```
+
+- **Playbooks** are [config-weave][config-weave] plays: desired state, with a
+  real drift check (`vmlab playbook check`) and reboot-aware apply loops.
+- **Provisions** are wscript: sequenced, imperative work with the full typed
+  guest API.
+- **Event handlers** (`on "vm.crashed" { … }`) react to lifecycle events.
+
+## The guest agent
+
+`vmlab-agent` is vmlab's own in-guest agent, reachable on a dedicated
+`vmlab.agent.0` virtio-serial port. It never touches the guest's network, so
+exec, file transfer, interactive terminals, log tailing, metrics, clipboard and
+readiness all work on air-gapped machines and before a guest is configured.
+
+It is baked into templates at build time from an auto-attached VMLAB bootstrap
+ISO, and verified live on the channel before the image is sealed. Container
+micro-VMs get it injected at boot. Guests that cannot run it (vintage OSes,
+`agent = false`) are still fully scriptable through the screen — keystrokes,
+mouse, image matching and OCR — they just never report ready.
+
+## The web console
+
+```sh
+vmlab-web                     # http://127.0.0.1:7878
+```
+
+`vmlab-web` serves the whole lab from a browser over the same daemon protocol
+the CLI uses: live desktops and agent terminals, a visual topology designer
+over `vmlab.wcl`, a whole-lab file editor with a playbook designer, template
+builds and OCI publishing, log streams, and guest-served web UIs proxied into
+sandboxed tabs. It binds loopback by default and requires a login on any
+other bind (`VMLAB_WEB_USER` / `VMLAB_WEB_PASSWORD`). Built behind the
+optional `web` feature; see [`docker/README.md`](docker/README.md).
+
 ## Examples
 
 Worked examples under `examples/`, all built and run end-to-end:
 
-- `templates/ubuntu-24.04/` — Ubuntu Server 24.04 template: ISO download +
-  sha256 verify, cloud-init autoinstall via a CIDATA media block, OCR-driven
-  confirmation in wscript.
-- `templates/windows-server-2025/` — Windows Server 2025 (eval) template:
-  fully unattended autounattend.xml install with virtio drivers, guest
-  agent on first logon, boot-prompt handling in wscript.
-- `mixed-lab/` — a two-VM Windows + Linux lab using both templates:
-  static IP, boot ordering, SMB share onto `S:`, host port-forward, and a
-  provision script driving both guests.
-- `ad-lab/` — a larger Active Directory lab definition (config + scripts
-  reference; templates for the client VM not included).
+| Example | What it shows |
+|---|---|
+| `templates/` | Eight template definitions built from installer media: `ubuntu-24.04`, `ubuntu-26.04`, `fedora-44`, `almalinux-10`, `arch`, `opensuse-leap-16.0`, `opensuse-tumbleweed` and `windows-server-2025` (fully unattended `autounattend.xml` with virtio drivers) |
+| `mixed-lab/` | Windows + Linux + an nginx container on one segment: static IP, `depends_on` ordering, an SMB share onto `S:`, a host port-forward, a provision script and a crash handler |
+| `ad-lab/` | A larger Active Directory lab definition (config + scripts reference) |
+| `alpine-registry/` | The no-build-step path: a template referenced by OCI ref and pulled on first `up` (PRD §6.4) |
+| `winsrv-desktop/` | The smallest useful lab — console access and `gui = true` (PRD §11) |
+| `alpine-arm64/` | An emulated aarch64 guest on an x86 host, NAT + SSH forward |
+| `riscv64-ubuntu/` | An emulated riscv64 guest (needs `qemu-system-riscv64` ≥ 8.1 and riscv64 UEFI firmware) |
+| `peer-a/` + `peer-b/` | Cross-instance L2 peering: a `global` segment with `connect {}` bridging two supervisors over a PSK-authenticated trunk (PRD §9.2) — `just peer-demo` |
+
+`docker/` holds the Compose stack's sample lab (`docker/lab`, a VM plus a
+container, playbooks and a share) and **ad-demo** (`docker/labs/ad-demo`), a
+two-VM Active Directory lab converged entirely by config-weave playbooks.
 
 ## CLI
 
 | Verb | Action |
 |---|---|
-| `vmlab up [vm...]` | Create/start lab (or subset), run provision scripts |
-| `vmlab down [vm...]` | Graceful stop; clones retained |
+| `vmlab up [machine...]` | Create/start the lab (or a subset), run playbooks and provisions |
+| `vmlab down [machine...] [--force]` | Graceful stop (`--force` hard-kills); clones retained |
+| `vmlab pull [machine...]` | Download missing registry templates/images without starting anything |
 | `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
-| `vmlab status` | Lab/VM/segment state, IPs, ready flags |
+| `vmlab status` | Lab/machine/segment state, IPs, ready flags |
 | `vmlab validate` | Full validation, no side effects |
-| `vmlab vm start / stop / restart <vm>` | Per-VM power operations |
-| `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide snapshots |
-| `vmlab console <vm>` | Attach a VNC viewer (TCP-forward fallback for WSL2) |
-| `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |
-| `vmlab cp <src> <vm>:<dest>` | Copy a host file or directory tree into a guest |
-| `vmlab osinfo <vm>` | Guest OS identification (guest-get-osinfo) as JSON |
-| `vmlab script <script.ws>` | Ad-hoc script against the current lab |
-| `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
-| `vmlab template build / list / rm / export / import` | Template store |
-| `vmlab template push / pull / login` | OCI registry distribution |
-| `vmlab daemon start / stop / status` | Supervisor control (normally automatic) |
+| `vmlab vm start / stop / restart / destroy <vm>` | Per-VM power operations |
+| `vmlab vm screenshot / sendkeys / mouse-move / click / drag <vm>` | Screen capture and input injection |
+| `vmlab vm ocr / find-image <vm>` | Read text off the screen; locate a template image |
+| `vmlab container start / stop / restart / destroy <c>` | Per-container lifecycle |
+| `vmlab container exec / shell / logs / ip <c>` | Container interaction |
+| `vmlab lab list / info / stop / destroy` | Manage running labs host-wide |
+| `vmlab snapshot create / restore / list / delete` | Lab-wide by default; `--vm` narrows to one machine |
+| `vmlab playbook list / check / apply` | config-weave playbooks; `check` reports drift without changing anything |
+| `vmlab console <vm>` | Attach a VNC viewer (`--tcp` forward for WSL2) |
+| `vmlab exec [--timeout s] <vm> -- cmd` | Run a command through the guest agent |
+| `vmlab shell <vm>` | Interactive root/SYSTEM shell over virtio-serial (Ctrl-] detaches) |
+| `vmlab cp <src> <dst>` | Copy files host↔guest — either side may be `<vm>:<path>` |
+| `vmlab tail <vm> <path>` | `tail -F` a guest file over the agent |
+| `vmlab eventlog <vm> [--filter XPATH]` | Follow a Windows guest's event log |
+| `vmlab osinfo <vm>` | Guest OS identification as JSON |
+| `vmlab script <script.ws>` | Ad-hoc wscript against the current lab |
+| `vmlab logs [lab/][vm] [-f] [-o jsonl]` | Tail/dump logs (pretty by default) |
+| `vmlab fastpath` | Which network fast-path tier is active, and why |
+| `vmlab template build / list / rm / clean / export / import` | Template store |
+| `vmlab template push / pull / search / login` | OCI registry distribution |
+| `vmlab template registry list / add / remove` | Shared registry namespaces |
+| `vmlab-web` | The browser console (separate binary) |
+
+The supervisor starts on demand; `vmlab daemon start / stop / status` exists as
+a hidden escape hatch.
 
 ## Building
 
-This crate depends on the sibling [WCL][wcl] and [wscript][wscript] workspaces via
-path dependencies (`../WCL`, `../wscript`). [`just`][just] is the command runner:
+[`just`][just] is the command runner. [WCL][wcl] and [wscript][wscript] are git
+dependencies pinned by rev in `Cargo.toml`, so no sibling checkouts are needed:
 
 ```sh
 just build    # cargo build
 just test     # cargo test
-just check    # clippy (-D warnings) + fmt check + tests
+just check    # clippy (-D warnings) + fmt check + tests + web-ui typecheck
+just check-all # the above plus the guest asset and eBPF verifier checks
 ```
 
-Runtime tools expected on the host: `qemu-system-<arch>`, `qemu-img`,
-`swtpm`, `tesseract`, an ISO tool (`xorriso`/`genisoimage`), `mtools` +
-`mkfs.vfat` (floppy building), and `smbd` (shared folders). The official
-container image (`Containerfile`) bundles them all.
+Runtime tools expected on the host: `qemu-system-<arch>`, `qemu-img`, `swtpm`,
+`tesseract` (OCR), an ISO tool (`xorriso`/`genisoimage`), `mtools` +
+`mkfs.vfat` (floppy building), `sqfstar` from `squashfs-tools` (required for
+containers), and a VNC viewer (`remote-viewer` preferred) for `vmlab console`.
+Shared folders use `virtiofsd` when host and guest both support it and fall
+back to a bundled unprivileged `smbd`, so having both covers every guest. The
+official container image bundles them all.
+
+## Networking
+
+Each lab gets a complete userspace network fabric — L2 switching, DHCP, DNS,
+NAT, routes, port forwards and L3 filtering — with no taps, bridges, or
+`CAP_NET_ADMIN`. An optional eBPF fast path (`VMLAB_FASTPATH=auto`, AF_XDP
+tier) accelerates it where the host allows; `vmlab fastpath` reports the
+selected tier, and an unavailable fast path silently falls back to userspace.
 
 ## WSL2
 
@@ -115,10 +238,26 @@ absent at daemon start.
 
 ## Container image
 
+The image ships both binaries and defaults to the web console on port 7878.
+The Compose stack is the shortest path — it wires the sample lab, the ad-demo
+lab, a shared folder and the template volume:
+
 ```sh
-docker build -t vmlab -f Containerfile .
-docker run --rm -it --device /dev/kvm --device /dev/net/tun \
+docker compose up --build           # then open http://localhost:7878
+```
+
+See [`docker/README.md`](docker/README.md) for the full tour. Plain
+`docker run` works too:
+
+```sh
+# Web console
+docker run --rm -p 7878:7878 --device /dev/kvm --device /dev/net/tun \
   --cap-add BPF --cap-add NET_ADMIN -e VMLAB_FASTPATH=auto \
+  -e VMLAB_WEB_USER=admin -e VMLAB_WEB_PASSWORD=secret \
+  -v "$PWD":/lab vmlab
+
+# CLI (override the default command)
+docker run --rm -it --device /dev/kvm \
   -v ~/.local/share/vmlab/templates:/root/.local/share/vmlab/templates \
   -v "$PWD":/lab -w /lab vmlab vmlab up
 ```
@@ -126,9 +265,9 @@ docker run --rm -it --device /dev/kvm --device /dev/net/tun \
 `--device /dev/kvm` is the only host grant required for KVM acceleration;
 without it vmlab falls back to TCG (slow but functional). The optional eBPF
 network fast path uses `/dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`, as shown
-above. No `--privileged` or host network mode is required, and an unavailable
-fast path falls back to the userspace fabric.
+above. No `--privileged` or host network mode is required.
 
 [wcl]: https://github.com/wiltaylor/wcl
 [wscript]: https://github.com/Configweave/wscript
+[config-weave]: https://github.com/Configweave/config-weave
 [just]: https://github.com/casey/just
