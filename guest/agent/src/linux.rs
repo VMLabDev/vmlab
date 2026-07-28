@@ -19,7 +19,7 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, chdir, chroot, dup2, execve, fork, setsid};
+use nix::unistd::{ForkResult, Pid, chdir, chroot, execve, fork, setsid};
 use std::os::unix::fs::PermissionsExt;
 
 use vmlab_agent_proto::{
@@ -623,11 +623,7 @@ fn spawn_shell(
     container: Option<&ContainerCtx>,
 ) -> std::io::Result<(OwnedFd, Pid)> {
     let pty = openpty(size, None).map_err(std::io::Error::from)?;
-    fcntl(
-        pty.master.as_raw_fd(),
-        FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC),
-    )
-    .map_err(std::io::Error::from)?;
+    fcntl(&pty.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(std::io::Error::from)?;
 
     let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, what.to_string());
     let c_exe = CString::new(shell[0].as_str()).map_err(|_| bad("NUL in shell path"))?;
@@ -686,8 +682,12 @@ fn spawn_shell(
             if unsafe { tiocsctty(slave_raw, 0) }.is_err() {
                 die("tiocsctty");
             }
+            // SAFETY: post-fork, redirecting stdio onto the PTY slave. Raw
+            // libc rather than nix's `dup2`, which since 0.31 wants an
+            // `AsFd`/`&mut OwnedFd` pair we do not have here — and which the
+            // async-signal-safe contract would not let us construct anyway.
             for fd in 0..=2 {
-                if dup2(slave_raw, fd).is_err() {
+                if unsafe { libc::dup2(slave_raw, fd) } < 0 {
                     die("dup2");
                 }
             }
