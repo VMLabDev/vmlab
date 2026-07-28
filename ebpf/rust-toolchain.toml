@@ -2,5 +2,5 @@
 # against this toolchain's libLLVM, so the channel pin (not just "nightly")
 # is load-bearing. Keep in sync with .github/workflows/ci.yml (ebpf-verify).
 [toolchain]
-channel = "nightly-2026-05-22"
+channel = "nightly-2026-07-21"
 components = ["rust-src"]
