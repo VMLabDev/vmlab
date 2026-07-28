@@ -937,8 +937,10 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "forge-core"
 version = "0.1.0"
-source = "git+https://github.com/wiltaylor/forge.git?rev=c634d1bda814f6ee1469c6b647633c05b8434875#c634d1bda814f6ee1469c6b647633c05b8434875"
+source = "git+https://github.com/wiltaylor/forge.git?rev=a11304659f58f494ba3b5595638c7231f8206dc7#a11304659f58f494ba3b5595638c7231f8206dc7"
 dependencies = [
+ "flate2",
+ "jpeg-encoder",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1496,6 +1498,12 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
 ]
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
 
 [[package]]
 name = "js-sys"
