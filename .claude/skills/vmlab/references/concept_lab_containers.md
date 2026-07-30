@@ -11,13 +11,16 @@ full machine parity with zero extra privileges:
 
 - **One namespace.** VM and container names share DNS, `depends_on` waves,
   `forward { to = … }` targets and provision scoping. To the rest of the lab
-  a container is just another machine on the segment.
+  a container is just another machine on the segment — and to the daemon,
+  the CLI and the API they answer the same `machine` commands, differing only
+  in what they report they can do (a container has no framebuffer; a VM keeps
+  no console log).
 - **Full snapshot parity.** Offline and online snapshots, standalone or
   lab-wide, identical to VMs.
 - **The same automation.** The [vmlab-agent](../references/entity_vmlab_agent.md) runs inside
-  the micro-VM, so `vmlab container exec`/`shell`, wscript
-  [`Container` handles](../references/entity_container_api.md), playbooks and file copy all
-  work — network or no network.
+  the micro-VM, so `vmlab container exec`/`shell`, `vmlab osinfo`, clipboard,
+  wscript [`Container` handles](../references/entity_container_api.md), playbooks and file copy
+  all work — network or no network.
 - **Volumes & ports.** Named or bind volumes ride virtiofs (CIFS fallback),
   and `port {}` blocks are sugar for segment forwards.
 

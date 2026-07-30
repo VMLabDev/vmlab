@@ -17,7 +17,7 @@ vm "name" {
   disk     = 80GiB                   // primary disk size — scratch VMs only
   cdrom    = "./isos/drivers.iso"    // paths relative to lab root
   floppy   = "./unattend.img"
-  depends_on  = ["dc01"]             // wait for these machines and their whole step list first
+  depends_on  = ["dc01"]             // start after these and their whole step list; stop before them
   nested      = true                 // nested virtualisation
   display     = "virtio-gpu"
   firmware    = "ovmf"               // "ovmf" | "seabios"
