@@ -507,7 +507,7 @@ impl ContainerInstance {
     /// first use — the same discipline as `VmInstance::agent`.
     pub async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
         if self.state().await != PowerState::Running {
-            bail!("{}: not running", self.cfg.name);
+            return Err(super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into());
         }
         self.agent
             .connect(&self.cfg.name, &self.dirs.agent_sock(), NO_AGENT_HINT)

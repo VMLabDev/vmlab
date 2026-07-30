@@ -208,11 +208,13 @@ pub trait Machine: Send + Sync + 'static {
             match self.agent().await {
                 Ok(agent) => return Ok(agent),
                 Err(e) => {
-                    let msg = format!("{e:#}");
-                    if msg.contains("not running") || msg.contains("no agent channel") {
-                        return Err(e);
-                    }
-                    if tokio::time::Instant::now() >= deadline {
+                    // A permanent reason will not improve with waiting.
+                    // Anything untyped is treated as permanent too: guessing
+                    // that an unknown failure is retryable is how a caller
+                    // ends up blocked for the whole timeout on a real fault.
+                    let transient =
+                        AgentUnavailable::of(&e).is_some_and(AgentUnavailable::is_transient);
+                    if !transient || tokio::time::Instant::now() >= deadline {
                         return Err(e);
                     }
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -341,6 +343,43 @@ impl dyn Machine {
 
 // ---- shared implementation details -----------------------------------------
 
+/// Why a machine's agent channel could not be reached.
+///
+/// The distinction that matters to a caller is whether waiting could change
+/// the answer. A stopped machine and a vintage guest with no agent channel
+/// will never answer; a failed handshake often will, because a machine can be
+/// briefly agent-less while claiming to be up — Windows first-boot ends in a
+/// settle reboot, and readiness is sticky across guest reboots.
+///
+/// Carried inside `anyhow::Error`, so the 21 call sites that only want a
+/// message are untouched and the few that must branch use
+/// [`AgentUnavailable::of`].
+#[derive(Debug, thiserror::Error)]
+pub enum AgentUnavailable {
+    #[error("{0}: not running")]
+    NotRunning(String),
+    #[error(
+        "{0}: this guest profile has no agent channel (vintage guest) — \
+         no interactive terminal is possible"
+    )]
+    NoChannel(String),
+    #[error("{machine}: {message}")]
+    Handshake { machine: String, message: String },
+}
+
+impl AgentUnavailable {
+    /// Whether retrying could succeed.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Handshake { .. })
+    }
+
+    /// Recover the typed reason from an error returned by
+    /// [`Machine::agent`], if that is what it is.
+    pub fn of(err: &anyhow::Error) -> Option<&AgentUnavailable> {
+        err.downcast_ref::<AgentUnavailable>()
+    }
+}
+
 /// The cached-connection half of a machine's agent channel, shared by both
 /// adapters: one live handle, plus when the last handshake failed so
 /// agent-less guests don't pay the timeout on every call.
@@ -375,7 +414,11 @@ impl AgentSlot {
             if let Some(at) = *failed
                 && at.elapsed() < Duration::from_secs(30)
             {
-                bail!("{name}: {hint}");
+                return Err(AgentUnavailable::Handshake {
+                    machine: name.to_string(),
+                    message: hint.to_string(),
+                }
+                .into());
             }
         }
         match AgentHandle::connect(sock, Duration::from_secs(5)).await {
@@ -386,7 +429,11 @@ impl AgentSlot {
             }
             Err(e) => {
                 *self.failed_at.lock().await = Some(std::time::Instant::now());
-                Err(anyhow!("{name}: {e:#} — {hint}"))
+                Err(AgentUnavailable::Handshake {
+                    machine: name.to_string(),
+                    message: format!("{e:#} — {hint}"),
+                }
+                .into())
             }
         }
     }
@@ -491,5 +538,55 @@ impl Display {
         opts: &crate::vision::MatchOptions,
     ) -> Result<Option<crate::vision::Match>> {
         crate::scripting::interact::find_image(&self.vm, templates, opts).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `wait_agent` retries a handshake and gives up immediately on a reason
+    /// that will never improve. Before this was typed it decided by searching
+    /// the error's text for "not running" — so rewording a message, or an
+    /// unrelated error that happened to contain the phrase, silently changed
+    /// whether callers blocked for the full timeout.
+    #[test]
+    fn only_a_failed_handshake_is_worth_retrying() {
+        let stopped = AgentUnavailable::NotRunning("dc01".into());
+        let vintage = AgentUnavailable::NoChannel("dos622".into());
+        let handshake = AgentUnavailable::Handshake {
+            machine: "dc01".into(),
+            message: "timed out".into(),
+        };
+        assert!(!stopped.is_transient(), "a stopped machine never answers");
+        assert!(
+            !vintage.is_transient(),
+            "a vintage guest has no agent at all"
+        );
+        assert!(
+            handshake.is_transient(),
+            "a machine can be briefly agent-less across a settle reboot"
+        );
+    }
+
+    /// The reason survives the trip through `anyhow`, which is how it reaches
+    /// `wait_agent` without changing 21 call sites that only want a message.
+    #[test]
+    fn the_reason_survives_anyhow() {
+        let err: anyhow::Error = AgentUnavailable::NotRunning("dc01".into()).into();
+        let found = AgentUnavailable::of(&err).expect("recoverable");
+        assert!(matches!(found, AgentUnavailable::NotRunning(n) if n == "dc01"));
+        assert!(!found.is_transient());
+        // And it still reads well for a human.
+        assert_eq!(format!("{err}"), "dc01: not running");
+    }
+
+    /// An error from somewhere else must not be mistaken for a retryable
+    /// handshake — treating unknown failures as transient would block a
+    /// caller for the whole timeout on a real fault.
+    #[test]
+    fn an_unrelated_error_is_not_transient() {
+        let err = anyhow::anyhow!("disk full while creating the clone");
+        assert!(AgentUnavailable::of(&err).is_none());
     }
 }

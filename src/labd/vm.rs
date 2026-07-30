@@ -336,14 +336,10 @@ impl VmInstance {
     /// agent transport.
     pub async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
         if self.state().await != PowerState::Running {
-            bail!("{}: not running", self.cfg.name);
+            return Err(super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into());
         }
         if !self.template().resolved.agent_channel {
-            bail!(
-                "{}: this guest profile has no agent channel (vintage guest) — \
-                 no interactive terminal is possible",
-                self.cfg.name
-            );
+            return Err(super::machine::AgentUnavailable::NoChannel(self.cfg.name.clone()).into());
         }
         self.agent
             .connect(&self.cfg.name, &self.dirs.agent_sock(), NO_AGENT_HINT)
