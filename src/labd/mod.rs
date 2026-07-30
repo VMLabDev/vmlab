@@ -10,6 +10,7 @@ pub mod lab;
 pub mod machine;
 pub mod netservices;
 pub mod network;
+pub mod plan;
 pub mod playbook;
 pub mod state;
 pub mod vm;

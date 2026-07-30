@@ -14,6 +14,7 @@ use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
 use super::events::EventLog;
 use super::machine::Machine;
 use super::network::{LabNetwork, nic_segment_name};
+use super::plan;
 use super::state::{LabState, SnapshotRecord, generate_mac};
 use super::vm::{PowerState, StopReason, VmDirs, VmInstance};
 use crate::config::LabFile;
@@ -1064,19 +1065,6 @@ impl LabRuntime {
             )
     }
 
-    /// `depends_on` of a machine (VM or container) by name.
-    fn machine_deps(&self, name: &str) -> Option<&[String]> {
-        if let Some(v) = self.config.lab.vms.iter().find(|v| v.name == name) {
-            return Some(&v.depends_on);
-        }
-        self.config
-            .lab
-            .containers
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| c.depends_on.as_slice())
-    }
-
     /// Something in the lab waits on this machine's readiness.
     fn has_dependents(&self, name: &str) -> bool {
         self.config
@@ -1535,40 +1523,15 @@ impl LabRuntime {
         subset: &[String],
         output: crate::scripting::OutputSink,
     ) -> Result<()> {
-        // One machine list spanning VMs and containers — they share the
-        // dependency graph and the waves.
-        let all_machines: Vec<String> = self
-            .config
-            .lab
-            .vms
-            .iter()
-            .map(|v| v.name.clone())
-            .chain(self.config.lab.containers.iter().map(|c| c.name.clone()))
-            .collect();
-        let targets: Vec<String> = if subset.is_empty() {
-            all_machines.clone()
-        } else {
-            for s in subset {
-                if !self.vms.contains_key(s) && !self.containers.contains_key(s) {
-                    bail!("no vm or container \"{s}\" in lab \"{}\"", self.name);
-                }
-            }
-            // Pull in transitive dependencies of the subset.
-            let mut wanted: HashSet<String> = HashSet::new();
-            let mut stack: Vec<String> = subset.to_vec();
-            while let Some(n) = stack.pop() {
-                if wanted.insert(n.clone())
-                    && let Some(deps) = self.machine_deps(&n)
-                {
-                    stack.extend(deps.iter().cloned());
-                }
-            }
-            all_machines
-                .iter()
-                .filter(|n| wanted.contains(*n))
-                .cloned()
-                .collect()
-        };
+        // Decide the whole schedule before touching anything: which
+        // machines a subset drags in, which wave each lands in, and which
+        // configuration steps are in scope (see `labd::plan`).
+        let plan =
+            plan::plan(&self.config.lab, subset, plan::Direction::Up).map_err(|e| anyhow!(e))?;
+        for skip in &plan.skipped {
+            output(format!("{}: {}\n", skip.what, skip.why));
+        }
+        let targets: Vec<String> = plan.machines().cloned().collect();
 
         // Deferred template/image downloads happen here — before the binary
         // preflight (pulled meta can change the resolved firmware/TPM needs)
@@ -1582,40 +1545,11 @@ impl LabRuntime {
         // during provisioning (PRD §7.5).
         self.ensure_smb(&output).await;
 
-        let mut remaining: Vec<String> = targets.clone();
-        let mut done: HashSet<String> = HashSet::new();
-        // Steps belong to their machine, so a partial `up` only runs the
-        // steps of the machines it started — anything else would stall the
-        // queue on a machine that is never coming up.
-        let mut steps = merged_up_steps(&self.config.lab);
-        steps.retain(|s| {
-            let in_scope = targets.contains(&s.machine);
-            if !in_scope {
-                output(format!(
-                    "{}: \"{}\" is not in this `up` — skipped\n",
-                    s.describe(),
-                    s.machine
-                ));
-            }
-            in_scope
-        });
+        let steps = plan.steps.clone();
         let mut next_step = 0usize;
-        while !remaining.is_empty() {
-            // A wave: every remaining machine whose deps (within the target
-            // set) are all done.
-            let wave: Vec<String> = remaining
-                .iter()
-                .filter(|n| {
-                    self.machine_deps(n)
-                        .unwrap_or(&[])
-                        .iter()
-                        .all(|d| done.contains(d) || !targets.contains(d))
-                })
-                .cloned()
-                .collect();
-            if wave.is_empty() {
-                bail!("dependency deadlock among: {}", remaining.join(", "));
-            }
+        let mut done: HashSet<String> = HashSet::new();
+        for wave in &plan.waves {
+            let wave = wave.clone();
 
             // A JoinSet, not loose handles: when one machine in the wave fails
             // the rest are aborted on the spot. Detached tasks used to keep
@@ -1668,8 +1602,7 @@ impl LabRuntime {
                         return Err(anyhow!("join: {e}"));
                     }
                 };
-                done.insert(started.clone());
-                remaining.retain(|x| x != &started);
+                done.insert(started);
             }
 
             // Between waves: run (in declaration order) every unrun
@@ -1759,13 +1692,13 @@ impl LabRuntime {
     }
 
     /// Run configuration steps (provision scripts and playbook applies —
-    /// one declaration-ordered queue, see [`merged_up_steps`]) in strict
+    /// one declaration-ordered queue, see [`plan`]) in strict
     /// order starting at `*next`. A step runs once the machine that declares
     /// it has started, waiting for its readiness first; the queue stops at
     /// the first step whose machine isn't up yet.
     async fn run_up_steps(
         self: &Arc<Self>,
-        steps: &[UpStep],
+        steps: &[plan::Step],
         next: &mut usize,
         started: &HashSet<String>,
         output: &crate::scripting::OutputSink,
@@ -1785,7 +1718,7 @@ impl LabRuntime {
                 self.vm(m)?.wait_ready(Duration::from_secs(600)).await?;
             }
             match &step.kind {
-                UpStepKind::Provision(p) => {
+                plan::StepKind::Provision(p) => {
                     let script = self.root.join(&p.script);
                     output(format!("provision: {} → {m}\n", p.script.display()));
                     // The script reaches its own machine with `lab.this_vm()`;
@@ -1795,7 +1728,7 @@ impl LabRuntime {
                         .await
                         .with_context(|| format!("provision {}", p.script.display()))?;
                 }
-                UpStepKind::Playbook(p) => {
+                plan::StepKind::Playbook(p) => {
                     output(format!(
                         "playbook: {} play {} → {m}\n",
                         p.path.display(),
@@ -1882,24 +1815,33 @@ impl LabRuntime {
     }
 
     /// Graceful stop; clones retained (PRD §12).
+    /// Stop machines in reverse dependency order.
+    ///
+    /// The mirror of [`up`](Self::up): a subset pulls in its *dependents*, and
+    /// the waves run leaves-first, so a domain controller outlives the members
+    /// that need it to shut down cleanly. `vmlab down dc01` therefore stops
+    /// everything that depends on dc01 as well — before this it stopped dc01
+    /// alone and left them running against a dead dependency.
     pub async fn down(self: &Arc<Self>, subset: &[String], force: bool) -> Result<()> {
-        let targets: Vec<String> = if subset.is_empty() {
-            self.vms
-                .keys()
-                .chain(self.containers.keys())
-                .cloned()
-                .collect()
-        } else {
-            subset.to_vec()
-        };
-        let mut handles = Vec::new();
-        for name in targets {
-            let m = self.machine(&name)?;
-            handles.push(tokio::spawn(async move { m.stop(force).await }));
+        let plan =
+            plan::plan(&self.config.lab, subset, plan::Direction::Down).map_err(|e| anyhow!(e))?;
+        for skip in &plan.skipped {
+            tracing::info!("{}: {}", skip.what, skip.why);
         }
-        for h in handles {
-            h.await.map_err(|e| anyhow!("join: {e}"))??;
+
+        for wave in &plan.waves {
+            let mut handles = Vec::new();
+            for name in wave {
+                // A machine the config declares but this runtime never built
+                // is nothing to stop.
+                let Ok(m) = self.machine(name) else { continue };
+                handles.push(tokio::spawn(async move { m.stop(force).await }));
+            }
+            for h in handles {
+                h.await.map_err(|e| anyhow!("join: {e}"))??;
+            }
         }
+
         // Full lab down: reap smbd too, or it outlives the daemon and holds
         // its port against the next `up`. Partial downs keep shares served.
         if subset.is_empty()
@@ -2327,148 +2269,5 @@ fn guest_os_hint(profile: Option<&str>) -> crate::smb::OsHint {
         Some("windows-legacy") => crate::smb::OsHint::WindowsXp,
         Some(p) if p.starts_with("windows") => crate::smb::OsHint::Windows,
         _ => crate::smb::OsHint::Linux,
-    }
-}
-
-/// What one `up`-phase configuration step does.
-enum UpStepKind {
-    Provision(crate::config::model::Provision),
-    Playbook(crate::config::model::Playbook),
-}
-
-/// One `up`-phase configuration step: a `provision`/`playbook` block declared
-/// inside `machine`, which is therefore its target.
-struct UpStep {
-    machine: String,
-    kind: UpStepKind,
-}
-
-impl UpStep {
-    /// How the step names itself in `up` output.
-    fn describe(&self) -> String {
-        match &self.kind {
-            UpStepKind::Provision(p) => format!("provision {}", p.script.display()),
-            UpStepKind::Playbook(p) => format!("playbook {} play {}", p.path.display(), p.play),
-        }
-    }
-}
-
-/// Every machine's configuration steps in file declaration order — within a
-/// machine that is the order its blocks were written, and across machines the
-/// order the machine blocks appear. Block byte spans recover both, since the
-/// model keeps provisions and playbooks in separate vecs.
-fn merged_up_steps(lab: &crate::config::model::Lab) -> Vec<UpStep> {
-    let mut steps: Vec<(usize, UpStep)> = Vec::new();
-    let mut collect = |machine: &str,
-                       provisions: &[crate::config::model::Provision],
-                       playbooks: &[crate::config::model::Playbook]| {
-        for p in provisions {
-            steps.push((
-                p.span.0,
-                UpStep {
-                    machine: machine.to_string(),
-                    kind: UpStepKind::Provision(p.clone()),
-                },
-            ));
-        }
-        for p in playbooks {
-            steps.push((
-                p.span.0,
-                UpStep {
-                    machine: machine.to_string(),
-                    kind: UpStepKind::Playbook(p.clone()),
-                },
-            ));
-        }
-    };
-    for vm in &lab.vms {
-        collect(&vm.name, &vm.provisions, &vm.playbooks);
-    }
-    for c in &lab.containers {
-        collect(&c.name, &c.provisions, &c.playbooks);
-    }
-    steps.sort_by_key(|(at, _)| *at);
-    steps.into_iter().map(|(_, s)| s).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn step_labels(src: &str) -> Vec<String> {
-        let lf = crate::config::load_lab_source(src, "<test>", std::path::Path::new("/tmp"))
-            .expect("parse");
-        merged_up_steps(&lf.lab)
-            .iter()
-            .map(|s| format!("{} → {}", s.describe(), s.machine))
-            .collect()
-    }
-
-    /// Within a machine, steps run in the order its blocks were written.
-    #[test]
-    fn up_steps_interleave_by_declaration_order() {
-        let steps = step_labels(
-            r#"import <vmlab.wcl>
-lab "l" {
-  vm "a" {
-    template = "x86_64/t"
-    provision "scripts/one.ws" { }
-    playbook "pb/base" { play = "base" }
-    provision "scripts/two.ws" { }
-  }
-}"#,
-        );
-        assert_eq!(
-            steps,
-            vec![
-                "provision scripts/one.ws → a",
-                "playbook pb/base play base → a",
-                "provision scripts/two.ws → a",
-            ]
-        );
-    }
-
-    /// Across machines, steps follow the order the machine blocks appear —
-    /// including containers, which share the queue with VMs.
-    #[test]
-    fn up_steps_order_across_machines() {
-        let steps = step_labels(
-            r#"import <vmlab.wcl>
-lab "l" {
-  vm "a" {
-    template = "x86_64/t"
-    playbook "pb/base" { play = "base" }
-  }
-  container "c" {
-    image = "nginx"
-    provision "scripts/c.ws" { }
-  }
-  vm "b" {
-    template = "x86_64/t"
-    provision "scripts/b.ws" { }
-  }
-}"#,
-        );
-        assert_eq!(
-            steps,
-            vec![
-                "playbook pb/base play base → a",
-                "provision scripts/c.ws → c",
-                "provision scripts/b.ws → b",
-            ]
-        );
-    }
-
-    /// A machine with no steps contributes none — there is no such thing as
-    /// a declared-but-target-less block any more.
-    #[test]
-    fn up_steps_empty_without_blocks() {
-        assert!(
-            step_labels(
-                r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "x86_64/t" } }"#,
-            )
-            .is_empty()
-        );
     }
 }
