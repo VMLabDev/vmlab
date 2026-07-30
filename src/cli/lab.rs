@@ -165,7 +165,26 @@ pub fn cmd_status() -> Result<()> {
 
 fn print_status(status: &Value) {
     println!("lab \"{}\"", status["lab"].as_str().unwrap_or("?"));
-    if let Some(vms) = status["vms"].as_array() {
+    // labd reports one `machines` array; the CLI keeps VMs and containers in
+    // separate tables — to a user they are different things, with different
+    // columns worth showing.
+    let machines = status["machines"].as_array().cloned().unwrap_or_default();
+    let of_kind = |kind: &str| -> Vec<&Value> {
+        machines
+            .iter()
+            .filter(|m| m["kind"].as_str() == Some(kind))
+            .collect()
+    };
+    let ready = |m: &Value| {
+        if m["ready"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "no"
+        }
+    };
+
+    let vms = of_kind("vm");
+    if !vms.is_empty() {
         println!(
             "  {:<16} {:<10} {:<7} {:<16} TEMPLATE",
             "VM", "STATE", "READY", "IP"
@@ -175,19 +194,15 @@ fn print_status(status: &Value) {
                 "  {:<16} {:<10} {:<7} {:<16} {}",
                 vm["name"].as_str().unwrap_or("?"),
                 vm["state"].as_str().unwrap_or("?"),
-                if vm["ready"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "no"
-                },
+                ready(vm),
                 vm["ip"].as_str().unwrap_or("-"),
                 vm["template"].as_str().unwrap_or("?"),
             );
         }
     }
-    if let Some(containers) = status["containers"].as_array()
-        && !containers.is_empty()
-    {
+
+    let containers = of_kind("container");
+    if !containers.is_empty() {
         println!();
         println!(
             "  {:<16} {:<10} {:<7} {:<10} {:<16} IMAGE",
@@ -198,11 +213,7 @@ fn print_status(status: &Value) {
                 "  {:<16} {:<10} {:<7} {:<10} {:<16} {}",
                 c["name"].as_str().unwrap_or("?"),
                 c["state"].as_str().unwrap_or("?"),
-                if c["ready"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "no"
-                },
+                ready(c),
                 match c["health"].as_bool() {
                     None => "-",
                     Some(true) => "ok",

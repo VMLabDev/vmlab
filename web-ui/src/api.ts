@@ -190,7 +190,7 @@ export interface DnsSegmentZone {
 
 export const listLabs = (): Promise<LabEntry[]> => req("/api/labs");
 export const labStatus = async (lab: string): Promise<LabStatus> => {
-  const raw = await req(`/api/labs/${encodeURIComponent(lab)}/status`);
+  const raw = await req(`/api/labs/${encodeURIComponent(lab)}`);
   return splitMachines(raw);
 };
 
