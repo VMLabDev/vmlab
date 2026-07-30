@@ -566,14 +566,17 @@ pub fn cmd_container_logs(container_ref: &str, follow: bool, lines: usize) -> Re
     })
 }
 
-pub fn cmd_container_ip(container_ref: &str) -> Result<()> {
+/// Print a machine's IP address. One implementation for both kinds — the
+/// address comes from the guest agent either way.
+pub fn cmd_machine_ip(machine_ref: &str, nic: Option<usize>) -> Result<()> {
     rt()?.block_on(async {
-        let (lab, container) = split_vm_ref(container_ref)?;
+        let (lab, machine) = split_vm_ref(machine_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
-        let ip = client
-            .call("machine.ip", json!({"machine": container}))
-            .await
-            .map_err(remote)?;
+        let mut args = json!({"machine": machine});
+        if let Some(n) = nic {
+            args["nic"] = json!(n);
+        }
+        let ip = client.call("machine.ip", args).await.map_err(remote)?;
         println!("{}", ip.as_str().unwrap_or_default());
         Ok(())
     })

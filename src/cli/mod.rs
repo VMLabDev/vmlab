@@ -188,6 +188,13 @@ pub enum Command {
 pub enum VmCmd {
     /// Start one VM
     Start { vm: String },
+    /// Print a VM's IP address (defaults to the first NIC with a lease)
+    Ip {
+        vm: String,
+        /// Report this NIC's address instead of the first one.
+        #[arg(long)]
+        nic: Option<usize>,
+    },
     /// Stop one VM (graceful ladder; --force to kill)
     Stop {
         vm: String,
@@ -355,6 +362,7 @@ pub fn run() -> ExitCode {
         Command::Validate => validate::cmd_validate().map(|_| ()),
         Command::Vm { cmd } => match cmd {
             VmCmd::Start { vm } => lab::cmd_vm_power(&vm, "start", false),
+            VmCmd::Ip { vm, nic } => lab::cmd_machine_ip(&vm, nic),
             VmCmd::Stop { vm, force } => lab::cmd_vm_power(&vm, "stop", force),
             VmCmd::Restart { vm } => lab::cmd_vm_power(&vm, "restart", false),
             VmCmd::Destroy { vm } => lab::cmd_vm_destroy(&vm),
@@ -392,7 +400,7 @@ pub fn run() -> ExitCode {
                 follow,
                 lines,
             } => lab::cmd_container_logs(&container, follow, lines),
-            ContainerCmd::Ip { container } => lab::cmd_container_ip(&container),
+            ContainerCmd::Ip { container } => lab::cmd_machine_ip(&container, None),
             ContainerCmd::Shell { container } => lab::cmd_container_shell(&container),
         },
         Command::Lab { cmd } => lab::cmd_lab(cmd),
