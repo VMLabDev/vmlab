@@ -31,7 +31,6 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::config::model::{self, MacAddr};
-use crate::qmp::QmpClient;
 
 use super::vm::PowerState;
 use super::vm_agent::AgentHandle;
@@ -437,27 +436,6 @@ impl AgentSlot {
         }
         *self.failed_at.lock().await = None;
     }
-}
-
-/// Wait for QEMU's QMP socket to accept a connection, failing fast if the
-/// process dies during startup. Shared by both adapters' start paths.
-pub(super) async fn connect_qmp_retry(
-    sock: &Path,
-    proc: &Arc<crate::qemu::Proc>,
-) -> Result<QmpClient> {
-    for _ in 0..100 {
-        if !proc.is_running() {
-            bail!(
-                "QEMU exited during startup: {}",
-                proc.exit_status().unwrap_or_default()
-            );
-        }
-        match QmpClient::connect(sock).await {
-            Ok(c) => return Ok(c),
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    }
-    bail!("QMP socket {} never came up", sock.display())
 }
 
 // ---- Display ----------------------------------------------------------------

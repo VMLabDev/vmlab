@@ -380,6 +380,9 @@ pub struct ContainerInstance {
     /// Lazy vmlab-agent connection (terminals/exec/files — same channel as
     /// full VMs; the agent is spawned by cinit inside the micro-VM).
     agent: super::machine::AgentSlot,
+    /// How this micro-VM reaches the host to actually run — see
+    /// [`super::hypervisor`].
+    hv: Arc<dyn super::hypervisor::Hypervisor>,
 }
 
 impl ContainerInstance {
@@ -422,6 +425,7 @@ impl ContainerInstance {
             qmp: Mutex::new(None),
             ctl: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
+            hv: Arc::new(super::hypervisor::Qemu),
         })
     }
 
@@ -606,14 +610,16 @@ impl ContainerInstance {
         let mut devices = Vec::new();
         for (i, (share, host, ro)) in self.volumes.iter().enumerate() {
             let sock = self.dirs.vfs_sock(i);
-            let proc = crate::qemu::virtiofsd::spawn(
-                &format!("{}/{share}", self.cfg.name),
-                &sock,
-                host,
-                *ro,
-                &self.dirs.logs.join(format!("virtiofsd{i}.log")),
-            )
-            .await?;
+            let proc = self
+                .hv
+                .start_virtiofsd(
+                    &format!("{}/{share}", self.cfg.name),
+                    &sock,
+                    host,
+                    *ro,
+                    &self.dirs.logs.join(format!("virtiofsd{i}.log")),
+                )
+                .await?;
             procs.push(proc);
             devices.push((share.clone(), sock));
         }
@@ -722,17 +728,20 @@ impl ContainerInstance {
                 self.memory(),
                 &self.build_paths(&asset, &parts, vfs_devices),
             )?;
-            let proc = Proc::spawn(
-                &format!("qemu:{}", self.cfg.name),
-                &qemu::emulator_binary(&self.arch),
-                &args,
-                &self.dirs.logs.join("qemu.log"),
-            )
-            .await?;
+            // QMP comes up shortly after spawn (-S leaves CPUs paused); the
+            // hypervisor returns once it answers.
+            let super::hypervisor::Running { proc, qmp } = self
+                .hv
+                .start_emulator(super::hypervisor::LaunchSpec {
+                    label: format!("qemu:{}", self.cfg.name),
+                    binary: qemu::emulator_binary(&self.arch),
+                    args,
+                    log: self.dirs.logs.join("qemu.log"),
+                    qmp_sock: self.dirs.qmp_sock(),
+                    fds: Vec::new(),
+                })
+                .await?;
             *self.qemu.lock().await = Some(proc.clone());
-
-            // QMP comes up shortly after spawn (-S leaves CPUs paused).
-            let qmp = super::machine::connect_qmp_retry(&self.dirs.qmp_sock(), &proc).await?;
             qmp.cont().await?;
             *self.qmp.lock().await = Some(qmp);
 

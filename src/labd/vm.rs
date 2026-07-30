@@ -171,6 +171,10 @@ pub struct VmInstance {
     qmp: Mutex<Option<QmpClient>>,
     /// Lazy vmlab-agent connection (terminals/exec/files — §"agent channel").
     agent: super::machine::AgentSlot,
+    /// How this machine reaches the host to actually run (see
+    /// [`super::hypervisor`]). Real QEMU in production; a fake in tests, which
+    /// is what makes the start ladder and the exit monitor testable.
+    hv: Arc<dyn super::hypervisor::Hypervisor>,
 }
 
 impl VmInstance {
@@ -207,7 +211,15 @@ impl VmInstance {
             virtiofs_mounts: Mutex::new(Vec::new()),
             qmp: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
+            hv: Arc::new(super::hypervisor::Qemu),
         })
+    }
+
+    /// Run this VM against a different hypervisor. Tests use it to drive the
+    /// start ladder and the exit monitor without KVM.
+    #[cfg(test)]
+    pub fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn super::hypervisor::Hypervisor>) {
+        Arc::get_mut(self).expect("sole owner").hv = hv;
     }
 
     /// Indices into `cfg.shares` that ride virtiofs (§7.5): explicit
@@ -457,14 +469,16 @@ impl VmInstance {
                 .unwrap_or_else(|| share.host.clone());
             let tag = crate::qemu::virtiofsd::mount_tag(&share.name);
             let sock = self.dirs.vfs_sock(i);
-            let proc = crate::qemu::virtiofsd::spawn(
-                &format!("{}/{}", self.cfg.name, share.name),
-                &sock,
-                &host,
-                share.readonly,
-                &self.dirs.logs.join(format!("virtiofsd{i}.log")),
-            )
-            .await?;
+            let proc = self
+                .hv
+                .start_virtiofsd(
+                    &format!("{}/{}", self.cfg.name, share.name),
+                    &sock,
+                    &host,
+                    share.readonly,
+                    &self.dirs.logs.join(format!("virtiofsd{i}.log")),
+                )
+                .await?;
             procs.push(proc);
             devices.push((tag.clone(), sock));
             mounts.push(VirtiofsMount {
@@ -555,20 +569,15 @@ impl VmInstance {
             }
 
             if t.resolved.tpm {
-                let swtpm = qemu::process::spawn_swtpm(
-                    &self.cfg.name,
-                    &self.dirs.tpm_state(),
-                    &self.dirs.tpm_sock(),
-                    &self.dirs.logs.join("swtpm.log"),
-                )
-                .await?;
-                // Give swtpm a moment to bind its control socket.
-                for _ in 0..50 {
-                    if self.dirs.tpm_sock().exists() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
+                let swtpm = self
+                    .hv
+                    .start_tpm(
+                        &self.cfg.name,
+                        &self.dirs.tpm_state(),
+                        &self.dirs.tpm_sock(),
+                        &self.dirs.logs.join("swtpm.log"),
+                    )
+                    .await?;
                 *self.swtpm.lock().await = Some(swtpm);
             }
 
@@ -591,18 +600,20 @@ impl VmInstance {
                 &self.build_paths(&t, nic_specs, vfs_devices)?,
                 accel,
             )?;
-            let proc = Proc::spawn_with_fds(
-                &format!("qemu:{}", self.cfg.name),
-                &qemu::emulator_binary(&t.resolved.arch),
-                &args,
-                &self.dirs.logs.join("qemu.log"),
-                nic_fds,
-            )
-            .await?;
+            // QMP comes up shortly after spawn (-S leaves CPUs paused); the
+            // hypervisor returns once it answers.
+            let super::hypervisor::Running { proc, qmp } = self
+                .hv
+                .start_emulator(super::hypervisor::LaunchSpec {
+                    label: format!("qemu:{}", self.cfg.name),
+                    binary: qemu::emulator_binary(&t.resolved.arch),
+                    args,
+                    log: self.dirs.logs.join("qemu.log"),
+                    qmp_sock: self.dirs.qmp_sock(),
+                    fds: nic_fds,
+                })
+                .await?;
             *self.qemu.lock().await = Some(proc.clone());
-
-            // QMP comes up shortly after spawn (-S leaves CPUs paused).
-            let qmp = super::machine::connect_qmp_retry(&self.dirs.qmp_sock(), &proc).await?;
 
             // Track guest-initiated shutdowns via the QMP SHUTDOWN event.
             let mut qmp_events = qmp.subscribe_events();
@@ -643,18 +654,11 @@ impl VmInstance {
                 .wait_exit(Duration::from_secs(60 * 60 * 24 * 365))
                 .await
                 .unwrap_or_else(|_| "unknown".to_string());
-            let requested = *me.stop_requested.read().await;
-            let guest = guest_shutdown.load(std::sync::atomic::Ordering::SeqCst);
-            let clean = status.contains("exit status: 0");
-            let reason = if requested {
-                StopReason::Requested
-            } else if guest && clean {
-                StopReason::GuestInitiated
-            } else if clean {
-                StopReason::Requested
-            } else {
-                StopReason::Crashed
-            };
+            let reason = super::hypervisor::classify_exit(
+                *me.stop_requested.read().await,
+                guest_shutdown.load(std::sync::atomic::Ordering::SeqCst),
+                &status,
+            );
             me.teardown().await;
             *me.state.write().await = PowerState::Stopped;
             *me.agent_up.write().await = false;

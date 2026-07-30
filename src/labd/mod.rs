@@ -6,6 +6,7 @@
 pub mod container;
 pub mod container_ctl;
 pub mod events;
+pub mod hypervisor;
 pub mod lab;
 pub mod machine;
 pub mod netservices;
