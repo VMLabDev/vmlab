@@ -379,10 +379,7 @@ pub struct ContainerInstance {
     ctl: Mutex<Option<CtlHandle>>,
     /// Lazy vmlab-agent connection (terminals/exec/files — same channel as
     /// full VMs; the agent is spawned by cinit inside the micro-VM).
-    agent: Mutex<Option<super::vm_agent::AgentHandle>>,
-    /// When the last agent handshake failed (old guest assets), so exec
-    /// fallback paths don't pay the timeout repeatedly.
-    agent_failed_at: Mutex<Option<std::time::Instant>>,
+    agent: super::machine::AgentSlot,
 }
 
 impl ContainerInstance {
@@ -424,8 +421,7 @@ impl ContainerInstance {
             qemu: Mutex::new(None),
             qmp: Mutex::new(None),
             ctl: Mutex::new(None),
-            agent: Mutex::new(None),
-            agent_failed_at: Mutex::new(None),
+            agent: super::machine::AgentSlot::default(),
         })
     }
 
@@ -509,65 +505,18 @@ impl ContainerInstance {
         if self.state().await != PowerState::Running {
             bail!("{}: not running", self.cfg.name);
         }
-        let mut agent = self.agent.lock().await;
-        if let Some(handle) = agent.as_ref() {
-            if handle.ping(Duration::from_secs(2)).await {
-                return Ok(handle.clone());
-            }
-            if let Some(dead) = agent.take() {
-                dead.shutdown().await; // frees the chardev's one-client slot
-            }
-        }
-        {
-            let failed = self.agent_failed_at.lock().await;
-            if let Some(at) = *failed
-                && at.elapsed() < Duration::from_secs(30)
-            {
-                bail!("{}: {}", self.cfg.name, NO_AGENT_HINT);
-            }
-        }
-        match super::vm_agent::AgentHandle::connect(&self.dirs.agent_sock(), Duration::from_secs(5))
+        self.agent
+            .connect(&self.cfg.name, &self.dirs.agent_sock(), NO_AGENT_HINT)
             .await
-        {
-            Ok(handle) => {
-                *self.agent_failed_at.lock().await = None;
-                *agent = Some(handle.clone());
-                Ok(handle)
-            }
-            Err(e) => {
-                *self.agent_failed_at.lock().await = Some(std::time::Instant::now());
-                Err(anyhow!("{}: {e:#} — {}", self.cfg.name, NO_AGENT_HINT))
-            }
-        }
     }
 
     /// Whether the vmlab-agent answers right now, sharing (and populating)
-    /// the cached handle — the container mirror of `VmInstance::agent_probe`
-    /// (short handshake timeout, bypasses the failed-handshake cache, never
-    /// leaves a half-dead connection on the one-client chardev).
+    /// the cached handle.
     async fn agent_probe(&self) -> bool {
         if self.state().await != PowerState::Running {
             return false;
         }
-        let mut agent = self.agent.lock().await;
-        if let Some(handle) = agent.as_ref() {
-            if handle.ping(Duration::from_secs(2)).await {
-                return true;
-            }
-            if let Some(dead) = agent.take() {
-                dead.shutdown().await;
-            }
-        }
-        match super::vm_agent::AgentHandle::connect(&self.dirs.agent_sock(), Duration::from_secs(2))
-            .await
-        {
-            Ok(handle) => {
-                *self.agent_failed_at.lock().await = None;
-                *agent = Some(handle);
-                true
-            }
-            Err(_) => false,
-        }
+        self.agent.probe(&self.dirs.agent_sock()).await
     }
 
     /// Record how the guest reaches the lab's SMB server (volume mounts).
@@ -783,7 +732,7 @@ impl ContainerInstance {
             *self.qemu.lock().await = Some(proc.clone());
 
             // QMP comes up shortly after spawn (-S leaves CPUs paused).
-            let qmp = connect_qmp_retry(&self.dirs.qmp_sock(), &proc).await?;
+            let qmp = super::machine::connect_qmp_retry(&self.dirs.qmp_sock(), &proc).await?;
             qmp.cont().await?;
             *self.qmp.lock().await = Some(qmp);
 
@@ -1004,10 +953,7 @@ impl ContainerInstance {
     async fn teardown(&self) {
         *self.ctl.lock().await = None;
         *self.qmp.lock().await = None;
-        if let Some(agent) = self.agent.lock().await.take() {
-            agent.shutdown().await;
-        }
-        *self.agent_failed_at.lock().await = None;
+        self.agent.drop().await;
         if let Some(proc) = self.qemu.lock().await.take()
             && proc.is_running()
         {
@@ -1069,7 +1015,7 @@ impl ContainerInstance {
         // make one quick connect attempt. The agent's initramfs fallback is
         // the raw reboot(2) syscall — exactly what a micro-VM needs.
         {
-            let agent = { self.agent.lock().await.clone() };
+            let agent = self.agent.cached().await;
             let agent = match agent {
                 Some(a) => Some(a),
                 None => super::vm_agent::AgentHandle::connect(
@@ -1167,10 +1113,7 @@ impl ContainerInstance {
         // magic resyncs any mid-frame garbage (guest/agent-proto). Shutdown,
         // not drop: live sessions hold handle clones, and a lingering
         // connection blocks QEMU's one-client chardev slot.
-        if let Some(agent) = self.agent.lock().await.take() {
-            agent.shutdown().await;
-        }
-        *self.agent_failed_at.lock().await = None;
+        self.agent.drop().await;
         qmp.cont().await?;
         self.reconnect_agent_after_load().await;
         if let Ok(ctl) = self.ctl().await {
@@ -1325,6 +1268,139 @@ impl ContainerInstance {
     }
 }
 
+#[async_trait::async_trait]
+impl super::machine::Machine for ContainerInstance {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+
+    fn kind(&self) -> super::machine::MachineKind {
+        super::machine::MachineKind::Container
+    }
+
+    fn arch(&self) -> String {
+        self.arch.clone()
+    }
+
+    /// A container micro-VM always runs vmlab's own Alpine guest.
+    fn guest_os(&self) -> super::playbook::GuestOs {
+        super::playbook::GuestOs::Linux
+    }
+
+    fn nics(&self) -> &[model::Nic] {
+        &self.cfg.nics
+    }
+
+    fn macs(&self) -> &[MacAddr] {
+        &self.macs
+    }
+
+    fn web_pages(&self) -> &[model::WebPage] {
+        &self.cfg.web
+    }
+
+    fn depends_on(&self) -> &[String] {
+        &self.cfg.depends_on
+    }
+
+    fn term_session_sock(&self, id: u32) -> PathBuf {
+        self.dirs.term_session_sock(id)
+    }
+
+    async fn state(&self) -> PowerState {
+        ContainerInstance::state(self).await
+    }
+
+    async fn is_ready(&self) -> bool {
+        ContainerInstance::is_ready(self).await
+    }
+
+    async fn is_agent_up(&self) -> bool {
+        ContainerInstance::is_agent_up(self).await
+    }
+
+    async fn stop(&self, force: bool) -> Result<()> {
+        ContainerInstance::stop(self, force).await
+    }
+
+    async fn qmp(&self) -> Result<QmpClient> {
+        ContainerInstance::qmp(self).await
+    }
+
+    async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
+        ContainerInstance::agent(self).await
+    }
+
+    async fn agent_answering(&self) -> bool {
+        self.agent_probe().await
+    }
+
+    async fn drop_agent(&self) {
+        ContainerInstance::drop_agent(self).await
+    }
+
+    async fn snapshot(&self, name: &str) -> Result<bool> {
+        ContainerInstance::snapshot(self, name).await
+    }
+
+    async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        ContainerInstance::delete_snapshot(self, name).await
+    }
+
+    fn snapshot_pin(&self) -> Option<String> {
+        self.image_digest()
+    }
+
+    /// QEMU starts container micro-VMs with no display device at all.
+    fn display(self: Arc<Self>) -> Option<super::machine::Display> {
+        None
+    }
+
+    fn console_log(&self, lines: usize) -> Option<Result<String>> {
+        Some(ContainerInstance::logs(self, lines))
+    }
+
+    /// Per-NIC IPv4 addresses. Prefer the agent's MAC-addressed interface
+    /// list; cinit's net-up report remains a first-NIC fallback during early
+    /// boot, before the agent is answering.
+    async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
+        let mut ips = match self.agent().await {
+            Ok(agent) => match agent.net_interfaces(Duration::from_secs(5)).await {
+                Ok(ifaces) => {
+                    let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
+                    super::vm_agent::ipv4_by_mac(&ifaces, &macs)
+                }
+                Err(_) => vec![None; self.macs.len()],
+            },
+            Err(_) => vec![None; self.macs.len()],
+        };
+        if ips.first().is_some_and(Option::is_none)
+            && let Some(ctl) = self.ctl.lock().await.clone()
+            && let Some(ip) = ctl.ip().await
+        {
+            ips[0] = Some(ip);
+        }
+        if ips.iter().any(Option::is_some) {
+            Ok(ips)
+        } else {
+            bail!("{}: no IPv4 address reported by agent", self.cfg.name)
+        }
+    }
+
+    async fn status_extra(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut extra = serde_json::Map::new();
+        extra.insert("image".into(), serde_json::json!(self.cfg.image.reference));
+        extra.insert("digest".into(), serde_json::json!(self.image_digest()));
+        extra.insert("health".into(), serde_json::json!(self.health().await));
+        extra.insert("restarts".into(), serde_json::json!(self.restart_count()));
+        extra.insert(
+            "exit_code".into(),
+            serde_json::json!(self.last_exit().await),
+        );
+        extra
+    }
+}
+
 /// Write a JSON document atomically (temp file + rename) so cinit can never
 /// read a torn `container.json`.
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1334,22 +1410,6 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming into place: {}", path.display()))?;
     Ok(())
-}
-
-async fn connect_qmp_retry(sock: &Path, proc: &Arc<Proc>) -> Result<QmpClient> {
-    for _ in 0..100 {
-        if !proc.is_running() {
-            bail!(
-                "QEMU exited during startup: {}",
-                proc.exit_status().unwrap_or_default()
-            );
-        }
-        match QmpClient::connect(sock).await {
-            Ok(c) => return Ok(c),
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    }
-    bail!("QMP socket {} never came up", sock.display())
 }
 
 async fn connect_ctl_retry(sock: &Path, proc: &Arc<Proc>) -> Result<CtlHandle> {

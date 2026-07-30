@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
 use super::events::EventLog;
+use super::machine::Machine;
 use super::network::{LabNetwork, nic_segment_name};
 use super::state::{LabState, SnapshotRecord, generate_mac};
 use super::vm::{PowerState, StopReason, VmDirs, VmInstance};
@@ -202,7 +203,7 @@ impl LabRuntime {
             let resolved = crate::qemu::resolve_vm(vm_cfg, meta.as_ref(), profiles)?;
 
             // Stable MACs: explicit > persisted > generated (PRD §9.4).
-            let vm_state = state.vm_mut(&vm_cfg.name);
+            let vm_state = state.machine_mut(&vm_cfg.name);
             let mut macs = Vec::new();
             for (i, nic) in vm_cfg.nics.iter().enumerate() {
                 let mac = nic
@@ -299,7 +300,7 @@ impl LabRuntime {
             let arch = std::env::consts::ARCH;
             let cache = crate::oci::image::ImageCache::new(crate::paths::oci_cache_dir());
             for c_cfg in &config.lab.containers {
-                let c_state = state.container_mut(&c_cfg.name);
+                let c_state = state.machine_mut(&c_cfg.name);
                 if c_state.image_ref.as_deref() != Some(c_cfg.image.reference.as_str()) {
                     // The `image =` line changed — drop the stale pin.
                     c_state.image_digest = None;
@@ -384,15 +385,9 @@ impl LabRuntime {
         let host_cfg = crate::config::host::HostConfig::load_default()?;
         let macs_by_vm: std::collections::HashMap<String, Vec<crate::config::model::MacAddr>> =
             state
-                .vms
+                .machines
                 .iter()
-                .map(|(n, v)| (n.clone(), v.macs.clone()))
-                .chain(
-                    state
-                        .containers
-                        .iter()
-                        .map(|(n, c)| (n.clone(), c.macs.clone())),
-                )
+                .map(|(n, m)| (n.clone(), m.macs.clone()))
                 .collect();
         network.wire_gateways(&config.lab, &macs_by_vm, &host_cfg);
 
@@ -665,7 +660,7 @@ impl LabRuntime {
                 let container = self.container(name)?;
                 {
                     let mut state = self.state.lock().await;
-                    let c_state = state.container_mut(name);
+                    let c_state = state.machine_mut(name);
                     c_state.image_digest = Some(image.manifest_digest.clone());
                     c_state.image_ref = Some(container.cfg.image.reference.clone());
                     state.save(&self.lab_local)?;
@@ -1040,6 +1035,33 @@ impl LabRuntime {
                 anyhow!("no container \"{name}\" in lab \"{}\"", self.name)
             }
         })
+    }
+
+    /// One machine by name, whichever kind it is — the accessor everything
+    /// that isn't `start` or `restore` should reach for. Machine names are
+    /// unique across both kinds ([`Self::vm`] and [`Self::container`] each
+    /// reject the other's names), so there is one namespace to look in.
+    pub fn machine(&self, name: &str) -> Result<Arc<dyn Machine>> {
+        if let Some(vm) = self.vms.get(name) {
+            return Ok(vm.clone() as Arc<dyn Machine>);
+        }
+        if let Some(c) = self.containers.get(name) {
+            return Ok(c.clone() as Arc<dyn Machine>);
+        }
+        bail!("no vm or container \"{name}\" in lab \"{}\"", self.name)
+    }
+
+    /// Every machine in the lab, VMs before containers, each kind in name
+    /// order.
+    pub fn machines(&self) -> impl Iterator<Item = Arc<dyn Machine>> + '_ {
+        self.vms
+            .values()
+            .map(|v| v.clone() as Arc<dyn Machine>)
+            .chain(
+                self.containers
+                    .values()
+                    .map(|c| c.clone() as Arc<dyn Machine>),
+            )
     }
 
     /// `depends_on` of a machine (VM or container) by name.
@@ -1847,13 +1869,8 @@ impl LabRuntime {
         };
         let mut handles = Vec::new();
         for name in targets {
-            if let Some(c) = self.containers.get(&name) {
-                let c = c.clone();
-                handles.push(tokio::spawn(async move { c.stop(force).await }));
-                continue;
-            }
-            let vm = self.vm(&name)?.clone();
-            handles.push(tokio::spawn(async move { vm.stop(force).await }));
+            let m = self.machine(&name)?;
+            handles.push(tokio::spawn(async move { m.stop(force).await }));
         }
         for h in handles {
             h.await.map_err(|e| anyhow!("join: {e}"))??;
@@ -1941,7 +1958,7 @@ impl LabRuntime {
         let _ = remove_tree(&container.dirs.run).await;
         {
             let mut state = self.state.lock().await;
-            let c = state.container_mut(name);
+            let c = state.machine_mut(name);
             c.image_digest = None;
             c.image_ref = None;
             // The scratch qcow2 (which held the snapshot data) is gone.
@@ -1956,110 +1973,22 @@ impl LabRuntime {
     }
 
     pub async fn status(&self) -> Value {
-        // One cheap map lookup per machine: is its template/image download
-        // still pending? Drives the web UI's "Download templates" button.
         let pending = self.pending_pulls.lock().await;
-        let mut vms = Vec::new();
-        for (name, vm) in &self.vms {
-            let state = vm.state().await;
-            let ready = vm.is_ready().await;
-            let assigned_ips = if ready {
-                vm.guest_ips()
-                    .await
-                    .unwrap_or_else(|_| vec![None; vm.cfg.nics.len()])
-            } else {
-                vec![None; vm.cfg.nics.len()]
-            };
-            let ip = assigned_ips.iter().flatten().next().cloned();
-            // NICs in declaration order, paired with their resolved MACs — the
-            // web UI groups machines by segment and shows MACs from this.
-            let nics: Vec<Value> = vm
-                .cfg
-                .nics
-                .iter()
-                .enumerate()
-                .map(|(i, nic)| {
-                    json!({
-                        "segment": nic.segment,
-                        "mac": vm.macs.get(i).map(|m| m.to_string()),
-                        "static_ip": nic.ip.map(|a| a.to_string()),
-                        "ip": assigned_ips.get(i).and_then(Clone::clone),
-                    })
-                })
-                .collect();
-            // Declared web pages (no credentials — the browser only needs
-            // name/port/path to build launch links; the proxy fetches auth
-            // separately over the daemon socket).
-            let web: Vec<Value> = vm
-                .cfg
-                .web
-                .iter()
-                .map(|w| json!({"name": w.name, "port": w.port, "path": w.path}))
-                .collect();
-            vms.push(json!({
-                "name": name,
-                "state": state,
-                "ready": ready,
-                "ip": ip,
-                "template_cached": !pending.contains_key(name),
-                "template": vm.cfg.template.to_string(),
-                "arch": vm.cfg.arch,
-                "cpus": vm.cfg.cpus,
-                "memory": vm.cfg.memory,
-                "nics": nics,
-                "web": web,
-                // The template carries a baked-in vmlab-agent (terminal
-                // support); null on vintage guests and pre-agent templates.
-                "agent_version": vm.template().agent_version,
-            }));
+        // One projection for both kinds: each adapter contributes its own
+        // fields under `extra` (see `Machine::status_extra`), so a machine is
+        // described in exactly one place.
+        let mut machines = Vec::new();
+        for m in self.machines() {
+            let mut status = m.status().await;
+            // Lab-level, not machine-level: is this machine's template/image
+            // download still pending? Drives the "Download" button.
+            status.extra.insert(
+                "cached".into(),
+                json!(!pending.contains_key(status.name.as_str())),
+            );
+            machines.push(json!(status));
         }
-        let mut containers = Vec::new();
-        for (name, c) in &self.containers {
-            let state = c.state().await;
-            let ready = c.is_ready().await;
-            let assigned_ips = if ready {
-                c.guest_ips()
-                    .await
-                    .unwrap_or_else(|_| vec![None; c.cfg.nics.len()])
-            } else {
-                vec![None; c.cfg.nics.len()]
-            };
-            let ip = assigned_ips.iter().flatten().next().cloned();
-            let nics: Vec<Value> = c
-                .cfg
-                .nics
-                .iter()
-                .enumerate()
-                .map(|(i, nic)| {
-                    json!({
-                        "segment": nic.segment,
-                        "mac": c.macs.get(i).map(|m| m.to_string()),
-                        "static_ip": nic.ip.map(|a| a.to_string()),
-                        "ip": assigned_ips.get(i).and_then(Clone::clone),
-                    })
-                })
-                .collect();
-            let web: Vec<Value> = c
-                .cfg
-                .web
-                .iter()
-                .map(|w| json!({"name": w.name, "port": w.port, "path": w.path}))
-                .collect();
-            containers.push(json!({
-                "name": name,
-                "state": state,
-                "ready": ready,
-                "health": c.health().await,
-                "ip": ip,
-                "image_cached": !pending.contains_key(name),
-                "image": c.cfg.image.reference,
-                "digest": c.image_digest(),
-                "restarts": c.restart_count(),
-                "exit_code": c.last_exit().await,
-                "nics": nics,
-                "web": web,
-            }));
-        }
+
         let net = self.network.lock().await;
         // Cross-host trunk state lives in the supervisor (it owns the global
         // switches); one best-effort RPC per status when the lab has global
@@ -2122,8 +2051,7 @@ impl LabRuntime {
             .collect();
         json!({
             "lab": self.name,
-            "vms": vms,
-            "containers": containers,
+            "machines": machines,
             "segments": segments,
             "provisioned": self.provisioned(),
             "pulls": pulls,
@@ -2167,36 +2095,16 @@ impl LabRuntime {
     /// state record note which; container records also pin the image digest
     /// the capture is valid against.
     pub async fn snapshot(&self, vm_name: &str, snap: &str) -> Result<bool> {
-        if let Some(container) = self.containers.get(vm_name) {
-            let online = container.snapshot(snap).await?;
-            {
-                let mut state = self.state.lock().await;
-                state.container_mut(vm_name).snapshots.insert(
-                    snap.to_string(),
-                    SnapshotRecord {
-                        online,
-                        taken_at: chrono::Utc::now(),
-                        image_digest: container.image_digest(),
-                    },
-                );
-                state.save(&self.lab_local)?;
-            }
-            self.events.emit(
-                "snapshot.created",
-                json!({"vm": vm_name, "name": snap, "online": online}),
-            );
-            return Ok(online);
-        }
-        let vm = self.vm(vm_name)?;
-        let online = vm.snapshot(snap).await?;
+        let m = self.machine(vm_name)?;
+        let online = m.snapshot(snap).await?;
         {
             let mut state = self.state.lock().await;
-            state.vm_mut(vm_name).snapshots.insert(
+            state.machine_mut(vm_name).snapshots.insert(
                 snap.to_string(),
                 SnapshotRecord {
                     online,
                     taken_at: chrono::Utc::now(),
-                    image_digest: None,
+                    image_digest: m.snapshot_pin(),
                 },
             );
             state.save(&self.lab_local)?;
@@ -2225,7 +2133,7 @@ impl LabRuntime {
         }
         let record = {
             let mut state = self.state.lock().await;
-            state.vm_mut(vm_name).snapshots.get(snap).cloned()
+            state.machine_mut(vm_name).snapshots.get(snap).cloned()
         }
         .ok_or_else(|| anyhow!("vm \"{vm_name}\" has no snapshot \"{snap}\""))?;
 
@@ -2267,7 +2175,7 @@ impl LabRuntime {
     async fn restore_container(self: &Arc<Self>, name: &str, snap: &str) -> Result<()> {
         let record = {
             let mut state = self.state.lock().await;
-            state.container_mut(name).snapshots.get(snap).cloned()
+            state.machine_mut(name).snapshots.get(snap).cloned()
         }
         .ok_or_else(|| anyhow!("container \"{name}\" has no snapshot \"{snap}\""))?;
 
@@ -2312,32 +2220,19 @@ impl LabRuntime {
 
     pub async fn delete_snapshot(&self, vm_name: &str, snap: &str) -> Result<()> {
         let mut state = self.state.lock().await;
-        if let Some(container) = self.containers.get(vm_name) {
-            container.delete_snapshot(snap).await?;
-            state.container_mut(vm_name).snapshots.remove(snap);
-        } else {
-            self.vm(vm_name)?.delete_snapshot(snap).await?;
-            state.vm_mut(vm_name).snapshots.remove(snap);
-        }
+        self.machine(vm_name)?.delete_snapshot(snap).await?;
+        state.machine_mut(vm_name).snapshots.remove(snap);
         state.save(&self.lab_local)?;
         Ok(())
     }
 
     pub async fn snapshots(&self, vm_name: &str) -> Result<Value> {
         let state = self.state.lock().await;
-        let snaps = if self.containers.contains_key(vm_name) {
-            state
-                .containers
-                .get(vm_name)
-                .map(|c| c.snapshots.clone())
-                .unwrap_or_default()
-        } else {
-            state
-                .vms
-                .get(vm_name)
-                .map(|v| v.snapshots.clone())
-                .unwrap_or_default()
-        };
+        let snaps = state
+            .machines
+            .get(vm_name)
+            .map(|m| m.snapshots.clone())
+            .unwrap_or_default();
         Ok(json!(
             snaps
                 .into_iter()

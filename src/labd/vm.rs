@@ -14,6 +14,10 @@ use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, Proc, VmPaths};
 use crate::qmp::QmpClient;
 
+/// What to tell a user whose guest has no answering vmlab-agent.
+const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the template likely predates \
+     agent support) — rebuild it with `vmlab template build`";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerState {
@@ -128,10 +132,6 @@ pub struct VirtiofsMount {
     pub readonly: bool,
 }
 
-/// What to tell a user whose guest has no answering vmlab-agent.
-const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the template likely predates \
-     agent support) — rebuild it with `vmlab template build`";
-
 pub struct VmInstance {
     pub lab: String,
     pub cfg: model::Vm,
@@ -170,10 +170,7 @@ pub struct VmInstance {
     virtiofs_mounts: Mutex<Vec<VirtiofsMount>>,
     qmp: Mutex<Option<QmpClient>>,
     /// Lazy vmlab-agent connection (terminals/exec/files — §"agent channel").
-    agent: Mutex<Option<super::vm_agent::AgentHandle>>,
-    /// When the last agent handshake failed, so agent-less templates don't
-    /// pay the handshake timeout on every call that would prefer the agent.
-    agent_failed_at: Mutex<Option<std::time::Instant>>,
+    agent: super::machine::AgentSlot,
 }
 
 impl VmInstance {
@@ -209,8 +206,7 @@ impl VmInstance {
             virtiofsd: Mutex::new(Vec::new()),
             virtiofs_mounts: Mutex::new(Vec::new()),
             qmp: Mutex::new(None),
-            agent: Mutex::new(None),
-            agent_failed_at: Mutex::new(None),
+            agent: super::machine::AgentSlot::default(),
         })
     }
 
@@ -337,69 +333,18 @@ impl VmInstance {
                 self.cfg.name
             );
         }
-        let mut agent = self.agent.lock().await;
-        if let Some(handle) = agent.as_ref() {
-            // A guest reboot leaves this connection open but talking to a
-            // fresh agent instance; a ping tells live from stale/dead.
-            if handle.ping(Duration::from_secs(2)).await {
-                return Ok(handle.clone());
-            }
-            if let Some(dead) = agent.take() {
-                dead.shutdown().await; // frees the chardev's one-client slot
-            }
-        }
-        {
-            let failed = self.agent_failed_at.lock().await;
-            if let Some(at) = *failed
-                && at.elapsed() < Duration::from_secs(30)
-            {
-                bail!("{}: {}", self.cfg.name, NO_AGENT_HINT);
-            }
-        }
-        match super::vm_agent::AgentHandle::connect(&self.dirs.agent_sock(), Duration::from_secs(5))
+        self.agent
+            .connect(&self.cfg.name, &self.dirs.agent_sock(), NO_AGENT_HINT)
             .await
-        {
-            Ok(handle) => {
-                *self.agent_failed_at.lock().await = None;
-                *agent = Some(handle.clone());
-                Ok(handle)
-            }
-            Err(e) => {
-                *self.agent_failed_at.lock().await = Some(std::time::Instant::now());
-                Err(anyhow!("{}: {e:#} — {}", self.cfg.name, NO_AGENT_HINT))
-            }
-        }
     }
 
     /// Whether the vmlab-agent answers right now, sharing (and populating)
-    /// the cached handle. Bypasses the failed-handshake cache — pollers need
-    /// prompt discovery, not exec-path backoff — with a short handshake
-    /// timeout, and never leaves a half-dead connection behind (QEMU's
-    /// chardev serves one client; a wedged socket would block every future
-    /// connect).
+    /// the cached handle.
     async fn agent_probe(&self) -> bool {
         if self.state().await != PowerState::Running || !self.template().resolved.agent_channel {
             return false;
         }
-        let mut agent = self.agent.lock().await;
-        if let Some(handle) = agent.as_ref() {
-            if handle.ping(Duration::from_secs(2)).await {
-                return true;
-            }
-            if let Some(dead) = agent.take() {
-                dead.shutdown().await;
-            }
-        }
-        match super::vm_agent::AgentHandle::connect(&self.dirs.agent_sock(), Duration::from_secs(2))
-            .await
-        {
-            Ok(handle) => {
-                *self.agent_failed_at.lock().await = None;
-                *agent = Some(handle);
-                true
-            }
-            Err(_) => false,
-        }
+        self.agent.probe(&self.dirs.agent_sock()).await
     }
 
     /// Forget a recently failed agent handshake so the next [`agent`](Self::agent)
@@ -407,17 +352,12 @@ impl VmInstance {
     /// agent. Unlike [`drop_agent`](Self::drop_agent) this never touches a live
     /// handle another task may be using.
     pub async fn clear_agent_failure(&self) {
-        *self.agent_failed_at.lock().await = None;
+        self.agent.clear_failure().await;
     }
 
-    /// Drop the cached agent connection (teardown, snapshot restore). An
-    /// explicit shutdown, not just a drop: live sessions hold handle clones,
-    /// and a half-dead connection blocks QEMU's one-client chardev slot.
+    /// Drop the cached agent connection (teardown, snapshot restore).
     pub async fn drop_agent(&self) {
-        if let Some(handle) = self.agent.lock().await.take() {
-            handle.shutdown().await;
-        }
-        *self.agent_failed_at.lock().await = None;
+        self.agent.drop().await;
     }
 
     /// Create disks on first use (PRD §7.1): linked clone of the template,
@@ -662,7 +602,7 @@ impl VmInstance {
             *self.qemu.lock().await = Some(proc.clone());
 
             // QMP comes up shortly after spawn (-S leaves CPUs paused).
-            let qmp = connect_qmp_retry(&self.dirs.qmp_sock(), &proc).await?;
+            let qmp = super::machine::connect_qmp_retry(&self.dirs.qmp_sock(), &proc).await?;
 
             // Track guest-initiated shutdowns via the QMP SHUTDOWN event.
             let mut qmp_events = qmp.subscribe_events();
@@ -791,7 +731,7 @@ impl VmInstance {
         // `agent()`'s Running gate can't be used: take the cached handle, or
         // make one quick connect attempt on guests with an agent channel.
         if self.is_agent_up().await {
-            let agent = { self.agent.lock().await.clone() };
+            let agent = self.agent.cached().await;
             let agent = match agent {
                 Some(a) => Some(a),
                 None if self.template().resolved.agent_channel => {
@@ -999,6 +939,120 @@ impl VmInstance {
     }
 }
 
+#[async_trait::async_trait]
+impl super::machine::Machine for VmInstance {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+
+    fn kind(&self) -> super::machine::MachineKind {
+        super::machine::MachineKind::Vm
+    }
+
+    fn arch(&self) -> String {
+        self.template().resolved.arch.clone()
+    }
+
+    fn guest_os(&self) -> super::playbook::GuestOs {
+        super::playbook::guest_os_of(self.template().resolved.profile.as_deref())
+    }
+
+    fn nics(&self) -> &[model::Nic] {
+        &self.cfg.nics
+    }
+
+    fn macs(&self) -> &[MacAddr] {
+        &self.macs
+    }
+
+    fn web_pages(&self) -> &[model::WebPage] {
+        &self.cfg.web
+    }
+
+    fn depends_on(&self) -> &[String] {
+        &self.cfg.depends_on
+    }
+
+    fn term_session_sock(&self, id: u32) -> PathBuf {
+        self.dirs.term_session_sock(id)
+    }
+
+    async fn state(&self) -> PowerState {
+        VmInstance::state(self).await
+    }
+
+    async fn is_ready(&self) -> bool {
+        VmInstance::is_ready(self).await
+    }
+
+    async fn is_agent_up(&self) -> bool {
+        VmInstance::is_agent_up(self).await
+    }
+
+    async fn stop(&self, force: bool) -> Result<()> {
+        VmInstance::stop(self, force).await
+    }
+
+    async fn qmp(&self) -> Result<QmpClient> {
+        VmInstance::qmp(self).await
+    }
+
+    async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
+        VmInstance::agent(self).await
+    }
+
+    async fn agent_answering(&self) -> bool {
+        VmInstance::agent_answering(self).await
+    }
+
+    async fn drop_agent(&self) {
+        VmInstance::drop_agent(self).await
+    }
+
+    async fn snapshot(&self, name: &str) -> Result<bool> {
+        VmInstance::snapshot(self, name).await
+    }
+
+    async fn delete_snapshot(&self, name: &str) -> Result<()> {
+        VmInstance::delete_snapshot(self, name).await
+    }
+
+    fn display(self: Arc<Self>) -> Option<super::machine::Display> {
+        Some(super::machine::Display::new(self))
+    }
+
+    fn can_reboot(&self) -> bool {
+        true
+    }
+
+    async fn reboot_guest(&self) -> Result<()> {
+        self.agent()
+            .await?
+            .shutdown_guest(
+                super::vm_agent::ShutdownMode::Reboot,
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| anyhow!("rebooting {}: {e}", self.cfg.name))
+    }
+
+    async fn status_extra(&self) -> serde_json::Map<String, serde_json::Value> {
+        let t = self.template();
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "template".into(),
+            serde_json::json!(self.cfg.template.to_string()),
+        );
+        extra.insert("arch".into(), serde_json::json!(self.cfg.arch));
+        extra.insert("cpus".into(), serde_json::json!(self.cfg.cpus));
+        extra.insert("memory".into(), serde_json::json!(self.cfg.memory));
+        // The template carries a baked-in vmlab-agent (terminal support);
+        // null on vintage guests and pre-agent templates.
+        extra.insert("agent_version".into(), serde_json::json!(t.agent_version));
+        extra
+    }
+}
+
 fn disk_nodes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("disk{i}")).collect()
 }
@@ -1012,22 +1066,6 @@ pub(crate) fn validate_snapshot_name(name: &str) -> Result<()> {
         bail!("invalid snapshot name `{name}` (alphanumeric, '-', '_', '.')");
     }
     Ok(())
-}
-
-async fn connect_qmp_retry(sock: &Path, proc: &Arc<Proc>) -> Result<QmpClient> {
-    for _ in 0..100 {
-        if !proc.is_running() {
-            bail!(
-                "QEMU exited during startup: {}",
-                proc.exit_status().unwrap_or_default()
-            );
-        }
-        match QmpClient::connect(sock).await {
-            Ok(c) => return Ok(c),
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    }
-    bail!("QMP socket {} never came up", sock.display())
 }
 
 /// Build a FAT-formatted qcow2 disk pre-populated from a folder (PRD §5.2).

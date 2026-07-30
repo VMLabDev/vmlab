@@ -457,67 +457,6 @@ pub struct PlaybookOutcome {
     pub report: Option<Value>,
 }
 
-/// A VM or container — both expose the same agent channel.
-enum MachineRef {
-    Vm(Arc<crate::labd::vm::VmInstance>),
-    Container(Arc<crate::labd::container::ContainerInstance>),
-}
-
-impl MachineRef {
-    fn of(lab: &LabRuntime, name: &str) -> Result<Self> {
-        if let Some(c) = lab.containers.get(name) {
-            return Ok(MachineRef::Container(c.clone()));
-        }
-        Ok(MachineRef::Vm(lab.vm(name)?.clone()))
-    }
-
-    async fn agent(&self) -> Result<AgentHandle> {
-        match self {
-            MachineRef::Vm(vm) => vm.agent().await,
-            MachineRef::Container(c) => c.agent().await,
-        }
-    }
-
-    /// [`Self::agent`], retrying transient handshake failures until
-    /// `timeout`. A machine can be momentarily agent-less while claiming to
-    /// be up — Windows first-boot ends in a settle reboot, and readiness is
-    /// sticky across guest reboots — so one failed handshake must not fail
-    /// the run. Hard failures (machine stopped, vintage guest with no agent
-    /// channel) surface immediately.
-    async fn wait_agent(&self, timeout: Duration) -> Result<AgentHandle> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            match self.agent().await {
-                Ok(agent) => return Ok(agent),
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    if msg.contains("not running") || msg.contains("no agent channel") {
-                        return Err(e);
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            }
-        }
-    }
-
-    fn arch(&self) -> String {
-        match self {
-            MachineRef::Vm(vm) => vm.template().resolved.arch.clone(),
-            MachineRef::Container(c) => c.arch.clone(),
-        }
-    }
-
-    fn os_hint(&self) -> GuestOs {
-        match self {
-            MachineRef::Vm(vm) => guest_os_of(vm.template().resolved.profile.as_deref()),
-            MachineRef::Container(_) => GuestOs::Linux,
-        }
-    }
-}
-
 /// Run one config-weave play against one machine: ensure the guest binary,
 /// re-push the playbook folder (always — the whole point is a fast edit→run
 /// loop), execute with `--json --events-ndjson`, stream progress to `output`
@@ -600,8 +539,8 @@ async fn run_inner(
     op_id: u64,
 ) -> Result<PlaybookOutcome> {
     let pb_path = pb.path.display().to_string();
-    let mref = MachineRef::of(lab, machine)?;
-    let arch = mref.arch();
+    let m = lab.machine(machine)?;
+    let arch = m.arch();
 
     // A line to everything watching: CLI stream / lab log, the op registry's
     // resync tail, and the event bus.
@@ -627,12 +566,12 @@ async fn run_inner(
         lab.events.emit("playbook.op.phase", payload);
     };
 
-    let agent = mref.wait_agent(Duration::from_secs(300)).await?;
+    let agent = m.wait_agent(Duration::from_secs(300)).await?;
     // The profile-name heuristic decides before boot; the agent's handshake
     // is authoritative once connected.
     let os = match agent.info().os.as_str() {
         "windows" => GuestOs::Windows,
-        _ => match mref.os_hint() {
+        _ => match m.guest_os() {
             GuestOs::Windows => GuestOs::Linux, // agent says non-windows: believe it
             other => other,
         },
@@ -745,7 +684,7 @@ async fn run_inner(
     }
     let mut reboots = 0u32;
     loop {
-        let agent = mref.wait_agent(Duration::from_secs(300)).await?;
+        let agent = m.wait_agent(Duration::from_secs(300)).await?;
         let on_line = |line: String| match serde_json::from_str::<Value>(&line) {
             Ok(cw) => {
                 if let Some(human) = render_cw_event(&cw) {
@@ -762,14 +701,17 @@ async fn run_inner(
         let report = parse_report(&stdout);
 
         if exit_code == 3 && mode == PlaybookMode::Apply {
-            match &mref {
-                MachineRef::Container(_) => bail!(
-                    "playbook {} play {} on {machine}: reboot required, but containers \
-                     cannot reboot (micro-VMs restart from a fresh rootfs)",
-                    pb.path.display(),
-                    pb.play
-                ),
-                MachineRef::Vm(vm) => {
+            {
+                if !m.can_reboot() {
+                    bail!(
+                        "playbook {} play {} on {machine}: reboot required, but this \
+                         machine cannot reboot in place (a container micro-VM restarts \
+                         from a fresh rootfs)",
+                        pb.path.display(),
+                        pb.play
+                    );
+                }
+                {
                     if reboots >= MAX_REBOOTS {
                         log_line(&format!(
                             "still reboot-required after {MAX_REBOOTS} reboots — giving up"
@@ -785,18 +727,11 @@ async fn run_inner(
                         "reboot required — restarting {machine} (attempt {reboots}/{MAX_REBOOTS})"
                     ));
                     set_phase("rebooting", reboots);
-                    vm.agent()
-                        .await?
-                        .shutdown_guest(
-                            crate::labd::vm_agent::ShutdownMode::Reboot,
-                            Duration::from_secs(10),
-                        )
-                        .await
-                        .map_err(|e| anyhow!("rebooting {machine}: {e}"))?;
+                    m.reboot_guest().await?;
                     // Wait for the agent to actually drop before waiting for
                     // it to come back; some guests keep answering briefly.
                     let grace = tokio::time::Instant::now() + Duration::from_secs(120);
-                    while vm.agent_answering().await && tokio::time::Instant::now() < grace {
+                    while m.agent_answering().await && tokio::time::Instant::now() < grace {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
                     // Narrated come-back wait: a DC's first post-promotion
@@ -806,10 +741,10 @@ async fn run_inner(
                     let deadline = started + Duration::from_secs(600);
                     let mut next_note = started + Duration::from_secs(30);
                     loop {
-                        if vm.agent_answering().await {
+                        if m.agent_answering().await {
                             break;
                         }
-                        if vm.state().await == crate::labd::vm::PowerState::Stopped {
+                        if m.state().await == crate::labd::vm::PowerState::Stopped {
                             bail!("{machine} stopped while rebooting for the playbook");
                         }
                         let now = tokio::time::Instant::now();

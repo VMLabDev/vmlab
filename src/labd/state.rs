@@ -10,12 +10,23 @@ use sha2::{Digest, Sha256};
 
 use crate::config::model::MacAddr;
 
+/// One machine's persisted state. VMs and containers record the same things;
+/// the image fields simply stay `None` on a VM.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct VmState {
+pub struct MachineState {
     /// MAC per NIC index — generated deterministically, persisted so DHCP
     /// reservations stay stable (PRD §9.4).
     #[serde(default)]
     pub macs: Vec<MacAddr>,
+    /// Containers only: image manifest digest resolved at first pull — pins
+    /// the container across `up`s (never re-pulled implicitly, mirroring
+    /// registry templates, PRD §6.4) until destroy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+    /// The `image =` reference the digest was resolved from; editing the
+    /// reference in vmlab.wcl invalidates the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
     /// Snapshot name → record.
     #[serde(default)]
     pub snapshots: BTreeMap<String, SnapshotRecord>,
@@ -34,30 +45,17 @@ pub struct SnapshotRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ContainerState {
-    /// MAC per NIC index — same stability contract as VM MACs.
-    #[serde(default)]
-    pub macs: Vec<MacAddr>,
-    /// Image manifest digest resolved at first pull — pins the container
-    /// across `up`s (never re-pulled implicitly, mirroring registry
-    /// templates, PRD §6.4) until `container destroy` / lab destroy.
-    #[serde(default)]
-    pub image_digest: Option<String>,
-    /// The `image =` reference the digest was resolved from; editing the
-    /// reference in vmlab.wcl invalidates the pin.
-    #[serde(default)]
-    pub image_ref: Option<String>,
-    /// Snapshot name → record, same contract as VM snapshots (PRD §18).
-    #[serde(default)]
-    pub snapshots: BTreeMap<String, SnapshotRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LabState {
+    /// Machine name → state, one namespace for both kinds.
     #[serde(default)]
-    pub vms: BTreeMap<String, VmState>,
-    #[serde(default)]
-    pub containers: BTreeMap<String, ContainerState>,
+    pub machines: BTreeMap<String, MachineState>,
+    /// Pre-unification state files kept VMs and containers in separate maps.
+    /// Read on load and folded into `machines`, never written back — so an
+    /// existing lab keeps its MACs, image pins and snapshot records.
+    #[serde(default, skip_serializing)]
+    vms: BTreeMap<String, MachineState>,
+    #[serde(default, skip_serializing)]
+    containers: BTreeMap<String, MachineState>,
 }
 
 impl LabState {
@@ -66,10 +64,26 @@ impl LabState {
     }
 
     pub fn load(lab_local: &Path) -> LabState {
-        std::fs::read_to_string(Self::path(lab_local))
+        let mut state: LabState = std::fs::read_to_string(Self::path(lab_local))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        state.migrate_legacy_maps();
+        state
+    }
+
+    /// Fold any legacy `vms`/`containers` entries into `machines`. Entries
+    /// already under `machines` win — a half-migrated file cannot lose the
+    /// newer record.
+    fn migrate_legacy_maps(&mut self) {
+        for (name, m) in self
+            .vms
+            .split_off("")
+            .into_iter()
+            .chain(self.containers.split_off("").into_iter())
+        {
+            self.machines.entry(name).or_insert(m);
+        }
     }
 
     pub fn save(&self, lab_local: &Path) -> anyhow::Result<()> {
@@ -80,12 +94,8 @@ impl LabState {
         Ok(())
     }
 
-    pub fn vm_mut(&mut self, name: &str) -> &mut VmState {
-        self.vms.entry(name.to_string()).or_default()
-    }
-
-    pub fn container_mut(&mut self, name: &str) -> &mut ContainerState {
-        self.containers.entry(name.to_string()).or_default()
+    pub fn machine_mut(&mut self, name: &str) -> &mut MachineState {
+        self.machines.entry(name.to_string()).or_default()
     }
 }
 
@@ -122,8 +132,8 @@ mod tests {
     fn state_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = LabState::default();
-        s.vm_mut("a").macs.push(generate_mac("l", "a", 0));
-        s.vm_mut("a").snapshots.insert(
+        s.machine_mut("a").macs.push(generate_mac("l", "a", 0));
+        s.machine_mut("a").snapshots.insert(
             "clean".into(),
             SnapshotRecord {
                 online: true,
@@ -131,7 +141,7 @@ mod tests {
                 image_digest: None,
             },
         );
-        s.container_mut("web").snapshots.insert(
+        s.machine_mut("web").snapshots.insert(
             "prepped".into(),
             SnapshotRecord {
                 online: false,
@@ -141,13 +151,80 @@ mod tests {
         );
         s.save(tmp.path()).unwrap();
         let loaded = LabState::load(tmp.path());
-        assert_eq!(loaded.vms["a"].macs.len(), 1);
-        assert!(loaded.vms["a"].snapshots["clean"].online);
+        assert_eq!(loaded.machines["a"].macs.len(), 1);
+        assert!(loaded.machines["a"].snapshots["clean"].online);
         assert_eq!(
-            loaded.containers["web"].snapshots["prepped"]
+            loaded.machines["web"].snapshots["prepped"]
                 .image_digest
                 .as_deref(),
             Some("sha256:abc")
+        );
+    }
+
+    /// A lab written before VMs and containers shared one map must keep its
+    /// MACs, image pins and snapshot records — losing a MAC would move a
+    /// guest's DHCP reservation, and losing a pin would orphan its snapshots.
+    #[test]
+    fn legacy_split_maps_migrate_without_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            LabState::path(tmp.path()),
+            r#"{
+              "vms": {
+                "dc01": {
+                  "macs": [[82, 84, 0, 170, 187, 204]],
+                  "snapshots": {
+                    "clean": {"online": true, "taken_at": "2026-07-01T00:00:00Z"}
+                  }
+                }
+              },
+              "containers": {
+                "web": {
+                  "macs": [[82, 84, 0, 221, 238, 255]],
+                  "image_digest": "sha256:abc",
+                  "image_ref": "nginx:1.27",
+                  "snapshots": {
+                    "prepped": {"online": false, "taken_at": "2026-07-02T00:00:00Z",
+                                "image_digest": "sha256:abc"}
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = LabState::load(tmp.path());
+        assert_eq!(loaded.machines.len(), 2, "both kinds folded in");
+        assert_eq!(
+            loaded.machines["dc01"].macs[0].to_string(),
+            "52:54:00:aa:bb:cc"
+        );
+        assert!(loaded.machines["dc01"].snapshots["clean"].online);
+        assert_eq!(
+            loaded.machines["web"].image_ref.as_deref(),
+            Some("nginx:1.27"),
+            "the container's image pin survives"
+        );
+        assert_eq!(
+            loaded.machines["web"].snapshots["prepped"]
+                .image_digest
+                .as_deref(),
+            Some("sha256:abc")
+        );
+
+        // Re-saving writes only the unified map; a second load is stable.
+        loaded.save(tmp.path()).unwrap();
+        let written = std::fs::read_to_string(LabState::path(tmp.path())).unwrap();
+        assert!(
+            !written.contains("\"vms\""),
+            "legacy maps are not rewritten"
+        );
+        assert!(!written.contains("\"containers\""));
+        let again = LabState::load(tmp.path());
+        assert_eq!(again.machines.len(), 2);
+        assert_eq!(
+            again.machines["web"].image_ref.as_deref(),
+            Some("nginx:1.27")
         );
     }
 }
