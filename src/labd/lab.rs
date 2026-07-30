@@ -150,7 +150,7 @@ impl LabRuntime {
         let lab_local = crate::paths::lab_local_dir(&root);
         std::fs::create_dir_all(&lab_local)?;
 
-        let mut state = LabState::load(&lab_local);
+        let mut state = LabState::load(&lab_local)?;
         let store = TemplateStore::new(crate::paths::template_store_dir());
         let mut network = LabNetwork::build(&config.lab)?;
         let mut pending: BTreeMap<String, PendingPull> = BTreeMap::new();

@@ -2,6 +2,7 @@
 //! created clones, snapshot power-state records (PRD §7.3 — every snapshot
 //! records the VM's power state at capture time).
 
+use anyhow::Context;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -63,13 +64,32 @@ impl LabState {
         lab_local.join("state.json")
     }
 
-    pub fn load(lab_local: &Path) -> LabState {
-        let mut state: LabState = std::fs::read_to_string(Self::path(lab_local))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+    /// Read the lab's persisted state.
+    ///
+    /// A missing file is a fresh lab and starts empty. A file that exists but
+    /// cannot be read or parsed is *not* treated as empty: doing so silently
+    /// regenerates every MAC — moving every DHCP reservation — and orphans
+    /// every snapshot record. The caller gets the error and the lab refuses to
+    /// come up rather than quietly rebuilding itself.
+    pub fn load(lab_local: &Path) -> anyhow::Result<LabState> {
+        let path = Self::path(lab_local);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LabState::default()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        let mut state: LabState = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "parsing {} — move it aside to start over, but every MAC will \
+                 be regenerated and every snapshot record lost",
+                path.display()
+            )
+        })?;
         state.migrate_legacy_maps();
-        state
+        Ok(state)
     }
 
     /// Fold any legacy `vms`/`containers` entries into `machines`. Entries
@@ -150,7 +170,7 @@ mod tests {
             },
         );
         s.save(tmp.path()).unwrap();
-        let loaded = LabState::load(tmp.path());
+        let loaded = LabState::load(tmp.path()).unwrap();
         assert_eq!(loaded.machines["a"].macs.len(), 1);
         assert!(loaded.machines["a"].snapshots["clean"].online);
         assert_eq!(
@@ -193,7 +213,7 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = LabState::load(tmp.path());
+        let loaded = LabState::load(tmp.path()).unwrap();
         assert_eq!(loaded.machines.len(), 2, "both kinds folded in");
         assert_eq!(
             loaded.machines["dc01"].macs[0].to_string(),
@@ -220,11 +240,30 @@ mod tests {
             "legacy maps are not rewritten"
         );
         assert!(!written.contains("\"containers\""));
-        let again = LabState::load(tmp.path());
+        let again = LabState::load(tmp.path()).unwrap();
         assert_eq!(again.machines.len(), 2);
         assert_eq!(
             again.machines["web"].image_ref.as_deref(),
             Some("nginx:1.27")
         );
+    }
+
+    /// Treating an unparseable state file as "no state" would regenerate every
+    /// MAC and orphan every snapshot, quietly. It has to be an error.
+    #[test]
+    fn a_corrupt_state_file_is_an_error_not_an_empty_lab() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(LabState::path(tmp.path()), "{ this is not json").unwrap();
+        let err = LabState::load(tmp.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("state.json"), "names the file: {msg}");
+        assert!(msg.contains("MAC"), "warns what starting over costs: {msg}");
+    }
+
+    /// A lab that has never run has no state file, and that is not an error.
+    #[test]
+    fn a_missing_state_file_is_a_fresh_lab() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(LabState::load(tmp.path()).unwrap().machines.is_empty());
     }
 }
