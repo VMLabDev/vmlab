@@ -1,6 +1,6 @@
 // Interactive terminal into a guest — a VM's vmlab-agent shell or a
-// container's recovery shell — over the /vms/{vm}/tty or
-// /containers/{name}/tty WebSocket. Binary frames are raw PTY bytes both
+// container's recovery shell — over the /machines/{name}/tty WebSocket.
+// Binary frames are raw PTY bytes both
 // ways; resizes go as a JSON text frame, which the server proxies to the lab
 // daemon (→ the agent resizes the guest PTY).
 //
@@ -34,10 +34,10 @@ export default function TerminalPanel(p: {
   let fit: FitAddon | undefined;
   let observer: ResizeObserver | undefined;
 
+  // One terminal endpoint: the shell rides the same agent channel whether
+  // the machine is a VM or a container.
   const path = () =>
-    p.target.kind === "vm"
-      ? `/api/labs/${encodeURIComponent(p.lab)}/vms/${encodeURIComponent(p.target.name)}/tty`
-      : `/api/labs/${encodeURIComponent(p.lab)}/containers/${encodeURIComponent(p.target.name)}/tty`;
+    `/api/labs/${encodeURIComponent(p.lab)}/machines/${encodeURIComponent(p.target.name)}/tty`;
 
   const connect = () => {
     setClosed(false);

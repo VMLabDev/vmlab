@@ -561,19 +561,19 @@ export async function destroyLab() {
 }
 
 export const vmStart = (vm: string) =>
-  run(`Starting ${vm}`, () => api.vmAction(state.currentLab!, vm, "start"));
+  run(`Starting ${vm}`, () => api.machineAction(state.currentLab!, vm, "start"));
 export const vmStop = (vm: string, force?: boolean) =>
-  run(`${f(force)} ${vm}`, () => api.vmAction(state.currentLab!, vm, "stop", force));
+  run(`${f(force)} ${vm}`, () => api.machineAction(state.currentLab!, vm, "stop", force));
 export const vmRestart = (vm: string, force?: boolean) =>
-  run(`Restarting ${vm}`, () => api.vmAction(state.currentLab!, vm, "restart", force));
+  run(`Restarting ${vm}`, () => api.machineAction(state.currentLab!, vm, "restart", force));
 
 export const containerStart = (name: string) =>
-  run(`Starting ${name}`, () => api.containerAction(state.currentLab!, name, "start"));
+  run(`Starting ${name}`, () => api.machineAction(state.currentLab!, name, "start"));
 export const containerStop = (name: string, force?: boolean) =>
-  run(`${f(force)} ${name}`, () => api.containerAction(state.currentLab!, name, "stop", force));
+  run(`${f(force)} ${name}`, () => api.machineAction(state.currentLab!, name, "stop", force));
 export const containerRestart = (name: string, force?: boolean) =>
   run(`Restarting ${name}`, () =>
-    api.containerAction(state.currentLab!, name, "restart", force),
+    api.machineAction(state.currentLab!, name, "restart", force),
   );
 
 export const takeSnapshot = (name: string, vm?: string) =>

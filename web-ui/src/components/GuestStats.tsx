@@ -23,11 +23,7 @@ export default function GuestStats(p: {
     if (inFlight) return;
     inFlight = true;
     try {
-      const s =
-        p.kind === "vm"
-          ? await api.vmStats(p.lab, p.name)
-          : await api.containerStats(p.lab, p.name);
-      setStats(s);
+      setStats(await api.machineStats(p.lab, p.name));
     } catch {
       setStats(undefined); // no agent / stopped: hide the card
     } finally {

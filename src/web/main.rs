@@ -224,54 +224,54 @@ async fn main() -> ExitCode {
             .route("/api/host/fs", web::get().to(api::host_fs))
             // The daemon's network fast-path tier (Topbar badge).
             .route("/api/fastpath", web::get().to(api::fastpath))
-            // VM sub-routes (literal before the `{action}` catch-all).
+            // Machine sub-routes (literal before the `{action}` catch-all).
+            // One path family for VMs and containers alike — the console
+            // still presents them as separate things, but there is one
+            // endpoint behind each affordance.
             .route(
-                "/api/labs/{lab}/vms/{vm}/sendkeys",
-                web::post().to(api::vm_sendkeys),
+                "/api/labs/{lab}/machines/{machine}/capabilities",
+                web::get().to(api::machine_capabilities),
             )
             .route(
-                "/api/labs/{lab}/vms/{vm}/screenshot.png",
-                web::get().to(api::vm_screenshot),
+                "/api/labs/{lab}/machines/{machine}/sendkeys",
+                web::post().to(api::machine_sendkeys),
             )
             .route(
-                "/api/labs/{lab}/vms/{vm}/snapshots",
-                web::get().to(api::vm_snapshots),
+                "/api/labs/{lab}/machines/{machine}/screenshot.png",
+                web::get().to(api::machine_screenshot),
             )
             .route(
-                "/api/labs/{lab}/vms/{vm}/snapshots/{name}",
+                "/api/labs/{lab}/machines/{machine}/snapshots",
+                web::get().to(api::machine_snapshots),
+            )
+            .route(
+                "/api/labs/{lab}/machines/{machine}/snapshots/{name}",
                 web::delete().to(api::snapshot_delete),
             )
-            // Interactive terminal inside the VM (vmlab-agent session).
-            .route("/api/labs/{lab}/vms/{vm}/tty", web::get().to(tty::vm_tty))
-            // Guest metrics + clipboard (vmlab-agent).
+            // Interactive terminal (vmlab-agent session).
             .route(
-                "/api/labs/{lab}/vms/{vm}/stats",
-                web::get().to(api::vm_stats),
+                "/api/labs/{lab}/machines/{machine}/tty",
+                web::get().to(tty::machine_tty),
             )
             .route(
-                "/api/labs/{lab}/vms/{vm}/clipboard",
-                web::get().to(api::vm_clipboard_get),
+                "/api/labs/{lab}/machines/{machine}/stats",
+                web::get().to(api::machine_stats),
             )
             .route(
-                "/api/labs/{lab}/vms/{vm}/clipboard",
-                web::post().to(api::vm_clipboard_set),
+                "/api/labs/{lab}/machines/{machine}/logs",
+                web::get().to(api::machine_logs),
             )
             .route(
-                "/api/labs/{lab}/containers/{container}/stats",
-                web::get().to(api::container_stats),
+                "/api/labs/{lab}/machines/{machine}/clipboard",
+                web::get().to(api::machine_clipboard_get),
             )
             .route(
-                "/api/labs/{lab}/vms/{vm}/{action}",
-                web::post().to(api::vm_action),
-            )
-            // Container lifecycle (mirrors the VM actions).
-            .route(
-                "/api/labs/{lab}/containers/{container}/tty",
-                web::get().to(tty::container_tty),
+                "/api/labs/{lab}/machines/{machine}/clipboard",
+                web::post().to(api::machine_clipboard_set),
             )
             .route(
-                "/api/labs/{lab}/containers/{container}/{action}",
-                web::post().to(api::container_action),
+                "/api/labs/{lab}/machines/{machine}/{action}",
+                web::post().to(api::machine_action),
             )
             // Snapshots (literal before the `{action}` catch-all).
             .route(
@@ -361,11 +361,7 @@ async fn main() -> ExitCode {
                 web::post().to(pkgs::repos_edit),
             )
             .route(
-                "/api/labs/{lab}/vms/{vm}/playbook/{action}",
-                web::post().to(playbooks::run_playbook),
-            )
-            .route(
-                "/api/labs/{lab}/containers/{container}/playbook/{action}",
+                "/api/labs/{lab}/machines/{machine}/playbook/{action}",
                 web::post().to(playbooks::run_playbook),
             )
             // Lab Files tab: the whole-lab-dir file API (literal before the

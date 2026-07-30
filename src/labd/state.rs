@@ -80,7 +80,7 @@ impl LabState {
             .vms
             .split_off("")
             .into_iter()
-            .chain(self.containers.split_off("").into_iter())
+            .chain(self.containers.split_off(""))
         {
             self.machines.entry(name).or_insert(m);
         }

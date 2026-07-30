@@ -138,9 +138,27 @@ export interface ActivePull {
   bytes_total: number;
   percent: number;
 }
+/** One machine exactly as labd reports it: common fields plus whichever
+ *  kind-specific ones its adapter contributed. The console never consumes
+ *  this directly — `labStatus` splits it into `vms` and `containers`, which
+ *  are separate things to a user even though they share one endpoint. */
+export interface RawMachine {
+  name: string;
+  kind: "vm" | "container";
+  state: string;
+  ready: boolean;
+  ip: string | null;
+  nics: Nic[];
+  web?: WebPage[];
+  /** False while the template/image still needs downloading. */
+  cached?: boolean;
+  [key: string]: unknown;
+}
 export interface LabStatus {
   lab: string;
+  /** Derived from `machines` — VMs only. */
   vms: Vm[];
+  /** Derived from `machines` — containers only. */
   containers: Container[];
   segments: Segment[];
   /** The lab has clones, container overlays or named volumes on disk — i.e.
@@ -171,8 +189,28 @@ export interface DnsSegmentZone {
 }
 
 export const listLabs = (): Promise<LabEntry[]> => req("/api/labs");
-export const labStatus = (lab: string): Promise<LabStatus> =>
-  req(`/api/labs/${encodeURIComponent(lab)}`);
+export const labStatus = async (lab: string): Promise<LabStatus> => {
+  const raw = await req(`/api/labs/${encodeURIComponent(lab)}/status`);
+  return splitMachines(raw);
+};
+
+/** labd reports one `machines` array; the console shows VMs and containers as
+ *  separate things. Split here, once, rather than at every call site. */
+export function splitMachines(raw: {
+  machines?: RawMachine[];
+  [key: string]: unknown;
+}): LabStatus {
+  const machines = raw.machines ?? [];
+  return {
+    ...(raw as object),
+    vms: machines
+      .filter((m) => m.kind === "vm")
+      .map((m) => ({ ...m, template_cached: m.cached }) as unknown as Vm),
+    containers: machines
+      .filter((m) => m.kind === "container")
+      .map((m) => ({ ...m, image_cached: m.cached }) as unknown as Container),
+  } as LabStatus;
+}
 export const dnsTable = (lab: string): Promise<{ segments: DnsSegmentZone[] }> =>
   req(`/api/labs/${encodeURIComponent(lab)}/dns`);
 // `force` applies to the stop-shaped actions (down / stop / restart's stop
@@ -188,33 +226,41 @@ export const labAction = (
  *  (an `up`, a `pull`) fails with "download cancelled". */
 export const cancelPull = (lab: string, machine: string): Promise<{ cancelled: boolean }> =>
   post(`/api/labs/${encodeURIComponent(lab)}/pulls/${encodeURIComponent(machine)}/cancel`);
-export const vmAction = (
+export const machineAction = (
   lab: string,
-  vm: string,
+  machine: string,
   action: "start" | "stop" | "restart" | "destroy",
   force?: boolean,
 ) =>
   post(
-    `/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/${action}${forceQs(force)}`,
+    `/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(machine)}/${action}${forceQs(force)}`,
   );
-export const containerAction = (
+
+/** What a machine can do, probed live — drives which affordances the console
+ *  offers instead of guessing from the kind. */
+export interface Capabilities {
+  kind: "vm" | "container";
+  display: boolean;
+  console_log: boolean;
+  reboot: boolean;
+  agent: string[];
+}
+export const machineCapabilities = (
   lab: string,
-  container: string,
-  action: "start" | "stop" | "restart" | "destroy",
-  force?: boolean,
-) =>
-  post(
-    `/api/labs/${encodeURIComponent(lab)}/containers/${encodeURIComponent(container)}/${action}${forceQs(force)}`,
+  machine: string,
+): Promise<Capabilities> =>
+  req(
+    `/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(machine)}/capabilities`,
   );
 export const sendKeys = (lab: string, vm: string, keys: string) =>
-  post(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/sendkeys`, {
+  post(`/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(vm)}/sendkeys`, {
     keys,
   });
 export const vmSnapshots = (lab: string, vm: string): Promise<Snapshot[]> =>
-  req(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/snapshots`);
+  req(`/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(vm)}/snapshots`);
 export const deleteSnapshot = (lab: string, vm: string, name: string) =>
   req(
-    `/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/snapshots/${encodeURIComponent(name)}`,
+    `/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(vm)}/snapshots/${encodeURIComponent(name)}`,
     { method: "DELETE" },
   );
 export const takeSnapshot = (lab: string, name: string, vm?: string) =>
@@ -227,16 +273,12 @@ export interface GuestStats {
   mem_total: number;
   disks: { mount: string; used: number; total: number }[];
 }
-export const vmStats = (lab: string, vm: string): Promise<GuestStats> =>
-  req(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/stats`);
-export const containerStats = (lab: string, container: string): Promise<GuestStats> =>
-  req(
-    `/api/labs/${encodeURIComponent(lab)}/containers/${encodeURIComponent(container)}/stats`,
-  );
+export const machineStats = (lab: string, machine: string): Promise<GuestStats> =>
+  req(`/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(machine)}/stats`);
 export const vmClipboardGet = (lab: string, vm: string): Promise<{ text: string }> =>
-  req(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/clipboard`);
+  req(`/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(vm)}/clipboard`);
 export const vmClipboardSet = (lab: string, vm: string, text: string) =>
-  post(`/api/labs/${encodeURIComponent(lab)}/vms/${encodeURIComponent(vm)}/clipboard`, {
+  post(`/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(vm)}/clipboard`, {
     text,
   });
 export const restoreSnapshot = (lab: string, name: string, vm?: string) =>

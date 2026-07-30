@@ -1299,10 +1299,6 @@ impl super::machine::Machine for ContainerInstance {
         &self.cfg.web
     }
 
-    fn depends_on(&self) -> &[String] {
-        &self.cfg.depends_on
-    }
-
     fn term_session_sock(&self, id: u32) -> PathBuf {
         self.dirs.term_session_sock(id)
     }
@@ -1315,16 +1311,8 @@ impl super::machine::Machine for ContainerInstance {
         ContainerInstance::is_ready(self).await
     }
 
-    async fn is_agent_up(&self) -> bool {
-        ContainerInstance::is_agent_up(self).await
-    }
-
     async fn stop(&self, force: bool) -> Result<()> {
         ContainerInstance::stop(self, force).await
-    }
-
-    async fn qmp(&self) -> Result<QmpClient> {
-        ContainerInstance::qmp(self).await
     }
 
     async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
@@ -1333,10 +1321,6 @@ impl super::machine::Machine for ContainerInstance {
 
     async fn agent_answering(&self) -> bool {
         self.agent_probe().await
-    }
-
-    async fn drop_agent(&self) {
-        ContainerInstance::drop_agent(self).await
     }
 
     async fn snapshot(&self, name: &str) -> Result<bool> {
@@ -1477,6 +1461,64 @@ mod tests {
             value: value.into(),
             span: (0, 0),
         }
+    }
+
+    // ---- the Machine interface ---------------------------------------------
+
+    fn instance(name: &str) -> Arc<ContainerInstance> {
+        let dirs = ContainerDirs::new(Path::new("/tmp/vmlab-test"), "lab", name);
+        ContainerInstance::new(
+            "lab",
+            container(name),
+            "x86_64",
+            dirs,
+            vec![],
+            vec![],
+            None,
+            vec![],
+        )
+    }
+
+    /// A container has no display device at all, so asking for one is a hard
+    /// no rather than a transient failure — the console reads this from
+    /// `capabilities` instead of branching on the kind.
+    #[test]
+    fn container_reports_no_display_but_keeps_a_console_log() {
+        use super::super::machine::{Machine, MachineKind};
+        let c = instance("web");
+        assert_eq!(c.kind(), MachineKind::Container);
+        assert!(
+            c.clone().display().is_none(),
+            "containers boot with no -vnc device"
+        );
+        assert!(
+            c.console_log(10).is_some(),
+            "a container's console log is its entrypoint's stdout"
+        );
+        assert!(
+            !c.can_reboot(),
+            "a micro-VM restart comes up from a fresh rootfs"
+        );
+    }
+
+    /// The refusal names the reason, not the kind — a user reading it should
+    /// learn why, not just that it did not work.
+    #[tokio::test]
+    async fn container_reboot_refusal_explains_itself() {
+        use super::super::machine::Machine;
+        let msg = format!("{:#}", instance("web").reboot_guest().await.unwrap_err());
+        assert!(msg.contains("web"), "names the machine: {msg}");
+        assert!(msg.contains("fresh rootfs"), "explains why: {msg}");
+    }
+
+    /// A container's snapshots are only valid against the rootfs they were
+    /// taken on, so it pins its image digest; a VM pins nothing.
+    #[test]
+    fn container_snapshot_pins_the_image() {
+        use super::super::machine::Machine;
+        let c = instance("web");
+        // No image bound yet (deferred pull) — nothing to pin.
+        assert_eq!(c.snapshot_pin(), None);
     }
 
     // ---- build_spec: entrypoint/cmd matrix (docker semantics) --------------

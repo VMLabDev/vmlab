@@ -202,18 +202,58 @@ fn stream_sink(lab: &Arc<LabRuntime>, stream: &Streamer) -> crate::scripting::Ou
     })
 }
 
-fn vm_arg(args: &Value) -> Result<String, String> {
-    args["vm"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| "missing vm".to_string())
+/// The machine a `machine.*` command addresses. `machine` is the arg name;
+/// `vm` and `container` are still accepted so a client that has not been
+/// updated keeps working.
+fn machine_arg(args: &Value) -> Result<String, String> {
+    for key in ["machine", "vm", "container"] {
+        if let Some(name) = args[key].as_str() {
+            return Ok(name.to_string());
+        }
+    }
+    Err("missing machine".to_string())
 }
 
-fn container_arg(args: &Value) -> Result<String, String> {
-    args["container"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| "missing container".to_string())
+/// The framebuffer of the addressed machine, or an error naming the reason a
+/// caller cannot have one. Containers run with no display device at all, so
+/// this is a hard "no" rather than a transient failure.
+fn display_of(
+    lab: &Arc<LabRuntime>,
+    args: &Value,
+) -> Result<crate::labd::machine::Display, String> {
+    let name = machine_arg(args)?;
+    let m = lab.machine(&name).map_err(|e| format!("{e:#}"))?;
+    m.display()
+        .ok_or_else(|| format!("{name}: this machine has no display"))
+}
+
+/// Stream an agent session's data to the client until it ends, the machine
+/// stops, or the session errors. Shared by `machine.tail` and
+/// `machine.eventlog`.
+async fn pump_session(
+    mut session: vm_agent::AgentSession,
+    m: &dyn crate::labd::machine::Machine,
+    stream: &Streamer,
+) -> Result<Value, String> {
+    loop {
+        tokio::select! {
+            ev = session.recv() => match ev {
+                Some(vm_agent::SessionEvent::Data(b)) => {
+                    stream.chunk(String::from_utf8_lossy(&b).into_owned()).await;
+                }
+                Some(vm_agent::SessionEvent::Error(msg)) => return Err(msg),
+                None => break,
+                Some(_) => {}
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if m.state().await != vm::PowerState::Running {
+                    break;
+                }
+            }
+        }
+    }
+    session.close().await;
+    Ok(json!(true))
 }
 
 fn vms_arg(args: &Value) -> Vec<String> {
@@ -292,123 +332,126 @@ impl Handler for LabdHandler {
                 lab.destroy().await.map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.start" => {
-                let vm = vm_arg(&args)?;
+            // ---- machines (PRD §7, §18) ---------------------------------
+            //
+            // One command set for VMs and containers alike. Where a machine
+            // genuinely cannot serve a command it says so through its
+            // capabilities (no display, no console log) rather than through
+            // its kind — see `labd::machine`.
+            "machine.start" => {
+                let name = machine_arg(&args)?;
                 // Pull with CLI-visible progress before the preflight (the
                 // pulled meta can change the resolved firmware/TPM needs);
-                // start_vm's internal pull is then a no-op.
+                // the internal pull in start is then a no-op.
                 let output = stream_sink(&self.lab, _stream);
-                lab.ensure_pulled(std::slice::from_ref(&vm), Some(&output))
+                lab.ensure_pulled(std::slice::from_ref(&name), Some(&output))
                     .await
                     .map_err(err)?;
-                lab.preflight_binaries(std::slice::from_ref(&vm))
+                lab.preflight_binaries(std::slice::from_ref(&name))
                     .map_err(err)?;
-                lab.start_vm(&vm).await.map_err(err)?;
+                lab.start_machine(&name).await.map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.stop" => {
+            "machine.stop" => {
                 let force = args["force"].as_bool().unwrap_or(false);
-                lab.vm(&vm_arg(&args)?)
+                lab.machine(&machine_arg(&args)?)
                     .map_err(err)?
                     .stop(force)
                     .await
                     .map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.restart" => {
-                let name = vm_arg(&args)?;
+            "machine.restart" => {
                 let force = args["force"].as_bool().unwrap_or(false);
-                let vm = lab.vm(&name).map_err(err)?.clone();
-                vm.stop(force).await.map_err(err)?;
-                // Wait for the exit monitor to settle, then boot again.
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-                while vm.state().await != vm::PowerState::Stopped {
-                    if tokio::time::Instant::now() > deadline {
-                        return Err(format!("{name} did not stop for restart"));
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                lab.start_vm(&name).await.map_err(err)?;
+                lab.restart_machine(&machine_arg(&args)?, force)
+                    .await
+                    .map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.destroy" => {
-                lab.destroy_vm(&vm_arg(&args)?).await.map_err(err)?;
+            "machine.destroy" => {
+                lab.destroy_machine(&machine_arg(&args)?)
+                    .await
+                    .map_err(err)?;
                 Ok(json!(true))
             }
-            // VM interaction (PRD §10.3: vmlab vm screenshot/sendkeys/mouse/…).
-            "vm.screenshot" => {
-                let name = vm_arg(&args)?;
+            // What this machine can do beyond the universal commands, probed
+            // live: a display, a console log, in-place reboot, and whichever
+            // features its agent negotiated at handshake.
+            "machine.capabilities" => {
+                let m = lab.machine(&machine_arg(&args)?).map_err(err)?;
+                Ok(json!(m.capabilities().await))
+            }
+            "machine.ip" => {
+                let nic = args["nic"].as_u64().map(|n| n as usize);
+                let ip = lab
+                    .machine(&machine_arg(&args)?)
+                    .map_err(err)?
+                    .guest_ip(nic)
+                    .await
+                    .map_err(err)?;
+                Ok(json!(ip))
+            }
+
+            // ---- display (machines with a framebuffer) --------------------
+            "machine.screenshot" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let vm = lab.vm(&name).map_err(err)?;
-                crate::scripting::interact::screenshot(vm, std::path::Path::new(path))
+                display_of(lab, &args)?
+                    .screenshot(std::path::Path::new(path))
                     .await
                     .map_err(err)?;
                 Ok(json!({"path": path}))
             }
-            "vm.sendkeys" => {
-                let name = vm_arg(&args)?;
+            "machine.sendkeys" => {
                 let keys = args["keys"].as_str().ok_or("missing keys")?;
-                let vm = lab.vm(&name).map_err(err)?;
-                crate::scripting::interact::send_keys(vm, keys)
-                    .await
-                    .map_err(err)?;
+                display_of(lab, &args)?.send_keys(keys).await.map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.mouse_move" => {
-                let name = vm_arg(&args)?;
+            "machine.mouse_move" => {
                 let x = args["x"].as_i64().ok_or("missing x")?;
                 let y = args["y"].as_i64().ok_or("missing y")?;
-                let vm = lab.vm(&name).map_err(err)?;
-                crate::scripting::interact::mouse_move(vm, x, y)
+                display_of(lab, &args)?
+                    .mouse_move(x, y)
                     .await
                     .map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.mouse_click" => {
-                let name = vm_arg(&args)?;
+            "machine.mouse_click" => {
                 let button = args["button"].as_str().unwrap_or("left");
                 let at = match (args["x"].as_i64(), args["y"].as_i64()) {
                     (Some(x), Some(y)) => Some((x, y)),
                     _ => None,
                 };
-                let vm = lab.vm(&name).map_err(err)?;
-                crate::scripting::interact::mouse_click(vm, button, at)
+                display_of(lab, &args)?
+                    .mouse_click(button, at)
                     .await
                     .map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.mouse_drag" => {
-                let name = vm_arg(&args)?;
+            "machine.mouse_drag" => {
                 let x1 = args["x1"].as_i64().ok_or("missing x1")?;
                 let y1 = args["y1"].as_i64().ok_or("missing y1")?;
                 let x2 = args["x2"].as_i64().ok_or("missing x2")?;
                 let y2 = args["y2"].as_i64().ok_or("missing y2")?;
-                let vm = lab.vm(&name).map_err(err)?;
-                crate::scripting::interact::mouse_drag(vm, x1, y1, x2, y2)
+                display_of(lab, &args)?
+                    .mouse_drag(x1, y1, x2, y2)
                     .await
                     .map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.ocr" => {
-                let name = vm_arg(&args)?;
+            "machine.ocr" => {
                 let region = region_arg(&args)?;
-                let vm = lab.vm(&name).map_err(err)?;
-                let text = crate::scripting::interact::ocr(vm, region)
-                    .await
-                    .map_err(err)?;
+                let text = display_of(lab, &args)?.ocr(region).await.map_err(err)?;
                 Ok(json!(text))
             }
-            "vm.find_image" => {
-                let name = vm_arg(&args)?;
+            "machine.find_image" => {
                 let image = args["image"].as_str().ok_or("missing image")?;
                 let threshold = args["threshold"].as_f64().unwrap_or(0.9);
                 let region = region_arg(&args)?;
                 let opts = crate::vision::MatchOptions { threshold, region };
-                let vm = lab.vm(&name).map_err(err)?;
-                let found =
-                    crate::scripting::interact::find_image(vm, &[PathBuf::from(image)], &opts)
-                        .await
-                        .map_err(err)?;
+                let found = display_of(lab, &args)?
+                    .find_image(&[PathBuf::from(image)], &opts)
+                    .await
+                    .map_err(err)?;
                 Ok(match found {
                     Some(m) => {
                         let (cx, cy) = m.center();
@@ -418,9 +461,13 @@ impl Handler for LabdHandler {
                     None => Value::Null,
                 })
             }
-            // Guest-agent exec (PRD §12: vmlab exec <vm> -- cmd).
-            "vm.exec" => {
-                let name = vm_arg(&args)?;
+
+            // ---- agent-backed commands ------------------------------------
+            //
+            // All of these ride the one `vmlab.agent.0` channel, so they work
+            // on any machine whose agent advertises the feature.
+            "machine.exec" => {
+                let name = machine_arg(&args)?;
                 let cmd = args["cmd"].as_str().ok_or("missing cmd")?;
                 let cmd_args: Vec<String> = args["args"]
                     .as_array()
@@ -432,8 +479,12 @@ impl Handler for LabdHandler {
                     .unwrap_or_default();
                 let timeout =
                     std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
-                let vm = lab.vm(&name).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
+                let agent = lab
+                    .machine(&name)
+                    .map_err(err)?
+                    .agent()
+                    .await
+                    .map_err(err)?;
                 let mut argv = vec![cmd.to_string()];
                 argv.extend(cmd_args);
                 let result = agent
@@ -446,12 +497,15 @@ impl Handler for LabdHandler {
                     "stderr": String::from_utf8_lossy(&result.stderr),
                 }))
             }
-            // Guest OS identification (PRD §12: vmlab osinfo).
-            "vm.osinfo" => {
-                let name = vm_arg(&args)?;
+            "machine.osinfo" => {
                 let timeout =
                     std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(30));
-                let agent = lab.vm(&name).map_err(err)?.agent().await.map_err(err)?;
+                let agent = lab
+                    .machine(&machine_arg(&args)?)
+                    .map_err(err)?
+                    .agent()
+                    .await
+                    .map_err(err)?;
                 let info = agent.osinfo(timeout).await.map_err(err)?;
                 Ok(json!({
                     "id": info.id,
@@ -462,37 +516,13 @@ impl Handler for LabdHandler {
                     "hostname": info.hostname,
                 }))
             }
-            // Interactive terminal over the vmlab-agent channel: opens a
-            // fresh session (multi-session — every attach gets its own
-            // shell), re-exposed as a raw-byte unix socket clients connect
-            // to directly; resize rides the agent's control channel.
-            "vm.tty_open" => {
-                let name = vm_arg(&args)?;
-                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
-                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
-                let vm = lab.vm(&name).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
-                let session = agent.open_terminal(cols, rows, None).await.map_err(err)?;
-                let id = session.id;
-                let path = vm.dirs.term_session_sock(id);
-                vm_agent::expose_terminal_socket(session, path.clone())
+            "machine.agent_info" => {
+                let agent = lab
+                    .machine(&machine_arg(&args)?)
+                    .map_err(err)?
+                    .agent()
                     .await
                     .map_err(err)?;
-                Ok(json!({"session": id, "path": path}))
-            }
-            "vm.tty_resize" => {
-                let name = vm_arg(&args)?;
-                let session = args["session"].as_u64().ok_or("missing session")? as u32;
-                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
-                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
-                let vm = lab.vm(&name).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
-                agent.resize(session, cols, rows).await.map_err(err)?;
-                Ok(json!(true))
-            }
-            "vm.agent_info" => {
-                let vm = lab.vm(&vm_arg(&args)?).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
                 let info = agent.info();
                 Ok(json!({
                     "version": info.agent_version,
@@ -500,27 +530,83 @@ impl Handler for LabdHandler {
                     "features": info.features,
                 }))
             }
-            // Fast binary file transfer over the agent channel (host paths
-            // are the daemon's — the CLI resolves them absolute first).
-            "vm.push_file" => {
-                let name = vm_arg(&args)?;
-                let from = args["from"].as_str().ok_or("missing from")?;
-                let to = args["to"].as_str().ok_or("missing to")?;
-                let mode = args["mode"].as_u64().map(|m| m as u32);
-                let vm = lab.vm(&name).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
-                let (sha256, len) = agent
-                    .push_file(std::path::Path::new(from), to, mode)
+            // Interactive terminal: opens a fresh session (multi-session —
+            // every attach gets its own shell), re-exposed as a raw-byte unix
+            // socket clients connect to directly; resize rides the agent's
+            // control channel.
+            "machine.tty_open" => {
+                let name = machine_arg(&args)?;
+                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
+                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
+                let m = lab.machine(&name).map_err(err)?;
+                let agent = m.agent().await.map_err(err)?;
+                let session = agent.open_terminal(cols, rows, None).await.map_err(err)?;
+                let id = session.id;
+                let path = m.term_session_sock(id);
+                vm_agent::expose_terminal_socket(session, path.clone())
                     .await
                     .map_err(err)?;
+                Ok(json!({"session": id, "path": path}))
+            }
+            "machine.tty_resize" => {
+                let session = args["session"].as_u64().ok_or("missing session")? as u32;
+                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
+                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
+                let agent = lab
+                    .machine(&machine_arg(&args)?)
+                    .map_err(err)?
+                    .agent()
+                    .await
+                    .map_err(err)?;
+                agent.resize(session, cols, rows).await.map_err(err)?;
+                Ok(json!(true))
+            }
+            // Fast binary file transfer over the agent channel. `from` is a
+            // host path the daemon can see (the CLI resolves it absolute
+            // first); `data` is inline base64 for callers that have bytes
+            // rather than a file.
+            "machine.push_file" => {
+                let name = machine_arg(&args)?;
+                let to = args["to"].as_str().ok_or("missing to")?;
+                let mode = args["mode"].as_u64().map(|m| m as u32);
+                let agent = lab
+                    .machine(&name)
+                    .map_err(err)?
+                    .agent()
+                    .await
+                    .map_err(err)?;
+                let (sha256, len) = match args["data"].as_str() {
+                    Some(data) => {
+                        use base64::Engine as _;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .map_err(|e| format!("invalid base64 data: {e}"))?;
+                        let tmp = std::env::temp_dir()
+                            .join(format!("vmlab-cp-{}-{name}", std::process::id()));
+                        std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+                        let res = agent.push_file(&tmp, to, mode).await;
+                        let _ = std::fs::remove_file(&tmp);
+                        res.map_err(err)?
+                    }
+                    None => {
+                        let from = args["from"].as_str().ok_or("missing from or data")?;
+                        agent
+                            .push_file(std::path::Path::new(from), to, mode)
+                            .await
+                            .map_err(err)?
+                    }
+                };
                 Ok(json!({"sha256": sha256, "len": len}))
             }
-            "vm.pull_file" => {
-                let name = vm_arg(&args)?;
+            "machine.pull_file" => {
                 let from = args["from"].as_str().ok_or("missing from")?;
                 let to = args["to"].as_str().ok_or("missing to")?;
-                let vm = lab.vm(&name).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
+                let agent = lab
+                    .machine(&machine_arg(&args)?)
+                    .map_err(err)?
+                    .agent()
+                    .await
+                    .map_err(err)?;
                 let (sha256, len) = agent
                     .pull_file(from, std::path::Path::new(to))
                     .await
@@ -528,69 +614,37 @@ impl Handler for LabdHandler {
                 Ok(json!({"sha256": sha256, "len": len}))
             }
             // Follow a guest file (tail -F semantics), streamed as chunks
-            // until the client hangs up or the VM stops.
-            "vm.tail" => {
-                let name = vm_arg(&args)?;
+            // until the client hangs up or the machine stops.
+            "machine.tail" => {
+                let name = machine_arg(&args)?;
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let vm = lab.vm(&name).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
-                let mut session = agent.open_tail(path.to_string()).await.map_err(err)?;
-                loop {
-                    tokio::select! {
-                        ev = session.recv() => match ev {
-                            Some(vm_agent::SessionEvent::Data(b)) => {
-                                _stream.chunk(String::from_utf8_lossy(&b).into_owned()).await;
-                            }
-                            Some(vm_agent::SessionEvent::Error(msg)) => return Err(msg),
-                            None => break,
-                            Some(_) => {}
-                        },
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                            if vm.state().await != vm::PowerState::Running {
-                                break;
-                            }
-                        }
-                    }
-                }
-                session.close().await;
-                Ok(json!(true))
+                let m = lab.machine(&name).map_err(err)?;
+                let agent = m.agent().await.map_err(err)?;
+                let session = agent.open_tail(path.to_string()).await.map_err(err)?;
+                pump_session(session, m.as_ref(), _stream).await
             }
             // Windows event log follow (agent `eventlog` feature).
-            "vm.eventlog" => {
-                let name = vm_arg(&args)?;
+            "machine.eventlog" => {
+                let name = machine_arg(&args)?;
                 let filter = args["filter"].as_str().map(String::from);
-                let vm = lab.vm(&name).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
+                let m = lab.machine(&name).map_err(err)?;
+                let agent = m.agent().await.map_err(err)?;
                 if !agent.has_feature(vmlab_agent_proto::features::EVENTLOG) {
                     return Err(format!(
                         "{name}: the guest agent has no event log (Windows-only feature)"
                     ));
                 }
-                let mut session = agent.open_eventlog(filter).await.map_err(err)?;
-                loop {
-                    tokio::select! {
-                        ev = session.recv() => match ev {
-                            Some(vm_agent::SessionEvent::Data(b)) => {
-                                _stream.chunk(String::from_utf8_lossy(&b).into_owned()).await;
-                            }
-                            Some(vm_agent::SessionEvent::Error(msg)) => return Err(msg),
-                            None => break,
-                            Some(_) => {}
-                        },
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                            if vm.state().await != vm::PowerState::Running {
-                                break;
-                            }
-                        }
-                    }
-                }
-                session.close().await;
-                Ok(json!(true))
+                let session = agent.open_eventlog(filter).await.map_err(err)?;
+                pump_session(session, m.as_ref(), _stream).await
             }
             // Latest guest metrics (subscribes the 2s sampler on first use).
-            "vm.stats" => {
-                let vm = lab.vm(&vm_arg(&args)?).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
+            "machine.stats" => {
+                let agent = lab
+                    .machine(&machine_arg(&args)?)
+                    .map_err(err)?
+                    .agent()
+                    .await
+                    .map_err(err)?;
                 let m = agent
                     .stats(std::time::Duration::from_secs(10))
                     .await
@@ -604,33 +658,63 @@ impl Handler for LabdHandler {
                     })).collect::<Vec<_>>(),
                 }))
             }
-            "vm.clipboard_get" => {
-                let vm = lab.vm(&vm_arg(&args)?).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
+            "machine.clipboard_get" => {
+                let agent = lab
+                    .machine(&machine_arg(&args)?)
+                    .map_err(err)?
+                    .agent()
+                    .await
+                    .map_err(err)?;
                 let text = agent
                     .get_clipboard(std::time::Duration::from_secs(10))
                     .await
                     .map_err(err)?;
                 Ok(json!(text))
             }
-            "vm.clipboard_set" => {
+            "machine.clipboard_set" => {
                 let text = args["text"].as_str().ok_or("missing text")?;
-                let vm = lab.vm(&vm_arg(&args)?).map_err(err)?;
-                let agent = vm.agent().await.map_err(err)?;
+                let agent = lab
+                    .machine(&machine_arg(&args)?)
+                    .map_err(err)?
+                    .agent()
+                    .await
+                    .map_err(err)?;
                 agent.set_clipboard(text.to_string()).await.map_err(err)?;
                 Ok(json!(true))
             }
-            "vm.ip" => {
-                let name = vm_arg(&args)?;
-                let nic = args["nic"].as_u64().map(|n| n as usize);
-                let ip = lab
-                    .vm(&name)
-                    .map_err(err)?
-                    .guest_ip(nic)
-                    .await
-                    .map_err(err)?;
-                Ok(json!(ip))
+
+            // ---- console log (machines that keep one) ---------------------
+            "machine.logs" => {
+                let name = machine_arg(&args)?;
+                let lines = args["lines"].as_u64().unwrap_or(100) as usize;
+                let m = lab.machine(&name).map_err(err)?;
+                let Some(tail) = m.console_log(lines) else {
+                    return Err(format!("{name}: this machine keeps no console log"));
+                };
+                let tail = tail.map_err(err)?;
+                if !args["follow"].as_bool().unwrap_or(false) {
+                    return Ok(json!(tail));
+                }
+                // Follow: stream the tail, then poll for growth until the
+                // client hangs up or the machine stops.
+                _stream.chunk(tail).await;
+                let mut seen = 0usize;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Some(Ok(all)) = m.console_log(usize::MAX) {
+                        let len = all.len();
+                        if len > seen {
+                            _stream.chunk(all[seen..].to_string()).await;
+                            seen = len;
+                        }
+                    }
+                    if m.state().await == vm::PowerState::Stopped {
+                        break;
+                    }
+                }
+                Ok(json!(true))
             }
+
             // Ensure a loopback forward for a declared web page; the web
             // server's proxy dials the returned addr. Reply carries the
             // page's auth spec (host socket only — never to the browser).
@@ -638,233 +722,6 @@ impl Handler for LabdHandler {
                 let machine = args["machine"].as_str().ok_or("missing machine")?;
                 let page = args["page"].as_str().ok_or("missing page")?;
                 lab.ensure_web_forward(machine, page).await.map_err(err)
-            }
-            // Container lifecycle (mirrors the vm.* verbs; PRD §18).
-            "container.start" => {
-                let name = container_arg(&args)?;
-                // Same ordering as vm.start: pull (with progress), preflight,
-                // start.
-                let output = stream_sink(&self.lab, _stream);
-                lab.ensure_pulled(std::slice::from_ref(&name), Some(&output))
-                    .await
-                    .map_err(err)?;
-                lab.preflight_binaries(std::slice::from_ref(&name))
-                    .map_err(err)?;
-                lab.start_container(&name).await.map_err(err)?;
-                Ok(json!(true))
-            }
-            "container.stop" => {
-                let force = args["force"].as_bool().unwrap_or(false);
-                lab.container(&container_arg(&args)?)
-                    .map_err(err)?
-                    .stop(force)
-                    .await
-                    .map_err(err)?;
-                Ok(json!(true))
-            }
-            "container.restart" => {
-                let name = container_arg(&args)?;
-                let force = args["force"].as_bool().unwrap_or(false);
-                let c = lab.container(&name).map_err(err)?.clone();
-                c.stop(force).await.map_err(err)?;
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-                while c.state().await != vm::PowerState::Stopped {
-                    if tokio::time::Instant::now() > deadline {
-                        return Err(format!("{name} did not stop for restart"));
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                lab.start_container(&name).await.map_err(err)?;
-                Ok(json!(true))
-            }
-            "container.destroy" => {
-                lab.destroy_container(&container_arg(&args)?)
-                    .await
-                    .map_err(err)?;
-                Ok(json!(true))
-            }
-            "container.exec" => {
-                let name = container_arg(&args)?;
-                let cmd = args["cmd"].as_str().ok_or("missing cmd")?;
-                let cmd_args: Vec<String> = args["args"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let timeout =
-                    std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
-                let c = lab.container(&name).map_err(err)?;
-                let arg_refs: Vec<&str> = cmd_args.iter().map(String::as_str).collect();
-                let result = c.exec(cmd, &arg_refs, timeout).await.map_err(err)?;
-                Ok(json!({
-                    "exit_code": result.exit_code,
-                    "stdout": String::from_utf8_lossy(&result.stdout),
-                    "stderr": String::from_utf8_lossy(&result.stderr),
-                }))
-            }
-            "container.logs" => {
-                let name = container_arg(&args)?;
-                let lines = args["lines"].as_u64().unwrap_or(100) as usize;
-                let c = lab.container(&name).map_err(err)?;
-                if !args["follow"].as_bool().unwrap_or(false) {
-                    return Ok(json!(c.logs(lines).map_err(err)?));
-                }
-                // Follow: stream the tail, then poll the console log for
-                // growth until the client hangs up or the container stops.
-                let path = c.dirs.console_log();
-                _stream.chunk(c.logs(lines).map_err(err)?).await;
-                let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let c = c.clone();
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    if len > offset {
-                        use std::io::{Read, Seek};
-                        let chunk = std::fs::File::open(&path)
-                            .and_then(|mut f| {
-                                f.seek(std::io::SeekFrom::Start(offset))?;
-                                let mut buf = String::new();
-                                f.read_to_string(&mut buf)?;
-                                Ok(buf)
-                            })
-                            .unwrap_or_default();
-                        offset = len;
-                        if !chunk.is_empty() {
-                            _stream.chunk(chunk).await;
-                        }
-                    }
-                    if c.state().await == vm::PowerState::Stopped {
-                        break;
-                    }
-                }
-                Ok(json!(true))
-            }
-            // Interactive shell over the vmlab-agent channel — the same
-            // session model as vm.tty_open (multi-session; every attach gets
-            // its own shell inside the container namespaces).
-            "container.tty_open" => {
-                let name = container_arg(&args)?;
-                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
-                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
-                let c = lab.container(&name).map_err(err)?;
-                let agent = c.agent().await.map_err(err)?;
-                let session = agent.open_terminal(cols, rows, None).await.map_err(err)?;
-                let id = session.id;
-                let path = c.dirs.term_session_sock(id);
-                vm_agent::expose_terminal_socket(session, path.clone())
-                    .await
-                    .map_err(err)?;
-                Ok(json!({"session": id, "path": path}))
-            }
-            "container.tty_resize" => {
-                let session = args["session"].as_u64().ok_or("missing session")? as u32;
-                let cols = args["cols"].as_u64().unwrap_or(80) as u16;
-                let rows = args["rows"].as_u64().unwrap_or(24) as u16;
-                let c = lab.container(&container_arg(&args)?).map_err(err)?;
-                let agent = c.agent().await.map_err(err)?;
-                agent.resize(session, cols, rows).await.map_err(err)?;
-                Ok(json!(true))
-            }
-            "container.push_file" => {
-                let name = container_arg(&args)?;
-                let from = args["from"].as_str().ok_or("missing from")?;
-                let to = args["to"].as_str().ok_or("missing to")?;
-                let mode = args["mode"].as_u64().map(|m| m as u32);
-                let c = lab.container(&name).map_err(err)?;
-                let agent = c.agent().await.map_err(err)?;
-                let (sha256, len) = agent
-                    .push_file(std::path::Path::new(from), to, mode)
-                    .await
-                    .map_err(err)?;
-                Ok(json!({"sha256": sha256, "len": len}))
-            }
-            "container.pull_file" => {
-                let name = container_arg(&args)?;
-                let from = args["from"].as_str().ok_or("missing from")?;
-                let to = args["to"].as_str().ok_or("missing to")?;
-                let c = lab.container(&name).map_err(err)?;
-                let agent = c.agent().await.map_err(err)?;
-                let (sha256, len) = agent
-                    .pull_file(from, std::path::Path::new(to))
-                    .await
-                    .map_err(err)?;
-                Ok(json!({"sha256": sha256, "len": len}))
-            }
-            // Follow a file inside the container (tail -F semantics).
-            "container.tail" => {
-                let name = container_arg(&args)?;
-                let path = args["path"].as_str().ok_or("missing path")?;
-                let c = lab.container(&name).map_err(err)?;
-                let agent = c.agent().await.map_err(err)?;
-                let mut session = agent.open_tail(path.to_string()).await.map_err(err)?;
-                loop {
-                    tokio::select! {
-                        ev = session.recv() => match ev {
-                            Some(vm_agent::SessionEvent::Data(b)) => {
-                                _stream.chunk(String::from_utf8_lossy(&b).into_owned()).await;
-                            }
-                            Some(vm_agent::SessionEvent::Error(msg)) => return Err(msg),
-                            None => break,
-                            Some(_) => {}
-                        },
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                            if c.state().await != vm::PowerState::Running {
-                                break;
-                            }
-                        }
-                    }
-                }
-                session.close().await;
-                Ok(json!(true))
-            }
-            // Micro-VM metrics (the whole VM is the container).
-            "container.stats" => {
-                let c = lab.container(&container_arg(&args)?).map_err(err)?;
-                let agent = c.agent().await.map_err(err)?;
-                let m = agent
-                    .stats(std::time::Duration::from_secs(10))
-                    .await
-                    .map_err(err)?;
-                Ok(json!({
-                    "cpu_pct": m.cpu_pct,
-                    "mem_used": m.mem_used,
-                    "mem_total": m.mem_total,
-                    "disks": m.disks.iter().map(|d| json!({
-                        "mount": d.mount, "used": d.used, "total": d.total,
-                    })).collect::<Vec<_>>(),
-                }))
-            }
-            "container.ip" => {
-                let ip = lab
-                    .container(&container_arg(&args)?)
-                    .map_err(err)?
-                    .guest_ip()
-                    .await
-                    .map_err(err)?;
-                Ok(json!(ip))
-            }
-            "container.copy_in" => {
-                let name = container_arg(&args)?;
-                let dest = args["dest"].as_str().ok_or("missing dest")?;
-                let data = args["data"].as_str().ok_or("missing data")?;
-                let bytes = {
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .map_err(|e| format!("invalid base64 data: {e}"))?
-                };
-                let timeout =
-                    std::time::Duration::from_secs(args["timeout"].as_u64().unwrap_or(120));
-                let c = lab.container(&name).map_err(err)?;
-                let tmp = std::env::temp_dir().join(format!("vmlab-cp-{}", std::process::id()));
-                std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
-                let res = c.copy_to(&tmp, dest, timeout).await;
-                let _ = std::fs::remove_file(&tmp);
-                res.map_err(err)?;
-                Ok(json!(true))
             }
             // config-weave playbooks (declared with `playbook {}` blocks):
             // list the lab's assignments, and run check/apply on demand
@@ -963,12 +820,12 @@ impl Handler for LabdHandler {
             }
             "snapshot.delete" => {
                 let snap = args["name"].as_str().ok_or("missing name")?;
-                lab.delete_snapshot(&vm_arg(&args)?, snap)
+                lab.delete_snapshot(&machine_arg(&args)?, snap)
                     .await
                     .map_err(err)?;
                 Ok(json!(true))
             }
-            "snapshot.list" => lab.snapshots(&vm_arg(&args)?).await.map_err(err),
+            "snapshot.list" => lab.snapshots(&machine_arg(&args)?).await.map_err(err),
             "shutdown" => {
                 tracing::info!("lab daemon shutdown requested");
                 let lab = lab.clone();
@@ -989,10 +846,28 @@ impl Handler for LabdHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{handler_matches, region_arg};
+    use super::{handler_matches, machine_arg, region_arg};
     use crate::config::model::Handler;
     use serde_json::json;
     use std::path::PathBuf;
+
+    /// The wire says `machine`, but a client that predates the collapse says
+    /// `vm` or `container`. Both keep working rather than failing with a
+    /// confusing "missing machine".
+    #[test]
+    fn machine_arg_accepts_the_old_names() {
+        assert_eq!(machine_arg(&json!({"machine": "dc01"})).unwrap(), "dc01");
+        assert_eq!(machine_arg(&json!({"vm": "dc01"})).unwrap(), "dc01");
+        assert_eq!(machine_arg(&json!({"container": "web"})).unwrap(), "web");
+        // `machine` wins when a client sends both.
+        assert_eq!(
+            machine_arg(&json!({"machine": "a", "vm": "b"})).unwrap(),
+            "a"
+        );
+        assert!(machine_arg(&json!({})).is_err());
+        // A non-string is as good as absent.
+        assert!(machine_arg(&json!({"machine": 7})).is_err());
+    }
 
     #[test]
     fn region_arg_parses_and_validates() {

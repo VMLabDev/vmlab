@@ -969,10 +969,6 @@ impl super::machine::Machine for VmInstance {
         &self.cfg.web
     }
 
-    fn depends_on(&self) -> &[String] {
-        &self.cfg.depends_on
-    }
-
     fn term_session_sock(&self, id: u32) -> PathBuf {
         self.dirs.term_session_sock(id)
     }
@@ -985,16 +981,8 @@ impl super::machine::Machine for VmInstance {
         VmInstance::is_ready(self).await
     }
 
-    async fn is_agent_up(&self) -> bool {
-        VmInstance::is_agent_up(self).await
-    }
-
     async fn stop(&self, force: bool) -> Result<()> {
         VmInstance::stop(self, force).await
-    }
-
-    async fn qmp(&self) -> Result<QmpClient> {
-        VmInstance::qmp(self).await
     }
 
     async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
@@ -1003,10 +991,6 @@ impl super::machine::Machine for VmInstance {
 
     async fn agent_answering(&self) -> bool {
         VmInstance::agent_answering(self).await
-    }
-
-    async fn drop_agent(&self) {
-        VmInstance::drop_agent(self).await
     }
 
     async fn snapshot(&self, name: &str) -> Result<bool> {
@@ -1023,6 +1007,10 @@ impl super::machine::Machine for VmInstance {
 
     fn can_reboot(&self) -> bool {
         true
+    }
+
+    fn ready_timeout(&self) -> Duration {
+        Duration::from_secs(600)
     }
 
     async fn reboot_guest(&self) -> Result<()> {

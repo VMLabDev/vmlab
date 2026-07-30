@@ -1165,6 +1165,39 @@ impl LabRuntime {
 
     /// Start one VM: wire its NIC sockets into the segment switches, then
     /// boot it with event-emitting callbacks.
+    /// Boot one machine, whichever kind it is.
+    ///
+    /// The last kind-branch in the lab runtime, and deliberately so: a VM
+    /// needs its template clone and segment attachments, a container needs its
+    /// image spec and restart policy. That difference belongs below a
+    /// Hypervisor seam, not in [`Machine`].
+    pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+        if self.containers.contains_key(name) {
+            self.start_container(name).await
+        } else {
+            self.start_vm(name).await
+        }
+    }
+
+    /// Stop one machine and delete everything it materialised.
+    pub async fn destroy_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+        if self.containers.contains_key(name) {
+            self.destroy_container(name).await
+        } else {
+            self.destroy_vm(name).await
+        }
+    }
+
+    /// Stop a machine, wait for the exit monitor to settle, and boot it again.
+    pub async fn restart_machine(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
+        let m = self.machine(name)?;
+        m.stop(force).await?;
+        m.wait_state(PowerState::Stopped, Duration::from_secs(60))
+            .await
+            .map_err(|_| anyhow!("{name} did not stop for restart"))?;
+        self.start_machine(name).await
+    }
+
     pub async fn start_vm(self: &Arc<Self>, name: &str) -> Result<()> {
         let vm = self.vm(name)?.clone();
         if vm.state().await != PowerState::Stopped {
@@ -1595,38 +1628,30 @@ impl LabRuntime {
                 let n = name.clone();
                 let out = output.clone();
                 wave_tasks.spawn(async move {
-                    if me.containers.contains_key(&n) {
-                        me.start_container(&n).await?;
-                        // Only gate the wave on readiness when something
-                        // later depends on this container. Container
-                        // entrypoints start fast; healthchecks govern the
-                        // rest — 300s is generous.
-                        if me.has_dependents(&n) {
-                            me.container(&n)?
-                                .wait_ready(Duration::from_secs(300))
-                                .await?;
+                    me.start_machine(&n).await?;
+                    // Post-start steps only a VM has: shares to mount, a
+                    // template first-boot provision to run, and the bake hook
+                    // template builds install.
+                    if let Ok(vm) = me.vm(&n) {
+                        // Detached, so provisions can rely on the shares
+                        // (§7.5) without the wave blocking on the mount
+                        // retry window.
+                        me.spawn_share_mount(&n);
+                        // Before this VM can be considered ready (§6.1). A
+                        // no-op for templates without one, so leaf-VM timing
+                        // is unchanged.
+                        me.run_first_boot(&n, &out).await?;
+                        // See `LabRuntime::pre_provision`.
+                        let hook = me.pre_provision.read().expect("pre_provision lock").clone();
+                        if let Some(hook) = hook {
+                            hook(vm.clone(), out.clone()).await?;
                         }
-                        return Ok::<_, anyhow::Error>(n);
-                    }
-                    me.start_vm(&n).await?;
-                    // Mount the VM's shares as soon as its agent answers —
-                    // detached, so provisions can rely on them (§7.5)
-                    // without the wave blocking on the mount retry window.
-                    me.spawn_share_mount(&n);
-                    // Run the template's first-boot provision before this VM
-                    // can be considered ready (§6.1). A no-op for templates
-                    // without one, so leaf-VM timing is unchanged.
-                    me.run_first_boot(&n, &out).await?;
-                    // Pre-provision hook (template builds bake the
-                    // vmlab-agent here — see `LabRuntime::pre_provision`).
-                    let hook = me.pre_provision.read().expect("pre_provision lock").clone();
-                    if let Some(hook) = hook {
-                        hook(me.vm(&n)?.clone(), out.clone()).await?;
                     }
                     // Only gate the wave on readiness when something later
-                    // depends on this VM.
+                    // depends on this machine.
                     if me.has_dependents(&n) {
-                        me.vm(&n)?.wait_ready(Duration::from_secs(600)).await?;
+                        let m = me.machine(&n)?;
+                        m.wait_ready(m.ready_timeout()).await?;
                     }
                     Ok::<_, anyhow::Error>(n)
                 });

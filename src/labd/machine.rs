@@ -45,15 +45,6 @@ pub enum MachineKind {
     Container,
 }
 
-impl MachineKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            MachineKind::Vm => "vm",
-            MachineKind::Container => "container",
-        }
-    }
-}
-
 /// What a machine can do beyond the universal operations, probed rather than
 /// inferred. Drives `machine.capabilities`, which is how the web console
 /// decides whether to offer a console tab, a clipboard button or a log view.
@@ -127,7 +118,6 @@ pub trait Machine: Send + Sync + 'static {
     fn nics(&self) -> &[model::Nic];
     fn macs(&self) -> &[MacAddr];
     fn web_pages(&self) -> &[model::WebPage];
-    fn depends_on(&self) -> &[String];
     /// Host socket re-exposing one agent terminal session as a raw byte pipe.
     fn term_session_sock(&self, id: u32) -> PathBuf;
 
@@ -135,10 +125,8 @@ pub trait Machine: Send + Sync + 'static {
 
     async fn state(&self) -> PowerState;
     async fn is_ready(&self) -> bool;
-    async fn is_agent_up(&self) -> bool;
     /// Graceful stop ladder, or an immediate kill when `force`.
     async fn stop(&self, force: bool) -> Result<()>;
-    async fn qmp(&self) -> Result<QmpClient>;
 
     /// Wait for the exit monitor to settle the power state.
     async fn wait_state(&self, want: PowerState, timeout: Duration) -> Result<()> {
@@ -154,6 +142,14 @@ pub trait Machine: Send + Sync + 'static {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Ok(())
+    }
+
+    /// How long `up` waits for this machine to become ready before giving
+    /// up. A container's entrypoint starts fast and its healthcheck governs
+    /// the rest; a VM may be running a first-boot provision through a
+    /// Windows settle reboot.
+    fn ready_timeout(&self) -> Duration {
+        Duration::from_secs(300)
     }
 
     /// Wait until the machine is fully usable: agent up and any first-boot
@@ -181,8 +177,6 @@ pub trait Machine: Send + Sync + 'static {
     /// Whether the agent answers a ping *right now* — unlike the sticky
     /// [`is_agent_up`](Machine::is_agent_up) this goes false mid-reboot.
     async fn agent_answering(&self) -> bool;
-    /// Drop the cached agent connection (teardown, snapshot restore).
-    async fn drop_agent(&self);
 
     /// Ask the guest to reboot in place, leaving the machine running.
     ///
@@ -485,11 +479,6 @@ impl Display {
         Self { vm }
     }
 
-    /// Capture the screen.
-    pub async fn grab(&self) -> Result<image::RgbImage> {
-        crate::scripting::interact::grab_screen(&self.vm).await
-    }
-
     /// Capture the screen to a PNG at `out`.
     pub async fn screenshot(&self, out: &Path) -> Result<()> {
         crate::scripting::interact::screenshot(&self.vm, out).await
@@ -498,11 +487,6 @@ impl Display {
     /// Send a key chord (e.g. `ctrl-alt-delete`).
     pub async fn send_keys(&self, chord: &str) -> Result<()> {
         crate::scripting::interact::send_keys(&self.vm, chord).await
-    }
-
-    /// Type literal text, one key at a time.
-    pub async fn type_text(&self, text: &str, delay_ms: u64) -> Result<()> {
-        crate::scripting::interact::type_text(&self.vm, text, delay_ms).await
     }
 
     pub async fn mouse_move(&self, x: i64, y: i64) -> Result<()> {

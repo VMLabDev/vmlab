@@ -417,15 +417,15 @@ pub fn cmd_vm_power(vm_ref: &str, op: &str, force: bool) -> Result<()> {
         let (_name, client) = lab_client_for(lab).await?;
         match op {
             "start" => client
-                .call("vm.start", json!({"vm": vm}))
+                .call("machine.start", json!({"machine": vm}))
                 .await
                 .map_err(remote)?,
             "stop" => client
-                .call("vm.stop", json!({"vm": vm, "force": force}))
+                .call("machine.stop", json!({"machine": vm, "force": force}))
                 .await
                 .map_err(remote)?,
             "restart" => client
-                .call("vm.restart", json!({"vm": vm}))
+                .call("machine.restart", json!({"machine": vm}))
                 .await
                 .map_err(remote)?,
             _ => unreachable!(),
@@ -439,7 +439,7 @@ pub fn cmd_vm_destroy(vm_ref: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call("vm.destroy", json!({"vm": vm}))
+            .call("machine.destroy", json!({"machine": vm}))
             .await
             .map_err(remote)?;
         println!("vm \"{vm}\" destroyed");
@@ -453,18 +453,18 @@ pub fn cmd_container_power(container_ref: &str, op: &str, force: bool) -> Result
         let (_name, client) = lab_client_for(lab).await?;
         match op {
             "start" => client
-                .call("container.start", json!({"container": container}))
+                .call("machine.start", json!({"machine": container}))
                 .await
                 .map_err(remote)?,
             "stop" => client
                 .call(
-                    "container.stop",
-                    json!({"container": container, "force": force}),
+                    "machine.stop",
+                    json!({"machine": container, "force": force}),
                 )
                 .await
                 .map_err(remote)?,
             "restart" => client
-                .call("container.restart", json!({"container": container}))
+                .call("machine.restart", json!({"machine": container}))
                 .await
                 .map_err(remote)?,
             _ => unreachable!(),
@@ -478,7 +478,7 @@ pub fn cmd_container_destroy(container_ref: &str) -> Result<()> {
         let (lab, container) = split_vm_ref(container_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call("container.destroy", json!({"container": container}))
+            .call("machine.destroy", json!({"machine": container}))
             .await
             .map_err(remote)?;
         println!("container \"{container}\" destroyed");
@@ -495,8 +495,8 @@ pub fn cmd_container_exec(container_ref: &str, timeout: u64, cmd: Vec<String>) -
         let (_name, client) = lab_client_for(lab).await?;
         let result = client
             .call(
-                "container.exec",
-                json!({"container": container, "cmd": cmd[0],
+                "machine.exec",
+                json!({"machine": container, "cmd": cmd[0],
                        "args": cmd[1..].to_vec(), "timeout": timeout}),
             )
             .await
@@ -521,8 +521,8 @@ pub fn cmd_container_logs(container_ref: &str, follow: bool, lines: usize) -> Re
         if !follow {
             let logs = client
                 .call(
-                    "container.logs",
-                    json!({"container": container, "lines": lines}),
+                    "machine.logs",
+                    json!({"machine": container, "lines": lines}),
                 )
                 .await
                 .map_err(remote)?;
@@ -537,8 +537,8 @@ pub fn cmd_container_logs(container_ref: &str, follow: bool, lines: usize) -> Re
         let mut first = true;
         client
             .call_streaming(
-                "container.logs",
-                json!({"container": container, "lines": lines, "follow": true}),
+                "machine.logs",
+                json!({"machine": container, "lines": lines, "follow": true}),
                 |chunk| {
                     if std::mem::take(&mut first) {
                         if !chunk.is_empty() {
@@ -560,7 +560,7 @@ pub fn cmd_container_ip(container_ref: &str) -> Result<()> {
         let (lab, container) = split_vm_ref(container_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let ip = client
-            .call("container.ip", json!({"container": container}))
+            .call("machine.ip", json!({"machine": container}))
             .await
             .map_err(remote)?;
         println!("{}", ip.as_str().unwrap_or_default());
@@ -581,8 +581,8 @@ pub fn cmd_container_shell(container_ref: &str) -> Result<()> {
             .unwrap_or((80, 24));
         let opened = client
             .call(
-                "container.tty_open",
-                json!({"container": container, "cols": cols, "rows": rows}),
+                "machine.tty_open",
+                json!({"machine": container, "cols": cols, "rows": rows}),
             )
             .await
             .map_err(remote)?;
@@ -595,8 +595,8 @@ pub fn cmd_container_shell(container_ref: &str) -> Result<()> {
                 Box::pin(async move {
                     let _ = client
                         .call(
-                            "container.tty_resize",
-                            json!({"container": container, "session": session,
+                            "machine.tty_resize",
+                            json!({"machine": container, "session": session,
                                    "cols": cols, "rows": rows}),
                         )
                         .await;
@@ -624,7 +624,10 @@ pub fn cmd_shell(vm_ref: &str) -> Result<()> {
             .map(|ws| (ws.ws_col, ws.ws_row))
             .unwrap_or((80, 24));
         let opened = client
-            .call("vm.tty_open", json!({"vm": vm, "cols": cols, "rows": rows}))
+            .call(
+                "machine.tty_open",
+                json!({"machine": vm, "cols": cols, "rows": rows}),
+            )
             .await
             .map_err(remote)?;
         let session = opened["session"].as_u64().unwrap_or(0);
@@ -636,8 +639,8 @@ pub fn cmd_shell(vm_ref: &str) -> Result<()> {
                 Box::pin(async move {
                     let _ = client
                         .call(
-                            "vm.tty_resize",
-                            json!({"vm": vm, "session": session, "cols": cols, "rows": rows}),
+                            "machine.tty_resize",
+                            json!({"machine": vm, "session": session, "cols": cols, "rows": rows}),
                         )
                         .await;
                 })
@@ -659,11 +662,15 @@ pub fn cmd_tail(vm_ref: &str, path: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call_streaming("vm.tail", json!({"vm": vm, "path": path}), |chunk| {
-                print!("{chunk}");
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            })
+            .call_streaming(
+                "machine.tail",
+                json!({"machine": vm, "path": path}),
+                |chunk| {
+                    print!("{chunk}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                },
+            )
             .await
             .map_err(remote)?;
         Ok(())
@@ -676,12 +683,12 @@ pub fn cmd_eventlog(vm_ref: &str, filter: Option<&str>) -> Result<()> {
     rt()?.block_on(async {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
-        let mut args = json!({"vm": vm});
+        let mut args = json!({"machine": vm});
         if let Some(f) = filter {
             args["filter"] = json!(f);
         }
         client
-            .call_streaming("vm.eventlog", args, |chunk| {
+            .call_streaming("machine.eventlog", args, |chunk| {
                 print!("{chunk}");
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
@@ -719,8 +726,8 @@ pub fn cmd_vm_screenshot(vm_ref: &str, path: &str) -> Result<()> {
         let (_name, client) = lab_client_for(lab).await?;
         let result = client
             .call(
-                "vm.screenshot",
-                json!({"vm": vm, "path": out.to_string_lossy()}),
+                "machine.screenshot",
+                json!({"machine": vm, "path": out.to_string_lossy()}),
             )
             .await
             .map_err(remote)?;
@@ -734,7 +741,7 @@ pub fn cmd_vm_sendkeys(vm_ref: &str, chord: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call("vm.sendkeys", json!({"vm": vm, "keys": chord}))
+            .call("machine.sendkeys", json!({"machine": vm, "keys": chord}))
             .await
             .map_err(remote)?;
         Ok(())
@@ -746,7 +753,7 @@ pub fn cmd_vm_mouse_move(vm_ref: &str, x: i64, y: i64) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call("vm.mouse_move", json!({"vm": vm, "x": x, "y": y}))
+            .call("machine.mouse_move", json!({"machine": vm, "x": x, "y": y}))
             .await
             .map_err(remote)?;
         Ok(())
@@ -760,12 +767,15 @@ pub fn cmd_vm_click(vm_ref: &str, x: Option<i64>, y: Option<i64>, button: &str) 
     rt()?.block_on(async {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
-        let mut args = json!({"vm": vm, "button": button});
+        let mut args = json!({"machine": vm, "button": button});
         if let (Some(x), Some(y)) = (x, y) {
             args["x"] = json!(x);
             args["y"] = json!(y);
         }
-        client.call("vm.mouse_click", args).await.map_err(remote)?;
+        client
+            .call("machine.mouse_click", args)
+            .await
+            .map_err(remote)?;
         Ok(())
     })
 }
@@ -776,8 +786,8 @@ pub fn cmd_vm_drag(vm_ref: &str, x1: i64, y1: i64, x2: i64, y2: i64) -> Result<(
         let (_name, client) = lab_client_for(lab).await?;
         client
             .call(
-                "vm.mouse_drag",
-                json!({"vm": vm, "x1": x1, "y1": y1, "x2": x2, "y2": y2}),
+                "machine.mouse_drag",
+                json!({"machine": vm, "x1": x1, "y1": y1, "x2": x2, "y2": y2}),
             )
             .await
             .map_err(remote)?;
@@ -791,7 +801,7 @@ pub fn cmd_vm_ocr(vm_ref: &str, region: Option<Vec<i64>>) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let text = client
-            .call("vm.ocr", json!({"vm": vm, "region": region}))
+            .call("machine.ocr", json!({"machine": vm, "region": region}))
             .await
             .map_err(remote)?;
         println!("{}", text.as_str().unwrap_or_default());
@@ -812,8 +822,8 @@ pub fn cmd_vm_find_image(
         let (_name, client) = lab_client_for(lab).await?;
         let m = client
             .call(
-                "vm.find_image",
-                json!({"vm": vm, "image": img.to_string_lossy(),
+                "machine.find_image",
+                json!({"machine": vm, "image": img.to_string_lossy(),
                        "threshold": threshold, "region": region}),
             )
             .await
@@ -845,8 +855,8 @@ pub fn cmd_exec(vm_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
         let (_name, client) = lab_client_for(lab).await?;
         let result = client
             .call(
-                "vm.exec",
-                json!({"vm": vm, "cmd": cmd[0], "args": cmd[1..].to_vec(), "timeout": timeout}),
+                "machine.exec",
+                json!({"machine": vm, "cmd": cmd[0], "args": cmd[1..].to_vec(), "timeout": timeout}),
             )
             .await
             .map_err(remote)?;
@@ -869,7 +879,7 @@ pub fn cmd_osinfo(vm_ref: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let info = client
-            .call("vm.osinfo", json!({"vm": vm}))
+            .call("machine.osinfo", json!({"machine": vm}))
             .await
             .map_err(remote)?;
         println!("{info}");
@@ -1025,8 +1035,11 @@ async fn push_via_agent(
     for (local, to, mode) in entries {
         // The daemon opens the file itself, so hand it an absolute path.
         let from = abs_path(local.to_str().unwrap_or_default())?;
-        let args = json!({"vm": vm, "from": from, "to": to, "mode": mode});
-        let r = client.call("vm.push_file", args).await.map_err(remote)?;
+        let args = json!({"machine": vm, "from": from, "to": to, "mode": mode});
+        let r = client
+            .call("machine.push_file", args)
+            .await
+            .map_err(remote)?;
         total += r["len"].as_u64().unwrap_or(0);
         files += 1;
     }
@@ -1056,8 +1069,8 @@ fn cp_pull(vm_part: &str, guest_src: &str, dest: &str) -> Result<()> {
         let (_name, client) = lab_client_for(lab).await?;
         let r = client
             .call(
-                "vm.pull_file",
-                json!({"vm": vm, "from": guest_src, "to": dest_abs}),
+                "machine.pull_file",
+                json!({"machine": vm, "from": guest_src, "to": dest_abs}),
             )
             .await
             .map_err(remote)?;
@@ -1133,7 +1146,7 @@ pub fn cmd_snapshots(vm_ref: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let snaps = client
-            .call("snapshot.list", json!({"vm": vm}))
+            .call("snapshot.list", json!({"machine": vm}))
             .await
             .map_err(remote)?;
         let list = snaps.as_array().cloned().unwrap_or_default();
@@ -1163,7 +1176,7 @@ pub fn cmd_snapshot_delete(vm_ref: &str, name: String) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_lab_name, client) = lab_client_for(lab).await?;
         client
-            .call("snapshot.delete", json!({"vm": vm, "name": name}))
+            .call("snapshot.delete", json!({"machine": vm, "name": name}))
             .await
             .map_err(remote)?;
         println!("snapshot \"{name}\" deleted");

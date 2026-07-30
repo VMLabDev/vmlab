@@ -1,5 +1,5 @@
-//! Interactive-terminal WebSockets: `GET /api/labs/{lab}/containers/{name}/tty`
-//! and `GET /api/labs/{lab}/vms/{vm}/tty` — a shell inside the guest served
+//! Interactive-terminal WebSocket: `GET /api/labs/{lab}/machines/{name}/tty`
+//! — a shell inside the guest served
 //! by vmlab-agent (guest/agent-proto) over a per-session unix socket the
 //! daemon exposes. Binary frames are raw PTY bytes both ways; text frames
 //! carry control JSON — `{"resize": {"cols": N, "rows": M}}` is proxied to
@@ -14,59 +14,18 @@ use tokio::net::UnixStream;
 
 use super::state::AppState;
 
-/// Which daemon-side RPC pair serves this terminal.
-struct TtyTarget {
-    /// `container.tty_open` / `vm.tty_open` — returns `{session, path}`.
-    open: &'static str,
-    /// `container.tty_resize` / `vm.tty_resize`.
-    resize: &'static str,
-    /// The machine key in the RPC args (`container` / `vm`).
-    arg_key: &'static str,
-    name: String,
-}
-
-pub async fn container_tty(
+/// `GET /api/labs/{lab}/machines/{machine}/tty` — a shell inside the guest.
+///
+/// One handler for both kinds: the terminal rides the same `vmlab.agent.0`
+/// channel whether the machine is a VM or a container.
+pub async fn machine_tty(
     req: HttpRequest,
     body: web::Payload,
     path: web::Path<(String, String)>,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    let (lab, container) = path.into_inner();
-    bridge(
-        req,
-        body,
-        state,
-        lab,
-        TtyTarget {
-            open: "container.tty_open",
-            resize: "container.tty_resize",
-            arg_key: "container",
-            name: container,
-        },
-    )
-    .await
-}
-
-pub async fn vm_tty(
-    req: HttpRequest,
-    body: web::Payload,
-    path: web::Path<(String, String)>,
-    state: web::Data<AppState>,
-) -> Result<HttpResponse, Error> {
-    let (lab, vm) = path.into_inner();
-    bridge(
-        req,
-        body,
-        state,
-        lab,
-        TtyTarget {
-            open: "vm.tty_open",
-            resize: "vm.tty_resize",
-            arg_key: "vm",
-            name: vm,
-        },
-    )
-    .await
+    let (lab, machine) = path.into_inner();
+    bridge(req, body, state, lab, machine).await
 }
 
 async fn bridge(
@@ -74,16 +33,16 @@ async fn bridge(
     body: web::Payload,
     state: web::Data<AppState>,
     lab: String,
-    target: TtyTarget,
+    machine: String,
 ) -> Result<HttpResponse, Error> {
-    if !super::state::valid_name(&lab) || !super::state::valid_name(&target.name) {
+    if !super::state::valid_name(&lab) || !super::state::valid_name(&machine) {
         return Ok(HttpResponse::BadRequest().json(json!({"error": "invalid lab or machine name"})));
     }
     // Open a fresh terminal session; the daemon binds a per-session socket
     // and hands back its path. Open failures (no agent in the guest, VM not
     // running) surface as a conflict with the daemon's actionable message.
     let opened = match state
-        .lab_call(&lab, target.open, json!({target.arg_key: target.name}))
+        .lab_call(&lab, "machine.tty_open", json!({"machine": machine}))
         .await
     {
         Ok(v) => v,
@@ -136,12 +95,12 @@ async fn bridge(
                         && let Some(r) = v.get("resize")
                     {
                         let args = json!({
-                            target.arg_key: target.name,
+                            "machine": machine,
                             "session": session,
                             "cols": r["cols"].as_u64().unwrap_or(80),
                             "rows": r["rows"].as_u64().unwrap_or(24),
                         });
-                        let _ = state.lab_call(&lab, target.resize, args).await;
+                        let _ = state.lab_call(&lab, "machine.tty_resize", args).await;
                     }
                 }
                 AggregatedMessage::Ping(p) => {

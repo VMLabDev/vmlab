@@ -549,22 +549,25 @@ pub async fn cancel_pull(
     }
 }
 
-/// `POST /api/labs/{lab}/vms/{vm}/{action}` where action ∈ start|stop|restart|destroy.
-pub async fn vm_action(
+/// `POST /api/labs/{lab}/machines/{machine}/{action}` where action ∈
+/// start|stop|restart|destroy. One endpoint for both kinds — the console
+/// still shows VMs and containers separately, but the plumbing behind each
+/// button is the same.
+pub async fn machine_action(
     state: web::Data<AppState>,
     path: web::Path<(String, String, String)>,
     q: web::Query<ForceQuery>,
 ) -> HttpResponse {
-    let (lab, vm, action) = path.into_inner();
+    let (lab, machine, action) = path.into_inner();
     let cmd = match action.as_str() {
-        "start" => "vm.start",
-        "stop" => "vm.stop",
-        "restart" => "vm.restart",
-        "destroy" => "vm.destroy",
-        _ => return HttpResponse::NotFound().json(json!({"error": "unknown vm action"})),
+        "start" => "machine.start",
+        "stop" => "machine.stop",
+        "restart" => "machine.restart",
+        "destroy" => "machine.destroy",
+        _ => return HttpResponse::NotFound().json(json!({"error": "unknown machine action"})),
     };
     match state
-        .lab_call(&lab, cmd, json!({"vm": vm, "force": q.force}))
+        .lab_call(&lab, cmd, json!({"machine": machine, "force": q.force}))
         .await
     {
         Ok(v) => ok(v),
@@ -572,24 +575,16 @@ pub async fn vm_action(
     }
 }
 
-/// `POST /api/labs/{lab}/containers/{container}/{action}` where action ∈
-/// start|stop|restart|destroy — the container mirror of [`vm_action`], proxied
-/// to the labd `container.*` commands (arg key `container`, not `vm`).
-pub async fn container_action(
+/// `GET /api/labs/{lab}/machines/{machine}/capabilities` — what this machine
+/// can do (display, console log, in-place reboot, agent features). The
+/// console drives its affordances from this rather than from the kind.
+pub async fn machine_capabilities(
     state: web::Data<AppState>,
-    path: web::Path<(String, String, String)>,
-    q: web::Query<ForceQuery>,
+    path: web::Path<(String, String)>,
 ) -> HttpResponse {
-    let (lab, container, action) = path.into_inner();
-    let cmd = match action.as_str() {
-        "start" => "container.start",
-        "stop" => "container.stop",
-        "restart" => "container.restart",
-        "destroy" => "container.destroy",
-        _ => return HttpResponse::NotFound().json(json!({"error": "unknown container action"})),
-    };
+    let (lab, machine) = path.into_inner();
     match state
-        .lab_call(&lab, cmd, json!({"container": container, "force": q.force}))
+        .lab_call(&lab, "machine.capabilities", json!({"machine": machine}))
         .await
     {
         Ok(v) => ok(v),
@@ -602,15 +597,19 @@ pub struct SendKeys {
     keys: String,
 }
 
-/// `POST /api/labs/{lab}/vms/{vm}/sendkeys` `{keys}`.
-pub async fn vm_sendkeys(
+/// `POST /api/labs/{lab}/machines/{machine}/sendkeys` `{keys}`.
+pub async fn machine_sendkeys(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
     body: web::Json<SendKeys>,
 ) -> HttpResponse {
     let (lab, vm) = path.into_inner();
     match state
-        .lab_call(&lab, "vm.sendkeys", json!({"vm": vm, "keys": body.keys}))
+        .lab_call(
+            &lab,
+            "machine.sendkeys",
+            json!({"machine": vm, "keys": body.keys}),
+        )
         .await
     {
         Ok(v) => ok(v),
@@ -618,9 +617,10 @@ pub async fn vm_sendkeys(
     }
 }
 
-/// `GET /api/labs/{lab}/vms/{vm}/screenshot.png` — capture and stream a PNG.
+/// `GET /api/labs/{lab}/machines/{machine}/screenshot.png` — capture and stream a
+/// PNG. Machines with no display answer with the daemon's "no display" error.
 /// A non-VNC fallback (the live view uses the WebSocket bridge).
-pub async fn vm_screenshot(
+pub async fn machine_screenshot(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
 ) -> HttpResponse {
@@ -637,7 +637,11 @@ pub async fn vm_screenshot(
         .join(format!("web-shot-{vm}-{}-{seq}.png", std::process::id()));
     let out_str = out.to_string_lossy().to_string();
     if let Err(e) = state
-        .lab_call(&lab, "vm.screenshot", json!({"vm": vm, "path": out_str}))
+        .lab_call(
+            &lab,
+            "machine.screenshot",
+            json!({"machine": vm, "path": out_str}),
+        )
         .await
     {
         return fail(e);
@@ -653,14 +657,14 @@ pub async fn vm_screenshot(
     }
 }
 
-/// `GET /api/labs/{lab}/vms/{vm}/snapshots` — list a VM's snapshots.
-pub async fn vm_snapshots(
+/// `GET /api/labs/{lab}/machines/{machine}/snapshots` — list a machine's snapshots.
+pub async fn machine_snapshots(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
 ) -> HttpResponse {
     let (lab, vm) = path.into_inner();
     match state
-        .lab_call(&lab, "snapshot.list", json!({"vm": vm}))
+        .lab_call(&lab, "snapshot.list", json!({"machine": vm}))
         .await
     {
         Ok(v) => ok(v),
@@ -692,14 +696,18 @@ pub async fn snapshot_take(
     }
 }
 
-/// `DELETE /api/labs/{lab}/vms/{vm}/snapshots/{name}` — delete one VM snapshot.
+/// `DELETE /api/labs/{lab}/machines/{machine}/snapshots/{name}` — delete one.
 pub async fn snapshot_delete(
     state: web::Data<AppState>,
     path: web::Path<(String, String, String)>,
 ) -> HttpResponse {
     let (lab, vm, name) = path.into_inner();
     match state
-        .lab_call(&lab, "snapshot.delete", json!({"vm": vm, "name": name}))
+        .lab_call(
+            &lab,
+            "snapshot.delete",
+            json!({"machine": vm, "name": name}),
+        )
         .await
     {
         Ok(v) => ok(v),
@@ -1231,32 +1239,52 @@ pub async fn snapshot_restore(
     }
 }
 
-/// `GET /api/labs/{lab}/vms/{vm}/stats` — latest guest metrics from the
+/// `GET /api/labs/{lab}/machines/{machine}/stats` — latest guest metrics from the
 /// vmlab-agent (CPU/memory/disks; 404-ish conflict for agent-less guests).
-pub async fn vm_stats(
+pub async fn machine_stats(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
 ) -> HttpResponse {
     let (lab, vm) = path.into_inner();
-    match state.lab_call(&lab, "vm.stats", json!({"vm": vm})).await {
-        Ok(v) => ok(v),
-        Err(e) => fail(e),
-    }
-}
-
-/// `GET /api/labs/{lab}/containers/{container}/stats` — micro-VM metrics.
-pub async fn container_stats(
-    state: web::Data<AppState>,
-    path: web::Path<(String, String)>,
-) -> HttpResponse {
-    let (lab, container) = path.into_inner();
     match state
-        .lab_call(&lab, "container.stats", json!({"container": container}))
+        .lab_call(&lab, "machine.stats", json!({"machine": vm}))
         .await
     {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
+}
+
+/// `GET /api/labs/{lab}/machines/{machine}/logs?lines=` — the machine's
+/// console log. 404-shaped error on machines that keep none (VMs); the
+/// console asks `capabilities` first.
+pub async fn machine_logs(
+    state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+    q: web::Query<LogsQuery>,
+) -> HttpResponse {
+    let (lab, machine) = path.into_inner();
+    match state
+        .lab_call(
+            &lab,
+            "machine.logs",
+            json!({"machine": machine, "lines": q.lines}),
+        )
+        .await
+    {
+        Ok(v) => ok(v),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LogsQuery {
+    #[serde(default = "default_log_lines")]
+    lines: usize,
+}
+
+fn default_log_lines() -> usize {
+    200
 }
 
 #[derive(serde::Deserialize)]
@@ -1264,15 +1292,15 @@ pub struct ClipboardBody {
     pub text: String,
 }
 
-/// `GET /api/labs/{lab}/vms/{vm}/clipboard` — read the guest clipboard
+/// `GET /api/labs/{lab}/machines/{machine}/clipboard` — read the guest clipboard
 /// (agent `clipboard` feature; needs a logged-on desktop session).
-pub async fn vm_clipboard_get(
+pub async fn machine_clipboard_get(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
 ) -> HttpResponse {
     let (lab, vm) = path.into_inner();
     match state
-        .lab_call(&lab, "vm.clipboard_get", json!({"vm": vm}))
+        .lab_call(&lab, "machine.clipboard_get", json!({"machine": vm}))
         .await
     {
         Ok(v) => ok(json!({"text": v})),
@@ -1280,9 +1308,9 @@ pub async fn vm_clipboard_get(
     }
 }
 
-/// `POST /api/labs/{lab}/vms/{vm}/clipboard` `{text}` — set the guest
+/// `POST /api/labs/{lab}/machines/{machine}/clipboard` `{text}` — set the guest
 /// clipboard.
-pub async fn vm_clipboard_set(
+pub async fn machine_clipboard_set(
     state: web::Data<AppState>,
     path: web::Path<(String, String)>,
     body: web::Json<ClipboardBody>,
@@ -1291,8 +1319,8 @@ pub async fn vm_clipboard_set(
     match state
         .lab_call(
             &lab,
-            "vm.clipboard_set",
-            json!({"vm": vm, "text": body.text}),
+            "machine.clipboard_set",
+            json!({"machine": vm, "text": body.text}),
         )
         .await
     {
