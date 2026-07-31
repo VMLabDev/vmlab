@@ -63,9 +63,11 @@ throughout the code and commit messages.
 
 - Trunk-based development: commit directly to `main`, no branches or PRs
   unless explicitly asked.
-- **just** as command runner: `just build` / `just test` / `just check`
-  (lint + fmt check + tests). Justfile follows the norms in the justfile
-  skill (groups, doc comments, `[private]`, noun-verb naming).
+- **just** as command runner: `just build` / `just test`, and `just ci::check`
+  for the merge bar — the `ci` module (`.just/ci/mod.just`) is the single
+  definition of what a change must pass, and `ci.yml` calls its recipes rather
+  than inlining equivalents. Justfile follows the norms in the justfile skill
+  (groups, doc comments, `[private]`, noun-verb naming, the norm-14 gate).
 - Standard Rust toolchain: `cargo build`, `cargo test`, `cargo clippy`,
   `cargo fmt`.
 
