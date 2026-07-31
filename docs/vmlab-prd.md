@@ -606,18 +606,6 @@ Formerly open; all resolved 2026-06-12 and folded into the sections referenced:
 | 9 | OCI media/artifact types | `application/vnd.vmlab.*.v1` family; freeze before first public push |
 | 10 | Lab-daemon crash handling | Supervisor marks failed + emits event; no auto-restart — restart policy belongs to script handlers (§3, §8) |
 
----|---|---|
-| 1 | Default DNS suffix | `lab.internal` (avoid `.local`) |
-| 2 | Auto-subnet pool default range/size | A /16 from RFC1918 carved into /24s, configurable; pick one unlikely to collide (e.g. within 10.213.0.0/16) |
-| 3 | ~~NAT defaults~~ | **Resolved:** no NICs = no network; declared segments NAT off; `nic { nat = true }` shorthand attaches to per-lab built-in NAT segment (§9.7) |
-| 4 | Snapshot mechanism (internal vs external) | Implementation design doc; behaviour contract in §7.3 binds |
-| 5 | Daemon-to-daemon auth for cross-host segments | PSK minimum; design doc |
-| 6 | OCR engine binding (Tesseract via library vs subprocess) | Implementation detail; API in §10.3 binds |
-| 7 | Where the wscript runtime executes | Implementation detail; daemon-unaware API binds |
-| 8 | Default OCI chunk size + compression level | ~512 MiB zstd; verify against current registry per-blob limits at implementation |
-| 9 | Exact vmlab OCI media/artifact type strings | `application/vnd.vmlab.*.v1` family; freeze before first public push |
-| 10 | Supervisor behaviour on lab-daemon crash | Mark failed + event only (no auto-restart); revisit if restart policies prove wanted beyond script handlers |
-
 ---
 
 ## 17. Out-of-scope ideas recorded for later
