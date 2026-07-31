@@ -60,8 +60,10 @@ machine is a VM or a container.
 
 **Display**:
 A machine's framebuffer, together with the keyboard, pointer, OCR and
-image-matching operations that read and drive it. VMs have one; containers do
-not.
+image-matching operations that read and drive it. Probed and reported like any
+other capability — not inferred from machine kind. No container reports one
+today; one running a display server could, so absence is reported as "this
+machine has no display", never as "containers cannot have displays".
 _Avoid_: console, screen, VNC, framebuffer (alone)
 
 ### Templates and images
