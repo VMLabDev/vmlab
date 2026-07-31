@@ -140,19 +140,57 @@ it. Firmware, TPM, filesystem daemons, disks and process spawning sit below
 it; power state, exit classification and readiness sit above.
 _Avoid_: driver, backend, runtime
 
+**Plan**:
+A decision computed in full, as a value, before anything acts on it. Computing
+the plan does no I/O; carrying it out is a separate operation. **LabPlan**,
+**Share plan**, **Mount steps**, **Pull ledger** and **Forward plan** are the
+plans the lab daemon computes.
+_Avoid_: strategy, intent, command object
+
 **LabPlan**:
 The ordered waves of machines, and the configuration steps between them, that
 a given `up` or `down` will carry out — computed in full before anything is
 started or stopped.
 _Avoid_: schedule, DAG, dependency graph
 
+**Share plan**:
+Which shared folders ride virtiofs and which fall back to SMB, per segment,
+together with the host port the bundled server takes.
+
+**Mount steps**:
+The ordered guest commands that mount a share plan inside a given guest OS.
+Guest-side knowledge lives here, not in the lab daemon.
+
+**Pull ledger**:
+The lifecycle and progress of template and image downloads — pending, active,
+done, errored, cancelled — as a value the console and CLI both read.
+
+**Forward plan**:
+The port-forward rules a lab's machines require, resolved to leases and
+gateways before any is installed.
+
 ### Configuration and surfaces
 
 **Schema projection**:
-The single reflected description of the `vmlab.wcl` schema — every block,
-field, type, default and doc string — from which the visual designer's forms
-are driven.
+The single description of the `vmlab.wcl` schema — every block, field, type,
+default and doc string — **reflected** from `schema.wcl` rather than restated,
+and read by everything that needs the schema's shape: the designer's forms, the
+console's config types, the enum option lists, the rendered reference. See
+ADR-0005; until it lands, the designer is still driven by hand-written
+descriptor tables.
 _Avoid_: DTO, view model, descriptor table
+
+**Block extractor**:
+The one module that turns a WCL block into a typed value — field access,
+coercion, source spans and the issue vocabulary. Lab files, host config,
+profiles and template metadata all read through it. See ADR-0006.
+
+**Lab status**:
+The typed projection of a lab's machines, segments and pulls that the lab
+daemon produces once and the CLI, REST surface and web console each render
+unchanged. Carries the state-to-label derivation, so all three surfaces speak
+one vocabulary. See ADR-0004.
+_Avoid_: state (a machine has a power state), snapshot, summary
 
 **Web console**:
 The browser UI served by `vmlab-web`: lab overview, visual designer, file and
