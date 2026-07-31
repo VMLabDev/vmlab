@@ -1,0 +1,21 @@
+name: Feature request
+description: Something vmlab should be able to do and can't.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: >-
+        The lab you're trying to build or the workflow you're trying to run —
+        the problem, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: shape
+    attributes:
+      label: What might it look like?
+      description: >-
+        A sketch of the config, CLI verb or wscript call you'd want. Optional —
+        skip it if you only have the problem.

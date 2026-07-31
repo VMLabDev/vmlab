@@ -1,0 +1,11 @@
+name: Quick note
+description: A short observation, rough edge or idea — no structure required.
+labels: ["needs-triage"]
+body:
+  - type: textarea
+    id: note
+    attributes:
+      label: What's on your mind?
+      description: A sentence or two is fine. Triage will ask for more if it needs it.
+    validations:
+      required: true
