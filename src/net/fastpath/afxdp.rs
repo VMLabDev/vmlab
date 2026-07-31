@@ -207,8 +207,13 @@ impl SegmentXdp {
     /// XDP program, spawn the bridge tasks. Must run inside the daemon's
     /// tokio runtime. Needs CAP_NET_ADMIN + CAP_BPF.
     pub fn new(segment: &str, mtu: u16) -> Result<Arc<SegmentXdp>> {
-        let tap = vmlab_tap::create("vmfp%d", u32::from(mtu) + HOST_TAP_SLACK)
-            .context("creating host tap")?;
+        let tap =
+            vmlab_tap::create("vmfp%d", u32::from(mtu) + HOST_TAP_SLACK).map_err(|error| {
+                anyhow!(
+                    "creating host tap: {error} — {}",
+                    diagnose_tap_failure(error.raw_os_error(), &TapEnv::probe())
+                )
+            })?;
         let engine = XdpEngine::load()?;
         let ifindex = ifindex(&tap.name)?;
         engine.attach(&tap.name)?;
@@ -401,4 +406,126 @@ fn ifindex(name: &str) -> Result<u32> {
             warn!("{e:#}");
             e
         })
+}
+
+/// What the host looks like to the tap layer. Split out so the diagnosis
+/// below is a pure function of it (and therefore testable off a real host).
+struct TapEnv {
+    /// `/dev/net/tun` is present.
+    node: bool,
+    /// Running kernel release, and whether its module tree is installed.
+    /// `None` when the release could not be read.
+    kernel: Option<(String, bool)>,
+}
+
+impl TapEnv {
+    fn probe() -> TapEnv {
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|release| {
+                let release = release.trim().to_string();
+                let modules = std::path::Path::new("/lib/modules").join(&release).is_dir();
+                (release, modules)
+            });
+        TapEnv {
+            node: std::path::Path::new("/dev/net/tun").exists(),
+            kernel,
+        }
+    }
+}
+
+/// Say what a tap-creation errno actually means for this host.
+///
+/// The raw errno is actively misleading here. `ENODEV` renders as "No such
+/// device" while the device node is sitting right there in `/dev/net/tun`:
+/// it means the `tun` driver is not registered, not that the node is
+/// missing. Worse, the usual remedy (`modprobe tun`) also fails when the
+/// running kernel's module tree has been removed by an in-place kernel
+/// upgrade — nothing short of a reboot fixes that, and nothing in the errno
+/// hints at it. Reading the fast path as "silently slower for no reason" is
+/// the failure this text exists to prevent.
+fn diagnose_tap_failure(errno: Option<i32>, env: &TapEnv) -> String {
+    match errno {
+        Some(nix::libc::ENODEV) if env.node => match &env.kernel {
+            Some((release, false)) => format!(
+                "the tun driver is not loaded and cannot be: the running kernel ({release}) has \
+                 no module tree under /lib/modules, so it was upgraded in place. Reboot into the \
+                 installed kernel, then the fast path selects itself"
+            ),
+            _ => "the tun driver is not loaded. Run `modprobe tun` on the host (not inside the \
+                  container) and restart vmlab"
+                .into(),
+        },
+        Some(nix::libc::ENODEV) | Some(nix::libc::ENOENT) => {
+            "/dev/net/tun is missing. In a container, pass `--device /dev/net/tun`; on a host, \
+             load the tun driver with `modprobe tun`"
+                .into()
+        }
+        Some(nix::libc::EPERM) | Some(nix::libc::EACCES) => {
+            "creating a tap needs CAP_NET_ADMIN. In a container, add `--cap-add NET_ADMIN` \
+             (the fast path also needs `--cap-add BPF`)"
+                .into()
+        }
+        _ => "the fast path stays off; the userspace fabric carries the lab unchanged".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(node: bool, kernel: Option<(&str, bool)>) -> TapEnv {
+        TapEnv {
+            node,
+            kernel: kernel.map(|(r, m)| (r.to_string(), m)),
+        }
+    }
+
+    /// The bug this text was written for: node present, driver unregistered,
+    /// running kernel's modules deleted by an in-place upgrade. `modprobe`
+    /// cannot help, so the diagnosis must say "reboot" and name the release.
+    #[test]
+    fn enodev_with_no_module_tree_blames_the_missing_reboot() {
+        let msg = diagnose_tap_failure(
+            Some(nix::libc::ENODEV),
+            &env(true, Some(("7.1.1-2-cachyos", false))),
+        );
+        assert!(msg.contains("7.1.1-2-cachyos"), "{msg}");
+        assert!(msg.contains("Reboot"), "{msg}");
+        assert!(!msg.contains("modprobe"), "modprobe cannot fix this: {msg}");
+    }
+
+    #[test]
+    fn enodev_with_a_module_tree_points_at_modprobe() {
+        let msg =
+            diagnose_tap_failure(Some(nix::libc::ENODEV), &env(true, Some(("7.1.5-1", true))));
+        assert!(msg.contains("modprobe tun"), "{msg}");
+        assert!(!msg.contains("Reboot"), "{msg}");
+    }
+
+    /// No node at all is the container-without-`--device` case, which reports
+    /// the same ENODEV on some runtimes — the node check is what separates them.
+    #[test]
+    fn missing_node_points_at_the_device_flag() {
+        for errno in [nix::libc::ENODEV, nix::libc::ENOENT] {
+            let msg = diagnose_tap_failure(Some(errno), &env(false, Some(("7.1.5-1", true))));
+            assert!(msg.contains("--device /dev/net/tun"), "{errno}: {msg}");
+        }
+    }
+
+    #[test]
+    fn permission_failures_name_the_capability() {
+        for errno in [nix::libc::EPERM, nix::libc::EACCES] {
+            let msg = diagnose_tap_failure(Some(errno), &env(true, Some(("7.1.5-1", true))));
+            assert!(msg.contains("NET_ADMIN"), "{errno}: {msg}");
+        }
+    }
+
+    /// An unclassified failure must still reassure rather than alarm: the lab
+    /// works, it is just not accelerated.
+    #[test]
+    fn unknown_errno_falls_back_to_the_reassuring_line() {
+        let msg = diagnose_tap_failure(Some(nix::libc::EIO), &env(true, None));
+        assert!(msg.contains("userspace fabric"), "{msg}");
+    }
 }

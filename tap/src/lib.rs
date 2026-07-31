@@ -111,15 +111,30 @@ mod tests {
 
     #[test]
     fn create_needs_net_admin_or_succeeds() {
-        // Unprivileged: a clean io::Error (EPERM). Privileged: a real tap
-        // with a kernel-assigned name that vanishes when `t` drops.
+        // Privileged: a real tap with a kernel-assigned name that vanishes
+        // when `t` drops. Otherwise a clean io::Error, and which one is an
+        // environment fact, not a bug: EPERM without CAP_NET_ADMIN, ENODEV
+        // when the tun driver is not registered (kernel upgraded in place,
+        // so /lib/modules has nothing to load), ENOENT with no device node
+        // at all. Asserting EPERM alone made this test fail on a host that
+        // simply had not rebooted.
         match create("vmfptest%d", 1500) {
             Ok(t) => {
                 assert!(t.name.starts_with("vmfptest"));
                 assert!(t.fd.as_raw_fd() >= 0);
             }
             Err(e) => {
-                assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{e}");
+                let errno = e.raw_os_error();
+                assert!(
+                    matches!(
+                        errno,
+                        Some(libc::EPERM)
+                            | Some(libc::EACCES)
+                            | Some(libc::ENODEV)
+                            | Some(libc::ENOENT)
+                    ),
+                    "unexpected tap failure: {e}"
+                );
             }
         }
     }
