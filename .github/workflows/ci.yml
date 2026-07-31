@@ -13,6 +13,12 @@ jobs:
   check:
     name: fmt + lint + test
     runs-on: ubuntu-latest
+    # pnpm/action-setup's default store lives under its own node_modules; the
+    # @forge git deps then build inside a node_modules path, where TypeScript's
+    # wildcard matching silently skips source files and the packages ship stub
+    # .d.ts files. The justfile passes this through to `pnpm install`.
+    env:
+      PNPM_STORE_DIR: ${{ github.workspace }}/../pnpm-store
     steps:
       - uses: actions/checkout@v7
       # vmlab's tests probe the host for the tools it drives — QEMU emulators +
@@ -33,8 +39,6 @@ jobs:
           components: rustfmt, clippy
       - uses: taiki-e/install-action@just
       - uses: Swatinem/rust-cache@v2
-      # `just check` lints --all-features, which compiles vmlab-web; rust-embed
-      # needs web-ui/dist present at compile time, so build the frontend first.
       # pnpm (major pinned): the @forge/* deps are git-subdir deps npm can't do.
       # No lockfile on purpose — pnpm installs FROM a lockfile fetch path: git
       # deps as the raw monorepo (web-ui/.gitignore); fresh resolution is
@@ -45,16 +49,14 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-      # --store-dir: pnpm/action-setup's default store lives under its own
-      # node_modules; the @forge git deps then build inside a node_modules
-      # path, where TypeScript's wildcard matching silently skips source files
-      # and the packages ship stub .d.ts files.
-      - name: Build web UI
-        run: |
-          cd web-ui
-          pnpm install --store-dir "$RUNNER_TEMP/pnpm-store"
-          pnpm build
-      - run: just check
+      # One part of the merge bar per step; `just ci::check` runs the same set
+      # in one go. Installing and building the frontend (rust-embed needs
+      # web-ui/dist at compile time to lint --all-features) is a dependency of
+      # the recipes themselves, so there is nothing to do here first.
+      - run: just ci::fmt-check
+      - run: just ci::lint
+      - run: just ci::test
+      - run: just ci::web-ui-check
 
   # The guest-side crates (cinit, agent, and their proto contracts) are
   # standalone — never swept into the host build — so lint/test them and the
@@ -70,6 +72,7 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, riscv64gc-unknown-linux-musl, x86_64-pc-windows-gnu
+      - uses: taiki-e/install-action@just
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -77,15 +80,7 @@ jobs:
             guest/cinit
             guest/agent-proto
             guest/agent
-      - name: Lint + test
-        run: |
-          for crate in cinit-proto cinit agent-proto agent; do
-            echo "::group::$crate"
-            cargo fmt --check --manifest-path "guest/$crate/Cargo.toml"
-            cargo clippy --all-targets --manifest-path "guest/$crate/Cargo.toml" -- -D warnings
-            cargo test --manifest-path "guest/$crate/Cargo.toml"
-            echo "::endgroup::"
-          done
+      - run: just ci::guest-check
       - name: Cross-check agent targets
         run: |
           cargo clippy --target x86_64-pc-windows-gnu \
@@ -113,7 +108,7 @@ jobs:
         with:
           workspaces: ebpf
       - run: just ebpf-tools
-      - run: just ebpf-verify
+      - run: just ci::ebpf-verify
 
   # ── Version ───────────────────────────────────────────────────────────────
   # Trailer-gated: a release only happens when HEAD carries a publish trailer.
@@ -210,6 +205,9 @@ jobs:
     needs: [version, check]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ${{ matrix.os }}
+    # See the check job: the default pnpm store breaks the @forge git deps.
+    env:
+      PNPM_STORE_DIR: ${{ github.workspace }}/../pnpm-store
     strategy:
       fail-fast: false
       matrix:
@@ -222,6 +220,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@just
       - uses: pnpm/action-setup@v6
         with:
           version: 10
@@ -238,13 +237,7 @@ jobs:
       - name: Build CLI
         run: cargo build --bin vmlab --release --target ${{ matrix.target }}
       # The web UI is embedded into vmlab-web (rust-embed), so build it first.
-      # --store-dir: see the check job — the default store path breaks the
-      # @forge git deps' TypeScript builds.
-      - name: Build web UI
-        run: |
-          cd web-ui
-          pnpm install --store-dir "$RUNNER_TEMP/pnpm-store"
-          pnpm build
+      - run: just web-ui-build
       - name: Build web server
         run: cargo build --bin vmlab-web --features web --release --target ${{ matrix.target }}
       - name: Stage assets

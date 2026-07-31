@@ -205,11 +205,17 @@ a hidden escape hatch.
 dependencies pinned by rev in `Cargo.toml`, so no sibling checkouts are needed:
 
 ```sh
-just build    # cargo build
-just test     # cargo test
-just check    # clippy (-D warnings) + fmt check + tests + web-ui typecheck
-just check-all # the above plus the guest asset and eBPF verifier checks
+just build     # cargo build
+just test      # cargo test
+just ci::check # the merge bar: everything a change must pass before it can merge
+just ci        # list the gate's parts — run one on its own with `just ci::lint`
 ```
+
+`just ci::check` is self-sufficient from a clean checkout (it builds the web UI
+that `vmlab-web` embeds, and installs its dependencies) and reports a missing
+tool as a missing tool. It covers clippy, `cargo fmt --check`, the test suite,
+the web UI typecheck, the standalone guest crates, and the committed BPF
+objects — the last of which needs a one-time `just ebpf-tools`.
 
 Runtime tools expected on the host: `qemu-system-<arch>`, `qemu-img`, `swtpm`,
 `tesseract` (OCR), an ISO tool (`xorriso`/`genisoimage`), `mtools` +

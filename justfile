@@ -1,3 +1,8 @@
+import '.just/shared.just'
+
+# The merge bar: everything a change must pass before it can merge (`just ci::check`)
+mod ci '.just/ci'
+
 [default, private]
 main:
 	@just --list
@@ -14,47 +19,12 @@ release:
 
 # Run the test suite
 [group('test')]
-test:
-	cargo test
+test: ci::test
 
-# Run clippy with warnings as errors (--all-features covers the web binary)
-[group('check')]
-lint:
-	cargo clippy --all-targets --all-features -- -D warnings
-
-# Verify formatting without changing files
-[group('check')]
-fmt-check:
-	cargo fmt --check
-
-# Format the codebase
+# Format the codebase (the fixer for `just ci::fmt-check`)
 [group('check')]
 fmt:
 	cargo fmt
-
-# Typecheck the web UI (`vite build` strips types without checking them)
-[group('check')]
-web-ui-check:
-	cd web-ui && pnpm typecheck
-
-# Lint, format check, tests, and the web UI typecheck
-[group('check')]
-check: lint fmt-check test web-ui-check
-
-# Format check, lint and test one guest-side crate
-[group('check')]
-guest-crate-check crate:
-	cargo fmt --check --manifest-path guest/{{crate}}/Cargo.toml
-	cargo clippy --all-targets --manifest-path guest/{{crate}}/Cargo.toml -- -D warnings
-	cargo test --manifest-path guest/{{crate}}/Cargo.toml
-
-# Check every guest-side crate (standalone workspaces `check` never touches)
-[group('check')]
-guest-check: (guest-crate-check 'cinit-proto') (guest-crate-check 'cinit') (guest-crate-check 'agent-proto') (guest-crate-check 'agent')
-
-# Everything CI gates on: check + guest crates + BPF objects (needs `ebpf-tools`)
-[group('check')]
-check-all: check guest-check ebpf-verify
 
 # Build the official runtime container image: `vmlab` CLI + `vmlab-web` (PRD §14)
 [group('build')]
@@ -93,19 +63,8 @@ ebpf-tools:
 	cd ebpf && rustup run "$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)" \
 		cargo install bpf-linker --version 0.10.3 --locked --force
 
-# Rebuild the committed BPF fast-path objects from ebpf/ (pinned toolchain)
-[group('build')]
-ebpf-build:
-	cd ebpf && cargo test -p fastpath-logic
-	cd ebpf && cargo build --release --target bpfel-unknown-none -Z build-std=core \
-		-p fastpath-sockmap -p xdp-switch
-	cp ebpf/target/bpfel-unknown-none/release/fastpath-sockmap src/net/fastpath/bpf/fastpath_sockmap.bpf.o
-	cp ebpf/target/bpfel-unknown-none/release/xdp-switch src/net/fastpath/bpf/xdp_switch.bpf.o
-
-# Verify the committed BPF objects match the ebpf/ sources (CI)
-[group('check')]
-ebpf-verify: ebpf-build
-	git diff --exit-code src/net/fastpath/bpf/
+# `ebpf-build` is imported from .just/shared.just (the gate needs it, and a
+# module cannot depend on a root recipe); `ebpf-verify` is now `ci::ebpf-verify`.
 
 # Run the privileged fast-path integration tests (kernel splice + XDP; sudo
 # prompts once). The tier is a per-process singleton, so each tier gets its
@@ -188,15 +147,8 @@ docs-clean:
 	rm -rf docs/_site docs/wskills/vmlab/out
 	find docs/help -mindepth 1 -not -name .gitkeep -delete
 
-# Install the SolidJS web UI's pnpm dependencies (@forge/* are git-subdir deps)
-[group('web')]
-web-ui-install:
-	cd web-ui && pnpm install
-
-# Build the web UI to web-ui/dist (embedded into vmlab-web at compile time)
-[group('web')]
-web-ui-build:
-	cd web-ui && pnpm build
+# `web-ui-install` and `web-ui-build` are imported from .just/shared.just — the
+# gate needs them, and a module cannot depend on a root recipe.
 
 # Pin the @forge/* deps to a new forge rev (updates package.json + the
 # pnpm-workspace.yaml prepare allowlist together, then reinstalls)
