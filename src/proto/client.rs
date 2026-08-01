@@ -1,7 +1,13 @@
 //! Protocol client side, used by the CLI against both daemon tiers and by
 //! the supervisor against lab daemons.
+//!
+//! A client is typed by the vocabulary its socket speaks ([`LabClient`],
+//! [`SupClient`]): the request it sends is a variant of that vocabulary, so a
+//! command the daemon does not serve, or an argument of the wrong shape, does
+//! not compile.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,10 +17,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use super::{Event, Message, ProtoError};
+use super::{
+    CommandError, ErrorCode, Event, LabRequest, Message, ProtoError, SupRequest, WireRequest,
+};
+
+/// A client for a lab daemon's control socket.
+pub type LabClient = Client<LabRequest>;
+/// A client for the supervisor's control socket.
+pub type SupClient = Client<SupRequest>;
 
 struct Pending {
-    resp: oneshot::Sender<Result<Value, String>>,
+    resp: oneshot::Sender<Result<Value, CommandError>>,
     chunks: Option<mpsc::Sender<String>>,
 }
 
@@ -27,13 +40,24 @@ struct Inner {
 }
 
 /// Cloneable async client for one daemon socket.
-#[derive(Clone)]
-pub struct Client {
+pub struct Client<R: WireRequest> {
     inner: Arc<Inner>,
+    _vocabulary: PhantomData<fn(R)>,
 }
 
-impl Client {
-    pub async fn connect(path: &Path) -> Result<Client, ProtoError> {
+// Derived `Clone` would demand `R: Clone`, which a vocabulary has no reason to
+// be: the client holds no request, only the type that names one.
+impl<R: WireRequest> Clone for Client<R> {
+    fn clone(&self) -> Self {
+        Client {
+            inner: self.inner.clone(),
+            _vocabulary: PhantomData,
+        }
+    }
+}
+
+impl<R: WireRequest> Client<R> {
+    pub async fn connect(path: &Path) -> Result<Client<R>, ProtoError> {
         let stream = UnixStream::connect(path).await?;
         let (read_half, write_half) = stream.into_split();
         let inner = Arc::new(Inner {
@@ -51,10 +75,15 @@ impl Client {
                     continue;
                 };
                 match msg {
-                    Message::Resp { id, ok, err } => {
+                    Message::Resp { id, ok, err, code } => {
                         if let Some(p) = reader_inner.pending.lock().await.remove(&id) {
                             let result = match (ok, err) {
-                                (_, Some(e)) => Err(e),
+                                // A daemon older than ADR-0007 sends prose and
+                                // no code; `Failed` is what its errors always
+                                // meant to the surfaces above.
+                                (_, Some(e)) => {
+                                    Err(CommandError::new(code.unwrap_or(ErrorCode::Failed), e))
+                                }
                                 (Some(v), None) => Ok(v),
                                 (None, None) => Ok(Value::Null),
                             };
@@ -84,11 +113,14 @@ impl Client {
             // Connection died: fail everything pending.
             let mut pending = reader_inner.pending.lock().await;
             for (_, p) in pending.drain() {
-                let _ = p.resp.send(Err("connection closed".into()));
+                let _ = p.resp.send(Err(CommandError::failed("connection closed")));
             }
         });
         *inner.reader.lock().await = Some(handle);
-        Ok(Client { inner })
+        Ok(Client {
+            inner,
+            _vocabulary: PhantomData,
+        })
     }
 
     async fn send_req(
@@ -96,7 +128,7 @@ impl Client {
         cmd: &str,
         args: Value,
         chunks: Option<mpsc::Sender<String>>,
-    ) -> Result<oneshot::Receiver<Result<Value, String>>, ProtoError> {
+    ) -> Result<oneshot::Receiver<Result<Value, CommandError>>, ProtoError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.inner
@@ -117,8 +149,9 @@ impl Client {
         Ok(rx)
     }
 
-    /// Plain request/response.
-    pub async fn call(&self, cmd: &str, args: Value) -> Result<Value, ProtoError> {
+    /// Send one request and wait for its answer.
+    pub async fn send(&self, req: R) -> Result<Value, ProtoError> {
+        let (cmd, args) = req.to_wire();
         let rx = self.send_req(cmd, args, None).await?;
         match rx.await {
             Ok(Ok(v)) => Ok(v),
@@ -127,14 +160,14 @@ impl Client {
         }
     }
 
-    /// Request with streamed output: `on_chunk` receives incremental text
-    /// (build logs, provision output) until the final response arrives.
-    pub async fn call_streaming(
+    /// Send one request whose output streams: `on_chunk` receives incremental
+    /// text (build logs, provision output) until the final answer arrives.
+    pub async fn send_streaming(
         &self,
-        cmd: &str,
-        args: Value,
+        req: R,
         mut on_chunk: impl FnMut(String) + Send,
     ) -> Result<Value, ProtoError> {
+        let (cmd, args) = req.to_wire();
         let (tx, mut rx) = mpsc::channel::<String>(256);
         let resp_rx = self.send_req(cmd, args, Some(tx)).await?;
         tokio::pin!(resp_rx);
@@ -161,47 +194,69 @@ impl Client {
     }
 
     /// Subscribe to the daemon's event stream.
+    ///
+    /// `subscribe` belongs to the framing rather than to either vocabulary:
+    /// the server intercepts it to flip this connection into event mode, and
+    /// it never reaches a command handler.
     pub async fn subscribe(&self) -> Result<mpsc::Receiver<Event>, ProtoError> {
         let (tx, rx) = mpsc::channel(256);
         *self.inner.events.lock().await = Some(tx);
-        self.call("subscribe", Value::Null).await?;
-        Ok(rx)
+        let resp = self.send_req("subscribe", Value::Null, None).await?;
+        match resp.await {
+            Ok(Ok(_)) => Ok(rx),
+            Ok(Err(e)) => Err(ProtoError::Remote(e)),
+            Err(_) => Err(ProtoError::Closed),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::Region;
     use super::super::server::{Handler, Server, Streamer};
     use super::*;
 
-    struct EchoHandler;
+    /// A stand-in lab daemon: enough of the real vocabulary to exercise
+    /// request/response, streaming, concurrency and each error code.
+    struct FakeLab;
 
     #[async_trait::async_trait]
-    impl Handler for EchoHandler {
-        async fn handle(&self, cmd: &str, args: Value, stream: &Streamer) -> Result<Value, String> {
-            match cmd {
-                "echo" => Ok(args),
-                "fail" => Err("nope".into()),
-                "build" => {
-                    for i in 0..3 {
-                        stream.chunk(format!("step {i}")).await;
-                    }
-                    Ok(serde_json::json!({"built": true}))
+    impl Handler<LabRequest> for FakeLab {
+        async fn handle(&self, req: LabRequest, stream: &Streamer) -> Result<Value, CommandError> {
+            match req {
+                LabRequest::Ping {} => Ok(Value::String("pong".into())),
+                LabRequest::MachineStart { machine } => Err(CommandError::conflict(format!(
+                    "{machine} is already running"
+                ))),
+                LabRequest::MachineStop { machine, force } => {
+                    Ok(serde_json::json!({"machine": machine, "force": force}))
                 }
-                "slow" => {
+                LabRequest::MachineLogs { machine, .. } => Err(CommandError::unsupported(format!(
+                    "{machine}: this machine keeps no console log"
+                ))),
+                LabRequest::SnapshotList { machine } => {
+                    Err(CommandError::not_found(format!("no machine `{machine}`")))
+                }
+                LabRequest::Up { machines } => {
+                    for machine in &machines {
+                        stream.chunk(format!("starting {machine}")).await;
+                    }
+                    Ok(serde_json::json!(true))
+                }
+                LabRequest::Status {} => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     Ok(Value::String("slow-done".into()))
                 }
-                other => Err(format!("unknown command {other}")),
+                other => Err(CommandError::failed(format!("unhandled {}", other.cmd()))),
             }
         }
     }
 
-    async fn start() -> (tempfile::TempDir, Server, Client) {
+    async fn start() -> (tempfile::TempDir, Server<LabRequest>, LabClient) {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("test.sock");
-        let server = Server::bind(&sock, Arc::new(EchoHandler)).await.unwrap();
-        let client = Client::connect(&sock).await.unwrap();
+        let server = Server::bind(&sock, Arc::new(FakeLab)).await.unwrap();
+        let client = LabClient::connect(&sock).await.unwrap();
         (dir, server, client)
     }
 
@@ -209,17 +264,78 @@ mod tests {
     async fn request_response() {
         let (_dir, _server, client) = start().await;
         let v = client
-            .call("echo", serde_json::json!({"x": 42}))
+            .send(LabRequest::MachineStop {
+                machine: "dc01".into(),
+                force: true,
+            })
             .await
             .unwrap();
-        assert_eq!(v["x"], 42);
+        assert_eq!(v["machine"], "dc01");
+        assert_eq!(v["force"], true);
     }
 
+    /// The point of the codes: a caller branches on why, not on wording.
     #[tokio::test]
-    async fn remote_errors_propagate() {
+    async fn remote_errors_carry_their_code() {
         let (_dir, _server, client) = start().await;
-        let err = client.call("fail", Value::Null).await.unwrap_err();
-        assert!(matches!(err, ProtoError::Remote(ref m) if m == "nope"));
+        let cases: Vec<(LabRequest, ErrorCode)> = vec![
+            (
+                LabRequest::MachineStart {
+                    machine: "dc01".into(),
+                },
+                ErrorCode::Conflict,
+            ),
+            (
+                LabRequest::SnapshotList {
+                    machine: "ghost".into(),
+                },
+                ErrorCode::NotFound,
+            ),
+            (
+                LabRequest::MachineLogs {
+                    machine: "web".into(),
+                    lines: 10,
+                    follow: false,
+                },
+                ErrorCode::Unsupported,
+            ),
+            (
+                LabRequest::Destroy {},
+                // Nothing more specific to say: the default.
+                ErrorCode::Failed,
+            ),
+        ];
+        for (req, want) in cases {
+            let cmd = req.cmd();
+            let err = client.send(req).await.unwrap_err();
+            assert_eq!(err.code(), want, "{cmd}");
+            assert!(!err.to_string().is_empty(), "{cmd}");
+        }
+    }
+
+    /// A command the daemon does not serve is answered, not dropped — and it
+    /// is a different code from a command whose arguments are wrong.
+    #[tokio::test]
+    async fn unknown_commands_and_bad_arguments_are_answered_by_code() {
+        let (_dir, _server, client) = start().await;
+        // Only a client bypassing the vocabulary can produce these, so the
+        // test writes the raw frames a foreign client would.
+        for (cmd, args, want) in [
+            (
+                "machine.teleport",
+                serde_json::json!({}),
+                ErrorCode::UnknownCommand,
+            ),
+            (
+                "machine.stop",
+                serde_json::json!({}),
+                ErrorCode::InvalidArgument,
+            ),
+        ] {
+            let rx = client.send_req(cmd, args, None).await.unwrap();
+            let err = rx.await.unwrap().unwrap_err();
+            assert_eq!(err.code, want, "{cmd}");
+        }
     }
 
     #[tokio::test]
@@ -227,27 +343,32 @@ mod tests {
         let (_dir, _server, client) = start().await;
         let mut chunks = Vec::new();
         let v = client
-            .call_streaming("build", Value::Null, |c| chunks.push(c))
+            .send_streaming(
+                LabRequest::Up {
+                    machines: vec!["a".into(), "b".into()],
+                },
+                |c| chunks.push(c),
+            )
             .await
             .unwrap();
-        assert_eq!(v["built"], true);
-        assert_eq!(chunks, vec!["step 0", "step 1", "step 2"]);
+        assert_eq!(v, serde_json::json!(true));
+        assert_eq!(chunks, vec!["starting a", "starting b"]);
     }
 
     #[tokio::test]
     async fn concurrent_requests_dont_block() {
         let (_dir, _server, client) = start().await;
         let slow = client.clone();
-        let slow_task = tokio::spawn(async move { slow.call("slow", Value::Null).await });
+        let slow_task = tokio::spawn(async move { slow.send(LabRequest::Status {}).await });
         // The fast call completes while the slow one is still in flight.
         let fast = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            client.call("echo", serde_json::json!(1)),
+            client.send(LabRequest::Ping {}),
         )
         .await
         .expect("fast call should not be blocked by slow one")
         .unwrap();
-        assert_eq!(fast, serde_json::json!(1));
+        assert_eq!(fast, Value::String("pong".into()));
         let slow_result = slow_task.await.unwrap().unwrap();
         assert_eq!(slow_result, Value::String("slow-done".into()));
     }
@@ -268,5 +389,23 @@ mod tests {
         assert_eq!(ev.event, "vm.ready");
         assert_eq!(ev.lab, "lab1");
         assert_eq!(ev.data["vm"], "dc01");
+    }
+
+    /// The region argument reaches the daemon as a rectangle, not as a raw
+    /// array the handler has to re-validate.
+    #[tokio::test]
+    async fn typed_arguments_survive_the_round_trip() {
+        let req = LabRequest::MachineOcr {
+            machine: "dc01".into(),
+            region: Some(Region {
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+            }),
+        };
+        let (cmd, args) = req.to_wire();
+        assert_eq!(args["region"], serde_json::json!([1, 2, 3, 4]));
+        assert_eq!(LabRequest::from_wire(cmd, args).unwrap(), req);
     }
 }

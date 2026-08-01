@@ -225,18 +225,15 @@ impl LabNetwork {
             if !seg.global {
                 continue;
             }
-            let client = crate::proto::client::Client::connect(&supervisor_sock)
+            let client = crate::proto::client::SupClient::connect(&supervisor_sock)
                 .await
                 .context("connecting to supervisor for global segment")?;
-            let mut args = serde_json::json!({"name": seg.name});
-            if let Some(subnet) = seg.config.as_ref().and_then(|c| c.subnet) {
-                args["subnet"] = serde_json::json!(subnet.to_string());
-            }
-            if let Some(peer) = &seg.peer {
-                args["peer"] = serde_json::json!(peer);
-            }
             let resp = client
-                .call("global.attach", args)
+                .send(crate::proto::SupRequest::GlobalAttach {
+                    name: seg.name.clone(),
+                    subnet: seg.config.as_ref().and_then(|c| c.subnet),
+                    peer: seg.peer.clone(),
+                })
                 .await
                 .map_err(|e| anyhow::anyhow!("global.attach: {e}"))?;
             let trunk_sock = std::path::PathBuf::from(
@@ -268,11 +265,11 @@ impl LabNetwork {
             return;
         }
         if let Ok(client) =
-            crate::proto::client::Client::connect(&crate::paths::supervisor_socket()).await
+            crate::proto::client::SupClient::connect(&crate::paths::supervisor_socket()).await
         {
             for name in names {
                 let _ = client
-                    .call("global.detach", serde_json::json!({"name": name}))
+                    .send(crate::proto::SupRequest::GlobalDetach { name })
                     .await;
             }
         }

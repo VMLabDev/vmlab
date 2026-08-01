@@ -4,16 +4,16 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
 
-use crate::proto::client::Client;
+use crate::proto::client::{LabClient, SupClient};
+use crate::proto::{LabRequest, SupRequest};
 
 /// Connect to the supervisor, auto-starting it if needed (PRD §3: one per
 /// user, auto-started by the CLI).
-pub async fn ensure_supervisor() -> Result<Client> {
+pub async fn ensure_supervisor() -> Result<SupClient> {
     let sock = crate::paths::supervisor_socket();
-    if let Ok(client) = Client::connect(&sock).await
-        && client.call("ping", Value::Null).await.is_ok()
+    if let Ok(client) = SupClient::connect(&sock).await
+        && client.send(SupRequest::Ping {}).await.is_ok()
     {
         return Ok(client);
     }
@@ -22,8 +22,8 @@ pub async fn ensure_supervisor() -> Result<Client> {
 
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Ok(client) = Client::connect(&sock).await
-            && client.call("ping", Value::Null).await.is_ok()
+        if let Ok(client) = SupClient::connect(&sock).await
+            && client.send(SupRequest::Ping {}).await.is_ok()
         {
             return Ok(client);
         }
@@ -62,10 +62,13 @@ fn spawn_supervisor() -> Result<()> {
 /// Connect to a lab's daemon, starting the supervisor and lab daemon as
 /// needed. Lab-scoped CLI verbs go through here, then talk to the lab
 /// daemon directly (PRD §3: no proxying in the hot path).
-pub async fn ensure_lab_daemon(name: &str, root: &std::path::Path) -> Result<Client> {
+pub async fn ensure_lab_daemon(name: &str, root: &std::path::Path) -> Result<LabClient> {
     let supervisor = ensure_supervisor().await?;
     let resp = supervisor
-        .call("lab.ensure", json!({"name": name, "root": root}))
+        .send(SupRequest::LabEnsure {
+            name: name.to_string(),
+            root: root.to_path_buf(),
+        })
         .await
         .map_err(|e| anyhow::anyhow!("starting lab daemon: {e}"))?;
     let sock = PathBuf::from(
@@ -73,14 +76,14 @@ pub async fn ensure_lab_daemon(name: &str, root: &std::path::Path) -> Result<Cli
             .as_str()
             .context("malformed lab.ensure response")?,
     );
-    Ok(Client::connect(&sock).await?)
+    Ok(LabClient::connect(&sock).await?)
 }
 
 /// Connect to a lab daemon only if it is already running.
-pub async fn try_lab_daemon(name: &str) -> Option<Client> {
+pub async fn try_lab_daemon(name: &str) -> Option<LabClient> {
     let sock = crate::paths::lab_socket(name);
-    let client = Client::connect(&sock).await.ok()?;
-    client.call("ping", Value::Null).await.ok()?;
+    let client = LabClient::connect(&sock).await.ok()?;
+    client.send(LabRequest::Ping {}).await.ok()?;
     Some(client)
 }
 
@@ -93,7 +96,7 @@ pub fn cmd_fastpath() -> Result<()> {
     rt.block_on(async {
         let client = ensure_supervisor().await?;
         let v = client
-            .call("fastpath", Value::Null)
+            .send(SupRequest::FastPath {})
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!(
@@ -134,9 +137,9 @@ pub fn cmd_daemon(cmd: DaemonCmd) -> Result<()> {
             }
             DaemonCmd::Stop => {
                 let sock = crate::paths::supervisor_socket();
-                match Client::connect(&sock).await {
+                match SupClient::connect(&sock).await {
                     Ok(client) => {
-                        let _ = client.call("shutdown", Value::Null).await;
+                        let _ = client.send(SupRequest::Shutdown {}).await;
                         println!("vmlabd stopped");
                     }
                     Err(_) => println!("vmlabd is not running"),
@@ -145,14 +148,14 @@ pub fn cmd_daemon(cmd: DaemonCmd) -> Result<()> {
             }
             DaemonCmd::Status => {
                 let sock = crate::paths::supervisor_socket();
-                match Client::connect(&sock).await {
+                match SupClient::connect(&sock).await {
                     Ok(client) => {
                         let version = client
-                            .call("version", Value::Null)
+                            .send(SupRequest::Version {})
                             .await
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let labs = client
-                            .call("status", Value::Null)
+                            .send(SupRequest::Status {})
                             .await
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         println!(
@@ -160,7 +163,7 @@ pub fn cmd_daemon(cmd: DaemonCmd) -> Result<()> {
                             version.as_str().unwrap_or("?"),
                             sock.display()
                         );
-                        if let Ok(fp) = client.call("fastpath", Value::Null).await {
+                        if let Ok(fp) = client.send(SupRequest::FastPath {}).await {
                             println!("network fast path: {}", fp["tier"].as_str().unwrap_or("?"));
                         }
                         let entries = labs.as_array().cloned().unwrap_or_default();

@@ -50,7 +50,9 @@ pub async fn logs(
     actix_web::rt::spawn(async move {
         // Touch state so the lab daemon is known/registered; not fatal if it
         // isn't running — logs persist on disk regardless.
-        let _ = state.lab_call(&lab, "ping", serde_json::Value::Null).await;
+        let _ = state
+            .lab_call(&lab, vmlab::proto::LabRequest::Ping {})
+            .await;
 
         if !logs::lab_dir(&lab).exists() {
             let _ = session

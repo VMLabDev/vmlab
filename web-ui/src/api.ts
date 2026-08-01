@@ -3,8 +3,11 @@
 // is sent as an Authorization header on REST calls and a ?token= query param
 // on WebSocket upgrades (browsers can't set WS headers).
 
+import type { ApiError, ErrorCode, LabAction, MachineAction } from "./protocol";
 import { parseLabStatus } from "./status";
 import type { LabStatus, WebPageStatus } from "./status";
+
+export type { ErrorCode, LabAction, MachineAction };
 
 const TOKEN_KEY = "vmlab_token";
 
@@ -20,6 +23,33 @@ export function clearToken(): void {
 
 export class Unauthorized extends Error {}
 
+/** A failed `/api` call. `code` is the daemon's own verdict (see
+ *  `protocol.ts`), so callers branch on it rather than on the message. */
+export class ApiFailure extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: ErrorCode,
+  ) {
+    super(message);
+  }
+}
+
+/** Read a failed response into an `ApiFailure`. A body that isn't the JSON
+ *  error shape (a proxy page, an empty 502) leaves the status text. */
+async function apiFailure(res: Response): Promise<ApiFailure> {
+  let message = res.statusText;
+  let code: ErrorCode | undefined;
+  try {
+    const body: ApiError = await res.json();
+    message = body.error ?? message;
+    code = body.code;
+  } catch {
+    /* keep statusText */
+  }
+  return new ApiFailure(message, res.status, code);
+}
+
 async function req(path: string, opts: RequestInit = {}): Promise<any> {
   const headers: Record<string, string> = {
     ...((opts.headers as Record<string, string>) ?? {}),
@@ -34,15 +64,7 @@ async function req(path: string, opts: RequestInit = {}): Promise<any> {
     clearToken();
     throw new Unauthorized("authentication required");
   }
-  if (!res.ok) {
-    let msg = res.statusText;
-    try {
-      msg = (await res.json()).error ?? msg;
-    } catch {
-      /* keep statusText */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw await apiFailure(res);
   const ct = res.headers.get("content-type") ?? "";
   return ct.includes("json") ? res.json() : res;
 }
@@ -102,11 +124,7 @@ export const dnsTable = (lab: string): Promise<{ segments: DnsSegmentZone[] }> =
 // `force` applies to the stop-shaped actions (down / stop / restart's stop
 // half): kill instead of the graceful ladder.
 const forceQs = (force?: boolean) => (force ? "?force=true" : "");
-export const labAction = (
-  lab: string,
-  action: "up" | "down" | "destroy" | "pull",
-  force?: boolean,
-) =>
+export const labAction = (lab: string, action: LabAction, force?: boolean) =>
   post(`/api/labs/${encodeURIComponent(lab)}/${action}${forceQs(force)}`);
 /** Abort the download running for one machine; whatever is waiting on it
  *  (an `up`, a `pull`) fails with "download cancelled". */
@@ -115,7 +133,7 @@ export const cancelPull = (lab: string, machine: string): Promise<{ cancelled: b
 export const machineAction = (
   lab: string,
   machine: string,
-  action: "start" | "stop" | "restart" | "destroy",
+  action: MachineAction,
   force?: boolean,
 ) =>
   post(
@@ -588,15 +606,7 @@ async function putConfig(lab: string, content: string, validateOnly: boolean): P
     const body = await res.json().catch(() => ({ issues: [] }));
     throw new ValidationError(body.issues ?? []);
   }
-  if (!res.ok) {
-    let msg = res.statusText;
-    try {
-      msg = (await res.json()).error ?? msg;
-    } catch {
-      /* keep statusText */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw await apiFailure(res);
 }
 
 export const validateConfig = (lab: string, content: string): Promise<void> =>
@@ -919,15 +929,7 @@ async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response>
 }
 
 async function finish(res: Response): Promise<any> {
-  if (!res.ok) {
-    let msg = res.statusText;
-    try {
-      msg = (await res.json()).error ?? msg;
-    } catch {
-      /* keep statusText */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw await apiFailure(res);
   return res.json();
 }
 

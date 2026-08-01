@@ -13,8 +13,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use vmlab::cli::daemon;
-use vmlab::proto::ProtoError;
-use vmlab::proto::client::Client;
+use vmlab::proto::client::{LabClient, SupClient};
+use vmlab::proto::{CommandError, LabRequest, ProtoError, SupRequest};
 
 /// Sessions older than this with no activity are dropped. Overridable via
 /// `VMLAB_WEB_SESSION_TTL_SECS`.
@@ -71,8 +71,8 @@ pub struct AppState {
     /// lab name → root directory (seeded from the cwd lab and the supervisor
     /// registry).
     roots: Mutex<HashMap<String, PathBuf>>,
-    supervisor: Mutex<Option<Client>>,
-    labs: Mutex<HashMap<String, Client>>,
+    supervisor: Mutex<Option<SupClient>>,
+    labs: Mutex<HashMap<String, LabClient>>,
 }
 
 impl AppState {
@@ -182,29 +182,30 @@ impl AppState {
     // --- daemon clients ---------------------------------------------------
 
     /// A live supervisor client, auto-starting `vmlabd` if needed.
-    pub async fn supervisor(&self) -> Result<Client, String> {
+    pub async fn supervisor(&self) -> Result<SupClient, CommandError> {
         let mut guard = self.supervisor.lock().await;
         if let Some(c) = guard.as_ref()
-            && c.call("ping", Value::Null).await.is_ok()
+            && c.send(SupRequest::Ping {}).await.is_ok()
         {
             return Ok(c.clone());
         }
         let client = daemon::ensure_supervisor()
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| CommandError::failed(format!("{e:#}")))?;
         *guard = Some(client.clone());
         Ok(client)
     }
 
-    /// A supervisor call, surfacing remote errors as plain strings.
-    pub async fn supervisor_call(&self, cmd: &str, args: Value) -> Result<Value, String> {
+    /// A supervisor call, keeping the daemon's error code so the REST layer
+    /// can map it to an HTTP status.
+    pub async fn supervisor_call(&self, req: SupRequest) -> Result<Value, CommandError> {
         let client = self.supervisor().await?;
-        client.call(cmd, args).await.map_err(proto_err)
+        client.send(req).await.map_err(CommandError::from)
     }
 
     /// Resolve a lab's root directory (public wrapper over `root_for`), used by
     /// the config read/write handlers.
-    pub async fn lab_root(&self, lab: &str) -> Result<PathBuf, String> {
+    pub async fn lab_root(&self, lab: &str) -> Result<PathBuf, CommandError> {
         self.root_for(lab).await
     }
 
@@ -237,14 +238,14 @@ impl AppState {
     /// registry. Every lab-addressed call funnels through here, so this is
     /// also where URL-supplied lab names are rejected before they can reach
     /// a socket path.
-    async fn root_for(&self, lab: &str) -> Result<PathBuf, String> {
+    async fn root_for(&self, lab: &str) -> Result<PathBuf, CommandError> {
         if !valid_name(lab) {
-            return Err(format!("invalid lab name `{lab}`"));
+            return Err(CommandError::invalid(format!("invalid lab name `{lab}`")));
         }
         if let Some(p) = self.roots.lock().await.get(lab) {
             return Ok(p.clone());
         }
-        let labs = self.supervisor_call("status", Value::Null).await?;
+        let labs = self.supervisor_call(SupRequest::Status {}).await?;
         let root = labs
             .as_array()
             .into_iter()
@@ -260,7 +261,7 @@ impl AppState {
             None => {
                 let managed = vmlab::paths::labs_home().join(lab);
                 if !managed.join(vmlab::paths::LAB_FILE).is_file() {
-                    return Err(format!("unknown lab `{lab}`"));
+                    return Err(CommandError::not_found(format!("unknown lab `{lab}`")));
                 }
                 managed
             }
@@ -274,14 +275,14 @@ impl AppState {
 
     /// A live client for a lab daemon, starting it (and the supervisor) if
     /// needed.
-    async fn lab_client(&self, lab: &str) -> Result<Client, String> {
+    async fn lab_client(&self, lab: &str) -> Result<LabClient, CommandError> {
         if let Some(c) = self.labs.lock().await.get(lab) {
             return Ok(c.clone());
         }
         let root = self.root_for(lab).await?;
         let client = daemon::ensure_lab_daemon(lab, &root)
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| CommandError::failed(format!("{e:#}")))?;
         self.labs
             .lock()
             .await
@@ -290,16 +291,16 @@ impl AppState {
     }
 
     /// A lab-daemon call with one reconnect on a dropped connection.
-    pub async fn lab_call(&self, lab: &str, cmd: &str, args: Value) -> Result<Value, String> {
+    pub async fn lab_call(&self, lab: &str, req: LabRequest) -> Result<Value, CommandError> {
         let client = self.lab_client(lab).await?;
-        match client.call(cmd, args.clone()).await {
+        match client.send(req.clone()).await {
             Ok(v) => Ok(v),
             Err(ProtoError::Closed) => {
                 self.labs.lock().await.remove(lab);
                 let client = self.lab_client(lab).await?;
-                client.call(cmd, args).await.map_err(proto_err)
+                client.send(req).await.map_err(CommandError::from)
             }
-            Err(e) => Err(proto_err(e)),
+            Err(e) => Err(CommandError::from(e)),
         }
     }
 }
@@ -307,10 +308,6 @@ impl AppState {
 fn prune(sessions: &mut HashMap<String, Instant>, ttl: Duration) {
     let now = Instant::now();
     sessions.retain(|_, seen| now.duration_since(*seen) < ttl);
-}
-
-fn proto_err(e: ProtoError) -> String {
-    e.to_string()
 }
 
 #[cfg(test)]

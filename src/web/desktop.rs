@@ -82,16 +82,15 @@ pub async fn template_vnc(
         );
     }
     let value = match state
-        .supervisor_call(
-            "template.console_path",
-            serde_json::json!({"lab": lab, "arch": arch, "template": template}),
-        )
+        .supervisor_call(vmlab::proto::SupRequest::TemplateConsolePath {
+            lab: lab.clone(),
+            arch: arch.clone(),
+            template: template.clone(),
+        })
         .await
     {
         Ok(value) => value,
-        Err(error) => {
-            return Ok(HttpResponse::Conflict().json(serde_json::json!({"error": error})));
-        }
+        Err(error) => return Ok(super::api::fail(error)),
     };
     let Some(path) = value.as_str() else {
         return Ok(HttpResponse::InternalServerError()

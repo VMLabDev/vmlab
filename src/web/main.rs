@@ -171,7 +171,15 @@ async fn main() -> ExitCode {
                 let data = data.clone();
                 actix_web::rt::spawn(async move {
                     println!("vmlab-web: bringing lab `{name}` up…");
-                    match data.lab_call(&name, "up", serde_json::json!({})).await {
+                    match data
+                        .lab_call(
+                            &name,
+                            vmlab::proto::LabRequest::Up {
+                                machines: Vec::new(),
+                            },
+                        )
+                        .await
+                    {
                         Ok(_) => println!("vmlab-web: lab `{name}` is up"),
                         Err(e) => eprintln!("vmlab-web: lab `{name}` failed to come up: {e}"),
                     }

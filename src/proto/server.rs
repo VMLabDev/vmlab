@@ -1,6 +1,7 @@
 //! Protocol server side: accept unix connections, dispatch requests to a
 //! handler, fan out events to subscribed connections.
 
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
 
-use super::{Event, Message};
+use super::{CommandError, Event, Message, WireRequest};
 
 /// Longest request line the server will buffer. Requests are small JSON
 /// objects; anything approaching this is a broken or hostile client, and an
@@ -37,21 +38,26 @@ impl Streamer {
 }
 
 /// Command handler implemented by the supervisor and lab daemons.
+///
+/// The request arrives already decoded into the daemon's vocabulary, so a
+/// handler matches on an enumeration rather than on a string — an unhandled
+/// command is a non-exhaustive `match`, which is a compile error.
 #[async_trait::async_trait]
-pub trait Handler: Send + Sync + 'static {
-    async fn handle(&self, cmd: &str, args: Value, stream: &Streamer) -> Result<Value, String>;
+pub trait Handler<R: WireRequest>: Send + Sync + 'static {
+    async fn handle(&self, req: R, stream: &Streamer) -> Result<Value, CommandError>;
 }
 
-/// A running protocol server bound to a unix socket.
-pub struct Server {
+/// A running protocol server bound to a unix socket, serving one vocabulary.
+pub struct Server<R: WireRequest> {
     pub events: broadcast::Sender<Event>,
     handle: tokio::task::JoinHandle<()>,
+    _vocabulary: PhantomData<fn() -> R>,
 }
 
-impl Server {
+impl<R: WireRequest + Send + 'static> Server<R> {
     /// Bind `path` (parent dirs created, stale socket file replaced) and
     /// serve until dropped/aborted.
-    pub async fn bind(path: &Path, handler: Arc<dyn Handler>) -> std::io::Result<Server> {
+    pub async fn bind(path: &Path, handler: Arc<dyn Handler<R>>) -> std::io::Result<Server<R>> {
         let (events, _) = broadcast::channel::<Event>(1024);
         Self::bind_with_events(path, handler, events).await
     }
@@ -60,9 +66,9 @@ impl Server {
     /// daemon can emit events without holding the server.
     pub async fn bind_with_events(
         path: &Path,
-        handler: Arc<dyn Handler>,
+        handler: Arc<dyn Handler<R>>,
         events: broadcast::Sender<Event>,
-    ) -> std::io::Result<Server> {
+    ) -> std::io::Result<Server<R>> {
         // The socket is a full-privilege interface (scripts, guest files,
         // daemon-side writes), so both the directory holding it and the socket
         // itself are owner-only — `bind` would otherwise honour the umask and
@@ -97,7 +103,11 @@ impl Server {
                 }
             }
         });
-        Ok(Server { events, handle })
+        Ok(Server {
+            events,
+            handle,
+            _vocabulary: PhantomData,
+        })
     }
 
     /// Emit an event to all subscribed connections.
@@ -106,7 +116,7 @@ impl Server {
     }
 }
 
-impl Drop for Server {
+impl<R: WireRequest> Drop for Server<R> {
     fn drop(&mut self) {
         self.handle.abort();
     }
@@ -147,9 +157,20 @@ async fn read_capped_line<R: AsyncBufRead + Unpin>(
     }
 }
 
-async fn serve_conn(
+/// The reply for a failed request: the prose a human reads and the code a
+/// caller branches on.
+fn fault(id: u64, e: CommandError) -> Message {
+    Message::Resp {
+        id,
+        ok: None,
+        err: Some(e.message),
+        code: Some(e.code),
+    }
+}
+
+async fn serve_conn<R: WireRequest + Send + 'static>(
     stream: UnixStream,
-    handler: Arc<dyn Handler>,
+    handler: Arc<dyn Handler<R>>,
     events: broadcast::Sender<Event>,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
@@ -181,11 +202,7 @@ async fn serve_conn(
             Ok(m) => m,
             Err(e) => {
                 let _ = out_tx
-                    .send(Message::Resp {
-                        id: 0,
-                        ok: None,
-                        err: Some(format!("bad message: {e}")),
-                    })
+                    .send(fault(0, CommandError::invalid(format!("bad message: {e}"))))
                     .await;
                 continue;
             }
@@ -225,10 +242,22 @@ async fn serve_conn(
                     id,
                     ok: Some(Value::Bool(true)),
                     err: None,
+                    code: None,
                 })
                 .await;
             continue;
         }
+
+        // Decode into the daemon's vocabulary here, once, so every handler
+        // below deals in typed requests and an unknown command or a bad
+        // argument is answered with a code rather than a guessable phrase.
+        let req = match R::from_wire(&cmd, args) {
+            Ok(req) => req,
+            Err(e) => {
+                let _ = out_tx.send(fault(id, e)).await;
+                continue;
+            }
+        };
 
         let streamer = Streamer {
             id,
@@ -239,17 +268,14 @@ async fn serve_conn(
         // Handle each request on its own task so a long build doesn't block
         // a status query on the same connection.
         tokio::spawn(async move {
-            let resp = match handler.handle(&cmd, args, &streamer).await {
+            let resp = match handler.handle(req, &streamer).await {
                 Ok(v) => Message::Resp {
                     id,
                     ok: Some(v),
                     err: None,
+                    code: None,
                 },
-                Err(e) => Message::Resp {
-                    id,
-                    ok: None,
-                    err: Some(e),
-                },
+                Err(e) => fault(id, e),
             };
             let _ = out.send(resp).await;
         });
@@ -266,12 +292,14 @@ async fn serve_conn(
 mod tests {
     use super::*;
 
+    use super::super::LabRequest;
+
     struct Echo;
 
     #[async_trait::async_trait]
-    impl Handler for Echo {
-        async fn handle(&self, cmd: &str, _args: Value, _s: &Streamer) -> Result<Value, String> {
-            Ok(Value::String(cmd.to_string()))
+    impl Handler<LabRequest> for Echo {
+        async fn handle(&self, req: LabRequest, _s: &Streamer) -> Result<Value, CommandError> {
+            Ok(Value::String(req.cmd().to_string()))
         }
     }
 

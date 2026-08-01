@@ -1,6 +1,7 @@
 //! REST handlers. Each is a thin translation of an HTTP request into a daemon
 //! proto call, returning the daemon's JSON (or an error mapped to a 4xx/5xx).
 
+use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, web};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -8,30 +9,24 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use vmlab::proto::{CommandError, ErrorCode, LabRequest, SupRequest};
+
 use super::fsops::{ensure_safe_parent, plain_relative};
 use super::state::AppState;
 use vmlab::status::LabStatus;
 
-/// Map a daemon error string to an HTTP response.
-pub(crate) fn fail(e: String) -> HttpResponse {
-    // Unknown lab / vm is the client's fault; everything else is treated as a
-    // bad gateway to the daemon.
-    if e.contains("already running") {
-        HttpResponse::Conflict().json(json!({"error": e}))
-    } else if e.contains("invalid lab name")
-        || e.contains("no push target")
-        || e.contains("has no `registry`")
-    {
-        HttpResponse::BadRequest().json(json!({"error": e}))
-    } else if e.contains("unknown lab")
-        || e.contains("no such")
-        || e.contains("not found")
-        || e.contains("no template named")
-    {
-        HttpResponse::NotFound().json(json!({"error": e}))
-    } else {
-        HttpResponse::BadGateway().json(json!({"error": e}))
-    }
+/// Map a daemon failure to an HTTP response.
+///
+/// The daemon says why it failed (ADR-0007) and this reads the code, so the
+/// wording of an error is free to change without moving a status code.
+pub(crate) fn fail(e: CommandError) -> HttpResponse {
+    let status = status_for(e.code);
+    HttpResponse::build(status).json(json!({"error": e.message, "code": e.code.as_str()}))
+}
+
+/// One code, one status — the published mapping, in actix's terms.
+pub(crate) fn status_for(code: ErrorCode) -> StatusCode {
+    StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
 fn ok(v: Value) -> HttpResponse {
@@ -42,7 +37,7 @@ fn ok(v: Value) -> HttpResponse {
 /// created this session (cached roots), and the managed labs home on disk.
 pub async fn list_labs(state: web::Data<AppState>) -> HttpResponse {
     let mut labs = state
-        .supervisor_call("status", Value::Null)
+        .supervisor_call(SupRequest::Status {})
         .await
         .ok()
         .and_then(|v| v.as_array().cloned())
@@ -587,7 +582,7 @@ pub async fn catalog_oci(q: web::Query<OciSearchQuery>) -> HttpResponse {
 /// `GET /api/labs/{lab}` — the lab status projection (ADR-0004): machines,
 /// segments and in-flight downloads, verbatim from the daemon.
 pub async fn lab_status(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
-    match state.lab_call(&lab, "status", Value::Null).await {
+    match state.lab_call(&lab, LabRequest::Status {}).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -596,10 +591,41 @@ pub async fn lab_status(state: web::Data<AppState>, lab: web::Path<String>) -> H
 /// `GET /api/labs/{lab}/dns` — live per-segment DNS zone snapshots
 /// (auto-registered guest records tagged `dynamic`, statics, sinkholes).
 pub async fn lab_dns_table(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
-    match state.lab_call(&lab, "dns.table", Value::Null).await {
+    match state.lab_call(&lab, LabRequest::DnsTable {}).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
+}
+
+/// The request behind `POST /api/labs/{lab}/{action}`, or `None` for a
+/// segment this endpoint does not serve.
+fn lab_request(action: &str, force: bool) -> Option<LabRequest> {
+    Some(match action {
+        "up" => LabRequest::Up {
+            machines: Vec::new(),
+        },
+        "pull" => LabRequest::Pull {
+            machines: Vec::new(),
+        },
+        "down" => LabRequest::Down {
+            machines: Vec::new(),
+            force,
+        },
+        "destroy" => LabRequest::Destroy {},
+        _ => return None,
+    })
+}
+
+/// As [`lab_request`], for
+/// `POST /api/labs/{lab}/machines/{machine}/{action}`.
+fn machine_request(action: &str, machine: String, force: bool) -> Option<LabRequest> {
+    Some(match action {
+        "start" => LabRequest::MachineStart { machine },
+        "stop" => LabRequest::MachineStop { machine, force },
+        "restart" => LabRequest::MachineRestart { machine, force },
+        "destroy" => LabRequest::MachineDestroy { machine },
+        _ => return None,
+    })
 }
 
 /// Optional `?force=true` on the stop-shaped actions: force-kill instead of
@@ -620,16 +646,10 @@ pub async fn lab_action(
     q: web::Query<ForceQuery>,
 ) -> HttpResponse {
     let (lab, action) = path.into_inner();
-    let cmd = match action.as_str() {
-        "up" | "down" | "destroy" | "pull" => action.as_str(),
-        _ => return HttpResponse::NotFound().json(json!({"error": "unknown lab action"})),
+    let Some(req) = lab_request(&action, q.force) else {
+        return HttpResponse::NotFound().json(json!({"error": "unknown lab action"}));
     };
-    let args = if cmd == "down" {
-        json!({"force": q.force})
-    } else {
-        json!({})
-    };
-    match state.lab_call(&lab, cmd, args).await {
+    match state.lab_call(&lab, req).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -644,7 +664,7 @@ pub async fn cancel_pull(
 ) -> HttpResponse {
     let (lab, machine) = path.into_inner();
     match state
-        .lab_call(&lab, "pull.cancel", json!({"machine": machine}))
+        .lab_call(&lab, LabRequest::PullCancel { machine })
         .await
     {
         Ok(v) => ok(json!({"cancelled": v.as_bool().unwrap_or(false)})),
@@ -662,17 +682,10 @@ pub async fn machine_action(
     q: web::Query<ForceQuery>,
 ) -> HttpResponse {
     let (lab, machine, action) = path.into_inner();
-    let cmd = match action.as_str() {
-        "start" => "machine.start",
-        "stop" => "machine.stop",
-        "restart" => "machine.restart",
-        "destroy" => "machine.destroy",
-        _ => return HttpResponse::NotFound().json(json!({"error": "unknown machine action"})),
+    let Some(req) = machine_request(&action, machine, q.force) else {
+        return HttpResponse::NotFound().json(json!({"error": "unknown machine action"}));
     };
-    match state
-        .lab_call(&lab, cmd, json!({"machine": machine, "force": q.force}))
-        .await
-    {
+    match state.lab_call(&lab, req).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -687,7 +700,7 @@ pub async fn machine_capabilities(
 ) -> HttpResponse {
     let (lab, machine) = path.into_inner();
     match state
-        .lab_call(&lab, "machine.capabilities", json!({"machine": machine}))
+        .lab_call(&lab, LabRequest::MachineCapabilities { machine })
         .await
     {
         Ok(v) => ok(v),
@@ -710,8 +723,10 @@ pub async fn machine_sendkeys(
     match state
         .lab_call(
             &lab,
-            "machine.sendkeys",
-            json!({"machine": vm, "keys": body.keys}),
+            LabRequest::MachineSendKeys {
+                machine: vm,
+                keys: body.keys.clone(),
+            },
         )
         .await
     {
@@ -742,8 +757,10 @@ pub async fn machine_screenshot(
     if let Err(e) = state
         .lab_call(
             &lab,
-            "machine.screenshot",
-            json!({"machine": vm, "path": out_str}),
+            LabRequest::MachineScreenshot {
+                machine: vm.clone(),
+                path: out_str,
+            },
         )
         .await
     {
@@ -767,7 +784,7 @@ pub async fn machine_snapshots(
 ) -> HttpResponse {
     let (lab, vm) = path.into_inner();
     match state
-        .lab_call(&lab, "snapshot.list", json!({"machine": vm}))
+        .lab_call(&lab, LabRequest::SnapshotList { machine: vm })
         .await
     {
         Ok(v) => ok(v),
@@ -789,11 +806,11 @@ pub async fn snapshot_take(
     lab: web::Path<String>,
     body: web::Json<SnapshotBody>,
 ) -> HttpResponse {
-    let mut args = json!({"name": body.name});
-    if let Some(vm) = &body.vm {
-        args["vm"] = json!(vm);
-    }
-    match state.lab_call(&lab, "snapshot.take", args).await {
+    let req = LabRequest::SnapshotTake {
+        name: body.name.clone(),
+        machine: body.vm.clone(),
+    };
+    match state.lab_call(&lab, req).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -806,11 +823,7 @@ pub async fn snapshot_delete(
 ) -> HttpResponse {
     let (lab, vm, name) = path.into_inner();
     match state
-        .lab_call(
-            &lab,
-            "snapshot.delete",
-            json!({"machine": vm, "name": name}),
-        )
+        .lab_call(&lab, LabRequest::SnapshotDelete { machine: vm, name })
         .await
     {
         Ok(v) => ok(v),
@@ -1088,7 +1101,7 @@ pub async fn reload_lab(state: web::Data<AppState>, lab: web::Path<String>) -> H
     // the daemon can't be started at all — a lab whose `vmlab.wcl` no longer
     // parses — and that is exactly the state reload exists to recover from.
     // Blocking there would make the button useless when it's needed most.
-    if let Ok(status) = state.lab_call(&lab, "status", Value::Null).await
+    if let Ok(status) = state.lab_call(&lab, LabRequest::Status {}).await
         && !all_machines_stopped(&status)
     {
         return HttpResponse::Conflict()
@@ -1099,8 +1112,11 @@ pub async fn reload_lab(state: web::Data<AppState>, lab: web::Path<String>) -> H
         Ok(r) => r,
         Err(e) => return fail(e),
     };
-    let args = json!({"name": lab.as_str(), "root": root.to_string_lossy()});
-    match state.supervisor_call("lab.restart", args).await {
+    let req = SupRequest::LabRestart {
+        name: lab.to_string(),
+        root,
+    };
+    match state.supervisor_call(req).await {
         Ok(_) => {
             // The old socket is gone; force a reconnect to the fresh daemon.
             state.drop_lab_client(&lab).await;
@@ -1110,19 +1126,21 @@ pub async fn reload_lab(state: web::Data<AppState>, lab: web::Path<String>) -> H
     }
 }
 
-/// Forward a `template.*` command to the supervisor with the lab's `lab` +
-/// `root` filled in (the supervisor loads `vmlab.wcl` from the root itself).
-/// Template names are NOT `valid_name`-checked: they may contain dots
-/// (`ubuntu-24.04`) and are only equality-matched against the parsed config,
-/// never used as paths.
-async fn template_call(state: &AppState, lab: &str, cmd: &str, mut args: Value) -> HttpResponse {
+/// Forward a `template.*` request to the supervisor, handing `build` the
+/// lab's name and root (the supervisor loads `vmlab.wcl` from the root
+/// itself). Template names are NOT `valid_name`-checked: they may contain
+/// dots (`ubuntu-24.04`) and are only equality-matched against the parsed
+/// config, never used as paths.
+async fn template_call(
+    state: &AppState,
+    lab: &str,
+    build: impl FnOnce(String, PathBuf) -> SupRequest,
+) -> HttpResponse {
     let root = match state.lab_root(lab).await {
         Ok(r) => r,
         Err(e) => return fail(e),
     };
-    args["lab"] = json!(lab);
-    args["root"] = json!(root.to_string_lossy());
-    match state.supervisor_call(cmd, args).await {
+    match state.supervisor_call(build(lab.to_string(), root)).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -1132,13 +1150,20 @@ async fn template_call(state: &AppState, lab: &str, cmd: &str, mut args: Value) 
 /// local store versions and any in-flight operation. `[]` when the lab file
 /// defines none (the UI hides the Templates page then).
 pub async fn list_templates(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
-    template_call(&state, &lab, "template.list", json!({})).await
+    template_call(&state, &lab, |lab, root| SupRequest::TemplateList {
+        lab,
+        root,
+    })
+    .await
 }
 
 /// `GET /api/labs/{lab}/templates/ops` — running build/push operations with
 /// their log tails, for reconnecting UIs.
 pub async fn template_ops(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
-    template_call(&state, &lab, "template.op_status", json!({})).await
+    template_call(&state, &lab, |lab, _root| SupRequest::TemplateOpStatus {
+        lab,
+    })
+    .await
 }
 
 /// `GET /api/labs/{lab}/templates/{tpl}/remote` — published tags/arches on
@@ -1149,11 +1174,14 @@ pub async fn template_remote(
     query: web::Query<TemplateSelector>,
 ) -> HttpResponse {
     let (lab, tpl) = path.into_inner();
-    let mut args = json!({"template": tpl});
-    if let Some(arch) = &query.arch {
-        args["arch"] = json!(arch);
-    }
-    template_call(&state, &lab, "template.remote", args).await
+    let arch = query.arch.clone();
+    template_call(&state, &lab, |lab, root| SupRequest::TemplateRemote {
+        lab,
+        root,
+        template: tpl,
+        arch,
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1170,11 +1198,14 @@ pub async fn template_build(
     body: web::Json<TemplateSelector>,
 ) -> HttpResponse {
     let (lab, tpl) = path.into_inner();
-    let mut args = json!({"template": tpl});
-    if let Some(arch) = &body.arch {
-        args["arch"] = json!(arch);
-    }
-    template_call(&state, &lab, "template.build", args).await
+    let arch = body.arch.clone();
+    template_call(&state, &lab, |lab, root| SupRequest::TemplateBuild {
+        lab,
+        root,
+        template: tpl,
+        arch,
+    })
+    .await
 }
 
 /// `POST /api/labs/{lab}/templates/{tpl}/stop` — cancel the active build for
@@ -1185,15 +1216,14 @@ pub async fn template_stop(
     body: web::Json<TemplateSelector>,
 ) -> HttpResponse {
     let (lab, tpl) = path.into_inner();
-    let Some(arch) = &body.arch else {
-        return fail("missing arch".to_string());
+    let Some(arch) = body.arch.clone() else {
+        return fail(CommandError::invalid("missing arch"));
     };
-    template_call(
-        &state,
-        &lab,
-        "template.stop_build",
-        json!({"template": tpl, "arch": arch}),
-    )
+    template_call(&state, &lab, |lab, _root| SupRequest::TemplateStopBuild {
+        lab,
+        arch,
+        template: tpl,
+    })
     .await
 }
 
@@ -1214,14 +1244,15 @@ pub async fn template_publish(
     body: web::Json<PublishBody>,
 ) -> HttpResponse {
     let (lab, tpl) = path.into_inner();
-    let mut args = json!({"template": tpl});
-    if let Some(arch) = &body.arch {
-        args["arch"] = json!(arch);
-    }
-    if let Some(v) = &body.version {
-        args["version"] = json!(v);
-    }
-    template_call(&state, &lab, "template.push", args).await
+    let (arch, version) = (body.arch.clone(), body.version.clone());
+    template_call(&state, &lab, |lab, root| SupRequest::TemplatePush {
+        lab,
+        root,
+        template: tpl,
+        arch,
+        version,
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1259,7 +1290,7 @@ pub async fn host_info() -> HttpResponse {
 /// (PRD §9.1) plus why the skipped kernel tiers were unavailable; drives the
 /// Topbar badge.
 pub async fn fastpath(state: web::Data<AppState>) -> HttpResponse {
-    match state.supervisor_call("fastpath", Value::Null).await {
+    match state.supervisor_call(SupRequest::FastPath {}).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -1341,11 +1372,11 @@ pub async fn snapshot_restore(
     body: web::Json<RestoreBody>,
 ) -> HttpResponse {
     let (lab, name) = path.into_inner();
-    let mut args = json!({"name": name});
-    if let Some(vm) = &body.vm {
-        args["vm"] = json!(vm);
-    }
-    match state.lab_call(&lab, "snapshot.restore", args).await {
+    let req = LabRequest::SnapshotRestore {
+        name,
+        machine: body.vm.clone(),
+    };
+    match state.lab_call(&lab, req).await {
         Ok(v) => ok(v),
         Err(e) => fail(e),
     }
@@ -1359,7 +1390,7 @@ pub async fn machine_stats(
 ) -> HttpResponse {
     let (lab, vm) = path.into_inner();
     match state
-        .lab_call(&lab, "machine.stats", json!({"machine": vm}))
+        .lab_call(&lab, LabRequest::MachineStats { machine: vm })
         .await
     {
         Ok(v) => ok(v),
@@ -1379,8 +1410,11 @@ pub async fn machine_logs(
     match state
         .lab_call(
             &lab,
-            "machine.logs",
-            json!({"machine": machine, "lines": q.lines}),
+            LabRequest::MachineLogs {
+                machine,
+                lines: q.lines,
+                follow: false,
+            },
         )
         .await
     {
@@ -1412,7 +1446,7 @@ pub async fn machine_clipboard_get(
 ) -> HttpResponse {
     let (lab, vm) = path.into_inner();
     match state
-        .lab_call(&lab, "machine.clipboard_get", json!({"machine": vm}))
+        .lab_call(&lab, LabRequest::MachineClipboardGet { machine: vm })
         .await
     {
         Ok(v) => ok(json!({"text": v})),
@@ -1431,8 +1465,10 @@ pub async fn machine_clipboard_set(
     match state
         .lab_call(
             &lab,
-            "machine.clipboard_set",
-            json!({"machine": vm, "text": body.text}),
+            LabRequest::MachineClipboardSet {
+                machine: vm,
+                text: body.text.clone(),
+            },
         )
         .await
     {
@@ -1459,6 +1495,91 @@ mod tests {
             Some(("lab".into(), root.to_path_buf())),
             false,
         ))
+    }
+
+    /// The HTTP contract of the daemon surface, in full. This used to be
+    /// substring matching on the daemon's prose, so rewording an error moved a
+    /// status code; now the code decides and the wording is free.
+    #[actix_web::test]
+    async fn every_error_code_has_its_status() {
+        let cases = [
+            (ErrorCode::UnknownCommand, 400),
+            (ErrorCode::InvalidArgument, 400),
+            (ErrorCode::NotFound, 404),
+            (ErrorCode::Conflict, 409),
+            (ErrorCode::Unsupported, 501),
+            (ErrorCode::Failed, 502),
+            (ErrorCode::Internal, 500),
+        ];
+        assert_eq!(
+            cases.len(),
+            ErrorCode::ALL.len(),
+            "a new code needs a status here"
+        );
+        for (code, want) in cases {
+            assert_eq!(status_for(code).as_u16(), want, "{code}");
+        }
+    }
+
+    /// The response body carries both halves: prose for a person, and the code
+    /// the console branches on.
+    #[actix_web::test]
+    async fn a_failure_body_carries_the_code_beside_the_message() {
+        let resp = fail(CommandError::conflict("dc01 is already running"));
+        assert_eq!(resp.status().as_u16(), 409);
+        let bytes = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "dc01 is already running");
+        assert_eq!(body["code"], "conflict");
+    }
+
+    /// The console's action unions and the protocol report are generated from
+    /// one table; this is what holds that table to the endpoints it claims to
+    /// describe. A segment the endpoint stops serving fails here rather than
+    /// 404-ing in the browser.
+    #[actix_web::test]
+    async fn action_segments_build_the_requests_the_report_documents() {
+        use vmlab::proto::WireRequest;
+        use vmlab::proto::report::{LAB_ACTIONS, MACHINE_ACTIONS};
+
+        for (segment, cmd) in LAB_ACTIONS {
+            let req = lab_request(segment, false).unwrap_or_else(|| panic!("`{segment}`"));
+            assert_eq!(req.cmd(), *cmd);
+        }
+        for (segment, cmd) in MACHINE_ACTIONS {
+            let req = machine_request(segment, "dc01".into(), false)
+                .unwrap_or_else(|| panic!("`{segment}`"));
+            assert_eq!(req.cmd(), *cmd);
+        }
+        assert!(lab_request("teleport", false).is_none());
+        assert!(machine_request("teleport", "dc01".into(), false).is_none());
+    }
+
+    /// `?force=true` is not decoration: it is the difference between the
+    /// graceful ladder and a kill, and it has to reach the request.
+    #[actix_web::test]
+    async fn force_reaches_the_stop_shaped_requests() {
+        assert_eq!(
+            machine_request("stop", "dc01".into(), true),
+            Some(LabRequest::MachineStop {
+                machine: "dc01".into(),
+                force: true
+            })
+        );
+        assert_eq!(
+            machine_request("restart", "dc01".into(), true),
+            Some(LabRequest::MachineRestart {
+                machine: "dc01".into(),
+                force: true
+            })
+        );
+        assert_eq!(
+            lab_request("down", true),
+            Some(LabRequest::Down {
+                machines: Vec::new(),
+                force: true
+            })
+        );
     }
 
     #[actix_web::test]

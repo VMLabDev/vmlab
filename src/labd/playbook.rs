@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use crate::config::model::{Lab, Playbook};
 use crate::labd::lab::LabRuntime;
 use crate::labd::vm_agent::{AgentHandle, SessionEvent};
+use crate::proto::CommandError;
 use crate::scripting::OutputSink;
 use crate::sync::LockRecover;
 
@@ -314,13 +315,13 @@ impl PlaybookOps {
         playbook: &str,
         play: &str,
         kind: &'static str,
-    ) -> Result<(OpGuard, u64), String> {
+    ) -> Result<(OpGuard, u64), CommandError> {
         let mut inner = self.inner.lock_recover();
         if let Some(op) = inner.ops.get(machine) {
-            return Err(format!(
+            return Err(CommandError::conflict(format!(
                 "{} of {} play {} already running for \"{machine}\"",
                 op.kind, op.playbook, op.play
-            ));
+            )));
         }
         inner.next_op += 1;
         let op_id = inner.next_op;
@@ -474,7 +475,7 @@ pub async fn run_playbook(
     let (_guard, op_id) = lab
         .playbook_ops
         .try_begin(machine, &pb_path, &pb.play, mode.verb())
-        .map_err(|e| anyhow!(e))?;
+        .map_err(anyhow::Error::new)?;
 
     let base = json!({
         "machine": machine, "playbook": pb_path, "play": pb.play, "op_id": op_id,
@@ -842,6 +843,33 @@ async fn exec_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second run on a busy machine is a conflict, and stays one all the
+    /// way to the surface: the code has to survive the `anyhow` that
+    /// `run_playbook` returns, or the console shows a bad gateway.
+    #[test]
+    fn a_second_run_on_one_machine_is_a_conflict() {
+        use crate::proto::ErrorCode;
+
+        let ops = PlaybookOps::default();
+        let _claim = ops
+            .try_begin("dc01", "playbooks/web", "main", "apply")
+            .unwrap();
+
+        let Err(err) = ops.try_begin("dc01", "playbooks/web", "main", "check") else {
+            panic!("a second claim on one machine should be rejected");
+        };
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.message.contains("already running"), "{err}");
+
+        // The trip `run_playbook` puts it through.
+        let surfaced: CommandError = anyhow::Error::new(err).into();
+        assert_eq!(surfaced.code, ErrorCode::Conflict);
+
+        // Another machine is unaffected.
+        ops.try_begin("dc02", "playbooks/web", "main", "check")
+            .unwrap();
+    }
 
     #[test]
     fn bin_dir_precedence() {

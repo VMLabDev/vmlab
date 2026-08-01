@@ -2240,10 +2240,13 @@ fn resolve_share_host(root: &std::path::Path, host: &std::path::Path) -> PathBuf
 /// `global.list` (PRD §9.2). `None` = supervisor unreachable; used by
 /// [`LabRuntime::status`] to report `peer_connected` per segment.
 async fn fetch_global_peer_states() -> Option<std::collections::HashMap<String, bool>> {
-    let client = crate::proto::client::Client::connect(&crate::paths::supervisor_socket())
+    let client = crate::proto::client::SupClient::connect(&crate::paths::supervisor_socket())
         .await
         .ok()?;
-    let list = client.call("global.list", Value::Null).await.ok()?;
+    let list = client
+        .send(crate::proto::SupRequest::GlobalList {})
+        .await
+        .ok()?;
     Some(
         list.as_array()?
             .iter()
