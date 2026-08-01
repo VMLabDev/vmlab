@@ -5,6 +5,7 @@
 
 pub mod global;
 pub mod registry;
+pub mod store;
 pub mod templates;
 
 use std::path::PathBuf;
@@ -446,8 +447,8 @@ impl Handler<SupRequest> for SupervisorHandler {
             // Template operations for the web Templates page (PRD §6). All
             // take `lab` + `root` like `lab.ensure`, so the supervisor works
             // for labs it never started.
-            SupRequest::TemplateList { lab, root } => {
-                templates::list(lab, root, sup.template_ops.clone()).await
+            SupRequest::TemplateList { lab, root, file } => {
+                templates::list(lab, root, file, sup.template_ops.clone()).await
             }
             SupRequest::TemplateRemote {
                 lab: _,
@@ -460,7 +461,11 @@ impl Handler<SupRequest> for SupervisorHandler {
                 root,
                 template,
                 arch,
-            } => templates::start_build(sup.clone(), lab, root, template, arch).await,
+                version,
+                file,
+            } => {
+                templates::start_build(sup.clone(), lab, root, template, arch, version, file).await
+            }
             SupRequest::TemplateStopBuild {
                 lab,
                 arch,
@@ -482,6 +487,53 @@ impl Handler<SupRequest> for SupervisorHandler {
                 let path = sup.template_ops.console_path(&lab, &arch, &template)?;
                 Ok(json!(path.to_string_lossy()))
             }
+            // The template store and its registries (PRD §3, §6): the
+            // supervisor is the only thing that opens either.
+            SupRequest::StoreList { remote } => store::list(remote).await,
+            SupRequest::StoreRemove { reference, force } => store::remove(reference, force).await,
+            SupRequest::StorePrune {
+                filter,
+                keep,
+                apply,
+                force,
+            } => store::prune(filter, keep, apply, force).await,
+            SupRequest::StoreExport { reference, out } => store::export(reference, out).await,
+            SupRequest::StoreImport { archive, overwrite } => {
+                store::import(archive, overwrite).await
+            }
+            SupRequest::StorePull {
+                target,
+                arch,
+                overwrite,
+            } => store::pull(target, arch, overwrite).await,
+            SupRequest::StorePush {
+                reference,
+                target,
+                source,
+                prerelease,
+                lab,
+            } => store::push(sup.clone(), reference, target, source, prerelease, lab).await,
+            SupRequest::StoreStopPush {
+                lab,
+                arch,
+                template,
+            } => store::stop_push(sup.clone(), lab, arch, template),
+            SupRequest::RegistrySearch {
+                query,
+                namespace,
+                arch,
+                containers,
+            } => store::search(query, namespace, arch, containers).await,
+            SupRequest::RegistryLogin {
+                registry,
+                username,
+                password,
+            } => store::login(registry, username, password).await,
+            SupRequest::RegistryNamespaces {} => store::namespaces(),
+            SupRequest::RegistryNamespaceAdd { namespace, use_for } => {
+                store::namespace_add(namespace, use_for)
+            }
+            SupRequest::RegistryNamespaceRemove { namespace } => store::namespace_remove(namespace),
             SupRequest::Shutdown {} => {
                 tracing::info!("supervisor shutdown requested");
                 let sup = sup.clone();

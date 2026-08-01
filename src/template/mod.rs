@@ -8,6 +8,7 @@ pub mod agent_install;
 pub mod artefact;
 pub mod bootstrap;
 pub mod build;
+pub mod catalog;
 pub mod cli;
 pub mod meta;
 pub mod oci_bridge;

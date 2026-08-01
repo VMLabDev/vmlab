@@ -26,7 +26,9 @@ PRD implemented (M1–M6). Module map under `src/`:
   firmware lookup, process management; `container.rs` builds the micro-VM
   argv for lab containers (§18).
 - `qmp/` — the QMP client.
-- `template/` — store, qemu-img, builds, artefact cache, store/OCI CLI.
+- `template/` — store, qemu-img, builds, artefact cache, registry catalog
+  search; `cli.rs` is the `vmlab template` surface, a pure protocol client
+  since the supervisor took ownership of the store (ADR-0010).
 - `oci/image/` — standard container-image pull: docker/OCI manifests,
   layer flatten (whiteouts → squashfs via sqfstar), digest-addressed cache.
 - `guest_asset.rs` + `guest/` — the container micro-VM kernel/initramfs:
@@ -48,7 +50,10 @@ PRD implemented (M1–M6). Module map under `src/`:
   (ADR-0007) and `error.rs` the error codes replies carry; `report.rs`
   generates `docs/protocol.md` and `web-ui/src/protocol.ts` from them
   (`just proto-generate`).
-- `supervisor/` — `vmlabd`: lab registry, global segments, watchdogs.
+- `supervisor/` — `vmlabd`: lab registry, global segments, watchdogs;
+  `templates.rs` runs lab-scoped builds/pushes for the console and `store.rs`
+  the store- and registry-scoped operations behind every `vmlab template` verb
+  (ADR-0010).
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;
   `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18).

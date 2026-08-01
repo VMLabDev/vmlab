@@ -37,13 +37,26 @@ the code is the contract.
 | `global.attach` | `name: String`, `subnet: Option<Ipv4Net>`, `peer: Option<String>` | `daemon` | Join a global segment (PRD §9.2), creating it on first use; answers with the trunk socket to bridge to. |
 | `global.detach` | `name: String` | `daemon` | Leave a global segment. |
 | `global.list` | — | `daemon` | Every global segment this host knows. |
-| `template.list` | `lab: String`, `root: std::path::PathBuf` | `web` | The templates a lab declares, with their store and build state. |
+| `template.list` | `lab: String`, `root: std::path::PathBuf`, `file: Option<std::path::PathBuf>` | `cli`, `web` | The templates a file declares, with their store and build state. |
 | `template.remote` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>` | `web` | What the registry holds for one declared template. |
-| `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>` | `web` | Start building one declared template. |
-| `template.stop_build` | `lab: String`, `arch: String`, `template: String` | `web` | Abort a running build. |
+| `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>` | `cli`, `web` | Start building one declared template. |
+| `template.stop_build` | `lab: String`, `arch: String`, `template: String` | `cli`, `web` | Abort a running build. |
 | `template.push` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>` | `web` | Start pushing one built template to its registry. |
 | `template.op_status` | `lab: String` | `web` | Which template builds and pushes are in flight for one lab. |
 | `template.console_path` | `lab: String`, `arch: String`, `template: String` | `web` | The socket serving a running build's console, for the web viewer. |
+| `store.list` | `remote: bool` | `cli` | Every template in the store, with its size and, on request, whether that exact version is published. |
+| `store.remove` | `reference: String`, `force: bool` | `cli` | Remove one exact store version `<arch>/<name>@<version>`. |
+| `store.prune` | `filter: Option<String>`, `keep: usize`, `apply: bool`, `force: bool` | `cli` | Plan a prune of superseded builds, and carry it out when `apply`. |
+| `store.export` | `reference: String`, `out: std::path::PathBuf` | `cli` | Write one store version to a portable archive. |
+| `store.import` | `archive: std::path::PathBuf`, `overwrite: bool` | `cli` | Read a template back out of an archive. |
+| `store.pull` | `target: String`, `arch: Option<String>`, `overwrite: bool` | `cli` | Download a published template into the store. |
+| `store.push` | `reference: String`, `target: Option<String>`, `source: Option<String>`, `prerelease: bool`, `lab: String` | `cli` | Start uploading one store version to an OCI registry. |
+| `store.stop_push` | `lab: String`, `arch: String`, `template: String` | `cli` | Abort a running store push. |
+| `registry.search` | `query: Option<String>`, `namespace: Option<String>`, `arch: Option<String>`, `containers: bool` | `cli` | Search one OCI namespace, or every configured one, for published templates or container images. |
+| `registry.login` | `registry: String`, `username: String`, `password: String` | `cli` | Store credentials for an OCI registry host. |
+| `registry.namespaces` | — | `cli` | The searchable OCI namespaces this host is configured with. |
+| `registry.namespace_add` | `namespace: String`, `use_for: crate::template::registries::RegistryUse` | `cli` | Add or update a searchable namespace. |
+| `registry.namespace_remove` | `namespace: String` | `cli` | Remove a searchable namespace. |
 | `shutdown` | — | `cli`, `daemon` | Tear the supervisor down; the reply is sent before it exits. |
 
 ## A lab daemon's socket
@@ -130,6 +143,19 @@ Deliberate, with the reason recorded beside the declaration:
 - `version` — What `vmlab daemon status` prints: which build of the supervisor is running on this host, asked by whoever is standing in front of it.
 - `lab.ensure` — Spawning-or-finding a lab daemon belongs in one place, and that place is the helper in `src/cli/daemon.rs` — the web layer calls it rather than asking the supervisor itself. One call site is the decision; the scan reports it as the CLI because that is where the helper lives.
 - `lab.release` — The other half of `lab.ensure`, and a shell's alone: a command finishes and gives the daemon back. The console does not finish, and leaves it up for the next request.
+- `store.list` — The store is host-wide; every template command the console has is scoped to the lab it has open, and it has no view of the store as a whole to hang this on. Giving it one is a separate decision from putting the operations on the protocol, which is what this namespace does.
+- `store.remove` — Store management, for the reason on `store.list`.
+- `store.prune` — Store management, for the reason on `store.list`.
+- `store.export` — Store management, for the reason on `store.list`.
+- `store.import` — Store management, for the reason on `store.list`.
+- `store.pull` — Store management, for the reason on `store.list`.
+- `store.push` — Store management, for the reason on `store.list`.
+- `store.stop_push` — The other half of `store.push`.
+- `registry.search` — The console searches a namespace through its own REST endpoint, which runs in the web process rather than over this socket — `GET /api/catalog/oci`. Routing it here is #37's business, not this command's.
+- `registry.login` — The console has its own login endpoint in the web process (`POST /api/registries/login`), for the same reason as `registry.search`.
+- `registry.namespaces` — Namespace settings reach the console through the web process's own `/api/registries` endpoints, for the same reason as `registry.search`.
+- `registry.namespace_add` — Namespace settings, for the reason on `registry.namespaces`.
+- `registry.namespace_remove` — Namespace settings, for the reason on `registry.namespaces`.
 
 ### Reachable only from `web`
 
@@ -137,16 +163,10 @@ Deliberate, with the reason recorded beside the declaration:
 
 - `web.forward` — A loopback forward for a guest's web page exists to be dialled by a browser, and the console is the only surface with one.
 - `playbook.op_status` — A poller's question. A CLI `check` or `apply` streams its own run and holds the terminal until it ends, so it never has to ask what is happening.
-
-Open gaps — nobody wrote the other half, and each is tracked:
-
-- `template.list` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
-- `template.remote` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
-- `template.build` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
-- `template.stop_build` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
-- `template.push` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
-- `template.op_status` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
-- `template.console_path` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
+- `template.remote` — Which versions a template's own registry publishes, so the console can offer them beside the local ones. A shell asks a namespace what is in it (`registry.search`) or the store what it holds (`store.list --remote`); neither is a lab declaration's view of its own registry.
+- `template.push` — The console pushes a template a lab declares to the registry that declaration names. A shell pushes a store reference wherever it is told, and annotates the package with the git origin of the directory it was run in — neither of which a lab declaration has, so `store.push` carries them.
+- `template.op_status` — A poller's question. A CLI build or push follows its own operation's events and holds the terminal until it ends, so it never has to ask what is happening.
+- `template.console_path` — A raw VNC socket exists to be bridged into a browser canvas, and the console is the only surface with one.
 
 ### Reachable only from `daemon`
 

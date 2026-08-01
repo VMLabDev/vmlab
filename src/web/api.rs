@@ -580,8 +580,8 @@ pub async fn catalog_oci(q: web::Query<OciSearchQuery>) -> HttpResponse {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let containers = q.kind.as_deref() == Some("container");
-    match vmlab::template::cli::search_catalog(query, registry, arch, containers).await {
-        Ok(rows) => ok(json!(rows)),
+    match vmlab::template::catalog::search_catalog(query, registry, arch, containers).await {
+        Ok(found) => ok(json!(found.rows)),
         Err(e) => HttpResponse::BadGateway().json(json!({"error": format!("{e:#}")})),
     }
 }
@@ -1160,6 +1160,8 @@ pub async fn list_templates(state: web::Data<AppState>, lab: web::Path<String>) 
     template_call(&state, &lab, |lab, root| SupRequest::TemplateList {
         lab,
         root,
+        // The console knows one file per lab: the lab's own.
+        file: None,
     })
     .await
 }
@@ -1211,6 +1213,9 @@ pub async fn template_build(
         root,
         template: tpl,
         arch,
+        // The console builds the lab's declared templates, version and all.
+        version: None,
+        file: None,
     })
     .await
 }

@@ -367,6 +367,9 @@ fn default_rows() -> u16 {
 fn default_log_lines() -> usize {
     100
 }
+fn default_keep() -> usize {
+    1
+}
 
 /// The spellings of "which machine". `machine`/`machines` are current;
 /// `vm`, `container` and `vms` are what the wire carried before VMs and
@@ -812,19 +815,22 @@ vocabulary! {
         )]
         GlobalList = "global.list" {},
 
-        // The seven `template.*` commands below are one gap, not seven: #39
-        // asks whether the CLI's in-process template verbs should route
-        // through these same supervisor operations the console uses. Each
-        // carries the annotation because the check is per command, but the
-        // question they are waiting on is a single architecture call.
-        /// The templates a lab declares, with their store and build state.
-        #[one_way_gap("web", 39)]
+        /// The templates a file declares, with their store and build state.
         TemplateList = "template.list" {
             lab: String,
             root: std::path::PathBuf,
+            /// The file declaring them; `root`'s `vmlab.wcl` when omitted.
+            #[serde(default)] file: Option<std::path::PathBuf>,
         },
         /// What the registry holds for one declared template.
-        #[one_way_gap("web", 39)]
+        #[one_way(
+            "web",
+            "Which versions a template's own registry publishes, so the \
+             console can offer them beside the local ones. A shell asks a \
+             namespace what is in it (`registry.search`) or the store what it \
+             holds (`store.list --remote`); neither is a lab declaration's \
+             view of its own registry."
+        )]
         TemplateRemote = "template.remote" {
             lab: String,
             root: std::path::PathBuf,
@@ -832,22 +838,31 @@ vocabulary! {
             #[serde(default)] arch: Option<String>,
         },
         /// Start building one declared template.
-        #[one_way_gap("web", 39)]
         TemplateBuild = "template.build" {
             lab: String,
             root: std::path::PathBuf,
             template: String,
             #[serde(default)] arch: Option<String>,
+            /// Pin this exact version instead of auto-incrementing.
+            #[serde(default)] version: Option<String>,
+            /// The file declaring it; `root`'s `vmlab.wcl` when omitted.
+            #[serde(default)] file: Option<std::path::PathBuf>,
         },
         /// Abort a running build.
-        #[one_way_gap("web", 39)]
         TemplateStopBuild = "template.stop_build" {
             lab: String,
             arch: String,
             template: String,
         },
         /// Start pushing one built template to its registry.
-        #[one_way_gap("web", 39)]
+        #[one_way(
+            "web",
+            "The console pushes a template a lab declares to the registry that \
+             declaration names. A shell pushes a store reference wherever it \
+             is told, and annotates the package with the git origin of the \
+             directory it was run in — neither of which a lab declaration has, \
+             so `store.push` carries them."
+        )]
         TemplatePush = "template.push" {
             lab: String,
             root: std::path::PathBuf,
@@ -856,16 +871,151 @@ vocabulary! {
             #[serde(default)] version: Option<String>,
         },
         /// Which template builds and pushes are in flight for one lab.
-        #[one_way_gap("web", 39)]
+        #[one_way(
+            "web",
+            "A poller's question. A CLI build or push follows its own \
+             operation's events and holds the terminal until it ends, so it \
+             never has to ask what is happening."
+        )]
         TemplateOpStatus = "template.op_status" {
             lab: String,
         },
         /// The socket serving a running build's console, for the web viewer.
-        #[one_way_gap("web", 39)]
+        #[one_way(
+            "web",
+            "A raw VNC socket exists to be bridged into a browser canvas, and \
+             the console is the only surface with one."
+        )]
         TemplateConsolePath = "template.console_path" {
             lab: String,
             arch: String,
             template: String,
+        },
+
+        /// Every template in the store, with its size and, on request,
+        /// whether that exact version is published.
+        #[one_way(
+            "cli",
+            "The store is host-wide; every template command the console has \
+             is scoped to the lab it has open, and it has no view of the \
+             store as a whole to hang this on. Giving it one is a separate \
+             decision from putting the operations on the protocol, which is \
+             what this namespace does."
+        )]
+        StoreList = "store.list" {
+            /// Also ask each template's registry whether its exact version and
+            /// architecture is published.
+            #[serde(default)] remote: bool,
+        },
+        /// Remove one exact store version `<arch>/<name>@<version>`.
+        #[one_way("cli", "Store management, for the reason on `store.list`.")]
+        StoreRemove = "store.remove" {
+            reference: String,
+            /// Remove even when the build still backs a clone.
+            #[serde(default)] force: bool,
+        },
+        /// Plan a prune of superseded builds, and carry it out when `apply`.
+        #[one_way("cli", "Store management, for the reason on `store.list`.")]
+        StorePrune = "store.prune" {
+            /// `<arch>/<name>`, `<arch>/`, or a bare name; every family when
+            /// omitted.
+            #[serde(default)] filter: Option<String>,
+            /// Most-recent builds to keep per template.
+            #[serde(default = "default_keep")] keep: usize,
+            /// Actually remove; otherwise the answer is the plan alone.
+            #[serde(default)] apply: bool,
+            /// Also remove builds that still back a clone.
+            #[serde(default)] force: bool,
+        },
+        /// Write one store version to a portable archive.
+        #[one_way("cli", "Store management, for the reason on `store.list`.")]
+        StoreExport = "store.export" {
+            reference: String,
+            out: std::path::PathBuf,
+        },
+        /// Read a template back out of an archive.
+        #[one_way("cli", "Store management, for the reason on `store.list`.")]
+        StoreImport = "store.import" {
+            archive: std::path::PathBuf,
+            #[serde(default)] overwrite: bool,
+        },
+        /// Download a published template into the store.
+        #[one_way("cli", "Store management, for the reason on `store.list`.")]
+        StorePull = "store.pull" {
+            target: String,
+            #[serde(default)] arch: Option<String>,
+            #[serde(default)] overwrite: bool,
+        },
+        /// Start uploading one store version to an OCI registry.
+        #[one_way("cli", "Store management, for the reason on `store.list`.")]
+        StorePush = "store.push" {
+            reference: String,
+            /// Registry repo; the template's own `registry` field when
+            /// omitted.
+            #[serde(default)] target: Option<String>,
+            /// Source repository URL to link the package to.
+            #[serde(default)] source: Option<String>,
+            /// Move `latest-prerelease` rather than `latest`.
+            #[serde(default)] prerelease: bool,
+            /// Lab to file the operation under, so a console watching that lab
+            /// sees it. Empty files it under the store itself.
+            #[serde(default)] lab: String,
+        },
+        /// Abort a running store push.
+        #[one_way("cli", "The other half of `store.push`.")]
+        StoreStopPush = "store.stop_push" {
+            #[serde(default)] lab: String,
+            arch: String,
+            template: String,
+        },
+
+        /// Search one OCI namespace, or every configured one, for published
+        /// templates or container images.
+        #[one_way(
+            "cli",
+            "The console searches a namespace through its own REST endpoint, \
+             which runs in the web process rather than over this socket — \
+             `GET /api/catalog/oci`. Routing it here is #37's business, not \
+             this command's."
+        )]
+        RegistrySearch = "registry.search" {
+            #[serde(default)] query: Option<String>,
+            /// The namespace to search; every configured one when omitted.
+            #[serde(default)] namespace: Option<String>,
+            #[serde(default)] arch: Option<String>,
+            /// Search container images rather than VM templates.
+            #[serde(default)] containers: bool,
+        },
+        /// Store credentials for an OCI registry host.
+        #[one_way(
+            "cli",
+            "The console has its own login endpoint in the web process \
+             (`POST /api/registries/login`), for the same reason as \
+             `registry.search`."
+        )]
+        RegistryLogin = "registry.login" {
+            registry: String,
+            username: String,
+            password: String,
+        },
+        /// The searchable OCI namespaces this host is configured with.
+        #[one_way(
+            "cli",
+            "Namespace settings reach the console through the web process's \
+             own `/api/registries` endpoints, for the same reason as \
+             `registry.search`."
+        )]
+        RegistryNamespaces = "registry.namespaces" {},
+        /// Add or update a searchable namespace.
+        #[one_way("cli", "Namespace settings, for the reason on `registry.namespaces`.")]
+        RegistryNamespaceAdd = "registry.namespace_add" {
+            namespace: String,
+            use_for: crate::template::registries::RegistryUse,
+        },
+        /// Remove a searchable namespace.
+        #[one_way("cli", "Namespace settings, for the reason on `registry.namespaces`.")]
+        RegistryNamespaceRemove = "registry.namespace_remove" {
+            namespace: String,
         },
 
         /// Tear the supervisor down; the reply is sent before it exits.
@@ -1081,6 +1231,100 @@ mod tests {
     #[test]
     fn a_command_more_than_one_surface_reaches_asserts_nothing() {
         assert!(LabRequest::spec("up").unwrap().one_way.is_none());
+    }
+
+    /// `template.list` and `template.build` grew a `file` (and `build` a
+    /// `version`) so a shell can point at any template file and pin a
+    /// version. The console sends neither, and must keep working untouched.
+    #[test]
+    fn the_consoles_template_payloads_still_decode() {
+        let req = SupRequest::from_wire(
+            "template.list",
+            json!({"lab": "demo", "root": "/labs/demo"}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            SupRequest::TemplateList {
+                lab: "demo".into(),
+                root: "/labs/demo".into(),
+                file: None,
+            }
+        );
+        let req = SupRequest::from_wire(
+            "template.build",
+            json!({"lab": "demo", "root": "/labs/demo", "template": "base"}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            SupRequest::TemplateBuild {
+                lab: "demo".into(),
+                root: "/labs/demo".into(),
+                template: "base".into(),
+                arch: None,
+                version: None,
+                file: None,
+            }
+        );
+    }
+
+    /// The store is addressed by reference, not by lab: a shell says which
+    /// version it means and how far it will go, and everything else defaults.
+    #[test]
+    fn store_commands_default_to_the_safe_shape() {
+        let req = SupRequest::from_wire("store.list", json!({})).unwrap();
+        assert_eq!(req, SupRequest::StoreList { remote: false });
+
+        let req = SupRequest::from_wire("store.prune", json!({})).unwrap();
+        assert_eq!(
+            req,
+            SupRequest::StorePrune {
+                filter: None,
+                // Keeping one build and not touching the disk is what a bare
+                // prune means; anything else has to be asked for.
+                keep: 1,
+                apply: false,
+                force: false,
+            }
+        );
+
+        let req = SupRequest::from_wire("store.push", json!({"reference": "x86_64/base"})).unwrap();
+        assert_eq!(
+            req,
+            SupRequest::StorePush {
+                reference: "x86_64/base".into(),
+                target: None,
+                source: None,
+                prerelease: false,
+                lab: String::new(),
+            }
+        );
+    }
+
+    /// A namespace's use is a closed set on the wire, so a typo is a bad
+    /// argument rather than a namespace nothing will ever search.
+    #[test]
+    fn a_namespace_use_is_one_of_three_spellings() {
+        use crate::template::registries::RegistryUse;
+        let req = SupRequest::from_wire(
+            "registry.namespace_add",
+            json!({"namespace": "ghcr.io/acme", "use_for": "containers"}),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            SupRequest::RegistryNamespaceAdd {
+                namespace: "ghcr.io/acme".into(),
+                use_for: RegistryUse::Containers,
+            }
+        );
+        let e = SupRequest::from_wire(
+            "registry.namespace_add",
+            json!({"namespace": "ghcr.io/acme", "use_for": "everything"}),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, crate::proto::ErrorCode::InvalidArgument);
     }
 
     /// Both vocabularies are enumerable, and every command in them is

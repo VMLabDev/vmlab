@@ -43,7 +43,7 @@ pub struct TemplateOps {
 impl TemplateOps {
     /// Claim `(lab, template)` for `kind`; the returned guard releases the
     /// claim on drop, so error and panic paths cannot wedge a template.
-    fn try_begin(
+    pub(super) fn try_begin(
         &self,
         lab: &str,
         arch: &str,
@@ -127,16 +127,27 @@ impl TemplateOps {
         Ok(path.clone())
     }
 
-    fn cancel_build(&self, lab: &str, arch: &str, template: &str) -> Result<(), CommandError> {
+    /// Cancel the operation claiming `(lab, arch, template)`, provided it is
+    /// the `kind` the caller means to stop — stopping a build and stopping a
+    /// push are different requests, and answering the wrong one would cancel
+    /// work nobody asked about.
+    pub(super) fn cancel(
+        &self,
+        lab: &str,
+        arch: &str,
+        template: &str,
+        kind: &str,
+    ) -> Result<(), CommandError> {
         let ops = self.inner.lock_recover();
         let op = ops
             .get(&(lab.to_string(), arch.to_string(), template.to_string()))
             .ok_or_else(|| {
-                CommandError::not_found(format!("no build running for `{arch}/{template}`"))
+                CommandError::not_found(format!("no {kind} running for `{arch}/{template}`"))
             })?;
-        if op.kind != "build" {
+        if op.kind != kind {
             return Err(CommandError::conflict(format!(
-                "the operation running for `{arch}/{template}` is a push"
+                "the operation running for `{arch}/{template}` is a {}",
+                op.kind
             )));
         }
         op.cancel.cancel();
@@ -182,14 +193,14 @@ impl TemplateOps {
 }
 
 /// Releases a [`TemplateOps`] claim on drop.
-struct OpGuard {
+pub(super) struct OpGuard {
     ops: TemplateOps,
     key: OpKey,
     cancel: tokio_util::sync::CancellationToken,
 }
 
 impl OpGuard {
-    fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+    pub(super) fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
         self.cancel.clone()
     }
 }
@@ -200,10 +211,16 @@ impl Drop for OpGuard {
     }
 }
 
-/// Parse the lab's `vmlab.wcl` and return its `template {}` blocks (the same
-/// loader `vmlab template build` uses, so a lab-less template file works too).
-fn load_defs(root: &Path) -> Result<Vec<TemplateDef>, String> {
-    let path = root.join(crate::paths::LAB_FILE);
+/// Parse a template file and return its `template {}` blocks. `file` is the
+/// file to read — a shell may point at any of them — and defaults to the
+/// lab's own `vmlab.wcl`, which is the only one the console knows about.
+/// `root` stays the directory every root-relative path in the blocks resolves
+/// against.
+pub(super) fn load_defs(root: &Path, file: Option<&Path>) -> Result<Vec<TemplateDef>, String> {
+    let path = match file {
+        Some(file) => file.to_path_buf(),
+        None => root.join(crate::paths::LAB_FILE),
+    };
     let source = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let tf = crate::config::load_template_source(&source, &path.display().to_string(), root)
@@ -211,8 +228,13 @@ fn load_defs(root: &Path) -> Result<Vec<TemplateDef>, String> {
     Ok(tf.templates)
 }
 
-fn find_def(root: &Path, template: &str, arch: Option<&str>) -> Result<TemplateDef, CommandError> {
-    let mut matches = load_defs(root)?
+fn find_def(
+    root: &Path,
+    file: Option<&Path>,
+    template: &str,
+    arch: Option<&str>,
+) -> Result<TemplateDef, CommandError> {
+    let mut matches = load_defs(root, file)?
         .into_iter()
         .filter(|d| d.name == template && arch.is_none_or(|a| d.arch == a));
     let first = matches.next().ok_or_else(|| {
@@ -231,9 +253,14 @@ fn find_def(root: &Path, template: &str, arch: Option<&str>) -> Result<TemplateD
 
 /// `template.list`: the lab's template definitions joined with their local
 /// store versions (newest first) and any in-flight operation.
-pub async fn list(lab: String, root: PathBuf, ops: TemplateOps) -> Result<Value, CommandError> {
+pub async fn list(
+    lab: String,
+    root: PathBuf,
+    file: Option<PathBuf>,
+    ops: TemplateOps,
+) -> Result<Value, CommandError> {
     let entries = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, CommandError> {
-        let defs = load_defs(&root)?;
+        let defs = load_defs(&root, file.as_deref())?;
         let store = TemplateStore::new(crate::paths::template_store_dir());
         Ok(defs
             .iter()
@@ -278,7 +305,7 @@ pub async fn remote(
 
     let def = {
         let template = template.clone();
-        tokio::task::spawn_blocking(move || find_def(&root, &template, arch.as_deref()))
+        tokio::task::spawn_blocking(move || find_def(&root, None, &template, arch.as_deref()))
             .await
             .map_err(|e| e.to_string())??
     };
@@ -317,11 +344,14 @@ pub async fn start_build(
     root: PathBuf,
     template: String,
     arch: Option<String>,
+    version: Option<String>,
+    file: Option<PathBuf>,
 ) -> Result<Value, CommandError> {
     let (def, profiles) = {
-        let (root, template, arch) = (root.clone(), template.clone(), arch.clone());
+        let (root, template, arch, file) =
+            (root.clone(), template.clone(), arch.clone(), file.clone());
         tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
-            let def = find_def(&root, &template, arch.as_deref())?;
+            let def = find_def(&root, file.as_deref(), &template, arch.as_deref())?;
             let profiles = crate::profiles::ProfileSet::load_default()
                 .map_err(|e| format!("loading profiles: {e:#}"))?;
             Ok((def, profiles))
@@ -391,7 +421,7 @@ pub async fn start_build(
             &store,
             &profiles,
             log,
-            None,
+            version.as_deref(),
             crate::template::build::BuildControl {
                 console_ready: Some(console_ready),
                 on_event: Some(on_event),
@@ -427,7 +457,7 @@ pub fn stop_build(
     arch: String,
     template: String,
 ) -> Result<Value, CommandError> {
-    sup.template_ops.cancel_build(&lab, &arch, &template)?;
+    sup.template_ops.cancel(&lab, &arch, &template, "build")?;
     Ok(json!({"stopping": true}))
 }
 
@@ -444,7 +474,7 @@ pub async fn start_push(
     let (resolved, repo) = {
         let (root, template, arch) = (root.clone(), template.clone(), arch.clone());
         tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
-            let def = find_def(&root, &template, arch.as_deref())?;
+            let def = find_def(&root, None, &template, arch.as_deref())?;
             let store = TemplateStore::new(crate::paths::template_store_dir());
             let resolved = store
                 .resolve(&def.arch, &def.name, version.as_deref())
@@ -523,7 +553,7 @@ pub async fn start_push(
 
 /// An [`OutputSink`](crate::scripting::OutputSink) that appends to the op's
 /// log ring and broadcasts each line as a `template.op.log` event.
-fn op_sink(
+pub(super) fn op_sink(
     sup: Arc<Supervisor>,
     lab: String,
     arch: String,
@@ -574,7 +604,7 @@ mod tests {
         let x86 = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
         let arm = ops.try_begin("lab1", "aarch64", "base", "build").unwrap();
 
-        ops.cancel_build("lab1", "x86_64", "base").unwrap();
+        ops.cancel("lab1", "x86_64", "base", "build").unwrap();
         assert!(x86.cancel_token().is_cancelled());
         assert!(!arm.cancel_token().is_cancelled());
     }
@@ -646,7 +676,7 @@ template "base" {
         .unwrap();
         let ops = TemplateOps::default();
         let _guard = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
-        let rows = list("lab1".into(), root.path().to_path_buf(), ops)
+        let rows = list("lab1".into(), root.path().to_path_buf(), None, ops)
             .await
             .unwrap();
         let rows = rows.as_array().unwrap();
@@ -667,8 +697,8 @@ template "base" {
             "import <vmlab.wcl>\ntemplate \"base\" { arch = \"x86_64\" version = \"1\" source \"scratch\" { } }\n",
         )
         .unwrap();
-        assert!(find_def(root.path(), "base", None).is_ok());
-        let err = find_def(root.path(), "nope", None).unwrap_err();
+        assert!(find_def(root.path(), None, "base", None).is_ok());
+        let err = find_def(root.path(), None, "nope", None).unwrap_err();
         assert_eq!(err.code, crate::proto::ErrorCode::NotFound);
         assert!(err.message.contains("no template named"), "{err}");
     }
@@ -684,11 +714,13 @@ template "base" { arch = "aarch64" version = "1" source "scratch" { } }
 "#,
         )
         .unwrap();
-        let err = find_def(root.path(), "base", None).unwrap_err();
+        let err = find_def(root.path(), None, "base", None).unwrap_err();
         assert_eq!(err.code, crate::proto::ErrorCode::InvalidArgument);
         assert!(err.message.contains("ambiguous"), "{err}");
         assert_eq!(
-            find_def(root.path(), "base", Some("aarch64")).unwrap().arch,
+            find_def(root.path(), None, "base", Some("aarch64"))
+                .unwrap()
+                .arch,
             "aarch64"
         );
     }
