@@ -103,7 +103,8 @@ the code is the contract.
 
 Asymmetry is not automatically wrong — some commands only make sense from one place.
 The lists below exist so that each one is a decision somebody made rather than a gap
-nobody noticed.
+nobody noticed. A command that carries its reason declares it in the vocabulary, beside
+its doc comment; a command listed bare is one nobody has decided about yet.
 
 ### Reachable from no surface
 
@@ -111,23 +112,23 @@ Every command has a caller.
 
 ### Reachable only from `cli`
 
-- `run`
-- `machine.ip`
-- `machine.mouse_move`
-- `machine.mouse_click`
-- `machine.mouse_drag`
-- `machine.ocr`
-- `machine.find_image`
-- `machine.exec`
+- `run` — A scratch script is a shell verb: it comes from a file the caller already has and streams its output back to the terminal that ran it. What the console runs is declared playbooks.
+- `machine.ip` — A scripting shortcut over data the console already holds: the lab status projection carries every machine's address, so the console reads it there rather than asking a second time.
+- `machine.mouse_move` — The console drives a machine through a live VNC canvas, where a human moves the pointer themselves. Scripted pointer input is for callers that have no canvas.
+- `machine.mouse_click` — Scripted input, for the same reason as `machine.mouse_move`: a console user clicks the VNC canvas directly.
+- `machine.mouse_drag` — Scripted input, for the same reason as `machine.mouse_move`: a console user drags on the VNC canvas directly.
+- `machine.ocr` — Reading text off the framebuffer is a script's substitute for looking at it. The console shows the framebuffer to somebody who can already read it.
+- `machine.find_image` — How a script finds a control it cannot see. A console user clicks the one they can, on the VNC canvas.
+- `machine.exec` — The scripted counterpart to the console's interactive terminals: one command, its output collected, an exit code to branch on. The console opens a shell and lets a human type instead.
 - `machine.osinfo`
 - `machine.push_file`
 - `machine.pull_file`
-- `machine.tail`
-- `machine.eventlog`
-- `playbook.list`
-- `version`
-- `lab.ensure`
-- `lab.release`
+- `machine.tail` — An open-ended stream of an arbitrary guest path, which is what a terminal is for. The console follows a machine's console log through `machine.logs`.
+- `machine.eventlog` — A stream into a terminal, for the same reason as `machine.tail`.
+- `playbook.list` — One flat table is the shape a shell wants. The console builds its playbook list from the lab's declarations directly and asks the daemon only which runs are in flight.
+- `version` — What `vmlab daemon status` prints: which build of the supervisor is running on this host, asked by whoever is standing in front of it.
+- `lab.ensure` — Every surface reaches it, through the one spawn-or-find helper in `src/cli/daemon.rs` that the web layer calls too. The scan sees the call where the helper lives, not where it is used from.
+- `lab.release` — The other half of `lab.ensure`, and a shell's alone: a command finishes and gives the daemon back. The console does not finish, and leaves it up for the next request.
 
 ### Reachable only from `web`
 
@@ -137,8 +138,8 @@ Every command has a caller.
 - `machine.stats`
 - `machine.clipboard_get`
 - `machine.clipboard_set`
-- `web.forward`
-- `playbook.op_status`
+- `web.forward` — A loopback forward for a guest's web page exists to be dialled by a browser, and the console is the only surface with one.
+- `playbook.op_status` — A poller's question. A CLI `check` or `apply` streams its own run and holds the terminal until it ends, so it never has to ask what is happening.
 - `lab.restart`
 - `template.list`
 - `template.remote`
@@ -150,9 +151,9 @@ Every command has a caller.
 
 ### Reachable only from `daemon`
 
-- `global.attach`
-- `global.detach`
-- `global.list`
+- `global.attach` — Daemon-internal: a lab daemon joins a global segment because a lab declared one, so there is nothing for a person to ask for.
+- `global.detach` — The other half of `global.attach`, and daemon-internal for the same reason.
+- `global.list` — A lab daemon reads it to fold each segment's peer state into the lab status projection, which is how both other surfaces already see it.
 
 ## REST action segments
 

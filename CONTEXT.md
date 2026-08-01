@@ -245,7 +245,8 @@ _Avoid_: error type, status (a status is a lab's or machine's condition)
 Something a person or a program drives vmlab through: the CLI, the REST API,
 the web console. Each adapts the request vocabulary; none holds its own list of
 commands. Which surface reaches which command is the coverage report in
-`docs/protocol.md`.
+`docs/protocol.md`; a command that belongs on one surface alone says why in the
+vocabulary, beside its declaration, and the report renders the reason.
 _Avoid_: frontend, client (a client is the protocol's connection object)
 
 **Web console**:
