@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::{ArgSpec, CommandSpec, ErrorCode, LabRequest, SupRequest, WireRequest};
+use super::{ArgSpec, CommandSpec, ErrorCode, LabRequest, OneWay, SupRequest, WireRequest};
 
 /// The generated protocol reference and coverage report.
 pub const MARKDOWN_PATH: &str = "docs/protocol.md";
@@ -18,6 +18,9 @@ pub const MARKDOWN_PATH: &str = "docs/protocol.md";
 pub const TYPESCRIPT_PATH: &str = "web-ui/src/protocol.ts";
 
 const GENERATED_BANNER: &str = "generated from `src/proto/vocab.rs` — run `just proto-generate`";
+
+/// Where an open gap's tracking issue lives, so the report can link it.
+const ISSUES_URL: &str = "https://github.com/VMLabDev/vmlab/issues";
 
 /// A caller of the protocol: a directory tree whose sources construct
 /// requests. Which surface reaches which command is the coverage report.
@@ -236,8 +239,9 @@ pub fn protocol_markdown(repo: &Path) -> String {
     out.push_str(
         "Asymmetry is not automatically wrong — some commands only make sense from one place.\n\
          The lists below exist so that each one is a decision somebody made rather than a gap\n\
-         nobody noticed. A command that carries its reason declares it in the vocabulary, beside\n\
-         its doc comment; a command listed bare is one nobody has decided about yet.\n\n",
+         nobody noticed. Every command reachable from a single surface says which it is, beside\n\
+         its declaration in the vocabulary, and the build fails while one says neither — so the\n\
+         open gaps below are a worklist rather than a list somebody has to re-derive.\n\n",
     );
 
     let by_caller = |want: &dyn Fn(&BTreeSet<&'static str>) -> bool| -> Vec<&CommandSpec> {
@@ -250,16 +254,25 @@ pub fn protocol_markdown(repo: &Path) -> String {
 
     let orphans = by_caller(&|s| s.is_empty());
     out.push_str("### Reachable from no surface\n\n");
-    push_list(&mut out, &orphans, "Every command has a caller.");
+    if orphans.is_empty() {
+        out.push_str("Every command has a caller.\n\n");
+    } else {
+        // No annotation applies: a command nothing calls has no asymmetry to
+        // explain, only a caller to find.
+        for spec in &orphans {
+            out.push_str(&bullet(spec, ""));
+        }
+        out.push('\n');
+    }
 
     for surface in SURFACES {
         let only = by_caller(&|s| s.len() == 1 && s.contains(surface.name));
         out.push_str(&format!("### Reachable only from `{}`\n\n", surface.name));
-        push_list(
-            &mut out,
-            &only,
-            &format!("Nothing is exclusive to `{}`.", surface.name),
-        );
+        if only.is_empty() {
+            out.push_str(&format!("Nothing is exclusive to `{}`.\n\n", surface.name));
+            continue;
+        }
+        push_one_way_lists(&mut out, &only);
     }
 
     out.push_str("## REST action segments\n\n");
@@ -283,20 +296,53 @@ pub fn protocol_markdown(repo: &Path) -> String {
     out
 }
 
-/// One command per line, each with its reason when it has one.
-fn push_list(out: &mut String, specs: &[&CommandSpec], empty: &str) {
-    if specs.is_empty() {
-        out.push_str(empty);
-        out.push_str("\n\n");
-        return;
-    }
+/// One command as a list item, with whatever the list says about it after the
+/// name.
+fn bullet(spec: &CommandSpec, tail: &str) -> String {
+    format!("- `{}`{tail}\n", spec.cmd)
+}
+
+/// One surface's one-way commands, as the lists they divide into.
+///
+/// Deliberate asymmetries and open gaps are rendered apart because telling
+/// them apart is what the report is for: one list is settled and the other is
+/// work. Reading them as one list is what made this exercise happen three
+/// times.
+fn push_one_way_lists(out: &mut String, specs: &[&CommandSpec]) {
+    let (mut deliberate, mut gaps, mut bare) = (String::new(), String::new(), String::new());
     for spec in specs {
         match spec.one_way {
-            Some(one_way) => out.push_str(&format!("- `{}` — {}\n", spec.cmd, one_way.why)),
-            None => out.push_str(&format!("- `{}`\n", spec.cmd)),
+            Some(OneWay::Deliberate { why, .. }) => {
+                deliberate.push_str(&bullet(spec, &format!(" — {why}")));
+            }
+            Some(OneWay::Gap { issue, .. }) => {
+                gaps.push_str(&bullet(
+                    spec,
+                    &format!(" — tracked in [#{issue}]({ISSUES_URL}/{issue})"),
+                ));
+            }
+            None => bare.push_str(&bullet(spec, "")),
         }
     }
-    out.push('\n');
+    for (lead, list) in [
+        (
+            "Deliberate, with the reason recorded beside the declaration:",
+            &deliberate,
+        ),
+        (
+            "Open gaps — nobody wrote the other half, and each is tracked:",
+            &gaps,
+        ),
+        // Empty in any tree that passes `every_one_way_command_records_why`.
+        // Rendered rather than dropped so that generating the report before
+        // running the test shows the same worklist the test is about to name.
+        ("Neither, which the build rejects:", &bare),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("{lead}\n\n{list}\n"));
+    }
 }
 
 /// `404` as `404 Not Found`, for the reference table. The number itself comes
@@ -430,36 +476,66 @@ mod tests {
             .filter_map(|spec| spec.one_way.map(|one_way| (spec, one_way)))
     }
 
-    /// A reason names the surface it claims the command is reachable from, so
-    /// a renamed or removed surface cannot leave a reason pointing at nothing.
+    /// An annotation of either kind names the surface it claims the command is
+    /// reachable from, so a renamed or removed surface cannot leave one
+    /// pointing at nothing.
     #[test]
     fn a_one_way_annotation_names_a_real_surface() {
         for (spec, one_way) in annotated() {
             assert!(
-                SURFACES.iter().any(|s| s.name == one_way.surface),
+                SURFACES.iter().any(|s| s.name == one_way.surface()),
                 "`{}` is annotated for surface `{}`, which does not exist",
                 spec.cmd,
-                one_way.surface,
+                one_way.surface(),
             );
         }
     }
 
-    /// An annotation asserts an asymmetry, so the asymmetry has to still be
-    /// there. Give an annotated command a second caller and this fails, rather
-    /// than leaving a reason behind that explains something no longer true.
+    /// An annotation of either kind asserts an asymmetry, so the asymmetry has
+    /// to still be there. Give an annotated command a second caller and this
+    /// fails, rather than leaving behind a reason that explains something no
+    /// longer true, or a gap the report advertises as open after it closed.
     #[test]
     fn an_annotated_command_is_still_one_way() {
         let usage = command_usage(repo());
         for (spec, one_way) in annotated() {
             let callers = &usage[spec.variant];
             assert!(
-                callers.len() == 1 && callers.contains(one_way.surface),
+                callers.len() == 1 && callers.contains(one_way.surface()),
                 "`{}` says it is reachable only from `{}`, but is called by {:?}",
                 spec.cmd,
-                one_way.surface,
+                one_way.surface(),
                 callers,
             );
         }
+    }
+
+    /// The ratchet. A command reachable from exactly one surface says which
+    /// kind of one-way it is, so adding a command with a single caller is a
+    /// decision made at declaration time rather than a fact a later audit
+    /// discovers. That audit has run three times (#8, #24, #33); this is what
+    /// stops a fourth.
+    ///
+    /// `#24` in the message is the issue that classified this list. A new gap
+    /// names whichever issue tracks it — #37, #38 and #39 are what #24 split
+    /// into.
+    #[test]
+    fn every_one_way_command_records_why() {
+        let usage = command_usage(repo());
+        let bare: Vec<&str> = LabRequest::COMMANDS
+            .iter()
+            .chain(SupRequest::COMMANDS)
+            .filter(|spec| spec.one_way.is_none() && usage[spec.variant].len() == 1)
+            .map(|spec| spec.cmd)
+            .collect();
+        assert!(
+            bare.is_empty(),
+            "reachable from one surface and saying nothing about why: {bare:?}\n\
+             Annotate each in `src/proto/vocab.rs`, beside its doc comment, with either\n\
+             `#[one_way(\"surface\", \"why it belongs there and nowhere else\")]` if that is a\n\
+             decision, or `#[one_way_gap(\"surface\", N)]`, naming the issue tracking it, if\n\
+             nobody wrote the other half yet.",
+        );
     }
 
     /// The report is only worth reading if it reflects real callers, so check

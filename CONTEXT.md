@@ -251,10 +251,12 @@ _Avoid_: frontend, client (a client is the protocol's connection object)
 
 **One-way command**:
 A command the coverage report finds reachable from exactly one surface. Not
-automatically a gap — several only mean anything from one place — so one that
-is deliberate carries `#[one_way("surface", "why")]` beside its declaration in
-the request vocabulary, and the report renders the reason next to it. No
-annotation means nobody has decided yet. See ADR-0007.
+automatically a gap — several only mean anything from one place — so every one
+declares which it is beside its declaration in the request vocabulary: a
+deliberate one carries `#[one_way("surface", "why")]` and an open gap carries
+`#[one_way_gap("surface", N)]`, naming the issue tracking whether it should
+close. The report renders the two as separate lists, and the build fails while
+a one-way command carries neither. See ADR-0007.
 _Avoid_: dead command (that is one with no caller at all), CLI-only /
 console-only (name the surface the report names)
 

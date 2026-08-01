@@ -106,9 +106,26 @@ report could say a command was reachable from one surface but not whether that
 was a decision, so each pass over the list re-derived the same classification.
 A variant may now carry `#[one_way("surface", "why")]` beside its doc comment,
 which reaches its `CommandSpec` and is rendered next to the command in the
-report. Annotation is optional — an unannotated command means nobody has
-decided — but an annotation is checked: it must name a real surface, and the
-command must still be reachable from that surface alone.
+report. An annotation is checked: it must name a real surface, and the command
+must still be reachable from that surface alone.
+
+Optional annotation left the same hole one step smaller — an unannotated
+command still read as "nobody has decided", so the list could drift back to
+undifferentiated. Annotation is now mandatory, which required a second kind: a
+genuine gap has no reason to give, so it carries
+`#[one_way_gap("surface", N)]` instead, naming the issue tracking whether it
+should close. The two are one enumeration rather than two fields because a
+command is one or the other; carrying both is a compile error, carrying neither
+fails a test that names the command and both options, and the report renders
+them as separate lists so the gaps read as a worklist. Of the seventeen
+commands #33 left bare, `machine.osinfo` turned out to be deliberate — a live
+guest probe with a timeout does not belong on a refreshing panel — and the
+other sixteen point at #37, #38 and #39, which is what #24 split into.
+
+What that check cannot see is an issue closed while its gap stays open — no
+test reaches GitHub. Closing the *gap* is caught, because the command stops
+being one-way and its annotation fails; the other direction goes stale
+silently, and issue-state checking is not worth building for it.
 
 Its counts are larger than the "eleven CLI-only and six console-only" above,
 which came from a hand count of the lab socket. The report covers both sockets
