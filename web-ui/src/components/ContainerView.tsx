@@ -20,6 +20,7 @@ import {
 import { containers } from "../status";
 import { canEditPlaybook, editPlaybook } from "./FilesView";
 import { openWebPage } from "./WebView";
+import FileTransfer from "./FileTransfer";
 import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
 import MachinePullStatus from "./MachinePullStatus";
@@ -212,6 +213,14 @@ export default function ContainerView() {
             </Card>
           </Show>
           <GuestStats lab={state.currentLab!} kind="container" name={ctr()!.name} running={on()} />
+          {/* A container's agent is started by cinit inside the micro-VM, so
+              a running container always has one. */}
+          <FileTransfer
+            lab={state.currentLab!}
+            machine={ctr()!.name}
+            running={on()}
+            hasAgent
+          />
         </div>
       </div>
     </Show>

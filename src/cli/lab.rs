@@ -1168,7 +1168,7 @@ fn cp_pull(vm_part: &str, guest_src: &str, dest: &str) -> Result<()> {
             .send(LabRequest::MachinePullFile {
                 machine: vm,
                 from: guest_src.to_string(),
-                to: dest_abs.to_string_lossy().into_owned(),
+                to: Some(dest_abs.to_string_lossy().into_owned()),
             })
             .await
             .map_err(remote)?;

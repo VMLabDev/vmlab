@@ -11,7 +11,7 @@ paths; `{action}` routes accept the verb in the path (e.g. `up`, `down`,
 VMs and containers share one `…/machines/{name}/…` path family — they are the
 same thing to the API even though the console presents them separately. Where
 a machine cannot serve a request it says why: a container has no framebuffer,
-so `screenshot.png` fails with "this machine has no display", and a VM keeps
+so `screenshot.png` fails with "machine `web` has no display", and a VM keeps
 no console log, so `logs` fails in kind. Ask `…/machines/{name}/capabilities`
 first — it reports `display`, `console_log`, `reboot` and the guest agent's
 negotiated features, which is what the console drives its affordances from.
@@ -20,7 +20,7 @@ negotiated features, which is what the console drives its affordances from.
 | Area | Endpoints |
 | --- | --- |
 | Labs | `GET/POST /api/labs` (list, create — the create body takes `preset`: `"empty"` (default) or `"starter"`; anything else is a 400), `GET /api/labs/{lab}` (status), `POST /api/labs/{lab}/{action}` (up/down/destroy/…), `POST …/reload`, `GET …/dns`, `GET …/logs`, `POST …/pulls/{machine}/cancel` (abort an in-flight registry pull) |
-| Machines (VMs + containers) | `POST …/machines/{name}/{action}` (start/stop/restart/destroy), `GET …/capabilities`, `POST …/sendkeys`, `GET …/screenshot.png`, `GET …/stats`, `GET …/logs`, `GET/POST …/clipboard`, `GET …/snapshots`, `DELETE …/snapshots/{name}` |
+| Machines (VMs + containers) | `POST …/machines/{name}/{action}` (start/stop/restart/destroy), `GET …/capabilities`, `POST …/sendkeys`, `GET …/screenshot.png`, `GET …/stats`, `GET …/logs`, `GET/POST …/clipboard`, `GET/POST …/files?path=` (one file out of / into the guest over the agent — the POST body is the file's bytes, the GET answers with them; 8 MiB each way), `GET …/snapshots`, `DELETE …/snapshots/{name}` |
 | Snapshots (lab-wide) | `POST …/snapshots` (take), `POST …/snapshots/{name}/restore` |
 | Templates | `GET …/templates`, `GET …/templates/ops`, `GET …/templates/{tpl}/remote`, `POST …/templates/{tpl}/build\|stop\|publish` |
 | Playbooks | `GET …/playbooks`, `GET …/playbooks/ops`, `GET …/playbooks/plays` (every play the lab's folders declare), `POST …/playbooks/scaffold` (takes the play name; the folder need not be declared yet, and names that would break the skeleton's WCL literals are rejected), `POST …/machines/{name}/playbook/{action}` (check/apply); config-weave packages: `POST …/playbooks/pkg`, `POST …/playbooks/pkg/search`, `GET/POST …/playbooks/repos` |

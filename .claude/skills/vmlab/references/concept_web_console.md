@@ -15,8 +15,8 @@ toggle and sign-out.
 | Lab editor — Overview | The visual designer: an SVG topology canvas (VMs, containers, segments, routers, playbook nodes) with a full-schema inspector; edits are span-addressed surgical rewrites of `vmlab.wcl`, autosaved as you go |
 | Lab editor — Files | Whole-lab-directory tree editor (create/edit/rename/delete any lab file), including playbook folders with config-weave package buttons and a repos modal; `playbook.wcl` opens in a visual designer with a **Designer \| Code** toggle |
 | Lab editor — Logs | The lab's JSON-line event stream, live |
-| Machine page | Tabs: **Console** (live VNC desktop), **Terminal** (vmlab-agent shell), **Log**, and **Playbook** when one targets the machine; plus screenshot, key/clipboard and metrics widgets |
-| Container page | Same shape: **Console**, **Recovery terminal**, **Log**, **Playbook** |
+| Machine page | Tabs: **Console** (live VNC desktop), **Terminal** (vmlab-agent shell), **Log**, and **Playbook** when one targets the machine; plus screenshot, key/clipboard and metrics widgets, and a **File transfer** card that sends one file into the guest or fetches one out of it over the agent |
+| Container page | Same shape: **Console**, **Recovery terminal**, **Log**, **Playbook**, and the same **File transfer** card |
 | Templates | Build templates with live progress consoles (VNC into the build VM), stop builds, **Check** a stored template's integrity, cancel a running pull, and publish/pull against OCI registries |
 | Web | Aggregate tab of all open [guest web pages](../references/entity_web_block.md), proxied into sandboxed iframes |
 | Segment inspector — DNS | Live DNS registrations while the lab runs; expected registrations when it is powered off |

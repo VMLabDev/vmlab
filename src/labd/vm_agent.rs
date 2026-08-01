@@ -32,6 +32,7 @@ use vmlab_agent_proto::{
 };
 pub use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
 
+use crate::proto::CommandError;
 use crate::sync::LockRecover;
 
 /// What the agent said about itself in the handshake.
@@ -163,6 +164,42 @@ struct Inner {
     /// Whether `subscribe_metrics` has been sent on this connection.
     metrics_subscribed: AtomicBool,
     token: String,
+}
+
+/// Where a pull puts the guest's bytes as they arrive.
+///
+/// A pull to a host path streams and is bounded by the disk; a pull a caller
+/// wants the bytes of is bounded by a ceiling, checked chunk by chunk so an
+/// oversized file is refused mid-flight rather than buffered whole and then
+/// rejected.
+enum PullTarget {
+    File(tokio::fs::File),
+    Memory { buf: Vec<u8>, limit: u64 },
+}
+
+impl PullTarget {
+    async fn write(&mut self, remote: &str, chunk: &[u8]) -> Result<()> {
+        match self {
+            PullTarget::File(file) => file.write_all(chunk).await?,
+            PullTarget::Memory { buf, limit } => {
+                if buf.len() as u64 + chunk.len() as u64 > *limit {
+                    return Err(anyhow::Error::new(CommandError::invalid(format!(
+                        "pull {remote}: the file is larger than the {limit}-byte inline limit; \
+                         pull it to a host path instead"
+                    ))));
+                }
+                buf.extend_from_slice(chunk);
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        if let PullTarget::File(file) = self {
+            file.flush().await?;
+        }
+        Ok(())
+    }
 }
 
 /// Handle to one guest's agent channel. Cheap to clone (`Arc` inner).
@@ -483,15 +520,40 @@ impl AgentHandle {
 
     /// Pull a guest file to the host, returning the verified digest+size.
     pub async fn pull_file(&self, remote: &str, local: &Path) -> Result<(String, u64)> {
-        use sha2::{Digest, Sha256};
         if let Some(parent) = local.parent()
             && !parent.as_os_str().is_empty()
         {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        let mut file = tokio::fs::File::create(local)
+        let file = tokio::fs::File::create(local)
             .await
             .with_context(|| format!("creating {}", local.display()))?;
+        let mut into = PullTarget::File(file);
+        self.pull_into(remote, &mut into).await
+    }
+
+    /// Pull a guest file into memory, for a caller that wants the bytes rather
+    /// than a file on this host — the inline form on the wire.
+    ///
+    /// `limit` is enforced as the bytes arrive, so an oversized file costs one
+    /// chunk of memory rather than all of it, and the caller gets the limit by
+    /// code instead of a file cut short.
+    pub async fn pull_bytes(&self, remote: &str, limit: u64) -> Result<(String, Vec<u8>)> {
+        let mut into = PullTarget::Memory {
+            buf: Vec::new(),
+            limit,
+        };
+        let (sha256, _len) = self.pull_into(remote, &mut into).await?;
+        let PullTarget::Memory { buf, .. } = into else {
+            unreachable!("the target this call built");
+        };
+        Ok((sha256, buf))
+    }
+
+    /// The pull itself: stream the guest's bytes into `into`, verifying the
+    /// digest the agent reports against the one we computed on the way.
+    async fn pull_into(&self, remote: &str, into: &mut PullTarget) -> Result<(String, u64)> {
+        use sha2::{Digest, Sha256};
         let mut session = self
             .open(|id| HostMsg::OpenFilePull {
                 id,
@@ -503,10 +565,10 @@ impl AgentHandle {
             match session.recv().await {
                 Some(SessionEvent::Data(b)) => {
                     hasher.update(&b);
-                    file.write_all(&b).await?;
+                    into.write(remote, &b).await?;
                 }
                 Some(SessionEvent::FileDone { sha256, len }) => {
-                    file.flush().await?;
+                    into.finish().await?;
                     if hex::encode(hasher.finalize()) != sha256 {
                         bail!("pull {remote}: digest mismatch after transfer");
                     }
@@ -1373,6 +1435,34 @@ mod tests {
         let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
         assert_eq!(len, 10_000);
         assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+    }
+
+    /// The inline form of a pull: the same transfer, verified the same way,
+    /// handed back as bytes instead of written to a host path.
+    #[tokio::test]
+    async fn pull_bytes_returns_the_verified_file() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let (sha, bytes) = agent.pull_bytes("/guest/some-file", 1 << 20).await.unwrap();
+        assert_eq!(bytes.len(), 10_000);
+        use sha2::{Digest, Sha256};
+        assert_eq!(sha, hex::encode(Sha256::digest(&bytes)));
+    }
+
+    /// A file too big to come back inline is refused while it streams, so
+    /// nothing buffers past the ceiling and the caller is told the limit
+    /// rather than handed a truncated file.
+    #[tokio::test]
+    async fn pull_bytes_refuses_a_file_over_the_ceiling() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let err = agent
+            .pull_bytes("/guest/some-file", 4_096)
+            .await
+            .unwrap_err();
+        let coded = crate::proto::CommandError::from(err);
+        assert_eq!(coded.code, crate::proto::ErrorCode::InvalidArgument);
+        assert!(coded.message.contains("4096"), "{}", coded.message);
     }
 
     #[tokio::test]

@@ -12,10 +12,14 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::{CommandError, Event, Message, WireRequest};
 
-/// Longest request line the server will buffer. Requests are small JSON
-/// objects; anything approaching this is a broken or hostile client, and an
+/// Longest request line the server will buffer. Most requests are small JSON
+/// objects; the exception is a file pushed inline, so the cap is
+/// [`super::INLINE_FILE_LIMIT`] base64-expanded plus room for the envelope
+/// around it — a push that respects the ceiling always fits, and a push that
+/// does not is refused by the handler with a code rather than by dropping the
+/// connection here. Beyond that the client is broken or hostile, and an
 /// unbounded `read_line` would let it grow the daemon's memory at will.
-const MAX_REQ_LINE: usize = 1 << 20;
+const MAX_REQ_LINE: usize = (super::INLINE_FILE_LIMIT as usize).div_ceil(3) * 4 + (1 << 16);
 
 /// Sink for incremental output of a long-running command. Dropping it is
 /// fine — chunks are best-effort.

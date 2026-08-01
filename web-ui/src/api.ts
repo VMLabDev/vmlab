@@ -185,6 +185,42 @@ export const vmClipboardSet = (lab: string, vm: string, text: string) =>
   post(`/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(vm)}/clipboard`, {
     text,
   });
+// --- guest file transfer ----------------------------------------------------
+//
+// Bytes in and out of a *guest*, over the agent channel — not the lab
+// directory on the host, which is the Files tab. Both directions carry the
+// file inline, so `INLINE_FILE_LIMIT` (generated from the vocabulary) is the
+// ceiling; over it the daemon answers `invalid_argument` naming the limit.
+
+const guestFileUrl = (lab: string, machine: string, path: string) =>
+  `/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(machine)}` +
+  `/files?path=${encodeURIComponent(path)}`;
+
+/** Copy one file into the guest at `path`. `mode` is a Unix mode (`0o644`),
+ *  ignored by Windows guests. */
+export const pushGuestFile = (
+  lab: string,
+  machine: string,
+  path: string,
+  file: Blob,
+  mode?: number,
+): Promise<{ sha256: string; len: number }> =>
+  req(guestFileUrl(lab, machine, path) + (mode === undefined ? "" : `&mode=${mode}`), {
+    method: "POST",
+    body: file,
+    headers: { "Content-Type": "application/octet-stream" },
+  });
+
+/** Copy one file out of the guest, as bytes the browser can save. */
+export async function pullGuestFile(
+  lab: string,
+  machine: string,
+  path: string,
+): Promise<Blob> {
+  const res: Response = await req(guestFileUrl(lab, machine, path));
+  return res.blob();
+}
+
 export const restoreSnapshot = (lab: string, name: string, vm?: string) =>
   post(
     `/api/labs/${encodeURIComponent(lab)}/snapshots/${encodeURIComponent(name)}/restore`,

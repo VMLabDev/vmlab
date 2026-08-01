@@ -20,6 +20,10 @@ export interface ApiError {
   code?: ErrorCode;
 }
 
+/** The most one guest file transfer may carry inline, in bytes. The console shows
+ *  this before a transfer is attempted; the daemon refuses anything over it. */
+export const INLINE_FILE_LIMIT = 8388608;
+
 /** Lab-wide actions: `POST /api/labs/{lab}/{action}`. */
 export type LabAction =
   /** `up` */

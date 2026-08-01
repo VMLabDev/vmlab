@@ -12,6 +12,20 @@ pub mod vocab;
 pub use error::{CommandError, ErrorCode};
 pub use vocab::{ArgSpec, CommandSpec, LabRequest, OneWay, Region, SupRequest, WireRequest};
 
+/// The most one file transfer may carry inline, base64, in a single wire
+/// message — `machine.push_file`'s `data` and `machine.pull_file`'s reply.
+///
+/// Inline bytes are how a caller that holds a file rather than a path — a
+/// browser, above all — moves one through the daemon, and they are the one
+/// thing on this transport that is not a small JSON object. The ceiling is
+/// what keeps "not small" from meaning "unbounded": [`server::MAX_REQ_LINE`]
+/// is derived from it, so a request that respects it always fits, and a
+/// transfer that exceeds it is refused by code
+/// ([`ErrorCode::InvalidArgument`], naming the limit) rather than discovered
+/// as a truncated file or a dropped connection. Larger transfers use the
+/// host-path forms, which stream and never touch the wire.
+pub const INLINE_FILE_LIMIT: u64 = 8 * 1024 * 1024;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

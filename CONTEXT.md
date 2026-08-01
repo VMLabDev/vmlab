@@ -236,6 +236,16 @@ the wire; nothing above the protocol spells it. See ADR-0007 and the generated
 _Avoid_: RPC, command table, API (an API is a surface, not the vocabulary
 under it)
 
+**Inline transfer**:
+Carrying a file's bytes *in* a wire message rather than beside it:
+`machine.push_file` with `data`, and `machine.pull_file` with no host path.
+It is the only form available to a caller that holds bytes and no path the
+daemon can see — a browser, above all. Bounded by `proto::INLINE_FILE_LIMIT`,
+which the transport's request cap is derived from, so exceeding it is refused
+by code rather than truncated; the host-path forms stream and have no ceiling.
+_Avoid_: upload/download (neither says which side holds the file), base64
+transfer (the encoding is incidental)
+
 **Error code**:
 The machine-readable half of a failed reply, beside the human-readable message.
 The code is the contract — it decides the REST surface's HTTP status and the
@@ -262,8 +272,8 @@ console-only (name the surface the report names)
 
 **Web console**:
 The browser UI served by `vmlab-web`: lab overview, visual designer, file and
-log editors, per-machine consoles and terminals, template builds, playbooks,
-and proxied guest web pages.
+log editors, per-machine consoles, terminals and guest file transfer, template
+builds, playbooks, and proxied guest web pages.
 _Avoid_: dashboard, portal, frontend
 
 **Guest web page**:

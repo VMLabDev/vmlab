@@ -608,7 +608,6 @@ vocabulary! {
         },
         /// Copy a file into the guest: either `from`, a host path the daemon
         /// can see, or `data`, base64 for a caller that holds bytes.
-        #[one_way_gap("cli", 37)]
         MachinePushFile = "machine.push_file" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             to: String,
@@ -616,12 +615,13 @@ vocabulary! {
             #[serde(default)] data: Option<String>,
             #[serde(default)] mode: Option<u32>,
         },
-        /// Copy a file out of the guest to a host path.
-        #[one_way_gap("cli", 37)]
+        /// Copy a file out of the guest: to `to`, a host path the daemon can
+        /// write, or — with `to` omitted — back inline as base64, for a caller
+        /// that wants the bytes rather than a file on the daemon's host.
         MachinePullFile = "machine.pull_file" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             from: String,
-            to: String,
+            #[serde(default)] to: Option<String>,
         },
         /// Follow a guest file (`tail -F` semantics), streamed as chunks
         /// until the caller hangs up or the machine stops.
@@ -1035,15 +1035,15 @@ mod tests {
     /// to carry: nobody has decided whether the asymmetry should close.
     #[test]
     fn a_gap_carries_the_issue_tracking_it_rather_than_a_reason() {
-        let one_way = LabRequest::spec("machine.push_file")
+        let one_way = LabRequest::spec("dns.table")
             .unwrap()
             .one_way
-            .expect("`machine.push_file` is a tracked gap");
+            .expect("`dns.table` is a tracked gap");
         assert_eq!(
             one_way,
             OneWay::Gap {
-                surface: "cli",
-                issue: 37
+                surface: "web",
+                issue: 38
             },
         );
     }
