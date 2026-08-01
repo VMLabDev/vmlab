@@ -236,6 +236,17 @@ pub enum Firmware {
     Seabios,
 }
 
+impl Firmware {
+    /// The schema spelling — the one string every surface that writes a
+    /// firmware back out (rendered lab files, template metadata) names it by.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Firmware::Ovmf => "ovmf",
+            Firmware::Seabios => "seabios",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Nic {
     pub span: Span,
