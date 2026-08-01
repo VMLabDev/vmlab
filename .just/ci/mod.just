@@ -5,11 +5,11 @@
 # one definition of what each part does. The exit code is the only signal a
 # caller needs.
 #
-# The gate is self-sufficient from a clean checkout: `lint` compiles vmlab-web,
-# whose rust-embed folder is web-ui/dist, so it builds the frontend first, and
-# `web-ui-check` installs the frontend's dependencies. External tooling is
-# guarded by the require-* helpers in ../shared.just, so a missing tool reports
-# as a missing tool rather than as a confusing build failure.
+# The gate is self-sufficient from a clean checkout: `lint` and `test` compile
+# vmlab-web, whose rust-embed folder is web-ui/dist, so they build the frontend
+# first, and `web-ui-check` installs the frontend's dependencies. External
+# tooling is guarded by the require-* helpers in ../shared.just, so a missing
+# tool reports as a missing tool rather than as a confusing build failure.
 #
 # Deliberately outside the bar: the privileged fast-path tests
 # (`just fastpath-test` — sudo, CAP_BPF, an XDP-capable kernel), the guest asset
@@ -40,10 +40,10 @@ lint: require-cargo web-ui-build
 fmt-check: require-cargo
 	cargo fmt --check
 
-# Run the test suite
+# Run the test suite (--all-features covers the web binary's tests)
 [group('ci')]
-test: require-cargo
-	cargo test
+test: require-cargo web-ui-build
+	cargo test --all-features
 
 # Typecheck the web UI (`vite build` strips types without checking them)
 [group('ci')]
