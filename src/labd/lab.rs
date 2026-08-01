@@ -22,7 +22,7 @@ use super::pull_ledger::{
 };
 use super::share_plan;
 use super::state::{LabState, SnapshotRecord, generate_mac};
-use super::vm::{PowerState, StopReason, VmDirs, VmInstance};
+use super::vm::{PowerState, VmDirs, VmInstance};
 use crate::config::LabFile;
 use crate::config::model::TemplateRef;
 use crate::profiles::ProfileSet;
@@ -37,6 +37,11 @@ pub struct LabRuntime {
     pub config: LabFile,
     pub vms: BTreeMap<String, Arc<VmInstance>>,
     pub containers: BTreeMap<String, Arc<ContainerInstance>>,
+    /// Every machine in the lab under one name namespace, in the order
+    /// `machines()` reports them. The same `Arc`s as `vms`/`containers`; those
+    /// two stay for the handful of places that legitimately want a concrete
+    /// type (binding a deferred pull's template or image).
+    machines: BTreeMap<String, Arc<dyn Machine>>,
     pub network: Mutex<LabNetwork>,
     pub state: Mutex<LabState>,
     pub events: Arc<EventLog>,
@@ -71,6 +76,10 @@ pub struct LabRuntime {
     /// In-flight config-weave runs, one per machine (`up` and on-demand
     /// check/apply claim through the same registry).
     pub playbook_ops: crate::labd::playbook::PlaybookOps,
+    /// This runtime as its own `Arc`. [`crate::labd::machine::LabServices`] is
+    /// a `&self` interface (it has to be, to be object-safe), and the work
+    /// behind two of its methods spawns tasks that outlive the call.
+    me: std::sync::Weak<LabRuntime>,
 }
 
 /// A live loopback forward backing a proxied web page.
@@ -369,13 +378,25 @@ impl LabRuntime {
                 .collect();
         network.wire_gateways(&config.lab, &macs_by_vm, &host_cfg);
 
-        Ok(Arc::new(LabRuntime {
+        let machines: BTreeMap<String, Arc<dyn Machine>> = vms
+            .iter()
+            .map(|(n, v)| (n.clone(), v.clone() as Arc<dyn Machine>))
+            .chain(
+                containers
+                    .iter()
+                    .map(|(n, c)| (n.clone(), c.clone() as Arc<dyn Machine>)),
+            )
+            .collect();
+
+        Ok(Arc::new_cyclic(|me| LabRuntime {
+            me: me.clone(),
             name,
             root,
             lab_local,
             config,
             vms,
             containers,
+            machines,
             network: Mutex::new(network),
             state: Mutex::new(state),
             events,
@@ -387,6 +408,51 @@ impl LabRuntime {
             pull_lock: Mutex::new(()),
             pre_provision: std::sync::RwLock::new(None),
             host_cfg,
+            playbook_ops: crate::labd::playbook::PlaybookOps::default(),
+        }))
+    }
+
+    /// A runtime whose machines are supplied rather than built from the lab
+    /// config — the seam that lets orchestration (waves, readiness gating,
+    /// teardown) be driven against doubles, with no hypervisor, template or
+    /// network in sight (ADR-0002).
+    #[cfg(test)]
+    pub(super) fn with_machines(
+        config: LabFile,
+        machines: Vec<Arc<dyn Machine>>,
+    ) -> Result<Arc<LabRuntime>> {
+        let name = config.lab.name.clone();
+        let root = config.root.clone();
+        let lab_local = crate::paths::lab_local_dir(&root);
+        std::fs::create_dir_all(&lab_local)?;
+        let network = LabNetwork::build(&config.lab)?;
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let events = Arc::new(super::events::EventLog::new(&name, tx)?);
+        let machines: BTreeMap<String, Arc<dyn Machine>> = machines
+            .into_iter()
+            .map(|m| (m.name().to_string(), m))
+            .collect();
+        let profiles = ProfileSet::shipped()?;
+        Ok(Arc::new_cyclic(|me| LabRuntime {
+            me: me.clone(),
+            name,
+            root,
+            lab_local: lab_local.clone(),
+            config,
+            vms: BTreeMap::new(),
+            containers: BTreeMap::new(),
+            machines,
+            network: Mutex::new(network),
+            state: Mutex::new(LabState::load(&lab_local).unwrap_or_default()),
+            events,
+            smb: Mutex::new(None),
+            machine_forwards: Mutex::new(std::collections::HashMap::new()),
+            web_forwards: Mutex::new(std::collections::HashMap::new()),
+            profiles,
+            pulls: std::sync::Mutex::new(PullLedger::new(BTreeMap::new())),
+            pull_lock: Mutex::new(()),
+            pre_provision: std::sync::RwLock::new(None),
+            host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
         }))
     }
@@ -760,20 +826,14 @@ impl LabRuntime {
             }
         }
 
-        // Hand each volume-declaring container its mount coordinates; the
-        // spec sent over ctl carries them (cinit mounts CIFS after net-up).
+        // Hand each machine whose guest mounts for itself its coordinates.
+        // A machine driven from the host instead ignores this.
         for (name, gateway) in smb.volume_gateways {
             let Some(creds) = labsmb.credentials(&name) else {
                 continue;
             };
-            if let Ok(container) = self.container(&name) {
-                container
-                    .set_smb(vmlab_cinit_proto::SmbInfo {
-                        gateway: gateway.to_string(),
-                        username: creds.username.clone(),
-                        password: creds.password.clone(),
-                    })
-                    .await;
+            if let Ok(m) = self.machine(&name) {
+                m.smb_ready(gateway, &creds.username, &creds.password).await;
             }
         }
 
@@ -825,90 +885,19 @@ impl LabRuntime {
         )
     }
 
-    /// Mount a VM's shares through the guest agent (PRD §7.5).
-    ///
-    /// What to run is a [`crate::smb::mount_plan`] — this only drives it, and
-    /// only knows how to retry. The commands themselves, and every piece of
-    /// guest-OS knowledge behind them, live next to the mount-step type.
-    /// XP-era guests without an agent are mounted by provision scripts via
-    /// screen automation instead (documented; not attempted here).
-    async fn mount_shares(self: &Arc<Self>, vm_name: &str) {
-        let cfg = self.config.lab.vms.iter().find(|v| v.name == vm_name);
-        let Some(cfg) = cfg else { return };
-        if cfg.shares.is_empty() {
-            return;
-        }
-        let Ok(vm) = self.vm(vm_name) else { return };
-        let os_hint = crate::smb::guest_os_hint(vm.template().resolved.profile.as_deref());
-        let smb_steps = {
-            let smb = self.smb.lock().await;
-            smb.as_ref()
-                .map(|labsmb| labsmb.mount_plan(vm_name, os_hint))
-                .unwrap_or_default()
-        };
-        let plan = crate::smb::mount_plan(os_hint, &vm.virtiofs_mounts().await, smb_steps);
-        // A share the guest cannot mount is the author's to fix, so it goes
-        // on the event feed the console watches, not only into the log.
-        for note in &plan.unsupported {
-            tracing::warn!("{vm_name}: {note}");
-            self.events
-                .emit("share.unmountable", json!({"vm": vm_name, "reason": note}));
-        }
-        if plan.is_empty() {
-            return;
-        }
-        let Ok(agent) = vm.agent().await else {
-            tracing::warn!("{vm_name}: no agent, cannot auto-mount shares");
-            return;
-        };
-        for step in &plan.steps {
-            let mut argv = vec![step.command.clone()];
-            argv.extend(step.args.iter().cloned());
-            let mut last: Option<String> = None;
-            for attempt in 0..plan.retry.attempts {
-                if attempt > 0 {
-                    tokio::time::sleep(plan.retry.delay).await;
-                }
-                let started = std::time::Instant::now();
-                match agent
-                    .exec(argv.clone(), vec![], None, None, Duration::from_secs(30))
-                    .await
-                {
-                    Ok(r) if r.exit_code == 0 => {
-                        tracing::info!(
-                            "{vm_name}: mount step `{}` ok (attempt {attempt}, {:?})",
-                            step.command,
-                            started.elapsed()
-                        );
-                        last = None;
-                        break;
-                    }
-                    Ok(r) => {
-                        let err = format!(
-                            "exited {}: {}",
-                            r.exit_code,
-                            String::from_utf8_lossy(&r.stderr)
-                        );
-                        tracing::debug!(
-                            "{vm_name}: mount attempt {attempt} ({:?}): {err}",
-                            started.elapsed()
-                        );
-                        last = Some(err);
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "{vm_name}: mount attempt {attempt} ({:?}): {e}",
-                            started.elapsed()
-                        );
-                        last = Some(e.to_string());
-                    }
-                }
-            }
-            if let Some(err) = last {
-                tracing::warn!("{vm_name}: mount step `{}` failed: {err}", step.command);
-            }
-        }
-    }
+    // ---- BEGIN kind-aware accessors (ADR-0002 exemption) --------------------
+    //
+    // The two places the lab runtime is allowed to name a kind, and the reason
+    // `orchestration_never_branches_on_machine_kind` skips this block:
+    //
+    //   * they exist *to* reject the other kind's name, so the error a user
+    //     reads says "that's a container" rather than "no such machine";
+    //   * a deferred pull has to reach a concrete type to bind the template or
+    //     image it just downloaded, and the wscript `poweroff` rung needs a
+    //     VM's QMP channel.
+    //
+    // Nothing here decides *behaviour* by kind. If a caller wants one of these
+    // to pick a code path, the difference belongs on `Machine` instead.
 
     pub fn vm(&self, name: &str) -> Result<&Arc<VmInstance>> {
         self.vms.get(name).ok_or_else(|| {
@@ -930,31 +919,32 @@ impl LabRuntime {
         })
     }
 
-    /// One machine by name, whichever kind it is — the accessor everything
-    /// that isn't `start` or `restore` should reach for. Machine names are
-    /// unique across both kinds ([`Self::vm`] and [`Self::container`] each
-    /// reject the other's names), so there is one namespace to look in.
+    // ---- END kind-aware accessors -------------------------------------------
+
+    /// One machine by name — the only accessor orchestration needs. Machine
+    /// names are unique across both kinds, so there is one namespace to look
+    /// in.
     pub fn machine(&self, name: &str) -> Result<Arc<dyn Machine>> {
-        if let Some(vm) = self.vms.get(name) {
-            return Ok(vm.clone() as Arc<dyn Machine>);
-        }
-        if let Some(c) = self.containers.get(name) {
-            return Ok(c.clone() as Arc<dyn Machine>);
-        }
-        bail!("no vm or container \"{name}\" in lab \"{}\"", self.name)
+        self.machines
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("no vm or container \"{name}\" in lab \"{}\"", self.name))
     }
 
-    /// Every machine in the lab, VMs before containers, each kind in name
-    /// order.
+    /// Every machine in the lab, in name order.
     pub fn machines(&self) -> impl Iterator<Item = Arc<dyn Machine>> + '_ {
-        self.vms
-            .values()
-            .map(|v| v.clone() as Arc<dyn Machine>)
-            .chain(
-                self.containers
-                    .values()
-                    .map(|c| c.clone() as Arc<dyn Machine>),
-            )
+        self.machines.values().cloned()
+    }
+
+    /// This runtime as the narrow interface a machine boots against.
+    fn services(&self) -> Arc<dyn crate::labd::machine::LabServices> {
+        self.arc() as Arc<dyn crate::labd::machine::LabServices>
+    }
+
+    /// This runtime's own `Arc`. Infallible in practice: every path that can
+    /// reach a `LabRuntime` reached it through one.
+    fn arc(&self) -> Arc<Self> {
+        self.me.upgrade().expect("lab runtime outlived its Arc")
     }
 
     /// Something in the lab waits on this machine's readiness.
@@ -970,23 +960,12 @@ impl LabRuntime {
     /// wants a TPM), so a missing package surfaces as one clear error before
     /// any clone or boot work begins instead of a spawn failure mid-`up`.
     pub fn preflight_binaries(&self, targets: &[String]) -> Result<()> {
-        let mut needed: Vec<String> = vec!["qemu-img".to_string()];
+        let mut needed: Vec<String> = Vec::new();
         for name in targets {
-            if let Some(c) = self.containers.get(name) {
-                let emu = crate::qemu::emulator_binary(&c.resolved.arch);
-                if !needed.contains(&emu) {
-                    needed.push(emu);
+            for binary in self.machine(name)?.required_binaries() {
+                if !needed.contains(&binary) {
+                    needed.push(binary);
                 }
-                continue;
-            }
-            let vm = self.vm(name)?;
-            let t = vm.template();
-            let emu = crate::qemu::emulator_binary(&t.resolved.arch);
-            if !needed.contains(&emu) {
-                needed.push(emu);
-            }
-            if t.resolved.tpm && !needed.iter().any(|b| b == "swtpm") {
-                needed.push("swtpm".to_string());
             }
         }
         let missing: Vec<String> = needed
@@ -1017,17 +996,8 @@ impl LabRuntime {
             if !targeted {
                 continue;
             }
-            let (os, arch) = if let Some(c) = self.containers.get(name) {
-                (playbook::GuestOs::Linux, c.resolved.arch.clone())
-            } else {
-                let vm = self.vm(name)?;
-                let t = vm.template();
-                (
-                    playbook::guest_os_of(t.resolved.profile.as_deref()),
-                    t.resolved.arch.clone(),
-                )
-            };
-            if let Err(e) = playbook::weave_binary(&dir, os, &arch) {
+            let m = self.machine(name)?;
+            if let Err(e) = playbook::weave_binary(&dir, m.guest_os(), &m.arch()) {
                 let msg = format!("\"{name}\": {e}");
                 if !errs.contains(&msg) {
                     errs.push(msg);
@@ -1040,29 +1010,31 @@ impl LabRuntime {
         Ok(())
     }
 
-    /// Start one VM: wire its NIC sockets into the segment switches, then
-    /// boot it with event-emitting callbacks.
     /// Boot one machine, whichever kind it is.
-    ///
-    /// The last kind-branch in the lab runtime, and deliberately so: a VM
-    /// needs its template clone and segment attachments, a container needs its
-    /// image spec and restart policy. That difference belongs below a
-    /// Hypervisor seam, not in [`Machine`].
     pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
-        if self.containers.contains_key(name) {
-            self.start_container(name).await
-        } else {
-            self.start_vm(name).await
-        }
+        self.machine(name)?.start(self.services()).await
     }
 
-    /// Stop one machine and delete everything it materialised.
+    /// Stop one machine and delete everything it materialised, leaving the
+    /// rest of the lab running. It stays in the lab config, so a later
+    /// `up <name>` re-materialises it (per-machine analogue of [`destroy`]).
     pub async fn destroy_machine(self: &Arc<Self>, name: &str) -> Result<()> {
-        if self.containers.contains_key(name) {
-            self.destroy_container(name).await
-        } else {
-            self.destroy_vm(name).await
+        let m = self.machine(name)?;
+        m.stop(true).await?;
+        // Settle before removing disks out from under a still-running QEMU.
+        wait_settled(&*m).await;
+        remove_tree(m.local_dir()).await?;
+        let _ = remove_tree(m.run_dir()).await;
+        {
+            let mut state = self.state.lock().await;
+            m.forget_artefacts(state.machine_mut(name)).await;
+            state.save(&self.lab_local)?;
         }
+        self.events.emit(
+            &format!("{}.destroyed", m.event_subject()),
+            json!({ m.event_subject(): name.to_string() }),
+        );
+        Ok(())
     }
 
     /// Stop a machine, wait for the exit monitor to settle, and boot it again.
@@ -1073,135 +1045,6 @@ impl LabRuntime {
             .await
             .map_err(|_| anyhow!("{name} did not stop for restart"))?;
         self.start_machine(name).await
-    }
-
-    pub async fn start_vm(self: &Arc<Self>, name: &str) -> Result<()> {
-        let vm = self.vm(name)?.clone();
-        if vm.state().await != PowerState::Stopped {
-            return Ok(());
-        }
-        // Safety net for paths that don't pull explicitly (restore, wscript):
-        // a no-op unless this VM's template download is still pending.
-        self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
-            .await?;
-        self.events.emit("vm.starting", json!({"vm": name}));
-
-        std::fs::create_dir_all(&vm.dirs.run)?;
-        {
-            let mut net = self.network.lock().await;
-            let mut attachments = Vec::with_capacity(vm.cfg.nics.len());
-            for (i, nic) in vm.cfg.nics.iter().enumerate() {
-                let sock = vm.dirs.nic_sock(i);
-                let _ = std::fs::remove_file(&sock);
-                let seg = net
-                    .segment_mut(nic_segment_name(nic))
-                    .ok_or_else(|| anyhow!("unknown segment for nic {i}"))?;
-                let mac = *vm
-                    .macs
-                    .get(i)
-                    .ok_or_else(|| anyhow!("no persisted MAC for nic {i}"))?;
-                attachments.push(seg.attach_nic(&sock, mac, nic.isolated).await?);
-            }
-            vm.set_nic_attachments(attachments).await;
-        }
-
-        let events_exit = self.events.clone();
-        let events_ready = self.events.clone();
-        let vm_name = name.to_string();
-        let vm_name2 = name.to_string();
-        vm.start(
-            move |reason, status| {
-                let payload = json!({"vm": vm_name, "reason": reason, "status": status});
-                match reason {
-                    StopReason::Crashed => {
-                        events_exit.emit("vm.crashed", payload.clone());
-                        events_exit.emit("vm.stopped", payload);
-                    }
-                    _ => events_exit.emit("vm.stopped", payload),
-                }
-            },
-            move || {
-                events_ready.emit("vm.ready", json!({"vm": vm_name2}));
-            },
-        )
-        .await
-    }
-
-    /// Start one container: wire its NIC sockets into the segment switches
-    /// (identically to a VM), then boot its micro-VM with event-emitting
-    /// callbacks. Restarts driven by the container's restart policy happen
-    /// inside the instance; the callbacks fire again on each attempt.
-    pub async fn start_container(self: &Arc<Self>, name: &str) -> Result<()> {
-        let container = self.container(name)?.clone();
-        if container.state().await != PowerState::Stopped {
-            return Ok(());
-        }
-        // Safety net (see start_vm): no-op unless this image is still pending.
-        self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
-            .await?;
-        // Volumes mount from the lab's SMB server; make sure it is serving
-        // (idempotent — a no-op when `up` already started it).
-        if !container.volumes.is_empty() {
-            let quiet: crate::scripting::OutputSink = std::sync::Arc::new(|_| {});
-            self.ensure_smb(&quiet).await;
-        }
-        self.events
-            .emit("container.starting", json!({"container": name}));
-
-        std::fs::create_dir_all(&container.dirs.run)?;
-        {
-            let mut net = self.network.lock().await;
-            for (i, nic) in container.cfg.nics.iter().enumerate() {
-                let sock = container.dirs.nic_sock(i);
-                let _ = std::fs::remove_file(&sock);
-                let seg = net
-                    .segment_mut(nic_segment_name(nic))
-                    .ok_or_else(|| anyhow!("unknown segment for nic {i}"))?;
-                seg.listen_nic(&sock, nic.isolated).await?;
-            }
-        }
-
-        let events_exit = self.events.clone();
-        let events_ready = self.events.clone();
-        let events_health = self.events.clone();
-        let me = self.clone();
-        let n_exit = name.to_string();
-        let n_ready = name.to_string();
-        let n_health = name.to_string();
-        let n_fwd = name.to_string();
-        container
-            .start(
-                move |reason, exit_code, will_restart| {
-                    let payload = json!({
-                        "container": n_exit,
-                        "reason": reason,
-                        "exit_code": exit_code,
-                        "restarting": will_restart,
-                    });
-                    if reason == StopReason::Crashed {
-                        events_exit.emit("container.crashed", payload.clone());
-                    }
-                    if !will_restart {
-                        events_exit.emit("container.stopped", payload);
-                    }
-                },
-                move || {
-                    events_ready.emit("container.ready", json!({"container": n_ready}));
-                    // Forwards target the container's lease; (re-)install on
-                    // every readiness so restarts keep them pointed right.
-                    let me = me.clone();
-                    let n = n_fwd.clone();
-                    tokio::spawn(async move {
-                        me.install_forwards(std::slice::from_ref(&n)).await;
-                    });
-                },
-                move |healthy| {
-                    if !healthy {
-                        events_health.emit("container.unhealthy", json!({"container": n_health}));
-                    }
-                },
-            )
-            .await
     }
 
     /// What the running network knows about `scope`'s machines — the only
@@ -1440,28 +1283,23 @@ impl LabRuntime {
                 let out = output.clone();
                 wave_tasks.spawn(async move {
                     me.start_machine(&n).await?;
-                    // Post-start steps only a VM has: shares to mount, a
-                    // template first-boot provision to run, and the bake hook
-                    // template builds install.
-                    if let Ok(vm) = me.vm(&n) {
-                        // Detached, so provisions can rely on the shares
-                        // (§7.5) without the wave blocking on the mount
-                        // retry window.
-                        me.spawn_share_mount(&n);
-                        // Before this VM can be considered ready (§6.1). A
-                        // no-op for templates without one, so leaf-VM timing
-                        // is unchanged.
-                        me.run_first_boot(&n, &out).await?;
-                        // See `LabRuntime::pre_provision`.
-                        let hook = me.pre_provision.read().expect("pre_provision lock").clone();
-                        if let Some(hook) = hook {
-                            hook(vm.clone(), out.clone()).await?;
-                        }
+                    let m = me.machine(&n)?;
+                    // Detached, so provisions can rely on the shares (§7.5)
+                    // without the wave blocking on the mount retry window. A
+                    // machine whose guest mounts for itself does nothing here.
+                    tokio::spawn(Arc::clone(&m).mount_shares(me.services()));
+                    // Before this machine can be considered ready (§6.1). A
+                    // no-op for machines carrying no first-boot script, so
+                    // leaf timing is unchanged.
+                    me.run_first_boot(&m, &out).await?;
+                    // See `LabRuntime::pre_provision`.
+                    let hook = me.pre_provision.read().expect("pre_provision lock").clone();
+                    if let (Some(hook), Ok(vm)) = (hook, me.vm(&n)) {
+                        hook(vm.clone(), out.clone()).await?;
                     }
                     // Only gate the wave on readiness when something later
                     // depends on this machine.
                     if me.has_dependents(&n) {
-                        let m = me.machine(&n)?;
                         m.wait_ready(m.ready_timeout()).await?;
                     }
                     Ok::<_, anyhow::Error>(n)
@@ -1498,29 +1336,6 @@ impl LabRuntime {
 
         self.events.emit("lab.up", json!({"vms": targets}));
         Ok(())
-    }
-
-    /// Mount a VM's SMB shares in a detached task once its agent answers.
-    /// Mounting used to happen at the end of `up`, AFTER the provision
-    /// pass — any provision waiting on a share waited on its own tail.
-    fn spawn_share_mount(self: &Arc<Self>, name: &str) {
-        let has_shares = self
-            .config
-            .lab
-            .vms
-            .iter()
-            .any(|v| v.name == name && !v.shares.is_empty());
-        if !has_shares {
-            return;
-        }
-        let me = self.clone();
-        let n = name.to_string();
-        tokio::spawn(async move {
-            let Ok(vm) = me.vm(&n).cloned() else { return };
-            if vm.wait_ready(Duration::from_secs(600)).await.is_ok() {
-                me.mount_shares(&n).await;
-            }
-        });
     }
 
     /// Wire up every forward `scope` requires — segment `forward {}` blocks
@@ -1604,21 +1419,17 @@ impl LabRuntime {
             if !started.contains(m) {
                 return Ok(());
             }
-            let container = self.containers.contains_key(m);
-            if container {
-                self.containers[m]
-                    .wait_ready(Duration::from_secs(300))
-                    .await?;
-            } else {
-                self.vm(m)?.wait_ready(Duration::from_secs(600)).await?;
-            }
+            let machine = self.machine(m)?;
+            // The machine's own budget, never a literal: a VM may still be
+            // running a first-boot provision, a container's entrypoint starts
+            // fast and its healthcheck governs the rest.
+            machine.wait_ready(machine.ready_timeout()).await?;
             match &step.kind {
                 plan::StepKind::Provision(p) => {
                     let script = self.root.join(&p.script);
                     output(format!("provision: {} → {m}\n", p.script.display()));
-                    // The script reaches its own machine with `lab.this_vm()`;
-                    // containers have no VM handle, so they don't bind one.
-                    let owner = (!container).then(|| crate::scripting::ScriptOwner::provision(m));
+                    // The script reaches its own machine with `lab.this_vm()`.
+                    let owner = Some(crate::scripting::ScriptOwner::provision(m));
                     crate::scripting::run_script_file(self.clone(), &script, owner, output.clone())
                         .await
                         .with_context(|| format!("provision {}", p.script.display()))?;
@@ -1655,33 +1466,30 @@ impl LabRuntime {
         Ok(())
     }
 
-    /// Run the backing template's first-boot provision the first time a clone
-    /// is instantiated, before the VM is reported ready (PRD §6.1). For VMs
-    /// with no pending first-boot the readiness poller already flips `ready`
-    /// (and emits `vm.ready`), so this returns immediately without blocking —
-    /// preserving the timing of templates that carry no first-boot script.
+    /// Run the machine's first-boot provision the first time it is
+    /// instantiated, before it is reported ready (PRD §6.1).
+    ///
+    /// For a machine with nothing pending the readiness poller already flips
+    /// `ready` (and emits the ready event), so this returns immediately without
+    /// blocking — preserving the timing of everything that carries no
+    /// first-boot script.
     ///
     /// For a pending first-boot it waits for the guest agent, runs the embedded
-    /// script scoped to this VM (reached via `lab.this_vm()`), then writes the
-    /// run-once sentinel, marks the VM ready, and emits `vm.ready`. Any error or
-    /// the overall timeout fails `up` and leaves the VM running for inspection.
+    /// script scoped to this machine (reached via `lab.this_vm()`), then marks
+    /// the machine ready and emits the ready event. Any error or the overall
+    /// timeout fails `up` and leaves the machine running for inspection.
     async fn run_first_boot(
         self: &Arc<Self>,
-        name: &str,
+        m: &Arc<dyn Machine>,
         output: &crate::scripting::OutputSink,
     ) -> Result<()> {
-        let vm = self.vm(name)?.clone();
-        if !vm.first_boot_pending() {
+        let Some(script) = m.pending_first_boot() else {
             return Ok(());
-        }
-        let script = vm
-            .template()
-            .first_boot_script
-            .clone()
-            .expect("first_boot_pending implies a script");
+        };
+        let name = m.name();
 
         output(format!("first-boot: provisioning {name}...\n"));
-        vm.wait_agent_up(Duration::from_secs(600))
+        m.wait_agent_up(m.ready_timeout())
             .await
             .with_context(|| format!("first-boot {name}: agent did not come up"))?;
 
@@ -1692,7 +1500,7 @@ impl LabRuntime {
             self.clone(),
             script,
             &label,
-            vm.dirs.local.clone(),
+            m.local_dir().to_path_buf(),
             Some(crate::scripting::ScriptOwner::first_boot(name)),
             output.clone(),
         );
@@ -1701,10 +1509,11 @@ impl LabRuntime {
             .map_err(|_| anyhow!("first-boot {name}: timed out after 1800s"))?
             .with_context(|| format!("first-boot provision for {name}"))?;
 
-        std::fs::write(vm.dirs.firstboot_sentinel(), b"")
-            .with_context(|| format!("writing first-boot sentinel for {name}"))?;
-        vm.mark_ready().await;
-        self.events.emit("vm.ready", json!({"vm": name}));
+        m.first_boot_done().await?;
+        self.events.emit(
+            &format!("{}.ready", m.event_subject()),
+            json!({ m.event_subject(): name }),
+        );
         output(format!("first-boot: {name} ready\n"));
         Ok(())
     }
@@ -1752,55 +1561,19 @@ impl LabRuntime {
     /// config (PRD §12).
     pub async fn destroy(self: &Arc<Self>) -> Result<()> {
         self.down(&[], true).await?;
+        // Wait for the exit monitors to settle before removing disks.
         for m in self.machines() {
-            wait_settled(m.as_ref()).await;
+            wait_settled(&*m).await;
         }
         // Removes clones, container overlays, AND named volumes — destroy is
         // the lab-scoped volume lifecycle boundary (PRD §12).
         remove_tree(&self.lab_local).await?;
-        let run_dir = crate::paths::lab_runtime_dir(&self.name);
-        let _ = remove_tree(&run_dir.join("vms")).await;
-        let _ = remove_tree(&run_dir.join("containers")).await;
-        Ok(())
-    }
-
-    /// Stop one VM and delete its clone and runtime state, leaving the rest of
-    /// the lab running. The VM stays in the lab config, so a later `up <vm>`
-    /// re-clones it from the template (per-VM analogue of [`destroy`]).
-    pub async fn destroy_vm(self: &Arc<Self>, name: &str) -> Result<()> {
-        let vm = self.vm(name)?.clone();
-        vm.stop(true).await?;
-        wait_settled(vm.as_ref()).await;
-        remove_tree(&vm.dirs.local).await?;
-        let _ = remove_tree(&vm.dirs.run).await;
-        self.events
-            .emit("vm.destroyed", json!({"vm": name.to_string()}));
-        Ok(())
-    }
-
-    /// Stop one container and delete its writable overlay, runtime state,
-    /// and pinned image digest — the config stays, so a later `up <name>`
-    /// re-resolves the image fresh. Named volumes are lab-scoped and
-    /// survive; only lab [`destroy`] removes them.
-    pub async fn destroy_container(self: &Arc<Self>, name: &str) -> Result<()> {
-        let container = self.container(name)?.clone();
-        container.stop(true).await?;
-        wait_settled(container.as_ref()).await;
-        remove_tree(&container.dirs.local).await?;
-        let _ = remove_tree(&container.dirs.run).await;
-        {
-            let mut state = self.state.lock().await;
-            let c = state.machine_mut(name);
-            c.image_digest = None;
-            c.image_ref = None;
-            // The scratch qcow2 (which held the snapshot data) is gone.
-            c.snapshots.clear();
-            state.save(&self.lab_local)?;
+        // Each machine's run dir, asked for rather than guessed at: the lab's
+        // runtime dir also holds the daemon's own control socket, so it is not
+        // ours to remove wholesale.
+        for m in self.machines() {
+            let _ = remove_tree(m.run_dir()).await;
         }
-        self.events.emit(
-            "container.destroyed",
-            json!({"container": name.to_string()}),
-        );
         Ok(())
     }
 
@@ -1879,9 +1652,7 @@ impl LabRuntime {
     /// that directory is created the moment the daemon opens the lab, so it
     /// says nothing; the per-machine dirs appear only once a machine starts.
     fn provisioned(&self) -> bool {
-        self.vms.values().any(|vm| vm.dirs.local.exists())
-            || self.containers.values().any(|c| c.dirs.local.exists())
-            || self.lab_local.join("volumes").exists()
+        self.machines().any(|m| m.local_dir().exists()) || self.lab_local.join("volumes").exists()
     }
 
     /// Live per-segment DNS zone snapshots (`dns.table`). Segments without a
@@ -1936,97 +1707,45 @@ impl LabRuntime {
     /// across machines is best-effort, not coordinated (PRD §7.3).
     pub async fn snapshot_all(&self, snap: &str) -> Result<Value> {
         let mut results = Vec::new();
-        for name in self.vms.keys().chain(self.containers.keys()) {
-            let online = self.snapshot(name, snap).await?;
-            results.push(json!({"vm": name, "online": online}));
+        for m in self.machines() {
+            let online = self.snapshot(m.name(), snap).await?;
+            results.push(json!({"vm": m.name(), "online": online}));
         }
         Ok(json!(results))
     }
 
-    pub async fn restore(self: &Arc<Self>, vm_name: &str, snap: &str) -> Result<()> {
-        if self.containers.contains_key(vm_name) {
-            return self.restore_container(vm_name, snap).await;
-        }
-        let record = {
-            let mut state = self.state.lock().await;
-            state.machine_mut(vm_name).snapshots.get(snap).cloned()
-        }
-        .ok_or_else(|| anyhow!("vm \"{vm_name}\" has no snapshot \"{snap}\""))?;
-
-        let vm = self.vm(vm_name)?.clone();
-        // Restoring into a running VM needs NIC listeners only if we must
-        // boot QEMU; reuse start_vm's wiring through the callbacks below.
-        if record.online && vm.state().await == PowerState::Stopped {
-            // Boot paused first via the normal path, then load.
-            self.start_vm(vm_name).await?;
-        }
-        let events_exit = self.events.clone();
-        let events_ready = self.events.clone();
-        let n1 = vm_name.to_string();
-        let n2 = vm_name.to_string();
-        vm.restore(
-            snap,
-            record.online,
-            move |reason, status| {
-                events_exit.emit(
-                    "vm.stopped",
-                    json!({"vm": n1, "reason": reason, "status": status}),
-                );
-            },
-            move || events_ready.emit("vm.ready", json!({"vm": n2})),
-        )
-        .await?;
-        self.events.emit(
-            "snapshot.restored",
-            json!({"vm": vm_name, "name": snap, "online": record.online}),
-        );
-        Ok(())
-    }
-
-    /// Restore a container snapshot with full VM semantics (PRD §18): an
-    /// online record boots the micro-VM if needed, loads the snapshot and
-    /// resumes exactly where it was; an offline record reverts the scratch
-    /// disk and leaves the container stopped. Volume contents are host state
-    /// and never roll back.
-    async fn restore_container(self: &Arc<Self>, name: &str, snap: &str) -> Result<()> {
+    /// Roll one machine back to a snapshot (PRD §7.3; containers §18).
+    ///
+    /// The pin rule has one home: a record that names an artefact identity is
+    /// only valid against a machine still reporting it
+    /// ([`Machine::snapshot_pin`]). A container's scratch overlay means
+    /// nothing without the same read-only rootfs; a VM's snapshots live inside
+    /// its own qcow2 chain, pin nothing, and pass this untouched.
+    pub async fn restore(self: &Arc<Self>, name: &str, snap: &str) -> Result<()> {
         let record = {
             let mut state = self.state.lock().await;
             state.machine_mut(name).snapshots.get(snap).cloned()
         }
-        .ok_or_else(|| anyhow!("container \"{name}\" has no snapshot \"{snap}\""))?;
+        .ok_or_else(|| anyhow!("\"{name}\" has no snapshot \"{snap}\""))?;
 
-        // The image must be bound before the pin comparison below (a daemon
-        // restarted after a cache wipe re-pends the pull).
+        let m = self.machine(name)?;
+        // The pin is compared after any deferred pull the machine's own
+        // restore performs, so bind the artefact first.
         self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
             .await?;
-        let container = self.container(name)?.clone();
-        // The scratch overlay (and any vmstate) is only valid against the
-        // rootfs it was captured over — refuse a changed image pin.
-        let current = container.image_digest();
-        if let Some(want) = &record.image_digest
-            && Some(want) != current.as_ref()
-        {
-            bail!(
-                "container \"{name}\": snapshot \"{snap}\" was taken against image {want}, but \
-                 the pinned image is now {} — destroy the container (clearing its snapshots) or \
-                 restore the original pin",
-                current.as_deref().unwrap_or("<not pulled>")
-            );
+        if let Some(want) = &record.image_digest {
+            let current = m.snapshot_pin();
+            if Some(want) != current.as_ref() {
+                bail!(
+                    "\"{name}\": snapshot \"{snap}\" was taken against {want}, but the pinned \
+                     artefact is now {} — destroy the machine (clearing its snapshots) or \
+                     restore the original pin",
+                    current.as_deref().unwrap_or("<not pulled>")
+                );
+            }
         }
 
-        if record.online {
-            // Ensure a running micro-VM to load into — the normal start path
-            // wires NIC listeners and the event callbacks. Whatever the
-            // fresh boot writes is rewound by the load.
-            if container.state().await == PowerState::Stopped {
-                self.start_container(name).await?;
-            }
-            container.restore_online(snap).await?;
-            // Re-point forwards / re-prime the NAT MAC at the restored lease.
-            self.install_forwards(&[name.to_string()]).await;
-        } else {
-            container.restore_offline(snap).await?;
-        }
+        m.restore(self.services(), snap, record.online).await?;
         self.events.emit(
             "snapshot.restored",
             json!({"vm": name, "name": snap, "online": record.online}),
@@ -2073,6 +1792,62 @@ async fn wait_settled(m: &dyn Machine) {
     }
 }
 
+/// The lab runtime as the narrow interface a machine boots against.
+///
+/// Everything here is lab-level work a machine cannot do for itself — reaching
+/// the fabric, the event log, the shared-folder server. Nothing here knows
+/// what kind of machine is asking.
+#[async_trait::async_trait]
+impl crate::labd::machine::LabServices for LabRuntime {
+    fn events(&self) -> &Arc<EventLog> {
+        &self.events
+    }
+
+    async fn ensure_pulled(&self, machine: &str) -> Result<()> {
+        // The inherent `ensure_pulled` needs `Arc<Self>` — it spawns
+        // cancellable download tasks that outlive the call — which a `&self`
+        // trait method cannot produce; hence [`LabRuntime::arc`].
+        self.arc().ensure_pulled(&[machine.to_string()], None).await
+    }
+
+    async fn ensure_shares(&self) {
+        let quiet: crate::scripting::OutputSink = Arc::new(|_| {});
+        self.arc().ensure_smb(&quiet).await;
+    }
+
+    async fn attach_nic(
+        &self,
+        segment: &str,
+        sock: &std::path::Path,
+        mac: crate::config::model::MacAddr,
+        isolated: bool,
+        tap_ok: bool,
+    ) -> Result<crate::net::fastpath::NicAttachment> {
+        let mut net = self.network.lock().await;
+        let seg = net
+            .segment_mut(segment)
+            .ok_or_else(|| anyhow!("unknown segment \"{segment}\""))?;
+        seg.attach_nic(sock, mac, isolated, tap_ok).await
+    }
+
+    async fn machine_ready(&self, machine: &str) {
+        self.arc()
+            .install_forwards(std::slice::from_ref(&machine.to_string()))
+            .await;
+    }
+
+    async fn smb_mount_plan(
+        &self,
+        machine: &str,
+        os: crate::smb::OsHint,
+    ) -> Vec<crate::smb::MountStep> {
+        match self.smb.lock().await.as_ref() {
+            Some(labsmb) => labsmb.mount_plan(machine, os),
+            None => Vec::new(),
+        }
+    }
+}
+
 /// Delete a directory tree off the runtime. A lab's clones are tens of GB of
 /// qcow2; doing this inline froze the daemon's whole reactor — the network
 /// fabric, QMP and agent channels, and the protocol server with it — for as
@@ -2111,4 +1886,412 @@ async fn fetch_global_peer_states() -> Option<std::collections::HashMap<String, 
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::labd::machine::{Capabilities, LabServices, MachineKind, MachineStatus};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// The property ADR-0002 exists to hold, checked against the source rather
+    /// than asserted in a comment.
+    ///
+    /// The last time this was a comment ("`start` and `restore` … are the only
+    /// places left that know a machine's kind") it decayed to seven further
+    /// branches before anyone noticed. Orchestration addresses machines through
+    /// [`Machine`]; when it needs to know *what a machine can do* it probes a
+    /// capability. Asking *what kind it is* is how the duplication came back.
+    ///
+    /// `LabRuntime::vm`/`container` are exempt, between explicit markers in the
+    /// source: they exist *to* reject the other kind's name, and the
+    /// deferred-pull paths must reach a concrete type to bind what they just
+    /// downloaded. What is banned is orchestration *deciding* by kind.
+    #[test]
+    fn orchestration_never_branches_on_machine_kind() {
+        let source = include_str!("lab.rs");
+        let body = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this test module")];
+        // One explicit, greppable exemption — see the block it delimits.
+        let (before, rest) = body
+            .split_once("// ---- BEGIN kind-aware accessors")
+            .expect("the exemption markers");
+        let (_, after) = rest
+            .split_once("// ---- END kind-aware accessors")
+            .expect("the exemption end marker");
+        let scanned = format!("{before}{after}");
+        let banned = [
+            // A match or comparison on the reported kind.
+            "MachineKind::",
+            // "is this name a container?" — the shape every one of the seven
+            // branches took.
+            "containers.contains_key",
+            "vms.contains_key",
+            "containers.get(",
+            "vms.get(",
+        ];
+        let offenders: Vec<(usize, &str, &str)> = scanned
+            .lines()
+            .enumerate()
+            .flat_map(|(i, line)| {
+                banned
+                    .iter()
+                    .filter(move |b| line.contains(**b))
+                    .map(move |b| (i + 1, *b, line.trim()))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the lab runtime branches on machine kind again — express the difference \
+             as a capability on `Machine`, or as implementation behind it (ADR-0002):\n{}",
+            offenders
+                .iter()
+                .map(|(n, b, l)| format!("  src/labd/lab.rs:{n}: {b} in `{l}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // ---- machine doubles -----------------------------------------------------
+
+    /// A machine that boots instantly and records what happened to it, so
+    /// wave ordering, readiness gating and teardown can be driven without a
+    /// hypervisor, a template or a network.
+    struct FakeMachine {
+        name: String,
+        kind: MachineKind,
+        ready_timeout: Duration,
+        /// How long `start` takes, so a wave's overlap is observable.
+        boot: Duration,
+        /// How long after `start` returns this machine reports ready.
+        settle: Duration,
+        state: tokio::sync::RwLock<PowerState>,
+        ready: tokio::sync::RwLock<bool>,
+        starts: AtomicU32,
+        stops: AtomicU32,
+        /// Global order of events, shared by every machine in the lab.
+        log: Arc<Mutex<Vec<String>>>,
+        seq: Arc<AtomicUsize>,
+        dir: PathBuf,
+    }
+
+    impl FakeMachine {
+        fn new(name: &str, kind: MachineKind, shared: &Shared) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                kind,
+                ready_timeout: Duration::from_secs(300),
+                boot: Duration::from_millis(0),
+                settle: Duration::from_millis(0),
+                state: tokio::sync::RwLock::new(PowerState::Stopped),
+                ready: tokio::sync::RwLock::new(false),
+                starts: AtomicU32::new(0),
+                stops: AtomicU32::new(0),
+                log: shared.log.clone(),
+                seq: shared.seq.clone(),
+                dir: shared.dir.join(name),
+            })
+        }
+
+        async fn note(&self, what: &str) {
+            let n = self.seq.fetch_add(1, Ordering::SeqCst);
+            self.log
+                .lock()
+                .await
+                .push(format!("{n}:{}:{what}", self.name));
+        }
+    }
+
+    #[derive(Clone)]
+    struct Shared {
+        log: Arc<Mutex<Vec<String>>>,
+        seq: Arc<AtomicUsize>,
+        dir: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl Machine for FakeMachine {
+        fn as_machine(&self) -> &dyn Machine {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn kind(&self) -> MachineKind {
+            self.kind
+        }
+        fn arch(&self) -> String {
+            "x86_64".into()
+        }
+        fn guest_os(&self) -> super::super::guest_os::GuestOs {
+            super::super::guest_os::GuestOs::Linux
+        }
+        fn nics(&self) -> &[crate::config::model::Nic] {
+            &[]
+        }
+        fn macs(&self) -> &[crate::config::model::MacAddr] {
+            &[]
+        }
+        fn web_pages(&self) -> &[crate::config::model::WebPage] {
+            &[]
+        }
+        fn term_session_sock(&self, _id: u32) -> PathBuf {
+            self.dir.join("term.sock")
+        }
+        /// A double has no host behind it, and no shares to place either.
+        fn virtiofsd_available(&self) -> bool {
+            false
+        }
+        fn event_subject(&self) -> &'static str {
+            match self.kind {
+                MachineKind::Vm => "vm",
+                MachineKind::Container => "container",
+            }
+        }
+        fn local_dir(&self) -> &std::path::Path {
+            &self.dir
+        }
+        fn run_dir(&self) -> &std::path::Path {
+            &self.dir
+        }
+        fn required_binaries(&self) -> Vec<String> {
+            // Something every host running the test suite has, so preflight is
+            // exercised rather than skipped.
+            vec!["sh".to_string()]
+        }
+        fn ready_timeout(&self) -> Duration {
+            self.ready_timeout
+        }
+
+        async fn state(&self) -> PowerState {
+            *self.state.read().await
+        }
+        async fn is_ready(&self) -> bool {
+            *self.ready.read().await
+        }
+        async fn stop(&self, _force: bool) -> Result<()> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            self.note("stop").await;
+            *self.state.write().await = PowerState::Stopped;
+            *self.ready.write().await = false;
+            Ok(())
+        }
+
+        async fn start(self: Arc<Self>, _lab: Arc<dyn LabServices>) -> Result<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.note("start").await;
+            *self.state.write().await = PowerState::Starting;
+            tokio::time::sleep(self.boot).await;
+            *self.state.write().await = PowerState::Running;
+            let me = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(me.settle).await;
+                *me.ready.write().await = true;
+                me.note("ready").await;
+            });
+            Ok(())
+        }
+
+        async fn restore(
+            self: Arc<Self>,
+            _lab: Arc<dyn LabServices>,
+            snap: &str,
+            _online: bool,
+        ) -> Result<()> {
+            self.note(&format!("restore:{snap}")).await;
+            Ok(())
+        }
+
+        async fn agent(&self) -> Result<super::super::vm_agent::AgentHandle> {
+            bail!("{}: no agent in a double", self.name)
+        }
+        async fn agent_answering(&self) -> bool {
+            *self.ready.read().await
+        }
+        async fn snapshot(&self, _name: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn delete_snapshot(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn status_detail(&self) -> crate::status::MachineDetail {
+            crate::status::MachineDetail::Container(crate::status::ContainerStatus {
+                image: "double:1".into(),
+                digest: None,
+                health: None,
+                restarts: 0,
+                exit_code: None,
+            })
+        }
+    }
+
+    fn shared(dir: &std::path::Path) -> Shared {
+        Shared {
+            log: Arc::new(Mutex::new(Vec::new())),
+            seq: Arc::new(AtomicUsize::new(0)),
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// A lab runtime whose machines are doubles. Everything else is real: the
+    /// plan, the waves, the readiness gate, the teardown.
+    fn lab_of(
+        dir: &std::path::Path,
+        src: &str,
+        machines: Vec<Arc<dyn Machine>>,
+    ) -> Arc<LabRuntime> {
+        let config = crate::config::load_lab_source(src, "<test>", dir).expect("lab source");
+        LabRuntime::with_machines(config, machines).expect("runtime")
+    }
+
+    fn quiet() -> crate::scripting::OutputSink {
+        Arc::new(|_| {})
+    }
+
+    /// `depends_on` gates on readiness identically for both kinds. `web`
+    /// depends on `db`, so `db` must be *ready* — not merely started — before
+    /// `web` starts, whether `db` is a VM or a container.
+    #[tokio::test]
+    async fn depends_on_gates_on_readiness_for_both_kinds() {
+        for kind in [MachineKind::Vm, MachineKind::Container] {
+            let dir = tempfile::tempdir().unwrap();
+            let sh = shared(dir.path());
+            let db = FakeMachine::new("db", kind, &sh);
+            let web = FakeMachine::new("web", MachineKind::Container, &sh);
+            let lab = lab_of(
+                dir.path(),
+                r#"import <vmlab.wcl>
+lab "t" {
+  container "db" { image = "db:1" }
+  container "web" { image = "web:1" depends_on = ["db"] }
+}"#,
+                vec![db.clone(), web.clone()],
+            );
+            lab.up(&[], quiet()).await.expect("up");
+
+            let log = sh.log.lock().await.clone();
+            let idx = |needle: &str| {
+                log.iter()
+                    .position(|l| l.ends_with(needle))
+                    .unwrap_or_else(|| panic!("{needle} missing from {log:?}"))
+            };
+            assert!(
+                idx("db:ready") < idx("web:start"),
+                "web started before db was ready: {log:?}"
+            );
+            assert_eq!(db.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(web.starts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// A machine nothing depends on does not gate its wave: `up` returns
+    /// without waiting out its readiness budget. Before the interface carried
+    /// `ready_timeout` this was the difference between a 300s and a 600s
+    /// literal at the call site.
+    #[tokio::test(start_paused = true)]
+    async fn a_leaf_machine_does_not_gate_its_wave() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let leaf = FakeMachine::new("leaf", MachineKind::Vm, &sh);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { container "leaf" { image = "x:1" } }"#,
+            vec![leaf.clone()],
+        );
+        let start = tokio::time::Instant::now();
+        lab.up(&[], quiet()).await.expect("up");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "up waited on a machine nothing depends on"
+        );
+    }
+
+    /// `down` runs the waves leaves-first: a dependency outlives the machines
+    /// that need it to shut down cleanly.
+    #[tokio::test]
+    async fn down_stops_dependents_before_their_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let db = FakeMachine::new("db", MachineKind::Vm, &sh);
+        let web = FakeMachine::new("web", MachineKind::Container, &sh);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  container "db" { image = "db:1" }
+  container "web" { image = "web:1" depends_on = ["db"] }
+}"#,
+            vec![db.clone(), web.clone()],
+        );
+        lab.down(&[], false).await.expect("down");
+
+        let log = sh.log.lock().await.clone();
+        let idx = |needle: &str| log.iter().position(|l| l.ends_with(needle)).unwrap();
+        assert!(
+            idx("web:stop") < idx("db:stop"),
+            "the dependency was stopped first: {log:?}"
+        );
+    }
+
+    /// Teardown iterates machines once: both kinds are stopped, and neither
+    /// needs the runtime to know which it is holding.
+    #[tokio::test]
+    async fn destroy_stops_and_clears_every_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let vm = FakeMachine::new("dc01", MachineKind::Vm, &sh);
+        let ct = FakeMachine::new("web", MachineKind::Container, &sh);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  container "dc01" { image = "a:1" }
+  container "web" { image = "b:1" }
+}"#,
+            vec![vm.clone(), ct.clone()],
+        );
+        lab.destroy_machine("dc01").await.expect("destroy dc01");
+        lab.destroy_machine("web").await.expect("destroy web");
+        assert_eq!(vm.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(ct.stops.load(Ordering::SeqCst), 1);
+    }
+
+    /// The budgets the four "wait until ready" implementations used to
+    /// disagree about, pinned to the values they converged on. A VM waits 600s
+    /// because it may be running a Windows first-boot through a settle reboot;
+    /// a container waits 300s because its entrypoint starts fast and its
+    /// healthcheck governs the rest.
+    #[test]
+    fn readiness_budgets_are_per_machine_and_pinned() {
+        assert_eq!(
+            crate::labd::machine::DEFAULT_READY_TIMEOUT,
+            Duration::from_secs(300),
+            "a container (and any machine that does not override) waits 300s"
+        );
+        assert_eq!(
+            crate::labd::vm::VM_READY_TIMEOUT,
+            Duration::from_secs(600),
+            "a VM waits 600s"
+        );
+    }
+
+    /// Capabilities are probed, and a machine that reports none still answers
+    /// the probe — nothing infers them from the kind.
+    #[tokio::test]
+    async fn capabilities_are_probed_not_inferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let m: Arc<dyn Machine> = FakeMachine::new("plain", MachineKind::Vm, &sh);
+        let caps: Capabilities = m.capabilities().await;
+        assert_eq!(caps.kind, MachineKind::Vm, "kind is reported…");
+        assert!(!caps.display, "…but a VM double reports no display");
+        assert!(!caps.console_log);
+        assert!(!caps.reboot);
+        assert!(!caps.healthcheck);
+        assert!(caps.agent.is_empty());
+        let status: MachineStatus = m.status().await;
+        assert_eq!(status.name, "plain");
+    }
 }

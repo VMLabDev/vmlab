@@ -17,7 +17,7 @@ choose by *when* the automation runs and *what shape* it takes:
 
 The imperative surfaces all land in the same place: a wscript `main(lab)`
 holding a [`Lab` handle](entity_lab_api), from which
-[`Vm`](entity_vm_api) and [`Container`](entity_container_api) handles expose
+The one [`Machine`](entity_vm_api) handle — for VMs and [containers](entity_container_api) alike — exposes
 power, exec, file transfer, terminals, snapshots, keystrokes, screen matching
 and OCR. Multi-step guest work belongs in a script, not a chain of
 `vmlab exec` calls — scripts get send/expect terminals, retries and real

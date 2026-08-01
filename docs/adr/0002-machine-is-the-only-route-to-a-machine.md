@@ -82,3 +82,15 @@ Concretely:
   meaningful for one kind and returns "unsupported" for the other, it is a
   capability, not a machine operation. The escape hatch is a capability probe,
   not an untyped map — see [ADR-0004](0004-lab-status-is-a-typed-projection.md).
+
+## Enforcement
+
+`orchestration_never_branches_on_machine_kind` (in `src/labd/lab.rs`) scans the
+lab runtime's own source and fails the build if it starts asking what kind of
+machine it is holding. This decision decayed once already while a comment
+claimed it held; the comment is now a test.
+
+Two accessors are exempt, between explicit `BEGIN`/`END kind-aware accessors`
+markers: `LabRuntime::vm` and `LabRuntime::container` exist *to* reject the
+other kind's name, and a deferred pull has to reach a concrete type to bind the
+template or image it just downloaded. Neither decides behaviour by kind.

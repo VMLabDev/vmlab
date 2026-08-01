@@ -7,7 +7,7 @@
 
 use vmlab
 
-fn share_visible(lab: Lab, win: Vm) -> Result[unit, string] {
+fn share_visible(lab: Lab, win: Machine) -> Result[unit, string] {
     // The daemon mounts shares as soon as the agent responds — S: is
     // normally there within seconds; the window is just safety margin.
     for i in 0..60 {
@@ -29,7 +29,7 @@ fn share_visible(lab: Lab, win: Vm) -> Result[unit, string] {
     Ok(())
 }
 
-fn autologon_enabled(win: Vm) -> bool {
+fn autologon_enabled(win: Machine) -> bool {
     let winlogon = "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"
     match win.exec("reg", ["query", winlogon, "/v", "AutoAdminLogon"]) {
         Ok(r) => {

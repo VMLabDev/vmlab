@@ -450,12 +450,22 @@ Scripts are **daemon-unaware**: they receive a lab handle and operate on it. Pro
 ### 10.1 Lab handle
 
 ```
-lab.vm("dc01") -> Vm                 # error if undefined in the lab
-lab.vms() -> [Vm]
+lab.machine("api") -> Machine        # any machine, error if undefined
+lab.machines() -> [Machine]
+lab.vm("dc01") -> Machine            # error if undefined, or if it's a container
+lab.vms() -> [Machine]               # the VMs only
+lab.container("web") -> Machine      # error if undefined, or if it's a VM
+lab.containers() -> [Machine]        # the containers only
+lab.this_vm() -> Machine             # the machine that declared this script
 lab.segment("corp") -> Segment
 lab.name() -> string
 lab.log(msg)                         # into the lab log + live CLI stream
 ```
+
+There is one machine handle, not one per kind (ADR-0002). `lab.vm` and
+`lab.container` remain because they read well and because rejecting the other
+kind's name gives a better error than "no such machine" — but they return the
+same `Machine`, and every operation below is available on all of them.
 
 ### 10.2 Segment handle
 
@@ -468,44 +478,59 @@ seg.forward(host_port, vm, guest_port) -> rule_id
 seg.rules() -> [Rule]
 ```
 
-### 10.3 VM handle
+### 10.3 Machine handle
+
+Every operation is available on every machine. What a particular machine cannot
+do is reported **at call time and names the capability** — `screenshot` on a
+machine with no display fails with *"machine `api` has no display"*, never with
+"no such method" and never with a claim about its kind. That is what keeps the
+expansion point open: the day a container reports a display, the same script
+works unchanged.
 
 **Lifecycle / state**
 
 ```
-vm.start()  vm.stop()  vm.stop_force()  vm.restart()
-vm.state() -> Running | Stopped | ...
-vm.wait_ready(timeout)               # agent responding
-vm.wait_shutdown(timeout)
-vm.ip(nic?) -> string                # from lease table / agent
+m.start()  m.stop()  m.stop_force()  m.restart()  m.poweroff()
+m.name() -> string   m.kind() -> "vm" | "container"
+m.state() -> Running | Stopped | ...
+m.wait_ready(timeout)                # fully usable: agent up, first-boot done
+m.is_ready() -> bool   m.is_healthy() -> bool   m.agent_answering() -> bool
+m.wait_shutdown(timeout)
+m.ip() -> string   m.ip_nic(i) -> string     # from lease table / agent
+m.logs(lines) -> string              # console log, where the machine keeps one
 ```
+
+Inside a machine's **own first-boot provision**, `is_ready` / `wait_ready` mean
+agent-level readiness rather than full readiness: full readiness is unreachable
+until that script returns, and a first-boot script that reboots its guest needs
+to wait for it to come back. Everywhere else they mean full readiness.
 
 **Snapshots**
 
 ```
-vm.snapshot(name)                    # online or offline per current state
-vm.restore(name)                     # resumes running iff snapshot was online
-vm.snapshots() -> [SnapshotInfo]     # name, taken_at, power_state
-vm.delete_snapshot(name)
+m.snapshot(name)                    # online or offline per current state
+m.restore(name)                     # resumes running iff snapshot was online
+m.snapshots() -> [SnapshotInfo]     # name, taken_at, power_state
+m.delete_snapshot(name)
 ```
 
-**Input**
+**Input** — the Display capability
 
 ```
-vm.send_keys("ctrl-alt-del")         # chords, QMP sendkey naming
-vm.type_text("Password1!\n", opts)   # human-ish pacing options
-vm.mouse_move(x, y)  vm.mouse_click(button)  vm.mouse_drag(...)
+m.send_keys("ctrl-alt-del")         # chords, QMP sendkey naming
+m.type_text("Password1!\n", opts)   # human-ish pacing options
+m.mouse_move(x, y)  m.mouse_click(button)  m.mouse_drag(...)
 ```
 
-**Screen**
+**Screen** — the Display capability
 
 ```
-vm.screenshot(path?) -> Image
-vm.wait_for_image(ref, opts) -> Match        # opts: timeout, threshold,
-vm.wait_for_any([refs], opts) -> Match       #   region{x,y,w,h}, interval
-vm.find_image(ref, opts) -> Match | None     # single-shot, no wait
-vm.ocr(opts) -> string                       # Tesseract; optional region
-vm.wait_for_text(pattern, opts) -> Match     # OCR-based wait, regex pattern
+m.screenshot(path?) -> Image
+m.wait_for_image(ref, opts) -> Match        # opts: timeout, threshold,
+m.wait_for_any([refs], opts) -> Match       #   region{x,y,w,h}, interval
+m.find_image(ref, opts) -> Match | None     # single-shot, no wait
+m.ocr(opts) -> string                       # Tesseract; optional region
+m.wait_for_text(pattern, opts) -> Match     # OCR-based wait, regex pattern
 ```
 
 Reference images are paths relative to the lab (convention: `images/` beside `vmlab.wcl`). Matching is normalised template matching with a similarity threshold (default ~0.9, overridable). `Match` carries location + score, so a found image can anchor a relative mouse click.
@@ -513,16 +538,16 @@ Reference images are paths relative to the lab (convention: `images/` beside `vm
 **Guest agent**
 
 ```
-vm.exec(cmd, opts) -> ExecResult     # exit_code, stdout, stderr; timeout opt
-vm.copy_to(local, guest_path)
-vm.copy_from(guest_path, local)
+m.exec(cmd, opts) -> ExecResult     # exit_code, stdout, stderr; timeout opt
+m.copy_to(local, guest_path)
+m.copy_from(guest_path, local)
 ```
 
 All blocking calls take timeouts and return wscript `Result`s; an error propagating out of a provision script fails the provision run (and therefore `vmlab up`) with the error attached to the lab log.
 
 ### 10.4 Execution model
 
-- Provision scripts are declared inside the `vm {}`/`container {}` they belong to and run during `up` in declaration order, once that machine is ready (per `depends_on`). A script orchestrating multiple VMs (stand up DC → wait → join member) is the expected normal case — it reaches the others through the lab handle, and `lab.this_vm()` gives it the machine that declared it.
+- Provision scripts are declared inside the `vm {}`/`container {}` they belong to and run during `up` in declaration order, once that machine is ready (per `depends_on`). A script orchestrating multiple machines (stand up DC → wait → join member) is the expected normal case — it reaches the others through the lab handle, and `lab.this_vm()` gives it the machine that declared it, VM or container alike.
 - Any script is also invocable ad hoc: `vmlab script scripts/whatever.ws` (no owning machine, so `this_vm()` is unavailable).
 - Event handlers receive `(event: Value, lab)` — the one dynamic escape hatch, consistent with Config Weave's boundary model.
 - Template build scripts get the same API scoped to the single build VM (a lab handle containing one VM).

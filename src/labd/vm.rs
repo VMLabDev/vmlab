@@ -17,6 +17,10 @@ use crate::smb::VirtiofsMount;
 
 use super::hypervisor::{Control, Hypervisor, Process};
 
+/// How long a VM gets to become ready: it may be running a template first-boot
+/// provision through a Windows specialize/OOBE pass and a settle reboot.
+pub const VM_READY_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// What to tell a user whose guest has no answering vmlab-agent.
 const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the template likely predates \
      agent support) — rebuild it with `vmlab template build`";
@@ -259,18 +263,18 @@ impl VmInstance {
         *self.nic_attachments.lock().await = attachments;
     }
 
-    pub async fn state(&self) -> PowerState {
+    async fn power_state(&self) -> PowerState {
         *self.state.read().await
     }
 
-    pub async fn is_ready(&self) -> bool {
+    async fn ready_flag(&self) -> bool {
         *self.ready.read().await
     }
 
     /// Whether the guest agent has answered at least once (PRD §2). This is a
     /// weaker signal than [`is_ready`]: it can be true while a first-boot
     /// provision is still running.
-    pub async fn is_agent_up(&self) -> bool {
+    async fn agent_up_flag(&self) -> bool {
         *self.agent_up.read().await
     }
 
@@ -278,26 +282,8 @@ impl VmInstance {
     /// [`is_agent_up`] flag, this goes false while the guest is down or
     /// mid-reboot — what a first-boot provision needs to watch its own guest
     /// restart (QEMU stays up, so power state never changes).
-    pub async fn agent_answering(&self) -> bool {
+    async fn agent_is_answering(&self) -> bool {
         self.agent_probe().await
-    }
-
-    /// Wait until the guest agent answers a live ping (see
-    /// [`agent_answering`](Self::agent_answering)).
-    pub async fn wait_agent_answering(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.agent_answering().await {
-                return Ok(());
-            }
-            if self.state().await == PowerState::Stopped {
-                bail!("{} stopped while waiting for agent", self.cfg.name);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("{}: agent not answering after {timeout:?}", self.cfg.name);
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
     }
 
     /// Mark the VM fully ready. Called by the orchestration layer once the
@@ -330,8 +316,8 @@ impl VmInstance {
     /// first use. A failed handshake is remembered briefly so agent-less
     /// guests don't pay the timeout on every exec that would prefer the
     /// agent transport.
-    pub async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
-        if self.state().await != PowerState::Running {
+    async fn agent_handle(&self) -> Result<super::vm_agent::AgentHandle> {
+        if self.power_state().await != PowerState::Running {
             return Err(super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into());
         }
         if !self.template().resolved.agent_channel {
@@ -345,7 +331,9 @@ impl VmInstance {
     /// Whether the vmlab-agent answers right now, sharing (and populating)
     /// the cached handle.
     async fn agent_probe(&self) -> bool {
-        if self.state().await != PowerState::Running || !self.template().resolved.agent_channel {
+        if self.power_state().await != PowerState::Running
+            || !self.template().resolved.agent_channel
+        {
             return false;
         }
         self.agent.probe(&self.dirs.agent_sock()).await
@@ -537,7 +525,16 @@ impl VmInstance {
     /// Spawn QEMU paused, connect QMP, then release the CPUs. The caller has
     /// already wired the NIC listener sockets on the segment switches.
     /// `on_exit` runs when the QEMU process ends (reason classified).
-    pub async fn start(
+    ///
+    /// The callback-level entry point [`Machine::start`](super::machine::Machine::start)
+    /// wraps: it turns these callbacks into the lab's lifecycle events and
+    /// wires the NICs first. `labd::lifecycle_tests` drives this directly,
+    /// because what it asserts on — the classified exit reason, how many times
+    /// readiness fired, every healthcheck transition — is exactly what the
+    /// callbacks carry and the event projection flattens. Not a second route
+    /// for consumers: `pub(super)`, and nothing outside this module tree can
+    /// reach it (ADR-0002).
+    pub(super) async fn boot(
         self: &Arc<Self>,
         on_exit: impl Fn(StopReason, String) + Send + Sync + 'static,
         on_ready: impl Fn() + Send + Sync + 'static,
@@ -664,7 +661,7 @@ impl VmInstance {
         tokio::spawn(async move {
             let defer_ready = me.first_boot_pending();
             loop {
-                if me.state().await != PowerState::Running {
+                if me.power_state().await != PowerState::Running {
                     return;
                 }
                 if me.agent_probe().await {
@@ -704,7 +701,7 @@ impl VmInstance {
 
     /// Graceful stop ladder (PRD §7.2): guest-agent shutdown → ACPI
     /// powerdown → hard kill, each with a timeout.
-    pub async fn stop(&self, force: bool) -> Result<()> {
+    async fn stop_ladder(&self, force: bool) -> Result<()> {
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
             return Ok(()); // already stopped
@@ -715,15 +712,13 @@ impl VmInstance {
         if force {
             proc.kill().await;
             let _ = proc.wait_exit(Duration::from_secs(10)).await;
-            return self
-                .wait_state(PowerState::Stopped, Duration::from_secs(10))
-                .await;
+            return self.settle_stopped(Duration::from_secs(10)).await;
         }
 
         // Rung 1: guest agent shutdown. The state is already Stopping so
         // `agent()`'s Running gate can't be used: take the cached handle, or
         // make one quick connect attempt on guests with an agent channel.
-        if self.is_agent_up().await {
+        if self.agent_up_flag().await {
             let agent = self.agent.cached().await;
             let agent = match agent {
                 Some(a) => Some(a),
@@ -747,9 +742,7 @@ impl VmInstance {
                     .is_ok()
                 && proc.wait_exit(Duration::from_secs(30)).await.is_ok()
             {
-                return self
-                    .wait_state(PowerState::Stopped, Duration::from_secs(10))
-                    .await;
+                return self.settle_stopped(Duration::from_secs(10)).await;
             }
         }
 
@@ -759,9 +752,7 @@ impl VmInstance {
         if let Some(control) = self.control.lock().await.clone() {
             let _ = control.powerdown().await;
             if proc.wait_exit(Duration::from_secs(30)).await.is_ok() {
-                return self
-                    .wait_state(PowerState::Stopped, Duration::from_secs(10))
-                    .await;
+                return self.settle_stopped(Duration::from_secs(10)).await;
             }
         }
 
@@ -769,68 +760,22 @@ impl VmInstance {
         tracing::warn!("{}: graceful stop timed out, killing", self.cfg.name);
         proc.kill().await;
         let _ = proc.wait_exit(Duration::from_secs(10)).await;
-        self.wait_state(PowerState::Stopped, Duration::from_secs(10))
-            .await
+        self.settle_stopped(Duration::from_secs(10)).await
     }
 
-    /// Wait for the exit monitor to settle the power state.
-    pub async fn wait_state(&self, want: PowerState, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while self.state().await != want {
-            if tokio::time::Instant::now() > deadline {
-                bail!(
-                    "{}: still {:?} after {timeout:?}",
-                    self.cfg.name,
-                    self.state().await
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        Ok(())
-    }
-
-    /// Wait until the VM is fully ready (PRD §10.3 wait_ready): agent up and
-    /// any first-boot provision complete.
-    pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.is_ready().await {
-                return Ok(());
-            }
-            if self.state().await == PowerState::Stopped {
-                bail!("{} stopped while waiting for ready", self.cfg.name);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("{}: not ready after {timeout:?}", self.cfg.name);
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
-
-    /// Wait until the guest agent first responds, ahead of the first-boot
-    /// provision. Weaker than [`wait_ready`].
-    pub async fn wait_agent_up(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.is_agent_up().await {
-                return Ok(());
-            }
-            if self.state().await == PowerState::Stopped {
-                bail!("{} stopped while waiting for agent", self.cfg.name);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("{}: agent not up after {timeout:?}", self.cfg.name);
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+    /// Wait for the exit monitor to settle the power state — the interface's
+    /// one implementation, reached explicitly because the inherent method that
+    /// used to shadow it is gone.
+    async fn settle_stopped(&self, timeout: Duration) -> Result<()> {
+        super::machine::Machine::wait_state(self, PowerState::Stopped, timeout).await
     }
 
     // ---- snapshots (PRD §7.3) ---------------------------------------------
 
     /// Take a snapshot; returns whether it was online (running) or offline.
-    pub async fn snapshot(&self, name: &str) -> Result<bool> {
+    async fn take_snapshot(&self, name: &str) -> Result<bool> {
         validate_snapshot_name(name)?;
-        match self.state().await {
+        match self.power_state().await {
             PowerState::Running => {
                 let qmp = self.qmp().await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
@@ -851,7 +796,7 @@ impl VmInstance {
     /// Restore must do the right thing (PRD §7.3): online snapshots resume
     /// running exactly where they were; offline snapshots leave the VM off.
     /// `was_online` comes from the recorded power state at capture.
-    pub async fn restore(
+    async fn load_snapshot(
         self: &Arc<Self>,
         name: &str,
         was_online: bool,
@@ -860,8 +805,8 @@ impl VmInstance {
     ) -> Result<()> {
         if was_online {
             // Ensure a running QEMU to load into.
-            if self.state().await == PowerState::Stopped {
-                self.start(on_exit, on_ready).await?;
+            if self.power_state().await == PowerState::Stopped {
+                self.boot(on_exit, on_ready).await?;
             }
             let qmp = self.qmp().await?;
             qmp.stop().await?;
@@ -879,16 +824,11 @@ impl VmInstance {
             Ok(())
         } else {
             // Offline: power off if needed, apply, stay off.
-            if self.state().await != PowerState::Stopped {
-                self.stop(false).await?;
-                // Wait for the exit monitor to settle the state.
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-                while self.state().await != PowerState::Stopped {
-                    if tokio::time::Instant::now() > deadline {
-                        bail!("{} did not stop for restore", self.cfg.name);
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+            if self.power_state().await != PowerState::Stopped {
+                self.stop_ladder(false).await?;
+                self.settle_stopped(Duration::from_secs(60))
+                    .await
+                    .with_context(|| format!("{} did not stop for restore", self.cfg.name))?;
             }
             for disk in self.all_disk_paths() {
                 crate::template::qimg::snapshot_apply(&disk, name).await?;
@@ -897,8 +837,8 @@ impl VmInstance {
         }
     }
 
-    pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
-        match self.state().await {
+    async fn drop_snapshot(&self, name: &str) -> Result<()> {
+        match self.power_state().await {
             PowerState::Running => {
                 let qmp = self.qmp().await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
@@ -913,24 +853,30 @@ impl VmInstance {
         }
         Ok(())
     }
+}
 
-    /// Per-NIC IPv4 addresses reported by the guest agent, matched to the
-    /// configured NIC order by resolved MAC address in one agent request.
-    pub async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
-        let agent = self.agent().await?;
-        let ifaces = agent.net_interfaces(Duration::from_secs(5)).await?;
-        let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
-        Ok(super::vm_agent::ipv4_by_mac(&ifaces, &macs))
+/// A VM's framebuffer is QEMU's: screendumps over QMP, input over QMP or RFB
+/// depending on what the guest actually listens to.
+#[async_trait::async_trait]
+impl super::screen::Screen for VmInstance {
+    fn name(&self) -> &str {
+        &self.cfg.name
     }
 
-    /// First IPv4 address, or the address of a specific NIC (PRD §10.3).
-    pub async fn guest_ip(&self, nic: Option<usize>) -> Result<String> {
-        let ips = self.guest_ips().await?;
-        let ip = match nic {
-            Some(index) => ips.get(index).and_then(Clone::clone),
-            None => ips.into_iter().flatten().next(),
-        };
-        ip.ok_or_else(|| anyhow::anyhow!("{}: no IPv4 address reported by agent", self.cfg.name))
+    async fn qmp(&self) -> Result<QmpClient> {
+        VmInstance::qmp(self).await
+    }
+
+    fn vnc_sock(&self) -> PathBuf {
+        self.dirs.vnc_sock()
+    }
+
+    fn capture_dir(&self) -> PathBuf {
+        self.dirs.run.clone()
+    }
+
+    fn input_transport(&self) -> crate::profiles::InputTransport {
+        self.template().resolved.input_transport
     }
 }
 
@@ -938,6 +884,10 @@ impl VmInstance {
 impl super::machine::Machine for VmInstance {
     fn virtiofsd_available(&self) -> bool {
         self.hv.virtiofsd_available()
+    }
+
+    fn as_machine(&self) -> &dyn super::machine::Machine {
+        self
     }
 
     fn name(&self) -> &str {
@@ -952,8 +902,8 @@ impl super::machine::Machine for VmInstance {
         self.template().resolved.arch.clone()
     }
 
-    fn guest_os(&self) -> super::playbook::GuestOs {
-        super::playbook::guest_os_of(self.template().resolved.profile.as_deref())
+    fn guest_os(&self) -> super::guest_os::GuestOs {
+        super::guest_os::guest_os_of(self.template().resolved.profile.as_deref())
     }
 
     fn nics(&self) -> &[model::Nic] {
@@ -972,48 +922,182 @@ impl super::machine::Machine for VmInstance {
         self.dirs.term_session_sock(id)
     }
 
+    fn event_subject(&self) -> &'static str {
+        "vm"
+    }
+
+    fn local_dir(&self) -> &Path {
+        &self.dirs.local
+    }
+
+    fn run_dir(&self) -> &Path {
+        &self.dirs.run
+    }
+
+    /// The per-arch emulator, `qemu-img` for the clone, and `swtpm` when the
+    /// resolved hardware wants a TPM.
+    fn required_binaries(&self) -> Vec<String> {
+        let t = self.template();
+        let mut needed = vec![
+            "qemu-img".to_string(),
+            qemu::emulator_binary(&t.resolved.arch),
+        ];
+        if t.resolved.tpm {
+            needed.push("swtpm".to_string());
+        }
+        needed
+    }
+
     async fn state(&self) -> PowerState {
-        VmInstance::state(self).await
+        self.power_state().await
     }
 
     async fn is_ready(&self) -> bool {
-        VmInstance::is_ready(self).await
+        self.ready_flag().await
     }
 
     async fn stop(&self, force: bool) -> Result<()> {
-        VmInstance::stop(self, force).await
+        self.stop_ladder(force).await
+    }
+
+    /// Wire this VM's NICs into the lab fabric — taps on the fast path where
+    /// available, since a VM's argv can carry pre-opened descriptors — then
+    /// spawn QEMU with event-emitting callbacks.
+    async fn start(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) -> Result<()> {
+        if self.power_state().await != PowerState::Stopped {
+            return Ok(());
+        }
+        // Safety net for paths that don't pull explicitly (restore, wscript):
+        // a no-op unless this VM's template download is still pending.
+        lab.ensure_pulled(&self.cfg.name).await?;
+        let events = lab.events().clone();
+        events.emit("vm.starting", serde_json::json!({"vm": self.cfg.name}));
+
+        std::fs::create_dir_all(&self.dirs.run)?;
+        let mut attachments = Vec::with_capacity(self.cfg.nics.len());
+        for (i, nic) in self.cfg.nics.iter().enumerate() {
+            let sock = self.dirs.nic_sock(i);
+            let _ = std::fs::remove_file(&sock);
+            let mac = *self
+                .macs
+                .get(i)
+                .ok_or_else(|| anyhow!("no persisted MAC for nic {i}"))?;
+            attachments.push(
+                lab.attach_nic(
+                    super::network::nic_segment_name(nic),
+                    &sock,
+                    mac,
+                    nic.isolated,
+                    true,
+                )
+                .await?,
+            );
+        }
+        self.set_nic_attachments(attachments).await;
+
+        let events_exit = events.clone();
+        let vm_name = self.cfg.name.clone();
+        let vm_name2 = self.cfg.name.clone();
+        self.boot(
+            move |reason, status| {
+                let payload =
+                    serde_json::json!({"vm": vm_name, "reason": reason, "status": status});
+                match reason {
+                    StopReason::Crashed => {
+                        events_exit.emit("vm.crashed", payload.clone());
+                        events_exit.emit("vm.stopped", payload);
+                    }
+                    _ => events_exit.emit("vm.stopped", payload),
+                }
+            },
+            move || {
+                events.emit("vm.ready", serde_json::json!({"vm": vm_name2}));
+            },
+        )
+        .await
+    }
+
+    /// An online snapshot boots the VM (through the normal start path, so the
+    /// NIC wiring and event callbacks are the usual ones) and loads into it;
+    /// an offline one reverts the qcow2 chain and leaves it stopped.
+    async fn restore(
+        self: Arc<Self>,
+        lab: Arc<dyn super::machine::LabServices>,
+        snap: &str,
+        online: bool,
+    ) -> Result<()> {
+        // Restoring into a running VM needs NIC listeners only if QEMU must be
+        // booted; go through `start` for that so the wiring stays in one place.
+        if online && self.power_state().await == PowerState::Stopped {
+            Arc::clone(&self).start(Arc::clone(&lab)).await?;
+        }
+        let events_exit = lab.events().clone();
+        let events_ready = lab.events().clone();
+        let n1 = self.cfg.name.clone();
+        let n2 = self.cfg.name.clone();
+        self.load_snapshot(
+            snap,
+            online,
+            move |reason, status| {
+                events_exit.emit(
+                    "vm.stopped",
+                    serde_json::json!({"vm": n1, "reason": reason, "status": status}),
+                );
+            },
+            move || events_ready.emit("vm.ready", serde_json::json!({"vm": n2})),
+        )
+        .await
+    }
+
+    /// A VM may be running a template first-boot provision through a Windows
+    /// specialize/OOBE pass and a settle reboot.
+    fn ready_timeout(&self) -> Duration {
+        VM_READY_TIMEOUT
+    }
+
+    fn pending_first_boot(&self) -> Option<String> {
+        self.first_boot_pending()
+            .then(|| self.template().first_boot_script.clone())
+            .flatten()
+    }
+
+    async fn first_boot_done(&self) -> Result<()> {
+        std::fs::write(self.dirs.firstboot_sentinel(), b"")
+            .with_context(|| format!("writing first-boot sentinel for {}", self.cfg.name))?;
+        self.mark_ready().await;
+        Ok(())
     }
 
     async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
-        VmInstance::agent(self).await
+        self.agent_handle().await
     }
 
     async fn agent_answering(&self) -> bool {
-        VmInstance::agent_answering(self).await
+        self.agent_is_answering().await
+    }
+
+    async fn is_agent_up(&self) -> bool {
+        self.agent_up_flag().await
     }
 
     async fn snapshot(&self, name: &str) -> Result<bool> {
-        VmInstance::snapshot(self, name).await
+        self.take_snapshot(name).await
     }
 
     async fn delete_snapshot(&self, name: &str) -> Result<()> {
-        VmInstance::delete_snapshot(self, name).await
+        self.drop_snapshot(name).await
     }
 
-    fn display(self: Arc<Self>) -> Option<super::machine::Display> {
-        Some(super::machine::Display::new(self))
+    fn display(self: Arc<Self>) -> Option<super::screen::Display> {
+        Some(super::screen::Display::new(self))
     }
 
     fn can_reboot(&self) -> bool {
         true
     }
 
-    fn ready_timeout(&self) -> Duration {
-        Duration::from_secs(600)
-    }
-
     async fn reboot_guest(&self) -> Result<()> {
-        self.agent()
+        self.agent_handle()
             .await?
             .shutdown_guest(
                 super::vm_agent::ShutdownMode::Reboot,
@@ -1021,6 +1105,98 @@ impl super::machine::Machine for VmInstance {
             )
             .await
             .map_err(|e| anyhow!("rebooting {}: {e}", self.cfg.name))
+    }
+
+    /// Mount this VM's shares through the guest agent (PRD §7.5).
+    ///
+    /// What to run is a [`crate::smb::mount_plan`] — this only drives it, and
+    /// only knows how to retry. The commands themselves, and every piece of
+    /// guest-OS knowledge behind them, live next to the mount-step type.
+    /// XP-era guests without an agent are mounted by provision scripts via
+    /// screen automation instead (documented; not attempted here).
+    ///
+    /// Waits for its own readiness rather than making the wave wait on the
+    /// retry window — Windows needs minutes before `net use` stops returning
+    /// error 67.
+    async fn mount_shares(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) {
+        if self.cfg.shares.is_empty() {
+            return;
+        }
+        if self.wait_ready(self.ready_timeout()).await.is_err() {
+            return;
+        }
+        let vm_name = &self.cfg.name;
+        let os_hint = crate::smb::guest_os_hint(self.template().resolved.profile.as_deref());
+        let smb_steps = lab.smb_mount_plan(vm_name, os_hint).await;
+        let plan = crate::smb::mount_plan(os_hint, &self.virtiofs_mounts().await, smb_steps);
+        // A share the guest cannot mount is the author's to fix, so it goes
+        // on the event feed the console watches, not only into the log.
+        for note in &plan.unsupported {
+            tracing::warn!("{vm_name}: {note}");
+            lab.events().emit(
+                "share.unmountable",
+                serde_json::json!({"vm": vm_name, "reason": note}),
+            );
+        }
+        if plan.is_empty() {
+            return;
+        }
+        let Ok(agent) = self.agent_handle().await else {
+            tracing::warn!("{vm_name}: no agent, cannot auto-mount shares");
+            return;
+        };
+        for step in &plan.steps {
+            let mut argv = vec![step.command.clone()];
+            argv.extend(step.args.iter().cloned());
+            let mut last: Option<String> = None;
+            for attempt in 0..plan.retry.attempts {
+                if attempt > 0 {
+                    tokio::time::sleep(plan.retry.delay).await;
+                }
+                let started = std::time::Instant::now();
+                match agent
+                    .exec(argv.clone(), vec![], None, None, Duration::from_secs(30))
+                    .await
+                {
+                    Ok(r) if r.exit_code == 0 => {
+                        tracing::info!(
+                            "{vm_name}: mount step `{}` ok (attempt {attempt}, {:?})",
+                            step.command,
+                            started.elapsed()
+                        );
+                        last = None;
+                        break;
+                    }
+                    Ok(r) => {
+                        let err = format!(
+                            "exited {}: {}",
+                            r.exit_code,
+                            String::from_utf8_lossy(&r.stderr)
+                        );
+                        tracing::debug!(
+                            "{vm_name}: mount attempt {attempt} ({:?}): {err}",
+                            started.elapsed()
+                        );
+                        last = Some(err);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "{vm_name}: mount attempt {attempt} ({:?}): {e}",
+                            started.elapsed()
+                        );
+                        last = Some(e.to_string());
+                    }
+                }
+            }
+            if let Some(err) = last {
+                tracing::warn!("{vm_name}: mount step `{}` failed: {err}", step.command);
+            }
+        }
+    }
+
+    /// QEMU's serial file, which is where a VM's guest console output lands.
+    fn console_log(&self, lines: usize) -> Option<Result<String>> {
+        Some(tail_file(&self.dirs.logs.join("serial.log"), lines))
     }
 
     async fn status_detail(&self) -> super::machine::MachineDetail {
@@ -1034,6 +1210,19 @@ impl super::machine::Machine for VmInstance {
             agent_version: self.template().agent_version.clone(),
         })
     }
+}
+
+/// The last `lines` lines of a log file; a file that was never written is
+/// empty rather than an error (the machine may not have started yet).
+pub(super) fn tail_file(path: &Path, lines: usize) -> Result<String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let all: Vec<&str> = content.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    Ok(all[start..].join("\n"))
 }
 
 fn disk_nodes(n: usize) -> Vec<String> {

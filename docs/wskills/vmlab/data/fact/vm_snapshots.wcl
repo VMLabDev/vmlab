@@ -1,15 +1,15 @@
 fact vm_snapshots {
-  title    = "Vm: snapshot methods"
+  title    = "Machine: snapshot methods"
   related  = [vm_api]
   audience = :both
   body {
     table {
       header = ["Method", "Returns"]
       rows = [
-        ["`vm.snapshot(name: string)`", "`Result[unit, string]` — online or offline per current state"],
-        ["`vm.restore(name: string)`", "`Result[unit, string]` — resumes running iff taken online"],
-        ["`vm.snapshots()`", "`Result[List[string], string]`"],
-        ["`vm.delete_snapshot(name: string)`", "`Result[unit, string]`"],
+        ["`m.snapshot(name: string)`", "`Result[unit, string]` — online or offline per current state"],
+        ["`m.restore(name: string)`", "`Result[unit, string]` — resumes running iff taken online"],
+        ["`m.snapshots()`", "`Result[List[string], string]`"],
+        ["`m.delete_snapshot(name: string)`", "`Result[unit, string]`"],
       ]
     }
     p "Share contents are outside snapshot scope."

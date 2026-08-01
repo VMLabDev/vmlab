@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use super::meta::TemplateMeta;
 use super::store::TemplateStore;
 use crate::config::model::{ArtefactSource, TemplateDef, TemplateSource};
+use crate::labd::machine::Machine;
 use crate::scripting::OutputSink;
 
 /// Called once the build VM's VNC socket is accepting connections.

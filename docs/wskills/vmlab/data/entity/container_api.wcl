@@ -1,14 +1,20 @@
 entity container_api {
-  name     = "Container"
+  name     = "Container handle"
   kind     = :api_object
-  summary  = "A container handle obtained from lab.container(name): lifecycle, snapshots, exec, file copy, logs, health, interactive terminal and stats — the VM API minus display/input."
+  summary  = "lab.container(name) returns the same Machine handle a VM does — this page is the container-flavoured tour of it, plus the one capability containers do not report."
   related  = [lab_containers, lab_api, vm_api, container_block, exec_result_type, vm_agent]
   audience = :both
   body {
     p <<PROSE
-A `Container` handle is returned by `lab.container(name)` (or `lab.containers()`).
-It mirrors the `Vm` handle's lifecycle, snapshot and guest-agent surface; there
-are no input or screen methods (containers have no display).
+`lab.container(name)` (or `lab.containers()`) returns a [Machine](entity_vm_api)
+— the same handle `lab.vm(name)` returns, with the same methods. The kind check
+is there so naming a VM gives you "that's a vm" rather than "no such machine".
+
+The screen and input methods exist on it like everything else. Calling one on a
+container fails at call time with *"machine `web` has no display"*: no container
+reports a display today, but that is a fact about the machine, not a rule about
+the kind — a container running a display server would report one, and the same
+script would then work unchanged.
 PROSE
     table {
       header = ["Method", "Meaning"]
@@ -25,7 +31,7 @@ PROSE
         ["`copy_to(local, path)` / `copy_from(path, local)`", "File copy in/out of the container filesystem"],
         ["`logs(lines)`", "Tail of the container's stdout/stderr (the serial console log)"],
         ["`terminal()`", "Interactive send/expect shell inside the container's PID namespace (the workload is PID 1) — a [Term](fact_vm_agent) handle"],
-        ["`stats()`", "Live `GuestStats` (cpu/mem/disks), as on [Vm](fact_vm_agent)"],
+        ["`stats()`", "Live `GuestStats` (cpu/mem/disks) — see [Guest agent](fact_vm_agent)"],
       ]
     }
     code "wscript" { source = <<'SRC'

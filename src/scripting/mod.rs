@@ -4,8 +4,6 @@
 //! execute on blocking threads and host methods bridge into the lab
 //! daemon's tokio runtime via `Handle::block_on`.
 
-pub mod interact;
-pub mod keymap;
 mod runner;
 pub mod terminal;
 
@@ -16,9 +14,10 @@ use std::time::Duration;
 
 use wscript::{Context, Module, Script};
 
-use crate::labd::container::ContainerInstance;
 use crate::labd::lab::LabRuntime;
-use crate::labd::vm::{PowerState, VmInstance};
+use crate::labd::machine::{Machine, MachineKind};
+use crate::labd::screen::Display;
+use crate::labd::vm::PowerState;
 use crate::vision;
 
 pub use runner::{OutputSink, ScriptOwner, run_event_handler, run_script_file, run_script_source};
@@ -62,12 +61,18 @@ impl LabHandle {
     }
 }
 
-/// A VM handle (PRD §10.3).
+/// A machine handle (PRD §10.3): the entry point to lifecycle, snapshots,
+/// input, screen matching and the guest agent, for a VM or a container alike.
+///
+/// One handle over [`Machine`], not one per kind. What a particular machine
+/// cannot do is reported at call time and names the capability — `screenshot`
+/// on a machine with no display fails with "machine `api` has no display",
+/// never "no such method" and never "containers cannot have displays".
 #[derive(Script)]
-#[script(name = "Vm")]
+#[script(name = "Machine")]
 #[script(opaque)]
-pub struct VmHandle {
-    pub(crate) vm: Arc<VmInstance>,
+pub struct MachineHandle {
+    pub(crate) machine: Arc<dyn Machine>,
     pub(crate) runtime: Arc<LabRuntime>,
     pub(crate) rt: tokio::runtime::Handle,
     /// Last pointer position, for the VNC input transport: RFB PointerEvent
@@ -76,26 +81,13 @@ pub struct VmHandle {
     pub(crate) last_pointer: Arc<std::sync::Mutex<(i64, i64)>>,
     /// Directory the running script lives in (see [`LabHandle::ref_base`]).
     pub(crate) ref_base: Arc<std::path::PathBuf>,
-    /// True when this handle targets the VM whose own first-boot provision
-    /// is the running script. Full readiness is unreachable until that script
-    /// returns (the poller defers the ready flag), so `is_ready`/`wait_ready`
-    /// on this handle mean agent-level readiness — a first-boot script that
-    /// reboots its guest can wait for it to come back.
+    /// True when this handle targets the machine whose own first-boot
+    /// provision is the running script. Full readiness is unreachable until
+    /// that script returns (the poller defers the ready flag), so `is_ready` /
+    /// `wait_ready` on this handle mean **agent-level** readiness — a
+    /// first-boot script that reboots its guest can wait for it to come back.
+    /// Everywhere else they mean full readiness.
     pub(crate) first_boot_gated: bool,
-}
-
-/// A container handle (PRD §16, §18): the lifecycle/exec/ip/snapshot subset
-/// of the VM surface — containers have no display, so no input/vision
-/// methods.
-#[derive(Script)]
-#[script(name = "Container")]
-#[script(opaque)]
-pub struct ContainerHandle {
-    pub(crate) container: Arc<ContainerInstance>,
-    pub(crate) runtime: Arc<LabRuntime>,
-    pub(crate) rt: tokio::runtime::Handle,
-    /// Directory the running script lives in (see [`LabHandle::ref_base`]).
-    pub(crate) ref_base: Arc<std::path::PathBuf>,
 }
 
 /// A segment handle (PRD §10.2).
@@ -204,31 +196,7 @@ fn estr(e: impl std::fmt::Display) -> String {
     format!("{e:#}")
 }
 
-/// `vm.exec` / `vm.exec_timeout` over the vmlab-agent transport (streamed,
-/// captured output).
-fn vm_exec(
-    v: &VmHandle,
-    cmd: String,
-    args: Vec<String>,
-    timeout: Duration,
-) -> Result<ExecResult, String> {
-    v.block(async {
-        let agent = v.vm.agent().await.map_err(estr)?;
-        let mut argv = vec![cmd];
-        argv.extend(args);
-        let r = agent
-            .exec(argv, vec![], None, None, timeout)
-            .await
-            .map_err(estr)?;
-        Ok(ExecResult {
-            exit_code: r.exit_code as i64,
-            stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
-        })
-    })
-}
-
-impl VmHandle {
+impl MachineHandle {
     fn block<F, T>(&self, fut: F) -> T
     where
         F: std::future::Future<Output = T>,
@@ -236,6 +204,11 @@ impl VmHandle {
         self.rt.block_on(fut)
     }
 
+    fn name(&self) -> &str {
+        self.machine.name()
+    }
+
+    /// Relative local paths resolve against the running script's directory.
     fn resolve_ref(&self, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() {
@@ -245,9 +218,41 @@ impl VmHandle {
         }
     }
 
-    /// QMP screendump → decoded image.
-    fn grab_screen(&self) -> Result<image::RgbImage, String> {
-        self.block(interact::grab_screen(&self.vm)).map_err(estr)
+    /// This machine's framebuffer, or an error naming the capability.
+    ///
+    /// The gate is the capability probe, never the machine kind: the day a
+    /// container reports a display, every screen method below works on it
+    /// unchanged. The message says what this machine does not offer, not what
+    /// its kind could never have.
+    fn display(&self) -> Result<Display, String> {
+        self.machine
+            .clone()
+            .display()
+            .ok_or_else(|| format!("machine `{}` has no display", self.name()))
+    }
+
+    /// `exec` / `exec_timeout` over the vmlab-agent transport (streamed,
+    /// captured output).
+    fn exec(
+        &self,
+        cmd: String,
+        args: Vec<String>,
+        timeout: Duration,
+    ) -> Result<ExecResult, String> {
+        self.block(async {
+            let agent = self.machine.agent().await.map_err(estr)?;
+            let mut argv = vec![cmd];
+            argv.extend(args);
+            let r = agent
+                .exec(argv, vec![], None, None, timeout)
+                .await
+                .map_err(estr)?;
+            Ok(ExecResult {
+                exit_code: r.exit_code as i64,
+                stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+            })
+        })
     }
 
     fn match_opts(threshold: f64, region: Vec<i64>) -> Result<vision::MatchOptions, String> {
@@ -269,7 +274,8 @@ impl VmHandle {
         refs: &[String],
         opts: &vision::MatchOptions,
     ) -> Result<Option<ScriptMatch>, String> {
-        let screen = self.grab_screen()?;
+        let display = self.display()?;
+        let screen = self.block(display.grab()).map_err(estr)?;
         for r in refs {
             let path = self.resolve_ref(r);
             let template = vision::load_screen(&path)
@@ -298,7 +304,8 @@ impl VmHandle {
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
                     "timed out after {timeout_secs}s waiting for {:?} on {}",
-                    refs, self.vm.cfg.name
+                    refs,
+                    self.name()
                 ));
             }
             std::thread::sleep(Duration::from_millis(interval_ms.max(50) as u64));
@@ -306,22 +313,16 @@ impl VmHandle {
     }
 }
 
-impl ContainerHandle {
-    fn block<F, T>(&self, fut: F) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        self.rt.block_on(fut)
-    }
-
-    /// Relative local paths resolve against the running script's directory,
-    /// exactly like [`VmHandle::resolve_ref`].
-    fn resolve_ref(&self, path: &str) -> PathBuf {
-        let p = PathBuf::from(path);
-        if p.is_absolute() {
-            p
-        } else {
-            self.ref_base.join(p)
+impl LabHandle {
+    fn handle_for(&self, machine: Arc<dyn Machine>) -> MachineHandle {
+        let first_boot_gated = self.owns_first_boot(machine.name());
+        MachineHandle {
+            machine,
+            runtime: self.runtime.clone(),
+            rt: self.rt.clone(),
+            last_pointer: Default::default(),
+            ref_base: self.ref_base.clone(),
+            first_boot_gated,
         }
     }
 }
@@ -354,70 +355,60 @@ pub fn lab_module() -> Module {
             (l.output)(format!("{msg}\n"));
         })
         .method(
-            "vm",
-            |l: &LabHandle, name: &str| -> Result<VmHandle, String> {
-                let vm = l.runtime.vm(name).map_err(estr)?.clone();
-                Ok(VmHandle {
-                    vm,
-                    runtime: l.runtime.clone(),
-                    rt: l.rt.clone(),
-                    last_pointer: Default::default(),
-                    ref_base: l.ref_base.clone(),
-                    first_boot_gated: l.owns_first_boot(name),
-                })
+            "machine",
+            |l: &LabHandle, name: &str| -> Result<MachineHandle, String> {
+                Ok(l.handle_for(l.runtime.machine(name).map_err(estr)?))
             },
         )
-        .method("this_vm", |l: &LabHandle| -> Result<VmHandle, String> {
-            let owner = l.owner.as_ref().ok_or(
-                "this_vm() is only available inside a vm's own provision or a template \
-                 first-boot script",
-            )?;
-            let vm = l.runtime.vm(&owner.vm).map_err(estr)?.clone();
-            Ok(VmHandle {
-                vm,
-                runtime: l.runtime.clone(),
-                rt: l.rt.clone(),
-                last_pointer: Default::default(),
-                ref_base: l.ref_base.clone(),
-                first_boot_gated: owner.first_boot,
-            })
+        .method("machines", |l: &LabHandle| -> Vec<MachineHandle> {
+            l.runtime.machines().map(|m| l.handle_for(m)).collect()
         })
-        .method("vms", |l: &LabHandle| -> Vec<VmHandle> {
+        // `vm` and `container` are `machine` with a kind check, kept because
+        // they read well in a script that knows what it declared — and because
+        // the error ("x is a container") is a better one than "no such
+        // machine". The handle they return is the same.
+        .method(
+            "vm",
+            |l: &LabHandle, name: &str| -> Result<MachineHandle, String> {
+                let m = l.runtime.machine(name).map_err(estr)?;
+                if m.kind() != MachineKind::Vm {
+                    return Err(format!("\"{name}\" is a container — use lab.container()"));
+                }
+                Ok(l.handle_for(m))
+            },
+        )
+        .method(
+            "this_vm",
+            |l: &LabHandle| -> Result<MachineHandle, String> {
+                let owner = l.owner.as_ref().ok_or(
+                    "this_vm() is only available inside a machine's own provision or a template \
+                 first-boot script",
+                )?;
+                Ok(l.handle_for(l.runtime.machine(&owner.vm).map_err(estr)?))
+            },
+        )
+        .method("vms", |l: &LabHandle| -> Vec<MachineHandle> {
             l.runtime
-                .vms
-                .values()
-                .map(|vm| VmHandle {
-                    vm: vm.clone(),
-                    runtime: l.runtime.clone(),
-                    rt: l.rt.clone(),
-                    last_pointer: Default::default(),
-                    ref_base: l.ref_base.clone(),
-                    first_boot_gated: l.owns_first_boot(&vm.cfg.name),
-                })
+                .machines()
+                .filter(|m| m.kind() == MachineKind::Vm)
+                .map(|m| l.handle_for(m))
                 .collect()
         })
         .method(
             "container",
-            |l: &LabHandle, name: &str| -> Result<ContainerHandle, String> {
-                let container = l.runtime.container(name).map_err(estr)?.clone();
-                Ok(ContainerHandle {
-                    container,
-                    runtime: l.runtime.clone(),
-                    rt: l.rt.clone(),
-                    ref_base: l.ref_base.clone(),
-                })
+            |l: &LabHandle, name: &str| -> Result<MachineHandle, String> {
+                let m = l.runtime.machine(name).map_err(estr)?;
+                if m.kind() != MachineKind::Container {
+                    return Err(format!("\"{name}\" is a vm — use lab.vm()"));
+                }
+                Ok(l.handle_for(m))
             },
         )
-        .method("containers", |l: &LabHandle| -> Vec<ContainerHandle> {
+        .method("containers", |l: &LabHandle| -> Vec<MachineHandle> {
             l.runtime
-                .containers
-                .values()
-                .map(|container| ContainerHandle {
-                    container: container.clone(),
-                    runtime: l.runtime.clone(),
-                    rt: l.rt.clone(),
-                    ref_base: l.ref_base.clone(),
-                })
+                .machines()
+                .filter(|m| m.kind() == MachineKind::Container)
+                .map(|m| l.handle_for(m))
                 .collect()
         })
         .method(
@@ -506,265 +497,294 @@ pub fn lab_module() -> Module {
             s.rules_json()
         });
 
-    // -- VM (§10.3) ----------------------------------------------------------
-    m.ty::<VmHandle>()
-        .method("name", |v: &VmHandle| v.vm.cfg.name.clone())
+    // -- Machine (§10.3, §16, §18) --------------------------------------------
+    //
+    // One surface for every machine. What a machine cannot do is reported at
+    // call time and names the capability, so a script written against a VM
+    // runs against a container and fails — if it fails at all — for a reason a
+    // lab author can act on.
+    m.ty::<MachineHandle>()
+        .method("name", |h: &MachineHandle| h.name().to_string())
+        .method("kind", |h: &MachineHandle| -> String {
+            match h.machine.kind() {
+                MachineKind::Vm => "vm".into(),
+                MachineKind::Container => "container".into(),
+            }
+        })
         // Lifecycle / state
-        .method("start", |v: &VmHandle| -> Result<(), String> {
-            let runtime = v.runtime.clone();
-            let name = v.vm.cfg.name.clone();
-            v.block(async move { runtime.start_vm(&name).await })
+        .method("start", |h: &MachineHandle| -> Result<(), String> {
+            let runtime = h.runtime.clone();
+            let name = h.name().to_string();
+            h.block(async move { runtime.start_machine(&name).await })
                 .map_err(estr)
         })
-        .method("stop", |v: &VmHandle| -> Result<(), String> {
-            v.block(v.vm.stop(false)).map_err(estr)
+        .method("stop", |h: &MachineHandle| -> Result<(), String> {
+            h.block(h.machine.stop(false)).map_err(estr)
         })
-        .method("stop_force", |v: &VmHandle| -> Result<(), String> {
-            v.block(v.vm.stop(true)).map_err(estr)
+        .method("stop_force", |h: &MachineHandle| -> Result<(), String> {
+            h.block(h.machine.stop(true)).map_err(estr)
+        })
+        .method("restart", |h: &MachineHandle| -> Result<(), String> {
+            let runtime = h.runtime.clone();
+            let name = h.name().to_string();
+            h.block(async move { runtime.restart_machine(&name, false).await })
+                .map_err(estr)
         })
         // Clean QMP `quit`: exits QEMU *gracefully*, flushing block-device
         // caches first (unlike stop_force's SIGKILL). For guests with no ACPI
         // (DOS, Win 3.x) this is the only way to seal a consistent disk — a
         // SIGKILL can drop unflushed qcow2 writes and leave it unbootable.
-        .method("poweroff", |v: &VmHandle| -> Result<(), String> {
-            v.block(async {
-                if let Ok(qmp) = v.vm.qmp().await {
+        .method("poweroff", |h: &MachineHandle| -> Result<(), String> {
+            h.block(async {
+                if let Ok(vm) = h.runtime.vm(h.name())
+                    && let Ok(qmp) = vm.qmp().await
+                {
                     // QEMU exits, so the QMP connection drops — that's expected.
                     let _ = qmp.quit().await;
                 }
-                v.vm.wait_state(PowerState::Stopped, Duration::from_secs(30))
+                h.machine
+                    .wait_state(PowerState::Stopped, Duration::from_secs(30))
                     .await
                     .map_err(estr)
             })
         })
-        .method("restart", |v: &VmHandle| -> Result<(), String> {
-            v.block(async {
-                v.vm.stop(false).await.map_err(estr)?;
-                v.vm.wait_state(PowerState::Stopped, Duration::from_secs(60))
-                    .await
-                    .map_err(estr)?;
-                v.runtime.start_vm(&v.vm.cfg.name).await.map_err(estr)
-            })
-        })
-        .method("state", |v: &VmHandle| -> String {
-            match v.block(v.vm.state()) {
+        .method("state", |h: &MachineHandle| -> String {
+            match h.block(h.machine.state()) {
                 PowerState::Stopped => "stopped".into(),
                 PowerState::Starting => "starting".into(),
                 PowerState::Running => "running".into(),
                 PowerState::Stopping => "stopping".into(),
             }
         })
-        // Readiness: inside the VM's own first-boot provision the ready flag
-        // is deferred until that script returns, so these mean "does the
-        // agent answer right now" there (see `VmHandle::first_boot_gated`) —
-        // a live signal the script can use to watch its own guest reboot —
+        // Readiness. Inside the machine's own first-boot provision the ready
+        // flag is deferred until that script returns, so these mean "does the
+        // agent answer right now" there (see `MachineHandle::first_boot_gated`)
+        // — a live signal the script can use to watch its own guest reboot —
         // and full readiness everywhere else.
-        .method("is_ready", |v: &VmHandle| -> bool {
-            if v.first_boot_gated {
-                v.block(v.vm.agent_answering())
+        .method("is_ready", |h: &MachineHandle| -> bool {
+            if h.first_boot_gated {
+                h.block(h.machine.agent_answering())
             } else {
-                v.block(v.vm.is_ready())
+                h.block(h.machine.is_ready())
             }
         })
         .method(
             "wait_ready",
-            |v: &VmHandle, timeout_secs: i64| -> Result<(), String> {
+            |h: &MachineHandle, timeout_secs: i64| -> Result<(), String> {
                 let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
-                if v.first_boot_gated {
-                    v.block(v.vm.wait_agent_answering(timeout)).map_err(estr)
+                if h.first_boot_gated {
+                    h.block(h.machine.wait_agent_answering(timeout))
+                        .map_err(estr)
                 } else {
-                    v.block(v.vm.wait_ready(timeout)).map_err(estr)
+                    h.block(h.machine.wait_ready(timeout)).map_err(estr)
                 }
             },
         )
-        // The live agent probe, ungated: goes false while the guest is down
-        // or mid-reboot even though the sticky ready flag stays set. What a
-        // build provision needs to watch an in-guest reboot it requested
-        // (`is_ready` outside first-boot is the sticky flag and never drops
-        // while QEMU runs).
-        .method("agent_answering", |v: &VmHandle| -> bool {
-            v.block(v.vm.agent_answering())
+        // Healthy = the healthcheck's latest verdict; a machine declaring none
+        // counts as healthy once it is ready.
+        .method("is_healthy", |h: &MachineHandle| -> bool {
+            h.block(h.machine.is_healthy())
+        })
+        // The live agent probe, ungated: goes false while the guest is down or
+        // mid-reboot even though the sticky ready flag stays set. What a build
+        // provision needs to watch an in-guest reboot it requested (`is_ready`
+        // outside first-boot never drops while QEMU runs).
+        .method("agent_answering", |h: &MachineHandle| -> bool {
+            h.block(h.machine.agent_answering())
         })
         .method(
             "wait_shutdown",
-            |v: &VmHandle, timeout_secs: i64| -> Result<(), String> {
-                v.block(v.vm.wait_state(
+            |h: &MachineHandle, timeout_secs: i64| -> Result<(), String> {
+                h.block(h.machine.wait_state(
                     PowerState::Stopped,
                     Duration::from_secs(timeout_secs.max(0) as u64),
                 ))
                 .map_err(estr)
             },
         )
-        .method("ip", |v: &VmHandle| -> Result<String, String> {
-            v.block(v.vm.guest_ip(None)).map_err(estr)
+        .method("ip", |h: &MachineHandle| -> Result<String, String> {
+            h.block(h.machine.guest_ip(None)).map_err(estr)
         })
         .method(
             "ip_nic",
-            |v: &VmHandle, nic: i64| -> Result<String, String> {
-                v.block(v.vm.guest_ip(Some(nic.max(0) as usize)))
+            |h: &MachineHandle, nic: i64| -> Result<String, String> {
+                h.block(h.machine.guest_ip(Some(nic.max(0) as usize)))
                     .map_err(estr)
             },
         )
-        // Snapshots (§10.3)
+        // Snapshots (§10.3, §18) — routed through the runtime so records,
+        // events and pin-guarding stay in one place.
         .method(
             "snapshot",
-            |v: &VmHandle, name: &str| -> Result<(), String> {
-                let runtime = v.runtime.clone();
-                let vm_name = v.vm.cfg.name.clone();
+            |h: &MachineHandle, name: &str| -> Result<(), String> {
+                let runtime = h.runtime.clone();
+                let machine = h.name().to_string();
                 let snap = name.to_string();
-                v.block(async move { runtime.snapshot(&vm_name, &snap).await })
+                h.block(async move { runtime.snapshot(&machine, &snap).await })
                     .map(|_| ())
                     .map_err(estr)
             },
         )
         .method(
             "restore",
-            |v: &VmHandle, name: &str| -> Result<(), String> {
-                let runtime = v.runtime.clone();
-                let vm_name = v.vm.cfg.name.clone();
+            |h: &MachineHandle, name: &str| -> Result<(), String> {
+                let runtime = h.runtime.clone();
+                let machine = h.name().to_string();
                 let snap = name.to_string();
-                v.block(async move { runtime.restore(&vm_name, &snap).await })
+                h.block(async move { runtime.restore(&machine, &snap).await })
                     .map_err(estr)
             },
         )
-        .method("snapshots", |v: &VmHandle| -> Result<Vec<String>, String> {
-            let runtime = v.runtime.clone();
-            let vm_name = v.vm.cfg.name.clone();
-            let val = v
-                .block(async move { runtime.snapshots(&vm_name).await })
-                .map_err(estr)?;
-            Ok(val
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s["name"].as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default())
-        })
+        .method(
+            "snapshots",
+            |h: &MachineHandle| -> Result<Vec<String>, String> {
+                let runtime = h.runtime.clone();
+                let machine = h.name().to_string();
+                let val = h
+                    .block(async move { runtime.snapshots(&machine).await })
+                    .map_err(estr)?;
+                Ok(val
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s["name"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default())
+            },
+        )
         .method(
             "delete_snapshot",
-            |v: &VmHandle, name: &str| -> Result<(), String> {
-                let runtime = v.runtime.clone();
-                let vm_name = v.vm.cfg.name.clone();
+            |h: &MachineHandle, name: &str| -> Result<(), String> {
+                let runtime = h.runtime.clone();
+                let machine = h.name().to_string();
                 let snap = name.to_string();
-                v.block(async move { runtime.delete_snapshot(&vm_name, &snap).await })
+                h.block(async move { runtime.delete_snapshot(&machine, &snap).await })
                     .map_err(estr)
             },
         )
-        // Input (§10.3)
+        // Input (§10.3) — the Display capability.
         .method(
             "send_keys",
-            |v: &VmHandle, chord: &str| -> Result<(), String> {
-                v.block(interact::send_keys(&v.vm, chord)).map_err(estr)
+            |h: &MachineHandle, chord: &str| -> Result<(), String> {
+                h.block(h.display()?.send_keys(chord)).map_err(estr)
             },
         )
         .method(
             "type_text",
-            |v: &VmHandle, text: &str| -> Result<(), String> {
-                v.block(interact::type_text(&v.vm, text, 35)).map_err(estr)
+            |h: &MachineHandle, text: &str| -> Result<(), String> {
+                h.block(h.display()?.type_text(text, 35)).map_err(estr)
             },
         )
         .method(
             "type_text_paced",
-            |v: &VmHandle, text: String, delay_ms: i64| -> Result<(), String> {
-                v.block(interact::type_text(&v.vm, &text, delay_ms.max(0) as u64))
+            |h: &MachineHandle, text: String, delay_ms: i64| -> Result<(), String> {
+                h.block(h.display()?.type_text(&text, delay_ms.max(0) as u64))
                     .map_err(estr)
             },
         )
         .method(
             "mouse_move",
-            |v: &VmHandle, x: i64, y: i64| -> Result<(), String> {
-                *v.last_pointer.lock_recover() = (x, y);
-                v.block(interact::mouse_move(&v.vm, x, y)).map_err(estr)
+            |h: &MachineHandle, x: i64, y: i64| -> Result<(), String> {
+                let display = h.display()?;
+                *h.last_pointer.lock_recover() = (x, y);
+                h.block(display.mouse_move(x, y)).map_err(estr)
             },
         )
         .method(
             "mouse_click",
-            |v: &VmHandle, button: &str| -> Result<(), String> {
+            |h: &MachineHandle, button: &str| -> Result<(), String> {
                 // A click reuses the position the preceding move set; for QMP
                 // this is a no-op (QEMU retains the last absolute position),
                 // for VNC it is the click target.
-                let at = *v.last_pointer.lock_recover();
-                v.block(interact::mouse_click(&v.vm, button, Some(at)))
-                    .map_err(estr)
+                let display = h.display()?;
+                let at = *h.last_pointer.lock_recover();
+                h.block(display.mouse_click(button, Some(at))).map_err(estr)
             },
         )
         .method(
             "mouse_drag",
-            |v: &VmHandle, x1: i64, y1: i64, x2: i64, y2: i64| -> Result<(), String> {
-                *v.last_pointer.lock_recover() = (x2, y2);
-                v.block(interact::mouse_drag(&v.vm, x1, y1, x2, y2))
-                    .map_err(estr)
+            |h: &MachineHandle, x1: i64, y1: i64, x2: i64, y2: i64| -> Result<(), String> {
+                let display = h.display()?;
+                *h.last_pointer.lock_recover() = (x2, y2);
+                h.block(display.mouse_drag(x1, y1, x2, y2)).map_err(estr)
             },
         )
-        // Screen (§10.3)
+        // Screen (§10.3) — the Display capability.
         .method(
             "screenshot",
-            |v: &VmHandle, path: &str| -> Result<String, String> {
+            |h: &MachineHandle, path: &str| -> Result<String, String> {
+                let display = h.display()?;
                 let out = if path.is_empty() {
-                    let dir = v.runtime.lab_local.join(SCREENSHOT_DIR);
+                    let dir = h.runtime.lab_local.join(SCREENSHOT_DIR);
                     dir.join(format!(
                         "{}-{}.png",
-                        v.vm.cfg.name,
+                        h.name(),
                         chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f")
                     ))
                 } else {
-                    v.resolve_ref(path)
+                    h.resolve_ref(path)
                 };
-                v.block(interact::screenshot(&v.vm, &out)).map_err(estr)?;
+                h.block(display.screenshot(&out)).map_err(estr)?;
                 Ok(out.display().to_string())
             },
         )
         .method(
             "wait_for_image",
-            |v: &VmHandle, image: String, timeout_secs: i64| -> Result<ScriptMatch, String> {
-                v.wait_for(&[image], 0.9, vec![], timeout_secs, 1000)
+            |h: &MachineHandle, image: String, timeout_secs: i64| -> Result<ScriptMatch, String> {
+                h.wait_for(&[image], 0.9, vec![], timeout_secs, 1000)
             },
         )
         .method(
             "wait_for_image_opts",
-            |v: &VmHandle,
+            |h: &MachineHandle,
              image: String,
              timeout_secs: i64,
              threshold: f64,
              region: Vec<i64>|
              -> Result<ScriptMatch, String> {
-                v.wait_for(&[image], threshold, region, timeout_secs, 1000)
+                h.wait_for(&[image], threshold, region, timeout_secs, 1000)
             },
         )
         .method(
             "wait_for_any",
-            |v: &VmHandle, images: Vec<String>, timeout_secs: i64| -> Result<ScriptMatch, String> {
-                v.wait_for(&images, 0.9, vec![], timeout_secs, 1000)
+            |h: &MachineHandle,
+             images: Vec<String>,
+             timeout_secs: i64|
+             -> Result<ScriptMatch, String> {
+                h.wait_for(&images, 0.9, vec![], timeout_secs, 1000)
             },
         )
         .method(
             "find_image",
-            |v: &VmHandle, image: &str| -> Result<Option<ScriptMatch>, String> {
-                let opts = VmHandle::match_opts(0.9, vec![])?;
-                v.find_once(&[image.to_string()], &opts)
+            |h: &MachineHandle, image: &str| -> Result<Option<ScriptMatch>, String> {
+                let opts = MachineHandle::match_opts(0.9, vec![])?;
+                h.find_once(&[image.to_string()], &opts)
             },
         )
-        .method("ocr", |v: &VmHandle| -> Result<String, String> {
-            v.block(interact::ocr(&v.vm, None)).map_err(estr)
+        .method("ocr", |h: &MachineHandle| -> Result<String, String> {
+            h.block(h.display()?.ocr(None)).map_err(estr)
         })
         .method(
             "ocr_region",
-            |v: &VmHandle, region: Vec<i64>| -> Result<String, String> {
-                let opts = VmHandle::match_opts(0.9, region)?;
-                v.block(interact::ocr(&v.vm, opts.region)).map_err(estr)
+            |h: &MachineHandle, region: Vec<i64>| -> Result<String, String> {
+                let opts = MachineHandle::match_opts(0.9, region)?;
+                h.block(h.display()?.ocr(opts.region)).map_err(estr)
             },
         )
         .method(
             "wait_for_text",
-            |v: &VmHandle, pattern: String, timeout_secs: i64| -> Result<ScriptMatch, String> {
+            |h: &MachineHandle,
+             pattern: String,
+             timeout_secs: i64|
+             -> Result<ScriptMatch, String> {
+                let display = h.display()?;
                 let re = regex::Regex::new(&pattern).map_err(|e| format!("bad pattern: {e}"))?;
                 let deadline =
                     std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
                 loop {
-                    let img = v.grab_screen()?;
-                    let text = v.block(vision::ocr(&img, None)).map_err(estr)?;
+                    let img = h.block(display.grab()).map_err(estr)?;
+                    let text = h.block(vision::ocr(&img, None)).map_err(estr)?;
                     if let Some(found) = re.find(&text) {
                         return Ok(ScriptMatch {
                             x: 0,
@@ -780,43 +800,38 @@ pub fn lab_module() -> Module {
                     if std::time::Instant::now() >= deadline {
                         return Err(format!(
                             "timed out after {timeout_secs}s waiting for /{pattern}/ on {}",
-                            v.vm.cfg.name
+                            h.name()
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(1000));
                 }
             },
         )
-        // Guest agent (§10.3). Exec and file transfer prefer the vmlab-agent
+        // Guest agent (§10.3). Exec and file transfer ride the vmlab-agent
         // channel (streamed, no polling, no base64); guests from pre-agent
         // templates have no exec transport at all.
         .method(
             "exec",
-            |v: &VmHandle, cmd: String, args: Vec<String>| -> Result<ExecResult, String> {
-                vm_exec(v, cmd, args, Duration::from_secs(120))
+            |h: &MachineHandle, cmd: String, args: Vec<String>| -> Result<ExecResult, String> {
+                h.exec(cmd, args, Duration::from_secs(120))
             },
         )
         .method(
             "exec_timeout",
-            |v: &VmHandle,
+            |h: &MachineHandle,
              cmd: String,
              args: Vec<String>,
              timeout_secs: i64|
              -> Result<ExecResult, String> {
-                vm_exec(
-                    v,
-                    cmd,
-                    args,
-                    Duration::from_secs(timeout_secs.max(1) as u64),
-                )
+                h.exec(cmd, args, Duration::from_secs(timeout_secs.max(1) as u64))
             },
         )
         .method(
             "copy_to",
-            |v: &VmHandle, local: String, guest_path: String| -> Result<(), String> {
-                let src = v.resolve_ref(&local);
-                v.block(async {
-                    let agent = v.vm.agent().await.map_err(estr)?;
+            |h: &MachineHandle, local: String, guest_path: String| -> Result<(), String> {
+                let src = h.resolve_ref(&local);
+                h.block(async {
+                    let agent = h.machine.agent().await.map_err(estr)?;
                     agent
                         .push_file(&src, &guest_path, None)
                         .await
@@ -827,13 +842,13 @@ pub fn lab_module() -> Module {
         )
         .method(
             "copy_from",
-            |v: &VmHandle, guest_path: String, local: String| -> Result<(), String> {
-                let out = v.resolve_ref(&local);
+            |h: &MachineHandle, guest_path: String, local: String| -> Result<(), String> {
+                let out = h.resolve_ref(&local);
                 if let Some(parent) = out.parent() {
                     std::fs::create_dir_all(parent).map_err(estr)?;
                 }
-                v.block(async {
-                    let agent = v.vm.agent().await.map_err(estr)?;
+                h.block(async {
+                    let agent = h.machine.agent().await.map_err(estr)?;
                     agent
                         .pull_file(&guest_path, &out)
                         .await
@@ -842,27 +857,37 @@ pub fn lab_module() -> Module {
                 })
             },
         )
+        // Console log: a container's captured stdout/stderr, a VM's serial log.
+        .method(
+            "logs",
+            |h: &MachineHandle, lines: i64| -> Result<String, String> {
+                match h.machine.console_log(lines.max(0) as usize) {
+                    Some(r) => r.map_err(estr),
+                    None => Err(format!("machine `{}` has no console log", h.name())),
+                }
+            },
+        )
         // Interactive terminal (send/expect; vmlab-agent `terminal` feature).
         .method(
             "terminal",
-            |v: &VmHandle| -> Result<terminal::TerminalHandle, String> {
-                let session = v.block(async {
-                    let agent = v.vm.agent().await.map_err(estr)?;
+            |h: &MachineHandle| -> Result<terminal::TerminalHandle, String> {
+                let session = h.block(async {
+                    let agent = h.machine.agent().await.map_err(estr)?;
                     agent
                         .open_terminal(terminal::SCRIPT_COLS, terminal::SCRIPT_ROWS, None)
                         .await
                         .map_err(estr)
                 })?;
                 Ok(terminal::TerminalHandle::new(
-                    v.vm.cfg.name.clone(),
-                    v.rt.clone(),
+                    h.name().to_string(),
+                    h.rt.clone(),
                     session,
                 ))
             },
         )
-        .method("stats", |v: &VmHandle| -> Result<GuestStats, String> {
-            v.block(async {
-                let agent = v.vm.agent().await.map_err(estr)?;
+        .method("stats", |h: &MachineHandle| -> Result<GuestStats, String> {
+            h.block(async {
+                let agent = h.machine.agent().await.map_err(estr)?;
                 agent
                     .stats(Duration::from_secs(10))
                     .await
@@ -870,238 +895,6 @@ pub fn lab_module() -> Module {
                     .map_err(estr)
             })
         });
-
-    // -- Container (§16) -------------------------------------------------------
-    m.ty::<ContainerHandle>()
-        .method("name", |c: &ContainerHandle| c.container.cfg.name.clone())
-        // Lifecycle / state
-        .method("start", |c: &ContainerHandle| -> Result<(), String> {
-            // Via the runtime, which wires the NIC listeners and events.
-            let runtime = c.runtime.clone();
-            let name = c.container.cfg.name.clone();
-            c.block(async move { runtime.start_container(&name).await })
-                .map_err(estr)
-        })
-        .method("stop", |c: &ContainerHandle| -> Result<(), String> {
-            c.block(c.container.stop(false)).map_err(estr)
-        })
-        .method("stop_force", |c: &ContainerHandle| -> Result<(), String> {
-            c.block(c.container.stop(true)).map_err(estr)
-        })
-        .method("restart", |c: &ContainerHandle| -> Result<(), String> {
-            c.block(async {
-                c.container.stop(false).await.map_err(estr)?;
-                c.container
-                    .wait_state(PowerState::Stopped, Duration::from_secs(60))
-                    .await
-                    .map_err(estr)?;
-                c.runtime
-                    .start_container(&c.container.cfg.name)
-                    .await
-                    .map_err(estr)
-            })
-        })
-        .method("state", |c: &ContainerHandle| -> String {
-            match c.block(c.container.state()) {
-                PowerState::Stopped => "stopped".into(),
-                PowerState::Starting => "starting".into(),
-                PowerState::Running => "running".into(),
-                PowerState::Stopping => "stopping".into(),
-            }
-        })
-        .method("is_ready", |c: &ContainerHandle| -> bool {
-            c.block(c.container.is_ready())
-        })
-        // Snapshots (§18) — same contract as VMs, routed through the runtime
-        // so records/events/digest-guarding stay in one place.
-        .method(
-            "snapshot",
-            |c: &ContainerHandle, name: &str| -> Result<(), String> {
-                let runtime = c.runtime.clone();
-                let cname = c.container.cfg.name.clone();
-                let snap = name.to_string();
-                c.block(async move { runtime.snapshot(&cname, &snap).await })
-                    .map(|_| ())
-                    .map_err(estr)
-            },
-        )
-        .method(
-            "restore",
-            |c: &ContainerHandle, name: &str| -> Result<(), String> {
-                let runtime = c.runtime.clone();
-                let cname = c.container.cfg.name.clone();
-                let snap = name.to_string();
-                c.block(async move { runtime.restore(&cname, &snap).await })
-                    .map_err(estr)
-            },
-        )
-        .method(
-            "snapshots",
-            |c: &ContainerHandle| -> Result<Vec<String>, String> {
-                let runtime = c.runtime.clone();
-                let cname = c.container.cfg.name.clone();
-                let val = c
-                    .block(async move { runtime.snapshots(&cname).await })
-                    .map_err(estr)?;
-                Ok(val
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|s| s["name"].as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default())
-            },
-        )
-        .method(
-            "delete_snapshot",
-            |c: &ContainerHandle, name: &str| -> Result<(), String> {
-                let runtime = c.runtime.clone();
-                let cname = c.container.cfg.name.clone();
-                let snap = name.to_string();
-                c.block(async move { runtime.delete_snapshot(&cname, &snap).await })
-                    .map_err(estr)
-            },
-        )
-        // Healthy = the healthcheck's latest verdict is passing; a container
-        // with no healthcheck (no verdict at all) counts as healthy once
-        // it is ready.
-        .method("is_healthy", |c: &ContainerHandle| -> bool {
-            c.block(async {
-                match c.container.health().await {
-                    Some(healthy) => healthy,
-                    None => c.container.is_ready().await,
-                }
-            })
-        })
-        .method(
-            "wait_ready",
-            |c: &ContainerHandle, timeout_secs: i64| -> Result<(), String> {
-                c.block(
-                    c.container
-                        .wait_ready(Duration::from_secs(timeout_secs.max(0) as u64)),
-                )
-                .map_err(estr)
-            },
-        )
-        .method(
-            "wait_shutdown",
-            |c: &ContainerHandle, timeout_secs: i64| -> Result<(), String> {
-                c.block(c.container.wait_state(
-                    PowerState::Stopped,
-                    Duration::from_secs(timeout_secs.max(0) as u64),
-                ))
-                .map_err(estr)
-            },
-        )
-        .method("ip", |c: &ContainerHandle| -> Result<String, String> {
-            c.block(c.container.guest_ip()).map_err(estr)
-        })
-        // Exec + files (runs inside the container rootfs, via the agent)
-        .method(
-            "exec",
-            |c: &ContainerHandle, cmd: String, args: Vec<String>| -> Result<ExecResult, String> {
-                c.block(async {
-                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                    let r = c
-                        .container
-                        .exec(&cmd, &arg_refs, Duration::from_secs(120))
-                        .await
-                        .map_err(estr)?;
-                    Ok(ExecResult {
-                        exit_code: r.exit_code as i64,
-                        stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
-                    })
-                })
-            },
-        )
-        .method(
-            "exec_timeout",
-            |c: &ContainerHandle,
-             cmd: String,
-             args: Vec<String>,
-             timeout_secs: i64|
-             -> Result<ExecResult, String> {
-                c.block(async {
-                    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                    let r = c
-                        .container
-                        .exec(
-                            &cmd,
-                            &arg_refs,
-                            Duration::from_secs(timeout_secs.max(1) as u64),
-                        )
-                        .await
-                        .map_err(estr)?;
-                    Ok(ExecResult {
-                        exit_code: r.exit_code as i64,
-                        stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
-                    })
-                })
-            },
-        )
-        .method(
-            "copy_to",
-            |c: &ContainerHandle, local: String, container_path: String| -> Result<(), String> {
-                let src = c.resolve_ref(&local);
-                c.block(
-                    c.container
-                        .copy_to(&src, &container_path, Duration::from_secs(60)),
-                )
-                .map_err(estr)
-            },
-        )
-        .method(
-            "copy_from",
-            |c: &ContainerHandle, container_path: String, local: String| -> Result<(), String> {
-                let out = c.resolve_ref(&local);
-                c.block(
-                    c.container
-                        .copy_from(&container_path, &out, Duration::from_secs(60)),
-                )
-                .map_err(estr)
-            },
-        )
-        // Console log (kernel messages + the container's stdout/stderr)
-        .method(
-            "logs",
-            |c: &ContainerHandle, lines: i64| -> Result<String, String> {
-                c.container.logs(lines.max(0) as usize).map_err(estr)
-            },
-        )
-        // Interactive terminal + metrics (vmlab-agent).
-        .method(
-            "terminal",
-            |c: &ContainerHandle| -> Result<terminal::TerminalHandle, String> {
-                let session = c.block(async {
-                    let agent = c.container.agent().await.map_err(estr)?;
-                    agent
-                        .open_terminal(terminal::SCRIPT_COLS, terminal::SCRIPT_ROWS, None)
-                        .await
-                        .map_err(estr)
-                })?;
-                Ok(terminal::TerminalHandle::new(
-                    c.container.cfg.name.clone(),
-                    c.rt.clone(),
-                    session,
-                ))
-            },
-        )
-        .method(
-            "stats",
-            |c: &ContainerHandle| -> Result<GuestStats, String> {
-                c.block(async {
-                    let agent = c.container.agent().await.map_err(estr)?;
-                    agent
-                        .stats(Duration::from_secs(10))
-                        .await
-                        .map(GuestStats::from)
-                        .map_err(estr)
-                })
-            },
-        );
 
     // -- Terminal sessions (send/expect) ---------------------------------------
     m.ty::<terminal::TerminalHandle>()
@@ -1209,55 +1002,88 @@ fn main(lab: Lab) {
         check_script_source(src).expect("API surface should type-check");
     }
 
+    /// Every operation is on every machine. Before ADR-0002 the surface was
+    /// split by Rust type: a container handle had no `snapshot`, no power
+    /// control and no `ip_nic`; a VM handle had no `logs` and no `is_healthy`.
+    /// A script asking for one got "no such method", which told a lab author
+    /// nothing about *this* machine.
     #[test]
-    fn container_api_compiles() {
+    fn one_surface_for_both_kinds() {
+        let src = r#"
+use vmlab
+
+fn drive(lab: Lab, m: Machine) {
+    let s = m.start()
+    match m.wait_ready(120) {
+        Ok(_) => lab.log(m.name() + " (" + m.kind() + ") is ready"),
+        Err(e) => lab.log("not ready: " + e),
+    }
+    match m.ip() {
+        Ok(ip) => lab.log("ip " + ip),
+        Err(e) => lab.log(e),
+    }
+    let nic0 = m.ip_nic(0)
+    if m.is_ready() && m.is_healthy() && m.agent_answering() {
+        match m.exec("uname", ["-a"]) {
+            Ok(r) => { if r.exit_code == 0 { lab.log(r.stdout) } else { lab.log(r.stderr) } }
+            Err(e) => lab.log("exec failed: " + e),
+        }
+        let t = m.exec_timeout("sleep", ["5"], 10)
+    }
+    let up = m.copy_to("conf/app.conf", "/etc/app.conf")
+    let down = m.copy_from("/var/log/app.log", "logs/app.log")
+    match m.logs(50) {
+        Ok(text) => lab.log(text),
+        Err(e) => lab.log(e),
+    }
+    let snap = m.snapshot("clean")
+    match m.snapshots() {
+        Ok(names) => { for n in names { lab.log(n) } }
+        Err(e) => lab.log(e),
+    }
+    let rs = m.restore("clean")
+    let ds = m.delete_snapshot("clean")
+    let r = m.restart()
+    let st = m.stop()
+    let sf = m.stop_force()
+    let po = m.poweroff()
+    let w = m.wait_shutdown(60)
+}
+
+fn main(lab: Lab) {
+    let Ok(web) = lab.container("web") else { return }
+    drive(lab, web)
+    let Ok(dc) = lab.vm("dc01") else { return }
+    drive(lab, dc)
+    let Ok(any) = lab.machine("api") else { return }
+    drive(lab, any)
+    for m in lab.machines() { lab.log(m.name() + ": " + m.state()) }
+    for c in lab.containers() { lab.log(c.name()) }
+}
+"#;
+        check_script_source(src).expect("one machine surface should type-check");
+    }
+
+    /// The screen operations are on every machine too — a container calling
+    /// one fails at runtime naming the Display capability, not at compile time
+    /// naming its kind. That is what keeps the expansion point open: the day a
+    /// container reports a display, this script runs unchanged.
+    #[test]
+    fn screen_operations_are_on_every_machine() {
         let src = r#"
 use vmlab
 
 fn main(lab: Lab) {
-    let Ok(web) = lab.container("web") else {
-        lab.log("no web container")
-        return
-    }
-    let s = web.start()
-    match web.wait_ready(120) {
-        Ok(_) => lab.log(web.name() + " is ready"),
-        Err(e) => lab.log("not ready: " + e),
-    }
-    match web.ip() {
-        Ok(ip) => lab.log("ip " + ip),
+    let Ok(web) = lab.container("web") else { return }
+    match web.screenshot("") {
+        Ok(path) => lab.log(path),
         Err(e) => lab.log(e),
     }
-    if web.is_ready() && web.is_healthy() {
-        match web.exec("nginx", ["-t"]) {
-            Ok(r) => { if r.exit_code == 0 { lab.log(r.stdout) } else { lab.log(r.stderr) } }
-            Err(e) => lab.log("exec failed: " + e),
-        }
-        let t = web.exec_timeout("sleep", ["5"], 10)
-    }
-    let up = web.copy_to("conf/nginx.conf", "/etc/nginx/nginx.conf")
-    let down = web.copy_from("/var/log/nginx/error.log", "logs/error.log")
-    let r = web.restart()
-    match web.logs(50) {
-        Ok(text) => lab.log(text),
-        Err(e) => lab.log(e),
-    }
-    let snap = web.snapshot("clean")
-    match web.snapshots() {
-        Ok(names) => { for n in names { lab.log(n) } }
-        Err(e) => lab.log(e),
-    }
-    let rs = web.restore("clean")
-    let ds = web.delete_snapshot("clean")
-    for c in lab.containers() {
-        lab.log(c.name() + ": " + c.state())
-    }
-    let st = web.stop()
-    let sf = web.stop_force()
-    let w = web.wait_shutdown(60)
+    let k = web.send_keys("ctrl-alt-del")
+    let o = web.ocr()
 }
 "#;
-        check_script_source(src).expect("container API surface should type-check");
+        check_script_source(src).expect("screen methods must exist on a container handle");
     }
 
     #[test]

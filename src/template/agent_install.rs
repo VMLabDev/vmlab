@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 
 use super::bootstrap::StagedGuestIso;
 use crate::agent_asset::AgentOs;
+use crate::labd::machine::Machine;
 use crate::labd::vm::VmInstance;
 
 /// Wait for the agent handshake; returns the staged asset's version stamp

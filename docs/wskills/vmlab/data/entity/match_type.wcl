@@ -5,7 +5,7 @@ entity match_type {
   related  = [vm_api, vm_vision]
   audience = :both
   body {
-    p "Returned by the image-matching and text-matching `Vm` methods (`wait_for_image`, `find_image`, `wait_for_text`, …)."
+    p "Returned by the image-matching and text-matching `Machine` methods (`wait_for_image`, `find_image`, `wait_for_text`, …)."
     code "rust" { source = <<'SRC'
 struct Match { x: int, y: int, w: int, h: int, score: float,
                cx: int, cy: int,      // center — feed to mouse_move
