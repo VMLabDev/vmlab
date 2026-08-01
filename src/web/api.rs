@@ -448,12 +448,7 @@ pub async fn catalog_inherited(q: web::Query<InheritedQuery>) -> HttpResponse {
 /// and runtime vocabularies, and stay sourced from their Rust constants.
 pub async fn catalog_meta() -> HttpResponse {
     let schema = SchemaProjection::get();
-    let default_secs = |field: &str| {
-        schema
-            .block("healthcheck")
-            .and_then(|b| b.field(field))
-            .and_then(|f| f.default_number)
-    };
+    let healthcheck_default = |field: &str| schema.default_number("healthcheck", field);
     ok(json!({
         "arches": vmlab::config::model::KNOWN_ARCHES,
         "events": vmlab::config::model::EVENT_NAMES,
@@ -467,20 +462,12 @@ pub async fn catalog_meta() -> HttpResponse {
         // The `healthcheck {}` defaults, in the seconds/counts the editor
         // edits in — reflected from the schema's `@default`s.
         "healthcheck_defaults": {
-            "interval": default_secs("interval"),
-            "timeout": default_secs("timeout"),
-            "retries": default_secs("retries"),
-            "start_period": default_secs("start_period"),
+            "interval": healthcheck_default("interval"),
+            "timeout": healthcheck_default("timeout"),
+            "retries": healthcheck_default("retries"),
+            "start_period": healthcheck_default("start_period"),
         },
     }))
-}
-
-/// `GET /api/schema` — the Schema projection itself: every block, field,
-/// type, optionality, default, doc string, option list, nesting and
-/// cardinality, reflected from `schema.wcl`. Surfaces that need the shape of
-/// `vmlab.wcl` read this rather than restating it.
-pub async fn schema_projection() -> HttpResponse {
-    ok(json!(SchemaProjection::get()))
 }
 
 /// `GET /api/registries` — host-level OCI search settings shared with the CLI.

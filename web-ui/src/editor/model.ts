@@ -35,7 +35,7 @@ export interface ShareModel {
   smb1: boolean;
   /** Derived from the guest path when not declared — treated as optional. */
   name: string;
-  transport: string; // auto | virtiofs | smb
+  transport: string;
 }
 
 export interface MediaModel {

@@ -56,6 +56,27 @@ pub enum Control {
 }
 
 impl Control {
+    /// Every control, with the note that documents it. The console's
+    /// `FieldType` union is rendered from this, so a new control reaches the
+    /// console by being added here once.
+    const ALL: &'static [(Control, &'static str)] = &[
+        (Control::Text, "utf8 → Input"),
+        (Control::Int, "i64 / duration in seconds → Input[number]"),
+        (
+            Control::Bool3,
+            "bool? with an inherited default → default/on/off ToggleGroup",
+        ),
+        (Control::Flag, "plain bool → Toggle"),
+        (Control::Bytes, "std.ByteSize → ByteSizeInput"),
+        (Control::Enum, "closed option list → Select"),
+        (Control::Lines, "list<utf8> → Textarea, one per line"),
+        (Control::SegRef, "one segment name"),
+        (Control::SegRefs, "several segment names"),
+        (Control::VmRef, "one VM name"),
+        (Control::VmRefs, "several machine names"),
+        (Control::Event, "lifecycle event picker"),
+    ];
+
     fn as_str(self) -> &'static str {
         match self {
             Control::Text => "text",
@@ -106,7 +127,7 @@ pub struct FormField {
     pub max: Option<i64>,
 }
 
-/// One exported descriptor table.
+/// One exported form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Form {
     /// The `const` the console imports, e.g. `VM_OVERRIDES`.
@@ -156,7 +177,7 @@ impl FieldSpec {
     }
 }
 
-struct FormSpec {
+pub struct FormSpec {
     export: &'static str,
     block: &'static str,
     variant: Option<&'static str>,
@@ -376,6 +397,22 @@ static FORMS: &[FormSpec] = &[
     ),
 ];
 
+/// One schema field the designer does not render as a form field.
+pub struct Unformed {
+    pub block: &'static str,
+    pub field: &'static str,
+    /// Where the field is edited instead, or why it is not editable.
+    pub reason: &'static str,
+}
+
+const fn unformed(block: &'static str, field: &'static str, reason: &'static str) -> Unformed {
+    Unformed {
+        block,
+        field,
+        reason,
+    }
+}
+
 /// Schema fields the designer deliberately does not render as a form field,
 /// each with the reason. Nested-block slots are not listed: they are always
 /// rendered as child lists.
@@ -388,95 +425,95 @@ static FORMS: &[FormSpec] = &[
 /// editable, just not through a descriptor row. `RAW_ONLY` is the honest
 /// backlog: the designer does not edit that field at all, and the author has
 /// to drop to the text editor for it.
-pub static UNFORMED: &[(&str, &str, &str)] = &[
+pub static UNFORMED: &[Unformed] = &[
     // The block's label, edited as its name in the inspector header.
-    ("lab", "name", LABEL),
-    ("segment", "name", LABEL),
-    ("vm", "name", LABEL),
-    ("container", "name", LABEL),
-    ("web", "name", LABEL),
-    ("provision", "script", LABEL),
-    ("playbook", "path", LABEL),
-    ("var", "name", LABEL),
+    unformed("lab", "name", LABEL),
+    unformed("segment", "name", LABEL),
+    unformed("vm", "name", LABEL),
+    unformed("container", "name", LABEL),
+    unformed("web", "name", LABEL),
+    unformed("provision", "script", LABEL),
+    unformed("playbook", "path", LABEL),
+    unformed("var", "name", LABEL),
     // Dedicated components, because the control is richer than a row.
-    ("vm", "template", "the template picker"),
-    ("vm", "arch", "folded into the template picker"),
-    ("vm", "profile", "folded into the template picker"),
-    ("vm", "cpus", "the vCPU slider"),
-    ("vm", "memory", "the memory slider"),
-    ("vm", "cdrom", "the storage tab's CD-ROM row"),
-    (
+    unformed("vm", "template", "the template picker"),
+    unformed("vm", "arch", "folded into the template picker"),
+    unformed("vm", "profile", "folded into the template picker"),
+    unformed("vm", "cpus", "the vCPU slider"),
+    unformed("vm", "memory", "the memory slider"),
+    unformed("vm", "cdrom", "the storage tab's CD-ROM row"),
+    unformed(
         "vm",
         "depends_on",
         "dependency edges on the topology canvas",
     ),
-    ("container", "image", "the image picker"),
-    ("container", "cpus", "the micro-VM vCPU slider"),
-    ("container", "memory", "the micro-VM memory slider"),
-    (
+    unformed("container", "image", "the image picker"),
+    unformed("container", "cpus", "the micro-VM vCPU slider"),
+    unformed("container", "memory", "the micro-VM memory slider"),
+    unformed(
         "container",
         "depends_on",
         "dependency edges on the topology canvas",
     ),
-    ("segment", "mtu", "the MTU slider"),
-    ("dns", "server", "the segment's DNS editor"),
-    ("dns", "enabled", "the segment's DNS editor"),
-    ("block", "cidr", "the segment's L3 rules table"),
-    ("block", "proto", "the segment's L3 rules table"),
-    ("block", "port", "the segment's L3 rules table"),
-    ("redirect", "from", "the segment's redirect rules table"),
-    ("redirect", "to", "the segment's redirect rules table"),
-    ("redirect", "proto", "the segment's redirect rules table"),
+    unformed("segment", "mtu", "the MTU slider"),
+    unformed("dns", "server", "the segment's DNS editor"),
+    unformed("dns", "enabled", "the segment's DNS editor"),
+    unformed("block", "cidr", "the segment's L3 rules table"),
+    unformed("block", "proto", "the segment's L3 rules table"),
+    unformed("block", "port", "the segment's L3 rules table"),
+    unformed("redirect", "from", "the segment's redirect rules table"),
+    unformed("redirect", "to", "the segment's redirect rules table"),
+    unformed("redirect", "proto", "the segment's redirect rules table"),
     // Wired by drawing on the topology canvas rather than typed.
-    ("nic", "nat", "cabling a NIC to the NAT bus"),
-    ("nic", "gateway", "cabling, which marks the gateway NIC"),
-    ("nic", "isolated", "the canvas's port-isolation toggle"),
-    ("segment", "nat", "cabling the segment to the NAT bus"),
-    ("segment", "global", "cabling a cross-host trunk"),
-    ("connect", "host", "cabling a cross-host trunk"),
+    unformed("nic", "nat", "cabling a NIC to the NAT bus"),
+    unformed("nic", "gateway", "cabling, which marks the gateway NIC"),
+    unformed("nic", "isolated", "the canvas's port-isolation toggle"),
+    unformed("segment", "nat", "cabling the segment to the NAT bus"),
+    unformed("segment", "global", "cabling a cross-host trunk"),
+    unformed("connect", "host", "cabling a cross-host trunk"),
     // Not editable in the designer — the raw config editor covers them.
-    ("lab", "gui", RAW_ONLY),
-    ("vm", "gui", RAW_ONLY),
-    ("segment", "routes_to", RAW_ONLY),
-    (
+    unformed("lab", "gui", RAW_ONLY),
+    unformed("vm", "gui", RAW_ONLY),
+    unformed("segment", "routes_to", RAW_ONLY),
+    unformed(
         "container",
         "mode",
         "the edit-op writer has no symbol support yet",
     ),
-    ("forward", "host_port", RAW_ONLY),
-    ("forward", "to", RAW_ONLY),
-    ("forward", "proto", RAW_ONLY),
-    ("route", "dest", RAW_ONLY),
-    ("route", "via", RAW_ONLY),
-    ("media", "kind", RAW_ONLY),
-    ("media", "from", RAW_ONLY),
-    ("media", "label", RAW_ONLY),
-    ("playbook", "play", "the playbook panel's play list"),
-    ("var", "value", "the playbook panel's variable rows"),
+    unformed("forward", "host_port", RAW_ONLY),
+    unformed("forward", "to", RAW_ONLY),
+    unformed("forward", "proto", RAW_ONLY),
+    unformed("route", "dest", RAW_ONLY),
+    unformed("route", "via", RAW_ONLY),
+    unformed("media", "kind", RAW_ONLY),
+    unformed("media", "from", RAW_ONLY),
+    unformed("media", "label", RAW_ONLY),
+    unformed("playbook", "play", "the playbook panel's play list"),
+    unformed("var", "value", "the playbook panel's variable rows"),
     // Template definitions are managed by the templates view and the
     // `vmlab template` verbs, not by the lab designer's inspector.
-    ("template", "name", TEMPLATE_VIEW),
-    ("template", "arch", TEMPLATE_VIEW),
-    ("template", "version", TEMPLATE_VIEW),
-    ("template", "registry", TEMPLATE_VIEW),
-    ("template", "profile", TEMPLATE_VIEW),
-    ("template", "cpus", TEMPLATE_VIEW),
-    ("template", "memory", TEMPLATE_VIEW),
-    ("template", "disk", TEMPLATE_VIEW),
-    ("template", "display", TEMPLATE_VIEW),
-    ("template", "firmware", TEMPLATE_VIEW),
-    ("template", "tpm", TEMPLATE_VIEW),
-    ("template", "secure_boot", TEMPLATE_VIEW),
-    ("template", "nested", TEMPLATE_VIEW),
-    ("template", "gui", TEMPLATE_VIEW),
-    ("template", "qemu_args", TEMPLATE_VIEW),
-    ("template", "first_boot", TEMPLATE_VIEW),
-    ("template", "agent", TEMPLATE_VIEW),
-    ("source", "kind", TEMPLATE_VIEW),
-    ("source", "path", TEMPLATE_VIEW),
-    ("source", "url", TEMPLATE_VIEW),
-    ("source", "sha256", TEMPLATE_VIEW),
-    ("source", "from", TEMPLATE_VIEW),
+    unformed("template", "name", TEMPLATE_VIEW),
+    unformed("template", "arch", TEMPLATE_VIEW),
+    unformed("template", "version", TEMPLATE_VIEW),
+    unformed("template", "registry", TEMPLATE_VIEW),
+    unformed("template", "profile", TEMPLATE_VIEW),
+    unformed("template", "cpus", TEMPLATE_VIEW),
+    unformed("template", "memory", TEMPLATE_VIEW),
+    unformed("template", "disk", TEMPLATE_VIEW),
+    unformed("template", "display", TEMPLATE_VIEW),
+    unformed("template", "firmware", TEMPLATE_VIEW),
+    unformed("template", "tpm", TEMPLATE_VIEW),
+    unformed("template", "secure_boot", TEMPLATE_VIEW),
+    unformed("template", "nested", TEMPLATE_VIEW),
+    unformed("template", "gui", TEMPLATE_VIEW),
+    unformed("template", "qemu_args", TEMPLATE_VIEW),
+    unformed("template", "first_boot", TEMPLATE_VIEW),
+    unformed("template", "agent", TEMPLATE_VIEW),
+    unformed("source", "kind", TEMPLATE_VIEW),
+    unformed("source", "path", TEMPLATE_VIEW),
+    unformed("source", "url", TEMPLATE_VIEW),
+    unformed("source", "sha256", TEMPLATE_VIEW),
+    unformed("source", "from", TEMPLATE_VIEW),
 ];
 
 const LABEL: &str = "the block's label, edited as its name";
@@ -485,15 +522,16 @@ const TEMPLATE_VIEW: &str = "template definitions are not edited by the lab desi
 
 /// Every form, with each field resolved against the schema.
 pub fn forms() -> Vec<Form> {
-    build(SchemaProjection::get()).expect("the designer's forms must resolve against the schema")
+    build(SchemaProjection::get(), FORMS)
+        .expect("the designer's forms must resolve against the schema")
 }
 
-/// Resolve every form against a projection, reporting each field a form names
-/// that the schema does not define.
-pub fn build(schema: &SchemaProjection) -> Result<Vec<Form>, Vec<String>> {
-    let mut out = Vec::with_capacity(FORMS.len());
+/// Resolve `specs` against a projection, reporting each block or field a form
+/// names that the schema does not define.
+pub fn build(schema: &SchemaProjection, specs: &[FormSpec]) -> Result<Vec<Form>, Vec<String>> {
+    let mut out = Vec::with_capacity(specs.len());
     let mut errors = Vec::new();
-    for spec in FORMS {
+    for spec in specs {
         let Some(block) = schema.block(spec.block) else {
             errors.push(format!(
                 "form `{}` names block `{}`, which the schema does not define",
@@ -568,7 +606,7 @@ fn sentence_case(name: &str) -> String {
 /// the committed copy no longer matches.
 pub const CONSOLE_ARTEFACT: &str = "web-ui/src/editor/schema.gen.ts";
 
-/// Render the descriptor tables the console imports.
+/// Render the form tables the console imports.
 pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
     let mut out = String::new();
     out.push_str(
@@ -580,21 +618,17 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
          // and defaults reflected from src/config/schema.wcl. Nothing here is\n\
          // hand-maintained, so nothing here can drift from the schema.\n\n",
     );
-    out.push_str(
-        "export type FieldType =\n\
-         \x20 | \"text\" // utf8 → Input\n\
-         \x20 | \"int\" // i64 / duration in seconds → Input[number]\n\
-         \x20 | \"bool3\" // bool? with an inherited default → default/on/off ToggleGroup\n\
-         \x20 | \"flag\" // plain bool → Toggle\n\
-         \x20 | \"bytes\" // std.ByteSize → ByteSizeInput\n\
-         \x20 | \"enum\" // closed option list → Select\n\
-         \x20 | \"lines\" // list<utf8> → Textarea, one per line\n\
-         \x20 | \"segref\" // one segment name\n\
-         \x20 | \"segrefs\" // several segment names\n\
-         \x20 | \"vmref\" // one VM name\n\
-         \x20 | \"vmrefs\" // several VM names\n\
-         \x20 | \"event\"; // lifecycle event picker\n\n",
-    );
+    out.push_str("export type FieldType =\n");
+    for (index, (control, note)) in Control::ALL.iter().enumerate() {
+        let last = index + 1 == Control::ALL.len();
+        let _ = writeln!(
+            out,
+            "  | {:?}{} // {note}",
+            control.as_str(),
+            if last { ";" } else { "" }
+        );
+    }
+    out.push('\n');
     out.push_str(
         "export interface FieldDesc {\n\
          \x20 key: string;\n\
@@ -611,10 +645,6 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
          \x20 max?: number;\n\
          \x20 /** The schema default, in WCL source form, when it declares one. */\n\
          \x20 default?: string;\n\
-         }\n\n\
-         export interface Section {\n\
-         \x20 title: string;\n\
-         \x20 fields: FieldDesc[];\n\
          }\n\n",
     );
 
@@ -634,12 +664,7 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
                 "  \"{}.{}\": [{}],",
                 block.kind,
                 field.name,
-                field
-                    .options
-                    .iter()
-                    .map(|o| format!("{o:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                quoted(&field.options)
             );
         }
     }
@@ -664,24 +689,27 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
     // "Exactly one of" rules, so the console's edit operations consume the
     // schema's rule instead of restating it.
     out.push_str(
-        "/** `@one_of` rules: exactly one field of each group must be set. */\n\
-         export const ONE_OF: Record<string, string[][]> = {\n",
+        "/** A `@one_of` rule: at least one of `fields` must be set, and unless\n\
+         \x20*  `exclusive` is false, no more than one. */\n\
+         export interface RequiredGroup {\n\
+         \x20 fields: string[];\n\
+         \x20 exclusive: boolean;\n\
+         }\n\n\
+         /** The `@one_of` rules, keyed by block kind. */\n\
+         export const REQUIRED_GROUPS: Record<string, RequiredGroup[]> = {\n",
     );
     for block in &schema.blocks {
-        if block.one_of.is_empty() {
+        if block.required_groups.is_empty() {
             continue;
         }
         let groups = block
-            .one_of
+            .required_groups
             .iter()
             .map(|group| {
                 format!(
-                    "[{}]",
-                    group
-                        .iter()
-                        .map(|n| format!("{n:?}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "{{ fields: [{}], exclusive: {} }}",
+                    quoted(&group.fields),
+                    group.exclusive
                 )
             })
             .collect::<Vec<_>>()
@@ -690,7 +718,7 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
     }
     out.push_str("};\n\n");
 
-    // The descriptor tables.
+    // The forms.
     let mut variants: Vec<&Form> = Vec::new();
     for form in forms {
         if form.variant.is_some() {
@@ -730,14 +758,8 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
         seen.push(form.export);
         let _ = writeln!(
             out,
-            "/** `{}` block fields, grouped by `{}`. */\nexport const {}: Record<string, FieldDesc[]> = {{",
-            form.block,
-            variants
-                .iter()
-                .find(|f| f.export == form.export)
-                .map(|_| "method")
-                .unwrap_or("variant"),
-            form.export
+            "/** `{}` block fields, grouped by the value that selects them. */\nexport const {}: Record<string, FieldDesc[]> = {{",
+            form.block, form.export
         );
         for grouped in variants.iter().filter(|f| f.export == form.export) {
             let block = schema.block(grouped.block);
@@ -753,6 +775,15 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
     out
 }
 
+/// A list of strings as a TypeScript array body: `"a", "b"`.
+fn quoted(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_field(field: &FormField, block: Option<&super::projection::Block>) -> String {
     let mut parts = vec![
         format!("key: {:?}", field.key),
@@ -761,15 +792,7 @@ fn render_field(field: &FormField, block: Option<&super::projection::Block>) -> 
         format!("type: {:?}", field.control.as_str()),
     ];
     if !field.options.is_empty() {
-        parts.push(format!(
-            "options: [{}]",
-            field
-                .options
-                .iter()
-                .map(|o| format!("{o:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        parts.push(format!("options: [{}]", quoted(&field.options)));
     }
     if let Some(placeholder) = &field.placeholder {
         parts.push(format!("placeholder: {placeholder:?}"));
@@ -804,7 +827,7 @@ mod tests {
     /// Story 15: a form cannot name a field the schema does not define.
     #[test]
     fn forms_resolve_against_the_schema() {
-        if let Err(errors) = build(SchemaProjection::get()) {
+        if let Err(errors) = build(SchemaProjection::get(), FORMS) {
             panic!("{}", errors.join("\n"));
         }
     }
@@ -826,7 +849,7 @@ mod tests {
                 });
                 let excused = UNFORMED
                     .iter()
-                    .any(|(kind, name, _)| *kind == block.kind && *name == field.name);
+                    .any(|u| u.block == block.kind && u.field == field.name);
                 if !in_form && !excused {
                     missing.push(format!("{}.{}", block.kind, field.name));
                 }
@@ -845,15 +868,22 @@ mod tests {
     #[test]
     fn exceptions_name_real_fields() {
         let schema = SchemaProjection::get();
-        for (kind, name, reason) in UNFORMED {
+        for entry in UNFORMED {
             let block = schema
-                .block(kind)
-                .unwrap_or_else(|| panic!("UNFORMED names unknown block `{kind}`"));
+                .block(entry.block)
+                .unwrap_or_else(|| panic!("UNFORMED names unknown block `{}`", entry.block));
             assert!(
-                block.field(name).is_some(),
-                "UNFORMED names unknown field `{kind}.{name}`"
+                block.field(entry.field).is_some(),
+                "UNFORMED names unknown field `{}.{}`",
+                entry.block,
+                entry.field
             );
-            assert!(!reason.is_empty(), "`{kind}.{name}` needs a reason");
+            assert!(
+                !entry.reason.is_empty(),
+                "`{}.{}` needs a reason",
+                entry.block,
+                entry.field
+            );
         }
     }
 
@@ -902,23 +932,43 @@ mod tests {
         }
     }
 
+    const GIZMO_SCHEMA: &str = r#"
+@document type Doc { @children("gizmo") gizmos: list<Gizmo> }
+@block("gizmo") type Gizmo { @doc("The real one") real: utf8? }
+"#;
+
+    #[test]
+    fn an_override_applies_to_the_reflected_field() {
+        let schema = SchemaProjection::reflect(GIZMO_SCHEMA, "test.wcl").expect("reflect");
+        static SPECS: &[FormSpec] = &[form("GIZMO_FIELDS", "gizmo", OVERRIDDEN)];
+        static OVERRIDDEN: &[FieldSpec] = &[f("real").label("Realness").hint("very")];
+        let forms = build(&schema, SPECS).expect("the form resolves");
+        let field = &forms[0].fields[0];
+        assert_eq!(field.label, "Realness");
+        assert_eq!(field.placeholder.as_deref(), Some("very"));
+        // Only the presentation is overridden — the rest is still the schema's.
+        assert_eq!(field.doc, "The real one");
+        assert_eq!(field.control, Control::Text);
+    }
+
     #[test]
     fn an_override_for_an_unknown_field_is_an_error() {
-        let schema = SchemaProjection::reflect(
-            r#"
-@document type Doc { @children("gizmo") gizmos: list<Gizmo> }
-@block("gizmo") type Gizmo { @doc("Real") real: utf8? }
-"#,
-            "test.wcl",
-        )
-        .expect("reflect");
-        // `build` walks the real FORMS table, so drive the same check with a
-        // schema that has none of its blocks: every form must be reported.
-        let errors = build(&schema).expect_err("a schema without these blocks must fail");
-        assert!(
-            errors.iter().all(|e| e.contains("does not define")),
-            "{errors:?}"
-        );
+        let schema = SchemaProjection::reflect(GIZMO_SCHEMA, "test.wcl").expect("reflect");
+        static SPECS: &[FormSpec] = &[form("GIZMO_FIELDS", "gizmo", IMAGINARY)];
+        static IMAGINARY: &[FieldSpec] = &[f("imaginary")];
+        let errors = build(&schema, SPECS).expect_err("an unknown field must be reported");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("gizmo.imaginary"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_form_over_an_unknown_block_is_an_error() {
+        let schema = SchemaProjection::reflect(GIZMO_SCHEMA, "test.wcl").expect("reflect");
+        static SPECS: &[FormSpec] = &[form("WIDGET_FIELDS", "widget", REAL)];
+        static REAL: &[FieldSpec] = &[f("real")];
+        let errors = build(&schema, SPECS).expect_err("an unknown block must be reported");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("`widget`"), "{errors:?}");
     }
 
     #[test]

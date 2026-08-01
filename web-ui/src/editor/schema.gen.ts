@@ -17,7 +17,7 @@ export type FieldType =
   | "segref" // one segment name
   | "segrefs" // several segment names
   | "vmref" // one VM name
-  | "vmrefs" // several VM names
+  | "vmrefs" // several machine names
   | "event"; // lifecycle event picker
 
 export interface FieldDesc {
@@ -35,11 +35,6 @@ export interface FieldDesc {
   max?: number;
   /** The schema default, in WCL source form, when it declares one. */
   default?: string;
-}
-
-export interface Section {
-  title: string;
-  fields: FieldDesc[];
 }
 
 /** Every closed option list in the schema, keyed `block.field`. */
@@ -72,10 +67,17 @@ export const SCHEMA_DEFAULTS: Record<string, number> = {
   "healthcheck.start_period": 10,
 };
 
-/** `@one_of` rules: exactly one field of each group must be set. */
-export const ONE_OF: Record<string, string[][]> = {
-  "volume": [["host", "name"]],
-  "disk": [["size", "from"]],
+/** A `@one_of` rule: at least one of `fields` must be set, and unless
+ *  `exclusive` is false, no more than one. */
+export interface RequiredGroup {
+  fields: string[];
+  exclusive: boolean;
+}
+
+/** The `@one_of` rules, keyed by block kind. */
+export const REQUIRED_GROUPS: Record<string, RequiredGroup[]> = {
+  "volume": [{ fields: ["host", "name"], exclusive: true }],
+  "disk": [{ fields: ["size", "from"], exclusive: false }],
 };
 
 /** `vm` block fields. */
@@ -201,7 +203,7 @@ export const HANDLER_FIELDS: FieldDesc[] = [
   { key: "targets", label: "Target machines", doc: "Optional VM/container names; empty handles every occurrence of the event", type: "vmrefs" },
 ];
 
-/** `auth` block fields, grouped by `method`. */
+/** `auth` block fields, grouped by the value that selects them. */
 export const WEB_AUTH_FIELDS: Record<string, FieldDesc[]> = {
   basic: [
     { key: "username", label: "Username", doc: "Username — `:basic`, `:ntlm`, `:form`", type: "text" },

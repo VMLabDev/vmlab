@@ -226,7 +226,6 @@ async fn main() -> ExitCode {
                 web::get().to(api::catalog_inherited),
             )
             .route("/api/catalog/meta", web::get().to(api::catalog_meta))
-            .route("/api/schema", web::get().to(api::schema_projection))
             .route("/api/catalog/oci", web::get().to(api::catalog_oci))
             .route("/api/registries", web::get().to(api::list_registries))
             .route("/api/registries", web::post().to(api::add_registry))

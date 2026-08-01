@@ -8,7 +8,7 @@
 // baseline spans, which stay valid for the whole batch because the server
 // mutates the AST without recomputing spans.
 
-import { ONE_OF } from "./schema.gen";
+import { REQUIRED_GROUPS } from "./schema.gen";
 import type {
   BlockRuleModel,
   BlockSpec,
@@ -154,8 +154,9 @@ const key = (s: Span) => `${s[0]}:${s[1]}`;
 // Groups are read as "any name in the group must be present"; presence means
 // the value survived specFields, i.e. it isn't empty or a schema default.
 // The single fields mirror the required fields in src/config/extract.rs; the
-// "exactly one of" groups are not restated here — they come from the schema's
-// `@one_of` rules through the projection.
+// grouped ones are not restated here — they come from the schema's `@one_of`
+// rules through the projection. Only "at least one present" matters for
+// writability; a group's exclusivity is the validator's business.
 const REQUIRED_SINGLES: Record<string, string[]> = {
   vm: ["template"],
   container: ["image"],
@@ -177,10 +178,15 @@ const REQUIRED_SINGLES: Record<string, string[]> = {
 };
 
 const REQUIRED_FIELDS: Record<string, string[][]> = Object.fromEntries(
-  [...new Set([...Object.keys(REQUIRED_SINGLES), ...Object.keys(ONE_OF)])].map((kind) => [
-    kind,
-    [...(REQUIRED_SINGLES[kind] ?? []).map((name) => [name]), ...(ONE_OF[kind] ?? [])],
-  ]),
+  [...new Set([...Object.keys(REQUIRED_SINGLES), ...Object.keys(REQUIRED_GROUPS)])].map(
+    (kind) => [
+      kind,
+      [
+        ...(REQUIRED_SINGLES[kind] ?? []).map((name) => [name]),
+        ...(REQUIRED_GROUPS[kind] ?? []).map((group) => group.fields),
+      ],
+    ],
+  ),
 );
 
 /** Whether a new block carries enough to survive the round trip. */

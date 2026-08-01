@@ -5,9 +5,9 @@
 //! `schema.wcl` is the single source of truth for the shape of `vmlab.wcl`.
 //! Every surface that needs that shape reads this projection instead of
 //! restating it: the console's pickers (`/api/catalog/meta`), the designer's
-//! inspector forms (see [`super::designer`], which renders the console's
-//! descriptor tables from here), and the rendered schema reference (which
-//! reflects the same file through WCL's `type_table` in the wskill).
+//! inspector forms (see [`super::designer`], which renders the console's form
+//! tables from here), and the rendered schema reference (which reflects the
+//! same file through WCL's `type_table` in the wskill).
 //!
 //! Reflection is the same machinery the wskill's reference uses — WCL's
 //! declaration views — reached from Rust rather than from WCL source. Nothing
@@ -61,6 +61,17 @@ pub struct ChildSlot {
     pub max: Option<u64>,
 }
 
+/// A `@one_of([…])` rule: at least one of the named fields must be set, and
+/// unless the rule says otherwise, no more than one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RequiredGroup {
+    /// The field names the rule spans.
+    pub fields: Vec<String>,
+    /// Setting more than one is an error. `volume`'s host/name is exclusive;
+    /// `disk`'s size/from is not — a disk may carry both.
+    pub exclusive: bool,
+}
+
 /// One field of one block, as the schema declares it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Field {
@@ -93,14 +104,6 @@ pub struct Field {
     pub child: Option<ChildSlot>,
 }
 
-impl Field {
-    /// The schema requires a value and supplies no default, so a form must
-    /// collect one.
-    pub fn required(&self) -> bool {
-        !self.optional && self.default.is_none() && self.child.is_none()
-    }
-}
-
 /// One block kind, as the schema declares it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Block {
@@ -111,8 +114,8 @@ pub struct Block {
     /// The type's doc comment (the `//` lines above it).
     pub doc: String,
     pub fields: Vec<Field>,
-    /// `@one_of([…])` rules: exactly one field of each group must be set.
-    pub one_of: Vec<Vec<String>>,
+    /// `@one_of([…])` rules over this block's fields.
+    pub required_groups: Vec<RequiredGroup>,
 }
 
 impl Block {
@@ -173,11 +176,19 @@ impl SchemaProjection {
                     kind,
                     type_name: decl.name_segments().join("."),
                     doc: decl.doc_comment().unwrap_or_default(),
-                    one_of: decl
+                    required_groups: decl
                         .decorators()
                         .filter(|d| d.name() == "one_of")
-                        .filter_map(|d| d.positional().ok())
-                        .filter_map(|args| string_list(args.first()?))
+                        .filter_map(|d| {
+                            Some(RequiredGroup {
+                                fields: string_list(d.positional().ok()?.first()?)?,
+                                // Exclusive unless the rule opts out.
+                                exclusive: !matches!(
+                                    d.named_arg("exclusive"),
+                                    Some(Ok(Value::Bool(false)))
+                                ),
+                            })
+                        })
                         .collect(),
                     fields: decl.fields().map(|f| field(&f, &symbol_sets)).collect(),
                 })
@@ -207,6 +218,13 @@ impl SchemaProjection {
             .and_then(|b| b.field(field))
             .map(|f| f.options.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// One field's default as a number in its base unit — seconds for a
+    /// duration, bytes for a byte size. `None` when the field declares no
+    /// default, does not exist, or its default is not numeric.
+    pub fn default_number(&self, kind: &str, field: &str) -> Option<i64> {
+        self.block(kind)?.field(field)?.default_number
     }
 }
 
@@ -476,11 +494,10 @@ mod tests {
     fn optionality_comes_from_the_schema() {
         let vm = projection().block("vm").expect("vm block");
         assert!(!vm.field("template").unwrap().optional);
-        assert!(vm.field("template").unwrap().required());
         assert!(vm.field("cpus").unwrap().optional);
-        assert!(!vm.field("cpus").unwrap().required());
-        // A block slot is never "required" of a form: it is a child list.
-        assert!(!vm.field("nics").unwrap().required());
+        // A `@children` slot is a list, never a value the author must supply.
+        assert!(!vm.field("nics").unwrap().optional);
+        assert!(vm.field("nics").unwrap().child.is_some());
     }
 
     #[test]
@@ -580,12 +597,12 @@ mod tests {
         let interval = healthcheck.field("interval").unwrap();
         assert_eq!(interval.default.as_deref(), Some("10s"));
         assert_eq!(interval.default_number, Some(10));
-        let memory = projection()
-            .block("container")
-            .and_then(|b| b.field("memory"))
-            .unwrap();
-        assert_eq!(memory.default.as_deref(), Some("256MiB"));
-        assert_eq!(memory.default_number, Some(256 * 1024 * 1024));
+        assert_eq!(
+            projection().default_number("container", "memory"),
+            Some(256 * 1024 * 1024)
+        );
+        assert_eq!(projection().default_number("vm", "cpus"), None);
+        assert_eq!(projection().default_number("vm", "no_such_field"), None);
     }
 
     #[test]
@@ -604,15 +621,21 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_of_rules_come_from_the_schema() {
+    fn required_group_rules_come_from_the_schema() {
+        // `volume` takes a host bind or a named volume, never both.
         let volume = projection().block("volume").expect("volume block");
-        assert_eq!(volume.one_of, [["host", "name"]]);
+        assert_eq!(volume.required_groups.len(), 1);
+        assert_eq!(volume.required_groups[0].fields, ["host", "name"]);
+        assert!(volume.required_groups[0].exclusive);
+        // A `disk` needs a size or a source folder, and may carry both —
+        // `check_disk_block` reads "size and/or from".
         let disk = projection().block("disk").expect("disk block");
-        assert_eq!(disk.one_of, [["size", "from"]]);
+        assert_eq!(disk.required_groups[0].fields, ["size", "from"]);
+        assert!(!disk.required_groups[0].exclusive);
         // Every named field in a rule must exist on the block it constrains.
         for block in &projection().blocks {
-            for group in &block.one_of {
-                for name in group {
+            for group in &block.required_groups {
+                for name in &group.fields {
                     assert!(
                         block.field(name).is_some(),
                         "@one_of on `{}` names unknown field `{name}`",
@@ -643,8 +666,6 @@ type Thing {
         assert_eq!(thing.field("count").unwrap().default.as_deref(), Some("7"));
         assert_eq!(thing.field("count").unwrap().default_number, Some(7));
         assert_eq!(thing.field("other").unwrap().default, None);
-        // A defaulted field is never "required": leaving it blank is legal.
-        assert!(!thing.field("greeting").unwrap().required());
     }
 
     #[test]

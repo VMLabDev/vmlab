@@ -23,6 +23,12 @@
 // The exact set of values a stringly-typed field accepts, e.g.
 // `@options(["ovmf", "seabios"]) firmware: utf8?`. A symbol-typed field needs
 // no annotation: its `symbol_set` already carries the set.
+//
+// Several `@doc` strings still spell their field's set out in prose. That is
+// not a fork to tidy away yet: the rendered reference reads `@doc` through
+// wdoc's `type_table`, which knows nothing of `@options`, so dropping the
+// prose would drop the set from the documentation. It collapses to one copy
+// when the reference reads the projection.
 @decorator("options")
 type FieldOptions {
   @doc("Every value the validator accepts, in the order a picker should offer them")
@@ -40,12 +46,16 @@ type FieldRange {
   @inline(1) max: i64?
 }
 
-// A block-level rule that exactly one of the named fields must be set, e.g.
-// `@one_of(["host", "name"])` on the `volume` block.
+// A block-level rule that at least one of the named fields must be set, e.g.
+// `@one_of(["host", "name"])` on the `volume` block. By default setting more
+// than one is an error too; `exclusive = false` allows the combination, as on
+// `disk`, where `size` and `from` may both appear.
 @decorator("one_of")
-type ExactlyOneOf {
-  @doc("Field names of which exactly one must be set on an instance of the block")
+type RequiredGroup {
+  @doc("Field names of which at least one must be set on an instance of the block")
   @inline(0) fields: list<utf8>
+  @doc("Setting more than one is an error (default true)")
+  exclusive: bool?
 }
 
 @document
@@ -357,7 +367,7 @@ type Healthcheck {
 
 // Additional disk: blank by size, or pre-formatted from a folder.
 @block("disk")
-@one_of(["size", "from"])
+@one_of(["size", "from"], exclusive = false)
 type DiskBlock {
   @doc("Disk identifier; the inline block label")
   @inline(0) name: utf8
