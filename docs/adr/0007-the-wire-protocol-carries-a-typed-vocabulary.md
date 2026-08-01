@@ -101,6 +101,15 @@ features it reported are already in `machine.capabilities`. The surface
 asymmetries it lists are left as they are; closing them is separate work, per
 gap.
 
+Making the asymmetries visible turned out not to be enough on its own: the
+report could say a command was reachable from one surface but not whether that
+was a decision, so each pass over the list re-derived the same classification.
+A variant may now carry `#[one_way("surface", "why")]` beside its doc comment,
+which reaches its `CommandSpec` and is rendered next to the command in the
+report. Annotation is optional — an unannotated command means nobody has
+decided — but an annotation is checked: it must name a real surface, and the
+command must still be reachable from that surface alone.
+
 Its counts are larger than the "eleven CLI-only and six console-only" above,
 which came from a hand count of the lab socket. The report covers both sockets
 and treats the REST layer as the console's reach, so it lists seventeen and

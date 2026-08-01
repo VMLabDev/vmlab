@@ -10,7 +10,7 @@ pub mod server;
 pub mod vocab;
 
 pub use error::{CommandError, ErrorCode};
-pub use vocab::{ArgSpec, CommandSpec, LabRequest, Region, SupRequest, WireRequest};
+pub use vocab::{ArgSpec, CommandSpec, LabRequest, OneWay, Region, SupRequest, WireRequest};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -236,15 +236,15 @@ pub fn protocol_markdown(repo: &Path) -> String {
     out.push_str(
         "Asymmetry is not automatically wrong — some commands only make sense from one place.\n\
          The lists below exist so that each one is a decision somebody made rather than a gap\n\
-         nobody noticed.\n\n",
+         nobody noticed. A command that carries its reason declares it in the vocabulary, beside\n\
+         its doc comment; a command listed bare is one nobody has decided about yet.\n\n",
     );
 
-    let by_caller = |want: &dyn Fn(&BTreeSet<&'static str>) -> bool| -> Vec<String> {
+    let by_caller = |want: &dyn Fn(&BTreeSet<&'static str>) -> bool| -> Vec<&CommandSpec> {
         LabRequest::COMMANDS
             .iter()
             .chain(SupRequest::COMMANDS)
             .filter(|spec| usage.get(spec.variant).is_some_and(want))
-            .map(|spec| spec.cmd.to_string())
             .collect()
     };
 
@@ -283,14 +283,18 @@ pub fn protocol_markdown(repo: &Path) -> String {
     out
 }
 
-fn push_list(out: &mut String, items: &[String], empty: &str) {
-    if items.is_empty() {
+/// One command per line, each with its reason when it has one.
+fn push_list(out: &mut String, specs: &[&CommandSpec], empty: &str) {
+    if specs.is_empty() {
         out.push_str(empty);
         out.push_str("\n\n");
         return;
     }
-    for item in items {
-        out.push_str(&format!("- `{item}`\n"));
+    for spec in specs {
+        match spec.one_way {
+            Some(one_way) => out.push_str(&format!("- `{}` — {}\n", spec.cmd, one_way.why)),
+            None => out.push_str(&format!("- `{}`\n", spec.cmd)),
+        }
     }
     out.push('\n');
 }
@@ -376,6 +380,7 @@ pub fn protocol_typescript() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::OneWay;
 
     fn repo() -> &'static Path {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -413,6 +418,46 @@ mod tests {
             assert!(
                 LabRequest::spec(cmd).is_some(),
                 "action `{segment}` maps to `{cmd}`, which is not in the lab vocabulary"
+            );
+        }
+    }
+
+    /// Every command that claims to be one-way, with the claim.
+    fn annotated() -> impl Iterator<Item = (&'static CommandSpec, OneWay)> {
+        LabRequest::COMMANDS
+            .iter()
+            .chain(SupRequest::COMMANDS)
+            .filter_map(|spec| spec.one_way.map(|one_way| (spec, one_way)))
+    }
+
+    /// A reason names the surface it claims the command is reachable from, so
+    /// a renamed or removed surface cannot leave a reason pointing at nothing.
+    #[test]
+    fn a_one_way_annotation_names_a_real_surface() {
+        for (spec, one_way) in annotated() {
+            assert!(
+                SURFACES.iter().any(|s| s.name == one_way.surface),
+                "`{}` is annotated for surface `{}`, which does not exist",
+                spec.cmd,
+                one_way.surface,
+            );
+        }
+    }
+
+    /// An annotation asserts an asymmetry, so the asymmetry has to still be
+    /// there. Give an annotated command a second caller and this fails, rather
+    /// than leaving a reason behind that explains something no longer true.
+    #[test]
+    fn an_annotated_command_is_still_one_way() {
+        let usage = command_usage(repo());
+        for (spec, one_way) in annotated() {
+            let callers = &usage[spec.variant];
+            assert!(
+                callers.len() == 1 && callers.contains(one_way.surface),
+                "`{}` says it is reachable only from `{}`, but is called by {:?}",
+                spec.cmd,
+                one_way.surface,
+                callers,
             );
         }
     }

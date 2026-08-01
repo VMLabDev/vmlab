@@ -29,6 +29,21 @@ pub struct ArgSpec {
     pub ty: &'static str,
 }
 
+/// Why a command is deliberately reachable from one surface and no other.
+///
+/// A one-way command is not automatically a gap — several only mean anything
+/// from one place — but nothing distinguishes a decision from an oversight
+/// unless the decision is written down. This is where it is written, and the
+/// coverage report renders it beside the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OneWay {
+    /// The surface the command is reachable from, spelled as the coverage
+    /// report spells it — one of `report::SURFACES`, which a test checks.
+    pub surface: &'static str,
+    /// Why that is the only surface it belongs on.
+    pub why: &'static str,
+}
+
 /// One command of one vocabulary: what it is called on the wire, what it
 /// takes, and what it is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +55,10 @@ pub struct CommandSpec {
     pub args: &'static [ArgSpec],
     /// The variant's doc comment, one line per `///`.
     pub doc: &'static str,
+    /// Why this command is reachable from one surface only, when that is a
+    /// decision somebody made. `None` means nobody has decided — which is the
+    /// honest state of an asymmetry nobody has looked at.
+    pub one_way: Option<OneWay>,
 }
 
 /// A request vocabulary: an enumeration that knows how to become, and be read
@@ -91,6 +110,26 @@ pub trait WireRequest: Serialize + DeserializeOwned + Sized {
     }
 }
 
+/// An optional `#[one_way(..)]` as an `Option<OneWay>`.
+///
+/// `vocabulary!` expands the variant's optional repetition straight into this
+/// call, so the arity of what comes out picks the arm: nothing for a variant
+/// that carried no annotation, two literals for one that did. The alternative
+/// — a `let mut` fixed up by the repetition — also evaluates in a `const`, but
+/// it puts a mutable binding in the middle of a table of constants to express
+/// something the two arms below say outright.
+macro_rules! one_way {
+    () => {
+        None
+    };
+    ($surface:literal, $why:literal) => {
+        Some(OneWay {
+            surface: $surface,
+            why: $why,
+        })
+    };
+}
+
 /// Declare a request vocabulary: one enumeration, its wire spellings, its
 /// argument shapes and the metadata the protocol report reads.
 ///
@@ -98,12 +137,18 @@ pub trait WireRequest: Serialize + DeserializeOwned + Sized {
 /// attributes on a field carry through, which is where an argument's default
 /// and its legacy aliases live. An optional `=> path::to::fn` names a pre-pass
 /// over the raw arguments, for legacy spellings serde alone cannot express.
+///
+/// A variant may carry `#[one_way("surface", "why")]` directly after its doc
+/// comments, recording that it is deliberately reachable from that one surface
+/// (see [`OneWay`]). It is an annotation, not a real attribute: it never
+/// reaches the generated enumeration, only the [`CommandSpec`].
 macro_rules! vocabulary {
     (
         $(#[$enum_meta:meta])*
         $name:ident $(=> $normalise:path)? {
             $(
                 $(#[doc = $doc:literal])*
+                $(#[one_way($surface:literal, $why:literal)])?
                 $variant:ident = $cmd:literal {
                     $(
                         $(#[$field_meta:meta])*
@@ -139,6 +184,7 @@ macro_rules! vocabulary {
                             $( ArgSpec { name: stringify!($field), ty: stringify!($ty) } ),*
                         ],
                         doc: concat!($($doc, "\n",)*),
+                        one_way: one_way!($( $surface, $why )?),
                     },
                 )*
             ];
@@ -319,6 +365,12 @@ vocabulary! {
             machine: String,
         },
         /// Run an ad-hoc wscript against the lab (PRD §12), streaming output.
+        #[one_way(
+            "cli",
+            "A scratch script is a shell verb: it comes from a file the caller \
+             already has and streams its output back to the terminal that ran \
+             it. What the console runs is declared playbooks."
+        )]
         Run = "run" {
             script: String,
         },
@@ -355,6 +407,12 @@ vocabulary! {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
         /// The machine's guest IP, optionally for one NIC index.
+        #[one_way(
+            "cli",
+            "A scripting shortcut over data the console already holds: the lab \
+             status projection carries every machine's address, so the console \
+             reads it there rather than asking a second time."
+        )]
         MachineIp = "machine.ip" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             #[serde(default)] nic: Option<usize>,
@@ -371,6 +429,12 @@ vocabulary! {
             keys: String,
         },
         /// Move the pointer to an absolute framebuffer position.
+        #[one_way(
+            "cli",
+            "The console drives a machine through a live VNC canvas, where a \
+             human moves the pointer themselves. Scripted pointer input is for \
+             callers that have no canvas."
+        )]
         MachineMouseMove = "machine.mouse_move" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             x: i64,
@@ -378,6 +442,11 @@ vocabulary! {
         },
         /// Click a mouse button, optionally moving there first (both `x` and
         /// `y`, or neither).
+        #[one_way(
+            "cli",
+            "Scripted input, for the same reason as `machine.mouse_move`: a \
+             console user clicks the VNC canvas directly."
+        )]
         MachineMouseClick = "machine.mouse_click" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             #[serde(default = "default_button")] button: String,
@@ -385,6 +454,11 @@ vocabulary! {
             #[serde(default)] y: Option<i64>,
         },
         /// Press at one point, drag, release at another.
+        #[one_way(
+            "cli",
+            "Scripted input, for the same reason as `machine.mouse_move`: a \
+             console user drags on the VNC canvas directly."
+        )]
         MachineMouseDrag = "machine.mouse_drag" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             x1: i64,
@@ -393,12 +467,23 @@ vocabulary! {
             y2: i64,
         },
         /// Read text off the machine's display, whole screen or one region.
+        #[one_way(
+            "cli",
+            "Reading text off the framebuffer is a script's substitute for \
+             looking at it. The console shows the framebuffer to somebody who \
+             can already read it."
+        )]
         MachineOcr = "machine.ocr" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             #[serde(default)] region: Option<Region>,
         },
         /// Find a template image on the machine's display; null when no match
         /// scores above `threshold`.
+        #[one_way(
+            "cli",
+            "How a script finds a control it cannot see. A console user clicks \
+             the one they can, on the VNC canvas."
+        )]
         MachineFindImage = "machine.find_image" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             image: String,
@@ -408,6 +493,12 @@ vocabulary! {
 
         /// Run a command in the guest through the agent and collect its
         /// output.
+        #[one_way(
+            "cli",
+            "The scripted counterpart to the console's interactive terminals: \
+             one command, its output collected, an exit code to branch on. The \
+             console opens a shell and lets a human type instead."
+        )]
         MachineExec = "machine.exec" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             cmd: String,
@@ -452,11 +543,21 @@ vocabulary! {
         },
         /// Follow a guest file (`tail -F` semantics), streamed as chunks
         /// until the caller hangs up or the machine stops.
+        #[one_way(
+            "cli",
+            "An open-ended stream of an arbitrary guest path, which is what a \
+             terminal is for. The console follows a machine's console log \
+             through `machine.logs`."
+        )]
         MachineTail = "machine.tail" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             path: String,
         },
         /// Follow the Windows event log, streamed as chunks.
+        #[one_way(
+            "cli",
+            "A stream into a terminal, for the same reason as `machine.tail`."
+        )]
         MachineEventLog = "machine.eventlog" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             #[serde(default)] filter: Option<String>,
@@ -484,12 +585,23 @@ vocabulary! {
 
         /// Ensure a loopback forward for a declared web page and return the
         /// address to dial, plus the page's auth spec (host-side only).
+        #[one_way(
+            "web",
+            "A loopback forward for a guest's web page exists to be dialled by \
+             a browser, and the console is the only surface with one."
+        )]
         WebForward = "web.forward" {
             machine: String,
             page: String,
         },
 
         /// Every playbook assignment in the lab, one row per (machine, block).
+        #[one_way(
+            "cli",
+            "One flat table is the shape a shell wants. The console builds its \
+             playbook list from the lab's declarations directly and asks the \
+             daemon only which runs are in flight."
+        )]
         PlaybookList = "playbook.list" {},
         /// Dry-run a playbook against one machine, streaming its output.
         PlaybookCheck = "playbook.check" {
@@ -504,6 +616,12 @@ vocabulary! {
             #[serde(default)] play: Option<String>,
         },
         /// Which playbook runs are in flight.
+        #[one_way(
+            "web",
+            "A poller's question. A CLI `check` or `apply` streams its own run \
+             and holds the terminal until it ends, so it never has to ask what \
+             is happening."
+        )]
         PlaybookOpStatus = "playbook.op_status" {},
 
         /// Snapshot one machine, or the whole lab when `machine` is omitted.
@@ -542,6 +660,12 @@ vocabulary! {
         /// Liveness check; answers `"pong"`.
         Ping = "ping" {},
         /// The supervisor's own build version.
+        #[one_way(
+            "cli",
+            "What `vmlab daemon status` prints: which build of the supervisor \
+             is running on this host, asked by whoever is standing in front of \
+             it."
+        )]
         Version = "version" {},
         /// Which network fast-path tier this host selected (PRD §9.1), and
         /// why the skipped tiers were unavailable.
@@ -550,11 +674,25 @@ vocabulary! {
         Status = "status" {},
 
         /// Spawn (or find) a lab's daemon; answers with its socket path.
+        #[one_way(
+            "cli",
+            "Spawning-or-finding a lab daemon belongs in one place, and that \
+             place is the helper in `src/cli/daemon.rs` — the web layer calls \
+             it rather than asking the supervisor itself. One call site is the \
+             decision; the scan reports it as the CLI because that is where \
+             the helper lives."
+        )]
         LabEnsure = "lab.ensure" {
             name: String,
             root: std::path::PathBuf,
         },
         /// Stop a lab's daemon, after `down` or `destroy`.
+        #[one_way(
+            "cli",
+            "The other half of `lab.ensure`, and a shell's alone: a command \
+             finishes and gives the daemon back. The console does not finish, \
+             and leaves it up for the next request."
+        )]
         LabRelease = "lab.release" {
             name: String,
         },
@@ -567,16 +705,32 @@ vocabulary! {
 
         /// Join a global segment (PRD §9.2), creating it on first use;
         /// answers with the trunk socket to bridge to.
+        #[one_way(
+            "daemon",
+            "Daemon-internal: a lab daemon joins a global segment because a \
+             lab declared one, so there is nothing for a person to ask for."
+        )]
         GlobalAttach = "global.attach" {
             name: String,
             #[serde(default, with = "opt_subnet")] subnet: Option<Ipv4Net>,
             #[serde(default)] peer: Option<String>,
         },
         /// Leave a global segment.
+        #[one_way(
+            "daemon",
+            "The other half of `global.attach`, and daemon-internal for the \
+             same reason."
+        )]
         GlobalDetach = "global.detach" {
             name: String,
         },
         /// Every global segment this host knows.
+        #[one_way(
+            "daemon",
+            "A lab daemon reads it to fold each segment's peer state into the \
+             lab status projection, which is how both other surfaces already \
+             see it."
+        )]
         GlobalList = "global.list" {},
 
         /// The templates a lab declares, with their store and build state.
@@ -761,6 +915,32 @@ mod tests {
         );
         assert!(
             SupRequest::from_wire("global.attach", json!({"name": "c", "subnet": "nope"})).is_err()
+        );
+    }
+
+    /// A command that is deliberately reachable from one surface carries the
+    /// reason on its spec, next to the doc comment it was written beside.
+    #[test]
+    fn an_annotated_command_carries_its_reason() {
+        let one_way = LabRequest::spec("run")
+            .unwrap()
+            .one_way
+            .expect("`run` is annotated");
+        assert_eq!(one_way.surface, "cli");
+        assert!(!one_way.why.is_empty());
+    }
+
+    /// No annotation means "not yet decided", which is what every command
+    /// reachable from more than one surface is, and what an undecided
+    /// asymmetry stays until somebody makes the call.
+    #[test]
+    fn an_unannotated_command_asserts_nothing() {
+        assert!(LabRequest::spec("up").unwrap().one_way.is_none());
+        assert!(
+            LabRequest::spec("machine.push_file")
+                .unwrap()
+                .one_way
+                .is_none()
         );
     }
 
