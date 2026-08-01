@@ -22,10 +22,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use miette::NamedSource;
+use thiserror::Error;
 use wcl_lang::{Block, Value};
 
 use super::model::Span;
-use super::{Issue, IssueList};
+use super::{ConfigErrors, Issue, IssueList};
 
 /// A value together with the span of the source text it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +106,15 @@ fn out_of_range(name: &str, lo: i64, hi: i64, got: i64) -> String {
     format!("`{name}` must be between {lo} and {hi}, got {got}")
 }
 
-fn one_of(name: &str, allowed: &str, got: &str) -> String {
+fn below_floor(name: &str, min: i64, got: i64) -> String {
+    format!("`{name}` must be at least {min}, got {got}")
+}
+
+fn too_large(name: &str, got: i64) -> String {
+    format!("`{name}` is too large: {got}")
+}
+
+fn must_be_one_of(name: &str, allowed: &str, got: &str) -> String {
     format!("`{name}` must be one of {allowed}, got `{got}`")
 }
 
@@ -275,28 +285,36 @@ impl<'b, 'i> Reader<'b, 'i> {
         }
     }
 
-    /// An integer inside an inclusive range, narrowed to `T`.
+    /// An integer inside an inclusive range, narrowed to `T`. The range is
+    /// the whole rule: `lo` and `hi` must themselves fit `T`, so a value
+    /// that passes the range always narrows.
     pub fn int_in<T: TryFrom<i64>>(&mut self, name: &str, lo: i64, hi: i64) -> Option<Spanned<T>> {
+        debug_assert!(
+            T::try_from(lo).is_ok() && T::try_from(hi).is_ok(),
+            "int_in({name}, {lo}, {hi}): the range must fit the target type, \
+             or a rejected value would be reported against a range it met"
+        );
         let n = self.int(name)?;
-        match T::try_from(n.value) {
-            Ok(v) if (lo..=hi).contains(&n.value) => Some(Spanned::new(v, n.span)),
-            _ => {
-                self.issue_at(n.span, out_of_range(name, lo, hi, n.value));
-                None
-            }
+        if !(lo..=hi).contains(&n.value) {
+            self.issue_at(n.span, out_of_range(name, lo, hi, n.value));
+            return None;
         }
+        T::try_from(n.value).ok().map(|v| Spanned::new(v, n.span))
     }
 
-    /// An integer no smaller than `min`, narrowed to `T`.
+    /// An integer no smaller than `min`, narrowed to `T`. `T`'s width is
+    /// the implicit ceiling: a value above `min` that will not fit is too
+    /// large, which is a different mistake from being below the floor.
     pub fn int_at_least<T: TryFrom<i64>>(&mut self, name: &str, min: i64) -> Option<Spanned<T>> {
         let n = self.int(name)?;
+        if n.value < min {
+            self.issue_at(n.span, below_floor(name, min, n.value));
+            return None;
+        }
         match T::try_from(n.value) {
-            Ok(v) if n.value >= min => Some(Spanned::new(v, n.span)),
-            _ => {
-                self.issue_at(
-                    n.span,
-                    format!("`{name}` must be at least {min}, got {}", n.value),
-                );
+            Ok(v) => Some(Spanned::new(v, n.span)),
+            Err(_) => {
+                self.issue_at(n.span, too_large(name, n.value));
                 None
             }
         }
@@ -402,7 +420,7 @@ impl<'b, 'i> Reader<'b, 'i> {
         if allowed.contains(&s.value.as_str()) {
             return Some(s);
         }
-        let msg = one_of(name, &allowed.join(", "), &s.value);
+        let msg = must_be_one_of(name, &allowed.join(", "), &s.value);
         self.issue_at(s.span, msg);
         None
     }
@@ -414,7 +432,7 @@ impl<'b, 'i> Reader<'b, 'i> {
             Some((_, v)) => Some(Spanned::new(*v, s.span)),
             None => {
                 let allowed = table.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", ");
-                self.issue_at(s.span, one_of(name, &allowed, &s.value));
+                self.issue_at(s.span, must_be_one_of(name, &allowed, &s.value));
                 None
             }
         }
@@ -436,7 +454,7 @@ impl<'b, 'i> Reader<'b, 'i> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let got = format!(":{symbol}");
-                self.issue_at(v.span, one_of(name, &allowed, &got));
+                self.issue_at(v.span, must_be_one_of(name, &allowed, &got));
                 None
             }
         }
@@ -462,6 +480,65 @@ impl<'b, 'i> Reader<'b, 'i> {
             }
         }
     }
+}
+
+/// Everything wrong with one file, as an error.
+///
+/// The message is the rendered list, so a caller that only prints it reads
+/// the same `file:line:col` lines a lab file gives. The positioned issues
+/// stay reachable through [`IssueError::diagnostic`], so a surface that
+/// wants to highlight the offending text can, whichever of the four files
+/// it came from — the CLI renders exactly that.
+#[derive(Debug, Error)]
+#[error("{rendered}")]
+pub struct IssueError {
+    rendered: String,
+    name: String,
+    text: String,
+    issues: IssueList,
+}
+
+impl IssueError {
+    /// The same issues as a miette diagnostic, renderable against the file
+    /// they came from — the positioned form, for any surface that wants to
+    /// point at the offending text rather than print a line number.
+    pub fn diagnostic(&self) -> ConfigErrors {
+        ConfigErrors {
+            name: self.name.clone(),
+            src: NamedSource::new(&self.name, self.text.clone()),
+            issues: self.issues.clone(),
+        }
+    }
+}
+
+/// Turn one pass's accumulated issues into a `Result`: the extracted value
+/// when nothing went wrong, else one error carrying every issue.
+///
+/// This is the shape all four call sites share once their field mapping is
+/// done, so it lives here rather than being written out four times.
+pub fn finish<T>(
+    name: &str,
+    source: &str,
+    issues: IssueList,
+    value: Option<T>,
+) -> Result<T, IssueError> {
+    if let Some(v) = value
+        && issues.is_empty()
+    {
+        return Ok(v);
+    }
+    let mut issues = issues;
+    if issues.is_empty() {
+        // Nothing extracted and nothing to say: a field mapping gave up
+        // without reporting why. Say something rather than "0 error(s)".
+        issues.push(Issue::new(format!("cannot read {name}")));
+    }
+    Err(IssueError {
+        rendered: render_issues(name, source, &issues),
+        name: name.to_string(),
+        text: source.to_string(),
+        issues,
+    })
 }
 
 /// Render an issue list as one error message, resolving spans to
@@ -559,6 +636,50 @@ mod tests {
         let ((written, absent), _) = read("a = false", |r| (r.has("a"), r.has("b")));
         assert!(written);
         assert!(!absent);
+    }
+
+    /// A malformed nested block: the child's reader shares the parent's
+    /// issue list, so one pass reports the parent's mistakes and the
+    /// child's, each against its own span.
+    #[test]
+    fn a_malformed_nested_block_reports_against_its_own_span() {
+        let src = "thing \"n\" { a = 1 inner { b = \"x\" } }";
+        let doc = Document::open(src, "<test>").unwrap();
+        let block = doc.blocks().next().unwrap();
+        let mut issues = IssueList::new();
+        let mut r = Reader::new(&block, &mut issues);
+        let parent_span = r.span();
+        assert!(r.string("a").is_none());
+        for child in r.children() {
+            let mut c = Reader::new(&child, r.issues());
+            assert!(c.int("b").is_none());
+        }
+        let msgs: Vec<&str> = issues.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(
+            msgs,
+            [
+                "`a` must be a string, got an integer",
+                "`b` must be an integer, got a string",
+            ]
+        );
+        // The child's issue points inside the child, not at the parent.
+        let child_at = issues[1].span.unwrap().offset();
+        assert!(
+            child_at > issues[0].span.unwrap().offset() && child_at < parent_span.1,
+            "child issue should sit after the parent's field and inside the parent"
+        );
+    }
+
+    /// The extractor has no unknown-field branch on purpose: a field it is
+    /// never asked for is simply not read, and naming what a block may
+    /// contain is the schema's job (the four call sites all schema-check
+    /// first). Reading a name that isn't there is silent, not an error.
+    #[test]
+    fn a_field_never_asked_for_is_not_the_extractors_business() {
+        let (v, issues) = read("known = \"x\" surprise = 1", |r| r.string("known"));
+        assert_eq!(v.unwrap().value, "x");
+        assert!(issues.is_empty(), "{issues:?}");
+        silent_none("surprise = 1", |r| r.string("absent"));
     }
 
     #[test]
@@ -678,12 +799,13 @@ mod tests {
         );
     }
 
+    /// The range is the whole rule: a rejected value is reported against
+    /// the range it actually missed, never against one it met.
     #[test]
-    fn int_in_rejects_what_the_target_type_cannot_hold() {
-        // The range allows it; u8 does not. Both are one message.
+    fn int_in_reports_the_range_it_was_given() {
         assert_eq!(
-            issue("a = 300", |r| r.int_in::<u8>("a", 0, 1000)),
-            "`a` must be between 0 and 1000, got 300"
+            issue("a = 300", |r| r.int_in::<u8>("a", 0, 200)),
+            "`a` must be between 0 and 200, got 300"
         );
     }
 
@@ -698,6 +820,16 @@ mod tests {
         assert_eq!(
             issue("a = -1", |r| r.int_at_least::<u32>("a", 0)),
             "`a` must be at least 0, got -1"
+        );
+    }
+
+    /// Above the floor but too wide for the target type is a different
+    /// mistake from being below it, and says so.
+    #[test]
+    fn int_at_least_reports_a_value_too_wide_for_its_type() {
+        assert_eq!(
+            issue("a = 5000000000", |r| r.int_at_least::<u32>("a", 1)),
+            "`a` is too large: 5000000000"
         );
     }
 
@@ -860,6 +992,39 @@ mod tests {
     }
 
     // ---- rendering -------------------------------------------------------
+
+    #[test]
+    fn finish_hands_back_the_value_when_nothing_went_wrong() {
+        let v = finish("f.wcl", "one\n", IssueList::new(), Some(7)).unwrap();
+        assert_eq!(v, 7);
+    }
+
+    #[test]
+    fn finish_keeps_the_spans_reachable_not_just_rendered() {
+        let issues = vec![Issue::at((4, 7), "second line")];
+        let err = finish("f.wcl", "one\ntwo\nthree", issues, Some(7)).unwrap_err();
+        // Printed, it reads like a lab file's diagnostic …
+        assert_eq!(
+            err.to_string(),
+            "1 error(s) in f.wcl\n  f.wcl:2:1: second line"
+        );
+        // … and the positions survive for a surface that wants to
+        // highlight the text rather than print a line number.
+        let diag = err.diagnostic();
+        assert_eq!(diag.name, "f.wcl");
+        assert_eq!(diag.issues[0].span.unwrap().offset(), 4);
+    }
+
+    /// A field mapping that gives up without saying why would otherwise
+    /// report "0 error(s)".
+    #[test]
+    fn finish_never_reports_an_empty_failure() {
+        let err = finish("f.wcl", "", IssueList::new(), None::<u8>).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "1 error(s) in f.wcl\n  f.wcl: cannot read f.wcl"
+        );
+    }
 
     #[test]
     fn render_resolves_spans_to_line_and_column() {

@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 use wcl_lang::{Document, Environment, Registry, disk_loader};
 
-use super::block::{Reader, Unspan, render_issues};
+use super::block::{Reader, Unspan, finish};
 
 pub const HOST_SCHEMA_WCL: &str = include_str!("host_schema.wcl");
 
@@ -79,7 +79,6 @@ impl HostConfig {
             let mut r = Reader::new(&block, &mut issues);
             // Every field is an override: absent (or malformed, which is
             // reported) leaves the default in place.
-            use crate::net::fastpath::FastpathMode as Fp;
             if let Some(v) = r.parse_as("subnet_pool", "CIDR").unspan() {
                 cfg.subnet_pool = v;
             }
@@ -96,15 +95,7 @@ impl HostConfig {
             }
             cfg.viewer = r.string("viewer").unspan();
             if let Some(v) = r
-                .keyword(
-                    "fastpath",
-                    &[
-                        ("auto", Fp::Auto),
-                        ("off", Fp::Off),
-                        ("sockmap", Fp::Sockmap),
-                        ("afxdp", Fp::AfXdp),
-                    ],
-                )
+                .keyword("fastpath", crate::net::fastpath::FastpathMode::NAMES)
                 .unspan()
             {
                 cfg.fastpath = v;
@@ -114,11 +105,7 @@ impl HostConfig {
                 cfg.oci_chunk_size = v;
             }
         }
-        if issues.is_empty() {
-            Ok(cfg)
-        } else {
-            Err(anyhow!(render_issues(name, source, &issues)))
-        }
+        Ok(finish(name, source, issues, Some(cfg))?)
     }
 }
 
@@ -248,6 +235,45 @@ host {
             "{err}"
         );
         assert!(err.contains("config.wcl:4:3: `fastpath` must be"), "{err}");
+    }
+
+    /// A field the host schema does not name is the schema's to reject, not
+    /// the extractor's — but it must still reach the user, positioned.
+    #[test]
+    fn an_unknown_field_is_rejected_by_the_schema() {
+        let err = host_err("host { bogus = 1 }\n");
+        assert!(err.contains("bogus"), "{err}");
+        assert!(err.contains("config.wcl:2:"), "unpositioned: {err}");
+    }
+
+    /// Spans survive as spans, not just as rendered text (ADR-0006, story 19).
+    #[test]
+    fn a_host_config_issue_carries_a_span_a_surface_can_use() {
+        let source = "import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n";
+        let err = HostConfig::parse(source, "config.wcl").unwrap_err();
+        let diag = err
+            .downcast_ref::<crate::config::block::IssueError>()
+            .expect("host config errors carry their issues")
+            .diagnostic();
+        let span = diag.issues[0].span.expect("positioned");
+        assert_eq!(
+            &source[span.offset()..span.offset() + span.len()],
+            "trunk_port = 0"
+        );
+    }
+
+    /// The one spelling of each fastpath mode: what the extractor accepts is
+    /// what `FastpathMode::parse` accepts, by construction.
+    #[test]
+    fn fastpath_accepts_exactly_the_modes_parse_knows() {
+        for (name, mode) in crate::net::fastpath::FastpathMode::NAMES {
+            let cfg = HostConfig::parse(
+                &format!("import <vmlab-host.wcl>\nhost {{ fastpath = \"{name}\" }}\n"),
+                "<t>",
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(cfg.fastpath, *mode);
+        }
     }
 
     #[test]

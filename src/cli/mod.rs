@@ -456,9 +456,15 @@ pub fn run() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // ConfigErrors render as rich miette reports; everything else as
-            // a plain error chain.
-            eprintln!("{err:?}");
+            // A config file's issues render as a rich miette report — the
+            // offending text underlined in its source — whichever of the four
+            // files they came from (ADR-0006). Lab files arrive already
+            // rendered; the other three carry their spans in an `IssueError`.
+            // Everything else renders as a plain error chain.
+            match err.downcast_ref::<crate::config::block::IssueError>() {
+                Some(issues) => eprintln!("{:?}", miette::Report::new(issues.diagnostic())),
+                None => eprintln!("{err:?}"),
+            }
             ExitCode::FAILURE
         }
     }

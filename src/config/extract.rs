@@ -69,9 +69,11 @@ pub fn extract_template_file(doc: &Document, issues: &mut IssueList) -> Template
 
 fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
+    // Read the label, but keep reading: a nameless block should not swallow
+    // the diagnostics for everything else wrong inside it.
+    let name = r.label();
     let mut lab = Lab {
-        name,
+        name: String::new(),
         span: r.span(),
         gui: r.bool("gui").unspan(),
         segments: Vec::new(),
@@ -116,14 +118,14 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
             _ => {}
         }
     }
-    Some(lab)
+    Some(Lab { name: name?, ..lab })
 }
 
 fn extract_segment(b: &Block, issues: &mut IssueList) -> Option<Segment> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
+    let name = r.label();
     let mut seg = Segment {
-        name,
+        name: String::new(),
         span: r.span(),
         subnet: r.parse_as("subnet", "CIDR").unspan(),
         global: r.bool("global").unspan().unwrap_or(false),
@@ -225,7 +227,7 @@ fn extract_segment(b: &Block, issues: &mut IssueList) -> Option<Segment> {
             _ => {}
         }
     }
-    Some(seg)
+    Some(Segment { name: name?, ..seg })
 }
 
 const L4_PROTOS: &[(&str, L4Proto)] = &[
@@ -384,9 +386,9 @@ fn extract_media(b: &Block, issues: &mut IssueList) -> Option<Media> {
 
 fn extract_web(b: &Block, issues: &mut IssueList) -> Option<WebPage> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
+    let name = r.label();
     let span = r.span();
-    let port = r.required("port", |r, n| r.port(n))?.value;
+    let port = r.required("port", |r, n| r.port(n));
     let path = match r.string("path") {
         Some(p) if !p.value.is_empty() => {
             if p.value.starts_with('/') {
@@ -397,18 +399,21 @@ fn extract_web(b: &Block, issues: &mut IssueList) -> Option<WebPage> {
         }
         _ => "/".to_string(),
     };
+    // The auth block's diagnostics name the page they are about; an
+    // unnamed page still gets them, under the placeholder.
+    let page = name.clone().unwrap_or_else(|| "?".to_string());
     let mut auth = None;
     let mut auth_span = None;
     for child in r.children() {
         if child.kind() == "auth" {
             auth_span = Some(span_of(&child));
-            auth = extract_web_auth(&child, &name, r.issues());
+            auth = extract_web_auth(&child, &page, r.issues());
         }
     }
     Some(WebPage {
-        name,
+        name: name?,
         span,
-        port,
+        port: port?.value,
         path,
         auth,
         auth_span,
@@ -544,12 +549,14 @@ fn extract_web_auth(b: &Block, page: &str, issues: &mut IssueList) -> Option<Web
 
 fn extract_disk_block(b: &Block, issues: &mut IssueList) -> Option<DiskBlock> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
+    let name = r.label();
+    let size = r.size("size").unspan();
+    let from = r.path("from").unspan();
     Some(DiskBlock {
-        name,
+        name: name?,
         span: r.span(),
-        size: r.size("size").unspan(),
-        from: r.path("from").unspan(),
+        size,
+        from,
     })
 }
 
@@ -583,43 +590,45 @@ fn extract_provision(b: &Block, issues: &mut IssueList) -> Option<Provision> {
 
 fn extract_playbook(b: &Block, issues: &mut IssueList) -> Option<Playbook> {
     let mut r = Reader::new(b, issues);
-    let path = r.label()?;
-    let play = r.required_string("play")?;
-    let mut pb = Playbook {
-        path: PathBuf::from(path),
-        play: play.value,
-        vars: Vec::new(),
-        span: r.span(),
-    };
+    let path = r.label();
+    let play = r.required_string("play");
+    let span = r.span();
+    let mut vars = Vec::new();
     for child in r.children() {
         if child.kind() == "var"
             && let Some(v) = extract_playbook_var(&child, r.issues())
         {
-            pb.vars.push(v);
+            vars.push(v);
         }
     }
-    Some(pb)
+    Some(Playbook {
+        path: PathBuf::from(path?),
+        play: play?.value,
+        vars,
+        span,
+    })
 }
 
 fn extract_playbook_var(b: &Block, issues: &mut IssueList) -> Option<PlaybookVar> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
-    let value = r.required_string("value")?;
+    let name = r.label();
+    let value = r.required_string("value");
     Some(PlaybookVar {
-        name,
-        value: value.value,
+        name: name?,
+        value: value?.value,
         span: r.span(),
     })
 }
 
 fn extract_handler(b: &Block, issues: &mut IssueList) -> Option<Handler> {
     let mut r = Reader::new(b, issues);
-    let event = r.label()?;
-    let run = r.required_path("run")?;
+    let event = r.label();
+    let run = r.required_path("run");
+    let targets = r.string_list("targets");
     Some(Handler {
-        event,
-        run: run.value,
-        targets: r.string_list("targets"),
+        event: event?,
+        run: run?.value,
+        targets,
         span: r.span(),
     })
 }
@@ -628,164 +637,205 @@ const FIRMWARES: &[(&str, Firmware)] = &[("ovmf", Firmware::Ovmf), ("seabios", F
 
 fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
+    let name = r.label();
     let span = r.span();
-    let template = r.required("template", |r, n| r.parsed(n, parse_template_ref))?;
-    let mut vm = Vm {
-        name,
-        span,
-        template: template.value,
-        template_span: template.span,
-        arch: r.string("arch").unspan(),
-        profile: r.string("profile").unspan(),
-        cpus: r.int_at_least("cpus", 1).unspan(),
-        memory: r.size("memory").unspan(),
-        disk: r.size("disk").unspan(),
-        cdrom: r.path("cdrom").unspan(),
-        floppy: r.path("floppy").unspan(),
-        depends_on: r.string_list("depends_on"),
-        nested: r.bool("nested").unspan().unwrap_or(false),
-        gui: r.bool("gui").unspan(),
-        display: r.string("display").unspan(),
-        firmware: r.keyword("firmware", FIRMWARES).unspan(),
-        tpm: r.bool("tpm").unspan(),
-        secure_boot: r.bool("secure_boot").unspan(),
-        qemu_args: r.string_list("qemu_args"),
-        gpu: None,
-        nics: Vec::new(),
-        extra_disks: Vec::new(),
-        shares: Vec::new(),
-        media: Vec::new(),
-        web: Vec::new(),
-        provisions: Vec::new(),
-        playbooks: Vec::new(),
-    };
+    let template = r.required("template", |r, n| r.parsed(n, parse_template_ref));
+    let arch = r.string("arch").unspan();
+    let profile = r.string("profile").unspan();
+    let cpus = r.int_at_least("cpus", 1).unspan();
+    let memory = r.size("memory").unspan();
+    let disk = r.size("disk").unspan();
+    let cdrom = r.path("cdrom").unspan();
+    let floppy = r.path("floppy").unspan();
+    let depends_on = r.string_list("depends_on");
+    let nested = r.bool("nested").unspan().unwrap_or(false);
+    let gui = r.bool("gui").unspan();
+    let display = r.string("display").unspan();
+    let firmware = r.keyword("firmware", FIRMWARES).unspan();
+    let tpm = r.bool("tpm").unspan();
+    let secure_boot = r.bool("secure_boot").unspan();
+    let qemu_args = r.string_list("qemu_args");
+    let mut gpu = None;
+    let mut nics = Vec::new();
+    let mut extra_disks = Vec::new();
+    let mut shares = Vec::new();
+    let mut media = Vec::new();
+    let mut web = Vec::new();
+    let mut provisions = Vec::new();
+    let mut playbooks = Vec::new();
     for child in r.children() {
         match child.kind() {
-            "nic" => vm.nics.push(extract_nic(&child, r.issues())),
-            "gpu" => vm.gpu = extract_gpu(&child, r.issues()),
+            "nic" => nics.push(extract_nic(&child, r.issues())),
+            "gpu" => gpu = extract_gpu(&child, r.issues()),
             "disk" => {
                 if let Some(d) = extract_disk_block(&child, r.issues()) {
-                    vm.extra_disks.push(d);
+                    extra_disks.push(d);
                 }
             }
             "share" => {
                 if let Some(s) = extract_share(&child, r.issues()) {
-                    vm.shares.push(s);
+                    shares.push(s);
                 }
             }
             "media" => {
                 if let Some(m) = extract_media(&child, r.issues()) {
-                    vm.media.push(m);
+                    media.push(m);
                 }
             }
             "web" => {
                 if let Some(w) = extract_web(&child, r.issues()) {
-                    vm.web.push(w);
+                    web.push(w);
                 }
             }
             "provision" => {
                 if let Some(p) = extract_provision(&child, r.issues()) {
-                    vm.provisions.push(p);
+                    provisions.push(p);
                 }
             }
             "playbook" => {
                 if let Some(p) = extract_playbook(&child, r.issues()) {
-                    vm.playbooks.push(p);
+                    playbooks.push(p);
                 }
             }
             _ => {}
         }
     }
-    Some(vm)
+    let template = template?;
+    Some(Vm {
+        name: name?,
+        span,
+        template: template.value,
+        template_span: template.span,
+        arch,
+        profile,
+        cpus,
+        memory,
+        disk,
+        cdrom,
+        floppy,
+        depends_on,
+        nested,
+        gui,
+        display,
+        firmware,
+        tpm,
+        secure_boot,
+        qemu_args,
+        gpu,
+        nics,
+        extra_disks,
+        shares,
+        media,
+        web,
+        provisions,
+        playbooks,
+    })
 }
 
 fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
+    let name = r.label();
     let span = r.span();
-    let image = r.required("image", |r, n| r.parsed(n, parse_image_ref))?;
-    let mut c = Container {
-        name,
-        span,
-        image: image.value,
-        image_span: image.span,
-        mode: r
-            .symbol(
-                "mode",
-                &[
-                    ("workload", ContainerMode::Workload),
-                    ("idle", ContainerMode::Idle),
-                ],
-            )
-            .unspan()
-            .unwrap_or_default(),
-        entrypoint: r.opt_string_list("entrypoint"),
-        command: r.opt_string_list("command"),
-        workdir: r.string("workdir").unspan(),
-        user: r.string("user").unspan(),
-        profile: r.string("profile").unspan(),
-        cpus: r.int_at_least("cpus", 1).unspan(),
-        memory: r.size("memory").unspan(),
-        depends_on: r.string_list("depends_on"),
-        restart: r
-            .keyword(
-                "restart",
-                &[
-                    ("no", RestartPolicy::No),
-                    ("on-failure", RestartPolicy::OnFailure),
-                    ("always", RestartPolicy::Always),
-                ],
-            )
-            .unspan()
-            .unwrap_or_default(),
-        nics: Vec::new(),
-        env: Vec::new(),
-        volumes: Vec::new(),
-        ports: Vec::new(),
-        healthcheck: None,
-        web: Vec::new(),
-        provisions: Vec::new(),
-        playbooks: Vec::new(),
-    };
+    let image = r.required("image", |r, n| r.parsed(n, parse_image_ref));
+    let mode = r
+        .symbol(
+            "mode",
+            &[
+                ("workload", ContainerMode::Workload),
+                ("idle", ContainerMode::Idle),
+            ],
+        )
+        .unspan()
+        .unwrap_or_default();
+    let entrypoint = r.opt_string_list("entrypoint");
+    let command = r.opt_string_list("command");
+    let workdir = r.string("workdir").unspan();
+    let user = r.string("user").unspan();
+    let profile = r.string("profile").unspan();
+    let cpus = r.int_at_least("cpus", 1).unspan();
+    let memory = r.size("memory").unspan();
+    let depends_on = r.string_list("depends_on");
+    let restart = r
+        .keyword(
+            "restart",
+            &[
+                ("no", RestartPolicy::No),
+                ("on-failure", RestartPolicy::OnFailure),
+                ("always", RestartPolicy::Always),
+            ],
+        )
+        .unspan()
+        .unwrap_or_default();
+    let mut nics = Vec::new();
+    let mut env = Vec::new();
+    let mut volumes = Vec::new();
+    let mut ports = Vec::new();
+    let mut healthcheck = None;
+    let mut web = Vec::new();
+    let mut provisions = Vec::new();
+    let mut playbooks = Vec::new();
     for child in r.children() {
         match child.kind() {
-            "nic" => c.nics.push(extract_nic(&child, r.issues())),
+            "nic" => nics.push(extract_nic(&child, r.issues())),
             "env" => {
                 if let Some(e) = extract_env(&child, r.issues()) {
-                    c.env.push(e);
+                    env.push(e);
                 }
             }
             "volume" => {
                 if let Some(v) = extract_volume(&child, r.issues()) {
-                    c.volumes.push(v);
+                    volumes.push(v);
                 }
             }
             "port" => {
                 if let Some(p) = extract_port(&child, r.issues()) {
-                    c.ports.push(p);
+                    ports.push(p);
                 }
             }
-            "healthcheck" => c.healthcheck = extract_healthcheck(&child, r.issues()),
+            "healthcheck" => healthcheck = extract_healthcheck(&child, r.issues()),
             "web" => {
                 if let Some(w) = extract_web(&child, r.issues()) {
-                    c.web.push(w);
+                    web.push(w);
                 }
             }
             "provision" => {
                 if let Some(p) = extract_provision(&child, r.issues()) {
-                    c.provisions.push(p);
+                    provisions.push(p);
                 }
             }
             "playbook" => {
                 if let Some(p) = extract_playbook(&child, r.issues()) {
-                    c.playbooks.push(p);
+                    playbooks.push(p);
                 }
             }
             _ => {}
         }
     }
-    Some(c)
+    let image = image?;
+    Some(Container {
+        name: name?,
+        span,
+        image: image.value,
+        image_span: image.span,
+        mode,
+        entrypoint,
+        command,
+        workdir,
+        user,
+        profile,
+        cpus,
+        memory,
+        depends_on,
+        restart,
+        nics,
+        env,
+        volumes,
+        ports,
+        healthcheck,
+        web,
+        provisions,
+        playbooks,
+    })
 }
 
 fn extract_env(b: &Block, issues: &mut IssueList) -> Option<EnvVar> {
@@ -904,10 +954,10 @@ fn extract_healthcheck(b: &Block, issues: &mut IssueList) -> Option<Healthcheck>
 
 fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
+    let name = r.label();
     let span = r.span();
-    let arch = r.required("arch", |r, n| r.one_of(n, KNOWN_ARCHES))?;
-    let version = r.required_string("version")?;
+    let arch = r.required("arch", |r, n| r.one_of(n, KNOWN_ARCHES));
+    let version = r.required_string("version");
     let mut source = None;
     let mut media = Vec::new();
     let mut provisions = Vec::new();
@@ -941,29 +991,43 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
             _ => {}
         }
     }
+    let registry = r.string("registry").unspan();
+    let profile = r.string("profile").unspan();
+    // `cpus` only guards its sign: what makes a count valid is §5.1's job.
+    let cpus = r.int_at_least("cpus", 0).unspan();
+    let memory = r.size("memory").unspan();
+    let disk = r.size("disk").unspan();
+    let display = r.string("display").unspan();
+    let firmware = r.keyword("firmware", FIRMWARES).unspan();
+    let tpm = r.bool("tpm").unspan();
+    let secure_boot = r.bool("secure_boot").unspan();
+    let nested = r.bool("nested").unspan().unwrap_or(false);
+    let gui = r.bool("gui").unspan().unwrap_or(false);
+    let qemu_args = r.string_list("qemu_args");
+    let first_boot = r.path("first_boot").unspan();
+    let agent = r.bool("agent").unspan().unwrap_or(true);
     // A missing `source` block is a schema error already (`@child("source")`
     // is not optional); saying so again here would just double the report.
-    let source = source?;
     Some(TemplateDef {
-        name,
+        name: name?,
         span,
-        arch: arch.value,
-        version: version.value,
-        registry: r.string("registry").unspan(),
-        profile: r.string("profile").unspan(),
-        cpus: r.int_at_least("cpus", 0).unspan(),
-        memory: r.size("memory").unspan(),
-        disk: r.size("disk").unspan(),
-        display: r.string("display").unspan(),
-        firmware: r.keyword("firmware", FIRMWARES).unspan(),
-        tpm: r.bool("tpm").unspan(),
-        secure_boot: r.bool("secure_boot").unspan(),
-        nested: r.bool("nested").unspan().unwrap_or(false),
-        gui: r.bool("gui").unspan().unwrap_or(false),
-        qemu_args: r.string_list("qemu_args"),
-        first_boot: r.path("first_boot").unspan(),
-        agent: r.bool("agent").unspan().unwrap_or(true),
-        source,
+        arch: arch?.value,
+        version: version?.value,
+        source: source?,
+        registry,
+        profile,
+        cpus,
+        memory,
+        disk,
+        display,
+        firmware,
+        tpm,
+        secure_boot,
+        nested,
+        gui,
+        qemu_args,
+        first_boot,
+        agent,
         media,
         provisions,
         playbooks,
@@ -1029,5 +1093,142 @@ fn extract_source(b: &Block, issues: &mut IssueList) -> Option<TemplateSource> {
             ));
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extract `body` as the contents of one lab, returning what survived
+    /// alongside every issue raised. Goes through the real schema, so what
+    /// the schema rejects shows up here too — which is the point: these
+    /// tests are about the field mapping, and the mapping's job stops where
+    /// the schema's begins.
+    fn lab(body: &str) -> (Option<Lab>, Vec<String>) {
+        let src = format!("import <vmlab.wcl>\nlab \"l\" {{\n{body}\n}}\n");
+        let doc = super::super::open(&src, "<test>", Some(Path::new("/tmp")))
+            .unwrap_or_else(|e| panic!("{body} should parse: {e:?}"));
+        let mut issues = super::super::schema_issues(&doc);
+        let block = doc.blocks().next().expect("the lab block");
+        let lab = extract_lab(&block, &mut issues);
+        (lab, issues.iter().map(|i| i.message.clone()).collect())
+    }
+
+    /// Fields the schema declares required but does not itself check for
+    /// (wcl enforces required *child blocks* only). Before ADR-0006 each of
+    /// these silently dropped the block it was in and the file still loaded.
+    #[test]
+    fn a_missing_required_field_is_reported_rather_than_dropped() {
+        let cases = [
+            (
+                "vm \"a\" { template = \"x86_64/t\" media { } }",
+                "missing required field `kind`",
+            ),
+            (
+                "vm \"a\" { template = \"x86_64/t\" media { kind = \"iso\" } }",
+                "missing required field `from`",
+            ),
+            (
+                "vm \"a\" { template = \"x86_64/t\" share { guest = \"/mnt/x\" } }",
+                "missing required field `host`",
+            ),
+            (
+                "record { ip = \"10.0.0.1\" }",
+                "missing required field `name`",
+            ),
+            ("record { name = \"a\" }", "missing required field `ip`"),
+            ("on \"vm.crashed\" { }", "missing required field `run`"),
+            (
+                "vm \"a\" { template = \"x86_64/t\" playbook \"p\" { } }",
+                "missing required field `play`",
+            ),
+            (
+                "segment \"s\" { route { via = \"10.0.0.1\" } }",
+                "missing required field `dest`",
+            ),
+            (
+                "container \"c\" { image = \"nginx\" port { container = 80 } }",
+                "missing required field `host`",
+            ),
+        ];
+        for (body, expected) in cases {
+            let (_, issues) = lab(body);
+            assert!(
+                issues.iter().any(|m| m == expected),
+                "{body}: expected `{expected}`, got {issues:?}"
+            );
+        }
+    }
+
+    /// One pass, every mistake — a lab author is not fixing one per run.
+    #[test]
+    fn every_mistake_is_reported_in_one_pass() {
+        let (_, issues) = lab("segment \"s\" { subnet = \"10.1\" mtu = 100 }\n\
+             vm \"a\" { template = \"x86_64/t\" cpus = 0 }");
+        for expected in [
+            "malformed CIDR `10.1`",
+            "`mtu` must be between 576 and 65535, got 100",
+            "`cpus` must be at least 1, got 0",
+        ] {
+            assert!(
+                issues.iter().any(|m| m == expected),
+                "missing `{expected}` in {issues:?}"
+            );
+        }
+    }
+
+    /// A block that cannot be built still reports everything else wrong
+    /// inside it: the mistake that sinks it does not hide its neighbours.
+    #[test]
+    fn a_block_that_cannot_be_built_still_reports_what_is_inside_it() {
+        // No `template`, so the VM is dropped — but its NIC, its share and
+        // its own bad `cpus` are all still reported.
+        let (_, issues) =
+            lab("vm \"a\" { cpus = 0 nic { ip = \"10.50\" } share { guest = \"/mnt/x\" } }");
+        for expected in [
+            "missing required field `template`",
+            "`cpus` must be at least 1, got 0",
+            "malformed IP address `10.50`",
+            "missing required field `host`",
+        ] {
+            assert!(
+                issues.iter().any(|m| m == expected),
+                "missing `{expected}` in {issues:?}"
+            );
+        }
+    }
+
+    /// The same, for the label: a nameless block does not swallow the
+    /// diagnostics for everything it contains.
+    #[test]
+    fn a_nameless_block_still_reports_what_is_inside_it() {
+        let (lab_out, issues) = lab("segment { mtu = 100 }");
+        assert!(lab_out.is_some(), "the lab itself is still built");
+        assert!(
+            issues
+                .iter()
+                .any(|m| m == "`segment` requires a name label"),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|m| m == "`mtu` must be between 576 and 65535, got 100"),
+            "{issues:?}"
+        );
+    }
+
+    /// Each issue points at the text that caused it, not at the block that
+    /// happens to contain it.
+    #[test]
+    fn an_issue_points_at_the_field_that_caused_it() {
+        let src = "import <vmlab.wcl>\nlab \"l\" { segment \"s\" { mtu = 100 } }\n";
+        let doc = super::super::open(src, "<test>", Some(Path::new("/tmp"))).unwrap();
+        let mut issues = super::super::schema_issues(&doc);
+        let block = doc.blocks().next().unwrap();
+        extract_lab(&block, &mut issues);
+        let span = issues[0].span.expect("positioned");
+        assert_eq!(&src[span.offset()..span.offset() + span.len()], "mtu = 100");
     }
 }

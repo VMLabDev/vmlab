@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, anyhow};
 use wcl_lang::{Block, Document, Environment, Registry, disk_loader};
 
 use crate::config::IssueList;
-use crate::config::block::{Reader, Unspan, render_issues};
+use crate::config::block::{Reader, Unspan, finish};
 
 pub const PROFILE_SCHEMA_WCL: &str = include_str!("profile_schema.wcl");
 pub const SHIPPED_PROFILES_WCL: &str = include_str!("shipped.wcl");
@@ -173,20 +173,18 @@ fn parse_profiles(source: &str, name: &str) -> Result<Vec<Profile>> {
             out.push(p);
         }
     }
-    if issues.is_empty() {
-        Ok(out)
-    } else {
-        Err(anyhow!(render_issues(name, source, &issues)))
-    }
+    Ok(finish(name, source, issues, Some(out))?)
 }
 
 /// The profile field mapping. Reading, coercion, spans and wording all come
 /// from [`crate::config::block`] (ADR-0006).
 fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
-    Some(Profile {
-        name,
+    // Read the label, but keep reading: a nameless profile should not
+    // swallow the diagnostics for everything else wrong with it.
+    let name = r.label();
+    let profile = Profile {
+        name: String::new(),
         description: r.string("description").unspan(),
         machine: r
             .keyword("machine", &[("q35", Machine::Q35), ("pc", Machine::I440fx)])
@@ -225,6 +223,10 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             .unspan()
             .unwrap_or_default(),
         virtiofs: r.bool("virtiofs").unspan().unwrap_or(false),
+    };
+    Some(Profile {
+        name: name?,
+        ..profile
     })
 }
 
@@ -353,6 +355,41 @@ profile "freebsd" { machine = "q35" firmware = "seabios" }
             "{err}"
         );
         assert!(err.contains("p.wcl:3:15: `tpm` must be a bool"), "{err}");
+    }
+
+    /// A profile with no name label still reports what else is wrong with
+    /// it — the label failure does not swallow the rest of the pass.
+    #[test]
+    fn a_nameless_profile_still_reports_its_other_mistakes() {
+        let err = profile_err("profile { machine = \"vax\" }\n");
+        assert!(err.contains("`profile` requires a name label"), "{err}");
+        assert!(err.contains("`machine` must be one of q35, pc"), "{err}");
+    }
+
+    /// A field the profile schema does not name is the schema's to reject,
+    /// not the extractor's — but it must still reach the user, positioned.
+    #[test]
+    fn an_unknown_field_is_rejected_by_the_schema() {
+        let err = profile_err("profile \"x\" { bogus = 1 }\n");
+        assert!(err.contains("bogus"), "{err}");
+        assert!(err.contains("p.wcl:2:"), "unpositioned: {err}");
+    }
+
+    /// Spans survive as spans, not just as rendered text, whichever config
+    /// file they came from (ADR-0006, story 19).
+    #[test]
+    fn a_profile_issue_carries_a_span_a_surface_can_use() {
+        let source = "import <vmlab-profile.wcl>\nprofile \"x\" { machine = \"vax\" }\n";
+        let err = parse_profiles(source, "p.wcl").unwrap_err();
+        let issues = err
+            .downcast_ref::<crate::config::block::IssueError>()
+            .expect("profile errors carry their issues")
+            .diagnostic();
+        let span = issues.issues[0].span.expect("positioned");
+        assert_eq!(
+            &source[span.offset()..span.offset() + span.len()],
+            "machine = \"vax\""
+        );
     }
 
     #[test]

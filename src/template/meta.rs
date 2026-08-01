@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use wcl_lang::{Block, Document, Environment, Registry, disk_loader};
 
 use crate::config::IssueList;
-use crate::config::block::{Reader, Unspan, render_issues};
+use crate::config::block::{Reader, Unspan, finish};
 
 /// Embedded schema, registered in the loader as `vmlab-meta.wcl`.
 const META_SCHEMA: &str = include_str!("meta_schema.wcl");
@@ -129,10 +129,7 @@ impl TemplateMeta {
             Some(block) => extract(&block, &mut issues),
             None => bail!("{name}: no `template_meta` block found"),
         };
-        match meta {
-            Some(meta) if issues.is_empty() => Ok(meta),
-            _ => Err(anyhow!(render_issues(name, source, &issues))),
-        }
+        Ok(finish(name, source, issues, meta)?)
     }
 
     /// Write to a file (overwriting).
@@ -154,7 +151,10 @@ impl TemplateMeta {
 /// hand-written, which is the one asymmetry left in this path.
 fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
     let mut r = Reader::new(b, issues);
-    let name = r.label()?;
+    // Read every field before giving up on a missing one, so a single pass
+    // reports everything wrong with the file — including when it is the
+    // name label that is missing.
+    let name = r.label();
     let created = r.required("created", |r, n| {
         r.parsed(n, |s| {
             DateTime::parse_from_rfc3339(s)
@@ -164,32 +164,39 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
     });
     let arch = r.required_string("arch");
     let version = r.required_string("version");
-    // Read every field before giving up on a missing one, so a single pass
-    // reports everything wrong with the file.
-    let meta = TemplateMeta {
-        name,
-        arch: String::new(),
-        version: String::new(),
-        profile: r.string("profile").unspan(),
-        cpus: r.int_at_least("cpus", 0).unspan(),
-        memory: r.size("memory").unspan(),
-        disk: r.size("disk").unspan(),
-        firmware: r.string("firmware").unspan(),
-        tpm: r.bool("tpm").unspan(),
-        secure_boot: r.bool("secure_boot").unspan(),
-        display: r.string("display").unspan(),
-        created: DateTime::UNIX_EPOCH,
-        origin: r.string("origin").unspan(),
-        registry: r.string("registry").unspan(),
-        sha256: r.string("sha256").unspan(),
-        first_boot_script: r.string("first_boot_script").unspan(),
-        agent_version: r.string("agent_version").unspan(),
-    };
+    let profile = r.string("profile").unspan();
+    // `cpus` only guards its sign here: what an already-built store holds is
+    // not this change's business (the lab file's own `cpus` takes 1, §5.1).
+    let cpus = r.int_at_least("cpus", 0).unspan();
+    let memory = r.size("memory").unspan();
+    let disk = r.size("disk").unspan();
+    let firmware = r.string("firmware").unspan();
+    let tpm = r.bool("tpm").unspan();
+    let secure_boot = r.bool("secure_boot").unspan();
+    let display = r.string("display").unspan();
+    let origin = r.string("origin").unspan();
+    let registry = r.string("registry").unspan();
+    let sha256 = r.string("sha256").unspan();
+    let first_boot_script = r.string("first_boot_script").unspan();
+    let agent_version = r.string("agent_version").unspan();
     Some(TemplateMeta {
+        name: name?,
         arch: arch?.value,
         version: version?.value,
         created: created?.value,
-        ..meta
+        profile,
+        cpus,
+        memory,
+        disk,
+        firmware,
+        tpm,
+        secure_boot,
+        display,
+        origin,
+        registry,
+        sha256,
+        first_boot_script,
+        agent_version,
     })
 }
 
@@ -413,13 +420,49 @@ mod tests {
         );
     }
 
+    /// A field the metadata schema does not name is the schema's to reject,
+    /// not the extractor's — but it must still reach the user, positioned.
     #[test]
     fn rejects_unknown_field() {
-        let src = format!(
-            "{SCHEMA_IMPORT}\ntemplate_meta \"x\" {{ arch = \"a\" version = \"1\" \
-             created = \"2026-01-02T03:04:05Z\" bogus = 1 }}\n"
+        let err = meta_err(
+            "template_meta \"x\" { arch = \"a\" version = \"1\" \
+             created = \"2026-01-02T03:04:05Z\" bogus = 1 }\n",
         );
-        assert!(TemplateMeta::from_wcl(&src, "<test>").is_err());
+        assert!(err.contains("bogus"), "{err}");
+        assert!(err.contains("template.wcl:2:"), "unpositioned: {err}");
+    }
+
+    /// A metadata block with no name label still reports what else is wrong
+    /// with it — the label failure does not swallow the rest of the pass.
+    #[test]
+    fn a_nameless_block_still_reports_its_other_mistakes() {
+        let err = meta_err("template_meta { arch = 7 }\n");
+        assert!(
+            err.contains("`template_meta` requires a name label"),
+            "{err}"
+        );
+        assert!(err.contains("`arch` must be a string"), "{err}");
+        assert!(err.contains("missing required field `version`"), "{err}");
+    }
+
+    /// Spans survive as spans, not just as rendered text (ADR-0006, story 19).
+    #[test]
+    fn a_metadata_issue_carries_a_span_a_surface_can_use() {
+        let source = format!("{SCHEMA_IMPORT}\ntemplate_meta \"x\" {{ arch = 7 }}\n");
+        let err = TemplateMeta::from_wcl(&source, "template.wcl").unwrap_err();
+        let diag = err
+            .downcast_ref::<crate::config::block::IssueError>()
+            .expect("metadata errors carry their issues")
+            .diagnostic();
+        let span = diag
+            .issues
+            .iter()
+            .find_map(|i| i.span.filter(|_| i.message.contains("must be a string")))
+            .expect("positioned type error");
+        assert_eq!(
+            &source[span.offset()..span.offset() + span.len()],
+            "arch = 7"
+        );
     }
 
     #[test]
