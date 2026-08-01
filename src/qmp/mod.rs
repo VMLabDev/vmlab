@@ -16,4 +16,4 @@ mod types;
 pub use client::QmpClient;
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;
