@@ -2,11 +2,13 @@
 //! (PRD §5).
 
 pub(crate) mod block;
+pub mod designer;
 pub mod dto;
 pub mod edit_ops;
 mod extract;
 pub mod host;
 pub mod model;
+pub mod projection;
 pub mod validate;
 
 use std::path::Path;

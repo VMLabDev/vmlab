@@ -57,6 +57,11 @@ guest-install: guest-build agent-build
 	mkdir -p ~/.local/share/vmlab/guest
 	cp -r guest/dist/* ~/.local/share/vmlab/guest/
 
+# Rebuild the committed console artefact from the Schema projection (ADR-0005)
+[group('build')]
+schema-gen:
+	VMLAB_BLESS=1 cargo test --lib config::designer::tests::console_artefact_is_current
+
 # The eBPF fast-path programs (ebpf/ workspace) need the nightly pinned in
 # ebpf/rust-toolchain.toml plus bpf-linker built against that same toolchain
 # (its LLVM proxy dlopens the toolchain's libLLVM — a mismatched install

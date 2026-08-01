@@ -6,7 +6,7 @@ import { For, Show, createSignal } from "solid-js";
 import { Button, IconButton } from "@forge/ui";
 import { ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-solid";
 // lucide-solid components satisfy forge's IconComponent shape.
-import type { FieldDesc } from "../../editor/fields";
+import type { FieldDesc } from "../../editor/schema.gen";
 import BlockForm from "./BlockForm";
 
 export interface BlockListProps {

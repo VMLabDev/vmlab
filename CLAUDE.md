@@ -18,7 +18,9 @@ Consult them for prior art only — the PRD overrides anything they did.
 
 PRD implemented (M1–M6). Module map under `src/`:
 
-- `config/` — WCL schema, typed model, §5.1 validation, host config, profiles.
+- `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
+  `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005)
+  and `designer.rs` renders the console's inspector forms from it.
 - `profiles/` — guest OS profiles (WCL data, user-overridable).
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
   firmware lookup, process management; `container.rs` builds the micro-VM

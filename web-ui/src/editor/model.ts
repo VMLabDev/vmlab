@@ -3,6 +3,8 @@
 // its source span as the edit address; blocks created in the editor carry
 // `span: null` until the first save returns the refreshed model.
 
+import { SCHEMA_DEFAULTS } from "./schema.gen";
+
 export type Span = [number, number];
 
 // --- blocks -----------------------------------------------------------------
@@ -33,6 +35,7 @@ export interface ShareModel {
   smb1: boolean;
   /** Derived from the guest path when not declared — treated as optional. */
   name: string;
+  transport: string;
 }
 
 export interface MediaModel {
@@ -144,13 +147,14 @@ export interface HealthcheckModel {
   start_period: number;
 }
 
-/** Schema defaults for `healthcheck {}` (mirrors src/config extraction). */
+/** Schema defaults for `healthcheck {}`, reflected from schema.wcl (seconds
+ *  and counts) — not restated here. */
 export const HEALTHCHECK_DEFAULTS = {
-  interval: 10,
-  timeout: 5,
-  retries: 3,
-  start_period: 10,
-} as const;
+  interval: SCHEMA_DEFAULTS["healthcheck.interval"],
+  timeout: SCHEMA_DEFAULTS["healthcheck.timeout"],
+  retries: SCHEMA_DEFAULTS["healthcheck.retries"],
+  start_period: SCHEMA_DEFAULTS["healthcheck.start_period"],
+};
 
 export interface ContainerModel {
   span: Span | null;

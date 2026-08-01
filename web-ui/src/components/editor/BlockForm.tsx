@@ -2,7 +2,7 @@
 // bound to the draft object via a (key, value) setter.
 
 import { For } from "solid-js";
-import type { FieldDesc } from "../../editor/fields";
+import type { FieldDesc } from "../../editor/schema.gen";
 import FieldRow from "./FieldRow";
 
 export interface BlockFormProps {
