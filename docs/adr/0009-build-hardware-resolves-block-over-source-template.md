@@ -95,6 +95,20 @@ Concretely:
   and both were repaired by adding more hand-written lines. A third says the
   enumeration itself is the defect and the emitter should be exhaustive by
   construction.
+
+  **The third has now happened.** #35 found the block's `disk {}` children
+  validated and then dropped, and it too was repaired by adding hand-written
+  lines — deliberately, because the issue asked for the gap filled and named
+  making the emitter exhaustive as separate work. This note is therefore
+  discharged as a prediction and stands as an open debt: the next drift should
+  not be repaired field by field. It is worth saying what "exhaustive by
+  construction" would have to mean here, since it is not free — the renderer
+  emits WCL *text*, and the fields it carries are not a subset of the template
+  block's but a translation of them (segment NICs rewritten to NAT, paths
+  rebased absolute, steps interleaved by span, four fields diverted to
+  metadata). An exhaustive emitter has to make that translation total rather
+  than assume it away, which is why each repair has looked cheaper than the
+  fix.
 - Firmware and secure boot separating. They only mean anything together —
   validation rejects secure boot on a machine resolving to SeaBIOS and names the
   layer each side came from — so any path that carries one carries both. The

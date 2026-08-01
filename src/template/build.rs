@@ -654,8 +654,9 @@ fn check_build_hardware(
     root: &Path,
     profiles: &crate::profiles::ProfileSet,
 ) -> Result<()> {
-    // Hardware-only probe: the verification variant carries no media and no
-    // steps, neither of which can change how the VM is built. Its own source
+    // Hardware-only probe: the verification variant carries none of the
+    // build-time attachments (extra disks, media, steps), and none of them can
+    // change the hardware this resolves. Its own source
     // label, so an issue reported against the render names the render that
     // produced it.
     let lab_name = build_lab_name(def);
@@ -709,8 +710,9 @@ fn wcl_str(value: impl std::fmt::Display) -> String {
 /// Render the synthetic build lab. The build VM is a `scratch` VM (so there
 /// is no template layer); its disk is pre-seeded after the runtime builds.
 /// `guest_iso` attaches the VMLAB bootstrap ISO folder as extra media.
-/// `with_steps = false` renders the verification-boot variant: no media at
-/// all and no provisions/playbooks — just boot the installed disk.
+/// `with_steps = false` renders the verification-boot variant: none of the
+/// build-time attachments — no extra disks, no media, no provisions or
+/// playbooks — just boot the installed disk.
 fn synth_lab(
     def: &TemplateDef,
     lab_name: &str,
@@ -784,10 +786,26 @@ fn synth_lab(
             writeln!(s, "    nic {{ {attrs} }}").unwrap();
         }
     }
-    // Media (driver/answer-file ISOs/floppies, §6.3) carry over, resolved
-    // relative to the original file's root. The verification boot carries
-    // none: the whole point is booting the installed disk alone.
+    // Everything the build attaches *to do the build with* — extra disks,
+    // media, steps — carries over here, with folder paths resolved relative to
+    // the original file's root. The verification boot carries none of it: the
+    // whole point is booting the installed disk alone.
     if with_steps {
+        // Template-declared disks are "additional disks attached during the
+        // build" (schema) — build-time scratch a provision can write to, gone
+        // once the primary disk is sealed and moved into the store (§6.1).
+        // `from` folders rebase absolute against the template root, like media.
+        for d in &def.extra_disks {
+            write!(s, "    disk {} {{", wcl_str(&d.name)).unwrap();
+            if let Some(size) = d.size {
+                write!(s, " size = {size}").unwrap();
+            }
+            if let Some(from) = &d.from {
+                write!(s, " from = {}", wcl_str(root.join(from).display())).unwrap();
+            }
+            writeln!(s, " }}").unwrap();
+        }
+        // Media: driver/answer-file ISOs and floppies built from folders (§6.3).
         for m in &def.media {
             let kind = match m.kind {
                 crate::config::model::MediaKind::Iso => "iso",
@@ -1029,6 +1047,73 @@ mod tests {
         assert!(verify.contains("nic { nat = true }"), "{verify}");
         crate::config::load_lab_source(&verify, "<verify>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("verification lab must parse: {e:?}\n{verify}"));
+    }
+
+    /// `disk {}` blocks on a `template {}` are "additional disks attached
+    /// during the build" (schema doc string). They used to be validated and
+    /// then dropped, so the build VM booted with its primary disk alone.
+    /// `from` is a folder relative to the template's root, so it has to be
+    /// rebased absolute — the synthetic lab's root is the throwaway work dir.
+    #[test]
+    fn declared_disks_carry_into_build_lab() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "  disk \"data\"    { size = 10GiB }\n",
+            "  disk \"drivers\" { from = \"./drivers/\" }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        let disks = &lf.lab.vms[0].extra_disks;
+        assert_eq!(disks.len(), 2, "{wcl}");
+        assert_eq!(disks[0].name, "data");
+        assert_eq!(disks[0].size, Some(10 << 30));
+        assert_eq!(disks[0].from, None);
+        assert_eq!(disks[1].name, "drivers");
+        assert_eq!(disks[1].size, None);
+        assert_eq!(
+            disks[1].from.as_deref(),
+            Some(Path::new("/root/drivers")),
+            "`from` must be rebased against the template root:\n{wcl}"
+        );
+
+        // The verification boot proves the sealed image boots alone, so it
+        // carries no extra disks — the same reason it carries no media.
+        let verify = synth_lab(
+            &d,
+            "build-t",
+            "build",
+            None,
+            Path::new("/root"),
+            None,
+            false,
+        )
+        .unwrap();
+        let vf = crate::config::load_lab_source(&verify, "<verify>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("verification lab must parse: {e:?}\n{verify}"));
+        assert!(vf.lab.vms[0].extra_disks.is_empty(), "{verify}");
+    }
+
+    /// A disk sized *and* sourced from a folder (the schema allows both:
+    /// `@one_of(["size", "from"], exclusive = false)`) carries both fields.
+    #[test]
+    fn a_disk_with_both_size_and_from_carries_both() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "  disk \"payload\" { size = 2GiB from = \"payload\" }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        let disk = &lf.lab.vms[0].extra_disks[0];
+        assert_eq!(disk.size, Some(2 << 30));
+        assert_eq!(disk.from.as_deref(), Some(Path::new("/root/payload")));
     }
 
     /// Every §5.2 hardware attribute a `template {}` block declares is a
