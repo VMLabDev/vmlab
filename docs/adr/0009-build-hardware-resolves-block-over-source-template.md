@@ -11,20 +11,22 @@ pre-seeded from the source, so the build reuses the whole lab runtime. The
 synthetic lab is rendered as WCL text from the template definition, and the
 renderer enumerates the fields it emits by hand.
 
-That hand-written list has drifted behind the template block's schema. It emits
-the profile, CPUs, memory, disk, CD-ROM, NICs, media and steps; it does not emit
-firmware, TPM, secure boot, display, nested or raw QEMU args — all of which the
-schema accepts on a template block and all of which parse into the definition.
-A template declaring OVMF and secure boot therefore installs its guest on
-SeaBIOS. The same class of drift previously swallowed declared NICs, which
-built with no network hardware at all until it was fixed by hand.
+That hand-written list has drifted behind the template block's schema twice. It
+first swallowed declared NICs, which built with no network hardware at all. It
+then swallowed the block's own firmware, TPM, secure boot, display, nested and
+raw QEMU args — all of which the schema accepts on a template block and all of
+which parse into the definition — so a template declaring OVMF and secure boot
+installed its guest on SeaBIOS. Both were repaired field by field, the second in
+#23, which also moved the firmware/secure-boot conflict check onto the build
+path as a pre-flight.
 
-A layered build — one whose source is an existing template — loses more than
-that. It resolves its source through the store and reads exactly one field off
-the recorded metadata, the first-boot script, then discards the rest. The
-profile falls back to a literal `linux-generic`. Rebuilding a Windows 11
-template that recorded q35, OVMF, secure boot and a TPM boots the installed disk
-on SeaBIOS with no TPM, which an OVMF-installed guest does not survive.
+What neither repair reached is the layer above the block. A layered build — one
+whose source is an existing template — resolves its source through the store and
+reads exactly one field off the recorded metadata, the first-boot script, then
+discards the rest. The profile falls back to a literal `linux-generic`.
+Rebuilding a Windows 11 template that recorded q35, OVMF, secure boot and a TPM
+boots the installed disk on SeaBIOS with no TPM, which an OVMF-installed guest
+does not survive.
 
 The loss then compounds. Sealed metadata is built from the template definition
 alone, so a layered build's *output* records only what its own block restated.
@@ -89,12 +91,16 @@ Concretely:
 
 **Watch for**
 
-- The renderer drifting behind the schema again. This is the second field-set it
-  has lost; a third would say the hand-written enumeration is the defect and the
-  emitter should be made exhaustive by construction.
+- The renderer drifting behind the schema again. Two field-sets have been lost
+  and both were repaired by adding more hand-written lines. A third says the
+  enumeration itself is the defect and the emitter should be exhaustive by
+  construction.
 - Firmware and secure boot separating. They only mean anything together —
   validation rejects secure boot on a machine resolving to SeaBIOS and names the
-  layer each side came from — so any path that carries one carries both.
+  layer each side came from — so any path that carries one carries both. The
+  pre-flight added in #23 is where a conflicting pair is now caught, so the merge
+  has to happen before it: inherited hardware arriving afterwards would reach the
+  build unchecked.
 - Pressure to freeze the profile "just for reproducibility". That is the option
   this record rejected; reproducibility of an image is the disk plus its
   recorded layers, not a snapshot of host-side defaults.
