@@ -963,24 +963,40 @@ pub async fn save_script(
     }
 }
 
+/// Whether a lab `status` payload *proves* nothing is running — the only
+/// evidence that lets a reload restart the daemon safely. The daemon reports
+/// VMs and containers in one `machines` list (`LabRuntime::status`), so that
+/// is the only key read here.
+///
+/// A payload this can't read — no `machines`, a state that isn't a known
+/// string — proves nothing, so it answers false. The affordable failure is a
+/// spurious 409 the user clears by stopping the lab; reading keys the daemon
+/// had stopped emitting is what silently disabled this guard once already.
+///
+/// Re-deriving from raw state on the surface side is what ADR-0004 rules out;
+/// this stays until the typed projection lands and can be rendered instead.
+fn all_machines_stopped(status: &Value) -> bool {
+    let Some(machines) = status["machines"].as_array() else {
+        return false;
+    };
+    machines
+        .iter()
+        .all(|m| m["state"].as_str() == Some("stopped"))
+}
+
 /// `POST /api/labs/{lab}/reload` — restart the lab daemon so it re-reads
 /// `vmlab.wcl`. Requires the lab to be down (the daemon can't re-adopt running
-/// VMs across a restart); responds 409 if any VM is still running.
+/// VMs across a restart); responds 409 if any machine is still running.
 pub async fn reload_lab(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
-    // Only block on running VMs if the daemon is actually up. If it isn't,
-    // there's nothing running to lose and the restart just starts it fresh.
-    if let Ok(status) = state.lab_call(&lab, "status", Value::Null).await {
-        let running = ["vms", "containers"].iter().any(|kind| {
-            status[kind]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|v| v["state"].as_str() != Some("stopped"))
-        });
-        if running {
-            return HttpResponse::Conflict()
-                .json(json!({"error": "stop all VMs and containers before reloading the lab"}));
-        }
+    // A `status` that never answered is not a veto: `lab_call` also fails when
+    // the daemon can't be started at all — a lab whose `vmlab.wcl` no longer
+    // parses — and that is exactly the state reload exists to recover from.
+    // Blocking there would make the button useless when it's needed most.
+    if let Ok(status) = state.lab_call(&lab, "status", Value::Null).await
+        && !all_machines_stopped(&status)
+    {
+        return HttpResponse::Conflict()
+            .json(json!({"error": "stop all VMs and containers before reloading the lab"}));
     }
 
     let root = match state.lab_root(&lab).await {
@@ -1401,6 +1417,47 @@ mod tests {
         assert!(body["memory"].as_u64().unwrap() > 0);
         assert!(matches!(body["acceleration"].as_str(), Some("kvm" | "tcg")));
         assert_eq!(body["arch"], std::env::consts::ARCH);
+    }
+
+    /// The reload guard's whole job: it reads the daemon's single `machines`
+    /// collection (`LabRuntime::status`), one entry per VM *and* container.
+    /// Reading keys the daemon no longer emits made it wave everything
+    /// through — the bug this test exists to keep fixed.
+    #[actix_web::test]
+    async fn only_an_all_stopped_lab_may_reload() {
+        let stopped = json!({"machines": [
+            {"name": "dc01", "kind": "vm", "state": "stopped"},
+            {"name": "web", "kind": "container", "state": "stopped"},
+        ]});
+        assert!(all_machines_stopped(&stopped));
+        assert!(all_machines_stopped(&json!({"machines": []})));
+
+        // Every non-stopped `PowerState` blocks, not just `running`: a machine
+        // mid-boot has a QEMU process the restart would orphan too.
+        for state in ["running", "starting", "stopping"] {
+            let status = json!({"machines": [
+                {"name": "dc01", "kind": "vm", "state": "stopped"},
+                {"name": "web", "kind": "container", "state": state},
+            ]});
+            assert!(!all_machines_stopped(&status), "state {state}");
+        }
+    }
+
+    /// A payload the guard can't read is not evidence that nothing is running
+    /// — it means the daemon answered in a shape this guard doesn't
+    /// understand, which is precisely how it came to wave running machines
+    /// through. Withhold the permission; the user can still stop the lab.
+    #[actix_web::test]
+    async fn an_unrecognised_status_payload_withholds_permission() {
+        // The pre-`3117cff` shape — separate `vms`/`containers` lists — which
+        // this guard went on reading after the daemon stopped emitting it.
+        let old = json!({"vms": [{"name": "dc01", "state": "stopped"}], "containers": []});
+        assert!(!all_machines_stopped(&old));
+        assert!(!all_machines_stopped(&json!({})));
+        assert!(!all_machines_stopped(&json!({"machines": "not-a-list"})));
+        assert!(!all_machines_stopped(
+            &json!({"machines": [{"name": "dc01"}]})
+        ));
     }
 
     #[actix_web::test]
