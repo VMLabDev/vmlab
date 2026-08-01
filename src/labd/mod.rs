@@ -6,6 +6,7 @@
 pub mod container;
 pub mod container_ctl;
 pub mod events;
+pub mod forward_plan;
 pub mod hypervisor;
 pub mod lab;
 #[cfg(test)]
@@ -15,6 +16,8 @@ pub mod netservices;
 pub mod network;
 pub mod plan;
 pub mod playbook;
+pub mod pull_ledger;
+pub mod share_plan;
 pub mod state;
 pub mod vm;
 pub mod vm_agent;

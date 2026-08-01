@@ -1290,6 +1290,10 @@ impl ContainerInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for ContainerInstance {
+    fn virtiofsd_available(&self) -> bool {
+        self.hv.virtiofsd_available()
+    }
+
     fn name(&self) -> &str {
         &self.cfg.name
     }

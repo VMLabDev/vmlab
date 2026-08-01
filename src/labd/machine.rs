@@ -81,6 +81,16 @@ pub trait Machine: Send + Sync + 'static {
     /// Host socket re-exposing one agent terminal session as a raw byte pipe.
     fn term_session_sock(&self, id: u32) -> PathBuf;
 
+    /// Whether the host running this machine can serve a share over virtiofs
+    /// ([`Hypervisor::virtiofsd_available`](super::hypervisor::Hypervisor::virtiofsd_available)).
+    ///
+    /// Exposed here because the decision it feeds is taken twice: once per
+    /// machine as it starts (a vhost-user-fs device cannot hotplug, so the
+    /// transport is fixed then) and once for the lab, when the share plan
+    /// works out what `smbd` must export. Both must read the same host, or a
+    /// substituted one disagrees with itself.
+    fn virtiofsd_available(&self) -> bool;
+
     // ---- power ------------------------------------------------------------
 
     async fn state(&self) -> PowerState;

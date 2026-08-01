@@ -10,6 +10,8 @@
 //! - [`config`]: `smb.conf` generation + credential generation + NT1 check.
 //! - [`server`]: spawn/stop the unprivileged `smbd`.
 //! - [`mount`]: guest mount-command string generation (Linux/Windows/XP).
+//! - [`steps`]: the ordered guest command plan, per guest OS, for both
+//!   transports (virtiofs and SMB).
 //!
 //! The top-level [`LabSmb`] ties these together for the daemon: given the
 //! lab's VMs, gateways, and shares it assigns a port, mints per-VM credentials,
@@ -26,6 +28,7 @@
 pub mod config;
 pub mod mount;
 pub mod server;
+pub mod steps;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -34,6 +37,7 @@ use std::path::{Path, PathBuf};
 pub use config::{ShareDef, SmbConfig, SmbCredentials};
 pub use mount::{linux_mount_cmd, windows_mount_cmds, xp_net_use_string};
 pub use server::{SmbError, SmbServer};
+pub use steps::{VirtiofsMount, guest_os_hint, mount_plan};
 
 use crate::config::model::Share;
 

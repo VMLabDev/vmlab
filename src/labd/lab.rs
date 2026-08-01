@@ -12,15 +12,21 @@ use tokio::sync::Mutex;
 
 use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
 use super::events::EventLog;
+use super::forward_plan::{self, ForwardPlan, ForwardRule, HostBinding};
 use super::machine::Machine;
-use super::network::{LabNetwork, nic_segment_name};
+use super::network::LabNetwork;
+use super::network::nic_segment_name;
 use super::plan;
+use super::pull_ledger::{
+    Cancellation, PullBatch, PullEvent, PullJob, PullLedger, PullOutcome, PullProgress,
+};
+use super::share_plan;
 use super::state::{LabState, SnapshotRecord, generate_mac};
 use super::vm::{PowerState, StopReason, VmDirs, VmInstance};
 use crate::config::LabFile;
 use crate::config::model::TemplateRef;
 use crate::profiles::ProfileSet;
-use crate::status::{LabStatus, PullKind, PullStatus, SegmentFrames, SegmentStatus};
+use crate::status::{LabStatus, SegmentFrames, SegmentStatus};
 use crate::sync::LockRecover;
 use crate::template::TemplateStore;
 
@@ -37,10 +43,10 @@ pub struct LabRuntime {
     /// SMB server for the lab's shares (PRD §7.5); `None` until `up` starts
     /// it (only when some VM declares shares).
     pub smb: Mutex<Option<crate::smb::LabSmb>>,
-    /// Forward ids installed for container `port {}` blocks, keyed by
-    /// container — removed and re-installed when a restart brings a new
-    /// lease, so a forward never points at a stale IP.
-    container_forwards: Mutex<std::collections::HashMap<String, Vec<(String, u64)>>>,
+    /// Forward ids installed for each machine — segment `forward {}` blocks
+    /// and container `port {}` blocks alike — removed and re-installed when
+    /// a restart brings a new lease, so a forward never points at a stale IP.
+    machine_forwards: Mutex<std::collections::HashMap<String, Vec<(String, u64)>>>,
     /// Loopback forwards backing proxied web pages, keyed by (machine, page).
     /// Revalidated on each `web.forward` (lease IP compare) so restarts and
     /// re-leases self-heal without hooking start events.
@@ -48,18 +54,13 @@ pub struct LabRuntime {
     /// Kept for post-pull re-resolution (deferred templates fold their meta
     /// into the hardware resolution only once pulled).
     profiles: ProfileSet,
-    /// Machines whose template/image is not in the local cache yet — the
-    /// deferred-pull work list. [`Self::ensure_pulled`] drains it; `status`
-    /// reports it as each machine's `cached` flag.
-    pending_pulls: Mutex<BTreeMap<String, PendingPull>>,
+    /// Deferred template/image downloads: what is still to fetch and what is
+    /// fetching right now (see [`pull_ledger`]). Std lock — the progress
+    /// callback is sync, and nothing awaits while it is held.
+    pulls: std::sync::Mutex<PullLedger>,
     /// Serialises pull runs (concurrent `up` + `pull` + `vm.start` must not
-    /// double-download); the loser re-checks the pending list and no-ops.
+    /// double-download); the loser re-checks the ledger and no-ops.
     pull_lock: Mutex<()>,
-    /// The download running right now, keyed by machine: last progress
-    /// snapshot (`status` resyncs the web UI from it) plus the handle that
-    /// `cancel_pull` aborts. Std lock — the progress callback is sync and
-    /// nothing awaits while it is held.
-    active_pulls: std::sync::Mutex<BTreeMap<String, ActivePull>>,
     /// Runs per VM after boot but before any provision script — template
     /// builds install the vmlab-agent here, so it lands even when the last
     /// provision generalizes/shuts the guest down (Windows sysprep). Std
@@ -90,23 +91,9 @@ pub type PreProvisionHook = Arc<
         + Sync,
 >;
 
-/// One outstanding deferred download.
-#[derive(Clone)]
-enum PendingPull {
-    Template { reference: String, arch: String },
-    Image { reference: String },
-}
-
-fn pull_percent(bytes_done: u64, bytes_total: u64) -> u32 {
-    bytes_done
-        .saturating_mul(100)
-        .checked_div(bytes_total)
-        .unwrap_or(0) as u32
-}
-
 /// The error a cancelled download fails with. A distinct type so the pull
-/// paths can tell a cancellation from a transport failure and leave the
-/// `.error` event unsent — `.cancelled` already went out.
+/// paths can tell a cancellation from a transport failure and report the
+/// right [`PullOutcome`].
 #[derive(Debug)]
 struct PullCancelled;
 
@@ -117,17 +104,6 @@ impl std::fmt::Display for PullCancelled {
 }
 
 impl std::error::Error for PullCancelled {}
-
-/// A download in progress, as reported by `status` and cancelled by
-/// `cancel_pull`.
-struct ActivePull {
-    kind: PullKind,
-    reference: String,
-    bytes_done: u64,
-    bytes_total: u64,
-    percent: u32,
-    abort: tokio::task::AbortHandle,
-}
 
 impl LabRuntime {
     pub async fn build(
@@ -143,7 +119,8 @@ impl LabRuntime {
         let mut state = LabState::load(&lab_local)?;
         let store = TemplateStore::new(crate::paths::template_store_dir());
         let mut network = LabNetwork::build(&config.lab)?;
-        let mut pending: BTreeMap<String, PendingPull> = BTreeMap::new();
+        let mut pending: BTreeMap<String, PullJob> = BTreeMap::new();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
 
         let mut vms = BTreeMap::new();
         for vm_cfg in &config.lab.vms {
@@ -180,7 +157,7 @@ impl LabRuntime {
                         None => {
                             pending.insert(
                                 vm_cfg.name.clone(),
-                                PendingPull::Template {
+                                PullJob::Template {
                                     reference: reference.clone(),
                                     arch,
                                 },
@@ -258,7 +235,7 @@ impl LabRuntime {
             let share_hosts = vm_cfg
                 .shares
                 .iter()
-                .map(|s| resolve_share_host(&root, &s.host))
+                .map(|s| share_plan::resolve_share_host(&root, home.as_deref(), &s.host))
                 .collect();
             let vm = VmInstance::new(
                 &name,
@@ -312,7 +289,13 @@ impl LabRuntime {
                     c_state.image_digest = Some(image.manifest_digest.clone());
                     c_state.image_ref = Some(c_cfg.image.reference.clone());
                 } else {
-                    pending.insert(c_cfg.name.clone(), PendingPull::Image { reference });
+                    pending.insert(
+                        c_cfg.name.clone(),
+                        PullJob::Image {
+                            reference,
+                            arch: arch.to_string(),
+                        },
+                    );
                 }
 
                 // Stable MACs: explicit > persisted > generated — the unified
@@ -397,12 +380,11 @@ impl LabRuntime {
             state: Mutex::new(state),
             events,
             smb: Mutex::new(None),
-            container_forwards: Mutex::new(std::collections::HashMap::new()),
+            machine_forwards: Mutex::new(std::collections::HashMap::new()),
             web_forwards: Mutex::new(std::collections::HashMap::new()),
             profiles: profiles.clone(),
-            pending_pulls: Mutex::new(pending),
+            pulls: std::sync::Mutex::new(PullLedger::new(pending)),
             pull_lock: Mutex::new(()),
-            active_pulls: std::sync::Mutex::new(BTreeMap::new()),
             pre_provision: std::sync::RwLock::new(None),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
@@ -417,407 +399,336 @@ impl LabRuntime {
     /// individual start paths, and from the `pull` command — a no-op once
     /// everything is cached, so a fully-cached lab stays offline.
     ///
-    /// Serialised by `pull_lock`; the work list is re-read under the lock so
-    /// a concurrent caller that lost the race finds nothing left to do. A
-    /// failed download emits `.error` and fails the caller; the pending
-    /// entry survives for retry.
+    /// Serialised by `pull_lock`; the work list is re-read from the ledger
+    /// under the lock so a concurrent caller that lost the race finds nothing
+    /// left to do. A failed download emits `.error` and fails the caller; the
+    /// ledger keeps the job pending for retry.
     pub async fn ensure_pulled(
         self: &Arc<Self>,
         targets: &[String],
         output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
         // Cheap common case: nothing pending anywhere.
-        if self.pending_pulls.lock().await.is_empty() {
+        if self.pulls.lock_recover().nothing_pending() {
             return Ok(());
         }
         let _guard = self.pull_lock.lock().await;
-        let work: Vec<(String, PendingPull)> = self
-            .pending_pulls
-            .lock()
-            .await
-            .iter()
-            .filter(|(n, _)| targets.is_empty() || targets.contains(n))
-            .map(|(n, p)| (n.clone(), p.clone()))
-            .collect();
-        for (machine, job) in work {
-            match job {
-                PendingPull::Template { reference, arch } => {
-                    self.pull_template(&machine, &reference, &arch, output)
-                        .await?;
-                }
-                PendingPull::Image { reference } => {
-                    self.pull_image(&machine, &reference, output).await?;
-                }
+        let batches = self.pulls.lock_recover().batches(targets);
+        for batch in batches {
+            match &batch.job {
+                PullJob::Template { .. } => self.pull_template(&batch, output).await?,
+                PullJob::Image { .. } => self.pull_image(&batch, output).await?,
             }
-            self.pending_pulls.lock().await.remove(&machine);
         }
         Ok(())
     }
 
-    /// Abort one machine's in-flight download; false when it isn't
-    /// downloading (already finished, or never started). The pending entry
-    /// stays, so a later `up`/`pull` retries from scratch — chunks already
-    /// fetched live in the store's `.oci-pull` work dir and are cleaned up by
-    /// the next successful pull.
+    /// Abort the download `machine` is waiting on; false when it isn't
+    /// downloading (queued but not started, already finished, or never
+    /// declared). The ledger keeps the job pending, so a later `up`/`pull`
+    /// retries from scratch — chunks already fetched live in the store's
+    /// `.oci-pull` work dir and are cleaned up by the next successful pull.
     ///
-    /// Cancelling only interrupts the download. The final assemble+install
-    /// runs on a blocking thread that cannot be interrupted, so a cancel that
-    /// lands during install still leaves a fully verified template behind.
+    /// Cancelling only interrupts the download, and takes down every machine
+    /// sharing it. The final assemble+install runs on a blocking thread that
+    /// cannot be interrupted, so a cancel that lands during install still
+    /// leaves a fully verified template behind.
     pub fn cancel_pull(&self, machine: &str) -> bool {
-        match self.active_pulls.lock_recover().get(machine) {
-            Some(pull) => {
-                pull.abort.abort();
+        let ledger = self.pulls.lock_recover();
+        match ledger.cancel(machine) {
+            Cancellation::Active { handle, .. } => {
+                handle.abort();
                 true
             }
-            None => false,
+            Cancellation::Pending | Cancellation::Unknown => false,
         }
     }
 
-    /// Register `task` as `machine`'s active download, await it, and clear the
-    /// entry. An abort from [`Self::cancel_pull`] surfaces as a
-    /// `<kind>.pull.cancelled` event and an error, so whatever needed the
-    /// download fails with a reason the caller can show.
+    fn emit_pulls(&self, events: Vec<PullEvent>) {
+        for e in events {
+            self.events.emit(&e.name, e.payload);
+        }
+    }
+
+    /// Keep the ledger's progress snapshot current (`status` resyncs the web
+    /// UI from it) and stream the progress event.
+    fn note_pull_progress(&self, machine: &str, progress: PullProgress) {
+        let events = self.pulls.lock_recover().progress(machine, progress);
+        self.emit_pulls(events);
+    }
+
+    /// Retire a batch in the ledger and emit whatever it says about it.
+    fn finish_pull(&self, batch: &PullBatch, outcome: PullOutcome) {
+        let events = self
+            .pulls
+            .lock_recover()
+            .finish(&batch.machines[0], outcome);
+        self.emit_pulls(events);
+    }
+
+    /// Register `task` as `batch`'s download, announce it, and await it. An
+    /// abort from [`Self::cancel_pull`] surfaces as [`PullCancelled`], so
+    /// whatever needed the download fails with a reason the caller can show.
     async fn join_pull<T>(
         self: &Arc<Self>,
-        machine: &str,
-        kind: PullKind,
-        reference: &str,
+        batch: &PullBatch,
         task: tokio::task::JoinHandle<Result<T>>,
     ) -> Result<T> {
-        self.active_pulls.lock_recover().insert(
-            machine.to_string(),
-            ActivePull {
-                kind,
-                reference: reference.to_string(),
-                bytes_done: 0,
-                bytes_total: 0,
-                percent: 0,
-                abort: task.abort_handle(),
-            },
-        );
-        let joined = task.await;
-        self.active_pulls.lock_recover().remove(machine);
-        match joined {
+        let started = self.pulls.lock_recover().begin(batch, task.abort_handle());
+        self.emit_pulls(started);
+        match task.await {
             Ok(result) => result,
-            Err(e) if e.is_cancelled() => {
-                self.events.emit(
-                    &format!("{kind}.pull.cancelled"),
-                    json!({ kind.subject(): machine, "reference": reference }),
-                );
-                Err(anyhow::Error::new(PullCancelled))
-            }
-            Err(e) => bail!("{kind} download task: {e}"),
+            Err(e) if e.is_cancelled() => Err(anyhow::Error::new(PullCancelled)),
+            Err(e) => bail!("{} download task: {e}", batch.job.kind()),
         }
     }
 
-    /// Keep the machine's progress snapshot current for `status` resync.
-    fn note_pull_progress(&self, machine: &str, bytes_done: u64, bytes_total: u64, percent: u32) {
-        if let Some(pull) = self.active_pulls.lock_recover().get_mut(machine) {
-            pull.bytes_done = bytes_done;
-            pull.bytes_total = bytes_total;
-            pull.percent = percent;
+    /// How a download's error maps onto the ledger: a cancellation already
+    /// knows what it is, anything else is a transport failure to report.
+    fn pull_outcome(e: &anyhow::Error) -> PullOutcome {
+        if e.is::<PullCancelled>() {
+            PullOutcome::Cancelled
+        } else {
+            PullOutcome::Failed(format!("{e:#}"))
         }
     }
 
     /// Pull one registry template, then bind the resolved parts (hardware
     /// re-resolution with the template meta, backing disk, first-boot script)
-    /// into the VM instance.
+    /// into every VM instance waiting on it.
     async fn pull_template(
         self: &Arc<Self>,
-        vm_name: &str,
-        reference: &str,
-        arch: &str,
+        batch: &PullBatch,
         output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
         let store = TemplateStore::new(crate::paths::template_store_dir());
-        self.events.emit(
-            "template.pull.start",
-            json!({"vm": vm_name, "reference": reference, "arch": arch}),
-        );
+        let reference = batch.job.reference().to_string();
+        let arch = batch.job.arch().to_string();
         if let Some(out) = output {
             out(format!("pull: {reference} ({arch})\n"));
         }
         // The download runs as its own task so `cancel_pull` can abort it.
         let me = Arc::clone(self);
-        let vm_s = vm_name.to_string();
-        let ref_s = reference.to_string();
-        let arch_s = arch.to_string();
+        let key = batch.machines[0].clone();
+        let ref_s = reference.clone();
+        let arch_s = arch.clone();
         let task = tokio::spawn(async move {
             let mut progress = |p: crate::oci::PullProgress| {
-                let percent = pull_percent(p.bytes_done, p.bytes_total);
-                me.note_pull_progress(&vm_s, p.bytes_done, p.bytes_total, percent);
-                me.events.emit(
-                    "template.pull.progress",
-                    json!({
-                        "vm": vm_s,
-                        "reference": ref_s,
-                        "chunk": p.chunk,
-                        "chunks": p.chunks,
-                        "bytes_done": p.bytes_done,
-                        "bytes_total": p.bytes_total,
-                        "percent": percent,
-                    }),
+                me.note_pull_progress(
+                    &key,
+                    PullProgress {
+                        unit: p.chunk,
+                        units: p.chunks,
+                        bytes_done: p.bytes_done,
+                        bytes_total: p.bytes_total,
+                    },
                 );
             };
             crate::oci::ensure_registry_template(&ref_s, &arch_s, &store, &mut progress).await
         });
-        let result = self
-            .join_pull(vm_name, PullKind::Template, reference, task)
-            .await;
-        match result {
-            Ok(resolved) => {
-                self.events.emit(
-                    "template.pull.done",
-                    json!({"vm": vm_name, "reference": reference}),
-                );
-                if let Some(out) = output {
-                    out(format!("pull: {reference} done\n"));
+        match self.join_pull(batch, task).await {
+            Ok(resolved) => match self.bind_template(batch, &resolved) {
+                Ok(()) => {
+                    self.finish_pull(batch, PullOutcome::Done);
+                    if let Some(out) = output {
+                        out(format!("pull: {reference} done\n"));
+                    }
+                    Ok(())
                 }
-                let vm_cfg = self
-                    .config
-                    .lab
-                    .vms
-                    .iter()
-                    .find(|v| v.name == vm_name)
-                    .ok_or_else(|| anyhow!("no vm \"{vm_name}\" in the lab config"))?;
-                let resolved_vm =
-                    crate::qemu::resolve_vm(vm_cfg, Some(&resolved.meta), &self.profiles)?;
-                self.vm(vm_name)?.set_template(super::vm::TemplateParts {
-                    resolved: resolved_vm,
-                    backing: Some(resolved.disk_path.clone()),
-                    disk_size: None,
-                    first_boot_script: resolved.meta.first_boot_script.clone(),
-                    agent_version: resolved.meta.agent_version.clone(),
-                });
-                Ok(())
-            }
+                Err(e) => {
+                    self.finish_pull(batch, Self::pull_outcome(&e));
+                    Err(e)
+                }
+            },
             Err(e) => {
-                // A cancellation already reported itself as `.cancelled`.
-                if !e.is::<PullCancelled>() {
-                    self.events.emit(
-                        "template.pull.error",
-                        json!({"vm": vm_name, "reference": reference, "error": format!("{e:#}")}),
-                    );
-                }
-                Err(e.context(format!("pulling template for vm \"{vm_name}\"")))
+                self.finish_pull(batch, Self::pull_outcome(&e));
+                Err(e.context(format!(
+                    "pulling template for vm(s) {}",
+                    batch.machines.join(", ")
+                )))
             }
         }
     }
 
+    /// Bind a freshly pulled template into each VM waiting on it: the
+    /// hardware re-resolves against the template meta the pull just made
+    /// available.
+    fn bind_template(
+        &self,
+        batch: &PullBatch,
+        resolved: &crate::template::store::ResolvedTemplate,
+    ) -> Result<()> {
+        for vm_name in &batch.machines {
+            let vm_cfg = self
+                .config
+                .lab
+                .vms
+                .iter()
+                .find(|v| &v.name == vm_name)
+                .ok_or_else(|| anyhow!("no vm \"{vm_name}\" in the lab config"))?;
+            let resolved_vm =
+                crate::qemu::resolve_vm(vm_cfg, Some(&resolved.meta), &self.profiles)?;
+            self.vm(vm_name)?.set_template(super::vm::TemplateParts {
+                resolved: resolved_vm,
+                backing: Some(resolved.disk_path.clone()),
+                disk_size: None,
+                first_boot_script: resolved.meta.first_boot_script.clone(),
+                agent_version: resolved.meta.agent_version.clone(),
+            });
+        }
+        Ok(())
+    }
+
     /// Pull one container image, pin its digest into the lab state, and bind
-    /// it (re-merging the cinit spec) into the container instance.
+    /// it (re-merging the cinit spec) into every container waiting on it.
     async fn pull_image(
         self: &Arc<Self>,
-        name: &str,
-        reference: &str,
+        batch: &PullBatch,
         output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
-        let arch = std::env::consts::ARCH;
         let cache = crate::oci::image::ImageCache::new(crate::paths::oci_cache_dir());
-        self.events.emit(
-            "container.pull.start",
-            json!({"container": name, "reference": reference, "arch": arch}),
-        );
+        let reference = batch.job.reference().to_string();
+        let arch = batch.job.arch().to_string();
         if let Some(out) = output {
             out(format!("pull: {reference}\n"));
         }
         // As in `pull_template`: a task of its own, so it can be cancelled.
         let me = Arc::clone(self);
-        let cn_s = name.to_string();
-        let ref_s = reference.to_string();
+        let key = batch.machines[0].clone();
+        let ref_s = reference.clone();
+        let arch_s = arch.clone();
         let task = tokio::spawn(async move {
             let mut progress = |p: crate::oci::image::ImagePullProgress| {
-                let percent = pull_percent(p.bytes_done, p.bytes_total);
-                me.note_pull_progress(&cn_s, p.bytes_done, p.bytes_total, percent);
-                me.events.emit(
-                    "container.pull.progress",
-                    json!({
-                        "container": cn_s,
-                        "reference": ref_s,
-                        "layer": p.layer,
-                        "layers": p.layers,
-                        "bytes_done": p.bytes_done,
-                        "bytes_total": p.bytes_total,
-                        "percent": percent,
-                    }),
+                me.note_pull_progress(
+                    &key,
+                    PullProgress {
+                        unit: p.layer,
+                        units: p.layers,
+                        bytes_done: p.bytes_done,
+                        bytes_total: p.bytes_total,
+                    },
                 );
             };
-            crate::oci::image::ensure_container_image(&ref_s, arch, &cache, &mut progress).await
+            crate::oci::image::ensure_container_image(&ref_s, &arch_s, &cache, &mut progress).await
         });
-        let result = self
-            .join_pull(name, PullKind::Container, reference, task)
-            .await;
-        match result {
-            Ok(image) => {
-                self.events.emit(
-                    "container.pull.done",
-                    json!({"container": name, "reference": reference}),
-                );
-                if let Some(out) = output {
-                    out(format!("pull: {reference} done\n"));
+        match self.join_pull(batch, task).await {
+            Ok(image) => match self.bind_image(batch, image).await {
+                Ok(()) => {
+                    self.finish_pull(batch, PullOutcome::Done);
+                    if let Some(out) = output {
+                        out(format!("pull: {reference} done\n"));
+                    }
+                    Ok(())
                 }
-                let container = self.container(name)?;
-                {
-                    let mut state = self.state.lock().await;
-                    let c_state = state.machine_mut(name);
-                    c_state.image_digest = Some(image.manifest_digest.clone());
-                    c_state.image_ref = Some(container.cfg.image.reference.clone());
-                    state.save(&self.lab_local)?;
+                Err(e) => {
+                    self.finish_pull(batch, Self::pull_outcome(&e));
+                    Err(e)
                 }
-                container.set_image(image);
-                Ok(())
-            }
+            },
             Err(e) => {
-                if !e.is::<PullCancelled>() {
-                    self.events.emit(
-                        "container.pull.error",
-                        json!({"container": name, "reference": reference, "error": format!("{e:#}")}),
-                    );
-                }
-                Err(e.context(format!("pulling image for container \"{name}\"")))
+                self.finish_pull(batch, Self::pull_outcome(&e));
+                Err(e.context(format!(
+                    "pulling image for container(s) {}",
+                    batch.machines.join(", ")
+                )))
             }
         }
     }
 
+    /// Pin a freshly pulled image's digest into the lab state and bind it
+    /// into each container waiting on it.
+    async fn bind_image(
+        &self,
+        batch: &PullBatch,
+        image: crate::oci::image::PulledImage,
+    ) -> Result<()> {
+        for name in &batch.machines {
+            let container = self.container(name)?;
+            {
+                let mut state = self.state.lock().await;
+                let c_state = state.machine_mut(name);
+                c_state.image_digest = Some(image.manifest_digest.clone());
+                c_state.image_ref = Some(container.cfg.image.reference.clone());
+                state.save(&self.lab_local)?;
+            }
+            container.set_image(image.clone());
+        }
+        Ok(())
+    }
+
     /// Start the SMB server for the lab's shares — VM `share {}` blocks and
     /// container volumes that fall back to CIFS (PRD §18: volumes ride
-    /// virtiofs when the host has a virtiofsd, smbd otherwise)
-    /// — and DNAT each relevant segment gateway's port 445 to it (PRD §7.5).
-    /// Best-effort: a failure is logged and the rest of the lab still works.
-    /// Idempotent; called from `up` and from any individual container start.
+    /// virtiofs when the host has a virtiofsd, smbd otherwise) — and DNAT
+    /// each relevant segment gateway's port 445 to it (PRD §7.5).
+    ///
+    /// Which shares those are, which segments need the rule and which host
+    /// port the server takes are all decided first, as a [`share_plan`]. This
+    /// only carries it out. Best-effort: a failure is logged and the rest of
+    /// the lab still works. Idempotent; called from `up` and from any
+    /// individual container start.
     async fn ensure_smb(self: &Arc<Self>, output: &crate::scripting::OutputSink) {
         if self.smb.lock().await.is_some() {
             return; // already serving
         }
-        // Collect sharing VMs and volume-declaring containers with their
-        // gateway IP (first NIC's segment).
-        let mut sharing: Vec<(String, std::net::Ipv4Addr, Vec<crate::config::model::Share>)> =
-            Vec::new();
-        let mut seg_ports: Vec<String> = Vec::new();
-        // Container name → the gateway its volumes mount from, for the
-        // post-spawn SmbInfo handout.
-        let mut volume_gateways: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
-        {
-            let net = self.network.lock().await;
-            for vm in &self.config.lab.vms {
-                if vm.shares.is_empty() {
-                    continue;
-                }
-                // Shares riding virtiofs (§7.5) are served by per-share
-                // virtiofsd daemons at VM start — smbd only exports the rest.
-                let vfs: std::collections::HashSet<usize> = self
-                    .vm(&vm.name)
-                    .map(|i| i.virtiofs_share_indices().into_iter().collect())
-                    .unwrap_or_default();
-                let mut shares: Vec<crate::config::model::Share> = vm
-                    .shares
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !vfs.contains(i))
-                    .map(|(_, s)| s.clone())
-                    .collect();
-                if shares.is_empty() {
-                    continue;
-                }
-                let Some(nic) = vm.nics.first() else { continue };
-                let seg_name = nic_segment_name(nic);
-                let Some(seg) = net.segments.get(seg_name) else {
-                    continue;
-                };
-                for s in &mut shares {
-                    s.host = resolve_share_host(&self.root, &s.host);
-                }
-                sharing.push((vm.name.clone(), seg.service_ip, shares));
-                if !seg_ports.contains(&seg_name.to_string()) {
-                    seg_ports.push(seg_name.to_string());
-                }
+        let plan = match self.share_plan().await {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::warn!("share plan: {e}");
+                output(format!("WARNING: shares will not mount: {e}\n"));
+                self.events
+                    .emit("smb.failed", json!({"error": e.to_string()}));
+                return;
             }
-            // Containers only need smbd for the CIFS fallback: with a
-            // virtiofsd on the host their volumes attach as vhost-user-fs
-            // devices instead (spawned per container start, PRD §18).
-            let containers_on_cifs = !crate::qemu::virtiofsd::available();
-            for (name, container) in &self.containers {
-                if container.volumes.is_empty() || !containers_on_cifs {
-                    continue;
-                }
-                // Validated: volumes require a NIC (§5.1).
-                let Some(nic) = container.cfg.nics.first() else {
-                    continue;
-                };
-                let seg_name = nic_segment_name(nic);
-                let Some(seg) = net.segments.get(seg_name) else {
-                    continue;
-                };
-                // Volume hosts are pre-resolved (resolve_volume_hosts); the
-                // guest target rides along for smb.conf comments only. Read
-                // targets from the config (1:1 with the resolved exports) so
-                // the SMB plan doesn't depend on the image being pulled yet.
-                let shares = container
-                    .volumes
-                    .iter()
-                    .zip(container.cfg.volumes.iter())
-                    .map(|((share, host, ro), vol)| crate::config::model::Share {
-                        span: (0, 0),
-                        host: host.clone(),
-                        guest: vol.target.clone(),
-                        readonly: *ro,
-                        smb1: false,
-                        name: share.clone(),
-                        transport: crate::config::model::ShareTransport::Smb,
-                    })
-                    .collect();
-                sharing.push((name.clone(), seg.service_ip, shares));
-                volume_gateways.push((name.clone(), seg.service_ip));
-                if !seg_ports.contains(&seg_name.to_string()) {
-                    seg_ports.push(seg_name.to_string());
-                }
-            }
-        }
-        if sharing.is_empty() {
-            return;
-        }
-
-        // smbd needs a free localhost port; the gateway DNAT hides the
-        // number from guests, so walk upward from a base until one binds
-        // (another lab's smbd — or an orphan from an unclean daemon death —
-        // may hold the earlier ones).
-        let base_port = 14450u16;
-        let mut labsmb = None;
-        let mut last_err = String::new();
-        for port in base_port..base_port + 10 {
-            let mut candidate =
-                crate::smb::LabSmb::plan(&self.name, &self.lab_local, port, &sharing);
-            let config = candidate.build_config();
-            match candidate.spawn(config) {
-                Ok(p) => {
-                    tracing::info!("SMB server for lab {} on 127.0.0.1:{p}", self.name);
-                    output(format!(
-                        "smb: serving shares on 127.0.0.1:{p} (guest mounts \\\\<gateway>\\<share>; credentials in .vmlab/smb/creds)\n"
-                    ));
-                    self.events.emit("smb.started", json!({"port": p}));
-                    labsmb = Some(candidate);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!("smbd on port {port} failed: {e}");
-                    last_err = e.to_string();
-                }
-            }
-        }
-        let Some(labsmb) = labsmb else {
-            tracing::warn!("SMB server failed to start: {last_err}");
-            output(format!(
-                "WARNING: SMB server failed to start — shares will not mount: {last_err}\n"
-            ));
-            self.events.emit("smb.failed", json!({"error": last_err}));
-            return;
         };
+        for skip in &plan.skipped {
+            tracing::warn!("{}: {}", skip.what, skip.why);
+            output(format!("WARNING: {}: {}\n", skip.what, skip.why));
+        }
+        // "Why did my share not arrive over virtiofs?" is a support question,
+        // and the plan is the only place that knows.
+        for placed in plan.placements() {
+            tracing::debug!(
+                "share {}/{} rides {:?}",
+                placed.machine,
+                placed.share,
+                placed.transport
+            );
+        }
+        let Some(smb) = plan.smb else {
+            return; // everything rides virtiofs, or there is nothing to share
+        };
+
+        let sharing: Vec<(String, std::net::Ipv4Addr, Vec<crate::config::model::Share>)> = smb
+            .exports
+            .iter()
+            .map(|e| (e.machine.clone(), e.gateway, e.shares.clone()))
+            .collect();
+        let mut labsmb =
+            crate::smb::LabSmb::plan(&self.name, &self.lab_local, smb.host_port, &sharing);
+        let config = labsmb.build_config();
+        let port = match labsmb.spawn(config) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("SMB server failed to start: {e}");
+                output(format!(
+                    "WARNING: SMB server failed to start — shares will not mount: {e}\n"
+                ));
+                self.events
+                    .emit("smb.failed", json!({"error": e.to_string()}));
+                return;
+            }
+        };
+        tracing::info!("SMB server for lab {} on 127.0.0.1:{port}", self.name);
+        output(format!(
+            "smb: serving shares on 127.0.0.1:{port} (guest mounts \\\\<gateway>\\<share>; credentials in .vmlab/smb/creds)\n"
+        ));
+        self.events.emit("smb.started", json!({"port": port}));
 
         // DNAT gateway:445 → 127.0.0.1:smbd on each sharing segment, so a
         // guest mounting \\<gateway>\<share> reaches the local smbd via NAT.
         {
             let net = self.network.lock().await;
-            for seg_name in &seg_ports {
+            for seg_name in &smb.gateway_segments {
                 if let Some(seg) = net.segments.get(seg_name)
                     && let Some(services) = &seg.services
                     && let Ok(mut rs) = services.rules.lock()
@@ -841,7 +752,7 @@ impl LabRuntime {
 
         // Hand each volume-declaring container its mount coordinates; the
         // spec sent over ctl carries them (cinit mounts CIFS after net-up).
-        for (name, gateway) in volume_gateways {
+        for (name, gateway) in smb.volume_gateways {
             let Some(creds) = labsmb.credentials(&name) else {
                 continue;
             };
@@ -859,121 +770,90 @@ impl LabRuntime {
         *self.smb.lock().await = Some(labsmb);
     }
 
-    /// Mount a VM's SMB shares through the guest agent (PRD §7.5). Linux
-    /// guests use cifs; Windows guests use net use / mklink. XP-era guests
-    /// without an agent are mounted by provision scripts via screen
-    /// automation instead (documented; not attempted here).
+    /// Whether this lab's host can serve virtiofs, asked through the same
+    /// [`Hypervisor`](super::hypervisor::Hypervisor) the machines start
+    /// against rather than probed again here — every machine in a lab runs on
+    /// one host, so any of them answers for all. A lab with no machines has
+    /// no shares either, so the fallback never decides anything.
+    fn host_virtiofsd(&self) -> bool {
+        self.machines()
+            .next()
+            .map(|m| m.virtiofsd_available())
+            .unwrap_or_else(crate::qemu::virtiofsd::available)
+    }
+
+    /// Where every share in this lab goes, computed against the host as it is
+    /// right now: the segment gateways the network assembly wired, each VM's
+    /// resolved virtiofs capability, and whether the host has a virtiofsd and
+    /// a free port at all.
+    async fn share_plan(&self) -> Result<share_plan::SharePlan, share_plan::SharePlanError> {
+        let gateways: BTreeMap<String, std::net::Ipv4Addr> = {
+            let net = self.network.lock().await;
+            net.segments
+                .iter()
+                .map(|(name, seg)| (name.clone(), seg.service_ip))
+                .collect()
+        };
+        // The resolved profile (which folds in template metadata) says whether
+        // the guest mounts virtiofs natively.
+        let guest_virtiofs: BTreeMap<String, bool> = self
+            .vms
+            .iter()
+            .map(|(name, vm)| (name.clone(), vm.template().resolved.virtiofs))
+            .collect();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        share_plan::plan(
+            &share_plan::ShareInputs {
+                lab: &self.config.lab,
+                root: &self.root,
+                home: home.as_deref(),
+                host_virtiofsd: self.host_virtiofsd(),
+                guest_virtiofs: &guest_virtiofs,
+                gateways: &gateways,
+            },
+            &share_plan::BindProbe,
+        )
+    }
+
+    /// Mount a VM's shares through the guest agent (PRD §7.5).
+    ///
+    /// What to run is a [`crate::smb::mount_plan`] — this only drives it, and
+    /// only knows how to retry. The commands themselves, and every piece of
+    /// guest-OS knowledge behind them, live next to the mount-step type.
+    /// XP-era guests without an agent are mounted by provision scripts via
+    /// screen automation instead (documented; not attempted here).
     async fn mount_shares(self: &Arc<Self>, vm_name: &str) {
         let cfg = self.config.lab.vms.iter().find(|v| v.name == vm_name);
         let Some(cfg) = cfg else { return };
         if cfg.shares.is_empty() {
             return;
         }
-
-        // Detect the guest OS family from the resolved profile (which folds
-        // in template metadata — the lab vm block usually omits `profile`).
         let Ok(vm) = self.vm(vm_name) else { return };
-        let os_hint = guest_os_hint(vm.template().resolved.profile.as_deref());
-
-        // virtiofs shares first (§7.5). Linux: mkdir + `mount -t virtiofs`
-        // by tag. Windows: register the WinFsp launcher class for
-        // virtiofs.exe (idempotent reg adds; virtio-win ships the binary but
-        // not the class), then a per-tag launchctl instance mounts the tag
-        // at the drive letter. Needs WinFsp in the template — without it
-        // the launchctl step fails and surfaces as the usual mount warning.
-        let mut steps: Vec<crate::smb::MountStep> = Vec::new();
-        let virtiofs_mounts = vm.virtiofs_mounts().await;
-        if os_hint == crate::smb::OsHint::Windows && !virtiofs_mounts.is_empty() {
-            const CLASS: &str = r"HKLM\Software\WOW6432Node\WinFsp\Services\virtiofs";
-            for (value, kind, data) in [
-                (
-                    "Executable",
-                    "REG_SZ",
-                    r"C:\Program Files\Virtio-Win\VioFS\virtiofs.exe",
-                ),
-                ("CommandLine", "REG_SZ", "-t %1 -m %2"),
-                ("Security", "REG_SZ", "D:P(A;;RPWPLC;;;WD)"),
-                ("JobControl", "REG_DWORD", "1"),
-            ] {
-                steps.push(crate::smb::MountStep {
-                    os_hint,
-                    command: "reg".into(),
-                    args: vec![
-                        "add".into(),
-                        CLASS.into(),
-                        "/v".into(),
-                        value.into(),
-                        "/t".into(),
-                        kind.into(),
-                        "/d".into(),
-                        data.into(),
-                        "/f".into(),
-                    ],
-                });
-            }
-        }
-        for m in &virtiofs_mounts {
-            if os_hint == crate::smb::OsHint::Windows {
-                steps.push(crate::smb::MountStep {
-                    os_hint,
-                    command: r"C:\Program Files (x86)\WinFsp\bin\launchctl-x64.exe".into(),
-                    args: vec![
-                        "start".into(),
-                        "virtiofs".into(),
-                        format!("viofs-{}", m.tag),
-                        m.tag.clone(),
-                        m.guest.clone(),
-                    ],
-                });
-                continue;
-            }
-            steps.push(crate::smb::MountStep {
-                os_hint,
-                command: "mkdir".into(),
-                args: vec!["-p".into(), m.guest.clone()],
-            });
-            let mut args = vec![
-                "-t".into(),
-                "virtiofs".into(),
-                m.tag.clone(),
-                m.guest.clone(),
-            ];
-            if m.readonly {
-                args.push("-o".into());
-                args.push("ro".into());
-            }
-            steps.push(crate::smb::MountStep {
-                os_hint,
-                command: "mount".into(),
-                args,
-            });
-        }
-
-        // Then the SMB plan for whatever smbd serves for this VM.
-        {
+        let os_hint = crate::smb::guest_os_hint(vm.template().resolved.profile.as_deref());
+        let smb_steps = {
             let smb = self.smb.lock().await;
-            if let Some(labsmb) = smb.as_ref() {
-                steps.extend(labsmb.mount_plan(vm_name, os_hint));
-            }
+            smb.as_ref()
+                .map(|labsmb| labsmb.mount_plan(vm_name, os_hint))
+                .unwrap_or_default()
+        };
+        let plan = crate::smb::mount_plan(os_hint, &vm.virtiofs_mounts().await, smb_steps);
+        for note in &plan.unsupported {
+            tracing::warn!("{vm_name}: {note}");
         }
-        if steps.is_empty() {
+        if plan.is_empty() {
             return;
         }
         let Ok(agent) = vm.agent().await else {
             tracing::warn!("{vm_name}: no agent, cannot auto-mount shares");
             return;
         };
-        for step in steps {
+        for step in &plan.steps {
             let mut argv = vec![step.command.clone()];
             argv.extend(step.args.iter().cloned());
-            // Early after boot Windows can't run the mount yet: the agent
-            // briefly fails to spawn children, then `net use` returns
-            // error 67 until the SMB client service is up (observed ~3-4
-            // minutes on Server 2025) — retry across a generous window.
             let mut last: Option<String> = None;
-            for attempt in 0..30 {
+            for attempt in 0..plan.retry.attempts {
                 if attempt > 0 {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(plan.retry.delay).await;
                 }
                 let started = std::time::Instant::now();
                 match agent
@@ -1301,7 +1181,7 @@ impl LabRuntime {
                     let me = me.clone();
                     let n = n_fwd.clone();
                     tokio::spawn(async move {
-                        me.install_container_ports(&n).await;
+                        me.install_forwards(std::slice::from_ref(&n)).await;
                     });
                 },
                 move |healthy| {
@@ -1313,79 +1193,101 @@ impl LabRuntime {
             .await
     }
 
-    /// Install a container's `port {}` forwards on its first NIC's segment —
-    /// the same NAT forward machinery as segment `forward {}` blocks.
-    /// Best-effort, like [`install_declared_forwards`].
-    async fn install_container_ports(self: &Arc<Self>, name: &str) {
-        let Ok(container) = self.container(name) else {
-            return;
-        };
-        if container.cfg.ports.is_empty() {
-            return;
+    /// Each machine's lease address and first hardware address — the only
+    /// runtime state the [`forward_plan`] needs, gathered once so the plan
+    /// itself touches no network. `scope` empty means the whole lab.
+    async fn forward_observations(
+        &self,
+        scope: &[String],
+    ) -> (
+        std::collections::HashMap<String, std::net::Ipv4Addr>,
+        std::collections::HashMap<String, crate::config::model::MacAddr>,
+    ) {
+        let mut leases = std::collections::HashMap::new();
+        let mut macs = std::collections::HashMap::new();
+        for m in self.machines() {
+            let name = m.name().to_string();
+            if !scope.is_empty() && !scope.contains(&name) {
+                continue;
+            }
+            if let Some(mac) = m.macs().first() {
+                macs.insert(name.clone(), *mac);
+            }
+            if let Ok(ip) = m.guest_ip(None).await
+                && let Ok(ip) = ip.parse::<std::net::Ipv4Addr>()
+            {
+                leases.insert(name, ip);
+            }
         }
-        let Some(nic) = container.cfg.nics.first() else {
-            return; // validated: ports require a NIC
-        };
-        let Ok(ip) = container.guest_ip().await else {
+        (leases, macs)
+    }
+
+    /// Install one planned forward, returning its id and — for an ephemeral
+    /// binding — the loopback address it landed on.
+    ///
+    /// The single executor behind every forward the lab installs, whether it
+    /// came from a segment `forward {}`, a container `port {}` or a `web {}`
+    /// page. Priming the NAT engine with the lease MAC happens for all three:
+    /// a machine that never originates egress is otherwise unreachable.
+    async fn install_forward(
+        &self,
+        net: &LabNetwork,
+        rule: &ForwardRule,
+    ) -> Result<(u64, Option<std::net::SocketAddr>), String> {
+        let services = net
+            .segments
+            .get(&rule.segment)
+            .and_then(|s| s.services.as_ref())
+            .ok_or_else(|| {
+                format!(
+                    "segment \"{}\" has no services — is the lab up?",
+                    rule.segment
+                )
+            })?;
+        if let Some(mac) = rule.prime_mac {
+            services.learn_mac(rule.guest_ip, mac);
+        }
+        match rule.host {
+            HostBinding::Port(port) => {
+                let host_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+                let id =
+                    services.add_forward(host_addr, rule.guest_ip, rule.guest_port, rule.proto)?;
+                Ok((id, None))
+            }
+            HostBinding::Ephemeral => {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .map_err(|e| format!("web forward bind failed: {e}"))?;
+                let addr = listener
+                    .local_addr()
+                    .map_err(|e| format!("web forward addr failed: {e}"))?;
+                let id = services.add_forward_bound(listener, rule.guest_ip, rule.guest_port)?;
+                Ok((id, Some(addr)))
+            }
+        }
+    }
+
+    /// Announce everything a plan left out, and every host port it found
+    /// claimed twice. Best-effort installation means these are the only
+    /// record that a forward the lab author asked for is not there.
+    fn announce_forward_plan(&self, plan: &ForwardPlan) {
+        for skip in &plan.skipped {
             self.events.emit(
                 "forward.skipped",
-                json!({"reason": "no lease", "container": name}),
+                json!({"what": skip.what, "reason": skip.why}),
             );
-            return;
-        };
-        let Ok(guest_ip) = ip.parse::<std::net::Ipv4Addr>() else {
-            return;
-        };
-        let seg_name = nic_segment_name(nic).to_string();
-        let net = self.network.lock().await;
-        // Drop forwards from a previous run/lease before re-installing.
-        let stale = self
-            .container_forwards
-            .lock()
-            .await
-            .remove(name)
-            .unwrap_or_default();
-        for (seg, id) in stale {
-            if let Some(s) = net.segments.get(&seg).and_then(|s| s.services.as_ref()) {
-                s.remove_forward(id);
-            }
         }
-        let Some(services) = net
-            .segments
-            .get(&seg_name)
-            .and_then(|s| s.services.as_ref())
-        else {
-            return;
-        };
-        // Prime the NAT engine with the lease MAC: a container that never
-        // originates egress (an idle nginx, say) is otherwise unreachable —
-        // the engine would broadcast the SYN and the guest TCP stack drops
-        // broadcast-framed segments.
-        if let Some(mac) = container.macs.first() {
-            services.learn_mac(guest_ip, *mac);
+        for conflict in &plan.conflicts {
+            tracing::warn!(
+                "host port {} claimed by {}",
+                conflict.host_port,
+                conflict.claimants.join(" and ")
+            );
+            self.events.emit(
+                "forward.conflict",
+                json!({"host_port": conflict.host_port, "claimants": conflict.claimants}),
+            );
         }
-        let mut installed = Vec::new();
-        for port in &container.cfg.ports {
-            let host_addr =
-                std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port.host_port));
-            match services.add_forward(host_addr, guest_ip, port.container_port, port.proto) {
-                Ok(id) => installed.push((seg_name.clone(), id)),
-                Err(e) => {
-                    self.events.emit(
-                        "forward.skipped",
-                        json!({
-                            "reason": e.to_string(),
-                            "container": name,
-                            "host_port": port.host_port,
-                        }),
-                    );
-                }
-            }
-        }
-        self.container_forwards
-            .lock()
-            .await
-            .insert(name.to_string(), installed);
     }
 
     /// Ensure a loopback forward exists for a declared web page and return
@@ -1398,67 +1300,33 @@ impl LabRuntime {
         machine: &str,
         page: &str,
     ) -> Result<serde_json::Value> {
-        // Locate the declared page + the machine's runtime handle (VM or
-        // container share the namespace).
-        let (web, macs, ip_res) =
-            if let Some(v) = self.config.lab.vms.iter().find(|v| v.name == machine) {
-                let inst = self.vm(machine)?;
-                let web = v
-                    .web
-                    .iter()
-                    .find(|w| w.name == page)
-                    .ok_or_else(|| anyhow!("no web page \"{page}\" on \"{machine}\""))?;
-                let first_seg = v.nics.first().map(nic_segment_name).map(str::to_string);
-                (
-                    (web.clone(), first_seg),
-                    inst.macs.clone(),
-                    inst.guest_ip(None).await,
-                )
-            } else if let Some(c) = self
-                .config
-                .lab
-                .containers
-                .iter()
-                .find(|c| c.name == machine)
-            {
-                let inst = self.container(machine)?;
-                let web = c
-                    .web
-                    .iter()
-                    .find(|w| w.name == page)
-                    .ok_or_else(|| anyhow!("no web page \"{page}\" on \"{machine}\""))?;
-                let first_seg = c.nics.first().map(nic_segment_name).map(str::to_string);
-                (
-                    (web.clone(), first_seg),
-                    inst.macs.clone(),
-                    inst.guest_ip().await,
-                )
-            } else {
-                bail!("no machine \"{machine}\" in lab \"{}\"", self.name);
-            };
-        let (web, seg_name) = web;
-        let seg_name = seg_name.ok_or_else(|| {
-            anyhow!("web page \"{page}\" on \"{machine}\" needs a NIC to reach it over")
-        })?;
-        let ip = ip_res.map_err(|_| {
-            anyhow!("\"{machine}\" has no network lease yet — is it running and ready?")
-        })?;
-        let guest_ip: std::net::Ipv4Addr = ip
-            .parse()
-            .map_err(|_| anyhow!("machine \"{machine}\" has a non-IPv4 lease"))?;
+        let scope = [machine.to_string()];
+        let (leases, macs) = self.forward_observations(&scope).await;
+        let rule = forward_plan::web_page(
+            &forward_plan::ForwardInputs {
+                lab: &self.config.lab,
+                machines: &scope,
+                leases: &leases,
+                macs: &macs,
+            },
+            machine,
+            page,
+        )
+        .map_err(|e| anyhow!(e))?;
+        let auth = self.web_page_auth(machine, page);
 
         let key = (machine.to_string(), page.to_string());
         // Cache hit whose lease still matches → reuse the live forward.
         {
             let cache = self.web_forwards.lock().await;
             if let Some(f) = cache.get(&key)
-                && f.guest_ip == guest_ip
+                && f.guest_ip == rule.guest_ip
             {
                 return Ok(json!({
                     "addr": f.addr.to_string(),
-                    "guest_ip": guest_ip.to_string(),
-                    "port": web.port,
-                    "auth": web.auth,
+                    "guest_ip": rule.guest_ip.to_string(),
+                    "port": rule.guest_port,
+                    "auth": auth,
                 }));
             }
         }
@@ -1473,43 +1341,43 @@ impl LabRuntime {
         {
             s.remove_forward(old.id);
         }
-        let Some(services) = net
-            .segments
-            .get(&seg_name)
-            .and_then(|s| s.services.as_ref())
-        else {
-            bail!("segment \"{seg_name}\" has no services — is the lab up?");
-        };
-        // Prime the NAT engine with the lease MAC (see install_container_ports).
-        if let Some(mac) = macs.first() {
-            services.learn_mac(guest_ip, *mac);
-        }
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .map_err(|e| anyhow!("web forward bind failed: {e}"))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| anyhow!("web forward addr failed: {e}"))?;
-        let id = services
-            .add_forward_bound(listener, guest_ip, web.port)
-            .map_err(|e| {
-                anyhow!("web page \"{page}\" needs NAT/egress on segment \"{seg_name}\": {e}")
-            })?;
+        let (id, addr) = self.install_forward(&net, &rule).await.map_err(|e| {
+            anyhow!(
+                "web page \"{page}\" needs NAT/egress on segment \"{}\": {e}",
+                rule.segment
+            )
+        })?;
+        let addr = addr.expect("an ephemeral binding reports its address");
         self.web_forwards.lock().await.insert(
             key,
             WebForward {
-                segment: seg_name,
+                segment: rule.segment,
                 id,
                 addr,
-                guest_ip,
+                guest_ip: rule.guest_ip,
             },
         );
         Ok(json!({
             "addr": addr.to_string(),
-            "guest_ip": guest_ip.to_string(),
-            "port": web.port,
-            "auth": web.auth,
+            "guest_ip": rule.guest_ip.to_string(),
+            "port": rule.guest_port,
+            "auth": auth,
         }))
+    }
+
+    /// The credentials the console's proxy injects for a declared page. Not
+    /// part of the forward — the rule says where to send bytes, this says
+    /// how to log in once they arrive.
+    fn web_page_auth(&self, machine: &str, page: &str) -> Option<crate::config::model::WebAuth> {
+        self.config
+            .lab
+            .vms
+            .iter()
+            .map(|v| (&v.name, &v.web))
+            .chain(self.config.lab.containers.iter().map(|c| (&c.name, &c.web)))
+            .find(|(name, _)| name.as_str() == machine)
+            .and_then(|(_, pages)| pages.iter().find(|p| p.name == page))
+            .and_then(|p| p.auth.clone())
     }
 
     /// `vmlab up [vm...]` (PRD §7.2, §10.4): start in depends_on waves and
@@ -1615,7 +1483,7 @@ impl LabRuntime {
         self.run_up_steps(&steps, &mut next_step, &done, &output)
             .await?;
 
-        self.install_declared_forwards().await;
+        self.install_forwards(&targets).await;
 
         self.events.emit("lab.up", json!({"vms": targets}));
         Ok(())
@@ -1644,48 +1512,65 @@ impl LabRuntime {
         });
     }
 
-    /// Wire each segment's declared `forward {}` rules (PRD §9.8) once
-    /// machines have leases. Targets resolve against VMs and containers.
-    /// Best-effort: a forward to a not-yet-ready machine is skipped.
-    async fn install_declared_forwards(self: &Arc<Self>) {
-        for seg in &self.config.lab.segments {
-            for fwd in &seg.forwards {
-                let ip = if let Ok(vm) = self.vm(&fwd.vm) {
-                    vm.guest_ip(None).await
-                } else if let Ok(c) = self.container(&fwd.vm) {
-                    c.guest_ip().await
-                } else {
-                    continue;
-                };
-                let Ok(ip) = ip else {
-                    self.events.emit(
-                        "forward.skipped",
-                        json!({"reason": "no lease", "vm": fwd.vm, "host_port": fwd.host_port}),
-                    );
-                    continue;
-                };
-                let Ok(guest_ip) = ip.parse::<std::net::Ipv4Addr>() else {
-                    continue;
-                };
-                let host_addr =
-                    std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, fwd.host_port));
-                let net = self.network.lock().await;
-                if let Some(services) = net
-                    .segments
-                    .get(&seg.name)
-                    .and_then(|s| s.services.as_ref())
-                {
-                    // Container targets: prime the lease MAC so a forward to
-                    // an egress-quiet container works from the first SYN
-                    // (see install_container_ports).
-                    if let Ok(c) = self.container(&fwd.vm)
-                        && let Some(mac) = c.macs.first()
-                    {
-                        services.learn_mac(guest_ip, *mac);
-                    }
-                    let _ = services.add_forward(host_addr, guest_ip, fwd.guest_port, fwd.proto);
+    /// Wire up every forward `scope` requires — segment `forward {}` blocks
+    /// aimed at those machines and their container `port {}` blocks alike
+    /// (PRD §9.8, §18). An empty `scope` means the whole lab.
+    ///
+    /// Forwards target a machine's lease, so a restart that brings a new one
+    /// must drop the old rules first: they are tracked per machine and
+    /// removed before re-installing, so a forward never points at a stale IP.
+    /// Best-effort — a forward that cannot be installed is announced on the
+    /// event feed and the rest of the lab still works.
+    async fn install_forwards(self: &Arc<Self>, scope: &[String]) {
+        let (leases, macs) = self.forward_observations(scope).await;
+        let plan = forward_plan::plan(&forward_plan::ForwardInputs {
+            lab: &self.config.lab,
+            machines: scope,
+            leases: &leases,
+            macs: &macs,
+        });
+        self.announce_forward_plan(&plan);
+
+        // Web pages bind on demand (`ensure_web_forward`) — the console needs
+        // the ephemeral port back, and nothing wants one until it is opened.
+        let mut installable: BTreeMap<&str, Vec<&ForwardRule>> = BTreeMap::new();
+        for rule in plan
+            .rules
+            .iter()
+            .filter(|r| r.host != HostBinding::Ephemeral)
+        {
+            installable
+                .entry(rule.machine.as_str())
+                .or_default()
+                .push(rule);
+        }
+        if installable.is_empty() {
+            return;
+        }
+
+        let net = self.network.lock().await;
+        let mut tracked = self.machine_forwards.lock().await;
+        for (machine, rules) in installable {
+            // Drop this machine's forwards from a previous run/lease.
+            for (seg, id) in tracked.remove(machine).unwrap_or_default() {
+                if let Some(s) = net.segments.get(&seg).and_then(|s| s.services.as_ref()) {
+                    s.remove_forward(id);
                 }
             }
+            let mut installed = Vec::new();
+            for rule in rules {
+                match self.install_forward(&net, rule).await {
+                    Ok((id, _)) => installed.push((rule.segment.clone(), id)),
+                    Err(e) => self.events.emit(
+                        "forward.skipped",
+                        json!({
+                            "what": format!("\"{machine}\": {}", rule.source.describe()),
+                            "reason": e,
+                        }),
+                    ),
+                }
+            }
+            tracked.insert(machine.to_string(), installed);
         }
     }
 
@@ -1855,24 +1740,8 @@ impl LabRuntime {
     /// config (PRD §12).
     pub async fn destroy(self: &Arc<Self>) -> Result<()> {
         self.down(&[], true).await?;
-        // Wait for exit monitors to settle.
-        for vm in self.vms.values() {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            while vm.state().await != PowerState::Stopped {
-                if tokio::time::Instant::now() > deadline {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-        for c in self.containers.values() {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            while c.state().await != PowerState::Stopped {
-                if tokio::time::Instant::now() > deadline {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+        for m in self.machines() {
+            wait_settled(m.as_ref()).await;
         }
         // Removes clones, container overlays, AND named volumes — destroy is
         // the lab-scoped volume lifecycle boundary (PRD §12).
@@ -1889,14 +1758,7 @@ impl LabRuntime {
     pub async fn destroy_vm(self: &Arc<Self>, name: &str) -> Result<()> {
         let vm = self.vm(name)?.clone();
         vm.stop(true).await?;
-        // Wait for the exit monitor to settle before removing its disks.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while vm.state().await != PowerState::Stopped {
-            if tokio::time::Instant::now() > deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        wait_settled(vm.as_ref()).await;
         remove_tree(&vm.dirs.local).await?;
         let _ = remove_tree(&vm.dirs.run).await;
         self.events
@@ -1911,14 +1773,7 @@ impl LabRuntime {
     pub async fn destroy_container(self: &Arc<Self>, name: &str) -> Result<()> {
         let container = self.container(name)?.clone();
         container.stop(true).await?;
-        // Wait for the exit monitor to settle before removing state.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while container.state().await != PowerState::Stopped {
-            if tokio::time::Instant::now() > deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        wait_settled(container.as_ref()).await;
         remove_tree(&container.dirs.local).await?;
         let _ = remove_tree(&container.dirs.run).await;
         {
@@ -1940,7 +1795,6 @@ impl LabRuntime {
     /// The lab status projection (ADR-0004) — produced here, rendered unchanged
     /// by the CLI, the REST surface and the console.
     pub async fn status(&self) -> LabStatus {
-        let pending = self.pending_pulls.lock().await;
         // One projection for both kinds: each adapter fills its own variant
         // (see `Machine::status_detail`), so a machine is described in exactly
         // one place.
@@ -1949,7 +1803,7 @@ impl LabRuntime {
             let mut status = m.status().await;
             // Lab-level, not machine-level: is this machine's template/image
             // download still pending? Drives the "Download" button.
-            status.cached = !pending.contains_key(status.name.as_str());
+            status.cached = !self.pulls.lock_recover().is_pending(&status.name);
             machines.push(status);
         }
 
@@ -1999,25 +1853,12 @@ impl LabRuntime {
         }
         // In-flight downloads, so a page load mid-pull still shows progress
         // (the events only reach clients that were already connected).
-        let pulls: Vec<PullStatus> = self
-            .active_pulls
-            .lock_recover()
-            .iter()
-            .map(|(machine, pull)| PullStatus {
-                machine: machine.clone(),
-                kind: pull.kind,
-                reference: pull.reference.clone(),
-                bytes_done: pull.bytes_done,
-                bytes_total: pull.bytes_total,
-                percent: pull.percent,
-            })
-            .collect();
         LabStatus {
             lab: self.name.clone(),
             machines,
             segments,
             provisioned: self.provisioned(),
-            pulls,
+            pulls: self.pulls.lock_recover().snapshot(),
         }
     }
 
@@ -2170,7 +2011,7 @@ impl LabRuntime {
             }
             container.restore_online(snap).await?;
             // Re-point forwards / re-prime the NAT MAC at the restored lease.
-            self.install_container_ports(name).await;
+            self.install_forwards(&[name.to_string()]).await;
         } else {
             container.restore_offline(snap).await?;
         }
@@ -2205,9 +2046,21 @@ impl LabRuntime {
     }
 }
 
-/// Resolve a share's host path for smb.conf: `~` against $HOME, relative
-/// paths against the lab root — smbd's cwd is not the lab's, so a literal
-/// `./shared` would canonicalize to `/shared` and fail every tree connect.
+/// How long teardown waits for a machine's exit monitor to settle before
+/// removing what the machine was using.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wait for one machine to come to rest before deleting its disks.
+///
+/// Best-effort, and deliberately: a machine that will not settle must not
+/// wedge a `destroy` forever. It is announced rather than waited on further,
+/// because the removal goes ahead either way.
+async fn wait_settled(m: &dyn Machine) {
+    if let Err(e) = m.wait_state(PowerState::Stopped, SETTLE_TIMEOUT).await {
+        tracing::warn!("{e} — tearing it down anyway");
+    }
+}
+
 /// Delete a directory tree off the runtime. A lab's clones are tens of GB of
 /// qcow2; doing this inline froze the daemon's whole reactor — the network
 /// fabric, QMP and agent channels, and the protocol server with it — for as
@@ -2222,18 +2075,6 @@ async fn remove_tree(dir: &std::path::Path) -> Result<()> {
     })
     .await
     .map_err(|e| anyhow!("remove task: {e}"))?
-}
-
-fn resolve_share_host(root: &std::path::Path, host: &std::path::Path) -> PathBuf {
-    if let Ok(rest) = host.strip_prefix("~")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    if host.is_relative() {
-        return root.join(host);
-    }
-    host.to_path_buf()
 }
 
 /// Cross-host trunk state per global segment name, from the supervisor's
@@ -2258,15 +2099,4 @@ async fn fetch_global_peer_states() -> Option<std::collections::HashMap<String, 
             })
             .collect(),
     )
-}
-
-/// Guess the guest OS family for SMB mount-command selection (PRD §7.5).
-/// Heuristic from the resolved profile name; Windows profiles → Windows,
-/// the legacy profile → XP-era, everything else → Linux.
-fn guest_os_hint(profile: Option<&str>) -> crate::smb::OsHint {
-    match profile {
-        Some("windows-legacy") => crate::smb::OsHint::WindowsXp,
-        Some(p) if p.starts_with("windows") => crate::smb::OsHint::Windows,
-        _ => crate::smb::OsHint::Linux,
-    }
 }
