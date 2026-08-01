@@ -117,19 +117,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Restart a lab's daemon so it re-reads vmlab.wcl.
-    ///
-    /// Not `down` + `up`: that stops every machine and re-runs provisioning,
-    /// whereas this replaces only the daemon. The lab must already be stopped
-    /// — a fresh daemon cannot re-adopt running machines — so a running lab
-    /// is refused rather than quietly taken down.
-    Restart {
-        lab: String,
-        /// Emit the raw JSON reply instead of a confirmation
-        #[arg(long)]
-        json: bool,
-    },
-    /// Manage running labs host-wide: list / info / stop / destroy
+    /// Manage running labs host-wide: list / info / stop / restart / destroy
     Lab {
         #[command(subcommand)]
         cmd: lab::LabCmd,
@@ -532,7 +520,6 @@ pub fn run() -> ExitCode {
             } => machine::cmd_clipboard_set(&machine, text, json),
         },
         Command::Dns { json } => lab::cmd_dns(json),
-        Command::Restart { lab, json } => lab::cmd_restart(&lab, json),
         Command::Lab { cmd } => lab::cmd_lab(cmd),
         Command::Snapshot { cmd } => match cmd {
             SnapshotCmd::Create { name, vm } => lab::cmd_snapshot(vm, name),

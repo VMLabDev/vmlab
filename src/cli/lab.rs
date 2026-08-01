@@ -506,6 +506,18 @@ pub enum LabCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Restart a lab's daemon so it re-reads vmlab.wcl.
+    ///
+    /// Not `down` + `up`: that stops every machine and re-runs provisioning,
+    /// whereas this replaces only the daemon. The lab must already be stopped
+    /// — a fresh daemon cannot re-adopt running machines — so a running lab
+    /// is refused rather than quietly taken down.
+    Restart {
+        lab: String,
+        /// Emit the raw JSON reply instead of a confirmation
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop a lab and delete its clones and local state
     Destroy { lab: String },
 }
@@ -515,6 +527,7 @@ pub fn cmd_lab(cmd: LabCmd) -> Result<()> {
         LabCmd::List { json } => cmd_lab_list(json),
         LabCmd::Info { lab, verbose } => cmd_lab_info(&lab, verbose),
         LabCmd::Stop { lab, force } => cmd_lab_stop(&lab, force),
+        LabCmd::Restart { lab, json } => cmd_lab_restart(&lab, json),
         LabCmd::Destroy { lab } => cmd_lab_destroy(&lab),
     }
 }
@@ -614,40 +627,8 @@ fn cmd_lab_stop(name: &str, force: bool) -> Result<()> {
     })
 }
 
-fn cmd_lab_destroy(name: &str) -> Result<()> {
-    rt()?.block_on(async {
-        let labs = registry_labs().await?;
-        let root = root_for(&labs, name);
-        match daemon::try_lab_daemon(name).await {
-            Some(client) => {
-                client.send(LabRequest::Destroy {}).await.map_err(remote)?;
-            }
-            None => match &root {
-                // No daemon, but .vmlab may still hold clones to clean up.
-                Some(root) => {
-                    let lab_local = crate::paths::lab_local_dir(root);
-                    if lab_local.exists() {
-                        std::fs::remove_dir_all(&lab_local)
-                            .with_context(|| format!("removing {}", lab_local.display()))?;
-                    }
-                }
-                None => bail!("lab \"{name}\" is not running"),
-            },
-        }
-        // Reap the lab daemon.
-        if let Ok(sup) = daemon::ensure_supervisor().await {
-            let _ = sup
-                .send(SupRequest::LabRelease {
-                    name: name.to_string(),
-                })
-                .await;
-        }
-        println!("lab \"{name}\" destroyed");
-        Ok(())
-    })
-}
-
-/// `vmlab restart <lab>` — replace a lab's daemon so it re-reads `vmlab.wcl`.
+/// `vmlab lab restart <lab>` — replace a lab's daemon so it re-reads
+/// `vmlab.wcl`.
 ///
 /// Not `down` + `up`: that stops the machines and starts them again, running
 /// every provision script a second time. This replaces only the daemon. It
@@ -655,7 +636,7 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
 /// machines the old one was running, and its own shutdown stops them — so a
 /// running lab is refused rather than quietly taken down, which is the rule
 /// the console's reload button follows too.
-pub fn cmd_restart(name: &str, json: bool) -> Result<()> {
+fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
     rt()?.block_on(async {
         let labs = registry_labs().await?;
         let root = match root_for(&labs, name) {
@@ -705,6 +686,39 @@ pub fn cmd_restart(name: &str, json: bool) -> Result<()> {
         super::emit(json, &reply, |_| {
             format!("lab \"{name}\" daemon restarted at {}\n", socket.display())
         })
+    })
+}
+
+fn cmd_lab_destroy(name: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let labs = registry_labs().await?;
+        let root = root_for(&labs, name);
+        match daemon::try_lab_daemon(name).await {
+            Some(client) => {
+                client.send(LabRequest::Destroy {}).await.map_err(remote)?;
+            }
+            None => match &root {
+                // No daemon, but .vmlab may still hold clones to clean up.
+                Some(root) => {
+                    let lab_local = crate::paths::lab_local_dir(root);
+                    if lab_local.exists() {
+                        std::fs::remove_dir_all(&lab_local)
+                            .with_context(|| format!("removing {}", lab_local.display()))?;
+                    }
+                }
+                None => bail!("lab \"{name}\" is not running"),
+            },
+        }
+        // Reap the lab daemon.
+        if let Ok(sup) = daemon::ensure_supervisor().await {
+            let _ = sup
+                .send(SupRequest::LabRelease {
+                    name: name.to_string(),
+                })
+                .await;
+        }
+        println!("lab \"{name}\" destroyed");
+        Ok(())
     })
 }
 
