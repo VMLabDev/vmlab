@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CatalogSearchRow {
     /// Leaf name (used for query matching).
     pub name: String,
@@ -23,10 +23,14 @@ pub struct CatalogSearchRow {
 /// failure — the rest of the namespace still answers — so the warnings travel
 /// with the rows instead of going to whichever process happened to run the
 /// search.
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CatalogSearch {
     pub rows: Vec<CatalogSearchRow>,
     pub warnings: Vec<String>,
+    /// How many namespaces were searched to produce this. One when a caller
+    /// named the namespace; however many are configured when it did not.
+    #[serde(default)]
+    pub namespaces: usize,
 }
 
 /// Search one OCI registry namespace and resolve each matching repository's
@@ -67,7 +71,11 @@ pub async fn search_catalog(
                 .is_none_or(|a| r.arches.iter().any(|x| x == a))
     });
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(CatalogSearch { rows, warnings })
+    Ok(CatalogSearch {
+        rows,
+        warnings,
+        namespaces: 1,
+    })
 }
 
 /// The vmlab spelling of an OCI platform architecture, or `None` for one

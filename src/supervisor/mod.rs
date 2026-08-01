@@ -92,6 +92,17 @@ async fn run_async() -> Result<()> {
     tracing::info!("vmlabd listening on {}", sock.display());
     supervisor.adopt_existing_labs().await;
 
+    // A build that was in flight when the last supervisor died is not resumed
+    // (ADR-0010) and its working disk is nobody's — the workdir guard is a
+    // `Drop`, and a killed process runs none. Nothing owns a build at this
+    // point, so anything still here is a leftover.
+    match crate::template::build::sweep_build_workdirs() {
+        0 => {}
+        swept => {
+            tracing::info!("cleared {swept} build working director(y|ies) left by a previous run")
+        }
+    }
+
     // Disk-space watchdog on the template store's filesystem (PRD §8.1).
     let store_dir = crate::paths::data_dir();
     crate::paths::ensure_dir(&store_dir)?;

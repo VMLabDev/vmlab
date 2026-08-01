@@ -30,6 +30,15 @@ use crate::config::model::{TemplateRef, parse_template_ref};
 use crate::proto::{CommandError, Event};
 use crate::template::TemplateStore;
 use crate::template::meta::TemplateMeta;
+use crate::template::store_view::{
+    PrunePlan, PushStarted, RemoteStatus, StoreEntry, StoredVersion, TemplateSummary,
+};
+
+/// Serialise a typed answer, which cannot realistically fail — every view in
+/// `store_view` is plain data.
+fn answer<T: serde::Serialize>(value: T) -> Result<Value, CommandError> {
+    serde_json::to_value(value).map_err(|e| CommandError::internal(e.to_string()))
+}
 
 fn store() -> TemplateStore {
     TemplateStore::new(crate::paths::template_store_dir())
@@ -46,32 +55,6 @@ fn parse_store_ref(reference: &str) -> Result<(String, String, Option<String>)> 
         } => Ok((arch, name, version)),
         _ => bail!("expected a local store reference `<arch>/<name>[@<version>]`"),
     }
-}
-
-/// Fixed-shape JSON for one store entry: every key always present (null when
-/// the template does not record it), sizes in bytes, created as RFC 3339.
-///
-/// This is the shape `vmlab template list --json` prints, so it is a
-/// published contract rather than a convenience.
-fn meta_json(t: &TemplateMeta) -> Value {
-    json!({
-        "arch": t.arch,
-        "name": t.name,
-        "version": t.version,
-        "ref": format!("{}/{}@{}", t.arch, t.name, t.version),
-        "profile": t.profile,
-        "cpus": t.cpus,
-        "memory": t.memory,
-        "disk": t.disk,
-        "firmware": t.firmware,
-        "tpm": t.tpm,
-        "secure_boot": t.secure_boot,
-        "display": t.display,
-        "created": t.created.to_rfc3339(),
-        "origin": t.origin,
-        "registry": t.registry,
-        "sha256": t.sha256,
-    })
 }
 
 fn disk_path(store: &TemplateStore, t: &TemplateMeta) -> PathBuf {
@@ -101,7 +84,7 @@ pub async fn list(remote: bool) -> Result<Value, CommandError> {
     .await
     .map_err(|e| e.to_string())??;
 
-    let statuses: Vec<String> = if remote {
+    let statuses: Vec<RemoteStatus> = if remote {
         use futures::StreamExt as _;
         // Owned triples first: the futures outlive the borrow of `templates`.
         let asked: Vec<(Option<String>, String, String)> = templates
@@ -120,39 +103,36 @@ pub async fn list(remote: bool) -> Result<Value, CommandError> {
         Vec::new()
     };
 
-    let rows: Vec<Value> = templates
+    let rows: Vec<StoreEntry> = templates
         .iter()
         .enumerate()
-        .map(|(i, t)| {
-            let mut row = json!({"meta": meta_json(t), "size": sizes[i]});
-            if remote {
-                row["remote"] = json!(statuses[i]);
-            }
-            row
+        .map(|(i, t)| StoreEntry {
+            meta: TemplateSummary::from(t),
+            size: sizes[i],
+            remote: statuses.get(i).copied(),
         })
         .collect();
-    Ok(Value::Array(rows))
+    answer(rows)
 }
 
-/// Whether `<registry>:<version>` already carries `arch` on the remote: `yes`,
-/// `no` (missing — needs upload), `local` (no registry target), or `?` (the
-/// registry ref is malformed).
-async fn registry_status(registry: Option<String>, version: String, arch: String) -> String {
+/// Whether the registry a template names already carries this exact version
+/// and architecture.
+async fn registry_status(registry: Option<String>, version: String, arch: String) -> RemoteStatus {
     let Some(reg) = registry else {
-        return "local".to_string();
+        return RemoteStatus::Local;
     };
     let Ok(r) = crate::oci::Registry::new(&reg) else {
-        return "?".to_string();
+        return RemoteStatus::Unknown;
     };
     match r.index_arches(&version).await {
-        Ok(arches) if arches.contains(&arch) => "yes".to_string(),
-        _ => "no".to_string(),
+        Ok(arches) if arches.contains(&arch) => RemoteStatus::Published,
+        _ => RemoteStatus::Missing,
     }
 }
 
 /// `store.remove`: drop one exact version.
 pub async fn remove(reference: String, force: bool) -> Result<Value, CommandError> {
-    let removed = tokio::task::spawn_blocking(move || -> Result<Value> {
+    let removed = tokio::task::spawn_blocking(move || -> Result<StoredVersion> {
         let (arch, name, version) = parse_store_ref(&reference)?;
         let version = version.ok_or_else(|| {
             anyhow!("specify the exact version to remove, e.g. {arch}/{name}@<version>")
@@ -167,11 +147,15 @@ pub async fn remove(reference: String, force: bool) -> Result<Value, CommandErro
                 )
             }
         })?;
-        Ok(json!({"arch": arch, "name": name, "version": version}))
+        Ok(StoredVersion {
+            arch,
+            name,
+            version,
+        })
     })
     .await
     .map_err(|e| e.to_string())??;
-    Ok(removed)
+    answer(removed)
 }
 
 /// `store.prune`: per `<arch>/<name>` family, keep the `keep` newest builds
@@ -223,16 +207,14 @@ pub async fn prune(
         }
     }
 
-    let freed: u64 = to_remove.iter().map(|t| disk_size(&store, t)).sum();
-    let entry = |t: &TemplateMeta| json!({"arch": t.arch, "name": t.name, "version": t.version});
-    let plan = json!({
-        "remove": to_remove.iter().map(entry).collect::<Vec<_>>(),
-        "skipped": skipped.iter().map(entry).collect::<Vec<_>>(),
-        "freed": freed,
-        "applied": apply,
-    });
+    let plan = PrunePlan {
+        freed: to_remove.iter().map(|t| disk_size(&store, t)).sum(),
+        remove: to_remove.iter().map(StoredVersion::of).collect(),
+        skipped: skipped.iter().map(StoredVersion::of).collect(),
+        applied: apply,
+    };
     if !apply {
-        return Ok(plan);
+        return answer(plan);
     }
 
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -246,7 +228,7 @@ pub async fn prune(
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| format!("{e:#}"))?;
-    Ok(plan)
+    answer(plan)
 }
 
 /// The builds a prune would drop: everything but the `keep` newest of each
@@ -320,14 +302,14 @@ async fn backing_disks_in_use() -> HashSet<PathBuf> {
 
 /// `store.export`: write one template to a portable archive.
 pub async fn export(reference: String, out: PathBuf) -> Result<Value, CommandError> {
-    let path = tokio::task::spawn_blocking(move || -> Result<Value> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let (arch, name, version) = parse_store_ref(&reference)?;
         store().export(&arch, &name, version.as_deref(), &out)?;
-        Ok(json!({"out": out}))
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())??;
-    Ok(path)
+    Ok(Value::Null)
 }
 
 /// `store.import`: read a template back out of an archive.
@@ -336,7 +318,7 @@ pub async fn import(archive: PathBuf, overwrite: bool) -> Result<Value, CommandE
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{e:#}"))?;
-    Ok(json!({"arch": meta.arch, "name": meta.name, "version": meta.version}))
+    answer(StoredVersion::of(&meta))
 }
 
 /// `store.pull`: download a published template into the store.
@@ -350,7 +332,7 @@ pub async fn pull(
         .await
         .context("pulling from registry")
         .map_err(|e| format!("{e:#}"))?;
-    Ok(json!({"arch": meta.arch, "name": meta.name, "version": meta.version}))
+    answer(StoredVersion::of(&meta))
 }
 
 /// `store.push`: start uploading one store version, reporting progress the
@@ -392,15 +374,12 @@ pub async fn push(
 
     let guard = sup.template_ops.try_begin(&lab, &arch, &name, "push")?;
     let cancel = guard.cancel_token();
-    let started = json!({
-        "started": true,
-        "arch": arch,
-        "name": name,
-        "version": version,
-        "target": target,
-        "source": source,
-        "moving_tag": moving_tag,
-    });
+    let started = answer(PushStarted {
+        pushing: StoredVersion::of(&resolved.meta),
+        target: target.clone(),
+        source: source.clone(),
+        moving_tag: moving_tag.to_string(),
+    })?;
     sup.emit(Event::new(
         "template.op.start",
         &*lab,
@@ -514,11 +493,11 @@ pub async fn search(
     warnings.extend(errors);
     rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.repo.cmp(&b.repo)));
     rows.dedup_by(|a, b| a.reference == b.reference);
-    Ok(json!({
-        "rows": rows,
-        "warnings": warnings,
-        "namespaces": namespaces.len(),
-    }))
+    answer(crate::template::catalog::CatalogSearch {
+        rows,
+        warnings,
+        namespaces: namespaces.len(),
+    })
 }
 
 /// `registry.login`: store credentials for a registry host.
@@ -534,14 +513,13 @@ pub async fn login(
     crate::template::oci_bridge::login(&registry, &username, &password)
         .await
         .map_err(|e| format!("{e:#}"))?;
-    Ok(json!({"registry": registry}))
+    Ok(Value::Null)
 }
 
 /// `registry.namespaces`: the searchable namespaces this host is configured
 /// with.
 pub fn namespaces() -> Result<Value, CommandError> {
-    let entries = crate::template::registries::list().map_err(|e| format!("{e:#}"))?;
-    serde_json::to_value(entries).map_err(|e| CommandError::internal(e.to_string()))
+    answer(crate::template::registries::list().map_err(|e| format!("{e:#}"))?)
 }
 
 /// `registry.namespace_add`: add or update one searchable namespace.
@@ -559,7 +537,7 @@ pub fn namespace_remove(namespace: String) -> Result<Value, CommandError> {
     crate::template::registries::remove(&namespace).map_err(|e| format!("{e:#}"))?;
     let normalised = crate::template::registries::normalise_namespace(&namespace)
         .map_err(|e| format!("{e:#}"))?;
-    Ok(json!({"namespace": normalised}))
+    answer(normalised)
 }
 
 #[cfg(test)]

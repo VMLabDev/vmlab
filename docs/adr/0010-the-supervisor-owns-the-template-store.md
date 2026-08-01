@@ -21,7 +21,7 @@ stopped from anywhere else, got no structured progress, and reproduced logic
 the supervisor already had.
 
 The genuine question was whether `vmlab template build` should acquire a
-dependency on a running daemon. It works today with no supervisor at all, which
+dependency on a running supervisor. It works today with no supervisor at all, which
 is a real property. Against it: two implementations of build and push, no
 cancellation, no shared visibility, and an ownership claim in the PRD that the
 code contradicts.
@@ -36,18 +36,26 @@ Concretely:
 - Store-scoped and registry-scoped operations get their own namespaces,
   `store.*` and `registry.*`. The existing `template.*` commands are
   lab-scoped — each takes `lab` and `root`, and `template.list` means "the
-  templates *this lab declares*" — and stay exactly as they are. Reusing them
-  for a store-wide list beside a lab-declared one would make the vocabulary lie
-  about what it addresses.
+  templates *this lab declares*" — and keep that meaning. Reusing them for a
+  store-wide list beside a lab-declared one would make the vocabulary lie about
+  what it addresses.
 - **Reads route too, and stay lock-free.** "Reads are lock-free" is about
   locking, not routing. A read command takes no lock; it routes so that there
   is one path to the store, not because it needs serialising.
 - A CLI build goes through the existing `template.build`, with the file's
   directory as the root and the lab that file declares as the lab. It is the
   same operation the console starts, claimed in the same registry, so the two
-  surfaces see and can stop each other's work. `template.build` gained two
-  optional arguments to make that possible — a `file`, because a shell may
-  point at any template file, and a `version` pin.
+  surfaces see and can stop each other's work. `template.list` and
+  `template.build` gained optional arguments to make that possible — a `file`,
+  because a shell may point at any template file, and a `version` pin. The
+  brief asked that `template.*` "stay exactly as they are"; this is the one
+  place that was not kept literally, because the alternative was a second build
+  command, which is the duplication the record exists to remove. Both arguments
+  default to what the console already sends, so its payloads are untouched, and
+  a test pins that.
+- **Stopping is a verb, not only an interrupt.** `vmlab template stop` cancels
+  an operation this terminal did not start — the half of "either surface can
+  stop the other's" that an interrupt handler cannot reach.
 - A CLI push is `store.push`, not `template.push`. It addresses a store
   reference rather than a lab's declaration, and carries a target and the git
   origin of the directory it was run in — none of which a lab declaration has.
@@ -55,12 +63,20 @@ Concretely:
   console already renders. A terminal reads that stream as text; there is no
   second progress mechanism.
 - **Interrupting the CLI cancels the operation** rather than detaching it, and
-  the CLI follows the operation to its end afterwards so the daemon has
+  the CLI follows the operation to its end afterwards so the supervisor has
   finished clearing up before the process exits. A build that should outlive a
-  terminal belongs to the console.
+  terminal belongs to the console. A second interrupt gives up waiting and
+  says so: tokio's handler has replaced SIGINT's default, so if this did not
+  honour it the user would have no way out of an upload that will not die.
 - **A supervisor restart fails in-flight builds and pushes.** There is no
   resumption. This is the in-process failure model reproduced: the process
-  dies, the workdir guard removes everything.
+  dies, the workdir guard removes everything. The guard is a `Drop`, which a
+  killed process does not run, so the supervisor also sweeps the build
+  directory at startup — the one moment it is certain to own no build.
+- **The answers are typed values, not hand-built JSON** (`template/store_view.rs`,
+  the shape ADR-0004 settled on for lab status). The supervisor builds them and
+  the CLI decodes them, so a renamed field stops the far side compiling instead
+  of rendering a confident zero.
 - Failures of the new commands answer with `ErrorCode::Failed`. These replaced
   in-process work whose every failure exited 1, and `Failed` is the code that
   still exits 1; classifying them more finely would silently change the exit
@@ -77,6 +93,8 @@ Concretely:
   status, and either surface can stop the other's.
 - The CLI gets cancellation and structured progress for nothing — it reads the
   event stream the console already had.
+- Build working directories stop surviving a killed supervisor, which on a
+  multi-gigabyte template was the sharpest edge of the old failure model.
 - The `template.*` group stops being an unexplained one-way block in the
   coverage report: four commands now have two callers, and the three that do
   not carry their reason.

@@ -16,12 +16,25 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::cli::daemon::ensure_supervisor;
+use crate::cli::daemon::{abs_path, ensure_supervisor, remote};
+use crate::proto::WireRequest;
 use crate::proto::client::SupClient;
 use crate::proto::{Event, SupRequest};
+use crate::template::catalog::CatalogSearch;
+use crate::template::registries::RegistryEntry;
+use crate::template::store_view::{PrunePlan, PushStarted, StoreEntry, StoredVersion};
+
+/// The two fields a build needs from `template.list`: which templates the
+/// file declares, and how each is addressed.
+#[derive(serde::Deserialize)]
+struct DeclaredTemplate {
+    arch: String,
+    name: String,
+}
 
 #[derive(clap::Subcommand)]
 pub enum TemplateCmd {
@@ -36,6 +49,15 @@ pub enum TemplateCmd {
         /// single target template)
         #[arg(long)]
         version: Option<String>,
+    },
+    /// Stop a build or push running for a template — one this terminal
+    /// started, or one the console did
+    Stop {
+        /// Template name, as the file declares it
+        name: String,
+        /// Architecture, when the name is declared for more than one
+        #[arg(long, default_value = "x86_64")]
+        arch: String,
     },
     /// List templates in the store
     List {
@@ -166,14 +188,18 @@ pub enum RegistryCmd {
     Remove { namespace: String },
 }
 
-/// A supervisor failure as an `anyhow` error that still carries its code, so
-/// `cli::run` can pick an exit code a script can branch on.
-fn remote_err(e: crate::proto::ProtoError) -> anyhow::Error {
-    anyhow::Error::new(crate::proto::CommandError::from(e))
-}
-
-async fn ask(sup: &SupClient, req: SupRequest) -> Result<Value> {
-    sup.send(req).await.map_err(remote_err)
+/// Send one request and decode its answer into the view the supervisor
+/// promised.
+///
+/// Decoding rather than indexing is what keeps the two halves of `store.*`
+/// honest: a field renamed on one side stops the other compiling, where
+/// `v["freed"].as_u64().unwrap_or(0)` would have printed a confident zero.
+async fn ask<T: DeserializeOwned>(sup: &SupClient, req: SupRequest) -> Result<T> {
+    let cmd = req.cmd();
+    let answer = sup.send(req).await.map_err(remote)?;
+    serde_json::from_value(answer).with_context(|| {
+        format!("the supervisor answered `{cmd}` in a shape this build cannot read")
+    })
 }
 
 pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
@@ -186,6 +212,7 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 name,
                 version,
             } => build(&sup, file, name, version).await,
+            TemplateCmd::Stop { name, arch } => stop(&sup, name, arch).await,
             TemplateCmd::List { json, remote } => list(&sup, json, remote).await,
             TemplateCmd::Search {
                 query,
@@ -236,13 +263,29 @@ enum OpOutcome {
     Cancelled,
 }
 
+impl OpOutcome {
+    /// The verb's result: `what` names the operation for the error message
+    /// ("building x86_64/base", "pushing to registry").
+    fn into_result(self, what: &str) -> Result<()> {
+        match self {
+            OpOutcome::Done => Ok(()),
+            OpOutcome::Cancelled => bail!("{what}: cancelled"),
+            OpOutcome::Failed(e) => bail!("{what}: {e}"),
+        }
+    }
+}
+
 /// Follow one template operation to its end, printing its log as it arrives.
 ///
 /// This is the same `template.op.*` stream the console renders, which is the
 /// point: there is one progress mechanism, and a terminal reads it as text
-/// where a browser draws it. `stop` is what an interrupt sends — after which
-/// the operation is followed to its end anyway, so the daemon has finished
-/// clearing up before the process exits.
+/// where a browser draws it.
+///
+/// `stop` is what an interrupt sends. The operation is then followed to its
+/// end anyway, so the supervisor has finished clearing up before this process
+/// exits — and because tokio's handler has replaced SIGINT's default, a second
+/// interrupt has to be honoured here or an upload that will not die leaves the
+/// user with no way out.
 async fn follow_op(
     sup: &SupClient,
     events: &mut mpsc::Receiver<Event>,
@@ -251,15 +294,18 @@ async fn follow_op(
     template: &str,
     stop: SupRequest,
 ) -> Result<OpOutcome> {
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
     let mut stopping = false;
     loop {
         tokio::select! {
-            _ = &mut interrupt, if !stopping => {
+            _ = &mut interrupt => {
+                if stopping {
+                    bail!("interrupted a second time — {arch}/{template} may still be running");
+                }
                 stopping = true;
                 eprintln!("interrupted — stopping {arch}/{template}");
                 let _ = sup.send(stop.clone()).await;
+                interrupt = Box::pin(tokio::signal::ctrl_c());
             }
             received = events.recv() => {
                 let Some(ev) = received else {
@@ -291,6 +337,15 @@ async fn follow_op(
     }
 }
 
+/// The lab the shell is standing in, or the empty lab when it is not in one.
+fn lab_here() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| crate::paths::find_lab_root(&cwd).ok())
+        .map(|root| lab_of(&root))
+        .unwrap_or_default()
+}
+
 /// The lab a template file belongs to, so its build is filed where a console
 /// watching that lab will see it. A file that declares no lab — a bare
 /// template file — belongs to the store, spelled as the empty lab.
@@ -318,7 +373,7 @@ async fn build(
     let root = path.parent().unwrap_or(&cwd).to_path_buf();
     let lab = lab_of(&root);
 
-    let declared = ask(
+    let declared: Vec<DeclaredTemplate> = ask(
         sup,
         SupRequest::TemplateList {
             lab: lab.clone(),
@@ -327,19 +382,12 @@ async fn build(
         },
     )
     .await?;
-    let declared = declared.as_array().cloned().unwrap_or_default();
     if declared.is_empty() {
         bail!("no `template {{}}` blocks in {}", path.display());
     }
-    let targets: Vec<(String, String)> = declared
-        .iter()
-        .filter_map(|row| {
-            Some((
-                row["arch"].as_str()?.to_string(),
-                row["name"].as_str()?.to_string(),
-            ))
-        })
-        .filter(|(_, name)| only.as_deref().is_none_or(|n| n == name))
+    let targets: Vec<DeclaredTemplate> = declared
+        .into_iter()
+        .filter(|t| only.as_deref().is_none_or(|n| n == t.name))
         .collect();
     if targets.is_empty() {
         bail!(
@@ -352,11 +400,12 @@ async fn build(
         bail!("--version needs a single target template; pass a template name too");
     }
 
-    for (arch, name) in targets {
+    for DeclaredTemplate { arch, name } in targets {
         // Subscribe before asking, so no line of the build's output can be
         // emitted between the request and the first thing we listen to.
-        let mut events = sup.subscribe().await.map_err(remote_err)?;
-        ask(
+        let mut events = sup.subscribe().await.map_err(remote)?;
+        let what = format!("building {arch}/{name}");
+        ask::<Value>(
             sup,
             SupRequest::TemplateBuild {
                 lab: lab.clone(),
@@ -368,18 +417,55 @@ async fn build(
             },
         )
         .await
-        .with_context(|| format!("building {arch}/{name}"))?;
+        .context(what.clone())?;
         let stop = SupRequest::TemplateStopBuild {
             lab: lab.clone(),
             arch: arch.clone(),
             template: name.clone(),
         };
-        match follow_op(sup, &mut events, &lab, &arch, &name, stop).await? {
-            OpOutcome::Done => {}
-            OpOutcome::Cancelled => bail!("building {arch}/{name}: cancelled"),
-            OpOutcome::Failed(e) => bail!("building {arch}/{name}: {e}"),
-        }
+        follow_op(sup, &mut events, &lab, &arch, &name, stop)
+            .await?
+            .into_result(&what)?;
     }
+    Ok(())
+}
+
+/// `vmlab template stop`: cancel an operation somebody else started — from
+/// another terminal, or from the console.
+///
+/// Build and push are stopped by different commands because they are
+/// different requests; a user with one running operation should not have to
+/// know which. So this asks to stop the build, and takes the supervisor's
+/// "that one is a push" as the answer to which command to send instead.
+async fn stop(sup: &SupClient, name: String, arch: String) -> Result<()> {
+    let lab = lab_here();
+    let build = SupRequest::TemplateStopBuild {
+        lab: lab.clone(),
+        arch: arch.clone(),
+        template: name.clone(),
+    };
+    let is_push = match sup.send(build).await {
+        Ok(_) => false,
+        Err(e) => {
+            let e = crate::proto::CommandError::from(e);
+            if e.code != crate::proto::ErrorCode::Conflict {
+                return Err(anyhow::Error::new(e));
+            }
+            true
+        }
+    };
+    if is_push {
+        ask::<Value>(
+            sup,
+            SupRequest::StoreStopPush {
+                lab,
+                arch: arch.clone(),
+                template: name.clone(),
+            },
+        )
+        .await?;
+    }
+    println!("stopping {arch}/{name}");
     Ok(())
 }
 
@@ -395,14 +481,10 @@ async fn push(
     let source = source.or_else(detect_git_source);
     // File the push under the lab the shell is in, when it is in one, so a
     // console watching that lab sees it and can stop it.
-    let lab = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| crate::paths::find_lab_root(&cwd).ok())
-        .map(|root| lab_of(&root))
-        .unwrap_or_default();
+    let lab = lab_here();
 
-    let mut events = sup.subscribe().await.map_err(remote_err)?;
-    let started = ask(
+    let mut events = sup.subscribe().await.map_err(remote)?;
+    let started: PushStarted = ask(
         sup,
         SupRequest::StorePush {
             reference,
@@ -415,30 +497,22 @@ async fn push(
     .await
     .context("pushing to registry")?;
 
-    let field = |key: &str| started[key].as_str().unwrap_or_default().to_string();
-    let (arch, name, version, target) = (
-        field("arch"),
-        field("name"),
-        field("version"),
-        field("target"),
-    );
+    let pushed = &started.pushing;
     let stop = SupRequest::StoreStopPush {
         lab: lab.clone(),
-        arch: arch.clone(),
-        template: name.clone(),
+        arch: pushed.arch.clone(),
+        template: pushed.name.clone(),
     };
-    match follow_op(sup, &mut events, &lab, &arch, &name, stop).await? {
-        OpOutcome::Done => {}
-        OpOutcome::Cancelled => bail!("pushing to registry: cancelled"),
-        OpOutcome::Failed(e) => bail!("pushing to registry: {e}"),
-    }
-    let src_note = started["source"]
-        .as_str()
+    follow_op(sup, &mut events, &lab, &pushed.arch, &pushed.name, stop)
+        .await?
+        .into_result("pushing to registry")?;
+    let src_note = started
+        .source
         .map(|s| format!(", source {s}"))
         .unwrap_or_default();
     println!(
-        "pushed {arch}/{name}@{version} to {target} (moved {}{src_note})",
-        field("moving_tag"),
+        "pushed {pushed} to {} (moved {}{src_note})",
+        started.target, started.moving_tag,
     );
     Ok(())
 }
@@ -447,17 +521,24 @@ async fn push(
 // The store
 // ---------------------------------------------------------------------------
 
-async fn list(sup: &SupClient, json: bool, remote: bool) -> Result<()> {
-    let rows = ask(sup, SupRequest::StoreList { remote }).await?;
-    let rows = rows.as_array().cloned().unwrap_or_default();
+async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
+    let rows: Vec<StoreEntry> = ask(
+        sup,
+        SupRequest::StoreList {
+            remote: check_remote,
+        },
+    )
+    .await?;
 
     if json {
+        // `--json` prints the metadata alone, with the registry check folded
+        // in as one more field when it was asked for.
         let entries: Vec<Value> = rows
             .iter()
             .map(|row| {
-                let mut meta = row["meta"].clone();
-                if let Some(status) = row.get("remote") {
-                    meta["remote"] = status.clone();
+                let mut meta = serde_json::to_value(&row.meta).unwrap_or(Value::Null);
+                if let Some(status) = row.remote {
+                    meta["remote"] = Value::String(status.as_str().into());
                 }
                 meta
             })
@@ -470,19 +551,16 @@ async fn list(sup: &SupClient, json: bool, remote: bool) -> Result<()> {
         return Ok(());
     }
     // Show the full registry path when known, else the bare store name.
-    let name_of = |row: &Value| {
-        row["meta"]["registry"]
-            .as_str()
-            .unwrap_or_else(|| row["meta"]["name"].as_str().unwrap_or_default())
-            .to_string()
-    };
+    fn name_of(row: &StoreEntry) -> &str {
+        row.meta.registry.as_deref().unwrap_or(&row.meta.name)
+    }
     let name_w = rows
         .iter()
         .map(|row| name_of(row).len())
         .max()
         .unwrap_or(0)
         .max(8);
-    if remote {
+    if check_remote {
         println!(
             "{:<8} {:<name_w$} {:<16} {:<8} {:<7} CREATED",
             "ARCH", "TEMPLATE", "VERSION", "SIZE", "REMOTE"
@@ -494,43 +572,34 @@ async fn list(sup: &SupClient, json: bool, remote: bool) -> Result<()> {
         );
     }
     for row in &rows {
-        let meta = &row["meta"];
-        let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
-        let size = human_size(row["size"].as_u64().unwrap_or(0));
+        let meta = &row.meta;
+        let size = human_size(row.size);
         // The wire carries RFC 3339; the table has always shown the date.
-        let created = text(&meta["created"]).chars().take(10).collect::<String>();
-        if remote {
-            println!(
-                "{:<8} {:<name_w$} {:<16} {:<8} {:<7} {}",
-                text(&meta["arch"]),
+        let created: String = meta.created.chars().take(10).collect();
+        match row.remote {
+            Some(status) => println!(
+                "{:<8} {:<name_w$} {:<16} {:<8} {:<7} {created}",
+                meta.arch,
                 name_of(row),
-                text(&meta["version"]),
+                meta.version,
                 size,
-                text(&row["remote"]),
-                created
-            );
-        } else {
-            println!(
-                "{:<8} {:<name_w$} {:<16} {:<8} {}",
-                text(&meta["arch"]),
+                status.as_str(),
+            ),
+            None => println!(
+                "{:<8} {:<name_w$} {:<16} {:<8} {created}",
+                meta.arch,
                 name_of(row),
-                text(&meta["version"]),
+                meta.version,
                 size,
-                created
-            );
+            ),
         }
     }
     Ok(())
 }
 
 async fn rm(sup: &SupClient, reference: String, force: bool) -> Result<()> {
-    let removed = ask(sup, SupRequest::StoreRemove { reference, force }).await?;
-    println!(
-        "removed {}/{}@{}",
-        removed["arch"].as_str().unwrap_or_default(),
-        removed["name"].as_str().unwrap_or_default(),
-        removed["version"].as_str().unwrap_or_default(),
-    );
+    let removed: StoredVersion = ask(sup, SupRequest::StoreRemove { reference, force }).await?;
+    println!("removed {removed}");
     Ok(())
 }
 
@@ -547,7 +616,7 @@ async fn clean(
     if keep == 0 {
         bail!("--keep must be >= 1 (use `template rm` to remove specific versions)");
     }
-    let plan = ask(
+    let plan: PrunePlan = ask(
         sup,
         SupRequest::StorePrune {
             filter,
@@ -557,58 +626,38 @@ async fn clean(
         },
     )
     .await?;
-    let rows = |key: &str| plan[key].as_array().cloned().unwrap_or_default();
-    let (to_remove, skipped) = (rows("remove"), rows("skipped"));
-    if to_remove.is_empty() && skipped.is_empty() {
+    if plan.remove.is_empty() && plan.skipped.is_empty() {
         println!("nothing to clean — every template is within --keep {keep}");
         return Ok(());
     }
-    let named = |t: &Value| {
-        format!(
-            "{}/{}@{}",
-            t["arch"].as_str().unwrap_or_default(),
-            t["name"].as_str().unwrap_or_default(),
-            t["version"].as_str().unwrap_or_default(),
-        )
+    let verb = if plan.applied {
+        "removing"
+    } else {
+        "would remove"
     };
-    let verb = if yes { "removing" } else { "would remove" };
-    for t in &to_remove {
-        println!("{verb} {}", named(t));
+    for t in &plan.remove {
+        println!("{verb} {t}");
     }
-    for t in &skipped {
-        println!("skipping {} — backs a clone (use --force)", named(t));
+    for t in &plan.skipped {
+        println!("skipping {t} — backs a clone (use --force)");
     }
 
-    let freed = human_size(plan["freed"].as_u64().unwrap_or(0));
-    if !yes {
-        println!(
-            "\n{} build(s), {freed} — dry run; re-run with --yes to remove",
-            to_remove.len(),
-        );
-        return Ok(());
+    let freed = human_size(plan.freed);
+    let count = plan.remove.len();
+    if plan.applied {
+        println!("\nremoved {count} build(s), freed {freed}");
+    } else {
+        println!("\n{count} build(s), {freed} — dry run; re-run with --yes to remove");
     }
-    println!("\nremoved {} build(s), freed {freed}", to_remove.len());
     Ok(())
 }
 
-/// Absolutise a path against the caller's cwd.
-///
-/// A relative archive path means "beside me" to whoever typed it, and the
-/// supervisor is not standing where they are — it would resolve the same
-/// string against its own working directory, wherever it was started.
-fn from_here(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    Ok(std::env::current_dir()?.join(path))
-}
-
 async fn export(sup: &SupClient, reference: String, out: PathBuf) -> Result<()> {
-    ask(
+    ask::<Value>(
         sup,
         SupRequest::StoreExport {
             reference,
-            out: from_here(&out)?,
+            out: abs_path(&out)?,
         },
     )
     .await?;
@@ -617,14 +666,9 @@ async fn export(sup: &SupClient, reference: String, out: PathBuf) -> Result<()> 
 }
 
 async fn import(sup: &SupClient, archive: PathBuf, overwrite: bool) -> Result<()> {
-    let archive = from_here(&archive)?;
-    let meta = ask(sup, SupRequest::StoreImport { archive, overwrite }).await?;
-    println!(
-        "imported {}/{}@{}",
-        meta["arch"].as_str().unwrap_or_default(),
-        meta["name"].as_str().unwrap_or_default(),
-        meta["version"].as_str().unwrap_or_default(),
-    );
+    let archive = abs_path(&archive)?;
+    let imported: StoredVersion = ask(sup, SupRequest::StoreImport { archive, overwrite }).await?;
+    println!("imported {imported}");
     Ok(())
 }
 
@@ -634,7 +678,7 @@ async fn pull(
     arch: Option<String>,
     overwrite: bool,
 ) -> Result<()> {
-    let meta = ask(
+    let pulled: StoredVersion = ask(
         sup,
         SupRequest::StorePull {
             target,
@@ -643,12 +687,7 @@ async fn pull(
         },
     )
     .await?;
-    println!(
-        "pulled {}/{}@{} into the store",
-        meta["arch"].as_str().unwrap_or_default(),
-        meta["name"].as_str().unwrap_or_default(),
-        meta["version"].as_str().unwrap_or_default(),
-    );
+    println!("pulled {pulled} into the store");
     Ok(())
 }
 
@@ -664,7 +703,7 @@ async fn search(
     kind: CatalogKind,
     json: bool,
 ) -> Result<()> {
-    let found = ask(
+    let found: CatalogSearch = ask(
         sup,
         SupRequest::RegistrySearch {
             query,
@@ -674,40 +713,35 @@ async fn search(
         },
     )
     .await?;
-    for warning in found["warnings"].as_array().cloned().unwrap_or_default() {
-        eprintln!("warning: {}", warning.as_str().unwrap_or_default());
+    for warning in &found.warnings {
+        eprintln!("warning: {warning}");
     }
-    let rows = found["rows"].as_array().cloned().unwrap_or_default();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        println!("{}", serde_json::to_string_pretty(&found.rows)?);
         return Ok(());
     }
-    if rows.is_empty() {
+    if found.rows.is_empty() {
         println!(
             "no results found in {} configured registries",
-            found["namespaces"].as_u64().unwrap_or(0)
+            found.namespaces
         );
         return Ok(());
     }
-    let repo_of = |row: &Value| row["repo"].as_str().unwrap_or_default().to_string();
-    let name_w = rows
+    let name_w = found
+        .rows
         .iter()
-        .map(|r| repo_of(r).len())
+        .map(|r| r.repo.len())
         .max()
         .unwrap_or(0)
         .max(8);
     println!("{:<name_w$} {:<24} VERSION", "TEMPLATE", "ARCH");
-    for r in &rows {
-        let arches: Vec<&str> = r["arches"]
-            .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
+    for r in &found.rows {
         println!(
             "{:<name_w$} {:<24} {}",
-            repo_of(r),
-            arches.join(","),
-            r["version"].as_str().unwrap_or_default()
+            r.repo,
+            r.arches.join(","),
+            r.version
         );
     }
     Ok(())
@@ -719,7 +753,7 @@ async fn login(
     username: String,
     password: String,
 ) -> Result<()> {
-    ask(
+    ask::<Value>(
         sup,
         SupRequest::RegistryLogin {
             registry: registry.clone(),
@@ -735,30 +769,25 @@ async fn login(
 async fn registry_command(sup: &SupClient, command: RegistryCmd) -> Result<()> {
     match command {
         RegistryCmd::List { json } => {
-            let entries = ask(sup, SupRequest::RegistryNamespaces {}).await?;
+            let entries: Vec<RegistryEntry> = ask(sup, SupRequest::RegistryNamespaces {}).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
             } else {
                 println!("{:<52} USE", "NAMESPACE");
-                for entry in entries.as_array().cloned().unwrap_or_default() {
-                    println!(
-                        "{:<52} {}",
-                        entry["namespace"].as_str().unwrap_or_default(),
-                        entry["use_for"].as_str().unwrap_or_default(),
-                    );
+                for entry in entries {
+                    println!("{:<52} {}", entry.namespace, entry.use_for.as_str());
                 }
             }
         }
         RegistryCmd::Add { namespace, use_for } => {
-            let entry = ask(sup, SupRequest::RegistryNamespaceAdd { namespace, use_for }).await?;
-            println!("added {}", entry["namespace"].as_str().unwrap_or_default());
+            let entry: RegistryEntry =
+                ask(sup, SupRequest::RegistryNamespaceAdd { namespace, use_for }).await?;
+            println!("added {}", entry.namespace);
         }
         RegistryCmd::Remove { namespace } => {
-            let removed = ask(sup, SupRequest::RegistryNamespaceRemove { namespace }).await?;
-            println!(
-                "removed {}",
-                removed["namespace"].as_str().unwrap_or_default()
-            );
+            let removed: String =
+                ask(sup, SupRequest::RegistryNamespaceRemove { namespace }).await?;
+            println!("removed {removed}");
         }
     }
     Ok(())
@@ -829,7 +858,7 @@ fn normalize_git_url(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use serde_json::json;
 
@@ -864,7 +893,7 @@ mod tests {
         Event::new(event, "demo", data)
     }
 
-    fn stop() -> SupRequest {
+    fn stop_request() -> SupRequest {
         SupRequest::TemplateStopBuild {
             lab: "demo".into(),
             arch: "x86_64".into(),
@@ -875,7 +904,7 @@ mod tests {
     async fn follow(sup: &SupClient, events: &mut mpsc::Receiver<Event>) -> Result<OpOutcome> {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            follow_op(sup, events, "demo", "x86_64", "base", stop()),
+            follow_op(sup, events, "demo", "x86_64", "base", stop_request()),
         )
         .await
         .expect("the operation should have ended")
@@ -901,10 +930,10 @@ mod tests {
         ));
     }
 
-    /// The daemon's own wording reaches the terminal, so a failed build says
+    /// The supervisor's own wording reaches the terminal, so a failed build says
     /// what went wrong rather than that something did.
     #[tokio::test]
-    async fn a_failed_build_carries_the_daemons_reason() {
+    async fn a_failed_build_carries_the_supervisors_reason() {
         let (_dir, server, sup) = supervisor().await;
         let mut events = sup.subscribe().await.unwrap();
         server.emit(op_event(
@@ -935,6 +964,75 @@ mod tests {
             follow(&sup, &mut events).await.unwrap(),
             OpOutcome::Cancelled
         ));
+    }
+
+    /// A supervisor that records what it was asked and answers the way a real
+    /// one would when the running operation is a push.
+    #[derive(Default)]
+    struct Busy {
+        asked: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler<SupRequest> for Busy {
+        async fn handle(&self, req: SupRequest, _s: &Streamer) -> Result<Value, CommandError> {
+            self.asked.lock().unwrap().push(req.cmd());
+            match req {
+                SupRequest::TemplateStopBuild { .. } => Err(CommandError::conflict(
+                    "the operation running for `x86_64/base` is a push",
+                )),
+                _ => Ok(Value::Bool(true)),
+            }
+        }
+    }
+
+    /// `vmlab template stop` means "stop whatever is running for this
+    /// template". Build and push are stopped by different commands, so it asks
+    /// for the build and takes the conflict as the answer to which to send.
+    #[tokio::test]
+    async fn stopping_falls_through_to_the_push_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vmlabd.sock");
+        let handler = Arc::new(Busy::default());
+        let _server = Server::bind(&sock, handler.clone()).await.unwrap();
+        let sup = SupClient::connect(&sock).await.unwrap();
+
+        stop(&sup, "base".into(), "x86_64".into()).await.unwrap();
+        assert_eq!(
+            *handler.asked.lock().unwrap(),
+            ["template.stop_build", "store.stop_push"]
+        );
+    }
+
+    /// The reason the answers are typed: a supervisor of a different build
+    /// answering a shape this one cannot read is an error, not a table of
+    /// zeroes and blanks.
+    #[tokio::test]
+    async fn an_unreadable_answer_is_a_failure_not_an_empty_render() {
+        struct Nonsense;
+        #[async_trait::async_trait]
+        impl Handler<SupRequest> for Nonsense {
+            async fn handle(&self, _r: SupRequest, _s: &Streamer) -> Result<Value, CommandError> {
+                Ok(json!({"remove": "all of them"}))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vmlabd.sock");
+        let _server = Server::bind(&sock, Arc::new(Nonsense)).await.unwrap();
+        let sup = SupClient::connect(&sock).await.unwrap();
+
+        let err = ask::<PrunePlan>(
+            &sup,
+            SupRequest::StorePrune {
+                filter: None,
+                keep: 1,
+                apply: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("store.prune"), "{err}");
     }
 
     /// The acceptance test of the whole change: nothing on the CLI's template

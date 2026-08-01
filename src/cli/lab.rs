@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
-use super::daemon;
+use super::daemon::{self, abs_path, remote};
 use super::yes_no;
 use crate::proto::client::{LabClient, SupClient};
 use crate::proto::{LabRequest, Region, SupRequest};
@@ -51,12 +51,6 @@ pub(super) async fn lab_client_for(lab: Option<String>) -> Result<(String, LabCl
 
 pub(super) fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Runtime::new()?)
-}
-
-/// A daemon failure as an `anyhow` error that still carries its code, so
-/// `cli::run` can pick an exit code a script can branch on.
-pub(super) fn remote(e: crate::proto::ProtoError) -> anyhow::Error {
-    anyhow::Error::new(crate::proto::CommandError::from(e))
 }
 
 pub fn cmd_up(vms: Vec<String>) -> Result<()> {
@@ -954,17 +948,6 @@ pub fn cmd_eventlog(vm_ref: &str, filter: Option<&str>) -> Result<()> {
     })
 }
 
-/// Make a CLI-supplied path absolute against the cwd, so the daemon (whose
-/// working directory differs) resolves it to the same file.
-fn abs_path(path: &str) -> Result<std::path::PathBuf> {
-    let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        Ok(p.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(p))
-    }
-}
-
 /// Validate an optional `--region x y w h` flag into the request's rectangle.
 fn region_value(region: Option<Vec<i64>>) -> Result<Option<Region>> {
     match region.as_deref() {
@@ -983,7 +966,7 @@ fn region_value(region: Option<Vec<i64>>) -> Result<Option<Region>> {
 }
 
 pub fn cmd_vm_screenshot(vm_ref: &str, path: &str) -> Result<()> {
-    let out = abs_path(path)?;
+    let out = abs_path(std::path::Path::new(path))?;
     rt()?.block_on(async {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
@@ -1330,7 +1313,7 @@ async fn push_via_agent(
     let mut files = 0usize;
     for (local, to, mode) in entries {
         // The daemon opens the file itself, so hand it an absolute path.
-        let from = abs_path(local.to_str().unwrap_or_default())?;
+        let from = abs_path(&local)?;
         let r = client
             .send(LabRequest::MachinePushFile {
                 machine: vm.to_string(),
@@ -1365,7 +1348,7 @@ fn cp_pull(vm_part: &str, guest_src: &str, dest: &str) -> Result<()> {
             .unwrap_or("pulled");
         dest_path = dest_path.join(name);
     }
-    let dest_abs = abs_path(dest_path.to_str().unwrap_or_default())?;
+    let dest_abs = abs_path(&dest_path)?;
     rt()?.block_on(async {
         let (_name, client) = lab_client_for(lab).await?;
         let r = client

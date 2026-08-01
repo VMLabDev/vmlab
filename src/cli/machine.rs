@@ -13,7 +13,8 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::lab::{lab_client_for, remote, rt, split_vm_ref};
+use super::daemon::remote;
+use super::lab::{lab_client_for, rt, split_vm_ref};
 use super::{emit, print_json, yes_no};
 use crate::proto::LabRequest;
 
