@@ -630,9 +630,15 @@ volumes, which are network-mounted (validation error, mirroring §7.5).
 
 **Architecture.** Every container runs in a **micro-VM**: a pinned Alpine
 `linux-virt` kernel + purpose-built initramfs (`vmlab-cinit` as PID 1,
-spawning `vmlab-agent`), booted directly with `-kernel/-initrd`, 1 vCPU / 256 MiB
-by default. The image's layers are flattened (whiteout-aware, tar-level, no
-host privileges) into a squashfs mounted read-only, with a per-container
+spawning `vmlab-agent`), booted directly with `-kernel/-initrd`. Its `cpus` and
+`memory` resolve through the §5.2 chain — the container block, then its
+`profile` (there is no template layer) — and there is no built-in default,
+because what a micro-VM needs depends entirely on its image: a container that
+neither declares a size nor names a profile supplying one is a §5.1 validation
+error rather than a guess it silently OOMs under. The shipped `container`
+profile carries the conservative floor of 1 vCPU / 256 MiB. The image's layers
+are flattened (whiteout-aware, tar-level, no host privileges) into a squashfs
+mounted read-only, with a per-container
 scratch qcow2 as the overlayfs writable layer. Config reaches the guest as a
 `ContainerSpec` pushed over the ctl channel (the virtio-serial port that also
 carries lifecycle events and stop/resync commands). Volumes attach as

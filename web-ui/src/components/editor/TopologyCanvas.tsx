@@ -105,6 +105,7 @@ import {
   setMachineNicTarget,
   setSegmentNat,
   setSegmentPeer,
+  inheritedForContainer,
   inheritedForVm,
   removeHostPortDraft,
 } from "../../editor/store";
@@ -3929,10 +3930,13 @@ export default function TopologyCanvas(props: {
               const h = () => machineCardHeight(ctr.nics.length);
               const footerY = () => p().y + h() - 30;
               const hw = () => {
-                // Schema defaults: 1 vCPU, 256MiB micro-VM.
-                const cpus = ctr.cpus ?? 1;
-                const mem = ctr.memory ?? 256 * 1024 * 1024;
-                return `${cpus} vCPU · ${formatMemory(mem)}`;
+                // Same resolver as the VM badge: a micro-VM has no built-in
+                // size, so an unsized container with no profile shows "?"
+                // rather than a default it does not have.
+                const inh = inheritedForContainer(ctr);
+                const cpus = ctr.cpus ?? inh?.cpus ?? null;
+                const mem = ctr.memory ?? inh?.memory ?? null;
+                return `${cpus ?? "?"} vCPU · ${mem != null ? formatMemory(mem) : "?"}`;
               };
               const badgeW = () => hw().length * 5.6 + 12;
               let gEl!: SVGGElement;

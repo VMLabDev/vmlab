@@ -713,6 +713,22 @@ mod tests {
 
     /// Arch-aware display selection reaches the inherited view too — the
     /// designer shows the device the machine will actually boot with.
+    /// A profile combining SeaBIOS with secure boot cannot resolve (#19).
+    /// The inherited view inherits that refusal — the designer must not
+    /// present values for a machine that would not boot.
+    #[test]
+    fn inherited_vm_inherits_the_secure_boot_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("bad.wcl"),
+            "import <vmlab-profile.wcl>\nprofile \"bad\" { firmware = \"seabios\" secure_boot = true }\n",
+        )
+        .unwrap();
+        let profiles = ProfileSet::load(tmp.path()).unwrap();
+        let err = inherited_vm("x86_64", Some("bad"), None, &profiles).unwrap_err();
+        assert!(err.to_string().contains("secure boot needs UEFI"), "{err}");
+    }
+
     #[test]
     fn inherited_vm_display_is_arch_aware() {
         let profiles = ProfileSet::shipped().unwrap();
