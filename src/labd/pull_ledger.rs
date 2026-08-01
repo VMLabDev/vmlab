@@ -204,11 +204,11 @@ impl<H> PullLedger<H> {
             .collect()
     }
 
-    /// Record a progress report against the batch `machine` belongs to and
-    /// announce it. Empty when nothing is running for that machine.
-    pub fn progress(&mut self, machine: &str, p: PullProgress) -> Vec<PullEvent> {
+    /// Record a progress report against `batch` and announce it. Empty when
+    /// that batch is not running.
+    pub fn progress(&mut self, batch: &PullBatch, p: PullProgress) -> Vec<PullEvent> {
         let percent = pull_percent(p.bytes_done, p.bytes_total);
-        let Some(active) = self.active.iter_mut().find(|a| holds(a, machine)) else {
+        let Some(active) = self.active.iter_mut().find(|a| a.job == batch.job) else {
             return Vec::new();
         };
         active.bytes_done = p.bytes_done;
@@ -234,11 +234,11 @@ impl<H> PullLedger<H> {
             .collect()
     }
 
-    /// Retire the batch `machine` belongs to. A [`PullOutcome::Done`] clears
-    /// the pending entries it satisfied; anything else leaves them for retry.
-    /// Empty when nothing is running for that machine.
-    pub fn finish(&mut self, machine: &str, outcome: PullOutcome) -> Vec<PullEvent> {
-        let Some(at) = self.active.iter().position(|a| holds(a, machine)) else {
+    /// Retire `batch`. A [`PullOutcome::Done`] clears the pending entries it
+    /// satisfied; anything else leaves them for retry. Empty when that batch
+    /// is not running.
+    pub fn finish(&mut self, batch: &PullBatch, outcome: PullOutcome) -> Vec<PullEvent> {
+        let Some(at) = self.active.iter().position(|a| a.job == batch.job) else {
             return Vec::new();
         };
         let active = self.active.remove(at);
@@ -276,7 +276,11 @@ impl<H> PullLedger<H> {
     /// not abort anything itself — it hands back the handle and says who else
     /// the abort takes with it.
     pub fn cancel(&self, machine: &str) -> Cancellation<&H> {
-        if let Some(active) = self.active.iter().find(|a| holds(a, machine)) {
+        if let Some(active) = self
+            .active
+            .iter()
+            .find(|a| a.machines.iter().any(|m| m == machine))
+        {
             return Cancellation::Active {
                 handle: &active.handle,
                 machines: active.machines.clone(),
@@ -309,10 +313,6 @@ impl<H> PullLedger<H> {
         rows.sort_by(|a, b| a.machine.cmp(&b.machine));
         rows
     }
-}
-
-fn holds<H>(active: &ActivePull<H>, machine: &str) -> bool {
-    active.machines.iter().any(|m| m == machine)
 }
 
 /// Percent complete, saturating and total-safe: a transport that has not
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(names(&led.begin(&batch, 1)), ["template.pull.start"]);
         assert_eq!(
             names(&led.progress(
-                "web",
+                &batch,
                 PullProgress {
                     unit: 1,
                     units: 4,
@@ -378,7 +378,7 @@ mod tests {
         );
         assert_eq!(led.snapshot()[0].percent, 25);
         assert_eq!(
-            names(&led.finish("web", PullOutcome::Done)),
+            names(&led.finish(&batch, PullOutcome::Done)),
             ["template.pull.done"]
         );
         assert!(led.snapshot().is_empty(), "no longer downloading");
@@ -442,7 +442,7 @@ mod tests {
             .map(|e| e.payload["vm"].as_str().unwrap())
             .collect();
         assert_eq!(subjects, ["app", "web"]);
-        assert_eq!(led.finish("app", PullOutcome::Done).len(), 2);
+        assert_eq!(led.finish(&batch, PullOutcome::Done).len(), 2);
         assert!(
             led.nothing_pending(),
             "one download satisfied both machines"
@@ -497,7 +497,7 @@ mod tests {
                 machines: vec!["app".to_string(), "web".to_string()],
             }
         );
-        let events = led.finish("web", PullOutcome::Cancelled);
+        let events = led.finish(&batch, PullOutcome::Cancelled);
         assert_eq!(
             names(&events),
             ["template.pull.cancelled", "template.pull.cancelled"]
@@ -515,7 +515,7 @@ mod tests {
         let mut led = ledger(&[("db", image("redis:7"))]);
         let batch = led.batches(&[]).remove(0);
         led.begin(&batch, 1);
-        let events = led.finish("db", PullOutcome::Failed("connection reset".into()));
+        let events = led.finish(&batch, PullOutcome::Failed("connection reset".into()));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "container.pull.error");
         assert_eq!(events[0].payload["container"], "db");
@@ -533,23 +533,26 @@ mod tests {
     #[test]
     fn each_kind_keeps_its_own_event_vocabulary() {
         let mut led = ledger(&[("web", template("reg/t:1")), ("db", image("redis:7"))]);
-        for batch in led.batches(&[]) {
-            led.begin(&batch, 1);
+        let batches = led.batches(&[]);
+        for batch in &batches {
+            led.begin(batch, 1);
         }
+        let image_batch = batches.iter().find(|b| b.machines == ["db"]).unwrap();
+        let template_batch = batches.iter().find(|b| b.machines == ["web"]).unwrap();
         let p = PullProgress {
             unit: 2,
             units: 5,
             bytes_done: 1,
             bytes_total: 4,
         };
-        let vm = led.progress("web", p).remove(0);
+        let vm = led.progress(template_batch, p).remove(0);
         assert_eq!(vm.name, "template.pull.progress");
         assert_eq!(vm.payload["vm"], "web");
         assert_eq!(vm.payload["chunk"], 2);
         assert_eq!(vm.payload["chunks"], 5);
         assert_eq!(vm.payload["percent"], 25);
 
-        let container = led.progress("db", p).remove(0);
+        let container = led.progress(image_batch, p).remove(0);
         assert_eq!(container.name, "container.pull.progress");
         assert_eq!(container.payload["container"], "db");
         assert_eq!(container.payload["layer"], 2);
@@ -559,10 +562,11 @@ mod tests {
     /// Progress and completion for a machine with nothing running are
     /// no-ops, not panics — a cancel can land between the two.
     #[test]
-    fn reports_for_an_idle_machine_are_ignored() {
+    fn reports_for_an_idle_batch_are_ignored() {
         let mut led = ledger(&[("web", template("reg/t:1"))]);
-        assert!(led.progress("web", PullProgress::default()).is_empty());
-        assert!(led.finish("web", PullOutcome::Done).is_empty());
+        let batch = led.batches(&[]).remove(0);
+        assert!(led.progress(&batch, PullProgress::default()).is_empty());
+        assert!(led.finish(&batch, PullOutcome::Done).is_empty());
         assert!(led.is_pending("web"), "nothing ran, so nothing completed");
     }
 
@@ -573,7 +577,7 @@ mod tests {
         let batch = led.batches(&[]).remove(0);
         led.begin(&batch, 1);
         led.progress(
-            "web",
+            &batch,
             PullProgress {
                 unit: 1,
                 units: 2,

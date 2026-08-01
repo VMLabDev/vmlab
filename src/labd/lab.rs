@@ -452,17 +452,14 @@ impl LabRuntime {
 
     /// Keep the ledger's progress snapshot current (`status` resyncs the web
     /// UI from it) and stream the progress event.
-    fn note_pull_progress(&self, machine: &str, progress: PullProgress) {
-        let events = self.pulls.lock_recover().progress(machine, progress);
+    fn note_pull_progress(&self, batch: &PullBatch, progress: PullProgress) {
+        let events = self.pulls.lock_recover().progress(batch, progress);
         self.emit_pulls(events);
     }
 
     /// Retire a batch in the ledger and emit whatever it says about it.
     fn finish_pull(&self, batch: &PullBatch, outcome: PullOutcome) {
-        let events = self
-            .pulls
-            .lock_recover()
-            .finish(&batch.machines[0], outcome);
+        let events = self.pulls.lock_recover().finish(batch, outcome);
         self.emit_pulls(events);
     }
 
@@ -509,13 +506,13 @@ impl LabRuntime {
         }
         // The download runs as its own task so `cancel_pull` can abort it.
         let me = Arc::clone(self);
-        let key = batch.machines[0].clone();
+        let owned = batch.clone();
         let ref_s = reference.clone();
         let arch_s = arch.clone();
         let task = tokio::spawn(async move {
             let mut progress = |p: crate::oci::PullProgress| {
                 me.note_pull_progress(
-                    &key,
+                    &owned,
                     PullProgress {
                         unit: p.chunk,
                         units: p.chunks,
@@ -594,13 +591,13 @@ impl LabRuntime {
         }
         // As in `pull_template`: a task of its own, so it can be cancelled.
         let me = Arc::clone(self);
-        let key = batch.machines[0].clone();
+        let owned = batch.clone();
         let ref_s = reference.clone();
         let arch_s = arch.clone();
         let task = tokio::spawn(async move {
             let mut progress = |p: crate::oci::image::ImagePullProgress| {
                 me.note_pull_progress(
-                    &key,
+                    &owned,
                     PullProgress {
                         unit: p.layer,
                         units: p.layers,
@@ -703,20 +700,33 @@ impl LabRuntime {
             .iter()
             .map(|e| (e.machine.clone(), e.gateway, e.shares.clone()))
             .collect();
-        let mut labsmb =
-            crate::smb::LabSmb::plan(&self.name, &self.lab_local, smb.host_port, &sharing);
-        let config = labsmb.build_config();
-        let port = match labsmb.spawn(config) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("SMB server failed to start: {e}");
-                output(format!(
-                    "WARNING: SMB server failed to start — shares will not mount: {e}\n"
-                ));
-                self.events
-                    .emit("smb.failed", json!({"error": e.to_string()}));
-                return;
+        // Work down the plan's free ports: one can be taken between the
+        // probe and the bind, and smbd can fail for reasons that have nothing
+        // to do with the port at all.
+        let mut started = None;
+        let mut last_err = String::new();
+        for port in &smb.host_ports {
+            let mut candidate =
+                crate::smb::LabSmb::plan(&self.name, &self.lab_local, *port, &sharing);
+            let config = candidate.build_config();
+            match candidate.spawn(config) {
+                Ok(p) => {
+                    started = Some((candidate, p));
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("smbd on port {port} failed: {e}");
+                    last_err = e.to_string();
+                }
             }
+        }
+        let Some((labsmb, port)) = started else {
+            tracing::warn!("SMB server failed to start: {last_err}");
+            output(format!(
+                "WARNING: SMB server failed to start — shares will not mount: {last_err}\n"
+            ));
+            self.events.emit("smb.failed", json!({"error": last_err}));
+            return;
         };
         tracing::info!("SMB server for lab {} on 127.0.0.1:{port}", self.name);
         output(format!(
@@ -837,8 +847,12 @@ impl LabRuntime {
                 .unwrap_or_default()
         };
         let plan = crate::smb::mount_plan(os_hint, &vm.virtiofs_mounts().await, smb_steps);
+        // A share the guest cannot mount is the author's to fix, so it goes
+        // on the event feed the console watches, not only into the log.
         for note in &plan.unsupported {
             tracing::warn!("{vm_name}: {note}");
+            self.events
+                .emit("share.unmountable", json!({"vm": vm_name, "reason": note}));
         }
         if plan.is_empty() {
             return;
@@ -947,11 +961,8 @@ impl LabRuntime {
     fn has_dependents(&self, name: &str) -> bool {
         self.config
             .lab
-            .vms
-            .iter()
-            .map(|v| &v.depends_on)
-            .chain(self.config.lab.containers.iter().map(|c| &c.depends_on))
-            .any(|deps| deps.iter().any(|d| d == name))
+            .machines()
+            .any(|m| m.depends_on().iter().any(|d| d == name))
     }
 
     /// Verify the external binaries starting `targets` will need are on PATH
@@ -1193,33 +1204,38 @@ impl LabRuntime {
             .await
     }
 
-    /// Each machine's lease address and first hardware address — the only
+    /// What the running network knows about `scope`'s machines — the only
     /// runtime state the [`forward_plan`] needs, gathered once so the plan
     /// itself touches no network. `scope` empty means the whole lab.
-    async fn forward_observations(
-        &self,
-        scope: &[String],
-    ) -> (
-        std::collections::HashMap<String, std::net::Ipv4Addr>,
-        std::collections::HashMap<String, crate::config::model::MacAddr>,
-    ) {
-        let mut leases = std::collections::HashMap::new();
-        let mut macs = std::collections::HashMap::new();
+    ///
+    /// The hardware address recorded is the one on the NIC actually holding
+    /// the lease, not simply the first: priming the NAT engine with a
+    /// multi-NIC machine's NIC-0 address for an address leased on NIC 1 would
+    /// point the engine at the wrong port.
+    async fn forward_observations(&self, scope: &[String]) -> forward_plan::Observed {
+        let mut observed = forward_plan::Observed::default();
         for m in self.machines() {
             let name = m.name().to_string();
             if !scope.is_empty() && !scope.contains(&name) {
                 continue;
             }
-            if let Some(mac) = m.macs().first() {
-                macs.insert(name.clone(), *mac);
+            let Ok(ips) = m.guest_ips().await else {
+                continue;
+            };
+            let leased = ips
+                .iter()
+                .enumerate()
+                .find_map(|(i, ip)| ip.as_ref().map(|ip| (i, ip)));
+            let Some((nic, ip)) = leased else { continue };
+            let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() else {
+                continue;
+            };
+            if let Some(mac) = m.macs().get(nic) {
+                observed.macs.insert(name.clone(), *mac);
             }
-            if let Ok(ip) = m.guest_ip(None).await
-                && let Ok(ip) = ip.parse::<std::net::Ipv4Addr>()
-            {
-                leases.insert(name, ip);
-            }
+            observed.leases.insert(name, ip);
         }
-        (leases, macs)
+        observed
     }
 
     /// Install one planned forward, returning its id and — for an ephemeral
@@ -1300,14 +1316,11 @@ impl LabRuntime {
         machine: &str,
         page: &str,
     ) -> Result<serde_json::Value> {
-        let scope = [machine.to_string()];
-        let (leases, macs) = self.forward_observations(&scope).await;
+        let observed = self.forward_observations(&[machine.to_string()]).await;
         let rule = forward_plan::web_page(
             &forward_plan::ForwardInputs {
                 lab: &self.config.lab,
-                machines: &scope,
-                leases: &leases,
-                macs: &macs,
+                observed: &observed,
             },
             machine,
             page,
@@ -1371,12 +1384,10 @@ impl LabRuntime {
     fn web_page_auth(&self, machine: &str, page: &str) -> Option<crate::config::model::WebAuth> {
         self.config
             .lab
-            .vms
+            .machine(machine)?
+            .web()
             .iter()
-            .map(|v| (&v.name, &v.web))
-            .chain(self.config.lab.containers.iter().map(|c| (&c.name, &c.web)))
-            .find(|(name, _)| name.as_str() == machine)
-            .and_then(|(_, pages)| pages.iter().find(|p| p.name == page))
+            .find(|p| p.name == page)
             .and_then(|p| p.auth.clone())
     }
 
@@ -1522,13 +1533,14 @@ impl LabRuntime {
     /// Best-effort — a forward that cannot be installed is announced on the
     /// event feed and the rest of the lab still works.
     async fn install_forwards(self: &Arc<Self>, scope: &[String]) {
-        let (leases, macs) = self.forward_observations(scope).await;
-        let plan = forward_plan::plan(&forward_plan::ForwardInputs {
-            lab: &self.config.lab,
-            machines: scope,
-            leases: &leases,
-            macs: &macs,
-        });
+        let observed = self.forward_observations(scope).await;
+        let plan = forward_plan::plan(
+            &forward_plan::ForwardInputs {
+                lab: &self.config.lab,
+                observed: &observed,
+            },
+            scope,
+        );
         self.announce_forward_plan(&plan);
 
         // Web pages bind on demand (`ensure_web_forward`) — the console needs

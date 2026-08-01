@@ -80,27 +80,9 @@ impl LabPlan {
 
 /// A machine's `depends_on`, whichever kind it is.
 fn deps_of(lab: &Lab, name: &str) -> Vec<String> {
-    lab.vms
-        .iter()
-        .find(|v| v.name == name)
-        .map(|v| v.depends_on.clone())
-        .or_else(|| {
-            lab.containers
-                .iter()
-                .find(|c| c.name == name)
-                .map(|c| c.depends_on.clone())
-        })
+    lab.machine(name)
+        .map(|m| m.depends_on().to_vec())
         .unwrap_or_default()
-}
-
-/// Every machine in the lab, in declaration order — VMs then containers, the
-/// order `status` and the waves both present them in.
-fn all_machines(lab: &Lab) -> Vec<String> {
-    lab.vms
-        .iter()
-        .map(|v| v.name.clone())
-        .chain(lab.containers.iter().map(|c| c.name.clone()))
-        .collect()
 }
 
 /// Work out what `direction` over `subset` will do.
@@ -113,7 +95,7 @@ fn all_machines(lab: &Lab) -> Vec<String> {
 /// Returns `Err` naming any machine that is not in the lab, and any dependency
 /// cycle, rather than discovering either mid-flight.
 pub fn plan(lab: &Lab, subset: &[String], direction: Direction) -> Result<LabPlan, String> {
-    let known: Vec<String> = all_machines(lab);
+    let known: Vec<String> = lab.machines().map(|m| m.name().to_string()).collect();
     for name in subset {
         if !known.contains(name) {
             return Err(format!(
@@ -233,31 +215,25 @@ pub fn plan(lab: &Lab, subset: &[String], direction: Direction) -> Result<LabPla
 /// model keeps provisions and playbooks in separate vecs.
 fn declared_steps(lab: &Lab) -> Vec<Step> {
     let mut steps: Vec<(usize, Step)> = Vec::new();
-    let mut collect = |machine: &str, provisions: &[Provision], playbooks: &[Playbook]| {
-        for p in provisions {
+    for m in lab.machines() {
+        for p in m.provisions() {
             steps.push((
                 p.span.0,
                 Step {
-                    machine: machine.to_string(),
+                    machine: m.name().to_string(),
                     kind: StepKind::Provision(p.clone()),
                 },
             ));
         }
-        for p in playbooks {
+        for p in m.playbooks() {
             steps.push((
                 p.span.0,
                 Step {
-                    machine: machine.to_string(),
+                    machine: m.name().to_string(),
                     kind: StepKind::Playbook(p.clone()),
                 },
             ));
         }
-    };
-    for vm in &lab.vms {
-        collect(&vm.name, &vm.provisions, &vm.playbooks);
-    }
-    for c in &lab.containers {
-        collect(&c.name, &c.provisions, &c.playbooks);
     }
     steps.sort_by_key(|(at, _)| *at);
     steps.into_iter().map(|(_, s)| s).collect()

@@ -41,6 +41,81 @@ pub struct Lab {
     pub sinkholes: Vec<SinkholeRule>,
 }
 
+/// One machine's declaration, whichever kind it is.
+///
+/// A machine is anything a lab boots and attaches to a segment, and VMs and
+/// containers share one name namespace. Most of what the daemon asks a
+/// declaration for — its NICs, its web pages, what it depends on, the
+/// configuration steps it declares — is the same question for both kinds, and
+/// asking it used to mean writing out the "look in `vms`, then look in
+/// `containers`" walk again.
+#[derive(Debug, Clone, Copy)]
+pub enum MachineCfg<'a> {
+    Vm(&'a Vm),
+    Container(&'a Container),
+}
+
+impl<'a> MachineCfg<'a> {
+    pub fn name(&self) -> &'a str {
+        match self {
+            MachineCfg::Vm(v) => &v.name,
+            MachineCfg::Container(c) => &c.name,
+        }
+    }
+
+    pub fn nics(&self) -> &'a [Nic] {
+        match self {
+            MachineCfg::Vm(v) => &v.nics,
+            MachineCfg::Container(c) => &c.nics,
+        }
+    }
+
+    pub fn web(&self) -> &'a [WebPage] {
+        match self {
+            MachineCfg::Vm(v) => &v.web,
+            MachineCfg::Container(c) => &c.web,
+        }
+    }
+
+    pub fn depends_on(&self) -> &'a [String] {
+        match self {
+            MachineCfg::Vm(v) => &v.depends_on,
+            MachineCfg::Container(c) => &c.depends_on,
+        }
+    }
+
+    pub fn provisions(&self) -> &'a [Provision] {
+        match self {
+            MachineCfg::Vm(v) => &v.provisions,
+            MachineCfg::Container(c) => &c.provisions,
+        }
+    }
+
+    pub fn playbooks(&self) -> &'a [Playbook] {
+        match self {
+            MachineCfg::Vm(v) => &v.playbooks,
+            MachineCfg::Container(c) => &c.playbooks,
+        }
+    }
+}
+
+impl Lab {
+    /// Every machine in declaration order — VMs then containers, the order
+    /// `status` and the `up` waves both present them in.
+    pub fn machines(&self) -> impl Iterator<Item = MachineCfg<'_>> {
+        self.vms
+            .iter()
+            .map(MachineCfg::Vm)
+            .chain(self.containers.iter().map(MachineCfg::Container))
+    }
+
+    /// One machine by name. There is one namespace to look in, so a name that
+    /// answers here is not also a machine of the other kind.
+    pub fn machine(&self, name: &str) -> Option<MachineCfg<'_>> {
+        self.machines().find(|m| m.name() == name)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Segment {
     pub name: String,

@@ -76,11 +76,17 @@ pub struct SmbExport {
 /// The bundled SMB server, present only when something actually needs it.
 #[derive(Debug, Clone)]
 pub struct SmbPlan {
-    /// The free localhost port `smbd` takes.
-    pub host_port: u16,
+    /// The free localhost ports to try, in range order, first choice first.
+    /// Never empty — a range with nothing free is a [`SharePlanError`].
+    ///
+    /// More than one, because a port free when the plan was computed can be
+    /// taken by the time `smbd` binds it, and because `smbd` can fail to come
+    /// up for reasons that have nothing to do with the port. The executor
+    /// works down the list.
+    pub host_ports: Vec<u16>,
     pub exports: Vec<SmbExport>,
-    /// Segments needing `gateway:445 → 127.0.0.1:host_port`, so a guest
-    /// mounting `\\<gateway>\<share>` reaches the local smbd through NAT.
+    /// Segments needing `gateway:445 → 127.0.0.1:<the port smbd took>`, so a
+    /// guest mounting `\\<gateway>\<share>` reaches the local smbd through NAT.
     pub gateway_segments: Vec<String>,
     /// Containers whose volumes mount over CIFS, with the gateway their
     /// cinit mounts from.
@@ -182,13 +188,66 @@ pub struct ShareInputs<'a> {
     pub gateways: &'a BTreeMap<String, Ipv4Addr>,
 }
 
+/// The half-built plan, so the two machine kinds can hand their SMB exports
+/// to one routine instead of writing the same "no nic → skip, no gateway →
+/// skip, export, remember the segment" block out twice.
+#[derive(Default)]
+struct Building {
+    virtiofs: Vec<VirtiofsShare>,
+    exports: Vec<SmbExport>,
+    gateway_segments: Vec<String>,
+    volume_gateways: Vec<(String, Ipv4Addr)>,
+    skipped: Vec<Skip>,
+}
+
+impl Building {
+    /// Export `shares` for `machine` at its first NIC's segment gateway, or
+    /// record why they cannot be served.
+    ///
+    /// `what` names the machine the way a skip should read it; `nic_why` is
+    /// what to say when it has no NIC, which differs by kind because a VM's
+    /// share and a container's volume are declared differently.
+    fn export(
+        &mut self,
+        inputs: &ShareInputs,
+        machine: &str,
+        nics: &[crate::config::model::Nic],
+        shares: Vec<Share>,
+        what: String,
+        nic_why: &str,
+    ) -> Option<Ipv4Addr> {
+        // Validated (§5.1): a machine with a non-virtiofs share has a NIC. A
+        // segment with no gateway cannot carry the DNAT, so say so rather
+        // than exporting shares nothing can reach.
+        let Some(segment) = nics.first().map(nic_segment_name) else {
+            self.skipped.push(Skip {
+                what,
+                why: nic_why.to_string(),
+            });
+            return None;
+        };
+        let Some(gateway) = inputs.gateways.get(segment).copied() else {
+            self.skipped.push(Skip {
+                what,
+                why: format!("segment \"{segment}\" has no gateway to serve them at"),
+            });
+            return None;
+        };
+        self.exports.push(SmbExport {
+            machine: machine.to_string(),
+            gateway,
+            shares,
+        });
+        if !self.gateway_segments.iter().any(|s| s == segment) {
+            self.gateway_segments.push(segment.to_string());
+        }
+        Some(gateway)
+    }
+}
+
 /// Work out where every share in the lab goes.
 pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, SharePlanError> {
-    let mut virtiofs = Vec::new();
-    let mut exports: Vec<SmbExport> = Vec::new();
-    let mut gateway_segments: Vec<String> = Vec::new();
-    let mut volume_gateways: Vec<(String, Ipv4Addr)> = Vec::new();
-    let mut skipped = Vec::new();
+    let mut b = Building::default();
 
     // -- VM `share {}` blocks --------------------------------------------
     for vm in &inputs.lab.vms {
@@ -204,7 +263,7 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
         for (i, share) in vm.shares.iter().enumerate() {
             let host = resolve_share_host(inputs.root, inputs.home, &share.host);
             match transport_of(share.transport, inputs.host_virtiofsd, guest_ok) {
-                Transport::Virtiofs => virtiofs.push(VirtiofsShare {
+                Transport::Virtiofs => b.virtiofs.push(VirtiofsShare {
                     machine: vm.name.clone(),
                     index: i,
                     name: share.name.clone(),
@@ -222,31 +281,14 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
         if smb_shares.is_empty() {
             continue;
         }
-        // Validated (§5.1): a VM with a non-virtiofs share has a NIC. A
-        // segment with no gateway cannot carry the DNAT, so say so rather
-        // than exporting shares nothing can reach.
-        let Some(segment) = vm.nics.first().map(nic_segment_name) else {
-            skipped.push(Skip {
-                what: format!("vm \"{}\": smb shares", vm.name),
-                why: "no nic — an smb share is reachable only over a segment".into(),
-            });
-            continue;
-        };
-        let Some(gateway) = inputs.gateways.get(segment).copied() else {
-            skipped.push(Skip {
-                what: format!("vm \"{}\": smb shares", vm.name),
-                why: format!("segment \"{segment}\" has no gateway to serve them at"),
-            });
-            continue;
-        };
-        exports.push(SmbExport {
-            machine: vm.name.clone(),
-            gateway,
-            shares: smb_shares,
-        });
-        if !gateway_segments.iter().any(|s| s == segment) {
-            gateway_segments.push(segment.to_string());
-        }
+        b.export(
+            inputs,
+            &vm.name,
+            &vm.nics,
+            smb_shares,
+            format!("vm \"{}\": smb shares", vm.name),
+            "no nic — an smb share is reachable only over a segment",
+        );
     }
 
     // -- container `volume {}` blocks ------------------------------------
@@ -259,9 +301,9 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
             continue;
         }
         let hosts = resolve_volume_hosts(c, inputs.root);
-        if inputs.host_virtiofsd {
+        if container_volume_transport(inputs.host_virtiofsd) == Transport::Virtiofs {
             for (i, ((name, host, readonly), vol)) in hosts.iter().zip(&c.volumes).enumerate() {
-                virtiofs.push(VirtiofsShare {
+                b.virtiofs.push(VirtiofsShare {
                     machine: c.name.clone(),
                     index: i,
                     name: name.clone(),
@@ -272,21 +314,6 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
             }
             continue;
         }
-        // Validated (§5.1): volumes require a NIC.
-        let Some(segment) = c.nics.first().map(nic_segment_name) else {
-            skipped.push(Skip {
-                what: format!("container \"{}\": volumes", c.name),
-                why: "no nic — a cifs volume is reachable only over a segment".into(),
-            });
-            continue;
-        };
-        let Some(gateway) = inputs.gateways.get(segment).copied() else {
-            skipped.push(Skip {
-                what: format!("container \"{}\": volumes", c.name),
-                why: format!("segment \"{segment}\" has no gateway to serve them at"),
-            });
-            continue;
-        };
         // The guest target rides along for smb.conf comments only; read it
         // from the config (1:1 with the resolved exports) so the plan does
         // not depend on the image being pulled yet.
@@ -303,37 +330,56 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
                 transport: ShareTransport::Smb,
             })
             .collect();
-        exports.push(SmbExport {
-            machine: c.name.clone(),
-            gateway,
+        if let Some(gateway) = b.export(
+            inputs,
+            &c.name,
+            &c.nics,
             shares,
-        });
-        volume_gateways.push((c.name.clone(), gateway));
-        if !gateway_segments.iter().any(|s| s == segment) {
-            gateway_segments.push(segment.to_string());
+            format!("container \"{}\": volumes", c.name),
+            "no nic — a cifs volume is reachable only over a segment",
+        ) {
+            b.volume_gateways.push((c.name.clone(), gateway));
         }
     }
 
-    check_collisions(&virtiofs, &exports)?;
+    check_collisions(&b.virtiofs, &b.exports)?;
 
-    let smb = if exports.is_empty() {
+    let smb = if b.exports.is_empty() {
         None
     } else {
         Some(SmbPlan {
-            host_port: free_port(ports)?,
-            exports,
-            gateway_segments,
-            volume_gateways,
+            host_ports: free_ports(ports)?,
+            exports: b.exports,
+            gateway_segments: b.gateway_segments,
+            volume_gateways: b.volume_gateways,
         })
     };
     Ok(SharePlan {
-        virtiofs,
+        virtiofs: b.virtiofs,
         smb,
-        skipped,
+        skipped: b.skipped,
     })
 }
 
-/// Which transport one declared share takes.
+/// Which transport a container's volumes ride, all together.
+///
+/// Containers declare no per-volume transport and the micro-VM's init mounts
+/// either, so there is no per-guest capability question: the whole set
+/// follows the host (PRD §18).
+///
+/// A vhost-user-fs device cannot hotplug, so this is decided again at machine
+/// start rather than read off the plan. Both sites call *this*, which is what
+/// keeps the plan's placement and what the machine actually attaches from
+/// drifting apart — the same arrangement [`transport_of`] gives VM shares.
+pub fn container_volume_transport(host_virtiofsd: bool) -> Transport {
+    if host_virtiofsd {
+        Transport::Virtiofs
+    } else {
+        Transport::Smb
+    }
+}
+
+/// Which transport one declared VM share takes.
 ///
 /// An explicit `transport = "virtiofs"` always rides virtiofs — a host with
 /// no virtiofsd errors at machine start rather than silently degrading. `smb`
@@ -397,16 +443,20 @@ fn check_collisions(
     Ok(())
 }
 
-/// The first free port in the range, or a diagnosable failure. Walking
+/// Every free port in the range, in order, or a diagnosable failure. Walking
 /// upward rather than taking an ephemeral port keeps the number predictable
 /// for anyone reading the smb.conf.
-fn free_port(ports: &dyn PortProbe) -> Result<u16, SharePlanError> {
-    (SMB_PORT_BASE..SMB_PORT_BASE + SMB_PORT_TRIES)
-        .find(|p| ports.is_free(*p))
-        .ok_or(SharePlanError::NoFreePort {
+fn free_ports(ports: &dyn PortProbe) -> Result<Vec<u16>, SharePlanError> {
+    let free: Vec<u16> = (SMB_PORT_BASE..SMB_PORT_BASE + SMB_PORT_TRIES)
+        .filter(|p| ports.is_free(*p))
+        .collect();
+    if free.is_empty() {
+        return Err(SharePlanError::NoFreePort {
             base: SMB_PORT_BASE,
             tries: SMB_PORT_TRIES,
-        })
+        });
+    }
+    Ok(free)
 }
 
 #[cfg(test)]
@@ -687,22 +737,27 @@ lab "l" {
     fn the_server_takes_the_first_free_port_in_the_range() {
         let lab = mixed();
         let host = Host::bare();
+        let all = plan_on(&lab, &host, &AllFree).unwrap().smb.unwrap();
+        assert_eq!(all.host_ports[0], SMB_PORT_BASE);
+        assert_eq!(all.host_ports.len(), SMB_PORT_TRIES as usize);
+
+        let held = plan_on(&lab, &host, &Held(3)).unwrap().smb.unwrap();
         assert_eq!(
-            plan_on(&lab, &host, &AllFree)
-                .unwrap()
-                .smb
-                .unwrap()
-                .host_port,
-            SMB_PORT_BASE
-        );
-        assert_eq!(
-            plan_on(&lab, &host, &Held(3))
-                .unwrap()
-                .smb
-                .unwrap()
-                .host_port,
+            held.host_ports[0],
             SMB_PORT_BASE + 3,
             "three earlier ports held by another lab"
+        );
+    }
+
+    /// A port free at plan time can be taken by the time smbd binds it, and
+    /// smbd can fail for reasons that are nothing to do with the port — so
+    /// the plan offers the executor every free port, not just the best one.
+    #[test]
+    fn the_plan_carries_a_fallback_for_every_free_port() {
+        let plan = plan_on(&mixed(), &Host::bare(), &Held(8)).unwrap();
+        assert_eq!(
+            plan.smb.unwrap().host_ports,
+            [SMB_PORT_BASE + 8, SMB_PORT_BASE + 9]
         );
     }
 

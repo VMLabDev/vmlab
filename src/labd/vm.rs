@@ -13,7 +13,7 @@ use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, VmPaths};
 use crate::qmp::QmpClient;
-pub use crate::smb::VirtiofsMount;
+use crate::smb::VirtiofsMount;
 
 use super::hypervisor::{Control, Hypervisor, Process};
 

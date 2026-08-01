@@ -14,8 +14,10 @@
 //!
 //! Two things the old routines did silently, this says out loud: a forward
 //! whose machine has no lease is [`Skip`]ped with a reason rather than
-//! dropped, and two forwards claiming one host port are reported as a
-//! [`HostPortConflict`] at plan time rather than discovered at bind time.
+//! dropped, and two forwards claiming one host port are settled here as a
+//! [`HostPortConflict`] — the first claimant keeps the port, the rest are
+//! dropped naming the winner — rather than all being installed and the
+//! losers failing at bind time with nothing to say why.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -76,10 +78,11 @@ pub struct ForwardRule {
     pub prime_mac: Option<MacAddr>,
 }
 
-/// Two or more forwards claiming one host port. Config validation already
-/// rejects this within a lab file; the plan catches whatever reaches it
-/// anyway — a partial `up`, or a rule composed from more than one source —
-/// before the loser fails at bind time with nothing to name it.
+/// Two or more forwards claiming one host port, in plan order. Config
+/// validation already rejects this within a lab file; the plan catches
+/// whatever reaches it anyway — a partial `up`, or a rule composed from more
+/// than one source. The first claimant keeps the port; every other is dropped
+/// from [`ForwardPlan::rules`] and appears in `skipped` naming the winner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPortConflict {
     pub host_port: u16,
@@ -95,63 +98,64 @@ pub struct ForwardPlan {
     pub conflicts: Vec<HostPortConflict>,
 }
 
+/// What the running network knows about the lab's machines: which address
+/// each one's lease holds, and the hardware address that lease sits behind.
+/// Gathering it is the caller's job — the plan itself touches no network.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Observed {
+    /// Absent = no lease yet.
+    pub leases: HashMap<String, Ipv4Addr>,
+    /// The hardware address of the NIC holding the lease, for NAT priming.
+    pub macs: HashMap<String, MacAddr>,
+}
+
 /// What the plan needs to know that is not in the lab file.
 pub struct ForwardInputs<'a> {
     pub lab: &'a Lab,
-    /// Plan only for these machines; empty means the whole lab.
-    pub machines: &'a [String],
-    /// The address each machine's lease holds. Absent = no lease yet.
-    pub leases: &'a HashMap<String, Ipv4Addr>,
-    /// Each machine's first hardware address, for NAT priming.
-    pub macs: &'a HashMap<String, MacAddr>,
+    pub observed: &'a Observed,
 }
 
 impl ForwardInputs<'_> {
-    fn in_scope(&self, machine: &str) -> bool {
-        self.machines.is_empty() || self.machines.iter().any(|m| m == machine)
-    }
-
     /// The segment a machine's forwards ride: its first NIC's. `None` when it
     /// has no NIC — validation requires one for ports and web pages, so this
     /// only fires on a lab that got past validation with neither.
     fn first_segment(&self, machine: &str) -> Option<&str> {
-        let nics = self
-            .lab
-            .vms
-            .iter()
-            .find(|v| v.name == machine)
-            .map(|v| &v.nics)
-            .or_else(|| {
-                self.lab
-                    .containers
-                    .iter()
-                    .find(|c| c.name == machine)
-                    .map(|c| &c.nics)
-            })?;
-        nics.first().map(nic_segment_name)
-    }
-
-    fn knows(&self, machine: &str) -> bool {
-        self.lab.vms.iter().any(|v| v.name == machine)
-            || self.lab.containers.iter().any(|c| c.name == machine)
+        self.lab
+            .machine(machine)?
+            .nics()
+            .first()
+            .map(nic_segment_name)
     }
 }
 
-/// Work out every forward the lab requires.
+/// One forward before its runtime address is known — everything the
+/// declaration itself decides.
+struct Draft {
+    machine: String,
+    segment: String,
+    host: HostBinding,
+    guest_port: u16,
+    proto: Proto,
+    source: ForwardSource,
+}
+
+/// Work out every forward the lab requires. `scope` narrows it to those
+/// machines; empty means the whole lab.
 ///
 /// Order is declaration order: segment `forward {}` blocks first, then
 /// container `port {}` blocks, then `web {}` pages — VMs before containers
 /// within each.
-pub fn plan(inputs: &ForwardInputs) -> ForwardPlan {
+pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
     let mut plan = ForwardPlan::default();
+    let in_scope = |machine: &str| scope.is_empty() || scope.iter().any(|m| m == machine);
 
     // Segment `forward {}` blocks name their own segment and their target.
     for seg in &inputs.lab.segments {
         for fwd in &seg.forwards {
-            if !inputs.in_scope(&fwd.vm) {
+            if !in_scope(&fwd.vm) {
                 continue;
             }
-            if !inputs.knows(&fwd.vm) {
+            if inputs.lab.machine(&fwd.vm).is_none() {
                 plan.skipped.push(Skip {
                     what: format!("forward {} → \"{}\"", fwd.host_port, fwd.vm),
                     why: "no such vm or container in the lab".into(),
@@ -161,72 +165,71 @@ pub fn plan(inputs: &ForwardInputs) -> ForwardPlan {
             push(
                 &mut plan,
                 inputs,
-                &fwd.vm,
-                seg.name.clone(),
-                HostBinding::Port(fwd.host_port),
-                fwd.guest_port,
-                fwd.proto,
-                ForwardSource::Declared,
+                Draft {
+                    machine: fwd.vm.clone(),
+                    segment: seg.name.clone(),
+                    host: HostBinding::Port(fwd.host_port),
+                    guest_port: fwd.guest_port,
+                    proto: fwd.proto,
+                    source: ForwardSource::Declared,
+                },
             );
         }
     }
 
     // Container `port {}` blocks land on the container's own segment.
     for c in &inputs.lab.containers {
-        if !inputs.in_scope(&c.name) {
+        if !in_scope(&c.name) {
             continue;
         }
         for port in &c.ports {
-            let Some(segment) =
-                segment_or_skip(&mut plan, inputs, &c.name, &ForwardSource::ContainerPort)
-            else {
+            let source = ForwardSource::ContainerPort;
+            let Some(segment) = segment_or_skip(&mut plan, inputs, &c.name, &source) else {
                 continue;
             };
             push(
                 &mut plan,
                 inputs,
-                &c.name,
-                segment,
-                HostBinding::Port(port.host_port),
-                port.container_port,
-                port.proto,
-                ForwardSource::ContainerPort,
+                Draft {
+                    machine: c.name.clone(),
+                    segment,
+                    host: HostBinding::Port(port.host_port),
+                    guest_port: port.container_port,
+                    proto: port.proto,
+                    source,
+                },
             );
         }
     }
 
     // `web {}` pages take an ephemeral loopback port the console proxies to.
-    let web_pages = inputs
-        .lab
-        .vms
-        .iter()
-        .map(|v| (&v.name, &v.web))
-        .chain(inputs.lab.containers.iter().map(|c| (&c.name, &c.web)));
-    for (machine, pages) in web_pages {
-        if !inputs.in_scope(machine) {
+    for m in inputs.lab.machines() {
+        if !in_scope(m.name()) {
             continue;
         }
-        for page in pages {
+        for page in m.web() {
             let source = ForwardSource::WebPage {
                 page: page.name.clone(),
             };
-            let Some(segment) = segment_or_skip(&mut plan, inputs, machine, &source) else {
+            let Some(segment) = segment_or_skip(&mut plan, inputs, m.name(), &source) else {
                 continue;
             };
             push(
                 &mut plan,
                 inputs,
-                machine,
-                segment,
-                HostBinding::Ephemeral,
-                page.port,
-                Proto::Tcp,
-                source,
+                Draft {
+                    machine: m.name().to_string(),
+                    segment,
+                    host: HostBinding::Ephemeral,
+                    guest_port: page.port,
+                    proto: Proto::Tcp,
+                    source,
+                },
             );
         }
     }
 
-    plan.conflicts = conflicts(&plan.rules);
+    resolve_conflicts(&mut plan);
     plan
 }
 
@@ -234,51 +237,29 @@ pub fn plan(inputs: &ForwardInputs) -> ForwardPlan {
 /// The console asks for these one at a time, so it gets the one rule rather
 /// than the whole plan.
 pub fn web_page(inputs: &ForwardInputs, machine: &str, page: &str) -> Result<ForwardRule, String> {
-    if !inputs.knows(machine) {
+    let Some(declared) = inputs.lab.machine(machine) else {
         return Err(format!(
             "no machine \"{machine}\" in lab \"{}\"",
             inputs.lab.name
         ));
+    };
+    if !declared.web().iter().any(|p| p.name == page) {
+        return Err(format!("no web page \"{page}\" on \"{machine}\""));
     }
-    let scope = [machine.to_string()];
-    let plan = plan(&ForwardInputs {
-        lab: inputs.lab,
-        machines: &scope,
-        leases: inputs.leases,
-        macs: inputs.macs,
-    });
+    let plan = plan(inputs, &[machine.to_string()]);
     let wanted = ForwardSource::WebPage {
         page: page.to_string(),
     };
     if let Some(rule) = plan.rules.into_iter().find(|r| r.source == wanted) {
         return Ok(rule);
     }
-    // Not planned: either the page is not declared, or something stopped it.
-    let declared = declares_page(inputs.lab, machine, page);
-    if !declared {
-        return Err(format!("no web page \"{page}\" on \"{machine}\""));
-    }
+    // Declared but not planned — the plan recorded why.
     Err(plan
         .skipped
         .iter()
         .find(|s| s.what.contains(&format!("web page \"{page}\"")))
         .map(|s| s.why.clone())
         .unwrap_or_else(|| format!("web page \"{page}\" on \"{machine}\" cannot be forwarded")))
-}
-
-fn declares_page(lab: &Lab, machine: &str, page: &str) -> bool {
-    let pages = lab
-        .vms
-        .iter()
-        .find(|v| v.name == machine)
-        .map(|v| &v.web)
-        .or_else(|| {
-            lab.containers
-                .iter()
-                .find(|c| c.name == machine)
-                .map(|c| &c.web)
-        });
-    pages.is_some_and(|ps| ps.iter().any(|p| p.name == page))
 }
 
 /// The machine's first NIC's segment, recording a skip when it has none.
@@ -301,55 +282,68 @@ fn segment_or_skip(
 }
 
 /// Add one rule, or record why it cannot be planned.
-#[allow(clippy::too_many_arguments)]
-fn push(
-    plan: &mut ForwardPlan,
-    inputs: &ForwardInputs,
-    machine: &str,
-    segment: String,
-    host: HostBinding,
-    guest_port: u16,
-    proto: Proto,
-    source: ForwardSource,
-) {
-    let Some(guest_ip) = inputs.leases.get(machine).copied() else {
+fn push(plan: &mut ForwardPlan, inputs: &ForwardInputs, draft: Draft) {
+    let Some(guest_ip) = inputs.observed.leases.get(&draft.machine).copied() else {
         plan.skipped.push(Skip {
-            what: format!("\"{machine}\": {}", source.describe()),
+            what: format!("\"{}\": {}", draft.machine, draft.source.describe()),
             why: "no lease — is it running and ready?".into(),
         });
         return;
     };
+    let prime_mac = inputs.observed.macs.get(&draft.machine).copied();
     plan.rules.push(ForwardRule {
-        machine: machine.to_string(),
-        segment,
-        host,
+        machine: draft.machine,
+        segment: draft.segment,
+        host: draft.host,
         guest_ip,
-        guest_port,
-        proto,
-        source,
-        prime_mac: inputs.macs.get(machine).copied(),
+        guest_port: draft.guest_port,
+        proto: draft.proto,
+        source: draft.source,
+        prime_mac,
     });
 }
 
-/// Host ports claimed more than once, in port order.
-fn conflicts(rules: &[ForwardRule]) -> Vec<HostPortConflict> {
-    let mut by_port: std::collections::BTreeMap<u16, Vec<String>> = Default::default();
-    for r in rules {
+/// Settle every host port claimed more than once: the first claimant in plan
+/// order keeps it, the rest are dropped with a reason naming the winner.
+///
+/// Dropping them is the point. Installing all of them and letting the losers
+/// fail at bind time is what this used to do, and a bind failure names
+/// neither the winner nor the fact that there was a contest.
+fn resolve_conflicts(plan: &mut ForwardPlan) {
+    let mut claims: std::collections::BTreeMap<u16, Vec<usize>> = Default::default();
+    for (i, r) in plan.rules.iter().enumerate() {
         if let HostBinding::Port(p) = r.host {
-            by_port
-                .entry(p)
-                .or_default()
-                .push(format!("{}: {}", r.machine, r.source.describe()));
+            claims.entry(p).or_default().push(i);
         }
     }
-    by_port
-        .into_iter()
-        .filter(|(_, claimants)| claimants.len() > 1)
-        .map(|(host_port, claimants)| HostPortConflict {
+    let mut dropped: Vec<usize> = Vec::new();
+    for (host_port, claimants) in claims {
+        if claimants.len() < 2 {
+            continue;
+        }
+        let describe = |i: &usize| {
+            let r = &plan.rules[*i];
+            format!("{}: {}", r.machine, r.source.describe())
+        };
+        let winner = describe(&claimants[0]);
+        for loser in &claimants[1..] {
+            plan.skipped.push(Skip {
+                what: describe(loser),
+                why: format!("host port {host_port} is already claimed by {winner}"),
+            });
+            dropped.push(*loser);
+        }
+        plan.conflicts.push(HostPortConflict {
             host_port,
-            claimants,
-        })
-        .collect()
+            claimants: claimants.iter().map(describe).collect(),
+        });
+    }
+    let mut i = 0;
+    plan.rules.retain(|_| {
+        let keep = !dropped.contains(&i);
+        i += 1;
+        keep
+    });
 }
 
 #[cfg(test)]
@@ -388,11 +382,6 @@ lab "l" {
         )
     }
 
-    struct Observed {
-        leases: HashMap<String, Ipv4Addr>,
-        macs: HashMap<String, MacAddr>,
-    }
-
     fn leased(pairs: &[(&str, u8)]) -> Observed {
         Observed {
             leases: pairs.iter().map(|(n, l)| (n.to_string(), ip(*l))).collect(),
@@ -403,13 +392,8 @@ lab "l" {
         }
     }
 
-    fn inputs<'a>(lab: &'a Lab, obs: &'a Observed, machines: &'a [String]) -> ForwardInputs<'a> {
-        ForwardInputs {
-            lab,
-            machines,
-            leases: &obs.leases,
-            macs: &obs.macs,
-        }
+    fn inputs<'a>(lab: &'a Lab, observed: &'a Observed) -> ForwardInputs<'a> {
+        ForwardInputs { lab, observed }
     }
 
     /// One plan, all three sources — the whole point of collapsing the three
@@ -418,7 +402,7 @@ lab "l" {
     fn every_source_lands_in_one_plan() {
         let lab = every_source();
         let obs = leased(&[("web", 10), ("cache", 11)]);
-        let p = plan(&inputs(&lab, &obs, &[]));
+        let p = plan(&inputs(&lab, &obs), &[]);
         let sources: Vec<&ForwardSource> = p.rules.iter().map(|r| &r.source).collect();
         assert_eq!(
             sources,
@@ -439,7 +423,7 @@ lab "l" {
     fn a_rule_carries_its_segment_lease_and_priming_mac() {
         let lab = every_source();
         let obs = leased(&[("web", 10), ("cache", 11)]);
-        let p = plan(&inputs(&lab, &obs, &[]));
+        let p = plan(&inputs(&lab, &obs), &[]);
         let declared = &p.rules[0];
         assert_eq!(declared.machine, "web");
         assert_eq!(declared.segment, "lan");
@@ -461,7 +445,7 @@ lab "l" {
     fn a_web_page_binds_an_ephemeral_port() {
         let lab = every_source();
         let obs = leased(&[("web", 10)]);
-        let rule = web_page(&inputs(&lab, &obs, &[]), "web", "admin").unwrap();
+        let rule = web_page(&inputs(&lab, &obs), "web", "admin").unwrap();
         assert_eq!(rule.host, HostBinding::Ephemeral);
         assert_eq!(rule.guest_port, 9000);
         assert_eq!(rule.proto, Proto::Tcp);
@@ -473,7 +457,7 @@ lab "l" {
     fn a_missing_lease_is_reported_not_skipped_silently() {
         let lab = every_source();
         let obs = leased(&[("cache", 11)]); // web never got a lease
-        let p = plan(&inputs(&lab, &obs, &[]));
+        let p = plan(&inputs(&lab, &obs), &[]);
         assert_eq!(
             p.rules.len(),
             1,
@@ -490,7 +474,7 @@ lab "l" {
     fn a_web_page_without_a_lease_says_why() {
         let lab = every_source();
         let obs = leased(&[]);
-        let err = web_page(&inputs(&lab, &obs, &[]), "web", "admin").unwrap_err();
+        let err = web_page(&inputs(&lab, &obs), "web", "admin").unwrap_err();
         assert!(err.contains("no lease"), "{err}");
     }
 
@@ -498,9 +482,9 @@ lab "l" {
     fn an_undeclared_web_page_is_named() {
         let lab = every_source();
         let obs = leased(&[("web", 10)]);
-        let err = web_page(&inputs(&lab, &obs, &[]), "web", "nope").unwrap_err();
+        let err = web_page(&inputs(&lab, &obs), "web", "nope").unwrap_err();
         assert!(err.contains("no web page \"nope\""), "{err}");
-        let err = web_page(&inputs(&lab, &obs, &[]), "ghost", "admin").unwrap_err();
+        let err = web_page(&inputs(&lab, &obs), "ghost", "admin").unwrap_err();
         assert!(err.contains("no machine \"ghost\""), "{err}");
     }
 
@@ -521,7 +505,7 @@ lab "l" {
 }"#,
         );
         let obs = leased(&[("a", 10), ("b", 11)]);
-        let p = plan(&inputs(&lab, &obs, &[]));
+        let p = plan(&inputs(&lab, &obs), &[]);
         assert_eq!(p.conflicts.len(), 1, "{p:#?}");
         assert_eq!(p.conflicts[0].host_port, 8080);
         assert_eq!(
@@ -544,7 +528,7 @@ lab "l" {
 }"#,
         );
         let obs = leased(&[("a", 10)]);
-        let p = plan(&inputs(&lab, &obs, &[]));
+        let p = plan(&inputs(&lab, &obs), &[]);
         assert_eq!(p.rules.len(), 2);
         assert!(p.conflicts.is_empty(), "{p:#?}");
     }
@@ -556,7 +540,7 @@ lab "l" {
     fn a_scoped_plan_ignores_other_machines() {
         let lab = every_source();
         let obs = leased(&[("cache", 11)]);
-        let p = plan(&inputs(&lab, &obs, &["cache".to_string()]));
+        let p = plan(&inputs(&lab, &obs), &["cache".to_string()]);
         assert_eq!(p.rules.len(), 1);
         assert_eq!(p.rules[0].machine, "cache");
         assert!(p.skipped.is_empty(), "{:#?}", p.skipped);
@@ -576,7 +560,7 @@ lab "l" {
 }"#,
         );
         let obs = leased(&[("a", 10)]);
-        let p = plan(&inputs(&lab, &obs, &[]));
+        let p = plan(&inputs(&lab, &obs), &[]);
         assert!(p.rules.is_empty());
         assert_eq!(p.skipped.len(), 1);
         assert!(p.skipped[0].what.contains("ghost"), "{:#?}", p.skipped);
@@ -592,8 +576,30 @@ lab "l" {
             leases: HashMap::from([("cache".to_string(), ip(11))]),
             macs: HashMap::new(),
         };
-        let p = plan(&inputs(&lab, &obs, &["cache".to_string()]));
+        let p = plan(&inputs(&lab, &obs), &["cache".to_string()]);
         assert_eq!(p.rules.len(), 1);
         assert_eq!(p.rules[0].prime_mac, None);
+    }
+
+    /// Every rule primes, whatever kind of machine it targets. A VM that
+    /// never originates egress is as unreachable as a container that does
+    /// not — the engine broadcasts the SYN either way, and a guest TCP stack
+    /// drops broadcast-framed segments whichever guest it is.
+    #[test]
+    fn a_forward_to_a_vm_primes_the_nat_engine_too() {
+        let lab = every_source();
+        let obs = leased(&[("web", 10), ("cache", 11)]);
+        let p = plan(&inputs(&lab, &obs), &[]);
+        let declared = p
+            .rules
+            .iter()
+            .find(|r| r.source == ForwardSource::Declared)
+            .unwrap();
+        assert_eq!(declared.machine, "web", "a vm target");
+        assert_eq!(declared.prime_mac, Some(mac(10)));
+        assert!(
+            p.rules.iter().all(|r| r.prime_mac.is_some()),
+            "no rule is left unprimed: {p:#?}"
+        );
     }
 }
