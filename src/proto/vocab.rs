@@ -29,19 +29,63 @@ pub struct ArgSpec {
     pub ty: &'static str,
 }
 
-/// Why a command is deliberately reachable from one surface and no other.
+/// What a command reachable from one surface and no other has to say for
+/// itself.
 ///
 /// A one-way command is not automatically a gap — several only mean anything
 /// from one place — but nothing distinguishes a decision from an oversight
 /// unless the decision is written down. This is where it is written, and the
-/// coverage report renders it beside the command.
+/// coverage report renders it beside the command. Every one-way command
+/// carries one of these: `report::every_one_way_command_records_why` fails
+/// when one carries neither, so a command with a single caller is a decision
+/// made at declaration time rather than one a later audit discovers.
+///
+/// The two kinds are one enumeration rather than two independent fields
+/// because a command is one or the other, never both and never a blend, and
+/// three of the four combinations two fields allow would be nonsense.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OneWay {
-    /// The surface the command is reachable from, spelled as the coverage
-    /// report spells it — one of `report::SURFACES`, which a test checks.
-    pub surface: &'static str,
-    /// Why that is the only surface it belongs on.
-    pub why: &'static str,
+pub enum OneWay {
+    /// A decision: this command belongs on this surface and no other, for
+    /// this reason.
+    Deliberate {
+        /// The surface the command is reachable from, spelled as the coverage
+        /// report spells it — one of `report::SURFACES`, which a test checks.
+        surface: &'static str,
+        /// Why that is the only surface it belongs on.
+        why: &'static str,
+    },
+    /// No decision: the command reaches one surface because nobody wrote the
+    /// other half, and `issue` tracks the question.
+    ///
+    /// This asserts nothing about whether the asymmetry is right, which is
+    /// exactly why it is not a [`Deliberate`](Self::Deliberate) with a reason
+    /// reading "unknown" — the report separates the two lists, and a reason
+    /// field used loosely would collapse the distinction the whole exercise
+    /// draws.
+    ///
+    /// The annotation self-cleans in one direction only. Close the *gap* by
+    /// giving the command a second caller and
+    /// `report::an_annotated_command_is_still_one_way` fails, so the report
+    /// cannot advertise a gap already closed. Close the *issue* while the gap
+    /// stays open and nothing notices: no test can reach GitHub, and building
+    /// issue-state checking for this is deliberately not worth it.
+    Gap {
+        /// As [`Deliberate::surface`](Self::Deliberate).
+        surface: &'static str,
+        /// The issue tracking whether this asymmetry should close.
+        issue: u32,
+    },
+}
+
+impl OneWay {
+    /// The surface the command is reachable from, whichever kind this is.
+    /// Both checks the report makes are about the surface, and neither cares
+    /// which kind made the claim.
+    pub fn surface(&self) -> &'static str {
+        match self {
+            Self::Deliberate { surface, .. } | Self::Gap { surface, .. } => surface,
+        }
+    }
 }
 
 /// One command of one vocabulary: what it is called on the wire, what it
@@ -55,9 +99,10 @@ pub struct CommandSpec {
     pub args: &'static [ArgSpec],
     /// The variant's doc comment, one line per `///`.
     pub doc: &'static str,
-    /// Why this command is reachable from one surface only, when that is a
-    /// decision somebody made. `None` means nobody has decided — which is the
-    /// honest state of an asymmetry nobody has looked at.
+    /// What this command says about being reachable from one surface only:
+    /// the reason, or the issue tracking the gap. `None` is legal in the type
+    /// and illegal in the repo — it means a command reachable from more than
+    /// one surface, and a test rejects it on one that is not.
     pub one_way: Option<OneWay>,
 }
 
@@ -110,23 +155,41 @@ pub trait WireRequest: Serialize + DeserializeOwned + Sized {
     }
 }
 
-/// An optional `#[one_way(..)]` as an `Option<OneWay>`.
+/// An optional `#[one_way(..)]` or `#[one_way_gap(..)]` as an
+/// `Option<OneWay>`.
 ///
-/// `vocabulary!` expands the variant's optional repetition straight into this
-/// call, so the arity of what comes out picks the arm: nothing for a variant
-/// that carried no annotation, two literals for one that did. The alternative
-/// — a `let mut` fixed up by the repetition — also evaluates in a `const`, but
-/// it puts a mutable binding in the middle of a table of constants to express
-/// something the two arms below say outright.
+/// `vocabulary!` expands both of the variant's optional repetitions straight
+/// into this call, so what comes out picks the arm: nothing for a variant that
+/// carried neither annotation, and a `deliberate` or `gap` tag with its
+/// literals for one that carried either. The alternative — a `let mut` fixed
+/// up by the repetitions — also evaluates in a `const`, but it puts a mutable
+/// binding in the middle of a table of constants to express something the arms
+/// below say outright, and it would quietly let the second annotation win
+/// instead of rejecting the pair.
 macro_rules! one_way {
     () => {
         None
     };
-    ($surface:literal, $why:literal) => {
-        Some(OneWay {
+    (deliberate $surface:literal, $why:literal) => {
+        Some(OneWay::Deliberate {
             surface: $surface,
             why: $why,
         })
+    };
+    (gap $surface:literal, $issue:literal) => {
+        Some(OneWay::Gap {
+            surface: $surface,
+            issue: $issue,
+        })
+    };
+    // Both annotations at once. Saying a command is deliberate *and* an open
+    // gap is a contradiction, not an override, so name it rather than leaving
+    // the reader with "no rules expected the token `gap`".
+    (deliberate $surface:literal, $why:literal gap $gap_surface:literal, $issue:literal) => {
+        compile_error!(
+            "a one-way command is either deliberate or a tracked gap, never both: \
+             delete `#[one_way]` if nobody has decided, or `#[one_way_gap]` if somebody has"
+        )
     };
 }
 
@@ -138,10 +201,13 @@ macro_rules! one_way {
 /// and its legacy aliases live. An optional `=> path::to::fn` names a pre-pass
 /// over the raw arguments, for legacy spellings serde alone cannot express.
 ///
-/// A variant may carry `#[one_way("surface", "why")]` directly after its doc
-/// comments, recording that it is deliberately reachable from that one surface
-/// (see [`OneWay`]). It is an annotation, not a real attribute: it never
-/// reaches the generated enumeration, only the [`CommandSpec`].
+/// A variant reachable from one surface only carries, directly after its doc
+/// comments, either `#[one_way("surface", "why")]` — deliberately there and
+/// nowhere else — or `#[one_way_gap("surface", 38)]` — nobody wrote the other
+/// half, and issue 38 tracks it (see [`OneWay`]). Both are annotations, not
+/// real attributes: they never reach the generated enumeration, only the
+/// [`CommandSpec`]. Carrying both is a compile error, and carrying neither
+/// fails a test.
 macro_rules! vocabulary {
     (
         $(#[$enum_meta:meta])*
@@ -149,6 +215,7 @@ macro_rules! vocabulary {
             $(
                 $(#[doc = $doc:literal])*
                 $(#[one_way($surface:literal, $why:literal)])?
+                $(#[one_way_gap($gap_surface:literal, $issue:literal)])?
                 $variant:ident = $cmd:literal {
                     $(
                         $(#[$field_meta:meta])*
@@ -184,7 +251,10 @@ macro_rules! vocabulary {
                             $( ArgSpec { name: stringify!($field), ty: stringify!($ty) } ),*
                         ],
                         doc: concat!($($doc, "\n",)*),
-                        one_way: one_way!($( $surface, $why )?),
+                        one_way: one_way!(
+                            $( deliberate $surface, $why )?
+                            $( gap $gap_surface, $issue )?
+                        ),
                     },
                 )*
             ];
@@ -347,6 +417,7 @@ vocabulary! {
         /// The whole lab's runtime status: machines, segments, readiness.
         Status = "status" {},
         /// The DNS zones the lab's segments serve.
+        #[one_way_gap("web", 38)]
         DnsTable = "dns.table" {},
 
         /// Bring the lab up, or just the named machines (empty = all).
@@ -361,6 +432,7 @@ vocabulary! {
         },
         /// Abort one machine's running download; whatever waits on it fails
         /// with "download cancelled".
+        #[one_way_gap("web", 38)]
         PullCancel = "pull.cancel" {
             machine: String,
         },
@@ -403,6 +475,7 @@ vocabulary! {
         /// What this machine can do beyond the universal commands, probed
         /// live: a display, a console log, in-place reboot, and whichever
         /// features its agent negotiated.
+        #[one_way_gap("web", 38)]
         MachineCapabilities = "machine.capabilities" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
@@ -507,6 +580,13 @@ vocabulary! {
             #[serde(default = "default_exec_timeout")] timeout: u64,
         },
         /// What the guest OS says it is.
+        #[one_way(
+            "cli",
+            "A live guest probe with a timeout, so it does not belong on a \
+             panel that refreshes; the status projection already carries what \
+             the console shows about a machine. Its CLI help calls it fit for \
+             scripting, which is what it is."
+        )]
         MachineOsInfo = "machine.osinfo" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             /// Seconds to wait for the guest to answer.
@@ -528,6 +608,7 @@ vocabulary! {
         },
         /// Copy a file into the guest: either `from`, a host path the daemon
         /// can see, or `data`, base64 for a caller that holds bytes.
+        #[one_way_gap("cli", 37)]
         MachinePushFile = "machine.push_file" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             to: String,
@@ -536,6 +617,7 @@ vocabulary! {
             #[serde(default)] mode: Option<u32>,
         },
         /// Copy a file out of the guest to a host path.
+        #[one_way_gap("cli", 37)]
         MachinePullFile = "machine.pull_file" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             from: String,
@@ -563,14 +645,17 @@ vocabulary! {
             #[serde(default)] filter: Option<String>,
         },
         /// Latest guest metrics; subscribes the sampler on first use.
+        #[one_way_gap("web", 38)]
         MachineStats = "machine.stats" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
         /// Read the guest clipboard.
+        #[one_way_gap("web", 38)]
         MachineClipboardGet = "machine.clipboard_get" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
         /// Write the guest clipboard.
+        #[one_way_gap("web", 38)]
         MachineClipboardSet = "machine.clipboard_set" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             text: String,
@@ -698,6 +783,7 @@ vocabulary! {
         },
         /// Restart a lab's daemon so it re-reads its config; answers with the
         /// new socket path.
+        #[one_way_gap("web", 38)]
         LabRestart = "lab.restart" {
             name: String,
             root: std::path::PathBuf,
@@ -733,12 +819,19 @@ vocabulary! {
         )]
         GlobalList = "global.list" {},
 
+        // The seven `template.*` commands below are one gap, not seven: #39
+        // asks whether the CLI's in-process template verbs should route
+        // through these same supervisor operations the console uses. Each
+        // carries the annotation because the check is per command, but the
+        // question they are waiting on is a single architecture call.
         /// The templates a lab declares, with their store and build state.
+        #[one_way_gap("web", 39)]
         TemplateList = "template.list" {
             lab: String,
             root: std::path::PathBuf,
         },
         /// What the registry holds for one declared template.
+        #[one_way_gap("web", 39)]
         TemplateRemote = "template.remote" {
             lab: String,
             root: std::path::PathBuf,
@@ -746,6 +839,7 @@ vocabulary! {
             #[serde(default)] arch: Option<String>,
         },
         /// Start building one declared template.
+        #[one_way_gap("web", 39)]
         TemplateBuild = "template.build" {
             lab: String,
             root: std::path::PathBuf,
@@ -753,12 +847,14 @@ vocabulary! {
             #[serde(default)] arch: Option<String>,
         },
         /// Abort a running build.
+        #[one_way_gap("web", 39)]
         TemplateStopBuild = "template.stop_build" {
             lab: String,
             arch: String,
             template: String,
         },
         /// Start pushing one built template to its registry.
+        #[one_way_gap("web", 39)]
         TemplatePush = "template.push" {
             lab: String,
             root: std::path::PathBuf,
@@ -767,10 +863,12 @@ vocabulary! {
             #[serde(default)] version: Option<String>,
         },
         /// Which template builds and pushes are in flight for one lab.
+        #[one_way_gap("web", 39)]
         TemplateOpStatus = "template.op_status" {
             lab: String,
         },
         /// The socket serving a running build's console, for the web viewer.
+        #[one_way_gap("web", 39)]
         TemplateConsolePath = "template.console_path" {
             lab: String,
             arch: String,
@@ -926,22 +1024,36 @@ mod tests {
             .unwrap()
             .one_way
             .expect("`run` is annotated");
-        assert_eq!(one_way.surface, "cli");
-        assert!(!one_way.why.is_empty());
+        let OneWay::Deliberate { surface, why } = one_way else {
+            panic!("`run` is one-way by decision, not a tracked gap");
+        };
+        assert_eq!(surface, "cli");
+        assert!(!why.is_empty());
     }
 
-    /// No annotation means "not yet decided", which is what every command
-    /// reachable from more than one surface is, and what an undecided
-    /// asymmetry stays until somebody makes the call.
+    /// A gap carries the issue instead of a reason, because there is no reason
+    /// to carry: nobody has decided whether the asymmetry should close.
     #[test]
-    fn an_unannotated_command_asserts_nothing() {
-        assert!(LabRequest::spec("up").unwrap().one_way.is_none());
-        assert!(
-            LabRequest::spec("machine.push_file")
-                .unwrap()
-                .one_way
-                .is_none()
+    fn a_gap_carries_the_issue_tracking_it_rather_than_a_reason() {
+        let one_way = LabRequest::spec("machine.push_file")
+            .unwrap()
+            .one_way
+            .expect("`machine.push_file` is a tracked gap");
+        assert_eq!(
+            one_way,
+            OneWay::Gap {
+                surface: "cli",
+                issue: 37
+            },
         );
+    }
+
+    /// Only a command more than one surface reaches says nothing: it has no
+    /// asymmetry to explain. A one-way command that says nothing fails
+    /// `report::every_one_way_command_records_why`.
+    #[test]
+    fn a_command_more_than_one_surface_reaches_asserts_nothing() {
+        assert!(LabRequest::spec("up").unwrap().one_way.is_none());
     }
 
     /// Both vocabularies are enumerable, and every command in them is

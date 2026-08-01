@@ -103,14 +103,17 @@ the code is the contract.
 
 Asymmetry is not automatically wrong — some commands only make sense from one place.
 The lists below exist so that each one is a decision somebody made rather than a gap
-nobody noticed. A command that carries its reason declares it in the vocabulary, beside
-its doc comment; a command listed bare is one nobody has decided about yet.
+nobody noticed. Every command reachable from a single surface says which it is, beside
+its declaration in the vocabulary, and the build fails while one says neither — so the
+open gaps below are a worklist rather than a list somebody has to re-derive.
 
 ### Reachable from no surface
 
 Every command has a caller.
 
 ### Reachable only from `cli`
+
+Deliberate, with the reason recorded beside the declaration:
 
 - `run` — A scratch script is a shell verb: it comes from a file the caller already has and streams its output back to the terminal that ran it. What the console runs is declared playbooks.
 - `machine.ip` — A scripting shortcut over data the console already holds: the lab status projection carries every machine's address, so the console reads it there rather than asking a second time.
@@ -120,9 +123,7 @@ Every command has a caller.
 - `machine.ocr` — Reading text off the framebuffer is a script's substitute for looking at it. The console shows the framebuffer to somebody who can already read it.
 - `machine.find_image` — How a script finds a control it cannot see. A console user clicks the one they can, on the VNC canvas.
 - `machine.exec` — The scripted counterpart to the console's interactive terminals: one command, its output collected, an exit code to branch on. The console opens a shell and lets a human type instead.
-- `machine.osinfo`
-- `machine.push_file`
-- `machine.pull_file`
+- `machine.osinfo` — A live guest probe with a timeout, so it does not belong on a panel that refreshes; the status projection already carries what the console shows about a machine. Its CLI help calls it fit for scripting, which is what it is.
 - `machine.tail` — An open-ended stream of an arbitrary guest path, which is what a terminal is for. The console follows a machine's console log through `machine.logs`.
 - `machine.eventlog` — A stream into a terminal, for the same reason as `machine.tail`.
 - `playbook.list` — One flat table is the shape a shell wants. The console builds its playbook list from the lab's declarations directly and asks the daemon only which runs are in flight.
@@ -130,26 +131,38 @@ Every command has a caller.
 - `lab.ensure` — Spawning-or-finding a lab daemon belongs in one place, and that place is the helper in `src/cli/daemon.rs` — the web layer calls it rather than asking the supervisor itself. One call site is the decision; the scan reports it as the CLI because that is where the helper lives.
 - `lab.release` — The other half of `lab.ensure`, and a shell's alone: a command finishes and gives the daemon back. The console does not finish, and leaves it up for the next request.
 
+Open gaps — nobody wrote the other half, and each is tracked:
+
+- `machine.push_file` — tracked in [#37](https://github.com/VMLabDev/vmlab/issues/37)
+- `machine.pull_file` — tracked in [#37](https://github.com/VMLabDev/vmlab/issues/37)
+
 ### Reachable only from `web`
 
-- `dns.table`
-- `pull.cancel`
-- `machine.capabilities`
-- `machine.stats`
-- `machine.clipboard_get`
-- `machine.clipboard_set`
+Deliberate, with the reason recorded beside the declaration:
+
 - `web.forward` — A loopback forward for a guest's web page exists to be dialled by a browser, and the console is the only surface with one.
 - `playbook.op_status` — A poller's question. A CLI `check` or `apply` streams its own run and holds the terminal until it ends, so it never has to ask what is happening.
-- `lab.restart`
-- `template.list`
-- `template.remote`
-- `template.build`
-- `template.stop_build`
-- `template.push`
-- `template.op_status`
-- `template.console_path`
+
+Open gaps — nobody wrote the other half, and each is tracked:
+
+- `dns.table` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
+- `pull.cancel` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
+- `machine.capabilities` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
+- `machine.stats` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
+- `machine.clipboard_get` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
+- `machine.clipboard_set` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
+- `lab.restart` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
+- `template.list` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
+- `template.remote` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
+- `template.build` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
+- `template.stop_build` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
+- `template.push` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
+- `template.op_status` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
+- `template.console_path` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
 
 ### Reachable only from `daemon`
+
+Deliberate, with the reason recorded beside the declaration:
 
 - `global.attach` — Daemon-internal: a lab daemon joins a global segment because a lab declared one, so there is nothing for a person to ask for.
 - `global.detach` — The other half of `global.attach`, and daemon-internal for the same reason.
