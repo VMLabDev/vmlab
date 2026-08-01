@@ -4,6 +4,7 @@
 pub mod console;
 pub mod daemon;
 pub mod lab;
+pub mod machine;
 pub mod tty_attach;
 pub mod validate;
 
@@ -67,6 +68,34 @@ pub enum Command {
     Container {
         #[command(subcommand)]
         cmd: ContainerCmd,
+    },
+    /// Ask a machine — VM or container — what it can do and how it is doing
+    Machine {
+        #[command(subcommand)]
+        cmd: MachineCmd,
+    },
+    /// Read or write a guest's clipboard
+    Clipboard {
+        #[command(subcommand)]
+        cmd: ClipboardCmd,
+    },
+    /// Print the DNS zones this lab's segments serve
+    Dns {
+        /// Emit the raw JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restart a lab's daemon so it re-reads vmlab.wcl.
+    ///
+    /// Not `down` + `up`: that stops every machine and re-runs provisioning,
+    /// whereas this replaces only the daemon. The lab must already be stopped
+    /// — a fresh daemon cannot re-adopt running machines — so a running lab
+    /// is refused rather than quietly taken down.
+    Restart {
+        lab: String,
+        /// Emit the raw JSON reply instead of a confirmation
+        #[arg(long)]
+        json: bool,
     },
     /// Manage running labs host-wide: list / info / stop / destroy
     Lab {
@@ -300,6 +329,54 @@ pub enum ContainerCmd {
     Shell { container: String },
 }
 
+/// Kind-neutral machine queries: a VM and a container answer both (PRD §18).
+#[derive(Subcommand)]
+pub enum MachineCmd {
+    /// What a machine can do beyond the universal commands, probed live: a
+    /// display, a console log, in-place reboot, a healthcheck, and whichever
+    /// features its agent negotiated
+    Capabilities {
+        machine: String,
+        /// Emit the raw JSON instead of a report
+        #[arg(long)]
+        json: bool,
+    },
+    /// Latest guest metrics: CPU, memory and mounted filesystems.
+    ///
+    /// Reading is not free of side effects: it subscribes the daemon's
+    /// sampler, so a machine nothing had asked about starts being sampled.
+    Stats {
+        machine: String,
+        /// Emit the raw JSON instead of a report
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Guest clipboard access over the agent channel (no guest network involved).
+#[derive(Subcommand)]
+pub enum ClipboardCmd {
+    /// Write the guest clipboard to stdout, with no trailing newline added
+    Get {
+        machine: String,
+        /// Emit the raw JSON string instead of the bare text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the guest clipboard from TEXT, or from stdin when TEXT is omitted.
+    ///
+    /// Stdin is passed through verbatim, trailing newline included, so
+    /// `vmlab clipboard get a | vmlab clipboard set b` round-trips exactly.
+    Set {
+        machine: String,
+        /// The text to copy (omit to read stdin)
+        text: Option<String>,
+        /// Emit the raw JSON reply instead of a confirmation
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Snapshot management (PRD §7.3; containers snapshot identically, §18).
 #[derive(Subcommand)]
 pub enum SnapshotCmd {
@@ -410,6 +487,20 @@ pub fn run() -> ExitCode {
             ContainerCmd::Ip { container } => lab::cmd_machine_ip(&container, None),
             ContainerCmd::Shell { container } => lab::cmd_container_shell(&container),
         },
+        Command::Machine { cmd } => match cmd {
+            MachineCmd::Capabilities { machine, json } => machine::cmd_capabilities(&machine, json),
+            MachineCmd::Stats { machine, json } => machine::cmd_stats(&machine, json),
+        },
+        Command::Clipboard { cmd } => match cmd {
+            ClipboardCmd::Get { machine, json } => machine::cmd_clipboard_get(&machine, json),
+            ClipboardCmd::Set {
+                machine,
+                text,
+                json,
+            } => machine::cmd_clipboard_set(&machine, text, json),
+        },
+        Command::Dns { json } => lab::cmd_dns(json),
+        Command::Restart { lab, json } => lab::cmd_restart(&lab, json),
         Command::Lab { cmd } => lab::cmd_lab(cmd),
         Command::Snapshot { cmd } => match cmd {
             SnapshotCmd::Create { name, vm } => lab::cmd_snapshot(vm, name),

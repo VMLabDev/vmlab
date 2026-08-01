@@ -32,7 +32,7 @@ pub fn split_vm_ref(vm_ref: &str) -> Result<(Option<String>, String)> {
     }
 }
 
-async fn lab_client_for(lab: Option<String>) -> Result<(String, LabClient)> {
+pub(super) async fn lab_client_for(lab: Option<String>) -> Result<(String, LabClient)> {
     match lab {
         Some(name) => {
             let client = daemon::try_lab_daemon(&name)
@@ -48,13 +48,13 @@ async fn lab_client_for(lab: Option<String>) -> Result<(String, LabClient)> {
     }
 }
 
-fn rt() -> Result<tokio::runtime::Runtime> {
+pub(super) fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Runtime::new()?)
 }
 
 /// A daemon failure as an `anyhow` error that still carries its code, so
 /// `cli::run` can pick an exit code a script can branch on.
-fn remote(e: crate::proto::ProtoError) -> anyhow::Error {
+pub(super) fn remote(e: crate::proto::ProtoError) -> anyhow::Error {
     anyhow::Error::new(crate::proto::CommandError::from(e))
 }
 
@@ -97,20 +97,72 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
 /// `vmlab pull [vms…]`: download missing registry templates/images with
 /// streamed progress, without starting anything — the CLI twin of the web
 /// UI's "Download templates" button.
+///
+/// ^C cancels the downloads rather than only abandoning them. The daemon
+/// outlives this process, so an interrupt that just walked away would leave
+/// the transfers running with nobody watching; there is no separate
+/// `pull cancel` verb because interrupting the pull is how a person asks for
+/// exactly this (issue #38).
 pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
     rt()?.block_on(async {
         super::validate::validate_current()?;
         let (name, root) = current_lab()?;
         let client = daemon::ensure_lab_daemon(&name, &root).await?;
-        client
-            .send_streaming(LabRequest::Pull { machines: vms }, |chunk| {
-                print!("{chunk}")
+        let pull = client.send_streaming(LabRequest::Pull { machines: vms }, |chunk| {
+            print!("{chunk}")
+        });
+        tokio::pin!(pull);
+        tokio::select! {
+            result = &mut pull => {
+                result.map_err(remote)?;
+                println!("lab \"{name}\": templates ready");
+                Ok(())
+            }
+            _ = tokio::signal::ctrl_c() => {
+                // The cancel rides a second request on the same multiplexed
+                // connection, so it does not wait on the download it aborts.
+                let cancelled = cancel_pulls_in_flight(&client).await?;
+                match cancelled.as_slice() {
+                    [] => bail!("interrupted — no download was in flight"),
+                    machines => bail!("interrupted — cancelled the download for {}", machines.join(", ")),
+                }
+            }
+        }
+    })
+}
+
+/// Cancel every download the lab currently has in flight, and answer with the
+/// machines whose download was aborted.
+///
+/// `pull.cancel` names a machine, and the lab's status projection is what
+/// knows which machines are downloading — so an interrupted `pull` asks it
+/// rather than tracking the fan-out itself.
+async fn cancel_pulls_in_flight(client: &LabClient) -> Result<Vec<String>> {
+    let mut cancelled = Vec::new();
+    for machine in pulling_machines(&lab_status(client).await?) {
+        let aborted = client
+            .send(LabRequest::PullCancel {
+                machine: machine.clone(),
             })
             .await
             .map_err(remote)?;
-        println!("lab \"{name}\": templates ready");
-        Ok(())
-    })
+        if aborted.as_bool().unwrap_or(false) {
+            cancelled.push(machine);
+        }
+    }
+    Ok(cancelled)
+}
+
+/// Which machines have a download in flight, once each: one download can have
+/// several machines waiting on it, and `status` reports a row per waiter.
+fn pulling_machines(status: &LabStatus) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    status
+        .pulls
+        .iter()
+        .filter(|p| seen.insert(p.machine.clone()))
+        .map(|p| p.machine.clone())
+        .collect()
 }
 
 pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
@@ -352,6 +404,82 @@ fn on_off(flag: bool) -> &'static str {
     if flag { "on" } else { "off" }
 }
 
+/// `vmlab dns` — the zones this lab's segments serve, which is what to read
+/// when a guest cannot resolve a peer. Segments with no local zone (global
+/// ones, and `dns { enabled = false }`) serve nothing and are not listed.
+pub fn cmd_dns(json: bool) -> Result<()> {
+    rt()?.block_on(async {
+        let (_name, client) = lab_client_for(None).await?;
+        let table = client.send(LabRequest::DnsTable {}).await.map_err(remote)?;
+        if json {
+            return super::machine::print_json(&table);
+        }
+        print!("{}", render_dns(&table));
+        Ok(())
+    })
+}
+
+/// One table per segment, with the zone's exact records, its wildcards and
+/// its sinkholes in one list: a name either resolves or it does not, and
+/// which of the three rules decided is the `KIND` column, not a separate
+/// table to cross-reference.
+fn render_dns(table: &Value) -> String {
+    use std::fmt::Write as _;
+    let segments = table["segments"].as_array().cloned().unwrap_or_default();
+    if segments.is_empty() {
+        return "no segment in this lab serves DNS\n".to_string();
+    }
+    let mut out = String::new();
+    for segment in &segments {
+        let zone = &segment["zone"];
+        let _ = writeln!(
+            out,
+            "segment \"{}\" — zone {}",
+            segment["segment"].as_str().unwrap_or("?"),
+            zone["suffix"].as_str().unwrap_or("?"),
+        );
+        let rows = dns_rows(zone);
+        if rows.is_empty() {
+            let _ = writeln!(out, "  (no records)");
+            continue;
+        }
+        let name_w = column_width("NAME", rows.iter().map(|(name, _, _)| name.len()));
+        let ip_w = column_width("IP", rows.iter().map(|(_, ip, _)| ip.len()));
+        let _ = writeln!(out, "  {:<name_w$} {:<ip_w$} KIND", "NAME", "IP");
+        for (name, ip, kind) in rows {
+            let _ = writeln!(out, "  {name:<name_w$} {ip:<ip_w$} {kind}");
+        }
+    }
+    out
+}
+
+/// One zone's rules as `(name, address, kind)` rows: exact records first, then
+/// wildcards, then sinkholes — the order the resolver consults them in.
+fn dns_rows(zone: &Value) -> Vec<(String, String, String)> {
+    let list = |key: &str| zone[key].as_array().cloned().unwrap_or_default();
+    let text = |v: &Value, key: &str| v[key].as_str().unwrap_or("?").to_string();
+    let mut rows: Vec<(String, String, String)> = list("records")
+        .iter()
+        .map(|r| (text(r, "name"), text(r, "ip"), text(r, "kind")))
+        .collect();
+    rows.extend(
+        list("wildcards")
+            .iter()
+            .map(|w| (text(w, "pattern"), text(w, "ip"), "wildcard".to_string())),
+    );
+    // A sinkhole answers with nothing, so it has no address to show; the mode
+    // is what a reader needs — NXDOMAIN and 0.0.0.0 fail differently in a
+    // guest.
+    rows.extend(list("sinkholes").iter().map(|s| {
+        (
+            text(s, "pattern"),
+            "-".to_string(),
+            format!("sinkhole/{}", text(s, "mode")),
+        )
+    }));
+    rows
+}
+
 /// Manage running labs host-wide, by name (not the cwd's lab).
 #[derive(clap::Subcommand)]
 pub enum LabCmd {
@@ -514,6 +642,62 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
                 .await;
         }
         println!("lab \"{name}\" destroyed");
+        Ok(())
+    })
+}
+
+/// `vmlab restart <lab>` — replace a lab's daemon so it re-reads `vmlab.wcl`.
+///
+/// Not `down` + `up`: that stops the machines and starts them again, running
+/// every provision script a second time. This replaces only the daemon. It
+/// does still need the lab stopped first — a fresh daemon cannot re-adopt
+/// machines the old one was running, and its own shutdown stops them — so a
+/// running lab is refused rather than quietly taken down, which is the rule
+/// the console's reload button follows too.
+pub fn cmd_restart(name: &str, json: bool) -> Result<()> {
+    rt()?.block_on(async {
+        let labs = registry_labs().await?;
+        let root = match root_for(&labs, name) {
+            Some(root) => root,
+            // Unregistered: the cwd's lab is the only other place a root can
+            // come from, and only when it is the lab being named.
+            None => match current_lab() {
+                Ok((cwd_lab, root)) if cwd_lab == name => root,
+                _ => bail!("lab \"{name}\" is not running"),
+            },
+        };
+        if let Some(client) = daemon::try_lab_daemon(name).await
+            && !lab_status(&client).await?.all_stopped()
+        {
+            bail!(
+                "lab \"{name}\" still has machines running — stop them first; \
+                 a restarted daemon cannot re-adopt them"
+            );
+        }
+        let supervisor = daemon::ensure_supervisor().await?;
+        let reply = supervisor
+            .send(SupRequest::LabRestart {
+                name: name.to_string(),
+                root,
+            })
+            .await
+            .map_err(remote)?;
+        // Follow the socket the supervisor answered with, not the one this
+        // process already knew: the daemon that owned that one is gone.
+        let socket = std::path::PathBuf::from(
+            reply["socket"]
+                .as_str()
+                .context("malformed lab.restart response")?,
+        );
+        LabClient::connect(&socket)
+            .await?
+            .send(LabRequest::Ping {})
+            .await
+            .map_err(remote)?;
+        if json {
+            return super::machine::print_json(&reply);
+        }
+        println!("lab \"{name}\" daemon restarted at {}", socket.display());
         Ok(())
     })
 }
@@ -1414,7 +1598,8 @@ pub fn cmd_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        LabRequest, PowerOp, Region, format_log_line, region_value, render_status, root_for,
+        LabRequest, PowerOp, Region, format_log_line, pulling_machines, region_value, render_dns,
+        render_status, root_for,
     };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
@@ -1639,6 +1824,101 @@ mod tests {
     fn unparseable_events_line_falls_back_to_raw() {
         let line = "not json at all";
         assert_eq!(format_log_line(line, true, LogFormat::Pretty, false), line);
+    }
+
+    /// The DNS report renders off the `dns.table` payload. All three kinds of
+    /// rule land in one table: a name that will not resolve is answered by
+    /// whichever of them matched, so a reader should not have to join tables
+    /// to find out which.
+    #[test]
+    fn the_dns_table_lists_records_wildcards_and_sinkholes_together() {
+        let out = render_dns(&json!({
+            "segments": [{
+                "segment": "lan",
+                "zone": {
+                    "suffix": "vmlab.internal",
+                    "records": [
+                        {"name": "dc01.lan.vmlab.internal", "ip": "10.0.0.10", "kind": "dynamic"},
+                        {"name": "intranet.corp", "ip": "10.0.0.5", "kind": "static"},
+                    ],
+                    "wildcards": [{"id": 1, "pattern": "*.corp", "ip": "10.0.0.6"}],
+                    "sinkholes": [{"id": 2, "pattern": "*.telemetry.example", "mode": "nxdomain"}],
+                },
+            }],
+        }));
+        assert!(
+            out.contains("segment \"lan\" — zone vmlab.internal"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("dc01.lan.vmlab.internal 10.0.0.10 dynamic"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("intranet.corp           10.0.0.5  static"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("*.corp                  10.0.0.6  wildcard"),
+            "got:\n{out}"
+        );
+        // A sinkhole answers with nothing, so it has no address — but the mode
+        // decides how the guest fails, so it stays on the row.
+        assert!(
+            out.contains("*.telemetry.example     -         sinkhole/nxdomain"),
+            "got:\n{out}"
+        );
+    }
+
+    /// Segments with no local zone are omitted by the daemon, so a lab whose
+    /// segments all delegate reads as a sentence rather than a bare header.
+    #[test]
+    fn a_lab_serving_no_dns_says_so() {
+        assert_eq!(
+            render_dns(&json!({"segments": []})),
+            "no segment in this lab serves DNS\n"
+        );
+    }
+
+    /// A segment whose zone is empty is still worth naming: it serves DNS, it
+    /// just knows nothing yet.
+    #[test]
+    fn an_empty_zone_is_named_rather_than_skipped() {
+        let out = render_dns(&json!({
+            "segments": [{
+                "segment": "dmz",
+                "zone": {"suffix": "vmlab.internal", "records": [], "wildcards": [], "sinkholes": []},
+            }],
+        }));
+        assert_eq!(
+            out,
+            "segment \"dmz\" — zone vmlab.internal\n  (no records)\n"
+        );
+    }
+
+    /// What an interrupted `vmlab pull` cancels. `status` reports one row per
+    /// machine waiting on a download, so two machines sharing one template
+    /// appear twice — and each machine is cancelled once.
+    #[test]
+    fn an_interrupted_pull_cancels_each_waiting_machine_once() {
+        let pull = |machine: &str, reference: &str| PullStatus {
+            machine: machine.into(),
+            kind: PullKind::Template,
+            reference: reference.into(),
+            bytes_done: 1,
+            bytes_total: 2,
+            percent: 50,
+        };
+        let mut status = lab(Vec::new());
+        status.pulls = vec![
+            pull("dc01", "ghcr.io/vmlab/win11:1"),
+            pull("web", "ghcr.io/vmlab/alpine:1"),
+            // The same machine can be listed twice when it waits on both a
+            // template and an image.
+            pull("dc01", "ghcr.io/vmlab/win11:1"),
+        ];
+        assert_eq!(pulling_machines(&status), vec!["dc01", "web"]);
+        assert!(pulling_machines(&lab(Vec::new())).is_empty());
     }
 
     #[test]
