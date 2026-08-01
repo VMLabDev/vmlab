@@ -41,6 +41,81 @@ pub struct ResolvedVm {
     pub qemu_args: Vec<String>,
 }
 
+/// Which layer of the §5.2 precedence chain supplied a resolved value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    Vm,
+    Template,
+    Profile,
+    /// Nothing declared it — vmlab's own fallback applied.
+    Default,
+}
+
+/// Firmware and secure boot, each tagged with the layer it came from. The
+/// two resolve together because they only mean anything together: secure
+/// boot is a property of the UEFI build, and a caller reporting a conflict
+/// between them has to name where each side was inherited from — either may
+/// have come from a layer the lab author never looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirmwareChoice {
+    pub firmware: Option<FirmwareKind>,
+    pub firmware_layer: Layer,
+    pub secure_boot: bool,
+    pub secure_boot_layer: Layer,
+}
+
+impl FirmwareChoice {
+    /// Secure boot was asked for but the resolved firmware cannot deliver
+    /// it. SeaBIOS has no secure boot at all, and unset firmware means
+    /// SeaBIOS on x86 — the QEMU default the cmdline builder relies on.
+    pub fn secure_boot_unsupported(&self) -> bool {
+        self.secure_boot && self.firmware != Some(FirmwareKind::Ovmf)
+    }
+}
+
+/// First layer that declared a value, and which layer that was.
+fn pick<T>(vm: Option<T>, template: Option<T>, profile: Option<T>) -> Option<(T, Layer)> {
+    vm.map(|v| (v, Layer::Vm))
+        .or_else(|| template.map(|v| (v, Layer::Template)))
+        .or_else(|| profile.map(|v| (v, Layer::Profile)))
+}
+
+/// Resolve firmware and secure boot for one VM. Split out of
+/// [`resolve_vm`] so validation can reach the same chain — and the layers
+/// behind it — without a template store or a full resolve (§5.1).
+pub fn resolve_firmware(
+    lab_vm: &Vm,
+    template: Option<&TemplateMeta>,
+    profile: &Profile,
+    arch: &str,
+) -> FirmwareChoice {
+    let (firmware, firmware_layer) = match pick(
+        lab_vm.firmware.map(firmware_kind),
+        template.and_then(|t| t.firmware.as_deref().and_then(meta_firmware)),
+        profile.firmware,
+    ) {
+        Some((f, layer)) => (Some(f), layer),
+        // The `virt` machine (non-x86) has no SeaBIOS fallback, so a guest
+        // that named no firmware would be unbootable — default it to UEFI.
+        None => (
+            (arch != "x86_64").then_some(FirmwareKind::Ovmf),
+            Layer::Default,
+        ),
+    };
+    let (secure_boot, secure_boot_layer) = pick(
+        lab_vm.secure_boot,
+        template.and_then(|t| t.secure_boot),
+        profile.secure_boot,
+    )
+    .unwrap_or((false, Layer::Default));
+    FirmwareChoice {
+        firmware,
+        firmware_layer,
+        secure_boot,
+        secure_boot_layer,
+    }
+}
+
 fn firmware_kind(f: Firmware) -> FirmwareKind {
     match f {
         Firmware::Ovmf => FirmwareKind::Ovmf,
@@ -125,14 +200,7 @@ pub fn resolve_vm(
         "virt".to_string()
     };
 
-    let firmware = lab_vm
-        .firmware
-        .map(firmware_kind)
-        .or_else(|| template.and_then(|t| t.firmware.as_deref().and_then(meta_firmware)))
-        .or(profile.firmware)
-        // The `virt` machine (non-x86) has no SeaBIOS fallback, so a guest
-        // that named no firmware would be unbootable — default it to UEFI.
-        .or_else(|| (arch != "x86_64").then_some(FirmwareKind::Ovmf));
+    let firmware_choice = resolve_firmware(lab_vm, template, profile, &arch);
 
     let display_device = lab_vm
         .display
@@ -156,12 +224,8 @@ pub fn resolve_vm(
             .or(profile.memory)
             .unwrap_or(2 << 30),
         machine,
-        firmware,
-        secure_boot: lab_vm
-            .secure_boot
-            .or(template.and_then(|t| t.secure_boot))
-            .or(profile.secure_boot)
-            .unwrap_or(false),
+        firmware: firmware_choice.firmware,
+        secure_boot: firmware_choice.secure_boot,
         tpm: lab_vm
             .tpm
             .or(template.and_then(|t| t.tpm))
@@ -265,6 +329,51 @@ mod tests {
         );
         let r = resolve_vm(&v, None, &profiles).unwrap();
         assert_eq!(r.machine, "virt,acpi=off");
+    }
+
+    #[test]
+    fn firmware_choice_reports_the_layer_each_value_came_from() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let legacy = profiles.get("windows-legacy").unwrap();
+
+        // Profile floor on both sides.
+        let v = vm("vm \"a\" { template = \"x86_64/t\" }");
+        let c = resolve_firmware(&v, None, legacy, "x86_64");
+        assert_eq!(c.firmware, Some(FirmwareKind::Seabios));
+        assert_eq!(c.firmware_layer, Layer::Profile);
+        assert!(!c.secure_boot);
+        assert_eq!(c.secure_boot_layer, Layer::Profile);
+        assert!(!c.secure_boot_unsupported());
+
+        // VM block over template over profile.
+        let v = vm("vm \"a\" { template = \"x86_64/t\" secure_boot = true }");
+        let mut m = meta();
+        m.firmware = Some("ovmf".into());
+        let c = resolve_firmware(&v, Some(&m), legacy, "x86_64");
+        assert_eq!(c.firmware, Some(FirmwareKind::Ovmf));
+        assert_eq!(c.firmware_layer, Layer::Template);
+        assert!(c.secure_boot);
+        assert_eq!(c.secure_boot_layer, Layer::Vm);
+        assert!(!c.secure_boot_unsupported());
+    }
+
+    #[test]
+    fn secure_boot_is_unsupported_without_uefi() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let legacy = profiles.get("windows-legacy").unwrap();
+        let custom = profiles.get("custom").unwrap();
+
+        let v = vm("vm \"a\" { template = \"x86_64/t\" secure_boot = true }");
+        assert!(resolve_firmware(&v, None, legacy, "x86_64").secure_boot_unsupported());
+
+        // Nothing named a firmware and x86 has no UEFI default: SeaBIOS.
+        let c = resolve_firmware(&v, None, custom, "x86_64");
+        assert_eq!(c.firmware, None);
+        assert_eq!(c.firmware_layer, Layer::Default);
+        assert!(c.secure_boot_unsupported());
+
+        // Non-x86 defaults to UEFI, so the same VM is fine there.
+        assert!(!resolve_firmware(&v, None, custom, "aarch64").secure_boot_unsupported());
     }
 
     #[test]

@@ -7,14 +7,31 @@ use std::path::{Path, PathBuf};
 
 use super::model::*;
 use super::{Issue, IssueList};
+use crate::profiles::{FirmwareKind, Profile};
+use crate::qemu::resolve::{Layer, resolve_firmware};
+use crate::template::TemplateMeta;
 
 /// Host facilities the validator consults. The CLI wires the real template
 /// store and wscript compiler; tests substitute fakes.
+///
+/// The lookups return the template's recorded hardware and the profile
+/// itself rather than a bare "it exists", because §5.1 checks that reason
+/// about hardware have to resolve it first — a VM's firmware or secure boot
+/// may have been inherited from either layer (§5.2).
 pub trait ValidationContext {
-    fn template_exists(&self, arch: &str, name: &str, version: Option<&str>) -> bool;
-    fn profile_exists(&self, name: &str) -> bool;
+    /// Recorded metadata for a template in the store, if it is there.
+    fn template_meta(&self, arch: &str, name: &str, version: Option<&str>) -> Option<TemplateMeta>;
+    /// A named guest OS profile, if it is known.
+    fn profile(&self, name: &str) -> Option<Profile>;
     /// Compile-check a wscript script at an absolute path.
     fn check_script(&self, path: &Path) -> Result<(), String>;
+
+    fn template_exists(&self, arch: &str, name: &str, version: Option<&str>) -> bool {
+        self.template_meta(arch, name, version).is_some()
+    }
+    fn profile_exists(&self, name: &str) -> bool {
+        self.profile(name).is_some()
+    }
 }
 
 /// Validate a parsed lab file. Returns every problem found (never short-
@@ -647,6 +664,94 @@ fn check_vm_hardware(
     {
         issues.push(Issue::at(vm.span, format!("unknown profile \"{p}\"")));
     }
+    check_secure_boot(vm, ctx, issues);
+}
+
+/// Secure boot exists only under UEFI: with SeaBIOS the cmdline builder has
+/// no pflash to load a secboot OVMF into, so `secure_boot = true` would be
+/// read nowhere and the VM would boot without it, silently. Either value may
+/// have been inherited, so this resolves the §5.2 chain and names the layer
+/// each side came from.
+fn check_secure_boot(vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueList) {
+    // Resolution needs the template layer, and only a store template can
+    // supply it here: a registry template is not pulled at validate time,
+    // and a missing store template is reported by `check_vm_template`. With
+    // that layer unknown, only a conflict written on the VM block itself is
+    // certain — nothing below it can override the VM block.
+    let (meta, template_known) = match &vm.template {
+        TemplateRef::Scratch => (None, true),
+        TemplateRef::Store {
+            arch,
+            name,
+            version,
+        } => {
+            let meta = ctx.template_meta(arch, name, version.as_deref());
+            let known = meta.is_some();
+            (meta, known)
+        }
+        TemplateRef::Registry { .. } => (None, false),
+    };
+    // An archless VM is already an error, and the arch only decides the
+    // no-firmware-declared fallback.
+    let arch = match &vm.template {
+        TemplateRef::Store { arch, .. } => Some(arch.clone()),
+        _ => vm.arch.clone(),
+    };
+    let Some(arch) = arch else { return };
+
+    let profile_name = vm
+        .profile
+        .clone()
+        .or_else(|| meta.as_ref().and_then(|m| m.profile.clone()));
+    let profile = match &profile_name {
+        // An unknown profile name is reported on its own; without the
+        // profile there is no floor to resolve against.
+        Some(name) => match ctx.profile(name) {
+            Some(p) => p,
+            None => return,
+        },
+        None => Profile::default(),
+    };
+
+    let choice = resolve_firmware(vm, meta.as_ref(), &profile, &arch);
+    if !choice.secure_boot_unsupported() {
+        return;
+    }
+    if !template_known
+        && !(choice.firmware_layer == Layer::Vm && choice.secure_boot_layer == Layer::Vm)
+    {
+        return;
+    }
+
+    let from_secure_boot = layer_label(choice.secure_boot_layer, profile_name.as_deref());
+    let message = match choice.firmware {
+        Some(FirmwareKind::Seabios) => format!(
+            "vm \"{}\": secure_boot = true (from {from_secure_boot}) but firmware = \"seabios\" \
+             (from {}) — secure boot needs UEFI, so it would be ignored silently (PRD §5.2)",
+            vm.name,
+            layer_label(choice.firmware_layer, profile_name.as_deref()),
+        ),
+        _ => format!(
+            "vm \"{}\": secure_boot = true (from {from_secure_boot}) but no firmware is set, so \
+             the VM boots SeaBIOS (the QEMU default on x86) — secure boot needs UEFI, set \
+             `firmware = \"ovmf\"` (PRD §5.2)",
+            vm.name,
+        ),
+    };
+    issues.push(Issue::at(vm.span, message));
+}
+
+/// How a resolved value's origin reads in an error message.
+fn layer_label(layer: Layer, profile: Option<&str>) -> String {
+    match layer {
+        Layer::Vm => "the vm block".to_string(),
+        Layer::Template => "the template".to_string(),
+        Layer::Profile => match profile {
+            Some(name) => format!("profile \"{name}\""),
+            None => "the profile".to_string(),
+        },
+        Layer::Default => "vmlab's default".to_string(),
+    }
 }
 
 /// Structural checks shared by every `playbook {}` block, wherever it is
@@ -1026,18 +1131,246 @@ pub(crate) mod tests {
     use super::*;
     use crate::config::load_lab_source;
 
-    /// Context where everything exists and compiles.
+    /// A template that records no hardware of its own — the store entry
+    /// exists, so every layer below it decides.
+    pub(crate) fn blank_meta(arch: &str, name: &str, version: Option<&str>) -> TemplateMeta {
+        TemplateMeta {
+            name: name.to_string(),
+            arch: arch.to_string(),
+            version: version.unwrap_or("1").to_string(),
+            profile: None,
+            cpus: None,
+            memory: None,
+            disk: None,
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            created: chrono::Utc::now(),
+            origin: None,
+            registry: None,
+            sha256: None,
+            first_boot_script: None,
+            agent_version: None,
+        }
+    }
+
+    /// Context where everything exists and compiles. Templates record no
+    /// hardware and profiles assume nothing, so resolved-hardware checks
+    /// see a blank slate.
     pub struct Permissive;
     impl ValidationContext for Permissive {
-        fn template_exists(&self, _: &str, _: &str, _: Option<&str>) -> bool {
-            true
+        fn template_meta(
+            &self,
+            arch: &str,
+            name: &str,
+            version: Option<&str>,
+        ) -> Option<TemplateMeta> {
+            Some(blank_meta(arch, name, version))
         }
-        fn profile_exists(&self, _: &str) -> bool {
-            true
+        fn profile(&self, name: &str) -> Option<Profile> {
+            Some(Profile {
+                name: name.to_string(),
+                ..Profile::default()
+            })
         }
         fn check_script(&self, _: &Path) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    /// Context backed by the real shipped profiles, with the store
+    /// template's recorded hardware supplied by the test — what the
+    /// resolved-hardware checks need to resolve against (§5.2).
+    struct Hardware {
+        profiles: crate::profiles::ProfileSet,
+        meta: Option<TemplateMeta>,
+    }
+
+    impl Hardware {
+        /// A store template that records nothing.
+        fn blank() -> Self {
+            Self::with_meta(blank_meta("x86_64", "t", None))
+        }
+        fn with_meta(meta: TemplateMeta) -> Self {
+            Self {
+                profiles: crate::profiles::ProfileSet::shipped().expect("shipped profiles"),
+                meta: Some(meta),
+            }
+        }
+        /// No such template in the store — the template layer is unknown.
+        fn missing_template() -> Self {
+            Self {
+                profiles: crate::profiles::ProfileSet::shipped().expect("shipped profiles"),
+                meta: None,
+            }
+        }
+    }
+
+    impl ValidationContext for Hardware {
+        fn template_meta(&self, _: &str, _: &str, _: Option<&str>) -> Option<TemplateMeta> {
+            self.meta.clone()
+        }
+        fn profile(&self, name: &str) -> Option<Profile> {
+            self.profiles.get(name).cloned()
+        }
+        fn check_script(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Validation messages against a real-profile context.
+    fn hw_errs(ctx: &Hardware, src: &str) -> Vec<String> {
+        validate(&lab(src), ctx)
+            .into_iter()
+            .map(|i| i.message)
+            .collect()
+    }
+
+    fn assert_secure_boot_conflict(ctx: &Hardware, src: &str, needles: &[&str]) {
+        let es = hw_errs(ctx, src);
+        let found = es
+            .iter()
+            .find(|m| m.contains("secure boot needs UEFI"))
+            .unwrap_or_else(|| panic!("expected a secure-boot conflict, got: {es:#?}"));
+        for needle in needles {
+            assert!(found.contains(needle), "missing {needle:?} in {found:?}");
+        }
+    }
+
+    fn assert_no_secure_boot_conflict(ctx: &Hardware, src: &str) {
+        let es = hw_errs(ctx, src);
+        assert!(
+            !es.iter().any(|m| m.contains("secure boot needs UEFI")),
+            "unexpected secure-boot conflict: {es:#?}"
+        );
+    }
+
+    /// The reported combination: SeaBIOS from one layer, secure boot from
+    /// another. Each side names where it came from, since either may have
+    /// been inherited.
+    #[test]
+    fn secure_boot_on_seabios_is_rejected_whichever_layer_it_came_from() {
+        // Profile supplies SeaBIOS, VM block asks for secure boot.
+        assert_secure_boot_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-legacy" secure_boot = true } }"#,
+            [
+                "secure_boot = true (from the vm block)",
+                "profile \"windows-legacy\"",
+            ]
+            .as_slice(),
+        );
+
+        // VM block supplies SeaBIOS, profile floor asks for secure boot.
+        assert_secure_boot_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-11" firmware = "seabios" } }"#,
+            [
+                "secure_boot = true (from profile \"windows-11\")",
+                "firmware = \"seabios\" (from the vm block)",
+            ]
+            .as_slice(),
+        );
+
+        // The template records SeaBIOS; the VM asks for secure boot.
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.firmware = Some("seabios".into());
+        assert_secure_boot_conflict(
+            &Hardware::with_meta(meta),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" secure_boot = true } }"#,
+            ["firmware = \"seabios\" (from the template)"].as_slice(),
+        );
+
+        // The template records secure boot on top of a SeaBIOS profile.
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.profile = Some("windows-legacy".into());
+        meta.secure_boot = Some(true);
+        assert_secure_boot_conflict(
+            &Hardware::with_meta(meta),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" } }"#,
+            [
+                "secure_boot = true (from the template)",
+                "profile \"windows-legacy\"",
+            ]
+            .as_slice(),
+        );
+
+        // Scratch VMs have no template layer at all (§6.5).
+        assert_secure_boot_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "scratch" arch = "x86_64" profile = "windows-legacy"
+  disk = 10GiB secure_boot = true } }"#,
+            ["profile \"windows-legacy\""].as_slice(),
+        );
+    }
+
+    /// Unset firmware is SeaBIOS on x86 (the QEMU default), so it swallows
+    /// secure boot just as silently as naming SeaBIOS does.
+    #[test]
+    fn secure_boot_without_any_firmware_is_rejected_on_x86() {
+        assert_secure_boot_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "custom" secure_boot = true } }"#,
+            ["no firmware is set", "SeaBIOS"].as_slice(),
+        );
+        // Non-x86 has no SeaBIOS to fall back to, so firmware defaults to
+        // UEFI and secure boot stands.
+        assert_no_secure_boot_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "aarch64/t" profile = "custom" secure_boot = true } }"#,
+        );
+    }
+
+    #[test]
+    fn uefi_secure_boot_and_plain_seabios_validate() {
+        // The whole point of windows-11: OVMF plus secure boot.
+        assert_no_secure_boot_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-11" } }"#,
+        );
+        // SeaBIOS with secure boot switched off at the VM is fine.
+        assert_no_secure_boot_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-11" firmware = "seabios"
+  secure_boot = false } }"#,
+        );
+    }
+
+    /// With the template layer unavailable, only a conflict written on the
+    /// VM block itself is certain — the template could have supplied either
+    /// value.
+    #[test]
+    fn unknown_template_layer_reports_only_vm_block_conflicts() {
+        let registry = r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "ghcr.io/acme/win:1" arch = "x86_64" profile = "windows-legacy"
+  secure_boot = true } }"#;
+        assert_no_secure_boot_conflict(&Hardware::blank(), registry);
+
+        assert_secure_boot_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "ghcr.io/acme/win:1" arch = "x86_64" firmware = "seabios"
+  secure_boot = true } }"#,
+            ["from the vm block"].as_slice(),
+        );
+
+        // Same for a store template that is not there: the missing template
+        // is the error to fix, not a hardware conflict inferred without it.
+        assert_no_secure_boot_conflict(
+            &Hardware::missing_template(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-legacy" secure_boot = true } }"#,
+        );
     }
 
     fn lab(src: &str) -> LabFile {
@@ -1198,11 +1531,14 @@ lab "l" { vm "a" { template = "scratch" } }"#,
     fn missing_template_in_store() {
         struct NoTemplates;
         impl ValidationContext for NoTemplates {
-            fn template_exists(&self, _: &str, _: &str, _: Option<&str>) -> bool {
-                false
+            fn template_meta(&self, _: &str, _: &str, _: Option<&str>) -> Option<TemplateMeta> {
+                None
             }
-            fn profile_exists(&self, _: &str) -> bool {
-                true
+            fn profile(&self, name: &str) -> Option<Profile> {
+                Some(Profile {
+                    name: name.to_string(),
+                    ..Profile::default()
+                })
             }
             fn check_script(&self, _: &Path) -> Result<(), String> {
                 Ok(())

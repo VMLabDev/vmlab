@@ -11,29 +11,34 @@ use crate::config::{self, ConfigErrors, ValidationContext};
 /// profile set. Script compile checking is wired to the wscript host module.
 pub struct HostContext {
     profiles: crate::profiles::ProfileSet,
+    store: crate::template::TemplateStore,
 }
 
 impl HostContext {
     pub fn new() -> Result<Self> {
         Ok(Self {
             profiles: crate::profiles::ProfileSet::load_default()?,
+            store: crate::template::TemplateStore::new(crate::paths::template_store_dir()),
         })
     }
 }
 
 impl ValidationContext for HostContext {
-    fn template_exists(&self, arch: &str, name: &str, version: Option<&str>) -> bool {
-        let dir = crate::paths::template_store_dir().join(arch).join(name);
-        match version {
-            Some(v) => dir.join(v).join("disk.qcow2").is_file(),
-            None => std::fs::read_dir(&dir)
-                .map(|mut entries| entries.any(|e| e.is_ok()))
-                .unwrap_or(false),
-        }
+    /// Resolved through the store, so a version pin resolves the same way
+    /// it will at `up` (PRD §6.2) and a half-installed entry — metadata
+    /// without its disk, or the reverse — reads as absent rather than
+    /// present-but-unusable.
+    fn template_meta(
+        &self,
+        arch: &str,
+        name: &str,
+        version: Option<&str>,
+    ) -> Option<crate::template::TemplateMeta> {
+        self.store.resolve(arch, name, version).ok().map(|t| t.meta)
     }
 
-    fn profile_exists(&self, name: &str) -> bool {
-        self.profiles.exists(name)
+    fn profile(&self, name: &str) -> Option<crate::profiles::Profile> {
+        self.profiles.get(name).cloned()
     }
 
     fn check_script(&self, path: &Path) -> Result<(), String> {
