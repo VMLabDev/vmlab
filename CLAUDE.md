@@ -41,7 +41,11 @@ PRD implemented (M1–M6). Module map under `src/`:
 - `vision/` — screenshot, template matching, OCR.
 - `net/` — userspace fabric: frame codecs, L2 switch, DHCP, DNS, gateway,
   NAT engine, L3 rules.
-- `proto/` — JSON-lines daemon wire protocol (client + server).
+- `proto/` — JSON-lines daemon wire protocol (client + server). `vocab.rs`
+  holds the typed request vocabulary every surface constructs through
+  (ADR-0007) and `error.rs` the error codes replies carry; `report.rs`
+  generates `docs/protocol.md` and `web-ui/src/protocol.ts` from them
+  (`just proto-generate`).
 - `supervisor/` — `vmlabd`: lab registry, global segments, watchdogs.
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;

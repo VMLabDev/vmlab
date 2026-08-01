@@ -4,10 +4,11 @@
 //! lab daemon directly.
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::daemon;
-use crate::proto::client::Client;
+use crate::proto::client::{LabClient, SupClient};
+use crate::proto::{LabRequest, Region, SupRequest};
 use crate::status::{LabStatus, MachineDetail, MachineStatus};
 
 /// Resolve the current lab (name + root) from cwd, like git.
@@ -31,7 +32,7 @@ pub fn split_vm_ref(vm_ref: &str) -> Result<(Option<String>, String)> {
     }
 }
 
-async fn lab_client_for(lab: Option<String>) -> Result<(String, Client)> {
+async fn lab_client_for(lab: Option<String>) -> Result<(String, LabClient)> {
     match lab {
         Some(name) => {
             let client = daemon::try_lab_daemon(&name)
@@ -51,8 +52,10 @@ fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Runtime::new()?)
 }
 
+/// A daemon failure as an `anyhow` error that still carries its code, so
+/// `cli::run` can pick an exit code a script can branch on.
 fn remote(e: crate::proto::ProtoError) -> anyhow::Error {
-    anyhow!("{e}")
+    anyhow::Error::new(crate::proto::CommandError::from(e))
 }
 
 pub fn cmd_up(vms: Vec<String>) -> Result<()> {
@@ -62,7 +65,9 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
         let (name, root) = current_lab()?;
         let client = daemon::ensure_lab_daemon(&name, &root).await?;
         client
-            .call_streaming("up", json!({"vms": vms}), |chunk| print!("{chunk}"))
+            .send_streaming(LabRequest::Up { vms: vms.clone() }, |chunk| {
+                print!("{chunk}")
+            })
             .await
             .map_err(remote)?;
         println!("lab \"{name}\" is up");
@@ -95,7 +100,7 @@ pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
         let (name, root) = current_lab()?;
         let client = daemon::ensure_lab_daemon(&name, &root).await?;
         client
-            .call_streaming("pull", json!({"vms": vms}), |chunk| print!("{chunk}"))
+            .send_streaming(LabRequest::Pull { vms }, |chunk| print!("{chunk}"))
             .await
             .map_err(remote)?;
         println!("lab \"{name}\": templates ready");
@@ -112,13 +117,15 @@ pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
             // disks open, and `down` is exactly where a user asks for that to
             // stop. Releasing the lab makes the supervisor reap them.
             if let Ok(sup) = daemon::ensure_supervisor().await {
-                let _ = sup.call("lab.release", json!({"name": name})).await;
+                let _ = sup
+                    .send(SupRequest::LabRelease { name: name.clone() })
+                    .await;
             }
             println!("lab \"{name}\" is not running (any orphaned processes were reaped)");
             return Ok(());
         };
         client
-            .call("down", json!({"vms": vms, "force": force}))
+            .send(LabRequest::Down { vms, force })
             .await
             .map_err(remote)?;
         println!("lab \"{name}\" is down (clones retained)");
@@ -134,7 +141,7 @@ pub fn cmd_destroy() -> Result<()> {
         let lab_local = crate::paths::lab_local_dir(&root);
         match daemon::try_lab_daemon(&name).await {
             Some(client) => {
-                client.call("destroy", Value::Null).await.map_err(remote)?;
+                client.send(LabRequest::Destroy {}).await.map_err(remote)?;
             }
             None if lab_local.exists() => {
                 std::fs::remove_dir_all(&lab_local)
@@ -144,7 +151,9 @@ pub fn cmd_destroy() -> Result<()> {
         }
         // Reap the lab daemon.
         if let Ok(sup) = daemon::ensure_supervisor().await {
-            let _ = sup.call("lab.release", json!({"name": name})).await;
+            let _ = sup
+                .send(SupRequest::LabRelease { name: name.clone() })
+                .await;
         }
         println!("lab \"{name}\" destroyed");
         Ok(())
@@ -168,8 +177,8 @@ pub fn cmd_status(verbose: bool) -> Result<()> {
 /// A payload that will not parse is an error, not an empty lab: the daemon and
 /// this binary disagreeing about the shape is exactly the failure that once
 /// printed a status table with no rows in it.
-async fn lab_status(client: &Client) -> Result<LabStatus> {
-    let payload = client.call("status", Value::Null).await.map_err(remote)?;
+async fn lab_status(client: &LabClient) -> Result<LabStatus> {
+    let payload = client.send(LabRequest::Status {}).await.map_err(remote)?;
     serde_json::from_value(payload).context("the lab daemon reported a status vmlab cannot read")
 }
 
@@ -376,10 +385,10 @@ pub fn cmd_lab(cmd: LabCmd) -> Result<()> {
 /// supervisor isn't running — read-only queries don't auto-start it.
 async fn registry_labs() -> Result<Vec<Value>> {
     let sock = crate::paths::supervisor_socket();
-    let Ok(client) = Client::connect(&sock).await else {
+    let Ok(client) = SupClient::connect(&sock).await else {
         return Ok(Vec::new());
     };
-    let labs = client.call("status", Value::Null).await.map_err(remote)?;
+    let labs = client.send(SupRequest::Status {}).await.map_err(remote)?;
     Ok(labs.as_array().cloned().unwrap_or_default())
 }
 
@@ -457,7 +466,10 @@ fn cmd_lab_stop(name: &str, force: bool) -> Result<()> {
             return Ok(());
         };
         client
-            .call("down", json!({"vms": Vec::<String>::new(), "force": force}))
+            .send(LabRequest::Down {
+                vms: Vec::new(),
+                force,
+            })
             .await
             .map_err(remote)?;
         println!("lab \"{name}\" is down (clones retained)");
@@ -471,7 +483,7 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
         let root = root_for(&labs, name);
         match daemon::try_lab_daemon(name).await {
             Some(client) => {
-                client.call("destroy", Value::Null).await.map_err(remote)?;
+                client.send(LabRequest::Destroy {}).await.map_err(remote)?;
             }
             None => match &root {
                 // No daemon, but .vmlab may still hold clones to clean up.
@@ -487,111 +499,77 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
         }
         // Reap the lab daemon.
         if let Ok(sup) = daemon::ensure_supervisor().await {
-            let _ = sup.call("lab.release", json!({"name": name})).await;
+            let _ = sup
+                .send(SupRequest::LabRelease {
+                    name: name.to_string(),
+                })
+                .await;
         }
         println!("lab \"{name}\" destroyed");
         Ok(())
     })
 }
 
-pub fn cmd_vm_power(vm_ref: &str, op: &str, force: bool) -> Result<()> {
-    rt()?.block_on(async {
-        let (lab, vm) = split_vm_ref(vm_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
-        match op {
-            "start" => client
-                .call("machine.start", json!({"machine": vm}))
-                .await
-                .map_err(remote)?,
-            "stop" => client
-                .call("machine.stop", json!({"machine": vm, "force": force}))
-                .await
-                .map_err(remote)?,
-            "restart" => client
-                .call("machine.restart", json!({"machine": vm}))
-                .await
-                .map_err(remote)?,
-            _ => unreachable!(),
-        };
-        Ok(())
-    })
+/// Which power operation a `vm`/`container` verb asked for. The two nouns
+/// are two ways to say the same wire request, so they share one path — the
+/// noun only decides the wording of what is printed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerOp {
+    Start,
+    Stop,
+    Restart,
 }
 
-pub fn cmd_vm_destroy(vm_ref: &str) -> Result<()> {
-    rt()?.block_on(async {
-        let (lab, vm) = split_vm_ref(vm_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
-        client
-            .call("machine.destroy", json!({"machine": vm}))
-            .await
-            .map_err(remote)?;
-        println!("vm \"{vm}\" destroyed");
-        Ok(())
-    })
-}
-
-pub fn cmd_container_power(container_ref: &str, op: &str, force: bool) -> Result<()> {
-    rt()?.block_on(async {
-        let (lab, container) = split_vm_ref(container_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
-        match op {
-            "start" => client
-                .call("machine.start", json!({"machine": container}))
-                .await
-                .map_err(remote)?,
-            "stop" => client
-                .call(
-                    "machine.stop",
-                    json!({"machine": container, "force": force}),
-                )
-                .await
-                .map_err(remote)?,
-            "restart" => client
-                .call("machine.restart", json!({"machine": container}))
-                .await
-                .map_err(remote)?,
-            _ => unreachable!(),
-        };
-        Ok(())
-    })
-}
-
-pub fn cmd_container_destroy(container_ref: &str) -> Result<()> {
-    rt()?.block_on(async {
-        let (lab, container) = split_vm_ref(container_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
-        client
-            .call("machine.destroy", json!({"machine": container}))
-            .await
-            .map_err(remote)?;
-        println!("container \"{container}\" destroyed");
-        Ok(())
-    })
-}
-
-pub fn cmd_container_exec(container_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
-    if cmd.is_empty() {
-        bail!("nothing to execute — usage: vmlab container exec <container> -- <cmd> [args...]");
-    }
-    rt()?.block_on(async {
-        let (lab, container) = split_vm_ref(container_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
-        let result = client
-            .call(
-                "machine.exec",
-                json!({"machine": container, "cmd": cmd[0],
-                       "args": cmd[1..].to_vec(), "timeout": timeout}),
-            )
-            .await
-            .map_err(remote)?;
-        print!("{}", result["stdout"].as_str().unwrap_or(""));
-        eprint!("{}", result["stderr"].as_str().unwrap_or(""));
-        let code = result["exit_code"].as_i64().unwrap_or(0);
-        if code != 0 {
-            std::process::exit(code as i32);
+impl PowerOp {
+    /// The request this operation makes against one machine.
+    fn request(self, machine: String, force: bool) -> LabRequest {
+        match self {
+            PowerOp::Start => LabRequest::MachineStart { machine },
+            PowerOp::Stop => LabRequest::MachineStop { machine, force },
+            PowerOp::Restart => LabRequest::MachineRestart { machine, force },
         }
+    }
+}
+
+/// `vmlab vm start|stop|restart` and `vmlab container start|stop|restart`.
+pub fn cmd_machine_power(machine_ref: &str, op: PowerOp, force: bool) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, machine) = split_vm_ref(machine_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        client
+            .send(op.request(machine, force))
+            .await
+            .map_err(remote)?;
         Ok(())
     })
+}
+
+/// `vmlab vm destroy` and `vmlab container destroy`; `noun` is what the
+/// confirmation calls the machine.
+pub fn cmd_machine_destroy(machine_ref: &str, noun: &str) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, machine) = split_vm_ref(machine_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        client
+            .send(LabRequest::MachineDestroy {
+                machine: machine.clone(),
+            })
+            .await
+            .map_err(remote)?;
+        println!("{noun} \"{machine}\" destroyed");
+        Ok(())
+    })
+}
+
+/// `vmlab container exec` — the container spelling of [`cmd_exec`]; `usage`
+/// is the invocation the error message suggests.
+pub fn cmd_container_exec(container_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
+    exec_on_machine(
+        container_ref,
+        timeout,
+        cmd,
+        "vmlab container exec <container> -- <cmd> [args...]",
+    )
 }
 
 /// `vmlab container logs <container>` — dump the console log tail, or with
@@ -599,14 +577,15 @@ pub fn cmd_container_exec(container_ref: &str, timeout: u64, cmd: Vec<String>) -
 /// the container stops.
 pub fn cmd_container_logs(container_ref: &str, follow: bool, lines: usize) -> Result<()> {
     rt()?.block_on(async {
-        let (lab, container) = split_vm_ref(container_ref)?;
+        let (lab, machine) = split_vm_ref(container_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         if !follow {
             let logs = client
-                .call(
-                    "machine.logs",
-                    json!({"machine": container, "lines": lines}),
-                )
+                .send(LabRequest::MachineLogs {
+                    machine,
+                    lines,
+                    follow: false,
+                })
                 .await
                 .map_err(remote)?;
             let text = logs.as_str().unwrap_or_default();
@@ -619,9 +598,12 @@ pub fn cmd_container_logs(container_ref: &str, follow: bool, lines: usize) -> Re
         // daemon joins lines); later chunks are raw file bytes.
         let mut first = true;
         client
-            .call_streaming(
-                "machine.logs",
-                json!({"machine": container, "lines": lines, "follow": true}),
+            .send_streaming(
+                LabRequest::MachineLogs {
+                    machine,
+                    lines,
+                    follow: true,
+                },
                 |chunk| {
                     if std::mem::take(&mut first) {
                         if !chunk.is_empty() {
@@ -644,11 +626,10 @@ pub fn cmd_machine_ip(machine_ref: &str, nic: Option<usize>) -> Result<()> {
     rt()?.block_on(async {
         let (lab, machine) = split_vm_ref(machine_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
-        let mut args = json!({"machine": machine});
-        if let Some(n) = nic {
-            args["nic"] = json!(n);
-        }
-        let ip = client.call("machine.ip", args).await.map_err(remote)?;
+        let ip = client
+            .send(LabRequest::MachineIp { machine, nic })
+            .await
+            .map_err(remote)?;
         println!("{}", ip.as_str().unwrap_or_default());
         Ok(())
     })
@@ -659,86 +640,58 @@ pub fn cmd_machine_ip(machine_ref: &str, nic: Option<usize>) -> Result<()> {
 /// attach opens a fresh session; the local terminal goes raw; `Ctrl-]`
 /// detaches, like telnet.
 pub fn cmd_container_shell(container_ref: &str) -> Result<()> {
-    rt()?.block_on(async {
-        let (lab, container) = split_vm_ref(container_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
-        let (cols, rows) = rustix::termios::tcgetwinsize(std::io::stdout())
-            .map(|ws| (ws.ws_col, ws.ws_row))
-            .unwrap_or((80, 24));
-        let opened = client
-            .call(
-                "machine.tty_open",
-                json!({"machine": container, "cols": cols, "rows": rows}),
-            )
-            .await
-            .map_err(remote)?;
-        let session = opened["session"].as_u64().unwrap_or(0);
-        let path = std::path::PathBuf::from(opened["path"].as_str().unwrap_or_default());
-        let resize: super::tty_attach::ResizeFn = {
-            let (client, container) = (client.clone(), container.clone());
-            std::sync::Arc::new(move |cols, rows| {
-                let (client, container) = (client.clone(), container.clone());
-                Box::pin(async move {
-                    let _ = client
-                        .call(
-                            "machine.tty_resize",
-                            json!({"machine": container, "session": session,
-                                   "cols": cols, "rows": rows}),
-                        )
-                        .await;
-                })
-            })
-        };
-        super::tty_attach::attach_tty(
-            &path,
-            &format!("connected to \"{container}\" — escape character is ^]"),
-            resize,
-        )
-        .await
-    })
+    rt()?.block_on(shell_on_machine(container_ref))
 }
 
 /// `vmlab shell <vm>` — attach an interactive shell inside the VM over the
 /// vmlab-agent channel (root on Linux, SYSTEM PowerShell on Windows). Every
 /// attach opens a fresh session; concurrent shells are independent.
 pub fn cmd_shell(vm_ref: &str) -> Result<()> {
-    rt()?.block_on(async {
-        let (lab, vm) = split_vm_ref(vm_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
-        // Open at the real terminal size so the first prompt lays out right.
-        let (cols, rows) = rustix::termios::tcgetwinsize(std::io::stdout())
-            .map(|ws| (ws.ws_col, ws.ws_row))
-            .unwrap_or((80, 24));
-        let opened = client
-            .call(
-                "machine.tty_open",
-                json!({"machine": vm, "cols": cols, "rows": rows}),
-            )
-            .await
-            .map_err(remote)?;
-        let session = opened["session"].as_u64().unwrap_or(0);
-        let path = std::path::PathBuf::from(opened["path"].as_str().unwrap_or_default());
-        let resize: super::tty_attach::ResizeFn = {
-            let (client, vm) = (client.clone(), vm.clone());
-            std::sync::Arc::new(move |cols, rows| {
-                let (client, vm) = (client.clone(), vm.clone());
-                Box::pin(async move {
-                    let _ = client
-                        .call(
-                            "machine.tty_resize",
-                            json!({"machine": vm, "session": session, "cols": cols, "rows": rows}),
-                        )
-                        .await;
-                })
-            })
-        };
-        super::tty_attach::attach_tty(
-            &path,
-            &format!("connected to \"{vm}\" — escape character is ^]"),
-            resize,
-        )
+    rt()?.block_on(shell_on_machine(vm_ref))
+}
+
+/// Open an agent terminal on one machine and hand the local terminal over to
+/// it. Both shell verbs land here — a VM and a container serve the same
+/// request.
+async fn shell_on_machine(machine_ref: &str) -> Result<()> {
+    let (lab, machine) = split_vm_ref(machine_ref)?;
+    let (_name, client) = lab_client_for(lab).await?;
+    // Open at the real terminal size so the first prompt lays out right.
+    let (cols, rows) = rustix::termios::tcgetwinsize(std::io::stdout())
+        .map(|ws| (ws.ws_col, ws.ws_row))
+        .unwrap_or((80, 24));
+    let opened = client
+        .send(LabRequest::MachineTtyOpen {
+            machine: machine.clone(),
+            cols,
+            rows,
+        })
         .await
-    })
+        .map_err(remote)?;
+    let session = opened["session"].as_u64().unwrap_or(0) as u32;
+    let path = std::path::PathBuf::from(opened["path"].as_str().unwrap_or_default());
+    let resize: super::tty_attach::ResizeFn = {
+        let (client, machine) = (client.clone(), machine.clone());
+        std::sync::Arc::new(move |cols, rows| {
+            let (client, machine) = (client.clone(), machine.clone());
+            Box::pin(async move {
+                let _ = client
+                    .send(LabRequest::MachineTtyResize {
+                        machine,
+                        session,
+                        cols,
+                        rows,
+                    })
+                    .await;
+            })
+        })
+    };
+    super::tty_attach::attach_tty(
+        &path,
+        &format!("connected to \"{machine}\" — escape character is ^]"),
+        resize,
+    )
+    .await
 }
 
 /// `vmlab tail <vm> <path>` — follow a file inside the guest (tail -F
@@ -748,9 +701,11 @@ pub fn cmd_tail(vm_ref: &str, path: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call_streaming(
-                "machine.tail",
-                json!({"machine": vm, "path": path}),
+            .send_streaming(
+                LabRequest::MachineTail {
+                    machine: vm,
+                    path: path.to_string(),
+                },
                 |chunk| {
                     print!("{chunk}");
                     use std::io::Write;
@@ -769,16 +724,18 @@ pub fn cmd_eventlog(vm_ref: &str, filter: Option<&str>) -> Result<()> {
     rt()?.block_on(async {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
-        let mut args = json!({"machine": vm});
-        if let Some(f) = filter {
-            args["filter"] = json!(f);
-        }
         client
-            .call_streaming("machine.eventlog", args, |chunk| {
-                print!("{chunk}");
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            })
+            .send_streaming(
+                LabRequest::MachineEventLog {
+                    machine: vm,
+                    filter: filter.map(str::to_string),
+                },
+                |chunk| {
+                    print!("{chunk}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                },
+            )
             .await
             .map_err(remote)?;
         Ok(())
@@ -796,11 +753,19 @@ fn abs_path(path: &str) -> Result<std::path::PathBuf> {
     }
 }
 
-/// Validate an optional `--region x y w h` flag into a JSON value for the RPC.
-fn region_value(region: Option<Vec<i64>>) -> Result<Value> {
-    match region {
-        None => Ok(Value::Null),
-        Some(r) if r.len() == 4 => Ok(json!(r)),
+/// Validate an optional `--region x y w h` flag into the request's rectangle.
+fn region_value(region: Option<Vec<i64>>) -> Result<Option<Region>> {
+    match region.as_deref() {
+        None => Ok(None),
+        Some([x, y, w, h]) => {
+            let at = |v: i64| v.max(0) as u32;
+            Ok(Some(Region {
+                x: at(*x),
+                y: at(*y),
+                w: at(*w),
+                h: at(*h),
+            }))
+        }
         Some(r) => bail!("--region needs 4 values (x y w h), got {}", r.len()),
     }
 }
@@ -811,10 +776,10 @@ pub fn cmd_vm_screenshot(vm_ref: &str, path: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let result = client
-            .call(
-                "machine.screenshot",
-                json!({"machine": vm, "path": out.to_string_lossy()}),
-            )
+            .send(LabRequest::MachineScreenshot {
+                machine: vm,
+                path: out.to_string_lossy().into_owned(),
+            })
             .await
             .map_err(remote)?;
         println!("{}", result["path"].as_str().unwrap_or(path));
@@ -827,7 +792,10 @@ pub fn cmd_vm_sendkeys(vm_ref: &str, chord: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call("machine.sendkeys", json!({"machine": vm, "keys": chord}))
+            .send(LabRequest::MachineSendKeys {
+                machine: vm,
+                keys: chord.to_string(),
+            })
             .await
             .map_err(remote)?;
         Ok(())
@@ -839,7 +807,7 @@ pub fn cmd_vm_mouse_move(vm_ref: &str, x: i64, y: i64) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call("machine.mouse_move", json!({"machine": vm, "x": x, "y": y}))
+            .send(LabRequest::MachineMouseMove { machine: vm, x, y })
             .await
             .map_err(remote)?;
         Ok(())
@@ -853,13 +821,13 @@ pub fn cmd_vm_click(vm_ref: &str, x: Option<i64>, y: Option<i64>, button: &str) 
     rt()?.block_on(async {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
-        let mut args = json!({"machine": vm, "button": button});
-        if let (Some(x), Some(y)) = (x, y) {
-            args["x"] = json!(x);
-            args["y"] = json!(y);
-        }
         client
-            .call("machine.mouse_click", args)
+            .send(LabRequest::MachineMouseClick {
+                machine: vm,
+                button: button.to_string(),
+                x,
+                y,
+            })
             .await
             .map_err(remote)?;
         Ok(())
@@ -871,10 +839,13 @@ pub fn cmd_vm_drag(vm_ref: &str, x1: i64, y1: i64, x2: i64, y2: i64) -> Result<(
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
-            .call(
-                "machine.mouse_drag",
-                json!({"machine": vm, "x1": x1, "y1": y1, "x2": x2, "y2": y2}),
-            )
+            .send(LabRequest::MachineMouseDrag {
+                machine: vm,
+                x1,
+                y1,
+                x2,
+                y2,
+            })
             .await
             .map_err(remote)?;
         Ok(())
@@ -887,7 +858,10 @@ pub fn cmd_vm_ocr(vm_ref: &str, region: Option<Vec<i64>>) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let text = client
-            .call("machine.ocr", json!({"machine": vm, "region": region}))
+            .send(LabRequest::MachineOcr {
+                machine: vm,
+                region,
+            })
             .await
             .map_err(remote)?;
         println!("{}", text.as_str().unwrap_or_default());
@@ -907,11 +881,12 @@ pub fn cmd_vm_find_image(
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let m = client
-            .call(
-                "machine.find_image",
-                json!({"machine": vm, "image": img.to_string_lossy(),
-                       "threshold": threshold, "region": region}),
-            )
+            .send(LabRequest::MachineFindImage {
+                machine: vm,
+                image: img.to_string_lossy().into_owned(),
+                threshold,
+                region,
+            })
             .await
             .map_err(remote)?;
         if m.is_null() {
@@ -933,17 +908,33 @@ pub fn cmd_vm_find_image(
 }
 
 pub fn cmd_exec(vm_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
+    exec_on_machine(vm_ref, timeout, cmd, "vmlab exec <vm> -- <cmd> [args...]")
+}
+
+/// Run a command in one machine's guest and mirror its output and exit code.
+/// Both exec verbs land here; `usage` is the invocation to suggest when the
+/// caller passed nothing to run.
+fn exec_on_machine(
+    machine_ref: &str,
+    timeout: u64,
+    mut cmd: Vec<String>,
+    usage: &str,
+) -> Result<()> {
     if cmd.is_empty() {
-        bail!("nothing to execute — usage: vmlab exec <vm> -- <cmd> [args...]");
+        bail!("nothing to execute — usage: {usage}");
     }
+    let args = cmd.split_off(1);
+    let program = cmd.remove(0);
     rt()?.block_on(async {
-        let (lab, vm) = split_vm_ref(vm_ref)?;
+        let (lab, machine) = split_vm_ref(machine_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let result = client
-            .call(
-                "machine.exec",
-                json!({"machine": vm, "cmd": cmd[0], "args": cmd[1..].to_vec(), "timeout": timeout}),
-            )
+            .send(LabRequest::MachineExec {
+                machine,
+                cmd: program,
+                args,
+                timeout,
+            })
             .await
             .map_err(remote)?;
         print!("{}", result["stdout"].as_str().unwrap_or(""));
@@ -965,7 +956,10 @@ pub fn cmd_osinfo(vm_ref: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let info = client
-            .call("machine.osinfo", json!({"machine": vm}))
+            .send(LabRequest::MachineOsInfo {
+                machine: vm,
+                timeout: 30,
+            })
             .await
             .map_err(remote)?;
         println!("{info}");
@@ -979,7 +973,7 @@ pub fn cmd_playbook_list() -> Result<()> {
     rt()?.block_on(async {
         let (_name, client) = lab_client_for(None).await?;
         let list = client
-            .call("playbook.list", Value::Null)
+            .send(LabRequest::PlaybookList {})
             .await
             .map_err(remote)?;
         let rows = list.as_array().cloned().unwrap_or_default();
@@ -1025,17 +1019,21 @@ pub fn cmd_playbook_run(
     rt()?.block_on(async {
         let (lab, machine) = split_vm_ref(machine_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
-        let cmd = if apply {
-            "playbook.apply"
+        let req = if apply {
+            LabRequest::PlaybookApply {
+                machine,
+                playbook,
+                play,
+            }
         } else {
-            "playbook.check"
+            LabRequest::PlaybookCheck {
+                machine,
+                playbook,
+                play,
+            }
         };
         let result = client
-            .call_streaming(
-                cmd,
-                json!({"machine": machine, "playbook": playbook, "play": play}),
-                |chunk| print!("{chunk}"),
-            )
+            .send_streaming(req, |chunk| print!("{chunk}"))
             .await
             .map_err(remote)?;
 
@@ -1109,7 +1107,7 @@ fn cp_push(src: &str, vm_part: &str, guest_dest: &str) -> Result<()> {
 /// Push one file or a tree over the agent channel (parent directories are
 /// created by the agent; digests verified end-to-end by the daemon).
 async fn push_via_agent(
-    client: &Client,
+    client: &LabClient,
     vm: &str,
     src: &std::path::Path,
     guest_dest: &str,
@@ -1121,9 +1119,14 @@ async fn push_via_agent(
     for (local, to, mode) in entries {
         // The daemon opens the file itself, so hand it an absolute path.
         let from = abs_path(local.to_str().unwrap_or_default())?;
-        let args = json!({"machine": vm, "from": from, "to": to, "mode": mode});
         let r = client
-            .call("machine.push_file", args)
+            .send(LabRequest::MachinePushFile {
+                machine: vm.to_string(),
+                to,
+                from: Some(from.to_string_lossy().into_owned()),
+                data: None,
+                mode,
+            })
             .await
             .map_err(remote)?;
         total += r["len"].as_u64().unwrap_or(0);
@@ -1154,10 +1157,11 @@ fn cp_pull(vm_part: &str, guest_src: &str, dest: &str) -> Result<()> {
     rt()?.block_on(async {
         let (_name, client) = lab_client_for(lab).await?;
         let r = client
-            .call(
-                "machine.pull_file",
-                json!({"machine": vm, "from": guest_src, "to": dest_abs}),
-            )
+            .send(LabRequest::MachinePullFile {
+                machine: vm,
+                from: guest_src.to_string(),
+                to: dest_abs.to_string_lossy().into_owned(),
+            })
             .await
             .map_err(remote)?;
         println!(
@@ -1177,7 +1181,12 @@ pub fn cmd_run(script: &str) -> Result<()> {
         }
         let client = daemon::ensure_lab_daemon(&name, &root).await?;
         client
-            .call_streaming("run", json!({"script": script}), |chunk| print!("{chunk}"))
+            .send_streaming(
+                LabRequest::Run {
+                    script: script.to_string(),
+                },
+                |chunk| print!("{chunk}"),
+            )
             .await
             .map_err(remote)?;
         Ok(())
@@ -1194,11 +1203,13 @@ pub fn cmd_snapshot(vm_ref: Option<String>, name: String) -> Result<()> {
             None => (None, None),
         };
         let (_lab_name, client) = lab_client_for(lab).await?;
-        let mut args = json!({"name": name});
-        if let Some(v) = vm {
-            args["vm"] = json!(v);
-        }
-        client.call("snapshot.take", args).await.map_err(remote)?;
+        client
+            .send(LabRequest::SnapshotTake {
+                name: name.clone(),
+                vm,
+            })
+            .await
+            .map_err(remote)?;
         println!("snapshot \"{name}\" created");
         Ok(())
     })
@@ -1214,12 +1225,11 @@ pub fn cmd_restore(vm_ref: Option<String>, name: String) -> Result<()> {
             None => (None, None),
         };
         let (_lab_name, client) = lab_client_for(lab).await?;
-        let mut args = json!({"name": name});
-        if let Some(v) = vm {
-            args["vm"] = json!(v);
-        }
         client
-            .call("snapshot.restore", args)
+            .send(LabRequest::SnapshotRestore {
+                name: name.clone(),
+                vm,
+            })
             .await
             .map_err(remote)?;
         println!("snapshot \"{name}\" restored");
@@ -1232,7 +1242,9 @@ pub fn cmd_snapshots(vm_ref: &str) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         let snaps = client
-            .call("snapshot.list", json!({"machine": vm}))
+            .send(LabRequest::SnapshotList {
+                machine: vm.clone(),
+            })
             .await
             .map_err(remote)?;
         let list = snaps.as_array().cloned().unwrap_or_default();
@@ -1262,7 +1274,10 @@ pub fn cmd_snapshot_delete(vm_ref: &str, name: String) -> Result<()> {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_lab_name, client) = lab_client_for(lab).await?;
         client
-            .call("snapshot.delete", json!({"machine": vm, "name": name}))
+            .send(LabRequest::SnapshotDelete {
+                machine: vm,
+                name: name.clone(),
+            })
             .await
             .map_err(remote)?;
         println!("snapshot \"{name}\" deleted");
@@ -1390,7 +1405,9 @@ pub fn cmd_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_log_line, region_value, render_status, root_for};
+    use super::{
+        LabRequest, PowerOp, Region, format_log_line, region_value, render_status, root_for,
+    };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
     use crate::status::{MachineDetail, MachineStatus, PowerState, PullKind, PullStatus};
@@ -1536,12 +1553,43 @@ mod tests {
         assert_eq!(render_status(&lab(Vec::new()), true), "lab \"demo\"\n");
     }
 
+    /// What `vmlab vm|container start|stop|restart` puts on the wire. Both
+    /// nouns route here, so this is the whole mapping — and `--force` is the
+    /// difference between a graceful stop and a kill, so it has to reach the
+    /// request rather than stopping at the verb.
+    #[test]
+    fn power_ops_build_their_documented_requests() {
+        assert_eq!(
+            PowerOp::Start.request("dc01".into(), true),
+            // Start has nothing to force.
+            LabRequest::MachineStart {
+                machine: "dc01".into(),
+            }
+        );
+        assert_eq!(
+            PowerOp::Stop.request("dc01".into(), true),
+            LabRequest::MachineStop {
+                machine: "dc01".into(),
+                force: true,
+            }
+        );
+        assert_eq!(
+            PowerOp::Restart.request("dc01".into(), false),
+            LabRequest::MachineRestart {
+                machine: "dc01".into(),
+                force: false,
+            }
+        );
+    }
+
     #[test]
     fn region_value_validates_arity() {
-        assert_eq!(region_value(None).unwrap(), serde_json::Value::Null);
+        assert_eq!(region_value(None).unwrap(), None);
         assert_eq!(
-            region_value(Some(vec![1, 2, 3, 4])).unwrap(),
-            json!([1, 2, 3, 4])
+            region_value(Some(vec![1, 2, 3, 4]))
+                .unwrap()
+                .map(Region::as_tuple),
+            Some((1, 2, 3, 4))
         );
         assert!(region_value(Some(vec![1, 2, 3])).is_err());
         assert!(region_value(Some(vec![1, 2, 3, 4, 5])).is_err());

@@ -46,6 +46,11 @@ guest-build arch='x86_64 aarch64':
 agent-build target='':
 	./guest/build-agent.sh {{target}}
 
+# Rewrite the generated protocol reference and console types (ADR-0007)
+[group('build')]
+proto-generate:
+	VMLAB_WRITE_PROTOCOL_DOCS=1 cargo test --lib proto::report::tests::generated_artefacts_are_current
+
 # Build + install the guest asset and agent binaries into ~/.local/share/vmlab/guest
 [group('build')]
 guest-install: guest-build agent-build

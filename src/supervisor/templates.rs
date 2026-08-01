@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::Supervisor;
 use crate::config::model::TemplateDef;
-use crate::proto::Event;
+use crate::proto::{CommandError, Event};
 use crate::sync::LockRecover;
 use crate::template::TemplateStore;
 
@@ -49,14 +49,14 @@ impl TemplateOps {
         arch: &str,
         template: &str,
         kind: &'static str,
-    ) -> Result<OpGuard, String> {
+    ) -> Result<OpGuard, CommandError> {
         let key = (lab.to_string(), arch.to_string(), template.to_string());
         let mut ops = self.inner.lock_recover();
         if let Some(op) = ops.get(&key) {
-            return Err(format!(
+            return Err(CommandError::conflict(format!(
                 "{} already running for `{arch}/{template}`",
                 op.kind
-            ));
+            )));
         }
         let cancel = tokio_util::sync::CancellationToken::new();
         ops.insert(
@@ -104,32 +104,40 @@ impl TemplateOps {
         }
     }
 
-    pub fn console_path(&self, lab: &str, arch: &str, template: &str) -> Result<PathBuf, String> {
+    pub fn console_path(
+        &self,
+        lab: &str,
+        arch: &str,
+        template: &str,
+    ) -> Result<PathBuf, CommandError> {
         let ops = self.inner.lock_recover();
         let op = ops
             .get(&(lab.to_string(), arch.to_string(), template.to_string()))
-            .ok_or_else(|| format!("no operation running for `{arch}/{template}`"))?;
-        let path = op
-            .console
-            .as_ref()
-            .ok_or_else(|| format!("console for `{arch}/{template}` is not ready"))?;
+            .ok_or_else(|| {
+                CommandError::not_found(format!("no operation running for `{arch}/{template}`"))
+            })?;
+        let path = op.console.as_ref().ok_or_else(|| {
+            CommandError::conflict(format!("console for `{arch}/{template}` is not ready"))
+        })?;
         if !path.exists() {
-            return Err(format!(
+            return Err(CommandError::conflict(format!(
                 "console for `{arch}/{template}` is no longer available"
-            ));
+            )));
         }
         Ok(path.clone())
     }
 
-    fn cancel_build(&self, lab: &str, arch: &str, template: &str) -> Result<(), String> {
+    fn cancel_build(&self, lab: &str, arch: &str, template: &str) -> Result<(), CommandError> {
         let ops = self.inner.lock_recover();
         let op = ops
             .get(&(lab.to_string(), arch.to_string(), template.to_string()))
-            .ok_or_else(|| format!("no build running for `{arch}/{template}`"))?;
+            .ok_or_else(|| {
+                CommandError::not_found(format!("no build running for `{arch}/{template}`"))
+            })?;
         if op.kind != "build" {
-            return Err(format!(
+            return Err(CommandError::conflict(format!(
                 "the operation running for `{arch}/{template}` is a push"
-            ));
+            )));
         }
         op.cancel.cancel();
         Ok(())
@@ -203,26 +211,28 @@ fn load_defs(root: &Path) -> Result<Vec<TemplateDef>, String> {
     Ok(tf.templates)
 }
 
-fn find_def(root: &Path, template: &str, arch: Option<&str>) -> Result<TemplateDef, String> {
+fn find_def(root: &Path, template: &str, arch: Option<&str>) -> Result<TemplateDef, CommandError> {
     let mut matches = load_defs(root)?
         .into_iter()
         .filter(|d| d.name == template && arch.is_none_or(|a| d.arch == a));
-    let first = matches.next().ok_or_else(|| match arch {
-        Some(arch) => format!("no template named `{arch}/{template}` in the lab config"),
-        None => format!("no template named `{template}` in the lab config"),
+    let first = matches.next().ok_or_else(|| {
+        CommandError::not_found(match arch {
+            Some(arch) => format!("no template named `{arch}/{template}` in the lab config"),
+            None => format!("no template named `{template}` in the lab config"),
+        })
     })?;
     if arch.is_none() && matches.next().is_some() {
-        return Err(format!(
+        return Err(CommandError::invalid(format!(
             "template name `{template}` is ambiguous; specify its architecture"
-        ));
+        )));
     }
     Ok(first)
 }
 
 /// `template.list`: the lab's template definitions joined with their local
 /// store versions (newest first) and any in-flight operation.
-pub async fn list(lab: String, root: PathBuf, ops: TemplateOps) -> Result<Value, String> {
-    let entries = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
+pub async fn list(lab: String, root: PathBuf, ops: TemplateOps) -> Result<Value, CommandError> {
+    let entries = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, CommandError> {
         let defs = load_defs(&root)?;
         let store = TemplateStore::new(crate::paths::template_store_dir());
         Ok(defs
@@ -263,7 +273,7 @@ pub async fn remote(
     root: PathBuf,
     template: String,
     arch: Option<String>,
-) -> Result<Value, String> {
+) -> Result<Value, CommandError> {
     use futures::StreamExt as _;
 
     let def = {
@@ -273,7 +283,9 @@ pub async fn remote(
             .map_err(|e| e.to_string())??
     };
     let Some(repo) = def.registry else {
-        return Err(format!("template `{template}` has no `registry` set"));
+        return Err(CommandError::invalid(format!(
+            "template `{template}` has no `registry` set"
+        )));
     };
     let registry = crate::oci::Registry::new(&repo).map_err(|e| format!("{e:#}"))?;
     let tags = registry.list_tags().await.map_err(|e| format!("{e:#}"))?;
@@ -305,10 +317,10 @@ pub async fn start_build(
     root: PathBuf,
     template: String,
     arch: Option<String>,
-) -> Result<Value, String> {
+) -> Result<Value, CommandError> {
     let (def, profiles) = {
         let (root, template, arch) = (root.clone(), template.clone(), arch.clone());
-        tokio::task::spawn_blocking(move || -> Result<_, String> {
+        tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
             let def = find_def(&root, &template, arch.as_deref())?;
             let profiles = crate::profiles::ProfileSet::load_default()
                 .map_err(|e| format!("loading profiles: {e:#}"))?;
@@ -414,7 +426,7 @@ pub fn stop_build(
     lab: String,
     arch: String,
     template: String,
-) -> Result<Value, String> {
+) -> Result<Value, CommandError> {
     sup.template_ops.cancel_build(&lab, &arch, &template)?;
     Ok(json!({"stopping": true}))
 }
@@ -428,10 +440,10 @@ pub async fn start_push(
     template: String,
     arch: Option<String>,
     version: Option<String>,
-) -> Result<Value, String> {
+) -> Result<Value, CommandError> {
     let (resolved, repo) = {
         let (root, template, arch) = (root.clone(), template.clone(), arch.clone());
-        tokio::task::spawn_blocking(move || -> Result<_, String> {
+        tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
             let def = find_def(&root, &template, arch.as_deref())?;
             let store = TemplateStore::new(crate::paths::template_store_dir());
             let resolved = store
@@ -442,7 +454,9 @@ pub async fn start_push(
                 .registry
                 .clone()
                 .or(def.registry)
-                .ok_or("no push target — set `registry` in the template")?;
+                .ok_or_else(|| {
+                    CommandError::invalid("no push target — set `registry` in the template")
+                })?;
             Ok((resolved, repo))
         })
         .await
@@ -539,7 +553,8 @@ mod tests {
         let Err(err) = ops.try_begin("lab1", "x86_64", "base", "push") else {
             panic!("second claim should be rejected");
         };
-        assert!(err.contains("build already running"), "{err}");
+        assert_eq!(err.code, crate::proto::ErrorCode::Conflict);
+        assert!(err.message.contains("build already running"), "{err}");
         // Other templates and other labs are unaffected.
         ops.try_begin("lab1", "aarch64", "base", "build").unwrap();
         ops.try_begin("lab1", "x86_64", "other", "build").unwrap();
@@ -654,7 +669,8 @@ template "base" {
         .unwrap();
         assert!(find_def(root.path(), "base", None).is_ok());
         let err = find_def(root.path(), "nope", None).unwrap_err();
-        assert!(err.contains("no template named"), "{err}");
+        assert_eq!(err.code, crate::proto::ErrorCode::NotFound);
+        assert!(err.message.contains("no template named"), "{err}");
     }
 
     #[test]
@@ -669,7 +685,8 @@ template "base" { arch = "aarch64" version = "1" source "scratch" { } }
         )
         .unwrap();
         let err = find_def(root.path(), "base", None).unwrap_err();
-        assert!(err.contains("ambiguous"), "{err}");
+        assert_eq!(err.code, crate::proto::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("ambiguous"), "{err}");
         assert_eq!(
             find_def(root.path(), "base", Some("aarch64")).unwrap().arch,
             "aarch64"

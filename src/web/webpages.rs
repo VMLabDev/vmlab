@@ -323,10 +323,13 @@ async fn resolve_target(
     let reply = state
         .lab_call(
             lab,
-            "web.forward",
-            json!({"machine": machine, "page": page}),
+            vmlab::proto::LabRequest::WebForward {
+                machine: machine.to_string(),
+                page: page.clone(),
+            },
         )
-        .await?;
+        .await
+        .map_err(|e| e.message)?;
     let addr: std::net::SocketAddr = reply["addr"]
         .as_str()
         .and_then(|s| s.parse().ok())

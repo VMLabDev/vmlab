@@ -39,7 +39,7 @@ pub async fn events(
                     // cached client would let every new WS session steal the
                     // previous one's event stream (older tabs go silent).
                     if state.supervisor().await.is_ok()
-                        && let Ok(sub) = vmlab::proto::client::Client::connect(
+                        && let Ok(sub) = vmlab::proto::client::SupClient::connect(
                             &vmlab::paths::supervisor_socket(),
                         )
                         .await

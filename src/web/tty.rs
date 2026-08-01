@@ -11,6 +11,7 @@ use futures::StreamExt;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use vmlab::proto::LabRequest;
 
 use super::state::AppState;
 
@@ -42,13 +43,20 @@ async fn bridge(
     // and hands back its path. Open failures (no agent in the guest, VM not
     // running) surface as a conflict with the daemon's actionable message.
     let opened = match state
-        .lab_call(&lab, "machine.tty_open", json!({"machine": machine}))
+        .lab_call(
+            &lab,
+            LabRequest::MachineTtyOpen {
+                machine: machine.clone(),
+                cols: 80,
+                rows: 24,
+            },
+        )
         .await
     {
         Ok(v) => v,
         Err(e) => return Ok(super::api::fail(e)),
     };
-    let session = opened["session"].as_u64().unwrap_or(0);
+    let session = opened["session"].as_u64().unwrap_or(0) as u32;
     let sock = std::path::PathBuf::from(opened["path"].as_str().unwrap_or_default());
     let unix = match UnixStream::connect(&sock).await {
         Ok(u) => u,
@@ -94,13 +102,17 @@ async fn bridge(
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
                         && let Some(r) = v.get("resize")
                     {
-                        let args = json!({
-                            "machine": machine,
-                            "session": session,
-                            "cols": r["cols"].as_u64().unwrap_or(80),
-                            "rows": r["rows"].as_u64().unwrap_or(24),
-                        });
-                        let _ = state.lab_call(&lab, "machine.tty_resize", args).await;
+                        let _ = state
+                            .lab_call(
+                                &lab,
+                                LabRequest::MachineTtyResize {
+                                    machine: machine.clone(),
+                                    session,
+                                    cols: r["cols"].as_u64().unwrap_or(80) as u16,
+                                    rows: r["rows"].as_u64().unwrap_or(24) as u16,
+                                },
+                            )
+                            .await;
                     }
                 }
                 AggregatedMessage::Ping(p) => {

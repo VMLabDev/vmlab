@@ -366,11 +366,11 @@ pub fn run() -> ExitCode {
         Command::Status { verbose } => lab::cmd_status(verbose),
         Command::Validate => validate::cmd_validate().map(|_| ()),
         Command::Vm { cmd } => match cmd {
-            VmCmd::Start { vm } => lab::cmd_vm_power(&vm, "start", false),
+            VmCmd::Start { vm } => lab::cmd_machine_power(&vm, lab::PowerOp::Start, false),
             VmCmd::Ip { vm, nic } => lab::cmd_machine_ip(&vm, nic),
-            VmCmd::Stop { vm, force } => lab::cmd_vm_power(&vm, "stop", force),
-            VmCmd::Restart { vm } => lab::cmd_vm_power(&vm, "restart", false),
-            VmCmd::Destroy { vm } => lab::cmd_vm_destroy(&vm),
+            VmCmd::Stop { vm, force } => lab::cmd_machine_power(&vm, lab::PowerOp::Stop, force),
+            VmCmd::Restart { vm } => lab::cmd_machine_power(&vm, lab::PowerOp::Restart, false),
+            VmCmd::Destroy { vm } => lab::cmd_machine_destroy(&vm, "vm"),
             VmCmd::Screenshot { vm, path } => lab::cmd_vm_screenshot(&vm, &path),
             VmCmd::Sendkeys { vm, chord } => lab::cmd_vm_sendkeys(&vm, &chord),
             VmCmd::MouseMove { vm, x, y } => lab::cmd_vm_mouse_move(&vm, x, y),
@@ -386,15 +386,17 @@ pub fn run() -> ExitCode {
         },
         Command::Container { cmd } => match cmd {
             ContainerCmd::Start { container } => {
-                lab::cmd_container_power(&container, "start", false)
+                lab::cmd_machine_power(&container, lab::PowerOp::Start, false)
             }
             ContainerCmd::Stop { container, force } => {
-                lab::cmd_container_power(&container, "stop", force)
+                lab::cmd_machine_power(&container, lab::PowerOp::Stop, force)
             }
             ContainerCmd::Restart { container } => {
-                lab::cmd_container_power(&container, "restart", false)
+                lab::cmd_machine_power(&container, lab::PowerOp::Restart, false)
             }
-            ContainerCmd::Destroy { container } => lab::cmd_container_destroy(&container),
+            ContainerCmd::Destroy { container } => {
+                lab::cmd_machine_destroy(&container, "container")
+            }
             ContainerCmd::Exec {
                 container,
                 timeout,
@@ -470,8 +472,21 @@ pub fn run() -> ExitCode {
                 Some(issues) => eprintln!("{:?}", miette::Report::new(issues.diagnostic())),
                 None => eprintln!("{err:?}"),
             }
-            ExitCode::FAILURE
+            exit_code_for(&err)
         }
+    }
+}
+
+/// The process exit code for a failed verb.
+///
+/// A daemon failure carries an [`ErrorCode`], so a script can branch on what
+/// went wrong without matching on the message. Anything else — a config
+/// error, an unreachable daemon, a local IO failure — is the plain failure
+/// code the CLI has always used.
+fn exit_code_for(err: &anyhow::Error) -> ExitCode {
+    match err.downcast_ref::<crate::proto::CommandError>() {
+        Some(e) => ExitCode::from(e.code.exit_code()),
+        None => ExitCode::FAILURE,
     }
 }
 

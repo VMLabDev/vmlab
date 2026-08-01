@@ -14,8 +14,9 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::proto::client::LabClient;
 use crate::proto::server::{Handler, Server, Streamer};
-use crate::proto::{Event, client::Client};
+use crate::proto::{CommandError, Event, LabRequest, SupRequest};
 use global::GlobalSegments;
 use registry::{LabEntry, LabState, Registry};
 
@@ -67,7 +68,7 @@ async fn run_async() -> Result<()> {
     let tasks = Arc::new(crate::lifecycle::TaskGroup::new());
 
     let sock = crate::paths::supervisor_socket();
-    let handler: Arc<dyn Handler> = Arc::new(SupervisorHandler {
+    let handler: Arc<dyn Handler<SupRequest>> = Arc::new(SupervisorHandler {
         sup: supervisor.clone(),
         tasks: tasks.clone(),
     });
@@ -161,9 +162,9 @@ impl Supervisor {
                 continue;
             }
             let sock = crate::paths::lab_socket(&entry.name);
-            match Client::connect(&sock).await {
+            match LabClient::connect(&sock).await {
                 Ok(client) => {
-                    if client.call("ping", Value::Null).await.is_ok() {
+                    if client.send(LabRequest::Ping {}).await.is_ok() {
                         self.watch_lab_events(entry.name.clone()).await;
                         continue;
                     }
@@ -205,8 +206,8 @@ impl Supervisor {
             let reg = self.registry.lock().await;
             if let Some(entry) = reg.get(name)
                 && entry.state == LabState::Running
-                && let Ok(c) = Client::connect(&sock).await
-                && c.call("ping", Value::Null).await.is_ok()
+                && let Ok(c) = LabClient::connect(&sock).await
+                && c.send(LabRequest::Ping {}).await.is_ok()
             {
                 return Ok(sock);
             }
@@ -287,8 +288,8 @@ impl Supervisor {
         // crash still reports fast.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            if let Ok(c) = Client::connect(&sock).await
-                && c.call("ping", Value::Null).await.is_ok()
+            if let Ok(c) = LabClient::connect(&sock).await
+                && c.send(LabRequest::Ping {}).await.is_ok()
             {
                 self.watch_lab_events(name.to_string()).await;
                 return Ok(sock);
@@ -316,7 +317,7 @@ impl Supervisor {
         let sock = crate::paths::lab_socket(&lab);
         let sup = self.clone();
         tokio::spawn(async move {
-            let Ok(client) = Client::connect(&sock).await else {
+            let Ok(client) = LabClient::connect(&sock).await else {
                 return;
             };
             let Ok(mut rx) = client.subscribe().await else {
@@ -346,8 +347,8 @@ impl Supervisor {
         // exit. A daemon that's already gone (e.g. a crashed/Failed lab) has no
         // reaper watching it, so remove the entry here — otherwise it would be
         // stuck in Stopping forever.
-        if let Ok(client) = Client::connect(&sock).await {
-            let _ = client.call("shutdown", Value::Null).await;
+        if let Ok(client) = LabClient::connect(&sock).await {
+            let _ = client.send(LabRequest::Shutdown {}).await;
         } else {
             // The daemon is gone and can't have stopped anything it owned. Reap
             // the QEMU processes AND the helpers it orphaned (swtpm, virtiofsd,
@@ -395,13 +396,6 @@ impl Supervisor {
     }
 }
 
-/// The `lab` + `root` argument pair shared by lab-addressed commands.
-fn lab_root_args(args: &Value) -> Result<(String, PathBuf), String> {
-    let lab = args["lab"].as_str().ok_or("missing lab")?.to_string();
-    let root = PathBuf::from(args["root"].as_str().ok_or("missing root")?);
-    Ok((lab, root))
-}
-
 /// Wrapper giving command handlers access to `Arc<Supervisor>` (needed for
 /// the tasks they spawn).
 struct SupervisorHandler {
@@ -411,110 +405,84 @@ struct SupervisorHandler {
 }
 
 #[async_trait::async_trait]
-impl Handler for SupervisorHandler {
-    async fn handle(&self, cmd: &str, args: Value, _stream: &Streamer) -> Result<Value, String> {
+impl Handler<SupRequest> for SupervisorHandler {
+    async fn handle(&self, req: SupRequest, _stream: &Streamer) -> Result<Value, CommandError> {
         let sup = &self.sup;
-        match cmd {
-            "ping" => Ok(json!("pong")),
-            "version" => Ok(json!(env!("CARGO_PKG_VERSION"))),
+        match req {
+            SupRequest::Ping {} => Ok(json!("pong")),
+            SupRequest::Version {} => Ok(json!(env!("CARGO_PKG_VERSION"))),
             // Which network fast-path tier this daemon selected (PRD §9.1),
             // plus why the skipped kernel tiers were unavailable.
-            "fastpath" => Ok(crate::net::fastpath::status_json()),
-            "status" => {
+            SupRequest::FastPath {} => Ok(crate::net::fastpath::status_json()),
+            SupRequest::Status {} => {
                 let reg = sup.registry.lock().await;
-                Ok(serde_json::to_value(reg.labs()).map_err(|e| e.to_string())?)
+                serde_json::to_value(reg.labs()).map_err(|e| CommandError::internal(e.to_string()))
             }
             // Spawn (or find) the lab daemon for a lab; returns its socket.
-            "lab.ensure" => {
-                let name = args["name"].as_str().ok_or("missing name")?.to_string();
-                let root = PathBuf::from(args["root"].as_str().ok_or("missing root")?);
+            SupRequest::LabEnsure { name, root } => {
                 let sock = sup.ensure_lab(&name, root).await?;
                 Ok(json!({"socket": sock}))
             }
             // Stop a lab daemon (after `down`/`destroy`).
-            "lab.release" => {
-                let name = args["name"].as_str().ok_or("missing name")?;
-                sup.release_lab(name).await?;
+            SupRequest::LabRelease { name } => {
+                sup.release_lab(&name).await?;
                 Ok(json!(true))
             }
             // Restart a lab daemon so it re-reads its config (web "reload").
-            "lab.restart" => {
-                let name = args["name"].as_str().ok_or("missing name")?.to_string();
-                let root = PathBuf::from(args["root"].as_str().ok_or("missing root")?);
+            SupRequest::LabRestart { name, root } => {
                 let sock = sup.restart_lab(&name, root).await?;
                 Ok(json!({"socket": sock}))
             }
             // Global segments (PRD §9.2): attach returns the trunk socket.
-            "global.attach" => {
-                let name = args["name"].as_str().ok_or("missing name")?;
-                let subnet = match args["subnet"].as_str() {
-                    Some(s) => Some(s.parse().map_err(|_| format!("bad subnet `{s}`"))?),
-                    None => None,
-                };
-                let peer = args["peer"].as_str().map(String::from);
-                let sock = sup
-                    .globals
-                    .attach(name, subnet, peer)
-                    .await
-                    .map_err(|e| format!("{e:#}"))?;
+            SupRequest::GlobalAttach { name, subnet, peer } => {
+                let sock = sup.globals.attach(&name, subnet, peer).await?;
                 Ok(json!({"socket": sock}))
             }
-            "global.detach" => {
-                let name = args["name"].as_str().ok_or("missing name")?;
-                sup.globals.detach(name).await;
+            SupRequest::GlobalDetach { name } => {
+                sup.globals.detach(&name).await;
                 Ok(json!(true))
             }
-            "global.list" => Ok(json!(sup.globals.list().await)),
+            SupRequest::GlobalList {} => Ok(json!(sup.globals.list().await)),
             // Template operations for the web Templates page (PRD §6). All
             // take `lab` + `root` like `lab.ensure`, so the supervisor works
             // for labs it never started.
-            "template.list" => {
-                let (lab, root) = lab_root_args(&args)?;
+            SupRequest::TemplateList { lab, root } => {
                 templates::list(lab, root, sup.template_ops.clone()).await
             }
-            "template.remote" => {
-                let (_, root) = lab_root_args(&args)?;
-                let template = args["template"].as_str().ok_or("missing template")?;
-                let arch = args["arch"].as_str().map(String::from);
-                templates::remote(root, template.to_string(), arch).await
-            }
-            "template.build" => {
-                let (lab, root) = lab_root_args(&args)?;
-                let template = args["template"].as_str().ok_or("missing template")?;
-                let arch = args["arch"].as_str().map(String::from);
-                templates::start_build(sup.clone(), lab, root, template.to_string(), arch).await
-            }
-            "template.stop_build" => {
-                let lab = args["lab"].as_str().ok_or("missing lab")?;
-                let template = args["template"].as_str().ok_or("missing template")?;
-                let arch = args["arch"].as_str().ok_or("missing arch")?;
-                templates::stop_build(
-                    sup.clone(),
-                    lab.to_string(),
-                    arch.to_string(),
-                    template.to_string(),
-                )
-            }
-            "template.push" => {
-                let (lab, root) = lab_root_args(&args)?;
-                let template = args["template"].as_str().ok_or("missing template")?;
-                let arch = args["arch"].as_str().map(String::from);
-                let version = args["version"].as_str().map(String::from);
-                templates::start_push(sup.clone(), lab, root, template.to_string(), arch, version)
-                    .await
-            }
-            "template.op_status" => {
-                let lab = args["lab"].as_str().ok_or("missing lab")?;
-                Ok(sup.template_ops.status(lab))
-            }
-            "template.console_path" => {
-                let lab = args["lab"].as_str().ok_or("missing lab")?;
-                let arch = args["arch"].as_str().ok_or("missing arch")?;
-                let template = args["template"].as_str().ok_or("missing template")?;
-                let path = sup.template_ops.console_path(lab, arch, template)?;
+            SupRequest::TemplateRemote {
+                lab: _,
+                root,
+                template,
+                arch,
+            } => templates::remote(root, template, arch).await,
+            SupRequest::TemplateBuild {
+                lab,
+                root,
+                template,
+                arch,
+            } => templates::start_build(sup.clone(), lab, root, template, arch).await,
+            SupRequest::TemplateStopBuild {
+                lab,
+                arch,
+                template,
+            } => templates::stop_build(sup.clone(), lab, arch, template),
+            SupRequest::TemplatePush {
+                lab,
+                root,
+                template,
+                arch,
+                version,
+            } => templates::start_push(sup.clone(), lab, root, template, arch, version).await,
+            SupRequest::TemplateOpStatus { lab } => Ok(sup.template_ops.status(&lab)),
+            SupRequest::TemplateConsolePath {
+                lab,
+                arch,
+                template,
+            } => {
+                let path = sup.template_ops.console_path(&lab, &arch, &template)?;
                 Ok(json!(path.to_string_lossy()))
             }
-            "shutdown" => {
+            SupRequest::Shutdown {} => {
                 tracing::info!("supervisor shutdown requested");
                 let sup = sup.clone();
                 let tasks = self.tasks.clone();
@@ -527,7 +495,6 @@ impl Handler for SupervisorHandler {
                 });
                 Ok(json!(true))
             }
-            _ => Err(format!("unknown command `{cmd}`")),
         }
     }
 }

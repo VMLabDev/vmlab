@@ -19,6 +19,7 @@ use std::time::Duration;
 use actix_web::{HttpResponse, web};
 use serde::Deserialize;
 use serde_json::json;
+use vmlab::proto::LabRequest;
 
 use super::api::fail;
 use super::fsops::{FsError as PbDirError, plain_relative};
@@ -233,7 +234,7 @@ pub async fn list_plays(
 /// `GET /api/labs/{lab}/playbooks/ops` — in-flight runs with log tails
 /// (the reconnect resync source, mirroring `template.op_status`).
 pub async fn playbook_ops(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
-    match state.lab_call(&lab, "playbook.op_status", json!({})).await {
+    match state.lab_call(&lab, LabRequest::PlaybookOpStatus {}).await {
         Ok(v) => HttpResponse::Ok().json(v),
         Err(e) => fail(e),
     }
@@ -259,16 +260,24 @@ pub async fn run_playbook(
     body: Option<web::Json<RunBody>>,
 ) -> HttpResponse {
     let (lab, machine, action) = path.into_inner();
-    let cmd = match action.as_str() {
-        "check" => "playbook.check",
-        "apply" => "playbook.apply",
+    let body = body.map(web::Json::into_inner).unwrap_or_default();
+    let (playbook, play) = (body.path, body.play);
+    let req = match action.as_str() {
+        "check" => LabRequest::PlaybookCheck {
+            machine,
+            playbook,
+            play,
+        },
+        "apply" => LabRequest::PlaybookApply {
+            machine,
+            playbook,
+            play,
+        },
         _ => return HttpResponse::NotFound().json(json!({"error": "unknown playbook action"})),
     };
-    let body = body.map(web::Json::into_inner).unwrap_or_default();
-    let args = json!({"machine": machine, "playbook": body.path, "play": body.play});
 
     let state = state.into_inner();
-    let task = tokio::spawn(async move { state.lab_call(&lab, cmd, args).await });
+    let task = tokio::spawn(async move { state.lab_call(&lab, req).await });
     match tokio::time::timeout(RUN_DETACH_AFTER, task).await {
         Ok(Ok(Ok(v))) => HttpResponse::Ok().json(v),
         Ok(Ok(Err(e))) => fail(e),
