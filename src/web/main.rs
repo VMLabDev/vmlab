@@ -14,6 +14,7 @@ mod editor;
 mod events;
 mod files;
 mod fsops;
+mod guest_files;
 mod help;
 mod logs;
 mod pkgs;
@@ -281,6 +282,10 @@ async fn main() -> ExitCode {
                 "/api/labs/{lab}/machines/{machine}/clipboard",
                 web::post().to(api::machine_clipboard_set),
             )
+            // One file in or out of the guest. A resource rather than two
+            // routes, so the push body's ceiling applies here and nowhere
+            // else.
+            .service(guest_files::service())
             .route(
                 "/api/labs/{lab}/machines/{machine}/{action}",
                 web::post().to(api::machine_action),

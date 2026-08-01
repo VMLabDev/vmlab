@@ -23,6 +23,7 @@ import { confirmDialog, promptDialog } from "./dialogs";
 import { canEditPlaybook, editPlaybook } from "./FilesView";
 import { openWebPage } from "./WebView";
 import ConsoleScreen from "./ConsoleScreen";
+import FileTransfer from "./FileTransfer";
 import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
 import PlaybookPanel from "./PlaybookPanel";
@@ -238,6 +239,12 @@ export default function MachineView() {
             </Card>
           </Show>
           <GuestStats lab={state.currentLab!} kind="vm" name={vm()!.name} running={on()} />
+          <FileTransfer
+            lab={state.currentLab!}
+            machine={vm()!.name}
+            running={on()}
+            hasAgent={hasAgent()}
+          />
           <Card
             title="Snapshots"
             action={

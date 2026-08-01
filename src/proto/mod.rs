@@ -12,6 +12,31 @@ pub mod vocab;
 pub use error::{CommandError, ErrorCode};
 pub use vocab::{ArgSpec, CommandSpec, LabRequest, OneWay, Region, SupRequest, WireRequest};
 
+/// The most one file transfer may carry inline, base64, in a single wire
+/// message — `machine.push_file`'s `data` and `machine.pull_file`'s reply.
+///
+/// Inline bytes are how a caller that holds a file rather than a path — a
+/// browser, above all — moves one through the daemon, and they are the one
+/// thing on this transport that is not a small JSON object. The ceiling is
+/// what keeps "not small" from meaning "unbounded": [`server::MAX_REQ_LINE`]
+/// is derived from it, so a request that respects it always fits, and a
+/// transfer that exceeds it is refused by code
+/// ([`ErrorCode::InvalidArgument`], naming the limit) rather than discovered
+/// as a truncated file or a dropped connection. Larger transfers use the
+/// host-path forms, which stream and never touch the wire.
+pub const INLINE_FILE_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// The refusal a transfer over the ceiling gets, wherever it is caught — the
+/// REST layer before it forwards, the daemon before it pushes, the pull as the
+/// bytes arrive. One wording, so a caller reads the same sentence whichever of
+/// the three noticed first, and `limit` is the ceiling that was actually
+/// applied rather than a constant restated.
+pub fn over_inline_limit(subject: impl std::fmt::Display, limit: u64) -> CommandError {
+    CommandError::invalid(format!(
+        "{subject}: over the {limit}-byte inline transfer limit; use a host path instead"
+    ))
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

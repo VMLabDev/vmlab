@@ -384,6 +384,15 @@ pub fn protocol_typescript() -> String {
     out.push_str("/** An error body from any `/api` endpoint. */\n");
     out.push_str("export interface ApiError {\n  error: string;\n  code?: ErrorCode;\n}\n\n");
 
+    out.push_str(
+        "/** The most one guest file transfer may carry inline, in bytes. The console shows\n\
+         \u{20}*  this before a transfer is attempted; the daemon refuses anything over it. */\n",
+    );
+    out.push_str(&format!(
+        "export const INLINE_FILE_LIMIT = {};\n\n",
+        super::INLINE_FILE_LIMIT
+    ));
+
     for (name, actions, doc) in [
         (
             "LabAction",

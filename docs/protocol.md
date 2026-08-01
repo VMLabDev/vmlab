@@ -76,8 +76,8 @@ the code is the contract.
 | `machine.osinfo` | `machine: String`, `timeout: u64` | `cli` | What the guest OS says it is. |
 | `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16` | `cli`, `web` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
 | `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli`, `web` | Resize an open terminal session. |
-| `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
-| `machine.pull_file` | `machine: String`, `from: String`, `to: String` | `cli` | Copy a file out of the guest to a host path. |
+| `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli`, `web` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
+| `machine.pull_file` | `machine: String`, `from: String`, `to: Option<String>` | `cli`, `web` | Copy a file out of the guest: to `to`, a host path the daemon can write, or — with `to` omitted — back inline as base64, for a caller that wants the bytes rather than a file on the daemon's host. |
 | `machine.tail` | `machine: String`, `path: String` | `cli` | Follow a guest file (`tail -F` semantics), streamed as chunks until the caller hangs up or the machine stops. |
 | `machine.eventlog` | `machine: String`, `filter: Option<String>` | `cli` | Follow the Windows event log, streamed as chunks. |
 | `machine.stats` | `machine: String` | `cli`, `web` | Latest guest metrics; subscribes the sampler on first use. |
@@ -130,11 +130,6 @@ Deliberate, with the reason recorded beside the declaration:
 - `version` — What `vmlab daemon status` prints: which build of the supervisor is running on this host, asked by whoever is standing in front of it.
 - `lab.ensure` — Spawning-or-finding a lab daemon belongs in one place, and that place is the helper in `src/cli/daemon.rs` — the web layer calls it rather than asking the supervisor itself. One call site is the decision; the scan reports it as the CLI because that is where the helper lives.
 - `lab.release` — The other half of `lab.ensure`, and a shell's alone: a command finishes and gives the daemon back. The console does not finish, and leaves it up for the next request.
-
-Open gaps — nobody wrote the other half, and each is tracked:
-
-- `machine.push_file` — tracked in [#37](https://github.com/VMLabDev/vmlab/issues/37)
-- `machine.pull_file` — tracked in [#37](https://github.com/VMLabDev/vmlab/issues/37)
 
 ### Reachable only from `web`
 

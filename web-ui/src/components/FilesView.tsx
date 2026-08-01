@@ -28,6 +28,7 @@ import * as api from "../api";
 import type { ConfigIssue, PlaybookTreeEntry } from "../api";
 import {
   anyVmRunning,
+  fmtSize,
   registerNavGuard,
   reloadLab as reloadCurrentLab,
   showLab,
@@ -260,13 +261,6 @@ window.addEventListener("beforeunload", (event) => {
 
 function msg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
-}
-
-function fmtSize(bytes: number | undefined): string {
-  if (bytes == null) return "";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function findEntry(entries: PlaybookTreeEntry[], path: string): PlaybookTreeEntry | null {

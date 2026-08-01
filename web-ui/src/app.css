@@ -39,6 +39,11 @@
   align-items: start;
 }
 .vm-side { display: flex; flex-direction: column; gap: var(--sp-4); }
+/* Guest file transfer card: a picker, then a path + its button per direction. */
+.xfer { display: flex; flex-direction: column; gap: var(--sp-3); }
+.xfer-pick { color: var(--fg-2); font-size: var(--fs-xs); max-width: 100%; }
+.xfer-row { display: flex; align-items: flex-end; gap: var(--sp-2); }
+.xfer-row > :first-child { flex: 1; min-width: 0; }
 /* Container page: terminal above the log panel, one column. */
 .ctr-main { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
 .power-busy { display: inline-flex; align-items: center; gap: var(--sp-2); }

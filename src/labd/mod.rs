@@ -545,6 +545,12 @@ impl Handler<LabRequest> for LabdHandler {
                             .map_err(|e| {
                                 CommandError::invalid(format!("invalid base64 data: {e}"))
                             })?;
+                        if bytes.len() as u64 > crate::proto::INLINE_FILE_LIMIT {
+                            return Err(crate::proto::over_inline_limit(
+                                format!("push {to}"),
+                                crate::proto::INLINE_FILE_LIMIT,
+                            ));
+                        }
                         let tmp = std::env::temp_dir()
                             .join(format!("vmlab-cp-{}-{machine}", std::process::id()));
                         std::fs::write(&tmp, &bytes)
@@ -563,10 +569,26 @@ impl Handler<LabRequest> for LabdHandler {
                 };
                 Ok(json!({"sha256": sha256, "len": len}))
             }
+            // The mirror of push: `to` is a host path the daemon writes, and
+            // omitting it hands the bytes back inline for a caller — a
+            // browser — that has nowhere on this host to put them.
             LabRequest::MachinePullFile { machine, from, to } => {
                 let agent = agent_of(lab, &machine).await?;
-                let (sha256, len) = agent.pull_file(&from, std::path::Path::new(&to)).await?;
-                Ok(json!({"sha256": sha256, "len": len}))
+                match to {
+                    Some(to) => {
+                        let (sha256, len) =
+                            agent.pull_file(&from, std::path::Path::new(&to)).await?;
+                        Ok(json!({"sha256": sha256, "len": len}))
+                    }
+                    None => {
+                        use base64::Engine as _;
+                        let (sha256, bytes) = agent
+                            .pull_bytes(&from, crate::proto::INLINE_FILE_LIMIT)
+                            .await?;
+                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        Ok(json!({"sha256": sha256, "len": bytes.len(), "data": data}))
+                    }
+                }
             }
             // Follow a guest file (tail -F semantics), streamed as chunks
             // until the client hangs up or the machine stops.

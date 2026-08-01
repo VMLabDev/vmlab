@@ -605,7 +605,6 @@ vocabulary! {
         },
         /// Copy a file into the guest: either `from`, a host path the daemon
         /// can see, or `data`, base64 for a caller that holds bytes.
-        #[one_way_gap("cli", 37)]
         MachinePushFile = "machine.push_file" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             to: String,
@@ -613,12 +612,13 @@ vocabulary! {
             #[serde(default)] data: Option<String>,
             #[serde(default)] mode: Option<u32>,
         },
-        /// Copy a file out of the guest to a host path.
-        #[one_way_gap("cli", 37)]
+        /// Copy a file out of the guest: to `to`, a host path the daemon can
+        /// write, or — with `to` omitted — back inline as base64, for a caller
+        /// that wants the bytes rather than a file on the daemon's host.
         MachinePullFile = "machine.pull_file" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             from: String,
-            to: String,
+            #[serde(default)] to: Option<String>,
         },
         /// Follow a guest file (`tail -F` semantics), streamed as chunks
         /// until the caller hangs up or the machine stops.
@@ -890,6 +890,40 @@ mod tests {
         assert_eq!(LabRequest::from_wire(cmd, args).unwrap(), req);
     }
 
+    /// A pull's host path is what tells the daemon where to put the file, and
+    /// omitting it is how a caller asks for the bytes instead. A client that
+    /// predates the inline form still sends `to`, and must still mean what it
+    /// always did.
+    #[test]
+    fn a_pull_without_a_host_path_asks_for_the_bytes() {
+        let inline = LabRequest::from_wire(
+            "machine.pull_file",
+            json!({"machine": "dc01", "from": "/var/log/syslog"}),
+        )
+        .unwrap();
+        assert_eq!(
+            inline,
+            LabRequest::MachinePullFile {
+                machine: "dc01".into(),
+                from: "/var/log/syslog".into(),
+                to: None,
+            }
+        );
+        let to_host = LabRequest::from_wire(
+            "machine.pull_file",
+            json!({"vm": "dc01", "from": "/var/log/syslog", "to": "/tmp/syslog"}),
+        )
+        .unwrap();
+        assert_eq!(
+            to_host,
+            LabRequest::MachinePullFile {
+                machine: "dc01".into(),
+                from: "/var/log/syslog".into(),
+                to: Some("/tmp/syslog".into()),
+            }
+        );
+    }
+
     #[test]
     fn an_argument_less_request_accepts_null_args() {
         let req = LabRequest::from_wire("status", Value::Null).unwrap();
@@ -1028,15 +1062,15 @@ mod tests {
     /// to carry: nobody has decided whether the asymmetry should close.
     #[test]
     fn a_gap_carries_the_issue_tracking_it_rather_than_a_reason() {
-        let one_way = LabRequest::spec("machine.push_file")
+        let one_way = LabRequest::spec("dns.table")
             .unwrap()
             .one_way
-            .expect("`machine.push_file` is a tracked gap");
+            .expect("`dns.table` is a tracked gap");
         assert_eq!(
             one_way,
             OneWay::Gap {
-                surface: "cli",
-                issue: 37
+                surface: "web",
+                issue: 38
             },
         );
     }
