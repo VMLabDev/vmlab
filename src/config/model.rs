@@ -320,6 +320,16 @@ impl Firmware {
             Firmware::Seabios => "seabios",
         }
     }
+
+    /// The inverse of [`Firmware::as_str`], for reading a spelling back off a
+    /// surface that stores it as free text (template metadata). A spelling
+    /// this build does not know is `None` rather than an error: the reader is
+    /// a store entry someone else may have written.
+    pub fn parse(s: &str) -> Option<Firmware> {
+        [Firmware::Ovmf, Firmware::Seabios]
+            .into_iter()
+            .find(|f| f.as_str() == s)
+    }
 }
 
 #[derive(Debug, Clone)]
