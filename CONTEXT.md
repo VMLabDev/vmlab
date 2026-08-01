@@ -85,6 +85,24 @@ _Avoid_: cache, registry (a registry is remote)
 How a template is stored in a registry: a non-runnable artifact whose qcow2 is
 chunked into zstd layers.
 
+**Layered build**:
+A build whose source is an existing template rather than an ISO, a qcow2 or a
+blank disk. Its working disk starts as a copy of the source's, and its hardware
+starts from the source's recorded metadata (ADR-0009).
+_Avoid_: derived template, child template
+
+**Build lab**:
+The synthetic one-VM lab a build runs as — rendered as WCL, `scratch`, with its
+primary disk pre-seeded from the source. Having no template layer (§6.5), it
+carries inherited hardware as vm-block attributes instead.
+
+**Effective build hardware**:
+What a build boots on and seals: the template block's declared hardware over the
+source template's recorded hardware, merged once before the build lab is
+rendered. The profile is deliberately *not* part of it — it stays a live layer,
+resolved when a VM clones the sealed template, so profile edits keep reaching
+existing templates (ADR-0009).
+
 **Profile**:
 A named set of hardware defaults — machine, firmware, TPM, disk bus, NIC,
 display, CPUs, memory — chosen with `profile = "..."`. Both machine kinds
