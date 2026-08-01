@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use super::daemon;
 use crate::proto::client::Client;
+use crate::status::{LabStatus, MachineDetail, MachineStatus};
 
 /// Resolve the current lab (name + root) from cwd, like git.
 pub fn current_lab() -> Result<(String, std::path::PathBuf)> {
@@ -150,90 +151,92 @@ pub fn cmd_destroy() -> Result<()> {
     })
 }
 
-pub fn cmd_status() -> Result<()> {
+pub fn cmd_status(verbose: bool) -> Result<()> {
     rt()?.block_on(async {
         let (name, _root) = current_lab()?;
         let Some(client) = daemon::try_lab_daemon(&name).await else {
             println!("lab \"{name}\": not running");
             return Ok(());
         };
-        let status = client.call("status", Value::Null).await.map_err(remote)?;
-        print_status(&status);
+        print!("{}", render_status(&lab_status(&client).await?, verbose));
         Ok(())
     })
 }
 
-fn print_status(status: &Value) {
-    println!("lab \"{}\"", status["lab"].as_str().unwrap_or("?"));
-    // labd reports one `machines` array; the CLI keeps VMs and containers in
-    // separate tables — to a user they are different things, with different
-    // columns worth showing.
-    let machines = status["machines"].as_array().cloned().unwrap_or_default();
-    let of_kind = |kind: &str| -> Vec<&Value> {
-        machines
-            .iter()
-            .filter(|m| m["kind"].as_str() == Some(kind))
-            .collect()
-    };
-    let ready = |m: &Value| {
-        if m["ready"].as_bool().unwrap_or(false) {
-            "yes"
-        } else {
-            "no"
-        }
-    };
+/// Ask a lab daemon for its status projection (ADR-0004).
+///
+/// A payload that will not parse is an error, not an empty lab: the daemon and
+/// this binary disagreeing about the shape is exactly the failure that once
+/// printed a status table with no rows in it.
+async fn lab_status(client: &Client) -> Result<LabStatus> {
+    let payload = client.call("status", Value::Null).await.map_err(remote)?;
+    serde_json::from_value(payload).context("the lab daemon reported a status vmlab cannot read")
+}
 
-    let vms = of_kind("vm");
-    if !vms.is_empty() {
-        println!(
-            "  {:<16} {:<10} {:<7} {:<16} TEMPLATE",
-            "VM", "STATE", "READY", "IP"
+/// The width of a column: its header, or the widest value under it.
+fn column_width(header: &str, values: impl Iterator<Item = usize>) -> usize {
+    values.max().unwrap_or(0).max(header.len())
+}
+
+/// Render the lab status projection as the `vmlab status` report.
+///
+/// Returns the text instead of printing it so the rendering can be asserted
+/// against a projection built in a test — this is the function a producer-side
+/// rename once blanked, with nothing to catch it (ADR-0004).
+///
+/// One table for both kinds, with the derived label under `STATUS`. The raw
+/// power state and the kind-specific fields are `--verbose`: to a user "is it
+/// up?" is the question, and `booting` answers it in a way `running` plus a
+/// separate readiness column did not.
+fn render_status(status: &LabStatus, verbose: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "lab \"{}\"", status.lab);
+
+    if !status.machines.is_empty() {
+        let name_w = column_width("NAME", status.machines.iter().map(|m| m.name.len()));
+        let status_w = column_width("STATUS", status.machines.iter().map(|m| m.label.text.len()));
+        let ip_w = column_width(
+            "IP",
+            status
+                .machines
+                .iter()
+                .map(|m| or_dash(m.ip.as_deref()).len()),
         );
-        for vm in vms {
-            println!(
-                "  {:<16} {:<10} {:<7} {:<16} {}",
-                vm["name"].as_str().unwrap_or("?"),
-                vm["state"].as_str().unwrap_or("?"),
-                ready(vm),
-                vm["ip"].as_str().unwrap_or("-"),
-                vm["template"].as_str().unwrap_or("?"),
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  {:<name_w$} {:<9} {:<status_w$} {:<ip_w$} TEMPLATE/IMAGE",
+            "NAME", "KIND", "STATUS", "IP"
+        );
+        for m in &status.machines {
+            let _ = writeln!(
+                out,
+                "  {:<name_w$} {:<9} {:<status_w$} {:<ip_w$} {}",
+                m.name,
+                m.kind().to_string(),
+                m.label.text,
+                or_dash(m.ip.as_deref()),
+                m.detail.artefact(),
             );
+            if verbose {
+                let _ = writeln!(out, "      {}", machine_detail(m));
+            }
         }
     }
 
-    let containers = of_kind("container");
-    if !containers.is_empty() {
-        println!();
-        println!(
-            "  {:<16} {:<10} {:<7} {:<10} {:<16} IMAGE",
-            "CONTAINER", "STATE", "READY", "HEALTH", "IP"
-        );
-        for c in containers {
-            println!(
-                "  {:<16} {:<10} {:<7} {:<10} {:<16} {}",
-                c["name"].as_str().unwrap_or("?"),
-                c["state"].as_str().unwrap_or("?"),
-                ready(c),
-                match c["health"].as_bool() {
-                    None => "-",
-                    Some(true) => "ok",
-                    Some(false) => "unhealthy",
-                },
-                c["ip"].as_str().unwrap_or("-"),
-                c["image"].as_str().unwrap_or("?"),
-            );
-        }
-    }
-    if let Some(segments) = status["segments"].as_array() {
-        println!();
-        println!(
-            "  {:<16} {:<18} {:<15} {:<8} {:<10} PEER",
+    if !status.segments.is_empty() {
+        let name_w = column_width("SEGMENT", status.segments.iter().map(|s| s.name.len()));
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  {:<name_w$} {:<18} {:<15} {:<8} {:<10} PEER",
             "SEGMENT", "SUBNET", "GATEWAY", "NAT/DHCP", "DROPPED"
         );
-        for s in segments {
+        for s in &status.segments {
             // PEER: the cross-host trunk state (PRD §9.2) — the configured
             // `connect` target plus whether the trunk is currently up.
-            let peer = match (s["connect"].as_str(), s["peer_connected"].as_bool()) {
+            let peer = match (s.connect.as_deref(), s.peer_connected) {
                 (Some(host), Some(true)) => format!("{host} (up)"),
                 (Some(host), Some(false)) => format!("{host} (down)"),
                 (Some(host), None) => host.to_string(),
@@ -243,29 +246,93 @@ fn print_status(status: &Value) {
             // DROPPED: switch frames shed on this segment. Anything other than
             // 0 means the fabric is losing frames under load — the thing that
             // makes guest transfers mysteriously slow.
-            let dropped = s["frames_dropped"].as_u64().unwrap_or(0);
-            println!(
-                "  {:<16} {:<18} {:<15} {:<8} {:<10} {peer}",
-                s["name"].as_str().unwrap_or("?"),
-                s["subnet"].as_str().unwrap_or("?"),
-                s["gateway"].as_str().unwrap_or("?"),
-                format!(
-                    "{}/{}",
-                    if s["nat"].as_bool().unwrap_or(false) {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                    if s["dhcp"].as_bool().unwrap_or(false) {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                ),
-                dropped,
+            let _ = writeln!(
+                out,
+                "  {:<name_w$} {:<18} {:<15} {:<8} {:<10} {peer}",
+                s.name,
+                s.subnet,
+                s.gateway,
+                format!("{}/{}", on_off(s.nat), on_off(s.dhcp)),
+                s.frames.dropped,
             );
         }
     }
+
+    // Downloads in flight, so a lab that looks stuck during `up` can be told
+    // apart from one that is merely slow.
+    if !status.pulls.is_empty() {
+        let name_w = column_width("MACHINE", status.pulls.iter().map(|p| p.machine.len()));
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  {:<name_w$} {:<9} {:<8} REFERENCE",
+            "MACHINE", "PULLING", "PERCENT"
+        );
+        for p in &status.pulls {
+            let _ = writeln!(
+                out,
+                "  {:<name_w$} {:<9} {:<8} {}",
+                p.machine,
+                p.kind.as_str(),
+                format!("{}%", p.percent),
+                p.reference,
+            );
+        }
+    }
+    out
+}
+
+/// The `--verbose` line under a machine: the raw state the derived label was
+/// built from, plus whatever its kind alone can report.
+fn machine_detail(m: &MachineStatus) -> String {
+    let mut detail = format!(
+        "state={} ready={} cached={}",
+        m.state,
+        yes_no(m.ready),
+        yes_no(m.cached)
+    );
+    let mut field = |k: &str, v: String| detail.push_str(&format!(" {k}={v}"));
+    match &m.detail {
+        MachineDetail::Vm(vm) => {
+            field("arch", or_dash(vm.arch.as_deref()).to_string());
+            field("cpus", vm.cpus.map_or("-".into(), |c| c.to_string()));
+            field(
+                "memory",
+                vm.memory
+                    .map_or("-".into(), crate::template::meta::format_size),
+            );
+            field("agent", or_dash(vm.agent_version.as_deref()).to_string());
+        }
+        MachineDetail::Container(c) => {
+            field(
+                "health",
+                match c.health {
+                    None => "-".into(),
+                    Some(true) => "ok".into(),
+                    Some(false) => "failing".into(),
+                },
+            );
+            field("restarts", c.restarts.to_string());
+            field(
+                "exit",
+                c.exit_code.map_or("-".into(), |code| code.to_string()),
+            );
+            field("digest", or_dash(c.digest.as_deref()).to_string());
+        }
+    }
+    detail
+}
+
+fn or_dash(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
+fn yes_no(flag: bool) -> &'static str {
+    if flag { "yes" } else { "no" }
+}
+
+fn on_off(flag: bool) -> &'static str {
+    if flag { "on" } else { "off" }
 }
 
 /// Manage running labs host-wide, by name (not the cwd's lab).
@@ -277,8 +344,14 @@ pub enum LabCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Show detailed status (VMs and segments) of a running lab
-    Info { lab: String },
+    /// Show detailed status (machines and segments) of a running lab
+    Info {
+        lab: String,
+        /// Add the raw power state, readiness, and each machine's
+        /// kind-specific detail
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Gracefully stop a running lab; clones retained
     Stop {
         lab: String,
@@ -293,7 +366,7 @@ pub enum LabCmd {
 pub fn cmd_lab(cmd: LabCmd) -> Result<()> {
     match cmd {
         LabCmd::List { json } => cmd_lab_list(json),
-        LabCmd::Info { lab } => cmd_lab_info(&lab),
+        LabCmd::Info { lab, verbose } => cmd_lab_info(&lab, verbose),
         LabCmd::Stop { lab, force } => cmd_lab_stop(&lab, force),
         LabCmd::Destroy { lab } => cmd_lab_destroy(&lab),
     }
@@ -348,7 +421,7 @@ fn cmd_lab_list(json: bool) -> Result<()> {
     })
 }
 
-fn cmd_lab_info(name: &str) -> Result<()> {
+fn cmd_lab_info(name: &str, verbose: bool) -> Result<()> {
     rt()?.block_on(async {
         let labs = registry_labs().await?;
         let entry = labs.iter().find(|l| l["name"].as_str() == Some(name));
@@ -357,8 +430,7 @@ fn cmd_lab_info(name: &str) -> Result<()> {
                 if let Some(root) = entry.and_then(|l| l["root"].as_str()) {
                     println!("directory: {root}");
                 }
-                let status = client.call("status", Value::Null).await.map_err(remote)?;
-                print_status(&status);
+                print!("{}", render_status(&lab_status(&client).await?, verbose));
                 Ok(())
             }
             // Registered but unreachable (e.g. crashed/Failed): show what the
@@ -1318,9 +1390,151 @@ pub fn cmd_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_log_line, region_value, root_for};
+    use super::{format_log_line, region_value, render_status, root_for};
     use crate::cli::LogFormat;
+    use crate::status::fixtures::{container, lab, vm};
+    use crate::status::{MachineDetail, MachineStatus, PowerState, PullKind, PullStatus};
+    use crate::status::{SegmentFrames, SegmentStatus};
     use serde_json::json;
+
+    /// A machine at an address, since every column but `IP` is exercised by the
+    /// shared fixture as it stands.
+    fn addressed(
+        name: &str,
+        state: PowerState,
+        ready: bool,
+        detail: MachineDetail,
+    ) -> MachineStatus {
+        MachineStatus {
+            ip: Some("10.0.0.5".into()),
+            ..crate::status::fixtures::machine(name, state, ready, detail)
+        }
+    }
+
+    /// The table renders straight off a projection value — no lab, no daemon.
+    /// Both kinds share one table and one `STATUS` column carrying the label
+    /// the daemon derived, so the CLI and the console cannot word a machine
+    /// differently.
+    #[test]
+    fn the_status_table_reports_the_derived_label_for_both_kinds() {
+        let out = render_status(
+            &lab(vec![
+                addressed("dc01", PowerState::Running, false, vm()),
+                addressed(
+                    "web",
+                    PowerState::Running,
+                    true,
+                    container(Some(false), None),
+                ),
+            ]),
+            false,
+        );
+        assert!(out.contains("lab \"demo\""), "got:\n{out}");
+        assert!(out.contains("NAME"), "got:\n{out}");
+        assert!(out.contains("KIND"), "got:\n{out}");
+        assert!(out.contains("STATUS"), "got:\n{out}");
+        // A VM that is up but not ready is booting; a container failing its
+        // check is unhealthy. Neither wording is built here.
+        assert!(out.contains("dc01 vm        booting"), "got:\n{out}");
+        assert!(out.contains("web  container unhealthy"), "got:\n{out}");
+        // The artefact each kind runs, and its address, stay on the row.
+        assert!(out.contains("x86_64/win11"), "got:\n{out}");
+        assert!(
+            out.contains("docker.io/library/nginx:latest"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("10.0.0.5"), "got:\n{out}");
+        // The raw power state is not in the default table.
+        assert!(!out.contains("state="), "got:\n{out}");
+    }
+
+    /// `--verbose` is where the raw power state went when `STATE`/`READY`
+    /// became one derived column, along with the fields only one kind has.
+    #[test]
+    fn verbose_adds_the_raw_state_and_the_kind_specific_fields() {
+        let out = render_status(
+            &lab(vec![
+                addressed("dc01", PowerState::Running, false, vm()),
+                addressed("web", PowerState::Stopping, false, container(None, None)),
+            ]),
+            true,
+        );
+        assert!(
+            out.contains(
+                "state=running ready=no cached=yes arch=x86_64 cpus=4 memory=8GiB agent=0.1.0"
+            ),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("state=stopping ready=no cached=yes health=- restarts=2"),
+            "got:\n{out}"
+        );
+    }
+
+    /// A machine with no address reads as `-` rather than shifting the columns.
+    #[test]
+    fn a_machine_without_an_address_still_lines_up() {
+        let mut stopped = addressed("dc01", PowerState::Stopped, false, vm());
+        stopped.ip = None;
+        let out = render_status(&lab(vec![stopped]), false);
+        assert!(
+            out.contains("dc01 vm        stopped -  x86_64/win11"),
+            "got:\n{out}"
+        );
+    }
+
+    /// The segment table surfaces the drop counter — a non-zero value is the
+    /// only warning a user gets that the fabric is shedding frames under load.
+    #[test]
+    fn the_segment_table_reports_dropped_frames() {
+        let mut status = lab(Vec::new());
+        status.segments.push(SegmentStatus {
+            name: "lan".into(),
+            subnet: "10.0.0.0/24".into(),
+            gateway: "10.0.0.1".into(),
+            nat: true,
+            dhcp: false,
+            global: false,
+            connect: None,
+            peer_connected: None,
+            frames: SegmentFrames {
+                dropped: 17,
+                ..SegmentFrames::default()
+            },
+        });
+        let out = render_status(&status, false);
+        assert!(out.contains("DROPPED"), "got:\n{out}");
+        assert!(
+            out.contains("lan     10.0.0.0/24        10.0.0.1        on/off   17"),
+            "got:\n{out}"
+        );
+    }
+
+    /// Downloads in flight are reported too, so `up` looking stuck can be told
+    /// apart from `up` being slow.
+    #[test]
+    fn downloads_in_flight_are_listed_with_progress() {
+        let mut status = lab(Vec::new());
+        status.pulls.push(PullStatus {
+            machine: "dc01".into(),
+            kind: PullKind::Template,
+            reference: "ghcr.io/vmlab/win11:1".into(),
+            bytes_done: 512,
+            bytes_total: 1024,
+            percent: 50,
+        });
+        let out = render_status(&status, false);
+        assert!(
+            out.contains("dc01    template  50%      ghcr.io/vmlab/win11:1"),
+            "got:\n{out}"
+        );
+    }
+
+    /// Nothing running is a table with no rows, not a panic or a stray header.
+    #[test]
+    fn an_empty_lab_renders_just_its_name() {
+        assert_eq!(render_status(&lab(Vec::new()), true), "lab \"demo\"\n");
+    }
 
     #[test]
     fn region_value_validates_arity() {

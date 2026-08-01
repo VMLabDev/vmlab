@@ -1367,17 +1367,14 @@ impl super::machine::Machine for ContainerInstance {
         }
     }
 
-    async fn status_extra(&self) -> serde_json::Map<String, serde_json::Value> {
-        let mut extra = serde_json::Map::new();
-        extra.insert("image".into(), serde_json::json!(self.cfg.image.reference));
-        extra.insert("digest".into(), serde_json::json!(self.image_digest()));
-        extra.insert("health".into(), serde_json::json!(self.health().await));
-        extra.insert("restarts".into(), serde_json::json!(self.restart_count()));
-        extra.insert(
-            "exit_code".into(),
-            serde_json::json!(self.last_exit().await),
-        );
-        extra
+    async fn status_detail(&self) -> super::machine::MachineDetail {
+        super::machine::MachineDetail::Container(crate::status::ContainerStatus {
+            image: self.cfg.image.reference.clone(),
+            digest: self.image_digest(),
+            health: self.health().await,
+            restarts: self.restart_count(),
+            exit_code: self.last_exit().await,
+        })
     }
 }
 

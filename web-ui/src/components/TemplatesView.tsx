@@ -58,14 +58,15 @@ import {
   vmRegistry,
   type RegistryEntry,
 } from "../registries";
+import { containers, vms } from "../status";
 
 export default function TemplatesView() {
   onMount(() => void refreshRegistries().catch((error) => showToast(String(error), "danger")));
   const registries = createMemo(() =>
     registryEntries([
       ...state.templates.flatMap((t) => (t.registry ? [vmRegistry(t.registry)!] : [])).filter(Boolean),
-      ...(state.status?.vms ?? []).map((vm) => vmRegistry(vm.template)).filter(Boolean),
-      ...(state.status?.containers ?? []).map((c) => containerRegistry(c.image)).filter(Boolean),
+      ...vms(state.status).map((vm) => vmRegistry(vm.template)).filter(Boolean),
+      ...containers(state.status).map((c) => containerRegistry(c.image)).filter(Boolean),
     ] as RegistryEntry[]),
   );
 

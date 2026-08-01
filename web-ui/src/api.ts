@@ -3,6 +3,9 @@
 // is sent as an Authorization header on REST calls and a ?token= query param
 // on WebSocket upgrades (browsers can't set WS headers).
 
+import { parseLabStatus } from "./status";
+import type { LabStatus, WebPageStatus } from "./status";
+
 const TOKEN_KEY = "vmlab_token";
 
 export function getToken(): string {
@@ -66,106 +69,6 @@ export interface LabEntry {
   root?: string;
   state?: string;
 }
-export interface Nic {
-  segment: string | null;
-  mac: string | null;
-  static_ip: string | null;
-  /** Live IPv4 address reported for this interface, null while unknown/offline. */
-  ip: string | null;
-}
-/** A declared HTTP UI on a machine, launchable in the Web tab (no
- *  credentials — the proxy fetches those separately). */
-export interface WebPage {
-  name: string;
-  port: number;
-  path: string;
-}
-export interface Vm {
-  name: string;
-  state: string;
-  ready: boolean;
-  ip: string | null;
-  /** False while the registry template still needs downloading. */
-  template_cached?: boolean;
-  template: string;
-  arch: string | null;
-  cpus: number | null;
-  memory: number | null;
-  nics: Nic[];
-  web?: WebPage[];
-  /** vmlab-agent stamp baked into the template — null means the template
-   *  predates agent support (no interactive terminal). */
-  agent_version?: string | null;
-}
-/** One container's runtime status (labd `status()` containers array). */
-export interface Container {
-  name: string;
-  state: string;
-  ready: boolean;
-  /** Latest healthcheck verdict; null = no check, or no report yet. */
-  health: boolean | null;
-  ip: string | null;
-  /** False while the container image still needs downloading. */
-  image_cached?: boolean;
-  image: string;
-  digest: string | null;
-  restarts: number;
-  exit_code: number | null;
-  nics: Nic[];
-  web?: WebPage[];
-}
-export interface Segment {
-  name: string;
-  subnet: string;
-  gateway: string;
-  nat: boolean;
-  dhcp: boolean;
-  global?: boolean;
-  /** Cross-host peer target (`connect { host }`), when declared. */
-  connect?: string | null;
-  /** Live trunk state: true/false for global segments (any trunk up, keyed
-   *  by segment name), null when not global or the supervisor is
-   *  unreachable. Drives the remote-vmlab node's LED. */
-  peer_connected?: boolean | null;
-}
-/** A registry download running right now, for resync: the `*.pull.*` events
- *  only reach clients that were connected when they fired. */
-export interface ActivePull {
-  machine: string;
-  kind: "template" | "image";
-  reference: string;
-  bytes_done: number;
-  bytes_total: number;
-  percent: number;
-}
-/** One machine exactly as labd reports it: common fields plus whichever
- *  kind-specific ones its adapter contributed. The console never consumes
- *  this directly — `labStatus` splits it into `vms` and `containers`, which
- *  are separate things to a user even though they share one endpoint. */
-export interface RawMachine {
-  name: string;
-  kind: "vm" | "container";
-  state: string;
-  ready: boolean;
-  ip: string | null;
-  nics: Nic[];
-  web?: WebPage[];
-  /** False while the template/image still needs downloading. */
-  cached?: boolean;
-  [key: string]: unknown;
-}
-export interface LabStatus {
-  lab: string;
-  /** Derived from `machines` — VMs only. */
-  vms: Vm[];
-  /** Derived from `machines` — containers only. */
-  containers: Container[];
-  segments: Segment[];
-  /** The lab has clones, container overlays or named volumes on disk — i.e.
-   *  destroy has something to remove. */
-  provisioned?: boolean;
-  pulls?: ActivePull[];
-}
 export interface Snapshot {
   name: string;
   online: boolean;
@@ -189,28 +92,11 @@ export interface DnsSegmentZone {
 }
 
 export const listLabs = (): Promise<LabEntry[]> => req("/api/labs");
-export const labStatus = async (lab: string): Promise<LabStatus> => {
-  const raw = await req(`/api/labs/${encodeURIComponent(lab)}`);
-  return splitMachines(raw);
-};
-
-/** labd reports one `machines` array; the console shows VMs and containers as
- *  separate things. Split here, once, rather than at every call site. */
-export function splitMachines(raw: {
-  machines?: RawMachine[];
-  [key: string]: unknown;
-}): LabStatus {
-  const machines = raw.machines ?? [];
-  return {
-    ...(raw as object),
-    vms: machines
-      .filter((m) => m.kind === "vm")
-      .map((m) => ({ ...m, template_cached: m.cached }) as unknown as Vm),
-    containers: machines
-      .filter((m) => m.kind === "container")
-      .map((m) => ({ ...m, image_cached: m.cached }) as unknown as Container),
-  } as LabStatus;
-}
+/** The lab status projection (ADR-0004). Its types are generated and live in
+ *  ./status, which every consumer imports from directly; this is only the
+ *  call. */
+export const labStatus = async (lab: string): Promise<LabStatus> =>
+  parseLabStatus(await req(`/api/labs/${encodeURIComponent(lab)}`));
 export const dnsTable = (lab: string): Promise<{ segments: DnsSegmentZone[] }> =>
   req(`/api/labs/${encodeURIComponent(lab)}/dns`);
 // `force` applies to the stop-shaped actions (down / stop / restart's stop
@@ -1056,7 +942,7 @@ export function webPageUrl(
   lab: string,
   kind: "vms" | "containers",
   machine: string,
-  page: WebPage,
+  page: WebPageStatus,
 ): string {
   const base = `/web/${encodeURIComponent(lab)}/${kind}/${encodeURIComponent(machine)}/${encodeURIComponent(page.name)}`;
   const path = page.path.startsWith("/") ? page.path : `/${page.path}`;

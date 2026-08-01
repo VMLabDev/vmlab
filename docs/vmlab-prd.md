@@ -546,7 +546,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab up [vm...]` | Create/start lab (or subset), run provision scripts |
 | `vmlab down [vm...]` | Graceful stop; clones retained |
 | `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
-| `vmlab status` | Lab/VM/segment state, IPs, ready flags |
+| `vmlab status [-v]` | Machine status, IPs and segments; `-v` adds raw state and per-kind detail |
 | `vmlab validate` | Full §5.1 validation, no side effects |
 | `vmlab vm start / stop / restart <vm>` | Per-VM power control |
 | `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide (§7.3) |

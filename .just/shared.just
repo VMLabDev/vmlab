@@ -48,6 +48,11 @@ web-ui-deps-ensure:
 web-ui-build: web-ui-deps-ensure
 	cd web-ui && pnpm build
 
+# Regenerate the console's status types from the Rust projection (src/status.rs)
+[group('web')]
+status-types-build: require-cargo
+	cargo test --lib status::export_bindings
+
 # Rebuild the committed BPF fast-path objects from ebpf/ (pinned toolchain)
 [group('build')]
 ebpf-build: require-rustup require-bpf-linker

@@ -1,5 +1,5 @@
 import { For, Show, createResource, createSignal } from "solid-js";
-import { Button, Card, Empty, Grid, Icon, Modal, PageHead, Spinner, Stat } from "@forge/ui";
+import { Badge, Button, Card, Empty, Grid, Icon, Modal, PageHead, Spinner, Stat } from "@forge/ui";
 import { Camera, Globe, History, Play, Square, Trash2 } from "lucide-solid";
 import {
   state,
@@ -12,6 +12,7 @@ import {
   labSnapshotList,
   fmtMem,
 } from "../store";
+import { vms } from "../status";
 import { confirmDialog, promptDialog } from "./dialogs";
 import ActionButton from "./ActionButton";
 import LabEditorView from "./editor/LabEditorView";
@@ -27,29 +28,21 @@ function fmtTime(t: string): string {
 export default function LabView() {
   const s = () => state.status;
   // "Machines" spans VMs and containers (they share one lab namespace).
-  const containers = () => s()?.containers ?? [];
-  const running = () =>
-    (s()?.vms.filter((v) => v.state === "running").length ?? 0) +
-    containers().filter((c) => c.state === "running").length;
-  const total = () => (s()?.vms.length ?? 0) + containers().length;
-  const vcpu = () => s()?.vms.reduce((a, v) => a + (v.cpus ?? 0), 0) ?? 0;
-  const mem = () => s()?.vms.reduce((a, v) => a + (v.memory ?? 0), 0) ?? 0;
+  const machines = () => s()?.machines ?? [];
+  const running = () => machines().filter((m) => m.state === "running").length;
+  const total = () => machines().length;
+  const vcpu = () => vms(s()).reduce((a, v) => a + (v.cpus ?? 0), 0);
+  const mem = () => vms(s()).reduce((a, v) => a + (v.memory ?? 0), 0);
   // Every declared `web {}` page across the lab, one launch card each.
   const webPages = () =>
-    [
-      ...(s()?.vms ?? []).map((v) => ({
-        kind: "vms" as const,
-        machine: v.name,
-        up: v.state === "running" && !!v.ip,
-        pages: v.web ?? [],
-      })),
-      ...containers().map((c) => ({
-        kind: "containers" as const,
-        machine: c.name,
-        up: c.state === "running" && !!c.ip,
-        pages: c.web ?? [],
-      })),
-    ].flatMap((m) => m.pages.map((page) => ({ ...m, page })));
+    machines()
+      .map((m) => ({
+        kind: m.kind === "vm" ? ("vms" as const) : ("containers" as const),
+        machine: m.name,
+        up: m.state === "running" && !!m.ip,
+        pages: m.web,
+      }))
+      .flatMap((m) => m.pages.map((page) => ({ ...m, page })));
 
   const snapshotLab = async () => {
     const name = await promptDialog({
@@ -101,7 +94,7 @@ export default function LabView() {
         sub={
           s()
             ? `${total()} machines · ${s()!.segments.length} segments`
-            : "lab daemon not running"
+            : (state.error ?? "lab daemon not running")
         }
         actions={
           <>
@@ -169,6 +162,33 @@ export default function LabView() {
             <Stat label="Segments" value={s() ? String(s()!.segments.length) : "—"} />
           </Card>
         </Grid>
+
+        {/* Per-segment switch counters. A non-zero drop count is the only
+            warning that the fabric is shedding frames under load — the thing
+            that makes a guest transfer mysteriously slow. The daemon has
+            always measured it; until the projection carried it, only the CLI
+            could show it. */}
+        <Show when={(s()?.segments.length ?? 0) > 0}>
+          <Card title="Segments">
+            <For each={s()!.segments}>
+              {(seg) => (
+                <div class="kv">
+                  <span class="kv-k">{seg.name}</span>
+                  <span class="kv-v">
+                    {seg.subnet} · nat {seg.nat ? "on" : "off"} · dhcp{" "}
+                    {seg.dhcp ? "on" : "off"}
+                    <Show when={seg.frames.dropped > 0}>
+                      {" "}
+                      <Badge tone="warning" dot>
+                        {seg.frames.dropped} frames dropped
+                      </Badge>
+                    </Show>
+                  </span>
+                </div>
+              )}
+            </For>
+          </Card>
+        </Show>
 
         <Show when={webPages().length > 0}>
           <Grid>

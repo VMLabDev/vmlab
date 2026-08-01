@@ -18,14 +18,10 @@ use crate::qmp::QmpClient;
 const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the template likely predates \
      agent support) — rebuild it with `vmlab template build`";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PowerState {
-    Stopped,
-    Starting,
-    Running,
-    Stopping,
-}
+/// A machine's power state. Declared with the status projection, which is what
+/// puts it on the wire (ADR-0004), and re-exported here because this is where
+/// the daemon's callers reach for it.
+pub use crate::status::PowerState;
 
 /// Why a VM left the Running state — carried on `vm.stopped` (PRD §8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1032,20 +1028,16 @@ impl super::machine::Machine for VmInstance {
             .map_err(|e| anyhow!("rebooting {}: {e}", self.cfg.name))
     }
 
-    async fn status_extra(&self) -> serde_json::Map<String, serde_json::Value> {
-        let t = self.template();
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "template".into(),
-            serde_json::json!(self.cfg.template.to_string()),
-        );
-        extra.insert("arch".into(), serde_json::json!(self.cfg.arch));
-        extra.insert("cpus".into(), serde_json::json!(self.cfg.cpus));
-        extra.insert("memory".into(), serde_json::json!(self.cfg.memory));
-        // The template carries a baked-in vmlab-agent (terminal support);
-        // null on vintage guests and pre-agent templates.
-        extra.insert("agent_version".into(), serde_json::json!(t.agent_version));
-        extra
+    async fn status_detail(&self) -> super::machine::MachineDetail {
+        super::machine::MachineDetail::Vm(crate::status::VmStatus {
+            template: self.cfg.template.to_string(),
+            arch: self.cfg.arch.clone(),
+            cpus: self.cfg.cpus,
+            memory: self.cfg.memory,
+            // The template carries a baked-in vmlab-agent (terminal support);
+            // null on vintage guests and pre-agent templates.
+            agent_version: self.template().agent_version.clone(),
+        })
     }
 }
 
