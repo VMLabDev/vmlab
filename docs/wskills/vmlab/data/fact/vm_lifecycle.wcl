@@ -1,21 +1,24 @@
 fact vm_lifecycle {
-  title    = "Vm: lifecycle & state methods"
+  title    = "Machine: lifecycle & state methods"
   related  = [vm_api, lab_api]
   audience = :both
   body {
     table {
       header = ["Method", "Returns", "Notes"]
       rows = [
-        ["`vm.name()`", "`string`", ""],
-        ["`vm.start()` / `vm.stop()` / `vm.stop_force()` / `vm.restart()`", "`Result[unit, string]`", "stop = graceful ladder (agent → ACPI → kill)"],
-        ["`vm.poweroff()`", "`Result[unit, string]`", "Clean QMP `quit` — exits QEMU flushing block caches. The only safe seal for guests with no ACPI (DOS, Win 3.x), where a force-kill can drop qcow2 writes"],
-        ["`vm.state()`", "`string`", "one of `\"stopped\"` / `\"starting\"` / `\"running\"` / `\"stopping\"`"],
-        ["`vm.is_ready()`", "`bool`", "The **sticky** ready flag — once set it stays set while QEMU runs, so it does not drop across a guest reboot"],
-        ["`vm.agent_answering()`", "`bool`", "The **live** agent probe, ungated — goes false while the guest is down or mid-reboot. Use this to watch a reboot you requested from inside the guest"],
-        ["`vm.wait_ready(timeout_secs: int)`", "`Result[unit, string]`", "Block until agent responds"],
-        ["`vm.wait_shutdown(timeout_secs: int)`", "`Result[unit, string]`", "Block until powered off"],
-        ["`vm.ip()`", "`Result[string, string]`", "Primary NIC IPv4 (DHCP lease / agent)"],
-        ["`vm.ip_nic(nic: int)`", "`Result[string, string]`", "By NIC index (0-based)"],
+        ["`m.name()`", "`string`", ""],
+        ["`m.kind()`", "`string`", "`\"vm\"` or `\"container\"` — reported so a script can *say* what it has, never so it has to branch to drive it"],
+        ["`m.start()` / `m.stop()` / `m.stop_force()` / `m.restart()`", "`Result[unit, string]`", "stop = graceful ladder (agent → ACPI → kill)"],
+        ["`m.poweroff()`", "`Result[unit, string]`", "Clean QMP `quit` — exits QEMU flushing block caches. The only safe seal for guests with no ACPI (DOS, Win 3.x), where a force-kill can drop qcow2 writes"],
+        ["`m.state()`", "`string`", "one of `\"stopped\"` / `\"starting\"` / `\"running\"` / `\"stopping\"`"],
+        ["`m.is_ready()`", "`bool`", "The **sticky** ready flag — once set it stays set while QEMU runs, so it does not drop across a guest reboot"],
+        ["`m.agent_answering()`", "`bool`", "The **live** agent probe, ungated — goes false while the guest is down or mid-reboot. Use this to watch a reboot you requested from inside the guest"],
+        ["`m.wait_ready(timeout_secs: int)`", "`Result[unit, string]`", "Block until agent responds"],
+        ["`m.wait_shutdown(timeout_secs: int)`", "`Result[unit, string]`", "Block until powered off"],
+        ["`m.ip()`", "`Result[string, string]`", "Primary NIC IPv4 (DHCP lease / agent)"],
+        ["`m.ip_nic(nic: int)`", "`Result[string, string]`", "By NIC index (0-based)"],
+        ["`m.is_healthy()`", "`bool`", "Latest healthcheck verdict; a machine declaring none counts healthy once ready"],
+        ["`m.logs(lines: int)`", "`Result[string, string]`", "Tail of the console log — a container's captured stdout/stderr, a VM's serial log"],
       ]
     }
     p <<PROSE

@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use super::meta::TemplateMeta;
 use super::store::TemplateStore;
 use crate::config::model::{ArtefactSource, TemplateDef, TemplateSource};
+use crate::labd::machine::Machine;
 use crate::scripting::OutputSink;
 
 /// Called once the build VM's VNC socket is accepting connections.
@@ -316,7 +317,7 @@ async fn run_build(
             }
             let log = move |s: String| out(s);
             super::agent_install::verify(
-                &vm,
+                &(vm.clone() as Arc<dyn Machine>),
                 wants_agent,
                 staged.as_deref(),
                 std::time::Duration::from_secs(3600),
@@ -329,13 +330,13 @@ async fn run_build(
         let staged = staged.clone();
         let agent_version = agent_version.clone();
         *runtime.pre_provision.write().expect("pre_provision lock") =
-            Some(Arc::new(move |vm, out| {
+            Some(Arc::new(move |machine, out| {
                 let staged = staged.clone();
                 let agent_version = agent_version.clone();
                 Box::pin(async move {
                     let log = move |s: String| out(s);
                     let version = super::agent_install::verify(
-                        &vm,
+                        &machine,
                         wants_agent,
                         staged.as_deref(),
                         std::time::Duration::from_secs(600),
@@ -512,7 +513,7 @@ async fn run_build(
                 move |s: String| out(s)
             };
             let version = super::agent_install::verify(
-                vm2,
+                &(vm2.clone() as Arc<dyn Machine>),
                 def.agent,
                 staged.as_deref(),
                 std::time::Duration::from_secs(900),

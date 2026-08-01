@@ -60,8 +60,13 @@ export type LabelState = { "state": "running" } | { "state": "booting" } | { "st
 export type MachineDetail = { "kind": "vm" } & VmStatus | { "kind": "container" } & ContainerStatus;
 
 /**
- * Which of the two kinds a machine is. Reported so a UI can pick an icon —
- * never so a caller can pick a code path.
+ * Which of the two kinds a machine is.
+ *
+ * Reported, so a caller can *say* what it is holding — an icon in a UI, the
+ * word in an error, the filter behind `lab.vms()`. Never so a caller can pick
+ * a code path for driving it: that difference belongs on
+ * [`Machine`](crate::labd::machine::Machine), as a capability or as
+ * implementation behind it (ADR-0002).
  */
 export type MachineKind = "vm" | "container";
 

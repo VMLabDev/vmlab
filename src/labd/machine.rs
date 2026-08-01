@@ -6,21 +6,31 @@
 //! runtime, playbooks, and the whole `machine.*` command surface) address them
 //! through [`Machine`] and never branch on which kind they hold.
 //!
+//! **There is no second route.** `start` and `restore` are on this interface
+//! too: booting a VM needs a template clone and segment attachments, booting a
+//! container needs an image spec and a restart policy, and that difference is
+//! implementation — not a branch in a caller. The lab runtime supplies what
+//! both need through [`LabServices`], and asks the machine to do the rest.
+//!
 //! What genuinely differs is expressed as a **capability**, not as a kind:
 //!
-//! - a framebuffer is [`Machine::display`], `Some` for VMs and `None` for
-//!   containers — the 7 screen/keyboard/pointer/vision operations live on the
-//!   concrete [`Display`] rather than on every machine;
-//! - a console log is [`Machine::console_log`], `Some` only for containers;
+//! - a framebuffer is [`Machine::display`] — the screen/keyboard/pointer/
+//!   vision operations live on the concrete [`Display`], and absence is
+//!   *reported*, never inferred: no container reports one today, and one
+//!   running a display server would report one without a line changing here;
+//! - a console log is [`Machine::console_log`];
+//! - a healthcheck verdict is [`Machine::health`];
+//! - in-place reboot is [`Machine::reboot_guest`], gated by
+//!   [`Machine::can_reboot`];
 //! - clipboard and Windows event log are agent features, already negotiated at
 //!   handshake time and reported through [`Capabilities::agent`].
 //!
-//! `start` and `restore` are deliberately absent. Bringing a machine up needs
-//! setup the two kinds do not share (segment attachment and template clones for
-//! VMs; an image spec and a restart policy for containers), and that difference
-//! belongs below a Hypervisor seam rather than in this interface. Until then
-//! [`super::lab::LabRuntime`] owns those two, and they are the only places left
-//! that know a machine's kind.
+//! This module used to claim the lab runtime "owns `start` and `restore`, and
+//! they are the only places left that know a machine's kind". That decayed to
+//! seven further branches before anyone noticed, because nothing enforced it
+//! (ADR-0002). The claim is now enforced rather than asserted:
+//! `orchestration_never_branches_on_machine_kind` in [`super::lab`] fails the
+//! build if the lab runtime learns to ask what kind it is holding.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,7 +40,12 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 
 use crate::config::model::{self, MacAddr};
+use crate::net::fastpath::NicAttachment;
 
+pub use super::display::Display;
+use super::events::EventLog;
+use super::guest_os::GuestOs;
+use super::state::MachineState;
 use super::vm::PowerState;
 use super::vm_agent::AgentHandle;
 
@@ -40,6 +55,13 @@ use super::vm_agent::AgentHandle;
 pub use crate::status::{
     MachineDetail, MachineKind, MachineLabel, MachineStatus, NicStatus, WebPageStatus,
 };
+
+/// How long [`Machine::poweroff`] waits for the emulator to actually go.
+pub(super) const POWEROFF_SETTLE: Duration = Duration::from_secs(30);
+
+/// How long a machine that does not say otherwise gets to become ready. A
+/// container's entrypoint starts fast and its healthcheck governs the rest.
+pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What a machine can do beyond the universal operations, probed rather than
 /// inferred. Drives `machine.capabilities`, which is how the web console
@@ -53,10 +75,60 @@ pub struct Capabilities {
     pub console_log: bool,
     /// The guest can reboot in place and come back.
     pub reboot: bool,
+    /// The machine declares a healthcheck, so [`Machine::health`] carries a
+    /// verdict rather than only "is it ready".
+    pub healthcheck: bool,
     /// Agent features negotiated at handshake (`terminal`, `exec`, `file`,
     /// `tail`, `metrics`, `clipboard`, `eventlog`). Empty when no agent is
     /// answering — which is a live fact, not a property of the kind.
     pub agent: Vec<String>,
+}
+
+/// What booting a machine needs from the lab around it.
+///
+/// Deliberately narrow. [`super::lab::LabRuntime`] implements it, but a
+/// machine implementation is handed this and not the runtime, so it cannot
+/// reach for the rest of the lab — and a test can boot a machine against a
+/// stub instead of a fabric.
+#[async_trait::async_trait]
+pub trait LabServices: Send + Sync + 'static {
+    /// The event log lifecycle transitions are reported on.
+    fn events(&self) -> &Arc<EventLog>;
+
+    /// Download this machine's template or image if it is not cached yet. A
+    /// no-op once cached, so a fully-cached lab stays offline.
+    async fn ensure_pulled(&self, machine: &str) -> Result<()>;
+
+    /// Make sure the lab's shared-folder server is serving. Idempotent.
+    async fn ensure_shares(&self);
+
+    /// Wire one NIC into `segment`'s switch, returning how the machine should
+    /// speak to it.
+    ///
+    /// `tap_ok` says this machine can consume a pre-opened tap fd; a machine
+    /// that can only take a stream socket (a container micro-VM builds its
+    /// argv without fd passing) passes `false` and always gets
+    /// [`NicAttachment::Stream`].
+    async fn attach_nic(
+        &self,
+        segment: &str,
+        sock: &Path,
+        mac: MacAddr,
+        isolated: bool,
+        tap_ok: bool,
+    ) -> Result<NicAttachment>;
+
+    /// This machine reached readiness — (re-)install anything keyed on its
+    /// network lease, which moves across restarts.
+    async fn machine_ready(&self, machine: &str);
+
+    /// The guest-side commands that mount whatever the lab's smbd exports for
+    /// `machine`. Empty when no SMB server is running.
+    async fn smb_mount_plan(
+        &self,
+        machine: &str,
+        os: crate::smb::OsHint,
+    ) -> Vec<crate::smb::MountStep>;
 }
 
 /// Everything a lab can boot, attach to a segment, and drive through the
@@ -74,7 +146,7 @@ pub trait Machine: Send + Sync + 'static {
     /// CPU architecture the machine runs (`x86_64`, `aarch64`, `riscv64`).
     fn arch(&self) -> String;
     /// Guest OS family, for callers that must shape a command line for it.
-    fn guest_os(&self) -> super::playbook::GuestOs;
+    fn guest_os(&self) -> GuestOs;
     fn nics(&self) -> &[model::Nic];
     fn macs(&self) -> &[MacAddr];
     fn web_pages(&self) -> &[model::WebPage];
@@ -91,12 +163,77 @@ pub trait Machine: Send + Sync + 'static {
     /// substituted one disagrees with itself.
     fn virtiofsd_available(&self) -> bool;
 
+    /// Host socket for the i-th NIC of the current run.
+    fn nic_sock(&self, i: usize) -> PathBuf;
+
+    /// Whether this machine can consume a pre-opened tap fd (the afxdp fast
+    /// path), or only a stream socket. A hardware fact about how its command
+    /// line is built, not a preference.
+    fn takes_tap_fds(&self) -> bool {
+        false
+    }
+
+    /// The word this machine's events name it under (`vm.stopped` vs
+    /// `container.stopped`). Reported, like [`kind`](Machine::kind), so the
+    /// event vocabulary stays what clients already parse without a caller
+    /// asking what it is holding.
+    fn event_subject(&self) -> &'static str;
+
+    /// `.vmlab/<kind>s/<name>` — the disks, overlays and firmware state a
+    /// destroy removes.
+    fn local_dir(&self) -> &Path;
+    /// `$XDG_RUNTIME_DIR/...` — this run's sockets.
+    fn run_dir(&self) -> &Path;
+
+    /// External binaries that must be on PATH before this machine can boot,
+    /// so a missing package surfaces as one clear error rather than a spawn
+    /// failure mid-`up`.
+    fn required_binaries(&self) -> Vec<String>;
+
+    /// This machine as the interface, so the default methods can share one
+    /// polling loop. `impl Machine for T { fn as_machine(&self) -> &dyn Machine { self } }`
+    /// — trait upcasting would make it unnecessary, and this goes when it lands.
+    fn as_machine(&self) -> &dyn Machine;
+
     // ---- power ------------------------------------------------------------
 
     async fn state(&self) -> PowerState;
     async fn is_ready(&self) -> bool;
     /// Graceful stop ladder, or an immediate kill when `force`.
     async fn stop(&self, force: bool) -> Result<()>;
+
+    /// Exit the emulator *gracefully*, flushing block-device caches first.
+    ///
+    /// The only safe seal for guests with no ACPI (DOS, Win 3.x): the stop
+    /// ladder's bottom rung is a SIGKILL, which can drop unflushed qcow2
+    /// writes and leave the disk unbootable. The default falls back to the
+    /// ladder for a machine with no such control channel.
+    async fn poweroff(&self) -> Result<()> {
+        self.stop(false).await?;
+        self.wait_state(PowerState::Stopped, POWEROFF_SETTLE).await
+    }
+
+    /// Boot this machine, wiring its NICs into the lab fabric and reporting
+    /// its lifecycle on the lab's event log. A no-op when it is already up.
+    ///
+    /// The kind-specific work — a template clone and segment attachments for a
+    /// VM, an image spec and a restart policy for a container — is
+    /// implementation. What both need from the lab arrives through
+    /// [`LabServices`].
+    async fn start(self: Arc<Self>, lab: Arc<dyn LabServices>) -> Result<()>;
+
+    /// Roll this machine back to `snap` (PRD §7.3).
+    ///
+    /// `online` is the power state recorded at capture, and it is the whole
+    /// contract: an online snapshot resumes running exactly where it was
+    /// (booting the machine first if it is off), an offline one leaves it
+    /// stopped. The caller has already checked [`snapshot_pin`](Machine::snapshot_pin).
+    async fn restore(
+        self: Arc<Self>,
+        lab: Arc<dyn LabServices>,
+        snap: &str,
+        online: bool,
+    ) -> Result<()>;
 
     /// Wait for the exit monitor to settle the power state.
     async fn wait_state(&self, want: PowerState, timeout: Duration) -> Result<()> {
@@ -114,39 +251,91 @@ pub trait Machine: Send + Sync + 'static {
         Ok(())
     }
 
-    /// How long `up` waits for this machine to become ready before giving
+    /// How long a caller waits for this machine to become ready before giving
     /// up. A container's entrypoint starts fast and its healthcheck governs
-    /// the rest; a VM may be running a first-boot provision through a
-    /// Windows settle reboot.
+    /// the rest; a VM may be running a first-boot provision through a Windows
+    /// settle reboot.
+    ///
+    /// Readiness policy lives here and nowhere else: callers pass
+    /// `m.ready_timeout()`, never a literal, so a VM cannot wait one budget
+    /// through one path and another through the next.
     fn ready_timeout(&self) -> Duration {
-        Duration::from_secs(300)
+        DEFAULT_READY_TIMEOUT
     }
 
     /// Wait until the machine is fully usable: agent up and any first-boot
     /// work complete (PRD §10.3).
+    ///
+    /// The only implementation. There used to be four, with three different
+    /// timeout budgets, and which one ran depended on whether the caller held
+    /// a concrete machine or this interface — see [`ready_timeout`](Machine::ready_timeout).
     async fn wait_ready(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.is_ready().await {
-                return Ok(());
-            }
-            if self.state().await == PowerState::Stopped {
-                bail!("{} stopped while waiting for ready", self.name());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("{}: not ready after {timeout:?}", self.name());
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        wait_until(self.as_machine(), timeout, "ready", |m| {
+            Box::pin(m.is_ready())
+        })
+        .await
+    }
+
+    // ---- first boot (PRD §6.1) ---------------------------------------------
+
+    /// The provision script this machine must run once, before it can be
+    /// reported ready. `None` when it carries none, or when it already ran for
+    /// this instantiation.
+    fn pending_first_boot(&self) -> Option<String> {
+        None
+    }
+
+    /// Record that the first-boot provision completed and report ready.
+    async fn first_boot_done(&self) -> Result<()> {
+        Ok(())
     }
 
     // ---- agent ------------------------------------------------------------
 
     /// The vmlab-agent channel, connecting on first use.
     async fn agent(&self) -> Result<AgentHandle>;
+    /// Whether this machine has an agent channel at all. `false` for a
+    /// vintage guest whose profile predates virtio-serial — no terminal, exec,
+    /// copy or readiness is possible, and no amount of waiting changes that.
+    fn has_agent_channel(&self) -> bool {
+        true
+    }
+
+    /// Forget a recently failed handshake so the next [`agent`](Machine::agent)
+    /// call reconnects immediately — used right after installing or starting an
+    /// agent. Unlike dropping the connection this never touches a live handle
+    /// another task may be using.
+    async fn clear_agent_failure(&self) {}
+
     /// Whether the agent answers a ping *right now* — unlike the sticky
     /// [`is_agent_up`](Machine::is_agent_up) this goes false mid-reboot.
     async fn agent_answering(&self) -> bool;
+
+    /// Whether the agent has answered at least once since this machine
+    /// started. Weaker than [`is_ready`](Machine::is_ready), which also waits
+    /// for first-boot work, and stickier than
+    /// [`agent_answering`](Machine::agent_answering), which drops mid-reboot.
+    async fn is_agent_up(&self) -> bool {
+        self.agent_answering().await
+    }
+
+    /// Wait until the agent has answered at least once.
+    async fn wait_agent_up(&self, timeout: Duration) -> Result<()> {
+        wait_until(self.as_machine(), timeout, "agent-up", |m| {
+            Box::pin(m.is_agent_up())
+        })
+        .await
+    }
+
+    /// Wait until the agent answers a live ping — what a first-boot script
+    /// that rebooted its own guest waits on, since QEMU never left `Running`
+    /// and the sticky flags never dropped.
+    async fn wait_agent_answering(&self, timeout: Duration) -> Result<()> {
+        wait_until(self.as_machine(), timeout, "agent-answering", |m| {
+            Box::pin(m.agent_answering())
+        })
+        .await
+    }
 
     /// Ask the guest to reboot in place, leaving the machine running.
     ///
@@ -232,17 +421,81 @@ pub trait Machine: Send + Sync + 'static {
 
     // ---- capability surfaces ----------------------------------------------
 
-    /// The machine's framebuffer, if it has one. `None` for containers, which
-    /// QEMU starts with no display device at all.
-    fn display(self: Arc<Self>) -> Option<Display>;
+    /// The machine's framebuffer, if it reports one.
+    ///
+    /// Absence is a fact about this machine, not about its kind: no container
+    /// reports a display today because QEMU starts container micro-VMs with no
+    /// display device, and one running a display server would report one by
+    /// overriding this — with every screen operation working unchanged. The
+    /// default is `None`, so a new machine kind is display-less until it says
+    /// otherwise.
+    fn display(self: Arc<Self>) -> Option<Display> {
+        None
+    }
 
-    /// The last `lines` lines of the machine's console log. `None` for
-    /// machines that keep no host-readable console — VMs log to QEMU's serial
-    /// file, which is not the same artefact and is served by `logs` at the lab
-    /// level.
+    /// The last `lines` lines of the machine's console log.
     fn console_log(&self, lines: usize) -> Option<Result<String>> {
         let _ = lines;
         None
+    }
+
+    /// The latest healthcheck verdict, when the machine declares one.
+    /// `None` means "no check, or no report yet" — a machine with no
+    /// healthcheck is healthy once it is ready.
+    async fn health(&self) -> Option<bool> {
+        None
+    }
+
+    /// Whether this machine declares a healthcheck at all. Distinct from
+    /// [`health`](Machine::health) returning `None`, which also covers "declared,
+    /// but has not reported yet".
+    fn has_healthcheck(&self) -> bool {
+        false
+    }
+
+    /// Whether this machine is healthy right now: its healthcheck's latest
+    /// verdict, or plain readiness when it declares none.
+    ///
+    /// A machine with no healthcheck answers `true` once it is ready rather
+    /// than reporting the capability missing. That is deliberate and predates
+    /// this interface: `is_healthy` is a gate lab authors write `if
+    /// m.is_healthy()` around, and failing it on every machine that declares
+    /// no check would break every script that does. [`Capabilities::healthcheck`]
+    /// is how a caller learns whether the answer means anything.
+    async fn is_healthy(&self) -> bool {
+        match self.health().await {
+            Some(healthy) => healthy,
+            None => self.is_ready().await,
+        }
+    }
+
+    // ---- shared folders (PRD §7.5, §18) -------------------------------------
+
+    /// Hand the machine the credentials its guest mounts the lab's SMB server
+    /// with. Called once smbd is up, for machines whose guest does the mount
+    /// itself rather than being driven from the host.
+    async fn smb_ready(&self, gateway: std::net::Ipv4Addr, username: &str, password: &str) {
+        let _ = (gateway, username, password);
+    }
+
+    /// Mount this machine's shares from inside the guest, once it is ready.
+    ///
+    /// Spawned per machine by `up` and expected to take its time — Windows
+    /// needs minutes before `net use` stops returning error 67 — so it waits
+    /// for readiness itself rather than making the wave wait on the retry
+    /// window. A no-op for machines whose guest mounts its own folders (a
+    /// container's init does it from the spec it was handed).
+    async fn mount_shares(self: Arc<Self>, lab: Arc<dyn LabServices>) {
+        let _ = lab;
+    }
+
+    // ---- teardown ------------------------------------------------------------
+
+    /// Forget the persisted artefacts a destroy invalidated. The lab has
+    /// already removed this machine's directories; anything it recorded about
+    /// them in lab state is the machine's to clear.
+    async fn forget_artefacts(&self, state: &mut MachineState) {
+        let _ = state;
     }
 
     // ---- projection --------------------------------------------------------
@@ -267,6 +520,7 @@ impl dyn Machine {
             display: self.clone().display().is_some(),
             console_log: self.console_log(1).is_some(),
             reboot: self.can_reboot(),
+            healthcheck: self.has_healthcheck(),
             agent,
         }
     }
@@ -321,6 +575,82 @@ impl dyn Machine {
 }
 
 // ---- shared implementation details -----------------------------------------
+
+/// Wire every one of `m`'s NICs into the lab fabric, in declaration order.
+///
+/// One implementation for both adapters: the segment, socket and MAC come from
+/// the machine, and whether it can take a tap fd is
+/// [`takes_tap_fds`](Machine::takes_tap_fds). A machine that ignores the
+/// returned attachments (a container micro-VM connects to the sockets itself)
+/// simply drops them.
+pub(super) async fn attach_all_nics(
+    m: &dyn Machine,
+    lab: &dyn LabServices,
+) -> Result<Vec<NicAttachment>> {
+    let tap_ok = m.takes_tap_fds();
+    let mut attachments = Vec::with_capacity(m.nics().len());
+    for (i, nic) in m.nics().iter().enumerate() {
+        let sock = m.nic_sock(i);
+        let _ = std::fs::remove_file(&sock);
+        let mac = *m
+            .macs()
+            .get(i)
+            .ok_or_else(|| anyhow!("{}: no persisted MAC for nic {i}", m.name()))?;
+        attachments.push(
+            lab.attach_nic(
+                super::network::nic_segment_name(nic),
+                &sock,
+                mac,
+                nic.isolated,
+                tap_ok,
+            )
+            .await?,
+        );
+    }
+    Ok(attachments)
+}
+
+/// [`Machine::poweroff`] for a machine QEMU is running: a clean QMP `quit`,
+/// then wait for the exit monitor to settle.
+///
+/// The QMP call is expected to fail — QEMU exits, so the connection drops
+/// mid-request — and a machine that is already down has no channel at all. The
+/// power state is the only answer that matters, so it is the only thing
+/// checked.
+pub(super) async fn quit_and_settle(
+    m: &dyn Machine,
+    qmp: Result<crate::qmp::QmpClient>,
+) -> Result<()> {
+    if let Ok(qmp) = qmp {
+        let _ = qmp.quit().await;
+    }
+    m.wait_state(PowerState::Stopped, POWEROFF_SETTLE).await
+}
+
+/// One polling wait, behind every "wait until …" on this interface: settle at
+/// 250ms, give up early when the machine stopped underneath (nothing it is
+/// waiting on can happen now), and name the machine and the budget on
+/// timeout.
+async fn wait_until(
+    m: &dyn Machine,
+    timeout: Duration,
+    what: &str,
+    probe: impl for<'a> Fn(&'a dyn Machine) -> futures::future::BoxFuture<'a, bool>,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if probe(m).await {
+            return Ok(());
+        }
+        if m.state().await == PowerState::Stopped {
+            bail!("{} stopped while waiting for {what}", m.name());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("{}: not {what} after {timeout:?}", m.name());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
 
 /// Why a machine's agent channel could not be reached.
 ///
@@ -461,62 +791,6 @@ impl AgentSlot {
             handle.shutdown().await;
         }
         *self.failed_at.lock().await = None;
-    }
-}
-
-// ---- Display ----------------------------------------------------------------
-
-/// A machine's framebuffer, with the operations that read and drive it:
-/// screenshots, key chords, pointer input, OCR and image matching.
-///
-/// Obtained from [`Machine::display`], so a caller that holds one has already
-/// established the machine has a screen — there is no "does this support
-/// screenshots" check to forget. Concrete rather than a trait: QEMU's
-/// framebuffer is the only thing that ever satisfies it, and a seam with one
-/// adapter is a seam that has not happened yet.
-pub struct Display {
-    vm: Arc<super::vm::VmInstance>,
-}
-
-impl Display {
-    pub(super) fn new(vm: Arc<super::vm::VmInstance>) -> Self {
-        Self { vm }
-    }
-
-    /// Capture the screen to a PNG at `out`.
-    pub async fn screenshot(&self, out: &Path) -> Result<()> {
-        crate::scripting::interact::screenshot(&self.vm, out).await
-    }
-
-    /// Send a key chord (e.g. `ctrl-alt-delete`).
-    pub async fn send_keys(&self, chord: &str) -> Result<()> {
-        crate::scripting::interact::send_keys(&self.vm, chord).await
-    }
-
-    pub async fn mouse_move(&self, x: i64, y: i64) -> Result<()> {
-        crate::scripting::interact::mouse_move(&self.vm, x, y).await
-    }
-
-    pub async fn mouse_click(&self, button: &str, at: Option<(i64, i64)>) -> Result<()> {
-        crate::scripting::interact::mouse_click(&self.vm, button, at).await
-    }
-
-    pub async fn mouse_drag(&self, x1: i64, y1: i64, x2: i64, y2: i64) -> Result<()> {
-        crate::scripting::interact::mouse_drag(&self.vm, x1, y1, x2, y2).await
-    }
-
-    /// Read text off the screen, optionally within a region.
-    pub async fn ocr(&self, region: Option<(u32, u32, u32, u32)>) -> Result<String> {
-        crate::scripting::interact::ocr(&self.vm, region).await
-    }
-
-    /// Search the screen for the first matching reference image.
-    pub async fn find_image(
-        &self,
-        templates: &[PathBuf],
-        opts: &crate::vision::MatchOptions,
-    ) -> Result<Option<crate::vision::Match>> {
-        crate::scripting::interact::find_image(&self.vm, templates, opts).await
     }
 }
 

@@ -22,12 +22,10 @@ use crate::proto::CommandError;
 use crate::scripting::OutputSink;
 use crate::sync::LockRecover;
 
-/// Guest OS family — picks the config-weave binary and path scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuestOs {
-    Linux,
-    Windows,
-}
+/// Guest OS family — picks the config-weave binary and path scheme. Owned by
+/// [`super::guest_os`], because [`super::machine::Machine`] reports it and an
+/// interface must not take its vocabulary from one of its consumers.
+pub use super::guest_os::GuestOs;
 
 /// Env var overriding the config-weave binary directory (between the host
 /// config setting and the XDG default).
@@ -72,20 +70,6 @@ pub fn weave_binary(dir: &Path, os: GuestOs, arch: &str) -> Result<PathBuf> {
         );
     }
     Ok(path)
-}
-
-/// Guest OS family from the resolved profile name, for selecting the
-/// config-weave binary — where XP-versus-modern Windows is irrelevant, so
-/// `windows-legacy` answers `Windows` here. Deliberately not the same
-/// question as [`crate::smb::guest_os_hint`], which selects a share mount
-/// command and for which the distinction matters a great deal. Containers are
-/// always Linux; VM answers are confirmed against the agent handshake
-/// (`AgentInfo.os`) once connected.
-pub fn guest_os_of(profile: Option<&str>) -> GuestOs {
-    match profile {
-        Some(p) if p.starts_with("windows") => GuestOs::Windows,
-        _ => GuestOs::Linux,
-    }
 }
 
 /// The `playbook {}` blocks declared inside `machine`, in declaration order.
@@ -913,14 +897,6 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let err = weave_binary(empty.path(), GuestOs::Linux, "x86_64").unwrap_err();
         assert!(err.to_string().contains("just install"), "{err}");
-    }
-
-    #[test]
-    fn guest_os_heuristic() {
-        assert_eq!(guest_os_of(Some("windows-server")), GuestOs::Windows);
-        assert_eq!(guest_os_of(Some("windows-legacy")), GuestOs::Windows);
-        assert_eq!(guest_os_of(Some("linux-modern")), GuestOs::Linux);
-        assert_eq!(guest_os_of(None), GuestOs::Linux);
     }
 
     #[tokio::test(start_paused = true)]

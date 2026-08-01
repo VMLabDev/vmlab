@@ -83,16 +83,21 @@ impl SegmentNet {
         Ok(())
     }
 
-    /// Attach one VM NIC: a tap on the afxdp fast path when that tier is
-    /// active (falling back per NIC on any failure), else the stream-socket
-    /// listener QEMU connects to.
+    /// Attach one NIC: a tap on the afxdp fast path when that tier is active
+    /// (falling back per NIC on any failure), else the stream-socket listener
+    /// QEMU connects to.
+    ///
+    /// `tap_ok` is the machine's ability to consume a pre-opened tap fd, not a
+    /// preference — a container micro-VM's argv carries no descriptors, so it
+    /// passes `false` and always gets a stream socket.
     pub async fn attach_nic(
         &mut self,
         sock: &Path,
         mac: MacAddr,
         isolated: bool,
+        tap_ok: bool,
     ) -> Result<NicAttachment> {
-        if fastpath::tier() == FastpathTier::AfXdp {
+        if tap_ok && fastpath::tier() == FastpathTier::AfXdp {
             match self.attach_tap(mac, isolated) {
                 Ok(att) => return Ok(att),
                 Err(error) => tracing::warn!(

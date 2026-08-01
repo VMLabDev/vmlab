@@ -15,7 +15,7 @@ paths; `{action}` routes accept the verb in the path (e.g. `up`, `down`,
 VMs and containers share one `…/machines/{name}/…` path family — they are the
 same thing to the API even though the console presents them separately. Where
 a machine cannot serve a request it says why: a container has no framebuffer,
-so `screenshot.png` fails with "this machine has no display", and a VM keeps
+so `screenshot.png` fails with "machine `web` has no display", and a VM keeps
 no console log, so `logs` fails in kind. Ask `…/machines/{name}/capabilities`
 first — it reports `display`, `console_log`, `reboot` and the guest agent's
 negotiated features, which is what the console drives its affordances from.

@@ -471,21 +471,20 @@ impl ContainerInstance {
         *self.image.write().expect("image lock") = Some(Arc::new(ImageParts { image, spec }));
     }
 
-    pub async fn state(&self) -> PowerState {
+    async fn power_state(&self) -> PowerState {
         *self.state.read().await
     }
 
-    pub async fn is_ready(&self) -> bool {
+    async fn ready_flag(&self) -> bool {
         *self.ready.read().await
     }
 
-    #[allow(dead_code)] // readiness detail; kept public alongside is_ready (mirrors VmInstance)
-    pub async fn is_agent_up(&self) -> bool {
+    async fn agent_up_flag(&self) -> bool {
         *self.agent_up.read().await
     }
 
     /// Latest healthcheck verdict (`None`: no check, or no report yet).
-    pub async fn health(&self) -> Option<bool> {
+    async fn health_verdict(&self) -> Option<bool> {
         *self.healthy.read().await
     }
 
@@ -523,8 +522,8 @@ impl ContainerInstance {
 
     /// The vmlab-agent channel, connecting (with the token handshake) on
     /// first use — the same discipline as `VmInstance::agent`.
-    pub async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
-        if self.state().await != PowerState::Running {
+    async fn agent_handle(&self) -> Result<super::vm_agent::AgentHandle> {
+        if self.power_state().await != PowerState::Running {
             return Err(super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into());
         }
         self.agent
@@ -535,7 +534,7 @@ impl ContainerInstance {
     /// Whether the vmlab-agent answers right now, sharing (and populating)
     /// the cached handle.
     async fn agent_probe(&self) -> bool {
-        if self.state().await != PowerState::Running {
+        if self.power_state().await != PowerState::Running {
             return false;
         }
         self.agent.probe(&self.dirs.agent_sock()).await
@@ -656,7 +655,16 @@ impl ContainerInstance {
     /// `on_ready` fires at most once, when the container is started, the
     /// agent answers, and the healthcheck (if any) first passes. `on_health`
     /// fires on every healthcheck transition for the container's lifetime.
-    pub async fn start(
+    ///
+    /// The callback-level entry point [`Machine::start`](super::machine::Machine::start)
+    /// wraps: it turns these callbacks into the lab's lifecycle events and
+    /// wires the NICs first. `labd::lifecycle_tests` drives this directly,
+    /// because what it asserts on — the classified exit reason, how many times
+    /// readiness fired, every healthcheck transition — is exactly what the
+    /// callbacks carry and the event projection flattens. Not a second route
+    /// for consumers: `pub(super)`, and nothing outside this module tree can
+    /// reach it (ADR-0002).
+    pub(super) async fn boot(
         self: &Arc<Self>,
         on_exit: impl Fn(StopReason, Option<i32>, bool) + Send + Sync + 'static,
         on_ready: impl Fn() + Send + Sync + 'static,
@@ -845,7 +853,7 @@ impl ContainerInstance {
         tokio::spawn(async move {
             // Phase 1: the container process is running.
             loop {
-                if me.state().await != PowerState::Running {
+                if me.power_state().await != PowerState::Running {
                     return;
                 }
                 if *me.started.read().await {
@@ -858,7 +866,7 @@ impl ContainerInstance {
             // instead.
             if me.cfg.mode == model::ContainerMode::Idle {
                 loop {
-                    if me.state().await != PowerState::Running {
+                    if me.power_state().await != PowerState::Running {
                         return;
                     }
                     if *me.agent_up.read().await {
@@ -875,7 +883,7 @@ impl ContainerInstance {
                 .unwrap_or(false);
             if has_healthcheck {
                 loop {
-                    if me.state().await != PowerState::Running {
+                    if me.power_state().await != PowerState::Running {
                         return;
                     }
                     if *me.healthy.read().await == Some(true) {
@@ -895,7 +903,7 @@ impl ContainerInstance {
         let me = self.clone();
         tokio::spawn(async move {
             loop {
-                if me.state().await != PowerState::Running {
+                if me.power_state().await != PowerState::Running {
                     return;
                 }
                 if me.agent_probe().await {
@@ -1001,7 +1009,7 @@ impl ContainerInstance {
     /// grace) → guest-agent shutdown → hard kill, each with a timeout.
     /// Setting `stop_requested` first also cancels any pending policy
     /// restart.
-    pub async fn stop(&self, force: bool) -> Result<()> {
+    async fn stop_ladder(&self, force: bool) -> Result<()> {
         *self.stop_requested.write().await = true;
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
@@ -1012,9 +1020,7 @@ impl ContainerInstance {
         if force {
             proc.kill().await;
             let _ = proc.wait_exit(Duration::from_secs(10)).await;
-            return self
-                .wait_state(PowerState::Stopped, Duration::from_secs(10))
-                .await;
+            return self.settle_stopped(Duration::from_secs(10)).await;
         }
 
         // Rung 1: the ctl channel — cinit signals the container and powers
@@ -1034,9 +1040,7 @@ impl ContainerInstance {
                 .await
                 .is_ok()
         {
-            return self
-                .wait_state(PowerState::Stopped, Duration::from_secs(10))
-                .await;
+            return self.settle_stopped(Duration::from_secs(10)).await;
         }
 
         // Rung 2: guest-agent shutdown. The state is already Stopping so
@@ -1064,9 +1068,7 @@ impl ContainerInstance {
                     .is_ok()
                 && proc.wait_exit(Duration::from_secs(15)).await.is_ok()
             {
-                return self
-                    .wait_state(PowerState::Stopped, Duration::from_secs(10))
-                    .await;
+                return self.settle_stopped(Duration::from_secs(10)).await;
             }
         }
 
@@ -1077,24 +1079,14 @@ impl ContainerInstance {
         }
         proc.kill().await;
         let _ = proc.wait_exit(Duration::from_secs(10)).await;
-        self.wait_state(PowerState::Stopped, Duration::from_secs(10))
-            .await
+        self.settle_stopped(Duration::from_secs(10)).await
     }
 
-    /// Wait for the exit monitor to settle the power state.
-    pub async fn wait_state(&self, want: PowerState, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while self.state().await != want {
-            if tokio::time::Instant::now() > deadline {
-                bail!(
-                    "{}: still {:?} after {timeout:?}",
-                    self.cfg.name,
-                    self.state().await
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        Ok(())
+    /// Wait for the exit monitor to settle the power state — the interface's
+    /// one implementation, reached explicitly because the inherent method that
+    /// used to shadow it is gone.
+    async fn settle_stopped(&self, timeout: Duration) -> Result<()> {
+        super::machine::Machine::wait_state(self, PowerState::Stopped, timeout).await
     }
 
     // ---- snapshots (PRD §7.3, §18) ------------------------------------------
@@ -1104,9 +1096,9 @@ impl ContainerInstance {
     /// state outside snapshot scope, §7.5 semantics). Online captures RAM +
     /// device state into the same qcow2, exactly like a VM; returns whether
     /// the capture was online.
-    pub async fn snapshot(&self, name: &str) -> Result<bool> {
+    async fn take_snapshot(&self, name: &str) -> Result<bool> {
         super::vm::validate_snapshot_name(name)?;
-        match self.state().await {
+        match self.power_state().await {
             PowerState::Running => {
                 let qmp = self.qmp().await?;
                 qmp.snapshot_save(name, "scratch", &["scratch"]).await?;
@@ -1131,7 +1123,7 @@ impl ContainerInstance {
     /// resume it exactly where it was, then ask cinit to replay lifecycle
     /// events — the resumed guest never re-emits `net_up`/`started`/`health`
     /// on its own, and host-side caches need them after a fresh boot.
-    pub async fn restore_online(&self, name: &str) -> Result<()> {
+    async fn restore_online(&self, name: &str) -> Result<()> {
         let qmp = self.qmp().await?;
         qmp.stop().await?;
         qmp.snapshot_load(name, "scratch", &["scratch"]).await?;
@@ -1174,18 +1166,17 @@ impl ContainerInstance {
     /// Apply an offline snapshot: power off if needed, revert the scratch
     /// disk, stay off (PRD §7.3 restore semantics). The stop sets
     /// `stop_requested`, so no restart policy fires.
-    pub async fn restore_offline(&self, name: &str) -> Result<()> {
-        if self.state().await != PowerState::Stopped {
-            self.stop(false).await?;
-            self.wait_state(PowerState::Stopped, Duration::from_secs(60))
-                .await?;
+    async fn restore_offline(&self, name: &str) -> Result<()> {
+        if self.power_state().await != PowerState::Stopped {
+            self.stop_ladder(false).await?;
+            self.settle_stopped(Duration::from_secs(60)).await?;
         }
         crate::template::qimg::snapshot_apply(&self.dirs.scratch_disk(), name).await?;
         Ok(())
     }
 
-    pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
-        match self.state().await {
+    async fn drop_snapshot(&self, name: &str) -> Result<()> {
+        match self.power_state().await {
             PowerState::Running => {
                 let qmp = self.qmp().await?;
                 qmp.snapshot_delete(name, &["scratch"]).await?;
@@ -1197,103 +1188,10 @@ impl ContainerInstance {
         Ok(())
     }
 
-    /// Wait until the container is fully ready: started, agent up, and past
-    /// the healthcheck gate.
-    pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.is_ready().await {
-                return Ok(());
-            }
-            if self.state().await == PowerState::Stopped {
-                bail!("{} stopped while waiting for ready", self.cfg.name);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("{}: not ready after {timeout:?}", self.cfg.name);
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
-
-    /// Per-NIC IPv4 addresses. Prefer the agent's MAC-addressed interface
-    /// list; cinit's net-up report remains a first-NIC fallback during early
-    /// boot.
-    pub async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
-        let mut ips = match self.agent().await {
-            Ok(agent) => match agent.net_interfaces(Duration::from_secs(5)).await {
-                Ok(ifaces) => {
-                    let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
-                    super::vm_agent::ipv4_by_mac(&ifaces, &macs)
-                }
-                Err(_) => vec![None; self.macs.len()],
-            },
-            Err(_) => vec![None; self.macs.len()],
-        };
-        if ips.first().is_some_and(Option::is_none)
-            && let Some(ctl) = self.ctl.lock().await.clone()
-            && let Some(ip) = ctl.ip().await
-        {
-            ips[0] = Some(ip);
-        }
-        if ips.iter().any(Option::is_some) {
-            Ok(ips)
-        } else {
-            bail!("{}: no IPv4 address reported by agent", self.cfg.name)
-        }
-    }
-
-    pub async fn guest_ip(&self) -> Result<String> {
-        self.guest_ips()
-            .await?
-            .into_iter()
-            .flatten()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("{}: no IPv4 address reported by agent", self.cfg.name))
-    }
-
-    /// Run a command *inside the container* over the vmlab-agent channel
-    /// (streamed; the agent joins the container namespaces itself).
-    pub async fn exec(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        timeout: Duration,
-    ) -> Result<super::vm_agent::ExecOutput> {
-        let agent = self.agent().await?;
-        let mut argv = vec![cmd.to_string()];
-        argv.extend(args.iter().map(ToString::to_string));
-        agent.exec(argv, vec![], None, None, timeout).await
-    }
-
-    /// Copy a host file into the container rootfs (guest paths are
-    /// container-relative; the agent resolves them under the rootfs).
-    pub async fn copy_to(&self, host: &Path, guest_path: &str, _timeout: Duration) -> Result<()> {
-        let agent = self.agent().await?;
-        agent.push_file(host, guest_path, None).await?;
-        Ok(())
-    }
-
-    /// Copy a file out of the container rootfs to the host.
-    pub async fn copy_from(&self, guest_path: &str, host: &Path, _timeout: Duration) -> Result<()> {
-        let agent = self.agent().await?;
-        agent.pull_file(guest_path, host).await?;
-        Ok(())
-    }
-
     /// The last `lines` lines of the container's console log (kernel
     /// messages + the container's stdout/stderr).
-    pub fn logs(&self, lines: usize) -> Result<String> {
-        let content = match std::fs::read_to_string(self.dirs.console_log()) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("reading {}", self.dirs.console_log().display()));
-            }
-        };
-        let all: Vec<&str> = content.lines().collect();
-        let start = all.len().saturating_sub(lines);
-        Ok(all[start..].join("\n"))
+    fn tail_console(&self, lines: usize) -> Result<String> {
+        super::vm::tail_file(&self.dirs.console_log(), lines)
     }
 }
 
@@ -1301,6 +1199,10 @@ impl ContainerInstance {
 impl super::machine::Machine for ContainerInstance {
     fn virtiofsd_available(&self) -> bool {
         self.hv.virtiofsd_available()
+    }
+
+    fn as_machine(&self) -> &dyn super::machine::Machine {
+        self
     }
 
     fn name(&self) -> &str {
@@ -1316,8 +1218,8 @@ impl super::machine::Machine for ContainerInstance {
     }
 
     /// A container micro-VM always runs vmlab's own Alpine guest.
-    fn guest_os(&self) -> super::playbook::GuestOs {
-        super::playbook::GuestOs::Linux
+    fn guest_os(&self) -> super::guest_os::GuestOs {
+        super::guest_os::GuestOs::Linux
     }
 
     fn nics(&self) -> &[model::Nic] {
@@ -1336,52 +1238,210 @@ impl super::machine::Machine for ContainerInstance {
         self.dirs.term_session_sock(id)
     }
 
+    fn nic_sock(&self, i: usize) -> PathBuf {
+        self.dirs.nic_sock(i)
+    }
+
+    fn event_subject(&self) -> &'static str {
+        "container"
+    }
+
+    fn local_dir(&self) -> &Path {
+        &self.dirs.local
+    }
+
+    fn run_dir(&self) -> &Path {
+        &self.dirs.run
+    }
+
+    /// A micro-VM needs the host-arch emulator; `qemu-img` creates its
+    /// scratch overlay.
+    fn required_binaries(&self) -> Vec<String> {
+        vec![
+            "qemu-img".to_string(),
+            qemu::emulator_binary(&self.resolved.arch),
+        ]
+    }
+
     async fn state(&self) -> PowerState {
-        ContainerInstance::state(self).await
+        self.power_state().await
     }
 
     async fn is_ready(&self) -> bool {
-        ContainerInstance::is_ready(self).await
+        self.ready_flag().await
     }
 
     async fn stop(&self, force: bool) -> Result<()> {
-        ContainerInstance::stop(self, force).await
+        self.stop_ladder(force).await
+    }
+
+    async fn poweroff(&self) -> Result<()> {
+        super::machine::quit_and_settle(self, ContainerInstance::qmp(self).await).await
+    }
+
+    /// Wire this container's NICs into the lab fabric — stream sockets only,
+    /// since the micro-VM argv carries no pre-opened descriptors — then boot
+    /// the micro-VM with event-emitting callbacks. Restarts driven by the
+    /// restart policy happen inside the instance; the callbacks fire again on
+    /// each attempt.
+    async fn start(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) -> Result<()> {
+        if self.power_state().await != PowerState::Stopped {
+            return Ok(());
+        }
+        // Safety net (see the VM's start): no-op unless the image is pending.
+        lab.ensure_pulled(&self.cfg.name).await?;
+        // Volumes mount from the lab's SMB server; make sure it is serving
+        // (idempotent — a no-op when `up` already started it).
+        if !self.volumes.is_empty() {
+            lab.ensure_shares().await;
+        }
+        let events = lab.events().clone();
+        events.emit(
+            "container.starting",
+            serde_json::json!({"container": self.cfg.name}),
+        );
+
+        std::fs::create_dir_all(&self.dirs.run)?;
+        // The micro-VM connects to the sockets itself, so the attachments are
+        // the lab's to hold, not this machine's.
+        super::machine::attach_all_nics(&*self, &*lab).await?;
+
+        let events_exit = events.clone();
+        let events_health = events.clone();
+        let n_exit = self.cfg.name.clone();
+        let n_ready = self.cfg.name.clone();
+        let n_health = self.cfg.name.clone();
+        let n_fwd = self.cfg.name.clone();
+        let ready_lab = Arc::clone(&lab);
+        self.boot(
+            move |reason, exit_code, will_restart| {
+                let payload = serde_json::json!({
+                    "container": n_exit,
+                    "reason": reason,
+                    "exit_code": exit_code,
+                    "restarting": will_restart,
+                });
+                if reason == StopReason::Crashed {
+                    events_exit.emit("container.crashed", payload.clone());
+                }
+                if !will_restart {
+                    events_exit.emit("container.stopped", payload);
+                }
+            },
+            move || {
+                events.emit("container.ready", serde_json::json!({"container": n_ready}));
+                // Forwards target the container's lease; (re-)install on every
+                // readiness so restarts keep them pointed right.
+                let lab = Arc::clone(&ready_lab);
+                let n = n_fwd.clone();
+                tokio::spawn(async move { lab.machine_ready(&n).await });
+            },
+            move |healthy| {
+                if !healthy {
+                    events_health.emit(
+                        "container.unhealthy",
+                        serde_json::json!({"container": n_health}),
+                    );
+                }
+            },
+        )
+        .await
+    }
+
+    /// Full VM semantics (PRD §18): an online record boots the micro-VM if
+    /// needed, loads the snapshot and resumes exactly where it was; an offline
+    /// record reverts the scratch disk and leaves the container stopped.
+    /// Volume contents are host state and never roll back.
+    async fn restore(
+        self: Arc<Self>,
+        lab: Arc<dyn super::machine::LabServices>,
+        snap: &str,
+        online: bool,
+    ) -> Result<()> {
+        // The image must be bound before anything else: a daemon restarted
+        // after a cache wipe re-pends the pull.
+        lab.ensure_pulled(&self.cfg.name).await?;
+        if online {
+            // Ensure a running micro-VM to load into — the normal start path
+            // wires NIC listeners and the event callbacks. Whatever the fresh
+            // boot writes is rewound by the load.
+            if self.power_state().await == PowerState::Stopped {
+                Arc::clone(&self).start(Arc::clone(&lab)).await?;
+            }
+            self.restore_online(snap).await?;
+            // Re-point forwards / re-prime the NAT MAC at the restored lease.
+            lab.machine_ready(&self.cfg.name).await;
+            Ok(())
+        } else {
+            self.restore_offline(snap).await
+        }
     }
 
     async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
-        ContainerInstance::agent(self).await
+        self.agent_handle().await
     }
 
     async fn agent_answering(&self) -> bool {
         self.agent_probe().await
     }
 
+    async fn is_agent_up(&self) -> bool {
+        self.agent_up_flag().await
+    }
+
+    async fn clear_agent_failure(&self) {
+        self.agent.clear_failure().await;
+    }
+
     async fn snapshot(&self, name: &str) -> Result<bool> {
-        ContainerInstance::snapshot(self, name).await
+        self.take_snapshot(name).await
     }
 
     async fn delete_snapshot(&self, name: &str) -> Result<()> {
-        ContainerInstance::delete_snapshot(self, name).await
+        self.drop_snapshot(name).await
     }
 
     fn snapshot_pin(&self) -> Option<String> {
         self.image_digest()
     }
 
-    /// QEMU starts container micro-VMs with no display device at all.
-    fn display(self: Arc<Self>) -> Option<super::machine::Display> {
-        None
+    fn console_log(&self, lines: usize) -> Option<Result<String>> {
+        Some(self.tail_console(lines))
     }
 
-    fn console_log(&self, lines: usize) -> Option<Result<String>> {
-        Some(ContainerInstance::logs(self, lines))
+    async fn health(&self) -> Option<bool> {
+        self.health_verdict().await
+    }
+
+    fn has_healthcheck(&self) -> bool {
+        self.cfg.healthcheck.is_some()
+    }
+
+    /// cinit mounts the CIFS volumes itself after net-up, from the spec sent
+    /// over the ctl channel — so the credentials go into the spec rather than
+    /// being driven from the host.
+    async fn smb_ready(&self, gateway: std::net::Ipv4Addr, username: &str, password: &str) {
+        self.set_smb(SmbInfo {
+            gateway: gateway.to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+        })
+        .await;
+    }
+
+    /// The scratch qcow2 that held the snapshot data is gone with the local
+    /// dir, and the image pin is re-resolved fresh on the next `up`.
+    async fn forget_artefacts(&self, state: &mut super::state::MachineState) {
+        state.image_digest = None;
+        state.image_ref = None;
+        state.snapshots.clear();
     }
 
     /// Per-NIC IPv4 addresses. Prefer the agent's MAC-addressed interface
     /// list; cinit's net-up report remains a first-NIC fallback during early
     /// boot, before the agent is answering.
     async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
-        let mut ips = match self.agent().await {
+        let mut ips = match self.agent_handle().await {
             Ok(agent) => match agent.net_interfaces(Duration::from_secs(5)).await {
                 Ok(ifaces) => {
                     let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
@@ -1408,7 +1468,7 @@ impl super::machine::Machine for ContainerInstance {
         super::machine::MachineDetail::Container(crate::status::ContainerStatus {
             image: self.cfg.image.reference.clone(),
             digest: self.image_digest(),
-            health: self.health().await,
+            health: self.health_verdict().await,
             restarts: self.restart_count(),
             exit_code: self.last_exit().await,
         })

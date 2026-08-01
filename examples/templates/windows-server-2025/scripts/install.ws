@@ -6,7 +6,7 @@
 
 use vmlab
 
-fn boot_from_dvd(lab: Lab, vm: Vm) -> Result[unit, string] {
+fn boot_from_dvd(lab: Lab, vm: Machine) -> Result[unit, string] {
     for attempt in 0..4 {
         // Spam enter through the prompt's window.
         for i in 0..30 {

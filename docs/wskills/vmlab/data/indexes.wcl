@@ -51,7 +51,7 @@ index ix_containers {
   related  = [lab_containers, container_block, container_api]
   audience = :both
   body {
-    p "The container story (PRD §18): why micro-VMs, the `container {}` block, and the wscript `Container` handle."
+    p "The container story (PRD §18): why micro-VMs, the `container {}` block, and containers on the one wscript machine handle."
   }
 }
 
@@ -76,7 +76,7 @@ index ix_automation {
 
   index ix_api {
     name     = "The vmlab API"
-    summary  = "The Lab / Vm / Segment handles and their method groups, plus the result types."
+    summary  = "The Lab / Machine / Segment handles and their method groups, plus the result types."
     related  = [lab_api, vm_api, vm_lifecycle, vm_snapshots, vm_input, vm_vision, vm_agent, vmlab_agent, seg_api, match_type, exec_result_type]
     audience = :both
     body {

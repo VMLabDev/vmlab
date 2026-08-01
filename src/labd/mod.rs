@@ -5,8 +5,10 @@
 
 pub mod container;
 pub mod container_ctl;
+pub mod display;
 pub mod events;
 pub mod forward_plan;
+pub mod guest_os;
 pub mod hypervisor;
 pub mod lab;
 #[cfg(test)]
@@ -231,7 +233,7 @@ fn display_of(
 ) -> Result<crate::labd::machine::Display, CommandError> {
     machine_of(lab, name)?
         .display()
-        .ok_or_else(|| CommandError::unsupported(format!("{name}: this machine has no display")))
+        .ok_or_else(|| CommandError::unsupported(format!("machine `{name}` has no display")))
 }
 
 /// The agent channel of the addressed machine.
@@ -621,7 +623,7 @@ impl Handler<LabRequest> for LabdHandler {
                 let m = machine_of(lab, &machine)?;
                 let Some(tail) = m.console_log(lines) else {
                     return Err(CommandError::unsupported(format!(
-                        "{machine}: this machine keeps no console log"
+                        "machine `{machine}` has no console log"
                     )));
                 };
                 let tail = tail?;

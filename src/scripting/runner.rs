@@ -300,7 +300,7 @@ impl SegmentHandle {
         // Resolve the target VM's leased IP on this segment.
         let guest_ip = self.rt.block_on(async {
             self.runtime
-                .vm(vm)
+                .machine(vm)
                 .map_err(|e| format!("{e:#}"))?
                 .guest_ip(None)
                 .await

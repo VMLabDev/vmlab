@@ -232,7 +232,7 @@ fn container(
 /// Start a VM with recorded callbacks.
 async fn start_vm(vm: &Arc<VmInstance>, cbs: Callbacks) -> anyhow::Result<()> {
     let Callbacks { exits, readies, .. } = cbs;
-    vm.start(
+    vm.boot(
         move |reason, status| {
             let _ = exits.send(Exited {
                 reason,
@@ -254,7 +254,7 @@ async fn start_container(ctr: &Arc<ContainerInstance>, cbs: Callbacks) -> anyhow
         readies,
         healths,
     } = cbs;
-    ctr.start(
+    ctr.boot(
         move |reason, code, will_restart| {
             let _ = exits.send(Exited {
                 reason,
@@ -456,7 +456,7 @@ async fn nothing_is_still_up_when_the_exit_callback_fires() {
     let seen = vm.clone();
     let seen_hv = hv.clone();
     let handle = tokio::runtime::Handle::current();
-    vm.start(
+    vm.boot(
         move |_reason, _status| {
             let m: Arc<dyn Machine> = seen.clone();
             let hv = seen_hv.clone();

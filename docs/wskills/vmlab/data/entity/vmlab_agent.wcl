@@ -21,7 +21,7 @@ PROSE
       header = ["Consumer", "Surface"]
       rows = [
         ["CLI", "`vmlab exec` / `shell` / `cp` / `tail` / `eventlog`; `vmlab container exec` / `shell` (see the CLI reference)"],
-        ["wscript", "`vm.exec` / `exec_timeout` / `copy_to` / `copy_from` / `terminal()` / `stats()` — [method tables](fact_vm_agent); containers expose the same via the [Container handle](entity_container_api)"],
+        ["wscript", "`m.exec` / `exec_timeout` / `copy_to` / `copy_from` / `terminal()` / `stats()` on any [Machine](entity_vm_api) — [method tables](fact_vm_agent)"],
         ["Web console", "Machine **Terminal** tabs, guest metrics meters, clipboard sync"],
       ]
     }
