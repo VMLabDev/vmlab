@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use vmlab::config::projection::SchemaProjection;
 use vmlab::proto::{CommandError, ErrorCode, LabRequest, SupRequest};
 
 use super::fsops::{ensure_safe_parent, plain_relative};
@@ -439,28 +440,47 @@ pub async fn catalog_inherited(q: web::Query<InheritedQuery>) -> HttpResponse {
     }
 }
 
-/// `GET /api/catalog/meta` — schema enums the editor renders as pickers,
-/// sourced from the Rust constants so they can never drift from the code.
+/// `GET /api/catalog/meta` — the option lists the editor renders as pickers.
+///
+/// Every closed set comes from the Schema projection (ADR-0005), so a picker
+/// offers exactly what `schema.wcl` declares and the validator accepts.
+/// `arches` and `events` are the two that are not schema facts: they are host
+/// and runtime vocabularies, and stay sourced from their Rust constants.
 pub async fn catalog_meta() -> HttpResponse {
+    let schema = SchemaProjection::get();
+    let default_secs = |field: &str| {
+        schema
+            .block("healthcheck")
+            .and_then(|b| b.field(field))
+            .and_then(|f| f.default_number)
+    };
     ok(json!({
         "arches": vmlab::config::model::KNOWN_ARCHES,
         "events": vmlab::config::model::EVENT_NAMES,
-        "firmware": ["ovmf", "seabios"],
-        "gpu_modes": ["passthrough", "virgl", "vulkan"],
-        "sinkhole_modes": ["nxdomain", "zero"],
-        "forward_protos": ["tcp", "udp", "both"],
-        "l4_protos": ["tcp", "udp", "icmp"],
-        "media_kinds": ["iso", "floppy"],
-        "restart_policies": ["no", "on-failure", "always"],
-        // Schema defaults for `healthcheck {}` (seconds / count), so the
-        // editor's placeholders can never drift from the parser's defaults.
+        "firmware": schema.options("vm", "firmware"),
+        "gpu_modes": schema.options("gpu", "mode"),
+        "sinkhole_modes": schema.options("sinkhole", "mode"),
+        "forward_protos": schema.options("forward", "proto"),
+        "l4_protos": schema.options("block", "proto"),
+        "media_kinds": schema.options("media", "kind"),
+        "restart_policies": schema.options("container", "restart"),
+        // The `healthcheck {}` defaults, in the seconds/counts the editor
+        // edits in — reflected from the schema's `@default`s.
         "healthcheck_defaults": {
-            "interval": 10,
-            "timeout": 5,
-            "retries": 3,
-            "start_period": 10,
+            "interval": default_secs("interval"),
+            "timeout": default_secs("timeout"),
+            "retries": default_secs("retries"),
+            "start_period": default_secs("start_period"),
         },
     }))
+}
+
+/// `GET /api/schema` — the Schema projection itself: every block, field,
+/// type, optionality, default, doc string, option list, nesting and
+/// cardinality, reflected from `schema.wcl`. Surfaces that need the shape of
+/// `vmlab.wcl` read this rather than restating it.
+pub async fn schema_projection() -> HttpResponse {
+    ok(json!(SchemaProjection::get()))
 }
 
 /// `GET /api/registries` — host-level OCI search settings shared with the CLI.

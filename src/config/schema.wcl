@@ -7,6 +7,46 @@
 // Per-field `@doc("…")` decorators are the single source for the generated
 // schema reference (the vmlab wskill reflects them with `type_table`); keep
 // them one-line and current.
+//
+// This file is the single source of truth for the *shape* of `vmlab.wcl`
+// (ADR-0005). Everything that needs that shape — the designer's forms, the
+// console's pickers, the rendered reference — reads the Schema projection
+// (`src/config/projection.rs`), which reflects this file. Nothing restates it.
+
+// ── Projection metadata ──────────────────────────────────────────────────────
+// Three user decorators carry the parts of a field's contract that WCL's type
+// system cannot: the closed value set of a stringly-typed field, an integer
+// range, and a "exactly one of these fields" rule. They constrain nothing at
+// parse time — `vmlab validate` (PRD §5.1) is still the enforcer — but they put
+// the rule in one place so no surface has to re-type it.
+
+// The exact set of values a stringly-typed field accepts, e.g.
+// `@options(["ovmf", "seabios"]) firmware: utf8?`. A symbol-typed field needs
+// no annotation: its `symbol_set` already carries the set.
+@decorator("options")
+type FieldOptions {
+  @doc("Every value the validator accepts, in the order a picker should offer them")
+  @inline(0) values: list<utf8>
+}
+
+// The inclusive bounds of a numeric field, e.g. `@range(1, 65535) port: i64`.
+// The upper bound is optional: `@range(1)` is a floor alone. On a
+// `std.Duration` field the bounds are whole seconds.
+@decorator("range")
+type FieldRange {
+  @doc("Smallest accepted value (inclusive)")
+  @inline(0) min: i64
+  @doc("Largest accepted value (inclusive); unbounded above when omitted")
+  @inline(1) max: i64?
+}
+
+// A block-level rule that exactly one of the named fields must be set, e.g.
+// `@one_of(["host", "name"])` on the `volume` block.
+@decorator("one_of")
+type ExactlyOneOf {
+  @doc("Field names of which exactly one must be set on an instance of the block")
+  @inline(0) fields: list<utf8>
+}
 
 @document
 type VmlabDoc {
@@ -45,11 +85,11 @@ type Segment {
   @doc("Owned by the supervisor and shared across labs")
   global: bool?
   @doc("Enable DHCP (default true)")
-  dhcp: bool?
+  @default(true) dhcp: bool?
   @doc("Enable NAT/internet egress for this segment (default false)")
-  nat: bool?
+  @default(false) nat: bool?
   @doc("Link MTU (576–65535); default jumbo (9000) on nat/global, else 1500")
-  mtu: i64?
+  @range(576, 65535) mtu: i64?
   @doc("Names of other segments to route to — daemon inter-segment routing opt-in")
   routes_to: list<utf8>?
   @doc("DNS service override: hand out another server, or opt out")
@@ -77,7 +117,7 @@ type SegmentDns {
   @doc("IPv4 of the DNS server to hand out via DHCP instead of the daemon")
   server: utf8?
   @doc("Hand out a DNS server at all (default true); false suppresses the DHCP option")
-  enabled: bool?
+  @default(true) enabled: bool?
 }
 
 // Cross-host segment peer: the two supervisors bridge this segment
@@ -110,11 +150,11 @@ type DnsRecord {
 @block("forward")
 type Forward {
   @doc("Host port to listen on (1–65535); unique across the lab (required)")
-  host_port: i64
+  @range(1, 65535) host_port: i64
   @doc("Target as `vm:port`; the VM must be declared (required)")
   to: utf8
   @doc("Protocol: `tcp` (default) | `udp` | `both`")
-  proto: utf8?
+  @options(["tcp", "udp", "both"]) @default("tcp") proto: utf8?
 }
 
 // L3 block rule at the switch.
@@ -123,9 +163,9 @@ type BlockRule {
   @doc("IPv4 CIDR to drop traffic to/from (required)")
   cidr: utf8
   @doc("Protocol to scope the rule: `tcp` | `udp` | `icmp`")
-  proto: utf8?
+  @options(["tcp", "udp", "icmp"]) proto: utf8?
   @doc("Port to scope the rule (1–65535); requires `proto`")
-  port: i64?
+  @range(1, 65535) port: i64?
 }
 
 // L3 DNAT redirect rule.
@@ -136,7 +176,7 @@ type RedirectRule {
   @doc("Rewrite destination to `ip[:port]` (required)")
   to: utf8
   @doc("Protocol to scope the rule: `tcp` | `udp`")
-  proto: utf8?
+  @options(["tcp", "udp"]) proto: utf8?
 }
 
 // DNS sinkhole: NXDOMAIN by default, or 0.0.0.0 with mode = "zero".
@@ -145,7 +185,7 @@ type SinkholeRule {
   @doc("DNS name pattern to sink; wildcards allowed (required)")
   pattern: utf8
   @doc("Response: `nxdomain` (default) | `zero` (resolve to 0.0.0.0)")
-  mode: utf8?
+  @options(["nxdomain", "zero"]) @default("nxdomain") mode: utf8?
 }
 
 @block("vm")
@@ -159,7 +199,7 @@ type Vm {
   @doc("Guest OS profile (hardware defaults); required for `scratch`")
   profile: utf8?
   @doc("vCPU count (> 0); inherited from template→profile if omitted")
-  cpus: i64?
+  @range(1) cpus: i64?
   @doc("RAM as a byte size, e.g. `8GiB`/`512MiB`; inherited if omitted")
   memory: std.ByteSize?
   @doc("Primary disk size, e.g. `64GiB` — scratch VMs only (rejected on cloned VMs)")
@@ -177,7 +217,7 @@ type Vm {
   @doc("QEMU display string; inherited from template→profile if omitted")
   display: utf8?
   @doc("Firmware: `ovmf` | `seabios`; inherited from template→profile")
-  firmware: utf8?
+  @options(["ovmf", "seabios"]) firmware: utf8?
   @doc("Enable a TPM 2.0 device; inherited from template→profile")
   tpm: bool?
   @doc("Enable secure boot (OVMF only); inherited from template→profile")
@@ -229,7 +269,7 @@ type Container {
   @doc("OCI image reference, e.g. `nginx:1.27` or `ghcr.io/owner/app@sha256:…` (required)")
   image: utf8
   @doc("Runtime mode: `:workload` (default) starts the OCI process; `:idle` keeps the micro-VM available for exec without running it")
-  mode: ContainerMode?
+  @default(:workload) mode: ContainerMode?
   @doc("Override the image entrypoint (exec form, e.g. [\"/bin/sh\", \"-c\"])")
   entrypoint: list<utf8>?
   @doc("Override the image cmd (exec form)")
@@ -241,13 +281,13 @@ type Container {
   @doc("Guest profile supplying micro-VM hardware defaults, e.g. `container`")
   profile: utf8?
   @doc("vCPU count for the micro-VM (> 0); inherited from `profile` if omitted — one of the two must supply it")
-  cpus: i64?
+  @range(1) cpus: i64?
   @doc("RAM for the micro-VM, e.g. `512MiB`; inherited from `profile` if omitted — one of the two must supply it")
   memory: std.ByteSize?
   @doc("VM/container names to wait for before this one (no cycles)")
   depends_on: list<utf8>?
   @doc("Restart policy: `no` (default) | `on-failure` | `always`")
-  restart: utf8?
+  @options(["no", "on-failure", "always"]) @default("no") restart: utf8?
   @doc("Network interfaces; none = air-gapped (exec/copy still work via the agent)")
   @children("nic")      nics: list<Nic>
   @doc("Environment variables passed to the container process")
@@ -277,6 +317,7 @@ type EnvVar {
 
 // Container mount: host bind (`host`) or named volume (`name`) — exactly one.
 @block("volume")
+@one_of(["host", "name"])
 type Volume {
   @doc("Host path to bind-mount, relative to the lab root; one of `host`/`name` is required")
   host: utf8?
@@ -285,18 +326,18 @@ type Volume {
   @doc("Absolute mount path inside the container (required)")
   target: utf8
   @doc("Mount read-only (default false)")
-  read_only: bool?
+  @default(false) read_only: bool?
 }
 
 // Host→container port forward (compiles into the segment forward machinery).
 @block("port")
 type PortMap {
   @doc("Host port to listen on (1–65535); unique across the lab (required)")
-  host: i64
+  @range(1, 65535) host: i64
   @doc("Container port to forward to (1–65535) (required)")
-  container: i64
+  @range(1, 65535) container: i64
   @doc("Protocol: `tcp` (default) | `udp` | `both`")
-  proto: utf8?
+  @options(["tcp", "udp", "both"]) @default("tcp") proto: utf8?
 }
 
 // Container health probe; readiness gates on the first pass.
@@ -305,17 +346,18 @@ type Healthcheck {
   @doc("Probe command run inside the container (exec form); exit 0 = healthy (required)")
   command: list<utf8>
   @doc("Time between probes, e.g. `10s` (default 10s)")
-  interval: std.Duration?
+  @range(1) @default(10s) interval: std.Duration?
   @doc("Per-probe timeout (default 5s)")
-  timeout: std.Duration?
+  @range(1) @default(5s) timeout: std.Duration?
   @doc("Consecutive failures before unhealthy (default 3)")
-  retries: i64?
+  @range(1) @default(3) retries: i64?
   @doc("Grace period after start before failures count (default 10s)")
-  start_period: std.Duration?
+  @range(0) @default(10s) start_period: std.Duration?
 }
 
 // Additional disk: blank by size, or pre-formatted from a folder.
 @block("disk")
+@one_of(["size", "from"])
 type DiskBlock {
   @doc("Disk identifier; the inline block label")
   @inline(0) name: utf8
@@ -333,13 +375,13 @@ type Share {
   @doc("Guest mount path, e.g. `/mnt/src` or `D:\\data` (required)")
   guest: utf8
   @doc("Mount read-only (default false)")
-  readonly: bool?
+  @default(false) readonly: bool?
   @doc("Enable the SMB1 dialect + auth relaxation for XP/2003-era guests")
   smb1: bool?
   @doc("Share name; derived from the guest path if omitted")
   name: utf8?
   @doc("Transport: auto (default; virtiofs when host + guest support it, else SMB) | virtiofs | smb")
-  transport: utf8?
+  @options(["auto", "virtiofs", "smb"]) @default("auto") transport: utf8?
 }
 
 // HTTP UI served inside the guest, launchable from the web console. The
@@ -350,9 +392,9 @@ type WebPage {
   @doc("Page name (DNS label); unique per machine; the inline block label")
   @inline(0) name: utf8
   @doc("Guest TCP port serving the HTTP UI (1–65535) (required)")
-  port: i64
+  @range(1, 65535) port: i64
   @doc("Initial path opened in the console (default `/`)")
-  path: utf8?
+  @default("/") path: utf8?
   @doc("Credentials the proxy injects so the guest app's own login never prompts")
   @child("auth") auth: WebAuth?
 }
@@ -380,11 +422,11 @@ type WebAuth {
   @doc("Login request path, e.g. `/login` — `:form` (required)")
   login_path: utf8?
   @doc("Login HTTP method: `POST` (default) | `GET` — `:form`")
-  login_method: utf8?
+  @options(["POST", "GET"]) @default("POST") login_method: utf8?
   @doc("Login body template; `{user}`/`{pass}` are substituted and escaped — `:form` (required)")
   login_body: utf8?
   @doc("Login body content type: `application/x-www-form-urlencoded` (default) | `application/json` — `:form`")
-  login_content_type: utf8?
+  @options(["application/x-www-form-urlencoded", "application/json"]) @default("application/x-www-form-urlencoded") login_content_type: utf8?
   @doc("Redirect-Location substring that means 'not logged in' (401/403 always retrigger) — `:form`")
   fail_redirect: utf8?
 }
@@ -393,7 +435,7 @@ type WebAuth {
 @block("media")
 type Media {
   @doc("Image kind: `iso` | `floppy` (required)")
-  kind: utf8
+  @options(["iso", "floppy"]) kind: utf8
   @doc("Source folder built into the image; must exist (required)")
   from: utf8
   @doc("Volume label for the image")
@@ -404,7 +446,7 @@ type Media {
 @block("gpu")
 type Gpu {
   @doc("Mode: `passthrough` | `virgl` | `vulkan` (required)")
-  mode: utf8
+  @options(["passthrough", "virgl", "vulkan"]) mode: utf8
   @doc("Host PCI address, e.g. `0000:01:00.0` — required for `passthrough`")
   address: utf8?
 }
@@ -475,7 +517,7 @@ type TemplateDef {
   @doc("QEMU display string for the build VM")
   display: utf8?
   @doc("Firmware: `ovmf` | `seabios`")
-  firmware: utf8?
+  @options(["ovmf", "seabios"]) firmware: utf8?
   @doc("Enable a TPM 2.0 device")
   tpm: bool?
   @doc("Enable secure boot (OVMF only)")
@@ -489,7 +531,7 @@ type TemplateDef {
   @doc("wscript run on first instantiation of a clone, before ready")
   first_boot: utf8?
   @doc("Bake the vmlab-agent service into the image (default true)")
-  agent: bool?
+  @default(true) agent: bool?
   @doc("What the build starts from — exactly one of four forms (required)")
   @child("source")       source: TemplateSource
   @doc("ISO/floppy images attached to the build")
@@ -508,7 +550,7 @@ type TemplateDef {
 @block("source")
 type TemplateSource {
   @doc("Source kind: `iso` | `qcow2` | `template` | `scratch`; the inline label")
-  @inline(0) kind: utf8
+  @options(["iso", "qcow2", "template", "scratch"]) @inline(0) kind: utf8
   @doc("Local file path — `iso`/`qcow2`; mutually exclusive with `url`")
   path: utf8?
   @doc("Remote artefact URL — `iso`/`qcow2`; requires `sha256`")

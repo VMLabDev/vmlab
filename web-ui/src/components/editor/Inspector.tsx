@@ -25,7 +25,7 @@ import type {
   WebPageModel,
 } from "../../editor/model";
 import { HEALTHCHECK_DEFAULTS, emptyWebAuth, emptyWebPage, uniqueName } from "../../editor/model";
-import * as F from "../../editor/fields";
+import * as F from "../../editor/schema.gen";
 import { formatByteSize, formatMemory, parseByteSize } from "../../editor/bytesize";
 import type { PlayCard, PlayTarget } from "../../editor/store";
 import {
@@ -1047,6 +1047,7 @@ function VmInspector(props: { index: number }) {
                 readonly: false,
                 smb1: false,
                 name: "",
+                transport: "auto",
               }),
             )
           }
@@ -1325,6 +1326,7 @@ function ContainerInspector(props: { index: number }) {
           value={ctr().image}
           onSelect={(reference) => setField("image", reference)}
         />
+        <BlockForm fields={F.CONTAINER_RUNTIME} value={ctr() as any} onSet={setField} />
       </Show>
       <Show when={tab() === "hardware"}>
         <div class="inspector-note">

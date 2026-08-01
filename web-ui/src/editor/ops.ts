@@ -8,6 +8,7 @@
 // baseline spans, which stay valid for the whole batch because the server
 // mutates the AST without recomputing spans.
 
+import { ONE_OF } from "./schema.gen";
 import type {
   BlockRuleModel,
   BlockSpec,
@@ -152,26 +153,35 @@ const key = (s: Span) => `${s[0]}:${s[1]}`;
 //
 // Groups are read as "any name in the group must be present"; presence means
 // the value survived specFields, i.e. it isn't empty or a schema default.
-// Mirrors the required fields in src/config/extract.rs.
-const REQUIRED_FIELDS: Record<string, string[][]> = {
-  vm: [["template"]],
-  container: [["image"]],
-  record: [["name"], ["ip"]],
-  on: [["run"]],
-  sinkhole: [["pattern"]],
-  share: [["host"], ["guest"]],
-  env: [["name"], ["value"]],
-  playbook: [["play"]],
-  var: [["value"]],
-  volume: [["target"], ["host", "name"]],
-  healthcheck: [["command"]],
-  block: [["cidr"]],
-  redirect: [["from"], ["to"]],
-  route: [["dest"], ["via"]],
-  forward: [["host_port"], ["to"]],
-  media: [["kind"], ["from"]],
-  connect: [["host"]],
+// The single fields mirror the required fields in src/config/extract.rs; the
+// "exactly one of" groups are not restated here — they come from the schema's
+// `@one_of` rules through the projection.
+const REQUIRED_SINGLES: Record<string, string[]> = {
+  vm: ["template"],
+  container: ["image"],
+  record: ["name", "ip"],
+  on: ["run"],
+  sinkhole: ["pattern"],
+  share: ["host", "guest"],
+  env: ["name", "value"],
+  playbook: ["play"],
+  var: ["value"],
+  volume: ["target"],
+  healthcheck: ["command"],
+  block: ["cidr"],
+  redirect: ["from", "to"],
+  route: ["dest", "via"],
+  forward: ["host_port", "to"],
+  media: ["kind", "from"],
+  connect: ["host"],
 };
+
+const REQUIRED_FIELDS: Record<string, string[][]> = Object.fromEntries(
+  [...new Set([...Object.keys(REQUIRED_SINGLES), ...Object.keys(ONE_OF)])].map((kind) => [
+    kind,
+    [...(REQUIRED_SINGLES[kind] ?? []).map((name) => [name]), ...(ONE_OF[kind] ?? [])],
+  ]),
+);
 
 /** Whether a new block carries enough to survive the round trip. */
 function writable(spec: BlockSpec): boolean {
@@ -281,6 +291,7 @@ const sharePairs = (s: ShareModel): [string, FV][] => [
   ["readonly", flag(s.readonly, false)],
   ["smb1", flag(s.smb1, false)],
   ["name", str(s.name)],
+  ["transport", strdef(s.transport || "auto", "auto")],
 ];
 
 const mediaPairs = (m: MediaModel): [string, FV][] => [

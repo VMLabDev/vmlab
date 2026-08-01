@@ -178,11 +178,13 @@ gateways before any is installed.
 
 **Schema projection**:
 The single description of the `vmlab.wcl` schema — every block, field, type,
-default and doc string — **reflected** from `schema.wcl` rather than restated,
-and read by everything that needs the schema's shape: the designer's forms, the
-console's config types, the enum option lists, the rendered reference. See
-ADR-0005; until it lands, the designer is still driven by hand-written
-descriptor tables.
+optionality, default, doc string, option list, nesting and cardinality —
+**reflected** from `schema.wcl` rather than restated (`src/config/projection.rs`),
+and read by everything that needs the schema's shape: the designer's forms
+(`src/config/designer.rs`, rendered into `web-ui/src/editor/schema.gen.ts`), the
+console's pickers (`/api/catalog/meta`, `/api/schema`), and the rendered
+reference. The console's configuration types still mirror the DTO, not the
+projection — that slice is blocked on the block extractor. See ADR-0005.
 _Avoid_: DTO, view model, descriptor table
 
 **Block extractor**:
