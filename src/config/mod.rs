@@ -1,6 +1,7 @@
 //! Lab configuration: WCL schema, typed model, extraction, validation
 //! (PRD §5).
 
+pub mod block;
 pub mod dto;
 pub mod edit_ops;
 mod extract;
@@ -98,7 +99,9 @@ fn open(source: &str, name: &str, base_dir: Option<&Path>) -> Result<Document, C
     })
 }
 
-fn schema_issues(doc: &Document) -> IssueList {
+/// Schema violations as positioned issues, so a caller can accumulate them
+/// alongside the ones [`block::Reader`] raises.
+pub(crate) fn schema_issues(doc: &Document) -> IssueList {
     doc.schema_errors()
         .into_iter()
         .map(|e| {
@@ -391,6 +394,75 @@ lab "l" {
             "expected mtu range error, got: {:?}",
             err.issues
         );
+    }
+
+    /// Fields the schema declares required but does not itself check for
+    /// (wcl only enforces required *child blocks*). Before ADR-0006 each of
+    /// these silently dropped the block it was in and the file still loaded.
+    #[test]
+    fn a_missing_required_field_is_reported_rather_than_dropped() {
+        let cases = [
+            (
+                "vm \"a\" { template = \"x86_64/t\" media { } }",
+                "missing required field `kind`",
+            ),
+            (
+                "vm \"a\" { template = \"x86_64/t\" media { kind = \"iso\" } }",
+                "missing required field `from`",
+            ),
+            (
+                "vm \"a\" { template = \"x86_64/t\" share { guest = \"/mnt/x\" } }",
+                "missing required field `host`",
+            ),
+            (
+                "record { ip = \"10.0.0.1\" }",
+                "missing required field `name`",
+            ),
+            ("record { name = \"a\" }", "missing required field `ip`"),
+            ("on \"vm.crashed\" { }", "missing required field `run`"),
+            (
+                "vm \"a\" { template = \"x86_64/t\" playbook \"p\" { } }",
+                "missing required field `play`",
+            ),
+            (
+                "segment \"s\" { route { via = \"10.0.0.1\" } }",
+                "missing required field `dest`",
+            ),
+            (
+                "container \"c\" { image = \"nginx\" port { container = 80 } }",
+                "missing required field `host`",
+            ),
+        ];
+        for (body, expected) in cases {
+            let src = format!("import <vmlab.wcl>\nlab \"l\" {{ {body} }}\n");
+            let err = load_lab_source(&src, "<test>", Path::new("/tmp"))
+                .err()
+                .unwrap_or_else(|| panic!("{body} should be rejected"));
+            let found = err.issues.iter().find(|i| i.message == expected);
+            let found = found
+                .unwrap_or_else(|| panic!("{body}: expected `{expected}`, got {:?}", err.issues));
+            assert!(found.span.is_some(), "{body}: the issue must carry a span");
+        }
+    }
+
+    /// One pass, every mistake — a lab author is not fixing one per run.
+    #[test]
+    fn every_mistake_in_a_lab_file_is_reported_at_once() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1" mtu = 100 }
+  vm "a" { template = "x86_64/t" cpus = 0 }
+}
+"#;
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        let msgs: Vec<&str> = err.issues.iter().map(|i| i.message.as_str()).collect();
+        for expected in [
+            "malformed CIDR `10.1`",
+            "`mtu` must be between 576 and 65535, got 100",
+            "`cpus` must be at least 1, got 0",
+        ] {
+            assert!(msgs.contains(&expected), "missing `{expected}` in {msgs:?}");
+        }
     }
 
     #[test]

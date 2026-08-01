@@ -5,7 +5,9 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use wcl_lang::{Document, Environment, Registry, Value, disk_loader};
+use wcl_lang::{Document, Environment, Registry, disk_loader};
+
+use super::block::{Reader, Unspan, render_issues};
 
 pub const HOST_SCHEMA_WCL: &str = include_str!("host_schema.wcl");
 
@@ -71,83 +73,52 @@ impl HostConfig {
             registry.loader(disk_loader()),
         )
         .map_err(|e| anyhow!("parse error in {name}: {e}"))?;
-        let errors = doc.schema_errors();
-        if !errors.is_empty() {
-            let msgs: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-            return Err(anyhow!("schema errors in {name}: {}", msgs.join("; ")));
-        }
-
+        let mut issues = super::schema_issues(&doc);
         let mut cfg = Self::default();
-        let Some(block) = doc.blocks().find(|b| b.kind() == "host") else {
-            return Ok(cfg);
-        };
-        let get_str = |field: &str| -> Result<Option<String>> {
-            match block.field(field) {
-                None => Ok(None),
-                Some(f) => match f.value() {
-                    Ok(Value::Utf8(s)) => Ok(Some(s.clone())),
-                    Ok(Value::None) => Ok(None),
-                    Ok(other) => Err(anyhow!(
-                        "host config: `{field}` must be a string, got {other:?}"
-                    )),
-                    Err(e) => Err(anyhow!("host config: cannot evaluate `{field}`: {e}")),
-                },
+        if let Some(block) = doc.blocks().find(|b| b.kind() == "host") {
+            let mut r = Reader::new(&block, &mut issues);
+            // Every field is an override: absent (or malformed, which is
+            // reported) leaves the default in place.
+            use crate::net::fastpath::FastpathMode as Fp;
+            if let Some(v) = r.parse_as("subnet_pool", "CIDR").unspan() {
+                cfg.subnet_pool = v;
             }
-        };
-        if let Some(pool) = get_str("subnet_pool")? {
-            cfg.subnet_pool = pool
-                .parse()
-                .map_err(|_| anyhow!("host config: malformed subnet_pool `{pool}`"))?;
-        }
-        if let Some(s) = get_str("dns_suffix")? {
-            cfg.dns_suffix = s;
-        }
-        cfg.dns_upstream = get_str("dns_upstream")?;
-        if let Some(f) = block.field("disk_low_percent") {
-            match f.value() {
-                Ok(Value::I64(n)) if (0..=100).contains(n) => cfg.disk_low_percent = *n as u8,
-                Ok(Value::None) => {}
-                Ok(other) => {
-                    return Err(anyhow!(
-                        "host config: disk_low_percent must be 0..=100, got {other:?}"
-                    ));
-                }
-                Err(e) => return Err(anyhow!("host config: {e}")),
+            if let Some(v) = r.string("dns_suffix").unspan() {
+                cfg.dns_suffix = v;
             }
-        }
-        cfg.psk = get_str("psk")?;
-        if let Some(f) = block.field("trunk_port") {
-            match f.value() {
-                Ok(Value::I64(n)) if (1..=65535).contains(n) => cfg.trunk_port = *n as u16,
-                Ok(Value::None) => {}
-                Ok(other) => {
-                    return Err(anyhow!(
-                        "host config: trunk_port must be 1..=65535, got {other:?}"
-                    ));
-                }
-                Err(e) => return Err(anyhow!("host config: {e}")),
+            cfg.dns_upstream = r.string("dns_upstream").unspan();
+            if let Some(v) = r.int_in("disk_low_percent", 0, 100).unspan() {
+                cfg.disk_low_percent = v;
+            }
+            cfg.psk = r.string("psk").unspan();
+            if let Some(v) = r.port("trunk_port").unspan() {
+                cfg.trunk_port = v;
+            }
+            cfg.viewer = r.string("viewer").unspan();
+            if let Some(v) = r
+                .keyword(
+                    "fastpath",
+                    &[
+                        ("auto", Fp::Auto),
+                        ("off", Fp::Off),
+                        ("sockmap", Fp::Sockmap),
+                        ("afxdp", Fp::AfXdp),
+                    ],
+                )
+                .unspan()
+            {
+                cfg.fastpath = v;
+            }
+            cfg.config_weave_bin_dir = r.path("config_weave_bin_dir").unspan();
+            if let Some(v) = r.size("oci_chunk_size").unspan() {
+                cfg.oci_chunk_size = v;
             }
         }
-        cfg.viewer = get_str("viewer")?;
-        if let Some(s) = get_str("fastpath")? {
-            cfg.fastpath = crate::net::fastpath::FastpathMode::parse(&s).ok_or_else(|| {
-                anyhow!("host config: fastpath must be auto|off|sockmap|afxdp, got `{s}`")
-            })?;
+        if issues.is_empty() {
+            Ok(cfg)
+        } else {
+            Err(anyhow!(render_issues(name, source, &issues)))
         }
-        cfg.config_weave_bin_dir = get_str("config_weave_bin_dir")?.map(std::path::PathBuf::from);
-        if let Some(f) = block.field("oci_chunk_size") {
-            match f.value() {
-                Ok(Value::I64(n)) if *n >= 0 => cfg.oci_chunk_size = *n as u64,
-                Ok(Value::None) => {}
-                Ok(other) => {
-                    return Err(anyhow!(
-                        "host config: oci_chunk_size must be a non-negative byte size, got {other:?}"
-                    ));
-                }
-                Err(e) => return Err(anyhow!("host config: {e}")),
-            }
-        }
-        Ok(cfg)
     }
 }
 
@@ -231,33 +202,52 @@ host {
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
     }
 
+    /// The diagnostics a host-config author now gets — same wording as a
+    /// lab file, anchored at the line (ADR-0006).
+    fn host_err(body: &str) -> String {
+        let source = format!("import <vmlab-host.wcl>\n{body}");
+        let err = HostConfig::parse(&source, "config.wcl").expect_err("should be rejected");
+        format!("{err:#}")
+    }
+
     #[test]
     fn rejects_bad_values() {
-        assert!(
-            HostConfig::parse(
-                "import <vmlab-host.wcl>\nhost { disk_low_percent = 200 }\n",
-                "<t>"
-            )
-            .is_err()
+        assert_eq!(
+            host_err("host { disk_low_percent = 200 }\n"),
+            "1 error(s) in config.wcl\n  \
+             config.wcl:2:8: `disk_low_percent` must be between 0 and 100, got 200"
         );
         assert!(
-            HostConfig::parse("import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n", "<t>").is_err()
+            host_err("host { trunk_port = 0 }\n")
+                .contains("`trunk_port` must be between 1 and 65535, got 0")
         );
         assert!(
-            HostConfig::parse(
-                "import <vmlab-host.wcl>\nhost { trunk_port = 70000 }\n",
-                "<t>"
-            )
-            .is_err()
+            host_err("host { trunk_port = 70000 }\n")
+                .contains("`trunk_port` must be between 1 and 65535, got 70000")
         );
         assert!(
-            HostConfig::parse(
-                "import <vmlab-host.wcl>\nhost { fastpath = \"fast\" }\n",
-                "<t>"
-            )
-            .is_err()
+            host_err("host { fastpath = \"fast\" }\n")
+                .contains("`fastpath` must be one of auto, off, sockmap, afxdp, got `fast`")
+        );
+        assert!(
+            host_err("host { subnet_pool = \"10.213\" }\n").contains("malformed CIDR `10.213`")
+        );
+        assert!(
+            host_err("host { dns_suffix = 3 }\n")
+                .contains("`dns_suffix` must be a string, got an integer")
         );
         assert!(HostConfig::parse("host { }\n", "<t>").is_err());
+    }
+
+    #[test]
+    fn every_mistake_in_a_host_config_is_reported_at_once() {
+        let err = host_err("host {\n  trunk_port = 0\n  fastpath = \"fast\"\n}\n");
+        assert!(err.starts_with("2 error(s) in config.wcl"), "{err}");
+        assert!(
+            err.contains("config.wcl:3:3: `trunk_port` must be"),
+            "{err}"
+        );
+        assert!(err.contains("config.wcl:4:3: `fastpath` must be"), "{err}");
     }
 
     #[test]

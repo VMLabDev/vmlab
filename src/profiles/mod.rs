@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow};
-use wcl_lang::{Document, Environment, Registry, Value, disk_loader};
+use wcl_lang::{Block, Document, Environment, Registry, disk_loader};
+
+use crate::config::IssueList;
+use crate::config::block::{Reader, Unspan, render_issues};
 
 pub const PROFILE_SCHEMA_WCL: &str = include_str!("profile_schema.wcl");
 pub const SHIPPED_PROFILES_WCL: &str = include_str!("shipped.wcl");
@@ -161,138 +164,68 @@ fn parse_profiles(source: &str, name: &str) -> Result<Vec<Profile>> {
         registry().loader(disk_loader()),
     )
     .map_err(|e| anyhow!("parse error in {name}: {e}"))?;
-    let schema_errors = doc.schema_errors();
-    if !schema_errors.is_empty() {
-        let msgs: Vec<String> = schema_errors.iter().map(|e| e.to_string()).collect();
-        return Err(anyhow!("schema errors in {name}: {}", msgs.join("; ")));
-    }
-
+    let mut issues = crate::config::schema_issues(&doc);
     let mut out = Vec::new();
     for block in doc.blocks() {
-        if block.kind() != "profile" {
-            continue;
+        if block.kind() == "profile"
+            && let Some(p) = extract_profile(&block, &mut issues)
+        {
+            out.push(p);
         }
-        let label = block
-            .labels()
-            .map_err(|e| anyhow!("cannot evaluate profile label: {e}"))?
-            .into_iter()
-            .next();
-        let Some(Value::Utf8(pname)) = label else {
-            return Err(anyhow!("profile block in {name} requires a name label"));
-        };
-
-        let get_str = |field: &str| -> Result<Option<String>> {
-            match block.field(field) {
-                None => Ok(None),
-                Some(f) => match f.value() {
-                    Ok(Value::Utf8(s)) => Ok(Some(s.clone())),
-                    Ok(Value::None) => Ok(None),
-                    Ok(other) => Err(anyhow!(
-                        "profile {pname}: `{field}` must be a string, got {other:?}"
-                    )),
-                    Err(e) => Err(anyhow!("profile {pname}: cannot evaluate `{field}`: {e}")),
-                },
-            }
-        };
-        let get_bool = |field: &str| -> Result<Option<bool>> {
-            match block.field(field) {
-                None => Ok(None),
-                Some(f) => match f.value() {
-                    Ok(Value::Bool(b)) => Ok(Some(*b)),
-                    Ok(Value::None) => Ok(None),
-                    Ok(other) => Err(anyhow!(
-                        "profile {pname}: `{field}` must be a bool, got {other:?}"
-                    )),
-                    Err(e) => Err(anyhow!("profile {pname}: cannot evaluate `{field}`: {e}")),
-                },
-            }
-        };
-
-        let machine = match get_str("machine")?.as_deref() {
-            None => None,
-            Some("q35") => Some(Machine::Q35),
-            Some("pc") => Some(Machine::I440fx),
-            Some(other) => {
-                return Err(anyhow!(
-                    "profile {pname}: unknown machine `{other}` (expected q35, pc)"
-                ));
-            }
-        };
-        let firmware = match get_str("firmware")?.as_deref() {
-            None => None,
-            Some("ovmf") => Some(FirmwareKind::Ovmf),
-            Some("seabios") => Some(FirmwareKind::Seabios),
-            Some(other) => {
-                return Err(anyhow!(
-                    "profile {pname}: unknown firmware `{other}` (expected ovmf, seabios)"
-                ));
-            }
-        };
-        let disk_bus = match get_str("disk_bus")?.as_deref() {
-            None => None,
-            Some("virtio") => Some(DiskBus::Virtio),
-            Some("ide") => Some(DiskBus::Ide),
-            Some("sata") => Some(DiskBus::Sata),
-            Some(other) => {
-                return Err(anyhow!(
-                    "profile {pname}: unknown disk_bus `{other}` (expected virtio, ide, sata)"
-                ));
-            }
-        };
-        let cpus = match block.field("cpus") {
-            None => None,
-            Some(f) => match f.value() {
-                Ok(Value::I64(n)) if *n > 0 => Some(*n as u32),
-                Ok(Value::None) => None,
-                Ok(other) => {
-                    return Err(anyhow!(
-                        "profile {pname}: cpus must be a positive integer, got {other:?}"
-                    ));
-                }
-                Err(e) => return Err(anyhow!("profile {pname}: cannot evaluate cpus: {e}")),
-            },
-        };
-        let memory = match block.field("memory") {
-            None => None,
-            Some(f) => match f.value() {
-                Ok(Value::I64(n)) if *n >= 0 => Some(*n as u64),
-                Ok(Value::None) => None,
-                Ok(other) => {
-                    return Err(anyhow!(
-                        "profile {pname}: memory must be a non-negative byte size, got {other:?}"
-                    ));
-                }
-                Err(e) => return Err(anyhow!("profile {pname}: cannot evaluate memory: {e}")),
-            },
-        };
-        let input_transport = match get_str("input_transport")?.as_deref() {
-            None | Some("qmp") => InputTransport::Qmp,
-            Some("vnc") => InputTransport::Vnc,
-            Some(other) => {
-                return Err(anyhow!(
-                    "profile {pname}: unknown input_transport `{other}` (expected qmp, vnc)"
-                ));
-            }
-        };
-
-        out.push(Profile {
-            name: pname.clone(),
-            description: get_str("description")?,
-            machine,
-            firmware,
-            secure_boot: get_bool("secure_boot")?,
-            tpm: get_bool("tpm")?,
-            disk_bus,
-            nic_model: get_str("nic_model")?,
-            display: get_str("display")?,
-            cpus,
-            memory,
-            agent_channel: get_bool("agent_channel")?.unwrap_or(true),
-            input_transport,
-            virtiofs: get_bool("virtiofs")?.unwrap_or(false),
-        });
     }
-    Ok(out)
+    if issues.is_empty() {
+        Ok(out)
+    } else {
+        Err(anyhow!(render_issues(name, source, &issues)))
+    }
+}
+
+/// The profile field mapping. Reading, coercion, spans and wording all come
+/// from [`crate::config::block`] (ADR-0006).
+fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
+    let mut r = Reader::new(b, issues);
+    let name = r.label()?;
+    Some(Profile {
+        name,
+        description: r.string("description").unspan(),
+        machine: r
+            .keyword("machine", &[("q35", Machine::Q35), ("pc", Machine::I440fx)])
+            .unspan(),
+        firmware: r
+            .keyword(
+                "firmware",
+                &[
+                    ("ovmf", FirmwareKind::Ovmf),
+                    ("seabios", FirmwareKind::Seabios),
+                ],
+            )
+            .unspan(),
+        secure_boot: r.bool("secure_boot").unspan(),
+        tpm: r.bool("tpm").unspan(),
+        disk_bus: r
+            .keyword(
+                "disk_bus",
+                &[
+                    ("virtio", DiskBus::Virtio),
+                    ("ide", DiskBus::Ide),
+                    ("sata", DiskBus::Sata),
+                ],
+            )
+            .unspan(),
+        nic_model: r.string("nic_model").unspan(),
+        display: r.string("display").unspan(),
+        cpus: r.int_at_least("cpus", 1).unspan(),
+        memory: r.size("memory").unspan(),
+        agent_channel: r.bool("agent_channel").unspan().unwrap_or(true),
+        input_transport: r
+            .keyword(
+                "input_transport",
+                &[("qmp", InputTransport::Qmp), ("vnc", InputTransport::Vnc)],
+            )
+            .unspan()
+            .unwrap_or_default(),
+        virtiofs: r.bool("virtiofs").unspan().unwrap_or(false),
+    })
 }
 
 #[cfg(test)]
@@ -361,16 +294,65 @@ profile "freebsd" { machine = "q35" firmware = "seabios" }
         assert!(set.exists("linux-modern"));
     }
 
+    /// The diagnostics a profile author now gets — the same wording a lab
+    /// author gets for the same mistake, anchored at the line (ADR-0006).
+    fn profile_err(body: &str) -> String {
+        let source = format!("import <vmlab-profile.wcl>\n{body}");
+        let err = parse_profiles(&source, "p.wcl").expect_err("profile should be rejected");
+        format!("{err:#}")
+    }
+
     #[test]
-    fn bad_profile_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("bad.wcl"),
-            "import <vmlab-profile.wcl>\nprofile \"x\" { machine = \"vax\" }\n",
-        )
-        .unwrap();
-        let err = ProfileSet::load(tmp.path()).unwrap_err();
-        assert!(format!("{err:#}").contains("unknown machine"));
+    fn bad_profile_rejected_with_the_shared_wording() {
+        assert_eq!(
+            profile_err("profile \"x\" { machine = \"vax\" }\n"),
+            "1 error(s) in p.wcl\n  p.wcl:2:15: `machine` must be one of q35, pc, got `vax`"
+        );
+        assert!(
+            profile_err("profile \"x\" { firmware = \"bios\" }\n")
+                .contains("`firmware` must be one of ovmf, seabios, got `bios`")
+        );
+        assert!(
+            profile_err("profile \"x\" { disk_bus = \"scsi\" }\n")
+                .contains("`disk_bus` must be one of virtio, ide, sata, got `scsi`")
+        );
+        assert!(
+            profile_err("profile \"x\" { input_transport = \"usb\" }\n")
+                .contains("`input_transport` must be one of qmp, vnc, got `usb`")
+        );
+    }
+
+    #[test]
+    fn profile_type_errors_read_like_lab_file_ones() {
+        assert!(
+            profile_err("profile \"x\" { nic_model = 3 }\n")
+                .contains("`nic_model` must be a string, got an integer")
+        );
+        assert!(
+            profile_err("profile \"x\" { tpm = \"yes\" }\n")
+                .contains("`tpm` must be a bool, got a string")
+        );
+        assert!(
+            profile_err("profile \"x\" { cpus = 0 }\n")
+                .contains("`cpus` must be at least 1, got 0")
+        );
+        assert!(
+            profile_err("profile \"x\" { memory = -1 }\n")
+                .contains("`memory` must be at least 0, got -1")
+        );
+    }
+
+    #[test]
+    fn every_mistake_in_a_profile_file_is_reported_at_once() {
+        let err =
+            profile_err("profile \"a\" { machine = \"vax\" }\nprofile \"b\" { tpm = \"yes\" }\n");
+        // Both mistakes in one pass, each at its own line — the second is
+        // no longer hidden behind the first.
+        assert!(
+            err.contains("p.wcl:2:15: `machine` must be one of"),
+            "{err}"
+        );
+        assert!(err.contains("p.wcl:3:15: `tpm` must be a bool"), "{err}");
     }
 
     #[test]
