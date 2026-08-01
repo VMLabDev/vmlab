@@ -53,11 +53,11 @@ the code is the contract.
 | `ping` | — | `cli`, `daemon`, `web` | Liveness check; answers `"pong"`. |
 | `status` | — | `cli`, `web` | The whole lab's runtime status: machines, segments, readiness. |
 | `dns.table` | — | `web` | The DNS zones the lab's segments serve. |
-| `up` | `vms: Vec<String>` | `cli`, `web` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
-| `pull` | `vms: Vec<String>` | `cli`, `web` | Download every pending template and image without starting anything, over the code path `up` runs first. |
+| `up` | `machines: Vec<String>` | `cli`, `web` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
+| `pull` | `machines: Vec<String>` | `cli`, `web` | Download every pending template and image without starting anything, over the code path `up` runs first. |
 | `pull.cancel` | `machine: String` | `web` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
 | `run` | `script: String` | `cli` | Run an ad-hoc wscript against the lab (PRD §12), streaming output. |
-| `down` | `vms: Vec<String>`, `force: bool` | `cli`, `web` | Stop the lab, or just the named machines (empty = all). |
+| `down` | `machines: Vec<String>`, `force: bool` | `cli`, `web` | Stop the lab, or just the named machines (empty = all). |
 | `destroy` | — | `cli`, `web` | Stop the lab and delete everything it materialised. |
 | `machine.start` | `machine: String` | `cli`, `web` | Start one machine, pulling its template or image first. |
 | `machine.stop` | `machine: String`, `force: bool` | `cli`, `web` | Stop one machine; `force` kills instead of the graceful ladder. |
@@ -89,8 +89,8 @@ the code is the contract.
 | `playbook.check` | `machine: String`, `playbook: Option<String>`, `play: Option<String>` | `cli`, `web` | Dry-run a playbook against one machine, streaming its output. |
 | `playbook.apply` | `machine: String`, `playbook: Option<String>`, `play: Option<String>` | `cli`, `web` | Apply a playbook to one machine, streaming its output. |
 | `playbook.op_status` | — | `web` | Which playbook runs are in flight. |
-| `snapshot.take` | `name: String`, `vm: Option<String>` | `cli`, `web` | Snapshot one machine, or the whole lab when `vm` is omitted. |
-| `snapshot.restore` | `name: String`, `vm: Option<String>` | `cli`, `web` | Restore one machine, or every machine when `vm` is omitted. |
+| `snapshot.take` | `name: String`, `machine: Option<String>` | `cli`, `web` | Snapshot one machine, or the whole lab when `machine` is omitted. |
+| `snapshot.restore` | `name: String`, `machine: Option<String>` | `cli`, `web` | Restore one machine, or every machine when `machine` is omitted. |
 | `snapshot.delete` | `machine: String`, `name: String` | `cli`, `web` | Delete one machine's snapshot. |
 | `snapshot.list` | `machine: String` | `cli`, `web` | One machine's snapshots. |
 | `shutdown` | — | `cli`, `daemon` | Tear the lab daemon down; the reply is sent before it exits. |

@@ -191,15 +191,10 @@ pub fn protocol_markdown(repo: &Path) -> String {
     }
     out.push('\n');
 
-    for (tier, title, specs) in [
-        (
-            "supervisor",
-            "The supervisor socket (`vmlabd`)",
-            SupRequest::COMMANDS,
-        ),
-        ("lab", "A lab daemon's socket", LabRequest::COMMANDS),
+    for (title, specs) in [
+        ("The supervisor socket (`vmlabd`)", SupRequest::COMMANDS),
+        ("A lab daemon's socket", LabRequest::COMMANDS),
     ] {
-        let _ = tier;
         out.push_str(&format!("## {title}\n\n"));
         out.push_str("| command | arguments | called by | what it does |\n|---|---|---|---|\n");
         for spec in specs {

@@ -329,7 +329,7 @@ async fn resolve_target(
             },
         )
         .await
-        .map_err(|e| e.message)?;
+        .map_err(|e| e.to_string())?;
     let addr: std::net::SocketAddr = reply["addr"]
         .as_str()
         .and_then(|s| s.parse().ok())

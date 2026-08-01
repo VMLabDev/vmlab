@@ -497,3 +497,36 @@ fn init_daemon_tracing() {
         .with_target(false)
         .init();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::exit_code_for;
+    use crate::proto::{CommandError, ErrorCode};
+
+    /// Story 15 of the wire-protocol spec: a script branches on why the verb
+    /// failed. That only works if the code survives the `anyhow` the verbs
+    /// return, so this drives the real conversion rather than the mapping
+    /// alone.
+    #[test]
+    fn a_daemon_failure_exits_with_its_code() {
+        for code in ErrorCode::ALL {
+            let err = anyhow::Error::new(CommandError::new(*code, "nope"));
+            assert_eq!(
+                format!("{:?}", exit_code_for(&err)),
+                format!("{:?}", std::process::ExitCode::from(code.exit_code())),
+                "{code}"
+            );
+        }
+    }
+
+    /// A local failure — a config error, an unreadable file — has no code and
+    /// exits the way the CLI always has.
+    #[test]
+    fn a_local_failure_exits_one() {
+        let err = anyhow::anyhow!("cannot read vmlab.wcl");
+        assert_eq!(
+            format!("{:?}", exit_code_for(&err)),
+            format!("{:?}", std::process::ExitCode::FAILURE),
+        );
+    }
+}

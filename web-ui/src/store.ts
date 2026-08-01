@@ -508,13 +508,32 @@ function endDestroyFx() {
 
 // --- actions --------------------------------------------------------------
 
+/** How a failed action reads. A conflict and a missing thing are the user's
+ *  situation, not a breakage, so they say what happened rather than "Failed";
+ *  anything else is a genuine fault. The daemon's error code decides
+ *  (see `protocol.ts`), never the wording of the message. */
+function failureToast(label: string, e: unknown): [string, Tone] {
+  if (!(e instanceof api.ApiFailure)) return [`Failed: ${e}`, "danger"];
+  switch (e.code) {
+    case "conflict":
+      return [`${label}: ${e.message}`, "warning"];
+    case "not_found":
+      return [`${label}: ${e.message}`, "warning"];
+    case "unsupported":
+      return [`${label} is not available here: ${e.message}`, "warning"];
+    default:
+      return [`Failed: ${e.message}`, "danger"];
+  }
+}
+
 async function run(label: string, fn: () => Promise<unknown>) {
   try {
     await fn();
     showToast(label);
     scheduleRefresh();
   } catch (e) {
-    showToast(`Failed: ${e}`, "danger");
+    const [message, tone] = failureToast(label, e);
+    showToast(message, tone);
   }
 }
 

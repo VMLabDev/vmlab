@@ -299,7 +299,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Handler<LabRequest> for Echo {
         async fn handle(&self, req: LabRequest, _s: &Streamer) -> Result<Value, CommandError> {
-            Ok(Value::String(req.command().to_string()))
+            Ok(Value::String(req.cmd().to_string()))
         }
     }
 

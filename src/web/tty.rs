@@ -47,6 +47,8 @@ async fn bridge(
             &lab,
             LabRequest::MachineTtyOpen {
                 machine: machine.clone(),
+                // A placeholder: xterm.js measures the pane and sends a
+                // resize as soon as the socket is up.
                 cols: 80,
                 rows: 24,
             },

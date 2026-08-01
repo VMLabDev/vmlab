@@ -65,9 +65,12 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
         let (name, root) = current_lab()?;
         let client = daemon::ensure_lab_daemon(&name, &root).await?;
         client
-            .send_streaming(LabRequest::Up { vms: vms.clone() }, |chunk| {
-                print!("{chunk}")
-            })
+            .send_streaming(
+                LabRequest::Up {
+                    machines: vms.clone(),
+                },
+                |chunk| print!("{chunk}"),
+            )
             .await
             .map_err(remote)?;
         println!("lab \"{name}\" is up");
@@ -100,7 +103,9 @@ pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
         let (name, root) = current_lab()?;
         let client = daemon::ensure_lab_daemon(&name, &root).await?;
         client
-            .send_streaming(LabRequest::Pull { vms }, |chunk| print!("{chunk}"))
+            .send_streaming(LabRequest::Pull { machines: vms }, |chunk| {
+                print!("{chunk}")
+            })
             .await
             .map_err(remote)?;
         println!("lab \"{name}\": templates ready");
@@ -125,7 +130,10 @@ pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
             return Ok(());
         };
         client
-            .send(LabRequest::Down { vms, force })
+            .send(LabRequest::Down {
+                machines: vms,
+                force,
+            })
             .await
             .map_err(remote)?;
         println!("lab \"{name}\" is down (clones retained)");
@@ -467,7 +475,7 @@ fn cmd_lab_stop(name: &str, force: bool) -> Result<()> {
         };
         client
             .send(LabRequest::Down {
-                vms: Vec::new(),
+                machines: Vec::new(),
                 force,
             })
             .await
@@ -1206,7 +1214,7 @@ pub fn cmd_snapshot(vm_ref: Option<String>, name: String) -> Result<()> {
         client
             .send(LabRequest::SnapshotTake {
                 name: name.clone(),
-                vm,
+                machine: vm,
             })
             .await
             .map_err(remote)?;
@@ -1228,7 +1236,7 @@ pub fn cmd_restore(vm_ref: Option<String>, name: String) -> Result<()> {
         client
             .send(LabRequest::SnapshotRestore {
                 name: name.clone(),
-                vm,
+                machine: vm,
             })
             .await
             .map_err(remote)?;

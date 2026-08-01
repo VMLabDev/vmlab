@@ -172,7 +172,12 @@ async fn main() -> ExitCode {
                 actix_web::rt::spawn(async move {
                     println!("vmlab-web: bringing lab `{name}` up…");
                     match data
-                        .lab_call(&name, vmlab::proto::LabRequest::Up { vms: Vec::new() })
+                        .lab_call(
+                            &name,
+                            vmlab::proto::LabRequest::Up {
+                                machines: Vec::new(),
+                            },
+                        )
                         .await
                     {
                         Ok(_) => println!("vmlab-web: lab `{name}` is up"),

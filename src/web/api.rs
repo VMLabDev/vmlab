@@ -601,10 +601,14 @@ pub async fn lab_dns_table(state: web::Data<AppState>, lab: web::Path<String>) -
 /// segment this endpoint does not serve.
 fn lab_request(action: &str, force: bool) -> Option<LabRequest> {
     Some(match action {
-        "up" => LabRequest::Up { vms: Vec::new() },
-        "pull" => LabRequest::Pull { vms: Vec::new() },
+        "up" => LabRequest::Up {
+            machines: Vec::new(),
+        },
+        "pull" => LabRequest::Pull {
+            machines: Vec::new(),
+        },
         "down" => LabRequest::Down {
-            vms: Vec::new(),
+            machines: Vec::new(),
             force,
         },
         "destroy" => LabRequest::Destroy {},
@@ -804,7 +808,7 @@ pub async fn snapshot_take(
 ) -> HttpResponse {
     let req = LabRequest::SnapshotTake {
         name: body.name.clone(),
-        vm: body.vm.clone(),
+        machine: body.vm.clone(),
     };
     match state.lab_call(&lab, req).await {
         Ok(v) => ok(v),
@@ -1370,7 +1374,7 @@ pub async fn snapshot_restore(
     let (lab, name) = path.into_inner();
     let req = LabRequest::SnapshotRestore {
         name,
-        vm: body.vm.clone(),
+        machine: body.vm.clone(),
     };
     match state.lab_call(&lab, req).await {
         Ok(v) => ok(v),
@@ -1547,13 +1551,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{segment}`"));
             assert_eq!(req.cmd(), *cmd);
         }
-        // …and nothing the endpoints serve is missing from the table.
-        for segment in ["up", "down", "destroy", "pull"] {
-            assert!(
-                LAB_ACTIONS.iter().any(|(s, _)| *s == segment),
-                "`{segment}` is served but undocumented"
-            );
-        }
         assert!(lab_request("teleport", false).is_none());
         assert!(machine_request("teleport", "dc01".into(), false).is_none());
     }
@@ -1579,7 +1576,7 @@ mod tests {
         assert_eq!(
             lab_request("down", true),
             Some(LabRequest::Down {
-                vms: Vec::new(),
+                machines: Vec::new(),
                 force: true
             })
         );

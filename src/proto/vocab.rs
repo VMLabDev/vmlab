@@ -45,8 +45,6 @@ pub struct CommandSpec {
 /// A request vocabulary: an enumeration that knows how to become, and be read
 /// back from, the `cmd` + `args` pair on the wire.
 pub trait WireRequest: Serialize + DeserializeOwned + Sized {
-    /// Which daemon serves this vocabulary (`supervisor`, `lab`).
-    const TIER: &'static str;
     /// Every command, in declaration order.
     const COMMANDS: &'static [CommandSpec];
 
@@ -98,13 +96,12 @@ pub trait WireRequest: Serialize + DeserializeOwned + Sized {
 ///
 /// Each variant is `Name = "wire.command" { field: Type, ... }`. Serde
 /// attributes on a field carry through, which is where an argument's default
-/// and its legacy aliases live. An optional `=> path::to::fn` after the tier
-/// names a pre-pass over the raw arguments, for legacy spellings serde alone
-/// cannot express.
+/// and its legacy aliases live. An optional `=> path::to::fn` names a pre-pass
+/// over the raw arguments, for legacy spellings serde alone cannot express.
 macro_rules! vocabulary {
     (
         $(#[$enum_meta:meta])*
-        $name:ident : $tier:literal $(=> $normalise:path)? {
+        $name:ident $(=> $normalise:path)? {
             $(
                 $(#[doc = $doc:literal])*
                 $variant:ident = $cmd:literal {
@@ -132,17 +129,7 @@ macro_rules! vocabulary {
             )*
         }
 
-        impl $name {
-            /// This request's command string, without going through serde.
-            pub fn command(&self) -> &'static str {
-                match self {
-                    $( $name::$variant { .. } => $cmd, )*
-                }
-            }
-        }
-
         impl WireRequest for $name {
-            const TIER: &'static str = $tier;
             const COMMANDS: &'static [CommandSpec] = &[
                 $(
                     CommandSpec {
@@ -157,7 +144,9 @@ macro_rules! vocabulary {
             ];
 
             fn cmd(&self) -> &'static str {
-                self.command()
+                match self {
+                    $( $name::$variant { .. } => $cmd, )*
+                }
             }
 
             fn normalise_args(cmd: &str, args: Value) -> Value {
@@ -263,30 +252,34 @@ fn default_log_lines() -> usize {
     100
 }
 
-/// The three spellings of "which machine": the current one, and the two the
-/// wire carried before VMs and containers collapsed into one command set.
-const MACHINE_SPELLINGS: [&str; 3] = ["machine", "vm", "container"];
+/// The spellings of "which machine". `machine`/`machines` are current;
+/// `vm`, `container` and `vms` are what the wire carried before VMs and
+/// containers collapsed into one command set (PRD §18).
+const MACHINE_SPELLINGS: [&[&str]; 2] = [&["machine", "vm", "container"], &["machines", "vms"]];
 
-/// Serde accepts any one machine spelling through field aliases, but two at
-/// once would be a duplicate field. A client sending both keeps working: the
-/// spelling the command actually declares wins, as it always has.
+/// Serde accepts any one spelling through field aliases, but two at once would
+/// be a duplicate field. A client sending both keeps working: the spelling the
+/// command actually declares wins, as it always has.
 fn drop_shadowed_machine_aliases(cmd: &str, mut args: Value) -> Value {
     let Some(spec) = LabRequest::spec(cmd) else {
         return args;
     };
-    let Some(canonical) = spec
-        .args
-        .iter()
-        .map(|arg| arg.name)
-        .find(|name| MACHINE_SPELLINGS.contains(name))
-    else {
+    let Some(obj) = args.as_object_mut() else {
         return args;
     };
-    if let Some(obj) = args.as_object_mut()
-        && obj.contains_key(canonical)
-    {
-        for shadowed in MACHINE_SPELLINGS.iter().filter(|s| **s != canonical) {
-            obj.remove(*shadowed);
+    for group in MACHINE_SPELLINGS {
+        let Some(canonical) = spec
+            .args
+            .iter()
+            .map(|arg| arg.name)
+            .find(|name| group.contains(name))
+        else {
+            continue;
+        };
+        if obj.contains_key(canonical) {
+            for shadowed in group.iter().filter(|s| **s != canonical) {
+                obj.remove(*shadowed);
+            }
         }
     }
     args
@@ -302,7 +295,7 @@ vocabulary! {
     /// One command set for VMs and containers alike (PRD §7, §18): where a
     /// machine genuinely cannot serve a command it says so through its
     /// capabilities, not through its kind.
-    LabRequest: "lab" => drop_shadowed_machine_aliases {
+    LabRequest => drop_shadowed_machine_aliases {
         /// Liveness check; answers `"pong"`.
         Ping = "ping" {},
         /// The whole lab's runtime status: machines, segments, readiness.
@@ -313,12 +306,12 @@ vocabulary! {
         /// Bring the lab up, or just the named machines (empty = all).
         /// Streams provisioning output.
         Up = "up" {
-            #[serde(default)] vms: Vec<String>,
+            #[serde(default, alias = "vms")] machines: Vec<String>,
         },
         /// Download every pending template and image without starting
         /// anything, over the code path `up` runs first.
         Pull = "pull" {
-            #[serde(default)] vms: Vec<String>,
+            #[serde(default, alias = "vms")] machines: Vec<String>,
         },
         /// Abort one machine's running download; whatever waits on it fails
         /// with "download cancelled".
@@ -331,7 +324,7 @@ vocabulary! {
         },
         /// Stop the lab, or just the named machines (empty = all).
         Down = "down" {
-            #[serde(default)] vms: Vec<String>,
+            #[serde(default, alias = "vms")] machines: Vec<String>,
             #[serde(default)] force: bool,
         },
         /// Stop the lab and delete everything it materialised.
@@ -513,15 +506,15 @@ vocabulary! {
         /// Which playbook runs are in flight.
         PlaybookOpStatus = "playbook.op_status" {},
 
-        /// Snapshot one machine, or the whole lab when `vm` is omitted.
+        /// Snapshot one machine, or the whole lab when `machine` is omitted.
         SnapshotTake = "snapshot.take" {
             name: String,
-            #[serde(default, alias = "machine")] vm: Option<String>,
+            #[serde(default, alias = "vm", alias = "container")] machine: Option<String>,
         },
-        /// Restore one machine, or every machine when `vm` is omitted.
+        /// Restore one machine, or every machine when `machine` is omitted.
         SnapshotRestore = "snapshot.restore" {
             name: String,
-            #[serde(default, alias = "machine")] vm: Option<String>,
+            #[serde(default, alias = "vm", alias = "container")] machine: Option<String>,
         },
         /// Delete one machine's snapshot.
         SnapshotDelete = "snapshot.delete" {
@@ -545,7 +538,7 @@ vocabulary! {
 vocabulary! {
     /// What `vmlabd` serves on the supervisor socket: the lab registry, global
     /// segments, and the template operations that outlive any one lab daemon.
-    SupRequest: "supervisor" {
+    SupRequest {
         /// Liveness check; answers `"pong"`.
         Ping = "ping" {},
         /// The supervisor's own build version.
@@ -680,6 +673,36 @@ mod tests {
                 }
             );
         }
+        for spelling in ["machines", "vms"] {
+            let req = LabRequest::from_wire("up", json!({spelling: ["dc01"]})).unwrap();
+            assert_eq!(
+                req,
+                LabRequest::Up {
+                    machines: vec!["dc01".into()]
+                }
+            );
+        }
+    }
+
+    /// Sending two spellings at once used to be harmless — `machine` won —
+    /// and still is, rather than failing as a duplicate field.
+    #[test]
+    fn the_declared_spelling_wins_when_a_client_sends_two() {
+        let req =
+            LabRequest::from_wire("machine.start", json!({"machine": "a", "vm": "b"})).unwrap();
+        assert_eq!(
+            req,
+            LabRequest::MachineStart {
+                machine: "a".into()
+            }
+        );
+        let req = LabRequest::from_wire("up", json!({"machines": ["a"], "vms": ["b"]})).unwrap();
+        assert_eq!(
+            req,
+            LabRequest::Up {
+                machines: vec!["a".into()]
+            }
+        );
     }
 
     #[test]

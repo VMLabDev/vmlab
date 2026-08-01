@@ -100,3 +100,14 @@ had no caller on any surface, and was removed rather than wired up — the
 features it reported are already in `machine.capabilities`. The surface
 asymmetries it lists are left as they are; closing them is separate work, per
 gap.
+
+Its counts are larger than the "eleven CLI-only and six console-only" above,
+which came from a hand count of the lab socket. The report covers both sockets
+and treats the REST layer as the console's reach, so it lists seventeen and
+sixteen. The shape of the finding is the same; the report is the number to
+trust, because it is regenerated rather than counted.
+
+Two argument names moved to match the glossary while the contract was being
+written down for the first time: `up`/`pull`/`down` take `machines`, and
+`snapshot.take`/`snapshot.restore` take `machine`. Both keep the old spellings
+as serde aliases, so nothing that spoke `vms`/`vm` breaks.

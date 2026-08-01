@@ -237,9 +237,9 @@ mod tests {
                 LabRequest::SnapshotList { machine } => {
                     Err(CommandError::not_found(format!("no machine `{machine}`")))
                 }
-                LabRequest::Up { vms } => {
-                    for vm in &vms {
-                        stream.chunk(format!("starting {vm}")).await;
+                LabRequest::Up { machines } => {
+                    for machine in &machines {
+                        stream.chunk(format!("starting {machine}")).await;
                     }
                     Ok(serde_json::json!(true))
                 }
@@ -247,10 +247,7 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     Ok(Value::String("slow-done".into()))
                 }
-                other => Err(CommandError::failed(format!(
-                    "unhandled {}",
-                    other.command()
-                ))),
+                other => Err(CommandError::failed(format!("unhandled {}", other.cmd()))),
             }
         }
     }
@@ -309,7 +306,7 @@ mod tests {
             ),
         ];
         for (req, want) in cases {
-            let cmd = req.command();
+            let cmd = req.cmd();
             let err = client.send(req).await.unwrap_err();
             assert_eq!(err.code(), want, "{cmd}");
             assert!(!err.to_string().is_empty(), "{cmd}");
@@ -348,7 +345,7 @@ mod tests {
         let v = client
             .send_streaming(
                 LabRequest::Up {
-                    vms: vec!["a".into(), "b".into()],
+                    machines: vec!["a".into(), "b".into()],
                 },
                 |c| chunks.push(c),
             )

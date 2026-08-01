@@ -200,6 +200,28 @@ unchanged. Carries the state-to-label derivation, so all three surfaces speak
 one vocabulary. See ADR-0004.
 _Avoid_: state (a machine has a power state), snapshot, summary
 
+**Request vocabulary**:
+The enumeration of every command a daemon serves, each variant carrying that
+command's argument shape. One per daemon — the supervisor's and a lab's — so
+each dispatch is an exhaustive match. The command string is still what goes on
+the wire; nothing above the protocol spells it. See ADR-0007 and the generated
+`docs/protocol.md`.
+_Avoid_: RPC, command table, API (an API is a surface, not the vocabulary
+under it)
+
+**Error code**:
+The machine-readable half of a failed reply, beside the human-readable message.
+The code is the contract — it decides the REST surface's HTTP status and the
+CLI's exit code — and the message is free to be reworded.
+_Avoid_: error type, status (a status is a lab's or machine's condition)
+
+**Surface**:
+Something a person or a program drives vmlab through: the CLI, the REST API,
+the web console. Each adapts the request vocabulary; none holds its own list of
+commands. Which surface reaches which command is the coverage report in
+`docs/protocol.md`.
+_Avoid_: frontend, client (a client is the protocol's connection object)
+
 **Web console**:
 The browser UI served by `vmlab-web`: lab overview, visual designer, file and
 log editors, per-machine consoles and terminals, template builds, playbooks,

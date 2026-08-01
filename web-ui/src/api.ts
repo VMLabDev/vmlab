@@ -35,6 +35,21 @@ export class ApiFailure extends Error {
   }
 }
 
+/** Read a failed response into an `ApiFailure`. A body that isn't the JSON
+ *  error shape (a proxy page, an empty 502) leaves the status text. */
+async function apiFailure(res: Response): Promise<ApiFailure> {
+  let message = res.statusText;
+  let code: ErrorCode | undefined;
+  try {
+    const body: ApiError = await res.json();
+    message = body.error ?? message;
+    code = body.code;
+  } catch {
+    /* keep statusText */
+  }
+  return new ApiFailure(message, res.status, code);
+}
+
 async function req(path: string, opts: RequestInit = {}): Promise<any> {
   const headers: Record<string, string> = {
     ...((opts.headers as Record<string, string>) ?? {}),
@@ -49,18 +64,7 @@ async function req(path: string, opts: RequestInit = {}): Promise<any> {
     clearToken();
     throw new Unauthorized("authentication required");
   }
-  if (!res.ok) {
-    let msg = res.statusText;
-    let code: ErrorCode | undefined;
-    try {
-      const body: ApiError = await res.json();
-      msg = body.error ?? msg;
-      code = body.code;
-    } catch {
-      /* keep statusText */
-    }
-    throw new ApiFailure(msg, res.status, code);
-  }
+  if (!res.ok) throw await apiFailure(res);
   const ct = res.headers.get("content-type") ?? "";
   return ct.includes("json") ? res.json() : res;
 }
@@ -602,18 +606,7 @@ async function putConfig(lab: string, content: string, validateOnly: boolean): P
     const body = await res.json().catch(() => ({ issues: [] }));
     throw new ValidationError(body.issues ?? []);
   }
-  if (!res.ok) {
-    let msg = res.statusText;
-    let code: ErrorCode | undefined;
-    try {
-      const body: ApiError = await res.json();
-      msg = body.error ?? msg;
-      code = body.code;
-    } catch {
-      /* keep statusText */
-    }
-    throw new ApiFailure(msg, res.status, code);
-  }
+  if (!res.ok) throw await apiFailure(res);
 }
 
 export const validateConfig = (lab: string, content: string): Promise<void> =>
@@ -936,18 +929,7 @@ async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response>
 }
 
 async function finish(res: Response): Promise<any> {
-  if (!res.ok) {
-    let msg = res.statusText;
-    let code: ErrorCode | undefined;
-    try {
-      const body: ApiError = await res.json();
-      msg = body.error ?? msg;
-      code = body.code;
-    } catch {
-      /* keep statusText */
-    }
-    throw new ApiFailure(msg, res.status, code);
-  }
+  if (!res.ok) throw await apiFailure(res);
   return res.json();
 }
 

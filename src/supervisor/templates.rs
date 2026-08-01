@@ -448,7 +448,7 @@ pub async fn start_push(
             let store = TemplateStore::new(crate::paths::template_store_dir());
             let resolved = store
                 .resolve(&def.arch, &def.name, version.as_deref())
-                .map_err(|e| format!("{e:#}"))?;
+                .map_err(|e| CommandError::not_found(format!("{e:#}")))?;
             let repo = resolved
                 .meta
                 .registry

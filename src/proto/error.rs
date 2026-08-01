@@ -153,13 +153,6 @@ impl CommandError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
     }
-
-    /// Re-code an error whose message is already right. Used where a helper
-    /// produces the prose but only the caller knows what the failure means.
-    pub fn with_code(mut self, code: ErrorCode) -> Self {
-        self.code = code;
-        self
-    }
 }
 
 impl std::fmt::Display for CommandError {
@@ -183,8 +176,15 @@ impl From<&str> for CommandError {
 }
 
 impl From<anyhow::Error> for CommandError {
+    /// An operation deep in the daemon that knew why it failed wraps a
+    /// `CommandError` and lets `anyhow` carry it up; recovering it here is
+    /// what makes a plain `?` in a handler keep the code. Everything else has
+    /// nothing more specific to say than [`ErrorCode::Failed`].
     fn from(e: anyhow::Error) -> Self {
-        Self::failed(format!("{e:#}"))
+        match e.downcast::<CommandError>() {
+            Ok(coded) => coded,
+            Err(plain) => Self::failed(format!("{plain:#}")),
+        }
     }
 }
 
@@ -230,5 +230,16 @@ mod tests {
         let e: CommandError = anyhow::anyhow!("root").context("outer").into();
         assert_eq!(e.code, ErrorCode::Failed);
         assert_eq!(e.message, "outer: root");
+    }
+
+    /// A code assigned deep in an operation survives the `anyhow` it travels
+    /// up through — otherwise a handler's `?` would quietly downgrade every
+    /// conflict to a generic failure.
+    #[test]
+    fn a_code_survives_the_trip_through_anyhow() {
+        let deep = anyhow::Error::new(CommandError::conflict("dc01 is already running"));
+        let e: CommandError = deep.into();
+        assert_eq!(e.code, ErrorCode::Conflict);
+        assert_eq!(e.message, "dc01 is already running");
     }
 }

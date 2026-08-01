@@ -269,14 +269,13 @@ async fn pump_session(
 /// Run one playbook against one machine; `check` and `apply` differ only in
 /// the mode they pass down.
 async fn run_playbook(
-    handler: &LabdHandler,
+    lab: &Arc<LabRuntime>,
     stream: &Streamer,
     machine: String,
     playbook: Option<String>,
     play: Option<String>,
     mode: playbook::PlaybookMode,
 ) -> Result<Value, CommandError> {
-    let lab = &handler.lab;
     let pb = playbook::resolve_playbook(
         &lab.config.lab,
         &machine,
@@ -308,17 +307,17 @@ impl Handler<LabRequest> for LabdHandler {
             // parses it straight back into `LabStatus`.
             LabRequest::Status {} => Ok(json!(lab.status().await)),
             LabRequest::DnsTable {} => Ok(lab.dns_table().await),
-            LabRequest::Up { vms } => {
+            LabRequest::Up { machines } => {
                 let output = stream_sink(&self.lab, stream);
-                lab.up(&vms, output).await?;
+                lab.up(&machines, output).await?;
                 Ok(json!(true))
             }
             // Download any pending templates/images without starting anything
             // (`vmlab pull`). The exact code path `up` runs first — same
             // progress events.
-            LabRequest::Pull { vms } => {
+            LabRequest::Pull { machines } => {
                 let output = stream_sink(&self.lab, stream);
-                lab.ensure_pulled(&vms, Some(&output)).await?;
+                lab.ensure_pulled(&machines, Some(&output)).await?;
                 Ok(json!(true))
             }
             // Abort one machine's running download (Templates page); whatever
@@ -331,8 +330,8 @@ impl Handler<LabRequest> for LabdHandler {
                 crate::scripting::run_script_file(lab.clone(), &path, None, output).await?;
                 Ok(json!(true))
             }
-            LabRequest::Down { vms, force } => {
-                lab.down(&vms, force).await?;
+            LabRequest::Down { machines, force } => {
+                lab.down(&machines, force).await?;
                 Ok(json!(true))
             }
             LabRequest::Destroy {} => {
@@ -689,7 +688,7 @@ impl Handler<LabRequest> for LabdHandler {
                 play,
             } => {
                 run_playbook(
-                    self,
+                    lab,
                     stream,
                     machine,
                     playbook,
@@ -704,7 +703,7 @@ impl Handler<LabRequest> for LabdHandler {
                 play,
             } => {
                 run_playbook(
-                    self,
+                    lab,
                     stream,
                     machine,
                     playbook,
@@ -714,16 +713,16 @@ impl Handler<LabRequest> for LabdHandler {
                 .await
             }
             LabRequest::PlaybookOpStatus {} => Ok(lab.playbook_ops.status()),
-            LabRequest::SnapshotTake { name, vm } => match vm {
-                Some(vm) => {
-                    let online = lab.snapshot(&vm, &name).await?;
+            LabRequest::SnapshotTake { name, machine } => match machine {
+                Some(machine) => {
+                    let online = lab.snapshot(&machine, &name).await?;
                     Ok(json!({"online": online}))
                 }
                 None => Ok(lab.snapshot_all(&name).await?),
             },
-            LabRequest::SnapshotRestore { name, vm } => {
-                match vm {
-                    Some(vm) => lab.restore(&vm, &name).await?,
+            LabRequest::SnapshotRestore { name, machine } => {
+                match machine {
+                    Some(machine) => lab.restore(&machine, &name).await?,
                     None => {
                         let names: Vec<String> = lab
                             .vms
