@@ -412,9 +412,22 @@ impl VmInstance {
         v
     }
 
+    /// The host's UEFI CODE/VARS pair for this VM, or `None` under SeaBIOS.
+    /// Firmware discovery probes the host filesystem, so it happens here —
+    /// where the runtime paths are assembled — rather than inside the argv
+    /// builder, which is a pure function of what it is handed (ADR-0008).
+    fn uefi_firmware(&self, t: &TemplateParts) -> Result<Option<qemu::firmware::UefiFirmware>> {
+        if t.resolved.firmware != Some(crate::profiles::FirmwareKind::Ovmf) {
+            return Ok(None);
+        }
+        let arch = qemu::qemu_arch(&t.resolved.arch);
+        Ok(Some(qemu::firmware::lookup(arch, t.resolved.secure_boot)?))
+    }
+
     fn build_paths(
         &self,
         t: &TemplateParts,
+        firmware: Option<&qemu::firmware::UefiFirmware>,
         nics: Vec<qemu::NicSpec>,
         virtiofs_shares: Vec<(String, PathBuf)>,
     ) -> Result<VmPaths> {
@@ -432,8 +445,8 @@ impl VmInstance {
             cdroms: self.cdroms.clone(),
             floppy: self.floppy.clone(),
             nics,
-            ovmf_vars: (t.resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf))
-                .then(|| self.dirs.ovmf_vars()),
+            firmware_code: firmware.map(|fw| fw.code.clone()),
+            ovmf_vars: firmware.map(|_| self.dirs.ovmf_vars()),
             tpm_sock: t.resolved.tpm.then(|| self.dirs.tpm_sock()),
             serial_log: Some(self.dirs.logs.join("serial.log")),
             virtiofs_shares,
@@ -551,15 +564,10 @@ impl VmInstance {
             self.ensure_disks().await?;
 
             // Per-VM writable OVMF VARS from the firmware template.
-            if t.resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf)
+            let firmware = self.uefi_firmware(&t)?;
+            if let Some(fw) = &firmware
                 && !self.dirs.ovmf_vars().exists()
             {
-                let fw = match t.resolved.arch.as_str() {
-                    "x86_64" => qemu::firmware::ovmf_x86_64(t.resolved.secure_boot)?,
-                    "aarch64" => qemu::firmware::uefi_aarch64()?,
-                    "riscv64" => qemu::firmware::uefi_riscv64()?,
-                    a => bail!("no UEFI firmware for arch {a}"),
-                };
                 std::fs::copy(&fw.vars_template, self.dirs.ovmf_vars())
                     .context("copying OVMF VARS template")?;
             }
@@ -593,7 +601,7 @@ impl VmInstance {
             let args = qemu::build_args(
                 &self.lab,
                 &t.resolved,
-                &self.build_paths(&t, nic_specs, vfs_devices)?,
+                &self.build_paths(&t, firmware.as_ref(), nic_specs, vfs_devices)?,
                 accel,
             )?;
             // QMP comes up shortly after spawn (-S leaves CPUs paused); the

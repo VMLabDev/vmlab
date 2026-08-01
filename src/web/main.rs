@@ -213,6 +213,10 @@ async fn main() -> ExitCode {
                 "/api/catalog/profiles",
                 web::get().to(api::catalog_profiles),
             )
+            .route(
+                "/api/catalog/inherited",
+                web::get().to(api::catalog_inherited),
+            )
             .route("/api/catalog/meta", web::get().to(api::catalog_meta))
             .route("/api/catalog/oci", web::get().to(api::catalog_oci))
             .route("/api/registries", web::get().to(api::list_registries))

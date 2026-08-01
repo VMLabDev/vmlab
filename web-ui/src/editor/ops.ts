@@ -322,6 +322,7 @@ const containerPairs = (c: ContainerModel): [string, FV][] => [
   ["command", list(c.command ?? [])],
   ["workdir", str(c.workdir)],
   ["user", str(c.user)],
+  ["profile", str(c.profile)],
   ["cpus", int(c.cpus)],
   ["memory", bytes(c.memory)],
   ["depends_on", list(c.depends_on)],

@@ -1087,6 +1087,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         command: get_opt_str_list(b, "command", issues),
         workdir: get_str(b, "workdir", issues).map(|(s, _)| s),
         user: get_str(b, "user", issues).map(|(s, _)| s),
+        profile: get_str(b, "profile", issues).map(|(s, _)| s),
         cpus: get_int(b, "cpus", issues).and_then(|(n, s)| {
             u32::try_from(n).ok().filter(|&c| c > 0).or_else(|| {
                 issues.push(Issue::at(

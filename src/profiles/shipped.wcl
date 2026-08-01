@@ -103,6 +103,19 @@ profile "linux-generic" {
   memory      = 2GiB
 }
 
+profile "container" {
+  description = "Micro-VM defaults for an OCI container (PRD §18): the smallest shape that boots the guest asset and a typical service image"
+  // A container micro-VM boots the guest asset directly — no firmware, disk
+  // bus, display or NIC model to choose — so this profile carries only the
+  // size, which is the whole reason a container names a profile. It is an
+  // order of magnitude below the VM floor on purpose: the micro-VM runs one
+  // process, not an operating system. Raise it per container with
+  // `memory = …`, or drop your own `container` profile into
+  // ~/.config/vmlab/profiles to change the default for every lab.
+  cpus   = 1
+  memory = 256MiB
+}
+
 profile "custom" {
   description = "Nothing assumed — supply everything via VM/template attributes and qemu_args"
 }

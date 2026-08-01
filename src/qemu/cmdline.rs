@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use vmlab_agent_proto::PORT_NAME as AGENT_PORT_NAME;
 
-use super::firmware;
 use super::resolve::ResolvedVm;
 use crate::config::model::{GpuMode, MacAddr};
 use crate::profiles::{DiskBus, FirmwareKind};
@@ -30,6 +29,11 @@ pub struct VmPaths {
     pub floppy: Option<PathBuf>,
     /// NIC attachments in declaration order.
     pub nics: Vec<NicSpec>,
+    /// Read-only UEFI CODE image for this VM's arch and secure-boot setting
+    /// (`firmware::UefiFirmware::code`). Discovery probes the host, so the
+    /// lab daemon does it once when it assembles these paths — this builder
+    /// stays a pure function of what it is handed (ADR-0008).
+    pub firmware_code: Option<PathBuf>,
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
     /// the template in `firmware::UefiFirmware::vars_template`).
     pub ovmf_vars: Option<PathBuf>,
@@ -187,19 +191,14 @@ pub fn build_args(
 
     // UEFI firmware: CODE read-only pflash + per-VM writable VARS.
     if vm.firmware == Some(FirmwareKind::Ovmf) {
-        let fw = match qemu_arch(vm.arch.as_str()) {
-            "x86_64" => firmware::ovmf_x86_64(vm.secure_boot)?,
-            "aarch64" => firmware::uefi_aarch64()?,
-            "riscv64" => firmware::uefi_riscv64()?,
-            other => anyhow::bail!("no UEFI firmware lookup for arch {other}"),
-        };
+        let code = paths
+            .firmware_code
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OVMF requires a firmware CODE path"))?;
         arg(
             &mut a,
             "drive",
-            format!(
-                "if=pflash,format=raw,readonly=on,file={}",
-                fw.code.display()
-            ),
+            format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
         );
         let vars = paths
             .ovmf_vars
@@ -439,63 +438,26 @@ pub fn build_args(
     Ok(a)
 }
 
-/// Whether this process can put a window on screen.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::ProfileSet;
+    // The real resolver, on real declarations: an argv test that hand-built
+    // its resolved hardware would be asserting against a copy of the
+    // precedence chain rather than against the chain (ADR-0008).
+    use super::super::resolve::testing::resolved_vm as resolved;
 
-    fn resolved(profile: &str, arch: &str) -> ResolvedVm {
-        let profiles = ProfileSet::shipped().unwrap();
-        let p = profiles.get(profile).unwrap();
-        ResolvedVm {
-            name: "t".into(),
-            profile: Some(profile.into()),
-            arch: arch.into(),
-            cpus: 2,
-            memory: 2 << 30,
-            machine: if arch == "x86_64" {
-                p.machine
-                    .map(|m| m.qemu_name().to_string())
-                    .unwrap_or("q35".into())
-            } else if arch == "riscv64" {
-                "virt,acpi=off".into()
-            } else {
-                "virt".into()
-            },
-            firmware: p.firmware,
-            secure_boot: p.secure_boot.unwrap_or(false),
-            tpm: p.tpm.unwrap_or(false),
-            disk_bus: p.disk_bus.unwrap_or(crate::profiles::DiskBus::Virtio),
-            nic_model: p.nic_model.clone().unwrap_or("virtio-net-pci".into()),
-            // Mirror of resolve::display_device_name (arch-aware: virtio-vga
-            // downgrades to virtio-gpu-pci off x86).
-            display_device: p.display.clone().map(|d| {
-                let x86 = arch == "x86_64" || arch == "x86";
-                match d.as_str() {
-                    "qxl" => "qxl-vga".to_string(),
-                    "virtio-vga" if !x86 => "virtio-gpu-pci".to_string(),
-                    "virtio-vga" => "virtio-vga".to_string(),
-                    "virtio-gpu" => "virtio-gpu-pci".to_string(),
-                    "std" => "VGA".to_string(),
-                    o => o.to_string(),
-                }
-            }),
-            agent_channel: true,
-            input_transport: crate::profiles::InputTransport::Qmp,
-            virtiofs: p.virtiofs,
-            nested: false,
-            gpu: None,
-            qemu_args: vec![],
-        }
-    }
-
+    /// Runtime paths the lab daemon would hand the builder, including the
+    /// firmware it discovered on the host. Both firmware paths are always
+    /// present here; `build_args` only reads them under OVMF, and no test
+    /// depends on this build host shipping edk2.
     fn paths() -> VmPaths {
         VmPaths {
             qmp_sock: "/run/l/t/qmp.sock".into(),
             agent_sock: "/run/l/t/agent.sock".into(),
             vnc_sock: "/run/l/t/vnc.sock".into(),
             primary_disk: "/lab/.vmlab/t/disk0.qcow2".into(),
+            firmware_code: Some("/usr/share/edk2/x64/OVMF_CODE.4m.fd".into()),
+            ovmf_vars: Some("/lab/.vmlab/t/OVMF_VARS.fd".into()),
             nics: vec![NicSpec {
                 mac: "52:54:00:00:00:01".parse().unwrap(),
                 mtu: None,
@@ -518,7 +480,6 @@ mod tests {
     fn virtiofs_shares_shape() {
         let vm = resolved("linux-modern", "x86_64");
         let mut p = paths();
-        p.ovmf_vars = Some("/v".into());
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("memory-backend"), "{s}");
         assert!(!s.contains("vhost-user-fs"), "{s}");
@@ -526,8 +487,9 @@ mod tests {
         p.virtiofs_shares = vec![("mnt_src".into(), PathBuf::from("/run/l/t/vfs0.sock"))];
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(s.contains("-machine q35,memory-backend=mem0"), "{s}");
+        // 4 GiB: the linux-modern profile's memory, through the resolver.
         assert!(
-            s.contains("memory-backend-memfd,id=mem0,size=2048M,share=on"),
+            s.contains("memory-backend-memfd,id=mem0,size=4096M,share=on"),
             "{s}"
         );
         assert!(s.contains("socket,id=vfs0,path=/run/l/t/vfs0.sock"), "{s}");
@@ -540,7 +502,6 @@ mod tests {
     #[test]
     fn windows11_shape() {
         let mut p = paths();
-        p.ovmf_vars = Some("/lab/.vmlab/t/OVMF_VARS.fd".into());
         p.tpm_sock = Some("/run/l/t/tpm.sock".into());
         let vm = resolved("windows-11", "x86_64");
         let args = build_args("lab1", &vm, &p, Accel::Kvm).unwrap();
@@ -548,8 +509,16 @@ mod tests {
         assert!(s.contains("-machine q35"));
         assert!(s.contains("-accel kvm"));
         assert!(s.contains("-cpu host"));
-        assert!(s.contains("if=pflash,format=raw,readonly=on"));
-        assert!(s.contains("secboot"), "secure boot firmware expected: {s}");
+        // 4 vCPU / 8 GiB come from the windows-11 profile via the resolver.
+        assert!(s.contains("-smp 4"), "{s}");
+        assert!(s.contains("-m 8192M"), "{s}");
+        // The CODE image is whatever the daemon discovered and injected —
+        // which build the host ships is firmware.rs's business, not this
+        // builder's, so these tests pass on a host with no edk2 at all.
+        assert!(
+            s.contains("if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd"),
+            "{s}"
+        );
         assert!(s.contains("driver=cfi.pflash01,property=secure,value=on"));
         assert!(s.contains("virtio-blk-pci,drive=disk0"));
         assert!(s.contains("tpm-tis,tpmdev=tpm0"));
@@ -597,7 +566,6 @@ mod tests {
     fn tap_backend_emits_fd_netdev() {
         let vm = resolved("linux-modern", "x86_64");
         let mut p = paths();
-        p.ovmf_vars = Some("/v".into());
         p.nics[0].backend = NicBackend::Tap { child_fd: 10 };
         p.nics[0].mtu = Some(9000);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
@@ -612,7 +580,6 @@ mod tests {
         let vm = resolved("linux-modern", "x86_64");
         let mut p = paths();
         p.nics.clear();
-        p.ovmf_vars = Some("/v".into());
         let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
         assert!(s.contains("-nic none"));
         assert!(s.contains("-accel tcg"));
@@ -625,14 +592,12 @@ mod tests {
         let vm = resolved("linux-modern", "x86_64");
         assert!(vm.nic_model.starts_with("virtio-net"));
         let mut p = paths();
-        p.ovmf_vars = Some("/v".into());
         p.nics[0].mtu = Some(9000);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(s.contains("host_mtu=9000"), "{s}");
 
         // 1500 is the default — no host_mtu emitted even on virtio.
         let mut p = paths();
-        p.ovmf_vars = Some("/v".into());
         p.nics[0].mtu = Some(1500);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("host_mtu"), "{s}");
@@ -677,8 +642,7 @@ mod tests {
     #[test]
     fn always_headless_with_vnc() {
         let vm = resolved("linux-modern", "x86_64");
-        let mut p = paths();
-        p.ovmf_vars = Some("/v".into());
+        let p = paths();
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(s.contains("-display none"), "{s}");
         assert!(!s.contains("gtk"), "{s}");
@@ -693,7 +657,6 @@ mod tests {
         let mut vm = resolved("linux-modern", "aarch64");
         vm.tpm = true;
         let mut p = paths();
-        p.ovmf_vars = Some("/lab/.vmlab/t/AAVMF_VARS.fd".into());
         p.tpm_sock = Some("/run/l/t/tpm.sock".into());
         p.cdroms = vec!["/lab/.vmlab/media/cidata.iso".into()];
         let s = joined(&build_args("lab1", &vm, &p, Accel::Tcg).unwrap());
@@ -719,7 +682,6 @@ mod tests {
         let mut vm = resolved("linux-modern", "riscv64");
         vm.tpm = true;
         let mut p = paths();
-        p.ovmf_vars = Some("/lab/.vmlab/t/RISCV_VIRT_VARS.fd".into());
         p.tpm_sock = Some("/run/l/t/tpm.sock".into());
         p.cdroms = vec!["/lab/.vmlab/media/cidata.iso".into()];
         let s = joined(&build_args("lab1", &vm, &p, Accel::Tcg).unwrap());
@@ -743,7 +705,6 @@ mod tests {
     fn q35_cdroms_get_their_own_ahci_ports() {
         let vm = resolved("linux-modern", "x86_64");
         let mut p = paths();
-        p.ovmf_vars = Some("/v".into());
         p.cdroms = vec![
             "/isos/installer.iso".into(),
             "/lab/.vmlab/media/cidata.iso".into(),

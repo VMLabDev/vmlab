@@ -105,7 +105,7 @@ import {
   setMachineNicTarget,
   setSegmentNat,
   setSegmentPeer,
-  storeTemplateFor,
+  inheritedForVm,
   removeHostPortDraft,
 } from "../../editor/store";
 import { formatMemory } from "../../editor/bytesize";
@@ -3678,9 +3678,11 @@ export default function TopologyCanvas(props: {
               const h = () => machineCardHeight(vm.nics.length);
               const footerY = () => p().y + h() - 30;
               const hw = () => {
-                const tpl = storeTemplateFor(vm.template);
-                const cpus = vm.cpus ?? tpl?.cpus ?? null;
-                const mem = vm.memory ?? tpl?.memory ?? null;
+                // Inherited values come from the resolver, so the badge shows
+                // what the VM boots with rather than the template layer alone.
+                const inh = inheritedForVm(vm);
+                const cpus = vm.cpus ?? inh?.cpus ?? null;
+                const mem = vm.memory ?? inh?.memory ?? null;
                 return `${cpus ?? "?"} vCPU · ${mem != null ? formatMemory(mem) : "?"}`;
               };
               const badgeW = () => hw().length * 5.6 + 12;

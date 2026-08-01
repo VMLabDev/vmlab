@@ -4,7 +4,14 @@
 
 import { createStore, produce } from "solid-js/store";
 import * as api from "../api";
-import type { CatalogMeta, ConfigIssue, HostInfo, PlaysInfo, StoreTemplate } from "../api";
+import type {
+  CatalogMeta,
+  ConfigIssue,
+  HostInfo,
+  InheritedHardware,
+  PlaysInfo,
+  StoreTemplate,
+} from "../api";
 import { StaleRev, ValidationError } from "../api";
 import { anyVmRunning, registerNavGuard, showToast } from "../store";
 import { confirmDialog } from "../components/dialogs";
@@ -1439,17 +1446,61 @@ export const containerNames = () => editor.draft?.containers.map((c) => c.name) 
 export const machineNames = () => [...vmNames(), ...containerNames()];
 export const segmentNames = () => editor.draft?.segments.map((s) => s.name) ?? [];
 
-/** The store-catalog entry a `<arch>/<name>[@version]` ref resolves to —
- *  the source of a VM's inherited defaults (cpus/memory/profile/…). */
-export function storeTemplateFor(ref: string): StoreTemplate | undefined {
-  const m = /^([^/@]+)\/([^/@]+)(?:@(.+))?$/.exec(ref);
-  if (!m) return undefined;
-  const [, arch, name, version] = m;
-  const candidates = editor.catalog.templates.filter(
-    (t) => t.arch === arch && t.name === name,
-  );
-  return (version && candidates.find((t) => t.version === version)) || candidates[0];
+// --- inherited hardware -------------------------------------------------------
+
+/** What a machine boots with when its own block declares nothing.
+ *
+ *  The daemon answers from the one resolver (declaration > template >
+ *  profile), so an unset field displays the value the machine will actually
+ *  boot with. The designer used to consult the template alone, which showed
+ *  nothing at all for every VM taking its memory from a shipped profile
+ *  (ADR-0008). */
+export interface InheritedQuery {
+  kind: "vm" | "container";
+  template?: string;
+  profile?: string;
+  arch?: string;
 }
+
+const [inheritedCache, setInheritedCache] = createStore<Record<string, InheritedHardware>>(
+  {},
+);
+/** Queries whose request is out (or which failed) — a failure caches an
+ *  empty answer, so a broken endpoint cannot spin up a request per render. */
+const inheritedInFlight = new Set<string>();
+
+const inheritedKey = (q: InheritedQuery) =>
+  `${q.kind}|${q.template ?? ""}|${q.profile ?? ""}|${q.arch ?? ""}`;
+
+/** The inherited hardware for `q`, fetching it on first ask. `undefined`
+ *  until the answer lands; the store update re-renders the caller. */
+export function inheritedHardware(q: InheritedQuery): InheritedHardware | undefined {
+  const key = inheritedKey(q);
+  const hit = inheritedCache[key];
+  if (hit) return hit;
+  if (!inheritedInFlight.has(key)) {
+    inheritedInFlight.add(key);
+    api
+      .inheritedHardware(q)
+      .catch(() => ({ cpus: null, memory: null, profile: null }) as InheritedHardware)
+      .then((r) => setInheritedCache(key, r));
+  }
+  return undefined;
+}
+
+/** The inherited hardware behind a VM's unset hardware fields. */
+export const inheritedForVm = (vm: VmModel) =>
+  inheritedHardware({
+    kind: "vm",
+    template: vm.template || undefined,
+    profile: vm.profile ?? undefined,
+    arch: vm.arch ?? undefined,
+  });
+
+/** The inherited hardware behind a container's unset hardware fields. A
+ *  container has no template layer, so its profile is the whole answer. */
+export const inheritedForContainer = (c: ContainerModel) =>
+  inheritedHardware({ kind: "container", profile: c.profile ?? undefined });
 
 // Lab switches consult this guard: flush the debounce so edits made in the
 // last half second still land (the draft itself survives view switches — it

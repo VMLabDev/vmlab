@@ -22,7 +22,9 @@ vm "nas" {
 }
 
 container "grafana" {
-  image = "grafana/grafana:11.2.0"
+  image   = "grafana/grafana:11.2.0"
+  profile = "container"
+  memory  = 512MiB
   nic { segment = "corp" }
   web "dash" {
     port = 3000

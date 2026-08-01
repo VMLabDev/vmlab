@@ -163,6 +163,8 @@ export interface ContainerModel {
   command: string[] | null;
   workdir: string | null;
   user: string | null;
+  /** Guest profile supplying micro-VM hardware defaults. */
+  profile: string | null;
   cpus: number | null;
   /** Bytes. */
   memory: number | null;
@@ -393,6 +395,9 @@ export function emptyContainer(name: string, image: string): ContainerModel {
     command: null,
     workdir: null,
     user: null,
+    // A micro-VM has no defensible default size, so a new container starts
+    // on the shipped `container` profile rather than an invisible constant.
+    profile: "container",
     cpus: null,
     memory: null,
     depends_on: [],

@@ -84,7 +84,8 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
           }
 
           container "web" {                    // an OCI image, run as a micro-VM
-            image = "nginx:1.27"
+            image   = "nginx:1.27"
+            profile = "container"         // micro-VM hardware floor
             nic { segment = "lan" }
           }
         }

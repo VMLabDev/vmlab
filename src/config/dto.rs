@@ -339,6 +339,8 @@ pub struct ContainerDto {
     pub command: Option<Vec<String>>,
     pub workdir: Option<String>,
     pub user: Option<String>,
+    /// Guest profile supplying micro-VM hardware defaults.
+    pub profile: Option<String>,
     pub cpus: Option<u32>,
     /// Bytes.
     pub memory: Option<u64>,
@@ -366,6 +368,7 @@ impl From<&Container> for ContainerDto {
             command: c.command.clone(),
             workdir: c.workdir.clone(),
             user: c.user.clone(),
+            profile: c.profile.clone(),
             cpus: c.cpus,
             memory: c.memory,
             depends_on: c.depends_on.clone(),

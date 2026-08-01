@@ -1,8 +1,14 @@
 //! Hardware inheritance (PRD §5.2): VM block > template > profile. The
 //! profile's defaults are the floor; `scratch` VMs have no template layer
-//! (§6.5).
+//! (§6.5), and containers have no template layer either — a container is
+//! declaration > profile.
+//!
+//! This is the only implementation of that precedence, for both machine
+//! kinds, and nothing mirrors it (ADR-0008). The resolved shapes differ
+//! because the hardware surfaces differ: a container micro-VM has no
+//! firmware, TPM, display or disk bus to choose.
 
-use crate::config::model::{Firmware, Gpu, TemplateRef, Vm};
+use crate::config::model::{Container, Firmware, Gpu, TemplateRef, Vm};
 use crate::profiles::{DiskBus, FirmwareKind, InputTransport, Machine, Profile, ProfileSet};
 use crate::template::TemplateMeta;
 
@@ -39,6 +45,23 @@ pub struct ResolvedVm {
     pub nested: bool,
     pub gpu: Option<Gpu>,
     pub qemu_args: Vec<String>,
+}
+
+/// Fully resolved hardware for one container micro-VM — input to the
+/// container cmdline builder.
+///
+/// Deliberately smaller than [`ResolvedVm`]: firmware, secure boot, TPM,
+/// disk bus, NIC model, display and GPU do not apply to a micro-VM that
+/// direct-boots the guest asset, so they are absent here rather than
+/// defaulted somewhere else (ADR-0008).
+#[derive(Debug, Clone)]
+pub struct ResolvedContainer {
+    pub name: String,
+    pub arch: String,
+    pub cpus: u32,
+    /// Bytes.
+    pub memory: u64,
+    pub machine: String,
 }
 
 /// Which layer of the §5.2 precedence chain supplied a resolved value.
@@ -307,17 +330,205 @@ pub fn resolve_vm(
     })
 }
 
+/// Resolve a container's micro-VM hardware: the same precedence chain as
+/// [`resolve_vm`], minus the template layer a container does not have.
+///
+/// `cpus` and `memory` are **required** — there is no module-constant
+/// fallback, because what a micro-VM needs depends entirely on its image and
+/// a guessed default is wrong silently (the container OOMs inside the
+/// micro-VM instead of reporting a misconfiguration). Ship the value in a
+/// profile, or declare it. The error names both, and `vmlab validate`
+/// surfaces it long before a start (§5.1).
+pub fn resolve_container(
+    container: &Container,
+    arch: &str,
+    profiles: &ProfileSet,
+) -> anyhow::Result<ResolvedContainer> {
+    let profile = match &container.profile {
+        Some(name) => Some(
+            profiles
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown profile \"{name}\""))?,
+        ),
+        None => None,
+    };
+
+    // A container micro-VM direct-boots the guest asset, so the machine is
+    // fixed per arch: no profile layer, no firmware to match, and nothing
+    // for a lab author to choose between.
+    let machine = match arch {
+        "x86_64" => "q35",
+        "aarch64" => "virt",
+        "riscv64" => "virt,acpi=off",
+        other => anyhow::bail!("containers do not run on arch {other} (x86_64, aarch64, riscv64)"),
+    };
+
+    let required = |field: &str| {
+        anyhow::anyhow!(
+            "container \"{}\" has no `{field}`: declare `{field}` on the container, or give it a \
+             `profile` that sets one (e.g. profile = \"container\")",
+            container.name
+        )
+    };
+    // The same `pick` the VM chain runs, one layer short: `None` is the
+    // template layer, which a container does not have.
+    fn layered<T>(declared: Option<T>, from_profile: Option<T>) -> Option<T> {
+        pick(declared, None, from_profile).map(|(v, _)| v)
+    }
+
+    Ok(ResolvedContainer {
+        name: container.name.clone(),
+        arch: arch.to_string(),
+        cpus: layered(container.cpus, profile.and_then(|p| p.cpus))
+            .ok_or_else(|| required("cpus"))?,
+        memory: layered(container.memory, profile.and_then(|p| p.memory))
+            .ok_or_else(|| required("memory"))?,
+        machine: machine.to_string(),
+    })
+}
+
+/// The hardware a machine inherits when its own block declares nothing —
+/// what a designer form shows behind an unset field.
+///
+/// This is [`resolve_vm`] with the declaration layer emptied, not a
+/// second implementation of the chain: the designer used to resolve the
+/// template only, so every VM taking its memory from a shipped profile
+/// displayed the wrong inherited value (ADR-0008).
+pub fn inherited_vm(
+    arch: &str,
+    profile: Option<&str>,
+    template: Option<&TemplateMeta>,
+    profiles: &ProfileSet,
+) -> anyhow::Result<ResolvedVm> {
+    resolve_vm(&bare_vm(arch, profile), template, profiles)
+}
+
+/// As [`inherited_vm`], for a container's micro-VM. `Err` when no layer
+/// sizes it — the same error `vmlab validate` reports, which is also the
+/// honest answer to "what would this inherit?": nothing.
+pub fn inherited_container(
+    arch: &str,
+    profile: Option<&str>,
+    profiles: &ProfileSet,
+) -> anyhow::Result<ResolvedContainer> {
+    resolve_container(&bare_container(profile), arch, profiles)
+}
+
+/// A VM declaring nothing but its arch and profile, so resolution answers
+/// with the template and profile layers alone.
+fn bare_vm(arch: &str, profile: Option<&str>) -> Vm {
+    Vm {
+        name: String::new(),
+        span: (0, 0),
+        template: TemplateRef::Scratch,
+        template_span: (0, 0),
+        arch: Some(arch.to_string()),
+        profile: profile.map(str::to_string),
+        cpus: None,
+        memory: None,
+        disk: None,
+        cdrom: None,
+        floppy: None,
+        depends_on: Vec::new(),
+        nested: false,
+        gui: None,
+        display: None,
+        firmware: None,
+        tpm: None,
+        secure_boot: None,
+        qemu_args: Vec::new(),
+        gpu: None,
+        nics: Vec::new(),
+        extra_disks: Vec::new(),
+        shares: Vec::new(),
+        media: Vec::new(),
+        web: Vec::new(),
+        provisions: Vec::new(),
+        playbooks: Vec::new(),
+    }
+}
+
+fn bare_container(profile: Option<&str>) -> Container {
+    Container {
+        name: String::new(),
+        span: (0, 0),
+        image: crate::config::model::ImageRef {
+            reference: String::new(),
+        },
+        image_span: (0, 0),
+        mode: Default::default(),
+        entrypoint: None,
+        command: None,
+        workdir: None,
+        user: None,
+        profile: profile.map(str::to_string),
+        cpus: None,
+        memory: None,
+        depends_on: Vec::new(),
+        restart: Default::default(),
+        nics: Vec::new(),
+        env: Vec::new(),
+        volumes: Vec::new(),
+        ports: Vec::new(),
+        healthcheck: None,
+        web: Vec::new(),
+        provisions: Vec::new(),
+        playbooks: Vec::new(),
+    }
+}
+
+/// The only supported way for a test to obtain a resolved machine: parse a
+/// real declaration and run it through the real precedence chain. Argv tests
+/// live in another module and use these rather than hand-building a resolved
+/// shape — a hand-built fixture is a mirror of this file, and a mirror
+/// drifts silently (ADR-0008). `resolution_is_never_mirrored` enforces it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
     use crate::config::load_lab_source;
     use std::path::Path;
 
-    fn vm(src: &str) -> Vm {
+    /// The machines declared in a lab-body fragment.
+    pub fn lab(src: &str) -> crate::config::model::Lab {
         let full = format!("import <vmlab.wcl>\nlab \"t\" {{\n{src}\n}}\n");
-        let lf = load_lab_source(&full, "<test>", Path::new("/tmp")).unwrap();
-        lf.lab.vms.into_iter().next().unwrap()
+        load_lab_source(&full, "<test>", Path::new("/tmp"))
+            .unwrap()
+            .lab
     }
+
+    pub fn vm(src: &str) -> Vm {
+        lab(src).vms.into_iter().next().unwrap()
+    }
+
+    pub fn container(src: &str) -> Container {
+        lab(src).containers.into_iter().next().unwrap()
+    }
+
+    /// A scratch VM on one shipped profile and arch, resolved — the shape
+    /// most argv tests want, with every hardware value coming from the real
+    /// chain rather than from the test.
+    pub fn resolved_vm(profile: &str, arch: &str) -> ResolvedVm {
+        let profiles = ProfileSet::shipped().unwrap();
+        let v = vm(&format!(
+            "vm \"t\" {{ template = \"scratch\" arch = \"{arch}\" profile = \"{profile}\" disk = 10GiB }}"
+        ));
+        resolve_vm(&v, None, &profiles).unwrap()
+    }
+
+    /// A container declaration resolved on `arch` against the shipped
+    /// profiles — `src` is the full `container "…" { … }` block, so a test
+    /// says what it declares and the chain decides the rest.
+    pub fn resolved_container(src: &str, arch: &str) -> ResolvedContainer {
+        let profiles = ProfileSet::shipped().unwrap();
+        resolve_container(&container(src), arch, &profiles).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::vm;
+    use super::*;
+    use std::path::Path;
 
     fn meta() -> TemplateMeta {
         TemplateMeta {
@@ -470,5 +681,171 @@ mod tests {
         let r = resolve_vm(&v, None, &profiles).unwrap();
         assert_eq!(r.firmware, Some(FirmwareKind::Seabios));
         assert!(!r.secure_boot);
+    }
+
+    // -- the inherited view ----------------------------------------------
+    // What a machine boots with when its own block declares nothing.
+
+    /// The inherited view is the same chain with the declaration emptied —
+    /// so a VM whose memory comes from its profile inherits the profile's
+    /// value, which is exactly what the designer used to get wrong (it
+    /// resolved the template layer only, and showed nothing at all for
+    /// every VM using a shipped profile).
+    #[test]
+    fn inherited_vm_falls_through_to_the_profile() {
+        let profiles = ProfileSet::shipped().unwrap();
+
+        // No template layer: the profile is the whole answer.
+        let r = inherited_vm("x86_64", Some("windows-11"), None, &profiles).unwrap();
+        assert_eq!(r.cpus, 4);
+        assert_eq!(r.memory, 8 << 30);
+        assert!(r.tpm);
+        assert_eq!(r.display_device.as_deref(), Some("virtio-vga"));
+
+        // With a template layer, the template wins where it speaks and the
+        // profile still supplies the rest.
+        let mut m = meta();
+        m.cpus = None;
+        let r = inherited_vm("x86_64", Some("windows-11"), Some(&m), &profiles).unwrap();
+        assert_eq!(r.memory, 16 << 30, "template memory wins");
+        assert_eq!(r.cpus, 4, "profile cpus fill the gap");
+    }
+
+    /// Arch-aware display selection reaches the inherited view too — the
+    /// designer shows the device the machine will actually boot with.
+    #[test]
+    fn inherited_vm_display_is_arch_aware() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let r = inherited_vm("aarch64", Some("linux-modern"), None, &profiles).unwrap();
+        assert_eq!(r.display_device.as_deref(), Some("virtio-gpu-pci"));
+    }
+
+    #[test]
+    fn inherited_container_needs_a_profile_that_sizes_it() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let r = inherited_container("x86_64", Some("container"), &profiles).unwrap();
+        assert_eq!(r.cpus, 1);
+        assert_eq!(r.memory, 256 << 20);
+        // Nothing to inherit without one: the designer shows no fallback
+        // rather than a default the container does not have.
+        assert!(inherited_container("x86_64", None, &profiles).is_err());
+    }
+
+    // -- containers ------------------------------------------------------
+    // Same chain, minus the template layer a container does not have.
+
+    fn container(src: &str) -> Container {
+        super::testing::container(src)
+    }
+
+    #[test]
+    fn container_precedence_declaration_over_profile() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let c = container(
+            "container \"web\" { image = \"nginx\" profile = \"container\" memory = 1GiB }",
+        );
+        let r = resolve_container(&c, "x86_64", &profiles).unwrap();
+        // memory: the declaration wins; cpus: the profile floor.
+        assert_eq!(r.memory, 1 << 30);
+        assert_eq!(r.cpus, 1);
+        assert_eq!(r.machine, "q35");
+    }
+
+    /// The shipped `container` profile is where the micro-VM defaults live —
+    /// an order of magnitude below the VM floor, on purpose and adjustable.
+    #[test]
+    fn shipped_container_profile_supplies_the_micro_vm_size() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let c = container("container \"web\" { image = \"nginx\" profile = \"container\" }");
+        let r = resolve_container(&c, "x86_64", &profiles).unwrap();
+        assert_eq!(r.cpus, 1);
+        assert_eq!(r.memory, 256 << 20);
+    }
+
+    /// No layer supplies the value and there is no constant to fall back on:
+    /// the error names both places it can come from.
+    #[test]
+    fn container_without_any_size_layer_is_an_error() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let c = container("container \"web\" { image = \"nginx\" cpus = 1 }");
+        let err = resolve_container(&c, "x86_64", &profiles).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no `memory`"), "{msg}");
+        assert!(msg.contains("`profile`"), "{msg}");
+        assert!(msg.contains("\"web\""), "{msg}");
+
+        let c = container("container \"web\" { image = \"nginx\" memory = 512MiB }");
+        let err = resolve_container(&c, "x86_64", &profiles).unwrap_err();
+        assert!(err.to_string().contains("no `cpus`"), "{err}");
+    }
+
+    #[test]
+    fn container_unknown_profile_is_an_error() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let c = container("container \"web\" { image = \"nginx\" profile = \"nope\" }");
+        let err = resolve_container(&c, "x86_64", &profiles).unwrap_err();
+        assert!(err.to_string().contains("unknown profile"), "{err}");
+    }
+
+    #[test]
+    fn container_machine_is_arch_derived() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let c = container("container \"web\" { image = \"nginx\" profile = \"container\" }");
+        for (arch, machine) in [
+            ("x86_64", "q35"),
+            ("aarch64", "virt"),
+            ("riscv64", "virt,acpi=off"),
+        ] {
+            let r = resolve_container(&c, arch, &profiles).unwrap();
+            assert_eq!(r.machine, machine, "{arch}");
+        }
+        let err = resolve_container(&c, "s390x", &profiles).unwrap_err();
+        assert!(err.to_string().contains("s390x"), "{err}");
+    }
+
+    /// Nothing outside this file may build a resolved machine by hand.
+    ///
+    /// The argv tests used to construct a `ResolvedVm` literal from a
+    /// profile, display-device selection and all — so thirteen of them
+    /// asserted against a copy of this module rather than against it, and a
+    /// change here could not fail them. A comment saying "mirror of" did not
+    /// stop that; this test does (ADR-0008). Resolved shapes come from
+    /// [`resolve_vm`]/[`resolve_container`], or from `testing` above.
+    #[test]
+    fn resolution_is_never_mirrored() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_file = src.join("qemu").join("resolve.rs");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path == this_file {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (i, line) in text.lines().enumerate() {
+                    // A struct literal, not a type mention: the name followed
+                    // by a field list opening on the same line. Spaces are
+                    // squeezed out first so `ResolvedVm{` cannot slip past.
+                    let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                    for ty in ["ResolvedVm{", "ResolvedContainer{"] {
+                        if squeezed.contains(ty) {
+                            offenders.push(format!("{}:{}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "resolved machines must come from the resolver, not be built by hand — \
+             see qemu::resolve::testing. Offending lines:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 }

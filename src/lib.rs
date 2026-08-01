@@ -33,6 +33,12 @@ pub mod profiles;
 pub mod proto;
 mod qemu;
 pub use qemu::kvm_available;
+/// The hardware-resolution surface `vmlab-web` needs: the designer shows the
+/// values a machine inherits, and takes them from the resolver rather than
+/// approximating the chain (ADR-0008).
+pub mod hardware {
+    pub use crate::qemu::{inherited_container, inherited_vm};
+}
 mod qmp;
 mod scripting;
 mod smb;
