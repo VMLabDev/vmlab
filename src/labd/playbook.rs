@@ -74,9 +74,13 @@ pub fn weave_binary(dir: &Path, os: GuestOs, arch: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Guest OS family from the resolved profile name — the same heuristic the
-/// SMB layer uses. Containers are always Linux; VM answers are confirmed
-/// against the agent handshake (`AgentInfo.os`) once connected.
+/// Guest OS family from the resolved profile name, for selecting the
+/// config-weave binary — where XP-versus-modern Windows is irrelevant, so
+/// `windows-legacy` answers `Windows` here. Deliberately not the same
+/// question as [`crate::smb::guest_os_hint`], which selects a share mount
+/// command and for which the distinction matters a great deal. Containers are
+/// always Linux; VM answers are confirmed against the agent handshake
+/// (`AgentInfo.os`) once connected.
 pub fn guest_os_of(profile: Option<&str>) -> GuestOs {
     match profile {
         Some(p) if p.starts_with("windows") => GuestOs::Windows,

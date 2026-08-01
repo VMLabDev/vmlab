@@ -13,6 +13,7 @@ use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, VmPaths};
 use crate::qmp::QmpClient;
+use crate::smb::VirtiofsMount;
 
 use super::hypervisor::{Control, Hypervisor, Process};
 
@@ -121,15 +122,6 @@ pub struct TemplateParts {
     pub agent_version: Option<String>,
 }
 
-/// One share the guest mounts natively over virtiofs this run (§7.5) —
-/// the guest agent runs `mount -t virtiofs <tag> <guest>` once ready.
-#[derive(Debug, Clone)]
-pub struct VirtiofsMount {
-    pub tag: String,
-    pub guest: String,
-    pub readonly: bool,
-}
-
 pub struct VmInstance {
     pub lab: String,
     pub cfg: model::Vm,
@@ -222,13 +214,16 @@ impl VmInstance {
         Arc::get_mut(self).expect("sole owner").hv = hv;
     }
 
-    /// Indices into `cfg.shares` that ride virtiofs (§7.5): explicit
-    /// `transport = "virtiofs"` always (a missing host virtiofsd errors at
-    /// start rather than silently degrading), `auto` when the host has a
-    /// virtiofsd AND the resolved profile says the guest mounts it natively.
-    /// `ensure_smb` uses the complement, so a share is served by exactly one
-    /// transport.
+    /// Indices into `cfg.shares` that ride virtiofs (§7.5).
+    ///
+    /// Both halves of the decision are shared with the share plan: the rule
+    /// is [`crate::labd::share_plan::transport_of`], and the host fact comes
+    /// from this machine's hypervisor, which is what the plan asks too. So
+    /// the plan's complement really is what `smbd` exports, and a share is
+    /// served by exactly one transport — under a substituted host as much as
+    /// a real one.
     pub fn virtiofs_share_indices(&self) -> Vec<usize> {
+        use crate::labd::share_plan::{Transport, transport_of};
         let host_has = self.hv.virtiofsd_available();
         let guest_ok = self.template().resolved.virtiofs;
         self.cfg
@@ -236,12 +231,7 @@ impl VmInstance {
             .iter()
             .enumerate()
             .filter_map(|(i, s)| {
-                let vfs = match s.transport {
-                    crate::config::model::ShareTransport::Smb => false,
-                    crate::config::model::ShareTransport::Virtiofs => true,
-                    crate::config::model::ShareTransport::Auto => host_has && guest_ok,
-                };
-                vfs.then_some(i)
+                (transport_of(s.transport, host_has, guest_ok) == Transport::Virtiofs).then_some(i)
             })
             .collect()
     }
@@ -946,6 +936,10 @@ impl VmInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for VmInstance {
+    fn virtiofsd_available(&self) -> bool {
+        self.hv.virtiofsd_available()
+    }
+
     fn name(&self) -> &str {
         &self.cfg.name
     }

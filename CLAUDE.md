@@ -52,8 +52,13 @@ PRD implemented (M1–M6). Module map under `src/`:
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;
   `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18).
+  Decisions the runtime used to make mid-flight are values computed before
+  execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
+  transports, gateway rules, the smbd port), `forward_plan.rs` (every port
+  forward), `pull_ledger.rs` (deferred download lifecycle).
 - `scripting/` — wscript host module (lab/VM/segment API), provisions, handlers.
-- `smb/` — bundled-smbd shared folders.
+- `smb/` — bundled-smbd shared folders; `steps.rs` owns the guest-side mount
+  plan (virtiofs + SMB, per guest OS) the lab runtime only executes.
 - `oci/` — OCI registry push/pull (chunked, multi-arch).
 - `cli/` — the `vmlab` verb surface.
 - `web/` — the `vmlab-web` binary (Actix-web): REST + WebSocket API over the

@@ -506,22 +506,15 @@ fn segment_service_ip(
         })
 }
 
-/// Segment a NIC attaches to: its declared segment, or the built-in NAT
-/// segment for `nat = true`.
 /// All machine NICs in the lab, `(name, nics)` per machine — VMs and
 /// containers attach to segments identically, so network assembly treats
 /// them uniformly.
 fn machine_nics(lab: &Lab) -> impl Iterator<Item = (&str, &[crate::config::model::Nic])> {
-    lab.vms
-        .iter()
-        .map(|v| (v.name.as_str(), v.nics.as_slice()))
-        .chain(
-            lab.containers
-                .iter()
-                .map(|c| (c.name.as_str(), c.nics.as_slice())),
-        )
+    lab.machines().map(|m| (m.name(), m.nics()))
 }
 
+/// Segment a NIC attaches to: its declared segment, or the built-in NAT
+/// segment for `nat = true`.
 pub fn nic_segment_name(nic: &crate::config::model::Nic) -> &str {
     if nic.nat {
         NAT_SEGMENT

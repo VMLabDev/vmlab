@@ -605,8 +605,17 @@ impl ContainerInstance {
     /// return the (tag, socket) list for the argv builder. With no
     /// virtiofsd on the host the volumes fall back to CIFS — empty list,
     /// `virtiofs_active` false — and the lab's smbd serves them as before.
+    ///
+    /// The choice itself is
+    /// [`share_plan::container_volume_transport`](crate::labd::share_plan::container_volume_transport)
+    /// over this machine's hypervisor, which is the rule and the host fact
+    /// the share plan reads too — so what this attaches and what the plan
+    /// says it attaches cannot disagree.
     async fn start_virtiofsds(&self) -> Result<Vec<(String, PathBuf)>> {
-        if self.volumes.is_empty() || !self.hv.virtiofsd_available() {
+        use crate::labd::share_plan::{Transport, container_volume_transport};
+        let on_virtiofs =
+            container_volume_transport(self.hv.virtiofsd_available()) == Transport::Virtiofs;
+        if self.volumes.is_empty() || !on_virtiofs {
             if !self.volumes.is_empty() {
                 tracing::warn!(
                     "{}: no virtiofsd on this host — volumes fall back to CIFS",
@@ -1290,6 +1299,10 @@ impl ContainerInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for ContainerInstance {
+    fn virtiofsd_available(&self) -> bool {
+        self.hv.virtiofsd_available()
+    }
+
     fn name(&self) -> &str {
         &self.cfg.name
     }
