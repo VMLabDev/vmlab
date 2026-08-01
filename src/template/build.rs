@@ -170,6 +170,12 @@ async fn run_build(
     let disk_size = def.disk.unwrap_or(20 << 30);
     let build_vm = "build";
 
+    // The template's own hardware decides how the build VM boots, so resolve
+    // it before the first expensive step: the resolver refuses combinations
+    // that cannot work (secure boot without UEFI, §5.2), and downloading a
+    // multi-gigabyte ISO first only to refuse at boot helps nobody.
+    check_build_hardware(def, build_vm, root, profiles)?;
+
     // Resolve the source into the working primary disk. A layered source's
     // embedded first-boot provision must gate the build boot exactly as it
     // gates a clone (PRD §6.1): a sysprep-generalized Windows source replays
@@ -225,7 +231,7 @@ async fn run_build(
     };
 
     // Synthesize a one-VM scratch lab for the build.
-    let lab_name = format!("build-{}", def.name);
+    let lab_name = build_lab_name(def);
     let lab_wcl = synth_lab(
         def,
         &lab_name,
@@ -564,10 +570,7 @@ async fn run_build(
         cpus: def.cpus,
         memory: def.memory,
         disk: Some(info.virtual_size),
-        firmware: def.firmware.map(|f| match f {
-            crate::config::model::Firmware::Ovmf => "ovmf".into(),
-            crate::config::model::Firmware::Seabios => "seabios".into(),
-        }),
+        firmware: def.firmware.map(|f| f.as_str().to_string()),
         tpm: def.tpm,
         secure_boot: def.secure_boot,
         display: def.display.clone(),
@@ -632,6 +635,44 @@ async fn resolve_artefact(src: &ArtefactSource, root: &Path, log: &OutputSink) -
     };
     let src = rebased.as_ref().unwrap_or(src);
     super::artefact::resolve(src, move |m| log(format!("{m}\n"))).await
+}
+
+/// The synthetic lab a build runs in, named after the template it builds.
+fn build_lab_name(def: &TemplateDef) -> String {
+    format!("build-{}", def.name)
+}
+
+/// Resolve the hardware the build VM will boot on, and fail if it cannot.
+///
+/// It resolves the rendered build lab rather than the `TemplateDef` directly,
+/// so what is checked is exactly what boots: same synthetic VM, same §5.2
+/// chain (no template layer — the build VM is `scratch`), same refusals.
+fn check_build_hardware(
+    def: &TemplateDef,
+    build_vm: &str,
+    root: &Path,
+    profiles: &crate::profiles::ProfileSet,
+) -> Result<()> {
+    // Hardware-only probe: the verification variant carries no media and no
+    // steps, neither of which can change how the VM is built. Its own source
+    // label, so an issue reported against the render names the render that
+    // produced it.
+    let lab_name = build_lab_name(def);
+    let wcl = synth_lab(def, &lab_name, build_vm, None, root, None, false)?;
+    let labfile = crate::config::load_lab_source(&wcl, "<preflight>", root)
+        .map_err(|e| anyhow::anyhow!("internal build lab invalid: {e:?}"))?;
+    let vm = labfile
+        .lab
+        .vms
+        .first()
+        .context("internal build lab has no VM")?;
+    crate::qemu::resolve::resolve_vm(vm, None, profiles).with_context(|| {
+        format!(
+            "template \"{}/{}\" cannot build: the hardware it declares does not resolve",
+            def.arch, def.name
+        )
+    })?;
+    Ok(())
 }
 
 fn source_origin(source: &TemplateSource) -> Option<String> {
@@ -701,6 +742,31 @@ fn synth_lab(
     }
     if def.gui {
         writeln!(s, "    gui      = true").unwrap();
+    }
+    // §5.2 hardware declared on the template block is hardware for the build
+    // VM (PRD §6.1: "boot per template hardware"), so it has to be rendered
+    // here — the four that also reach the metadata are the inheritance layer
+    // for VMs cloning the template, which is a different job. The build VM is
+    // `scratch`, so it has no template layer of its own (§6.5): these land on
+    // the vm block, with the profile as the floor beneath them.
+    if let Some(d) = &def.display {
+        writeln!(s, "    display  = {}", wcl_str(d)).unwrap();
+    }
+    if let Some(f) = def.firmware {
+        writeln!(s, "    firmware = {}", wcl_str(f.as_str())).unwrap();
+    }
+    if let Some(tpm) = def.tpm {
+        writeln!(s, "    tpm      = {tpm}").unwrap();
+    }
+    if let Some(sb) = def.secure_boot {
+        writeln!(s, "    secure_boot = {sb}").unwrap();
+    }
+    if def.nested {
+        writeln!(s, "    nested   = true").unwrap();
+    }
+    if !def.qemu_args.is_empty() {
+        let args: Vec<String> = def.qemu_args.iter().map(wcl_str).collect();
+        writeln!(s, "    qemu_args = [{}]", args.join(", ")).unwrap();
     }
     // Template-declared NICs carry over. The synthetic lab declares no
     // segments, so only NAT NICs make sense here — segment references are
@@ -962,6 +1028,177 @@ mod tests {
         assert!(verify.contains("nic { nat = true }"), "{verify}");
         crate::config::load_lab_source(&verify, "<verify>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("verification lab must parse: {e:?}\n{verify}"));
+    }
+
+    /// Every §5.2 hardware attribute a `template {}` block declares is a
+    /// setting *for the build VM* (schema doc strings, PRD §6.1 "boot per
+    /// template hardware"). They used to be written to the template metadata
+    /// only — `nested`/`qemu_args` nowhere at all — so the build booted the
+    /// profile's hardware whatever the block said.
+    #[test]
+    fn declared_hardware_reaches_the_build_vm() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  profile     = \"linux-modern\"\n",
+            "  display     = \"std\"\n",
+            "  firmware    = \"seabios\"\n",
+            "  tpm         = false\n",
+            "  secure_boot = false\n",
+            "  nested      = true\n",
+            "  qemu_args   = [\"-device\", \"weird-thing\"]\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        let build = &lf.lab.vms[0];
+        assert_eq!(build.display.as_deref(), Some("std"));
+        assert_eq!(
+            build.firmware,
+            Some(crate::config::model::Firmware::Seabios)
+        );
+        assert_eq!(build.tpm, Some(false));
+        assert_eq!(build.secure_boot, Some(false));
+        assert!(build.nested);
+        assert_eq!(build.qemu_args, ["-device", "weird-thing"]);
+    }
+
+    /// …and the resolved hardware really is the template's, not the profile
+    /// floor underneath it: `linux-modern` is OVMF, the block said SeaBIOS.
+    #[test]
+    fn declared_hardware_wins_over_the_profile_floor() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  profile  = \"linux-modern\"\n",
+            "  firmware = \"seabios\"\n",
+            "  display  = \"std\"\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root")).unwrap();
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        // No template layer: the build VM is `scratch` (§6.5).
+        let resolved = crate::qemu::resolve::resolve_vm(&lf.lab.vms[0], None, &profiles).unwrap();
+        assert_eq!(
+            resolved.firmware,
+            Some(crate::profiles::FirmwareKind::Seabios)
+        );
+        assert_eq!(resolved.display_device.as_deref(), Some("VGA"));
+    }
+
+    /// Now that both values are live for the build, the pair that cannot work
+    /// together is refused up front instead of booting a VM whose secure boot
+    /// is dropped on the floor (§5.2, the #14/#19 shape on the build path).
+    #[test]
+    fn secure_boot_on_a_seabios_template_refuses_the_build() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  firmware    = \"seabios\"\n",
+            "  secure_boot = true\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let err = super::check_build_hardware(&d, "build", Path::new("/root"), &profiles)
+            .expect_err("secure boot under SeaBIOS must refuse the build");
+        let report = format!("{err:#}");
+        assert!(report.contains("x86_64/t"), "{report}");
+        assert!(report.contains("secure boot needs UEFI"), "{report}");
+    }
+
+    /// The happy path resolves — the pre-flight must not refuse an ordinary
+    /// build (it runs before every one of them).
+    #[test]
+    fn ordinary_hardware_passes_the_pre_flight() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  profile  = \"linux-modern\"\n",
+            "  firmware = \"seabios\"\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        super::check_build_hardware(&d, "build", Path::new("/root"), &profiles).unwrap();
+    }
+
+    /// The verification boot re-renders the same VM with no media and no
+    /// steps — it still has to boot the hardware the build was sealed on.
+    #[test]
+    fn declared_hardware_reaches_the_verification_boot() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  firmware  = \"ovmf\"\n",
+            "  nested    = true\n",
+            "  qemu_args = [\"-smbios\", \"type=1\"]\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(
+            &d,
+            "build-t",
+            "build",
+            None,
+            Path::new("/root"),
+            None,
+            false,
+        )
+        .unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<verify>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("verification lab must parse: {e:?}\n{wcl}"));
+        let build = &lf.lab.vms[0];
+        assert_eq!(build.firmware, Some(crate::config::model::Firmware::Ovmf));
+        assert!(build.nested);
+        assert_eq!(build.qemu_args, ["-smbios", "type=1"]);
+    }
+
+    /// A `qemu_args` entry with a quote or backslash has to survive the round
+    /// trip through the rendered lab file (the same hazard `wcl_str` exists
+    /// for on labels and paths).
+    #[test]
+    fn qemu_args_are_escaped() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  qemu_args = [\"-fw_cfg\", \"name=opt/x,string=say \\\"hi\\\"\"]\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        assert_eq!(
+            lf.lab.vms[0].qemu_args,
+            ["-fw_cfg", "name=opt/x,string=say \"hi\""]
+        );
+    }
+
+    /// A template that declares no hardware renders no hardware: the build
+    /// VM falls through to the profile floor (§5.2), as before.
+    #[test]
+    fn undeclared_hardware_is_not_rendered() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        let build = &lf.lab.vms[0];
+        assert!(build.display.is_none(), "{wcl}");
+        assert!(build.firmware.is_none(), "{wcl}");
+        assert!(build.tpm.is_none(), "{wcl}");
+        assert!(build.secure_boot.is_none(), "{wcl}");
+        assert!(!build.nested, "{wcl}");
+        assert!(build.qemu_args.is_empty(), "{wcl}");
     }
 
     /// `first_boot` parses to the script path; it is build-time-only, so the
