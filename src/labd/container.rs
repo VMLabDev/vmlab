@@ -21,12 +21,13 @@ use vmlab_cinit_proto::{
 };
 
 use super::container_ctl::CtlHandle;
+use super::hypervisor::{Control, Hypervisor, Process};
 use super::vm::{PowerState, StopReason};
 use crate::config::model::{self, MacAddr, RestartPolicy, VolumeSource};
 use crate::oci::image::model::{ImageConfig, ImageHealthcheck};
 use crate::oci::image::pull::PulledImage;
 use crate::qemu::container::ContainerVmPaths;
-use crate::qemu::{self, Proc, ResolvedContainer};
+use crate::qemu::{self, ResolvedContainer};
 use crate::qmp::QmpClient;
 
 /// Scratch (overlay upper layer) qcow2 virtual size. Sparse — real usage is
@@ -348,7 +349,7 @@ pub struct ContainerInstance {
     /// The per-volume virtiofsd daemons of the current run (empty when the
     /// volumes ride CIFS). Killed on teardown; respawned by every start
     /// attempt.
-    virtiofsd: Mutex<Vec<Arc<Proc>>>,
+    virtiofsd: Mutex<Vec<Arc<dyn Process>>>,
     /// This run's volumes are vhost-user-fs devices (virtiofsd found and
     /// spawned) rather than CIFS mounts. Decided per start attempt;
     /// `spec_for_guest` tags the volumes accordingly.
@@ -372,15 +373,18 @@ pub struct ContainerInstance {
     consecutive_failures: AtomicU32,
     /// Exit code from the ctl `exited` event of the last run.
     last_exit: RwLock<Option<i32>>,
-    qemu: Mutex<Option<Arc<Proc>>>,
-    qmp: Mutex<Option<QmpClient>>,
+    qemu: Mutex<Option<Arc<dyn Process>>>,
+    /// The running micro-VM's control channel (see [`Control`]); `None` while
+    /// stopped.
+    control: Mutex<Option<Arc<dyn Control>>>,
     ctl: Mutex<Option<CtlHandle>>,
     /// Lazy vmlab-agent connection (terminals/exec/files — same channel as
     /// full VMs; the agent is spawned by cinit inside the micro-VM).
     agent: super::machine::AgentSlot,
     /// How this micro-VM reaches the host to actually run — see
-    /// [`super::hypervisor`].
-    hv: Arc<dyn super::hypervisor::Hypervisor>,
+    /// [`super::hypervisor`]. Real QEMU in production; a fake in tests, which
+    /// is what makes the restart ladder and the readiness gate testable.
+    hv: Arc<dyn Hypervisor>,
 }
 
 impl ContainerInstance {
@@ -420,11 +424,21 @@ impl ContainerInstance {
             consecutive_failures: AtomicU32::new(0),
             last_exit: RwLock::new(None),
             qemu: Mutex::new(None),
-            qmp: Mutex::new(None),
+            control: Mutex::new(None),
             ctl: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
         })
+    }
+
+    /// Run this container against a different hypervisor. Tests use it to
+    /// drive the start ladder, the readiness gate and the restart policy
+    /// without KVM — the same injection point [`super::vm::VmInstance`] has,
+    /// because the seam covers both machine kinds or it covers neither
+    /// (ADR-0001).
+    #[cfg(test)]
+    pub(crate) fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn Hypervisor>) {
+        Arc::get_mut(self).expect("sole owner").hv = hv;
     }
 
     /// The pulled image + merged spec, or an error while the deferred pull
@@ -485,11 +499,17 @@ impl ContainerInstance {
         self.restarts.load(Ordering::SeqCst)
     }
 
+    /// The live QMP client, for the operations that genuinely need a
+    /// hypervisor — the scratch-disk snapshots. Absent both when the
+    /// container is stopped and when it is running under an in-memory
+    /// adapter, which is why those stay verified against a running lab
+    /// (ADR-0001).
     pub async fn qmp(&self) -> Result<QmpClient> {
-        self.qmp
+        self.control
             .lock()
             .await
-            .clone()
+            .as_ref()
+            .and_then(|c| c.qmp())
             .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
     }
 
@@ -586,7 +606,7 @@ impl ContainerInstance {
     /// virtiofsd on the host the volumes fall back to CIFS — empty list,
     /// `virtiofs_active` false — and the lab's smbd serves them as before.
     async fn start_virtiofsds(&self) -> Result<Vec<(String, PathBuf)>> {
-        if self.volumes.is_empty() || !crate::qemu::virtiofsd::available() {
+        if self.volumes.is_empty() || !self.hv.virtiofsd_available() {
             if !self.volumes.is_empty() {
                 tracing::warn!(
                     "{}: no virtiofsd on this host — volumes fall back to CIFS",
@@ -701,7 +721,7 @@ impl ContainerInstance {
             // vhost-user chardevs connect at startup).
             let vfs_devices = self.start_virtiofsds().await?;
 
-            let asset = crate::guest_asset::ensure_guest_asset(&self.resolved.arch)?;
+            let asset = self.hv.guest_asset(&self.resolved.arch)?;
             let accel = qemu::pick_accel(&self.resolved.arch);
             if accel == qemu::Accel::Tcg {
                 tracing::warn!(
@@ -715,9 +735,9 @@ impl ContainerInstance {
                 &self.resolved,
                 &self.build_paths(&asset, &parts, vfs_devices),
             )?;
-            // QMP comes up shortly after spawn (-S leaves CPUs paused); the
-            // hypervisor returns once it answers.
-            let super::hypervisor::Running { proc, qmp } = self
+            // The machine answers control shortly after spawn (-S leaves
+            // CPUs paused); the hypervisor returns once it does.
+            let super::hypervisor::Running { proc, control } = self
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
@@ -726,11 +746,15 @@ impl ContainerInstance {
                     log: self.dirs.logs.join("qemu.log"),
                     qmp_sock: self.dirs.qmp_sock(),
                     fds: Vec::new(),
+                    channels: super::hypervisor::GuestChannels {
+                        agent: self.dirs.agent_sock(),
+                        ctl: Some(self.dirs.ctl_sock()),
+                    },
                 })
                 .await?;
             *self.qemu.lock().await = Some(proc.clone());
-            qmp.cont().await?;
-            *self.qmp.lock().await = Some(qmp);
+            control.resume().await?;
+            *self.control.lock().await = Some(control);
 
             // QEMU creates the ctl socket at startup; retry briefly in
             // case we won the race.
@@ -878,7 +902,7 @@ impl ContainerInstance {
     /// on every exit; `will_restart` is true when a respawn follows.
     fn spawn_exit_monitor(
         self: &Arc<Self>,
-        proc: Arc<Proc>,
+        proc: Arc<dyn Process>,
         cbs: Arc<Callbacks>,
         started_at: tokio::time::Instant,
     ) {
@@ -948,7 +972,7 @@ impl ContainerInstance {
 
     async fn teardown(&self) {
         *self.ctl.lock().await = None;
-        *self.qmp.lock().await = None;
+        *self.control.lock().await = None;
         self.agent.drop().await;
         if let Some(proc) = self.qemu.lock().await.take()
             && proc.is_running()
@@ -1037,10 +1061,10 @@ impl ContainerInstance {
             }
         }
 
-        // Rung 3: QMP quit, then the hard kill.
+        // Rung 3: ask the emulator itself to go, then the hard kill.
         tracing::warn!("{}: graceful stop timed out, killing", self.cfg.name);
-        if let Ok(qmp) = self.qmp().await {
-            let _ = qmp.quit().await;
+        if let Some(control) = self.control.lock().await.clone() {
+            let _ = control.quit().await;
         }
         proc.kill().await;
         let _ = proc.wait_exit(Duration::from_secs(10)).await;
@@ -1392,7 +1416,7 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
     Ok(())
 }
 
-async fn connect_ctl_retry(sock: &Path, proc: &Arc<Proc>) -> Result<CtlHandle> {
+async fn connect_ctl_retry(sock: &Path, proc: &Arc<dyn Process>) -> Result<CtlHandle> {
     for _ in 0..100 {
         if !proc.is_running() {
             bail!(

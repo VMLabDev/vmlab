@@ -8,6 +8,8 @@ pub mod container_ctl;
 pub mod events;
 pub mod hypervisor;
 pub mod lab;
+#[cfg(test)]
+mod lifecycle_tests;
 pub mod machine;
 pub mod netservices;
 pub mod network;

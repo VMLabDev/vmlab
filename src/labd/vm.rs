@@ -11,8 +11,10 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
-use crate::qemu::{self, Proc, VmPaths};
+use crate::qemu::{self, VmPaths};
 use crate::qmp::QmpClient;
+
+use super::hypervisor::{Control, Hypervisor, Process};
 
 /// What to tell a user whose guest has no answering vmlab-agent.
 const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the template likely predates \
@@ -160,21 +162,23 @@ pub struct VmInstance {
     /// provision (if any) has completed. Gates dependents and provisions.
     ready: RwLock<bool>,
     stop_requested: RwLock<bool>,
-    qemu: Mutex<Option<Arc<Proc>>>,
-    swtpm: Mutex<Option<Arc<Proc>>>,
+    qemu: Mutex<Option<Arc<dyn Process>>>,
+    swtpm: Mutex<Option<Arc<dyn Process>>>,
     /// Per-share virtiofsd daemons of the current run (§7.5). Killed on
     /// teardown; respawned by every start.
-    virtiofsd: Mutex<Vec<Arc<Proc>>>,
+    virtiofsd: Mutex<Vec<Arc<dyn Process>>>,
     /// The shares this run attached over virtiofs, for the ready-time mount
     /// (see `LabRuntime::mount_shares`).
     virtiofs_mounts: Mutex<Vec<VirtiofsMount>>,
-    qmp: Mutex<Option<QmpClient>>,
+    /// The running machine's control channel (see [`Control`]); `None` while
+    /// stopped.
+    control: Mutex<Option<Arc<dyn Control>>>,
     /// Lazy vmlab-agent connection (terminals/exec/files — §"agent channel").
     agent: super::machine::AgentSlot,
     /// How this machine reaches the host to actually run (see
     /// [`super::hypervisor`]). Real QEMU in production; a fake in tests, which
     /// is what makes the start ladder and the exit monitor testable.
-    hv: Arc<dyn super::hypervisor::Hypervisor>,
+    hv: Arc<dyn Hypervisor>,
 }
 
 impl VmInstance {
@@ -209,7 +213,7 @@ impl VmInstance {
             swtpm: Mutex::new(None),
             virtiofsd: Mutex::new(Vec::new()),
             virtiofs_mounts: Mutex::new(Vec::new()),
-            qmp: Mutex::new(None),
+            control: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
         })
@@ -218,7 +222,7 @@ impl VmInstance {
     /// Run this VM against a different hypervisor. Tests use it to drive the
     /// start ladder and the exit monitor without KVM.
     #[cfg(test)]
-    pub fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn super::hypervisor::Hypervisor>) {
+    pub(crate) fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn Hypervisor>) {
         Arc::get_mut(self).expect("sole owner").hv = hv;
     }
 
@@ -229,7 +233,7 @@ impl VmInstance {
     /// `ensure_smb` uses the complement, so a share is served by exactly one
     /// transport.
     pub fn virtiofs_share_indices(&self) -> Vec<usize> {
-        let host_has = crate::qemu::virtiofsd::available();
+        let host_has = self.hv.virtiofsd_available();
         let guest_ok = self.template().resolved.virtiofs;
         self.cfg
             .shares
@@ -322,11 +326,17 @@ impl VmInstance {
         self.template().first_boot_script.is_some() && !self.dirs.firstboot_sentinel().exists()
     }
 
+    /// The live QMP client, for the operations that genuinely need a
+    /// hypervisor — snapshots, the framebuffer, scripted input. Absent both
+    /// when the VM is stopped and when it is running under an in-memory
+    /// adapter, which is why those stay verified against a running lab
+    /// (ADR-0001).
     pub async fn qmp(&self) -> Result<QmpClient> {
-        self.qmp
+        self.control
             .lock()
             .await
-            .clone()
+            .as_ref()
+            .and_then(|c| c.qmp())
             .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
     }
 
@@ -463,7 +473,7 @@ impl VmInstance {
         let mut mounts = Vec::new();
         for i in self.virtiofs_share_indices() {
             let share = &self.cfg.shares[i];
-            if !crate::qemu::virtiofsd::available() {
+            if !self.hv.virtiofsd_available() {
                 bail!(
                     "{}: share \"{}\" demands transport = \"virtiofs\" but no virtiofsd was \
                      found on this host (install one or set VMLAB_VIRTIOFSD)",
@@ -604,9 +614,9 @@ impl VmInstance {
                 &self.build_paths(&t, firmware.as_ref(), nic_specs, vfs_devices)?,
                 accel,
             )?;
-            // QMP comes up shortly after spawn (-S leaves CPUs paused); the
-            // hypervisor returns once it answers.
-            let super::hypervisor::Running { proc, qmp } = self
+            // The machine answers control shortly after spawn (-S leaves CPUs
+            // paused); the hypervisor returns once it does.
+            let super::hypervisor::Running { proc, control } = self
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
@@ -615,32 +625,21 @@ impl VmInstance {
                     log: self.dirs.logs.join("qemu.log"),
                     qmp_sock: self.dirs.qmp_sock(),
                     fds: nic_fds,
+                    channels: super::hypervisor::GuestChannels {
+                        agent: self.dirs.agent_sock(),
+                        ctl: None,
+                    },
                 })
                 .await?;
             *self.qemu.lock().await = Some(proc.clone());
 
-            // Track guest-initiated shutdowns via the QMP SHUTDOWN event.
-            let mut qmp_events = qmp.subscribe_events();
-            let guest_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let flag = guest_shutdown.clone();
-            tokio::spawn(async move {
-                while let Ok(ev) = qmp_events.recv().await {
-                    if ev.event == "SHUTDOWN" {
-                        let initiator = ev.data.get("reason").and_then(|r| r.as_str());
-                        if initiator == Some("guest-shutdown") || initiator == Some("guest-reset") {
-                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    }
-                }
-            });
+            control.resume().await?;
+            *self.control.lock().await = Some(control.clone());
 
-            qmp.cont().await?;
-            *self.qmp.lock().await = Some(qmp);
-
-            Ok::<_, anyhow::Error>((proc, guest_shutdown))
+            Ok::<_, anyhow::Error>((proc, control))
         };
 
-        let (proc, guest_shutdown) = match run.await {
+        let (proc, control) = match run.await {
             Ok(v) => v,
             Err(e) => {
                 *self.state.write().await = PowerState::Stopped;
@@ -660,7 +659,7 @@ impl VmInstance {
                 .unwrap_or_else(|_| "unknown".to_string());
             let reason = super::hypervisor::classify_exit(
                 *me.stop_requested.read().await,
-                guest_shutdown.load(std::sync::atomic::Ordering::SeqCst),
+                control.guest_shutdown(),
                 &status,
             );
             me.teardown().await;
@@ -712,7 +711,7 @@ impl VmInstance {
         // RAII: dropping tap attachments detaches their switch ports and
         // XDP state; with QEMU gone, the kernel then destroys the taps.
         self.nic_attachments.lock().await.clear();
-        *self.qmp.lock().await = None;
+        *self.control.lock().await = None;
         self.drop_agent().await;
         *self.qemu.lock().await = None;
     }
@@ -768,9 +767,11 @@ impl VmInstance {
             }
         }
 
-        // Rung 2: ACPI powerdown via QMP.
-        if let Ok(qmp) = self.qmp().await {
-            let _ = qmp.system_powerdown().await;
+        // Rung 2: ACPI powerdown. Delivery succeeding says nothing about the
+        // guest acting on it — a guest with no ACPI daemon, or one sitting at
+        // a "really shut down?" dialog, ignores it entirely.
+        if let Some(control) = self.control.lock().await.clone() {
+            let _ = control.powerdown().await;
             if proc.wait_exit(Duration::from_secs(30)).await.is_ok() {
                 return self
                     .wait_state(PowerState::Stopped, Duration::from_secs(10))

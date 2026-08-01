@@ -71,61 +71,6 @@ where
     }
 }
 
-/// Bind a mock QMP server at `path` and connect a real [`QmpClient`] to it.
-///
-/// Lets code outside this module — notably the fake hypervisor in
-/// [`crate::labd::hypervisor`] — hand callers a genuine client without a
-/// genuine QEMU. Answers the handshake and the handful of commands a machine
-/// issues while coming up; anything else gets an empty `{"return": {}}`.
-pub(crate) async fn spawn_mock_qmp(path: &std::path::Path) -> anyhow::Result<QmpClient> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)?;
-    tokio::spawn(async move {
-        let Ok((stream, _)) = listener.accept().await else {
-            return;
-        };
-        let (read_half, mut write_half) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let greeting = json!({
-            "QMP": {"version": {"qemu": {"major": 9, "minor": 2, "micro": 0}}, "capabilities": []}
-        });
-        if write_half
-            .write_all(format!("{greeting}\n").as_bytes())
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
-                continue;
-            };
-            let reply = match msg["execute"].as_str() {
-                Some("query-status") => json!({"status": "running", "running": true}),
-                _ => json!({}),
-            };
-            let out = json!({"return": reply, "id": msg["id"]});
-            if write_half
-                .write_all(format!("{out}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    Ok(QmpClient::connect(path).await?)
-}
-
 /// Response `{"return": ret}` echoing the command's id.
 fn ok(msg: &Value, ret: Value) -> String {
     json!({"return": ret, "id": msg["id"]}).to_string()

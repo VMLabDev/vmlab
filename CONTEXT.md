@@ -141,8 +141,13 @@ the network fabric, snapshots and the wscript runtime.
 
 **Hypervisor**:
 The seam between deciding a machine should run and the host actually running
-it. Firmware, TPM, filesystem daemons, disks and process spawning sit below
-it; power state, exit classification and readiness sit above.
+it. Stated as what running means — the machine is up, it answers control, it
+exited for this reason — rather than which binary is launched, and it hands
+back its own handle types (**Process**, **Control**) rather than a host process
+and a QMP client, so an adapter can be entirely in-memory. TPM, filesystem
+daemons, the guest boot asset and process spawning sit below it; power state,
+exit classification, readiness, teardown ordering and restart policy sit above.
+Two adapters, both live: QEMU in production, the fake in the lifecycle tests.
 _Avoid_: driver, backend, runtime
 
 **Plan**:
