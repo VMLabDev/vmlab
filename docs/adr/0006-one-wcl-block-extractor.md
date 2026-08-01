@@ -82,3 +82,23 @@ Concretely:
 - The shared extractor accumulating call-site-specific behaviour behind flags.
   If it grows a parameter per caller it has become four extractors again with
   extra steps.
+
+## Implementation note: required fields
+
+Written down because it changes what an existing file does, which the spec put
+out of scope, and the reader deserves to find it here rather than in a diff.
+
+wcl schema-checks a missing required *child block* but not a missing required
+*scalar field*. Before this, an absent required field read as `None` and the
+block it was in was silently dropped: `media { }` with no `kind`, `record { }`
+with no `ip`, `on "x" { }` with no `run` all vanished and the lab file still
+loaded. Nothing reported it, because the four extractors had no way to say
+"absent" as distinct from "malformed".
+
+`Reader::required` gives them one, so those files are now rejected. This is a
+change in what loads, not only in what is reported — deliberate, because the
+alternative is a lab that silently runs without the thing the author wrote.
+
+The reverse also holds: where the schema *does* state the rule, the extractor
+stopped restating it. A `template` with no `source` block reports once, from
+the schema, rather than twice.

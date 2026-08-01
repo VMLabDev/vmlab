@@ -1673,7 +1673,7 @@ lab "l" { vm "a" { template = "x86_64/t" nic { nat = true } web "Bad Name" { por
                 r#"import <vmlab.wcl>
 lab "l" { vm "a" { template = "x86_64/t" nic { nat = true } web "ui" { port = 99999 } } }"#
             )
-            .contains("out of range"),
+            .contains("`port` must be between 1 and 65535, got 99999"),
         );
         // ntlm requires username+password; a stray token is flagged.
         let err = parse_err(
@@ -1733,7 +1733,10 @@ lab "l" {
   }
 }"#,
         );
-        assert!(err.contains("unknown share transport"), "{err}");
+        assert!(
+            err.contains("`transport` must be one of auto, virtiofs, smb, got `nfs`"),
+            "{err}"
+        );
         let err = parse_err(
             r#"import <vmlab.wcl>
 lab "l" {

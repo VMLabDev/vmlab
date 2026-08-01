@@ -81,14 +81,20 @@ pub enum FastpathMode {
 }
 
 impl FastpathMode {
+    /// The spelling of each mode, once — read by `parse` here and by the
+    /// host config's block extractor, so the two cannot drift.
+    pub const NAMES: &'static [(&'static str, Self)] = &[
+        ("auto", Self::Auto),
+        ("off", Self::Off),
+        ("sockmap", Self::Sockmap),
+        ("afxdp", Self::AfXdp),
+    ];
+
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "auto" => Some(Self::Auto),
-            "off" => Some(Self::Off),
-            "sockmap" => Some(Self::Sockmap),
-            "afxdp" => Some(Self::AfXdp),
-            _ => None,
-        }
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == s)
+            .map(|(_, mode)| *mode)
     }
 
     pub fn as_str(self) -> &'static str {

@@ -188,7 +188,10 @@ _Avoid_: DTO, view model, descriptor table
 **Block extractor**:
 The one module that turns a WCL block into a typed value — field access,
 coercion, source spans and the issue vocabulary. Lab files, host config,
-profiles and template metadata all read through it. See ADR-0006.
+profiles and template metadata all read through it. `config::block`; its
+per-block cursor is `Reader`, and what each caller keeps is a *field mapping*.
+See ADR-0006.
+_Avoid_: parser (wcl parses; this reads a parsed block), deserializer
 
 **Lab status**:
 The typed projection of a lab's machines, segments and pulls that the lab

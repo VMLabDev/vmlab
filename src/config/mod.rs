@@ -1,6 +1,7 @@
 //! Lab configuration: WCL schema, typed model, extraction, validation
 //! (PRD §5).
 
+pub(crate) mod block;
 pub mod dto;
 pub mod edit_ops;
 mod extract;
@@ -98,7 +99,9 @@ fn open(source: &str, name: &str, base_dir: Option<&Path>) -> Result<Document, C
     })
 }
 
-fn schema_issues(doc: &Document) -> IssueList {
+/// Schema violations as positioned issues, so a caller can accumulate them
+/// alongside the ones [`block::Reader`] raises.
+pub(crate) fn schema_issues(doc: &Document) -> IssueList {
     doc.schema_errors()
         .into_iter()
         .map(|e| {
