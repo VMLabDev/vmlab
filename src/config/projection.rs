@@ -598,9 +598,12 @@ mod tests {
         assert_eq!(interval.default.as_deref(), Some("10s"));
         assert_eq!(interval.default_number, Some(10));
         assert_eq!(
-            projection().default_number("container", "memory"),
-            Some(256 * 1024 * 1024)
+            projection().default_number("healthcheck", "timeout"),
+            Some(5)
         );
+        // A micro-VM's size comes from its profile, not from the schema
+        // (ADR-0008), so there is no default to report.
+        assert_eq!(projection().default_number("container", "memory"), None);
         assert_eq!(projection().default_number("vm", "cpus"), None);
         assert_eq!(projection().default_number("vm", "no_such_field"), None);
     }

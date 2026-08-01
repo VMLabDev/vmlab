@@ -59,8 +59,6 @@ export const SCHEMA_OPTIONS: Record<string, string[]> = {
 
 /** Schema defaults in base units (seconds / bytes / count), keyed `block.field`. */
 export const SCHEMA_DEFAULTS: Record<string, number> = {
-  "container.cpus": 1,
-  "container.memory": 268435456,
   "healthcheck.interval": 10,
   "healthcheck.timeout": 5,
   "healthcheck.retries": 3,

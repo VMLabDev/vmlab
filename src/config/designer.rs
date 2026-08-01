@@ -448,6 +448,7 @@ pub static UNFORMED: &[Unformed] = &[
         "dependency edges on the topology canvas",
     ),
     unformed("container", "image", "the image picker"),
+    unformed("container", "profile", "the hardware tab's profile picker"),
     unformed("container", "cpus", "the micro-VM vCPU slider"),
     unformed("container", "memory", "the micro-VM memory slider"),
     unformed(

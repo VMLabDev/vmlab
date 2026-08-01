@@ -182,9 +182,10 @@ optionality, default, doc string, option list, nesting and cardinality —
 **reflected** from `schema.wcl` rather than restated (`src/config/projection.rs`),
 and read by everything that needs the schema's shape: the designer's forms
 (`src/config/designer.rs`, rendered into `web-ui/src/editor/schema.gen.ts`), the
-console's pickers (`/api/catalog/meta`, `/api/schema`), and the rendered
-reference. The console's configuration types still mirror the DTO, not the
-projection — that slice is blocked on the block extractor. See ADR-0005.
+console's pickers (`/api/catalog/meta`), and the rendered reference. The
+console's configuration types still mirror the DTO rather than the projection;
+now that the **Block extractor** has landed, that is the next slice. See
+ADR-0005.
 _Avoid_: DTO, view model, descriptor table
 
 **Block extractor**:
