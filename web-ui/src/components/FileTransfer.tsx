@@ -6,25 +6,18 @@
 // machine's own page rather than in that tree. Both directions carry the file
 // inline over the wire, so INLINE_FILE_LIMIT (generated from the protocol
 // vocabulary) is the ceiling — checked here so an oversized file is refused
-// before it is uploaded, and again by the daemon for every other caller.
+// before it crosses the network, and again by the daemon for every other
+// caller.
 
 import { Show, createSignal } from "solid-js";
 import { Alert, Button, Card, Input } from "@forge/ui";
 import { Download, Upload } from "lucide-solid";
 import { pullGuestFile, pushGuestFile } from "../api";
 import { INLINE_FILE_LIMIT } from "../protocol";
-
-/** Byte sizes at the scale one file lands in. The store's helpers round to
- *  whole megabytes, which reads as "0 MB" for most of what moves through
- *  here. */
-function fmtSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+import { fmtSize } from "../store";
 
 /** Join a guest folder and a file name with the separator the folder uses, so
- *  a Windows path stays a Windows path and an empty folder means the root. */
+ *  a Windows path stays a Windows path. */
 function guestJoin(folder: string, name: string): string {
   const sep = folder.includes("\\") ? "\\" : "/";
   const base = folder.trim().replace(/[/\\]+$/, "");
@@ -61,9 +54,13 @@ export default function FileTransfer(p: {
     setError(null);
   };
 
+  // An empty destination would push to the guest's root, which nobody means
+  // to do — the REST layer refuses an empty path outright, so ask for one.
+  const sendable = () => file() !== null && dest().trim() !== "" && busy() === null;
+
   async function send() {
     const chosen = file();
-    if (!chosen || !ready()) return;
+    if (!chosen || !sendable() || !ready()) return;
     if (chosen.size > INLINE_FILE_LIMIT) {
       setNote(null);
       setError(
@@ -90,14 +87,18 @@ export default function FileTransfer(p: {
     start("pull");
     try {
       const blob = await pullGuestFile(p.lab, p.machine, from);
-      // Hand the bytes to the browser's own download machinery: an anchor with
-      // `download`, clicked once, then the object URL released.
+      // Hand the bytes to the browser's own save machinery: an anchor with
+      // `download`, in the document (Firefox ignores one that is not) and
+      // clicked once. The object URL outlives the click deliberately —
+      // revoking it in the same tick cancels the save in some browsers.
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
       anchor.download = baseName(from);
+      document.body.appendChild(anchor);
       anchor.click();
-      URL.revokeObjectURL(url);
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
       setNote(`Fetched ${fmtSize(blob.size)} from ${from}`);
     } catch (e) {
       setError(message(e));
@@ -131,11 +132,7 @@ export default function FileTransfer(p: {
               value={dest()}
               onInput={(e) => setDest(e.currentTarget.value)}
             />
-            <Button
-              icon={Upload}
-              disabled={!file() || busy() !== null}
-              onClick={() => void send()}
-            >
+            <Button icon={Upload} disabled={!sendable()} onClick={() => void send()}>
               {busy() === "push" ? "Sending…" : "Send"}
             </Button>
           </div>

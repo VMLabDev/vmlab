@@ -1081,6 +1081,15 @@ export function fmtMem(bytes: number | null): string {
   return mb >= 1024 ? `${Math.round(mb / 102.4) / 10} GB` : `${Math.round(mb)} MB`;
 }
 
+/** Byte size at the scale one file lands in (e.g. "812 B", "4.2 KiB"). The
+ *  two above round to whole megabytes, which reads as "0 MB" for most files. */
+export function fmtSize(bytes: number | null | undefined): string {
+  if (bytes == null) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
 /** Compact byte size for download progress (e.g. "734 MB", "1.4 GB"). */
 export function fmtBytes(bytes: number): string {
   if (bytes <= 0) return "0 MB";

@@ -32,7 +32,6 @@ use vmlab_agent_proto::{
 };
 pub use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
 
-use crate::proto::CommandError;
 use crate::sync::LockRecover;
 
 /// What the agent said about itself in the handshake.
@@ -167,37 +166,45 @@ struct Inner {
 }
 
 /// Where a pull puts the guest's bytes as they arrive.
-///
-/// A pull to a host path streams and is bounded by the disk; a pull a caller
-/// wants the bytes of is bounded by a ceiling, checked chunk by chunk so an
-/// oversized file is refused mid-flight rather than buffered whole and then
-/// rejected.
-enum PullTarget {
-    File(tokio::fs::File),
-    Memory { buf: Vec<u8>, limit: u64 },
-}
-
-impl PullTarget {
-    async fn write(&mut self, remote: &str, chunk: &[u8]) -> Result<()> {
-        match self {
-            PullTarget::File(file) => file.write_all(chunk).await?,
-            PullTarget::Memory { buf, limit } => {
-                if buf.len() as u64 + chunk.len() as u64 > *limit {
-                    return Err(anyhow::Error::new(CommandError::invalid(format!(
-                        "pull {remote}: the file is larger than the {limit}-byte inline limit; \
-                         pull it to a host path instead"
-                    ))));
-                }
-                buf.extend_from_slice(chunk);
-            }
-        }
+trait PullSink {
+    /// Take one chunk, or fail the pull.
+    async fn write(&mut self, chunk: &[u8]) -> Result<()>;
+    /// Every chunk has arrived and the digest matched.
+    async fn finish(&mut self) -> Result<()> {
         Ok(())
     }
+}
 
+/// Straight to a host file: bounded by the disk, never held in memory.
+struct FileSink(tokio::fs::File);
+
+impl PullSink for FileSink {
+    async fn write(&mut self, chunk: &[u8]) -> Result<()> {
+        Ok(self.0.write_all(chunk).await?)
+    }
     async fn finish(&mut self) -> Result<()> {
-        if let PullTarget::File(file) = self {
-            file.flush().await?;
+        Ok(self.0.flush().await?)
+    }
+}
+
+/// Into memory, for a caller that wants the bytes. The ceiling is checked
+/// chunk by chunk, so an oversized file is refused mid-flight rather than
+/// buffered whole and then rejected.
+struct MemorySink {
+    remote: String,
+    buf: Vec<u8>,
+    limit: u64,
+}
+
+impl PullSink for MemorySink {
+    async fn write(&mut self, chunk: &[u8]) -> Result<()> {
+        if self.buf.len() as u64 + chunk.len() as u64 > self.limit {
+            return Err(anyhow::Error::new(crate::proto::over_inline_limit(
+                format!("pull {}", self.remote),
+                self.limit,
+            )));
         }
+        self.buf.extend_from_slice(chunk);
         Ok(())
     }
 }
@@ -528,8 +535,7 @@ impl AgentHandle {
         let file = tokio::fs::File::create(local)
             .await
             .with_context(|| format!("creating {}", local.display()))?;
-        let mut into = PullTarget::File(file);
-        self.pull_into(remote, &mut into).await
+        self.pull_into(remote, &mut FileSink(file)).await
     }
 
     /// Pull a guest file into memory, for a caller that wants the bytes rather
@@ -539,20 +545,18 @@ impl AgentHandle {
     /// chunk of memory rather than all of it, and the caller gets the limit by
     /// code instead of a file cut short.
     pub async fn pull_bytes(&self, remote: &str, limit: u64) -> Result<(String, Vec<u8>)> {
-        let mut into = PullTarget::Memory {
+        let mut sink = MemorySink {
+            remote: remote.to_string(),
             buf: Vec::new(),
             limit,
         };
-        let (sha256, _len) = self.pull_into(remote, &mut into).await?;
-        let PullTarget::Memory { buf, .. } = into else {
-            unreachable!("the target this call built");
-        };
-        Ok((sha256, buf))
+        let (sha256, _len) = self.pull_into(remote, &mut sink).await?;
+        Ok((sha256, sink.buf))
     }
 
-    /// The pull itself: stream the guest's bytes into `into`, verifying the
+    /// The pull itself: stream the guest's bytes into `sink`, verifying the
     /// digest the agent reports against the one we computed on the way.
-    async fn pull_into(&self, remote: &str, into: &mut PullTarget) -> Result<(String, u64)> {
+    async fn pull_into(&self, remote: &str, sink: &mut impl PullSink) -> Result<(String, u64)> {
         use sha2::{Digest, Sha256};
         let mut session = self
             .open(|id| HostMsg::OpenFilePull {
@@ -565,10 +569,10 @@ impl AgentHandle {
             match session.recv().await {
                 Some(SessionEvent::Data(b)) => {
                     hasher.update(&b);
-                    into.write(remote, &b).await?;
+                    sink.write(&b).await?;
                 }
                 Some(SessionEvent::FileDone { sha256, len }) => {
-                    into.finish().await?;
+                    sink.finish().await?;
                     if hex::encode(hasher.finalize()) != sha256 {
                         bail!("pull {remote}: digest mismatch after transfer");
                     }

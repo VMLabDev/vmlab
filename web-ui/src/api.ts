@@ -196,16 +196,14 @@ const guestFileUrl = (lab: string, machine: string, path: string) =>
   `/api/labs/${encodeURIComponent(lab)}/machines/${encodeURIComponent(machine)}` +
   `/files?path=${encodeURIComponent(path)}`;
 
-/** Copy one file into the guest at `path`. `mode` is a Unix mode (`0o644`),
- *  ignored by Windows guests. */
+/** Copy one file into the guest at `path`. */
 export const pushGuestFile = (
   lab: string,
   machine: string,
   path: string,
   file: Blob,
-  mode?: number,
 ): Promise<{ sha256: string; len: number }> =>
-  req(guestFileUrl(lab, machine, path) + (mode === undefined ? "" : `&mode=${mode}`), {
+  req(guestFileUrl(lab, machine, path), {
     method: "POST",
     body: file,
     headers: { "Content-Type": "application/octet-stream" },

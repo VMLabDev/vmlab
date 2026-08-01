@@ -283,8 +283,8 @@ async fn main() -> ExitCode {
                 web::post().to(api::machine_clipboard_set),
             )
             // One file in or out of the guest. A resource rather than two
-            // routes, so the upload's payload ceiling applies here and
-            // nowhere else.
+            // routes, so the push body's ceiling applies here and nowhere
+            // else.
             .service(guest_files::service())
             .route(
                 "/api/labs/{lab}/machines/{machine}/{action}",

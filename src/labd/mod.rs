@@ -545,16 +545,11 @@ impl Handler<LabRequest> for LabdHandler {
                             .map_err(|e| {
                                 CommandError::invalid(format!("invalid base64 data: {e}"))
                             })?;
-                        // The transport caps the request line above this, so
-                        // an over-long push never arrives; the ceiling is what
-                        // a caller near it gets told instead.
                         if bytes.len() as u64 > crate::proto::INLINE_FILE_LIMIT {
-                            return Err(CommandError::invalid(format!(
-                                "push {to}: {} bytes is over the {}-byte inline limit; \
-                                 push from a host path instead",
-                                bytes.len(),
+                            return Err(crate::proto::over_inline_limit(
+                                format!("push {to}"),
                                 crate::proto::INLINE_FILE_LIMIT,
-                            )));
+                            ));
                         }
                         let tmp = std::env::temp_dir()
                             .join(format!("vmlab-cp-{}-{machine}", std::process::id()));

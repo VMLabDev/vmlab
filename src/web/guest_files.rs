@@ -16,21 +16,22 @@ use actix_web::{HttpResponse, web};
 use base64::Engine as _;
 use serde::Deserialize;
 
-use vmlab::proto::{CommandError, INLINE_FILE_LIMIT, LabRequest};
+use vmlab::proto::{CommandError, INLINE_FILE_LIMIT, LabRequest, over_inline_limit};
 
 use super::api::fail;
 use super::state::AppState;
 
-/// What actix will buffer for an upload. Above the wire's ceiling, so a body
-/// that merely overshoots it gets the typed error naming the limit instead of
-/// actix's own "payload too large".
-const MAX_UPLOAD_BYTES: usize = INLINE_FILE_LIMIT as usize + (1 << 16);
+/// What actix will buffer for a push body. A margin above the wire's ceiling,
+/// so a body that merely overshoots the ceiling reaches the handler and is
+/// told the limit; far beyond that it is a broken client, and actix refuses it
+/// as an oversized payload rather than buffering it.
+const MAX_PUSH_BODY: usize = INLINE_FILE_LIMIT as usize + (1 << 16);
 
-/// The endpoint, wired: both directions and the payload ceiling the upload
-/// needs, in one place so the route and its limit cannot drift apart.
+/// The endpoint, wired: both directions and the body ceiling the push needs,
+/// in one place so the route and its limit cannot drift apart.
 pub fn service() -> actix_web::Resource {
     web::resource("/api/labs/{lab}/machines/{machine}/files")
-        .app_data(web::PayloadConfig::new(MAX_UPLOAD_BYTES))
+        .app_data(web::PayloadConfig::new(MAX_PUSH_BODY))
         .route(web::get().to(pull))
         .route(web::post().to(push))
 }
@@ -39,10 +40,6 @@ pub fn service() -> actix_web::Resource {
 pub struct GuestFileQuery {
     /// The file's path inside the guest, guest-absolute.
     path: String,
-    /// Unix mode for a pushed file, as a number (`420` for `0644`). Ignored by
-    /// Windows guests.
-    #[serde(default)]
-    mode: Option<u32>,
 }
 
 /// `POST /api/labs/{lab}/machines/{machine}/files?path=` — the raw request
@@ -58,17 +55,17 @@ pub async fn push(
         return fail(CommandError::invalid("no guest path given"));
     }
     if body.len() as u64 > INLINE_FILE_LIMIT {
-        return fail(CommandError::invalid(format!(
-            "the file is {} bytes, over the {INLINE_FILE_LIMIT}-byte transfer limit",
-            body.len(),
-        )));
+        return fail(over_inline_limit(
+            format!("{} bytes", body.len()),
+            INLINE_FILE_LIMIT,
+        ));
     }
     let req = LabRequest::MachinePushFile {
         machine,
         to: query.path.clone(),
         from: None,
         data: Some(base64::engine::general_purpose::STANDARD.encode(&body)),
-        mode: query.mode,
+        mode: None,
     };
     match state.lab_call(&lab, req).await {
         Ok(v) => HttpResponse::Ok().json(v),
@@ -113,14 +110,6 @@ pub async fn pull(
         .insert_header((
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", attachment_name(&query.path)),
-        ))
-        .insert_header((
-            "X-Vmlab-Sha256",
-            reply
-                .get("sha256")
-                .and_then(|s| s.as_str())
-                .unwrap_or_default()
-                .to_string(),
         ))
         .body(bytes)
 }
@@ -168,7 +157,7 @@ mod tests {
     /// A file over the ceiling is refused here, by code, naming the limit —
     /// the daemon never sees it, and nothing is truncated on the way.
     #[actix_web::test]
-    async fn an_oversized_upload_is_refused_with_the_limit() {
+    async fn an_oversized_push_is_refused_with_the_limit() {
         let app = test::init_service(App::new().app_data(state()).service(service())).await;
         let body = vec![0u8; INLINE_FILE_LIMIT as usize + 1];
         let resp = test::call_service(
