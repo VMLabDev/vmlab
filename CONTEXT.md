@@ -245,9 +245,17 @@ _Avoid_: error type, status (a status is a lab's or machine's condition)
 Something a person or a program drives vmlab through: the CLI, the REST API,
 the web console. Each adapts the request vocabulary; none holds its own list of
 commands. Which surface reaches which command is the coverage report in
-`docs/protocol.md`; a command that belongs on one surface alone says why in the
-vocabulary, beside its declaration, and the report renders the reason.
+`docs/protocol.md`.
 _Avoid_: frontend, client (a client is the protocol's connection object)
+
+**One-way command**:
+A command the coverage report finds reachable from exactly one surface. Not
+automatically a gap — several only mean anything from one place — so one that
+is deliberate carries `#[one_way("surface", "why")]` beside its declaration in
+the request vocabulary, and the report renders the reason next to it. No
+annotation means nobody has decided yet. See ADR-0007.
+_Avoid_: dead command (that is one with no caller at all), CLI-only /
+console-only (name the surface the report names)
 
 **Web console**:
 The browser UI served by `vmlab-web`: lab overview, visual designer, file and

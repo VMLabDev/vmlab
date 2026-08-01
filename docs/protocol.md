@@ -127,7 +127,7 @@ Every command has a caller.
 - `machine.eventlog` — A stream into a terminal, for the same reason as `machine.tail`.
 - `playbook.list` — One flat table is the shape a shell wants. The console builds its playbook list from the lab's declarations directly and asks the daemon only which runs are in flight.
 - `version` — What `vmlab daemon status` prints: which build of the supervisor is running on this host, asked by whoever is standing in front of it.
-- `lab.ensure` — Every surface reaches it, through the one spawn-or-find helper in `src/cli/daemon.rs` that the web layer calls too. The scan sees the call where the helper lives, not where it is used from.
+- `lab.ensure` — Spawning-or-finding a lab daemon belongs in one place, and that place is the helper in `src/cli/daemon.rs` — the web layer calls it rather than asking the supervisor itself. One call site is the decision; the scan reports it as the CLI because that is where the helper lives.
 - `lab.release` — The other half of `lab.ensure`, and a shell's alone: a command finishes and gives the daemon back. The console does not finish, and leaves it up for the next request.
 
 ### Reachable only from `web`

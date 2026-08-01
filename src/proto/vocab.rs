@@ -37,8 +37,8 @@ pub struct ArgSpec {
 /// coverage report renders it beside the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OneWay {
-    /// The surface the command is reachable from, named as the coverage
-    /// report names it (`cli`, `web`, `daemon`).
+    /// The surface the command is reachable from, spelled as the coverage
+    /// report spells it — one of `report::SURFACES`, which a test checks.
     pub surface: &'static str,
     /// Why that is the only surface it belongs on.
     pub why: &'static str,
@@ -676,9 +676,11 @@ vocabulary! {
         /// Spawn (or find) a lab's daemon; answers with its socket path.
         #[one_way(
             "cli",
-            "Every surface reaches it, through the one spawn-or-find helper in \
-             `src/cli/daemon.rs` that the web layer calls too. The scan sees \
-             the call where the helper lives, not where it is used from."
+            "Spawning-or-finding a lab daemon belongs in one place, and that \
+             place is the helper in `src/cli/daemon.rs` — the web layer calls \
+             it rather than asking the supervisor itself. One call site is the \
+             decision; the scan reports it as the CLI because that is where \
+             the helper lives."
         )]
         LabEnsure = "lab.ensure" {
             name: String,

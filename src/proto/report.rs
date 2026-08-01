@@ -380,6 +380,7 @@ pub fn protocol_typescript() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::OneWay;
 
     fn repo() -> &'static Path {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -421,14 +422,19 @@ mod tests {
         }
     }
 
+    /// Every command that claims to be one-way, with the claim.
+    fn annotated() -> impl Iterator<Item = (&'static CommandSpec, OneWay)> {
+        LabRequest::COMMANDS
+            .iter()
+            .chain(SupRequest::COMMANDS)
+            .filter_map(|spec| spec.one_way.map(|one_way| (spec, one_way)))
+    }
+
     /// A reason names the surface it claims the command is reachable from, so
     /// a renamed or removed surface cannot leave a reason pointing at nothing.
     #[test]
     fn a_one_way_annotation_names_a_real_surface() {
-        for spec in LabRequest::COMMANDS.iter().chain(SupRequest::COMMANDS) {
-            let Some(one_way) = spec.one_way else {
-                continue;
-            };
+        for (spec, one_way) in annotated() {
             assert!(
                 SURFACES.iter().any(|s| s.name == one_way.surface),
                 "`{}` is annotated for surface `{}`, which does not exist",
@@ -444,10 +450,7 @@ mod tests {
     #[test]
     fn an_annotated_command_is_still_one_way() {
         let usage = command_usage(repo());
-        for spec in LabRequest::COMMANDS.iter().chain(SupRequest::COMMANDS) {
-            let Some(one_way) = spec.one_way else {
-                continue;
-            };
+        for (spec, one_way) in annotated() {
             let callers = &usage[spec.variant];
             assert!(
                 callers.len() == 1 && callers.contains(one_way.surface),
