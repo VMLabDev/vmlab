@@ -8,7 +8,7 @@
 //! container, and a container that one day runs a display server reports a
 //! `Display` like anything else.
 //!
-//! What a framebuffer needs from the machine underneath it is [`Screen`] — a
+//! What a display needs from the machine underneath it is [`DisplayHost`] — a
 //! QMP channel, a VNC socket, somewhere to drop a capture, and which of the
 //! two input transports the guest actually listens to. That is the whole
 //! contract, and it is why this module lives beside the machine rather than
@@ -30,14 +30,14 @@ use crate::profiles::InputTransport;
 use crate::qmp::QmpClient;
 use crate::vision::{self, Match, MatchOptions};
 
-/// What a framebuffer needs from the machine behind it.
+/// What a [`Display`] needs from the machine behind it.
 ///
 /// Implemented by [`crate::labd::vm::VmInstance`]. A machine kind that grows a
 /// display implements this and returns `Some` from
 /// [`Machine::display`](super::machine::Machine::display); nothing else has to
 /// change.
 #[async_trait::async_trait]
-pub trait Screen: Send + Sync + 'static {
+pub trait DisplayHost: Send + Sync + 'static {
     /// The machine's name, for error messages.
     fn name(&self) -> &str;
     /// The QMP channel driving the framebuffer.
@@ -51,25 +51,24 @@ pub trait Screen: Send + Sync + 'static {
     fn input_transport(&self) -> InputTransport;
 }
 
-/// A machine's framebuffer, with the operations that read and drive it.
+/// A machine's display, with the operations that read and drive it.
 ///
-/// Concrete rather than a trait: QEMU's framebuffer is the only thing that
-/// ever satisfies it, and the part that *does* vary per machine sits behind
-/// [`Screen`].
+/// Concrete rather than a trait: QEMU's is the only one that ever satisfies
+/// it, and the part that *does* vary per machine sits behind [`DisplayHost`].
 #[derive(Clone)]
 pub struct Display {
-    screen: Arc<dyn Screen>,
+    host: Arc<dyn DisplayHost>,
 }
 
 impl Display {
-    pub fn new(screen: Arc<dyn Screen>) -> Self {
-        Self { screen }
+    pub fn new(host: Arc<dyn DisplayHost>) -> Self {
+        Self { host }
     }
 
     /// True when input should go over VNC instead of QMP (for USB-HID-only
     /// guests like macOS where QMP `send-key` is ignored).
     fn input_vnc(&self) -> bool {
-        matches!(self.screen.input_transport(), InputTransport::Vnc)
+        matches!(self.host.input_transport(), InputTransport::Vnc)
     }
 
     /// Open a fresh RFB connection. A long-lived connection that never drains
@@ -77,16 +76,16 @@ impl Display {
     /// guests (DOS/9x TUIs); a fresh connection per op mirrors an external
     /// viewer's reliable behaviour.
     async fn vnc(&self) -> Result<crate::vnc::VncInput> {
-        crate::vnc::VncInput::connect(&self.screen.vnc_sock()).await
+        crate::vnc::VncInput::connect(&self.host.vnc_sock()).await
     }
 
     /// QMP screendump → decoded image.
     pub async fn grab(&self) -> Result<RgbImage> {
-        let qmp = self.screen.qmp().await?;
+        let qmp = self.host.qmp().await?;
         let tmp = self
-            .screen
+            .host
             .capture_dir()
-            .join(format!(".grab-{}.ppm", self.screen.name()));
+            .join(format!(".grab-{}.ppm", self.host.name()));
         qmp.screendump(&tmp).await?;
         let img = vision::load_screen(&tmp)?;
         let _ = std::fs::remove_file(&tmp);
@@ -123,7 +122,7 @@ impl Display {
             return c.chord(&syms).await;
         }
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let qmp = self.screen.qmp().await?;
+        let qmp = self.host.qmp().await?;
         qmp.send_key(&refs, None).await?;
         Ok(())
     }
@@ -149,7 +148,7 @@ impl Display {
             }
             return Ok(());
         }
-        let qmp = self.screen.qmp().await?;
+        let qmp = self.host.qmp().await?;
         for ch in text.chars() {
             let keys = keymap::char_keys(ch).map_err(|e| anyhow!(e))?;
             let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
@@ -166,7 +165,7 @@ impl Display {
             return c.mouse_move(x, y).await;
         }
         let (w, h) = self.size().await?;
-        let qmp = self.screen.qmp().await?;
+        let qmp = self.host.qmp().await?;
         qmp.mouse_move_abs(x.max(0) as u32, y.max(0) as u32, w, h)
             .await?;
         Ok(())
@@ -185,7 +184,7 @@ impl Display {
         if let Some((x, y)) = at {
             self.mouse_move(x, y).await?;
         }
-        let qmp = self.screen.qmp().await?;
+        let qmp = self.host.qmp().await?;
         qmp.mouse_button(button, true).await?;
         tokio::time::sleep(Duration::from_millis(60)).await;
         qmp.mouse_button(button, false).await?;
@@ -208,7 +207,7 @@ impl Display {
             return c.pointer(x2, y2, 0).await;
         }
         let (w, h) = self.size().await?;
-        let qmp = self.screen.qmp().await?;
+        let qmp = self.host.qmp().await?;
         qmp.mouse_move_abs(x1.max(0) as u32, y1.max(0) as u32, w, h)
             .await?;
         qmp.mouse_button("left", true).await?;
@@ -235,11 +234,11 @@ impl Display {
         templates: &[PathBuf],
         opts: &MatchOptions,
     ) -> Result<Option<Match>> {
-        let screen = self.grab().await?;
+        let current = self.grab().await?;
         for path in templates {
             let template = vision::load_screen(path)
                 .map_err(|e| anyhow!("reference image {}: {e:#}", path.display()))?;
-            if let Some(m) = vision::find_template(&screen, &template, opts) {
+            if let Some(m) = vision::find_template(&current, &template, opts) {
                 return Ok(Some(m));
             }
         }
@@ -248,7 +247,7 @@ impl Display {
 }
 
 /// RFB button mask for a button name.
-pub fn vnc_button(button: &str) -> Result<u8> {
+fn vnc_button(button: &str) -> Result<u8> {
     match button {
         "left" => Ok(crate::vnc::BTN_LEFT),
         "middle" => Ok(crate::vnc::BTN_MIDDLE),

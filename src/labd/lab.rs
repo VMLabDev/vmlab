@@ -66,7 +66,7 @@ pub struct LabRuntime {
     /// Serialises pull runs (concurrent `up` + `pull` + `vm.start` must not
     /// double-download); the loser re-checks the ledger and no-ops.
     pull_lock: Mutex<()>,
-    /// Runs per VM after boot but before any provision script — template
+    /// Runs per machine after boot but before any provision script — template
     /// builds install the vmlab-agent here, so it lands even when the last
     /// provision generalizes/shuts the guest down (Windows sysprep). Std
     /// lock: set once before `up`, cloned out, never held across await.
@@ -93,7 +93,7 @@ struct WebForward {
 /// See [`LabRuntime::pre_provision`].
 pub type PreProvisionHook = Arc<
     dyn Fn(
-            Arc<VmInstance>,
+            Arc<dyn Machine>,
             crate::scripting::OutputSink,
         ) -> futures::future::BoxFuture<'static, Result<()>>
         + Send
@@ -631,6 +631,9 @@ impl LabRuntime {
                 .ok_or_else(|| anyhow!("no vm \"{vm_name}\" in the lab config"))?;
             let resolved_vm =
                 crate::qemu::resolve_vm(vm_cfg, Some(&resolved.meta), &self.profiles)?;
+            // kind-aware: binding a downloaded template needs the concrete
+            // type that holds one. Not a decision — this path only ever runs
+            // for a machine whose artefact is a template.
             self.vm(vm_name)?.set_template(super::vm::TemplateParts {
                 resolved: resolved_vm,
                 backing: Some(resolved.disk_path.clone()),
@@ -706,6 +709,8 @@ impl LabRuntime {
         image: crate::oci::image::PulledImage,
     ) -> Result<()> {
         for name in &batch.machines {
+            // kind-aware: as in `bind_template` — binding a downloaded image
+            // needs the concrete type that holds one.
             let container = self.container(name)?;
             {
                 let mut state = self.state.lock().await;
@@ -1294,8 +1299,8 @@ impl LabRuntime {
                     me.run_first_boot(&m, &out).await?;
                     // See `LabRuntime::pre_provision`.
                     let hook = me.pre_provision.read().expect("pre_provision lock").clone();
-                    if let (Some(hook), Ok(vm)) = (hook, me.vm(&n)) {
-                        hook(vm.clone(), out.clone()).await?;
+                    if let Some(hook) = hook {
+                        hook(Arc::clone(&m), out.clone()).await?;
                     }
                     // Only gate the wave on readiness when something later
                     // depends on this machine.
@@ -1903,10 +1908,16 @@ mod tests {
     /// [`Machine`]; when it needs to know *what a machine can do* it probes a
     /// capability. Asking *what kind it is* is how the duplication came back.
     ///
-    /// `LabRuntime::vm`/`container` are exempt, between explicit markers in the
-    /// source: they exist *to* reject the other kind's name, and the
-    /// deferred-pull paths must reach a concrete type to bind what they just
-    /// downloaded. What is banned is orchestration *deciding* by kind.
+    /// Reaching a concrete type counts: `if let Ok(vm) = self.vm(n)` decides by
+    /// kind just as surely as a match does.
+    ///
+    /// Two exemptions, both explicit and greppable in the source:
+    /// `LabRuntime::vm`/`container` themselves, between `BEGIN`/`END
+    /// kind-aware accessors` markers — they exist *to* reject the other kind's
+    /// name; and single statements preceded by a `// kind-aware:` comment
+    /// giving the reason, for the deferred-pull paths that must reach a
+    /// concrete type to bind the artefact they just downloaded. Neither
+    /// decides *behaviour* by kind.
     #[test]
     fn orchestration_never_branches_on_machine_kind() {
         let source = include_str!("lab.rs");
@@ -1921,6 +1932,18 @@ mod tests {
             .split_once("// ---- END kind-aware accessors")
             .expect("the exemption end marker");
         let scanned = format!("{before}{after}");
+        // Isolated statements that must reach a concrete type to bind an
+        // artefact they just downloaded carry a `kind-aware:` marker on the
+        // line above, with the reason. Skip those.
+        let scanned: String = scanned
+            .lines()
+            .scan(false, |exempt_next, line| {
+                let exempt = *exempt_next;
+                *exempt_next = line.contains("// kind-aware:") || (exempt && line.contains("//"));
+                Some(if exempt { "" } else { line })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let banned = [
             // A match or comparison on the reported kind.
             "MachineKind::",
@@ -1930,6 +1953,14 @@ mod tests {
             "vms.contains_key",
             "containers.get(",
             "vms.get(",
+            // Reaching a concrete type *is* a kind branch: `if let Ok(vm) =
+            // self.vm(n)` decides by kind just as surely as a match does, and
+            // that is exactly how the `pre_provision` hook stayed VM-only
+            // through the first draft of this test.
+            "self.vm(",
+            "self.container(",
+            "me.vm(",
+            "me.container(",
         ];
         let offenders: Vec<(usize, &str, &str)> = scanned
             .lines()
@@ -2038,6 +2069,9 @@ mod tests {
         }
         fn term_session_sock(&self, _id: u32) -> PathBuf {
             self.dir.join("term.sock")
+        }
+        fn nic_sock(&self, i: usize) -> PathBuf {
+            self.dir.join(format!("nic{i}.sock"))
         }
         /// A double has no host behind it, and no shares to place either.
         fn virtiofsd_available(&self) -> bool {

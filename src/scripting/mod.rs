@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use wscript::{Context, Module, Script};
 
+use crate::labd::display::Display;
 use crate::labd::lab::LabRuntime;
 use crate::labd::machine::{Machine, MachineKind};
-use crate::labd::screen::Display;
 use crate::labd::vm::PowerState;
 use crate::vision;
 
@@ -535,18 +535,7 @@ pub fn lab_module() -> Module {
         // (DOS, Win 3.x) this is the only way to seal a consistent disk — a
         // SIGKILL can drop unflushed qcow2 writes and leave it unbootable.
         .method("poweroff", |h: &MachineHandle| -> Result<(), String> {
-            h.block(async {
-                if let Ok(vm) = h.runtime.vm(h.name())
-                    && let Ok(qmp) = vm.qmp().await
-                {
-                    // QEMU exits, so the QMP connection drops — that's expected.
-                    let _ = qmp.quit().await;
-                }
-                h.machine
-                    .wait_state(PowerState::Stopped, Duration::from_secs(30))
-                    .await
-                    .map_err(estr)
-            })
+            h.block(h.machine.poweroff()).map_err(estr)
         })
         .method("state", |h: &MachineHandle| -> String {
             match h.block(h.machine.state()) {

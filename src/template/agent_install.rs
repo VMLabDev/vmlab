@@ -19,7 +19,6 @@ use anyhow::{Context, Result};
 use super::bootstrap::StagedGuestIso;
 use crate::agent_asset::AgentOs;
 use crate::labd::machine::Machine;
-use crate::labd::vm::VmInstance;
 
 /// Wait for the agent handshake; returns the staged asset's version stamp
 /// (by the handshake's OS flavour), or `None` when verification was skipped
@@ -29,7 +28,7 @@ use crate::labd::vm::VmInstance;
 /// down the OS and run its first-logon hooks — routinely 15–45 minutes for
 /// Windows.
 pub async fn verify(
-    vm: &Arc<VmInstance>,
+    machine: &Arc<dyn Machine>,
     wants_agent: bool,
     staged: Option<&StagedGuestIso>,
     wait: Duration,
@@ -39,7 +38,7 @@ pub async fn verify(
         log("agent: skipped (template sets agent = false)\n".into());
         return Ok(None);
     }
-    if !vm.template().resolved.agent_channel {
+    if !machine.has_agent_channel() {
         log("agent: skipped (guest profile has no agent channel)\n".into());
         return Ok(None);
     }
@@ -47,13 +46,13 @@ pub async fn verify(
 
     // Probe until the freshly installed service answers. Earlier agent-first
     // execs may have failed a handshake against the not-yet-installed agent,
-    // which `vm.agent()` remembers for 30 s — clear that memory before each
+    // which `machine.agent()` remembers for 30 s — clear that memory before each
     // attempt. Never drop_agent here: a concurrent provision may be using
     // the cached handle, and teardown at seal time cleans it up anyway.
     let deadline = tokio::time::Instant::now() + wait;
     let handle = loop {
-        vm.clear_agent_failure().await;
-        match vm.agent().await {
+        machine.clear_agent_failure().await;
+        match machine.agent().await {
             Ok(handle) => break handle,
             Err(e) => {
                 if tokio::time::Instant::now() >= deadline {

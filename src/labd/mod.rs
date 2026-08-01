@@ -5,6 +5,7 @@
 
 pub mod container;
 pub mod container_ctl;
+pub mod display;
 pub mod events;
 pub mod forward_plan;
 pub mod guest_os;
@@ -18,7 +19,6 @@ pub mod network;
 pub mod plan;
 pub mod playbook;
 pub mod pull_ledger;
-pub mod screen;
 pub mod share_plan;
 pub mod state;
 pub mod vm;

@@ -10,7 +10,7 @@
 //! too: booting a VM needs a template clone and segment attachments, booting a
 //! container needs an image spec and a restart policy, and that difference is
 //! implementation — not a branch in a caller. The lab runtime supplies what
-//! both need through [`Boot`], and asks the machine to do the rest.
+//! both need through [`LabServices`], and asks the machine to do the rest.
 //!
 //! What genuinely differs is expressed as a **capability**, not as a kind:
 //!
@@ -42,9 +42,9 @@ use serde::Serialize;
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
 
+pub use super::display::Display;
 use super::events::EventLog;
 use super::guest_os::GuestOs;
-pub use super::screen::Display;
 use super::state::MachineState;
 use super::vm::PowerState;
 use super::vm_agent::AgentHandle;
@@ -55,6 +55,9 @@ use super::vm_agent::AgentHandle;
 pub use crate::status::{
     MachineDetail, MachineKind, MachineLabel, MachineStatus, NicStatus, WebPageStatus,
 };
+
+/// How long [`Machine::poweroff`] waits for the emulator to actually go.
+pub(super) const POWEROFF_SETTLE: Duration = Duration::from_secs(30);
 
 /// How long a machine that does not say otherwise gets to become ready. A
 /// container's entrypoint starts fast and its healthcheck governs the rest.
@@ -160,6 +163,16 @@ pub trait Machine: Send + Sync + 'static {
     /// substituted one disagrees with itself.
     fn virtiofsd_available(&self) -> bool;
 
+    /// Host socket for the i-th NIC of the current run.
+    fn nic_sock(&self, i: usize) -> PathBuf;
+
+    /// Whether this machine can consume a pre-opened tap fd (the afxdp fast
+    /// path), or only a stream socket. A hardware fact about how its command
+    /// line is built, not a preference.
+    fn takes_tap_fds(&self) -> bool {
+        false
+    }
+
     /// The word this machine's events name it under (`vm.stopped` vs
     /// `container.stopped`). Reported, like [`kind`](Machine::kind), so the
     /// event vocabulary stays what clients already parse without a caller
@@ -188,6 +201,17 @@ pub trait Machine: Send + Sync + 'static {
     async fn is_ready(&self) -> bool;
     /// Graceful stop ladder, or an immediate kill when `force`.
     async fn stop(&self, force: bool) -> Result<()>;
+
+    /// Exit the emulator *gracefully*, flushing block-device caches first.
+    ///
+    /// The only safe seal for guests with no ACPI (DOS, Win 3.x): the stop
+    /// ladder's bottom rung is a SIGKILL, which can drop unflushed qcow2
+    /// writes and leave the disk unbootable. The default falls back to the
+    /// ladder for a machine with no such control channel.
+    async fn poweroff(&self) -> Result<()> {
+        self.stop(false).await?;
+        self.wait_state(PowerState::Stopped, POWEROFF_SETTLE).await
+    }
 
     /// Boot this machine, wiring its NICs into the lab fabric and reporting
     /// its lifecycle on the lab's event log. A no-op when it is already up.
@@ -270,6 +294,19 @@ pub trait Machine: Send + Sync + 'static {
 
     /// The vmlab-agent channel, connecting on first use.
     async fn agent(&self) -> Result<AgentHandle>;
+    /// Whether this machine has an agent channel at all. `false` for a
+    /// vintage guest whose profile predates virtio-serial — no terminal, exec,
+    /// copy or readiness is possible, and no amount of waiting changes that.
+    fn has_agent_channel(&self) -> bool {
+        true
+    }
+
+    /// Forget a recently failed handshake so the next [`agent`](Machine::agent)
+    /// call reconnects immediately — used right after installing or starting an
+    /// agent. Unlike dropping the connection this never touches a live handle
+    /// another task may be using.
+    async fn clear_agent_failure(&self) {}
+
     /// Whether the agent answers a ping *right now* — unlike the sticky
     /// [`is_agent_up`](Machine::is_agent_up) this goes false mid-reboot.
     async fn agent_answering(&self) -> bool;
@@ -416,8 +453,15 @@ pub trait Machine: Send + Sync + 'static {
         false
     }
 
-    /// Whether this machine can be healthy right now: its healthcheck's latest
+    /// Whether this machine is healthy right now: its healthcheck's latest
     /// verdict, or plain readiness when it declares none.
+    ///
+    /// A machine with no healthcheck answers `true` once it is ready rather
+    /// than reporting the capability missing. That is deliberate and predates
+    /// this interface: `is_healthy` is a gate lab authors write `if
+    /// m.is_healthy()` around, and failing it on every machine that declares
+    /// no check would break every script that does. [`Capabilities::healthcheck`]
+    /// is how a caller learns whether the answer means anything.
     async fn is_healthy(&self) -> bool {
         match self.health().await {
             Some(healthy) => healthy,
@@ -531,6 +575,57 @@ impl dyn Machine {
 }
 
 // ---- shared implementation details -----------------------------------------
+
+/// Wire every one of `m`'s NICs into the lab fabric, in declaration order.
+///
+/// One implementation for both adapters: the segment, socket and MAC come from
+/// the machine, and whether it can take a tap fd is
+/// [`takes_tap_fds`](Machine::takes_tap_fds). A machine that ignores the
+/// returned attachments (a container micro-VM connects to the sockets itself)
+/// simply drops them.
+pub(super) async fn attach_all_nics(
+    m: &dyn Machine,
+    lab: &dyn LabServices,
+) -> Result<Vec<NicAttachment>> {
+    let tap_ok = m.takes_tap_fds();
+    let mut attachments = Vec::with_capacity(m.nics().len());
+    for (i, nic) in m.nics().iter().enumerate() {
+        let sock = m.nic_sock(i);
+        let _ = std::fs::remove_file(&sock);
+        let mac = *m
+            .macs()
+            .get(i)
+            .ok_or_else(|| anyhow!("{}: no persisted MAC for nic {i}", m.name()))?;
+        attachments.push(
+            lab.attach_nic(
+                super::network::nic_segment_name(nic),
+                &sock,
+                mac,
+                nic.isolated,
+                tap_ok,
+            )
+            .await?,
+        );
+    }
+    Ok(attachments)
+}
+
+/// [`Machine::poweroff`] for a machine QEMU is running: a clean QMP `quit`,
+/// then wait for the exit monitor to settle.
+///
+/// The QMP call is expected to fail — QEMU exits, so the connection drops
+/// mid-request — and a machine that is already down has no channel at all. The
+/// power state is the only answer that matters, so it is the only thing
+/// checked.
+pub(super) async fn quit_and_settle(
+    m: &dyn Machine,
+    qmp: Result<crate::qmp::QmpClient>,
+) -> Result<()> {
+    if let Ok(qmp) = qmp {
+        let _ = qmp.quit().await;
+    }
+    m.wait_state(PowerState::Stopped, POWEROFF_SETTLE).await
+}
 
 /// One polling wait, behind every "wait until …" on this interface: settle at
 /// 250ms, give up early when the machine stopped underneath (nothing it is

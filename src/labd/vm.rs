@@ -211,8 +211,11 @@ impl VmInstance {
         })
     }
 
-    /// Run this VM against a different hypervisor. Tests use it to drive the
-    /// start ladder and the exit monitor without KVM.
+    /// Run this VM against a different hypervisor — the injection point
+    /// ADR-0001 introduced so the start ladder and the exit monitor can be
+    /// driven without KVM. `labd::lifecycle_tests` drives both kinds through
+    /// it; orchestration is driven a level up, against whole-machine doubles
+    /// (see `labd::lab`'s tests).
     #[cfg(test)]
     pub(crate) fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn Hypervisor>) {
         Arc::get_mut(self).expect("sole owner").hv = hv;
@@ -337,14 +340,6 @@ impl VmInstance {
             return false;
         }
         self.agent.probe(&self.dirs.agent_sock()).await
-    }
-
-    /// Forget a recently failed agent handshake so the next [`agent`](Self::agent)
-    /// call reconnects immediately — used right after installing/starting the
-    /// agent. Unlike [`drop_agent`](Self::drop_agent) this never touches a live
-    /// handle another task may be using.
-    pub async fn clear_agent_failure(&self) {
-        self.agent.clear_failure().await;
     }
 
     /// Drop the cached agent connection (teardown, snapshot restore).
@@ -855,10 +850,10 @@ impl VmInstance {
     }
 }
 
-/// A VM's framebuffer is QEMU's: screendumps over QMP, input over QMP or RFB
+/// A VM's display is QEMU's: screendumps over QMP, input over QMP or RFB
 /// depending on what the guest actually listens to.
 #[async_trait::async_trait]
-impl super::screen::Screen for VmInstance {
+impl super::display::DisplayHost for VmInstance {
     fn name(&self) -> &str {
         &self.cfg.name
     }
@@ -922,6 +917,16 @@ impl super::machine::Machine for VmInstance {
         self.dirs.term_session_sock(id)
     }
 
+    fn nic_sock(&self, i: usize) -> PathBuf {
+        self.dirs.nic_sock(i)
+    }
+
+    /// A VM's argv carries pre-opened descriptors, so its NICs can ride the
+    /// afxdp tap fast path.
+    fn takes_tap_fds(&self) -> bool {
+        true
+    }
+
     fn event_subject(&self) -> &'static str {
         "vm"
     }
@@ -960,6 +965,10 @@ impl super::machine::Machine for VmInstance {
         self.stop_ladder(force).await
     }
 
+    async fn poweroff(&self) -> Result<()> {
+        super::machine::quit_and_settle(self, VmInstance::qmp(self).await).await
+    }
+
     /// Wire this VM's NICs into the lab fabric — taps on the fast path where
     /// available, since a VM's argv can carry pre-opened descriptors — then
     /// spawn QEMU with event-emitting callbacks.
@@ -974,25 +983,7 @@ impl super::machine::Machine for VmInstance {
         events.emit("vm.starting", serde_json::json!({"vm": self.cfg.name}));
 
         std::fs::create_dir_all(&self.dirs.run)?;
-        let mut attachments = Vec::with_capacity(self.cfg.nics.len());
-        for (i, nic) in self.cfg.nics.iter().enumerate() {
-            let sock = self.dirs.nic_sock(i);
-            let _ = std::fs::remove_file(&sock);
-            let mac = *self
-                .macs
-                .get(i)
-                .ok_or_else(|| anyhow!("no persisted MAC for nic {i}"))?;
-            attachments.push(
-                lab.attach_nic(
-                    super::network::nic_segment_name(nic),
-                    &sock,
-                    mac,
-                    nic.isolated,
-                    true,
-                )
-                .await?,
-            );
-        }
+        let attachments = super::machine::attach_all_nics(&*self, &*lab).await?;
         self.set_nic_attachments(attachments).await;
 
         let events_exit = events.clone();
@@ -1080,6 +1071,14 @@ impl super::machine::Machine for VmInstance {
         self.agent_up_flag().await
     }
 
+    fn has_agent_channel(&self) -> bool {
+        self.template().resolved.agent_channel
+    }
+
+    async fn clear_agent_failure(&self) {
+        self.agent.clear_failure().await;
+    }
+
     async fn snapshot(&self, name: &str) -> Result<bool> {
         self.take_snapshot(name).await
     }
@@ -1088,8 +1087,8 @@ impl super::machine::Machine for VmInstance {
         self.drop_snapshot(name).await
     }
 
-    fn display(self: Arc<Self>) -> Option<super::screen::Display> {
-        Some(super::screen::Display::new(self))
+    fn display(self: Arc<Self>) -> Option<super::display::Display> {
+        Some(super::display::Display::new(self))
     }
 
     fn can_reboot(&self) -> bool {

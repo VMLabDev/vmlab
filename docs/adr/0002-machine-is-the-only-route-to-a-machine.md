@@ -90,7 +90,16 @@ lab runtime's own source and fails the build if it starts asking what kind of
 machine it is holding. This decision decayed once already while a comment
 claimed it held; the comment is now a test.
 
-Two accessors are exempt, between explicit `BEGIN`/`END kind-aware accessors`
-markers: `LabRuntime::vm` and `LabRuntime::container` exist *to* reject the
-other kind's name, and a deferred pull has to reach a concrete type to bind the
-template or image it just downloaded. Neither decides behaviour by kind.
+Reaching a concrete type counts: `if let Ok(vm) = self.vm(n)` decides by kind
+just as surely as a match does, and that is exactly the shape the branches took.
+
+Two exemptions, both explicit and greppable:
+
+- `LabRuntime::vm` and `LabRuntime::container` themselves, between `BEGIN`/`END
+  kind-aware accessors` markers — they exist *to* reject the other kind's name,
+  so the error a user reads says "that's a container".
+- Single statements preceded by a `// kind-aware:` comment giving the reason,
+  for the deferred-pull paths that must reach a concrete type to bind the
+  template or image they just downloaded.
+
+Neither decides *behaviour* by kind. Anything else does, and fails the build.

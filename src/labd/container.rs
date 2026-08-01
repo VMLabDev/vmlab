@@ -1238,6 +1238,10 @@ impl super::machine::Machine for ContainerInstance {
         self.dirs.term_session_sock(id)
     }
 
+    fn nic_sock(&self, i: usize) -> PathBuf {
+        self.dirs.nic_sock(i)
+    }
+
     fn event_subject(&self) -> &'static str {
         "container"
     }
@@ -1271,6 +1275,10 @@ impl super::machine::Machine for ContainerInstance {
         self.stop_ladder(force).await
     }
 
+    async fn poweroff(&self) -> Result<()> {
+        super::machine::quit_and_settle(self, ContainerInstance::qmp(self).await).await
+    }
+
     /// Wire this container's NICs into the lab fabric — stream sockets only,
     /// since the micro-VM argv carries no pre-opened descriptors — then boot
     /// the micro-VM with event-emitting callbacks. Restarts driven by the
@@ -1294,22 +1302,9 @@ impl super::machine::Machine for ContainerInstance {
         );
 
         std::fs::create_dir_all(&self.dirs.run)?;
-        for (i, nic) in self.cfg.nics.iter().enumerate() {
-            let sock = self.dirs.nic_sock(i);
-            let _ = std::fs::remove_file(&sock);
-            let mac = *self
-                .macs
-                .get(i)
-                .ok_or_else(|| anyhow!("no persisted MAC for nic {i}"))?;
-            lab.attach_nic(
-                super::network::nic_segment_name(nic),
-                &sock,
-                mac,
-                nic.isolated,
-                false,
-            )
-            .await?;
-        }
+        // The micro-VM connects to the sockets itself, so the attachments are
+        // the lab's to hold, not this machine's.
+        super::machine::attach_all_nics(&*self, &*lab).await?;
 
         let events_exit = events.clone();
         let events_health = events.clone();
@@ -1392,6 +1387,10 @@ impl super::machine::Machine for ContainerInstance {
 
     async fn is_agent_up(&self) -> bool {
         self.agent_up_flag().await
+    }
+
+    async fn clear_agent_failure(&self) {
+        self.agent.clear_failure().await;
     }
 
     async fn snapshot(&self, name: &str) -> Result<bool> {
