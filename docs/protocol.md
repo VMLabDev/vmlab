@@ -33,7 +33,7 @@ the code is the contract.
 | `status` | — | `cli`, `web` | Every lab in the registry. |
 | `lab.ensure` | `name: String`, `root: std::path::PathBuf` | `cli` | Spawn (or find) a lab's daemon; answers with its socket path. |
 | `lab.release` | `name: String` | `cli` | Stop a lab's daemon, after `down` or `destroy`. |
-| `lab.restart` | `name: String`, `root: std::path::PathBuf` | `web` | Restart a lab's daemon so it re-reads its config; answers with the new socket path. |
+| `lab.restart` | `name: String`, `root: std::path::PathBuf` | `cli`, `web` | Restart a lab's daemon so it re-reads its config; answers with the new socket path. |
 | `global.attach` | `name: String`, `subnet: Option<Ipv4Net>`, `peer: Option<String>` | `daemon` | Join a global segment (PRD §9.2), creating it on first use; answers with the trunk socket to bridge to. |
 | `global.detach` | `name: String` | `daemon` | Leave a global segment. |
 | `global.list` | — | `daemon` | Every global segment this host knows. |
@@ -52,10 +52,10 @@ the code is the contract.
 |---|---|---|---|
 | `ping` | — | `cli`, `daemon`, `web` | Liveness check; answers `"pong"`. |
 | `status` | — | `cli`, `web` | The whole lab's runtime status: machines, segments, readiness. |
-| `dns.table` | — | `web` | The DNS zones the lab's segments serve. |
+| `dns.table` | — | `cli`, `web` | The DNS zones the lab's segments serve. |
 | `up` | `machines: Vec<String>` | `cli`, `web` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
 | `pull` | `machines: Vec<String>` | `cli`, `web` | Download every pending template and image without starting anything, over the code path `up` runs first. |
-| `pull.cancel` | `machine: String` | `web` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
+| `pull.cancel` | `machine: String` | `cli`, `web` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
 | `run` | `script: String` | `cli` | Run an ad-hoc wscript against the lab (PRD §12), streaming output. |
 | `down` | `machines: Vec<String>`, `force: bool` | `cli`, `web` | Stop the lab, or just the named machines (empty = all). |
 | `destroy` | — | `cli`, `web` | Stop the lab and delete everything it materialised. |
@@ -63,7 +63,7 @@ the code is the contract.
 | `machine.stop` | `machine: String`, `force: bool` | `cli`, `web` | Stop one machine; `force` kills instead of the graceful ladder. |
 | `machine.restart` | `machine: String`, `force: bool` | `cli`, `web` | Stop one machine, wait for it to settle, and boot it again. |
 | `machine.destroy` | `machine: String` | `cli`, `web` | Stop one machine and delete everything it materialised. |
-| `machine.capabilities` | `machine: String` | `web` | What this machine can do beyond the universal commands, probed live: a display, a console log, in-place reboot, and whichever features its agent negotiated. |
+| `machine.capabilities` | `machine: String` | `cli`, `web` | What this machine can do beyond the universal commands, probed live: a display, a console log, in-place reboot, and whichever features its agent negotiated. |
 | `machine.ip` | `machine: String`, `nic: Option<usize>` | `cli` | The machine's guest IP, optionally for one NIC index. |
 | `machine.screenshot` | `machine: String`, `path: String` | `cli`, `web` | Write a PNG of the machine's framebuffer to a host path. |
 | `machine.sendkeys` | `machine: String`, `keys: String` | `cli`, `web` | Send a key chord to the machine's display. |
@@ -80,9 +80,9 @@ the code is the contract.
 | `machine.pull_file` | `machine: String`, `from: String`, `to: String` | `cli` | Copy a file out of the guest to a host path. |
 | `machine.tail` | `machine: String`, `path: String` | `cli` | Follow a guest file (`tail -F` semantics), streamed as chunks until the caller hangs up or the machine stops. |
 | `machine.eventlog` | `machine: String`, `filter: Option<String>` | `cli` | Follow the Windows event log, streamed as chunks. |
-| `machine.stats` | `machine: String` | `web` | Latest guest metrics; subscribes the sampler on first use. |
-| `machine.clipboard_get` | `machine: String` | `web` | Read the guest clipboard. |
-| `machine.clipboard_set` | `machine: String`, `text: String` | `web` | Write the guest clipboard. |
+| `machine.stats` | `machine: String` | `cli`, `web` | Latest guest metrics; subscribes the sampler on first use. |
+| `machine.clipboard_get` | `machine: String` | `cli`, `web` | Read the guest clipboard. |
+| `machine.clipboard_set` | `machine: String`, `text: String` | `cli`, `web` | Write the guest clipboard. |
 | `machine.logs` | `machine: String`, `lines: usize`, `follow: bool` | `cli`, `web` | The machine's console log: the last `lines`, then, with `follow`, streamed growth until the machine stops. |
 | `web.forward` | `machine: String`, `page: String` | `web` | Ensure a loopback forward for a declared web page and return the address to dial, plus the page's auth spec (host-side only). |
 | `playbook.list` | — | `cli` | Every playbook assignment in the lab, one row per (machine, block). |
@@ -145,13 +145,6 @@ Deliberate, with the reason recorded beside the declaration:
 
 Open gaps — nobody wrote the other half, and each is tracked:
 
-- `dns.table` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
-- `pull.cancel` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
-- `machine.capabilities` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
-- `machine.stats` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
-- `machine.clipboard_get` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
-- `machine.clipboard_set` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
-- `lab.restart` — tracked in [#38](https://github.com/VMLabDev/vmlab/issues/38)
 - `template.list` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
 - `template.remote` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)
 - `template.build` — tracked in [#39](https://github.com/VMLabDev/vmlab/issues/39)

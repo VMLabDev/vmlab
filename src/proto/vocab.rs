@@ -417,7 +417,6 @@ vocabulary! {
         /// The whole lab's runtime status: machines, segments, readiness.
         Status = "status" {},
         /// The DNS zones the lab's segments serve.
-        #[one_way_gap("web", 38)]
         DnsTable = "dns.table" {},
 
         /// Bring the lab up, or just the named machines (empty = all).
@@ -432,7 +431,6 @@ vocabulary! {
         },
         /// Abort one machine's running download; whatever waits on it fails
         /// with "download cancelled".
-        #[one_way_gap("web", 38)]
         PullCancel = "pull.cancel" {
             machine: String,
         },
@@ -475,7 +473,6 @@ vocabulary! {
         /// What this machine can do beyond the universal commands, probed
         /// live: a display, a console log, in-place reboot, and whichever
         /// features its agent negotiated.
-        #[one_way_gap("web", 38)]
         MachineCapabilities = "machine.capabilities" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
@@ -645,17 +642,14 @@ vocabulary! {
             #[serde(default)] filter: Option<String>,
         },
         /// Latest guest metrics; subscribes the sampler on first use.
-        #[one_way_gap("web", 38)]
         MachineStats = "machine.stats" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
         /// Read the guest clipboard.
-        #[one_way_gap("web", 38)]
         MachineClipboardGet = "machine.clipboard_get" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
         /// Write the guest clipboard.
-        #[one_way_gap("web", 38)]
         MachineClipboardSet = "machine.clipboard_set" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             text: String,
@@ -783,7 +777,6 @@ vocabulary! {
         },
         /// Restart a lab's daemon so it re-reads its config; answers with the
         /// new socket path.
-        #[one_way_gap("web", 38)]
         LabRestart = "lab.restart" {
             name: String,
             root: std::path::PathBuf,
