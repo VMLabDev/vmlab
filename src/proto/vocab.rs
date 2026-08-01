@@ -1210,18 +1210,47 @@ mod tests {
 
     /// A gap carries the issue instead of a reason, because there is no reason
     /// to carry: nobody has decided whether the asymmetry should close.
+    ///
+    /// This declares its own vocabulary rather than naming a real command,
+    /// because there are no open gaps left — #37, #38 and #39 closed the
+    /// sixteen that #36 recorded. Naming one would make this test fail every
+    /// time somebody closed the last gap, which is the opposite of what it is
+    /// for; the annotation has to keep working for the next one regardless.
     #[test]
     fn a_gap_carries_the_issue_tracking_it_rather_than_a_reason() {
-        let one_way = LabRequest::spec("dns.table")
-            .unwrap()
-            .one_way
-            .expect("`dns.table` is a tracked gap");
+        vocabulary! {
+            /// A stand-in vocabulary, one command of each kind.
+            Undecided {
+                /// Nobody has decided about this one.
+                #[one_way_gap("web", 1234)]
+                Wondering = "wondering" {},
+                /// This one is settled.
+                #[one_way("cli", "because")]
+                Settled = "settled" {},
+            }
+        }
         assert_eq!(
-            one_way,
-            OneWay::Gap {
+            Undecided::spec("wondering").unwrap().one_way,
+            Some(OneWay::Gap {
                 surface: "web",
-                issue: 38
-            },
+                issue: 1234
+            }),
+        );
+        assert_eq!(
+            Undecided::spec("settled").unwrap().one_way,
+            Some(OneWay::Deliberate {
+                surface: "cli",
+                why: "because"
+            }),
+        );
+        // Whichever kind it is, the report asks it the same question.
+        assert_eq!(
+            Undecided::spec("wondering")
+                .unwrap()
+                .one_way
+                .unwrap()
+                .surface(),
+            "web"
         );
     }
 
