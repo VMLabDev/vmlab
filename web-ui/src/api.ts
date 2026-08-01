@@ -860,6 +860,35 @@ const storeTemplatePath = (t: StoreTemplate) =>
 export const listProfiles = (): Promise<string[]> => req("/api/catalog/profiles");
 export const catalogMeta = (): Promise<CatalogMeta> => req("/api/catalog/meta");
 
+/** The hardware a machine boots with when its own block declares nothing —
+ *  resolved by the daemon's one resolver (GET /api/catalog/inherited), not
+ *  re-derived here. `null` on a field means no layer supplies it. */
+export interface InheritedHardware {
+  cpus: number | null;
+  memory: number | null;
+  /** VM only. */
+  machine?: string | null;
+  firmware?: string | null;
+  secure_boot?: boolean | null;
+  tpm?: boolean | null;
+  display?: string | null;
+  /** The profile the answer came from (the VM's, else its template's). */
+  profile: string | null;
+}
+
+export const inheritedHardware = (q: {
+  kind: "vm" | "container";
+  template?: string;
+  profile?: string;
+  arch?: string;
+}): Promise<InheritedHardware> => {
+  const params = new URLSearchParams({ kind: q.kind });
+  if (q.template) params.set("template", q.template);
+  if (q.profile) params.set("profile", q.profile);
+  if (q.arch) params.set("arch", q.arch);
+  return req(`/api/catalog/inherited?${params}`);
+};
+
 export interface OciCatalogEntry {
   name: string;
   repo: string;

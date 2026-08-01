@@ -41,6 +41,17 @@ impl ValidationContext for HostContext {
         self.profiles.get(name).cloned()
     }
 
+    fn check_container_hardware(
+        &self,
+        container: &crate::config::model::Container,
+    ) -> Result<(), String> {
+        // Containers run the host architecture (v1), which is also what the
+        // lab runtime resolves them on.
+        crate::qemu::resolve_container(container, std::env::consts::ARCH, &self.profiles)
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+    }
+
     fn check_script(&self, path: &Path) -> Result<(), String> {
         let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         crate::scripting::check_script_source(&source)

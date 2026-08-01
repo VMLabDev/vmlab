@@ -1,5 +1,5 @@
 // A host-capped slider for an optional (inherited) hardware attr: unset
-// shows the template's default marked "inherited"; dragging sets the attr;
+// shows the value the machine inherits, marked "inherited"; dragging sets it;
 // the reset button clears it back to inherited. Clicking the readout swaps
 // it for a text box so an exact value can be typed (committed on
 // Enter/blur, clamped to the host range).
@@ -11,9 +11,10 @@ import { RotateCcw } from "lucide-solid";
 export interface SliderRowProps {
   label: string;
   doc: string;
-  /** The VM's own value; null = inherited from template→profile. */
+  /** The machine's own value; null = inherited from the layers below it. */
   value: number | null;
-  /** The template's default, shown while `value` is unset. */
+  /** What it inherits, from the daemon's resolver — shown while `value` is
+   *  unset. Null when no layer supplies one. */
   fallback: number | null;
   min: number;
   max: number;

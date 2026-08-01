@@ -10,6 +10,9 @@ pub mod virtiofsd;
 
 pub use cmdline::{
     Accel, NicBackend, NicSpec, VmPaths, build_args, emulator_binary, kvm_available, pick_accel,
+    qemu_arch,
 };
 pub use process::Proc;
-pub use resolve::{ResolvedVm, resolve_vm};
+pub use resolve::{
+    ResolvedContainer, ResolvedVm, inherited_container, inherited_vm, resolve_container, resolve_vm,
+};

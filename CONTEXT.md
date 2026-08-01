@@ -87,7 +87,10 @@ chunked into zstd layers.
 
 **Profile**:
 A named set of hardware defaults — machine, firmware, TPM, disk bus, NIC,
-display, CPUs, memory — chosen with `profile = "..."`.
+display, CPUs, memory — chosen with `profile = "..."`. Both machine kinds
+name one: a VM inherits VM block > template > profile, a container block >
+profile (it has no template layer). One resolver applies that precedence for
+both, and nothing else may reimplement it (ADR-0008).
 
 ### Guest automation
 

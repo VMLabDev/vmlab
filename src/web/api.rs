@@ -342,6 +342,107 @@ pub async fn catalog_profiles() -> HttpResponse {
     }
 }
 
+/// Which kind of machine [`catalog_inherited`] is being asked about.
+#[derive(serde::Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MachineKindQuery {
+    #[default]
+    Vm,
+    Container,
+}
+
+/// Query for [`catalog_inherited`]: the layers below a machine's own block.
+#[derive(serde::Deserialize)]
+pub struct InheritedQuery {
+    #[serde(default)]
+    kind: MachineKindQuery,
+    /// `<arch>/<name>[@version]` store reference, for a VM's template layer.
+    template: Option<String>,
+    profile: Option<String>,
+    /// Emulator arch; defaults to x86_64 (also inferred from `template`).
+    arch: Option<String>,
+}
+
+/// `GET /api/catalog/inherited` — the hardware a machine would boot with if
+/// its own block declared nothing, straight from the resolver.
+///
+/// The designer shows this behind every unset hardware field. It asks the
+/// resolver rather than approximating it, so the inherited display is the
+/// value the machine actually boots with; a field with no layer to inherit
+/// from comes back null (ADR-0008).
+pub async fn catalog_inherited(q: web::Query<InheritedQuery>) -> HttpResponse {
+    let q = q.into_inner();
+    let result = web::block(move || -> anyhow::Result<Value> {
+        let profiles = vmlab::profiles::ProfileSet::load_default()?;
+        let template_ref = q
+            .template
+            .as_deref()
+            .and_then(|r| vmlab::config::model::parse_template_ref(r).ok());
+        let meta = match &template_ref {
+            Some(vmlab::config::model::TemplateRef::Store {
+                arch,
+                name,
+                version,
+            }) => vmlab::template::TemplateStore::new(vmlab::paths::template_store_dir())
+                .resolve(arch, name, version.as_deref())
+                .ok()
+                .map(|r| r.meta),
+            _ => None,
+        };
+        // A store reference carries the arch; an explicit one wins. A draft
+        // that has named neither is mid-edit, so assume the common case
+        // rather than refuse to answer.
+        let arch = q
+            .arch
+            .clone()
+            .or_else(|| meta.as_ref().map(|m| m.arch.clone()))
+            .unwrap_or_else(|| "x86_64".to_string());
+        let profile = q.profile.as_deref();
+
+        if q.kind == MachineKindQuery::Container {
+            // No layer sizing the micro-VM means nothing to inherit, which
+            // is a fact about the config, not an error to report here.
+            let r = vmlab::hardware::inherited_container(&arch, profile, &profiles).ok();
+            return Ok(json!({
+                "cpus": r.as_ref().map(|r| r.cpus),
+                "memory": r.as_ref().map(|r| r.memory),
+                "profile": profile,
+            }));
+        }
+        // The template's profile backs the VM's own — but that fallback is
+        // the resolver's to apply, and `ResolvedVm::profile` reports which
+        // one it landed on. Restating it here is the mirror ADR-0008 removes.
+        //
+        // A refusal here is config-shaped, not a server fault: an unknown
+        // profile, or one asking for secure boot on SeaBIOS, which resolution
+        // will not answer for (§5.2). Validation reports those against the
+        // source span, so the honest answer for the form behind an unset
+        // field is that there is nothing to inherit.
+        let Ok(r) = vmlab::hardware::inherited_vm(&arch, profile, meta.as_ref(), &profiles) else {
+            return Ok(json!({ "cpus": null, "memory": null, "profile": profile }));
+        };
+        Ok(json!({
+            "cpus": r.cpus,
+            "memory": r.memory,
+            "machine": r.machine,
+            "firmware": r.firmware.map(|f| match f {
+                vmlab::profiles::FirmwareKind::Ovmf => "ovmf",
+                vmlab::profiles::FirmwareKind::Seabios => "seabios",
+            }),
+            "secure_boot": r.secure_boot,
+            "tpm": r.tpm,
+            "display": r.display_device,
+            "profile": r.profile,
+        }))
+    })
+    .await;
+    match result {
+        Ok(Ok(v)) => ok(v),
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(json!({"error": format!("{e:#}")})),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
 /// `GET /api/catalog/meta` — schema enums the editor renders as pickers,
 /// sourced from the Rust constants so they can never drift from the code.
 pub async fn catalog_meta() -> HttpResponse {

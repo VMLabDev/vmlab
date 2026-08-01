@@ -357,9 +357,12 @@ pub struct Container {
     pub workdir: Option<String>,
     /// `uid[:gid]` or a user/group name resolved against the image.
     pub user: Option<String>,
-    /// Micro-VM vCPUs; default 1 at runtime.
+    /// Guest profile supplying micro-VM hardware defaults (§5.3). Containers
+    /// have no template layer, so this is the only inheritance they have.
+    pub profile: Option<String>,
+    /// Micro-VM vCPUs; falls back to the profile (`qemu::resolve_container`).
     pub cpus: Option<u32>,
-    /// Micro-VM RAM in bytes; default 256 MiB at runtime.
+    /// Micro-VM RAM in bytes; falls back to the profile.
     pub memory: Option<u64>,
     /// VM or container names — the namespaces are unified.
     pub depends_on: Vec<String>,

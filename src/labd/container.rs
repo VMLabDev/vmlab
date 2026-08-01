@@ -26,16 +26,12 @@ use crate::config::model::{self, MacAddr, RestartPolicy, VolumeSource};
 use crate::oci::image::model::{ImageConfig, ImageHealthcheck};
 use crate::oci::image::pull::PulledImage;
 use crate::qemu::container::ContainerVmPaths;
-use crate::qemu::{self, Proc};
+use crate::qemu::{self, Proc, ResolvedContainer};
 use crate::qmp::QmpClient;
 
 /// Scratch (overlay upper layer) qcow2 virtual size. Sparse — real usage is
 /// whatever the container writes.
 const SCRATCH_SIZE: u64 = 2 << 30;
-
-/// Default micro-VM shape when the config leaves cpus/memory unset.
-const DEFAULT_CPUS: u32 = 1;
-const DEFAULT_MEMORY: u64 = 256 << 20;
 
 /// What to tell a user whose container has no answering vmlab-agent.
 const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the guest boot asset predates \
@@ -331,8 +327,10 @@ pub struct ImageParts {
 pub struct ContainerInstance {
     pub lab: String,
     pub cfg: model::Container,
-    /// Micro-VM architecture (the lab's arch; must match the pulled image).
-    pub arch: String,
+    /// Micro-VM hardware from the one resolver, for both machine kinds
+    /// (ADR-0008) — including the arch, which is the lab's and must match
+    /// the pulled image.
+    pub resolved: ResolvedContainer,
     pub dirs: ContainerDirs,
     pub macs: Vec<MacAddr>,
     /// Effective MTU of each NIC's segment, in declaration order.
@@ -389,7 +387,7 @@ impl ContainerInstance {
     pub fn new(
         lab: &str,
         cfg: model::Container,
-        arch: &str,
+        resolved: ResolvedContainer,
         dirs: ContainerDirs,
         macs: Vec<MacAddr>,
         nic_mtus: Vec<u16>,
@@ -403,7 +401,7 @@ impl ContainerInstance {
         Arc::new(Self {
             lab: lab.to_string(),
             cfg,
-            arch: arch.to_string(),
+            resolved,
             dirs,
             macs,
             nic_mtus,
@@ -558,14 +556,6 @@ impl ContainerInstance {
         .await
     }
 
-    fn cpus(&self) -> u32 {
-        self.cfg.cpus.unwrap_or(DEFAULT_CPUS)
-    }
-
-    fn memory(&self) -> u64 {
-        self.cfg.memory.unwrap_or(DEFAULT_MEMORY)
-    }
-
     fn build_paths(
         &self,
         asset: &crate::guest_asset::GuestAsset,
@@ -711,21 +701,18 @@ impl ContainerInstance {
             // vhost-user chardevs connect at startup).
             let vfs_devices = self.start_virtiofsds().await?;
 
-            let asset = crate::guest_asset::ensure_guest_asset(&self.arch)?;
-            let accel = qemu::pick_accel(&self.arch);
+            let asset = crate::guest_asset::ensure_guest_asset(&self.resolved.arch)?;
+            let accel = qemu::pick_accel(&self.resolved.arch);
             if accel == qemu::Accel::Tcg {
                 tracing::warn!(
                     "{}: KVM unavailable for {} — falling back to TCG (slow)",
                     self.cfg.name,
-                    self.arch
+                    self.resolved.arch
                 );
             }
             let args = qemu::container::build_container_args(
                 &self.lab,
-                &self.cfg.name,
-                &self.arch,
-                self.cpus(),
-                self.memory(),
+                &self.resolved,
                 &self.build_paths(&asset, &parts, vfs_devices),
             )?;
             // QMP comes up shortly after spawn (-S leaves CPUs paused); the
@@ -734,7 +721,7 @@ impl ContainerInstance {
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
-                    binary: qemu::emulator_binary(&self.arch),
+                    binary: qemu::emulator_binary(&self.resolved.arch),
                     args,
                     log: self.dirs.logs.join("qemu.log"),
                     qmp_sock: self.dirs.qmp_sock(),
@@ -1288,7 +1275,7 @@ impl super::machine::Machine for ContainerInstance {
     }
 
     fn arch(&self) -> String {
-        self.arch.clone()
+        self.resolved.arch.clone()
     }
 
     /// A container micro-VM always runs vmlab's own Alpine guest.
@@ -1440,6 +1427,7 @@ mod tests {
             command: None,
             workdir: None,
             user: None,
+            profile: Some("container".into()),
             cpus: None,
             memory: None,
             depends_on: vec![],
@@ -1476,16 +1464,14 @@ mod tests {
 
     fn instance(name: &str) -> Arc<ContainerInstance> {
         let dirs = ContainerDirs::new(Path::new("/tmp/vmlab-test"), "lab", name);
-        ContainerInstance::new(
-            "lab",
-            container(name),
+        let cfg = container(name);
+        let resolved = crate::qemu::resolve_container(
+            &cfg,
             "x86_64",
-            dirs,
-            vec![],
-            vec![],
-            None,
-            vec![],
+            &crate::profiles::ProfileSet::shipped().unwrap(),
         )
+        .unwrap();
+        ContainerInstance::new("lab", cfg, resolved, dirs, vec![], vec![], None, vec![])
     }
 
     /// A container has no display device at all, so asking for one is a hard

@@ -25,6 +25,12 @@ pub trait ValidationContext {
     fn template_meta(&self, arch: &str, name: &str, version: Option<&str>) -> Option<TemplateMeta>;
     /// A named guest OS profile, if it is known.
     fn profile(&self, name: &str) -> Option<Profile>;
+    /// Run a container's micro-VM hardware through the real resolver
+    /// (declaration > profile) and report what it says. Delegated rather
+    /// than restated: precedence has one implementation, and the message a
+    /// missing layer produces is the message the user should read
+    /// (ADR-0008). A permissive context may answer `Ok`.
+    fn check_container_hardware(&self, container: &Container) -> Result<(), String>;
     /// Compile-check a wscript script at an absolute path.
     fn check_script(&self, path: &Path) -> Result<(), String>;
 
@@ -270,6 +276,18 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             ));
         }
         check_dns_label(&c.name, c.span, "container name", &mut issues);
+
+        // Micro-VM hardware, through the same chain as a VM's. An unknown
+        // profile is reported here rather than by the resolver's own error,
+        // so it reads like every other unknown-profile issue.
+        if let Some(p) = &c.profile
+            && !ctx.profile_exists(p)
+        {
+            issues.push(Issue::at(c.span, format!("unknown profile \"{p}\"")));
+        } else if let Err(msg) = ctx.check_container_hardware(c) {
+            issues.push(Issue::at(c.span, msg));
+        }
+
         if c.mode == ContainerMode::Idle {
             if c.entrypoint.is_some() || c.command.is_some() {
                 issues.push(Issue::at(
@@ -1169,6 +1187,12 @@ pub(crate) mod tests {
                 ..Profile::default()
             })
         }
+        /// Permissive by name and by nature: hardware resolution has its own
+        /// tests, and the container fixtures below are about other rules.
+        /// `container_without_a_size_layer_is_rejected` uses a real one.
+        fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
+            Ok(())
+        }
         fn check_script(&self, _: &Path) -> Result<(), String> {
             Ok(())
         }
@@ -1208,6 +1232,11 @@ pub(crate) mod tests {
         }
         fn profile(&self, name: &str) -> Option<Profile> {
             self.profiles.get(name).cloned()
+        }
+        fn check_container_hardware(&self, container: &Container) -> Result<(), String> {
+            crate::qemu::resolve_container(container, "x86_64", &self.profiles)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"))
         }
         fn check_script(&self, _: &Path) -> Result<(), String> {
             Ok(())
@@ -1535,6 +1564,9 @@ lab "l" { vm "a" { template = "scratch" } }"#,
                     ..Profile::default()
                 })
             }
+            fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
+                Ok(())
+            }
             fn check_script(&self, _: &Path) -> Result<(), String> {
                 Ok(())
             }
@@ -1859,6 +1891,51 @@ lab "l" {
   container "c" { image = "nginx" volume { host = "no/such/dir" target = "/data" } }
 }"#,
             "not a directory",
+        );
+    }
+
+    /// A container's micro-VM size has no defensible default — what it needs
+    /// depends on its image — so no layer supplying it is a validation error
+    /// rather than a hardcoded guess the container silently OOMs under.
+    #[test]
+    fn container_without_a_size_layer_is_rejected() {
+        let f = lab(r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "nginx" } }"#);
+        let es = validate(&f, &Hardware::blank());
+        let msgs: Vec<&str> = es.iter().map(|i| i.message.as_str()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("no `cpus`")),
+            "expected a missing-hardware issue, got {msgs:?}"
+        );
+        // The message names both places the value can come from.
+        let m = msgs.iter().find(|m| m.contains("no `cpus`")).unwrap();
+        assert!(m.contains("declare `cpus`"), "{m}");
+        assert!(m.contains("`profile`"), "{m}");
+    }
+
+    /// …and a container naming a profile that supplies one is fine, as is
+    /// one declaring the values itself.
+    #[test]
+    fn container_sized_by_profile_or_declaration_validates() {
+        for src in [
+            r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "nginx" profile = "container" } }"#,
+            r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "nginx" cpus = 2 memory = 512MiB } }"#,
+        ] {
+            let es = validate(&lab(src), &Hardware::blank());
+            assert!(es.is_empty(), "{src}\n{es:?}");
+        }
+    }
+
+    #[test]
+    fn container_unknown_profile_is_rejected() {
+        let f = lab(r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "nginx" profile = "no-such-profile" } }"#);
+        let es = validate(&f, &Hardware::blank());
+        assert!(
+            es.iter().any(|i| i.message.contains("unknown profile")),
+            "{es:?}"
         );
     }
 

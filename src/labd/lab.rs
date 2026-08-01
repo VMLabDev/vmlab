@@ -349,10 +349,14 @@ impl LabRuntime {
                     .collect();
                 let dirs = ContainerDirs::new(&root, &name, &c_cfg.name);
                 let volumes = resolve_volume_hosts(c_cfg, &root);
+                // Same resolver as the VMs above: declaration > profile
+                // (a container has no template layer). §5.1 validation has
+                // already rejected a container no layer sizes.
+                let resolved = crate::qemu::resolve_container(c_cfg, arch, profiles)?;
                 let container = ContainerInstance::new(
                     &name,
                     c_cfg.clone(),
-                    arch,
+                    resolved,
                     dirs,
                     macs,
                     nic_mtus,
@@ -1084,7 +1088,7 @@ impl LabRuntime {
         let mut needed: Vec<String> = vec!["qemu-img".to_string()];
         for name in targets {
             if let Some(c) = self.containers.get(name) {
-                let emu = crate::qemu::emulator_binary(&c.arch);
+                let emu = crate::qemu::emulator_binary(&c.resolved.arch);
                 if !needed.contains(&emu) {
                     needed.push(emu);
                 }
@@ -1129,7 +1133,7 @@ impl LabRuntime {
                 continue;
             }
             let (os, arch) = if let Some(c) = self.containers.get(name) {
-                (playbook::GuestOs::Linux, c.arch.clone())
+                (playbook::GuestOs::Linux, c.resolved.arch.clone())
             } else {
                 let vm = self.vm(name)?;
                 let t = vm.template();

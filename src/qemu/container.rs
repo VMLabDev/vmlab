@@ -18,9 +18,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use super::cmdline::{Accel, pick_accel};
+use super::resolve::ResolvedContainer;
 use crate::config::model::MacAddr;
 
 /// Per-container runtime paths and attachments supplied by the lab daemon.
@@ -60,23 +61,18 @@ pub struct ContainerVmPaths {
 /// picking the accelerator via [`pick_accel`].
 pub fn build_container_args(
     lab: &str,
-    name: &str,
-    arch: &str,
-    cpus: u32,
-    memory_bytes: u64,
+    container: &ResolvedContainer,
     paths: &ContainerVmPaths,
 ) -> Result<Vec<String>> {
-    build_container_args_with_accel(lab, name, arch, cpus, memory_bytes, paths, pick_accel(arch))
+    let accel = pick_accel(&container.arch);
+    build_container_args_with_accel(lab, container, paths, accel)
 }
 
 /// The accel-injectable core of [`build_container_args`] (tests pin the
 /// accelerator so assertions don't depend on /dev/kvm on the build host).
 pub(crate) fn build_container_args_with_accel(
     lab: &str,
-    name: &str,
-    arch: &str,
-    cpus: u32,
-    memory_bytes: u64,
+    container: &ResolvedContainer,
     paths: &ContainerVmPaths,
     accel: Accel,
 ) -> Result<Vec<String>> {
@@ -84,25 +80,20 @@ pub(crate) fn build_container_args_with_accel(
         a.push(format!("-{s}"));
         a.push(v);
     }
+    let arch = container.arch.as_str();
     let mut a: Vec<String> = Vec::new();
 
     // Same marker as full VMs so `kill_lab_orphans` reaps containers too.
-    arg(&mut a, "name", format!("vmlab:{lab}/{name}"));
+    arg(&mut a, "name", format!("vmlab:{lab}/{}", container.name));
 
-    let machine = match arch {
-        "x86_64" => "q35",
-        "aarch64" => "virt",
-        "riscv64" => "virt,acpi=off",
-        other => bail!("containers do not run on arch {other} (x86_64, aarch64, riscv64)"),
-    };
     // vhost-user-fs back-ends map guest RAM, which requires a shared memory
     // backend. Only volume-carrying containers get one: switching the
     // backend renames the RAM block inside existing snapshots (pc.ram →
     // mem0), so the plain `-m` shape stays untouched for everyone else.
     let machine = if paths.volumes.is_empty() {
-        machine.to_string()
+        container.machine.clone()
     } else {
-        format!("{machine},memory-backend=mem0")
+        format!("{},memory-backend=mem0", container.machine)
     };
     arg(&mut a, "machine", machine);
     if !paths.volumes.is_empty() {
@@ -111,7 +102,7 @@ pub(crate) fn build_container_args_with_accel(
             "object",
             format!(
                 "memory-backend-memfd,id=mem0,size={}M,share=on",
-                memory_bytes >> 20
+                container.memory >> 20
             ),
         );
     }
@@ -125,8 +116,8 @@ pub(crate) fn build_container_args_with_accel(
             arg(&mut a, "cpu", "max".into());
         }
     }
-    arg(&mut a, "smp", cpus.to_string());
-    arg(&mut a, "m", format!("{}M", memory_bytes >> 20));
+    arg(&mut a, "smp", container.cpus.to_string());
+    arg(&mut a, "m", format!("{}M", container.memory >> 20));
 
     // Fully headless: no display, and no default VGA either (a micro-VM has
     // no console to look at — the serial log is the console). No USB, no
@@ -274,6 +265,9 @@ pub(crate) fn build_container_args_with_accel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Same discipline as the full-VM argv tests: the resolved shape comes
+    // from the real resolver, never from a fixture (ADR-0008).
+    use super::super::resolve::testing::resolved_container as resolved;
 
     fn paths() -> ContainerVmPaths {
         ContainerVmPaths {
@@ -301,9 +295,11 @@ mod tests {
     #[test]
     fn x86_64_shape() {
         let p = paths();
-        let args =
-            build_container_args_with_accel("lab1", "web", "x86_64", 2, 256 << 20, &p, Accel::Kvm)
-                .unwrap();
+        let c = resolved(
+            "container \"web\" { image = \"nginx:1.27\" cpus = 2 memory = 256MiB }",
+            "x86_64",
+        );
+        let args = build_container_args_with_accel("lab1", &c, &p, Accel::Kvm).unwrap();
         let s = joined(&args);
         assert!(s.contains("-name vmlab:lab1/web"), "{s}");
         assert!(s.contains("-machine q35"), "{s}");
@@ -387,9 +383,11 @@ mod tests {
     /// the second (scratch).
     #[test]
     fn blockdev_order_matches_cmdline_device_names() {
-        let args =
-            build_container_args_with_accel("l", "c", "x86_64", 1, 256 << 20, &paths(), Accel::Kvm)
-                .unwrap();
+        let c = resolved(
+            "container \"c\" { image = \"alpine\" profile = \"container\" }",
+            "x86_64",
+        );
+        let args = build_container_args_with_accel("l", &c, &paths(), Accel::Kvm).unwrap();
         let pos = |needle: &str| {
             args.iter()
                 .position(|a| a == needle)
@@ -412,9 +410,11 @@ mod tests {
     fn aarch64_airgapped_shape() {
         let mut p = paths();
         p.nics.clear();
-        let args =
-            build_container_args_with_accel("lab1", "iso", "aarch64", 1, 128 << 20, &p, Accel::Tcg)
-                .unwrap();
+        let c = resolved(
+            "container \"iso\" { image = \"alpine\" cpus = 1 memory = 128MiB }",
+            "aarch64",
+        );
+        let args = build_container_args_with_accel("lab1", &c, &p, Accel::Tcg).unwrap();
         let s = joined(&args);
         assert!(s.contains("-machine virt"), "{s}");
         assert!(!s.contains("acpi=off"), "{s}");
@@ -430,18 +430,11 @@ mod tests {
 
     #[test]
     fn riscv64_pins_acpi_off_and_ttys0() {
-        let s = joined(
-            &build_container_args_with_accel(
-                "l",
-                "c",
-                "riscv64",
-                1,
-                256 << 20,
-                &paths(),
-                Accel::Tcg,
-            )
-            .unwrap(),
+        let c = resolved(
+            "container \"c\" { image = \"alpine\" profile = \"container\" }",
+            "riscv64",
         );
+        let s = joined(&build_container_args_with_accel("l", &c, &paths(), Accel::Tcg).unwrap());
         assert!(s.contains("-machine virt,acpi=off"), "{s}");
         assert!(s.contains("console=ttyS0"), "{s}");
     }
@@ -455,9 +448,11 @@ mod tests {
             ("vol-web-0".into(), PathBuf::from("/run/l/web/vfs0.sock")),
             ("vol-web-1".into(), PathBuf::from("/run/l/web/vfs1.sock")),
         ];
-        let args =
-            build_container_args_with_accel("lab1", "web", "x86_64", 1, 512 << 20, &p, Accel::Kvm)
-                .unwrap();
+        let c = resolved(
+            "container \"web\" { image = \"nginx:1.27\" cpus = 1 memory = 512MiB }",
+            "x86_64",
+        );
+        let args = build_container_args_with_accel("lab1", &c, &p, Accel::Kvm).unwrap();
         let s = joined(&args);
         assert!(s.contains("-machine q35,memory-backend=mem0"), "{s}");
         assert!(
@@ -490,29 +485,33 @@ mod tests {
 
     #[test]
     fn jumbo_mtu_sets_host_mtu() {
+        let c = resolved(
+            "container \"c\" { image = \"alpine\" profile = \"container\" }",
+            "x86_64",
+        );
         let mut p = paths();
         p.nics[0].2 = Some(9000);
-        let s = joined(
-            &build_container_args_with_accel("l", "c", "x86_64", 1, 1 << 30, &p, Accel::Kvm)
-                .unwrap(),
-        );
+        let s = joined(&build_container_args_with_accel("l", &c, &p, Accel::Kvm).unwrap());
         assert!(s.contains("host_mtu=9000"), "{s}");
 
         // 1500 is the default — nothing emitted.
         let mut p = paths();
         p.nics[0].2 = Some(1500);
-        let s = joined(
-            &build_container_args_with_accel("l", "c", "x86_64", 1, 1 << 30, &p, Accel::Kvm)
-                .unwrap(),
-        );
+        let s = joined(&build_container_args_with_accel("l", &c, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("host_mtu"), "{s}");
     }
 
+    /// A container declaring its own size overrides the profile, exactly as
+    /// a VM block overrides its template and profile.
     #[test]
-    fn unsupported_arch_is_an_error() {
-        let err =
-            build_container_args_with_accel("l", "c", "s390x", 1, 1 << 30, &paths(), Accel::Tcg)
-                .unwrap_err();
-        assert!(err.to_string().contains("s390x"), "{err}");
+    fn declared_size_beats_the_profile() {
+        let c = resolved(
+            "container \"c\" { image = \"alpine\" profile = \"container\" memory = 1GiB }",
+            "x86_64",
+        );
+        let s = joined(&build_container_args_with_accel("l", &c, &paths(), Accel::Kvm).unwrap());
+        // cpus still from the profile, memory from the declaration.
+        assert!(s.contains("-smp 1"), "{s}");
+        assert!(s.contains("-m 1024M"), "{s}");
     }
 }

@@ -238,9 +238,11 @@ type Container {
   workdir: utf8?
   @doc("User to run as: `uid[:gid]` or a name from the image; image default if omitted")
   user: utf8?
-  @doc("vCPU count for the micro-VM (> 0); default 1")
+  @doc("Guest profile supplying micro-VM hardware defaults, e.g. `container`")
+  profile: utf8?
+  @doc("vCPU count for the micro-VM (> 0); inherited from `profile` if omitted — one of the two must supply it")
   cpus: i64?
-  @doc("RAM for the micro-VM, e.g. `512MiB`; default 256MiB")
+  @doc("RAM for the micro-VM, e.g. `512MiB`; inherited from `profile` if omitted — one of the two must supply it")
   memory: std.ByteSize?
   @doc("VM/container names to wait for before this one (no cycles)")
   depends_on: list<utf8>?

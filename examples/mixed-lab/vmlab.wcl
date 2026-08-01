@@ -55,6 +55,9 @@ lab "mixed-lab" {
   # run in a micro-VM, resolvable as web.mixed-lab.<suffix> from the VMs.
   container "web" {
     image = "nginx:1.27"
+    # The micro-VM's size comes from the profile; declare `cpus`/`memory`
+    # here to override it. One of the two must supply them.
+    profile = "container"
     depends_on = ["nix01"]
     nic {
       segment = "lan"

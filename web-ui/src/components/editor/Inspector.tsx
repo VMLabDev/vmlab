@@ -60,7 +60,8 @@ import {
   renameVm,
   select,
   setEditor,
-  storeTemplateFor,
+  inheritedForContainer,
+  inheritedForVm,
 } from "../../editor/store";
 import { anyVmRunning, state } from "../../store";
 import { dnsTable } from "../../api";
@@ -956,7 +957,7 @@ function VmInspector(props: { index: number }) {
           label="vCPUs"
           doc="vCPU count; inherited from template→profile if not set"
           value={vm().cpus}
-          fallback={storeTemplateFor(vm().template)?.cpus ?? null}
+          fallback={inheritedForVm(vm())?.cpus ?? null}
           min={1}
           max={editor.catalog.host?.cpus ?? 16}
           step={1}
@@ -972,7 +973,7 @@ function VmInspector(props: { index: number }) {
           label="Memory"
           doc="RAM; inherited from template→profile if not set"
           value={vm().memory}
-          fallback={storeTemplateFor(vm().template)?.memory ?? null}
+          fallback={inheritedForVm(vm())?.memory ?? null}
           min={256 * MIB}
           max={editor.catalog.host?.memory ?? 16 * GIB}
           step={256 * MIB}
@@ -1327,14 +1328,33 @@ function ContainerInspector(props: { index: number }) {
       </Show>
       <Show when={tab() === "hardware"}>
         <div class="inspector-note">
-          The container runs in its own micro-VM — these size that VM (defaults: 1 vCPU,
-          256MiB).
+          The container runs in its own micro-VM — these size that VM. A micro-VM has no
+          default size: the value comes from this block or from its profile, and a
+          container with neither fails validation.
+        </div>
+        <div class="field-row">
+          <div
+            class="field-row-label"
+            title="Guest profile supplying micro-VM hardware defaults, e.g. `container`"
+          >
+            Profile
+          </div>
+          <div class="field-row-control">
+            <Select
+              value={ctr().profile ?? ""}
+              options={[
+                { value: "", label: "none" },
+                ...editor.catalog.profiles.map((p) => ({ value: p, label: p })),
+              ]}
+              onChange={(v) => setField("profile", v || null)}
+            />
+          </div>
         </div>
         <SliderRow
           label="vCPUs"
-          doc="vCPU count for the micro-VM (> 0); default 1"
+          doc="vCPU count for the micro-VM (> 0); inherited from the profile if not set"
           value={ctr().cpus}
-          fallback={1}
+          fallback={inheritedForContainer(ctr())?.cpus ?? null}
           min={1}
           max={editor.catalog.host?.cpus ?? 16}
           step={1}
@@ -1344,20 +1364,18 @@ function ContainerInspector(props: { index: number }) {
             const n = parseInt(t, 10);
             return Number.isFinite(n) ? n : null;
           }}
-          unsetLabel="default"
           onChange={(v) => setField("cpus", v)}
         />
         <SliderRow
           label="Memory"
-          doc="RAM for the micro-VM, e.g. `512MiB`; default 256MiB"
+          doc="RAM for the micro-VM, e.g. `512MiB`; inherited from the profile if not set"
           value={ctr().memory}
-          fallback={256 * MIB}
+          fallback={inheritedForContainer(ctr())?.memory ?? null}
           min={128 * MIB}
           max={editor.catalog.host?.memory ?? 16 * GIB}
           step={128 * MIB}
           fmt={formatMemory}
           parse={parseByteSize}
-          unsetLabel="default"
           onChange={(v) => setField("memory", v)}
         />
       </Show>

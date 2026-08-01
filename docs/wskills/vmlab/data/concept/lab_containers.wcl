@@ -29,7 +29,9 @@ full machine parity with zero extra privileges:
 PROSE
     code "wcl" { source = <<'SRC'
 container "db" {
-  image = "postgres:17"
+  image   = "postgres:17"
+  profile = "container"
+  memory  = 1GiB
   nic    { segment = "corp" }
   env    { name = "POSTGRES_PASSWORD" value = "lab" }
   volume { name = "pgdata" target = "/var/lib/postgresql/data" }
