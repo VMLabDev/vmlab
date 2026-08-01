@@ -16,6 +16,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0006](0006-one-wcl-block-extractor.md) | One WCL block extractor | Accepted |
 | [0007](0007-the-wire-protocol-carries-a-typed-vocabulary.md) | The wire protocol carries a typed vocabulary and error codes | Accepted |
 | [0008](0008-hardware-resolution-happens-once.md) | Hardware resolution happens once, for both machine kinds | Accepted |
+| [0009](0009-build-hardware-resolves-block-over-source-template.md) | Build hardware resolves block over source template, and the profile stays live | Accepted |
 
 ## Format
 

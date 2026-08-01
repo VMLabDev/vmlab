@@ -72,8 +72,7 @@ throughout the code and commit messages.
 
 ## Conventions
 
-- Trunk-based development: commit directly to `main`, no branches or PRs
-  unless explicitly asked.
+- Changes land on a branch and merge to `main` via a pull request.
 - **just** as command runner: `just build` / `just test`, and `just ci::check`
   for the merge bar — the `ci` module (`.just/ci/mod.just`) is the single
   definition of what a change must pass, and `ci.yml` calls its recipes rather
