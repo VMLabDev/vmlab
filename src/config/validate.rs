@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 
 use super::model::*;
 use super::{Issue, IssueList};
-use crate::profiles::{FirmwareKind, Profile};
-use crate::qemu::resolve::{Layer, resolve_firmware};
+use crate::profiles::Profile;
+use crate::qemu::resolve::{
+    Layer, default_profile, effective_profile_name, resolve_firmware, vm_arch,
+};
 use crate::template::TemplateMeta;
 
 /// Host facilities the validator consults. The CLI wires the real template
@@ -673,36 +675,11 @@ fn check_vm_hardware(
 /// have been inherited, so this resolves the §5.2 chain and names the layer
 /// each side came from.
 fn check_secure_boot(vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueList) {
-    // Resolution needs the template layer, and only a store template can
-    // supply it here: a registry template is not pulled at validate time,
-    // and a missing store template is reported by `check_vm_template`. With
-    // that layer unknown, only a conflict written on the VM block itself is
-    // certain — nothing below it can override the VM block.
-    let (meta, template_known) = match &vm.template {
-        TemplateRef::Scratch => (None, true),
-        TemplateRef::Store {
-            arch,
-            name,
-            version,
-        } => {
-            let meta = ctx.template_meta(arch, name, version.as_deref());
-            let known = meta.is_some();
-            (meta, known)
-        }
-        TemplateRef::Registry { .. } => (None, false),
-    };
-    // An archless VM is already an error, and the arch only decides the
-    // no-firmware-declared fallback.
-    let arch = match &vm.template {
-        TemplateRef::Store { arch, .. } => Some(arch.clone()),
-        _ => vm.arch.clone(),
-    };
-    let Some(arch) = arch else { return };
-
-    let profile_name = vm
-        .profile
-        .clone()
-        .or_else(|| meta.as_ref().and_then(|m| m.profile.clone()));
+    let layer = TemplateLayer::of(vm, ctx);
+    // The arch only decides which firmware applies when no layer names one;
+    // a VM without one is already an error.
+    let Some(arch) = vm_arch(vm) else { return };
+    let profile_name = effective_profile_name(vm, layer.meta());
     let profile = match &profile_name {
         // An unknown profile name is reported on its own; without the
         // profile there is no floor to resolve against.
@@ -710,47 +687,65 @@ fn check_secure_boot(vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueLis
             Some(p) => p,
             None => return,
         },
-        None => Profile::default(),
+        None => default_profile(),
     };
 
-    let choice = resolve_firmware(vm, meta.as_ref(), &profile, &arch);
+    let choice = resolve_firmware(vm, layer.meta(), &profile, &arch);
     if !choice.secure_boot_unsupported() {
         return;
     }
-    if !template_known
-        && !(choice.firmware_layer == Layer::Vm && choice.secure_boot_layer == Layer::Vm)
-    {
+    // With the template layer unknown, only a conflict the vm block decided
+    // by itself is certain — nothing below it can override the vm block.
+    let certain = layer.is_known()
+        || (choice.firmware_layer == Layer::Vm && choice.secure_boot_layer == Layer::Vm);
+    if !certain {
         return;
     }
-
-    let from_secure_boot = layer_label(choice.secure_boot_layer, profile_name.as_deref());
-    let message = match choice.firmware {
-        Some(FirmwareKind::Seabios) => format!(
-            "vm \"{}\": secure_boot = true (from {from_secure_boot}) but firmware = \"seabios\" \
-             (from {}) — secure boot needs UEFI, so it would be ignored silently (PRD §5.2)",
-            vm.name,
-            layer_label(choice.firmware_layer, profile_name.as_deref()),
-        ),
-        _ => format!(
-            "vm \"{}\": secure_boot = true (from {from_secure_boot}) but no firmware is set, so \
-             the VM boots SeaBIOS (the QEMU default on x86) — secure boot needs UEFI, set \
-             `firmware = \"ovmf\"` (PRD §5.2)",
-            vm.name,
-        ),
-    };
-    issues.push(Issue::at(vm.span, message));
+    issues.push(Issue::at(
+        vm.span,
+        choice.conflict_message(&vm.name, profile_name.as_deref()),
+    ));
 }
 
-/// How a resolved value's origin reads in an error message.
-fn layer_label(layer: Layer, profile: Option<&str>) -> String {
-    match layer {
-        Layer::Vm => "the vm block".to_string(),
-        Layer::Template => "the template".to_string(),
-        Layer::Profile => match profile {
-            Some(name) => format!("profile \"{name}\""),
-            None => "the profile".to_string(),
-        },
-        Layer::Default => "vmlab's default".to_string(),
+/// What validation knows about a VM's template layer — §5.2's middle layer,
+/// which it can only sometimes see.
+enum TemplateLayer {
+    /// A `scratch` VM has no template layer at all (§6.5).
+    Absent,
+    /// Boxed: the metadata dwarfs the other two variants.
+    Known(Box<TemplateMeta>),
+    /// The layer exists but its contents do not: a registry template is not
+    /// pulled at validate time, and a store template that is missing is
+    /// reported by `check_vm_template`. Either could have supplied any
+    /// hardware value, so nothing below the vm block can be trusted.
+    Unknown,
+}
+
+impl TemplateLayer {
+    fn of(vm: &Vm, ctx: &dyn ValidationContext) -> Self {
+        match &vm.template {
+            TemplateRef::Scratch => Self::Absent,
+            TemplateRef::Store {
+                arch,
+                name,
+                version,
+            } => match ctx.template_meta(arch, name, version.as_deref()) {
+                Some(meta) => Self::Known(Box::new(meta)),
+                None => Self::Unknown,
+            },
+            TemplateRef::Registry { .. } => Self::Unknown,
+        }
+    }
+
+    fn meta(&self) -> Option<&TemplateMeta> {
+        match self {
+            Self::Known(meta) => Some(meta.as_ref()),
+            Self::Absent | Self::Unknown => None,
+        }
+    }
+
+    fn is_known(&self) -> bool {
+        !matches!(self, Self::Unknown)
     }
 }
 

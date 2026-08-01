@@ -71,6 +71,42 @@ impl FirmwareChoice {
     pub fn secure_boot_unsupported(&self) -> bool {
         self.secure_boot && self.firmware != Some(FirmwareKind::Ovmf)
     }
+
+    /// Why the combination cannot work, naming the layer each side came
+    /// from — either may have been inherited from somewhere the lab author
+    /// never looked. One wording, whether validation reports it against a
+    /// source span or the resolver refuses to boot on it.
+    pub fn conflict_message(&self, machine: &str, profile_name: Option<&str>) -> String {
+        let from_secure_boot = self.secure_boot_layer.label(profile_name);
+        match self.firmware {
+            Some(_) => format!(
+                "vm \"{machine}\": secure_boot = true (from {from_secure_boot}) but firmware = \
+                 \"seabios\" (from {}) — secure boot needs UEFI, so it would be ignored silently \
+                 (PRD §5.2)",
+                self.firmware_layer.label(profile_name),
+            ),
+            None => format!(
+                "vm \"{machine}\": secure_boot = true (from {from_secure_boot}) but no firmware \
+                 is set, so the VM boots SeaBIOS (the QEMU default on x86) — secure boot needs \
+                 UEFI, set `firmware = \"ovmf\"` (PRD §5.2)"
+            ),
+        }
+    }
+}
+
+impl Layer {
+    /// How this layer reads in an error message.
+    pub fn label(self, profile_name: Option<&str>) -> String {
+        match self {
+            Layer::Vm => "the vm block".to_string(),
+            Layer::Template => "the template".to_string(),
+            Layer::Profile => match profile_name {
+                Some(name) => format!("profile \"{name}\""),
+                None => "the profile".to_string(),
+            },
+            Layer::Default => "vmlab's default".to_string(),
+        }
+    }
 }
 
 /// First layer that declared a value, and which layer that was.
@@ -78,6 +114,34 @@ fn pick<T>(vm: Option<T>, template: Option<T>, profile: Option<T>) -> Option<(T,
     vm.map(|v| (v, Layer::Vm))
         .or_else(|| template.map(|v| (v, Layer::Template)))
         .or_else(|| profile.map(|v| (v, Layer::Profile)))
+}
+
+/// The effective profile name: the VM's own, else the one its template
+/// recorded (§5.2).
+pub fn effective_profile_name(lab_vm: &Vm, template: Option<&TemplateMeta>) -> Option<String> {
+    lab_vm
+        .profile
+        .clone()
+        .or_else(|| template.and_then(|t| t.profile.clone()))
+}
+
+/// The arch a VM runs at: a store template names it in its reference,
+/// every other kind has to declare it (§6.4/§6.5). `None` is a validation
+/// error elsewhere.
+pub fn vm_arch(lab_vm: &Vm) -> Option<String> {
+    match &lab_vm.template {
+        TemplateRef::Scratch | TemplateRef::Registry { .. } => lab_vm.arch.clone(),
+        TemplateRef::Store { arch, .. } => Some(arch.clone()),
+    }
+}
+
+/// The floor for a VM that names no profile: `custom`'s "assume nothing"
+/// (§5.3), except that the agent channel is vmlab's own, not the guest's.
+pub fn default_profile() -> Profile {
+    Profile {
+        agent_channel: true,
+        ..Profile::default()
+    }
 }
 
 /// Resolve firmware and secure boot for one VM. Split out of
@@ -160,14 +224,8 @@ pub fn resolve_vm(
     template: Option<&TemplateMeta>,
     profiles: &ProfileSet,
 ) -> anyhow::Result<ResolvedVm> {
-    let profile_name = lab_vm
-        .profile
-        .clone()
-        .or_else(|| template.and_then(|t| t.profile.clone()));
-    let default_profile = Profile {
-        agent_channel: true,
-        ..Profile::default()
-    };
+    let profile_name = effective_profile_name(lab_vm, template);
+    let default_profile = default_profile();
     let profile = match &profile_name {
         Some(name) => profiles
             .get(name)
@@ -175,13 +233,8 @@ pub fn resolve_vm(
         None => &default_profile,
     };
 
-    let arch = match &lab_vm.template {
-        TemplateRef::Scratch | TemplateRef::Registry { .. } => lab_vm
-            .arch
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("vm \"{}\" needs an explicit arch", lab_vm.name))?,
-        TemplateRef::Store { arch, .. } => arch.clone(),
-    };
+    let arch = vm_arch(lab_vm)
+        .ok_or_else(|| anyhow::anyhow!("vm \"{}\" needs an explicit arch", lab_vm.name))?;
 
     let machine = if arch == "x86_64" || arch == "x86" {
         // `x86` is a display-only alias that runs on the x86_64 emulator, so it
@@ -201,6 +254,14 @@ pub fn resolve_vm(
     };
 
     let firmware_choice = resolve_firmware(lab_vm, template, profile, &arch);
+    // Validation rejects this combination against the source span, but it
+    // cannot always see the template layer — a registry template is not
+    // pulled at validate time. By the time a machine resolves, every layer
+    // is in hand: refuse rather than boot a VM whose secure boot would be
+    // dropped on the floor (§5.2).
+    if firmware_choice.secure_boot_unsupported() {
+        anyhow::bail!(firmware_choice.conflict_message(&lab_vm.name, profile_name.as_deref()));
+    }
 
     let display_device = lab_vm
         .display
@@ -374,6 +435,30 @@ mod tests {
 
         // Non-x86 defaults to UEFI, so the same VM is fine there.
         assert!(!resolve_firmware(&v, None, custom, "aarch64").secure_boot_unsupported());
+    }
+
+    /// Validation cannot see a registry template's hardware — it is not
+    /// pulled at validate time — so the resolver is the backstop: by the
+    /// time a machine resolves, every layer is in hand.
+    #[test]
+    fn resolve_refuses_secure_boot_without_uefi() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let v = vm(
+            "vm \"a\" { template = \"ghcr.io/acme/win:1\" arch = \"x86_64\" secure_boot = true }",
+        );
+        let mut m = meta();
+        m.profile = Some("windows-legacy".into());
+        let err = resolve_vm(&v, Some(&m), &profiles)
+            .expect_err("secure boot on SeaBIOS must not resolve")
+            .to_string();
+        assert!(err.contains("secure boot needs UEFI"), "{err}");
+        assert!(err.contains("profile \"windows-legacy\""), "{err}");
+
+        // The same VM on a UEFI profile resolves as before.
+        m.profile = Some("windows-11".into());
+        let r = resolve_vm(&v, Some(&m), &profiles).expect("UEFI secure boot resolves");
+        assert!(r.secure_boot);
+        assert_eq!(r.firmware, Some(FirmwareKind::Ovmf));
     }
 
     #[test]
