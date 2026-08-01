@@ -8,12 +8,14 @@ pub mod agent_install;
 pub mod artefact;
 pub mod bootstrap;
 pub mod build;
+pub mod catalog;
 pub mod cli;
 pub mod meta;
 pub mod oci_bridge;
 pub mod qimg;
 pub mod registries;
 pub mod store;
+pub mod store_view;
 
 pub use meta::{META_FILE, TemplateMeta};
 pub use store::TemplateStore;

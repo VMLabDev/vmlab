@@ -1,15 +1,40 @@
 //! `vmlab template ...` — store management, builds, OCI distribution (PRD
-//! §6, §12). Runs in the CLI process (template store writes are serialised
-//! by the store's own file lock).
+//! §6, §12), as a client of the supervisor.
+//!
+//! Nothing here opens the template store or dials a registry. PRD §3 gives
+//! the supervisor "serialised writes to the template store (pulls, builds,
+//! imports …)", so every verb below is a request over the supervisor socket
+//! and this file is presentation: parse the flags, ask, render the answer.
+//! That is what makes a build started from a terminal visible to the console
+//! and stoppable from either, instead of the two surfaces each running their
+//! own copy.
+//!
+//! Reading the caller's own surroundings stays here, because only the caller
+//! has them: which lab file the shell is standing in, and the git `origin` a
+//! pushed package should be linked to.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use tokio::sync::mpsc;
 
-use super::build::build_template;
-use super::store::TemplateStore;
-use crate::config::model::parse_template_ref;
+use crate::cli::daemon::{abs_path, ensure_supervisor, remote};
+use crate::proto::WireRequest;
+use crate::proto::client::SupClient;
+use crate::proto::{Event, SupRequest};
+use crate::template::catalog::CatalogSearch;
+use crate::template::registries::RegistryEntry;
+use crate::template::store_view::{PrunePlan, PushStarted, StoreEntry, StoredVersion};
+
+/// The two fields a build needs from `template.list`: which templates the
+/// file declares, and how each is addressed.
+#[derive(serde::Deserialize)]
+struct DeclaredTemplate {
+    arch: String,
+    name: String,
+}
 
 #[derive(clap::Subcommand)]
 pub enum TemplateCmd {
@@ -24,6 +49,15 @@ pub enum TemplateCmd {
         /// single target template)
         #[arg(long)]
         version: Option<String>,
+    },
+    /// Stop a build or push running for a template — one this terminal
+    /// started, or one the console did
+    Stop {
+        /// Template name, as the file declares it
+        name: String,
+        /// Architecture, when the name is declared for more than one
+        #[arg(long, default_value = "x86_64")]
+        arch: String,
     },
     /// List templates in the store
     List {
@@ -154,58 +188,179 @@ pub enum RegistryCmd {
     Remove { namespace: String },
 }
 
-fn store() -> TemplateStore {
-    TemplateStore::new(crate::paths::template_store_dir())
+/// Send one request and decode its answer into the view the supervisor
+/// promised.
+///
+/// Decoding rather than indexing is what keeps the two halves of `store.*`
+/// honest: a field renamed on one side stops the other compiling, where
+/// `v["freed"].as_u64().unwrap_or(0)` would have printed a confident zero.
+async fn ask<T: DeserializeOwned>(sup: &SupClient, req: SupRequest) -> Result<T> {
+    let cmd = req.cmd();
+    let answer = sup.send(req).await.map_err(remote)?;
+    serde_json::from_value(answer).with_context(|| {
+        format!("the supervisor answered `{cmd}` in a shape this build cannot read")
+    })
 }
 
 pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        let sup = ensure_supervisor().await?;
         match cmd {
             TemplateCmd::Build {
                 file,
                 name,
                 version,
-            } => build(file, name, version).await,
-            TemplateCmd::List { json, remote } => list(json, remote).await,
+            } => build(&sup, file, name, version).await,
+            TemplateCmd::Stop { name, arch } => stop(&sup, name, arch).await,
+            TemplateCmd::List { json, remote } => list(&sup, json, remote).await,
             TemplateCmd::Search {
                 query,
                 registry,
                 arch,
                 kind,
                 json,
-            } => search(query, registry, arch, kind, json).await,
-            TemplateCmd::Rm { reference, force } => rm(&reference, force),
+            } => search(&sup, query, registry, arch, kind, json).await,
+            TemplateCmd::Rm { reference, force } => rm(&sup, reference, force).await,
             TemplateCmd::Clean {
                 filter,
                 keep,
                 yes,
                 force,
-            } => clean(filter, keep, yes, force).await,
-            TemplateCmd::Export { reference, out } => export(&reference, &out),
-            TemplateCmd::Import { archive, overwrite } => import(&archive, overwrite),
+            } => clean(&sup, filter, keep, yes, force).await,
+            TemplateCmd::Export { reference, out } => export(&sup, reference, out).await,
+            TemplateCmd::Import { archive, overwrite } => import(&sup, archive, overwrite).await,
             TemplateCmd::Push {
                 reference,
                 target,
                 source,
                 prerelease,
-            } => push(&reference, target, source, prerelease).await,
+            } => push(&sup, reference, target, source, prerelease).await,
             TemplateCmd::Pull {
                 target,
                 arch,
                 overwrite,
-            } => pull(&target, arch.as_deref(), overwrite).await,
+            } => pull(&sup, target, arch, overwrite).await,
             TemplateCmd::Login {
                 registry,
                 username,
                 password,
-            } => login(&registry, &username, &password).await,
-            TemplateCmd::Registry { command } => registry_command(command),
+            } => login(&sup, registry, username, password).await,
+            TemplateCmd::Registry { command } => registry_command(&sup, command).await,
         }
     })
 }
 
-async fn build(file: Option<PathBuf>, only: Option<String>, version: Option<String>) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Long-running operations
+// ---------------------------------------------------------------------------
+
+/// How far a followed operation got.
+#[derive(Debug)]
+enum OpOutcome {
+    Done,
+    Failed(String),
+    Cancelled,
+}
+
+impl OpOutcome {
+    /// The verb's result: `what` names the operation for the error message
+    /// ("building x86_64/base", "pushing to registry").
+    fn into_result(self, what: &str) -> Result<()> {
+        match self {
+            OpOutcome::Done => Ok(()),
+            OpOutcome::Cancelled => bail!("{what}: cancelled"),
+            OpOutcome::Failed(e) => bail!("{what}: {e}"),
+        }
+    }
+}
+
+/// Follow one template operation to its end, printing its log as it arrives.
+///
+/// This is the same `template.op.*` stream the console renders, which is the
+/// point: there is one progress mechanism, and a terminal reads it as text
+/// where a browser draws it.
+///
+/// `stop` is what an interrupt sends. The operation is then followed to its
+/// end anyway, so the supervisor has finished clearing up before this process
+/// exits — and because tokio's handler has replaced SIGINT's default, a second
+/// interrupt has to be honoured here or an upload that will not die leaves the
+/// user with no way out.
+async fn follow_op(
+    sup: &SupClient,
+    events: &mut mpsc::Receiver<Event>,
+    lab: &str,
+    arch: &str,
+    template: &str,
+    stop: SupRequest,
+) -> Result<OpOutcome> {
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+    let mut stopping = false;
+    loop {
+        tokio::select! {
+            _ = &mut interrupt => {
+                if stopping {
+                    bail!("interrupted a second time — {arch}/{template} may still be running");
+                }
+                stopping = true;
+                eprintln!("interrupted — stopping {arch}/{template}");
+                let _ = sup.send(stop.clone()).await;
+                interrupt = Box::pin(tokio::signal::ctrl_c());
+            }
+            received = events.recv() => {
+                let Some(ev) = received else {
+                    bail!("lost the supervisor connection while it was running");
+                };
+                if ev.lab != lab
+                    || ev.data["arch"] != *arch
+                    || ev.data["template"] != *template
+                {
+                    continue;
+                }
+                match ev.event.as_str() {
+                    "template.op.log" => {
+                        if let Some(line) = ev.data["line"].as_str() {
+                            println!("{line}");
+                        }
+                    }
+                    "template.op.done" => return Ok(OpOutcome::Done),
+                    "template.op.cancelled" => return Ok(OpOutcome::Cancelled),
+                    "template.op.error" => {
+                        return Ok(OpOutcome::Failed(
+                            ev.data["error"].as_str().unwrap_or("failed").to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// The lab the shell is standing in, or the empty lab when it is not in one.
+fn lab_here() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| crate::paths::find_lab_root(&cwd).ok())
+        .map(|root| lab_of(&root))
+        .unwrap_or_default()
+}
+
+/// The lab a template file belongs to, so its build is filed where a console
+/// watching that lab will see it. A file that declares no lab — a bare
+/// template file — belongs to the store, spelled as the empty lab.
+fn lab_of(root: &Path) -> String {
+    crate::config::load_lab_root(root)
+        .map(|f| f.lab.name)
+        .unwrap_or_default()
+}
+
+async fn build(
+    sup: &SupClient,
+    file: Option<PathBuf>,
+    only: Option<String>,
+    version: Option<String>,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let path = match file {
         // Absolutize: a bare `-f vmlab.wcl` has an EMPTY parent(), which used
@@ -216,20 +371,22 @@ async fn build(file: Option<PathBuf>, only: Option<String>, version: Option<Stri
         None => crate::paths::find_lab_root(&cwd)?.join(crate::paths::LAB_FILE),
     };
     let root = path.parent().unwrap_or(&cwd).to_path_buf();
-    let source =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let tf = crate::config::load_template_source(&source, &path.display().to_string(), &root)
-        .map_err(|e| anyhow!("{:?}", miette::Report::new(e)))?;
-    if tf.templates.is_empty() {
+    let lab = lab_of(&root);
+
+    let declared: Vec<DeclaredTemplate> = ask(
+        sup,
+        SupRequest::TemplateList {
+            lab: lab.clone(),
+            root: root.clone(),
+            file: Some(path.clone()),
+        },
+    )
+    .await?;
+    if declared.is_empty() {
         bail!("no `template {{}}` blocks in {}", path.display());
     }
-    let profiles = crate::profiles::ProfileSet::load_default()?;
-    let store = store();
-    let log: crate::scripting::OutputSink = Arc::new(|line: String| print!("{line}"));
-
-    let targets: Vec<_> = tf
-        .templates
-        .iter()
+    let targets: Vec<DeclaredTemplate> = declared
+        .into_iter()
         .filter(|t| only.as_deref().is_none_or(|n| n == t.name))
         .collect();
     if targets.is_empty() {
@@ -242,72 +399,168 @@ async fn build(file: Option<PathBuf>, only: Option<String>, version: Option<Stri
     if version.is_some() && targets.len() > 1 {
         bail!("--version needs a single target template; pass a template name too");
     }
-    for def in targets {
-        build_template(
-            def,
-            &root,
-            &store,
-            &profiles,
-            log.clone(),
-            version.as_deref(),
-            crate::template::build::BuildControl::default(),
+
+    for DeclaredTemplate { arch, name } in targets {
+        // Subscribe before asking, so no line of the build's output can be
+        // emitted between the request and the first thing we listen to.
+        let mut events = sup.subscribe().await.map_err(remote)?;
+        let what = format!("building {arch}/{name}");
+        ask::<Value>(
+            sup,
+            SupRequest::TemplateBuild {
+                lab: lab.clone(),
+                root: root.clone(),
+                template: name.clone(),
+                arch: Some(arch.clone()),
+                version: version.clone(),
+                file: Some(path.clone()),
+            },
         )
         .await
-        .with_context(|| format!("building {}/{}", def.arch, def.name))?;
+        .context(what.clone())?;
+        let stop = SupRequest::TemplateStopBuild {
+            lab: lab.clone(),
+            arch: arch.clone(),
+            template: name.clone(),
+        };
+        follow_op(sup, &mut events, &lab, &arch, &name, stop)
+            .await?
+            .into_result(&what)?;
     }
     Ok(())
 }
 
-async fn list(json: bool, remote: bool) -> Result<()> {
-    let store = store();
-    let templates = store.list()?;
-
-    // With --remote, check each template's registry concurrently (preserving
-    // order) for whether its exact version+arch is already uploaded.
-    let statuses: Vec<String> = if remote {
-        use futures::StreamExt as _;
-        futures::stream::iter(
-            templates
-                .iter()
-                .map(|t| registry_status(t.registry.clone(), t.version.clone(), t.arch.clone())),
-        )
-        .buffered(8)
-        .collect()
-        .await
-    } else {
-        Vec::new()
+/// `vmlab template stop`: cancel an operation somebody else started — from
+/// another terminal, or from the console.
+///
+/// Build and push are stopped by different commands because they are
+/// different requests; a user with one running operation should not have to
+/// know which. So this asks to stop the build, and takes the supervisor's
+/// "that one is a push" as the answer to which command to send instead.
+async fn stop(sup: &SupClient, name: String, arch: String) -> Result<()> {
+    let lab = lab_here();
+    let build = SupRequest::TemplateStopBuild {
+        lab: lab.clone(),
+        arch: arch.clone(),
+        template: name.clone(),
     };
+    let is_push = match sup.send(build).await {
+        Ok(_) => false,
+        Err(e) => {
+            let e = crate::proto::CommandError::from(e);
+            if e.code != crate::proto::ErrorCode::Conflict {
+                return Err(anyhow::Error::new(e));
+            }
+            true
+        }
+    };
+    if is_push {
+        ask::<Value>(
+            sup,
+            SupRequest::StoreStopPush {
+                lab,
+                arch: arch.clone(),
+                template: name.clone(),
+            },
+        )
+        .await?;
+    }
+    println!("stopping {arch}/{name}");
+    Ok(())
+}
+
+async fn push(
+    sup: &SupClient,
+    reference: String,
+    target: Option<String>,
+    source: Option<String>,
+    prerelease: bool,
+) -> Result<()> {
+    // The git origin of the directory the user is standing in — a fact only
+    // this process has, so it travels with the request.
+    let source = source.or_else(detect_git_source);
+    // File the push under the lab the shell is in, when it is in one, so a
+    // console watching that lab sees it and can stop it.
+    let lab = lab_here();
+
+    let mut events = sup.subscribe().await.map_err(remote)?;
+    let started: PushStarted = ask(
+        sup,
+        SupRequest::StorePush {
+            reference,
+            target,
+            source,
+            prerelease,
+            lab: lab.clone(),
+        },
+    )
+    .await
+    .context("pushing to registry")?;
+
+    let pushed = &started.pushing;
+    let stop = SupRequest::StoreStopPush {
+        lab: lab.clone(),
+        arch: pushed.arch.clone(),
+        template: pushed.name.clone(),
+    };
+    follow_op(sup, &mut events, &lab, &pushed.arch, &pushed.name, stop)
+        .await?
+        .into_result("pushing to registry")?;
+    let src_note = started
+        .source
+        .map(|s| format!(", source {s}"))
+        .unwrap_or_default();
+    println!(
+        "pushed {pushed} to {} (moved {}{src_note})",
+        started.target, started.moving_tag,
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The store
+// ---------------------------------------------------------------------------
+
+async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
+    let rows: Vec<StoreEntry> = ask(
+        sup,
+        SupRequest::StoreList {
+            remote: check_remote,
+        },
+    )
+    .await?;
 
     if json {
-        let entries: Vec<_> = templates
+        // `--json` prints the metadata alone, with the registry check folded
+        // in as one more field when it was asked for.
+        let entries: Vec<Value> = rows
             .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let mut v = meta_json(t);
-                if remote {
-                    v["remote"] = serde_json::json!(statuses[i]);
+            .map(|row| {
+                let mut meta = serde_json::to_value(&row.meta).unwrap_or(Value::Null);
+                if let Some(status) = row.remote {
+                    meta["remote"] = Value::String(status.as_str().into());
                 }
-                v
+                meta
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
         return Ok(());
     }
-    if templates.is_empty() {
+    if rows.is_empty() {
         println!("no templates in the store");
         return Ok(());
     }
     // Show the full registry path when known, else the bare store name.
-    let name_of = |t: &crate::template::meta::TemplateMeta| {
-        t.registry.clone().unwrap_or_else(|| t.name.clone())
-    };
-    let name_w = templates
+    fn name_of(row: &StoreEntry) -> &str {
+        row.meta.registry.as_deref().unwrap_or(&row.meta.name)
+    }
+    let name_w = rows
         .iter()
-        .map(|t| name_of(t).len())
+        .map(|row| name_of(row).len())
         .max()
         .unwrap_or(0)
         .max(8);
-    if remote {
+    if check_remote {
         println!(
             "{:<8} {:<name_w$} {:<16} {:<8} {:<7} CREATED",
             "ARCH", "TEMPLATE", "VERSION", "SIZE", "REMOTE"
@@ -318,54 +571,231 @@ async fn list(json: bool, remote: bool) -> Result<()> {
             "ARCH", "TEMPLATE", "VERSION", "SIZE"
         );
     }
-    for (i, t) in templates.iter().enumerate() {
-        let disk = store
-            .root()
-            .join(&t.arch)
-            .join(&t.name)
-            .join(&t.version)
-            .join(crate::template::store::DISK_FILE);
-        let size = human_size(std::fs::metadata(&disk).map(|m| m.len()).unwrap_or(0));
-        let created = t.created.format("%Y-%m-%d");
-        if remote {
-            println!(
-                "{:<8} {:<name_w$} {:<16} {:<8} {:<7} {}",
-                t.arch,
-                name_of(t),
-                t.version,
+    for row in &rows {
+        let meta = &row.meta;
+        let size = human_size(row.size);
+        // The wire carries RFC 3339; the table has always shown the date.
+        let created: String = meta.created.chars().take(10).collect();
+        match row.remote {
+            Some(status) => println!(
+                "{:<8} {:<name_w$} {:<16} {:<8} {:<7} {created}",
+                meta.arch,
+                name_of(row),
+                meta.version,
                 size,
-                statuses[i],
-                created
-            );
-        } else {
-            println!(
-                "{:<8} {:<name_w$} {:<16} {:<8} {}",
-                t.arch,
-                name_of(t),
-                t.version,
+                status.as_str(),
+            ),
+            None => println!(
+                "{:<8} {:<name_w$} {:<16} {:<8} {created}",
+                meta.arch,
+                name_of(row),
+                meta.version,
                 size,
-                created
-            );
+            ),
         }
     }
     Ok(())
 }
 
-/// Whether `<registry>:<version>` already carries `arch` on the remote: `yes`,
-/// `no` (missing — needs upload), `local` (no registry target), or `?` (the
-/// registry ref is malformed).
-async fn registry_status(registry: Option<String>, version: String, arch: String) -> String {
-    let Some(reg) = registry else {
-        return "local".to_string();
-    };
-    let Ok(r) = crate::oci::Registry::new(&reg) else {
-        return "?".to_string();
-    };
-    match r.index_arches(&version).await {
-        Ok(arches) if arches.contains(&arch) => "yes".to_string(),
-        _ => "no".to_string(),
-    }
+async fn rm(sup: &SupClient, reference: String, force: bool) -> Result<()> {
+    let removed: StoredVersion = ask(sup, SupRequest::StoreRemove { reference, force }).await?;
+    println!("removed {removed}");
+    Ok(())
 }
+
+/// `vmlab template clean`: per `<arch>/<name>` family, keep the `keep` newest
+/// builds (by version order) and remove the rest. Dry-run unless `yes`; a build
+/// still backing a clone is skipped unless `force`.
+async fn clean(
+    sup: &SupClient,
+    filter: Option<String>,
+    keep: usize,
+    yes: bool,
+    force: bool,
+) -> Result<()> {
+    if keep == 0 {
+        bail!("--keep must be >= 1 (use `template rm` to remove specific versions)");
+    }
+    let plan: PrunePlan = ask(
+        sup,
+        SupRequest::StorePrune {
+            filter,
+            keep,
+            apply: yes,
+            force,
+        },
+    )
+    .await?;
+    if plan.remove.is_empty() && plan.skipped.is_empty() {
+        println!("nothing to clean — every template is within --keep {keep}");
+        return Ok(());
+    }
+    let verb = if plan.applied {
+        "removing"
+    } else {
+        "would remove"
+    };
+    for t in &plan.remove {
+        println!("{verb} {t}");
+    }
+    for t in &plan.skipped {
+        println!("skipping {t} — backs a clone (use --force)");
+    }
+
+    let freed = human_size(plan.freed);
+    let count = plan.remove.len();
+    if plan.applied {
+        println!("\nremoved {count} build(s), freed {freed}");
+    } else {
+        println!("\n{count} build(s), {freed} — dry run; re-run with --yes to remove");
+    }
+    Ok(())
+}
+
+async fn export(sup: &SupClient, reference: String, out: PathBuf) -> Result<()> {
+    ask::<Value>(
+        sup,
+        SupRequest::StoreExport {
+            reference,
+            out: abs_path(&out)?,
+        },
+    )
+    .await?;
+    println!("exported to {}", out.display());
+    Ok(())
+}
+
+async fn import(sup: &SupClient, archive: PathBuf, overwrite: bool) -> Result<()> {
+    let archive = abs_path(&archive)?;
+    let imported: StoredVersion = ask(sup, SupRequest::StoreImport { archive, overwrite }).await?;
+    println!("imported {imported}");
+    Ok(())
+}
+
+async fn pull(
+    sup: &SupClient,
+    target: String,
+    arch: Option<String>,
+    overwrite: bool,
+) -> Result<()> {
+    let pulled: StoredVersion = ask(
+        sup,
+        SupRequest::StorePull {
+            target,
+            arch,
+            overwrite,
+        },
+    )
+    .await?;
+    println!("pulled {pulled} into the store");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registries
+// ---------------------------------------------------------------------------
+
+async fn search(
+    sup: &SupClient,
+    query: Option<String>,
+    registry: Option<String>,
+    arch: Option<String>,
+    kind: CatalogKind,
+    json: bool,
+) -> Result<()> {
+    let found: CatalogSearch = ask(
+        sup,
+        SupRequest::RegistrySearch {
+            query,
+            namespace: registry,
+            arch,
+            containers: matches!(kind, CatalogKind::Container),
+        },
+    )
+    .await?;
+    for warning in &found.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&found.rows)?);
+        return Ok(());
+    }
+    if found.rows.is_empty() {
+        println!(
+            "no results found in {} configured registries",
+            found.namespaces
+        );
+        return Ok(());
+    }
+    let name_w = found
+        .rows
+        .iter()
+        .map(|r| r.repo.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    println!("{:<name_w$} {:<24} VERSION", "TEMPLATE", "ARCH");
+    for r in &found.rows {
+        println!(
+            "{:<name_w$} {:<24} {}",
+            r.repo,
+            r.arches.join(","),
+            r.version
+        );
+    }
+    Ok(())
+}
+
+async fn login(
+    sup: &SupClient,
+    registry: String,
+    username: String,
+    password: String,
+) -> Result<()> {
+    ask::<Value>(
+        sup,
+        SupRequest::RegistryLogin {
+            registry: registry.clone(),
+            username,
+            password,
+        },
+    )
+    .await?;
+    println!("logged in to {registry}");
+    Ok(())
+}
+
+async fn registry_command(sup: &SupClient, command: RegistryCmd) -> Result<()> {
+    match command {
+        RegistryCmd::List { json } => {
+            let entries: Vec<RegistryEntry> = ask(sup, SupRequest::RegistryNamespaces {}).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                println!("{:<52} USE", "NAMESPACE");
+                for entry in entries {
+                    println!("{:<52} {}", entry.namespace, entry.use_for.as_str());
+                }
+            }
+        }
+        RegistryCmd::Add { namespace, use_for } => {
+            let entry: RegistryEntry =
+                ask(sup, SupRequest::RegistryNamespaceAdd { namespace, use_for }).await?;
+            println!("added {}", entry.namespace);
+        }
+        RegistryCmd::Remove { namespace } => {
+            let removed: String =
+                ask(sup, SupRequest::RegistryNamespaceRemove { namespace }).await?;
+            println!("removed {removed}");
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rendering, and the caller's own surroundings
+// ---------------------------------------------------------------------------
 
 /// Round a byte count to a short human string (`1.8G`, `456M`, `512B`).
 fn human_size(bytes: u64) -> String {
@@ -384,443 +814,6 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{size:.1}{}", UNITS[unit])
     }
-}
-
-/// Fixed-shape JSON for scripting: every key always present (null when
-/// the template does not record it), sizes in bytes, created as RFC 3339.
-fn meta_json(t: &crate::template::meta::TemplateMeta) -> serde_json::Value {
-    serde_json::json!({
-        "arch": t.arch,
-        "name": t.name,
-        "version": t.version,
-        "ref": format!("{}/{}@{}", t.arch, t.name, t.version),
-        "profile": t.profile,
-        "cpus": t.cpus,
-        "memory": t.memory,
-        "disk": t.disk,
-        "firmware": t.firmware,
-        "tpm": t.tpm,
-        "secure_boot": t.secure_boot,
-        "display": t.display,
-        "created": t.created.to_rfc3339(),
-        "origin": t.origin,
-        "registry": t.registry,
-        "sha256": t.sha256,
-    })
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CatalogSearchRow {
-    /// Leaf name (used for query matching).
-    pub name: String,
-    /// Full OCI repository path, e.g. ghcr.io/owner/group/name.
-    pub repo: String,
-    pub arches: Vec<String>,
-    pub version: String,
-    pub reference: String,
-}
-
-/// Search one OCI registry namespace and resolve each matching repository's
-/// newest usable tag plus the architectures published by its manifest index.
-/// Shared by the CLI and the web editor's VM/container chooser.
-pub async fn search_catalog(
-    query: Option<String>,
-    registry: String,
-    arch: Option<String>,
-    containers: bool,
-) -> Result<Vec<CatalogSearchRow>> {
-    use futures::StreamExt as _;
-
-    let namespace = registry;
-    let repos = crate::oci::list_repositories_filtered(&namespace, query.as_deref())
-        .await
-        .with_context(|| format!("listing templates in {namespace}"))?;
-    let ns_prefix = format!("{}/", namespace.trim_end_matches('/'));
-
-    // Resolve each repo's latest version + arches concurrently.
-    let mut rows: Vec<CatalogSearchRow> = futures::stream::iter(repos.into_iter().map(|repo| {
-        let ns_prefix = ns_prefix.clone();
-        async move { fetch_search_row(repo, &ns_prefix, containers).await }
-    }))
-    .buffer_unordered(8)
-    .filter_map(|row| async move { row })
-    .collect()
-    .await;
-
-    let q = query.map(|s| s.to_lowercase());
-    let wanted_arch = arch;
-    rows.retain(|r| {
-        q.as_ref().is_none_or(|q| r.name.to_lowercase().contains(q))
-            && wanted_arch
-                .as_ref()
-                .is_none_or(|a| r.arches.iter().any(|x| x == a))
-    });
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(rows)
-}
-
-async fn search(
-    query: Option<String>,
-    registry: Option<String>,
-    arch: Option<String>,
-    kind: CatalogKind,
-    json: bool,
-) -> Result<()> {
-    let containers = matches!(kind, CatalogKind::Container);
-    let namespaces = match registry {
-        Some(namespace) => vec![namespace],
-        None => super::registries::list()?
-            .into_iter()
-            .filter(|entry| {
-                if containers {
-                    entry.use_for.containers()
-                } else {
-                    entry.use_for.vms()
-                }
-            })
-            .map(|entry| entry.namespace)
-            .collect(),
-    };
-    let mut rows = Vec::new();
-    let mut errors = Vec::new();
-    for namespace in &namespaces {
-        match search_catalog(query.clone(), namespace.clone(), arch.clone(), containers).await {
-            Ok(found) => rows.extend(found),
-            Err(error) => errors.push(format!("{namespace}: {error:#}")),
-        }
-    }
-    if rows.is_empty() && !errors.is_empty() {
-        bail!("{}", errors.join("\n"));
-    }
-    for error in errors {
-        eprintln!("warning: {error}");
-    }
-    rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.repo.cmp(&b.repo)));
-    rows.dedup_by(|a, b| a.reference == b.reference);
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
-    }
-    if rows.is_empty() {
-        println!(
-            "no results found in {} configured registries",
-            namespaces.len()
-        );
-        return Ok(());
-    }
-    let name_w = rows.iter().map(|r| r.repo.len()).max().unwrap_or(0).max(8);
-    println!("{:<name_w$} {:<24} VERSION", "TEMPLATE", "ARCH");
-    for r in rows {
-        println!(
-            "{:<name_w$} {:<24} {}",
-            r.repo,
-            r.arches.join(","),
-            r.version
-        );
-    }
-    Ok(())
-}
-
-fn registry_command(command: RegistryCmd) -> Result<()> {
-    match command {
-        RegistryCmd::List { json } => {
-            let entries = super::registries::list()?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&entries)?);
-            } else {
-                println!("{:<52} USE", "NAMESPACE");
-                for entry in entries {
-                    let use_for = match entry.use_for {
-                        super::registries::RegistryUse::Vms => "vms",
-                        super::registries::RegistryUse::Containers => "containers",
-                        super::registries::RegistryUse::Both => "both",
-                    };
-                    println!("{:<52} {use_for}", entry.namespace);
-                }
-            }
-        }
-        RegistryCmd::Add { namespace, use_for } => {
-            let entry = super::registries::add(&namespace, use_for)?;
-            println!("added {}", entry.namespace);
-        }
-        RegistryCmd::Remove { namespace } => {
-            super::registries::remove(&namespace)?;
-            println!(
-                "removed {}",
-                super::registries::normalise_namespace(&namespace)?
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Resolve one repository's display name, latest version and arches. Returns
-/// `None` (skipping the repo) on any error or when it has no usable tag.
-fn oci_to_vmlab_arch(arch: String) -> Option<String> {
-    match arch.as_str() {
-        "amd64" => Some("x86_64".into()),
-        "arm64" => Some("aarch64".into()),
-        "riscv64" => Some(arch),
-        _ => None,
-    }
-}
-
-async fn fetch_search_row(
-    repo: String,
-    ns_prefix: &str,
-    containers: bool,
-) -> Option<CatalogSearchRow> {
-    let name = repo.strip_prefix(ns_prefix).unwrap_or(&repo).to_string();
-    let registry = crate::oci::Registry::new(&repo).ok()?;
-    let tags = match registry.list_tags().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("warning: {repo}: {e:#}");
-            return None;
-        }
-    };
-    // Prefer the highest concrete version tag; fall back to `latest`.
-    let versions: Vec<String> = tags
-        .iter()
-        .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .cloned()
-        .collect();
-    let newest_version = versions
-        .into_iter()
-        .max_by(|a, b| crate::template::store::compare_versions(a, b));
-    let latest = tags.iter().find(|t| *t == "latest").cloned();
-    let tag = if containers {
-        latest.or(newest_version)
-    } else {
-        newest_version.or(latest)
-    }
-    .or_else(|| tags.iter().max().cloned())?;
-    let mut arches = if containers {
-        registry
-            .index_platform_arches(&tag)
-            .await
-            .ok()?
-            .into_iter()
-            .filter_map(oci_to_vmlab_arch)
-            .collect()
-    } else {
-        registry.index_arches(&tag).await.ok()?
-    };
-    arches.sort();
-    arches.dedup();
-    Some(CatalogSearchRow {
-        name,
-        arches,
-        version: tag.clone(),
-        reference: format!("{repo}:{tag}"),
-        repo,
-    })
-}
-
-fn rm(reference: &str, force: bool) -> Result<()> {
-    let (arch, name, version) = parse_store_ref(reference)?;
-    let version = version.ok_or_else(|| {
-        anyhow!("specify the exact version to remove, e.g. {arch}/{name}@<version>")
-    })?;
-    store().remove(&arch, &name, &version, force, &|_| {
-        if force {
-            None
-        } else {
-            Some(
-                "deleting a template may break existing linked clones; re-run with --force"
-                    .to_string(),
-            )
-        }
-    })?;
-    println!("removed {arch}/{name}@{version}");
-    Ok(())
-}
-
-/// `vmlab template clean`: per `<arch>/<name>` family, keep the `keep` newest
-/// builds (by version order) and remove the rest. Dry-run unless `yes`; a build
-/// still backing a clone is skipped unless `force`.
-async fn clean(filter: Option<String>, keep: usize, yes: bool, force: bool) -> Result<()> {
-    if keep == 0 {
-        bail!("--keep must be >= 1 (use `template rm` to remove specific versions)");
-    }
-    let store = store();
-    let templates = store.list()?;
-
-    // Group versions by (arch, name), preserving the list's arch/name/version
-    // ordering (ascending version within each family).
-    let mut families: Vec<((String, String), Vec<crate::template::meta::TemplateMeta>)> =
-        Vec::new();
-    for t in templates {
-        if !family_matches(filter.as_deref(), &t.arch, &t.name) {
-            continue;
-        }
-        match families.last_mut() {
-            Some((k, v)) if k.0 == t.arch && k.1 == t.name => v.push(t),
-            _ => families.push(((t.arch.clone(), t.name.clone()), vec![t])),
-        }
-    }
-
-    // Decide removals: all but the `keep` highest versions per family.
-    let mut removals: Vec<crate::template::meta::TemplateMeta> = Vec::new();
-    for (_, metas) in &families {
-        let cut = metas.len().saturating_sub(keep);
-        removals.extend(metas.iter().take(cut).cloned());
-    }
-    if removals.is_empty() {
-        println!("nothing to clean — every template is within --keep {keep}");
-        return Ok(());
-    }
-
-    // In-use protection: store disks currently backing a clone are skipped
-    // unless --force.
-    let in_use = if force {
-        std::collections::HashSet::new()
-    } else {
-        backing_disks_in_use().await
-    };
-
-    let mut to_remove = Vec::new();
-    let mut skipped = Vec::new();
-    for t in removals {
-        let disk = store
-            .root()
-            .join(&t.arch)
-            .join(&t.name)
-            .join(&t.version)
-            .join(crate::template::store::DISK_FILE);
-        let canon = disk.canonicalize().unwrap_or(disk.clone());
-        if in_use.contains(&canon) {
-            skipped.push(t);
-        } else {
-            to_remove.push((t, disk));
-        }
-    }
-
-    let mut freed = 0u64;
-    for (t, disk) in &to_remove {
-        freed += std::fs::metadata(disk).map(|m| m.len()).unwrap_or(0);
-        let verb = if yes { "removing" } else { "would remove" };
-        println!("{verb} {}/{}@{}", t.arch, t.name, t.version);
-    }
-    for t in &skipped {
-        println!(
-            "skipping {}/{}@{} — backs a clone (use --force)",
-            t.arch, t.name, t.version
-        );
-    }
-
-    if !yes {
-        println!(
-            "\n{} build(s), {} — dry run; re-run with --yes to remove",
-            to_remove.len(),
-            human_size(freed)
-        );
-        return Ok(());
-    }
-
-    let mut removed = 0usize;
-    for (t, _) in &to_remove {
-        store
-            .remove(&t.arch, &t.name, &t.version, true, &|_| None)
-            .with_context(|| format!("removing {}/{}@{}", t.arch, t.name, t.version))?;
-        removed += 1;
-    }
-    println!("\nremoved {removed} build(s), freed {}", human_size(freed));
-    Ok(())
-}
-
-/// Whether a `filter` selects `<arch>/<name>`: `None` matches all; `arch/name`
-/// is exact; `arch/` matches any name in that arch; a bare `name` matches that
-/// leaf name in any arch.
-fn family_matches(filter: Option<&str>, arch: &str, name: &str) -> bool {
-    let Some(f) = filter else { return true };
-    match f.split_once('/') {
-        Some((a, "")) => a == arch,
-        Some((a, n)) => a == arch && n == name,
-        None => f == name,
-    }
-}
-
-/// Canonical store disk paths (`<version>/disk.qcow2`) currently backing a
-/// linked clone in any registered lab. Best-effort: unreadable labs/clones are
-/// skipped, so a scan hiccup never blocks a clean.
-async fn backing_disks_in_use() -> std::collections::HashSet<PathBuf> {
-    let mut in_use = std::collections::HashSet::new();
-    let reg = crate::supervisor::registry::Registry::load();
-    for lab in reg.labs() {
-        let vms = crate::paths::lab_local_dir(&lab.root).join("vms");
-        let Ok(entries) = std::fs::read_dir(&vms) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let disk = e.path().join("disk0.qcow2");
-            if !disk.is_file() {
-                continue;
-            }
-            if let Ok(info) = super::qimg::image_info(&disk).await
-                && let Some(backing) = info.backing_file
-                && let Ok(canon) = backing.canonicalize()
-            {
-                in_use.insert(canon);
-            }
-        }
-    }
-    in_use
-}
-
-fn export(reference: &str, out: &std::path::Path) -> Result<()> {
-    let (arch, name, version) = parse_store_ref(reference)?;
-    store().export(&arch, &name, version.as_deref(), out)?;
-    println!("exported to {}", out.display());
-    Ok(())
-}
-
-fn import(archive: &std::path::Path, overwrite: bool) -> Result<()> {
-    let meta = store().import(archive, overwrite)?;
-    println!("imported {}/{}@{}", meta.arch, meta.name, meta.version);
-    Ok(())
-}
-
-async fn push(
-    reference: &str,
-    target: Option<String>,
-    source: Option<String>,
-    prerelease: bool,
-) -> Result<()> {
-    let (arch, name, version) = parse_store_ref(reference)?;
-    let resolved = store().resolve(&arch, &name, version.as_deref())?;
-    // Target repo: explicit CLI arg, else the template's own `registry` field.
-    let repo = match target.or_else(|| resolved.meta.registry.clone()) {
-        Some(t) => t,
-        None => bail!(
-            "no push target — pass one (ghcr.io/owner/name) or set `registry` in the template"
-        ),
-    };
-    let target = crate::oci::with_version_tag(&repo, &resolved.meta.version)?;
-    let moving_tag = if prerelease {
-        "latest-prerelease"
-    } else {
-        "latest"
-    };
-    let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
-    let source = source.or_else(detect_git_source);
-    super::oci_bridge::push(
-        &resolved.dir,
-        &target,
-        host_cfg.oci_chunk_size,
-        &arch,
-        source.as_deref(),
-        Some(moving_tag),
-    )
-    .await
-    .context("pushing to registry")?;
-    let src_note = source.map(|s| format!(", source {s}")).unwrap_or_default();
-    println!(
-        "pushed {arch}/{name}@{} to {target} (moved {moving_tag}{src_note})",
-        resolved.meta.version
-    );
-    Ok(())
 }
 
 /// Best-effort source-repo URL for the package link: the git `origin` remote
@@ -863,66 +856,217 @@ fn normalize_git_url(raw: &str) -> Option<String> {
     None
 }
 
-async fn pull(target: &str, arch: Option<&str>, overwrite: bool) -> Result<()> {
-    let store = store();
-    let meta = super::oci_bridge::pull(target, arch, &store, overwrite)
-        .await
-        .context("pulling from registry")?;
-    println!(
-        "pulled {}/{}@{} into the store",
-        meta.arch, meta.name, meta.version
-    );
-    Ok(())
-}
-
-async fn login(registry: &str, username: &str, password: &str) -> Result<()> {
-    super::oci_bridge::login(registry, username, password).await?;
-    println!("logged in to {registry}");
-    Ok(())
-}
-
-fn parse_store_ref(reference: &str) -> Result<(String, String, Option<String>)> {
-    match parse_template_ref(reference).map_err(|e| anyhow!(e))? {
-        crate::config::model::TemplateRef::Store {
-            arch,
-            name,
-            version,
-        } => Ok((arch, name, version)),
-        _ => bail!("expected a local store reference `<arch>/<name>[@<version>]`"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{family_matches, normalize_git_url};
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::proto::server::{Handler, Server, Streamer};
+    use crate::proto::{CommandError, SupRequest};
+
+    /// A supervisor that answers everything and says nothing, so a test can
+    /// drive `follow_op` purely from the events it emits.
+    struct Quiet;
+
+    #[async_trait::async_trait]
+    impl Handler<SupRequest> for Quiet {
+        async fn handle(&self, _req: SupRequest, _s: &Streamer) -> Result<Value, CommandError> {
+            Ok(Value::Bool(true))
+        }
+    }
+
+    async fn supervisor() -> (tempfile::TempDir, Server<SupRequest>, SupClient) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vmlabd.sock");
+        let server = Server::bind(&sock, Arc::new(Quiet)).await.unwrap();
+        let client = SupClient::connect(&sock).await.unwrap();
+        (dir, server, client)
+    }
+
+    fn op_event(event: &str, arch: &str, template: &str, extra: Value) -> Event {
+        let mut data = json!({"arch": arch, "template": template, "kind": "build"});
+        for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+            data[k] = v;
+        }
+        Event::new(event, "demo", data)
+    }
+
+    fn stop_request() -> SupRequest {
+        SupRequest::TemplateStopBuild {
+            lab: "demo".into(),
+            arch: "x86_64".into(),
+            template: "base".into(),
+        }
+    }
+
+    async fn follow(sup: &SupClient, events: &mut mpsc::Receiver<Event>) -> Result<OpOutcome> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            follow_op(sup, events, "demo", "x86_64", "base", stop_request()),
+        )
+        .await
+        .expect("the operation should have ended")
+    }
+
+    /// A build ends where its own `template.op.*` stream ends — and another
+    /// template's failure, arriving on the same broadcast, is not its.
+    #[tokio::test]
+    async fn a_followed_build_ends_on_its_own_done_event() {
+        let (_dir, server, sup) = supervisor().await;
+        let mut events = sup.subscribe().await.unwrap();
+        server.emit(op_event(
+            "template.op.error",
+            "x86_64",
+            "other",
+            json!({"error": "somebody else's problem"}),
+        ));
+        server.emit(op_event("template.op.log", "x86_64", "base", json!({})));
+        server.emit(op_event("template.op.done", "x86_64", "base", json!({})));
+        assert!(matches!(
+            follow(&sup, &mut events).await.unwrap(),
+            OpOutcome::Done
+        ));
+    }
+
+    /// The supervisor's own wording reaches the terminal, so a failed build says
+    /// what went wrong rather than that something did.
+    #[tokio::test]
+    async fn a_failed_build_carries_the_supervisors_reason() {
+        let (_dir, server, sup) = supervisor().await;
+        let mut events = sup.subscribe().await.unwrap();
+        server.emit(op_event(
+            "template.op.error",
+            "x86_64",
+            "base",
+            json!({"error": "no such ISO"}),
+        ));
+        let OpOutcome::Failed(reason) = follow(&sup, &mut events).await.unwrap() else {
+            panic!("the build failed");
+        };
+        assert_eq!(reason, "no such ISO");
+    }
+
+    /// A build cancelled from anywhere — this terminal, another one, or the
+    /// console — is a cancellation here, not a success.
+    #[tokio::test]
+    async fn a_cancelled_build_is_not_a_finished_one() {
+        let (_dir, server, sup) = supervisor().await;
+        let mut events = sup.subscribe().await.unwrap();
+        server.emit(op_event(
+            "template.op.cancelled",
+            "x86_64",
+            "base",
+            json!({}),
+        ));
+        assert!(matches!(
+            follow(&sup, &mut events).await.unwrap(),
+            OpOutcome::Cancelled
+        ));
+    }
+
+    /// A supervisor that records what it was asked and answers the way a real
+    /// one would when the running operation is a push.
+    #[derive(Default)]
+    struct Busy {
+        asked: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler<SupRequest> for Busy {
+        async fn handle(&self, req: SupRequest, _s: &Streamer) -> Result<Value, CommandError> {
+            self.asked.lock().unwrap().push(req.cmd());
+            match req {
+                SupRequest::TemplateStopBuild { .. } => Err(CommandError::conflict(
+                    "the operation running for `x86_64/base` is a push",
+                )),
+                _ => Ok(Value::Bool(true)),
+            }
+        }
+    }
+
+    /// `vmlab template stop` means "stop whatever is running for this
+    /// template". Build and push are stopped by different commands, so it asks
+    /// for the build and takes the conflict as the answer to which to send.
+    #[tokio::test]
+    async fn stopping_falls_through_to_the_push_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vmlabd.sock");
+        let handler = Arc::new(Busy::default());
+        let _server = Server::bind(&sock, handler.clone()).await.unwrap();
+        let sup = SupClient::connect(&sock).await.unwrap();
+
+        stop(&sup, "base".into(), "x86_64".into()).await.unwrap();
+        assert_eq!(
+            *handler.asked.lock().unwrap(),
+            ["template.stop_build", "store.stop_push"]
+        );
+    }
+
+    /// The reason the answers are typed: a supervisor of a different build
+    /// answering a shape this one cannot read is an error, not a table of
+    /// zeroes and blanks.
+    #[tokio::test]
+    async fn an_unreadable_answer_is_a_failure_not_an_empty_render() {
+        struct Nonsense;
+        #[async_trait::async_trait]
+        impl Handler<SupRequest> for Nonsense {
+            async fn handle(&self, _r: SupRequest, _s: &Streamer) -> Result<Value, CommandError> {
+                Ok(json!({"remove": "all of them"}))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vmlabd.sock");
+        let _server = Server::bind(&sock, Arc::new(Nonsense)).await.unwrap();
+        let sup = SupClient::connect(&sock).await.unwrap();
+
+        let err = ask::<PrunePlan>(
+            &sup,
+            SupRequest::StorePrune {
+                filter: None,
+                keep: 1,
+                apply: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("store.prune"), "{err}");
+    }
+
+    /// The acceptance test of the whole change: nothing on the CLI's template
+    /// surface opens the store or dials a registry. Every one of these used
+    /// to appear in this file, and each is now the supervisor's.
+    #[test]
+    fn the_template_verbs_reach_the_store_only_through_the_supervisor() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/template/cli.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        // Everything before the first `#[cfg(test)]` is the surface itself;
+        // the needles below would otherwise match this very test.
+        let surface = source.split("#[cfg(test)]").next().unwrap();
+        for needle in [
+            "TemplateStore",
+            "oci_bridge",
+            "crate::oci",
+            "build_template",
+            "registries::list",
+            "registries::add",
+            "registries::remove",
+        ] {
+            assert!(
+                !surface.contains(needle),
+                "`{needle}` is back in the template CLI — it belongs to the supervisor"
+            );
+        }
+    }
 
     #[test]
-    fn family_filter_matching() {
-        // None matches everything.
-        assert!(family_matches(None, "x86_64", "win11"));
-        // Exact arch/name.
-        assert!(family_matches(Some("x86_64/win11"), "x86_64", "win11"));
-        assert!(!family_matches(Some("x86_64/win11"), "x86_64", "win10"));
-        assert!(!family_matches(Some("x86_64/win11"), "aarch64", "win11"));
-        // arch-only (trailing slash) matches any name in that arch.
-        assert!(family_matches(Some("x86_64/"), "x86_64", "anything"));
-        assert!(!family_matches(Some("x86_64/"), "aarch64", "anything"));
-        // Bare name matches that leaf name in any arch.
-        assert!(family_matches(
-            Some("ubuntu-24.04"),
-            "x86_64",
-            "ubuntu-24.04"
-        ));
-        assert!(family_matches(
-            Some("ubuntu-24.04"),
-            "aarch64",
-            "ubuntu-24.04"
-        ));
-        assert!(!family_matches(
-            Some("ubuntu-24.04"),
-            "x86_64",
-            "ubuntu-26.04"
-        ));
+    fn byte_counts_render_short() {
+        assert_eq!(human_size(0), "-");
+        assert_eq!(human_size(512), "512B");
+        assert_eq!(human_size(2 * 1024), "2.0K");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0G");
     }
 
     #[test]

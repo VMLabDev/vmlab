@@ -78,7 +78,11 @@ A copy-on-write qcow2 overlay a machine boots, backed by a template. The
 template is never written to. Short form "clone" is fine.
 
 **Store**:
-The local template store. Writes are serialised by the supervisor.
+The local template store. Every write goes through the supervisor's `store.*`
+and `template.*` commands, so there is one implementation of each; the store's
+own file lock is what serialises them. Reads are lock-free, and a daemon that
+already holds the store open — a lab daemon binding a clone, the web process
+listing versions — still reads it directly. See ADR-0010.
 _Avoid_: cache, registry (a registry is remote)
 
 **OCI artifact**:

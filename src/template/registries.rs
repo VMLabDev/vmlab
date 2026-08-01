@@ -21,6 +21,15 @@ pub enum RegistryUse {
 }
 
 impl RegistryUse {
+    /// The one-word spelling, which is also the wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vms => "vms",
+            Self::Containers => "containers",
+            Self::Both => "both",
+        }
+    }
+
     pub fn vms(self) -> bool {
         matches!(self, Self::Vms | Self::Both)
     }

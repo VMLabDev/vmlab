@@ -1,12 +1,30 @@
 //! Supervisor control (`vmlab daemon ...`) and the auto-start path every
 //! other verb uses to reach the daemons (PRD §3, §12).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::proto::client::{LabClient, SupClient};
-use crate::proto::{LabRequest, SupRequest};
+use crate::proto::{LabRequest, ProtoError, SupRequest};
+
+/// A daemon failure as an `anyhow` error that still carries its code, so
+/// [`crate::cli::run`] can pick an exit code a script can branch on.
+pub fn remote(e: ProtoError) -> anyhow::Error {
+    anyhow::Error::new(crate::proto::CommandError::from(e))
+}
+
+/// Make a CLI-supplied path absolute against the cwd.
+///
+/// A relative path means "beside me" to whoever typed it, and no daemon is
+/// standing where they are — each would resolve the same string against its
+/// own working directory.
+pub fn abs_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()?.join(path))
+}
 
 /// Connect to the supervisor, auto-starting it if needed (PRD §3: one per
 /// user, auto-started by the CLI).

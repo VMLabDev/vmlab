@@ -150,12 +150,35 @@ impl Drop for WorkdirGuard {
     }
 }
 
+/// Where every build's working directory lives.
+pub fn builds_dir() -> PathBuf {
+    crate::paths::data_dir().join("cache").join("builds")
+}
+
 fn build_workdir(def: &TemplateDef) -> PathBuf {
-    super::artefact::cache_dir()
-        .parent()
-        .unwrap_or(&super::artefact::cache_dir())
-        .join("builds")
-        .join(format!("{}-{}-{}", def.arch, def.name, def.version))
+    builds_dir().join(format!("{}-{}-{}", def.arch, def.name, def.version))
+}
+
+/// Delete every build working directory, returning how many went.
+///
+/// [`WorkdirGuard`] clears one up when its build ends, but it is a `Drop` and
+/// a killed process runs none: a supervisor that is SIGKILLed — or that exits
+/// through `process::exit` on `shutdown` — leaves its in-flight builds' disks
+/// behind, several gigabytes each. The supervisor sweeps at startup, when by
+/// definition it owns no build, so a leftover survives at most until the next
+/// time the daemon comes up (ADR-0010).
+pub fn sweep_build_workdirs() -> usize {
+    sweep_workdirs_in(&builds_dir())
+}
+
+fn sweep_workdirs_in(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().is_dir() && std::fs::remove_dir_all(e.path()).is_ok())
+        .count()
 }
 
 async fn run_build(
@@ -1071,9 +1094,35 @@ fn synth_lab(
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildBoot, EffectiveHardware, SealedImage, seal_meta, synth_lab, wcl_str};
+    use super::{
+        BuildBoot, EffectiveHardware, SealedImage, seal_meta, sweep_workdirs_in, synth_lab, wcl_str,
+    };
     use crate::template::meta::TemplateMeta;
     use std::path::Path;
+
+    /// A supervisor that was killed mid-build leaves its working disk behind
+    /// — the guard that would have removed it is a `Drop`. The next one to
+    /// start owns no build, so everything it finds there is a leftover.
+    #[test]
+    fn a_sweep_clears_every_leftover_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing to sweep, and a directory that was never created, are both
+        // fine rather than errors.
+        assert_eq!(sweep_workdirs_in(dir.path()), 0);
+        assert_eq!(sweep_workdirs_in(&dir.path().join("never-made")), 0);
+
+        for name in ["x86_64-base-1.0", "aarch64-base-2.0"] {
+            let work = dir.path().join(name);
+            std::fs::create_dir_all(work.join("nested")).unwrap();
+            std::fs::write(work.join("disk.qcow2"), "pretend").unwrap();
+        }
+        // A stray file is not a working directory and is left alone.
+        std::fs::write(dir.path().join("stray"), "").unwrap();
+
+        assert_eq!(sweep_workdirs_in(dir.path()), 2);
+        assert!(!dir.path().join("x86_64-base-1.0").exists());
+        assert!(dir.path().join("stray").is_file());
+    }
 
     fn def(source: &str) -> crate::config::model::TemplateDef {
         let tf = crate::config::load_template_source(source, "<test>", Path::new("/root")).unwrap();
