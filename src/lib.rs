@@ -32,6 +32,10 @@ pub mod paths;
 pub mod profiles;
 pub mod proto;
 mod qemu;
+/// The lab status projection every surface renders (ADR-0004): produced by the
+/// lab daemon, consumed unchanged by the CLI table, the REST endpoint and the
+/// web console.
+pub mod status;
 pub use qemu::kvm_available;
 mod qmp;
 mod scripting;

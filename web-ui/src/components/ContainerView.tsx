@@ -10,7 +10,6 @@ import { Globe, RotateCcw, SquarePen } from "lucide-solid";
 import ActionButton from "./ActionButton";
 import PowerButton from "./PowerButton";
 import {
-  containerLook,
   containerRestart,
   containerStart,
   containerStop,
@@ -18,6 +17,7 @@ import {
   playbooksFor,
   state,
 } from "../store";
+import { containers } from "../status";
 import { canEditPlaybook, editPlaybook } from "./FilesView";
 import { openWebPage } from "./WebView";
 import GuestStats from "./GuestStats";
@@ -29,13 +29,9 @@ import TerminalPanel from "./TerminalPanel";
 export default function ContainerView() {
   const [tab, setTab] = createSignal<"console" | "terminal" | "log" | "playbook">("console");
   // Accessors so the view tracks the selected container reactively.
-  const ctr = () => state.status?.containers?.find((c) => c.name === state.view.vm);
+  const ctr = () => containers(state.status).find((c) => c.name === state.view.vm);
   const on = () => ctr()?.state === "running";
   const pull = () => (ctr() ? currentPullFor(ctr()!.name) : undefined);
-  const lk = () => {
-    const c = ctr();
-    return c ? containerLook(c) : { label: "", tone: "neutral" as const };
-  };
   const segments = () =>
     ctr()
       ?.nics.map((n) => n.segment)
@@ -55,8 +51,8 @@ export default function ContainerView() {
         title={
           <span style={{ display: "inline-flex", "align-items": "center", gap: "10px" }}>
             {ctr()!.name}
-            <Badge tone={lk().tone} dot>
-              {lk().label}
+            <Badge tone={ctr()!.label.severity} dot>
+              {ctr()!.label.text}
             </Badge>
           </span>
         }
@@ -158,6 +154,9 @@ export default function ContainerView() {
               k="Health"
               v={ctr()!.health == null ? "no probe" : ctr()!.health ? "healthy" : "unhealthy"}
             />
+            {/* The raw power state the status badge was derived from — kept in
+                the detail view, per the vocabulary decision on issue #7. */}
+            <KV k="Power state" v={ctr()!.state} />
           </Card>
           <Show when={playbooksFor(ctr()!.name).length > 0}>
             <Card title="Playbooks">

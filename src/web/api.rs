@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use super::fsops::{ensure_safe_parent, plain_relative};
 use super::state::AppState;
+use vmlab::status::LabStatus;
 
 /// Map a daemon error string to an HTTP response.
 pub(crate) fn fail(e: String) -> HttpResponse {
@@ -482,7 +483,8 @@ pub async fn catalog_oci(q: web::Query<OciSearchQuery>) -> HttpResponse {
     }
 }
 
-/// `GET /api/labs/{lab}` — full lab status (vms + segments).
+/// `GET /api/labs/{lab}` — the lab status projection (ADR-0004): machines,
+/// segments and in-flight downloads, verbatim from the daemon.
 pub async fn lab_status(state: web::Data<AppState>, lab: web::Path<String>) -> HttpResponse {
     match state.lab_call(&lab, "status", Value::Null).await {
         Ok(v) => ok(v),
@@ -964,24 +966,17 @@ pub async fn save_script(
 }
 
 /// Whether a lab `status` payload *proves* nothing is running — the only
-/// evidence that lets a reload restart the daemon safely. The daemon reports
-/// VMs and containers in one `machines` list (`LabRuntime::status`), so that
-/// is the only key read here.
+/// evidence that lets a reload restart the daemon safely.
 ///
-/// A payload this can't read — no `machines`, a state that isn't a known
-/// string — proves nothing, so it answers false. The affordable failure is a
-/// spurious 409 the user clears by stopping the lab; reading keys the daemon
-/// had stopped emitting is what silently disabled this guard once already.
+/// The payload is parsed into the projection the daemon produces
+/// ([`LabStatus`], ADR-0004) rather than read key by key, so a producer-side
+/// rename fails this at compile time instead of quietly waving running machines
+/// through, which is how this guard came to be disarmed once already.
 ///
-/// Re-deriving from raw state on the surface side is what ADR-0004 rules out;
-/// this stays until the typed projection lands and can be rendered instead.
+/// A payload that will not parse proves nothing, so it answers false. The
+/// affordable failure is a spurious 409 the user clears by stopping the lab.
 fn all_machines_stopped(status: &Value) -> bool {
-    let Some(machines) = status["machines"].as_array() else {
-        return false;
-    };
-    machines
-        .iter()
-        .all(|m| m["state"].as_str() == Some("stopped"))
+    serde_json::from_value::<LabStatus>(status.clone()).is_ok_and(|status| status.all_stopped())
 }
 
 /// `POST /api/labs/{lab}/reload` — restart the lab daemon so it re-reads
@@ -1349,6 +1344,9 @@ pub async fn machine_clipboard_set(
 mod tests {
     use super::*;
     use actix_web::{App, test};
+    use vmlab::status::{
+        ContainerStatus, MachineDetail, MachineLabel, MachineStatus, PowerState, VmStatus,
+    };
 
     fn script_test_state(root: &Path) -> web::Data<AppState> {
         web::Data::new(AppState::new(
@@ -1419,26 +1417,79 @@ mod tests {
         assert_eq!(body["arch"], std::env::consts::ARCH);
     }
 
-    /// The reload guard's whole job: it reads the daemon's single `machines`
-    /// collection (`LabRuntime::status`), one entry per VM *and* container.
-    /// Reading keys the daemon no longer emits made it wave everything
-    /// through — the bug this test exists to keep fixed.
+    /// One lab status payload in exactly the form the daemon emits it: the
+    /// projection, serialised.
+    ///
+    /// Built here rather than from `vmlab::status::fixtures`, which this binary
+    /// cannot reach — it links the ordinary library, not the library's own test
+    /// build.
+    fn status_payload(machines: Vec<(&str, PowerState)>) -> Value {
+        let machines = machines
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, state))| {
+                // Alternate the kinds so a guard that only understood one of
+                // them would have to skip a machine to pass.
+                let detail = if i.is_multiple_of(2) {
+                    MachineDetail::Vm(VmStatus {
+                        template: "x86_64/win11".into(),
+                        arch: Some("x86_64".into()),
+                        cpus: Some(4),
+                        memory: Some(8 << 30),
+                        agent_version: None,
+                    })
+                } else {
+                    MachineDetail::Container(ContainerStatus {
+                        image: "docker.io/library/nginx:latest".into(),
+                        digest: None,
+                        health: None,
+                        restarts: 0,
+                        exit_code: None,
+                    })
+                };
+                MachineStatus {
+                    name: name.into(),
+                    label: MachineLabel::derive(state, false, &detail),
+                    state,
+                    ready: false,
+                    ip: None,
+                    nics: Vec::new(),
+                    web: Vec::new(),
+                    cached: true,
+                    detail,
+                }
+            })
+            .collect();
+        json!(LabStatus {
+            lab: "demo".into(),
+            machines,
+            segments: Vec::new(),
+            provisioned: true,
+            pulls: Vec::new(),
+        })
+    }
+
+    /// The reload guard's whole job: the daemon cannot re-adopt a live QEMU
+    /// process across a restart, so a reload needs proof that there is none.
+    /// The guard reads the daemon's own projection, one entry per VM *and*
+    /// container — reading keys the daemon no longer emitted made it wave
+    /// everything through, and that is the bug this test exists to keep fixed.
     #[actix_web::test]
     async fn only_an_all_stopped_lab_may_reload() {
-        let stopped = json!({"machines": [
-            {"name": "dc01", "kind": "vm", "state": "stopped"},
-            {"name": "web", "kind": "container", "state": "stopped"},
-        ]});
-        assert!(all_machines_stopped(&stopped));
-        assert!(all_machines_stopped(&json!({"machines": []})));
+        assert!(all_machines_stopped(&status_payload(vec![
+            ("dc01", PowerState::Stopped),
+            ("web", PowerState::Stopped),
+        ])));
+        assert!(all_machines_stopped(&status_payload(Vec::new())));
 
-        // Every non-stopped `PowerState` blocks, not just `running`: a machine
+        // Every non-stopped state blocks, not just `Running`: a machine
         // mid-boot has a QEMU process the restart would orphan too.
-        for state in ["running", "starting", "stopping"] {
-            let status = json!({"machines": [
-                {"name": "dc01", "kind": "vm", "state": "stopped"},
-                {"name": "web", "kind": "container", "state": state},
-            ]});
+        for state in [
+            PowerState::Running,
+            PowerState::Starting,
+            PowerState::Stopping,
+        ] {
+            let status = status_payload(vec![("dc01", PowerState::Stopped), ("web", state)]);
             assert!(!all_machines_stopped(&status), "state {state}");
         }
     }
@@ -1455,8 +1506,10 @@ mod tests {
         assert!(!all_machines_stopped(&old));
         assert!(!all_machines_stopped(&json!({})));
         assert!(!all_machines_stopped(&json!({"machines": "not-a-list"})));
+        // A machine with no kind is not a machine this guard can vouch for.
         assert!(!all_machines_stopped(
-            &json!({"machines": [{"name": "dc01"}]})
+            &json!({"lab": "demo", "machines": [{"name": "dc01", "state": "stopped"}],
+                    "segments": [], "provisioned": true, "pulls": []})
         ));
     }
 

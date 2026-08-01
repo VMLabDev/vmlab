@@ -49,8 +49,13 @@ pub enum Command {
     },
     /// Stop the lab and delete clones, lab-local state, dynamic net config
     Destroy,
-    /// Lab/VM/segment state, IPs, ready flags
-    Status,
+    /// Machine and segment status: what each machine is doing, and its IP
+    Status {
+        /// Add the raw power state, readiness, and each machine's
+        /// kind-specific detail (template/hardware, image/health/restarts)
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Validate the lab file with no side effects
     Validate,
     /// Per-VM power control and interaction: start/stop, screenshot, input, OCR
@@ -358,7 +363,7 @@ pub fn run() -> ExitCode {
         Command::Pull { vms } => lab::cmd_pull(vms),
         Command::Down { vms, force } => lab::cmd_down(vms, force),
         Command::Destroy => lab::cmd_destroy(),
-        Command::Status => lab::cmd_status(),
+        Command::Status { verbose } => lab::cmd_status(verbose),
         Command::Validate => validate::cmd_validate().map(|_| ()),
         Command::Vm { cmd } => match cmd {
             VmCmd::Start { vm } => lab::cmd_vm_power(&vm, "start", false),

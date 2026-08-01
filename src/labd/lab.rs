@@ -20,6 +20,7 @@ use super::vm::{PowerState, StopReason, VmDirs, VmInstance};
 use crate::config::LabFile;
 use crate::config::model::TemplateRef;
 use crate::profiles::ProfileSet;
+use crate::status::{LabStatus, PullKind, PullStatus, SegmentFrames, SegmentStatus};
 use crate::sync::LockRecover;
 use crate::template::TemplateStore;
 
@@ -49,7 +50,7 @@ pub struct LabRuntime {
     profiles: ProfileSet,
     /// Machines whose template/image is not in the local cache yet — the
     /// deferred-pull work list. [`Self::ensure_pulled`] drains it; `status`
-    /// reports it as `template_cached` / `image_cached`.
+    /// reports it as each machine's `cached` flag.
     pending_pulls: Mutex<BTreeMap<String, PendingPull>>,
     /// Serialises pull runs (concurrent `up` + `pull` + `vm.start` must not
     /// double-download); the loser re-checks the pending list and no-ops.
@@ -103,16 +104,6 @@ fn pull_percent(bytes_done: u64, bytes_total: u64) -> u32 {
         .unwrap_or(0) as u32
 }
 
-/// The field a `<kind>.pull.*` event names its machine under: VM downloads
-/// say `vm`, container downloads say `container`.
-fn pull_subject(kind: &str) -> &'static str {
-    if kind == "template" {
-        "vm"
-    } else {
-        "container"
-    }
-}
-
 /// The error a cancelled download fails with. A distinct type so the pull
 /// paths can tell a cancellation from a transport failure and leave the
 /// `.error` event unsent — `.cancelled` already went out.
@@ -130,8 +121,7 @@ impl std::error::Error for PullCancelled {}
 /// A download in progress, as reported by `status` and cancelled by
 /// `cancel_pull`.
 struct ActivePull {
-    /// "template" (VM disk from a registry) or "image" (container image).
-    kind: &'static str,
+    kind: PullKind,
     reference: String,
     bytes_done: u64,
     bytes_total: u64,
@@ -486,7 +476,7 @@ impl LabRuntime {
     async fn join_pull<T>(
         self: &Arc<Self>,
         machine: &str,
-        kind: &'static str,
+        kind: PullKind,
         reference: &str,
         task: tokio::task::JoinHandle<Result<T>>,
     ) -> Result<T> {
@@ -508,7 +498,7 @@ impl LabRuntime {
             Err(e) if e.is_cancelled() => {
                 self.events.emit(
                     &format!("{kind}.pull.cancelled"),
-                    json!({ pull_subject(kind): machine, "reference": reference }),
+                    json!({ kind.subject(): machine, "reference": reference }),
                 );
                 Err(anyhow::Error::new(PullCancelled))
             }
@@ -567,7 +557,9 @@ impl LabRuntime {
             };
             crate::oci::ensure_registry_template(&ref_s, &arch_s, &store, &mut progress).await
         });
-        let result = self.join_pull(vm_name, "template", reference, task).await;
+        let result = self
+            .join_pull(vm_name, PullKind::Template, reference, task)
+            .await;
         match result {
             Ok(resolved) => {
                 self.events.emit(
@@ -648,7 +640,9 @@ impl LabRuntime {
             };
             crate::oci::image::ensure_container_image(&ref_s, arch, &cache, &mut progress).await
         });
-        let result = self.join_pull(name, "container", reference, task).await;
+        let result = self
+            .join_pull(name, PullKind::Container, reference, task)
+            .await;
         match result {
             Ok(image) => {
                 self.events.emit(
@@ -1939,21 +1933,20 @@ impl LabRuntime {
         Ok(())
     }
 
-    pub async fn status(&self) -> Value {
+    /// The lab status projection (ADR-0004) — produced here, rendered unchanged
+    /// by the CLI, the REST surface and the console.
+    pub async fn status(&self) -> LabStatus {
         let pending = self.pending_pulls.lock().await;
-        // One projection for both kinds: each adapter contributes its own
-        // fields under `extra` (see `Machine::status_extra`), so a machine is
-        // described in exactly one place.
+        // One projection for both kinds: each adapter fills its own variant
+        // (see `Machine::status_detail`), so a machine is described in exactly
+        // one place.
         let mut machines = Vec::new();
         for m in self.machines() {
             let mut status = m.status().await;
             // Lab-level, not machine-level: is this machine's template/image
             // download still pending? Drives the "Download" button.
-            status.extra.insert(
-                "cached".into(),
-                json!(!pending.contains_key(status.name.as_str())),
-            );
-            machines.push(json!(status));
+            status.cached = !pending.contains_key(status.name.as_str());
+            machines.push(status);
         }
 
         let net = self.network.lock().await;
@@ -1968,61 +1961,60 @@ impl LabRuntime {
             };
         let mut segments = Vec::new();
         for seg in net.segments.values() {
-            // null = not a global segment (no trunk possible) or supervisor
+            // None = not a global segment (no trunk possible) or supervisor
             // unreachable; bool = live trunk state keyed by segment name, so
             // the accept side (no local `connect`) lights up too.
             let peer_connected = if seg.global {
                 trunk_states
                     .as_ref()
-                    .map(|m| json!(m.get(&seg.name).copied().unwrap_or(false)))
-                    .unwrap_or(Value::Null)
+                    .map(|m| m.get(&seg.name).copied().unwrap_or(false))
             } else {
-                Value::Null
+                None
             };
             // Switch counters ride along: a non-zero drop count is the signal
             // that a segment is shedding frames under load (a port's egress
             // queue filling), which otherwise only shows up as mysteriously
             // slow guest transfers.
             let sw = seg.switch.stats();
-            segments.push(json!({
-                "name": seg.name,
-                "subnet": seg.subnet.to_string(),
-                "gateway": seg.gateway_ip.to_string(),
-                "nat": seg.nat,
-                "dhcp": seg.dhcp,
-                "global": seg.global,
-                "connect": seg.peer,
-                "peer_connected": peer_connected,
-                "frames_forwarded": sw.frames_forwarded,
-                "frames_flooded": sw.frames_flooded,
-                "frames_dropped": sw.frames_dropped,
-                "frames_offloaded": sw.frames_offloaded,
-            }));
+            segments.push(SegmentStatus {
+                name: seg.name.clone(),
+                subnet: seg.subnet.to_string(),
+                gateway: seg.gateway_ip.to_string(),
+                nat: seg.nat,
+                dhcp: seg.dhcp,
+                global: seg.global,
+                connect: seg.peer.clone(),
+                peer_connected,
+                frames: SegmentFrames {
+                    forwarded: sw.frames_forwarded,
+                    flooded: sw.frames_flooded,
+                    dropped: sw.frames_dropped,
+                    offloaded: sw.frames_offloaded,
+                },
+            });
         }
         // In-flight downloads, so a page load mid-pull still shows progress
         // (the events only reach clients that were already connected).
-        let pulls: Vec<Value> = self
+        let pulls: Vec<PullStatus> = self
             .active_pulls
             .lock_recover()
             .iter()
-            .map(|(machine, pull)| {
-                json!({
-                    "machine": machine,
-                    "kind": pull.kind,
-                    "reference": pull.reference,
-                    "bytes_done": pull.bytes_done,
-                    "bytes_total": pull.bytes_total,
-                    "percent": pull.percent,
-                })
+            .map(|(machine, pull)| PullStatus {
+                machine: machine.clone(),
+                kind: pull.kind,
+                reference: pull.reference.clone(),
+                bytes_done: pull.bytes_done,
+                bytes_total: pull.bytes_total,
+                percent: pull.percent,
             })
             .collect();
-        json!({
-            "lab": self.name,
-            "machines": machines,
-            "segments": segments,
-            "provisioned": self.provisioned(),
-            "pulls": pulls,
-        })
+        LabStatus {
+            lab: self.name.clone(),
+            machines,
+            segments,
+            provisioned: self.provisioned(),
+            pulls,
+        }
     }
 
     /// Whether this lab has materialised anything a destroy would remove:

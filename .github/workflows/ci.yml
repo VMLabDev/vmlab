@@ -57,6 +57,9 @@ jobs:
       - run: just ci::lint
       - run: just ci::test
       - run: just ci::web-ui-check
+      # The console's status types are generated from src/status.rs; a
+      # producer-side change that was not regenerated fails here.
+      - run: just ci::status-types-verify
 
   # The guest-side crates (cinit, agent, and their proto contracts) are
   # standalone — never swept into the host build — so lint/test them and the

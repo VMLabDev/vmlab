@@ -3,8 +3,6 @@ import { NavLink, NavSection, StatusDot } from "@forge/ui";
 import { Globe, LayoutGrid, Package } from "lucide-solid";
 import {
   archOf,
-  containerLook,
-  look,
   showContainer,
   showLab,
   showTemplates,
@@ -12,6 +10,7 @@ import {
   showWeb,
   state,
 } from "../store";
+import { containers, vms } from "../status";
 import { openWebCount } from "./WebView";
 
 /** Wrap a view-switch action as an anchor click handler. */
@@ -29,7 +28,7 @@ export default function SidebarNav() {
         href="#"
         icon={LayoutGrid}
         active={state.view.kind === "lab"}
-        count={s()?.vms.length}
+        count={vms(s()).length}
         onClick={nav(showLab)}
       >
         {state.currentLab ?? "—"}
@@ -56,7 +55,7 @@ export default function SidebarNav() {
       </Show>
 
       <NavSection>Machines</NavSection>
-      <For each={s()?.vms ?? []}>
+      <For each={vms(s())}>
         {(vm) => (
           <NavLink
             href="#"
@@ -64,15 +63,15 @@ export default function SidebarNav() {
             count={archOf(vm)}
             onClick={nav(() => showVm(vm.name))}
           >
-            <StatusDot tone={look(vm).tone} />
+            <StatusDot tone={vm.label.severity} />
             {vm.name}
           </NavLink>
         )}
       </For>
 
-      <Show when={(s()?.containers ?? []).length > 0}>
+      <Show when={containers(s()).length > 0}>
         <NavSection>Containers</NavSection>
-        <For each={s()?.containers ?? []}>
+        <For each={containers(s())}>
           {(c) => (
             <NavLink
               href="#"
@@ -80,7 +79,7 @@ export default function SidebarNav() {
               count="oci"
               onClick={nav(() => showContainer(c.name))}
             >
-              <StatusDot tone={containerLook(c).tone} />
+              <StatusDot tone={c.label.severity} />
               {c.name}
             </NavLink>
           )}

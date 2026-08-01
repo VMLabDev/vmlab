@@ -61,10 +61,18 @@ vmlab destroy
 
 ## vmlab status
 
-Show lab / VM / segment state, IPs and ready flags.
+Show every machine's status and IP, plus the lab's segments. One row per VM and container, labelled in the words the web console uses.
+
+| Switch | Value | Description |
+| --- | --- | --- |
+| --verbose | — | Add the raw power state, readiness and each machine's kind-specific detail. |
 
 ```console
 vmlab status
+```
+
+```console
+vmlab status --verbose
 ```
 
 ## vmlab vm

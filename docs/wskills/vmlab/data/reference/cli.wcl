@@ -49,8 +49,10 @@ cli vmlab_cli {
 
   subcommand c_status {
     name = "status"
-    description = "Show lab / VM / segment state, IPs and ready flags."
+    description = "Show every machine's status and IP, plus the lab's segments. One row per VM and container, labelled in the words the web console uses."
+    cli_switch s_status_verbose { long = "--verbose"  description = "Add the raw power state, readiness and each machine's kind-specific detail." }
     code_example { lang = "console"  code = "vmlab status" }
+    code_example { lang = "console"  code = "vmlab status --verbose" }
   }
 
   // ---- Per-VM power ----

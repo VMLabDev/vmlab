@@ -4,19 +4,18 @@
 
 import { createStore } from "solid-js/store";
 import { toast } from "@forge/ui";
-import type { StatusTone, Tone } from "@forge/ui";
+import type { Tone } from "@forge/ui";
 import * as api from "./api";
 import type {
-  Container,
   FastpathInfo,
   HostInfo,
   LabEntry,
-  LabStatus,
   PlaybookInfo,
   TemplateInfo,
-  Vm,
   DaemonEvent,
 } from "./api";
+import { containers as containersOf, vms as vmsOf } from "./status";
+import type { LabStatus, VmMachine } from "./status";
 import { playDestroyRecreate } from "./fx";
 
 export type ViewKind = "lab" | "vm" | "container" | "templates" | "web";
@@ -372,7 +371,11 @@ export async function refreshStatus() {
     setState({ status, error: null });
     adoptActivePulls(status);
   } catch (e) {
+    // A status this console cannot read has to be said out loud: the failure
+    // it replaces is a machine list that silently renders as an empty lab
+    // (ADR-0004). `state.error` alone is not visible anywhere.
     setState({ error: String(e) });
+    showToast(String(e), "danger");
   }
 }
 
@@ -380,7 +383,7 @@ export async function refreshStatus() {
  *  mid-download still shows progress (the `*.pull.*` events only reach clients
  *  that were already connected). Errored/cancelled entries are the client's
  *  own until dismissed, so they are left alone. */
-function adoptActivePulls(status: api.LabStatus) {
+function adoptActivePulls(status: LabStatus) {
   const active = status.pulls ?? [];
   for (const pull of active) {
     const key = `${status.lab}/${pull.machine}`;
@@ -446,21 +449,18 @@ export async function createLabAndOpen(
 /** True if any VM or container in the current lab is not stopped (gates a
  *  reload — the daemon can't re-adopt running machines). */
 export function anyVmRunning(): boolean {
-  return (
-    (state.status?.vms ?? []).some((v) => v.state !== "stopped") ||
-    (state.status?.containers ?? []).some((c) => c.state !== "stopped")
-  );
+  return (state.status?.machines ?? []).some((m) => m.state !== "stopped");
 }
 
 /** Runtime configuration is mutable only once a machine is fully stopped. */
 export function vmIsUp(name: string): boolean {
-  const vm = state.status?.vms.find((v) => v.name === name);
+  const vm = vmsOf(state.status).find((v) => v.name === name);
   return vm !== undefined && vm.state !== "stopped";
 }
 
 /** Containers follow the same conservative lifecycle rule as VMs. */
 export function containerIsUp(name: string): boolean {
-  const container = state.status?.containers.find((c) => c.name === name);
+  const container = containersOf(state.status).find((c) => c.name === name);
   return container !== undefined && container.state !== "stopped";
 }
 
@@ -496,10 +496,8 @@ function beginDestroyFx(lab: string) {
     timer: setTimeout(endDestroyFx, 60_000) as unknown as number,
   };
   // Machines already powered off emit no stop event — explode them now.
-  for (const v of state.status?.vms ?? [])
-    if (v.state === "stopped") fireDestroyFx(`vm:${v.name}`);
-  for (const c of state.status?.containers ?? [])
-    if (c.state === "stopped") fireDestroyFx(`container:${c.name}`);
+  for (const m of state.status?.machines ?? [])
+    if (m.state === "stopped") fireDestroyFx(`${m.kind}:${m.name}`);
 }
 
 function endDestroyFx() {
@@ -619,7 +617,7 @@ export async function deleteLabSnapshot(name: string) {
   const st = state.status;
   if (!lab || !st) return;
   await Promise.allSettled(
-    st.vms.map((v) => api.deleteSnapshot(lab, v.name, name)),
+    vmsOf(st).map((v) => api.deleteSnapshot(lab, v.name, name)),
   );
   showToast("Snapshot deleted");
   scheduleRefresh();
@@ -632,7 +630,7 @@ export async function labSnapshotList(): Promise<{ name: string; taken_at: strin
   const st = state.status;
   if (!lab || !st) return [];
   const lists = await Promise.all(
-    st.vms.map((v) => api.vmSnapshots(lab, v.name).catch(() => [])),
+    vmsOf(st).map((v) => api.vmSnapshots(lab, v.name).catch(() => [])),
   );
   const latest = new Map<string, string>();
   for (const list of lists) {
@@ -704,9 +702,8 @@ function handleEvent(ev: DaemonEvent) {
     } else if (ev.event === "lab.down") {
       // Sweep: a machine whose stop was a no-op (stale status said running)
       // emitted nothing — every node gets its effect exactly once.
-      for (const v of state.status?.vms ?? []) fireDestroyFx(`vm:${v.name}`);
-      for (const c of state.status?.containers ?? [])
-        fireDestroyFx(`container:${c.name}`);
+      for (const m of state.status?.machines ?? [])
+        fireDestroyFx(`${m.kind}:${m.name}`);
       endDestroyFx();
     }
   }
@@ -1042,47 +1039,19 @@ export function currentPullFor(machine: string): Pull | undefined {
 
 // --- derived helpers (shared by views) ------------------------------------
 
-export interface StateLook {
-  label: string;
-  tone: StatusTone; // forge Badge/StatusDot tone
-}
+/** The daemon derives one label per machine (ADR-0004) and sends it with the
+ *  status projection; a view renders `m.label.text` and passes
+ *  `m.label.severity` straight to a forge Badge or StatusDot. There is no
+ *  console-side derivation any more — that is what made `vmlab status` and
+ *  this console describe the same machine with different words. */
 
-export function look(vm: Vm): StateLook {
-  switch (vm.state) {
-    case "running":
-      return vm.ready
-        ? { label: "running", tone: "success" }
-        : { label: "booting", tone: "warning" };
-    case "starting":
-      return { label: "booting", tone: "warning" };
-    default:
-      return { label: "stopped", tone: "neutral" };
-  }
-}
-
-/** Container state badge: like [`look`], plus the healthcheck verdict. */
-export function containerLook(c: Container): StateLook {
-  switch (c.state) {
-    case "running":
-      if (!c.ready) return { label: "starting", tone: "warning" };
-      if (c.health === false) return { label: "unhealthy", tone: "danger" };
-      return { label: "running", tone: "success" };
-    case "starting":
-      return { label: "starting", tone: "warning" };
-    default:
-      return c.exit_code != null && c.exit_code !== 0
-        ? { label: `exited (${c.exit_code})`, tone: "danger" }
-        : { label: "stopped", tone: "neutral" };
-  }
-}
-
-export function archOf(vm: Vm): string {
+export function archOf(vm: VmMachine): string {
   if (vm.arch) return vm.arch;
   const slash = vm.template.indexOf("/");
   return slash > 0 ? vm.template.slice(0, slash) : "x86_64";
 }
 
-export function osOf(vm: Vm): string {
+export function osOf(vm: VmMachine): string {
   const slash = vm.template.indexOf("/");
   return slash > 0 ? vm.template.slice(slash + 1) : vm.template;
 }

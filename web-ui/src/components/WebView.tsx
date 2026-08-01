@@ -7,7 +7,7 @@ import { For, Show, createSignal } from "solid-js";
 import { Empty, IconButton } from "@forge/ui";
 import { RotateCw, X } from "lucide-solid";
 import * as api from "../api";
-import type { WebPage } from "../api";
+import type { WebPageStatus } from "../status";
 import { showWeb } from "../store";
 
 interface WebTab {
@@ -43,7 +43,7 @@ export function openWebPage(
   lab: string,
   kind: "vms" | "containers",
   machine: string,
-  page: WebPage,
+  page: WebPageStatus,
 ) {
   const id = `${lab}/${kind}/${machine}/${page.name}`;
   openTab({

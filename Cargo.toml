@@ -107,6 +107,12 @@ glob = "0.3"
 tempfile = "3"
 ipnet = "2.12.0"
 async-trait = "0.1.91"
+# Generates the console's TypeScript types from the lab status projection
+# (src/status.rs, ADR-0004) so they cannot drift from what the daemon emits.
+# The derive contributes trait impls only; the export itself runs under
+# `just status-types-build`, and `just ci::check` fails if the committed
+# web-ui/src/gen/status.ts no longer matches.
+ts-rs = "12"
 # `net` is for sockopt::socket_cookie (SO_COOKIE), the sockmap fast path's
 # per-socket BPF map key.
 rustix = { version = "1.1.4", features = ["termios", "net"] }

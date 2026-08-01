@@ -11,7 +11,6 @@ import {
   takeSnapshot,
   restoreSnapshot,
   deleteSnapshot,
-  look,
   osOf,
   archOf,
   fmtMem,
@@ -19,6 +18,7 @@ import {
   playbooksFor,
 } from "../store";
 import { vmSnapshots } from "../api";
+import { vms } from "../status";
 import { confirmDialog, promptDialog } from "./dialogs";
 import { canEditPlaybook, editPlaybook } from "./FilesView";
 import { openWebPage } from "./WebView";
@@ -32,15 +32,11 @@ export default function MachineView() {
   const [tab, setTab] = createSignal<"console" | "terminal" | "log" | "playbook">("console");
   // All of these are accessors so the view tracks the selected VM reactively —
   // switching machines re-runs them rather than pinning to the first one.
-  const vm = () => state.status?.vms.find((v) => v.name === state.view.vm);
+  const vm = () => vms(state.status).find((v) => v.name === state.view.vm);
   const on = () => vm()?.state === "running";
   // Terminal support: the template carries a baked-in vmlab-agent.
   const hasAgent = () => Boolean(vm()?.agent_version);
   const pull = () => (vm() ? currentPullFor(vm()!.name) : undefined);
-  const lk = () => {
-    const v = vm();
-    return v ? look(v) : { label: "", tone: "neutral" as const };
-  };
   const segments = () =>
     vm()
       ?.nics.map((n) => n.segment)
@@ -87,8 +83,8 @@ export default function MachineView() {
         title={
           <span style={{ display: "inline-flex", "align-items": "center", gap: "10px" }}>
             {vm()!.name}
-            <Badge tone={lk().tone} dot>
-              {lk().label}
+            <Badge tone={vm()!.label.severity} dot>
+              {vm()!.label.text}
             </Badge>
           </span>
         }
@@ -184,6 +180,10 @@ export default function MachineView() {
             <KV k="Address" v={vm()!.ip ?? "—"} />
             <KV k="MAC" v={vm()!.nics[0]?.mac ?? "—"} />
             <KV k="Segment" v={segments()} />
+            {/* The agent stamp baked into the template — "none" is why this
+                machine offers no terminal, and is worth saying out loud. */}
+            <KV k="Agent" v={vm()!.agent_version ?? "none"} />
+            <KV k="Power state" v={vm()!.state} />
           </Card>
           <Show when={playbooksFor(vm()!.name).length > 0}>
             <Card title="Playbooks">

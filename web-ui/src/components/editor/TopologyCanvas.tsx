@@ -109,15 +109,14 @@ import {
   removeHostPortDraft,
 } from "../../editor/store";
 import { formatMemory } from "../../editor/bytesize";
+import { machine as machineOf } from "../../status";
 import {
   anyVmRunning,
   containerIsUp,
-  containerLook,
   containerRestart,
   containerStart,
   containerStop,
   currentPullFor,
-  look,
   showContainer,
   showVm,
   state,
@@ -2237,38 +2236,19 @@ export default function TopologyCanvas(props: {
     return `M ${a.x} ${a.y} L ${x} ${a.y} L ${x} ${b.y} L ${b.x} ${b.y}`;
   }
 
-  // Live power state per VM / container (the daemon's view; absent = no daemon).
-  const runtimeOf = (name: string) => state.status?.vms.find((v) => v.name === name);
-  const vmRunning = (name: string) => {
-    const rv = runtimeOf(name);
-    return !!rv && rv.state !== "stopped";
+  // The daemon's live view of a machine (absent = no daemon). VMs and
+  // containers share one name space and one status projection, so the LED
+  // reads the label the daemon derived instead of the canvas deciding what a
+  // power state means (ADR-0004).
+  const runtimeOf = (name: string) => machineOf(state.status, name);
+  const machineUp = (name: string) => {
+    const m = runtimeOf(name);
+    return !!m && m.state !== "stopped";
   };
-  const ledTone = (name: string) => {
-    const rv = runtimeOf(name);
-    return rv ? look(rv).tone : "neutral";
-  };
-  const ledLabel = (name: string) => {
-    const rv = runtimeOf(name);
-    return rv ? look(rv).label : "no daemon";
-  };
-  const ctrRuntimeOf = (name: string) =>
-    (state.status?.containers ?? []).find((c) => c.name === name);
-  const ctrRunning = (name: string) => {
-    const rc = ctrRuntimeOf(name);
-    return !!rc && rc.state !== "stopped";
-  };
-  const ctrLedTone = (name: string) => {
-    const rc = ctrRuntimeOf(name);
-    return rc ? containerLook(rc).tone : "neutral";
-  };
-  const ctrLedLabel = (name: string) => {
-    const rc = ctrRuntimeOf(name);
-    return rc ? containerLook(rc).label : "no daemon";
-  };
-  const machineRunning = (kind: MachineKind, name: string) =>
-    kind === "vm" ? vmRunning(name) : ctrRunning(name);
-  const runtimeNic = (kind: MachineKind, name: string, nicIndex: number) =>
-    (kind === "vm" ? runtimeOf(name) : ctrRuntimeOf(name))?.nics[nicIndex] ?? null;
+  const ledTone = (name: string) => runtimeOf(name)?.label.severity ?? "neutral";
+  const ledLabel = (name: string) => runtimeOf(name)?.label.text ?? "no daemon";
+  const runtimeNic = (name: string, nicIndex: number) =>
+    runtimeOf(name)?.nics[nicIndex] ?? null;
 
   const ipv4Number = (value: string): number | null => {
     const parts = value.split(".");
@@ -2348,7 +2328,7 @@ export default function TopologyCanvas(props: {
     return !!segment?.subnet && !segment.global;
   }
   const hostPortLive = (entry: HostPortEntry) =>
-    !!entry.target && hostPortValid(entry) && machineRunning(entry.target.kind, entry.target.name);
+    !!entry.target && hostPortValid(entry) && machineUp(entry.target.name);
 
   /** Live cross-host trunk state for a segment (daemon status; null-ish =
    *  unknown / no daemon / not global). */
@@ -2912,7 +2892,7 @@ export default function TopologyCanvas(props: {
                         <Show when={path() && !dragged()}>
                           <g
                             class="topo-edge"
-                            classList={{ live: machineRunning(mkind, m.name) }}
+                            classList={{ live: machineUp(m.name) }}
                             onPointerDown={(e: PointerEvent) => {
                               e.stopPropagation();
                               const mi = machinesOf(mkind).findIndex((x) => x.name === m.name);
@@ -3795,11 +3775,11 @@ export default function TopologyCanvas(props: {
                       y={p().y + 8}
                       act="console"
                       title={
-                        vmRunning(vm.name)
+                        machineUp(vm.name)
                           ? `Open ${vm.web[0].name}`
                           : "Start the VM to open its web pages"
                       }
-                      disabled={!vmRunning(vm.name)}
+                      disabled={!machineUp(vm.name)}
                       onClick={() =>
                         openWebPage(state.currentLab!, "vms", vm.name, vm.web[0])
                       }
@@ -3814,14 +3794,14 @@ export default function TopologyCanvas(props: {
                     title={
                       pull()?.status !== "error" && pull()
                         ? pullLabel(pull()!)
-                        : vmRunning(vm.name)
+                        : machineUp(vm.name)
                           ? "Stop"
                           : "Start"
                     }
                     disabled={!!pull() && pull()!.status !== "error"}
-                    onClick={() => (vmRunning(vm.name) ? vmStop(vm.name) : vmStart(vm.name))}
+                    onClick={() => (machineUp(vm.name) ? vmStop(vm.name) : vmStart(vm.name))}
                   >
-                    <Show when={vmRunning(vm.name)} fallback={<Play size={11} />}>
+                    <Show when={machineUp(vm.name)} fallback={<Play size={11} />}>
                       <Square size={11} />
                     </Show>
                   </VmBtn>
@@ -3829,8 +3809,8 @@ export default function TopologyCanvas(props: {
                     x={p().x + VM_W - 49}
                     y={p().y + 8}
                     act="restart"
-                    title={vmRunning(vm.name) ? "Restart" : "Restart unavailable while powered off"}
-                    disabled={!vmRunning(vm.name)}
+                    title={machineUp(vm.name) ? "Restart" : "Restart unavailable while powered off"}
+                    disabled={!machineUp(vm.name)}
                     onClick={() => vmRestart(vm.name)}
                   >
                     <RotateCw size={11} />
@@ -3847,7 +3827,7 @@ export default function TopologyCanvas(props: {
                   <Index each={vm.nics}>
                     {(nic, i) => {
                       const port = () => machineNicPort("vm", vm.name, i, nic());
-                      const runtime = () => runtimeNic("vm", vm.name, i);
+                      const runtime = () => runtimeNic(vm.name, i);
                       const rowY = () => p().y + 48 + i * NIC_ROW_H;
                       const target = () => (nic().nat ? "NAT" : nic().segment ?? "unplugged");
                       const compactTarget = () =>
@@ -3989,9 +3969,9 @@ export default function TopologyCanvas(props: {
                           cx={p().x + 19}
                           cy={p().y + 38}
                           r="4"
-                          class={`topo-led ${ctrLedTone(ctr.name)}`}
+                          class={`topo-led ${ledTone(ctr.name)}`}
                         >
-                          <title>{ctrLedLabel(ctr.name)}</title>
+                          <title>{ledLabel(ctr.name)}</title>
                         </circle>
                       </>
                     }
@@ -4046,11 +4026,11 @@ export default function TopologyCanvas(props: {
                       y={p().y + 8}
                       act="console"
                       title={
-                        ctrRunning(ctr.name)
+                        machineUp(ctr.name)
                           ? `Open ${ctr.web[0].name}`
                           : "Start the container to open its web pages"
                       }
-                      disabled={!ctrRunning(ctr.name)}
+                      disabled={!machineUp(ctr.name)}
                       onClick={() =>
                         openWebPage(state.currentLab!, "containers", ctr.name, ctr.web[0])
                       }
@@ -4065,16 +4045,16 @@ export default function TopologyCanvas(props: {
                     title={
                       pull()?.status !== "error" && pull()
                         ? pullLabel(pull()!)
-                        : ctrRunning(ctr.name)
+                        : machineUp(ctr.name)
                           ? "Stop"
                           : "Start"
                     }
                     disabled={!!pull() && pull()!.status !== "error"}
                     onClick={() =>
-                      ctrRunning(ctr.name) ? containerStop(ctr.name) : containerStart(ctr.name)
+                      machineUp(ctr.name) ? containerStop(ctr.name) : containerStart(ctr.name)
                     }
                   >
-                    <Show when={ctrRunning(ctr.name)} fallback={<Play size={11} />}>
+                    <Show when={machineUp(ctr.name)} fallback={<Play size={11} />}>
                       <Square size={11} />
                     </Show>
                   </VmBtn>
@@ -4083,9 +4063,9 @@ export default function TopologyCanvas(props: {
                     y={p().y + 8}
                     act="restart"
                     title={
-                      ctrRunning(ctr.name) ? "Restart" : "Restart unavailable while powered off"
+                      machineUp(ctr.name) ? "Restart" : "Restart unavailable while powered off"
                     }
-                    disabled={!ctrRunning(ctr.name)}
+                    disabled={!machineUp(ctr.name)}
                     onClick={() => containerRestart(ctr.name)}
                   >
                     <RotateCw size={11} />
@@ -4102,7 +4082,7 @@ export default function TopologyCanvas(props: {
                   <Index each={ctr.nics}>
                     {(nic, i) => {
                       const port = () => machineNicPort("container", ctr.name, i, nic());
-                      const runtime = () => runtimeNic("container", ctr.name, i);
+                      const runtime = () => runtimeNic(ctr.name, i);
                       const rowY = () => p().y + 48 + i * NIC_ROW_H;
                       const target = () => (nic().nat ? "NAT" : nic().segment ?? "unplugged");
                       const compactTarget = () =>

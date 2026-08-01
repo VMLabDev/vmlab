@@ -28,21 +28,18 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
-use serde_json::{Map, Value};
 
 use crate::config::model::{self, MacAddr};
 
 use super::vm::PowerState;
 use super::vm_agent::AgentHandle;
 
-/// Which of the two kinds a machine is. Reported so a UI can pick an icon —
-/// never so a caller can pick a code path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MachineKind {
-    Vm,
-    Container,
-}
+/// The status vocabulary this seam reports in. Declared with the projection
+/// (ADR-0004) because it is what reaches the CLI, the REST surface and the
+/// console; re-exported here because this is where machines produce it.
+pub use crate::status::{
+    MachineDetail, MachineKind, MachineLabel, MachineStatus, NicStatus, WebPageStatus,
+};
 
 /// What a machine can do beyond the universal operations, probed rather than
 /// inferred. Drives `machine.capabilities`, which is how the web console
@@ -60,42 +57,6 @@ pub struct Capabilities {
     /// `tail`, `metrics`, `clipboard`, `eventlog`). Empty when no agent is
     /// answering — which is a live fact, not a property of the kind.
     pub agent: Vec<String>,
-}
-
-/// One NIC's addressing as reported to `status`.
-#[derive(Debug, Clone, Serialize)]
-pub struct NicStatus {
-    /// `None` on a NAT-only NIC that joins no segment.
-    pub segment: Option<String>,
-    pub mac: Option<String>,
-    pub static_ip: Option<String>,
-    pub ip: Option<String>,
-}
-
-/// A guest web page as reported to `status` — no credentials; the browser only
-/// needs enough to build a launch link.
-#[derive(Debug, Clone, Serialize)]
-pub struct WebPageStatus {
-    pub name: String,
-    pub port: u16,
-    pub path: String,
-}
-
-/// One machine's line in `status`. The common fields are shared; each adapter
-/// contributes its own under `extra` (a VM's template and hardware, a
-/// container's image, health and restarts) so this stays one projection
-/// instead of two hand-written ones.
-#[derive(Debug, Clone, Serialize)]
-pub struct MachineStatus {
-    pub name: String,
-    pub kind: MachineKind,
-    pub state: PowerState,
-    pub ready: bool,
-    pub ip: Option<String>,
-    pub nics: Vec<NicStatus>,
-    pub web: Vec<WebPageStatus>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
 }
 
 /// Everything a lab can boot, attach to a segment, and drive through the
@@ -276,8 +237,9 @@ pub trait Machine: Send + Sync + 'static {
 
     // ---- projection --------------------------------------------------------
 
-    /// Kind-specific `status` fields, merged into [`MachineStatus::extra`].
-    async fn status_extra(&self) -> Map<String, Value>;
+    /// This machine's kind-specific half of [`MachineStatus`] — the variant
+    /// only this adapter can fill (ADR-0004).
+    async fn status_detail(&self) -> MachineDetail;
 }
 
 /// Blanket helpers that need `Arc<dyn Machine>` rather than `&dyn Machine`.
@@ -300,8 +262,14 @@ impl dyn Machine {
     }
 
     /// This machine's line in `status`.
+    ///
+    /// `cached` is left true here: whether a registry download is still pending
+    /// is lab-level knowledge, and [`super::lab::LabRuntime::status`] fills it
+    /// in.
     pub async fn status(self: &Arc<Self>) -> MachineStatus {
         let ready = self.is_ready().await;
+        let state = self.state().await;
+        let detail = self.status_detail().await;
         let assigned = if ready {
             self.guest_ips()
                 .await
@@ -322,8 +290,8 @@ impl dyn Machine {
             .collect();
         MachineStatus {
             name: self.name().to_string(),
-            kind: self.kind(),
-            state: self.state().await,
+            label: MachineLabel::derive(state, ready, &detail),
+            state,
             ready,
             ip: assigned.iter().flatten().next().cloned(),
             nics,
@@ -336,7 +304,8 @@ impl dyn Machine {
                     path: w.path.clone(),
                 })
                 .collect(),
-            extra: self.status_extra().await,
+            cached: true,
+            detail,
         }
     }
 }

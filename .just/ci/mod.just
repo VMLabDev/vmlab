@@ -28,7 +28,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: lint fmt-check test web-ui-check guest-check ebpf-verify
+check: lint fmt-check test web-ui-check guest-check status-types-verify ebpf-verify
 
 # Run clippy with warnings as errors (--all-features covers the web binary)
 [group('ci')]
@@ -60,6 +60,11 @@ guest-crate-check crate: require-cargo
 # Check every guest-side crate (standalone workspaces the host build never sweeps in)
 [group('ci')]
 guest-check: (guest-crate-check 'cinit-proto') (guest-crate-check 'cinit') (guest-crate-check 'agent-proto') (guest-crate-check 'agent')
+
+# Verify the committed console status types match the Rust projection
+[group('ci')]
+status-types-verify: status-types-build
+	git diff --exit-code web-ui/src/gen/
 
 # Verify the committed BPF objects match the ebpf/ sources
 [group('ci')]

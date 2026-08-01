@@ -292,7 +292,9 @@ impl Handler for LabdHandler {
         let err = |e: anyhow::Error| format!("{e:#}");
         match cmd {
             "ping" => Ok(json!("pong")),
-            "status" => Ok(lab.status().await),
+            // The wire form of the status projection (ADR-0004); every surface
+            // parses it straight back into `LabStatus`.
+            "status" => Ok(json!(lab.status().await)),
             "dns.table" => Ok(lab.dns_table().await),
             "up" => {
                 let output = stream_sink(&self.lab, _stream);
