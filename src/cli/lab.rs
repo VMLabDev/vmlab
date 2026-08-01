@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
 use super::daemon;
+use super::yes_no;
 use crate::proto::client::{LabClient, SupClient};
 use crate::proto::{LabRequest, Region, SupRequest};
 use crate::status::{LabStatus, MachineDetail, MachineStatus};
@@ -108,9 +109,12 @@ pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
         super::validate::validate_current()?;
         let (name, root) = current_lab()?;
         let client = daemon::ensure_lab_daemon(&name, &root).await?;
-        let pull = client.send_streaming(LabRequest::Pull { machines: vms }, |chunk| {
-            print!("{chunk}")
-        });
+        let pull = client.send_streaming(
+            LabRequest::Pull {
+                machines: vms.clone(),
+            },
+            |chunk| print!("{chunk}"),
+        );
         tokio::pin!(pull);
         tokio::select! {
             result = &mut pull => {
@@ -121,7 +125,7 @@ pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 // The cancel rides a second request on the same multiplexed
                 // connection, so it does not wait on the download it aborts.
-                let cancelled = cancel_pulls_in_flight(&client).await?;
+                let cancelled = cancel_pulls_in_flight(&client, &vms).await?;
                 match cancelled.as_slice() {
                     [] => bail!("interrupted — no download was in flight"),
                     machines => bail!("interrupted — cancelled the download for {}", machines.join(", ")),
@@ -131,15 +135,15 @@ pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
     })
 }
 
-/// Cancel every download the lab currently has in flight, and answer with the
+/// Cancel the downloads this `pull` was waiting on, and answer with the
 /// machines whose download was aborted.
 ///
 /// `pull.cancel` names a machine, and the lab's status projection is what
 /// knows which machines are downloading — so an interrupted `pull` asks it
 /// rather than tracking the fan-out itself.
-async fn cancel_pulls_in_flight(client: &LabClient) -> Result<Vec<String>> {
+async fn cancel_pulls_in_flight(client: &LabClient, targets: &[String]) -> Result<Vec<String>> {
     let mut cancelled = Vec::new();
-    for machine in pulling_machines(&lab_status(client).await?) {
+    for machine in pulling_machines(&lab_status(client).await?, targets) {
         let aborted = client
             .send(LabRequest::PullCancel {
                 machine: machine.clone(),
@@ -155,11 +159,17 @@ async fn cancel_pulls_in_flight(client: &LabClient) -> Result<Vec<String>> {
 
 /// Which machines have a download in flight, once each: one download can have
 /// several machines waiting on it, and `status` reports a row per waiter.
-fn pulling_machines(status: &LabStatus) -> Vec<String> {
+///
+/// `targets` is the machine list the interrupted `pull` named, and an empty
+/// one means it asked for the whole lab. Cancelling only what this invocation
+/// waited on is the difference between `^C` on `vmlab pull web` and taking
+/// down a download the console or another terminal started.
+fn pulling_machines(status: &LabStatus, targets: &[String]) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     status
         .pulls
         .iter()
+        .filter(|p| targets.is_empty() || targets.contains(&p.machine))
         .filter(|p| seen.insert(p.machine.clone()))
         .map(|p| p.machine.clone())
         .collect()
@@ -396,10 +406,6 @@ fn or_dash(value: Option<&str>) -> &str {
     value.unwrap_or("-")
 }
 
-fn yes_no(flag: bool) -> &'static str {
-    if flag { "yes" } else { "no" }
-}
-
 fn on_off(flag: bool) -> &'static str {
     if flag { "on" } else { "off" }
 }
@@ -411,11 +417,7 @@ pub fn cmd_dns(json: bool) -> Result<()> {
     rt()?.block_on(async {
         let (_name, client) = lab_client_for(None).await?;
         let table = client.send(LabRequest::DnsTable {}).await.map_err(remote)?;
-        if json {
-            return super::machine::print_json(&table);
-        }
-        print!("{}", render_dns(&table));
-        Ok(())
+        super::emit(json, &table, render_dns)
     })
 }
 
@@ -540,8 +542,7 @@ fn cmd_lab_list(json: bool) -> Result<()> {
     rt()?.block_on(async {
         let labs = registry_labs().await?;
         if json {
-            println!("{}", serde_json::to_string_pretty(&labs)?);
-            return Ok(());
+            return super::print_json(&Value::Array(labs));
         }
         if labs.is_empty() {
             println!("no running labs");
@@ -666,8 +667,15 @@ pub fn cmd_restart(name: &str, json: bool) -> Result<()> {
                 _ => bail!("lab \"{name}\" is not running"),
             },
         };
+        // Machines still running is a veto: the restart shuts the old daemon
+        // down, and that stops them. A `status` that would not answer or
+        // would not parse is *not* — a lab whose `vmlab.wcl` no longer loads
+        // is exactly what restart exists to recover from, and blocking there
+        // would make the verb useless when it is needed most (the console's
+        // reload button reasons the same way).
         if let Some(client) = daemon::try_lab_daemon(name).await
-            && !lab_status(&client).await?.all_stopped()
+            && let Ok(status) = lab_status(&client).await
+            && !status.all_stopped()
         {
             bail!(
                 "lab \"{name}\" still has machines running — stop them first; \
@@ -694,11 +702,9 @@ pub fn cmd_restart(name: &str, json: bool) -> Result<()> {
             .send(LabRequest::Ping {})
             .await
             .map_err(remote)?;
-        if json {
-            return super::machine::print_json(&reply);
-        }
-        println!("lab \"{name}\" daemon restarted at {}", socket.display());
-        Ok(())
+        super::emit(json, &reply, |_| {
+            format!("lab \"{name}\" daemon restarted at {}\n", socket.display())
+        })
     })
 }
 
@@ -1901,24 +1907,38 @@ mod tests {
     /// appear twice — and each machine is cancelled once.
     #[test]
     fn an_interrupted_pull_cancels_each_waiting_machine_once() {
-        let pull = |machine: &str, reference: &str| PullStatus {
-            machine: machine.into(),
-            kind: PullKind::Template,
-            reference: reference.into(),
-            bytes_done: 1,
-            bytes_total: 2,
-            percent: 50,
-        };
         let mut status = lab(Vec::new());
-        status.pulls = vec![
-            pull("dc01", "ghcr.io/vmlab/win11:1"),
-            pull("web", "ghcr.io/vmlab/alpine:1"),
-            // The same machine can be listed twice when it waits on both a
-            // template and an image.
-            pull("dc01", "ghcr.io/vmlab/win11:1"),
-        ];
-        assert_eq!(pulling_machines(&status), vec!["dc01", "web"]);
-        assert!(pulling_machines(&lab(Vec::new())).is_empty());
+        status.pulls = downloading(&["dc01", "web", "dc01"]);
+        assert_eq!(pulling_machines(&status, &[]), vec!["dc01", "web"]);
+        assert!(pulling_machines(&lab(Vec::new()), &[]).is_empty());
+    }
+
+    /// `vmlab pull web` cancels `web`'s download and nothing else. The lab may
+    /// be downloading for a machine this invocation never named — the console
+    /// or a second terminal started it — and walking away from that one is
+    /// right where cancelling it is not.
+    #[test]
+    fn an_interrupted_pull_leaves_downloads_it_did_not_ask_for_alone() {
+        let mut status = lab(Vec::new());
+        status.pulls = downloading(&["dc01", "web"]);
+        assert_eq!(pulling_machines(&status, &["web".to_string()]), vec!["web"]);
+        // A machine that is named but is not downloading has nothing to cancel.
+        assert!(pulling_machines(&status, &["ghost".to_string()]).is_empty());
+    }
+
+    /// One in-flight download per named machine, as `status` reports them.
+    fn downloading(machines: &[&str]) -> Vec<PullStatus> {
+        machines
+            .iter()
+            .map(|machine| PullStatus {
+                machine: (*machine).into(),
+                kind: PullKind::Template,
+                reference: format!("ghcr.io/vmlab/{machine}:1"),
+                bytes_done: 1,
+                bytes_total: 2,
+                percent: 50,
+            })
+            .collect()
     }
 
     #[test]

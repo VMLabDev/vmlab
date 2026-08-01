@@ -8,8 +8,40 @@ pub mod machine;
 pub mod tty_attach;
 pub mod validate;
 
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde_json::Value;
 use std::process::ExitCode;
+
+/// Print a daemon payload the way `--json` asks for: pretty, so a human
+/// reading a piped file can still follow it.
+pub(crate) fn print_json(payload: &Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(payload)?);
+    Ok(())
+}
+
+/// Answer a verb the two ways every verb answers: the daemon's payload
+/// verbatim under `--json`, or `render`'s reading of it.
+///
+/// The convention is `vmlab lab list --json`'s, applied uniformly rather than
+/// decided per verb — `vmlab osinfo` prints JSON unconditionally and predates
+/// it, which is its own compatibility question.
+pub(crate) fn emit(
+    json: bool,
+    payload: &Value,
+    render: impl FnOnce(&Value) -> String,
+) -> Result<()> {
+    if json {
+        return print_json(payload);
+    }
+    print!("{}", render(payload));
+    Ok(())
+}
+
+/// A boolean as a person reads it, for the reports that tabulate flags.
+pub(crate) fn yes_no(flag: bool) -> &'static str {
+    if flag { "yes" } else { "no" }
+}
 
 /// How `vmlab logs` renders its output.
 #[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]

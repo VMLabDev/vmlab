@@ -14,13 +14,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::lab::{lab_client_for, remote, rt, split_vm_ref};
+use super::{emit, print_json, yes_no};
 use crate::proto::LabRequest;
-
-/// Print a daemon payload as the pretty JSON `--json` asks for.
-pub(super) fn print_json(payload: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(payload)?);
-    Ok(())
-}
 
 /// `vmlab machine capabilities <machine>` — what this machine can do beyond
 /// the universal commands, probed live rather than inferred from its kind.
@@ -34,11 +29,7 @@ pub fn cmd_capabilities(machine_ref: &str, json: bool) -> Result<()> {
             .send(LabRequest::MachineCapabilities { machine })
             .await
             .map_err(remote)?;
-        if json {
-            return print_json(&caps);
-        }
-        print!("{}", render_capabilities(&caps));
-        Ok(())
+        emit(json, &caps, render_capabilities)
     })
 }
 
@@ -85,11 +76,7 @@ pub fn cmd_stats(machine_ref: &str, json: bool) -> Result<()> {
             .send(LabRequest::MachineStats { machine })
             .await
             .map_err(remote)?;
-        if json {
-            return print_json(&stats);
-        }
-        print!("{}", render_stats(&stats));
-        Ok(())
+        emit(json, &stats, render_stats)
     })
 }
 
@@ -199,36 +186,34 @@ pub fn cmd_clipboard_set(machine_ref: &str, text: Option<String>, json: bool) ->
             })
             .await
             .map_err(remote)?;
-        if json {
-            return print_json(&done);
-        }
-        println!("copied {} bytes to \"{machine}\" clipboard", text.len());
-        Ok(())
+        emit(json, &done, |_| {
+            format!("copied {} bytes to \"{machine}\" clipboard\n", text.len())
+        })
     })
-}
-
-fn yes_no(flag: bool) -> &'static str {
-    if flag { "yes" } else { "no" }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{human_bytes, render_capabilities, render_stats, usage};
+    use crate::labd::machine::Capabilities;
+    use crate::status::MachineKind;
     use serde_json::json;
 
-    /// The report renders off the payload `machine.capabilities` answers with,
-    /// so a producer-side rename shows up here rather than as a blank line in
-    /// front of a user.
+    /// The payload the report reads is the producer's own [`Capabilities`],
+    /// serialised the way the daemon serialises it — so a field renamed in
+    /// `src/labd/machine.rs` stops compiling here instead of blanking a line
+    /// in front of a user (ADR-0004's lesson).
     #[test]
     fn capabilities_report_every_probed_flag_and_the_agent_features() {
-        let out = render_capabilities(&json!({
-            "kind": "vm",
-            "display": true,
-            "console_log": false,
-            "reboot": true,
-            "healthcheck": false,
-            "agent": ["terminal", "exec", "metrics"],
-        }));
+        let caps = Capabilities {
+            kind: MachineKind::Vm,
+            display: true,
+            console_log: false,
+            reboot: true,
+            healthcheck: false,
+            agent: vec!["terminal".into(), "exec".into(), "metrics".into()],
+        };
+        let out = render_capabilities(&serde_json::to_value(caps).unwrap());
         assert!(out.contains("kind         vm"), "got:\n{out}");
         assert!(out.contains("display      yes"), "got:\n{out}");
         assert!(out.contains("console log  no"), "got:\n{out}");
@@ -244,14 +229,15 @@ mod tests {
     /// dash, so "probed and got nothing" cannot be mistaken for "not probed".
     #[test]
     fn a_machine_with_no_agent_answering_reports_a_dash() {
-        let out = render_capabilities(&json!({
-            "kind": "container",
-            "display": false,
-            "console_log": true,
-            "reboot": false,
-            "healthcheck": true,
-            "agent": [],
-        }));
+        let caps = Capabilities {
+            kind: MachineKind::Container,
+            display: false,
+            console_log: true,
+            reboot: false,
+            healthcheck: true,
+            agent: Vec::new(),
+        };
+        let out = render_capabilities(&serde_json::to_value(caps).unwrap());
         assert!(out.contains("agent        -"), "got:\n{out}");
         assert!(out.contains("kind         container"), "got:\n{out}");
     }
