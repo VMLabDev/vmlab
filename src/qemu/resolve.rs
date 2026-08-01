@@ -212,12 +212,11 @@ fn firmware_kind(f: Firmware) -> FirmwareKind {
     }
 }
 
+/// Template metadata records a firmware as free text, so a store entry can name
+/// a spelling this build cannot read — that one resolves to nothing and the
+/// layer below decides.
 fn meta_firmware(s: &str) -> Option<FirmwareKind> {
-    match s {
-        "ovmf" => Some(FirmwareKind::Ovmf),
-        "seabios" => Some(FirmwareKind::Seabios),
-        _ => None,
-    }
+    Firmware::parse(s).map(firmware_kind)
 }
 
 fn display_device_name(d: &str, arch: &str) -> String {

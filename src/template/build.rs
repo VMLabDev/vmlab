@@ -14,8 +14,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 
 use super::meta::TemplateMeta;
-use super::store::TemplateStore;
-use crate::config::model::{ArtefactSource, TemplateDef, TemplateSource};
+use super::store::{ResolvedTemplate, TemplateStore};
+use crate::config::model::{ArtefactSource, Firmware, TemplateDef, TemplateRef, TemplateSource};
 use crate::labd::machine::Machine;
 use crate::scripting::OutputSink;
 
@@ -171,11 +171,17 @@ async fn run_build(
     let disk_size = def.disk.unwrap_or(20 << 30);
     let build_vm = "build";
 
-    // The template's own hardware decides how the build VM boots, so resolve
-    // it before the first expensive step: the resolver refuses combinations
-    // that cannot work (secure boot without UEFI, §5.2), and downloading a
-    // multi-gigabyte ISO first only to refuse at boot helps nobody.
-    check_build_hardware(def, build_vm, root, profiles)?;
+    // A layered build boots the hardware its source recorded, under whatever
+    // the block restates (ADR-0009), so the source's metadata has to be in
+    // hand before anything asks what this build boots on.
+    let mut layered = resolve_layered_source(def, store)?;
+    let hw = EffectiveHardware::resolve(def, layered.as_ref().map(|r| &r.meta));
+
+    // That hardware decides how the build VM boots, so resolve it before the
+    // first expensive step: the resolver refuses combinations that cannot work
+    // (secure boot without UEFI, §5.2), and downloading a multi-gigabyte ISO
+    // first only to refuse at boot helps nobody.
+    check_build_hardware(def, &hw, build_vm, root, profiles)?;
 
     // Resolve the source into the working primary disk. A layered source's
     // embedded first-boot provision must gate the build boot exactly as it
@@ -192,37 +198,17 @@ async fn run_build(
             let img = cancelable(&run.control.cancel, resolve_artefact(src, root, log)).await?;
             (None, SeedDisk::CopyFrom(img))
         }
-        TemplateSource::Template { from, .. } => {
-            let arch_name_ver = match from {
-                crate::config::model::TemplateRef::Store {
-                    arch,
-                    name,
-                    version,
-                } => (arch.clone(), name.clone(), version.clone()),
-                _ => bail!("layered build source must be a store reference"),
-            };
-            let resolved = store
-                .resolve(
-                    &arch_name_ver.0,
-                    &arch_name_ver.1,
-                    arch_name_ver.2.as_deref(),
-                )
-                .context("resolving layered build source")?;
+        TemplateSource::Template { .. } => {
+            let resolved = layered
+                .take()
+                .context("no store entry resolved for a layered build source")?;
             source_first_boot = resolved.meta.first_boot_script.clone();
             (None, SeedDisk::CopyFrom(resolved.disk_path))
         }
         TemplateSource::Scratch { .. } => (None, SeedDisk::Blank(disk_size)),
     };
 
-    // Stage the VMLAB bootstrap ISO (agent binaries + install scripts): the
-    // guest's own unattended install runs it, so the agent exists before any
-    // host channel does. Skipped when the template opts out or the profile
-    // has no agent channel (vintage guests would just carry a dead ISO).
-    let profile_channel = profiles
-        .get(def.profile.as_deref().unwrap_or("linux-generic"))
-        .map(|p| p.agent_channel)
-        .unwrap_or(true);
-    let wants_agent = def.agent && profile_channel;
+    let wants_agent = wants_agent(def, &hw, profiles);
     let staged: Option<Arc<super::bootstrap::StagedGuestIso>> = if wants_agent {
         Some(Arc::new(super::bootstrap::stage_guest_iso_dir(
             work, &def.arch,
@@ -235,12 +221,14 @@ async fn run_build(
     let lab_name = build_lab_name(def);
     let lab_wcl = synth_lab(
         def,
+        &hw,
         &lab_name,
         build_vm,
-        cdrom.as_deref(),
         root,
-        staged.as_ref().map(|s| s.dir.as_path()),
-        true,
+        BuildBoot::Install {
+            cdrom: cdrom.as_deref(),
+            guest_iso: staged.as_ref().map(|s| s.dir.as_path()),
+        },
     )?;
     std::fs::write(work.join("vmlab.wcl"), &lab_wcl)?;
 
@@ -488,7 +476,7 @@ async fn run_build(
     // session.
     if needs_verify_boot {
         log("agent: verification boot (installer sealed without a live handshake)\n".to_string());
-        let verify_wcl = synth_lab(def, &lab_name, build_vm, None, root, None, false)?;
+        let verify_wcl = synth_lab(def, &hw, &lab_name, build_vm, root, BuildBoot::Bare)?;
         let labfile = crate::config::load_lab_source(&verify_wcl, "<verify>", work)
             .map_err(|e| anyhow::anyhow!("internal verification lab invalid: {e:?}"))?;
         let (events_tx, _) = tokio::sync::broadcast::channel::<crate::proto::Event>(256);
@@ -563,25 +551,17 @@ async fn run_build(
         }
         None => None,
     };
-    let meta = TemplateMeta {
-        name: def.name.clone(),
-        arch: def.arch.clone(),
-        version: version.to_string(),
-        profile: def.profile.clone(),
-        cpus: def.cpus,
-        memory: def.memory,
-        disk: Some(info.virtual_size),
-        firmware: def.firmware.map(|f| f.as_str().to_string()),
-        tpm: def.tpm,
-        secure_boot: def.secure_boot,
-        display: def.display.clone(),
-        created: chrono::Utc::now(),
-        origin: source_origin(&def.source),
-        registry: def.registry.clone(),
-        sha256: Some(sha),
-        first_boot_script,
-        agent_version: agent_version.lock().expect("agent_version lock").clone(),
-    };
+    let meta = seal_meta(
+        def,
+        &hw,
+        version,
+        SealedImage {
+            disk: info.virtual_size,
+            sha256: sha,
+            first_boot_script,
+            agent_version: agent_version.lock().expect("agent_version lock").clone(),
+        },
+    );
 
     store
         .install(&staging, &meta, false)
@@ -643,6 +623,126 @@ fn build_lab_name(def: &TemplateDef) -> String {
     format!("build-{}", def.name)
 }
 
+/// Effective build hardware: what a build boots on and seals, the template
+/// block over the source template's recorded metadata (ADR-0009).
+///
+/// Those two layers and no more. It is deliberately not the §5.2 chain — it
+/// names a profile but takes nothing *from* one. That layer stays live,
+/// resolved by [`crate::qemu::resolve`] over the rendered lab, so an image
+/// still picks up a later edit to the profile it names. A field neither layer
+/// declares stays `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EffectiveHardware {
+    profile: Option<String>,
+    cpus: Option<u32>,
+    memory: Option<u64>,
+    firmware: Option<Firmware>,
+    tpm: Option<bool>,
+    secure_boot: Option<bool>,
+    display: Option<String>,
+}
+
+impl EffectiveHardware {
+    /// Merge the template block over `source` — the recorded metadata of the
+    /// template a layered build layers on, `None` for every other source kind.
+    fn resolve(def: &TemplateDef, source: Option<&TemplateMeta>) -> Self {
+        let (source_firmware, source_secure_boot) = source_firmware(source);
+        Self {
+            profile: def
+                .profile
+                .clone()
+                .or_else(|| source.and_then(|m| m.profile.clone())),
+            cpus: def.cpus.or_else(|| source.and_then(|m| m.cpus)),
+            memory: def.memory.or_else(|| source.and_then(|m| m.memory)),
+            firmware: def.firmware.or(source_firmware),
+            tpm: def.tpm.or_else(|| source.and_then(|m| m.tpm)),
+            secure_boot: def.secure_boot.or(source_secure_boot),
+            display: def
+                .display
+                .clone()
+                .or_else(|| source.and_then(|m| m.display.clone())),
+        }
+    }
+
+    /// The profile the build resolves against. `linux-generic` is vmlab's
+    /// default layer, below the profile rather than a substitute for it: it
+    /// applies only when neither the block nor the source names one, and it is
+    /// never recorded in the sealed metadata.
+    fn profile_or_default(&self) -> &str {
+        self.profile.as_deref().unwrap_or("linux-generic")
+    }
+}
+
+/// What a source template contributes to the firmware/secure-boot pair.
+///
+/// The two only mean anything together (ADR-0009), so the source offers them
+/// together or not at all. Metadata records a firmware as free text, so a store
+/// entry can name a spelling this build cannot read: that firmware is dropped
+/// — the lab schema names exactly two, and an unknown one would fail the
+/// synthetic lab's own validation — and the secure boot beside it goes with it,
+/// rather than being left hanging over whatever firmware the profile floor
+/// happens to supply. A source recording secure boot and no firmware at all is
+/// a different case and inherits normally: its profile carries over too, and
+/// that is where its firmware came from.
+///
+/// Values the block declares are unaffected — it gets what it asked for.
+fn source_firmware(source: Option<&TemplateMeta>) -> (Option<Firmware>, Option<bool>) {
+    let Some(meta) = source else {
+        return (None, None);
+    };
+    match meta.firmware.as_deref() {
+        Some(recorded) => match Firmware::parse(recorded) {
+            Some(f) => (Some(f), meta.secure_boot),
+            None => (None, None),
+        },
+        None => (None, meta.secure_boot),
+    }
+}
+
+/// Resolve a layered build's source through the store.
+///
+/// Runs before the hardware pre-flight, because the source's recorded hardware
+/// is one of the layers the build boots on (ADR-0009) — a pair inherited from
+/// it has to reach the pre-flight, not arrive after it. It reads local
+/// metadata only; the expensive artefact fetch stays behind the gate.
+fn resolve_layered_source(
+    def: &TemplateDef,
+    store: &TemplateStore,
+) -> Result<Option<ResolvedTemplate>> {
+    let TemplateSource::Template { from, .. } = &def.source else {
+        return Ok(None);
+    };
+    let TemplateRef::Store {
+        arch,
+        name,
+        version,
+    } = from
+    else {
+        bail!("layered build source must be a store reference");
+    };
+    store
+        .resolve(arch, name, version.as_deref())
+        .context("resolving layered build source")
+        .map(Some)
+}
+
+/// Whether the build stages the VMLAB bootstrap ISO (agent binaries + install
+/// scripts), which the guest's own unattended install runs so the agent exists
+/// before any host channel does. Skipped when the template opts out or the
+/// effective profile has no agent channel — a layered build inherits its
+/// source's profile, and a vintage guest would just carry a dead ISO.
+fn wants_agent(
+    def: &TemplateDef,
+    hw: &EffectiveHardware,
+    profiles: &crate::profiles::ProfileSet,
+) -> bool {
+    let channel = profiles
+        .get(hw.profile_or_default())
+        .map(|p| p.agent_channel)
+        .unwrap_or(true);
+    def.agent && channel
+}
+
 /// Resolve the hardware the build VM will boot on, and fail if it cannot.
 ///
 /// It resolves the rendered build lab rather than the `TemplateDef` directly,
@@ -650,17 +750,17 @@ fn build_lab_name(def: &TemplateDef) -> String {
 /// chain (no template layer — the build VM is `scratch`), same refusals.
 fn check_build_hardware(
     def: &TemplateDef,
+    hw: &EffectiveHardware,
     build_vm: &str,
     root: &Path,
     profiles: &crate::profiles::ProfileSet,
 ) -> Result<()> {
-    // Hardware-only probe: the verification variant carries none of the
-    // build-time attachments (extra disks, media, steps), and none of them can
-    // change the hardware this resolves. Its own source
-    // label, so an issue reported against the render names the render that
-    // produced it.
+    // Hardware-only probe: the bare variant carries none of the build-time
+    // attachments (extra disks, media, steps), and none of them can change the
+    // hardware this resolves. Its own source label, so an issue reported
+    // against the render names the render that produced it.
     let lab_name = build_lab_name(def);
-    let wcl = synth_lab(def, &lab_name, build_vm, None, root, None, false)?;
+    let wcl = synth_lab(def, hw, &lab_name, build_vm, root, BuildBoot::Bare)?;
     let labfile = crate::config::load_lab_source(&wcl, "<preflight>", root)
         .map_err(|e| anyhow::anyhow!("internal build lab invalid: {e:?}"))?;
     let vm = labfile
@@ -675,6 +775,51 @@ fn check_build_hardware(
         )
     })?;
     Ok(())
+}
+
+/// Facts about the sealed image that only exist once the build has run.
+struct SealedImage {
+    /// Virtual size of the flattened disk, in bytes.
+    disk: u64,
+    /// Hex SHA-256 of the flattened disk.
+    sha256: String,
+    first_boot_script: Option<String>,
+    agent_version: Option<String>,
+}
+
+/// The metadata a finished build installs alongside its disk.
+///
+/// Hardware comes from the merged build hardware, not the block alone: a
+/// layered build records what it inherited, so a chain of rebuilds ends with
+/// the hardware the first one recorded instead of losing a layer each time
+/// (ADR-0009). Nothing profile-derived is recorded — a field neither the block
+/// nor the source declared stays absent, and the profile it names stays a live
+/// layer for whoever clones this template.
+fn seal_meta(
+    def: &TemplateDef,
+    hw: &EffectiveHardware,
+    version: &str,
+    image: SealedImage,
+) -> TemplateMeta {
+    TemplateMeta {
+        name: def.name.clone(),
+        arch: def.arch.clone(),
+        version: version.to_string(),
+        profile: hw.profile.clone(),
+        cpus: hw.cpus,
+        memory: hw.memory,
+        disk: Some(image.disk),
+        firmware: hw.firmware.map(|f| f.as_str().to_string()),
+        tpm: hw.tpm,
+        secure_boot: hw.secure_boot,
+        display: hw.display.clone(),
+        created: chrono::Utc::now(),
+        origin: source_origin(&def.source),
+        registry: def.registry.clone(),
+        sha256: Some(image.sha256),
+        first_boot_script: image.first_boot_script,
+        agent_version: image.agent_version,
+    }
 }
 
 fn source_origin(source: &TemplateSource) -> Option<String> {
@@ -707,37 +852,75 @@ fn wcl_str(value: impl std::fmt::Display) -> String {
     out
 }
 
+/// What a rendered build lab boots with — the only thing that differs between
+/// the renders below, all of which describe the same machine.
+enum BuildBoot<'a> {
+    /// The build proper: everything the build attaches *to do the build with*
+    /// — the template's extra disks and media, the installer's `cdrom`, the
+    /// VMLAB bootstrap ISO folder in `guest_iso`, and its provisions and
+    /// playbooks.
+    Install {
+        cdrom: Option<&'a Path>,
+        guest_iso: Option<&'a Path>,
+    },
+    /// The installed disk alone, with none of those attachments. Both the
+    /// hardware pre-flight and the verification boot render this: neither can
+    /// be changed by what the build attached, and the verification boot's whole
+    /// point is proving the sealed image boots by itself.
+    Bare,
+}
+
 /// Render the synthetic build lab. The build VM is a `scratch` VM (so there
 /// is no template layer); its disk is pre-seeded after the runtime builds.
-/// `guest_iso` attaches the VMLAB bootstrap ISO folder as extra media.
-/// `with_steps = false` renders the verification-boot variant: none of the
-/// build-time attachments — no extra disks, no media, no provisions or
-/// playbooks — just boot the installed disk.
+///
+/// Hardware comes from `hw`, never from `def` directly: a layered build's
+/// source contributes to it (ADR-0009), and the emitter needs one source of
+/// truth for the values the pre-flight will check.
 fn synth_lab(
     def: &TemplateDef,
+    hw: &EffectiveHardware,
     lab_name: &str,
     vm: &str,
-    cdrom: Option<&Path>,
     root: &Path,
-    guest_iso: Option<&Path>,
-    with_steps: bool,
+    boot: BuildBoot<'_>,
 ) -> Result<String> {
     use std::fmt::Write;
+    let (cdrom, guest_iso) = match boot {
+        BuildBoot::Install { cdrom, guest_iso } => (cdrom, guest_iso),
+        BuildBoot::Bare => (None, None),
+    };
+    let with_steps = matches!(boot, BuildBoot::Install { .. });
+    // Destructured rather than read field by field: this emitter has drifted
+    // behind the block three times now, each repaired by hand (ADR-0009's
+    // discharged note). An exhaustive binding makes the next *hardware* field a
+    // compile error here instead of a template that builds on hardware it never
+    // chose. It does not make the whole emitter exhaustive — the fields it
+    // translates rather than copies are still enumerated below, which is the
+    // debt that record leaves open.
+    let EffectiveHardware {
+        // Rendered below through its default floor, never raw.
+        profile: _,
+        cpus,
+        memory,
+        firmware,
+        tpm,
+        secure_boot,
+        display,
+    } = hw;
     let mut s = String::from("import <vmlab.wcl>\n\n");
     writeln!(s, "lab {} {{", wcl_str(lab_name)).unwrap();
     writeln!(s, "  vm {} {{", wcl_str(vm)).unwrap();
     writeln!(s, "    template = \"scratch\"").unwrap();
     writeln!(s, "    arch     = {}", wcl_str(&def.arch)).unwrap();
-    let profile = def.profile.as_deref().unwrap_or("linux-generic");
-    writeln!(s, "    profile  = {}", wcl_str(profile)).unwrap();
+    writeln!(s, "    profile  = {}", wcl_str(hw.profile_or_default())).unwrap();
     // Bare integers: `disk`/`memory` are std.ByteSize in the schema, which
     // takes byte counts or size literals — never quoted strings.
     let disk = def.disk.unwrap_or(20 << 30);
     writeln!(s, "    disk     = {disk}").unwrap();
-    if let Some(cpus) = def.cpus {
+    if let Some(cpus) = cpus {
         writeln!(s, "    cpus     = {cpus}").unwrap();
     }
-    if let Some(mem) = def.memory {
+    if let Some(mem) = memory {
         writeln!(s, "    memory   = {mem}").unwrap();
     }
     if let Some(c) = cdrom {
@@ -746,22 +929,22 @@ fn synth_lab(
     if def.gui {
         writeln!(s, "    gui      = true").unwrap();
     }
-    // §5.2 hardware declared on the template block is hardware for the build
-    // VM (PRD §6.1: "boot per template hardware"), so it has to be rendered
-    // here — the four that also reach the metadata are the inheritance layer
-    // for VMs cloning the template, which is a different job. The build VM is
-    // `scratch`, so it has no template layer of its own (§6.5): these land on
-    // the vm block, with the profile as the floor beneath them.
-    if let Some(d) = &def.display {
+    // §5.2 hardware the build resolved is hardware for the build VM (PRD §6.1:
+    // "boot per template hardware"), so it has to be rendered here — the four
+    // that also reach the metadata are the inheritance layer for VMs cloning
+    // the template, which is a different job. The build VM is `scratch`, so it
+    // has no template layer of its own (§6.5): these land on the vm block,
+    // with the profile as the floor beneath them.
+    if let Some(d) = display {
         writeln!(s, "    display  = {}", wcl_str(d)).unwrap();
     }
-    if let Some(f) = def.firmware {
+    if let Some(f) = firmware {
         writeln!(s, "    firmware = {}", wcl_str(f.as_str())).unwrap();
     }
-    if let Some(tpm) = def.tpm {
+    if let Some(tpm) = tpm {
         writeln!(s, "    tpm      = {tpm}").unwrap();
     }
-    if let Some(sb) = def.secure_boot {
+    if let Some(sb) = secure_boot {
         writeln!(s, "    secure_boot = {sb}").unwrap();
     }
     if def.nested {
@@ -888,12 +1071,90 @@ fn synth_lab(
 
 #[cfg(test)]
 mod tests {
-    use super::{synth_lab, wcl_str};
+    use super::{BuildBoot, EffectiveHardware, SealedImage, seal_meta, synth_lab, wcl_str};
+    use crate::template::meta::TemplateMeta;
     use std::path::Path;
 
     fn def(source: &str) -> crate::config::model::TemplateDef {
         let tf = crate::config::load_template_source(source, "<test>", Path::new("/root")).unwrap();
         tf.templates.into_iter().next().unwrap()
+    }
+
+    /// The build render, with the VMLAB bootstrap ISO folder attached or not.
+    fn install(guest_iso: Option<&Path>) -> BuildBoot<'_> {
+        BuildBoot::Install {
+            cdrom: None,
+            guest_iso,
+        }
+    }
+
+    /// Render the build lab for a template with no source template under it.
+    fn render(d: &crate::config::model::TemplateDef) -> String {
+        synth_lab(
+            d,
+            &hw(d),
+            "build-t",
+            "build",
+            Path::new("/root"),
+            install(None),
+        )
+        .unwrap()
+    }
+
+    /// Build hardware for a template with no source template under it — every
+    /// source kind but a layered one.
+    fn hw(def: &crate::config::model::TemplateDef) -> EffectiveHardware {
+        EffectiveHardware::resolve(def, None)
+    }
+
+    /// A store entry's recorded metadata, hardware only: what a layered build
+    /// layers on.
+    fn source_meta() -> TemplateMeta {
+        TemplateMeta {
+            name: "win11".into(),
+            arch: "x86_64".into(),
+            version: "26100.1".into(),
+            profile: None,
+            cpus: None,
+            memory: None,
+            disk: None,
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            created: "2026-01-02T03:04:05Z".parse().unwrap(),
+            origin: None,
+            registry: None,
+            sha256: None,
+            first_boot_script: None,
+            agent_version: None,
+        }
+    }
+
+    /// The same, with every hardware field recorded — what rebuilding a real
+    /// Windows 11 template layers on.
+    fn source_meta_full() -> TemplateMeta {
+        TemplateMeta {
+            profile: Some("windows-11".into()),
+            cpus: Some(4),
+            memory: Some(8 << 30),
+            firmware: Some("ovmf".into()),
+            tpm: Some(true),
+            secure_boot: Some(true),
+            display: Some("virtio-vga".into()),
+            ..source_meta()
+        }
+    }
+
+    /// A layered template block naming `x86_64/win11` as its source, plus
+    /// whatever `body` declares of its own.
+    fn layered(body: &str) -> crate::config::model::TemplateDef {
+        def(&format!(
+            "import <vmlab.wcl>\n\
+             template \"t\" {{ arch = \"x86_64\" version = \"1\"\n{body}\
+             \x20 source \"template\" {{ from = \"x86_64/win11@26100.1\" }}\n\
+             }}\n"
+        ))
     }
 
     #[test]
@@ -915,7 +1176,7 @@ mod tests {
             "  media { kind = \"iso\" from = \"drivers\" label = \"say \\\"hi\\\"\" }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         assert!(wcl.contains(r#"label = "say \"hi\"""#), "{wcl}");
         crate::config::load_lab_source(&wcl, "<synth>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic lab must parse: {e:?}\n{wcl}"));
@@ -932,7 +1193,7 @@ mod tests {
             "  nic { nat = true }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         assert!(wcl.contains("nic { nat = true }"), "{wcl}");
     }
 
@@ -944,7 +1205,7 @@ mod tests {
             "  source \"scratch\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         assert!(wcl.contains("nic { nat = true }"), "{wcl}");
     }
 
@@ -962,7 +1223,7 @@ mod tests {
             "  provision \"b.ws\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         assert!(
             wcl.contains(
                 "playbook \"/root/pb\" { play = \"baseline\" var \"tz\" { value = \"UTC\" } }"
@@ -996,7 +1257,7 @@ mod tests {
             "  source \"scratch\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
     }
@@ -1016,12 +1277,11 @@ mod tests {
         ));
         let wcl = synth_lab(
             &d,
+            &hw(&d),
             "build-t",
             "build",
-            None,
             Path::new("/root"),
-            Some(Path::new("/work/guest-iso")),
-            true,
+            install(Some(Path::new("/work/guest-iso"))),
         )
         .unwrap();
         assert!(
@@ -1034,12 +1294,11 @@ mod tests {
 
         let verify = synth_lab(
             &d,
+            &hw(&d),
             "build-t",
             "build",
-            None,
             Path::new("/root"),
-            None,
-            false,
+            BuildBoot::Bare,
         )
         .unwrap();
         assert!(!verify.contains("media"), "{verify}");
@@ -1064,7 +1323,7 @@ mod tests {
             "  disk \"drivers\" { from = \"./drivers/\" }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
         let disks = &lf.lab.vms[0].extra_disks;
@@ -1084,12 +1343,11 @@ mod tests {
         // carries no extra disks — the same reason it carries no media.
         let verify = synth_lab(
             &d,
+            &hw(&d),
             "build-t",
             "build",
-            None,
             Path::new("/root"),
-            None,
-            false,
+            BuildBoot::Bare,
         )
         .unwrap();
         let vf = crate::config::load_lab_source(&verify, "<verify>", Path::new("/root"))
@@ -1108,7 +1366,7 @@ mod tests {
             "  disk \"payload\" { size = 2GiB from = \"payload\" }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
         let disk = &lf.lab.vms[0].extra_disks[0];
@@ -1136,7 +1394,7 @@ mod tests {
             "  source \"scratch\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
         let build = &lf.lab.vms[0];
@@ -1164,7 +1422,7 @@ mod tests {
             "  source \"scratch\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root")).unwrap();
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
         // No template layer: the build VM is `scratch` (§6.5).
@@ -1190,7 +1448,7 @@ mod tests {
             "}\n"
         ));
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        let err = super::check_build_hardware(&d, "build", Path::new("/root"), &profiles)
+        let err = super::check_build_hardware(&d, &hw(&d), "build", Path::new("/root"), &profiles)
             .expect_err("secure boot under SeaBIOS must refuse the build");
         let report = format!("{err:#}");
         assert!(report.contains("x86_64/t"), "{report}");
@@ -1210,7 +1468,7 @@ mod tests {
             "}\n"
         ));
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        super::check_build_hardware(&d, "build", Path::new("/root"), &profiles).unwrap();
+        super::check_build_hardware(&d, &hw(&d), "build", Path::new("/root"), &profiles).unwrap();
     }
 
     /// The verification boot re-renders the same VM with no media and no
@@ -1228,12 +1486,11 @@ mod tests {
         ));
         let wcl = synth_lab(
             &d,
+            &hw(&d),
             "build-t",
             "build",
-            None,
             Path::new("/root"),
-            None,
-            false,
+            BuildBoot::Bare,
         )
         .unwrap();
         let lf = crate::config::load_lab_source(&wcl, "<verify>", Path::new("/root"))
@@ -1256,7 +1513,7 @@ mod tests {
             "  source \"scratch\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
         assert_eq!(
@@ -1275,7 +1532,7 @@ mod tests {
             "  source \"scratch\" { }\n",
             "}\n"
         ));
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
         let build = &lf.lab.vms[0];
@@ -1303,7 +1560,293 @@ mod tests {
             d.first_boot.as_deref(),
             Some(Path::new("scripts/firstboot.ws"))
         );
-        let wcl = synth_lab(&d, "build-t", "build", None, Path::new("/root"), None, true).unwrap();
+        let wcl = render(&d);
         assert!(!wcl.contains("firstboot.ws"), "{wcl}");
+    }
+
+    // ---- layered builds: the source template's recorded hardware ----------
+
+    /// A layered build's source is the layer beneath the block, so a block
+    /// that restates nothing inherits everything the source recorded
+    /// (ADR-0009). Rebuilding a Windows 11 template used to boot the installed
+    /// disk on `linux-generic` — SeaBIOS, no TPM — which an OVMF-installed
+    /// guest does not survive.
+    #[test]
+    fn a_silent_block_inherits_the_sources_hardware() {
+        let hw = EffectiveHardware::resolve(&layered(""), Some(&source_meta_full()));
+        assert_eq!(hw.profile.as_deref(), Some("windows-11"));
+        assert_eq!(hw.cpus, Some(4));
+        assert_eq!(hw.memory, Some(8 << 30));
+        assert_eq!(hw.firmware, Some(crate::config::model::Firmware::Ovmf));
+        assert_eq!(hw.tpm, Some(true));
+        assert_eq!(hw.secure_boot, Some(true));
+        assert_eq!(hw.display.as_deref(), Some("virtio-vga"));
+    }
+
+    /// Where both layers declare a value the block wins — the same precedence
+    /// a VM cloning that template gets (§5.2).
+    #[test]
+    fn the_block_wins_over_the_source() {
+        let d = layered(concat!(
+            "  profile     = \"linux-generic\"\n",
+            "  cpus        = 2\n",
+            "  memory      = 2GiB\n",
+            "  firmware    = \"seabios\"\n",
+            "  tpm         = false\n",
+            "  secure_boot = false\n",
+            "  display     = \"std\"\n",
+        ));
+        let hw = EffectiveHardware::resolve(&d, Some(&source_meta_full()));
+        assert_eq!(hw.profile.as_deref(), Some("linux-generic"));
+        assert_eq!(hw.cpus, Some(2));
+        assert_eq!(hw.memory, Some(2 << 30));
+        assert_eq!(hw.firmware, Some(crate::config::model::Firmware::Seabios));
+        assert_eq!(hw.tpm, Some(false));
+        assert_eq!(hw.secure_boot, Some(false));
+        assert_eq!(hw.display.as_deref(), Some("std"));
+    }
+
+    /// A field neither layer declares stays absent: the profile beneath is a
+    /// live layer, not something the merge freezes (ADR-0009).
+    #[test]
+    fn a_field_neither_layer_declares_stays_absent() {
+        let hw = EffectiveHardware::resolve(&layered(""), Some(&source_meta()));
+        assert_eq!(hw, EffectiveHardware::default());
+        // …and the profile floor is applied at render time only.
+        assert_eq!(hw.profile_or_default(), "linux-generic");
+    }
+
+    /// Metadata stores a firmware as free text, so a store entry can name one
+    /// this build has no spelling for. It is dropped rather than rendered —
+    /// the lab schema names exactly two, and an unknown one would fail the
+    /// synthetic lab's own validation — and it takes the secure boot beside it
+    /// with it. Keeping that alone would leave a secure-boot demand hanging
+    /// over whatever firmware the profile floor supplies, which is the pair
+    /// separating that ADR-0009 says to watch for: under `linux-generic` the
+    /// pre-flight would refuse a build whose source demonstrably ran UEFI.
+    #[test]
+    fn an_unreadable_recorded_firmware_takes_its_secure_boot_with_it() {
+        let meta = TemplateMeta {
+            firmware: Some("uefi".into()),
+            secure_boot: Some(true),
+            ..source_meta()
+        };
+        let d = layered("");
+        let hw = EffectiveHardware::resolve(&d, Some(&meta));
+        assert_eq!(hw.firmware, None);
+        assert_eq!(hw.secure_boot, None);
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        super::check_build_hardware(&d, &hw, "build", Path::new("/root"), &profiles).unwrap();
+    }
+
+    /// The block's own values are never collateral: it gets the secure boot it
+    /// asked for whatever the source recorded beside its unreadable firmware.
+    #[test]
+    fn the_blocks_own_secure_boot_survives_an_unreadable_source_firmware() {
+        let meta = TemplateMeta {
+            firmware: Some("uefi".into()),
+            secure_boot: Some(true),
+            ..source_meta()
+        };
+        let d = layered("  firmware = \"ovmf\"\n  secure_boot = true\n");
+        let hw = EffectiveHardware::resolve(&d, Some(&meta));
+        assert_eq!(hw.firmware, Some(crate::config::model::Firmware::Ovmf));
+        assert_eq!(hw.secure_boot, Some(true));
+    }
+
+    /// A source recording secure boot and no firmware at all is a different
+    /// case: its profile carries over too, and that is where its firmware came
+    /// from — so the demand still means something and is inherited.
+    #[test]
+    fn secure_boot_recorded_without_a_firmware_is_still_inherited() {
+        let meta = TemplateMeta {
+            profile: Some("linux-modern".into()), // OVMF
+            secure_boot: Some(true),
+            ..source_meta()
+        };
+        let d = layered("");
+        let hw = EffectiveHardware::resolve(&d, Some(&meta));
+        assert_eq!(hw.firmware, None);
+        assert_eq!(hw.secure_boot, Some(true));
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        super::check_build_hardware(&d, &hw, "build", Path::new("/root"), &profiles).unwrap();
+    }
+
+    /// The inherited hardware has to reach the build VM, not just the merge:
+    /// render it, parse it back, and read it off the VM that will boot.
+    #[test]
+    fn inherited_hardware_reaches_the_build_vm() {
+        let d = layered("");
+        let hw = EffectiveHardware::resolve(&d, Some(&source_meta_full()));
+        let wcl = synth_lab(
+            &d,
+            &hw,
+            "build-t",
+            "build",
+            Path::new("/root"),
+            install(None),
+        )
+        .unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        let build = &lf.lab.vms[0];
+        assert_eq!(build.profile.as_deref(), Some("windows-11"));
+        assert_eq!(build.cpus, Some(4));
+        assert_eq!(build.memory, Some(8 << 30));
+        assert_eq!(build.firmware, Some(crate::config::model::Firmware::Ovmf));
+        assert_eq!(build.tpm, Some(true));
+        assert_eq!(build.secure_boot, Some(true));
+        assert_eq!(build.display.as_deref(), Some("virtio-vga"));
+    }
+
+    /// A build that names no profile in either layer still renders the default
+    /// floor, as before.
+    #[test]
+    fn no_profile_in_either_layer_still_renders_linux_generic() {
+        let d = layered("");
+        let hw = EffectiveHardware::resolve(&d, Some(&source_meta()));
+        let wcl = synth_lab(
+            &d,
+            &hw,
+            "build-t",
+            "build",
+            Path::new("/root"),
+            install(None),
+        )
+        .unwrap();
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root")).unwrap();
+        assert_eq!(lf.lab.vms[0].profile.as_deref(), Some("linux-generic"));
+    }
+
+    /// Inherited OVMF and secure boot travel together and pass the pre-flight:
+    /// the merge runs before it, so what is checked is what will boot.
+    #[test]
+    fn inherited_ovmf_and_secure_boot_pass_the_pre_flight() {
+        let mut meta = source_meta();
+        meta.firmware = Some("ovmf".into());
+        meta.secure_boot = Some(true);
+        meta.tpm = Some(true);
+        let d = layered("");
+        let hw = EffectiveHardware::resolve(&d, Some(&meta));
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        super::check_build_hardware(&d, &hw, "build", Path::new("/root"), &profiles).unwrap();
+    }
+
+    /// …and an inherited pair that cannot work is refused by the pre-flight,
+    /// before any artefact is downloaded — not at boot with secure boot
+    /// silently dropped.
+    #[test]
+    fn inherited_secure_boot_under_seabios_refuses_the_build() {
+        let mut meta = source_meta();
+        meta.firmware = Some("seabios".into());
+        meta.secure_boot = Some(true);
+        let d = layered("");
+        let hw = EffectiveHardware::resolve(&d, Some(&meta));
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let err = super::check_build_hardware(&d, &hw, "build", Path::new("/root"), &profiles)
+            .expect_err("secure boot under SeaBIOS must refuse the build");
+        let report = format!("{err:#}");
+        assert!(report.contains("x86_64/t"), "{report}");
+        assert!(report.contains("secure boot needs UEFI"), "{report}");
+    }
+
+    /// The sealed template records what it inherited, so a chain of layered
+    /// rebuilds keeps the profile the first one recorded instead of losing a
+    /// layer each time.
+    #[test]
+    fn sealed_metadata_records_the_inherited_hardware() {
+        // The source records everything but the memory, which the block
+        // declares itself.
+        let meta = TemplateMeta {
+            memory: None,
+            ..source_meta_full()
+        };
+        let d = layered("  memory = 8GiB\n");
+        let hw = EffectiveHardware::resolve(&d, Some(&meta));
+        let sealed = seal_meta(
+            &d,
+            &hw,
+            "1.0",
+            SealedImage {
+                disk: 64 << 30,
+                sha256: "ab".repeat(32),
+                first_boot_script: None,
+                agent_version: None,
+            },
+        );
+        assert_eq!(sealed.profile.as_deref(), Some("windows-11"));
+        assert_eq!(sealed.cpus, Some(4));
+        assert_eq!(sealed.memory, Some(8 << 30)); // the block's own
+        assert_eq!(sealed.firmware.as_deref(), Some("ovmf"));
+        assert_eq!(sealed.tpm, Some(true));
+        assert_eq!(sealed.secure_boot, Some(true));
+        assert_eq!(sealed.display.as_deref(), Some("virtio-vga"));
+        assert_eq!(sealed.disk, Some(64 << 30));
+        assert_eq!(sealed.origin.as_deref(), Some("x86_64/win11@26100.1"));
+    }
+
+    /// Nothing profile-derived is frozen into the image: a field neither the
+    /// block nor the source declared stays `None`, so the template still picks
+    /// up a later edit to the profile it names (ADR-0009).
+    #[test]
+    fn sealed_metadata_freezes_no_profile_derived_value() {
+        let mut meta = source_meta();
+        meta.profile = Some("linux-modern".into()); // OVMF, virtio-vga, 2 cpus
+        let d = layered("");
+        let hw = EffectiveHardware::resolve(&d, Some(&meta));
+        let sealed = seal_meta(
+            &d,
+            &hw,
+            "1.0",
+            SealedImage {
+                disk: 20 << 30,
+                sha256: "cd".repeat(32),
+                first_boot_script: None,
+                agent_version: None,
+            },
+        );
+        assert_eq!(sealed.profile.as_deref(), Some("linux-modern"));
+        assert_eq!(sealed.cpus, None);
+        assert_eq!(sealed.memory, None);
+        assert_eq!(sealed.firmware, None);
+        assert_eq!(sealed.tpm, None);
+        assert_eq!(sealed.secure_boot, None);
+        assert_eq!(sealed.display, None);
+    }
+
+    /// The bootstrap ISO decision follows the *effective* profile: a layered
+    /// build from a source whose profile has no agent channel must not stage
+    /// an ISO the guest can never answer over.
+    #[test]
+    fn the_agent_iso_decision_follows_the_inherited_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vintage.wcl"),
+            "import <vmlab-profile.wcl>\n\n\
+             profile \"vintage\" {\n  description = \"no virtio-serial\"\n  \
+             agent_channel = false\n}\n",
+        )
+        .unwrap();
+        let profiles = crate::profiles::ProfileSet::load(dir.path()).unwrap();
+
+        let mut meta = source_meta();
+        meta.profile = Some("vintage".into());
+        let d = layered("");
+        assert!(!super::wants_agent(
+            &d,
+            &EffectiveHardware::resolve(&d, Some(&meta)),
+            &profiles
+        ));
+        // The block's own profile still wins, so restating a modern one puts
+        // the ISO back.
+        let d = layered("  profile = \"linux-modern\"\n");
+        assert!(super::wants_agent(
+            &d,
+            &EffectiveHardware::resolve(&d, Some(&meta)),
+            &profiles
+        ));
+        // …as does a source that records nothing (the default floor).
+        let d = layered("");
+        assert!(super::wants_agent(&d, &hw(&d), &profiles));
     }
 }

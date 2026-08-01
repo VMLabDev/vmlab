@@ -109,12 +109,33 @@ Concretely:
   metadata). An exhaustive emitter has to make that translation total rather
   than assume it away, which is why each repair has looked cheaper than the
   fix.
+
+  **The hardware fields are now exhaustive by construction; the rest are not.**
+  #22 gave the renderer one value to read hardware from — effective build
+  hardware — and destructures it exhaustively at the emitter, so a field added
+  to it fails to compile here instead of silently going missing from the build
+  lab. That covers the slice this record is about and no further: `arch`,
+  `disk`, `gui`, `nested`, `qemu_args`, NICs, extra disks, media and steps are
+  still enumerated by hand off the template block, and they are precisely the
+  ones needing the translation described above. The debt is narrower, not
+  discharged.
 - Firmware and secure boot separating. They only mean anything together —
   validation rejects secure boot on a machine resolving to SeaBIOS and names the
   layer each side came from — so any path that carries one carries both. The
   pre-flight added in #23 is where a conflicting pair is now caught, so the merge
   has to happen before it: inherited hardware arriving afterwards would reach the
   build unchecked.
+
+  #22 made this concrete on the source layer: a source template offers the pair
+  together or not at all. Metadata records a firmware as free text, so a store
+  entry can name a spelling this build cannot read; that firmware is dropped —
+  the lab schema names exactly two — and the secure boot recorded beside it goes
+  with it, rather than being left hanging over whatever firmware the profile
+  floor happens to supply, where the pre-flight would refuse a build whose source
+  demonstrably ran UEFI. A source recording secure boot and *no* firmware is the
+  different case and inherits normally: its profile carries over too, and that is
+  where its firmware came from. Values the block itself declares are never
+  collateral — it gets what it asked for.
 - Pressure to freeze the profile "just for reproducibility". That is the option
   this record rejected; reproducibility of an image is the disk plus its
   recorded layers, not a snapshot of host-side defaults.

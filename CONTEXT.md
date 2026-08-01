@@ -99,9 +99,10 @@ carries inherited hardware as vm-block attributes instead.
 **Effective build hardware**:
 What a build boots on and seals: the template block's declared hardware over the
 source template's recorded hardware, merged once before the build lab is
-rendered. The profile is deliberately *not* part of it — it stays a live layer,
-resolved when a VM clones the sealed template, so profile edits keep reaching
-existing templates (ADR-0009).
+rendered. It names a profile but takes nothing *from* one — no profile-derived
+value is frozen into the build lab or the sealed image, so the profile stays a
+live layer, resolved when a VM clones the sealed template, and profile edits
+keep reaching existing templates (ADR-0009).
 
 **Profile**:
 A named set of hardware defaults — machine, firmware, TPM, disk bus, NIC,
