@@ -1,0 +1,49 @@
+{"t": 0.0243, "kind": "listening", "socket": "/run/user/1000/vf/run/lab.sock"}
+{"t": 22.525, "kind": "connection", "client_version": null}
+{"t": 22.5687, "kind": "auth_begin", "username": "dev", "result": "none-accepted"}
+{"t": 22.5699, "kind": "auth_completed"}
+{"t": 22.5759, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 22.5802, "kind": "channel-request", "request": "shell", "want_reply": true}
+{"t": 22.582, "kind": "session", "command": null, "subsystem": null, "pty": false, "term": null, "term_size": null, "env": {}}
+{"t": 221.3158, "kind": "connection", "client_version": null}
+{"t": 221.3395, "kind": "auth_begin", "username": "dev", "result": "none-accepted"}
+{"t": 221.3404, "kind": "auth_completed"}
+{"t": 221.341, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 221.3437, "kind": "channel-request", "request": "subsystem", "want_reply": true}
+{"t": 221.4004, "kind": "disconnect", "error": null}
+{"t": 221.5928, "kind": "connection", "client_version": null}
+{"t": 221.6169, "kind": "auth_begin", "username": "dev", "result": "none-accepted"}
+{"t": 221.6186, "kind": "auth_completed"}
+{"t": 221.6202, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 221.6245, "kind": "channel-request", "request": "exec", "want_reply": true}
+{"t": 221.6679, "kind": "disconnect", "error": null}
+{"t": 235.1883, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 235.1914, "kind": "channel-request", "request": "exec", "want_reply": true}
+{"t": 235.1933, "kind": "session", "command": "echo MUX_OK", "subsystem": null, "pty": false, "term": null, "term_size": null, "env": {}}
+{"t": 235.2015, "kind": "session_exit", "status": 0}
+{"t": 247.142, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 247.1458, "kind": "channel-request", "request": "subsystem", "want_reply": true}
+{"t": 247.2619, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 247.2646, "kind": "channel-request", "request": "subsystem", "want_reply": true}
+{"t": 277.3472, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 277.3501, "kind": "channel-request", "request": "subsystem", "want_reply": true}
+{"t": 279.8817, "kind": "channel-open", "channel_type": "direct-tcpip", "want_reply": false}
+{"t": 279.8829, "kind": "direct-tcpip", "dest": "127.0.0.1:43073", "orig": "127.0.0.1:33076", "result": "accepted"}
+{"t": 279.8866, "kind": "channel-open", "channel_type": "direct-tcpip", "want_reply": false}
+{"t": 279.8875, "kind": "direct-tcpip", "dest": "127.0.0.1:43073", "orig": "127.0.0.1:33092", "result": "accepted"}
+{"t": 451.0226, "kind": "connection", "client_version": null}
+{"t": 451.0452, "kind": "auth_begin", "username": "dev", "result": "none-accepted"}
+{"t": 451.0466, "kind": "auth_completed"}
+{"t": 451.0475, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 451.0508, "kind": "channel-request", "request": "exec", "want_reply": true}
+{"t": 451.0525, "kind": "session", "command": "echo RESOLVED_VIA_DEFAULT_CONFIG", "subsystem": null, "pty": false, "term": null, "term_size": null, "env": {}}
+{"t": 451.0607, "kind": "session_exit", "status": 0}
+{"t": 451.065, "kind": "disconnect", "error": null}
+{"t": 1078.8939, "kind": "connection", "client_version": null}
+{"t": 1078.9375, "kind": "auth_begin", "username": "dev", "result": "none-accepted"}
+{"t": 1078.9388, "kind": "auth_completed"}
+{"t": 1078.9399, "kind": "channel-open", "channel_type": "session", "want_reply": false}
+{"t": 1078.9435, "kind": "channel-request", "request": "exec", "want_reply": true}
+{"t": 1078.945, "kind": "session", "command": "echo JB_ALIAS_OK", "subsystem": null, "pty": false, "term": null, "term_size": null, "env": {}}
+{"t": 1078.9548, "kind": "session_exit", "status": 0}
+{"t": 1078.9579, "kind": "disconnect", "error": null}

@@ -1,0 +1,17 @@
+# Managed by vmlab — do not edit. (stand-in for ~/.config/vmlab/ssh/config)
+# NOTE: paths below are from the original run; edit before reuse.
+Host vmlab-probe-dev01
+    User dev
+    HostName vmlab-probe-dev01
+    ProxyCommand /tmp/claude-1000/-home-wil-orca-vmlab/20a91bdb-7753-45f8-bd70-5ff8d430f737/scratchpad/venv/bin/python /run/user/1000/vf/ssh-proxy.py --socket /run/user/1000/vf/run/lab.sock --log /run/user/1000/vf/run/proxy.log %h %p
+    UserKnownHostsFile /run/user/1000/vf/run/known_hosts
+    StrictHostKeyChecking accept-new
+    ControlMaster auto
+    ControlPath /run/user/1000/vf/mux/%n
+    ControlPersist 10m
+    IdentitiesOnly yes
+    IdentityAgent none
+
+Host vmlab-include-plain
+    HostName 127.0.0.1
+    User dev

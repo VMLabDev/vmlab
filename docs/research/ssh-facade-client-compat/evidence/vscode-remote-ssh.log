@@ -1,0 +1,287 @@
+[11:59:22.457] Log Level: 2
+[11:59:22.518] VS Code version: 1.131.0
+[11:59:22.519] Remote-SSH version: remote-ssh@0.124.0
+[11:59:22.519] linux x64
+[11:59:22.557] SSH Resolver called for "ssh-remote+vmlab-probe-dev01", attempt 1
+[11:59:22.573] remote.SSH.useLocalServer = true
+[11:59:22.574] remote.SSH.useExecServer = true
+[11:59:22.574] remote.SSH.bindHost = {}
+[11:59:22.575] remote.SSH.path = 
+[11:59:22.575] remote.SSH.configFile = /run/user/1000/vf/vmlab-ssh-config
+[11:59:22.575] remote.SSH.useFlock = true
+[11:59:22.575] remote.SSH.lockfilesInTmp = false
+[11:59:22.575] remote.SSH.localServerDownload = always
+[11:59:22.576] remote.SSH.remoteServerListenOnSocket = false
+[11:59:22.576] remote.SSH.defaultExtensions = []
+[11:59:22.576] remote.SSH.defaultExtensionsIfInstalledLocally = []
+[11:59:22.576] remote.SSH.loglevel = 2
+[11:59:22.577] remote.SSH.enableDynamicForwarding = true
+[11:59:22.577] remote.SSH.enableRemoteCommand = false
+[11:59:22.582] remote.SSH.serverPickPortsFromRange = {}
+[11:59:22.582] remote.SSH.serverInstallPath = {}
+[11:59:22.583] remote.SSH.permitPtyAllocation = false
+[11:59:22.583] remote.SSH.preferredLocalPortRange = undefined
+[11:59:22.583] remote.SSH.useCurlAndWgetConfigurationFiles = false
+[11:59:22.583] remote.SSH.experimental.chat = true
+[11:59:22.583] remote.SSH.experimental.enhancedSessionLogs = true
+[11:59:22.583] remote.SSH.httpProxy = {"*":""}
+[11:59:22.583] remote.SSH.httpsProxy = {"*":""}
+[11:59:22.611] SSH Resolver called for host: vmlab-probe-dev01
+[11:59:22.611] Setting up SSH remote "vmlab-probe-dev01"
+[11:59:22.639] Acquiring local install lock: /tmp/vscode-remote-ssh-c57908ed-install.lock
+[11:59:22.643] Looking for existing server data file at /home/wil/.config/Code/User/globalStorage/ms-vscode-remote.remote-ssh/vscode-ssh-host-c57908ed-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75-0.124.0-es/data.json
+[11:59:22.643] No existing data file
+[11:59:22.645] Using commit id "e4c7e7b1d6d060162f4aa7f8225271b67ce1df75" and quality "stable" for server
+[11:59:22.645] Extensions to install: 
+[11:59:22.661] Install and start server if needed
+[11:59:22.672] PATH: <redacted>
+[11:59:22.672] Checking ssh with "ssh -V"
+[11:59:22.695] > OpenSSH_10.4p1, OpenSSL 3.6.3 9 Jun 2026
+
+[11:59:22.707] Using SSH config file "/run/user/1000/vf/vmlab-ssh-config"
+[11:59:22.710] askpass server listening on /run/user/1000/vscode-ssh-askpass-77d73df64aefc060bbbe0559c8d95d3805ceec1f.sock
+[11:59:22.711] Spawning local server with {"serverId":1,"ipcHandlePath":"/run/user/1000/vscode-ssh-askpass-09156919fdcf6b4202d1724c63081654784abd00.sock","sshCommand":"ssh","sshArgs":["-v","-T","-D","45709","-o","ConnectTimeout=90","-F","/run/user/1000/vf/vmlab-ssh-config","vmlab-probe-dev01"],"serverDataFolderName":".vscode-server","dataFilePath":"/home/wil/.config/Code/User/globalStorage/ms-vscode-remote.remote-ssh/vscode-ssh-host-c57908ed-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75-0.124.0-es/data.json"}
+[11:59:22.711] Local server env: {"SHELL":"/usr/bin/bash","DISPLAY":":1","ELECTRON_RUN_AS_NODE":"1","SSH_ASKPASS":"/home/wil/.vscode/extensions/ms-vscode-remote.remote-ssh-0.124.0/out/local-server/askpass.sh","VSCODE_SSH_ASKPASS_NODE":"/usr/share/code/code","VSCODE_SSH_ASKPASS_EXTRA_ARGS":"","VSCODE_SSH_ASKPASS_MAIN":"/home/wil/.vscode/extensions/ms-vscode-remote.remote-ssh-0.124.0/out/askpass-main.js","VSCODE_SSH_ASKPASS_HANDLE":"/run/user/1000/vscode-ssh-askpass-77d73df64aefc060bbbe0559c8d95d3805ceec1f.sock"}
+[11:59:22.724] Spawned 3833637
+[11:59:22.727] Using connect timeout of 92 seconds
+[11:59:23.148] > local-server-1> Running ssh connection command: ssh -v -T -D 45709 -o ConnectTimeout=90 -F /run/user/1000/vf/vmlab-ssh-config vmlab-probe-dev01
+[11:59:23.162] > local-server-1> Spawned ssh, pid=3833647
+[11:59:23.262] stderr> (node:3833637) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+[11:59:23.262] stderr> (Use `code --trace-deprecation ...` to show where the warning was created)
+[11:59:23.347] stderr> debug1: Server host key: ssh-ed25519 SHA256:v1ActMon5FrK9RR1Dh7cdYhnD5CWTZ6Dk4rObcKajZM
+[11:59:23.373] stderr> Authenticated to vmlab-probe-dev01 (via proxy) using "none".
+[11:59:24.275] > ready: c5a284b2599d
+[11:59:24.283] > Linux 7.1.5-1-cachyos #1 SMP PREEMPT_DYNAMIC Mon, 27 Jul 2026 14:05:40 +0000
+[11:59:24.286] Platform: linux
+[11:59:24.290] > /usr/bin/bash
+[11:59:24.291] Parent Shell: bash
+[11:59:24.291] Parent Shell pid: 3833637
+[11:59:24.292] Waiting for subshell to start
+[11:59:24.302] > 3833724
+[11:59:24.302] stdout -> '3833724'
+[11:59:24.303] sub-process detected
+[11:59:24.332] > c5a284b2599d: running
+> Script executing under PID: 3833724
+[11:59:24.376] > Installing to /home/wil/.vscode-server...
+[11:59:24.379] > Trigger local server download
+> c5a284b2599d:trigger_server_download
+> artifact==cli-alpine-x64==
+[11:59:24.380] > destFolder==/home/wil/.vscode-server==
+> destFolder2==/vscode-cli-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75.tar.gz==
+> c5a284b2599d:trigger_server_download_end
+> Waiting for client to transfer server archive...
+> Waiting for /home/wil/.vscode-server/vscode-cli-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75.tar.gz.done and vscode-server.tar.gz to exist
+>  
+[11:59:24.383] Got request to download on client for {"artifact":"cli-alpine-x64","destPath":"/home/wil/.vscode-server/vscode-cli-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75.tar.gz"}
+[11:59:24.383] server download URL: https://update.code.visualstudio.com/commit:e4c7e7b1d6d060162f4aa7f8225271b67ce1df75/cli-alpine-x64/stable
+[11:59:24.386] Downloading VS Code server locally...
+[11:59:27.019] Downloaded VS Code server to /tmp/1bb50112-41ef-4845-a819-039a6320208a
+[11:59:27.021] Renamed VS Code server to /tmp/vscode_server_1785808767019/vscode-cli-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75.tar.gz
+[11:59:27.021] Preparing to scp to host vmlab-probe-dev01
+[11:59:27.029] PATH: <redacted>
+[11:59:27.029] Checking ssh with "ssh -V"
+[11:59:27.051] > OpenSSH_10.4p1, OpenSSL 3.6.3 9 Jun 2026
+
+[11:59:27.055] Testing scp with "scp"
+[11:59:27.071] scp exited with code: 1
+[11:59:27.071] Got stderr from scp: usage: scp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]
+           [-i identity_file] [-J destination] [-l limit] [-o ssh_option]
+           [-P port] [-S program] [-X sftp_option] source ... target
+[11:59:27.072] Using SSH config file "/run/user/1000/vf/vmlab-ssh-config"
+[11:59:27.073] Copying file to remote with scp -o ConnectTimeout=90 -F '/run/user/1000/vf/vmlab-ssh-config' 'vscode-cli-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75.tar.gz' 'vscode-cli-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75.tar.gz.done' 'vmlab-probe-dev01':'/home/wil/.vscode-server'
+[11:59:27.075] Using cwd: file:///tmp/vscode_server_1785808767019
+[11:59:27.385] >  
+[11:59:30.387] >  
+[11:59:33.393] >  
+[11:59:36.400] >  
+[11:59:39.403] >  
+[11:59:42.407] >  
+[11:59:45.413] >  
+[11:59:48.419] >  
+[11:59:51.424] >  
+[11:59:54.428] >  
+[11:59:57.434] >  
+[12:00:00.439] >  
+[12:00:03.444] >  
+[12:00:06.448] >  
+[12:00:09.452] >  
+[12:00:12.457] >  
+[12:00:15.462] >  
+[12:00:18.471] >  
+[12:00:21.474] >  
+[12:00:24.479] >  
+[12:00:27.485] >  
+[12:00:30.489] >  
+[12:00:33.501] >  
+[12:00:36.501] >  
+[12:00:39.506] >  
+[12:00:42.509] >  
+[12:00:45.513] >  
+[12:00:48.528] >  
+[12:00:51.526] >  
+[12:00:54.531] >  
+[12:00:57.536] >  
+[12:01:00.542] >  
+[12:01:03.547] >  
+[12:01:06.554] >  
+[12:01:09.559] >  
+[12:01:12.565] >  
+[12:01:15.571] >  
+[12:01:18.574] >  
+[12:01:21.578] >  
+[12:01:24.585] >  
+[12:01:27.588] >  
+[12:01:30.594] >  
+[12:01:33.600] >  
+[12:01:36.604] >  
+[12:01:39.608] >  
+[12:01:42.613] >  
+[12:01:45.617] >  
+[12:01:48.623] >  
+[12:01:51.627] >  
+[12:01:54.634] >  
+[12:01:57.640] >  
+[12:02:00.644] >  
+[12:02:03.650] >  
+[12:02:06.653] >  
+[12:02:09.657] >  
+[12:02:12.663] >  
+[12:02:15.666] >  
+[12:02:18.670] >  
+[12:02:21.674] >  
+[12:02:24.677] >  
+[12:02:27.683] >  
+[12:02:30.687] >  
+[12:02:33.693] >  
+[12:02:36.700] >  
+[12:02:39.705] >  
+[12:02:42.709] >  
+[12:02:45.713] >  
+[12:02:48.718] >  
+[12:02:51.723] >  
+[12:02:54.728] >  
+[12:02:57.733] >  
+[12:03:00.738] >  
+[12:03:03.743] >  
+[12:03:06.748] >  
+[12:03:09.754] >  
+[12:03:12.759] >  
+[12:03:15.762] >  
+[12:03:18.767] >  
+[12:03:21.770] >  
+[12:03:24.774] >  
+[12:03:27.779] >  
+[12:03:30.784] >  
+[12:03:33.791] >  
+[12:03:36.796] >  
+[12:03:39.803] > Found flag and server on host
+[12:03:39.822] > c5a284b2599d%%2%%
+[12:03:39.833] > tar --version: tar (GNU tar) 1.35
+> Copyright (C) 2023 Free Software Foundation, Inc.
+> License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.
+> This is free software: you are free to change and redistribute it.
+> There is NO WARRANTY, to the extent permitted by law.
+> 
+> Written by John Gilmore and Jay Fenlason.
+[12:03:40.372] > code 1.131.0 (commit e4c7e7b1d6d060162f4aa7f8225271b67ce1df75)
+[12:03:40.381] > Starting VS Code CLI...
+[12:03:40.397] > Spawned remote CLI: 3848546
+[12:03:40.405] > Waiting for server log...
+[12:03:40.447] > Waiting for server log...
+[12:03:40.488] > Waiting for server log...
+[12:03:40.528] > Waiting for server log...
+[12:03:40.591] > c5a284b2599d: start
+> listeningOn==127.0.0.1:43073==
+> osReleaseId==cachyos==
+> arch==x86_64==
+> vscodeArch==x64==
+> bitness==64==
+> tmpDir==/run/user/1000==
+> platform==linux==
+> unpackResult==success==
+> didLocalDownload==1==
+> downloadTime====
+> installTime==532==
+> serverStartTime==198==
+> execServerToken==aaa11a11-111a-1a11-a1aa-aa11a1a111a1==
+[12:03:40.592] > platformDownloadPath==cli-alpine-x64==
+> SSH_AUTH_SOCK====
+> DISPLAY==:1==
+> c5a284b2599d: end
+[12:03:40.593] Received install output: 
+listeningOn==127.0.0.1:43073==
+osReleaseId==cachyos==
+arch==x86_64==
+vscodeArch==x64==
+bitness==64==
+tmpDir==/run/user/1000==
+platform==linux==
+unpackResult==success==
+didLocalDownload==1==
+downloadTime====
+installTime==532==
+serverStartTime==198==
+execServerToken==aaa11a11-111a-1a11-a1aa-aa11a1a111a1==aaaaaaaaAaaaaaaaAaaa==aaa-aaaaaa-a11==
+SSH_AUTH_SOCK====
+DISPLAY==:1==
+
+[12:03:40.597] Remote server is listening on port 43073
+[12:03:40.598] Parsed server configuration: {"serverConfiguration":{"remoteListeningOn":{"port":43073},"osReleaseId":"cachyos","arch":"x86_64","sshAuthSock":"","display":":1","tmpDir":"/run/user/1000","platform":"linux","execServerToken":"aaa11a11-111a-1a11-a1aa-aa11a1a111a1"},"installTime":532,"serverStartTime":198,"didLocalDownload":true,"installUnpackCode":"success"}
+[12:03:40.606] Persisting server connection details to /home/wil/.config/Code/User/globalStorage/ms-vscode-remote.remote-ssh/vscode-ssh-host-c57908ed-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75-0.124.0-es/data.json
+[12:03:40.620] Starting forwarding server. local port 37973 -> socksPort 45709 -> remotePort 43073
+[12:03:40.622] Forwarding server listening on port 37973
+[12:03:40.623] Waiting for ssh tunnel to be ready
+[12:03:40.630] [Forwarding server port 37973] Got connection 0
+[12:03:40.637] Tunneled port 43073 to local port 37973
+[12:03:40.637] Resolved "ssh-remote+vmlab-probe-dev01" to "port 37973"
+[12:03:40.661] Initizing new exec server for ssh-remote+vmlab-probe-dev01
+[12:03:40.662] Resolving exec server at port 37973
+[12:03:40.665] [Forwarding server port 37973] Got connection 1
+[12:03:40.884] Exec server for ssh-remote+vmlab-probe-dev01 created and cached
+[12:03:40.884] Extensions to install: 
+[12:03:40.885] Remote extension host environment: {"DISPLAY":":1"}
+[12:03:40.913] ------
+
+
+
+
+[12:03:40.914] No hints found in the recent session.
+[12:04:13.938] [server] Checking /home/wil/.vscode-server/cli/servers/Stable-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75/log.txt and /home/wil/.vscode-server/cli/servers/Stable-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75/pid.txt for a running server...
+[12:04:14.649] [server] Installing and setting up Visual Studio Code Server...
+[12:04:14.650] [server] Server setup complete
+[12:04:14.651] [server] Starting server...
+[12:04:14.651] [server] Starting server with command... Command { std: "/home/wil/.vscode-server/cli/servers/Stable-e4c7e7b1d6d060162f4aa7f8225271b67ce1df75/server/bin/code-server" "--connection-token=remotessh" "--accept-server-license-terms" "--agent-host-bridge-port=43439" "--agent-host-bridge-host=127.0.0.1" "--agent-host-bridge-connection-token=67f1a1af-9897-4f39-88c7-b1b786a88caa" "--start-server" "--enable-remote-auto-shutdown" "--socket-path=/tmp/code-5a8c2922-a9f6-434e-83cf-a6a606789999", kill_on_drop: false }
+[12:04:15.212] [server] *
+[12:04:15.214] [server] * Visual Studio Code Server
+[12:04:15.217] [server] *
+[12:04:15.217] [server] * By using the software, you agree to
+[12:04:15.218] [server] * the Visual Studio Code Server License Terms (https://aka.ms/vscode-server-license) and
+[12:04:15.218] [server] * the Microsoft Privacy Statement (https://privacy.microsoft.com/en-US/privacystatement).
+[12:04:15.221] [server] Server bound to /tmp/code-5a8c2922-a9f6-434e-83cf-a6a606789999
+[12:04:15.221] [server] Extension host agent listening on /tmp/code-5a8c2922-a9f6-434e-83cf-a6a606789999
+[12:04:15.222] [server] parsed location: "/tmp/code-5a8c2922-a9f6-434e-83cf-a6a606789999"
+[12:04:15.223] [server] 
+[12:04:15.224] [server] Server started
+[12:04:15.501] [server] [12:04:15] 
+[12:04:15.542] [server] 
+[12:04:15.542] [server] 
+[12:04:15.543] [server] 
+[12:04:15.747] [server] [reconnection-grace-time] No CLI argument provided, using default: 10800000ms (10800s)
+[12:04:15.755] [server] [12:04:15] [AgentHostChannel] Registered IPC channel 'agentHostProxy' (upstream: 127.0.0.1:43439)
+[12:04:15.767] [server] [12:04:15] Extension host agent started.
+[12:04:15.902] [server] (node:3850138) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+[12:04:15.942] [server] (Use `node --trace-deprecation ...` to show where the warning was created)
+[12:04:15.969] [server] [12:04:15] Started initializing default profile extensions in extensions installation folder. file:///home/wil/.vscode-server/extensions
+[12:04:16.011] [server] [12:04:15] [<unknown>][eaa989d9][ManagementConnection] New connection established.
+[12:04:16.011] [server] [12:04:15] [<unknown>][e40a840d][ExtensionHostConnection] New connection established.
+[12:04:16.012] [server] [12:04:15] [<unknown>][e40a840d][ExtensionHostConnection] Starting extension host process...
+[12:04:16.272] [server] [12:04:16] Completed initializing default profile extensions in extensions installation folder. file:///home/wil/.vscode-server/extensions
+[12:04:17.223] [server] [12:04:17] [<unknown>][e40a840d][ExtensionHostConnection] <3850268> Launched Extension Host Process.
+[12:04:18.276] [server] [12:04:18] [<unknown>][e40a840d][ExtensionHostConnection] <3850268> [reconnection-grace-time] Extension host: read VSCODE_RECONNECTION_GRACE_TIME=10800000ms (10800s)
+[12:04:18.281] [server] 
+[12:04:19.955] Opening exec server for ssh-remote+vmlab-probe-dev01
+[12:04:20.117] Verified and reusing cached exec server for ssh-remote+vmlab-probe-dev01
+[12:04:20.118] No hints found in the recent session.
+[12:04:20.131] Opening exec server for ssh-remote+vmlab-probe-dev01
+[12:04:20.146] Verified and reusing cached exec server for ssh-remote+vmlab-probe-dev01
+[12:04:20.146] No hints found in the recent session.
