@@ -52,6 +52,9 @@ pub struct TemplateConfig {
     /// vmlab-agent stamp baked into the image by the template build.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub agent_version: Option<String>,
+    /// Host wscript surface used by embedded scripts.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub wscript_surface: Option<crate::scripting::WscriptSurfaceVersion>,
 }
 
 impl TemplateConfig {
@@ -74,6 +77,7 @@ impl TemplateConfig {
             sha256: meta.sha256.clone(),
             first_boot_script: meta.first_boot_script.clone(),
             agent_version: meta.agent_version.clone(),
+            wscript_surface: meta.wscript_surface,
         }
     }
 
@@ -102,6 +106,7 @@ impl TemplateConfig {
             sha256: self.sha256,
             first_boot_script: self.first_boot_script,
             agent_version: self.agent_version,
+            wscript_surface: self.wscript_surface,
         })
     }
 
@@ -140,6 +145,7 @@ mod tests {
             sha256: Some("ab".repeat(32)),
             first_boot_script: Some("use vmlab\nfn main(lab) { let vm = lab.this_vm() }\n".into()),
             agent_version: Some("agent=abc123".into()),
+            wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
         }
     }
 
@@ -162,5 +168,14 @@ mod tests {
             .into_meta(Some("ghcr.io/owner/win11:26100.1".into()))
             .unwrap();
         assert_eq!(m2.origin.as_deref(), Some("ghcr.io/owner/win11:26100.1"));
+    }
+
+    #[test]
+    fn legacy_config_without_a_surface_version_is_accepted() {
+        let mut value = serde_json::to_value(TemplateConfig::from_meta(&meta())).unwrap();
+        value.as_object_mut().unwrap().remove("wscript_surface");
+        let config: TemplateConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.wscript_surface, None);
+        assert_eq!(config.into_meta(None).unwrap().wscript_surface, None);
     }
 }

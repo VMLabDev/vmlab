@@ -130,6 +130,13 @@ predicates = "3"
 # test-util enables tokio::time::{pause, advance} for clock-driven expiry tests.
 tokio = { version = "1", features = ["full", "test-util"] }
 
+# The pinned wscript release has no host-type alias primitive. These two small
+# crates are vendored from that exact revision with the registry/checker support
+# needed to keep historical template scripts source-compatible (issue #67).
+[patch."https://github.com/Configweave/wscript.git"]
+wscript-core = { path = "vendor/wscript-core" }
+wscript-compiler = { path = "vendor/wscript-compiler" }
+
 [lints.rust]
 unsafe_code = "deny"
 

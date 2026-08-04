@@ -1165,6 +1165,7 @@ pub(crate) mod tests {
             sha256: None,
             first_boot_script: None,
             agent_version: None,
+            wscript_surface: None,
         }
     }
 

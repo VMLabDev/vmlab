@@ -172,7 +172,7 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
             resolved,
             backing: None,
             disk_size: Some(10 << 30),
-            first_boot_script: None,
+            first_boot: None,
             agent_version: Some("0.1.0".into()),
         },
     );

@@ -1,0 +1,8 @@
+[package]
+name = "wscript-core"
+description = "Shared core types for the wscript scripting language: spans, diagnostics, types, bytecode, values"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]

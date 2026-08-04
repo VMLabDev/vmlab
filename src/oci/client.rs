@@ -1185,6 +1185,7 @@ mod tests {
             sha256: None,
             first_boot_script: None,
             agent_version: None,
+            wscript_surface: None,
         }
     }
 
@@ -1574,6 +1575,7 @@ mod tests {
             sha256: None,
             first_boot_script: None,
             agent_version: None,
+            wscript_surface: None,
         };
         std::fs::create_dir_all(store.root()).unwrap();
         let staging = tempfile::tempdir_in(store.root()).unwrap();

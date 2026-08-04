@@ -3722,7 +3722,6 @@ dependencies = [
 [[package]]
 name = "wscript-compiler"
 version = "0.2.0"
-source = "git+https://github.com/Configweave/wscript.git?rev=c631c6b724ebcc38a9ae53235b20bf10ba64dc51#c631c6b724ebcc38a9ae53235b20bf10ba64dc51"
 dependencies = [
  "wscript-core",
 ]
@@ -3730,7 +3729,6 @@ dependencies = [
 [[package]]
 name = "wscript-core"
 version = "0.2.0"
-source = "git+https://github.com/Configweave/wscript.git?rev=c631c6b724ebcc38a9ae53235b20bf10ba64dc51#c631c6b724ebcc38a9ae53235b20bf10ba64dc51"
 
 [[package]]
 name = "wscript-macros"

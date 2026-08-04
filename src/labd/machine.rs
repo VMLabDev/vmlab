@@ -281,7 +281,7 @@ pub trait Machine: Send + Sync + 'static {
     /// The provision script this machine must run once, before it can be
     /// reported ready. `None` when it carries none, or when it already ran for
     /// this instantiation.
-    fn pending_first_boot(&self) -> Option<String> {
+    fn pending_first_boot(&self) -> Option<FirstBootProvision> {
         None
     }
 
@@ -503,6 +503,13 @@ pub trait Machine: Send + Sync + 'static {
     /// This machine's kind-specific half of [`MachineStatus`] — the variant
     /// only this adapter can fill (ADR-0004).
     async fn status_detail(&self) -> MachineDetail;
+}
+
+/// Template payload compiled by the host before a machine becomes ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstBootProvision {
+    pub(crate) template: String,
+    pub(crate) script: crate::scripting::EmbeddedWscript,
 }
 
 /// Blanket helpers that need `Arc<dyn Machine>` rather than `&dyn Machine`.
