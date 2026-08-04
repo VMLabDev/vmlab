@@ -21,6 +21,10 @@ use super::{MountStep, OsHint};
 pub struct VirtiofsMount {
     pub tag: String,
     pub guest: String,
+    /// Enforced host-side by virtiofsd's `--readonly` flag. Linux also
+    /// advertises it to the guest with `mount -o ro`; Windows cannot, because
+    /// `virtiofs.exe` has no read-only option (its `-o` expects `UID:GID`, not
+    /// mount options).
     pub readonly: bool,
 }
 
@@ -151,6 +155,8 @@ fn virtiofs_plan(os_hint: OsHint, mounts: &[VirtiofsMount]) -> MountPlan {
                 }
             }
             for m in mounts {
+                // `readonly` is deliberately absent here: Windows has no
+                // guest-side equivalent. See `VirtiofsMount::readonly`.
                 steps.push(step(
                     WINFSP_LAUNCHCTL,
                     vec![
@@ -278,6 +284,23 @@ mod tests {
             lines[5],
             format!(r"{WINFSP_LAUNCHCTL} start virtiofs viofs-docs docs /mnt/docs")
         );
+    }
+
+    /// Host-side enforcement distinguishes the shares, but virtio-win exposes
+    /// no guest-side flag with which to distinguish their mount plans.
+    #[test]
+    fn a_windows_readonly_mount_has_the_same_guest_plan_as_readwrite() {
+        let mut mount = VirtiofsMount {
+            tag: "docs".into(),
+            guest: "D:".into(),
+            readonly: false,
+        };
+        let readwrite = mount_plan(OsHint::Windows, std::slice::from_ref(&mount), Vec::new());
+
+        mount.readonly = true;
+        let readonly = mount_plan(OsHint::Windows, &[mount], Vec::new());
+
+        assert_eq!(readonly, readwrite);
     }
 
     /// No virtiofs shares means no registry work either.
