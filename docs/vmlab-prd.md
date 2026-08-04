@@ -226,11 +226,12 @@ Templates are defined in `template {}` blocks — in a dedicated WCL file or alo
 - **Media** — additional ISO/floppy attachments for the build, including images built from folders (§6.3) — unattend files, driver media, agent installers.
 - **Provision scripts** — the same wscript machinery as labs (§10): the build boots the source, the script drives the installer with keystrokes/screen matching, configures, and seals. The vmlab guest agent is installed by the guest's own unattended-install hook from the auto-attached VMLAB bootstrap ISO, and the build verifies its handshake before sealing.
 
-Build flow: create working qcow2 → boot per template hardware → run build provision scripts → graceful shutdown → move qcow2 + metadata into the store under `<arch>/<name>/<version>/`. A failed build leaves nothing in the store.
+Build flow: create working qcow2 → boot per template hardware → run build provision scripts → graceful shutdown → move qcow2 + metadata into the store under `<arch>/<name>/<version>/`. Metadata records both the baked `agent_version` and the host wscript-surface version used by embedded first-boot scripts. A failed build leaves nothing in the store.
 
 ### 6.2 Store, addressing, export
 
 - Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store. `vmlab validate` rejects archless references.
+- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted.
 - `vmlab template list / rm` manage the store.
 - `vmlab template export` produces a single portable archive (qcow2 + metadata); `vmlab template import` installs one — the offline/sneakernet sharing path.
 - The online sharing path is OCI registries (§6.4).
@@ -244,7 +245,7 @@ Build flow: create working qcow2 → boot per template hardware → run build pr
 Templates are distributable through standard OCI registries (GHCR, Docker Hub, Harbor, a self-hosted registry on Hermes — anything speaking the OCI distribution API), as **OCI artifacts, not container images**:
 
 - **Artifact identity.** The manifest carries a vmlab-specific `artifactType` (e.g. `application/vnd.vmlab.template.v1`), and all blobs use vmlab media types. A `docker pull`/`docker run` against a vmlab reference must fail fast as "not a container image" rather than half-work — that's the whole point of typing it. Conversely, `vmlab template pull` refuses manifests that aren't vmlab artifacts.
-- **Layout.** Config blob = template metadata (the recorded hardware, profile, agent info from `template.wcl`). Layers = the qcow2, **chunked**.
+- **Layout.** Config blob = template metadata (the recorded hardware, profile, agent version and wscript-surface version from `template.wcl`). Layers = the qcow2, **chunked**.
 - **Chunking.** The qcow2 is split into fixed-size chunks — **default 512 MiB, configurable** — each pushed as one ordered layer blob with a chunk media type, compressed (zstd). Manifest annotations record chunk count, chunk size, total size, and the digest of the assembled image; pull reassembles in order and verifies the whole-image digest before installing to the store. Sizing rationale: GHCR (the expected primary home for templates) enforces a 10 GB per-layer limit *and* a 10-minute per-upload timeout — the timeout, not the size cap, is the binding constraint on realistic upstream bandwidth, and 512 MiB clears it with wide margin while keeping parallel transfer and chunk-granularity retry/resume cheap.
 - **Multi-arch.** A registry tag may resolve through an **OCI image index** keyed by platform arch — mapping the store's `arch` dimension onto OCI's native multi-platform mechanism. Consistent with §6.2, arch is always explicit: `pull` requires `--arch` (or an unambiguous single-arch manifest) and never silently assumes the host arch.
 - **Addressing.** `vmlab template push/pull ghcr.io/<owner>/<name>:<version>` — registry tag = template version. Pulled templates land in the local store under their arch+name+version like any other; the originating reference is recorded in metadata.
@@ -466,6 +467,9 @@ There is one machine handle, not one per kind (ADR-0002). `lab.vm` and
 `lab.container` remain because they read well and because rejecting the other
 kind's name gives a better error than "no such machine" — but they return the
 same `Machine`, and every operation below is available on all of them.
+`Vm` remains a silent compatibility alias for `Machine` so first-boot scripts
+embedded in older templates continue to compile; new scripts document and use
+`Machine`.
 
 ### 10.2 Segment handle
 

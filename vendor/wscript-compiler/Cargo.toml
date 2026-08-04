@@ -1,0 +1,9 @@
+[package]
+name = "wscript-compiler"
+description = "wscript compiler: lexer, parser, type checker, bytecode emitter"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+wscript-core = { path = "../wscript-core", version = "0.2.0" }

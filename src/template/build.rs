@@ -211,7 +211,7 @@ async fn run_build(
     // gates a clone (PRD §6.1): a sysprep-generalized Windows source replays
     // specialize/OOBE on this boot, and the agent answers while that is
     // still running — sealing then would capture a half-specialized image.
-    let mut source_first_boot: Option<String> = None;
+    let mut source_first_boot: Option<crate::scripting::EmbeddedWscript> = None;
     let (cdrom, seed_disk): (Option<PathBuf>, SeedDisk) = match &def.source {
         TemplateSource::Iso(src) => {
             let iso = cancelable(&run.control.cancel, resolve_artefact(src, root, log)).await?;
@@ -225,7 +225,7 @@ async fn run_build(
             let resolved = layered
                 .take()
                 .context("no store entry resolved for a layered build source")?;
-            source_first_boot = resolved.meta.first_boot_script.clone();
+            source_first_boot = resolved.meta.first_boot();
             (None, SeedDisk::CopyFrom(resolved.disk_path))
         }
         TemplateSource::Scratch { .. } => (None, SeedDisk::Blank(disk_size)),
@@ -365,13 +365,13 @@ async fn run_build(
     // The build seeds the working disk directly (below) instead of cloning
     // through the store, so the script would otherwise be lost — and `up()`
     // runs it before the agent bake and any build provisions.
-    if let Some(script) = source_first_boot {
+    if let Some(first_boot) = source_first_boot {
         let parts = vm.template();
         vm.set_template(crate::labd::vm::TemplateParts {
             resolved: parts.resolved.clone(),
             backing: parts.backing.clone(),
             disk_size: parts.disk_size,
-            first_boot_script: Some(script),
+            first_boot: Some(first_boot),
             agent_version: parts.agent_version.clone(),
         });
     }
@@ -842,6 +842,7 @@ fn seal_meta(
         sha256: Some(image.sha256),
         first_boot_script: image.first_boot_script,
         agent_version: image.agent_version,
+        wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
     }
 }
 
@@ -1177,6 +1178,7 @@ mod tests {
             sha256: None,
             first_boot_script: None,
             agent_version: None,
+            wscript_surface: None,
         }
     }
 
@@ -1832,6 +1834,10 @@ mod tests {
         assert_eq!(sealed.display.as_deref(), Some("virtio-vga"));
         assert_eq!(sealed.disk, Some(64 << 30));
         assert_eq!(sealed.origin.as_deref(), Some("x86_64/win11@26100.1"));
+        assert_eq!(
+            sealed.wscript_surface,
+            Some(crate::scripting::WSCRIPT_SURFACE_VERSION)
+        );
     }
 
     /// Nothing profile-derived is frozen into the image: a field neither the

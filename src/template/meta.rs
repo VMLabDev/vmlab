@@ -52,9 +52,22 @@ pub struct TemplateMeta {
     /// build (`None` = template predates agent support: no interactive
     /// terminal, no exec/copy).
     pub agent_version: Option<String>,
+    /// Host wscript surface this template's embedded scripts were built
+    /// against. `None` means a legacy, pre-versioning template and is accepted.
+    pub wscript_surface: Option<crate::scripting::WscriptSurfaceVersion>,
 }
 
 impl TemplateMeta {
+    /// Embedded first-boot script paired with the surface it targets.
+    pub(crate) fn first_boot(&self) -> Option<crate::scripting::EmbeddedWscript> {
+        self.first_boot_script
+            .clone()
+            .map(|source| crate::scripting::EmbeddedWscript {
+                source,
+                surface_version: self.wscript_surface,
+            })
+    }
+
     /// Render as deterministic WCL text (fixed field order, omitted
     /// optionals). Output starts with the schema import.
     pub fn to_wcl(&self) -> String {
@@ -103,6 +116,9 @@ impl TemplateMeta {
         }
         if let Some(a) = &self.agent_version {
             let _ = writeln!(out, "  agent_version = {}", quote(a));
+        }
+        if let Some(v) = self.wscript_surface {
+            let _ = writeln!(out, "  wscript_surface = {v}");
         }
         let _ = writeln!(out, "}}");
         out
@@ -179,6 +195,10 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
     let sha256 = r.string("sha256").unspan();
     let first_boot_script = r.string("first_boot_script").unspan();
     let agent_version = r.string("agent_version").unspan();
+    let wscript_surface = r
+        .int_at_least::<u32>("wscript_surface", 0)
+        .map(|version| version.map(Into::into))
+        .unspan();
     Some(TemplateMeta {
         name: name?,
         arch: arch?.value,
@@ -197,6 +217,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         sha256,
         first_boot_script,
         agent_version,
+        wscript_surface,
     })
 }
 
@@ -265,6 +286,7 @@ mod tests {
                 "use vmlab\nfn main(lab) {\n    let vm = lab.this_vm()\n}\n".into(),
             ),
             agent_version: Some("agent=abc123".into()),
+            wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
         }
     }
 
@@ -287,6 +309,7 @@ mod tests {
             sha256: None,
             first_boot_script: None,
             agent_version: None,
+            wscript_surface: None,
         }
     }
 

@@ -227,7 +227,7 @@ impl LabRuntime {
                 }
             }
 
-            let first_boot_script = meta.as_ref().and_then(|m| m.first_boot_script.clone());
+            let first_boot = meta.as_ref().and_then(|m| m.first_boot());
             let agent_version = meta.as_ref().and_then(|m| m.agent_version.clone());
             // Each NIC inherits its segment's effective MTU (jumbo on NAT/global
             // by default); drives `host_mtu=` on virtio NICs in the cmdline.
@@ -259,7 +259,7 @@ impl LabRuntime {
                     resolved,
                     backing,
                     disk_size,
-                    first_boot_script,
+                    first_boot,
                     agent_version,
                 },
             );
@@ -638,7 +638,7 @@ impl LabRuntime {
                 resolved: resolved_vm,
                 backing: Some(resolved.disk_path.clone()),
                 disk_size: None,
-                first_boot_script: resolved.meta.first_boot_script.clone(),
+                first_boot: resolved.meta.first_boot(),
                 agent_version: resolved.meta.agent_version.clone(),
             });
         }
@@ -1488,10 +1488,16 @@ impl LabRuntime {
         m: &Arc<dyn Machine>,
         output: &crate::scripting::OutputSink,
     ) -> Result<()> {
-        let Some(script) = m.pending_first_boot() else {
+        let Some(first_boot) = m.pending_first_boot() else {
             return Ok(());
         };
         let name = m.name();
+
+        crate::scripting::ensure_wscript_surface_supported(
+            &first_boot.template,
+            first_boot.script.surface_version,
+        )
+        .map_err(anyhow::Error::msg)?;
 
         output(format!("first-boot: provisioning {name}...\n"));
         m.wait_agent_up(m.ready_timeout())
@@ -1503,7 +1509,7 @@ impl LabRuntime {
         let label = format!("first-boot:{name}");
         let run = crate::scripting::run_script_source(
             self.clone(),
-            script,
+            first_boot.script.source,
             &label,
             m.local_dir().to_path_buf(),
             Some(crate::scripting::ScriptOwner::first_boot(name)),

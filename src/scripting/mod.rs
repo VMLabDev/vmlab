@@ -5,6 +5,7 @@
 //! daemon's tokio runtime via `Handle::block_on`.
 
 mod runner;
+mod surface;
 pub mod terminal;
 
 use crate::sync::LockRecover;
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use wscript::{Context, Module, Script};
+use wscript::{Context, Module, Script, ScriptType, Type};
 
 use crate::labd::display::Display;
 use crate::labd::lab::LabRuntime;
@@ -21,6 +22,10 @@ use crate::labd::vm::PowerState;
 use crate::vision;
 
 pub use runner::{OutputSink, ScriptOwner, run_event_handler, run_script_file, run_script_source};
+pub(crate) use surface::{
+    EmbeddedWscript, WSCRIPT_SURFACE_VERSION, WscriptSurfaceVersion,
+    ensure_wscript_surface_supported,
+};
 
 /// Convention: reference images resolve relative to the lab root, typically
 /// `images/` beside vmlab.wcl (PRD §10.3).
@@ -920,13 +925,21 @@ pub fn lab_module() -> Module {
 
 /// Build the full wscript context for compiling and running lab scripts.
 pub fn context() -> Context {
-    Context::new()
+    let context = Context::new()
         .module(lab_module())
         .register_type::<ExecResult>()
         .register_type::<ScriptMatch>()
         .register_type::<EventData>()
         .register_type::<GuestStats>()
-        .register_type::<DiskStat>()
+        .register_type::<DiskStat>();
+    let mut registry = context.registry().clone();
+    let Type::Named(machine) = MachineHandle::script_type(&mut registry.defs) else {
+        unreachable!("MachineHandle is a nominal wscript type")
+    };
+    registry
+        .alias_type("Vm", machine)
+        .expect("Vm compatibility alias must be unique");
+    Context::from_registry(registry)
 }
 
 /// Compile-check a script (used by `vmlab validate`, PRD §5.1).
@@ -1146,6 +1159,52 @@ fn main(lab: Lab) {
 }
 "#;
         check_script_source(src).expect("first-boot this_vm() should type-check");
+    }
+
+    #[test]
+    fn legacy_windows_first_boot_fixture_still_compiles() {
+        // Exact source from vmlab-templates@8f25d56. Compatibility fixtures
+        // are add-only: never edit one when the host surface changes.
+        let source = include_str!("fixtures/surface-legacy/windows-server-2025-firstboot.ws");
+        check_script_source(source).expect("legacy wscript surfaces are a compatibility contract");
+    }
+
+    #[test]
+    fn current_and_legacy_machine_names_are_the_same_type() {
+        let source = r#"
+use vmlab
+
+fn legacy(machine: Vm) -> string { machine.name() }
+fn current(machine: Machine) -> string { legacy(machine) }
+
+fn main(lab: Lab) {
+    let machine = lab.this_vm().expect("no target")
+    lab.log(legacy(machine))
+    lab.log(current(machine))
+}
+"#;
+        check_script_source(source).expect("Vm must be a silent alias for Machine");
+    }
+
+    #[test]
+    fn unstamped_and_newer_template_surfaces_are_accepted() {
+        ensure_wscript_surface_supported("x86_64/win11@legacy", None).unwrap();
+        ensure_wscript_surface_supported("x86_64/win11@current", Some(1.into())).unwrap();
+        ensure_wscript_surface_supported("x86_64/win11@newer", Some(2.into())).unwrap();
+    }
+
+    #[test]
+    fn a_template_below_the_surface_floor_gets_one_actionable_error() {
+        let err = ensure_wscript_surface_supported("x86_64/win11@old", Some(0.into())).unwrap_err();
+        assert_eq!(
+            err,
+            "template `x86_64/win11@old` records wscript surface 0, below this host's supported \
+             floor 1; rebuild the template with this vmlab version"
+        );
+        assert!(
+            !err.contains("E02"),
+            "must not expose compiler cascades: {err}"
+        );
     }
 
     #[test]

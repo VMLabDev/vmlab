@@ -28,4 +28,5 @@ type TemplateMeta {
   sha256: utf8?       // hex digest of disk.qcow2
   first_boot_script: utf8?  // embedded wscript script run on first instantiation
   agent_version: utf8?      // vmlab-agent stamp baked in by the template build
+  wscript_surface: i64?     // host scripting surface used by embedded scripts
 }

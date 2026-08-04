@@ -117,10 +117,10 @@ pub struct TemplateParts {
     pub backing: Option<PathBuf>,
     /// Primary disk virtual size (scratch: from config; clone: template's).
     pub disk_size: Option<u64>,
-    /// Embedded first-boot provision script carried by the backing template
-    /// (None for scratch / templates without one). Run on first instantiation,
-    /// before the VM is reported ready (PRD §6.1).
-    pub first_boot_script: Option<String>,
+    /// Embedded first-boot provision and its host-surface contract. `None` for
+    /// scratch / templates without one. Run on first instantiation before the
+    /// VM is reported ready (PRD §6.1).
+    pub first_boot: Option<crate::scripting::EmbeddedWscript>,
     /// vmlab-agent stamp the template build baked in (`None` = the template
     /// predates agent support — no terminal, exec, copy or readiness).
     pub agent_version: Option<String>,
@@ -298,7 +298,7 @@ impl VmInstance {
     /// Whether a first-boot provision still needs to run for this clone: the
     /// template carries one and no completion sentinel exists yet.
     pub fn first_boot_pending(&self) -> bool {
-        self.template().first_boot_script.is_some() && !self.dirs.firstboot_sentinel().exists()
+        self.template().first_boot.is_some() && !self.dirs.firstboot_sentinel().exists()
     }
 
     /// The live QMP client, for the operations that genuinely need a
@@ -1046,10 +1046,15 @@ impl super::machine::Machine for VmInstance {
         VM_READY_TIMEOUT
     }
 
-    fn pending_first_boot(&self) -> Option<String> {
-        self.first_boot_pending()
-            .then(|| self.template().first_boot_script.clone())
-            .flatten()
+    fn pending_first_boot(&self) -> Option<super::machine::FirstBootProvision> {
+        if !self.first_boot_pending() {
+            return None;
+        }
+        let template = self.template();
+        Some(super::machine::FirstBootProvision {
+            template: self.cfg.template.to_string(),
+            script: template.first_boot.clone()?,
+        })
     }
 
     async fn first_boot_done(&self) -> Result<()> {
