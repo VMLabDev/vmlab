@@ -3,7 +3,7 @@
 //!
 //! Everything here is the code that decides *when* a machine is running — the
 //! start ladder, the power-state machine, the exit monitor, readiness gating,
-//! teardown ordering, the stop ladder and the container restart policy. None
+//! teardown ordering and the stop ladder. None
 //! of it needs a hypervisor to be correct, and until the seam handed back its
 //! own handle types none of it could be reached without one.
 //!
@@ -31,8 +31,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::container::{ContainerDirs, ContainerInstance};
+use super::events::EventLog;
 use super::hypervisor::fake::{FakeHypervisor, Run, Script};
-use super::machine::Machine;
+use super::machine::{LabServices, Machine};
 use super::vm::{PowerState, StopReason, TemplateParts, VmDirs, VmInstance};
 use crate::oci::image::model::{ImageConfig, RuntimeDefaults};
 use crate::oci::image::pull::PulledImage;
@@ -65,8 +66,6 @@ struct Exited {
     reason: StopReason,
     /// The emulator's exit status, verbatim.
     status: String,
-    /// Containers only: a respawn follows.
-    will_restart: bool,
 }
 
 /// The callbacks a `start` installs, recorded. This is the whole of what a
@@ -99,6 +98,46 @@ fn callbacks() -> (Callbacks, Observed) {
             healths,
         },
     )
+}
+
+struct TestLab {
+    events: Arc<EventLog>,
+}
+
+#[async_trait::async_trait]
+impl LabServices for TestLab {
+    fn events(&self) -> &Arc<EventLog> {
+        &self.events
+    }
+
+    async fn ensure_pulled(&self, _machine: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn ensure_shares(&self) {}
+
+    async fn attach_nic(
+        &self,
+        _segment: &str,
+        sock: &std::path::Path,
+        _mac: crate::config::model::MacAddr,
+        _isolated: bool,
+        _tap_ok: bool,
+    ) -> anyhow::Result<crate::net::fastpath::NicAttachment> {
+        Ok(crate::net::fastpath::NicAttachment::Stream {
+            sock: sock.to_path_buf(),
+        })
+    }
+
+    async fn machine_ready(&self, _machine: &str) {}
+
+    async fn smb_mount_plan(
+        &self,
+        _machine: &str,
+        _os: crate::smb::OsHint,
+    ) -> Vec<crate::smb::MountStep> {
+        Vec::new()
+    }
 }
 
 impl Observed {
@@ -234,11 +273,7 @@ async fn start_vm(vm: &Arc<VmInstance>, cbs: Callbacks) -> anyhow::Result<()> {
     let Callbacks { exits, readies, .. } = cbs;
     vm.boot(
         move |reason, status| {
-            let _ = exits.send(Exited {
-                reason,
-                status,
-                will_restart: false,
-            });
+            let _ = exits.send(Exited { reason, status });
         },
         move || {
             readies.fetch_add(1, Ordering::SeqCst);
@@ -255,13 +290,12 @@ async fn start_container(ctr: &Arc<ContainerInstance>, cbs: Callbacks) -> anyhow
         healths,
     } = cbs;
     ctr.boot(
-        move |reason, code, will_restart| {
+        move |reason, code| {
             let _ = exits.send(Exited {
                 reason,
                 // A container's exit status is the code its entrypoint
                 // reported over the ctl channel.
                 status: format!("{code:?}"),
-                will_restart,
             });
         },
         move || {
@@ -747,13 +781,12 @@ async fn readiness_times_out_at_the_machines_own_budget() {
     ctr.stop(true).await.expect("stop");
 }
 
-// ---- the container restart ladder -------------------------------------------
+// ---- container exit handling ------------------------------------------------
 
-/// `restart = "no"` means no: a container that exits non-zero stays stopped,
-/// and the exit is reported as final so a caller is not left waiting for a
-/// respawn that never comes.
+/// A crash is observable but never rescued: the container settles to stopped,
+/// and neither lifecycle payload advertises a daemon-owned respawn.
 #[tokio::test]
-async fn a_container_with_no_restart_policy_stays_stopped() {
+async fn a_crashed_container_stays_stopped_until_explicitly_started() {
     let dirs = Dirs::new();
     let (ctr, _hv) = container(
         &dirs,
@@ -764,165 +797,71 @@ async fn a_container_with_no_restart_policy_stays_stopped() {
             ..Script::default()
         },
     );
-    let (cbs, mut observed) = callbacks();
-    start_container(&ctr, cbs).await.expect("start");
+    let (events, mut rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab { events });
 
-    let exit = observed.exit().await;
-    assert_eq!(exit.reason, StopReason::Crashed);
-    assert!(!exit.will_restart, "restart = no honoured");
+    ctr.clone().start(lab.clone()).await.expect("start");
+
+    let mut exits = Vec::new();
+    while exits.len() < 2 {
+        let event = tokio::time::timeout(SETTLE, rx.recv())
+            .await
+            .expect("no lifecycle event")
+            .expect("event stream closed");
+        if matches!(
+            event.event.as_str(),
+            "container.crashed" | "container.stopped"
+        ) {
+            exits.push(event);
+        }
+    }
+
+    assert_eq!(
+        exits
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        ["container.crashed", "container.stopped"]
+    );
+    assert!(
+        exits
+            .iter()
+            .all(|event| event.data.get("restarting").is_none()),
+        "exit payloads must not promise a daemon-owned respawn: {exits:?}"
+    );
     ctr.wait_state(PowerState::Stopped, SETTLE)
         .await
         .expect("stays stopped");
-    assert_eq!(ctr.restart_count(), 0);
-}
 
-/// A crash-looping container is restarted, and each exit is reported as one
-/// a respawn follows. The backoff schedule itself is pinned by
-/// `should_restart`; what this proves is that the ladder actually runs it —
-/// the counter advances and the machine comes back up on its own.
-#[tokio::test]
-async fn a_crash_looping_container_is_restarted() {
-    let dirs = Dirs::new();
-    let (ctr, _hv) = container(
-        &dirs,
-        r#"container "web" { image = "nginx:1" profile = "container" restart = "always" }"#,
-        Script {
-            agent: false,
-            // The last entry repeats: it fails, and keeps failing.
-            runs: vec![Run::container_exits(Duration::from_millis(20), 1)],
-            ..Script::default()
-        },
-    );
-    let (cbs, mut observed) = callbacks();
-    start_container(&ctr, cbs).await.expect("start");
-
-    let first = observed.exit().await;
-    assert_eq!(first.reason, StopReason::Crashed);
-    assert!(first.will_restart, "a policy restart was announced");
-
-    // The first backoff is a second, so the second exit needs a longer
-    // window than SETTLE's default patience allows for a single transition.
-    let second = tokio::time::timeout(Duration::from_secs(10), observed.exits.recv())
-        .await
-        .expect("the restart never happened")
-        .expect("closed");
-    assert!(second.will_restart);
-    assert!(
-        ctr.restart_count() >= 1,
-        "restarts are counted for `status`"
-    );
-
-    ctr.stop(true).await.expect("stop");
-}
-
-/// A container that ran for a while before dying is not crash-looping, so its
-/// consecutive-failure count resets and it gets its full allowance again.
-///
-/// Without the reset, a long-lived service that restarts once a day would
-/// eventually exhaust the rapid-failure budget and stay down — the failure
-/// mode this accounting exists to prevent. The difference is visible in how
-/// many restarts the policy performs before it gives up: five after a long
-/// run, four when every run was rapid.
-///
-/// Time is paused: the window is a minute and the backoffs add half of one
-/// again, none of which the test is about.
-#[tokio::test(start_paused = true)]
-async fn a_long_run_resets_the_rapid_failure_count() {
-    async fn restarts_before_giving_up(first: Run) -> u32 {
-        let dirs = Dirs::new();
-        let (ctr, _hv) = container(
-            &dirs,
-            r#"container "web" { image = "nginx:1" profile = "container" restart = "always" }"#,
-            Script {
-                agent: false,
-                // The last entry repeats, so every later run is a rapid one.
-                runs: vec![first, Run::container_exits(Duration::from_millis(20), 1)],
-                ..Script::default()
-            },
-        );
-        let (cbs, mut observed) = callbacks();
-        start_container(&ctr, cbs).await.expect("start");
-
-        // Drain until the policy stops announcing a respawn. The patience is
-        // virtual time, so it only has to outlast the scripted runs and their
-        // backoffs.
-        loop {
-            if !observed
-                .exit_within(Duration::from_secs(600))
-                .await
-                .will_restart
-            {
-                break;
-            }
-        }
-        ctr.wait_state(PowerState::Stopped, SETTLE)
+    ctr.clone().start(lab).await.expect("explicit start");
+    let mut after_start = Vec::new();
+    while after_start.len() < 3 {
+        let event = tokio::time::timeout(SETTLE, rx.recv())
             .await
-            .expect("gives up eventually");
-        ctr.restart_count()
+            .expect("no lifecycle event after explicit start")
+            .expect("event stream closed");
+        if matches!(
+            event.event.as_str(),
+            "container.starting" | "container.crashed" | "container.stopped"
+        ) {
+            after_start.push(event.event);
+        }
     }
-
-    // `RAPID_RUN` is a minute; a run past it counts as healthy service.
-    let after_a_long_run =
-        restarts_before_giving_up(Run::container_exits(Duration::from_secs(90), 1)).await;
-    let always_rapid =
-        restarts_before_giving_up(Run::container_exits(Duration::from_millis(20), 1)).await;
-
     assert_eq!(
-        always_rapid, 4,
-        "five rapid failures in a row exhaust the budget"
+        after_start,
+        [
+            "container.starting",
+            "container.crashed",
+            "container.stopped"
+        ]
     );
-    assert_eq!(
-        after_a_long_run,
-        always_rapid + 1,
-        "the long first run did not count against the budget"
-    );
-}
-
-/// Stopping a crash-looping container has to actually stop it. The restart
-/// waits out a backoff with no machine running, so the stop request is the
-/// only thing that can cancel it — a caller who asks for a stop must not
-/// watch the container come back a second later.
-#[tokio::test]
-async fn a_stop_during_the_backoff_cancels_the_restart() {
-    let dirs = Dirs::new();
-    let (ctr, _hv) = container(
-        &dirs,
-        r#"container "web" { image = "nginx:1" profile = "container" restart = "always" }"#,
-        Script {
-            agent: false,
-            runs: vec![Run::container_exits(Duration::from_millis(20), 1)],
-            ..Script::default()
-        },
-    );
-    let (cbs, mut observed) = callbacks();
-    start_container(&ctr, cbs).await.expect("start");
-
-    let first = observed.exit().await;
-    assert!(first.will_restart, "a restart is pending");
     ctr.wait_state(PowerState::Stopped, SETTLE)
         .await
-        .expect("down between attempts");
-
-    // Mid-backoff: no machine is running, so this takes the "already
-    // stopped" path — and must still cancel the pending respawn.
-    ctr.stop(false).await.expect("stop during backoff");
-
-    // Long enough to cover the 1s backoff and then some.
-    tokio::time::sleep(Duration::from_millis(1800)).await;
-    assert_eq!(
-        ctr.state().await,
-        PowerState::Stopped,
-        "the pending restart was cancelled"
-    );
-    assert!(
-        observed.exits.try_recv().is_err(),
-        "no further exit: nothing came back up"
-    );
+        .expect("explicitly started run also settles");
 }
 
-/// Two starts cannot both proceed. Whatever asks second — an operator racing
-/// the restart policy, or two `up` runs — is refused rather than spawning a
-/// second emulator against the same sockets and disks.
+/// Two starts cannot both proceed. A second operator or `up` run is refused
+/// rather than spawning another emulator against the same sockets and disks.
 #[tokio::test]
 async fn a_machine_that_is_already_running_refuses_a_second_start() {
     let dirs = Dirs::new();
@@ -953,7 +892,6 @@ async fn a_container_stops_through_its_ctl_channel() {
 
     let exit = observed.exit().await;
     assert_eq!(exit.reason, StopReason::Requested);
-    assert!(!exit.will_restart);
     assert_eq!(ctr.state().await, PowerState::Stopped);
 }
 

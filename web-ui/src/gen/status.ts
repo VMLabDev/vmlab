@@ -13,10 +13,6 @@ digest: string | null,
  */
 health: boolean | null, 
 /**
- * How many times the restart policy has brought it back.
- */
-restarts: number, 
-/**
  * The last exit status, once it has one.
  */
 exit_code: number | null, };

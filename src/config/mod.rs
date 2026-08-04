@@ -309,7 +309,6 @@ lab "l" {
     cpus       = 2
     memory     = 512MiB
     depends_on = ["db"]
-    restart    = "on-failure"
     nic { segment = "s" ip = "10.1.1.30" }
     env { name = "MODE" value = "prod" }
     volume { name = "data" target = "/var/lib/data" }
@@ -344,7 +343,6 @@ lab "l" {
         assert_eq!(web.cpus, Some(2));
         assert_eq!(web.memory, Some(512 << 20));
         assert_eq!(web.depends_on, vec!["db"]);
-        assert_eq!(web.restart, RestartPolicy::OnFailure);
         assert_eq!(web.nics.len(), 1);
         assert_eq!(web.nics[0].ip.unwrap().to_string(), "10.1.1.30");
         assert_eq!(web.env.len(), 1);
@@ -370,7 +368,6 @@ lab "l" {
 
         let db = &lab.containers[1];
         assert_eq!(db.mode, ContainerMode::Idle);
-        assert_eq!(db.restart, RestartPolicy::No);
         assert!(db.entrypoint.is_none());
         assert!(db.command.is_none());
         assert!(db.healthcheck.is_none());
@@ -383,6 +380,26 @@ lab "l" {
         assert!(
             err.issues.iter().any(|i| i.message.contains("bogus_attr")),
             "expected unknown-attribute error, got: {:?}",
+            err.issues
+        );
+    }
+
+    #[test]
+    fn rejects_the_removed_container_restart_field_at_its_source_line() {
+        let src = "import <vmlab.wcl>\nlab \"x\" {\n  container \"web\" { image = \"nginx\" restart = \"always\" }\n}\n";
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        let restart_line = src.find("restart =").unwrap();
+
+        assert!(
+            err.issues.iter().any(|issue| {
+                issue.message.contains("restart")
+                    && issue.span.is_some_and(|span| {
+                        let offset = span.offset();
+                        offset >= restart_line
+                            && offset < src[restart_line..].find('\n').unwrap() + restart_line
+                    })
+            }),
+            "expected an unknown restart-field error on its source line, got: {:?}",
             err.issues
         );
     }

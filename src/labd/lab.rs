@@ -2154,7 +2154,6 @@ mod tests {
                 image: "double:1".into(),
                 digest: None,
                 health: None,
-                restarts: 0,
                 exit_code: None,
             })
         }

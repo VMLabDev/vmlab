@@ -750,7 +750,6 @@ export interface CatalogMeta {
   forward_protos: string[];
   l4_protos: string[];
   media_kinds: string[];
-  restart_policies: string[];
   /** `healthcheck {}` schema defaults (seconds / count). */
   healthcheck_defaults: {
     interval: number;

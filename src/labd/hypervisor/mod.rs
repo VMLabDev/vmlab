@@ -4,9 +4,8 @@
 //! same 260 lines. `VmInstance::start` reached straight for `spawn_swtpm`,
 //! `virtiofsd::spawn`, `Proc::spawn_with_fds` and `QmpClient::connect`, so the
 //! parts with real logic — the power-state machine, the exit monitor that
-//! classifies *why* the emulator ended, readiness gating, the stop ladder and
-//! the container restart policy — could only be exercised by booting real
-//! QEMU on a real host.
+//! classifies *why* the emulator ended, readiness gating and the stop ladder —
+//! could only be exercised by booting real QEMU on a real host.
 //!
 //! Everything that touches the host sits below this seam; everything that
 //! decides what the machine's state *means* sits above it. The seam is stated

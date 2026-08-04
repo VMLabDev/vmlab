@@ -8,9 +8,9 @@ use serde::Serialize;
 use super::model::{
     BlockRule, Connect, Container, ContainerMode, DiskBlock, DnsRecord, EnvVar, Firmware, Forward,
     Gpu, GpuMode, Handler, Healthcheck, HostPort, L4Proto, Lab, LabFile, Media, MediaKind, Nic,
-    Playbook, PlaybookVar, PortMap, Provision, RedirectRule, RestartPolicy, Route, Segment,
-    SegmentDns, Share, ShareTransport, SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume,
-    VolumeSource, WebAuth, WebPage,
+    Playbook, PlaybookVar, PortMap, Provision, RedirectRule, Route, Segment, SegmentDns, Share,
+    ShareTransport, SinkholeMode, SinkholeRule, Span, TemplateDef, Vm, Volume, VolumeSource,
+    WebAuth, WebPage,
 };
 
 #[derive(Serialize)]
@@ -345,7 +345,6 @@ pub struct ContainerDto {
     /// Bytes.
     pub memory: Option<u64>,
     pub depends_on: Vec<String>,
-    pub restart: RestartPolicy,
     pub nics: Vec<NicDto>,
     pub env: Vec<EnvVarDto>,
     pub volumes: Vec<VolumeDto>,
@@ -372,7 +371,6 @@ impl From<&Container> for ContainerDto {
             cpus: c.cpus,
             memory: c.memory,
             depends_on: c.depends_on.clone(),
-            restart: c.restart,
             nics: c.nics.iter().map(NicDto::from).collect(),
             env: c.env.iter().map(EnvVarDto::from).collect(),
             volumes: c.volumes.iter().map(VolumeDto::from).collect(),

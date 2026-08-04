@@ -1,5 +1,5 @@
 // A container's page: state/health badges, start/stop/restart, its facts
-// (image, digest, address, restarts), and three tabs — Console (the raw
+// (image, digest, address, last exit), and three tabs — Console (the raw
 // text the container writes, i.e. the `console` log stream), Recovery
 // terminal (an on-demand shell into the micro-VM) and Log (every log line
 // for this container, timestamped and stream-tagged).
@@ -149,7 +149,6 @@ export default function ContainerView() {
             <KV k="Address" v={ctr()!.ip ?? "—"} />
             <KV k="MAC" v={ctr()!.nics[0]?.mac ?? "—"} />
             <KV k="Segment" v={segments()} />
-            <KV k="Restarts" v={String(ctr()!.restarts)} />
             <KV k="Last exit" v={ctr()!.exit_code != null ? String(ctr()!.exit_code) : "—"} />
             <KV
               k="Health"

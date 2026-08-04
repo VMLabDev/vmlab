@@ -755,17 +755,6 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
     let cpus = r.int_at_least("cpus", 1).unspan();
     let memory = r.size("memory").unspan();
     let depends_on = r.string_list("depends_on");
-    let restart = r
-        .keyword(
-            "restart",
-            &[
-                ("no", RestartPolicy::No),
-                ("on-failure", RestartPolicy::OnFailure),
-                ("always", RestartPolicy::Always),
-            ],
-        )
-        .unspan()
-        .unwrap_or_default();
     let mut nics = Vec::new();
     let mut env = Vec::new();
     let mut volumes = Vec::new();
@@ -826,7 +815,6 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         cpus,
         memory,
         depends_on,
-        restart,
         nics,
         env,
         volumes,

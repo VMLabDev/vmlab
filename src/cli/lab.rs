@@ -385,7 +385,6 @@ fn machine_detail(m: &MachineStatus) -> String {
                     Some(false) => "failing".into(),
                 },
             );
-            field("restarts", c.restarts.to_string());
             field(
                 "exit",
                 c.exit_code.map_or("-".into(), |code| code.to_string()),
@@ -1679,7 +1678,7 @@ mod tests {
             "got:\n{out}"
         );
         assert!(
-            out.contains("state=stopping ready=no cached=yes health=- restarts=2"),
+            out.contains("state=stopping ready=no cached=yes health=- exit=-"),
             "got:\n{out}"
         );
     }

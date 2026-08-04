@@ -184,7 +184,7 @@ exited for this reason — rather than which binary is launched, and it hands
 back its own handle types (**Process**, **Control**) rather than a host process
 and a QMP client, so an adapter can be entirely in-memory. TPM, filesystem
 daemons, the guest boot asset and process spawning sit below it; power state,
-exit classification, readiness, teardown ordering and restart policy sit above.
+exit classification, readiness and teardown ordering sit above.
 Two adapters, both live: QEMU in production, the fake in the lifecycle tests.
 _Avoid_: driver, backend, runtime
 

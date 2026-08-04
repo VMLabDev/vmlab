@@ -85,7 +85,7 @@ pub enum Command {
     /// Machine and segment status: what each machine is doing, and its IP
     Status {
         /// Add the raw power state, readiness, and each machine's
-        /// kind-specific detail (template/hardware, image/health/restarts)
+        /// kind-specific detail (template/hardware, image/health/last exit)
         #[arg(short, long)]
         verbose: bool,
     },

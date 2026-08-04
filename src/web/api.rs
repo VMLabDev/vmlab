@@ -458,7 +458,6 @@ pub async fn catalog_meta() -> HttpResponse {
         "forward_protos": schema.options("forward", "proto"),
         "l4_protos": schema.options("block", "proto"),
         "media_kinds": schema.options("media", "kind"),
-        "restart_policies": schema.options("container", "restart"),
         // The `healthcheck {}` defaults, in the seconds/counts the editor
         // edits in — reflected from the schema's `@default`s.
         "healthcheck_defaults": {
@@ -1677,7 +1676,6 @@ mod tests {
                         image: "docker.io/library/nginx:latest".into(),
                         digest: None,
                         health: None,
-                        restarts: 0,
                         exit_code: None,
                     })
                 };

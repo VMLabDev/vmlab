@@ -425,7 +425,7 @@ impl<'b, 'i> Reader<'b, 'i> {
         None
     }
 
-    /// A string drawn from a fixed set: `restart = "always"`.
+    /// A string drawn from a fixed set: `firmware = "ovmf"`.
     pub fn keyword<T: Copy>(&mut self, name: &str, table: &[(&str, T)]) -> Option<Spanned<T>> {
         let s = self.string(name)?;
         match table.iter().find(|(k, _)| *k == s.value) {
