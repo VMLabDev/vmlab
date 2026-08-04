@@ -65,17 +65,11 @@ pub fn is_drive_letter(target: &str) -> bool {
 /// - **Drive-letter target** (`X:`): a single `net use X: \\<gw>\<share>
 ///   /user:<u> <p> /persistent:yes`. This maps directly (PRD §7.5).
 /// - **Folder-path target** (e.g. `C:\mnt\data`): realised as a directory
-///   symlink/junction to the UNC path — `cmd /c mklink /D <folder>
-///   \\<gw>\<share>`. We additionally prime credentials with a credential-only
-///   `net use \\<gw>\<share> /user:<u> <p>` so the symlink resolves
-///   authenticated.
-///
-/// ⚠ PRD §7.5 implementation note: verify the folder-path mechanism against
-/// current Windows at implementation time — specifically mklink-to-UNC
-/// behaviour (symlink evaluation of remote-to-remote / `\\?\UNC` forms) and
-/// whether the mapping persists profile-vs-machine across reboots. The
-/// drive-letter path uses `/persistent:yes`; the symlink path relies on the
-/// credential being re-established (stale TCP re-auth, §7.5) on each boot.
+///   symbolic link to the UNC path — `cmd /c mklink /D <folder>
+///   \\<gw>\<share>`. Windows permits UNC targets for `/D`; `/J` junctions
+///   cannot target UNC paths. We additionally prime credentials with a
+///   credential-only `net use \\<gw>\<share> /user:<u> <p>` so the symbolic
+///   link resolves authenticated.
 pub fn windows_mount_cmds(
     gateway: Ipv4Addr,
     share: &str,
@@ -111,7 +105,7 @@ pub fn windows_mount_cmds(
         );
         vec![cleanup, map]
     } else {
-        // Folder-path target: authenticate, then junction the folder to the UNC.
+        // Folder-path target: authenticate, then link the folder to the UNC.
         let auth = (
             "net".to_string(),
             vec![
@@ -304,7 +298,7 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         // first authenticates
         assert_eq!(cmds[0].0, "net");
-        // second is the mklink junction
+        // second is the directory symbolic link
         let (prog, args) = &cmds[1];
         assert_eq!(prog, "cmd");
         let joined = args.join(" ");
