@@ -88,7 +88,8 @@ pub async fn ensure_lab_daemon(name: &str, root: &std::path::Path) -> Result<Lab
             root: root.to_path_buf(),
         })
         .await
-        .map_err(|e| anyhow::anyhow!("starting lab daemon: {e}"))?;
+        .map_err(remote)
+        .context("starting lab daemon")?;
     let sock = PathBuf::from(
         resp["socket"]
             .as_str()

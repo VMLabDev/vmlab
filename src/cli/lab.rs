@@ -633,14 +633,13 @@ fn cmd_lab_stop(name: &str, force: bool) -> Result<()> {
 fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
     rt()?.block_on(async {
         let labs = registry_labs().await?;
-        let root = match root_for(&labs, name) {
-            Some(root) => root,
-            // Unregistered: the cwd's lab is the only other place a root can
-            // come from, and only when it is the lab being named.
-            None => match current_lab() {
-                Ok((cwd_lab, root)) if cwd_lab == name => root,
-                _ => bail!("lab \"{name}\" is not running"),
-            },
+        // Prefer the cwd when it declares this name. The supervisor must see
+        // that requested root so it can reject a collision; substituting the
+        // registered root here would make two different labs look identical.
+        // Outside that lab, a named restart still uses the registry entry.
+        let root = match current_lab() {
+            Ok((cwd_lab, root)) if cwd_lab == name => root,
+            _ => root_for(&labs, name).ok_or_else(|| anyhow!("lab \"{name}\" is not running"))?,
         };
         // Machines still running is a veto: the restart shuts the old daemon
         // down, and that stops them. A `status` that would not answer or

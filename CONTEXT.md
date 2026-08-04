@@ -14,7 +14,8 @@ disagree, this file wins.
 
 **Lab**:
 A set of machines plus the virtual networks connecting them, declared in a
-`lab {}` block in `vmlab.wcl`.
+`lab {}` block in `vmlab.wcl`. Its declared name identifies it uniquely among
+the labs registered on one host.
 _Avoid_: environment, project, stack
 
 **Machine**:

@@ -207,15 +207,31 @@ impl Supervisor {
 
     /// Spawn the lab daemon for `name` if it isn't running; wait until its
     /// control socket answers. Returns the socket path.
-    async fn ensure_lab(self: &Arc<Self>, name: &str, root: PathBuf) -> Result<PathBuf, String> {
+    async fn ensure_lab(
+        self: &Arc<Self>,
+        name: &str,
+        root: PathBuf,
+    ) -> Result<PathBuf, CommandError> {
+        let root = registry::canonical_root(&root)?;
         // Serialise per lab: a status poll and an `up` arriving together must
         // not both spawn the daemon in parallel.
         let lock = self.ensure_lock(name).await;
         let _guard = lock.lock().await;
 
+        self.ensure_lab_locked(name, root).await
+    }
+
+    /// The already-serialised half of [`Self::ensure_lab`], also used after a
+    /// restart has kept the same name lock across identity check and release.
+    async fn ensure_lab_locked(
+        self: &Arc<Self>,
+        name: &str,
+        root: PathBuf,
+    ) -> Result<PathBuf, CommandError> {
         let sock = crate::paths::lab_socket(name);
         {
             let reg = self.registry.lock().await;
+            reg.check_name(name, &root)?;
             if let Some(entry) = reg.get(name)
                 && entry.state == LabState::Running
                 && let Ok(c) = LabClient::connect(&sock).await
@@ -262,7 +278,7 @@ impl Supervisor {
                 root: root.clone(),
                 pid,
                 state: LabState::Running,
-            });
+            })?;
             reg.save();
         }
 
@@ -310,14 +326,22 @@ impl Supervisor {
                 let reg = self.registry.lock().await;
                 match reg.get(name) {
                     Some(entry) if entry.state == LabState::Failed => {
-                        return Err(format!("lab daemon for {name} failed during startup"));
+                        return Err(CommandError::failed(format!(
+                            "lab daemon for {name} failed during startup"
+                        )));
                     }
-                    None => return Err(format!("lab daemon for {name} exited during startup")),
+                    None => {
+                        return Err(CommandError::failed(format!(
+                            "lab daemon for {name} exited during startup"
+                        )));
+                    }
                     _ => {}
                 }
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!("lab daemon for {name} did not come up"));
+                return Err(CommandError::failed(format!(
+                    "lab daemon for {name} did not come up"
+                )));
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -384,8 +408,20 @@ impl Supervisor {
     /// The caller is responsible for ensuring the lab is down (no running VMs):
     /// a restart drops the daemon's in-memory state, so a fresh daemon cannot
     /// re-adopt VMs the old one left running.
-    async fn restart_lab(self: &Arc<Self>, name: &str, root: PathBuf) -> Result<PathBuf, String> {
-        let registered = { self.registry.lock().await.get(name).is_some() };
+    async fn restart_lab(
+        self: &Arc<Self>,
+        name: &str,
+        root: PathBuf,
+    ) -> Result<PathBuf, CommandError> {
+        let root = registry::canonical_root(&root)?;
+        let lock = self.ensure_lock(name).await;
+        let _guard = lock.lock().await;
+
+        let registered = {
+            let registry = self.registry.lock().await;
+            registry.check_name(name, &root)?;
+            registry.get(name).is_some()
+        };
         if registered {
             self.release_lab(name).await?;
             // Wait for the old daemon to fully exit before re-spawning. On a
@@ -399,12 +435,14 @@ impl Supervisor {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
-                    return Err(format!("lab daemon for {name} did not stop in time"));
+                    return Err(CommandError::failed(format!(
+                        "lab daemon for {name} did not stop in time"
+                    )));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
-        self.ensure_lab(name, root).await
+        self.ensure_lab_locked(name, root).await
     }
 }
 

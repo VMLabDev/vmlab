@@ -18,6 +18,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0008](0008-hardware-resolution-happens-once.md) | Hardware resolution happens once, for both machine kinds | Accepted |
 | [0009](0009-build-hardware-resolves-block-over-source-template.md) | Build hardware resolves block over source template, and the profile stays live | Accepted |
 | [0010](0010-the-supervisor-owns-the-template-store.md) | The supervisor owns the template store, and every surface asks it | Accepted |
+| [0011](0011-a-lab-name-is-its-host-global-runtime-identity.md) | A lab name is its host-global runtime identity | Accepted |
 
 ## Format
 
