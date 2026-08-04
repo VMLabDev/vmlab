@@ -51,6 +51,21 @@ _Avoid_: network, VLAN, bridge, subnet
 A VM booted from a blank disk (`template = "scratch"`) with no template,
 requiring explicit `arch`, `profile` and `disk`.
 
+**Dev machine**:
+A lab machine designated as a development environment with a `@dev` decorator
+on its block, which vmlab publishes as an SSH endpoint an editor attaches
+*into*. VM or container, Windows or Linux — one contract for every machine
+kind. The decorator states something *about* the machine rather than
+configuring something *inside* it: nothing it carries is a setting the guest
+sees. A lab may have any number, or none.
+_Avoid_: devbox, workspace (a workspace is the source tree on one), devcontainer
+
+**Default dev machine**:
+The dev machine carrying `@dev(default = true)`, or the only one carrying
+`@dev`. A property of the **lab file**, so it is the same for everyone who
+opens it — not per-developer. Which dev machine is *mine* is host-side state
+and deliberately not expressible in `vmlab.wcl`.
+
 ### Capabilities
 
 **Capability**:
