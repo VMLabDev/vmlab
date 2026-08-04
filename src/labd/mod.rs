@@ -40,6 +40,35 @@ fn handler_matches(handler: &crate::config::model::Handler, event: &str, machine
         && (handler.targets.is_empty() || handler.targets.iter().any(|name| name == machine))
 }
 
+fn matching_handler_runs(
+    runtime: &LabRuntime,
+    event: &crate::proto::Event,
+) -> Vec<(PathBuf, crate::scripting::EventData)> {
+    // Container events carry the name under "container"; handlers read it
+    // from `event.vm` either way.
+    let machine = event.data["vm"]
+        .as_str()
+        .or_else(|| event.data["container"].as_str())
+        .unwrap_or_default();
+    runtime
+        .config
+        .lab
+        .handlers
+        .iter()
+        .filter(|handler| handler_matches(handler, &event.event, machine))
+        .map(|handler| {
+            (
+                runtime.root.join(&handler.run),
+                crate::scripting::EventData {
+                    name: event.event.clone(),
+                    vm: machine.to_string(),
+                    data: event.data.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Entry point for `vmlab __labd --lab <name> --root <dir>`.
 pub fn run(lab: String, root: PathBuf) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -110,8 +139,7 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     // Event → wscript handler bindings (PRD §8.2). Failures are logged, never
     // fatal.
     {
-        let handlers = runtime.config.lab.handlers.clone();
-        if !handlers.is_empty() {
+        if !runtime.config.lab.handlers.is_empty() {
             let mut rx = events_tx.subscribe();
             let runtime = runtime.clone();
             let group = tasks.clone();
@@ -126,22 +154,7 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         },
                     };
-                    // Container events carry the name under "container";
-                    // handlers read it from `event.vm` either way.
-                    let machine = ev.data["vm"]
-                        .as_str()
-                        .or_else(|| ev.data["container"].as_str())
-                        .unwrap_or_default();
-                    for h in handlers
-                        .iter()
-                        .filter(|handler| handler_matches(handler, &ev.event, machine))
-                    {
-                        let script = runtime.root.join(&h.run);
-                        let event = crate::scripting::EventData {
-                            name: ev.event.clone(),
-                            vm: machine.to_string(),
-                            data: ev.data.to_string(),
-                        };
+                    for (script, event) in matching_handler_runs(&runtime, &ev) {
                         let runtime = runtime.clone();
                         let output: crate::scripting::OutputSink = Arc::new(
                             |line| tracing::info!(target: "handler", "{}", line.trim_end()),

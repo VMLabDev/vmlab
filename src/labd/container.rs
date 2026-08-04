@@ -345,7 +345,7 @@ pub struct ContainerInstance {
     agent: super::machine::AgentSlot,
     /// How this micro-VM reaches the host to actually run — see
     /// [`super::hypervisor`]. Real QEMU in production; a fake in tests, which
-    /// is what makes the restart ladder and the readiness gate testable.
+    /// is what makes the start ladder and the readiness gate testable.
     hv: Arc<dyn Hypervisor>,
 }
 
@@ -903,13 +903,13 @@ impl ContainerInstance {
 
     /// Graceful stop ladder (PRD §7.2 shape): ctl `stop` (in-guest signal +
     /// grace) → guest-agent shutdown → hard kill, each with a timeout.
-    /// Setting `stop_requested` first also cancels any pending policy
-    /// restart.
+    /// Setting `stop_requested` first tells the exit monitor that shutdown was
+    /// operator-requested.
     async fn stop_ladder(&self, force: bool) -> Result<()> {
         *self.stop_requested.write().await = true;
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
-            return Ok(()); // already stopped (or waiting out a backoff)
+            return Ok(()); // already stopped
         };
         *self.state.write().await = PowerState::Stopping;
 

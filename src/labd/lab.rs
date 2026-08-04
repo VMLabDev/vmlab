@@ -2182,6 +2182,48 @@ mod tests {
         Arc::new(|_| {})
     }
 
+    #[tokio::test]
+    async fn crash_handler_can_explicitly_start_a_stopped_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let container = FakeMachine::new("web", MachineKind::Container, &sh);
+        std::fs::write(
+            dir.path().join("restart.ws"),
+            r#"use vmlab
+
+fn handle(event: Event, lab: Lab) {
+    let Ok(machine) = lab.machine(event.vm) else { return }
+    let started = machine.start()
+}
+"#,
+        )
+        .unwrap();
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  container "web" { image = "web:1" }
+  on "container.crashed" { run = "restart.ws" targets = ["web"] }
+}
+"#,
+            vec![container.clone()],
+        );
+        let event = crate::proto::Event::new(
+            "container.crashed",
+            "t",
+            json!({"container": "web", "exit_code": 1}),
+        );
+
+        let runs = super::super::matching_handler_runs(&lab, &event);
+        assert_eq!(runs.len(), 1, "the declared crash handler must match");
+        for (script, event) in runs {
+            crate::scripting::run_event_handler(lab.clone(), &script, event, quiet()).await;
+        }
+
+        assert_eq!(container.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(container.state().await, PowerState::Running);
+    }
+
     /// `depends_on` gates on readiness identically for both kinds. `web`
     /// depends on `db`, so `db` must be *ready* — not merely started — before
     /// `web` starts, whether `db` is a VM or a container.

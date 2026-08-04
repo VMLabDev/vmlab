@@ -388,15 +388,15 @@ lab "l" {
     fn rejects_the_removed_container_restart_field_at_its_source_line() {
         let src = "import <vmlab.wcl>\nlab \"x\" {\n  container \"web\" { image = \"nginx\" restart = \"always\" }\n}\n";
         let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
-        let restart_line = src.find("restart =").unwrap();
+        let restart_offset = src.find("restart =").unwrap();
 
         assert!(
             err.issues.iter().any(|issue| {
                 issue.message.contains("restart")
                     && issue.span.is_some_and(|span| {
                         let offset = span.offset();
-                        offset >= restart_line
-                            && offset < src[restart_line..].find('\n').unwrap() + restart_line
+                        offset >= restart_offset
+                            && offset < src[restart_offset..].find('\n').unwrap() + restart_offset
                     })
             }),
             "expected an unknown restart-field error on its source line, got: {:?}",

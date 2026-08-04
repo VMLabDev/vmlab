@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
@@ -98,6 +98,24 @@ fn callbacks() -> (Callbacks, Observed) {
             healths,
         },
     )
+}
+
+async fn collect_events(
+    rx: &mut broadcast::Receiver<crate::proto::Event>,
+    wanted: &[&str],
+    count: usize,
+) -> Vec<crate::proto::Event> {
+    let mut events = Vec::new();
+    while events.len() < count {
+        let event = tokio::time::timeout(SETTLE, rx.recv())
+            .await
+            .expect("no lifecycle event")
+            .expect("event stream closed");
+        if wanted.contains(&event.event.as_str()) {
+            events.push(event);
+        }
+    }
+    events
 }
 
 struct TestLab {
@@ -802,19 +820,7 @@ async fn a_crashed_container_stays_stopped_until_explicitly_started() {
 
     ctr.clone().start(lab.clone()).await.expect("start");
 
-    let mut exits = Vec::new();
-    while exits.len() < 2 {
-        let event = tokio::time::timeout(SETTLE, rx.recv())
-            .await
-            .expect("no lifecycle event")
-            .expect("event stream closed");
-        if matches!(
-            event.event.as_str(),
-            "container.crashed" | "container.stopped"
-        ) {
-            exits.push(event);
-        }
-    }
+    let exits = collect_events(&mut rx, &["container.crashed", "container.stopped"], 2).await;
 
     assert_eq!(
         exits
@@ -834,21 +840,21 @@ async fn a_crashed_container_stays_stopped_until_explicitly_started() {
         .expect("stays stopped");
 
     ctr.clone().start(lab).await.expect("explicit start");
-    let mut after_start = Vec::new();
-    while after_start.len() < 3 {
-        let event = tokio::time::timeout(SETTLE, rx.recv())
-            .await
-            .expect("no lifecycle event after explicit start")
-            .expect("event stream closed");
-        if matches!(
-            event.event.as_str(),
-            "container.starting" | "container.crashed" | "container.stopped"
-        ) {
-            after_start.push(event.event);
-        }
-    }
+    let after_start = collect_events(
+        &mut rx,
+        &[
+            "container.starting",
+            "container.crashed",
+            "container.stopped",
+        ],
+        3,
+    )
+    .await;
     assert_eq!(
-        after_start,
+        after_start
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
         [
             "container.starting",
             "container.crashed",
