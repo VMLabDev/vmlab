@@ -217,6 +217,14 @@ done, errored, cancelled — as a value the console and CLI both read.
 The port-forward rules a lab's machines require, resolved to leases and
 gateways before any is installed.
 
+**SSH facade**:
+The SSH server vmlab terminates on the host, one process per client invocation
+over stdio. Presents an SSH interface with no sshd in the guest: session, exec
+and sftp channels are serviced by vmlab-agent, `direct-tcpip` by an SSH-scoped
+tunnel stream. _Specified by PRD §19; not built yet_ — the term is recorded
+here because the effort that coined it spans several sessions.
+_Avoid_: sshd, SSH server (implies guest-side), gateway, proxy
+
 ### Configuration and surfaces
 
 **Schema projection**:
