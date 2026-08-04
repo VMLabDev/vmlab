@@ -47,6 +47,25 @@ impl EventLog {
         }
         let _ = self.tx.send(ev);
     }
+
+    #[cfg(test)]
+    pub(super) fn recording(
+        lab: &str,
+        path: PathBuf,
+    ) -> (
+        std::sync::Arc<Self>,
+        tokio::sync::broadcast::Receiver<Event>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        (
+            std::sync::Arc::new(Self {
+                lab: lab.to_string(),
+                file: Mutex::new(AppendLog::open(path)),
+                tx,
+            }),
+            rx,
+        )
+    }
 }
 
 #[cfg(test)]

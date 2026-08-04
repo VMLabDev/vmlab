@@ -113,7 +113,6 @@ container "web" {
   profile    = "container"               // micro-VM hardware floor (§5.3)
   memory     = 512MiB                    // overrides the profile; cpus likewise
   depends_on = ["db"]                    // VM or container names — one namespace
-  restart    = "on-failure"              // "no" (default) | "on-failure" | "always"
   nic    { segment = "corp" ip = "10.50.0.20" }
   env    { name = "MODE" value = "prod" }
   volume { name = "data" target = "/var/lib/data" }

@@ -523,7 +523,6 @@ lab "demo" {
                 "fields": [
                     {"name": "image", "value": "nginx:1.27"},
                     {"name": "memory", "value": {"num": 256, "unit": "MiB"}},
-                    {"name": "restart", "value": "always"},
                 ],
                 "children": [
                     {"kind": "nic", "fields": [{"name": "segment", "value": "corp"}]},
@@ -543,7 +542,6 @@ lab "demo" {
         let web = re.containers.iter().find(|c| c.name == "web").unwrap();
         assert_eq!(web.image.reference, "nginx:1.27");
         assert_eq!(web.memory, Some(256 << 20));
-        assert_eq!(web.restart, crate::config::model::RestartPolicy::Always);
         assert_eq!(web.nics.len(), 1);
         assert_eq!(web.env.len(), 1);
         assert_eq!(web.ports[0].host_port, 18080);

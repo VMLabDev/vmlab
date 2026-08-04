@@ -8,9 +8,9 @@
 //!
 //! **There is no second route.** `start` and `restore` are on this interface
 //! too: booting a VM needs a template clone and segment attachments, booting a
-//! container needs an image spec and a restart policy, and that difference is
-//! implementation — not a branch in a caller. The lab runtime supplies what
-//! both need through [`LabServices`], and asks the machine to do the rest.
+//! container needs an image spec, and that difference is implementation — not
+//! a branch in a caller. The lab runtime supplies what both need through
+//! [`LabServices`], and asks the machine to do the rest.
 //!
 //! What genuinely differs is expressed as a **capability**, not as a kind:
 //!
@@ -217,9 +217,8 @@ pub trait Machine: Send + Sync + 'static {
     /// its lifecycle on the lab's event log. A no-op when it is already up.
     ///
     /// The kind-specific work — a template clone and segment attachments for a
-    /// VM, an image spec and a restart policy for a container — is
-    /// implementation. What both need from the lab arrives through
-    /// [`LabServices`].
+    /// VM, an image spec for a container — is implementation. What both need
+    /// from the lab arrives through [`LabServices`].
     async fn start(self: Arc<Self>, lab: Arc<dyn LabServices>) -> Result<()>;
 
     /// Roll this machine back to `snap` (PRD §7.3).

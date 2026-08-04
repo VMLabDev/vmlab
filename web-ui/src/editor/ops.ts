@@ -343,7 +343,6 @@ const containerPairs = (c: ContainerModel): [string, FV][] => [
   ["cpus", int(c.cpus)],
   ["memory", bytes(c.memory)],
   ["depends_on", list(c.depends_on)],
-  ["restart", strdef(c.restart || "no", "no")],
 ];
 
 const envPairs = (e: EnvVarModel): [string, FV][] => [

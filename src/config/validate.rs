@@ -304,12 +304,6 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     format!("idle container \"{}\" cannot declare a healthcheck", c.name),
                 ));
             }
-            if c.restart != RestartPolicy::No {
-                issues.push(Issue::at(
-                    c.span,
-                    format!("idle container \"{}\" must use restart = \"no\"", c.name),
-                ));
-            }
         }
         check_nics(
             lab,
@@ -1855,7 +1849,6 @@ lab "l" { container "c" { image = "alpine" mode = :idle } }"#,
             (r#"entrypoint = ["/bin/sh"]"#, "entrypoint"),
             (r#"command = ["sleep", "infinity"]"#, "command"),
             (r#"healthcheck { command = ["true"] }"#, "healthcheck"),
-            (r#"restart = "always""#, "restart"),
         ] {
             assert_any_err(
                 &format!(
@@ -1944,16 +1937,11 @@ lab "l" { container "c" { image = "nginx" profile = "no-such-profile" } }"#);
     }
 
     #[test]
-    fn container_bad_image_and_restart() {
+    fn container_bad_image() {
         assert_any_err(
             r#"import <vmlab.wcl>
 lab "l" { container "c" { image = "UPPER/Case" } }"#,
             "lowercase",
-        );
-        assert_any_err(
-            r#"import <vmlab.wcl>
-lab "l" { container "c" { image = "nginx" restart = "sometimes" } }"#,
-            "`restart` must be one of",
         );
     }
 

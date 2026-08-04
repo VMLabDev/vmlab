@@ -462,7 +462,6 @@ pub struct Container {
     pub memory: Option<u64>,
     /// VM or container names — the namespaces are unified.
     pub depends_on: Vec<String>,
-    pub restart: RestartPolicy,
     pub nics: Vec<Nic>,
     pub env: Vec<EnvVar>,
     pub volumes: Vec<Volume>,
@@ -480,15 +479,6 @@ pub enum ContainerMode {
     #[default]
     Workload,
     Idle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RestartPolicy {
-    #[default]
-    No,
-    OnFailure,
-    Always,
 }
 
 #[derive(Debug, Clone)]

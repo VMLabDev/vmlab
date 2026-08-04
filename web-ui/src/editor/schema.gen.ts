@@ -45,7 +45,6 @@ export const SCHEMA_OPTIONS: Record<string, string[]> = {
   "sinkhole.mode": ["nxdomain", "zero"],
   "vm.firmware": ["ovmf", "seabios"],
   "container.mode": ["workload", "idle"],
-  "container.restart": ["no", "on-failure", "always"],
   "port.proto": ["tcp", "udp", "both"],
   "share.transport": ["auto", "virtiofs", "smb"],
   "auth.method": ["basic", "bearer", "header", "ntlm", "form"],
@@ -135,7 +134,6 @@ export const WEB_AUTH_METHOD: FieldDesc = { key: "method", label: "Method", doc:
 
 /** `container` block fields. */
 export const CONTAINER_RUNTIME: FieldDesc[] = [
-  { key: "restart", label: "Restart policy", doc: "Restart policy: `no` (default) | `on-failure` | `always`", type: "enum", options: ["no", "on-failure", "always"], required: true, default: "\"no\"" },
   { key: "workdir", label: "Working directory", doc: "Working directory inside the container; image default if omitted", type: "text", placeholder: "/srv/app" },
   { key: "user", label: "User", doc: "User to run as: `uid[:gid]` or a name from the image; image default if omitted", type: "text", placeholder: "1000:1000" },
   { key: "entrypoint", label: "Entrypoint", doc: "Override the image entrypoint (exec form, e.g. [\"/bin/sh\", \"-c\"])", type: "lines" },

@@ -262,8 +262,6 @@ pub struct ContainerStatus {
     pub digest: Option<String>,
     /// Latest healthcheck verdict; `None` = no check declared, or no report yet.
     pub health: Option<bool>,
-    /// How many times the restart policy has brought it back.
-    pub restarts: u32,
     /// The last exit status, once it has one.
     pub exit_code: Option<i32>,
 }
@@ -522,7 +520,6 @@ pub(crate) mod fixtures {
             image: "docker.io/library/nginx:latest".into(),
             digest: Some("sha256:abc".into()),
             health,
-            restarts: 2,
             exit_code,
         })
     }

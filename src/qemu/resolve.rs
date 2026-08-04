@@ -466,7 +466,6 @@ fn bare_container(profile: Option<&str>) -> Container {
         cpus: None,
         memory: None,
         depends_on: Vec::new(),
-        restart: Default::default(),
         nics: Vec::new(),
         env: Vec::new(),
         volumes: Vec::new(),

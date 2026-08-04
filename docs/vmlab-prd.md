@@ -650,7 +650,7 @@ standard container image (`nginx:1.27`, `ghcr.io/owner/app@sha256:…` — Docke
 Hub shorthand normalises to `registry-1.docker.io`) plus compose-style
 configuration: `env {}` variables, `volume {}` binds and named volumes,
 `entrypoint`/`command`/`workdir`/`user` overrides, `port {}` host forwards, a
-`healthcheck {}`, a `restart` policy, and `nic {}` blocks identical to VM NICs.
+`healthcheck {}`, and `nic {}` blocks identical to VM NICs.
 VM and container names share one namespace: DNS, `depends_on` waves,
 `forward { to = "name:port" }` targets, and configuration steps all resolve
 across both kinds. A container with no NICs is valid — air-gapped, still
@@ -699,12 +699,10 @@ implicitly; `vmlab container destroy` (or editing the `image =` line) clears
 the pin. The supervisor pre-pulls images with `container.pull.*` progress
 events before spawning the lab daemon. Readiness is two-stage — process
 started, then the first passing healthcheck (when declared) — and gates
-`depends_on` waves. Exit handling is host-side: `restart = "on-failure" |
-"always"` respawns with 1→30 s backoff (giving up after 5 rapid failures);
-events `container.starting/ready/stopped/crashed/unhealthy` are bindable with
-`on {}`. The stop ladder mirrors VMs: in-guest stop signal + grace, then
-guest shutdown, then kill. Container stdout/stderr is the serial console log
-(`vmlab container logs [-f]`).
+`depends_on` waves. Events `container.starting/ready/stopped/crashed/unhealthy`
+are bindable with `on {}`. The stop ladder mirrors VMs: in-guest stop signal +
+grace, then guest shutdown, then kill. Container stdout/stderr is the serial
+console log (`vmlab container logs [-f]`).
 
 **Snapshots.** Containers are snapshottable with full VM parity (§7.3).
 Offline snapshots capture the scratch disk; online snapshots capture scratch

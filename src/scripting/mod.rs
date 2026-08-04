@@ -1214,9 +1214,13 @@ use vmlab
 
 fn handle(event: Event, lab: Lab) {
     lab.log("event " + event.name + " on " + event.vm)
+    if event.name == "container.crashed" {
+        let Ok(machine) = lab.machine(event.vm) else { return }
+        let started = machine.start()
+    }
 }
 "#;
-        check_script_source(src).expect("handler signature should type-check");
+        check_script_source(src).expect("a crash handler can explicitly start the machine");
     }
 
     #[test]

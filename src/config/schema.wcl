@@ -296,8 +296,6 @@ type Container {
   memory: std.ByteSize?
   @doc("VM/container names to wait for before this one (no cycles)")
   depends_on: list<utf8>?
-  @doc("Restart policy: `no` (default) | `on-failure` | `always`")
-  @options(["no", "on-failure", "always"]) @default("no") restart: utf8?
   @doc("Network interfaces; none = air-gapped (exec/copy still work via the agent)")
   @children("nic")      nics: list<Nic>
   @doc("Environment variables passed to the container process")

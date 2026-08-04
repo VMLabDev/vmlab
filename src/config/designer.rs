@@ -325,7 +325,6 @@ static FORMS: &[FormSpec] = &[
         "CONTAINER_RUNTIME",
         "container",
         &[
-            f("restart").label("Restart policy"),
             f("workdir").label("Working directory").hint("/srv/app"),
             f("user").hint("1000:1000"),
             f("entrypoint"),

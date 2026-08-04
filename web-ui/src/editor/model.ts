@@ -173,7 +173,6 @@ export interface ContainerModel {
   /** Bytes. */
   memory: number | null;
   depends_on: string[];
-  restart: string; // no | on-failure | always
   nics: NicModel[];
   env: EnvVarModel[];
   volumes: VolumeModel[];
@@ -405,7 +404,6 @@ export function emptyContainer(name: string, image: string): ContainerModel {
     cpus: null,
     memory: null,
     depends_on: [],
-    restart: "no",
     nics: [],
     env: [],
     volumes: [],

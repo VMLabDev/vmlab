@@ -1,8 +1,8 @@
 // The start/stop control for a machine (VM or container), reflecting power
 // transitions: clicking either side swaps the button for a spinner
 // ("Starting…" / "Stopping…") until the observed power state settles, then
-// it becomes the opposite button. Server-side transitions (a restart policy
-// respawn, a CLI-initiated stop) spin too via the reported state.
+// it becomes the opposite button. Server-side transitions (such as a
+// CLI-initiated stop) spin too via the reported state.
 
 import { Show, createEffect, createSignal } from "solid-js";
 import { Button, DropdownMenu, Spinner } from "@forge/ui";

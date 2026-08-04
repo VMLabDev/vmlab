@@ -1,5 +1,5 @@
 //! Per-container runtime (PRD §18): scratch/config preparation, the micro-VM
-//! QEMU spawn, the ctl-channel lifecycle, restart policy, readiness with the
+//! QEMU spawn, the ctl-channel lifecycle, readiness with the
 //! healthcheck gate, and the stop ladder. Mirrors [`super::vm`] — a container
 //! is "a VM whose OS is the guest asset and whose workload is one OCI image".
 
@@ -8,9 +8,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,7 +22,7 @@ use vmlab_cinit_proto::{
 use super::container_ctl::CtlHandle;
 use super::hypervisor::{Control, Hypervisor, Process};
 use super::vm::{PowerState, StopReason};
-use crate::config::model::{self, MacAddr, RestartPolicy, VolumeSource};
+use crate::config::model::{self, MacAddr, VolumeSource};
 use crate::oci::image::model::{ImageConfig, ImageHealthcheck};
 use crate::oci::image::pull::PulledImage;
 use crate::qemu::container::ContainerVmPaths;
@@ -37,13 +36,6 @@ const SCRATCH_SIZE: u64 = 2 << 30;
 /// What to tell a user whose container has no answering vmlab-agent.
 const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the guest boot asset predates \
      it) — rebuild with guest/build-asset.sh and reinstall";
-
-/// Consecutive rapid failures (runs shorter than [`RAPID_RUN`]) after which
-/// the restart policy gives up.
-const MAX_RAPID_FAILURES: u32 = 5;
-
-/// A run at least this long resets the rapid-failure counter.
-const RAPID_RUN: Duration = Duration::from_secs(60);
 
 pub struct ContainerDirs {
     /// `.vmlab/containers/<name>` — scratch qcow2, cfg/ (container.json).
@@ -278,38 +270,12 @@ fn health_from_image(hc: &ImageHealthcheck) -> Option<HealthSpec> {
     })
 }
 
-/// The restart decision after one exit, as a pure function so policy is
-/// unit-testable. `consecutive_failures` counts rapid failures (runs shorter
-/// than [`RAPID_RUN`]) *including* the exit being classified; a run of at
-/// least [`RAPID_RUN`] resets it to zero before the call. `None` = stay
-/// stopped; `Some(backoff)` = restart after that delay (1s·2ⁿ capped 30s).
-pub fn should_restart(
-    policy: RestartPolicy,
-    stop_requested: bool,
-    exit_code: Option<i32>,
-    consecutive_failures: u32,
-) -> Option<Duration> {
-    if stop_requested {
-        return None;
-    }
-    let wants_restart = match policy {
-        RestartPolicy::No => false,
-        RestartPolicy::Always => true,
-        RestartPolicy::OnFailure => exit_code != Some(0),
-    };
-    if !wants_restart || consecutive_failures >= MAX_RAPID_FAILURES {
-        return None;
-    }
-    let secs = 1u64 << consecutive_failures.saturating_sub(1).min(5);
-    Some(Duration::from_secs(secs.min(30)))
-}
-
-/// The lifecycle callbacks a `start` installs, shared across restarts.
-/// `on_exit(reason, exit_code, will_restart)` fires on every QEMU exit;
+/// The lifecycle callbacks a `start` installs.
+/// `on_exit(reason, exit_code)` fires on every QEMU exit;
 /// `on_ready` at most once per `start`; `on_health` on every health
 /// transition.
 struct Callbacks {
-    on_exit: Box<dyn Fn(StopReason, Option<i32>, bool) + Send + Sync>,
+    on_exit: Box<dyn Fn(StopReason, Option<i32>) + Send + Sync>,
     on_ready: Box<dyn Fn() + Send + Sync>,
     on_health: Box<dyn Fn(bool) + Send + Sync>,
     ready_fired: AtomicBool,
@@ -367,10 +333,6 @@ pub struct ContainerInstance {
     /// Latest healthcheck verdict; `None` until the first report (or when
     /// there is no healthcheck).
     healthy: RwLock<Option<bool>>,
-    /// Restarts performed by the policy since the last explicit `start`.
-    restarts: AtomicU32,
-    /// Consecutive rapid failures feeding [`should_restart`].
-    consecutive_failures: AtomicU32,
     /// Exit code from the ctl `exited` event of the last run.
     last_exit: RwLock<Option<i32>>,
     qemu: Mutex<Option<Arc<dyn Process>>>,
@@ -383,7 +345,7 @@ pub struct ContainerInstance {
     agent: super::machine::AgentSlot,
     /// How this micro-VM reaches the host to actually run — see
     /// [`super::hypervisor`]. Real QEMU in production; a fake in tests, which
-    /// is what makes the restart ladder and the readiness gate testable.
+    /// is what makes the start ladder and the readiness gate testable.
     hv: Arc<dyn Hypervisor>,
 }
 
@@ -420,8 +382,6 @@ impl ContainerInstance {
             ready: RwLock::new(false),
             stop_requested: RwLock::new(false),
             healthy: RwLock::new(None),
-            restarts: AtomicU32::new(0),
-            consecutive_failures: AtomicU32::new(0),
             last_exit: RwLock::new(None),
             qemu: Mutex::new(None),
             control: Mutex::new(None),
@@ -432,7 +392,7 @@ impl ContainerInstance {
     }
 
     /// Run this container against a different hypervisor. Tests use it to
-    /// drive the start ladder, the readiness gate and the restart policy
+    /// drive the start ladder and the readiness gate.
     /// without KVM — the same injection point [`super::vm::VmInstance`] has,
     /// because the seam covers both machine kinds or it covers neither
     /// (ADR-0001).
@@ -491,11 +451,6 @@ impl ContainerInstance {
     /// Exit code of the last completed run, from the ctl `exited` event.
     pub async fn last_exit(&self) -> Option<i32> {
         *self.last_exit.read().await
-    }
-
-    /// Restarts the policy has performed since the last explicit `start`.
-    pub fn restart_count(&self) -> u32 {
-        self.restarts.load(Ordering::SeqCst)
     }
 
     /// The live QMP client, for the operations that genuinely need a
@@ -650,8 +605,7 @@ impl ContainerInstance {
     /// the ctl channel and guest agent. The caller has already wired the NIC
     /// listener sockets on the segment switches.
     ///
-    /// `on_exit(reason, exit_code, will_restart)` runs on every QEMU exit —
-    /// `will_restart` marks exits the restart policy follows with a respawn.
+    /// `on_exit(reason, exit_code)` runs on every QEMU exit.
     /// `on_ready` fires at most once, when the container is started, the
     /// agent answers, and the healthcheck (if any) first passes. `on_health`
     /// fires on every healthcheck transition for the container's lifetime.
@@ -666,7 +620,7 @@ impl ContainerInstance {
     /// reach it (ADR-0002).
     pub(super) async fn boot(
         self: &Arc<Self>,
-        on_exit: impl Fn(StopReason, Option<i32>, bool) + Send + Sync + 'static,
+        on_exit: impl Fn(StopReason, Option<i32>) + Send + Sync + 'static,
         on_ready: impl Fn() + Send + Sync + 'static,
         on_health: impl Fn(bool) + Send + Sync + 'static,
     ) -> Result<()> {
@@ -678,8 +632,6 @@ impl ContainerInstance {
             *st = PowerState::Starting;
         }
         *self.stop_requested.write().await = false;
-        self.restarts.store(0, Ordering::SeqCst);
-        self.consecutive_failures.store(0, Ordering::SeqCst);
 
         let cbs = Arc::new(Callbacks {
             on_exit: Box::new(on_exit),
@@ -690,17 +642,7 @@ impl ContainerInstance {
         self.clone().start_attempt(cbs).await
     }
 
-    /// Boxed [`start_attempt`](Self::start_attempt) so the exit monitor can
-    /// re-invoke the start sequence without a recursive future type.
-    fn start_attempt_boxed(
-        self: Arc<Self>,
-        cbs: Arc<Callbacks>,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        Box::pin(self.start_attempt(cbs))
-    }
-
-    /// One run of the start sequence. The state must already be `Starting`
-    /// (set by [`start`](Self::start) or the exit monitor's restart path);
+    /// One run of the start sequence. The state must already be `Starting`;
     /// on failure the state reverts to `Stopped` and handles are torn down.
     async fn start_attempt(self: Arc<Self>, cbs: Arc<Callbacks>) -> Result<()> {
         *self.last_exit.write().await = None;
@@ -795,11 +737,10 @@ impl ContainerInstance {
         };
 
         *self.state.write().await = PowerState::Running;
-        let started_at = tokio::time::Instant::now();
 
         self.spawn_ctl_watcher(&ctl, &cbs);
         self.spawn_readiness(&cbs);
-        self.spawn_exit_monitor(proc, cbs, started_at);
+        self.spawn_exit_monitor(proc, cbs);
         Ok(())
     }
 
@@ -915,14 +856,8 @@ impl ContainerInstance {
         });
     }
 
-    /// Classify why QEMU ended and apply the restart policy. `on_exit` fires
-    /// on every exit; `will_restart` is true when a respawn follows.
-    fn spawn_exit_monitor(
-        self: &Arc<Self>,
-        proc: Arc<dyn Process>,
-        cbs: Arc<Callbacks>,
-        started_at: tokio::time::Instant,
-    ) {
+    /// Classify why QEMU ended and report it after teardown completes.
+    fn spawn_exit_monitor(self: &Arc<Self>, proc: Arc<dyn Process>, cbs: Arc<Callbacks>) {
         let me = self.clone();
         tokio::spawn(async move {
             let _ = proc
@@ -944,46 +879,7 @@ impl ContainerInstance {
             *me.agent_up.write().await = false;
             *me.started.write().await = false;
             *me.ready.write().await = false;
-
-            // Rapid-failure accounting: a run of at least RAPID_RUN resets
-            // the counter; anything shorter counts one more failure.
-            let failures = if started_at.elapsed() >= RAPID_RUN {
-                me.consecutive_failures.store(0, Ordering::SeqCst);
-                0
-            } else {
-                me.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1
-            };
-
-            let Some(backoff) = should_restart(me.cfg.restart, requested, exit_code, failures)
-            else {
-                (cbs.on_exit)(reason, exit_code, false);
-                return;
-            };
-
-            (cbs.on_exit)(reason, exit_code, true);
-            me.restarts.fetch_add(1, Ordering::SeqCst);
-            tracing::info!(
-                "{}: restarting in {backoff:?} (policy {:?}, exit {exit_code:?})",
-                me.cfg.name,
-                me.cfg.restart
-            );
-            tokio::time::sleep(backoff).await;
-
-            // A stop during the backoff cancels the restart.
-            if *me.stop_requested.read().await {
-                return;
-            }
-            {
-                let mut st = me.state.write().await;
-                if *st != PowerState::Stopped {
-                    return; // someone else already started it
-                }
-                *st = PowerState::Starting;
-            }
-            if let Err(e) = me.clone().start_attempt_boxed(cbs.clone()).await {
-                tracing::warn!("{}: restart failed: {e:#}", me.cfg.name);
-                (cbs.on_exit)(StopReason::Crashed, None, false);
-            }
+            (cbs.on_exit)(reason, exit_code);
         });
     }
 
@@ -1007,13 +903,13 @@ impl ContainerInstance {
 
     /// Graceful stop ladder (PRD §7.2 shape): ctl `stop` (in-guest signal +
     /// grace) → guest-agent shutdown → hard kill, each with a timeout.
-    /// Setting `stop_requested` first also cancels any pending policy
-    /// restart.
+    /// Setting `stop_requested` first tells the exit monitor that shutdown was
+    /// operator-requested.
     async fn stop_ladder(&self, force: bool) -> Result<()> {
         *self.stop_requested.write().await = true;
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
-            return Ok(()); // already stopped (or waiting out a backoff)
+            return Ok(()); // already stopped
         };
         *self.state.write().await = PowerState::Stopping;
 
@@ -1165,7 +1061,7 @@ impl ContainerInstance {
 
     /// Apply an offline snapshot: power off if needed, revert the scratch
     /// disk, stay off (PRD §7.3 restore semantics). The stop sets
-    /// `stop_requested`, so no restart policy fires.
+    /// `stop_requested`, so the exit is classified as requested.
     async fn restore_offline(&self, name: &str) -> Result<()> {
         if self.power_state().await != PowerState::Stopped {
             self.stop_ladder(false).await?;
@@ -1281,9 +1177,7 @@ impl super::machine::Machine for ContainerInstance {
 
     /// Wire this container's NICs into the lab fabric — stream sockets only,
     /// since the micro-VM argv carries no pre-opened descriptors — then boot
-    /// the micro-VM with event-emitting callbacks. Restarts driven by the
-    /// restart policy happen inside the instance; the callbacks fire again on
-    /// each attempt.
+    /// the micro-VM with event-emitting callbacks.
     async fn start(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) -> Result<()> {
         if self.power_state().await != PowerState::Stopped {
             return Ok(());
@@ -1314,24 +1208,21 @@ impl super::machine::Machine for ContainerInstance {
         let n_fwd = self.cfg.name.clone();
         let ready_lab = Arc::clone(&lab);
         self.boot(
-            move |reason, exit_code, will_restart| {
+            move |reason, exit_code| {
                 let payload = serde_json::json!({
                     "container": n_exit,
                     "reason": reason,
                     "exit_code": exit_code,
-                    "restarting": will_restart,
                 });
                 if reason == StopReason::Crashed {
                     events_exit.emit("container.crashed", payload.clone());
                 }
-                if !will_restart {
-                    events_exit.emit("container.stopped", payload);
-                }
+                events_exit.emit("container.stopped", payload);
             },
             move || {
                 events.emit("container.ready", serde_json::json!({"container": n_ready}));
-                // Forwards target the container's lease; (re-)install on every
-                // readiness so restarts keep them pointed right.
+                // Forwards target the container's lease; install them once it
+                // is ready.
                 let lab = Arc::clone(&ready_lab);
                 let n = n_fwd.clone();
                 tokio::spawn(async move { lab.machine_ready(&n).await });
@@ -1469,7 +1360,6 @@ impl super::machine::Machine for ContainerInstance {
             image: self.cfg.image.reference.clone(),
             digest: self.image_digest(),
             health: self.health_verdict().await,
-            restarts: self.restart_count(),
             exit_code: self.last_exit().await,
         })
     }
@@ -1525,7 +1415,6 @@ mod tests {
             cpus: None,
             memory: None,
             depends_on: vec![],
-            restart: RestartPolicy::No,
             nics: vec![],
             env: vec![],
             volumes: vec![],
@@ -1889,47 +1778,6 @@ mod tests {
         assert_eq!(hc.timeout_secs, 2);
         assert_eq!(hc.retries, 3);
         assert_eq!(hc.start_period_secs, 0);
-    }
-
-    // ---- restart policy ------------------------------------------------------
-
-    #[test]
-    fn restart_policy_decision() {
-        use RestartPolicy::*;
-        let s = should_restart;
-
-        // `no` never restarts.
-        assert_eq!(s(No, false, Some(1), 1), None);
-        assert_eq!(s(No, false, Some(0), 0), None);
-
-        // A requested stop never restarts, whatever the policy.
-        assert_eq!(s(Always, true, Some(1), 1), None);
-        assert_eq!(s(OnFailure, true, Some(1), 1), None);
-
-        // `always` restarts on any exit code (including clean).
-        assert!(s(Always, false, Some(0), 1).is_some());
-        assert!(s(Always, false, Some(137), 1).is_some());
-
-        // `on-failure` only on non-zero (or unknown) exits.
-        assert_eq!(s(OnFailure, false, Some(0), 1), None);
-        assert!(s(OnFailure, false, Some(2), 1).is_some());
-        assert!(
-            s(OnFailure, false, None, 1).is_some(),
-            "no ctl exit report = crash = failure"
-        );
-
-        // Exponential backoff: 1s·2ⁿ for the nth consecutive rapid failure.
-        assert_eq!(s(Always, false, Some(1), 1), Some(Duration::from_secs(1)));
-        assert_eq!(s(Always, false, Some(1), 2), Some(Duration::from_secs(2)));
-        assert_eq!(s(Always, false, Some(1), 3), Some(Duration::from_secs(4)));
-        assert_eq!(s(Always, false, Some(1), 4), Some(Duration::from_secs(8)));
-
-        // Gives up after MAX_RAPID_FAILURES consecutive rapid failures.
-        assert_eq!(s(Always, false, Some(1), 5), None);
-        assert_eq!(s(Always, false, Some(1), 6), None);
-
-        // A long run reset the counter (0): restart after the base delay.
-        assert_eq!(s(Always, false, Some(1), 0), Some(Duration::from_secs(1)));
     }
 
     // ---- dirs & volumes -------------------------------------------------------
