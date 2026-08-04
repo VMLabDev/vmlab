@@ -16,7 +16,10 @@ Consult them for prior art only — the PRD overrides anything they did.
 
 ## Status
 
-PRD implemented (M1–M6). Module map under `src/`:
+PRD implemented (M1–M6). **§19 (Dev machines) is specified, not built** —
+the SSH facade, machine-level `login {}`, the agent's `tunnel`/`fileops`/`watch`
+vocabularies and the workspace syncer are all spec only; implementation is
+tracked by #78–#98. Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
   `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005)

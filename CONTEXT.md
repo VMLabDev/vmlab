@@ -67,6 +67,22 @@ The dev machine carrying `@dev(default = true)`, or the only one carrying
 opens it — not per-developer. Which dev machine is *mine* is host-side state
 and deliberately not expressible in `vmlab.wcl`.
 
+**Workspace**:
+A dev machine's source tree: a guest-local working copy on the machine's own
+disk, of a host directory that is canonical. Declared with `@dev(workspace)`,
+kept in step by the **workspace syncer**, and pointedly not a `share {}` —
+a share is virtiofs/SMB passthrough where a workspace is a synced local copy,
+which is why the argument is never spelled bare `guest`. See ADR-0014.
+_Avoid_: source share, bind mount, project directory
+
+**Guest-owned**:
+A path the ignore rules exclude from the workspace. Not *skipped*: the guest is
+expected to hold its own diverging content there — `node_modules` with
+guest-native binaries is the proving case — so neither sync direction ever
+touches it, and it does not survive a rebuild, correctly, because it is
+reconstructible.
+_Avoid_: ignored (that describes the rule, not the path), excluded
+
 ### Capabilities
 
 **Capability**:
@@ -219,12 +235,100 @@ The port-forward rules a lab's machines require, resolved to leases and
 gateways before any is installed.
 
 **SSH facade**:
-The SSH server vmlab terminates on the host, one process per client invocation
-over stdio. Presents an SSH interface with no sshd in the guest: session, exec
-and sftp channels are serviced by vmlab-agent, `direct-tcpip` by an SSH-scoped
-tunnel stream. _Specified by PRD §19; not built yet_ — the term is recorded
+The SSH server vmlab terminates on the host, reached as a stdio `ProxyCommand`
+so nothing listens and no port is leased. Presents an SSH interface with no
+sshd in the guest: `session` channels are serviced by vmlab-agent, SFTP is
+terminated host-side over a **fileops session**, and `direct-tcpip` rides an
+SSH-scoped tunnel stream. It only ever *answers* a channel open, never
+initiates one (ADR-0013), which is why `-R`, agent forwarding and X11 are
+refused. See PRD §19.3 and ADR-0012. _Not built yet_ — the term is recorded
 here because the effort that coined it spans several sessions.
 _Avoid_: sshd, SSH server (implies guest-side), gateway, proxy
+
+**Login**:
+A labelled identity declared on a machine — an account, its secret, and whether
+it is elevated. What a surface attaches *as*, selected by label; the SSH
+username carries the label, never the raw account.
+_Avoid_: user (that is a person, or the guest's OS account), credential (that
+is the secret alone), account (the guest owns those; vmlab owns the login)
+
+**Agent identity**:
+What the guest agent itself runs as — SYSTEM on Windows, root on Linux. The
+floor when no login applies, and what vmlab's own machinery uses on its own
+behalf, *except where it produces the developer's files*. Spelled
+`--user SYSTEM` / `--user root`.
+_Avoid_: system user, service account
+
+**Cached logon**:
+The token minted once per (account, secret, machine) and shared by every channel
+using it: one `LogonId`, one ticket cache, one set of drive mappings. Dies with
+the machine, and is recycled at idle once older than its Kerberos ticket
+lifetime.
+_Avoid_: session (ambiguous with an SSH session or a terminal)
+
+**Fileops session**:
+One agent channel serving file requests as an RPC session: handle-based,
+offset-addressed, pipelined with out-of-order replies, records framed inside the
+channel's own credit window. Opened per SFTP session by the SSH facade and per
+transfer by the console and the workspace syncer; handles are scoped to the
+channel and die with it.
+_Avoid_: file channel (it carries requests, not one file's bytes), SFTP channel
+(SFTP is terminated host-side and never reaches the guest)
+
+**Diverged machine**:
+A running machine whose guest content no longer matches the template it was
+cloned from, because a vmlab verb deliberately changed it in place — today, only
+the agent repair verb. Divergence is always user-initiated and always reported;
+vmlab never diverges a machine on its own, because the template's sealed
+metadata is otherwise the truth about what a clone contains.
+_Avoid_: dirty, modified, patched, drifted (drift implies unnoticed)
+
+**Workspace syncer**:
+The lab-daemon-owned component that keeps a **workspace**'s two copies in step:
+guest changes arrive through the agent's watch, host changes through the host's
+own watcher, and every apply lands temp-then-rename. The one piece of vmlab's
+machinery that runs as the machine's default login rather than the agent
+identity, because its whole output is the developer's own tree.
+_Avoid_: sync daemon, mirror, replication
+
+**Sync ledger**:
+The host-side record of last agreed state per path — content digest, plus each
+side's own size and mtime as a pre-filter. Lives in the lab's `.vmlab/` per
+(machine, workspace) and dies with `destroy`. Each side's mtime is compared only
+against its own recorded value; a host mtime is never compared to a guest one.
+_Avoid_: index, manifest, state file
+
+**Agreed**:
+A path whose two sides matched at a known point, as recorded in the sync ledger.
+A **conflict** is a path where both sides moved since one.
+
+**Sync halt**:
+The workspace-wide, both-directions stop a conflict triggers on one machine,
+naming every conflicting path in the batch. Distinct from a **deferral** — the
+`.git` lock wait and the post-overflow rescan barrier — which is timing and
+clears itself with no developer action.
+_Avoid_: pause, error state, conflict mode
+
+**Dirty set**:
+The guest-side, deduplicated set of paths the agent's watcher has touched since
+the last drain. A set, not a queue: it holds paths, not events, so no platform
+event kind ever crosses the seam. Capped; exceeding the cap collapses the batch
+to a rescan.
+
+**Drain**:
+The host swapping the dirty set out and receiving it as a batch of stat records,
+each the path plus its current kind, size and mtime — or a tombstone. At most
+one outstanding.
+
+**Prune list**:
+Host-computed directory prefixes the guest never registers a watch on — ignored
+directories with no negation reaching below them. The host still decides; the
+guest is handed the answer, never asked the question.
+
+**Watch discontinuity**:
+Any watch (re)open. Identical to the list of stat-walk triggers — first sync,
+ledger loss, overflow, post-restore re-converge — which is why no resync token
+exists.
 
 ### Configuration and surfaces
 
