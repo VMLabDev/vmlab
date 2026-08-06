@@ -35,6 +35,8 @@ nix = { version = "0.31", features = [
     "sched",
     "user",
     "net",
+    "inotify",
+    "poll",
 ] }
 
 [target.'cfg(windows)'.dependencies]

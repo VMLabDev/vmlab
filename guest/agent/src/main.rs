@@ -15,6 +15,7 @@ mod metrics;
 mod mux;
 mod tail;
 mod tunnel;
+mod watch;
 
 #[cfg(test)]
 mod sessions_test;
