@@ -334,7 +334,9 @@ exists.
 
 **Schema projection**:
 The single description of the `vmlab.wcl` schema — every block, field, type,
-optionality, default, doc string, option list, nesting and cardinality —
+optionality, default, doc string, option list, nesting and cardinality, plus
+every decorator the schema declares (where it may be written, how often, and
+its typed arguments) —
 **reflected** from `schema.wcl` rather than restated (`src/config/projection.rs`),
 and read by everything that needs the schema's shape: the designer's forms
 (`src/config/designer.rs`, rendered into `web-ui/src/editor/schema.gen.ts`), the

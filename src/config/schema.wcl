@@ -19,6 +19,12 @@
 // range, and a "exactly one of these fields" rule. They constrain nothing at
 // parse time — `vmlab validate` (PRD §5.1) is still the enforcer — but they put
 // the rule in one place so no surface has to re-type it.
+//
+// Each one declares where it may be written (`@applies_to`). All three
+// annotate this file's own declarations, never a block in a `vmlab.wcl`. None
+// of them names the `block` position. Two things follow: `@options(…)` on a
+// `vm` block is an error, not a no-op; and the designer's inspector offers
+// only the decorators a lab file may carry.
 
 // The exact set of values a stringly-typed field accepts, e.g.
 // `@options(["ovmf", "seabios"]) firmware: utf8?`. A symbol-typed field needs
@@ -30,6 +36,7 @@
 // prose would drop the set from the documentation. It collapses to one copy
 // when the reference reads the projection.
 @decorator("options")
+@applies_to(on = [:type_field])
 type FieldOptions {
   @doc("Every value the validator accepts, in the order a picker should offer them")
   @inline(0) values: list<utf8>
@@ -39,6 +46,7 @@ type FieldOptions {
 // The upper bound is optional: `@range(1)` is a floor alone. On a
 // `std.Duration` field the bounds are whole seconds.
 @decorator("range")
+@applies_to(on = [:type_field])
 type FieldRange {
   @doc("Smallest accepted value (inclusive)")
   @inline(0) min: i64
@@ -50,7 +58,9 @@ type FieldRange {
 // `@one_of(["host", "name"])` on the `volume` block. By default setting more
 // than one is an error too; `exclusive = false` allows the combination, as on
 // `disk`, where `size` and `from` may both appear.
-@decorator("one_of")
+// A block may carry several rules, so the declaration is repeatable.
+@decorator("one_of", repeatable = true)
+@applies_to(on = [:type])
 type RequiredGroup {
   @doc("Field names of which at least one must be set on an instance of the block")
   @inline(0) fields: list<utf8>

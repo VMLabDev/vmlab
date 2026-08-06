@@ -125,6 +125,79 @@ pub struct FormField {
     pub required: bool,
     pub min: Option<i64>,
     pub max: Option<i64>,
+    /// The schema default in WCL source form, when the field declares one.
+    pub default: Option<String>,
+}
+
+/// What a row edits, which decides when the control demands a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Site {
+    /// A field of the block, written `name = value`.
+    BlockField,
+    /// An argument of a decorator on the block, written `@dec(arg = value)`.
+    DecoratorArg,
+}
+
+impl FormField {
+    /// One row, from the schema field plus the presentation the schema cannot
+    /// carry. `None` when the field is a nested block, which no row renders.
+    fn new(
+        field: &Field,
+        site: Site,
+        label: Option<&str>,
+        control: Option<Control>,
+        hint: Option<&str>,
+    ) -> Option<FormField> {
+        let control = control.or_else(|| Control::of(field))?;
+        Some(FormField {
+            key: field.name.clone(),
+            label: label
+                .map(str::to_string)
+                .unwrap_or_else(|| sentence_case(&field.name)),
+            doc: field.doc.clone(),
+            control,
+            options: field.options.clone(),
+            placeholder: hint.map(str::to_string),
+            // A picker only offers "(default)" where leaving the field blank
+            // genuinely leaves it unset. A block field the schema requires,
+            // and one whose default the picker would otherwise let the author
+            // unselect, are both marked required. A decorator argument is
+            // not: the author writes the argument or leaves it out, so an
+            // optional argument stays optional whatever its default (PRD
+            // §19.1 — "a bare `@dev` is a complete, attachable dev machine").
+            required: !field.optional
+                || (site == Site::BlockField
+                    && control == Control::Enum
+                    && field.default.is_some()),
+            min: field.min,
+            max: field.max,
+            default: field.default.clone(),
+        })
+    }
+}
+
+/// One decorator an author may write on a block, as the inspector offers it.
+///
+/// Nothing here is hand-written. A decorator declared in `schema.wcl` with
+/// `@applies_to(on = [:block])` reaches the inspector by that declaration
+/// alone, as a block field reaches a form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DecoratorForm {
+    /// The spelling in the lab file, without the `@`.
+    pub name: String,
+    /// The decorator's doc comment — its help text.
+    pub doc: String,
+    /// The author may write it more than once on one block.
+    pub repeatable: bool,
+    /// One row per declared argument.
+    pub fields: Vec<FormField>,
+}
+
+/// The decorators one block kind offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockDecorators {
+    pub block: String,
+    pub decorators: Vec<DecoratorForm>,
 }
 
 /// One exported form.
@@ -548,31 +621,20 @@ pub fn build(schema: &SchemaProjection, specs: &[FormSpec]) -> Result<Vec<Form>,
                 ));
                 continue;
             };
-            let Some(control) = field_spec.control.or_else(|| Control::of(field)) else {
+            let Some(row) = FormField::new(
+                field,
+                Site::BlockField,
+                field_spec.label,
+                field_spec.control,
+                field_spec.placeholder,
+            ) else {
                 errors.push(format!(
                     "form `{}` names `{}.{}`, which is a nested block, not a form field",
                     spec.export, spec.block, field_spec.field
                 ));
                 continue;
             };
-            fields.push(FormField {
-                key: field.name.clone(),
-                label: field_spec
-                    .label
-                    .map(str::to_string)
-                    .unwrap_or_else(|| sentence_case(&field.name)),
-                doc: field.doc.clone(),
-                control,
-                options: field.options.clone(),
-                placeholder: field_spec.placeholder.map(str::to_string),
-                // A picker only offers "(default)" where leaving the field
-                // blank genuinely leaves it unset — so a field the schema
-                // requires, or one whose default the picker would otherwise
-                // let the author unselect, is marked required.
-                required: !field.optional || (control == Control::Enum && field.default.is_some()),
-                min: field.min,
-                max: field.max,
-            });
+            fields.push(row);
         }
         out.push(Form {
             export: spec.export,
@@ -581,6 +643,52 @@ pub fn build(schema: &SchemaProjection, specs: &[FormSpec]) -> Result<Vec<Form>,
             single: spec.single,
             fields,
         });
+    }
+    if errors.is_empty() {
+        Ok(out)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Every block kind that offers a decorator, with the decorators it offers.
+pub fn decorators() -> Vec<BlockDecorators> {
+    build_decorators(SchemaProjection::get())
+        .expect("the schema's decorators must render as inspector rows")
+}
+
+/// The decorator rows one projection yields. Unlike [`build`], there is no
+/// spec to resolve against: a decorator argument the inspector cannot render
+/// is a schema problem, and is reported rather than dropped.
+pub fn build_decorators(schema: &SchemaProjection) -> Result<Vec<BlockDecorators>, Vec<String>> {
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    for block in &schema.blocks {
+        let mut decorators = Vec::new();
+        for decorator in schema.block_decorators(&block.kind) {
+            let mut fields = Vec::with_capacity(decorator.args.len());
+            for arg in &decorator.args {
+                match FormField::new(arg, Site::DecoratorArg, None, None, None) {
+                    Some(row) => fields.push(row),
+                    None => errors.push(format!(
+                        "decorator `@{}` argument `{}` is not a value a form row can render",
+                        decorator.name, arg.name
+                    )),
+                }
+            }
+            decorators.push(DecoratorForm {
+                name: decorator.name.clone(),
+                doc: decorator.doc.clone(),
+                repeatable: decorator.repeatable,
+                fields,
+            });
+        }
+        if !decorators.is_empty() {
+            out.push(BlockDecorators {
+                block: block.kind.clone(),
+                decorators,
+            });
+        }
     }
     if errors.is_empty() {
         Ok(out)
@@ -607,7 +715,11 @@ fn sentence_case(name: &str) -> String {
 pub const CONSOLE_ARTEFACT: &str = "web-ui/src/editor/schema.gen.ts";
 
 /// Render the form tables the console imports.
-pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
+pub fn render_typescript(
+    schema: &SchemaProjection,
+    forms: &[Form],
+    decorators: &[BlockDecorators],
+) -> String {
     let mut out = String::new();
     out.push_str(
         "// GENERATED — do not edit. Run `just schema-gen` after changing\n\
@@ -718,6 +830,42 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
     }
     out.push_str("};\n\n");
 
+    // The decorators a block may carry, with their arguments as ordinary
+    // rows. The record is empty until `schema.wcl` declares a decorator with
+    // `@applies_to(on = [:block])`; declaring one is all it takes to fill in.
+    out.push_str(
+        "/** A decorator an author may write on a block, with one row per\n\
+         \x20*  declared argument. */\n\
+         export interface DecoratorDesc {\n\
+         \x20 name: string;\n\
+         \x20 /** The decorator declaration's doc comment. */\n\
+         \x20 doc: string;\n\
+         \x20 /** It may be written more than once on one block. */\n\
+         \x20 repeatable: boolean;\n\
+         \x20 fields: FieldDesc[];\n\
+         }\n\n\
+         /** The decorators each block kind accepts, keyed by block kind. */\n\
+         export const BLOCK_DECORATORS: Record<string, DecoratorDesc[]> = {\n",
+    );
+    for entry in decorators {
+        let _ = writeln!(out, "  {:?}: [", entry.block);
+        for decorator in &entry.decorators {
+            let rows = decorator
+                .fields
+                .iter()
+                .map(render_field)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "    {{ name: {:?}, doc: {:?}, repeatable: {}, fields: [{rows}] }},",
+                decorator.name, decorator.doc, decorator.repeatable
+            );
+        }
+        out.push_str("  ],\n");
+    }
+    out.push_str("};\n\n");
+
     // The forms.
     let mut variants: Vec<&Form> = Vec::new();
     for form in forms {
@@ -725,7 +873,6 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
             variants.push(form);
             continue;
         }
-        let block = schema.block(form.block);
         if form.single {
             let _ = write!(
                 out,
@@ -734,7 +881,7 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
                 form.fields.first().map(|f| f.key.as_str()).unwrap_or(""),
                 form.export
             );
-            out.push_str(&render_field(&form.fields[0], block));
+            out.push_str(&render_field(&form.fields[0]));
             out.push_str(";\n\n");
         } else {
             let _ = writeln!(
@@ -743,7 +890,7 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
                 form.block, form.export
             );
             for field in &form.fields {
-                let _ = writeln!(out, "  {},", render_field(field, block));
+                let _ = writeln!(out, "  {},", render_field(field));
             }
             out.push_str("];\n\n");
         }
@@ -762,10 +909,9 @@ pub fn render_typescript(schema: &SchemaProjection, forms: &[Form]) -> String {
             form.block, form.export
         );
         for grouped in variants.iter().filter(|f| f.export == form.export) {
-            let block = schema.block(grouped.block);
             let _ = writeln!(out, "  {}: [", grouped.variant.unwrap_or_default());
             for field in &grouped.fields {
-                let _ = writeln!(out, "    {},", render_field(field, block));
+                let _ = writeln!(out, "    {},", render_field(field));
             }
             out.push_str("  ],\n");
         }
@@ -784,7 +930,7 @@ fn quoted(values: &[String]) -> String {
         .join(", ")
 }
 
-fn render_field(field: &FormField, block: Option<&super::projection::Block>) -> String {
+fn render_field(field: &FormField) -> String {
     let mut parts = vec![
         format!("key: {:?}", field.key),
         format!("label: {:?}", field.label),
@@ -806,10 +952,7 @@ fn render_field(field: &FormField, block: Option<&super::projection::Block>) -> 
     if let Some(max) = field.max {
         parts.push(format!("max: {max}"));
     }
-    if let Some(default) = block
-        .and_then(|b| b.field(&field.key))
-        .and_then(|f| f.default.as_deref())
-    {
+    if let Some(default) = &field.default {
         parts.push(format!("default: {default:?}"));
     }
     format!("{{ {} }}", parts.join(", "))
@@ -971,6 +1114,77 @@ mod tests {
         assert!(errors[0].contains("`widget`"), "{errors:?}");
     }
 
+    /// A decorator declared for a block kind reaches the inspector as rows,
+    /// with no entry in this file: the argument's control, help, options,
+    /// bounds and default are the schema's, exactly as a block field's are.
+    #[test]
+    fn a_declared_decorator_reaches_the_inspector() {
+        const SCHEMA: &str = r#"
+@decorator("options") @applies_to(on = [:type_field])
+type FieldOptions { @inline(0) values: list<utf8> }
+@document type Doc {
+  @children("gizmo") gizmos: list<Gizmo>
+  @children("widget") widgets: list<Widget>
+}
+// Hands the gizmo to a developer.
+@decorator("dev", repeatable = true)
+@applies_to(on = [:block], kinds = ["gizmo"])
+type Dev {
+  @doc("Who to hand it to") @inline(0) owner: utf8
+  @doc("How to reach it") @options(["ssh", "rdp"]) @default("ssh") over: utf8?
+  @doc("Port to reach it on") port: i64?
+}
+@block("gizmo") type Gizmo { @doc("A field") flavour: utf8? }
+@block("widget") type Widget { @doc("A field") size: i64? }
+"#;
+        let schema = SchemaProjection::reflect(SCHEMA, "test.wcl").expect("reflect");
+        let rendered = build_decorators(&schema).expect("the decorator rows resolve");
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|e| e.block.as_str())
+                .collect::<Vec<_>>(),
+            ["gizmo"],
+            "only the kind the declaration names offers it"
+        );
+
+        let dev = &rendered[0].decorators[0];
+        assert_eq!(dev.name, "dev");
+        assert_eq!(dev.doc, "Hands the gizmo to a developer.");
+        assert!(dev.repeatable);
+
+        let owner = &dev.fields[0];
+        assert_eq!(owner.label, "Owner");
+        assert_eq!(owner.doc, "Who to hand it to");
+        assert_eq!(owner.control, Control::Text);
+        assert!(owner.required, "the schema requires it");
+
+        let over = &dev.fields[1];
+        assert_eq!(over.control, Control::Enum);
+        assert_eq!(over.options, ["ssh", "rdp"]);
+        assert_eq!(over.default.as_deref(), Some("\"ssh\""));
+        // An optional argument stays optional, default or no default: the
+        // author may leave it out and write the decorator bare.
+        assert!(!over.required);
+
+        assert_eq!(dev.fields[2].control, Control::Int);
+        assert!(!dev.fields[2].required);
+
+        // And it reaches the console artefact under its block kind.
+        let typescript = render_typescript(&schema, &[], &rendered);
+        assert!(
+            typescript.contains("\"gizmo\": [\n    { name: \"dev\""),
+            "the decorator is missing from the artefact:\n{typescript}"
+        );
+    }
+
+    /// The schema declares no block decorator yet (PRD §19's `@dev` is the
+    /// first), so the console's record is empty rather than wrong.
+    #[test]
+    fn the_schema_declares_no_block_decorator_yet() {
+        assert!(decorators().is_empty());
+    }
+
     #[test]
     fn labels_default_to_the_field_name() {
         assert_eq!(sentence_case("secure_boot"), "Secure boot");
@@ -981,7 +1195,7 @@ mod tests {
     /// Set `VMLAB_BLESS=1` (or run `just schema-gen`) to rewrite it.
     #[test]
     fn console_artefact_is_current() {
-        let rendered = render_typescript(SchemaProjection::get(), &forms());
+        let rendered = render_typescript(SchemaProjection::get(), &forms(), &decorators());
         let path = repo_root().join(CONSOLE_ARTEFACT);
         if std::env::var_os("VMLAB_BLESS").is_some() {
             std::fs::write(&path, &rendered).expect("write the console artefact");

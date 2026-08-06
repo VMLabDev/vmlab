@@ -904,11 +904,10 @@ naming both machines** — the same class as the existing duplicate-static-IP
 rule. `@dev` on a machine whose agent cannot serve an attach is *not* a
 validation error; see §19.4 for why, and where it fails instead.
 
-> **⚠ Prerequisite.** Validated instance decorators are WCL work that landed
-> after the `wcl_lang` revision vmlab currently pins. Bumping the pin — and
-> teaching the schema projection to reflect decorator declarations alongside
-> block fields — is a precondition of implementing §19. It is mechanical, not a
-> decision, but it is the first thing on the list.
+> **✔ Prerequisite, met.** Validated instance decorators were WCL work that
+> landed after the `wcl_lang` revision vmlab pinned. The pin now carries them,
+> and the schema projection reflects decorator declarations alongside block
+> fields, so `@dev` is ordinary schema work.
 
 ### 19.2 Identity — who you are when you attach
 

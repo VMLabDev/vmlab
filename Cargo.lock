@@ -3445,7 +3445,7 @@ dependencies = [
 [[package]]
 name = "wcl_lang"
 version = "0.0.0"
-source = "git+https://github.com/wiltaylor/wcl.git?rev=ecf0390703ef56436fe3074ca098fe6865495a4d#ecf0390703ef56436fe3074ca098fe6865495a4d"
+source = "git+https://github.com/wiltaylor/wcl.git?rev=e9636a2ac10a4f5b1a69c13a2212e35cb5a64e62#e9636a2ac10a4f5b1a69c13a2212e35cb5a64e62"
 dependencies = [
  "miette",
  "serde",

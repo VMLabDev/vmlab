@@ -415,6 +415,114 @@ lab "l" {
         );
     }
 
+    /// A decorator nothing declares is a typo, not an annotation WCL ignores.
+    #[test]
+    fn rejects_an_undeclared_decorator_on_a_block() {
+        let src =
+            "import <vmlab.wcl>\nlab \"x\" {\n  @dev\n  vm \"a\" { template = \"x86_64/t\" }\n}\n";
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        assert!(
+            err.issues
+                .iter()
+                .any(|i| i.message.contains("'dev'") && i.message.contains("@decorator")),
+            "expected the undeclared decorator to be named, got: {:?}",
+            err.issues
+        );
+    }
+
+    /// The schema's own metadata decorators say where they may be written, so
+    /// one of them on a lab block is an error rather than a silent no-op.
+    #[test]
+    fn rejects_a_schema_metadata_decorator_on_a_block() {
+        let src = "import <vmlab.wcl>\nlab \"x\" {\n  @options([\"a\"])\n  vm \"a\" { template = \"x86_64/t\" }\n}\n";
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        assert!(
+            err.issues
+                .iter()
+                .any(|i| i.message.contains("'@options'")
+                    && i.message.contains("'block' position")),
+            "expected a position-applicability error, got: {:?}",
+            err.issues
+        );
+    }
+
+    /// A lab file may declare decorators of its own; a declared decorator's
+    /// arguments are typed, so a wrong-typed or unknown one is an error.
+    #[test]
+    fn rejects_wrong_typed_and_unknown_decorator_arguments() {
+        let declaration =
+            "@decorator(\"dev\")\ntype Dev {\n  @inline(0) owner: utf8\n  port: i64?\n}\n";
+        let wrong_type = format!(
+            "import <vmlab.wcl>\n{declaration}lab \"x\" {{\n  @dev(42)\n  vm \"a\" {{ template = \"x86_64/t\" }}\n}}\n"
+        );
+        let err = load_lab_source(&wrong_type, "<test>", Path::new("/tmp")).unwrap_err();
+        assert!(
+            err.issues
+                .iter()
+                .any(|i| i.message.contains("'owner'") && i.message.contains("utf8")),
+            "expected a typed-argument error, got: {:?}",
+            err.issues
+        );
+
+        let unknown_arg = format!(
+            "import <vmlab.wcl>\n{declaration}lab \"x\" {{\n  @dev(\"wil\", prot = 22)\n  vm \"a\" {{ template = \"x86_64/t\" }}\n}}\n"
+        );
+        let err = load_lab_source(&unknown_arg, "<test>", Path::new("/tmp")).unwrap_err();
+        assert!(
+            err.issues
+                .iter()
+                .any(|i| i.message.contains("'prot'") && i.message.contains("not declared")),
+            "expected an unknown-argument error, got: {:?}",
+            err.issues
+        );
+    }
+
+    /// `@applies_to` narrows a decorator to the block kinds it is meant for,
+    /// and the error points at the decorator rather than at the block.
+    #[test]
+    fn rejects_a_decorator_on_a_block_kind_it_does_not_apply_to() {
+        let src = "import <vmlab.wcl>\n\
+                   @decorator(\"dev\")\n\
+                   @applies_to(on = [:block], kinds = [\"vm\"])\n\
+                   type Dev {}\n\
+                   lab \"x\" {\n  \
+                     @dev\n  \
+                     container \"c\" { image = \"nginx\" }\n\
+                   }\n";
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        let use_site = src.rfind("@dev").expect("the decorator use site");
+        assert!(
+            err.issues.iter().any(|issue| {
+                issue.message.contains("container")
+                    && issue.span.is_some_and(|span| span.offset() == use_site + 1)
+            }),
+            "expected a kind-applicability error spanning the decorator, got: {:?}",
+            err.issues
+        );
+    }
+
+    /// A decorator that is not declared `repeatable` may appear once per node.
+    #[test]
+    fn rejects_a_repeated_at_most_once_decorator() {
+        let src = "import <vmlab.wcl>\n\
+                   @decorator(\"dev\")\n\
+                   @applies_to(on = [:block], kinds = [\"vm\"])\n\
+                   type Dev {}\n\
+                   lab \"x\" {\n  \
+                     @dev\n  \
+                     @dev\n  \
+                     vm \"a\" { template = \"x86_64/t\" }\n\
+                   }\n";
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        assert!(
+            err.issues
+                .iter()
+                .any(|i| i.message.contains("at most once")),
+            "expected a cardinality error, got: {:?}",
+            err.issues
+        );
+    }
+
     #[test]
     fn requires_schema_import() {
         let err = load_lab_source("lab \"x\" {}\n", "<t>", Path::new("/tmp")).unwrap_err();
