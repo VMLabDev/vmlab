@@ -16,8 +16,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use vmlab_agent_proto::{
-    AgentMsg, Frame, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD, NetInterface, OsInfo,
-    PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame,
+    AgentMsg, ErrorCause, Frame, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD, NetInterface,
+    OsInfo, PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame,
 };
 
 /// Host→guest bytes for one session, fed by the reader dispatch and drained
@@ -146,6 +146,17 @@ impl Mux {
         self.send_ctrl(&AgentMsg::Error {
             id,
             msg: msg.into(),
+            cause: None,
+        });
+    }
+
+    /// Fail a channel with a reason the host branches on, not just reports —
+    /// today only a tunnel's connect failure (see [`ErrorCause`]).
+    pub fn send_error_cause(&self, id: Option<u32>, msg: impl Into<String>, cause: ErrorCause) {
+        self.send_ctrl(&AgentMsg::Error {
+            id,
+            msg: msg.into(),
+            cause: Some(cause),
         });
     }
 
@@ -316,6 +327,9 @@ impl Mux {
                 platform.open_exec(self, id, argv, env, cwd)
             }
             HostMsg::Eof { id } => self.route_input(id, Input::Eof),
+            // No platform hook: the dial is portable, and a container
+            // micro-VM shares the guest's network stack anyway.
+            HostMsg::OpenTunnel { id, host, port } => crate::tunnel::open(self, id, host, port),
             HostMsg::OpenFilePush { id, path, mode } => {
                 crate::files::open_push(self, id, platform.resolve_path(path), mode)
             }

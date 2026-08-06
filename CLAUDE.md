@@ -16,10 +16,11 @@ Consult them for prior art only — the PRD overrides anything they did.
 
 ## Status
 
-PRD implemented (M1–M6). **§19 (Dev machines) is specified, not built** —
-the SSH facade, machine-level `login {}`, the agent's `tunnel`/`fileops`/`watch`
+PRD implemented (M1–M6). **§19 (Dev machines) is mostly specified, not built**
+— the SSH facade, machine-level `login {}`, the agent's `fileops`/`watch`
 vocabularies and the workspace syncer are all spec only; implementation is
-tracked by #78–#98. Module map under `src/`:
+tracked by #78–#98. The agent's `tunnel` vocabulary (§19.5) is built (#85).
+Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
   `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005)
@@ -40,7 +41,8 @@ tracked by #78–#98. Module map under `src/`:
 - `agent_asset.rs` + `guest/agent`, `guest/agent-proto` — `vmlab-agent`, the
   in-guest agent on the `vmlab.agent.0` virtio-serial port: interactive
   terminals (PTY/ConPTY), streaming exec, file transfer, tail, metrics,
-  clipboard — no guest network involved. Baked into templates by
+  clipboard, and guest-side TCP tunnels (`tunnel.rs`, §19.5) — only a
+  tunnel's payload touches the guest network. Baked into templates by
   `template/agent_install.rs`; spawned by cinit inside container micro-VMs;
   `labd/vm_agent.rs` is the host-side client; `build-agent.sh` builds the
   per-target binaries (musl + windows-gnu).

@@ -1,6 +1,7 @@
 //! Streaming exec: run an argv with piped stdio bridged to a channel.
 //! stdin = host DATA frames (EOF via the `eof` control), stdout = DATA
-//! frames back, stderr = DATA_ERR frames, exit code via `exited`.
+//! frames back, stderr = DATA_ERR frames, an agent `eof` once both are
+//! drained, exit code via `exited`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -115,6 +116,10 @@ pub fn open(
         done.store(true, Ordering::SeqCst);
         let _ = out_pump.join();
         let _ = err_pump.join();
+        // Both pipes are drained: the channel's guest→host bytes are
+        // complete. A consumer that only wants the output no longer has to
+        // read `exited` to learn that.
+        mux.send_ctrl(&AgentMsg::Eof { id });
         mux.send_ctrl(&AgentMsg::Exited { id, code });
         mux.remove_finished(id);
     });

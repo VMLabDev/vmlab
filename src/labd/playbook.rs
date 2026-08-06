@@ -822,7 +822,9 @@ async fn exec_streaming(
                 return Ok((code, String::from_utf8_lossy(&stdout).into_owned()));
             }
             Some(SessionEvent::Error(msg)) => bail!("`{display}`: {msg}"),
-            Some(SessionEvent::FileDone { .. }) => {}
+            // The exit code is what ends this loop; the output EOF that
+            // precedes it adds nothing here.
+            Some(SessionEvent::Eof) | Some(SessionEvent::FileDone { .. }) => {}
             None => bail!("agent channel closed during `{display}`"),
         }
     }
