@@ -16,6 +16,7 @@ use std::time::Duration;
 use wscript::{Context, Module, Script, ScriptType, Type};
 
 use crate::labd::display::Display;
+use crate::labd::guest_os::GuestOs;
 use crate::labd::lab::LabRuntime;
 use crate::labd::machine::{Machine, MachineKind};
 use crate::labd::vm::PowerState;
@@ -181,6 +182,58 @@ impl From<vision::Match> for ScriptMatch {
             text: String::new(),
         }
     }
+}
+
+/// One identity the machine declares (`m.logins()`, PRD §19.2).
+///
+/// The wscript rung of §19.2's precedence ladder is *reading* as well as
+/// overriding: a provision script creates exactly the account the lab file
+/// declares, rather than the password existing in two places that drift. So
+/// `password` crosses as it was written — `none` where the author declared
+/// none, never an empty string a script would happily pass to `net user`.
+///
+/// `elevated` and `default` cross **resolved**, because a script asking "is
+/// this the default identity" wants the answer vmlab will act on, and a lone
+/// login is the default without saying so.
+#[derive(Script, Clone)]
+#[script(name = "Login")]
+pub struct ScriptLogin {
+    /// What an SSH username selects this identity by.
+    pub label: String,
+    /// The guest account, e.g. `PROBE\dev`.
+    pub user: String,
+    /// The declared secret, or `none` where the author declared none — never
+    /// an empty string a script would pass to `net user` as a password.
+    pub password: Option<String>,
+    /// Whether the session runs elevated. Elevation is Windows-only (§19.2),
+    /// so this is false on a Linux guest, where declaring it is a validation
+    /// error and the session is simply whatever the account is.
+    pub elevated: bool,
+    /// Whether this is the machine's default identity, with the lone-login
+    /// rule applied.
+    pub default: bool,
+}
+
+/// Every declared login of one machine, with §19.2's two implicit rules
+/// applied: a lone login is the default, and an undeclared `elevated`
+/// defaults true on Windows only.
+///
+/// The guest OS decides the elevation default rather than [`Login::elevated`]
+/// doing it alone, or `if login.elevated { … add to Administrators }` would
+/// branch true on every Linux login — for a field §19.2 says cannot exist
+/// there. A written value always survives, whichever guest reads it.
+fn script_logins(logins: &[crate::config::model::Login], os: GuestOs) -> Vec<ScriptLogin> {
+    let default = crate::config::model::default_login(logins);
+    logins
+        .iter()
+        .map(|l| ScriptLogin {
+            label: l.label.clone(),
+            user: l.user.clone(),
+            password: l.password.clone(),
+            elevated: l.elevated.unwrap_or(os == GuestOs::Windows),
+            default: default.is_some_and(|d| std::ptr::eq(d, l)),
+        })
+        .collect()
 }
 
 /// Event payload for handler scripts (PRD §10.4: handlers receive
@@ -879,6 +932,9 @@ pub fn lab_module() -> Module {
                 ))
             },
         )
+        .method("logins", |h: &MachineHandle| -> Vec<ScriptLogin> {
+            script_logins(h.machine.logins(), h.machine.guest_os())
+        })
         .method("stats", |h: &MachineHandle| -> Result<GuestStats, String> {
             h.block(async {
                 let agent = h.machine.agent().await.map_err(estr)?;
@@ -931,7 +987,8 @@ pub fn context() -> Context {
         .register_type::<ScriptMatch>()
         .register_type::<EventData>()
         .register_type::<GuestStats>()
-        .register_type::<DiskStat>();
+        .register_type::<DiskStat>()
+        .register_type::<ScriptLogin>();
     let mut registry = context.registry().clone();
     let Type::Named(machine) = MachineHandle::script_type(&mut registry.defs) else {
         unreachable!("MachineHandle is a nominal wscript type")
@@ -1086,6 +1143,94 @@ fn main(lab: Lab) {
 }
 "#;
         check_script_source(src).expect("screen methods must exist on a container handle");
+    }
+
+    /// §19.2: a provision script reads the machine's declared logins so it
+    /// creates *exactly* the account the lab declares, rather than the
+    /// password existing in two places that drift.
+    #[test]
+    fn declared_logins_are_readable_from_a_script() {
+        let src = r#"
+use vmlab
+
+fn create_accounts(lab: Lab, m: Machine) {
+    for login in m.logins() {
+        let Some(password) = login.password else {
+            lab.log("no secret declared for " + login.user)
+            continue
+        }
+        let r = m.exec("net", ["user", login.user, password, "/add"])
+        if login.default {
+            lab.log(login.label + " is the default identity")
+        }
+        if login.elevated {
+            let g = m.exec("net", ["localgroup", "Administrators", login.user, "/add"])
+        }
+    }
+}
+
+fn main(lab: Lab) {
+    let Ok(dc) = lab.vm("dc01") else { return }
+    create_accounts(lab, dc)
+    let Ok(box) = lab.container("buildbox") else { return }
+    create_accounts(lab, box)
+}
+"#;
+        check_script_source(src).expect("m.logins() must be on every machine handle");
+    }
+
+    /// What crosses to a script: the secret exactly as declared, and the two
+    /// flags resolved the way vmlab will act on them.
+    #[test]
+    fn logins_cross_with_the_implicit_rules_applied() {
+        use crate::config::model::Login;
+        let login = |label: &str, password: Option<&str>, elevated, default| Login {
+            label: label.into(),
+            user: format!("PROBE\\{label}"),
+            password: password.map(str::to_string),
+            elevated,
+            default,
+            span: (0, 0),
+        };
+
+        // A lone login is the default without saying so, and elevation
+        // defaults to true on Windows.
+        let lone = script_logins(
+            &[login("dev", Some("vmlab123!"), None, None)],
+            GuestOs::Windows,
+        );
+        assert!(lone[0].default);
+        assert!(lone[0].elevated);
+        assert_eq!(lone[0].password.as_deref(), Some("vmlab123!"));
+        assert_eq!(lone[0].user, r"PROBE\dev");
+
+        // With more than one, only the marked one is the default.
+        let pair = script_logins(
+            &[
+                login("dev", Some("s"), Some(false), None),
+                login("admin", None, None, Some(true)),
+            ],
+            GuestOs::Windows,
+        );
+        assert!(!pair[0].default);
+        assert!(!pair[0].elevated);
+        assert!(pair[1].default);
+        // An undeclared secret stays undeclared — never an empty string a
+        // script would pass to `net user` as a password.
+        assert!(pair[1].password.is_none());
+
+        // Elevation is Windows-only (§19.2), so a Linux login that never
+        // declared it does not report one — `if login.elevated { … sudoers }`
+        // must not fire for a field the guest cannot have.
+        let linux = script_logins(&[login("dev", None, None, None)], GuestOs::Linux);
+        assert!(!linux[0].elevated);
+        assert!(linux[0].default);
+        // A written value still survives on either guest, so a Windows VM on
+        // an unclassifiable profile is not silently de-elevated.
+        let written = script_logins(&[login("dev", Some("s"), Some(true), None)], GuestOs::Linux);
+        assert!(written[0].elevated);
+
+        assert!(script_logins(&[], GuestOs::Windows).is_empty());
     }
 
     #[test]

@@ -299,6 +299,8 @@ pub struct Vm {
     pub shares: Vec<Share>,
     pub media: Vec<Media>,
     pub web: Vec<WebPage>,
+    /// Declared identities, in declaration order (§19.2).
+    pub logins: Vec<Login>,
     /// Configuration steps for this VM, in declaration order (§10).
     pub provisions: Vec<Provision>,
     pub playbooks: Vec<Playbook>,
@@ -468,6 +470,8 @@ pub struct Container {
     pub ports: Vec<PortMap>,
     pub healthcheck: Option<Healthcheck>,
     pub web: Vec<WebPage>,
+    /// Declared identities, in declaration order (§19.2).
+    pub logins: Vec<Login>,
     /// Configuration steps for this container, in declaration order (§10).
     pub provisions: Vec<Provision>,
     pub playbooks: Vec<Playbook>,
@@ -583,6 +587,53 @@ impl std::fmt::Display for ImageRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.reference)
     }
+}
+
+/// A labelled identity declared on a machine (PRD §19.2): the account a
+/// surface attaches *as*, its secret, and whether the session is elevated.
+///
+/// Declared on the machine and not on the attach, because the SSH facade is a
+/// general capability — an unmarked machine needs an identity too. The secret
+/// is plaintext by decision, not by omission: the account exists because the
+/// lab's own provisioning created it, so the string already sits in the
+/// provision script beside it (§19.2, §1.2).
+#[derive(Debug, Clone)]
+pub struct Login {
+    /// What an SSH username selects this identity by. Carrying the *label*
+    /// rather than the account is what keeps `DOMAIN\user` out of an SSH
+    /// username, and what lets one account be declared twice at different
+    /// elevation.
+    pub label: String,
+    /// The guest account, e.g. `PROBE\dev` or `dev`.
+    pub user: String,
+    /// The account's password. Absent is legal only where a credential-free
+    /// logon exists — never on Windows, where the agent is SYSTEM (§19.2).
+    pub password: Option<String>,
+    /// Whether the session is elevated. `None` is "not declared", which is
+    /// what §19.2's Linux rule is about. Deliberately not resolved here: the
+    /// default is true on Windows and nothing at all on Linux, so only a
+    /// caller that knows the guest family can fold it in.
+    pub elevated: Option<bool>,
+    /// Whether this is the machine's default identity. `None` is "not
+    /// declared"; [`default_login`] folds in the lone-login case.
+    pub default: Option<bool>,
+    pub span: Span,
+}
+
+/// A machine's default identity: the login marked `default = true`, or — where
+/// none is — the only login it declares.
+///
+/// The implicit case matches `@dev`'s shape (§19.1/§19.2): a lone declaration
+/// never has to meet the concept. More than one `default = true` is a §5.1
+/// error, so the first is taken here rather than the ambiguity being repeated.
+pub fn default_login(logins: &[Login]) -> Option<&Login> {
+    logins
+        .iter()
+        .find(|l| l.default == Some(true))
+        .or(match logins {
+            [only] => Some(only),
+            _ => None,
+        })
 }
 
 /// wscript run once during `up`, after the machine that declares it is ready.

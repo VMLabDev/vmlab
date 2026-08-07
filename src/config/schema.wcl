@@ -256,10 +256,36 @@ type Vm {
   @children("media") media: list<Media>
   @doc("HTTP UIs served in the guest, proxied into the web console (require ≥1 NIC)")
   @children("web")   web: list<WebPage>
+  @doc("Identities a surface attaches to this VM as; without one every verb keeps the agent identity")
+  @children("login") logins: list<Login>
   @doc("wscript provision scripts run on `vmlab up` once this VM is ready, interleaved with its playbooks in declaration order")
   @children("provision") provisions: list<Provision>
   @doc("config-weave playbooks applied to this VM on `vmlab up`, interleaved with its provisions in declaration order")
   @children("playbook")  playbooks: list<Playbook>
+}
+
+// A labelled identity on a machine — the account a surface attaches *as*
+// (PRD §19.2). Declared on the machine rather than on the attach, because the
+// SSH facade is a general capability and an unmarked machine needs an identity
+// too. Repeatable: one account may be declared twice at different elevation,
+// and the SSH username selects between them by label.
+//
+// The secret is written in the lab file plainly. The account exists because
+// the lab's own provisioning created it, so the same string is already in the
+// provision script beside it — which is what buys the absence of a credential
+// store, a login verb and a wscript credential API (§19.2, §1.2).
+@block("login")
+type Login {
+  @doc("Identity label — what an SSH username selects it by, e.g. `dev`; unique per machine; the inline block label")
+  @inline(0) label: utf8
+  @doc("Guest account to log on as, e.g. `PROBE\\dev` (required)")
+  user: utf8
+  @doc("The account's password, plainly; required on a Windows-family profile")
+  password: utf8?
+  @doc("Run the session elevated (default true); Windows-only — declaring it on a Linux-family profile is an error")
+  @default(true) elevated: bool?
+  @doc("Make this the machine's default identity; implied when the machine declares exactly one login")
+  default: bool?
 }
 
 @block("nic")
@@ -316,6 +342,8 @@ type Container {
   @children("port")     ports: list<PortMap>
   @doc("Health probe gating readiness; without one the container is ready once its process starts")
   @child("healthcheck") healthcheck: Healthcheck?
+  @doc("Identities a surface attaches to this container as; without one it falls to the user cinit resolves")
+  @children("login")    logins: list<Login>
   @doc("HTTP UIs served in the container, proxied into the web console (require ≥1 NIC)")
   @children("web")      web: list<WebPage>
   @doc("wscript provision scripts run on `vmlab up` once this container is ready, interleaved with its playbooks in declaration order")

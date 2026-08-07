@@ -256,11 +256,20 @@ here because the effort that coined it spans several sessions.
 _Avoid_: sshd, SSH server (implies guest-side), gateway, proxy
 
 **Login**:
-A labelled identity declared on a machine — an account, its secret, and whether
-it is elevated. What a surface attaches *as*, selected by label; the SSH
-username carries the label, never the raw account.
+A labelled identity declared on a machine with a repeatable `login {}` block —
+an account, its secret, and whether it is elevated. What a surface attaches
+*as*, selected by label; the SSH username carries the label, never the raw
+account. Declared on the machine rather than on the attach, because the SSH
+facade is a general capability: an unmarked machine needs an identity too. A
+machine may declare any number, or none — with none, everything falls to the
+**agent identity**.
 _Avoid_: user (that is a person, or the guest's OS account), credential (that
 is the secret alone), account (the guest owns those; vmlab owns the login)
+
+**Default login**:
+The login carrying `default = true`, or — where none does — the only login the
+machine declares. The same implicit-lone rule as the **default dev machine**,
+and for the same reason: a lone declaration never has to meet the concept.
 
 **Agent identity**:
 What the guest agent itself runs as — SYSTEM on Windows, root on Linux. The

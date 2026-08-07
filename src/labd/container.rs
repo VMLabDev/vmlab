@@ -1130,6 +1130,10 @@ impl super::machine::Machine for ContainerInstance {
         &self.cfg.web
     }
 
+    fn logins(&self) -> &[model::Login] {
+        &self.cfg.logins
+    }
+
     fn term_session_sock(&self, id: u32) -> PathBuf {
         self.dirs.term_session_sock(id)
     }
@@ -1421,6 +1425,7 @@ mod tests {
             ports: vec![],
             healthcheck: None,
             web: vec![],
+            logins: vec![],
             provisions: vec![],
             playbooks: vec![],
         }

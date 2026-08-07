@@ -444,6 +444,7 @@ fn bare_vm(arch: &str, profile: Option<&str>) -> Vm {
         shares: Vec::new(),
         media: Vec::new(),
         web: Vec::new(),
+        logins: Vec::new(),
         provisions: Vec::new(),
         playbooks: Vec::new(),
     }
@@ -472,6 +473,7 @@ fn bare_container(profile: Option<&str>) -> Container {
         ports: Vec::new(),
         healthcheck: None,
         web: Vec::new(),
+        logins: Vec::new(),
         provisions: Vec::new(),
         playbooks: Vec::new(),
     }

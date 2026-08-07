@@ -235,6 +235,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             vm.span,
             &mut issues,
         );
+        // The family a VM's logins are judged against is the §5.2 resolved
+        // profile, so a lab that names its profile only on the template still
+        // gets the Windows rules.
+        check_logins(
+            "vm",
+            &vm.name,
+            &vm.logins,
+            login_family(effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref()),
+            &mut issues,
+        );
         for m in &vm.media {
             check_media(&file.root, m, &mut issues);
         }
@@ -354,6 +364,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             &c.web,
             c.nics.is_empty(),
             c.span,
+            &mut issues,
+        );
+        // A container's guest is the OCI image inside a Linux micro-VM, so
+        // its family is fixed regardless of the profile it names — the
+        // `container` profile carries micro-VM size, not a guest OS.
+        check_logins(
+            "container",
+            &c.name,
+            &c.logins,
+            LoginFamily::Linux,
             &mut issues,
         );
 
@@ -758,6 +778,108 @@ impl TemplateLayer {
 
     fn is_known(&self) -> bool {
         !matches!(self, Self::Unknown)
+    }
+}
+
+/// The guest OS family a machine's `login {}` blocks are judged against.
+///
+/// Three-valued where its siblings are two-valued, and deliberately so. Both
+/// of §19.2's family rules are statements about a *known* family — "the agent
+/// is SYSTEM, so a passwordless logon is impossible" and "root is root" — and
+/// neither is a claim vmlab can make about `custom`, whose whole contract is
+/// that nothing is assumed (§5.3), or about a VM whose profile is only
+/// knowable once its registry template is pulled. Those machines are left to
+/// fail loudly at attach time (§19.2) rather than rejected here on a guess.
+///
+/// Not the same question as [`crate::labd::guest_os::guest_os_of`] (which
+/// picks a config-weave binary) or [`crate::smb::guest_os_hint`] (which picks
+/// a share mount command); both answer `Linux` for everything they cannot
+/// place, which is the right default for *doing* something and the wrong one
+/// for *rejecting* something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginFamily {
+    Windows,
+    Linux,
+    /// No profile resolved, or one that names no family.
+    Unknown,
+}
+
+fn login_family(profile: Option<&str>) -> LoginFamily {
+    match profile {
+        Some(p) if p.starts_with("windows") => LoginFamily::Windows,
+        Some(p) if p.starts_with("linux") => LoginFamily::Linux,
+        _ => LoginFamily::Unknown,
+    }
+}
+
+/// §19.2's rules for a machine's identities — the ones WCL's own schema
+/// validation cannot see, because each reads a second declaration: the
+/// machine's resolved profile, or another `login` block beside it. The two
+/// family rules and the one-default rule are §5.1's; the label-uniqueness
+/// rule is the same "unique per machine" guard every other labelled child
+/// block carries, and here it is what keeps the SSH selector addressable.
+fn check_logins(
+    kind: &str,
+    machine: &str,
+    logins: &[Login],
+    family: LoginFamily,
+    issues: &mut IssueList,
+) {
+    let mut labels: HashSet<&str> = HashSet::new();
+    let mut default: Option<&Login> = None;
+    for login in logins {
+        // A Windows agent runs as LocalSystem and mints the logon with
+        // `LogonUser`, so there is no credential-free route to the account —
+        // every one of them is the S4U logon §19.3 already disqualified.
+        if family == LoginFamily::Windows && login.password.is_none() {
+            issues.push(Issue::at(
+                login.span,
+                format!(
+                    "{kind} \"{machine}\": login \"{}\" has no `password` — a Windows guest has no \
+                     credential-free logon (PRD §19.2)",
+                    login.label
+                ),
+            ));
+        }
+        // Elevation is a Windows concept: it selects the linked token. On
+        // Linux root is root, and a non-root user is not elevatable without
+        // sudo — so the field could only be read nowhere.
+        if family == LoginFamily::Linux && login.elevated.is_some() {
+            issues.push(Issue::at(
+                login.span,
+                format!(
+                    "{kind} \"{machine}\": login \"{}\" declares `elevated`, which is Windows-only \
+                     (PRD §19.2)",
+                    login.label
+                ),
+            ));
+        }
+        // The label is the SSH username selector (§19.2), so two of them on
+        // one machine is an identity that cannot be addressed.
+        if !labels.insert(&login.label) {
+            issues.push(Issue::at(
+                login.span,
+                format!(
+                    "{kind} \"{machine}\": duplicate login \"{}\" — the label is what an SSH \
+                     username selects an identity by (PRD §19.2)",
+                    login.label
+                ),
+            ));
+        }
+        if login.default == Some(true) {
+            if let Some(first) = default {
+                issues.push(Issue::at(
+                    login.span,
+                    format!(
+                        "{kind} \"{machine}\": logins \"{}\" and \"{}\" both set `default = true` \
+                         — a machine has one default identity (PRD §19.2)",
+                        first.label, login.label
+                    ),
+                ));
+            } else {
+                default = Some(login);
+            }
+        }
     }
 }
 
@@ -1648,6 +1770,137 @@ lab "l" { vm "a" { template = "x86_64/t" nic { nat = true }
 lab "l" { vm "a" { template = "x86_64/t" nic { nat = true } web "Bad Name" { port = 80 } } }"#,
             "must be a DNS label",
         );
+    }
+
+    /// §19.2's first rule: the Windows agent is LocalSystem and mints the
+    /// logon with a credential, so a passwordless `login` on a Windows-family
+    /// profile has no route to the account at all.
+    #[test]
+    fn a_windows_login_needs_a_password() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-server"
+  login "dev" { user = "PROBE\\dev" } } }"#,
+            "login \"dev\" has no `password`",
+        );
+        // The family resolves through §5.2, so a lab that names its profile
+        // only on the template is judged the same way.
+        let from_template = Hardware::with_meta(TemplateMeta {
+            profile: Some("windows-11".into()),
+            ..blank_meta("x86_64", "t", None)
+        });
+        assert!(
+            hw_errs(
+                &from_template,
+                r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" login "dev" { user = "dev" } } }"#,
+            )
+            .iter()
+            .any(|m| m.contains("has no `password`")),
+            "the template's profile decides the family too"
+        );
+        // A password makes it legal, and nothing else about the login does.
+        assert!(
+            errs(
+                r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-server"
+  login "dev" { user = "PROBE\\dev" password = "vmlab123!" } } }"#
+            )
+            .is_empty(),
+            "a declared secret is all the rule wants"
+        );
+    }
+
+    /// §19.2's second rule. Elevation selects a Windows linked token; on Linux
+    /// root is root, so the field could only be read nowhere.
+    #[test]
+    fn elevated_is_windows_only() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern"
+  login "dev" { user = "dev" elevated = false } } }"#,
+            "declares `elevated`, which is Windows-only",
+        );
+        // A container's guest is Linux whatever profile it names — the
+        // `container` profile is micro-VM size, not a guest OS.
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "nginx:1" profile = "container"
+  login "dev" { user = "dev" elevated = true } } }"#,
+            "container \"c\": login \"dev\" declares `elevated`",
+        );
+        // Its absence is not the error — a Linux login without the field is
+        // ordinary, and needs no password either.
+        assert!(
+            errs(
+                r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern"
+  login "dev" { user = "dev" } } }"#
+            )
+            .is_empty(),
+            "a plain Linux login is legal"
+        );
+    }
+
+    /// §19.2's third rule, which names both offenders — the point of the
+    /// message is to show the author the pair they have to choose between.
+    #[test]
+    fn one_machine_has_one_default_login() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern"
+  login "dev"   { user = "dev"   default = true }
+  login "admin" { user = "admin" default = true } } }"#,
+        );
+        let named = es
+            .iter()
+            .find(|m| m.contains("default = true"))
+            .unwrap_or_else(|| panic!("expected a duplicate-default error, got: {es:#?}"));
+        assert!(named.contains("\"dev\""), "{named}");
+        assert!(named.contains("\"admin\""), "{named}");
+        // One `default = true` among several is the ordinary case.
+        assert!(
+            errs(
+                r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern"
+  login "dev"   { user = "dev" default = true }
+  login "admin" { user = "admin" } } }"#
+            )
+            .is_empty()
+        );
+    }
+
+    /// The label is what an SSH username selects an identity by, so two of
+    /// them on one machine name an identity nothing can address.
+    #[test]
+    fn login_labels_are_unique_per_machine() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern"
+  login "dev" { user = "dev" }
+  login "dev" { user = "root" } } }"#,
+            "duplicate login \"dev\"",
+        );
+    }
+
+    /// Both family rules are claims about a *known* family. A profile that
+    /// names none — `custom`, or a registry template whose profile is not
+    /// knowable until it is pulled — is left to fail loudly at attach time
+    /// (§19.2) rather than rejected here on a guess.
+    #[test]
+    fn an_unclassifiable_profile_triggers_neither_family_rule() {
+        for profile in ["profile = \"custom\"", ""] {
+            let src = format!(
+                r#"import <vmlab.wcl>
+lab "l" {{ vm "a" {{ template = "x86_64/t" {profile}
+  login "dev" {{ user = "dev" elevated = true }} }} }}"#
+            );
+            assert!(
+                errs(&src).is_empty(),
+                "{profile:?} classifies no family, so neither rule may fire: {:#?}",
+                errs(&src)
+            );
+        }
     }
 
     /// Web-page extract issues (port range, defaults, auth method rules)

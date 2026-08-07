@@ -150,6 +150,11 @@ pub trait Machine: Send + Sync + 'static {
     fn nics(&self) -> &[model::Nic];
     fn macs(&self) -> &[MacAddr];
     fn web_pages(&self) -> &[model::WebPage];
+    /// The identities this machine declares (§19.2), in declaration order.
+    /// Reported by the machine and not looked up in the lab file, for the
+    /// same reason [`web_pages`](Machine::web_pages) is: a caller holding a
+    /// machine has everything about it.
+    fn logins(&self) -> &[model::Login];
     /// Host socket re-exposing one agent terminal session as a raw byte pipe.
     fn term_session_sock(&self, id: u32) -> PathBuf;
 

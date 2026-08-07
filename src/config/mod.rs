@@ -373,6 +373,98 @@ lab "l" {
         assert!(db.healthcheck.is_none());
     }
 
+    /// §19.2: identity is machine-level, so `login {}` reads the same on a VM
+    /// and on a container, and a machine may declare several.
+    #[test]
+    fn login_blocks_extract_on_both_machine_kinds() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  vm "dev01" {
+    template = "x86_64/t"
+    login "dev"   { user = "PROBE\\dev"   password = "vmlab123!" default = true }
+    login "admin" { user = "PROBE\\admin" password = "vmlab123!" elevated = false }
+  }
+  container "buildbox" {
+    image = "sdk:9.0"
+    login "dev" { user = "dev" }
+  }
+}
+"#;
+        let lf = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap();
+        let vm = &lf.lab.vms[0];
+        assert_eq!(vm.logins.len(), 2);
+        assert_eq!(vm.logins[0].label, "dev");
+        assert_eq!(vm.logins[0].user, r"PROBE\dev");
+        assert_eq!(vm.logins[0].password.as_deref(), Some("vmlab123!"));
+        assert_eq!(vm.logins[0].default, Some(true));
+        // Unwritten `elevated` stays unwritten in the model: §19.2's Linux
+        // rule is about the field being declared, not about its value, and
+        // the default it would take depends on the guest family.
+        assert_eq!(vm.logins[0].elevated, None);
+        assert_eq!(vm.logins[1].elevated, Some(false));
+        assert!(vm.logins[1].password.is_some());
+
+        let container = &lf.lab.containers[0];
+        assert_eq!(container.logins.len(), 1);
+        assert_eq!(container.logins[0].user, "dev");
+        assert!(container.logins[0].password.is_none());
+        assert_eq!(container.logins[0].default, None);
+    }
+
+    /// §19.2: "a lone `login {}` is the default implicitly, matching `@dev`'s
+    /// shape" — so a single declaration never has to meet the concept.
+    #[test]
+    fn a_lone_login_is_the_default_without_saying_so() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  vm "one" { template = "x86_64/t"  login "dev" { user = "dev" } }
+  vm "two" {
+    template = "x86_64/t"
+    login "dev"   { user = "dev" }
+    login "admin" { user = "admin" default = true }
+  }
+  vm "none" { template = "x86_64/t" }
+}
+"#;
+        let lf = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap();
+        let vms = &lf.lab.vms;
+        assert_eq!(
+            default_login(&vms[0].logins).map(|l| l.label.as_str()),
+            Some("dev")
+        );
+        assert_eq!(
+            default_login(&vms[1].logins).map(|l| l.label.as_str()),
+            Some("admin")
+        );
+        assert!(default_login(&vms[2].logins).is_none());
+    }
+
+    /// The label is the SSH username selector (§19.2), so it is required —
+    /// an unlabelled `login {}` is not a nameless identity, it is a mistake.
+    #[test]
+    fn a_login_needs_a_label_and_a_user() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t"  login { user = "dev" } }
+  vm "b" { template = "x86_64/t"  login "dev" { } }
+}
+"#;
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        let messages: Vec<&str> = err.issues.iter().map(|i| i.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("`login` requires a name label")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("missing required field `user`")),
+            "{messages:?}"
+        );
+    }
+
     #[test]
     fn rejects_unknown_attributes() {
         let src = "import <vmlab.wcl>\nlab \"x\" {\n  vm \"a\" { template = \"x86_64/t\" bogus_attr = 1 }\n}\n";

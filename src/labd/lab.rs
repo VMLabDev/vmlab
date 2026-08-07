@@ -2073,6 +2073,9 @@ mod tests {
         fn web_pages(&self) -> &[crate::config::model::WebPage] {
             &[]
         }
+        fn logins(&self) -> &[crate::config::model::Login] {
+            &[]
+        }
         fn term_session_sock(&self, _id: u32) -> PathBuf {
             self.dir.join("term.sock")
         }
