@@ -35,8 +35,8 @@ use vmlab_agent_proto::{
 use crate::logon::Held;
 use crate::mux::Mux;
 use crate::spawn::{
-    Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile, adopt_as_agent,
-    create_file_directly, hold_until_it_exits, piped_command,
+    Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, adopt_as_agent,
+    hold_until_it_exits, piped_command,
 };
 
 use login::{Account, Credentials, Logins, Mechanism, Session};
@@ -275,7 +275,7 @@ impl crate::mux::Platform for LinuxPlatform {
         let mut f = vec![
             features::TERMINAL.to_string(),
             features::EXEC.to_string(),
-            features::FILE.to_string(),
+            features::FILEOPS.to_string(),
             features::TAIL.to_string(),
             features::METRICS.to_string(),
             features::TUNNEL.to_string(),
@@ -291,10 +291,13 @@ impl crate::mux::Platform for LinuxPlatform {
         &self.spawner
     }
 
-    fn resolve_path(&self, path: String) -> String {
+    fn path_resolver(&self) -> crate::mux::PathResolver {
         match &self.container {
-            None => path,
-            Some(ctx) => format!("{}/{}", ctx.rootfs, path.trim_start_matches('/')),
+            None => Arc::new(|path| path),
+            Some(ctx) => {
+                let rootfs = ctx.rootfs.clone();
+                Arc::new(move |path: String| format!("{rootfs}/{}", path.trim_start_matches('/')))
+            }
         }
     }
 
@@ -642,18 +645,6 @@ impl Spawner for LinuxSpawner {
         let held = self.logins.resolve(identity)?;
         let plan = self.exec_plan(&self.route(&held), spec)?;
         Ok(hold_until_it_exits(spawn_piped(plan)?, held))
-    }
-
-    fn create_file(&self, identity: &Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
-        // Creating the file *as* the session is what gives the developer's
-        // files the developer's owner — the whole argument of §19.2's
-        // exception, and the reason `.git` objects do not end up owned by a
-        // principal the user is not.
-        let held = self.logins.resolve(identity)?;
-        match owner(&self.route(&held)) {
-            Some(account) => login::create_file_as(path, account),
-            None => create_file_directly(path),
-        }
     }
 
     fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter> {

@@ -5,10 +5,13 @@
 #![cfg(test)]
 #![cfg(unix)]
 
+use vmlab_agent_proto::fileops::{ErrorCode, Op, OpenFlags, Reply};
+use vmlab_agent_proto::watch::EntryKind;
 use vmlab_agent_proto::{AgentMsg, HostMsg};
 
+use crate::fileops::hex;
 use crate::mux::{Input, Mux, Platform};
-use crate::testutil::capture_mux;
+use crate::testutil::{ask, ask_with, capture_mux};
 
 fn platform() -> impl Platform {
     crate::platform_impl::new_platform()
@@ -164,87 +167,403 @@ fn exec_missing_binary_reports_error() {
     }
 }
 
+/// The whole push shape over the new vocabulary: open, write at offsets,
+/// close, then ask the guest for its own digest of what landed — which is
+/// the verification the retired whole-file transfer offered, kept (§19.5).
 #[test]
-fn file_push_writes_bytes_mode_and_digest() {
+fn fileops_writes_at_offsets_applies_the_mode_and_digests_what_landed() {
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub/dir")).unwrap();
     let path = dir.path().join("sub/dir/pushed.bin");
     let (mux, mut cap) = capture_mux();
     let p = platform();
-    let payload = vec![0xabu8; 200_000];
-    open(
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+
+    open(&mux, &p, HostMsg::OpenFileOps { id: 6, logon: None });
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 6 });
+
+    ask(
         &mux,
-        &p,
-        HostMsg::OpenFilePush {
-            id: 6,
+        6,
+        1,
+        Op::Open {
             path: path.to_str().unwrap().into(),
+            flags: OpenFlags::create_truncate(),
             mode: Some(0o750),
         },
     );
-    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 6 });
-    for chunk in payload.chunks(60_000) {
-        mux.route_input(6, Input::Bytes(chunk.to_vec()));
+    let (reply, _) = cap.fileops(6);
+    let Reply::Handle { handle } = reply.reply else {
+        panic!("expected a handle, got {reply:?}");
+    };
+    assert_eq!(reply.id, 1);
+
+    // Offset-addressed: the chunks go out back to back without waiting, and
+    // the file is assembled from where each one says it belongs.
+    let chunks: Vec<&[u8]> = payload.chunks(64 * 1024).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        ask_with(
+            &mux,
+            6,
+            100 + i as u64,
+            Op::Write {
+                handle,
+                offset: (i * 64 * 1024) as u64,
+            },
+            chunk,
+        );
     }
-    mux.route_input(6, Input::Eof);
-    let (_, sha, len) = cap.until_file_done(6);
-    assert_eq!(len, payload.len() as u64);
-    assert_eq!(sha, crate::files::hex(&Sha256::digest(&payload)));
+    let mut acked: Vec<u64> = Vec::new();
+    while acked.len() < chunks.len() {
+        let (reply, _) = cap.fileops(6);
+        assert_eq!(reply.reply, Reply::Ok, "write {} failed", reply.id);
+        acked.push(reply.id);
+    }
+    acked.sort_unstable();
+    assert_eq!(acked, (100..100 + chunks.len() as u64).collect::<Vec<_>>());
+
+    ask(&mux, 6, 2, Op::Close { handle });
+    assert_eq!(cap.fileops(6).0.reply, Reply::Ok);
+
+    ask(
+        &mux,
+        6,
+        3,
+        Op::Digest {
+            path: path.to_str().unwrap().into(),
+        },
+    );
+    let (reply, _) = cap.fileops(6);
+    assert_eq!(
+        reply.reply,
+        Reply::Digest {
+            sha256: hex(&Sha256::digest(&payload)),
+            len: payload.len() as u64,
+        }
+    );
+
     assert_eq!(std::fs::read(&path).unwrap(), payload);
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o750);
 }
 
+/// The pull shape: read at offsets until a short read says end-of-file, with
+/// the bytes riding raw beside the metadata rather than inflated inside it.
 #[test]
-fn file_pull_streams_bytes_and_digest() {
-    use sha2::{Digest, Sha256};
+fn fileops_reads_at_offsets_until_a_short_read_ends_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pulled.bin");
     let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(&path, &payload).unwrap();
     let (mux, mut cap) = capture_mux();
     let p = platform();
-    open(
-        &mux,
-        &p,
-        HostMsg::OpenFilePull {
-            id: 7,
-            path: path.to_str().unwrap().into(),
-        },
-    );
+
+    open(&mux, &p, HostMsg::OpenFileOps { id: 7, logon: None });
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 7 });
-    // The payload exceeds the initial window: grant more while the transfer
-    // runs, exercising the credit path.
+    // The payload exceeds the initial window: grant more while the reads run,
+    // exercising the credit path a record is chunked into.
     let mux2 = mux.clone();
     let granter = std::thread::spawn(move || {
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
             mux2.grant(7, 64 * 1024);
         }
     });
-    let (data, sha, len) = cap.until_file_done(7);
+
+    ask(
+        &mux,
+        7,
+        1,
+        Op::Open {
+            path: path.to_str().unwrap().into(),
+            flags: OpenFlags::read(),
+            mode: None,
+        },
+    );
+    let Reply::Handle { handle } = cap.fileops(7).0.reply else {
+        panic!("expected a handle");
+    };
+
+    let mut got = Vec::new();
+    let mut id = 2;
+    loop {
+        ask(
+            &mux,
+            7,
+            id,
+            Op::Read {
+                handle,
+                offset: got.len() as u64,
+                len: 64 * 1024,
+            },
+        );
+        let (reply, bytes) = cap.fileops(7);
+        assert_eq!(reply.id, id);
+        assert_eq!(reply.reply, Reply::Data);
+        if bytes.is_empty() {
+            break;
+        }
+        got.extend(bytes);
+        id += 1;
+    }
     granter.join().unwrap();
-    assert_eq!(len, payload.len() as u64);
-    assert_eq!(data, payload);
-    assert_eq!(sha, crate::files::hex(&Sha256::digest(&payload)));
+    assert_eq!(got, payload);
 }
 
+/// A failed operation is a reply, not a dead channel: the session that asked
+/// for a file that is not there keeps going and its next request works.
 #[test]
-fn file_pull_missing_file_reports_error() {
+fn a_failed_operation_answers_a_coded_error_and_the_session_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(&mux, &p, HostMsg::OpenFileOps { id: 8, logon: None });
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 8 });
+
+    ask(
+        &mux,
+        8,
+        1,
+        Op::Open {
+            path: "/no/such/file".into(),
+            flags: OpenFlags::read(),
+            mode: None,
+        },
+    );
+    let (reply, _) = cap.fileops(8);
+    assert_eq!(reply.id, 1);
+    match reply.reply {
+        Reply::Error { code, msg } => {
+            assert_eq!(code, ErrorCode::NoSuchFile);
+            assert!(msg.contains("/no/such/file"), "{msg}");
+        }
+        other => panic!("expected a coded error, got {other:?}"),
+    }
+
+    // A read past the record cap is refused rather than quietly cut short,
+    // because a short answer is how end-of-file is spelled.
+    std::fs::write(dir.path().join("f"), b"xyz").unwrap();
+    ask(
+        &mux,
+        8,
+        10,
+        Op::Open {
+            path: dir.path().join("f").to_str().unwrap().into(),
+            flags: OpenFlags::read(),
+            mode: None,
+        },
+    );
+    let Reply::Handle { handle } = cap.fileops(8).0.reply else {
+        panic!("expected a handle");
+    };
+    ask(
+        &mux,
+        8,
+        11,
+        Op::Read {
+            handle,
+            offset: 0,
+            len: vmlab_agent_proto::fileops::MAX_DATA as u32 + 1,
+        },
+    );
+    match cap.fileops(8).0.reply {
+        Reply::Error { code, msg } => {
+            assert_eq!(code, ErrorCode::Failure);
+            assert!(msg.contains("record cap"), "{msg}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // A handle this channel never handed out is refused the same way.
+    ask(&mux, 8, 2, Op::Close { handle: 99 });
+    let (reply, _) = cap.fileops(8);
+    assert!(matches!(
+        reply.reply,
+        Reply::Error {
+            code: ErrorCode::BadHandle,
+            ..
+        }
+    ));
+
+    // And the session is still good.
+    ask(
+        &mux,
+        8,
+        3,
+        Op::Stat {
+            path: dir.path().to_str().unwrap().into(),
+        },
+    );
+    let (reply, _) = cap.fileops(8);
+    match reply.reply {
+        Reply::Attrs { attrs } => assert_eq!(attrs.kind, EntryKind::Dir),
+        other => panic!("expected attrs, got {other:?}"),
+    }
+}
+
+/// The directory half a tree push and the syncer both need: `mkdir` with its
+/// case-sensitivity flag, `opendir`/`readdir`, `rename`, `remove`, `rmdir`
+/// and `realpath`.
+#[test]
+fn fileops_serves_the_directory_vocabulary() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(&mux, &p, HostMsg::OpenFileOps { id: 9, logon: None });
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 9 });
+
+    // A Linux directory is case-sensitive by construction, so the flag is
+    // satisfied rather than refused.
+    ask(
+        &mux,
+        9,
+        1,
+        Op::Mkdir {
+            path: format!("{root}/src"),
+            mode: Some(0o755),
+            case_sensitive: true,
+        },
+    );
+    assert_eq!(cap.fileops(9).0.reply, Reply::Ok);
+    std::fs::write(dir.path().join("src/a.rs"), "fn main() {}").unwrap();
+
+    ask(
+        &mux,
+        9,
+        2,
+        Op::OpenDir {
+            path: format!("{root}/src"),
+        },
+    );
+    let Reply::Handle { handle } = cap.fileops(9).0.reply else {
+        panic!("expected a handle");
+    };
+    ask(&mux, 9, 3, Op::ReadDir { handle });
+    match cap.fileops(9).0.reply {
+        Reply::Entries { entries, eof } => {
+            assert!(eof);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, "a.rs");
+            assert_eq!(entries[0].attrs.size, 12);
+        }
+        other => panic!("expected entries, got {other:?}"),
+    }
+    ask(&mux, 9, 4, Op::Close { handle });
+    assert_eq!(cap.fileops(9).0.reply, Reply::Ok);
+
+    ask(
+        &mux,
+        9,
+        5,
+        Op::Rename {
+            from: format!("{root}/src/a.rs"),
+            to: format!("{root}/src/b.rs"),
+        },
+    );
+    assert_eq!(cap.fileops(9).0.reply, Reply::Ok);
+
+    ask(
+        &mux,
+        9,
+        6,
+        Op::Realpath {
+            path: format!("{root}/src/../src/b.rs"),
+        },
+    );
+    match cap.fileops(9).0.reply {
+        // The tempdir may itself sit behind a symlink, so what matters is
+        // that the `..` is gone rather than the exact prefix.
+        Reply::Name { path } => assert!(path.ends_with("/src/b.rs"), "{path}"),
+        other => panic!("expected a name, got {other:?}"),
+    }
+
+    ask(
+        &mux,
+        9,
+        7,
+        Op::Remove {
+            path: format!("{root}/src/b.rs"),
+        },
+    );
+    assert_eq!(cap.fileops(9).0.reply, Reply::Ok);
+    ask(
+        &mux,
+        9,
+        8,
+        Op::Rmdir {
+            path: format!("{root}/src"),
+        },
+    );
+    assert_eq!(cap.fileops(9).0.reply, Reply::Ok);
+    assert!(!dir.path().join("src").exists());
+}
+
+/// Handles are scoped to the channel and die with it: after a `close` the
+/// session's files are released, so a guest is never left holding handles a
+/// host has forgotten.
+#[test]
+fn closing_the_channel_releases_every_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("held.bin");
+    std::fs::write(&path, b"held").unwrap();
     let (mux, mut cap) = capture_mux();
     let p = platform();
     open(
         &mux,
         &p,
-        HostMsg::OpenFilePull {
-            id: 8,
-            path: "/no/such/file".into(),
+        HostMsg::OpenFileOps {
+            id: 10,
+            logon: None,
         },
     );
-    match cap.ctrl() {
-        AgentMsg::Error { id: Some(8), .. } => {}
-        other => panic!("expected error, got {other:?}"),
-    }
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 10 });
+    ask(
+        &mux,
+        10,
+        1,
+        Op::Open {
+            path: path.to_str().unwrap().into(),
+            flags: OpenFlags::read(),
+            mode: None,
+        },
+    );
+    let Reply::Handle { handle } = cap.fileops(10).0.reply else {
+        panic!("expected a handle");
+    };
+
+    mux.remove(10);
+
+    // A second session starts its handle table from nothing, so the first
+    // session's handle means nothing in it.
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenFileOps {
+            id: 11,
+            logon: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 11 });
+    ask(
+        &mux,
+        11,
+        1,
+        Op::Read {
+            handle,
+            offset: 0,
+            len: 4,
+        },
+    );
+    assert!(matches!(
+        cap.fileops(11).0.reply,
+        Reply::Error {
+            code: ErrorCode::BadHandle,
+            ..
+        }
+    ));
 }
 
 #[test]

@@ -1,5 +1,5 @@
 //! The wire contract between the vmlab host and `vmlab-agent`, the in-guest
-//! agent that serves interactive terminals, streaming exec, file transfer,
+//! agent that serves interactive terminals, streaming exec, file operations,
 //! tailing, metrics, clipboard and TCP tunnels over **one** virtio-serial
 //! port (`vmlab.agent.0`) — the agent's own traffic never touches the guest
 //! network, though a tunnel's payload does by definition.
@@ -29,6 +29,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod fileops;
 pub mod watch;
 
 /// Version of this contract. The agent reports it in [`AgentMsg::Hello`]; the
@@ -57,7 +58,12 @@ pub const WINDOW_REPLENISH: u64 = INITIAL_WINDOW / 2;
 pub mod features {
     pub const TERMINAL: &str = "terminal";
     pub const EXEC: &str = "exec";
-    pub const FILE: &str = "file";
+    /// The handle-based, offset-addressed file RPC session
+    /// ([`HostMsg::OpenFileOps`], [`crate::fileops`], PRD §19.5). It replaced
+    /// the whole-file `file` vocabulary outright: an agent that predates it
+    /// fails through this capability path, which is why `PROTO_VERSION` did
+    /// not need to move.
+    pub const FILEOPS: &str = "fileops";
     pub const TAIL: &str = "tail";
     pub const METRICS: &str = "metrics";
     pub const CLIPBOARD: &str = "clipboard";
@@ -145,8 +151,8 @@ const HEADER_LEN: usize = 4 + 4 + 1 + 4;
 pub enum FrameKind {
     /// JSON [`HostMsg`] / [`AgentMsg`] on channel 0.
     Ctrl,
-    /// Channel byte stream (PTY bytes, exec stdin/stdout, file bytes, tail
-    /// output).
+    /// Channel byte stream (PTY bytes, exec stdin/stdout, tail output, and
+    /// the framed records a [`fileops`] or [`watch`] channel carries).
     Data,
     /// Exec stderr (same channel id as the exec's stdout).
     DataErr,
@@ -370,9 +376,9 @@ pub enum HostMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         logon: Option<Logon>,
     },
-    /// No more host->guest bytes on this channel (exec stdin EOF; end of a
-    /// pushed file's bytes; a tunnel's host side shutting down its write
-    /// half — see [`AgentMsg::Eof`] for the other direction).
+    /// No more host->guest bytes on this channel (exec stdin EOF; a tunnel's
+    /// host side shutting down its write half — see [`AgentMsg::Eof`] for the
+    /// other direction).
     Eof {
         id: u32,
     },
@@ -400,20 +406,23 @@ pub enum HostMsg {
         host: String,
         port: u16,
     },
-    /// Receive a file: host streams DATA frames, then [`HostMsg::Eof`]; the
-    /// agent writes `path` (mode is Unix permission bits, ignored on
-    /// Windows) and replies [`AgentMsg::FileDone`].
-    OpenFilePush {
+    /// Open a file **RPC session** on channel `id`: the channel then carries
+    /// length-prefixed [`fileops`] records — JSON metadata with raw bytes
+    /// appended for a read or a write — under the usual credit window.
+    ///
+    /// One file vocabulary, not two. The whole-file, path-addressed pair this
+    /// replaced could not express a client that opens once and writes 400
+    /// times, and the syncer (§19.6) needs `stat`, mtimes and offset writes,
+    /// so keeping both would have made every consumer choose and made the
+    /// third straddle them. Handles are scoped to this channel and die with
+    /// it.
+    ///
+    /// `logon` is whose files these are; absent is the agent identity
+    /// (§19.2's floor).
+    OpenFileOps {
         id: u32,
-        path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        mode: Option<u32>,
-    },
-    /// Send a file: the agent streams `path` as DATA frames and finishes
-    /// with [`AgentMsg::FileDone`].
-    OpenFilePull {
-        id: u32,
-        path: String,
+        logon: Option<Logon>,
     },
     /// Follow a file (like `tail -F`): existing tail then live appends as
     /// DATA frames until closed. Survives rotation/truncation.
@@ -483,8 +492,9 @@ pub enum HostMsg {
         id: u32,
         bytes: u64,
     },
-    /// Tear down a channel (kills the terminal/exec process, stops a
-    /// tail/transfer). The agent must not send further frames for `id`.
+    /// Tear down a channel (kills the terminal/exec process, stops a tail,
+    /// releases a file session's handles). The agent must not send further
+    /// frames for `id`.
     Close {
         id: u32,
     },
@@ -505,7 +515,7 @@ pub enum AgentMsg {
         token: String,
     },
     /// A channel opened by the host is live (terminal spawned, exec started,
-    /// file opened, tail/eventlog following).
+    /// file session ready, tail/eventlog following).
     Opened {
         id: u32,
     },
@@ -526,13 +536,6 @@ pub enum AgentMsg {
     /// initiates a stream (ADR-0013).
     Eof {
         id: u32,
-    },
-    /// A file transfer completed (both directions). `sha256` is the hex
-    /// digest of the bytes written/read so the host can verify.
-    FileDone {
-        id: u32,
-        sha256: String,
-        len: u64,
     },
     /// Periodic sample after [`HostMsg::SubscribeMetrics`].
     Metrics {
@@ -815,14 +818,14 @@ mod tests {
                 host: "registry.internal".into(),
                 port: 5000,
             },
-            HostMsg::OpenFilePush {
-                id: 4,
-                path: "/etc/motd".into(),
-                mode: Some(0o644),
-            },
-            HostMsg::OpenFilePull {
+            HostMsg::OpenFileOps { id: 4, logon: None },
+            HostMsg::OpenFileOps {
                 id: 5,
-                path: "C:\\log.txt".into(),
+                logon: Some(Logon {
+                    user: "dev".into(),
+                    secret: "hunter2".into(),
+                    elevated: false,
+                }),
             },
             HostMsg::OpenTail {
                 id: 6,
@@ -871,11 +874,6 @@ mod tests {
             AgentMsg::Opened { id: 1 },
             AgentMsg::Eof { id: 10 },
             AgentMsg::Exited { id: 1, code: 130 },
-            AgentMsg::FileDone {
-                id: 4,
-                sha256: "ab".repeat(32),
-                len: 1 << 30,
-            },
             AgentMsg::Metrics {
                 cpu_pct: 12.5,
                 mem_used: 1 << 30,
@@ -1051,6 +1049,20 @@ mod tests {
             })
             .unwrap(),
             r#"{"cmd":"open_exec","id":3,"argv":["whoami"],"env":[],"logon":{"user":"PROBE\\dev","secret":"vmlab123!","elevated":true}}"#
+        );
+        // §19.2's "everything a person invokes": a file session is one of the
+        // four opens that carry the triple, and it carries nothing else.
+        assert_eq!(
+            serde_json::to_string(&HostMsg::OpenFileOps {
+                id: 4,
+                logon: Some(Logon {
+                    user: "dev".into(),
+                    secret: "hunter2".into(),
+                    elevated: false,
+                }),
+            })
+            .unwrap(),
+            r#"{"cmd":"open_file_ops","id":4,"logon":{"user":"dev","secret":"hunter2","elevated":false}}"#
         );
         // An open from a host that predates the field is the agent identity,
         // not a parse error.

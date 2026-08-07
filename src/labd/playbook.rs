@@ -826,7 +826,7 @@ async fn exec_streaming(
             Some(SessionEvent::Error(msg)) => bail!("`{display}`: {msg}"),
             // The exit code is what ends this loop; the output EOF that
             // precedes it adds nothing here.
-            Some(SessionEvent::Eof) | Some(SessionEvent::FileDone { .. }) => {}
+            Some(SessionEvent::Eof) => {}
             None => bail!("agent channel closed during `{display}`"),
         }
     }

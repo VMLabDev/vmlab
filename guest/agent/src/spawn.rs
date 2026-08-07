@@ -3,8 +3,13 @@
 //! The agent used to create processes in three unrelated places: the
 //! interactive terminal, streaming exec, and the file push. Each did its own
 //! creation, on each of the two guest targets. PRD §19.2 makes *who a
-//! process runs as* a per-channel decision, so all three funnel here — one
-//! call, taking an [`Identity`] and returning a running process.
+//! process runs as* a per-channel decision, so both process shapes funnel
+//! here — one call, taking an [`Identity`] and returning a running process.
+//!
+//! The file half is [`Spawner::adopter`] rather than a handle factory: a
+//! `fileops` session opens, reads, writes, stats and renames for as long as
+//! its channel lives (§19.5), so what it needs from the seam is the identity
+//! itself, lent to the thread doing the work.
 //!
 //! The returned handles are the seam's own types, not the platform's, so an
 //! adapter can be entirely in-memory (ADR-0015, which follows ADR-0001).
@@ -82,20 +87,17 @@ pub struct Spawned {
     pub wait: Box<dyn FnOnce() -> i32 + Send>,
 }
 
-/// A file the seam opened for writing.
-pub trait WriteFile: Write + Send {
-    /// Apply the host-requested POSIX mode to the file. A no-op on Windows,
-    /// where the wire's `mode` has no meaning.
-    fn set_mode(&self, mode: u32);
-}
-
 /// An identity lent to the calling thread, released when dropped.
 ///
-/// Reads are the one shape the seam cannot hand a handle back for: `tail`
-/// reopens its file across rotation, so a single opened handle would not
-/// carry the identity far enough. The seam lends the identity to the thread
-/// instead — Windows impersonates the logon, and every open the thread makes
-/// while the guard lives is that user's.
+/// A handle is the one shape the seam cannot hand back: `tail` reopens its
+/// file across rotation, and a `fileops` session opens, reads, writes,
+/// stats and renames for as long as its channel lives (§19.5) — so a single
+/// opened handle would not carry the identity far enough. The seam lends the
+/// identity to the thread instead, and every open the thread makes while the
+/// guard lives is that user's. Windows impersonates the logon; Linux sets
+/// the thread's `setfsuid`/`setfsgid`, which also makes anything the thread
+/// *creates* belong to the session — §19.2's exception, delivered without a
+/// second creation path.
 pub trait Adopted {}
 
 /// Resolves an identity once, then lends it to whichever thread asks.
@@ -103,7 +105,7 @@ pub trait Adopted {}
 /// Two steps rather than one because the two failures are different: the
 /// logon is minted when the adopter is built, so a missing account or a
 /// wrong secret fails the *open* loudly (§19.2), while adopting is a
-/// per-thread call a session makes wherever its reads happen.
+/// per-thread call a session makes wherever its file work happens.
 pub type Adopter = Box<dyn Fn() -> std::io::Result<Box<dyn Adopted>> + Send + Sync>;
 
 /// Guest-side process and handle creation — the whole of it.
@@ -115,11 +117,9 @@ pub trait Spawner: Send + Sync {
     fn terminal(&self, identity: &Identity, spec: TerminalSpec) -> std::io::Result<Spawned>;
     /// Start a process with piped stdio.
     fn exec(&self, identity: &Identity, spec: ProcessSpec) -> std::io::Result<Spawned>;
-    /// Create (truncating) a file for writing, making its parent
-    /// directories first.
-    fn create_file(&self, identity: &Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>>;
     /// Resolve `identity` into something a session thread can adopt for the
-    /// reads it makes. See [`Adopted`] for why reads take this shape.
+    /// files it opens, reads, writes and creates. See [`Adopted`] for why
+    /// files take this shape rather than a handle.
     fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter>;
 }
 
@@ -206,9 +206,7 @@ pub fn command_line(argv: &[String]) -> String {
 // ---- creation with whatever identity the caller already has ---------------
 //
 // Both production adapters share these. For the agent identity they are the
-// whole of PRD §19.2's floor — no platform-specific logon at all. Windows
-// also reaches for `create_file_directly` under impersonation, where "the
-// identity the calling thread has" is a declared logon.
+// whole of PRD §19.2's floor — no platform-specific logon at all.
 
 /// Spawn `spec` with piped stdio, with one hook into the `Command` before it
 /// is spawned.
@@ -267,59 +265,6 @@ pub fn piped_command(
             Err(_) => 127,
         }),
     })
-}
-
-/// Create a file for writing with whatever identity the calling thread
-/// already has, creating its parent directories first.
-pub fn create_file_directly(path: &str) -> std::io::Result<Box<dyn WriteFile>> {
-    if let Some(parent) = std::path::Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("mkdir: {e}")))?;
-    }
-    Ok(Box::new(create_plain_file(path)?))
-}
-
-/// The file itself, without the parent directories or the boxing — for an
-/// adapter that has something to do to the handle before it hands it over.
-/// The Linux one chowns it to the session that will own the file (§19.2).
-pub fn create_plain_file(path: &str) -> std::io::Result<PlainFile> {
-    Ok(PlainFile(std::fs::File::create(path)?))
-}
-
-pub struct PlainFile(std::fs::File);
-
-impl PlainFile {
-    /// The handle itself, so the Linux adapter can chown it to the session
-    /// that will own the file. Windows takes the identity from the thread
-    /// that created it and has nothing to do here.
-    #[cfg(unix)]
-    pub fn as_file(&self) -> &std::fs::File {
-        &self.0
-    }
-}
-
-impl Write for PlainFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-impl WriteFile for PlainFile {
-    #[cfg(unix)]
-    fn set_mode(&self, mode: u32) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = self
-            .0
-            .set_permissions(std::fs::Permissions::from_mode(mode));
-    }
-
-    #[cfg(windows)]
-    fn set_mode(&self, _mode: u32) {}
 }
 
 #[cfg(unix)]

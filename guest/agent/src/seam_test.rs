@@ -2,7 +2,7 @@
 //! child process, no filesystem.
 //!
 //! They cover what the funnel exists to make testable — that terminals,
-//! exec and file pushes all reach the one seam, and reach it with the
+//! exec and file sessions all reach the one seam, and reach it with the
 //! identity the channel resolved to (PRD §19.2).
 
 #![cfg(test)]
@@ -24,7 +24,7 @@ fn open(mux: &Mux, platform: &TestPlatform, msg: HostMsg) {
 }
 
 #[test]
-fn terminal_exec_and_push_all_reach_the_seam_as_the_agent() {
+fn terminal_exec_and_files_all_reach_the_seam_as_the_agent() {
     let (mux, mut cap) = capture_mux();
     let p = TestPlatform::new();
 
@@ -54,15 +54,7 @@ fn terminal_exec_and_push_all_reach_the_seam_as_the_agent() {
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 2 });
 
-    open(
-        &mux,
-        &p,
-        HostMsg::OpenFilePush {
-            id: 3,
-            path: "/srv/app.conf".into(),
-            mode: None,
-        },
-    );
+    open(&mux, &p, HostMsg::OpenFileOps { id: 3, logon: None });
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 3 });
 
     assert_eq!(
@@ -80,9 +72,11 @@ fn terminal_exec_and_push_all_reach_the_seam_as_the_agent() {
                 env: vec![("K".into(), "V".into())],
                 cwd: Some("/tmp".into()),
             },
-            Call::CreateFile {
+            // A file session asks the seam for an identity rather than for a
+            // handle: it opens, reads, writes and stats for its whole life
+            // (§19.5), so what it needs is the identity itself.
+            Call::Adopt {
                 identity: Identity::Agent,
-                path: "/srv/app.conf".into(),
             },
         ]
     );
@@ -127,6 +121,16 @@ fn an_open_that_carries_a_logon_reaches_the_seam_as_that_account() {
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 2 });
 
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenFileOps {
+            id: 3,
+            logon: Some(dev.clone()),
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 3 });
+
     assert_eq!(
         p.spawner.calls(),
         vec![
@@ -137,10 +141,13 @@ fn an_open_that_carries_a_logon_reaches_the_seam_as_that_account() {
                 rows: 24,
             },
             Call::Exec {
-                identity: Identity::Declared(dev),
+                identity: Identity::Declared(dev.clone()),
                 argv: vec!["whoami".into()],
                 env: vec![],
                 cwd: None,
+            },
+            Call::Adopt {
+                identity: Identity::Declared(dev),
             },
         ]
     );
@@ -396,48 +403,25 @@ fn exec_empty_argv_never_reaches_the_seam() {
     assert!(p.spawner.calls().is_empty());
 }
 
+/// A file session is one account's view of the filesystem for its whole
+/// life, so a logon that cannot be minted fails the *open* — not the first
+/// request that happens to touch a file, and never a silent fall back to the
+/// agent identity (§19.2).
 #[test]
-fn push_writes_through_the_seam_and_applies_the_mode() {
-    use sha2::{Digest, Sha256};
+fn a_file_session_that_cannot_mint_its_logon_fails_the_open() {
     let (mux, mut cap) = capture_mux();
     let p = TestPlatform::new();
+    p.spawner.fail_next("no such account: PROBE\\ghost");
     open(
         &mux,
         &p,
-        HostMsg::OpenFilePush {
-            id: 6,
-            path: "/srv/app.conf".into(),
-            mode: Some(0o750),
-        },
-    );
-    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 6 });
-
-    mux.route_input(6, Input::Bytes(b"hello ".to_vec()));
-    mux.route_input(6, Input::Bytes(b"world".to_vec()));
-    mux.route_input(6, Input::Eof);
-
-    let (_data, sha, len) = cap.until_file_done(6);
-    assert_eq!(len, 11);
-    assert_eq!(sha, crate::files::hex(&Sha256::digest(b"hello world")));
-
-    let file = p.spawner.file(0);
-    assert_eq!(file.bytes(), b"hello world");
-    assert_eq!(file.mode(), Some(0o750));
-}
-
-#[test]
-fn push_create_failure_reports_the_seam_error() {
-    let (mux, mut cap) = capture_mux();
-    let p = TestPlatform::new();
-    p.spawner
-        .fail_next("mkdir: Permission denied (os error 13)");
-    open(
-        &mux,
-        &p,
-        HostMsg::OpenFilePush {
+        HostMsg::OpenFileOps {
             id: 7,
-            path: "/srv/app.conf".into(),
-            mode: None,
+            logon: Some(Logon {
+                user: r"PROBE\ghost".into(),
+                secret: "vmlab123!".into(),
+                elevated: false,
+            }),
         },
     );
     match cap.ctrl() {
@@ -445,12 +429,7 @@ fn push_create_failure_reports_the_seam_error() {
             id: Some(7),
             msg,
             cause: None,
-        } => {
-            assert_eq!(
-                msg,
-                "push /srv/app.conf: mkdir: Permission denied (os error 13)"
-            );
-        }
+        } => assert_eq!(msg, "fileops: no such account: PROBE\\ghost"),
         other => panic!("expected error, got {other:?}"),
     }
 }

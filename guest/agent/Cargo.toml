@@ -1,5 +1,5 @@
 # vmlab-agent — the in-guest agent serving interactive terminals, streaming
-# exec, file transfer, tailing, metrics and clipboard over the vmlab.agent.0
+# exec, file operations, tailing, metrics and clipboard over the vmlab.agent.0
 # virtio-serial port (guest/agent-proto). Baked into templates as a service
 # (systemd / Windows SCM) and spawned by cinit inside container micro-VMs.
 #

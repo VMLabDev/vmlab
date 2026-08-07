@@ -1,6 +1,6 @@
 //! vmlab-agent — the in-guest agent for vmlab VMs and container micro-VMs.
 //!
-//! Serves interactive terminals, streaming exec, file transfer, tailing,
+//! Serves interactive terminals, streaming exec, file operations, tailing,
 //! metrics, clipboard and TCP tunnels to the host over the `vmlab.agent.0`
 //! virtio-serial port. Only a tunnel's payload touches the guest network;
 //! everything else is served without it. See `guest/agent-proto` for the
@@ -10,7 +10,7 @@
 //! template build) or in the foreground for debugging.
 
 mod exec;
-mod files;
+mod fileops;
 // The logon cache is portable policy, and both adapters resolve through it:
 // what a logon *is* stays with the platform that mints it.
 mod logon;

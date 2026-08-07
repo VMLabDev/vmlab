@@ -519,7 +519,7 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
                     proto_version: AGENT_PROTO,
                     agent_version: "0.0.0-fake".into(),
                     os: "linux".into(),
-                    features: vec!["exec".into(), "file".into(), "terminal".into()],
+                    features: vec!["exec".into(), "fileops".into(), "terminal".into()],
                     token,
                 },
                 HostMsg::Ping => AgentMsg::Pong,

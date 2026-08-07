@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use crate::mux::Mux;
 use crate::spawn::{
-    Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile, adopt_as_agent,
-    create_file_directly, hold_until_it_exits, piped_command,
+    Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, adopt_as_agent,
+    hold_until_it_exits, piped_command,
 };
 
 pub struct WindowsPlatform {
@@ -64,16 +64,6 @@ impl Spawner for WindowsSpawner {
         Ok(hold_until_it_exits(spawned, held))
     }
 
-    fn create_file(&self, identity: &Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
-        // Impersonating for the create is what gives the developer's files
-        // the developer's owner — the whole argument of §19.2's exception.
-        // The identity is only needed for the create: the handle it returns
-        // already carries the ACL.
-        let adopter = self.adopter(identity)?;
-        let _adopted = adopter()?;
-        create_file_directly(path)
-    }
-
     fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter> {
         match self.logons.resolve(identity)? {
             Some(held) => Ok(logon::adopter_for(held)),
@@ -102,7 +92,7 @@ impl crate::mux::Platform for WindowsPlatform {
         vec![
             features::TERMINAL.to_string(),
             features::EXEC.to_string(),
-            features::FILE.to_string(),
+            features::FILEOPS.to_string(),
             features::TAIL.to_string(),
             features::METRICS.to_string(),
             features::WATCH.to_string(),
