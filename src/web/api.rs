@@ -1270,6 +1270,13 @@ pub async fn template_publish(
 pub struct RestoreBody {
     #[serde(default)]
     vm: Option<String>,
+    /// §19.6's explicit discard flag: restore a machine whose workspace is
+    /// halted, throwing the guest copy of every conflicting path away. The
+    /// console does not offer it — resolution is host-side and per path, and
+    /// a checkbox is the wrong shape for a decision about a developer's own
+    /// working copy — but the API carries it so the surface is one vocabulary.
+    #[serde(default)]
+    discard: bool,
 }
 
 /// `GET /api/host` — host capacity (CPU cores + total RAM) for the editor's
@@ -1386,6 +1393,7 @@ pub async fn snapshot_restore(
     let req = LabRequest::SnapshotRestore {
         name,
         machine: body.vm.clone(),
+        discard: body.discard,
     };
     match state.lab_call(&lab, req).await {
         Ok(v) => ok(v),

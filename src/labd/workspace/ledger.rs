@@ -129,6 +129,32 @@ pub struct Ledger {
     /// skip — on Linux, one watch descriptor per directory of it.
     #[serde(default)]
     pub prune: Vec<String>,
+    /// A snapshot restore has rewound the guest under this ledger, and the
+    /// next syncer owes the **bracket's re-seed** before it reconciles
+    /// anything (§19.6).
+    ///
+    /// **Durable, because a restore does not need a running machine.**
+    /// `vmlab snapshot restore` on a stopped dev machine leaves nothing in
+    /// memory to remember by, and the next `up` would start a syncer that
+    /// stat-walks a rewound tree — reading five hundred rolled-back files as
+    /// guest-side edits and carrying them onto the canonical copy, which is
+    /// the one thing this whole bracket exists to prevent. It rides the ledger
+    /// because the ledger is already the per-(machine, workspace) record in
+    /// the lab's `.vmlab/`, so `destroy` forgets it with everything else there
+    /// — correctly, since there is no guest tree left to re-converge.
+    ///
+    /// It is cleared by the re-seed completing, never by anything else: a
+    /// failed one leaves it standing, and so does a crash between the two.
+    #[serde(default)]
+    pub reseed_owed: bool,
+    /// What the last completed pass halted on, if it halted (§19.6).
+    ///
+    /// Durable for the same reason and the mirror case: a restore refuses
+    /// while a halt stands, and a developer who stopped the machine before
+    /// restoring it must not lose that refusal along with the syncer that was
+    /// holding it.
+    #[serde(default)]
+    pub halted: Vec<String>,
     /// Keyed by `/`-separated path relative to the workspace root.
     pub entries: BTreeMap<String, Agreed>,
 }
@@ -143,8 +169,34 @@ impl Ledger {
             guest_root: guest_root.to_string(),
             ignore_digest: String::new(),
             prune: Vec::new(),
+            reseed_owed: false,
+            halted: Vec::new(),
             entries: BTreeMap::new(),
         }
+    }
+
+    /// A ledger about no workspace at all — what a machine that declares none
+    /// has to say about one.
+    ///
+    /// It exists so a caller asking a ledger a question can ask the same
+    /// question of every machine and get an empty answer for the ones with
+    /// nothing to answer with, rather than branching first.
+    pub fn about_nothing() -> Ledger {
+        Ledger::new(Path::new(""), "")
+    }
+
+    /// Note on the ledger **as it stands on disk** that the guest has been
+    /// rewound, so the next syncer owes a re-seed (§19.6).
+    ///
+    /// The one write a snapshot restore makes with no syncer to ask. An absent
+    /// or unreadable ledger is not a problem to solve here: it loads empty,
+    /// gains the flag, and the re-seed it forces seeds the whole tree from the
+    /// canonical copy — which is the right answer for a workspace nothing has
+    /// ever agreed about.
+    pub fn mark_rewound(path: &Path, host_root: &Path, guest_root: &str) -> Result<()> {
+        let mut ledger = Ledger::load(path, host_root, guest_root);
+        ledger.reseed_owed = true;
+        ledger.save(path)
     }
 
     /// Where one machine's ledger lives under the lab's `.vmlab/`. `destroy`

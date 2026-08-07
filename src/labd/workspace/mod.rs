@@ -32,6 +32,15 @@
 //!   invariant a halt is otherwise nothing happening.
 //! - [`apply`] — the executor: temp-name-then-rename in the same directory,
 //!   with the ledger written only **after** the rename.
+//! - [`reseed`] — what a **snapshot restore** does instead of a
+//!   reconciliation: a host-only, digest-based reconcile that carries the
+//!   rewound guest back to the canonical copy and emits no guest→host action
+//!   at all. The argument that this syncer is vmlab-integrated rather than a
+//!   generic tool wrapped — an off-the-shelf one cannot know a rewind
+//!   happened.
+//! - [`bracket`] — what capture and restore refuse, and the words they refuse
+//!   in: capture with no escape flag, restore with one, and the sentence every
+//!   snapshot surface says — **snapshots are not a workspace backup**.
 //! - [`watcher`] — the host-side watcher whose per-path debounce keeps the
 //!   syncer from reading a file mid-write.
 //! - [`windows`] — the three actions a Windows guest costs vmlab, resolved as
@@ -46,6 +55,7 @@
 //! guest tree is simply the case where every host path has no counterpart.
 
 pub mod apply;
+pub mod bracket;
 pub mod diff;
 pub mod guest;
 pub mod halt;
@@ -53,6 +63,7 @@ pub mod ignore;
 pub mod ledger;
 pub mod locks;
 pub mod plan;
+pub mod reseed;
 pub mod scan;
 pub mod syncer;
 pub mod watcher;

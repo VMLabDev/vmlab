@@ -42,7 +42,17 @@ route — make the two sides identical by hand — that needs no verb. With it t
 **guest→host bulk-delete guard** (a proportion with a floor; host→guest deletes
 stay unguarded), the **volume warning** that names a subtree and never halts,
 and the `.git` **lock deferral** that clears itself. The console reads the halt
-and offers no resolution. Snapshot bracketing (#97) is still spec. The `@dev`
+and offers no resolution. So is **snapshot bracketing** (#97): vmlab performs a
+restore, so it brackets it — capture **pre-flight flushes and refuses with no
+escape flag** where the guest holds work the canonical copy has never seen, and
+restore takes the syncer off the workspace, rewinds, and puts it back owing a
+**re-seed**: a host-only, **digest-based** reconcile that emits no guest→host
+action at all, completes **before the watch reopens**, and replaces the
+stat-walk rather than following one. The note that a re-seed is owed, and the
+halt a restore refuses on, both ride the **ledger**, because a restore does not
+need a running machine. Restore's refusal has the one escape flag in §19.6
+(`--discard-guest-changes`); capture's has none. Every surface that takes or
+restores one says **snapshots are not a workspace backup**. The `@dev`
 declaration (#80) and all
 three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
 `fileops` (#84) — the handle-based, offset-addressed, pipelined file RPC
@@ -160,10 +170,14 @@ Module map under `src/`:
   Windows actions as a value computed before the loop (`windows.rs`), the
   halt and the guest marker file it writes (`halt.rs`), `.git`'s mutable set
   and the deferral a held lock buys it (`locks.rs`), the two copies
-  `dev sync diff` brings together (`diff.rs`), and the lab-daemon-owned loop
-  (`syncer.rs`), which drains the guest's dirty set, holds the rescan barrier
-  and the halt, serves the `dev sync` verbs, and is the one piece of vmlab's
-  machinery running as the machine's default login.
+  `dev sync diff` brings together (`diff.rs`), what a **snapshot restore** does
+  instead of a reconciliation (`reseed.rs` — the host-only, digest-based
+  reconcile that carries a rewound guest back to the canonical copy and cannot
+  emit a guest→host action), what capture and restore **refuse** and the words
+  they refuse in (`bracket.rs`), and the lab-daemon-owned loop
+  (`syncer.rs`), which drains the guest's dirty set, holds the rescan and
+  re-seed barriers and the halt, serves the `dev sync` verbs, and is the one
+  piece of vmlab's machinery running as the machine's default login.
   Decisions the runtime used to make mid-flight are values computed before
   execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
   transports, gateway rules, the smbd port), `forward_plan.rs` (every port

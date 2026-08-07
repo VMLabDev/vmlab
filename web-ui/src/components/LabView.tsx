@@ -18,6 +18,7 @@ import ActionButton from "./ActionButton";
 import LabEditorView from "./editor/LabEditorView";
 import PullPanel from "./PullPanel";
 import { openWebPage } from "./WebView";
+import { NOT_A_BACKUP } from "./WorkspaceSync";
 
 function fmtTime(t: string): string {
   if (!t) return "";
@@ -250,6 +251,9 @@ export default function LabView() {
             </div>
           }
         >
+          {/* §19.6, said where a developer would otherwise assume the
+              opposite. A lab-wide restore reaches every dev machine in it. */}
+          <p class="snap-row-time">{NOT_A_BACKUP}</p>
           <Show
             when={(labSnaps()?.length ?? 0) > 0}
             fallback={<Empty title="No snapshots found in this lab" />}

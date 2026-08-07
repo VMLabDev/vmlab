@@ -375,6 +375,11 @@ pub struct WorkspaceSyncStatus {
     /// Both directions are waiting on a stat-walk, and why — the overflow
     /// symptom, as a state rather than as a pause.
     pub rescan: Option<String>,
+    /// Both directions are waiting on the bracket's re-seed after a snapshot
+    /// restore (§19.6). Apart from `rescan` because the two are opposite
+    /// answers to the same pause: a rescan means vmlab does not know what the
+    /// guest did, a re-seed means it knows exactly, because it did it.
+    pub reseed: Option<String>,
     /// How many watch discontinuities this syncer has answered with a walk.
     /// Repeated ones are the symptom a single lost event is not.
     #[ts(type = "number")]
@@ -386,6 +391,10 @@ pub struct WorkspaceSyncStatus {
     /// `.git`'s mutable set, waiting on a lock held on one side. Timing, not a
     /// conflict: nothing needs resolving and it clears itself.
     pub deferred: Vec<String>,
+    /// Changes the last pass did not carry across, by name. What a snapshot
+    /// capture refuses on (§19.6), and what answers "how far behind is my
+    /// workspace" without the workspace having to be halted to say so.
+    pub unsynced: Vec<String>,
     /// The last pass could not finish. Not a halt — nothing was agreed, so the
     /// next pass starts over.
     pub trouble: Option<String>,
@@ -729,9 +738,11 @@ pub(crate) mod fixtures {
                     resolve: Some("`vmlab dev sync resolve <path> --host` or `--guest`".into()),
                     volume: None,
                     rescan: None,
+                    reseed: None,
                     rescans: 0,
                     skipped: Vec::new(),
                     deferred: Vec::new(),
+                    unsynced: Vec::new(),
                     trouble: None,
                     passes: 4,
                 }),

@@ -1777,29 +1777,16 @@ impl LabRuntime {
         output: &crate::scripting::OutputSink,
     ) {
         for dev in self.dev_machines() {
-            let Some(workspace) = dev.workspace.clone() else {
+            if dev.workspace.is_none() {
                 continue;
-            };
+            }
             if !scope.is_empty() && !scope.contains(&dev.name) {
                 continue;
             }
-            let Ok(machine) = self.machine(&dev.name) else {
+            let (Some(workspace), Ok(machine)) =
+                (self.workspace_of(&dev.name), self.machine(&dev.name))
+            else {
                 continue;
-            };
-            let declared = self.root.join(&workspace);
-            let host_root = match declared.canonicalize() {
-                Ok(root) if root.is_dir() => root,
-                _ => {
-                    self.events.emit(
-                        "workspace.unavailable",
-                        json!({
-                            "machine": dev.name,
-                            "workspace": declared.display().to_string(),
-                            "reason": "the host workspace directory is not there",
-                        }),
-                    );
-                    continue;
-                }
             };
             // The syncer is the one piece of vmlab's machinery that runs as
             // the machine's default login (§19.6). With none declared it can
@@ -1817,38 +1804,72 @@ impl LabRuntime {
                     }),
                 );
             }
-            // §19.6, resolved from the declaration alone (ADR-0003): the
-            // guest family and the default login's elevation are what decide
-            // the three Windows actions, and the syncer should never have to
-            // ask.
-            let preconditions =
-                crate::labd::workspace::preconditions(machine.guest_os(), machine.logins());
             // **Up front, on the terminal that asked for the `up`.** The
             // event log alone would only reach someone already watching it,
             // and the whole point is that both degradations otherwise fail at
             // a random path hours in, looking like a vmlab bug. The syncer
             // emits them too, for whoever attaches later.
-            for degradation in preconditions.degradations() {
+            for degradation in workspace.preconditions.degradations() {
                 output(format!("warning: {}: {degradation}\n", dev.name));
             }
             self.workspaces
                 .start(
-                    crate::labd::workspace::Workspace {
-                        machine: dev.name.clone(),
-                        ledger_path: crate::labd::workspace::ledger::Ledger::path(
-                            &self.lab_local,
-                            &dev.name,
-                        ),
-                        host_root,
-                        guest_root: dev.workspace_guest.clone(),
-                        max_file_bytes: self.host_cfg.workspace_max_file,
-                        preconditions,
-                    },
+                    workspace,
                     Arc::new(WorkspaceSessions { machine }),
                     self.events.clone(),
                 )
                 .await;
         }
+    }
+
+    /// One machine's workspace as declared, resolved against this host — or
+    /// `None` for a machine that is not a dev machine carrying one, or whose
+    /// canonical directory is not there.
+    ///
+    /// Resolved in one place because two callers need the same answer for
+    /// opposite reasons: [`start_workspaces`](Self::start_workspaces) starts a
+    /// syncer with it, and the snapshot bracket (§19.6) needs the ledger's
+    /// location for a machine that is **down** — where there is no syncer to
+    /// ask and the restore still has to leave its note.
+    ///
+    /// A workspace whose host directory is not there does not resolve, loudly.
+    /// Creating it would be worse than refusing: an empty canonical tree is a
+    /// tree the syncer would then propagate *as* empty.
+    fn workspace_of(&self, machine: &str) -> Option<crate::labd::workspace::Workspace> {
+        let dev = self
+            .dev_machines()
+            .into_iter()
+            .find(|d| d.name == machine)?;
+        let declared = self.root.join(dev.workspace.as_ref()?);
+        let host_root = match declared.canonicalize() {
+            Ok(root) if root.is_dir() => root,
+            _ => {
+                self.events.emit(
+                    "workspace.unavailable",
+                    json!({
+                        "machine": machine,
+                        "workspace": declared.display().to_string(),
+                        "reason": "the host workspace directory is not there",
+                    }),
+                );
+                return None;
+            }
+        };
+        // §19.6, resolved from the declaration alone (ADR-0003): the guest
+        // family and the default login's elevation are what decide the three
+        // Windows actions, and the syncer should never have to ask.
+        let handle = self.machine(machine).ok()?;
+        Some(crate::labd::workspace::Workspace {
+            machine: machine.to_string(),
+            ledger_path: crate::labd::workspace::ledger::Ledger::path(&self.lab_local, machine),
+            host_root,
+            guest_root: dev.workspace_guest.clone(),
+            max_file_bytes: self.host_cfg.workspace_max_file,
+            preconditions: crate::labd::workspace::preconditions(
+                handle.guest_os(),
+                handle.logins(),
+            ),
+        })
     }
 
     /// Run one machine's sync pass now and answer with what it decided
@@ -2060,8 +2081,19 @@ impl LabRuntime {
     /// Snapshot one machine — VM or container, same contract. The event and
     /// state record note which; container records also pin the image digest
     /// the capture is valid against.
+    ///
+    /// **A pre-flight flush brackets capture** (§19.6). A dev machine's
+    /// workspace is flushed first, so the snapshot is coherent with the
+    /// canonical tree and restoring it later lands somewhere meaningful rather
+    /// than mid-transfer — and if the guest is holding work the host has never
+    /// seen, this refuses. **With no escape flag**: a snapshot of a tree that
+    /// exists nowhere else is not a thing to take against a warning. Every
+    /// other machine passes straight through.
     pub async fn snapshot(&self, vm_name: &str, snap: &str) -> Result<bool> {
         let m = self.machine(vm_name)?;
+        self.workspaces
+            .before_capture(vm_name, self.workspace_of(vm_name).as_ref())
+            .await?;
         let online = m.snapshot(snap).await?;
         {
             let mut state = self.state.lock().await;
@@ -2100,7 +2132,20 @@ impl LabRuntime {
     /// ([`Machine::snapshot_pin`]). A container's scratch overlay means
     /// nothing without the same read-only rootfs; a VM's snapshots live inside
     /// its own qcow2 chain, pin nothing, and pass this untouched.
-    pub async fn restore(self: &Arc<Self>, name: &str, snap: &str) -> Result<()> {
+    ///
+    /// **Restore brackets the syncer** (§19.6). A restore rewinds the guest by
+    /// hundreds of files at once, which a bidirectional syncer cannot tell from
+    /// the developer having edited them — and it would carry them onto the
+    /// canonical copy, silently. vmlab performs the restore, so it can bracket
+    /// it: the syncer comes off the workspace before the rewind and goes back
+    /// on owing a **re-seed**, which carries the tree back host→guest and lets
+    /// nothing flow the other way.
+    ///
+    /// `discard` is the explicit flag a halted workspace needs. Refusing
+    /// outright would be obstruction — wanting to throw the guest copy away is
+    /// frequently *why* someone restores — but a restore destroys the guest
+    /// copy of every conflicting path, so it is asked for by name.
+    pub async fn restore(self: &Arc<Self>, name: &str, snap: &str, discard: bool) -> Result<()> {
         let record = {
             let mut state = self.state.lock().await;
             state.machine_mut(name).snapshots.get(snap).cloned()
@@ -2108,6 +2153,12 @@ impl LabRuntime {
         .ok_or_else(|| anyhow!("\"{name}\" has no snapshot \"{snap}\""))?;
 
         let m = self.machine(name)?;
+        let workspace = self.workspace_of(name);
+        // Before anything is rolled back, and before the syncer is taken off
+        // the workspace: a refusal has to leave the machine exactly as it was.
+        self.workspaces
+            .before_restore(name, discard, workspace.as_ref())
+            .await?;
         // The pin is compared after any deferred pull the machine's own
         // restore performs, so bind the artefact first.
         self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
@@ -2124,7 +2175,64 @@ impl LabRuntime {
             }
         }
 
-        m.restore(self.services(), snap, record.online).await?;
+        // **Suspend first**, and it is load-bearing twice over. A pass already
+        // scanning would otherwise be free to finish against a guest that gets
+        // rewound underneath it — and that pass is the one that carries five
+        // hundred rolled-back files onto the canonical copy. It would also
+        // *erase the note below*: the loop holds the ledger in memory and
+        // saves it whole, so a pass completing after the note was written
+        // would put back a ledger that never had it, and the resumed syncer
+        // would stat-walk the rewound tree as though nothing had happened.
+        // Suspending is a real stop, waited for, which closes both.
+        let bracket = self.workspaces.suspend(name).await;
+
+        // **Every check that can refuse has already run**, so the note goes on
+        // before the rewind and stays on if the rewind fails. That ordering is
+        // the bracket's whole safety argument: after this point nobody can
+        // tell whether the guest was rolled back or not, and the two mistakes
+        // are not equally expensive — an unwanted re-seed costs unsynced guest
+        // work the developer just asked to roll back, where a missed one costs
+        // the canonical copy, which is the thing nothing re-derives. It is
+        // also why the note is on the ledger rather than in this process: a
+        // daemon that dies mid-restore must not lose it.
+        let noted = match &workspace {
+            None => Ok(()),
+            Some(workspace) => self.workspaces.mark_rewound(workspace).await,
+        };
+        // The note is the rewind's **precondition**, so a note that could not
+        // be written stops the restore rather than being carried on without:
+        // a syncer coming back to a rolled-back tree it was never told about
+        // is exactly the propagation this bracket exists to prevent.
+        let restored = match noted {
+            Ok(()) => m.restore(self.services(), snap, record.online).await,
+            Err(e) => Err(e),
+        };
+        // Put back on **both** paths. A workspace whose syncer quietly never
+        // came back looks exactly like a machine with nothing to sync, which
+        // is the silent-divergence failure ADR-0014 exists to rule out.
+        if let Some(bracket) = bracket {
+            self.workspaces.resume(bracket).await;
+        }
+        if let (Err(e), Some(workspace)) = (&restored, &workspace) {
+            // Said rather than silently undone, for the reason above: the
+            // re-seed is still owed, and a developer whose restore failed
+            // should hear that their guest tree is about to be re-converged
+            // anyway rather than discover it.
+            self.events.emit(
+                "workspace.reseed_owed",
+                json!({
+                    "machine": name,
+                    "workspace": workspace.host_root.display().to_string(),
+                    "reason": format!(
+                        "the restore failed ({e:#}) after the workspace was already marked as \
+                         rewound, so the re-seed still runs: whether the guest tree was rolled \
+                         back is no longer knowable, and re-converging a tree that was not is \
+                         cheaper than propagating one that was"
+                    ),
+                }),
+            );
+        }
+        restored?;
         self.events.emit(
             "snapshot.restored",
             json!({"vm": name, "name": snap, "online": record.online}),

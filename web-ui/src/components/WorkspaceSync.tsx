@@ -4,6 +4,22 @@ import { CircleAlert, TriangleAlert } from "lucide-solid";
 import type { MachineStatus } from "../gen/status";
 
 /**
+ * The one sentence PRD §19.6 wants every snapshot surface to say.
+ *
+ * It restates `bracket::NOT_A_BACKUP` on the Rust side rather than being
+ * carried in the status projection — a fixed sentence with no per-machine
+ * content has no business on the wire — so the two are kept in step by hand.
+ * The wording is the same; only the Rust side's backticks around `destroy`
+ * differ, since those are a terminal's markup and would read as punctuation
+ * here. It lives beside the workspace rather than beside either snapshot panel
+ * because it is the *workspace*'s claim about snapshots, and both panels
+ * import it so there is one copy in the console rather than two.
+ */
+export const NOT_A_BACKUP =
+  "Snapshots are not a workspace backup: a dev machine's source lives on the host, which is " +
+  "what survives destroy and what a restore re-converges the guest from.";
+
+/**
  * A dev machine's workspace syncer (PRD §19.6).
  *
  * **The console displays the halt and does not act on it.** That is a decision,
@@ -26,6 +42,7 @@ export default function WorkspaceSync(props: { machine: MachineStatus }) {
     [
       sync()?.trouble ? { kind: "trouble", text: sync()!.trouble! } : undefined,
       sync()?.rescan ? { kind: "waiting", text: sync()!.rescan! } : undefined,
+      sync()?.reseed ? { kind: "reseed", text: sync()!.reseed! } : undefined,
       sync()?.volume ? { kind: "volume", text: sync()!.volume! } : undefined,
     ].filter(Boolean) as { kind: string; text: string }[];
 
@@ -35,12 +52,29 @@ export default function WorkspaceSync(props: { machine: MachineStatus }) {
         <Show
           when={halted()}
           fallback={
-            <p class="ws-line">
-              <Badge tone="success" dot>
-                in step
-              </Badge>{" "}
-              {sync()!.passes} pass{sync()!.passes === 1 ? "" : "es"}
-            </p>
+            <Show
+              when={sync()!.unsynced.length === 0}
+              fallback={
+                // Not "in step": these are the paths a snapshot capture
+                // refuses on (§19.6), and a console that called this in step
+                // would disagree with the refusal the developer is about to
+                // read.
+                <p class="ws-line">
+                  <Badge tone="warning" dot>
+                    {sync()!.unsynced.length} behind
+                  </Badge>{" "}
+                  not yet carried onto the canonical copy:{" "}
+                  {sync()!.unsynced.join(", ")}
+                </p>
+              }
+            >
+              <p class="ws-line">
+                <Badge tone="success" dot>
+                  in step
+                </Badge>{" "}
+                {sync()!.passes} pass{sync()!.passes === 1 ? "" : "es"}
+              </p>
+            </Show>
           }
         >
           <p class="ws-halt" role="status" aria-live="polite">
