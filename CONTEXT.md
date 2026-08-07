@@ -288,12 +288,32 @@ behalf, *except where it produces the developer's files*. Spelled
 `--user SYSTEM` / `--user root`.
 _Avoid_: system user, service account
 
+**Container floor**:
+The **agent identity** inside a container micro-VM: the user cinit resolved for
+the workload — the declared `user`, else the image's `USER`, else root — which
+every session lands as when the container declares no **login**. It is
+devcontainers' `remoteUser`/`containerUser`, and it costs nothing because Linux
+needs no credential to become that user.
+
 **Cached logon**:
-The token minted once per (account, secret, machine) and shared by every channel
-using it: one `LogonId`, one ticket cache, one set of drive mappings. Dies with
-the machine, and is recycled at idle once older than its Kerberos ticket
-lifetime.
+The identity minted once per (account, secret, machine) and shared by every
+channel using it, which is what makes "the file transfer's logon is the shell's
+logon" true by construction. On Windows that is a token: one `LogonId`, one
+ticket cache, one set of drive mappings, with the user's profile loaded when it
+is minted and unloaded when it is dropped. On Linux the **login session** is
+each `su`'s, so what is shared is the resolution — the account, the machinery,
+the runtime directory. Dies with the machine, and is recycled at idle once
+older than its Kerberos ticket lifetime.
 _Avoid_: session (ambiguous with an SSH session or a terminal)
+
+**Login session**:
+What a **login** gets on a Linux guest: the environment, supplementary groups,
+`XDG_RUNTIME_DIR`, cwd and login shell a real login would have — realised
+through the guest's own `su`, so PAM runs, and assembled by the agent itself
+where the guest has no PAM. Which of the two ran is named in the agent's log
+and in the terminal's banner, because it is the answer to "why does rootless
+podman not work in here".
+_Avoid_: setuid (that is the fallback, not the concept), impersonation
 
 **Fileops session**:
 One agent channel serving file requests as an RPC session: handle-based,

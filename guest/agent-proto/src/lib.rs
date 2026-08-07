@@ -89,6 +89,17 @@ pub struct ContainerConfig {
     /// Working directory inside the rootfs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// The container's user (`name[:group]` or `uid[:gid]`) — the declared
+    /// `user`, else the image's `USER`, else absent for root.
+    ///
+    /// This is PRD §19.2's container floor: with no `login {}` declared, an
+    /// attached session lands as whoever the workload itself runs as, which
+    /// is devcontainers' own default. It crosses as the *spec* string rather
+    /// than as cinit's resolved ids because the agent needs more of the
+    /// passwd entry than cinit does — the shell, and the supplementary
+    /// groups a login has to carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// Initramfs layout shared by cinit and the agent: the static BusyBox that

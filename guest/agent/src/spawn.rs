@@ -43,6 +43,7 @@ impl From<Option<Logon>> for Identity {
 }
 
 /// What to run, and with what environment.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ProcessSpec {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -144,7 +145,6 @@ pub fn adopt_as_agent() -> Adopter {
 /// It hangs off `wait` rather than off a new [`Spawned`] field because
 /// `wait` is exactly "the process has ended, and its resources are
 /// released": one more resource joins the ones already released there.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn hold_until_it_exits<T: Send + Sync + 'static>(
     mut spawned: Spawned,
     held: Option<std::sync::Arc<T>>,
@@ -210,8 +210,22 @@ pub fn command_line(argv: &[String]) -> String {
 // also reaches for `create_file_directly` under impersonation, where "the
 // identity the calling thread has" is a declared logon.
 
-/// Spawn `spec` with piped stdio as the agent's own identity.
-pub fn piped_command(spec: ProcessSpec) -> std::io::Result<Spawned> {
+/// Spawn `spec` with piped stdio, with one hook into the `Command` before it
+/// is spawned.
+///
+/// The hook exists because the Linux adapter drops to a declared login's
+/// credentials in a `pre_exec`, which is the one thing about the spawn that is
+/// not `ProcessSpec`-shaped — while the rest of the plumbing (pipes, the kill
+/// hook, the reaper) is identical, so it stays in one place rather than being
+/// written twice. `|_| {}` is the agent's own identity, on both targets.
+///
+/// The hook runs **before** the spec's environment is applied, so an adapter
+/// can clear what the agent itself is holding without losing what the caller
+/// asked for — which is what a login has to do.
+pub fn piped_command(
+    spec: ProcessSpec,
+    prepare: impl FnOnce(&mut Command),
+) -> std::io::Result<Spawned> {
     if spec.argv.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -228,6 +242,7 @@ pub fn piped_command(spec: ProcessSpec) -> std::io::Result<Spawned> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
+    prepare(&mut cmd);
     for (k, v) in spec.env {
         cmd.env(k, v);
     }
@@ -263,10 +278,27 @@ pub fn create_file_directly(path: &str) -> std::io::Result<Box<dyn WriteFile>> {
         std::fs::create_dir_all(parent)
             .map_err(|e| std::io::Error::new(e.kind(), format!("mkdir: {e}")))?;
     }
-    Ok(Box::new(PlainFile(std::fs::File::create(path)?)))
+    Ok(Box::new(create_plain_file(path)?))
 }
 
-struct PlainFile(std::fs::File);
+/// The file itself, without the parent directories or the boxing — for an
+/// adapter that has something to do to the handle before it hands it over.
+/// The Linux one chowns it to the session that will own the file (§19.2).
+pub fn create_plain_file(path: &str) -> std::io::Result<PlainFile> {
+    Ok(PlainFile(std::fs::File::create(path)?))
+}
+
+pub struct PlainFile(std::fs::File);
+
+impl PlainFile {
+    /// The handle itself, so the Linux adapter can chown it to the session
+    /// that will own the file. Windows takes the identity from the thread
+    /// that created it and has nothing to do here.
+    #[cfg(unix)]
+    pub fn as_file(&self) -> &std::fs::File {
+        &self.0
+    }
+}
 
 impl Write for PlainFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
