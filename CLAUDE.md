@@ -17,8 +17,13 @@ Consult them for prior art only — the PRD overrides anything they did.
 ## Status
 
 PRD implemented (M1–M6). **§19 (Dev machines) is partly built** — the
-workspace syncer is spec only; implementation is tracked by #78–#98. The
-`@dev` declaration (#80) and all
+workspace syncer's later halves are spec only; implementation is tracked by
+#78–#98. The **workspace syncer's host-canonical half** (#93) is built: the
+ledger, the layered ignores, the size guard, the host watcher's per-path
+debounce and temp-then-rename applies as the machine's default login.
+Guest→host (#94), the Windows preconditions (#95), the conflict halt and its
+verbs (#96) and snapshot bracketing (#97) are still spec. The `@dev`
+declaration (#80) and all
 three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
 `fileops` (#84) — the handle-based, offset-addressed, pipelined file RPC
 session that **replaced** the whole-file push/pull pair outright, carrying
@@ -114,7 +119,14 @@ Module map under `src/`:
   `ssh/` is the SSH facade vmlab terminates on the host (§19.3, ADR-0012) —
   no guest runs an sshd, and its refusals follow ADR-0013's invariant;
   `agent_repair.rs` is `machine.repair_agent` (§19.4), the plan for replacing
-  a guest's agent binary over its own channel and the divergence it records.
+  a guest's agent binary over its own channel and the divergence it records;
+  `workspace/` is the workspace syncer (§19.6, ADR-0014) — the layered
+  ignore rules (`ignore.rs`), the host-side sync ledger (`ledger.rs`), the
+  reconciliation as a value (`plan.rs`), the two sides' scans (`scan.rs`)
+  over the one guest-side seam (`guest.rs`), temp-then-rename applies
+  (`apply.rs`), the host watcher and its per-path debounce (`watcher.rs`) and
+  the lab-daemon-owned loop (`syncer.rs`), which is the one piece of vmlab's
+  machinery running as the machine's default login.
   Decisions the runtime used to make mid-flight are values computed before
   execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
   transports, gateway rules, the smbd port), `forward_plan.rs` (every port

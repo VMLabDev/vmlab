@@ -27,6 +27,7 @@ pub mod ssh;
 pub mod state;
 pub mod vm;
 pub mod vm_agent;
+pub mod workspace;
 
 use std::path::PathBuf;
 use std::sync::Arc;

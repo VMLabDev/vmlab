@@ -1164,6 +1164,159 @@ impl FileOps {
         }
     }
 
+    /// What is at `path` **itself**, never followed — `Ok(None)` where
+    /// nothing is there.
+    ///
+    /// Absence is an answer rather than an error because the callers that
+    /// want it are asking "does the guest hold this?": the workspace syncer
+    /// probes a path it may well be about to create.
+    pub async fn lstat(&self, path: &str) -> Result<Option<Attrs>> {
+        match self
+            .inner
+            .call(
+                Op::Lstat {
+                    path: path.to_string(),
+                },
+                &[],
+            )
+            .await?
+        {
+            (Reply::Attrs { attrs }, _) => Ok(Some(attrs)),
+            (
+                Reply::Error {
+                    code: ErrorCode::NoSuchFile,
+                    ..
+                },
+                _,
+            ) => Ok(None),
+            (Reply::Error { code, msg }, _) => {
+                Err(anyhow::Error::new(FileOpsError { code, msg }).context(format!("lstat {path}")))
+            }
+            (other, _) => bail!("agent answered an lstat with {other:?}"),
+        }
+    }
+
+    /// A symlink's target string, verbatim. vmlab never translates one across
+    /// the seam (§19.6).
+    pub async fn readlink(&self, path: &str) -> Result<String> {
+        match self
+            .inner
+            .call(
+                Op::Readlink {
+                    path: path.to_string(),
+                },
+                &[],
+            )
+            .await?
+        {
+            (Reply::Name { path }, _) => Ok(path),
+            (Reply::Error { code, msg }, _) => {
+                Err(anyhow::Error::new(FileOpsError { code, msg })
+                    .context(format!("readlink {path}")))
+            }
+            (other, _) => bail!("agent answered a readlink with {other:?}"),
+        }
+    }
+
+    /// Create a symlink at `link` pointing at `target`. `kind` is carried
+    /// because Windows picks a different object for a file and a directory
+    /// link at creation, and a dangling link does not reveal which it is.
+    pub async fn symlink(&self, target: &str, link: &str, kind: LinkKind) -> Result<()> {
+        self.inner
+            .expect_ok(
+                Op::Symlink {
+                    target: target.to_string(),
+                    link: link.to_string(),
+                    kind,
+                },
+                &[],
+            )
+            .await
+            .with_context(|| format!("linking {link} → {target}"))
+    }
+
+    /// Remove a file or symlink; already-absent is success, since that is the
+    /// state the caller asked for.
+    pub async fn remove(&self, path: &str) -> Result<()> {
+        self.absent_is_fine(
+            Op::Remove {
+                path: path.to_string(),
+            },
+            path,
+        )
+        .await
+    }
+
+    /// Remove an empty directory; already-absent is success.
+    pub async fn rmdir(&self, path: &str) -> Result<()> {
+        self.absent_is_fine(
+            Op::Rmdir {
+                path: path.to_string(),
+            },
+            path,
+        )
+        .await
+    }
+
+    async fn absent_is_fine(&self, op: Op, path: &str) -> Result<()> {
+        match self.inner.expect_ok(op, &[]).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if e.downcast_ref::<FileOpsError>()
+                    .is_some_and(|e| e.code == ErrorCode::NoSuchFile)
+                {
+                    return Ok(());
+                }
+                Err(e.context(format!("removing {path}")))
+            }
+        }
+    }
+
+    /// Rename, overwriting `to` where the guest OS allows it. The atomic half
+    /// of every workspace apply (§19.6).
+    pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.inner
+            .expect_ok(
+                Op::Rename {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                },
+                &[],
+            )
+            .await
+            .with_context(|| format!("renaming {from} → {to}"))
+    }
+
+    /// Create one directory, treating an existing one as success.
+    ///
+    /// `case_sensitive` rides the creation because NTFS accepts the
+    /// per-directory flag only while the directory is still empty, so it can
+    /// never be a later `setstat` (§19.5).
+    pub async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
+        match self
+            .inner
+            .expect_ok(
+                Op::Mkdir {
+                    path: path.to_string(),
+                    mode: None,
+                    case_sensitive,
+                },
+                &[],
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if e.downcast_ref::<FileOpsError>()
+                    .is_some_and(|e| e.code == ErrorCode::AlreadyExists)
+                {
+                    return Ok(());
+                }
+                Err(e.context(format!("creating guest directory {path}")))
+            }
+        }
+    }
+
     /// Create `dir` and every missing parent, ignoring the ones already
     /// there. Both guest separators are accepted, and a Windows drive root
     /// (`C:`) is a place rather than a directory to create.
@@ -1184,28 +1337,11 @@ impl FileOps {
             if part.ends_with(':') {
                 continue;
             }
-            match self
-                .inner
-                .expect_ok(
-                    Op::Mkdir {
-                        path: prefix.clone(),
-                        mode: None,
-                        case_sensitive: false,
-                    },
-                    &[],
-                )
+            // Already there is the normal case for a parent, not a failure,
+            // which is exactly what `mkdir` already tolerates.
+            self.mkdir(&prefix, false)
                 .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    // Already there is the normal case, not a failure.
-                    if e.downcast_ref::<FileOpsError>()
-                        .is_none_or(|e| e.code != ErrorCode::AlreadyExists)
-                    {
-                        return Err(e.context(format!("creating guest directory {dir}")));
-                    }
-                }
-            }
+                .with_context(|| format!("creating guest directory {dir}"))?;
         }
         Ok(())
     }

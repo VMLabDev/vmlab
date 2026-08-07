@@ -11,6 +11,13 @@ use super::block::{Reader, Unspan, finish};
 
 pub const HOST_SCHEMA_WCL: &str = include_str!("host_schema.wcl");
 
+/// The workspace size guard's default cap (PRD §19.6). Sized to catch the
+/// 4 GB `.vhdx` nobody wrote an ignore rule for while leaving room for the
+/// large-but-legitimate files a source tree does hold, because the guard's
+/// job is to refuse *unwanted* work — a build burst is wanted work that
+/// happens to be large, and that warns rather than refuses.
+pub const DEFAULT_WORKSPACE_MAX_FILE: u64 = 256 << 20;
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub subnet_pool: ipnet::Ipv4Net,
@@ -33,6 +40,11 @@ pub struct HostConfig {
     /// block redirected somewhere OpenSSH does not read warns honestly rather
     /// than pretending to work.
     pub ssh_config: Option<std::path::PathBuf>,
+    /// The workspace syncer's per-file size guard (PRD §19.6). Host config
+    /// rather than a `@dev` argument: the cap is about this developer's link
+    /// to this guest, not about the lab everyone shares — and the refusal
+    /// message names it, because "raise the cap" has to point somewhere.
+    pub workspace_max_file: u64,
 }
 
 impl Default for HostConfig {
@@ -49,6 +61,7 @@ impl Default for HostConfig {
             fastpath: crate::net::fastpath::FastpathMode::Auto,
             config_weave_bin_dir: None,
             ssh_config: None,
+            workspace_max_file: DEFAULT_WORKSPACE_MAX_FILE,
         }
     }
 }
@@ -112,6 +125,9 @@ impl HostConfig {
             if let Some(v) = r.size("oci_chunk_size").unspan() {
                 cfg.oci_chunk_size = v;
             }
+            if let Some(v) = r.size("workspace_max_file").unspan() {
+                cfg.workspace_max_file = v;
+            }
         }
         Ok(finish(name, source, issues, Some(cfg))?)
     }
@@ -169,6 +185,7 @@ mod tests {
         assert_eq!(cfg.dns_suffix, "vmlab.internal");
         assert_eq!(cfg.disk_low_percent, 10);
         assert_eq!(cfg.oci_chunk_size, 512 << 20);
+        assert_eq!(cfg.workspace_max_file, DEFAULT_WORKSPACE_MAX_FILE);
     }
 
     #[test]
@@ -183,6 +200,7 @@ host {
   trunk_port       = 13948
   oci_chunk_size   = 128MiB
   fastpath         = "sockmap"
+  workspace_max_file = 2GiB
 }
 "#,
             "<test>",
@@ -195,6 +213,7 @@ host {
         assert_eq!(cfg.trunk_port, 13948);
         assert_eq!(cfg.oci_chunk_size, 128 << 20);
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
+        assert_eq!(cfg.workspace_max_file, 2 << 30);
     }
 
     /// The diagnostics a host-config author now gets — same wording as a
