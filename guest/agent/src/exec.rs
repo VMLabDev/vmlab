@@ -16,7 +16,7 @@ use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
 use crate::mux::{Input, Mux, pump_out};
 use crate::spawn::{Identity, ProcessSpec, Spawned, Spawner};
 
-pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: Identity, id: u32, spec: ProcessSpec) {
+pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec: ProcessSpec) {
     let Some(exe) = spec.argv.first().cloned() else {
         mux.send_error(Some(id), "exec: empty argv");
         return;

@@ -22,7 +22,7 @@ use crate::spawn::{Identity, Spawner};
 pub fn open_push(
     mux: &Mux,
     spawner: &dyn Spawner,
-    identity: Identity,
+    identity: &Identity,
     id: u32,
     path: String,
     mode: Option<u32>,

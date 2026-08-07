@@ -14,16 +14,32 @@
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
+use vmlab_agent_proto::Logon;
+
 /// Who a guest-side process runs as, and who owns the files it writes.
 ///
-/// PRD §19.2 declares identity on the machine and resolves it per channel;
-/// [`Identity::Agent`] is the only value the agent can produce today.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// PRD §19.2 declares identity on the machine and the host resolves it per
+/// channel; the agent only ever receives the answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Identity {
     /// Whatever the agent itself already runs as: `LocalSystem` on Windows,
     /// `root` on a Linux VM, and in a container micro-VM the user cinit
     /// resolved. PRD §19.2's floor — spawn directly, with no logon.
     Agent,
+    /// A declared account the agent logs on as. The triple arrives on every
+    /// open that carries one (§19.5), so the agent's cache is an internal
+    /// optimisation and a host re-handshake costs nothing.
+    Declared(Logon),
+}
+
+impl From<Option<Logon>> for Identity {
+    /// The wire's optional `logon`: absent is the agent identity.
+    fn from(logon: Option<Logon>) -> Identity {
+        match logon {
+            Some(logon) => Identity::Declared(logon),
+            None => Identity::Agent,
+        }
+    }
 }
 
 /// What to run, and with what environment.
@@ -72,24 +88,127 @@ pub trait WriteFile: Write + Send {
     fn set_mode(&self, mode: u32);
 }
 
+/// An identity lent to the calling thread, released when dropped.
+///
+/// Reads are the one shape the seam cannot hand a handle back for: `tail`
+/// reopens its file across rotation, so a single opened handle would not
+/// carry the identity far enough. The seam lends the identity to the thread
+/// instead — Windows impersonates the logon, and every open the thread makes
+/// while the guard lives is that user's.
+pub trait Adopted {}
+
+/// Resolves an identity once, then lends it to whichever thread asks.
+///
+/// Two steps rather than one because the two failures are different: the
+/// logon is minted when the adopter is built, so a missing account or a
+/// wrong secret fails the *open* loudly (§19.2), while adopting is a
+/// per-thread call a session makes wherever its reads happen.
+pub type Adopter = Box<dyn Fn() -> std::io::Result<Box<dyn Adopted>> + Send + Sync>;
+
 /// Guest-side process and handle creation — the whole of it.
 ///
 /// One implementation per guest target, plus the in-memory one the tests
 /// substitute. Every method takes the identity the work runs as.
 pub trait Spawner: Send + Sync {
     /// Start a shell on a terminal bridged to a channel.
-    fn terminal(&self, identity: Identity, spec: TerminalSpec) -> std::io::Result<Spawned>;
+    fn terminal(&self, identity: &Identity, spec: TerminalSpec) -> std::io::Result<Spawned>;
     /// Start a process with piped stdio.
-    fn exec(&self, identity: Identity, spec: ProcessSpec) -> std::io::Result<Spawned>;
+    fn exec(&self, identity: &Identity, spec: ProcessSpec) -> std::io::Result<Spawned>;
     /// Create (truncating) a file for writing, making its parent
     /// directories first.
-    fn create_file(&self, identity: Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>>;
+    fn create_file(&self, identity: &Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>>;
+    /// Resolve `identity` into something a session thread can adopt for the
+    /// reads it makes. See [`Adopted`] for why reads take this shape.
+    fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter>;
 }
 
-// ---- the agent's own identity ---------------------------------------------
+/// The guard for [`Identity::Agent`], on every target: the agent is already
+/// itself, so there is nothing to adopt and nothing to release.
+pub struct AlreadyMe;
+impl Adopted for AlreadyMe {}
+
+/// The adopter for [`Identity::Agent`] — hands out [`AlreadyMe`] forever.
+pub fn adopt_as_agent() -> Adopter {
+    Box::new(|| Ok(Box::new(AlreadyMe) as Box<dyn Adopted>))
+}
+
+/// Keep `held` alive until the spawned process ends.
+///
+/// The logon cache drops a logon no channel holds, and *no channel holds it*
+/// has to mean the session has ended — not that the spawn call returned.
+/// Without this the sweeper would unload the profile and close the token out
+/// from under a running shell after the idle grace, which reads as the shell
+/// losing its home directory and its mapped drives for no visible reason
+/// (PRD §19.2).
+///
+/// It hangs off `wait` rather than off a new [`Spawned`] field because
+/// `wait` is exactly "the process has ended, and its resources are
+/// released": one more resource joins the ones already released there.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn hold_until_it_exits<T: Send + Sync + 'static>(
+    mut spawned: Spawned,
+    held: Option<std::sync::Arc<T>>,
+) -> Spawned {
+    let Some(held) = held else {
+        return spawned;
+    };
+    let wait = spawned.wait;
+    spawned.wait = Box::new(move || {
+        let code = wait();
+        drop(held);
+        code
+    });
+    spawned
+}
+
+/// An argv rendered as one Windows command line.
+///
+/// Windows hands a process a single string and lets it parse its own argv,
+/// so the caller does the quoting: a run of backslashes is doubled only
+/// where it precedes a quote (or the closing quote), which is the rule
+/// `CommandLineToArgvW` inverts. Both Windows process shapes need this —
+/// the ConPTY shell and the exec that `CreateProcessAsUserW` starts — so it
+/// lives here rather than being written twice.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn command_line(argv: &[String]) -> String {
+    let mut out = String::new();
+    for (i, arg) in argv.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+            out.push_str(arg);
+            continue;
+        }
+        out.push('"');
+        let mut backslashes = 0;
+        for ch in arg.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                    backslashes = 0;
+                    out.push('"');
+                }
+                _ => {
+                    out.extend(std::iter::repeat_n('\\', backslashes));
+                    backslashes = 0;
+                    out.push(ch);
+                }
+            }
+        }
+        out.extend(std::iter::repeat_n('\\', backslashes * 2));
+        out.push('"');
+    }
+    out
+}
+
+// ---- creation with whatever identity the caller already has ---------------
 //
-// Both production adapters share these: spawning as the agent needs no
-// platform-specific logon, which is exactly PRD §19.2's floor.
+// Both production adapters share these. For the agent identity they are the
+// whole of PRD §19.2's floor — no platform-specific logon at all. Windows
+// also reaches for `create_file_directly` under impersonation, where "the
+// identity the calling thread has" is a declared logon.
 
 /// Spawn `spec` with piped stdio as the agent's own identity.
 pub fn piped_command(spec: ProcessSpec) -> std::io::Result<Spawned> {
@@ -135,9 +254,9 @@ pub fn piped_command(spec: ProcessSpec) -> std::io::Result<Spawned> {
     })
 }
 
-/// Create a file for writing as the agent's own identity, creating its
-/// parent directories first.
-pub fn create_file_as_agent(path: &str) -> std::io::Result<Box<dyn WriteFile>> {
+/// Create a file for writing with whatever identity the calling thread
+/// already has, creating its parent directories first.
+pub fn create_file_directly(path: &str) -> std::io::Result<Box<dyn WriteFile>> {
     if let Some(parent) = std::path::Path::new(path).parent()
         && !parent.as_os_str().is_empty()
     {
@@ -183,4 +302,73 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 #[cfg(windows)]
 fn exit_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(127)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Spawned, command_line, hold_until_it_exits};
+    use std::sync::Arc;
+
+    /// A `Spawned` with nothing behind it: `wait` reports what the test
+    /// asks for and nothing else is touched.
+    fn nothing_running(code: i32) -> Spawned {
+        Spawned {
+            input: Box::new(std::io::sink()),
+            output: Box::new(std::io::empty()),
+            errors: None,
+            resize: None,
+            kill: Box::new(|| {}),
+            wait: Box::new(move || code),
+        }
+    }
+
+    /// A logon must outlive the process it started, or the cache's sweeper
+    /// unloads the profile under a running shell after the idle grace —
+    /// which is what §19.2's "lives while any channel uses it" forbids.
+    #[test]
+    fn a_logon_is_held_until_the_process_it_started_exits() {
+        let logon = Arc::new("a token");
+        let spawned = hold_until_it_exits(nothing_running(3), Some(logon.clone()));
+        assert_eq!(
+            Arc::strong_count(&logon),
+            2,
+            "the session must still hold the logon while its process runs"
+        );
+        assert_eq!((spawned.wait)(), 3, "the exit code must survive the wrap");
+        assert_eq!(
+            Arc::strong_count(&logon),
+            1,
+            "and let go once the process has ended"
+        );
+    }
+
+    /// The agent identity holds no logon, and wrapping must not change what
+    /// the seam handed back.
+    #[test]
+    fn the_agent_identity_holds_nothing() {
+        let spawned = hold_until_it_exits(nothing_running(7), None::<Arc<()>>);
+        assert_eq!((spawned.wait)(), 7);
+    }
+
+    /// Windows parses its own argv out of one string, so what the seam
+    /// hands `CreateProcessAsUserW` has to survive `CommandLineToArgvW`
+    /// putting it back together — including the paths a dev machine is full
+    /// of, which end in backslashes.
+    #[test]
+    fn a_command_line_quotes_what_windows_would_otherwise_resplit() {
+        assert_eq!(command_line(&["whoami".into()]), "whoami");
+        assert_eq!(
+            command_line(&["C:\\Program Files\\git\\git.exe".into(), "status".into()]),
+            r#""C:\Program Files\git\git.exe" status"#
+        );
+        // A trailing backslash inside quotes would escape the closing quote,
+        // so the run is doubled.
+        assert_eq!(
+            command_line(&["cd".into(), "C:\\src\\my project\\".into()]),
+            r#"cd "C:\src\my project\\""#
+        );
+        // An embedded quote is escaped, and the backslashes before it with it.
+        assert_eq!(command_line(&[r#"say"hi"#.into()]), r#""say\"hi""#);
+        assert_eq!(command_line(&["".into()]), r#""""#);
+    }
 }

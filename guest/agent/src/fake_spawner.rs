@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode, features};
 
 use crate::mux::{Mux, Platform};
-use crate::spawn::{Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile};
+use crate::spawn::{Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile};
 
 /// One creation the seam was asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +38,10 @@ pub enum Call {
     CreateFile {
         identity: Identity,
         path: String,
+    },
+    /// A session asked for an identity to read through (`tail`).
+    Adopt {
+        identity: Identity,
     },
 }
 
@@ -238,9 +242,9 @@ enum Shape {
 }
 
 impl Spawner for FakeSpawner {
-    fn terminal(&self, identity: Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
+    fn terminal(&self, identity: &Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
         self.calls.lock().unwrap().push(Call::Terminal {
-            identity,
+            identity: identity.clone(),
             command: spec.command,
             cols: spec.cols,
             rows: spec.rows,
@@ -251,9 +255,9 @@ impl Spawner for FakeSpawner {
         }
     }
 
-    fn exec(&self, identity: Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
+    fn exec(&self, identity: &Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
         self.calls.lock().unwrap().push(Call::Exec {
-            identity,
+            identity: identity.clone(),
             argv: spec.argv,
             env: spec.env,
             cwd: spec.cwd,
@@ -264,9 +268,9 @@ impl Spawner for FakeSpawner {
         }
     }
 
-    fn create_file(&self, identity: Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
+    fn create_file(&self, identity: &Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
         self.calls.lock().unwrap().push(Call::CreateFile {
-            identity,
+            identity: identity.clone(),
             path: path.to_string(),
         });
         if let Some(e) = self.next_failure() {
@@ -275,6 +279,16 @@ impl Spawner for FakeSpawner {
         let file = FakeFile::default();
         self.files.lock().unwrap().push(file.clone());
         Ok(Box::new(file))
+    }
+
+    fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter> {
+        self.calls.lock().unwrap().push(Call::Adopt {
+            identity: identity.clone(),
+        });
+        match self.next_failure() {
+            Some(e) => Err(e),
+            None => Ok(crate::spawn::adopt_as_agent()),
+        }
     }
 }
 

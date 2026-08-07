@@ -51,6 +51,11 @@ async fn bridge(
                 // resize as soon as the socket is up.
                 cols: 80,
                 rows: 24,
+                // The console's terminals are person-invoked, so they take
+                // the machine's default login (PRD §19.2). Picking a
+                // non-default one is a console affordance of its own.
+                user: None,
+                password: None,
             },
         )
         .await

@@ -583,6 +583,7 @@ async fn run_inner(
                 None,
                 None,
                 Duration::from_secs(30),
+                None,
             )
             .await;
         need_push = !matches!(probe, Ok(ref o) if o.exit_code == 0);
@@ -602,6 +603,7 @@ async fn run_inner(
                         None,
                         None,
                         Duration::from_secs(30),
+                        None,
                     )
                     .await?;
                 if smoke.exit_code != 0 {
@@ -647,7 +649,7 @@ async fn run_inner(
         let guest_dir = guest_dir.clone();
         async move {
             let _ = agent
-                .exec(rm, Vec::new(), None, None, Duration::from_secs(60))
+                .exec(rm, Vec::new(), None, None, Duration::from_secs(60), None)
                 .await; // absent dir is fine
             agent.push_tree(&src, &guest_dir).await
         }
@@ -798,7 +800,7 @@ async fn exec_streaming(
     mut on_line: impl FnMut(String),
 ) -> Result<(i32, String)> {
     let display = argv.join(" ");
-    let mut session = agent.open_exec(argv, Vec::new(), None).await?;
+    let mut session = agent.open_exec(argv, Vec::new(), None, None).await?;
     session.eof().await?;
     let mut stdout = Vec::new();
     let mut carry = String::new();

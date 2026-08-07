@@ -32,7 +32,7 @@ use vmlab_agent_proto::{
     AgentMsg, DiskUsage, ErrorCause, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
     PROTO_VERSION, RecvWindow, encode_ctrl, encode_frame, features,
 };
-pub use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
+pub use vmlab_agent_proto::{Logon, NetInterface, OsInfo, ShutdownMode};
 
 use crate::sync::LockRecover;
 
@@ -419,17 +419,24 @@ impl AgentHandle {
 
     /// Interactive shell session. `command` overrides the guest's default
     /// shell.
+    ///
+    /// `logon` is who the shell runs as (§19.2), already resolved from the
+    /// machine's declaration by [`crate::labd::identity::resolve`]; `None`
+    /// is the agent identity, which is what everything vmlab does on its own
+    /// behalf passes.
     pub async fn open_terminal(
         &self,
         cols: u16,
         rows: u16,
         command: Option<Vec<String>>,
+        logon: Option<Logon>,
     ) -> Result<AgentSession> {
         self.open(|id| HostMsg::OpenTerminal {
             id,
             cols,
             rows,
             command,
+            logon,
         })
         .await
     }
@@ -441,9 +448,16 @@ impl AgentHandle {
         argv: Vec<String>,
         env: Vec<(String, String)>,
         cwd: Option<String>,
+        logon: Option<Logon>,
     ) -> Result<AgentSession> {
-        self.open(|id| HostMsg::OpenExec { id, argv, env, cwd })
-            .await
+        self.open(|id| HostMsg::OpenExec {
+            id,
+            argv,
+            env,
+            cwd,
+            logon,
+        })
+        .await
     }
 
     /// Dial `host:port` over TCP from inside the guest; the session is then
@@ -474,8 +488,9 @@ impl AgentHandle {
     }
 
     /// Follow a guest file (`tail -F`); the session yields `Data` chunks.
-    pub async fn open_tail(&self, path: String) -> Result<AgentSession> {
-        self.open(|id| HostMsg::OpenTail { id, path }).await
+    /// `logon` is whose view of the filesystem it is read through (§19.2).
+    pub async fn open_tail(&self, path: String, logon: Option<Logon>) -> Result<AgentSession> {
+        self.open(|id| HostMsg::OpenTail { id, path, logon }).await
     }
 
     /// Watch the guest tree at `path` recursively (§19.5). `prune` is the
@@ -514,9 +529,10 @@ impl AgentHandle {
         cwd: Option<String>,
         stdin: Option<Vec<u8>>,
         timeout: Duration,
+        logon: Option<Logon>,
     ) -> Result<ExecOutput> {
         let display = argv.join(" ");
-        let mut session = self.open_exec(argv, env, cwd).await?;
+        let mut session = self.open_exec(argv, env, cwd, logon).await?;
         if let Some(stdin) = stdin {
             session.send(&stdin).await?;
         }
@@ -1416,10 +1432,21 @@ mod tests {
                                     send_data(id, format!("resized:{cols}x{rows}").into_bytes())
                                         .await;
                                 }
-                                HostMsg::OpenExec { id, argv, .. } => {
+                                HostMsg::OpenExec {
+                                    id, argv, logon, ..
+                                } => {
                                     send(AgentMsg::Opened { id }).await;
-                                    send_data(id, format!("ran:{}", argv.join(" ")).into_bytes())
-                                        .await;
+                                    // Echo who the open said to run as, so a
+                                    // test can assert the identity actually
+                                    // reached the wire (PRD §19.2).
+                                    let who = logon
+                                        .map(|l| format!(" as:{}:{}", l.user, l.elevated))
+                                        .unwrap_or_default();
+                                    send_data(
+                                        id,
+                                        format!("ran:{}{who}", argv.join(" ")).into_bytes(),
+                                    )
+                                    .await;
                                     let _ = tx
                                         .lock()
                                         .await
@@ -1682,7 +1709,7 @@ mod tests {
     async fn terminal_echoes_and_resizes() {
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
-        let mut session = agent.open_terminal(80, 24, None).await.unwrap();
+        let mut session = agent.open_terminal(80, 24, None, None).await.unwrap();
         match session.recv().await.unwrap() {
             SessionEvent::Data(b) => assert_eq!(b, b"prompt$ "),
             other => panic!("expected prompt, got {other:?}"),
@@ -1705,12 +1732,37 @@ mod tests {
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
         let Err(err) = agent
-            .open_terminal(80, 24, Some(vec!["/no/shell".into()]))
+            .open_terminal(80, 24, Some(vec!["/no/shell".into()]), None)
             .await
         else {
             panic!("expected open failure");
         };
         assert!(err.to_string().contains("no shell found"), "{err}");
+    }
+
+    /// PRD §19.5: identity rides per-open and self-contained — the host puts
+    /// the whole triple on every open rather than handing out a handshake id,
+    /// so a re-handshake after a snapshot restore costs nothing.
+    #[tokio::test]
+    async fn an_open_carries_the_whole_logon_not_a_handle() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let out = agent
+            .exec(
+                vec!["whoami".into()],
+                vec![],
+                None,
+                None,
+                Duration::from_secs(5),
+                Some(Logon {
+                    user: r"PROBE\dev".into(),
+                    secret: "vmlab123!".into(),
+                    elevated: true,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, br"ran:whoami as:PROBE\dev:true");
     }
 
     #[tokio::test]
@@ -1724,6 +1776,7 @@ mod tests {
                 None,
                 None,
                 Duration::from_secs(5),
+                None,
             )
             .await
             .unwrap();
@@ -1876,7 +1929,7 @@ mod tests {
     async fn exposed_terminal_socket_bridges_a_client() {
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
-        let session = agent.open_terminal(80, 24, None).await.unwrap();
+        let session = agent.open_terminal(80, 24, None, None).await.unwrap();
         let work = tempfile::tempdir().unwrap();
         let sock = work.path().join("term-1.sock");
         expose_terminal_socket(session, sock.clone()).await.unwrap();

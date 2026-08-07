@@ -27,8 +27,8 @@ use vmlab_agent_proto::{
 
 use crate::mux::Mux;
 use crate::spawn::{
-    Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile, create_file_as_agent,
-    piped_command,
+    Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile, adopt_as_agent,
+    create_file_directly, piped_command,
 };
 
 const TERMINAL_MOTD: &str = concat!(
@@ -288,8 +288,23 @@ impl crate::mux::Platform for LinuxPlatform {
     }
 }
 
+/// A Linux session is a real login, not a `setuid` — the guest's own login
+/// machinery, PAM, supplementary groups and `XDG_RUNTIME_DIR` (PRD §19.2).
+/// That is #83's work; until it lands a declared logon fails by name, which
+/// §19.2 demands over quietly running as root anyway.
+fn agent_only(identity: &Identity) -> std::io::Result<()> {
+    match identity {
+        Identity::Agent => Ok(()),
+        Identity::Declared(l) => Err(std::io::Error::other(format!(
+            "cannot log on as `{}`: this guest's agent serves only the agent identity",
+            l.user
+        ))),
+    }
+}
+
 impl Spawner for LinuxSpawner {
-    fn terminal(&self, _identity: Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
+    fn terminal(&self, identity: &Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
+        agent_only(identity)?;
         let (shell, env) = match &self.container {
             None => (spec.command.or_else(default_shell), shell_env()),
             Some(ctx) => (
@@ -338,7 +353,8 @@ impl Spawner for LinuxSpawner {
         })
     }
 
-    fn exec(&self, _identity: Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
+    fn exec(&self, identity: &Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
+        agent_only(identity)?;
         match &self.container {
             None => piped_command(spec),
             // Container: reroute through the nsexec trampoline (a re-exec of
@@ -357,8 +373,14 @@ impl Spawner for LinuxSpawner {
         }
     }
 
-    fn create_file(&self, _identity: Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
-        create_file_as_agent(path)
+    fn create_file(&self, identity: &Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
+        agent_only(identity)?;
+        create_file_directly(path)
+    }
+
+    fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter> {
+        agent_only(identity)?;
+        Ok(adopt_as_agent())
     }
 }
 

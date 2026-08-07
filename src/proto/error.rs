@@ -153,6 +153,15 @@ impl CommandError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
     }
+
+    /// Say what this failure was about, keeping its code.
+    ///
+    /// For failures a lower layer can only half-name: the guest agent can say
+    /// which account it could not log on as, but has never been told which
+    /// machine it serves (PRD §19.2).
+    pub fn prefixed(self, subject: &str) -> Self {
+        Self::new(self.code, format!("{subject}: {}", self.message))
+    }
 }
 
 impl std::fmt::Display for CommandError {

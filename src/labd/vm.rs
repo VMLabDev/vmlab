@@ -1169,7 +1169,14 @@ impl super::machine::Machine for VmInstance {
                 }
                 let started = std::time::Instant::now();
                 match agent
-                    .exec(argv.clone(), vec![], None, None, Duration::from_secs(30))
+                    .exec(
+                        argv.clone(),
+                        vec![],
+                        None,
+                        None,
+                        Duration::from_secs(30),
+                        None,
+                    )
                     .await
                 {
                     Ok(r) if r.exit_code == 0 => {

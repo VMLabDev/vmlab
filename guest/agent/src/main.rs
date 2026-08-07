@@ -11,6 +11,12 @@
 
 mod exec;
 mod files;
+// The logon cache is the Windows adapter's caller today; #83 puts the Linux
+// session under the same lifetime rules. Its policy is portable and tested
+// on every target, so it is compiled everywhere and the surface Linux does
+// not yet call is expected rather than dead.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod logon;
 mod metrics;
 mod mux;
 mod spawn;

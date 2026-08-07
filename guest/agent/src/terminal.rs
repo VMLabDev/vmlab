@@ -16,7 +16,7 @@ use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
 use crate::mux::{Input, Mux, pump_out};
 use crate::spawn::{Identity, Spawned, Spawner, TerminalSpec};
 
-pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: Identity, id: u32, spec: TerminalSpec) {
+pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec: TerminalSpec) {
     let Spawned {
         mut input,
         output,

@@ -6,8 +6,10 @@
 pub mod clipboard;
 pub mod conpty;
 pub mod eventlog;
+pub mod logon;
 pub mod metrics;
 pub mod port;
+pub mod proc;
 pub mod service;
 pub mod sysinfo;
 
@@ -17,10 +19,12 @@ pub use port::open_port;
 
 use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode, features};
 
+use std::sync::Arc;
+
 use crate::mux::Mux;
 use crate::spawn::{
-    Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile, create_file_as_agent,
-    piped_command,
+    Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile, adopt_as_agent,
+    create_file_directly, hold_until_it_exits, piped_command,
 };
 
 pub struct WindowsPlatform {
@@ -28,26 +32,53 @@ pub struct WindowsPlatform {
 }
 
 /// The Windows half of the process/handle seam: ConPTY terminals, piped
-/// exec, and the file writes behind `push`.
-pub struct WindowsSpawner;
+/// exec, and the file writes behind `push` — each as the agent, or as a
+/// declared logon the channel carried (PRD §19.2).
+pub struct WindowsSpawner {
+    logons: Arc<logon::Logons>,
+}
 
 pub fn new_platform() -> WindowsPlatform {
+    let logons = Arc::new(logon::Logons::new());
+    // Idle logons are dropped on a timer, which is what unloads their
+    // profile hives — nothing else would.
+    logon::start_sweeper(logons.clone());
     WindowsPlatform {
-        spawner: WindowsSpawner,
+        spawner: WindowsSpawner { logons },
     }
 }
 
 impl Spawner for WindowsSpawner {
-    fn terminal(&self, _identity: Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
-        conpty::spawn(spec)
+    fn terminal(&self, identity: &Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
+        let held = self.logons.resolve(identity)?;
+        let spawned = conpty::spawn(spec, held.as_deref().map(|h| &h.value))?;
+        Ok(hold_until_it_exits(spawned, held))
     }
 
-    fn exec(&self, _identity: Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
-        piped_command(spec)
+    fn exec(&self, identity: &Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
+        let held = self.logons.resolve(identity)?;
+        let spawned = match held.as_deref() {
+            Some(logon) => proc::spawn_piped(&logon.value, spec)?,
+            None => piped_command(spec)?,
+        };
+        Ok(hold_until_it_exits(spawned, held))
     }
 
-    fn create_file(&self, _identity: Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
-        create_file_as_agent(path)
+    fn create_file(&self, identity: &Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
+        // Impersonating for the create is what gives the developer's files
+        // the developer's owner — the whole argument of §19.2's exception.
+        // The identity is only needed for the create: the handle it returns
+        // already carries the ACL.
+        let adopter = self.adopter(identity)?;
+        let _adopted = adopter()?;
+        create_file_directly(path)
+    }
+
+    fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter> {
+        match self.logons.resolve(identity)? {
+            Some(held) => Ok(logon::adopter_for(held)),
+            None => Ok(adopt_as_agent()),
+        }
     }
 }
 

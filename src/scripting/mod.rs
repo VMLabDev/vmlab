@@ -302,7 +302,7 @@ impl MachineHandle {
             let mut argv = vec![cmd];
             argv.extend(args);
             let r = agent
-                .exec(argv, vec![], None, None, timeout)
+                .exec(argv, vec![], None, None, timeout, None)
                 .await
                 .map_err(estr)?;
             Ok(ExecResult {
@@ -921,7 +921,7 @@ pub fn lab_module() -> Module {
                 let session = h.block(async {
                     let agent = h.machine.agent().await.map_err(estr)?;
                     agent
-                        .open_terminal(terminal::SCRIPT_COLS, terminal::SCRIPT_ROWS, None)
+                        .open_terminal(terminal::SCRIPT_COLS, terminal::SCRIPT_ROWS, None, None)
                         .await
                         .map_err(estr)
                 })?;

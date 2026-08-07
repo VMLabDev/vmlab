@@ -97,6 +97,35 @@ pub struct ContainerConfig {
 pub const BUSYBOX_FALLBACK: &str = "/.vmlab/busybox";
 pub const BUSYBOX_BIN_DIR: &str = "/.vmlab/bin";
 
+/// Who a channel's work runs as (PRD §19.2), carried by the opens that
+/// touch a user's resources.
+///
+/// **Self-contained, not a handshake id.** A `logon_id` would put the
+/// resource's lifetime on the host, and after a snapshot restore both sides
+/// discard channel state on the re-handshake — the host would hold a
+/// reference the agent has forgotten. With the triple on every open a
+/// re-handshake costs nothing and §19.2's lifetime rules stay inside the
+/// agent, whose cache is then a pure internal optimisation.
+///
+/// The secret crossing repeatedly is a non-cost: this is a pipe on the same
+/// host, and the secret sits in the lab file in plaintext already (§1.2 —
+/// vmlab is not a security boundary).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Logon {
+    /// The guest account, e.g. `PROBE\dev`, `dev@probe.local` or `dev`.
+    /// The host has already resolved a label to the account it names, so no
+    /// vmlab label ever reaches the guest.
+    pub user: String,
+    /// The account's password.
+    pub secret: String,
+    /// Whether the session is elevated. Windows-only: it selects the
+    /// account's linked token where it has one. `elevated` on a
+    /// Linux-family profile is a §5.1 validation error, so a Linux guest
+    /// never sees it set.
+    #[serde(default)]
+    pub elevated: bool,
+}
+
 const MAGIC: [u8; 4] = *b"VMLB";
 const HEADER_LEN: usize = 4 + 4 + 1 + 4;
 
@@ -299,12 +328,17 @@ pub enum HostMsg {
     },
     /// Open an interactive shell on channel `id`. `command` overrides the
     /// agent's default shell (absolute argv).
+    ///
+    /// `logon` is who the shell runs as; absent is the agent identity
+    /// (§19.2's floor).
     OpenTerminal {
         id: u32,
         cols: u16,
         rows: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logon: Option<Logon>,
     },
     /// Resize a terminal's PTY.
     Resize {
@@ -322,6 +356,8 @@ pub enum HostMsg {
         env: Vec<(String, String)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logon: Option<Logon>,
     },
     /// No more host->guest bytes on this channel (exec stdin EOF; end of a
     /// pushed file's bytes; a tunnel's host side shutting down its write
@@ -344,6 +380,10 @@ pub enum HostMsg {
     /// [`ErrorCause::ConnectFailed`], which the caller must tell apart from
     /// vmlab refusing the open. Only the SSH facade opens a tunnel; general
     /// host->guest TCP is the Forward plan's job (§9.8).
+    ///
+    /// It carries no [`Logon`]: a TCP connect has no user context on either
+    /// OS, and the field would imply a per-user network view that does not
+    /// exist.
     OpenTunnel {
         id: u32,
         host: String,
@@ -366,9 +406,14 @@ pub enum HostMsg {
     },
     /// Follow a file (like `tail -F`): existing tail then live appends as
     /// DATA frames until closed. Survives rotation/truncation.
+    ///
+    /// `logon` is whose view of the filesystem the file is read through;
+    /// absent is the agent identity.
     OpenTail {
         id: u32,
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logon: Option<Logon>,
     },
     /// Watch the tree at `path` recursively on channel `id`, which becomes a
     /// stream of length-prefixed [`watch`] records rather than a byte
@@ -389,6 +434,11 @@ pub enum HostMsg {
     },
     /// Follow the Windows event log (XML-rendered events as DATA frames).
     /// `filter` is an XPath query, default `*` on the System channel.
+    ///
+    /// It carries no [`Logon`]: the event log is machine-scoped and its ACLs
+    /// assume an administrator, so an ordinary login would get a silently
+    /// empty Security channel. A stated agent-identity read beats a quiet
+    /// empty one (§19.5).
     OpenEventLog {
         id: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -719,12 +769,18 @@ mod tests {
                 cols: 120,
                 rows: 32,
                 command: None,
+                logon: None,
             },
             HostMsg::OpenTerminal {
                 id: 2,
                 cols: 80,
                 rows: 24,
                 command: Some(vec!["/bin/zsh".into(), "-l".into()]),
+                logon: Some(Logon {
+                    user: r"PROBE\dev".into(),
+                    secret: "vmlab123!".into(),
+                    elevated: true,
+                }),
             },
             HostMsg::Resize {
                 id: 1,
@@ -736,6 +792,11 @@ mod tests {
                 argv: vec!["ls".into(), "-l".into()],
                 env: vec![("K".into(), "v".into())],
                 cwd: Some("/tmp".into()),
+                logon: Some(Logon {
+                    user: "dev".into(),
+                    secret: "hunter2".into(),
+                    elevated: false,
+                }),
             },
             HostMsg::Eof { id: 3 },
             HostMsg::OpenTunnel {
@@ -755,6 +816,7 @@ mod tests {
             HostMsg::OpenTail {
                 id: 6,
                 path: "/var/log/syslog".into(),
+                logon: None,
             },
             HostMsg::OpenEventLog {
                 id: 7,
@@ -915,18 +977,84 @@ mod tests {
         );
     }
 
-    /// §19.5: a watcher observes — it produces none of the developer's
-    /// files, so the open runs as the agent identity and grows no `logon`.
+    /// §19.5: three opens never carry a `logon`, each for a stated reason —
+    /// a watcher observes rather than produces, a TCP connect has no user
+    /// context, and the event log is machine-scoped. The check is that the
+    /// field cannot be set on them at all, which is what the wire shows.
     #[test]
-    fn open_watch_carries_no_logon() {
+    fn three_opens_carry_no_logon() {
+        for (msg, wire) in [
+            (
+                HostMsg::OpenWatch {
+                    id: 8,
+                    path: "/home/dev/work".into(),
+                    prune: vec![],
+                },
+                r#"{"cmd":"open_watch","id":8,"path":"/home/dev/work","prune":[]}"#,
+            ),
+            (
+                HostMsg::OpenTunnel {
+                    id: 9,
+                    host: "db".into(),
+                    port: 5432,
+                },
+                r#"{"cmd":"open_tunnel","id":9,"host":"db","port":5432}"#,
+            ),
+            (
+                HostMsg::OpenEventLog {
+                    id: 10,
+                    filter: None,
+                },
+                r#"{"cmd":"open_event_log","id":10}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
+        }
+    }
+
+    /// The absent case is the agent identity and must not put a null on the
+    /// wire — an agent built before §19.2 still parses these, and a host
+    /// built before it still parses an open that carries one.
+    #[test]
+    fn a_logon_is_optional_and_self_contained() {
         assert_eq!(
-            serde_json::to_string(&HostMsg::OpenWatch {
-                id: 8,
-                path: "/home/dev/work".into(),
-                prune: vec![],
+            serde_json::to_string(&HostMsg::OpenTail {
+                id: 6,
+                path: "/var/log/syslog".into(),
+                logon: None,
             })
             .unwrap(),
-            r#"{"cmd":"open_watch","id":8,"path":"/home/dev/work","prune":[]}"#
+            r#"{"cmd":"open_tail","id":6,"path":"/var/log/syslog"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&HostMsg::OpenExec {
+                id: 3,
+                argv: vec!["whoami".into()],
+                env: vec![],
+                cwd: None,
+                logon: Some(Logon {
+                    user: r"PROBE\dev".into(),
+                    secret: "vmlab123!".into(),
+                    elevated: true,
+                }),
+            })
+            .unwrap(),
+            r#"{"cmd":"open_exec","id":3,"argv":["whoami"],"env":[],"logon":{"user":"PROBE\\dev","secret":"vmlab123!","elevated":true}}"#
+        );
+        // An open from a host that predates the field is the agent identity,
+        // not a parse error.
+        assert_eq!(
+            serde_json::from_str::<HostMsg>(
+                r#"{"cmd":"open_terminal","id":1,"cols":80,"rows":24}"#
+            )
+            .unwrap(),
+            HostMsg::OpenTerminal {
+                id: 1,
+                cols: 80,
+                rows: 24,
+                command: None,
+                logon: None,
+            }
         );
     }
 

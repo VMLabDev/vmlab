@@ -215,6 +215,16 @@ PTY, so an adapter can be entirely in-memory. Three adapters, all live: Linux
 and Windows in production, the fake in the session tests.
 _Avoid_: launcher, process factory, executor
 
+**Adopter**:
+The one thing the **Spawner** hands out that is not a handle: a resolved
+identity a session thread can wear while it opens files of its own. Reads need
+it because `tail` reopens across rotation, so a single handle would not carry
+the identity far enough. Building the adopter mints the logon — which is where
+a missing account or a wrong secret fails, loudly — and wearing it produces a
+guard that lets go when dropped.
+_Avoid_: impersonation (that is the Windows mechanism, not the concept),
+context, credential
+
 **Plan**:
 A decision computed in full, as a value, before anything acts on it. Computing
 the plan does no I/O; carrying it out is a separate operation. **LabPlan**,
