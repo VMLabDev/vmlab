@@ -8,6 +8,8 @@ use vmlab_agent_proto::watch::{EntryKind, RecordDecoder, StatRecord, WatchRecord
 use vmlab_agent_proto::{AgentMsg, Frame, FrameKind, HostMsg};
 
 use super::*;
+// Dispatch needs a platform; a watch reaches nothing on it but `resolve_path`.
+use crate::fake_spawner::TestPlatform;
 use crate::mux::Input;
 use crate::testutil::{Capture, capture_mux};
 
@@ -199,7 +201,7 @@ fn open_watch(root: &std::path::Path, prune: Vec<String>) -> (Mux, Watcher) {
             channel: 0,
             payload: serde_json::to_vec(&msg).unwrap(),
         },
-        &TestPlatform,
+        &TestPlatform::new(),
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
     (
@@ -211,29 +213,6 @@ fn open_watch(root: &std::path::Path, prune: Vec<String>) -> (Mux, Watcher) {
             pending: Vec::new(),
         },
     )
-}
-
-/// Dispatch needs a platform; nothing but `resolve_path` is reached here.
-struct TestPlatform;
-
-impl crate::mux::Platform for TestPlatform {
-    fn os(&self) -> &'static str {
-        "test"
-    }
-    fn features(&self) -> Vec<String> {
-        vec![vmlab_agent_proto::features::WATCH.to_string()]
-    }
-    fn open_terminal(&self, _: &Mux, _: u32, _: u16, _: u16, _: Option<Vec<String>>) {}
-    fn open_eventlog(&self, _: &Mux, _: u32, _: Option<String>) {}
-    fn set_clipboard(&self, _: &Mux, _: String) {}
-    fn get_clipboard(&self, _: &Mux) {}
-    fn net_info(&self) -> Result<Vec<vmlab_agent_proto::NetInterface>, String> {
-        Ok(vec![])
-    }
-    fn os_info(&self) -> Result<vmlab_agent_proto::OsInfo, String> {
-        Err("unsupported".into())
-    }
-    fn shutdown(&self, _: &Mux, _: vmlab_agent_proto::ShutdownMode) {}
 }
 
 fn find<'a>(entries: &'a [StatRecord], path: &str) -> &'a StatRecord {
