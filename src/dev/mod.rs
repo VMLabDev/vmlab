@@ -16,6 +16,11 @@
 //!   only machine carrying `@dev`.** "First in file order wins" was rejected:
 //!   declaration order already means something in vmlab, and overloading it
 //!   would let a block reorder silently move the default.
+//!
+//! [`select`] carries the other half of the question, the one `vmlab.wcl`
+//! structurally cannot answer: which of those machines is *mine* (§19.7).
+
+pub mod select;
 
 use std::path::PathBuf;
 

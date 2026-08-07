@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
@@ -66,7 +66,12 @@ pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(300);
 /// What a machine can do beyond the universal operations, probed rather than
 /// inferred. Drives `machine.capabilities`, which is how the web console
 /// decides whether to offer a console tab, a clipboard button or a log view.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` because a client reads it back: `vmlab dev attach` waits on
+/// the probed feature list, and reading it as the producer's own type is what
+/// stops a field renamed here from silently becoming an empty answer there
+/// (ADR-0004's lesson).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
     pub kind: MachineKind,
     /// A framebuffer: screenshots, key/pointer input, OCR, image matching.

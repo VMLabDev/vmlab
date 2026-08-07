@@ -3,6 +3,7 @@
 
 pub mod console;
 pub mod daemon;
+pub mod dev;
 pub mod lab;
 pub mod machine;
 pub mod tty_attach;
@@ -203,6 +204,14 @@ pub enum Command {
         #[arg(long, value_name = "MACHINE")]
         print: Option<String>,
     },
+    /// Dev machines: attach to one, and record which one is yours (PRD §19.7)
+    ///
+    /// Only what is meaningless for a machine that is not `@dev` lives here —
+    /// the SSH facade is a general capability, so its verbs are top level.
+    Dev {
+        #[command(subcommand)]
+        cmd: DevCmd,
+    },
     /// The `ProxyCommand` target: pipe stdin/stdout onto a machine's SSH
     /// facade (PRD §19.3). Hidden — spawned by `ssh`, never typed.
     #[command(hide = true)]
@@ -284,6 +293,28 @@ pub enum Command {
         #[arg(long)]
         root: std::path::PathBuf,
     },
+}
+
+/// The dev-machine verbs (PRD §19.7).
+#[derive(Subcommand)]
+pub enum DevCmd {
+    /// Up the dev machine, wait until it is attachable, and become a shell
+    /// on it — cold to editing in one command
+    ///
+    /// It prints the SSH alias and the editor settings snippet, and launches
+    /// no editor: pick the alias out of your own client's host list. The
+    /// workspace syncer belongs to the lab daemon, so leaving the shell does
+    /// not stop it.
+    Attach {
+        /// Which dev machine (default: $VMLAB_DEV_MACHINE, then the
+        /// `vmlab dev use` selection, then the lab's default `@dev` machine)
+        machine: Option<String>,
+    },
+    /// Record which dev machine is yours, in the lab's gitignored `.vmlab/`
+    ///
+    /// Per-developer by construction: `vmlab.wcl` is committed, so it cannot
+    /// say it. `vmlab destroy` forgets the selection.
+    Use { machine: String },
 }
 
 /// Per-VM power control and interaction (PRD §12, §10.3).
@@ -652,6 +683,10 @@ pub fn run() -> ExitCode {
         Command::Ssh { machine, cmd } => lab::cmd_ssh(&machine, cmd),
         Command::SshConfig { print } => lab::cmd_ssh_config(print.as_deref()),
         Command::SshProxy { machine } => lab::cmd_ssh_proxy(&machine),
+        Command::Dev { cmd } => match cmd {
+            DevCmd::Attach { machine } => dev::cmd_dev_attach(machine),
+            DevCmd::Use { machine } => dev::cmd_dev_use(&machine),
+        },
         Command::Cp { src, dest } => lab::cmd_cp(&src, &dest),
         Command::Tail { vm, path } => lab::cmd_tail(&vm, &path),
         Command::Eventlog { vm, filter } => lab::cmd_eventlog(&vm, filter.as_deref()),
