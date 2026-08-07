@@ -50,6 +50,7 @@ impl crate::mux::Platform for WindowsPlatform {
             features::METRICS.to_string(),
             features::EVENTLOG.to_string(),
             features::CLIPBOARD.to_string(),
+            features::TUNNEL.to_string(),
         ]
     }
 

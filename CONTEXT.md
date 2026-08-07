@@ -176,7 +176,7 @@ re-runs and automatic reboots.
 **vmlab-agent**:
 vmlab's first-party in-guest agent, reached over a virtio-serial port with no
 guest network involved. Powers readiness, exec, file transfer, terminals,
-tail, metrics and clipboard, in both VMs and containers.
+tail, metrics, clipboard and **tunnels**, in both VMs and containers.
 _Avoid_: QGA, qemu-guest-agent (removed), guest tools
 
 **Event handler**:
@@ -274,6 +274,16 @@ transfer by the console and the workspace syncer; handles are scoped to the
 channel and die with it.
 _Avoid_: file channel (it carries requests, not one file's bytes), SFTP channel
 (SFTP is terminated host-side and never reaches the guest)
+
+**Tunnel**:
+One agent channel carrying a TCP connection the agent dialled *inside* the
+guest. The destination string crosses verbatim and the guest resolves it, and
+no destination policy applies — any address the guest can reach. Opened only by
+the SSH facade, for `direct-tcpip`. A dial that fails is a **connect failure**,
+reported apart from a refusal so a SOCKS client can tell "nothing is listening"
+from "vmlab refused you".
+_Avoid_: port forward (that is the Forward plan's host→guest lease), socket,
+proxy
 
 **Diverged machine**:
 A running machine whose guest content no longer matches the template it was

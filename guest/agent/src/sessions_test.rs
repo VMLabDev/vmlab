@@ -152,7 +152,9 @@ fn exec_missing_binary_reports_error() {
         },
     );
     match cap.ctrl() {
-        AgentMsg::Error { id: Some(5), msg } => assert!(msg.contains("/no/such/binary")),
+        AgentMsg::Error {
+            id: Some(5), msg, ..
+        } => assert!(msg.contains("/no/such/binary")),
         other => panic!("expected error, got {other:?}"),
     }
 }
@@ -271,6 +273,138 @@ fn tail_sends_backlog_then_appends() {
     std::fs::write(&path, "rotated content\n").unwrap();
     cap.data_until(9, b"rotated content");
     mux.remove(9);
+}
+
+/// The dial happens inside the guest and the channel is the byte pipe: the
+/// host writes, the peer answers, and the answer comes back as DATA frames.
+#[test]
+fn tunnel_dials_and_carries_bytes_both_ways() {
+    use std::io::{Read, Write};
+    // An echo server standing in for whatever the guest can reach.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 64];
+        let n = peer.read(&mut buf).unwrap();
+        peer.write_all(b"pong:").unwrap();
+        peer.write_all(&buf[..n]).unwrap();
+        // Half-close: the peer is done sending, the host is not.
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let n = peer.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"after-eof");
+    });
+
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTunnel {
+            id: 20,
+            // A name, not an address: the guest resolves it.
+            host: "localhost".into(),
+            port,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 20 });
+    mux.route_input(20, Input::Bytes(b"ping".to_vec()));
+    let (data, _) = cap.data_until(20, b"pong:ping");
+    assert_eq!(data, b"pong:ping");
+    // The peer's shutdown is an agent `eof`, not a dead channel.
+    assert_eq!(cap.ctrl(), AgentMsg::Eof { id: 20 });
+    // ...and the other direction still carries bytes.
+    mux.route_input(20, Input::Bytes(b"after-eof".to_vec()));
+    mux.route_input(20, Input::Eof);
+    server.join().unwrap();
+}
+
+/// Nothing listening is a *connect* failure, which the SSH facade has to
+/// tell apart from vmlab refusing the open.
+#[test]
+fn tunnel_connect_failure_carries_its_cause() {
+    // Bind then drop: a port nothing is listening on, chosen by the OS.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = dead.local_addr().unwrap().port();
+    drop(dead);
+
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTunnel {
+            id: 21,
+            host: "127.0.0.1".into(),
+            port,
+        },
+    );
+    match cap.ctrl() {
+        AgentMsg::Error {
+            id: Some(21),
+            cause,
+            msg,
+        } => {
+            assert_eq!(cause, Some(vmlab_agent_proto::ErrorCause::ConnectFailed));
+            assert!(msg.contains(&port.to_string()), "{msg}");
+        }
+        other => panic!("expected a connect failure, got {other:?}"),
+    }
+}
+
+/// An unresolvable name fails guest-side too, and reports the same way.
+#[test]
+fn tunnel_unresolvable_host_is_a_connect_failure() {
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTunnel {
+            id: 22,
+            host: "no-such-host.invalid".into(),
+            port: 80,
+        },
+    );
+    match cap.ctrl() {
+        AgentMsg::Error {
+            id: Some(22),
+            cause: Some(vmlab_agent_proto::ErrorCause::ConnectFailed),
+            ..
+        } => {}
+        other => panic!("expected a connect failure, got {other:?}"),
+    }
+}
+
+/// A host `close` drops the connection, so the peer sees the socket go away
+/// instead of hanging on a tunnel nobody owns any more.
+#[test]
+fn tunnel_close_stops_the_connection() {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut peer, _) = listener.accept().unwrap();
+        // The tunnel's close shuts the socket, so this read ends rather than
+        // blocking for the lifetime of the test.
+        let mut buf = Vec::new();
+        peer.read_to_end(&mut buf).unwrap();
+    });
+
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTunnel {
+            id: 23,
+            host: "127.0.0.1".into(),
+            port,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 23 });
+    mux.remove(23);
+    server.join().unwrap();
 }
 
 #[test]

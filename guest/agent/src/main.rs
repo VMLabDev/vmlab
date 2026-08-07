@@ -1,8 +1,9 @@
 //! vmlab-agent — the in-guest agent for vmlab VMs and container micro-VMs.
 //!
 //! Serves interactive terminals, streaming exec, file transfer, tailing,
-//! metrics and clipboard to the host over the `vmlab.agent.0` virtio-serial
-//! port. No guest network involved anywhere. See `guest/agent-proto` for the
+//! metrics, clipboard and TCP tunnels to the host over the `vmlab.agent.0`
+//! virtio-serial port. Only a tunnel's payload touches the guest network;
+//! everything else is served without it. See `guest/agent-proto` for the
 //! wire contract and `src/mux.rs` for the dispatch core.
 //!
 //! Runs as a service (systemd on Linux, SCM on Windows — installed by the
@@ -13,6 +14,7 @@ mod files;
 mod metrics;
 mod mux;
 mod tail;
+mod tunnel;
 
 #[cfg(test)]
 mod sessions_test;

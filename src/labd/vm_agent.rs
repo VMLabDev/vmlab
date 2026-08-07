@@ -27,8 +27,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 
 use vmlab_agent_proto::{
-    AgentMsg, DiskUsage, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
-    PROTO_VERSION, RecvWindow, encode_ctrl, encode_frame,
+    AgentMsg, DiskUsage, ErrorCause, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
+    PROTO_VERSION, RecvWindow, encode_ctrl, encode_frame, features,
 };
 pub use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
 
@@ -57,6 +57,10 @@ pub enum SessionEvent {
     Data(Vec<u8>),
     /// Exec stderr.
     Stderr(Vec<u8>),
+    /// No more guest→host bytes, and the channel is still open: a tunnel's
+    /// peer shut down its write half, or an exec's output pipes drained.
+    /// Host→guest bytes may still flow after it.
+    Eof,
     /// Terminal shell / exec process ended.
     Exited(i32),
     /// File transfer completed (both directions).
@@ -129,6 +133,12 @@ const SESSION_QUEUE: usize = 2048;
 /// How long the reader waits on one session's full queue before declaring
 /// the consumer stuck and closing that session (never the whole port).
 const STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long an `open_*` waits for the agent's `opened`. Longer than the
+/// agent's tunnel dial budget, so a dead destination arrives as the connect
+/// failure the agent reports rather than as this timeout, which says nothing
+/// about why.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Inner {
     /// The connection's runtime, so cleanup can be spawned from any thread
@@ -343,6 +353,17 @@ impl AgentHandle {
 
     /// Open a channel and wait for the agent's `opened` (or error).
     async fn open(&self, build: impl FnOnce(u32) -> HostMsg) -> Result<AgentSession> {
+        self.try_open(build).await.map_err(|e| e.error)
+    }
+
+    /// The open itself, keeping the agent's machine-readable cause. Only a
+    /// tunnel branches on it, and only ever here: the guest dials before it
+    /// answers `opened`, so a connect failure is always this reply and never
+    /// a mid-stream error.
+    async fn try_open(
+        &self,
+        build: impl FnOnce(u32) -> HostMsg,
+    ) -> Result<AgentSession, OpenError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel(SESSION_QUEUE);
         // The opened/error reply arrives on a oneshot so the session's event
@@ -373,18 +394,23 @@ impl AgentHandle {
         };
         if let Err(e) = self.send_msg(&build(id)).await {
             session.forget().await;
-            return Err(e);
+            return Err(OpenError::plain(e));
         }
-        match tokio::time::timeout(Duration::from_secs(15), opened_rx).await {
+        match tokio::time::timeout(OPEN_TIMEOUT, opened_rx).await {
             Ok(Ok(Ok(()))) => Ok(session),
-            Ok(Ok(Err(msg))) => {
+            Ok(Ok(Err(refusal))) => {
                 session.forget().await;
-                bail!("{msg}");
+                Err(OpenError {
+                    error: anyhow!("{}", refusal.msg),
+                    cause: refusal.cause,
+                })
             }
             Ok(Err(_)) | Err(_) => {
                 session.forget().await;
                 let _ = self.send_msg(&HostMsg::Close { id }).await;
-                bail!("agent did not open the channel in time");
+                Err(OpenError::plain(anyhow!(
+                    "agent did not open the channel in time"
+                )))
             }
         }
     }
@@ -416,6 +442,33 @@ impl AgentHandle {
     ) -> Result<AgentSession> {
         self.open(|id| HostMsg::OpenExec { id, argv, env, cwd })
             .await
+    }
+
+    /// Dial `host:port` over TCP from inside the guest; the session is then
+    /// the connection's byte pipe (PRD §19.5).
+    ///
+    /// `host` goes across verbatim and the guest resolves it, which is what
+    /// makes a domain name in a SOCKS request work, and no destination
+    /// policy applies — any address the guest can reach. Only the SSH facade
+    /// calls this; general host→guest TCP is the Forward plan's job (§9.8),
+    /// and no daemon command reaches it.
+    pub async fn open_tunnel(&self, host: String, port: u16) -> Result<AgentSession, TunnelError> {
+        if !self.has_feature(features::TUNNEL) {
+            return Err(TunnelError::Refused(
+                "this guest's agent cannot open tunnels — rebuild the template, or push the \
+                 shipped agent with `vmlab machine repair-agent`"
+                    .into(),
+            ));
+        }
+        self.try_open(|id| HostMsg::OpenTunnel { id, host, port })
+            .await
+            .map_err(|e| {
+                let detail = format!("{:#}", e.error);
+                match e.cause {
+                    Some(ErrorCause::ConnectFailed) => TunnelError::ConnectFailed(detail),
+                    None => TunnelError::Refused(detail),
+                }
+            })
     }
 
     /// Follow a guest file (`tail -F`); the session yields `Data` chunks.
@@ -461,7 +514,9 @@ impl AgentHandle {
                     });
                 }
                 Some(SessionEvent::Error(msg)) => bail!("exec `{display}`: {msg}"),
-                Some(SessionEvent::FileDone { .. }) => {}
+                // `exited` is what completes a collected exec; the output
+                // EOF just before it tells this caller nothing new.
+                Some(SessionEvent::Eof) | Some(SessionEvent::FileDone { .. }) => {}
                 None => bail!("agent channel closed during exec `{display}`"),
             }
         }
@@ -773,7 +828,53 @@ pub struct ExecOutput {
 }
 
 /// A waiter for the `opened`/error reply to an `open_*` message.
-type OpenWaiter = tokio::sync::oneshot::Sender<Result<(), String>>;
+type OpenWaiter = tokio::sync::oneshot::Sender<Result<(), OpenRefusal>>;
+
+/// The agent's refusal of an `open_*`, with the machine-readable cause where
+/// it sent one.
+#[derive(Debug)]
+struct OpenRefusal {
+    msg: String,
+    cause: Option<ErrorCause>,
+}
+
+/// An `open_*` that produced no channel. `error` is what an ordinary caller
+/// reports; `cause` is what a tunnel branches on.
+struct OpenError {
+    error: anyhow::Error,
+    cause: Option<ErrorCause>,
+}
+
+impl OpenError {
+    /// A failure the agent gave no machine-readable cause for.
+    fn plain(error: anyhow::Error) -> Self {
+        Self { error, cause: None }
+    }
+}
+
+/// Why [`AgentHandle::open_tunnel`] produced no tunnel. The split is the one
+/// PRD §19.5 requires: the SSH facade answers `SSH_OPEN_CONNECT_FAILED` for a
+/// connect failure and keeps `ADMINISTRATIVELY_PROHIBITED` for a refusal, so
+/// a SOCKS client can tell "nothing is listening" from "vmlab refused you".
+#[derive(Debug)]
+pub enum TunnelError {
+    /// The guest dialled the destination and did not get through: nothing
+    /// listening, the name did not resolve, the route is dead.
+    ConnectFailed(String),
+    /// No dial happened. The agent has no `tunnel` feature, the channel
+    /// never came up, or the agent connection is gone.
+    Refused(String),
+}
+
+impl std::fmt::Display for TunnelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TunnelError::ConnectFailed(m) | TunnelError::Refused(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for TunnelError {}
 
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -852,18 +953,25 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
                 let _ = w.send(Ok(()));
             }
         }
-        AgentMsg::Error { id: Some(id), msg } => {
+        AgentMsg::Error {
+            id: Some(id),
+            msg,
+            cause,
+        } => {
             let waiter = inner.open_waiters.lock_recover().remove(&id);
             match waiter {
                 Some(w) => {
-                    let _ = w.send(Err(msg));
+                    let _ = w.send(Err(OpenRefusal { msg, cause }));
                 }
+                // Mid-stream failures carry no cause worth branching on: the
+                // one coded failure (a tunnel's dial) happens before `opened`.
                 None => deliver(inner, id, SessionEvent::Error(msg)).await,
             }
         }
-        AgentMsg::Error { id: None, msg } => {
+        AgentMsg::Error { id: None, msg, .. } => {
             tracing::warn!("agent error: {msg}");
         }
+        AgentMsg::Eof { id } => deliver(inner, id, SessionEvent::Eof).await,
         AgentMsg::Exited { id, code } => deliver(inner, id, SessionEvent::Exited(code)).await,
         AgentMsg::FileDone { id, sha256, len } => {
             deliver(inner, id, SessionEvent::FileDone { sha256, len }).await
@@ -1086,8 +1194,26 @@ mod tests {
 
     /// A minimal in-process agent speaking the real frame protocol over a
     /// unix socket, mirroring what `guest/agent` does: echo terminals,
-    /// canned exec output, in-memory file store.
+    /// canned exec output, in-memory file store, echo tunnels.
     async fn mock_agent(answer_hello: bool) -> (tempfile::TempDir, PathBuf) {
+        mock_agent_with(
+            answer_hello,
+            vec![
+                "terminal".into(),
+                "exec".into(),
+                "file".into(),
+                "tunnel".into(),
+            ],
+        )
+        .await
+    }
+
+    /// The same agent, advertising exactly `features` — for the callers that
+    /// have to see an agent *without* one.
+    async fn mock_agent_with(
+        answer_hello: bool,
+        advertised: Vec<String>,
+    ) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent.sock");
         let listener = UnixListener::bind(&path).expect("bind mock agent socket");
@@ -1116,6 +1242,7 @@ mod tests {
             let mut buf = [0u8; 8192];
             // Channel kinds the mock tracks.
             let mut terminals: Vec<u32> = Vec::new();
+            let mut tunnels: Vec<u32> = Vec::new();
             let mut pushes: HashMap<u32, Vec<u8>> = HashMap::new();
             let mut pulled = b"pulled-file-content".repeat(1000);
             pulled.truncate(10_000);
@@ -1151,11 +1278,7 @@ mod tests {
                                             proto_version: PROTO_VERSION,
                                             agent_version: "0.1.0-mock".into(),
                                             os: "linux".into(),
-                                            features: vec![
-                                                "terminal".into(),
-                                                "exec".into(),
-                                                "file".into(),
-                                            ],
+                                            features: advertised.clone(),
                                             token,
                                         })
                                         .await;
@@ -1167,6 +1290,7 @@ mod tests {
                                         send(AgentMsg::Error {
                                             id: Some(id),
                                             msg: "terminal: no shell found".into(),
+                                            cause: None,
                                         })
                                         .await;
                                     } else {
@@ -1194,6 +1318,33 @@ mod tests {
                                         .await;
                                     send(AgentMsg::Exited { id, code: 42 }).await;
                                 }
+                                // Port 0 stands in for a dead destination and
+                                // `refused.invalid` for something vmlab
+                                // itself will not do; everything else is an
+                                // echo tunnel.
+                                HostMsg::OpenTunnel { id, host, port } => {
+                                    if port == 0 {
+                                        send(AgentMsg::Error {
+                                            id: Some(id),
+                                            msg: format!(
+                                                "tunnel {host}:{port}: \
+                                                          connection refused"
+                                            ),
+                                            cause: Some(ErrorCause::ConnectFailed),
+                                        })
+                                        .await;
+                                    } else if host == "refused.invalid" {
+                                        send(AgentMsg::Error {
+                                            id: Some(id),
+                                            msg: "not today".into(),
+                                            cause: None,
+                                        })
+                                        .await;
+                                    } else {
+                                        tunnels.push(id);
+                                        send(AgentMsg::Opened { id }).await;
+                                    }
+                                }
                                 HostMsg::OpenFilePush { id, .. } => {
                                     pushes.insert(id, Vec::new());
                                     send(AgentMsg::Opened { id }).await;
@@ -1220,6 +1371,12 @@ mod tests {
                                             len: data.len() as u64,
                                         })
                                         .await;
+                                    }
+                                    // A tunnel peer that sees the FIN shuts
+                                    // its own write half — a half-close, not
+                                    // the end of the channel.
+                                    if tunnels.contains(&id) {
+                                        send(AgentMsg::Eof { id }).await;
                                     }
                                 }
                                 HostMsg::Close { id } => {
@@ -1416,6 +1573,61 @@ mod tests {
         assert_eq!(out.exit_code, 42);
         assert_eq!(out.stdout, b"ran:echo hi");
         assert_eq!(out.stderr, b"warning-line");
+    }
+
+    /// The tunnel is a plain byte pipe, and each direction ends on its own:
+    /// the host's `eof` does not take the channel down, and the guest's
+    /// answer arrives as an event rather than as a dead session.
+    #[tokio::test]
+    async fn tunnel_carries_bytes_and_reports_a_half_close() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut session = agent
+            .open_tunnel("db.internal".into(), 5432)
+            .await
+            .expect("tunnel opens");
+        session.send(b"SELECT 1").await.unwrap();
+        match session.recv().await.unwrap() {
+            SessionEvent::Data(b) => assert_eq!(b, b"SELECT 1"),
+            other => panic!("expected the echo, got {other:?}"),
+        }
+        session.eof().await.unwrap();
+        assert!(matches!(session.recv().await.unwrap(), SessionEvent::Eof));
+    }
+
+    /// A SOCKS client has to tell "nothing is listening" from "vmlab refused
+    /// you", so the two arrive as different errors and never as one string a
+    /// caller has to parse.
+    #[tokio::test]
+    async fn tunnel_connect_failure_is_distinct_from_a_refusal() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+
+        let Err(TunnelError::ConnectFailed(msg)) = agent.open_tunnel("db.internal".into(), 0).await
+        else {
+            panic!("expected a connect failure");
+        };
+        assert!(msg.contains("connection refused"), "{msg}");
+
+        let Err(TunnelError::Refused(msg)) =
+            agent.open_tunnel("refused.invalid".into(), 5432).await
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(msg.contains("not today"), "{msg}");
+    }
+
+    /// An agent too old to tunnel is a refusal, named as one, and the guest
+    /// is never asked to dial.
+    #[tokio::test]
+    async fn tunnel_without_the_feature_is_refused() {
+        let (_dir, path) = mock_agent_with(true, vec!["terminal".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let Err(TunnelError::Refused(msg)) = agent.open_tunnel("db.internal".into(), 5432).await
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(msg.contains("repair-agent"), "{msg}");
     }
 
     #[tokio::test]
