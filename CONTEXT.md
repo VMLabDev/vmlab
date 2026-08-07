@@ -455,6 +455,29 @@ _Avoid_: index, manifest, state file
 A path whose two sides matched at a known point, as recorded in the sync ledger.
 A **conflict** is a path where both sides moved since one.
 
+**Windows preconditions**:
+The three things vmlab actively does to a Windows workspace, because each is a
+precondition of the *mechanism* rather than the lab author's `provision {}`: the
+NTFS case-sensitivity flag on every directory the syncer creates, a symlink
+attempted and warned about by name where it fails, and the guest's git
+line-ending conversion turned off. Resolved as a value before the syncer's loop
+starts.
+_Avoid_: Windows fixups, quirks, workarounds
+
+**Case collision refusal**:
+Two host paths differing only in case, refused by name where the guest folds
+case — the fallback to the case-sensitivity flag, never the policy. Neither copy
+is transferred, because picking one is the silent overwrite the refusal exists
+to prevent.
+_Avoid_: case conflict (a **conflict** is two moved sides), case clash
+
+**Workspace degradation**:
+A named way this machine's workspace is less than whole, reported **up front**
+rather than discovered at a random path. A Windows login declared
+`elevated = false` brings exactly two: no case-sensitive directories and no
+symlinks.
+_Avoid_: limitation, unsupported, fallback mode
+
 **Sync halt**:
 The workspace-wide, both-directions stop a conflict triggers on one machine,
 naming every conflicting path in the batch. Distinct from a **deferral** — the

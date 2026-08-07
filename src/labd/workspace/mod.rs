@@ -26,6 +26,11 @@
 //!   with the ledger written only **after** the rename.
 //! - [`watcher`] — the host-side watcher whose per-path debounce keeps the
 //!   syncer from reading a file mid-write.
+//! - [`windows`] — the three actions a Windows guest costs vmlab, resolved as
+//!   a value before the loop starts: the NTFS case-sensitivity flag every
+//!   `mkdir` carries, the symlink attempt that warns by name, and the guest's
+//!   line-ending setting. Also the two degradations a login declared
+//!   `elevated = false` brings, said up front.
 //! - [`syncer`] — the lab-daemon-owned task that runs the loop, as the
 //!   machine's default login, from after provisioning until the machine stops.
 //!
@@ -40,5 +45,7 @@ pub mod plan;
 pub mod scan;
 pub mod syncer;
 pub mod watcher;
+pub mod windows;
 
 pub use syncer::{Workspace, WorkspaceSyncers};
+pub use windows::preconditions;
