@@ -1861,7 +1861,10 @@ pub fn cmd_snapshot(vm_ref: Option<String>, name: String) -> Result<()> {
     })
 }
 
-pub fn cmd_restore(vm_ref: Option<String>, name: String) -> Result<()> {
+/// `vmlab snapshot restore` (§7.3), which for a dev machine is also §19.6's
+/// bracket: the workspace is discarded guest-side and re-converged from the
+/// canonical copy, and `discard` is the explicit flag a halted one needs.
+pub fn cmd_restore(vm_ref: Option<String>, name: String, discard: bool) -> Result<()> {
     rt()?.block_on(async {
         let (lab, vm) = match &vm_ref {
             Some(r) => {
@@ -1875,6 +1878,7 @@ pub fn cmd_restore(vm_ref: Option<String>, name: String) -> Result<()> {
             .send(LabRequest::SnapshotRestore {
                 name: name.clone(),
                 machine: vm,
+                discard,
             })
             .await
             .map_err(remote)?;

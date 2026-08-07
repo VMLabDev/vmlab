@@ -184,6 +184,16 @@ pub struct Report {
     /// Both directions are waiting for a stat-walk, and why — the overflow
     /// symptom, said as a state rather than left as a pause.
     pub rescan: Option<String>,
+    /// Both directions are waiting for the **bracket's re-seed** (§19.6): a
+    /// snapshot restore rewound the guest, and nothing propagates until the
+    /// tree has been carried back to host truth.
+    ///
+    /// Its own field rather than [`rescan`](Report::rescan)'s because the two
+    /// are opposite answers to the same pause. A rescan means *we do not know
+    /// what the guest did*; a re-seed means *we know exactly, because vmlab
+    /// did it* — and a surface that conflated them would tell a developer to
+    /// wait for a walk that is never going to run.
+    pub reseed: Option<String>,
     /// How many watch discontinuities this syncer has answered with a walk
     /// since it started. Repeated overflows are the symptom that says the
     /// guest is writing faster than the watch can report, which one event lost
@@ -196,6 +206,15 @@ pub struct Report {
     pub oversize: Vec<Oversize>,
     /// `.git`'s mutable set, waiting on a lock held on one side or the other.
     pub deferred: Vec<String>,
+    /// Changes the last pass did not carry across, by name — still inside a
+    /// debounce window, owed behind a halt, or waiting on a lock.
+    ///
+    /// The question a **snapshot capture** asks before it goes ahead
+    /// ([`bracket`](super::bracket)): a snapshot of a tree the canonical copy
+    /// has never seen restores to somewhere meaningless. Carried in the
+    /// projection too, because "how far behind is my workspace" is a question
+    /// `dev sync status` should not have to be halted to answer.
+    pub unsynced: Vec<String>,
     /// The last pass could not finish — a dropped channel, a guest that has
     /// stopped answering. Not a halt: nothing was agreed, so the next pass
     /// starts over.
@@ -228,6 +247,7 @@ impl Report {
             resolve: self.halt.as_ref().map(Halt::routes),
             volume: self.volume.as_ref().map(Volume::to_string),
             rescan: self.rescan.clone(),
+            reseed: self.reseed.clone(),
             rescans: self.rescans,
             skipped: self
                 .skipped
@@ -247,6 +267,7 @@ impl Report {
                 .take(REPORTED)
                 .collect(),
             deferred: self.deferred.clone(),
+            unsynced: self.unsynced.iter().take(REPORTED).cloned().collect(),
             trouble: self.trouble.clone(),
             passes: self.passes,
         }
@@ -378,6 +399,25 @@ struct Running {
     syncer: Arc<Syncer>,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
+    /// Everything needed to start this machine's loop again — held so a
+    /// [`Bracket`] can put back exactly the syncer it took away.
+    sessions: Arc<dyn GuestSessions>,
+    events: Arc<EventLog>,
+}
+
+/// One machine's syncer, taken off the workspace across a snapshot restore
+/// (§19.6).
+///
+/// **Suspending is the bracket's first half, and it has to be a real stop.**
+/// Arming a flag would leave a pass that is already scanning free to finish
+/// against a guest that gets rewound underneath it, and *that* pass is the one
+/// that carries five hundred rolled-back files onto the canonical copy. So the
+/// loop is stopped and waited for — which also closes the watch, whose channel
+/// the restore was about to drop anyway.
+pub struct Bracket {
+    workspace: Workspace,
+    sessions: Arc<dyn GuestSessions>,
+    events: Arc<EventLog>,
 }
 
 impl WorkspaceSyncers {
@@ -394,11 +434,159 @@ impl WorkspaceSyncers {
         let (stop, halted) = watch::channel(false);
         let machine = workspace.machine.clone();
         let syncer = Arc::new(Syncer::new(workspace));
-        let task = tokio::spawn(run(syncer.clone(), sessions, events, halted));
-        self.running
-            .lock()
-            .await
-            .insert(machine, Running { syncer, stop, task });
+        let task = tokio::spawn(run(
+            syncer.clone(),
+            sessions.clone(),
+            events.clone(),
+            halted,
+        ));
+        self.running.lock().await.insert(
+            machine,
+            Running {
+                syncer,
+                stop,
+                task,
+                sessions,
+                events,
+            },
+        );
+    }
+
+    /// The pre-flight flush that brackets a **capture** (§19.6).
+    ///
+    /// Flushing before a capture is what makes the snapshot coherent with the
+    /// host tree, so restoring it later lands somewhere meaningful rather than
+    /// mid-transfer — and if the guest has work the canonical copy has never
+    /// seen, this **refuses, with no escape flag**. A machine with no
+    /// workspace has nothing to bracket and passes straight through.
+    ///
+    /// `declared` is the workspace of a machine that is **down**, where there
+    /// is no syncer to flush. A stopped machine cannot be brought into step at
+    /// all, so this refuses only on the halt its ledger still records: making
+    /// every down dev machine unsnapshottable would be a bigger obstruction
+    /// than the incoherence it guards against, and the halt is the part a
+    /// developer can actually answer.
+    pub async fn before_capture(&self, machine: &str, declared: Option<&Workspace>) -> Result<()> {
+        let Some(syncer) = self.get(machine).await else {
+            let ledger = recorded(declared).unwrap_or_else(Ledger::about_nothing);
+            return refuse(super::bracket::Outstanding::when_stopped(
+                machine,
+                &ledger.halted,
+                ledger.reseed_owed,
+            ));
+        };
+        let report = match syncer.pass_now().await {
+            Ok(report) => report,
+            // The flush did not come back at all. That is the strongest reason
+            // of the lot to refuse — not knowing what the guest holds is worse
+            // than knowing it is behind — so it becomes the report's own
+            // `trouble` rather than a second error path with its own words.
+            Err(e) => Report {
+                trouble: Some(format!("{e:#}")),
+                ..syncer.report()
+            },
+        };
+        refuse(super::bracket::Outstanding::of(machine, &report))
+    }
+
+    /// What a **restore** has to be asked twice about (§19.6).
+    ///
+    /// A halt is the one state where restoring destroys something a developer
+    /// was about to be asked about, so it refuses — but only until the flag is
+    /// given, because wanting to throw the guest copy away is frequently why
+    /// someone restores.
+    ///
+    /// It reaches a machine that is **down** through the same `declared`
+    /// workspace, because a restore does not need a running machine and the
+    /// halt is exactly the state a developer must not lose by having stopped
+    /// one.
+    pub async fn before_restore(
+        &self,
+        machine: &str,
+        discard: bool,
+        declared: Option<&Workspace>,
+    ) -> Result<()> {
+        if discard {
+            return Ok(());
+        }
+        match self.get(machine).await {
+            Some(syncer) => refuse(super::bracket::halted(machine, &syncer.report())),
+            // A restore is not refused for owing a re-seed: it is about to
+            // ask for another one, and the second answers the first.
+            None => refuse(super::bracket::halted_when_stopped(
+                machine,
+                &recorded(declared)
+                    .unwrap_or_else(Ledger::about_nothing)
+                    .halted,
+            )),
+        }
+    }
+
+    /// Take one machine's syncer off the workspace for the duration of a
+    /// restore, or `None` for a machine that has none.
+    ///
+    /// Every caller must hand the [`Bracket`] back to [`resume`](Self::resume),
+    /// including on the path where the restore itself failed: a workspace whose
+    /// syncer quietly never came back is the silent-divergence failure ADR-0014
+    /// exists to rule out, and it would look exactly like a machine with
+    /// nothing to sync.
+    pub async fn suspend(&self, machine: &str) -> Option<Bracket> {
+        let running = self.running.lock().await.remove(machine)?;
+        let _ = running.stop.send(true);
+        // Waited for, not just signalled: the point of suspending is that no
+        // pass is in flight when the guest is rewound.
+        let _ = running.task.await;
+        Some(Bracket {
+            workspace: running.syncer.workspace.clone(),
+            sessions: running.sessions,
+            events: running.events,
+        })
+    }
+
+    /// Note on one machine's ledger that its guest is about to be rewound
+    /// (§19.6) — the other half of [`suspend`](Self::suspend), and the half
+    /// that survives the machine being down.
+    ///
+    /// **Only with the syncer already off**, and that is checked rather than
+    /// left to a comment. A running loop holds the ledger in memory and saves
+    /// it *whole*, so a note written under one is erased by the next pass to
+    /// complete — after which the resumed syncer stat-walks a rolled-back tree,
+    /// reads every file in it as a guest-side edit, and carries them onto the
+    /// canonical copy. That failure is silent, and it is precisely the one this
+    /// bracket exists to prevent, so the ordering is enforced where it can be
+    /// rather than described where it cannot.
+    pub async fn mark_rewound(&self, workspace: &Workspace) -> Result<()> {
+        if self.running.lock().await.contains_key(&workspace.machine) {
+            anyhow::bail!(
+                "\"{}\"'s workspace was marked as rewound while its syncer was still running: the \
+                 note would be erased by the next pass to complete, and the restore would then \
+                 propagate the rolled-back tree onto the canonical copy (§19.6). Suspend first.",
+                workspace.machine,
+            );
+        }
+        Ledger::mark_rewound(
+            &workspace.ledger_path,
+            &workspace.host_root,
+            &workspace.guest_root,
+        )
+        .with_context(|| {
+            format!(
+                "noting on \"{}\"'s sync ledger that its workspace is about to be rewound",
+                workspace.machine,
+            )
+        })
+    }
+
+    /// Put the syncer back.
+    ///
+    /// Whether it owes the bracket's re-seed is **not** decided here: it is
+    /// written on the ledger before the rewind ([`Ledger::mark_rewound`]) and
+    /// read by the loop at start-up, so a restore of a machine that is *down*
+    /// — where there is no syncer to suspend and none to resume — owes exactly
+    /// the same re-seed as this path does. One fact, in one place.
+    pub async fn resume(&self, bracket: Bracket) {
+        self.start(bracket.workspace, bracket.sessions, bracket.events)
+            .await;
     }
 
     /// One machine's syncer, or `None` — which is every machine that is not a
@@ -465,6 +653,41 @@ enum Woke {
     Asked,
     Quiet,
 }
+
+/// A refusal as its words, or nothing to refuse.
+///
+/// One shape for both brackets, so a refusal is always the `Display` of the
+/// value that decided it — never a sentence assembled at the call site, which
+/// is how two surfaces end up saying different things about one state.
+fn refuse(said: Option<impl std::fmt::Display>) -> Result<()> {
+    match said {
+        Some(said) => Err(anyhow::anyhow!("{said}")),
+        None => Ok(()),
+    }
+}
+
+/// What a stopped machine's ledger still records about its workspace.
+///
+/// Read off disk rather than remembered, because the syncer that knew it went
+/// with the machine — and read here rather than by the caller so the two
+/// brackets cannot disagree about where the answer lives.
+fn recorded(declared: Option<&Workspace>) -> Option<Ledger> {
+    let workspace = declared?;
+    Some(Ledger::load(
+        &workspace.ledger_path,
+        &workspace.host_root,
+        &workspace.guest_root,
+    ))
+}
+
+/// Why both directions are stopped while the bracket's re-seed runs.
+///
+/// Said as a **state** rather than left as a pause, like the rescan barrier
+/// beside it: a surface asked "why is nothing moving" during a re-convergence
+/// has to be able to answer without reading a log.
+const RESEEDING: &str = "a snapshot restore rewound this machine, so the workspace is being carried back to the \
+     canonical copy before anything else runs — nothing flows guest→host during it, and the \
+     watch stays closed until it completes";
 
 /// The loop. Runs until `stop` flips, whatever the machine or the channel
 /// does in the meantime.
@@ -540,18 +763,105 @@ async fn run(
     let mut passes = 0u64;
     // When to run a pass nothing else will ask for — see [`LOCK_RETRY`].
     let mut look_again: Option<Instant> = None;
+    // The re-seed has just completed, so the watch about to open is the one
+    // (re)open that is **not** a discontinuity — see below.
+    let mut seeded = false;
+    // The bracket's second half, read off the ledger rather than passed in:
+    // a snapshot restore notes the rewind there precisely so that a machine
+    // restored while it was *down* owes the same re-seed as one restored while
+    // it was up (§19.6).
+    let mut reseed = ledger.reseed_owed;
+
+    if reseed {
+        syncer.publish(Report {
+            reseed: Some(RESEEDING.to_string()),
+            ..Report::default()
+        });
+    }
 
     loop {
         if *stop.borrow() {
             return;
+        }
+        // **The re-seed completes before the watch reopens**, or the syncer's
+        // own writes fill a fresh dirty set with tens of thousands of
+        // self-inflicted paths. Nothing else runs first: no watch, no probe,
+        // and above all no ordinary reconciliation, which would read the
+        // rewound tree as five hundred guest-side edits.
+        if reseed {
+            let serving = syncer.requested.load(Ordering::SeqCst);
+            match reconverge(
+                &workspace,
+                sessions.as_ref(),
+                &events,
+                &mut ledger,
+                &mut learned,
+            )
+            .await
+            {
+                Ok(report) => {
+                    passes += 1;
+                    reseed = false;
+                    // A restore takes the bracket's re-seed **rather than a
+                    // stat-walk**: the walk asks what the guest did while
+                    // nobody was watching, and vmlab already knows.
+                    seeded = true;
+                    rescan = false;
+                    // The rules may have changed on the host while the machine
+                    // was rolled back, and the re-seed has just recomputed
+                    // them — so the watch opens on the current list.
+                    prune = ledger.prune.clone();
+                    syncer.publish(Report {
+                        rescans,
+                        passes,
+                        ..report
+                    });
+                    let _ = syncer.served.send(serving);
+                }
+                Err(e) => {
+                    // The barrier **stays**. A re-seed that failed leaves a
+                    // guest holding rolled-back content and a ledger that
+                    // still describes it, and an ordinary pass over that pair
+                    // is exactly the propagation this bracket exists to
+                    // prevent — so the loop retries rather than falling back
+                    // to one.
+                    syncer.publish(Report {
+                        reseed: Some(RESEEDING.to_string()),
+                        trouble: Some(format!("{e:#}")),
+                        rescans,
+                        passes,
+                        ..syncer.report()
+                    });
+                    let _ = syncer.served.send(serving);
+                    events.emit(
+                        "workspace.deferred",
+                        json!({
+                            "machine": workspace.machine,
+                            "reason": format!(
+                                "the workspace could not re-converge after the snapshot restore, \
+                                 so both directions stay stopped rather than propagating over a \
+                                 rolled-back tree: {e:#}"
+                            ),
+                            "retry_in_s": RETRY.as_secs(),
+                        }),
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(RETRY) => {}
+                        _ = stop.changed() => return,
+                    }
+                    continue;
+                }
+            }
         }
         if guest_watch.is_none() {
             match sessions.watch(&workspace.guest_root, prune.clone()).await {
                 Ok(watch) => {
                     guest_watch = Some(watch);
                     // Every (re)open is a discontinuity: what happened while
-                    // there was no watch is exactly what the walk is for.
-                    rescan = true;
+                    // there was no watch is exactly what the walk is for. The
+                    // one exception is the open that follows a re-seed, where
+                    // the answer is already in hand.
+                    rescan = !std::mem::take(&mut seeded);
                     due = true;
                 }
                 Err(e) => {
@@ -615,10 +925,28 @@ async fn run(
                         (!done.report.deferred.is_empty()).then(|| Instant::now() + LOCK_RETRY);
                     marker = done.marker;
                     syncer.restore_resolutions(done.unresolved);
+                    // Guest-side work the canonical copy has not seen: owed
+                    // from this pass, plus whatever the guest is still writing.
+                    // What a snapshot capture refuses on, so it is assembled
+                    // where the whole of it is known rather than inside the
+                    // pass, which sees only its own half.
+                    //
+                    // **Guest-side only.** A host-side save inside its own
+                    // debounce window means the *guest* is momentarily behind,
+                    // which a restore fixes and a capture does not lose — and
+                    // counting it would let an editor open on the host refuse
+                    // a capture that has no flag to answer it with.
+                    let unsynced: BTreeSet<String> = owed
+                        .iter()
+                        .cloned()
+                        .chain(guest_debounce.in_flight())
+                        .collect();
                     syncer.publish(Report {
                         rescan: None,
+                        reseed: None,
                         rescans,
                         passes,
+                        unsynced: unsynced.into_iter().collect(),
                         ..done.report
                     });
                     let _ = syncer.served.send(serving);
@@ -1264,9 +1592,19 @@ async fn pass(
     } else {
         rules
     };
-    if !plan.nothing_to_record() || ledger.ignore_digest != record_rules || ledger.prune != prune {
+    // The halted paths ride the ledger for the snapshot bracket's sake
+    // (§19.6): a restore refuses while a halt stands, and `vmlab down` takes
+    // the syncer holding it — so without this, stopping a machine would be a
+    // way to lose the refusal along with it.
+    let halted_now = halt.as_ref().map(Halt::paths).unwrap_or_default();
+    if !plan.nothing_to_record()
+        || ledger.ignore_digest != record_rules
+        || ledger.prune != prune
+        || ledger.halted != halted_now
+    {
         ledger.ignore_digest = record_rules;
         ledger.prune = prune.clone();
+        ledger.halted = halted_now;
         ledger
             .save(&workspace.ledger_path)
             .with_context(|| format!("saving {}", workspace.ledger_path.display()))?;
@@ -1354,6 +1692,110 @@ async fn pass(
     })
 }
 
+/// The bracket's re-seed as one pass: the whole workspace carried back to the
+/// canonical copy after a snapshot restore (§19.6, [`reseed`](super::reseed)).
+///
+/// It stands in for a reconciliation rather than beside one, and the two
+/// differences are the point. It asks the guest nothing it would act on — the
+/// tree is walked only to decide what to overwrite and delete — and it takes no
+/// stat-walk in the ordinary sense, because there is no question about what
+/// happened to that tree: vmlab did it.
+///
+/// The halt marker is not written or read here. A restore that reached this
+/// point either had no halt or was asked for it explicitly, and the halt it
+/// discarded is gone with the guest state it was about — so the marker goes
+/// with the rest of the rolled-back tree, as an ordinary removal or an
+/// overwrite, and the loop's own `marker` starts empty on the restarted loop.
+async fn reconverge(
+    workspace: &Workspace,
+    sessions: &dyn GuestSessions,
+    events: &EventLog,
+    ledger: &mut Ledger,
+    learned: &mut Learned,
+) -> Result<Report> {
+    let guest = sessions
+        .open()
+        .await
+        .context("opening a file session as the machine's default login")?;
+    // Before the re-seed for the same reason it comes before an ordinary pass:
+    // whether this guest will hold two names differing only in case decides
+    // whether a colliding pair is transferred or refused, and finding out from
+    // a failed `mkdir` half way through means one of them has already landed
+    // on the other.
+    preconditions(workspace, sessions, guest.as_ref(), events, learned).await?;
+
+    let done = super::reseed::reconverge(
+        guest.as_ref(),
+        workspace,
+        learned.case_sensitive_dirs,
+        learned.case_folding(),
+        ledger,
+    )
+    .await?;
+    ledger
+        .save(&workspace.ledger_path)
+        .with_context(|| format!("saving {}", workspace.ledger_path.display()))?;
+
+    events.emit(
+        "workspace.reconverged",
+        json!({
+            "machine": workspace.machine,
+            "placed": done.placed,
+            "removed": done.removed,
+            "adopted": done.adopted,
+            "reason": done.headline(&workspace.machine),
+        }),
+    );
+    for refusal in &done.oversize {
+        events.emit(
+            "workspace.refused",
+            json!({
+                "machine": workspace.machine,
+                "path": refusal.path,
+                "size": refusal.size,
+                "cap": refusal.cap,
+                "reason": refusal.to_string(),
+            }),
+        );
+    }
+    for collision in &done.collisions {
+        events.emit(
+            "workspace.case_collision",
+            json!({
+                "machine": workspace.machine,
+                "paths": collision.paths,
+                "reason": collision.to_string(),
+            }),
+        );
+    }
+    for skip in &done.skipped {
+        events.emit(
+            "workspace.skipped",
+            json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
+        );
+    }
+    // Named, and left for the next ordinary pass. Nothing was agreed about
+    // them, so they are carried the usual way rather than blocking the
+    // barrier for ever — the guarantee the bracket owes is that no *guest*
+    // state reached the host, and a path that did not land breaks none of it.
+    for failure in &done.failures {
+        events.emit(
+            "workspace.failed",
+            json!({"machine": workspace.machine, "path": failure.path, "reason": failure.why}),
+        );
+    }
+
+    Ok(Report {
+        // A restore discards the guest side of the workspace, so whatever the
+        // two sides were disagreeing about before it is not a disagreement any
+        // more. There is nothing left for a developer to resolve.
+        halt: None,
+        skipped: done.skipped.into_iter().take(REPORTED).collect(),
+        oversize: done.oversize,
+        ..Report::default()
+    })
+}
+
 /// Put the halt marker at the guest's workspace root, or take it away.
 ///
 /// Temp-then-rename in the target's own directory, like every other apply and
@@ -1387,6 +1829,13 @@ mod tests {
         watcher: Arc<FakeWatcher>,
         /// The prune list of every watch that has been opened, in order.
         opens: std::sync::Mutex<Vec<Vec<String>>>,
+        /// How many guest writes had already happened when each watch opened.
+        ///
+        /// How a test says *the re-seed completed before the watch reopened*
+        /// as a fact rather than as a hope: the ordering is the whole of
+        /// §19.6's rule, and without this a test could only observe that both
+        /// things eventually happened.
+        opened_after: std::sync::Mutex<Vec<usize>>,
     }
 
     impl OneFake {
@@ -1396,11 +1845,16 @@ mod tests {
                 guest,
                 watcher,
                 opens: std::sync::Mutex::new(Vec::new()),
+                opened_after: std::sync::Mutex::new(Vec::new()),
             })
         }
 
         fn opens(&self) -> Vec<Vec<String>> {
             self.opens.lock().expect("opens").clone()
+        }
+
+        fn opened_after(&self) -> Vec<usize> {
+            self.opened_after.lock().expect("opened_after").clone()
         }
     }
 
@@ -1412,6 +1866,10 @@ mod tests {
 
         async fn watch(&self, _root: &str, prune: Vec<String>) -> Result<Box<dyn GuestWatch>> {
             self.opens.lock().expect("opens").push(prune);
+            self.opened_after
+                .lock()
+                .expect("opened_after")
+                .push(self.guest.writes().len());
             Ok(self.watcher.session())
         }
     }
@@ -2708,5 +3166,415 @@ mod tests {
                         .contains("will not make a directory case-sensitive")),
             "{emitted:?}"
         );
+    }
+
+    // ---- the snapshot bracket (§19.6) -------------------------------------
+
+    /// Roll the guest back the way a snapshot restore does: the tree it was
+    /// holding at capture time, complete with an older clock and work the host
+    /// has never seen.
+    fn rewind(guest: &FakeGuest) {
+        guest.file("/src/main.rs", "the version in the snapshot", 1);
+        guest.file("/src/experiment.rs", "never synced anywhere", 1);
+    }
+
+    /// The sequence `Lab::restore` performs around a rewind (§19.6): take the
+    /// syncer off the workspace and wait for it, *then* note the rewind on the
+    /// ledger, rewind, and put the syncer back.
+    ///
+    /// Spelled out here rather than hidden behind a helper on the syncers,
+    /// because the ordering **is** the safety argument and a test that took a
+    /// convenient order would prove nothing about the real one. The suspend
+    /// comes first for two reasons at once: no pass may be in flight while the
+    /// guest is rewound, and a pass that finished after the note was written
+    /// would save its own in-memory ledger over it — leaving a resumed syncer
+    /// to stat-walk a rolled-back tree with no idea anything had happened.
+    async fn restore_bracket<T>(
+        syncers: &WorkspaceSyncers,
+        ws: &Workspace,
+        rewind_guest: impl FnOnce() -> T,
+    ) -> T {
+        let bracket = syncers
+            .suspend(&ws.machine)
+            .await
+            .expect("a workspace to hold");
+        assert!(!syncers.is_running(&ws.machine).await);
+        syncers.mark_rewound(ws).await.unwrap();
+        let observed = rewind_guest();
+        syncers.resume(bracket).await;
+        observed
+    }
+
+    /// The whole hazard in one test. A restore rewinds the guest by files the
+    /// syncer cannot tell from edits; the bracket makes the tree re-converge
+    /// **from the host**, and the canonical copy is not touched at all.
+    #[tokio::test]
+    async fn a_restore_re_converges_the_guest_and_never_writes_to_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "the canonical version").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+
+        // vmlab performs the restore, so it brackets it: the syncer comes off
+        // the workspace first, and no pass can be in flight while the guest is
+        // rewound.
+        let ws = workspace(dir.path(), state.path());
+        restore_bracket(&syncers, &ws, || rewind(&guest)).await;
+
+        let converged = {
+            let guest = guest.clone();
+            eventually(move || {
+                guest.text("/src/main.rs").as_deref() == Some("the canonical version")
+                    && guest.get("/src/experiment.rs").is_none()
+            })
+            .await
+        };
+        assert!(
+            converged,
+            "the guest was left rolled back: {:?}",
+            guest.paths()
+        );
+
+        // **Nothing flows guest→host.** The rolled-back copy and the guest's
+        // own unsynced file both end here, and neither reached the tree
+        // nothing re-derives.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "the canonical version",
+        );
+        assert!(!dir.path().join("experiment.rs").exists());
+        syncers.stop("dev01").await;
+        let _ = sessions;
+    }
+
+    /// **The re-seed completes before the watch reopens**, or the syncer's own
+    /// writes fill a fresh dirty set with tens of thousands of self-inflicted
+    /// paths — and **a restore takes the bracket's re-seed rather than a
+    /// stat-walk**, because vmlab already knows what is in that tree.
+    #[tokio::test]
+    async fn the_re_seed_finishes_before_the_watch_reopens_and_takes_no_stat_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "the canonical version").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+
+        let opens_before = sessions.opens().len();
+        let ws = workspace(dir.path(), state.path());
+        let writes_before = restore_bracket(&syncers, &ws, || {
+            rewind(&guest);
+            guest.writes().len()
+        })
+        .await;
+
+        let converged = {
+            let guest = guest.clone();
+            eventually(move || {
+                guest.text("/src/main.rs").as_deref() == Some("the canonical version")
+            })
+            .await
+        };
+        assert!(converged);
+        let reopened = {
+            let sessions = sessions.clone();
+            eventually(move || sessions.opens().len() > opens_before).await
+        };
+        assert!(reopened, "the watch never came back");
+
+        // The watch that follows the restore opened only after the re-seed had
+        // already written the tree back.
+        let after = sessions.opened_after();
+        assert!(
+            after[opens_before] > writes_before,
+            "the watch reopened before the re-seed wrote anything: {after:?} against \
+             {writes_before} writes",
+        );
+
+        // And no walk was taken for it. A rescan is what answers *we do not
+        // know what the guest did*; here vmlab does.
+        let syncer = syncers.get("dev01").await.expect("still running");
+        let settled = eventually_async(|| async { syncer.report().passes > 0 }).await;
+        assert!(settled);
+        assert_eq!(
+            syncer.report().rescans,
+            0,
+            "a restore must not answer itself with a stat-walk",
+        );
+        assert!(syncer.report().reseed.is_none(), "the barrier never lifted");
+        syncers.stop("dev01").await;
+    }
+
+    /// A restore discards the guest side by design, so the halt it was
+    /// carrying goes with it: a developer who asked for the restore has
+    /// already answered the question the halt was asking.
+    #[tokio::test]
+    async fn a_restore_clears_the_halt_it_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
+        diverge(dir.path(), &guest, &sessions);
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
+
+        // Refused while the halt stands…
+        let refused = syncers
+            .before_restore("dev01", false, None)
+            .await
+            .expect_err("a halted workspace refuses an unasked restore");
+        assert!(
+            refused
+                .to_string()
+                .contains(super::super::bracket::DISCARD_FLAG),
+            "{refused:#}"
+        );
+        // …and allowed once it is asked for by name.
+        syncers.before_restore("dev01", true, None).await.unwrap();
+
+        let ws = workspace(dir.path(), state.path());
+        restore_bracket(&syncers, &ws, || {}).await;
+
+        let cleared = eventually_async(|| async {
+            syncers
+                .get("dev01")
+                .await
+                .is_some_and(|s| s.report().passes > 0 && s.report().halt.is_none())
+        })
+        .await;
+        assert!(cleared, "the halt outlived the restore that discarded it");
+        assert_eq!(
+            guest.text("/src/main.rs").as_deref(),
+            Some("the host's version"),
+            "the guest kept the copy the restore was told to throw away",
+        );
+        syncers.stop("dev01").await;
+    }
+
+    /// **Capture refuses with no escape** when the guest holds work the
+    /// canonical copy has never seen — and lets an in-step workspace through,
+    /// which is the case that must stay cheap.
+    #[tokio::test]
+    async fn a_capture_flushes_first_and_refuses_on_unsynced_guest_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
+
+        // In step: the pre-flight flush is the whole of the check, and it
+        // passes.
+        syncers.before_capture("dev01", None).await.unwrap();
+
+        // A guest-side save that has not drained yet. The flush carries it,
+        // which is the other half of the bracket: flushing before capture is
+        // what makes the snapshot coherent with the host tree.
+        guest.file("/src/main.rs", "typed just now", 900);
+        sessions.watcher.mark("main.rs");
+        syncers.before_capture("dev01", None).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "typed just now",
+            "the pre-flight flush did not carry the guest's work",
+        );
+
+        // A halt, which the flush cannot clear: refused, and with no flag on
+        // offer.
+        diverge(dir.path(), &guest, &sessions);
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
+        let refused = syncers
+            .before_capture("dev01", None)
+            .await
+            .expect_err("a halted workspace is not a coherent capture");
+        let said = format!("{refused:#}");
+        assert!(said.contains("no flag for this"), "{said}");
+        assert!(said.contains(super::super::bracket::NOT_A_BACKUP), "{said}");
+        syncers.stop("dev01").await;
+    }
+
+    /// A machine that is not a dev machine, or has no workspace, has nothing
+    /// to bracket — and snapshotting one must not grow a dev machine's costs.
+    #[tokio::test]
+    async fn a_machine_with_no_workspace_brackets_nothing() {
+        let syncers = WorkspaceSyncers::default();
+        syncers.before_capture("plain-vm", None).await.unwrap();
+        syncers
+            .before_restore("plain-vm", false, None)
+            .await
+            .unwrap();
+        assert!(syncers.suspend("plain-vm").await.is_none());
+    }
+
+    /// **A restore does not need a running machine.** `vmlab down` takes the
+    /// syncer with it, so the fact that the guest was rewound rides the
+    /// ledger — otherwise the next `up` would start a syncer that stat-walks a
+    /// rolled-back tree, read five hundred old files as guest-side edits, and
+    /// carry them onto the canonical copy. Which is the whole hazard.
+    #[tokio::test]
+    async fn a_restore_of_a_stopped_machine_still_owes_the_re_seed_when_it_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "the canonical version").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+
+        // The machine goes down, taking its syncer with it.
+        syncers.stop("dev01").await;
+        assert!(syncers.suspend("dev01").await.is_none());
+
+        // …and is restored while stopped. All the restore can do is leave the
+        // note, which is exactly what it does.
+        let ws = workspace(dir.path(), state.path());
+        syncers.mark_rewound(&ws).await.unwrap();
+        rewind(&guest);
+
+        // `up` again.
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+
+        let converged = {
+            let guest = guest.clone();
+            eventually(move || {
+                guest.text("/src/main.rs").as_deref() == Some("the canonical version")
+                    && guest.get("/src/experiment.rs").is_none()
+            })
+            .await
+        };
+        assert!(
+            converged,
+            "the note on the ledger bought nothing: {:?}",
+            guest.paths()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "the canonical version",
+            "the rolled-back copy reached the canonical tree",
+        );
+        // …and the note is spent, so an ordinary restart does not re-seed
+        // again.
+        let syncer = syncers.get("dev01").await.expect("running");
+        assert!(eventually_async(|| async { syncer.report().passes > 0 }).await);
+        assert!(
+            !Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed,
+            "the re-seed never cleared its own note",
+        );
+        syncers.stop("dev01").await;
+    }
+
+    /// The mirror case: a halt must not be lost by stopping the machine, or
+    /// the very next restore destroys the guest copy of every conflicting path
+    /// unasked.
+    #[tokio::test]
+    async fn a_halt_survives_the_machine_stopping_so_a_restore_still_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
+        diverge(dir.path(), &guest, &sessions);
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
+        syncers.stop("dev01").await;
+
+        let ws = workspace(dir.path(), state.path());
+        let refused = syncers
+            .before_restore("dev01", false, Some(&ws))
+            .await
+            .expect_err("a halt outlives the machine that was holding it");
+        let said = format!("{refused:#}");
+        assert!(said.contains("main.rs"), "{said}");
+        assert!(said.contains(super::super::bracket::DISCARD_FLAG), "{said}");
+        // A capture of a stopped machine refuses on the same recorded halt —
+        // it cannot flush one, but it can still decline to freeze a
+        // disagreement.
+        assert!(
+            syncers.before_capture("dev01", Some(&ws)).await.is_err(),
+            "a stopped, halted workspace is not a coherent capture",
+        );
+        // …and the flag answers it, as it does for a running one.
+        syncers
+            .before_restore("dev01", true, Some(&ws))
+            .await
+            .unwrap();
+    }
+
+    /// A stopped machine whose workspace agrees with itself is snapshottable.
+    /// Refusing every down dev machine would be a bigger obstruction than the
+    /// incoherence it guards against.
+    #[tokio::test]
+    async fn a_stopped_machine_in_step_is_still_snapshottable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "agreed").unwrap();
+        let (syncers, _guest, _sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        syncers.stop("dev01").await;
+
+        let ws = workspace(dir.path(), state.path());
+        syncers.before_capture("dev01", Some(&ws)).await.unwrap();
+        syncers
+            .before_restore("dev01", false, Some(&ws))
+            .await
+            .unwrap();
+    }
+
+    /// **The note cannot be written under a running syncer**, and the refusal
+    /// is a check rather than a comment.
+    ///
+    /// A running loop holds the ledger in memory and saves it whole, so a note
+    /// written while a pass was still in flight is erased by that pass when it
+    /// completes — and nothing says so: the resumed syncer simply stat-walks a
+    /// rolled-back tree and carries every file in it onto the canonical copy.
+    /// A comment would have been one edit away from being wrong, and the
+    /// failure it guards is silent, which is the combination §19.6 refuses.
+    #[tokio::test]
+    async fn the_rewind_note_refuses_to_be_written_under_a_running_syncer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "the canonical version").unwrap();
+        let (syncers, _guest, _sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+
+        let ws = workspace(dir.path(), state.path());
+        let refused = syncers
+            .mark_rewound(&ws)
+            .await
+            .expect_err("the syncer is still running");
+        let said = format!("{refused:#}");
+        assert!(said.contains("still running"), "{said}");
+        assert!(said.contains("Suspend first"), "{said}");
+        assert!(
+            !Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed,
+            "the note was written anyway",
+        );
+
+        // …and it lands once the syncer is off, which is the order the bracket
+        // takes.
+        let bracket = syncers.suspend("dev01").await.expect("a workspace to hold");
+        syncers.mark_rewound(&ws).await.unwrap();
+        assert!(Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed);
+        syncers.resume(bracket).await;
+        syncers.stop("dev01").await;
+    }
+
+    /// A machine that owes a re-seed holds neither version whole, so capturing
+    /// it would freeze a tree mid-rewrite. The `up` that runs the re-seed is
+    /// the way out, and the refusal says so rather than offering a flag.
+    #[tokio::test]
+    async fn a_stopped_machine_that_still_owes_a_re_seed_refuses_a_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "agreed").unwrap();
+        let (syncers, _guest, _sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        syncers.stop("dev01").await;
+
+        let ws = workspace(dir.path(), state.path());
+        syncers.mark_rewound(&ws).await.unwrap();
+
+        let refused = syncers
+            .before_capture("dev01", Some(&ws))
+            .await
+            .expect_err("a tree that has not re-converged is not a coherent capture");
+        let said = format!("{refused:#}");
+        assert!(said.contains("has not been carried back"), "{said}");
+        assert!(said.contains("no flag for this"), "{said}");
+
+        // …and a *restore* is not refused for it: it is about to ask for
+        // another re-seed, and the second answers the first.
+        syncers
+            .before_restore("dev01", false, Some(&ws))
+            .await
+            .unwrap();
     }
 }

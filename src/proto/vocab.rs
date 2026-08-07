@@ -753,9 +753,16 @@ vocabulary! {
             #[serde(default, alias = "vm", alias = "container")] machine: Option<String>,
         },
         /// Restore one machine, or every machine when `machine` is omitted.
+        ///
+        /// `discard` is §19.6's explicit discard flag: a restore rewinds a dev
+        /// machine's workspace and re-converges it from the host, which
+        /// destroys the guest copy of every conflicting path, so a halted
+        /// workspace refuses until this says so. It defaults to `false` and
+        /// means nothing for a machine without a workspace.
         SnapshotRestore = "snapshot.restore" {
             name: String,
             #[serde(default, alias = "vm", alias = "container")] machine: Option<String>,
+            #[serde(default)] discard: bool,
         },
         /// Delete one machine's snapshot.
         SnapshotDelete = "snapshot.delete" {

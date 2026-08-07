@@ -105,7 +105,7 @@ the code is the contract.
 | `playbook.apply` | `machine: String`, `playbook: Option<String>`, `play: Option<String>` | `cli`, `web` | Apply a playbook to one machine, streaming its output. |
 | `playbook.op_status` | — | `web` | Which playbook runs are in flight. |
 | `snapshot.take` | `name: String`, `machine: Option<String>` | `cli`, `web` | Snapshot one machine, or the whole lab when `machine` is omitted. |
-| `snapshot.restore` | `name: String`, `machine: Option<String>` | `cli`, `web` | Restore one machine, or every machine when `machine` is omitted. |
+| `snapshot.restore` | `name: String`, `machine: Option<String>`, `discard: bool` | `cli`, `web` | Restore one machine, or every machine when `machine` is omitted. `discard` is §19.6's explicit discard flag: a restore rewinds a dev machine's workspace and re-converges it from the host, which destroys the guest copy of every conflicting path, so a halted workspace refuses until this says so. It defaults to `false` and means nothing for a machine without a workspace. |
 | `snapshot.delete` | `machine: String`, `name: String` | `cli`, `web` | Delete one machine's snapshot. |
 | `snapshot.list` | `machine: String` | `cli`, `web` | One machine's snapshots. |
 | `workspace.flush` | `machine: String` | `cli` | Run a workspace sync pass now and answer with what it decided (PRD §19.6). What `vmlab dev sync flush` and `status --wait` are. |

@@ -28,7 +28,7 @@ import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
 import PlaybookPanel from "./PlaybookPanel";
 import TerminalPanel from "./TerminalPanel";
-import WorkspaceSync from "./WorkspaceSync";
+import WorkspaceSync, { NOT_A_BACKUP } from "./WorkspaceSync";
 
 export default function MachineView() {
   const [tab, setTab] = createSignal<"console" | "terminal" | "log" | "playbook">("console");
@@ -255,6 +255,10 @@ export default function MachineView() {
               </Button>
             }
           >
+            {/* §19.6, said where a developer would otherwise assume the
+                opposite. Capture flushes the workspace and refuses if it
+                cannot; restore discards the guest copy and re-converges it. */}
+            <p class="snap-row-time">{NOT_A_BACKUP}</p>
             <Show
               when={(snaps()?.length ?? 0) > 0}
               fallback={<div class="snap-row-time">No snapshots yet.</div>}

@@ -326,6 +326,23 @@ fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
                  the guest is not answering."
             );
         }
+        // Not "in step": the two copies still differ, which is the whole
+        // question a snapshot capture asks before it goes ahead. Saying "in
+        // step" here would make `dev sync status` disagree with the refusal a
+        // capture is about to print.
+        None if !sync.unsynced.is_empty() => {
+            let _ = writeln!(
+                out,
+                "\"{machine}\"'s workspace is {} {} behind the canonical copy ({} passes).",
+                sync.unsynced.len(),
+                if sync.unsynced.len() == 1 {
+                    "path"
+                } else {
+                    "paths"
+                },
+                sync.passes,
+            );
+        }
         None => {
             let _ = writeln!(
                 out,
@@ -336,6 +353,7 @@ fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
     }
     for (label, said) in [
         ("waiting", sync.rescan.as_ref()),
+        ("re-seeding", sync.reseed.as_ref()),
         ("volume", sync.volume.as_ref()),
         ("trouble", sync.trouble.as_ref()),
     ] {
@@ -357,6 +375,16 @@ fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
             "\ndeferred while git holds a lock — timing, not a conflict, and it clears itself:"
         );
         for path in &sync.deferred {
+            let _ = writeln!(out, "  {path}");
+        }
+    }
+    if !sync.unsynced.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nnot yet carried across — a snapshot capture refuses while any of these stand \
+             (§19.6):"
+        );
+        for path in &sync.unsynced {
             let _ = writeln!(out, "  {path}");
         }
     }
@@ -930,9 +958,11 @@ mod tests {
             resolve: Some("`vmlab dev sync resolve <path> --host` or `--guest`".into()),
             volume: None,
             rescan: None,
+            reseed: None,
             rescans: 0,
             skipped: Vec::new(),
             deferred: Vec::new(),
+            unsynced: Vec::new(),
             trouble: None,
             passes: 7,
         }
@@ -981,12 +1011,14 @@ mod tests {
                 resolve: None,
                 volume: Some("this pass is carrying 4000 paths under target".into()),
                 rescan: Some("the guest's watch lost coverage".into()),
+                reseed: None,
                 rescans: 3,
                 skipped: vec![crate::status::WorkspaceSkipStatus {
                     path: "build/app.sock".into(),
                     reason: "guest: not a file, directory or symlink".into(),
                 }],
                 deferred: vec![".git/index".into()],
+                unsynced: Vec::new(),
                 trouble: None,
                 passes: 12,
             },
@@ -1017,6 +1049,51 @@ mod tests {
             },
         );
         assert!(said.contains("is in step (7 passes)"), "{said}");
+    }
+
+    /// A workspace that is behind is **not** in step, and says which paths —
+    /// these are exactly what a snapshot capture refuses on (§19.6), so
+    /// `status` calling them "in step" would disagree with the refusal a
+    /// developer is about to read.
+    #[test]
+    fn a_workspace_that_is_behind_says_so_rather_than_saying_in_step() {
+        let said = sync_report(
+            "dev01",
+            &WorkspaceSyncStatus {
+                halt: None,
+                conflicts: Vec::new(),
+                conflicts_total: 0,
+                resolve: None,
+                unsynced: vec!["src/main.rs".into(), "src/lib.rs".into()],
+                ..halted_sync()
+            },
+        );
+        assert!(!said.contains("in step"), "{said}");
+        assert!(said.contains("2 paths behind the canonical copy"), "{said}");
+        assert!(said.contains("src/main.rs"), "{said}");
+        assert!(said.contains("a snapshot capture refuses"), "{said}");
+    }
+
+    /// The re-seed barrier is its own state, not a rescan. Telling a
+    /// developer to wait for a walk that is never going to run is worse than
+    /// saying nothing.
+    #[test]
+    fn a_re_seeding_workspace_says_the_restore_is_what_it_is_waiting_on() {
+        let said = sync_report(
+            "dev01",
+            &WorkspaceSyncStatus {
+                halt: None,
+                conflicts: Vec::new(),
+                conflicts_total: 0,
+                resolve: None,
+                reseed: Some("a snapshot restore rewound this machine".into()),
+                ..halted_sync()
+            },
+        );
+        assert!(
+            said.contains("re-seeding: a snapshot restore rewound"),
+            "{said}"
+        );
     }
 
     /// The verb this one exists for: the guest's copy, host-side, next to the

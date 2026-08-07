@@ -557,9 +557,19 @@ pub enum ClipboardCmd {
 }
 
 /// Snapshot management (PRD §7.3; containers snapshot identically, §18).
+///
+/// The one sentence §19.6 wants every snapshot surface to say —
+/// [`NOT_A_BACKUP`](crate::labd::workspace::bracket::NOT_A_BACKUP) — reaches
+/// both verbs through `after_help` rather than being paraphrased into a doc
+/// comment, so what the CLI says and what the daemon's own refusals say cannot
+/// drift.
 #[derive(Subcommand)]
 pub enum SnapshotCmd {
     /// Take a snapshot of one VM/container, or lab-wide with no --vm
+    ///
+    /// A dev machine's workspace is flushed first and the capture refuses if
+    /// the guest holds work the host has never seen (§19.6).
+    #[command(after_help = crate::labd::workspace::bracket::NOT_A_BACKUP)]
     Create {
         /// Snapshot name
         name: String,
@@ -568,12 +578,20 @@ pub enum SnapshotCmd {
         vm: Option<String>,
     },
     /// Restore a snapshot (resumes running iff it was taken online)
+    ///
+    /// A dev machine's workspace is discarded guest-side and re-converged from
+    /// the host afterwards (§19.6).
+    #[command(after_help = crate::labd::workspace::bracket::NOT_A_BACKUP)]
     Restore {
         /// Snapshot name
         name: String,
         /// Machine ([lab/]name); omitted = every VM and container in the lab
         #[arg(long)]
         vm: Option<String>,
+        /// Restore a machine whose workspace is halted, throwing the guest
+        /// copy of every conflicting path away
+        #[arg(long)]
+        discard_guest_changes: bool,
     },
     /// List a VM's/container's snapshots
     List { vm: String },
@@ -708,7 +726,11 @@ pub fn run() -> ExitCode {
         Command::Lab { cmd } => lab::cmd_lab(cmd),
         Command::Snapshot { cmd } => match cmd {
             SnapshotCmd::Create { name, vm } => lab::cmd_snapshot(vm, name),
-            SnapshotCmd::Restore { name, vm } => lab::cmd_restore(vm, name),
+            SnapshotCmd::Restore {
+                name,
+                vm,
+                discard_guest_changes,
+            } => lab::cmd_restore(vm, name, discard_guest_changes),
             SnapshotCmd::List { vm } => lab::cmd_snapshots(&vm),
             SnapshotCmd::Delete { vm, name } => lab::cmd_snapshot_delete(&vm, name),
         },

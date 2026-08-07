@@ -678,7 +678,23 @@ pub fn lab_module() -> Module {
                 let runtime = h.runtime.clone();
                 let machine = h.name().to_string();
                 let snap = name.to_string();
-                h.block(async move { runtime.restore(&machine, &snap).await })
+                h.block(async move { runtime.restore(&machine, &snap, false).await })
+                    .map_err(estr)
+            },
+        )
+        // §19.6's explicit discard flag, as its own verb rather than as a
+        // second argument to `restore`. Two reasons, both about the flag being
+        // *asked for*: a boolean argument reads as `m.restore("clean", true)`
+        // at the call site, which says nothing about what the `true` destroys;
+        // and a `restore` that took one silently would be the destruction the
+        // flag exists to prevent, one typo away.
+        .method(
+            "restore_discarding_workspace",
+            |h: &MachineHandle, name: &str| -> Result<(), String> {
+                let runtime = h.runtime.clone();
+                let machine = h.name().to_string();
+                let snap = name.to_string();
+                h.block(async move { runtime.restore(&machine, &snap, true).await })
                     .map_err(estr)
             },
         )
@@ -1107,6 +1123,7 @@ fn drive(lab: Lab, m: Machine) {
         Err(e) => lab.log(e),
     }
     let rs = m.restore("clean")
+    let rd = m.restore_discarding_workspace("clean")
     let ds = m.delete_snapshot("clean")
     let r = m.restart()
     let st = m.stop()

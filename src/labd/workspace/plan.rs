@@ -854,7 +854,12 @@ fn settle_both(
 /// exactly the question being asked: two host paths that lower-case to the
 /// same string are two host paths that become one guest path — whether they
 /// differ in the file name or three directories up.
-fn collisions(inputs: &Inputs<'_>) -> Vec<Collision> {
+///
+/// Shared with the bracket's [`reseed`](super::reseed), which asks the same
+/// question about the same host tree: a re-seed that raced two colliding names
+/// onto one guest path would land the second on the first in silence, which is
+/// the thing this refusal exists to make impossible whichever pass is running.
+pub(super) fn collisions(inputs: &Inputs<'_>) -> Vec<Collision> {
     if !inputs.case_folding {
         return Vec::new();
     }
@@ -912,7 +917,11 @@ fn dir_link(link: &str, target: &str, host: &BTreeMap<String, State>) -> bool {
 
 /// The action that puts `state` on the other side, or the size guard's
 /// refusal.
-fn place(
+///
+/// Shared with the bracket's [`reseed`](super::reseed) so the size guard, the
+/// symlink's verbatim target and Windows' file-link-or-directory-link decision
+/// cannot say one thing in the steady state and another during a re-seed.
+pub(super) fn place(
     direction: Direction,
     path: &str,
     state: &State,

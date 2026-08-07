@@ -484,17 +484,19 @@ _Avoid_: limitation, unsupported, fallback mode
 
 **Sync halt**:
 The workspace-wide, both-directions stop a conflict triggers on one machine,
-naming every conflicting path in the batch. Distinct from a **deferral** — the
-`.git` lock wait and the post-overflow rescan barrier — which is timing and
-clears itself with no developer action.
+naming every conflicting path in the batch. Distinct from a **deferral**, which
+is timing and clears itself with no developer action. Its paths are recorded on
+the **sync ledger** as well as held in memory, so stopping the machine is not a
+way to lose the refusal a **snapshot bracket** owes them.
 _Avoid_: pause, error state, conflict mode
 
 **Deferral**:
 A path or a direction the syncer is leaving alone *for now*, with no developer
-in the loop: the `.git` mutable set while a lock is held on either side, and
-both directions between an overflow and the completed rescan. It clears itself.
-Never a **sync halt**, which needs an answer, and never a **skip**, which is
-permanent for as long as its cause is.
+in the loop: the `.git` mutable set while a lock is held on either side, both
+directions between an overflow and the completed rescan, and both directions
+between a **snapshot bracket**'s rewind and the completed **re-seed**. It clears
+itself. Never a **sync halt**, which needs an answer, and never a **skip**, which
+is permanent for as long as its cause is.
 _Avoid_: halt, blocked, stalled (all three read as needing a developer)
 
 **Resolution**:
@@ -554,9 +556,35 @@ directories with no negation reaching below them. The host still decides; the
 guest is handed the answer, never asked the question.
 
 **Watch discontinuity**:
-Any watch (re)open. Identical to the list of stat-walk triggers — first sync,
-ledger loss, overflow, post-restore re-converge — which is why no resync token
-exists.
+Any watch (re)open. Identical to the list of agreement-losing events — first
+sync, ledger loss, overflow, post-restore re-converge — which is why no resync
+token exists. Three of the four are answered by the **stat-walk**; the fourth is
+answered by the **re-seed**, because vmlab performed the rewind and does not need
+to ask what happened.
+
+**Snapshot bracket**:
+What vmlab does around a snapshot of a machine carrying a workspace, and the
+argument that the syncer is vmlab-integrated rather than a generic tool wrapped:
+an off-the-shelf one cannot know a rewind happened. **Capture** flushes first and
+refuses — with no escape flag — where the guest holds work the canonical copy has
+never seen. **Restore** takes the syncer off the workspace, rewinds, and puts it
+back owing a **re-seed**; it refuses while a **sync halt** stands unless
+`--discard-guest-changes` says otherwise, because it destroys the guest copy of
+every conflicting path by design. **Snapshots are not a workspace backup**, and
+every surface that takes or restores one says so.
+_Avoid_: hook, wrapper, pre/post step
+
+**Re-seed**:
+The host-only, digest-based reconcile a **snapshot bracket**'s restore owes: the
+guest tree is walked to decide what to overwrite and delete and for nothing else,
+and no action it produces can flow guest→host, so a rolled-back copy cannot reach
+the canonical one. **By digest, never by mtime** — a restored guest's clock runs
+behind the host, so a same-size in-place write compares identical on
+`(size, mtime)`. It completes **before the watch reopens**, and it replaces the
+**stat-walk** rather than following one. That it is owed rides the **sync
+ledger**, because a restore does not need a running machine.
+_Avoid_: resync, re-sync, reseed pass, full push (a wipe-and-re-transfer is
+legal, not required)
 
 ### Configuration and surfaces
 

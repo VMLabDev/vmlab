@@ -931,9 +931,13 @@ impl Handler<LabRequest> for LabdHandler {
                 }
                 None => Ok(lab.snapshot_all(&name).await?),
             },
-            LabRequest::SnapshotRestore { name, machine } => {
+            LabRequest::SnapshotRestore {
+                name,
+                machine,
+                discard,
+            } => {
                 match machine {
-                    Some(machine) => lab.restore(&machine, &name).await?,
+                    Some(machine) => lab.restore(&machine, &name, discard).await?,
                     None => {
                         let names: Vec<String> = lab
                             .vms
@@ -942,7 +946,7 @@ impl Handler<LabRequest> for LabdHandler {
                             .cloned()
                             .collect();
                         for vm in names {
-                            lab.restore(&vm, &name).await?;
+                            lab.restore(&vm, &name, discard).await?;
                         }
                     }
                 }
