@@ -91,7 +91,9 @@ fn is_floor(selector: &str, guest_os: GuestOs) -> bool {
     selector.eq_ignore_ascii_case(floor(guest_os))
 }
 
-fn floor(guest_os: GuestOs) -> &'static str {
+/// The selector that names the agent's own identity on this guest family —
+/// what a surface tells a caller to use when it has to name the floor.
+pub fn floor(guest_os: GuestOs) -> &'static str {
     match guest_os {
         GuestOs::Windows => WINDOWS_FLOOR,
         GuestOs::Linux => LINUX_FLOOR,

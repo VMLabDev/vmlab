@@ -36,6 +36,7 @@ fn terminal_exec_and_files_all_reach_the_seam_as_the_agent() {
             cols: 80,
             rows: 24,
             command: Some(vec!["/bin/sh".into()]),
+            env: vec![],
             logon: None,
         },
     );
@@ -65,6 +66,7 @@ fn terminal_exec_and_files_all_reach_the_seam_as_the_agent() {
                 command: Some(vec!["/bin/sh".into()]),
                 cols: 80,
                 rows: 24,
+                env: vec![],
             },
             Call::Exec {
                 identity: Identity::Agent,
@@ -103,6 +105,7 @@ fn an_open_that_carries_a_logon_reaches_the_seam_as_that_account() {
             cols: 80,
             rows: 24,
             command: None,
+            env: vec![],
             logon: Some(dev.clone()),
         },
     );
@@ -139,6 +142,7 @@ fn an_open_that_carries_a_logon_reaches_the_seam_as_that_account() {
                 command: None,
                 cols: 80,
                 rows: 24,
+                env: vec![],
             },
             Call::Exec {
                 identity: Identity::Declared(dev.clone()),
@@ -246,6 +250,7 @@ fn terminal_bridges_keystrokes_output_resize_and_exit() {
             cols: 80,
             rows: 24,
             command: None,
+            env: vec![],
             logon: None,
         },
     );
@@ -279,6 +284,7 @@ fn terminal_close_kills_the_shell_through_the_seam() {
             cols: 80,
             rows: 24,
             command: None,
+            env: vec![],
             logon: None,
         },
     );
@@ -304,6 +310,7 @@ fn terminal_spawn_failure_reports_the_seam_error() {
             cols: 80,
             rows: 24,
             command: None,
+            env: vec![],
             logon: None,
         },
     );

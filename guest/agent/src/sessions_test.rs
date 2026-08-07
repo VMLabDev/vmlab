@@ -43,6 +43,7 @@ fn terminal_runs_an_interactive_shell() {
                 "-c".into(),
                 "echo ready; read x; echo got:$x; exit 7".into(),
             ]),
+            env: vec![],
             logon: None,
         },
     );
@@ -74,6 +75,7 @@ fn terminal_resize_reaches_the_pty() {
                 // stty reads the PTY size; print it after the host resizes.
                 "read x; stty size; exit 0".into(),
             ]),
+            env: vec![],
             logon: None,
         },
     );
@@ -98,6 +100,7 @@ fn terminal_close_kills_the_shell() {
             cols: 80,
             rows: 24,
             command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()]),
+            env: vec![],
             logon: None,
         },
     );

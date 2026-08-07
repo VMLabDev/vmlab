@@ -56,6 +56,31 @@ impl EnvBlock {
     pub fn as_ptr(&self) -> *const core::ffi::c_void {
         self.block.as_ptr() as *const _
     }
+
+    /// `K=V\0K=V\0\0` in UTF-16, which is what `CREATE_UNICODE_ENVIRONMENT`
+    /// promises the child.
+    fn from_vars(vars: Vec<String>) -> EnvBlock {
+        let mut block: Vec<u16> = Vec::new();
+        for var in vars {
+            block.extend(var.encode_utf16());
+            block.push(0);
+        }
+        block.push(0);
+        EnvBlock { block }
+    }
+}
+
+/// Apply the caller's overrides on top of an environment, replacing a key
+/// that is already there (case-insensitively — Windows environment keys are)
+/// rather than appending a second entry the child would have to choose
+/// between.
+fn with_overrides(mut vars: Vec<String>, overrides: &[(String, String)]) -> Vec<String> {
+    for (key, value) in overrides {
+        let prefix = format!("{key}=").to_lowercase();
+        vars.retain(|v| !v.to_lowercase().starts_with(&prefix));
+        vars.push(format!("{key}={value}"));
+    }
+    vars
 }
 
 /// The environment a process started in `session` gets: the profile's own
@@ -67,23 +92,19 @@ pub fn env_block(logon: &MintedLogon, overrides: &[(String, String)]) -> std::io
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: Win32 promises a double-null-terminated UTF-16 block.
-    let mut vars = unsafe { read_block(raw as *const u16) };
+    let vars = unsafe { read_block(raw as *const u16) };
     // SAFETY: the block we were just handed, freed once.
     unsafe { DestroyEnvironmentBlock(raw) };
 
-    for (key, value) in overrides {
-        let prefix = format!("{key}=").to_lowercase();
-        vars.retain(|v| !v.to_lowercase().starts_with(&prefix));
-        vars.push(format!("{key}={value}"));
-    }
+    Ok(EnvBlock::from_vars(with_overrides(vars, overrides)))
+}
 
-    let mut block: Vec<u16> = Vec::new();
-    for var in vars {
-        block.extend(var.encode_utf16());
-        block.push(0);
-    }
-    block.push(0);
-    Ok(EnvBlock { block })
+/// The agent's *own* environment with the caller's overrides applied — the
+/// [`env_block`] counterpart for the agent identity, which has no profile to
+/// load and would otherwise simply inherit ours.
+pub fn agent_env_block(overrides: &[(String, String)]) -> EnvBlock {
+    let vars = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
+    EnvBlock::from_vars(with_overrides(vars, overrides))
 }
 
 /// Copy a `K=V\0K=V\0\0` block out of Win32-owned memory.

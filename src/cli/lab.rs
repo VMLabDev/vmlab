@@ -941,6 +941,54 @@ async fn shell_on_machine(machine_ref: &str, run_as: As) -> Result<()> {
     .await
 }
 
+/// `vmlab ssh-proxy [lab/]<machine>` — the `ProxyCommand` an `ssh` process
+/// is given (PRD §19.3). It asks the lab for a socket onto the machine's SSH
+/// facade and copies bytes between that socket and this process's
+/// stdin/stdout. That is all it does: the proxy *is* the client's server
+/// connection, so nothing listens on the host and no port is leased.
+///
+/// **It never does lifecycle.** It is spawned by an editor with no TTY, its
+/// stderr may never be shown, and a client spawns several concurrently — so
+/// "boot and wait" would be a silent multi-minute hang racing itself against
+/// the client's own connect timeout. It fails immediately instead, with a
+/// diagnostic that survives being printed into an editor's log (§19.7).
+pub fn cmd_ssh_proxy(machine_ref: &str) -> Result<()> {
+    rt()?.block_on(async {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (lab, machine) = split_vm_ref(machine_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let opened = client
+            .send(LabRequest::MachineSshOpen {
+                machine: machine.clone(),
+            })
+            .await
+            .map_err(remote)?;
+        let path = opened["path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("lab daemon returned no socket for \"{machine}\""))?;
+        let stream = tokio::net::UnixStream::connect(path)
+            .await
+            .with_context(|| format!("connecting the SSH facade socket for \"{machine}\""))?;
+
+        let (mut from_facade, mut to_facade) = stream.into_split();
+        // Both directions run to their own end: `ssh` closing its side must
+        // reach the facade as EOF, and the facade closing must end this
+        // process rather than leave a proxy holding a dead socket.
+        let up = tokio::spawn(async move {
+            let mut stdin = tokio::io::stdin();
+            let _ = tokio::io::copy(&mut stdin, &mut to_facade).await;
+            let _ = to_facade.shutdown().await;
+        });
+        let mut stdout = tokio::io::stdout();
+        let copied = tokio::io::copy(&mut from_facade, &mut stdout).await;
+        let _ = stdout.flush().await;
+        up.abort();
+        copied.context("the SSH facade closed the connection")?;
+        Ok(())
+    })
+}
+
 /// `vmlab tail <vm> <path>` — follow a file inside the guest (tail -F
 /// semantics over the agent channel; no network, no shell required).
 pub fn cmd_tail(vm_ref: &str, path: &str) -> Result<()> {

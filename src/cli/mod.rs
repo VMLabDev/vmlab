@@ -181,6 +181,15 @@ pub enum Command {
         #[command(flatten)]
         run_as: As,
     },
+    /// The `ProxyCommand` target: pipe stdin/stdout onto a machine's SSH
+    /// facade (PRD §19.3). Hidden — spawned by `ssh`, never typed.
+    #[command(hide = true)]
+    SshProxy {
+        /// [lab/]machine — the lab-qualified form is what the generated
+        /// `ssh_config` block passes, since an editor spawns this from
+        /// wherever it happens to be.
+        machine: String,
+    },
     /// Copy files between host and guest (either side may be <vm>:<path>;
     /// parent directories are created)
     ///
@@ -603,6 +612,7 @@ pub fn run() -> ExitCode {
             cmd,
         } => lab::cmd_exec(&vm, timeout, cmd, run_as),
         Command::Shell { vm, run_as } => lab::cmd_shell(&vm, run_as),
+        Command::SshProxy { machine } => lab::cmd_ssh_proxy(&machine),
         Command::Cp { src, dest } => lab::cmd_cp(&src, &dest),
         Command::Tail { vm, path } => lab::cmd_tail(&vm, &path),
         Command::Eventlog { vm, filter } => lab::cmd_eventlog(&vm, filter.as_deref()),

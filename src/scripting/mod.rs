@@ -921,7 +921,13 @@ pub fn lab_module() -> Module {
                 let session = h.block(async {
                     let agent = h.machine.agent().await.map_err(estr)?;
                     agent
-                        .open_terminal(terminal::SCRIPT_COLS, terminal::SCRIPT_ROWS, None, None)
+                        .open_terminal(
+                            terminal::SCRIPT_COLS,
+                            terminal::SCRIPT_ROWS,
+                            None,
+                            vec![],
+                            None,
+                        )
                         .await
                         .map_err(estr)
                 })?;

@@ -28,6 +28,7 @@ pub enum Call {
         command: Option<Vec<String>>,
         cols: u16,
         rows: u16,
+        env: Vec<(String, String)>,
     },
     Exec {
         identity: Identity,
@@ -202,6 +203,7 @@ impl Spawner for FakeSpawner {
             command: spec.command,
             cols: spec.cols,
             rows: spec.rows,
+            env: spec.env,
         });
         match self.next_failure() {
             Some(e) => Err(e),

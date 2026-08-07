@@ -257,15 +257,24 @@ The port-forward rules a lab's machines require, resolved to leases and
 gateways before any is installed.
 
 **SSH facade**:
-The SSH server vmlab terminates on the host, reached as a stdio `ProxyCommand`
-so nothing listens and no port is leased. Presents an SSH interface with no
-sshd in the guest: `session` channels are serviced by vmlab-agent, SFTP is
-terminated host-side over a **fileops session**, and `direct-tcpip` rides an
-SSH-scoped tunnel stream. It only ever *answers* a channel open, never
-initiates one (ADR-0013), which is why `-R`, agent forwarding and X11 are
-refused. See PRD §19.3 and ADR-0012. _Not built yet_ — the term is recorded
-here because the effort that coined it spans several sessions.
+The SSH protocol vmlab terminates on the host, reached as a stdio
+`ProxyCommand` so nothing listens and no port is leased. Presents an SSH
+interface with no sshd in the guest: `session` channels are serviced by
+vmlab-agent, SFTP is terminated host-side over a **fileops session**, and
+`direct-tcpip` rides an SSH-scoped tunnel stream. It only ever *answers* a
+channel open, never initiates one (ADR-0013), which is why `-R`, agent
+forwarding and X11 are refused. See PRD §19.3 and ADR-0012. _`session` is
+built; SFTP and `direct-tcpip` refuse by name until their own tickets land._
 _Avoid_: sshd, SSH server (implies guest-side), gateway, proxy
+
+**Host key**:
+The SSH identity the facade presents, minted per (lab, machine) into vmlab's
+own state directory beside a `known_hosts` vmlab also owns. It survives
+`destroy`, so a recreated machine presents the identity its entry already
+records, and the developer's `~/.ssh/known_hosts` is never touched. No guest
+holds one, so a template clone cannot carry a stale key and a snapshot restore
+cannot roll one back.
+_Avoid_: server key, machine key (that is not what it identifies)
 
 **Login**:
 A labelled identity declared on a machine with a repeatable `login {}` block —

@@ -123,6 +123,12 @@ aya = { version = "0.14", optional = true }
 vmlab-tap = { path = "tap", optional = true }
 # Passes pre-opened tap fds to QEMU at spawn (dup2 shuffle in pre_exec).
 command-fds = { version = "0.3", optional = true }
+# The SSH server the facade terminates on the host (PRD §19.3, ADR-0012).
+# `ring` rather than the default `aws-lc-rs` backend: it needs no cmake/clang
+# at build time. No `rsa` and no `flate2` — vmlab owns both ends of the host
+# key and a client that negotiates compression over a unix socket gains
+# nothing.
+russh = { version = "0.62.5", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 assert_cmd = "2"
