@@ -1,11 +1,25 @@
 //! What each side is holding — the input the reconciliation reasons over
 //! (PRD §19.6).
 //!
-//! Two walks with one vocabulary. The host's is a real directory descent that
-//! reads the ignore rules as it goes; the guest's is a **probe of the paths
-//! the host already knows about**, not a tree walk — this direction never asks
-//! the guest what it has, only whether it still holds what was agreed. (The
-//! full guest stat-walk, which the exception paths need, is its own ticket.)
+//! Three walks with one vocabulary. The host's is a real directory descent
+//! that reads the ignore rules as it goes. The guest has two, and which one
+//! runs is the difference between the steady state and the exception path:
+//!
+//! - [`probe_guest`] asks about **paths already named** — the host's tree, the
+//!   ledger's, and whatever the guest's own watcher drained. That is the
+//!   steady state, and it costs one round trip per path in a window.
+//! - [`guest_walk`] is the **stat-walk**: the guest reports its tree and the
+//!   host applies the ignore set *on receipt*. It runs on a watch
+//!   discontinuity and nowhere else — first sync, ledger loss, overflow, a
+//!   dropped channel — so there is no resync token, because that list is
+//!   exactly the list of discontinuities and a token would be surface with no
+//!   consumer.
+//!
+//! A Merkle tree was designed and rejected for the reason the walk keeps: a
+//! comparable subtree root requires the guest to decide, **for a file it
+//! created itself**, whether that file is in the synced set — and that
+//! decision *is* the ignore set. Keeping ignore semantics out of the guest was
+//! worth more than an O(depth) root comparison.
 //!
 //! Three rules both sides obey:
 //!
@@ -32,7 +46,7 @@ use anyhow::{Context, Result};
 use futures::stream::StreamExt;
 
 use super::guest::GuestFs;
-use super::ignore::{Ignores, join_rel};
+use super::ignore::{Ignores, Verdict, join_rel};
 use super::ledger::{Kind, Ledger, Side};
 use super::plan::{State, needs_digest};
 
@@ -68,6 +82,10 @@ pub struct HostScan {
     /// Every directory inside the workspace, `""` for the root — what the
     /// watcher registers on, already pruned of everything guest-owned.
     pub dirs: Vec<String>,
+    /// Every directory the walk declined to enter because it is guest-owned.
+    /// One of the two sources of the guest's prune list — the one that catches
+    /// a rule matching at a depth its own text does not name.
+    pub pruned: Vec<String>,
     pub skipped: Vec<Skip>,
 }
 
@@ -128,6 +146,9 @@ pub fn host_scan(root: &Path, ledger: &Ledger, max_file_bytes: u64) -> Result<(H
             if ignores.verdict(&rel, kind == Kind::Dir).is_guest_owned() {
                 // Guest-owned, not skipped: the guest is expected to hold its
                 // own diverging content here, so neither direction descends.
+                if kind == Kind::Dir {
+                    scan.pruned.push(rel);
+                }
                 continue;
             }
             let side = Side::new(meta.len(), mtime_ns(&meta));
@@ -184,6 +205,7 @@ pub fn host_scan(root: &Path, ledger: &Ledger, max_file_bytes: u64) -> Result<(H
     }
     scan.dirs.push(String::new());
     scan.dirs.sort();
+    scan.pruned.sort();
     Ok((scan, ignores))
 }
 
@@ -198,6 +220,7 @@ pub async fn probe_guest(
     guest_root: &str,
     paths: &BTreeSet<String>,
     ledger: &Ledger,
+    max_file_bytes: u64,
 ) -> GuestProbe {
     let mut probe = GuestProbe::default();
     let stats: Vec<(String, Result<Option<crate::labd::vm_agent::Attrs>>)> =
@@ -214,7 +237,8 @@ pub async fn probe_guest(
     for (rel, attrs) in stats {
         let attrs = match attrs {
             Ok(Some(attrs)) => attrs,
-            // Absent is an answer: this direction is about to create it.
+            // Absent is an answer: either this direction is about to create
+            // it, or the guest has deleted what the ledger remembers.
             Ok(None) => continue,
             Err(e) => {
                 probe.skipped.push(Skip {
@@ -224,31 +248,168 @@ pub async fn probe_guest(
                 continue;
             }
         };
-        let Some(kind) = Kind::of(attrs.kind) else {
-            probe.skipped.push(Skip {
-                path: rel,
-                why: "guest: not a file, directory or symlink".into(),
-            });
-            continue;
-        };
-        let side = Side::new(attrs.size, attrs.mtime_ns);
-        let state = State {
-            kind,
-            size: side.size,
-            mtime_ns: side.mtime_ns,
-            digest: None,
-            target: None,
-            // Host-side only: the guard refuses a *host* file before
-            // transferring it, and this direction never transfers out.
-            oversize: false,
-        };
-        if kind == Kind::Symlink || needs_digest(ledger.entries.get(&rel), kind, side, false) {
-            suspects.push((rel, state));
-        } else {
-            probe.tree.insert(rel, state);
+        match classify(rel, &attrs, ledger, max_file_bytes) {
+            Ok(seen) if seen.suspect => suspects.push((seen.rel, seen.state)),
+            Ok(seen) => {
+                probe.tree.insert(seen.rel, seen.state);
+            }
+            Err(skip) => probe.skipped.push(skip),
         }
     }
+    resolve(files, guest_root, suspects, &mut probe).await;
+    probe
+}
 
+/// The **stat-walk**: what the guest holds, everywhere, as its own tree.
+///
+/// The guest reports; the **host** applies the ignore set on receipt and asks
+/// for a digest only where the pre-filter cannot vouch for the path. The guest
+/// is never asked to decide anything — it is handed no rules and answers no
+/// questions about them, which is the property the whole design rests on.
+///
+/// An absent root is an empty tree **only where nothing was ever agreed**: on
+/// a first sync the workspace directory is exactly what this pass is about to
+/// create. With a ledger behind it, an absent root is the workspace directory
+/// having *gone*, and it fails by name — the same distinction §19.5 makes when
+/// a vanished watch root fails its channel rather than degrading to a rescan,
+/// so what surfaces is *the workspace directory is gone* and not *the guest
+/// deleted 4 000 files*.
+///
+/// A root that exists and cannot be *read* is a failure for the same reason:
+/// "I could not look" and "nothing is there" produce opposite actions, and
+/// only one of them is recoverable.
+pub async fn guest_walk(
+    files: &dyn GuestFs,
+    guest_root: &str,
+    ignores: &Ignores,
+    ledger: &Ledger,
+    max_file_bytes: u64,
+) -> Result<GuestProbe> {
+    let mut probe = GuestProbe::default();
+    match files.lstat(guest_root).await {
+        Ok(Some(_)) => {}
+        // Nothing there yet: the seed is about to make it.
+        Ok(None) if ledger.entries.is_empty() => return Ok(probe),
+        Ok(None) => {
+            return Err(anyhow::anyhow!(
+                "the workspace directory {guest_root} is gone from the guest: every path this \
+                 machine had agreed would otherwise read as a guest-side delete and take the \
+                 canonical copy with it"
+            ));
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading the guest tree at {guest_root}")),
+    }
+
+    let mut suspects: Vec<(String, State)> = Vec::new();
+    let mut level = vec![String::new()];
+    while !level.is_empty() {
+        // One level at a time, every directory in it at once: a source tree
+        // is wide and shallow, so the window pays the round trip off across
+        // siblings rather than across depth.
+        let listings: Vec<(String, Result<Vec<crate::labd::vm_agent::DirEntry>>)> =
+            futures::stream::iter(level.drain(..))
+                .map(|dir| async move {
+                    let entries = files.readdir(&join_guest(guest_root, &dir)).await;
+                    (dir, entries)
+                })
+                .buffered(PROBE_WINDOW)
+                .collect()
+                .await;
+
+        for (dir, entries) in listings {
+            let entries = match entries {
+                Ok(entries) => entries,
+                // A directory the login cannot traverse is a named skip, not
+                // a halt — and emphatically not an empty listing, which would
+                // read as the guest having deleted everything under it.
+                Err(e) => {
+                    probe.skipped.push(Skip {
+                        path: if dir.is_empty() { ".".into() } else { dir },
+                        why: format!("guest: cannot read the directory ({e:#})"),
+                    });
+                    continue;
+                }
+            };
+            for entry in entries {
+                let rel = join_rel(&dir, &entry.name);
+                let is_dir = entry.attrs.kind == crate::labd::vm_agent::EntryKind::Dir;
+                if ignores.verdict(&rel, is_dir) == Verdict::GuestOwned {
+                    // Guest-owned: the guest holds its own diverging content
+                    // here on purpose, and the walk does not descend it.
+                    continue;
+                }
+                match classify(rel, &entry.attrs, ledger, max_file_bytes) {
+                    Ok(seen) => {
+                        if is_dir {
+                            level.push(seen.rel.clone());
+                        }
+                        if seen.suspect {
+                            suspects.push((seen.rel, seen.state));
+                        } else {
+                            probe.tree.insert(seen.rel, seen.state);
+                        }
+                    }
+                    Err(skip) => probe.skipped.push(skip),
+                }
+            }
+        }
+    }
+    resolve(files, guest_root, suspects, &mut probe).await;
+    Ok(probe)
+}
+
+/// One guest entry, as the reconciliation wants it.
+struct Seen {
+    rel: String,
+    state: State,
+    /// It still has to be hashed before anything can be concluded about it —
+    /// the pre-filter's one and only power.
+    suspect: bool,
+}
+
+/// Read one guest entry, or the reason it is skipped by name.
+fn classify(
+    rel: String,
+    attrs: &crate::labd::vm_agent::Attrs,
+    ledger: &Ledger,
+    max_file_bytes: u64,
+) -> std::result::Result<Seen, Skip> {
+    let Some(kind) = Kind::of(attrs.kind) else {
+        return Err(Skip {
+            path: rel,
+            why: "guest: not a file, directory or symlink".into(),
+        });
+    };
+    let side = Side::new(attrs.size, attrs.mtime_ns);
+    // The size guard is symmetric: hashing four gigabytes guest-side to then
+    // refuse to carry them wastes the same ten minutes the guard exists to
+    // save, in the direction where the *canonical* copy is the target.
+    let oversize = kind == Kind::File && side.size > max_file_bytes;
+    let state = State {
+        kind,
+        size: side.size,
+        mtime_ns: side.mtime_ns,
+        digest: None,
+        target: None,
+        oversize,
+    };
+    let suspect = !oversize
+        && (kind == Kind::Symlink || needs_digest(ledger.entries.get(&rel), kind, side, false));
+    Ok(Seen {
+        rel,
+        state,
+        suspect,
+    })
+}
+
+/// Ask the guest for the content of everything the pre-filter could not vouch
+/// for, a window at a time.
+async fn resolve(
+    files: &dyn GuestFs,
+    guest_root: &str,
+    suspects: Vec<(String, State)>,
+    probe: &mut GuestProbe,
+) {
     let answered: Vec<(String, State, Result<Content>)> = futures::stream::iter(suspects)
         .map(|(rel, state)| {
             let guest_path = join_guest(guest_root, &rel);
@@ -289,7 +450,6 @@ pub async fn probe_guest(
             }),
         }
     }
-    probe
 }
 
 /// A guest path from the workspace root and a `/`-separated relative path.
@@ -330,7 +490,7 @@ fn digest_file(path: &Path) -> Result<String> {
 /// Modification time in nanoseconds since the Unix epoch, negative before it —
 /// the watch vocabulary's spelling, so the two sides' records are the same
 /// shape even though they are never compared to each other.
-fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
+pub(super) fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
     let Ok(mtime) = meta.modified() else {
         return 0;
     };
@@ -465,6 +625,119 @@ mod tests {
         assert!(scan.tree["big.vhdx"].digest.is_none());
         assert!(!scan.tree["small.rs"].oversize);
         assert!(scan.tree["small.rs"].digest.is_some());
+    }
+
+    /// The other source of the prune list: a rule matching at a depth its own
+    /// text does not name is still a directory the guest must not watch.
+    #[test]
+    fn the_scan_records_the_directories_it_declined_to_enter() {
+        let dir = workspace(&[
+            (".gitignore", "target/\n"),
+            ("target/debug/app", "x"),
+            ("crates/api/target/debug/app", "x"),
+            ("crates/api/src/lib.rs", "y"),
+        ]);
+        let (scan, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+        assert_eq!(
+            scan.pruned,
+            vec!["crates/api/target".to_string(), "target".to_string()]
+        );
+        assert_eq!(
+            ignores.prune_list(&scan.pruned),
+            vec!["crates/api/target".to_string(), "target".to_string()]
+        );
+    }
+
+    /// The stat-walk's contract: the **guest** reports its tree and the
+    /// **host** applies the ignore set to the answer. A dependency tree the
+    /// host has never seen is guest-owned, so the walk never descends it and
+    /// nothing under it reaches the reconciliation.
+    #[tokio::test]
+    async fn the_stat_walk_reports_the_guest_tree_with_the_host_applying_the_rules() {
+        let dir = workspace(&[(".gitignore", "node_modules/\n")]);
+        let (_, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+        let guest = super::super::guest::fake::FakeGuest::new();
+        guest.dir("/src");
+        guest.dir("/src/app");
+        guest.file("/src/app/main.rs", "guest wrote this", 7);
+        guest.dir("/src/node_modules");
+        guest.dir("/src/node_modules/pkg");
+        guest.file("/src/node_modules/pkg/index.js", "guest-native", 7);
+
+        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), NO_CAP)
+            .await
+            .unwrap();
+        let paths: Vec<&String> = walk.tree.keys().collect();
+        assert_eq!(paths, vec!["app", "app/main.rs"]);
+        assert!(
+            walk.tree["app/main.rs"].digest.is_some(),
+            "hashed as a suspect"
+        );
+        assert!(walk.skipped.is_empty(), "{:?}", walk.skipped);
+    }
+
+    /// A first sync has no guest tree at all, which is an empty answer rather
+    /// than a failure: the seed is what is about to create it.
+    #[tokio::test]
+    async fn a_stat_walk_against_a_guest_with_no_workspace_yet_is_empty() {
+        let dir = workspace(&[]);
+        let (_, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+        let guest = super::super::guest::fake::FakeGuest::new();
+        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), NO_CAP)
+            .await
+            .unwrap();
+        assert!(walk.tree.is_empty());
+    }
+
+    /// The reciprocal of the watch running as the agent identity: the walk
+    /// sees a superset of what the login can read, so a directory the login
+    /// cannot traverse is a **named skip** — never an empty listing, which
+    /// would read as the guest having deleted everything under it, and never
+    /// a halt, because a build leaving a root-owned artefact in the tree must
+    /// not stop a dev machine.
+    #[tokio::test]
+    async fn a_directory_the_login_cannot_read_is_a_named_skip() {
+        let dir = workspace(&[]);
+        let (_, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+        let guest = super::super::guest::fake::FakeGuest::new();
+        guest.dir("/src");
+        guest.dir("/src/root-only");
+        guest.file("/src/root-only/secret", "x", 1);
+        guest.file("/src/app.rs", "y", 1);
+        guest.unreadable("/src/root-only");
+
+        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), NO_CAP)
+            .await
+            .unwrap();
+        assert!(walk.tree.contains_key("app.rs"));
+        assert!(!walk.tree.contains_key("root-only/secret"));
+        assert_eq!(walk.skipped.len(), 1);
+        assert_eq!(walk.skipped[0].path, "root-only");
+        assert!(
+            walk.skipped[0].why.contains("cannot read"),
+            "{:?}",
+            walk.skipped[0]
+        );
+    }
+
+    /// The size guard is symmetric. A guest file over the cap is never hashed
+    /// here either: the refusal happens before the transfer, and hashing it
+    /// first spends the same time the guard exists to save.
+    #[tokio::test]
+    async fn a_guest_file_over_the_cap_is_never_hashed() {
+        let dir = workspace(&[]);
+        let (_, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+        let guest = super::super::guest::fake::FakeGuest::new();
+        guest.dir("/src");
+        guest.file("/src/big.vhdx", "0123456789", 1);
+        guest.file("/src/small.rs", "x", 1);
+
+        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), 4)
+            .await
+            .unwrap();
+        assert!(walk.tree["big.vhdx"].oversize);
+        assert!(walk.tree["big.vhdx"].digest.is_none());
+        assert!(walk.tree["small.rs"].digest.is_some());
     }
 
     #[test]

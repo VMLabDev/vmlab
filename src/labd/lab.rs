@@ -120,6 +120,19 @@ impl crate::labd::workspace::syncer::GuestSessions for WorkspaceSessions {
         let agent = self.machine.agent().await?;
         Ok(Box::new(agent.open_fileops(logon).await?))
     }
+
+    /// The one open that carries **no** logon (§19.5): a watcher observes and
+    /// produces none of the developer's files, so it runs as the agent
+    /// identity — which also makes its coverage a superset of what the login
+    /// can traverse, rather than a subtree that silently stops reporting.
+    async fn watch(
+        &self,
+        root: &str,
+        prune: Vec<String>,
+    ) -> Result<Box<dyn crate::labd::workspace::guest::GuestWatch>> {
+        let agent = self.machine.agent().await?;
+        Ok(Box::new(agent.open_watch(root.to_string(), prune).await?))
+    }
 }
 
 #[async_trait::async_trait]

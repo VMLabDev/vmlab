@@ -18,16 +18,21 @@ Consult them for prior art only — the PRD overrides anything they did.
 
 PRD implemented (M1–M6). **§19 (Dev machines) is partly built** — the
 workspace syncer's later halves are spec only; implementation is tracked by
-#78–#98. The **workspace syncer's host-canonical half** (#93) is built: the
-ledger, the layered ignores, the size guard, the host watcher's per-path
-debounce and temp-then-rename applies as the machine's default login. So are
-the **Windows preconditions** (#95): the NTFS case-sensitivity flag on every
-directory the syncer creates including the workspace root, the collision
-refused by name where the flag cannot be set, the symlink attempted and warned
-about, the guest's `core.autocrlf` turned off, and the two degradations an
-`elevated = false` login brings, said up front.
-Guest→host (#94), the conflict halt and its
-verbs (#96) and snapshot bracketing (#97) are still spec. The `@dev`
+#78–#98. The **workspace syncer syncs both ways** (#93, #94): the ledger, the
+layered ignores, the size guard, the two watchers' per-path debounce and
+temp-then-rename applies on either side, as the machine's default login.
+Guest changes arrive by draining the agent's dirty set into the ledger, under
+a host-computed **prune list** the guest is handed rather than asked about;
+the **stat-walk** runs on a watch discontinuity and nowhere else — first sync,
+ledger loss, overflow, a dropped channel — and an overflow warns, forces the
+walk and **blocks both directions until it completes**. So are the **Windows
+preconditions** (#95): the NTFS case-sensitivity flag on every directory the
+syncer creates including the workspace root, the collision refused by name
+where the flag cannot be set, the symlink attempted and warned about, the
+guest's `core.autocrlf` turned off, and the two degradations an
+`elevated = false` login brings, said up front. The conflict halt and its
+verbs (#96, which owns the guest→host bulk-delete guard) and snapshot
+bracketing (#97) are still spec. The `@dev`
 declaration (#80) and all
 three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
 `fileops` (#84) — the handle-based, offset-addressed, pipelined file RPC
@@ -136,13 +141,16 @@ Module map under `src/`:
   `agent_repair.rs` is `machine.repair_agent` (§19.4), the plan for replacing
   a guest's agent binary over its own channel and the divergence it records;
   `workspace/` is the workspace syncer (§19.6, ADR-0014) — the layered
-  ignore rules (`ignore.rs`), the host-side sync ledger (`ledger.rs`), the
-  reconciliation as a value (`plan.rs`), the two sides' scans (`scan.rs`)
-  over the one guest-side seam (`guest.rs`), temp-then-rename applies
-  (`apply.rs`), the host watcher and its per-path debounce (`watcher.rs`),
-  §19.6's three Windows actions as a value computed before the loop
-  (`windows.rs`) and the lab-daemon-owned loop (`syncer.rs`), which is the one
-  piece of vmlab's machinery running as the machine's default login.
+  ignore rules and the prune list they yield (`ignore.rs`), the host-side sync
+  ledger (`ledger.rs`), the one bidirectional reconciliation as a value
+  (`plan.rs`), the three walks (`scan.rs` — the host descent, the guest probe
+  and the stat-walk) over the one guest-side seam (`guest.rs`),
+  temp-then-rename applies on both sides (`apply.rs`), the host watcher and
+  the per-path debounce both directions use (`watcher.rs`), §19.6's three
+  Windows actions as a value computed before the loop (`windows.rs`) and the
+  lab-daemon-owned loop (`syncer.rs`), which drains the guest's dirty set,
+  holds the rescan barrier, and is the one piece of vmlab's machinery running
+  as the machine's default login.
   Decisions the runtime used to make mid-flight are values computed before
   execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
   transports, gateway rules, the smbd port), `forward_plan.rs` (every port
