@@ -463,46 +463,73 @@ impl LinuxSpawner {
     }
 
     /// Everything the forked shell child needs, decided before the fork.
+    ///
+    /// `overrides` are applied *over* the environment the route already
+    /// brings, never instead of it: the SSH facade's `env` requests arrive
+    /// this way (§19.3), and everything vmlab opens on its own behalf sends
+    /// none.
     fn shell_plan(
         &self,
         route: &Route,
         command: Option<Vec<String>>,
+        overrides: Vec<(String, String)>,
     ) -> std::io::Result<ShellPlan> {
         let motd = terminal_motd(route);
         let plan = match route {
             // The injected BusyBox (so a distroless image still gets a
             // toolbox) as whoever the session is.
-            Route::Container(ctx, session) => ShellPlan {
-                argv: command.or_else(|| container_shell(&ctx.rootfs)),
-                env: container_env(ctx, *session),
-                credentials: session.and_then(login::credentials_for),
-                cwd: container_home(ctx, *session).unwrap_or_else(|| ctx.workdir.clone()),
-                motd,
-            },
-            Route::Agent => ShellPlan {
-                argv: command.or_else(default_shell),
-                env: root_env(),
-                credentials: None,
-                cwd: "/root".to_string(),
-                motd,
-            },
-            Route::Pam(s, su) => ShellPlan {
-                argv: Some(login::su_argv(
-                    su,
-                    &s.account.name,
-                    command.map(|argv| login::login_script(&[], None, &argv)),
-                )),
-                env: vec![
-                    ("TERM".to_string(), "xterm-256color".to_string()),
-                    ("PATH".to_string(), login::SUPATH.to_string()),
-                ],
-                credentials: None,
-                cwd: s.account.home.clone(),
-                motd,
-            },
+            Route::Container(ctx, session) => {
+                let mut env = container_env(ctx, *session);
+                env.extend(overrides);
+                ShellPlan {
+                    argv: command.or_else(|| container_shell(&ctx.rootfs)),
+                    env,
+                    credentials: session.and_then(login::credentials_for),
+                    cwd: container_home(ctx, *session).unwrap_or_else(|| ctx.workdir.clone()),
+                    motd,
+                }
+            }
+            Route::Agent => {
+                let mut env = root_env();
+                env.extend(overrides);
+                ShellPlan {
+                    argv: command.or_else(default_shell),
+                    env,
+                    credentials: None,
+                    cwd: "/root".to_string(),
+                    motd,
+                }
+            }
+            // `su -l` resets the environment as part of being a login, so
+            // overrides are re-applied inside the script it runs — the same
+            // place an exec's are. With neither a command nor an override
+            // there is no script at all, which is what keeps an ordinary
+            // attach a plain interactive `su -l`.
+            Route::Pam(s, su) => {
+                let inner = match (command, overrides.is_empty()) {
+                    (Some(argv), _) => Some(argv),
+                    (None, false) => Some(s.account.login_shell()),
+                    (None, true) => None,
+                };
+                ShellPlan {
+                    argv: Some(login::su_argv(
+                        su,
+                        &s.account.name,
+                        inner.map(|argv| login::login_script(&overrides, None, &argv)),
+                    )),
+                    env: vec![
+                        ("TERM".to_string(), "xterm-256color".to_string()),
+                        ("PATH".to_string(), login::SUPATH.to_string()),
+                    ],
+                    credentials: None,
+                    cwd: s.account.home.clone(),
+                    motd,
+                }
+            }
             Route::Setuid(s) => {
                 let mut env = s.env();
                 env.push(("TERM".to_string(), "xterm-256color".to_string()));
+                env.extend(overrides);
                 ShellPlan {
                     argv: Some(command.unwrap_or_else(|| s.account.login_shell())),
                     env,
@@ -607,7 +634,7 @@ impl Spawner for LinuxSpawner {
     fn terminal(&self, identity: &Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
         let held = self.logins.resolve(identity)?;
         let route = self.route(&held);
-        let plan = self.shell_plan(&route, spec.command)?;
+        let plan = self.shell_plan(&route, spec.command, spec.env)?;
         let size = winsize(spec.cols, spec.rows);
         let (master, pid) = spawn_shell(&plan, &size, self.container.as_deref(), owner(&route))?;
         // The master is shared: one dup drives keystrokes in, another the VT
@@ -1785,7 +1812,9 @@ mod tests {
         ctx.floor = logins.floor("app");
         let spawner = container_spawner(ctx);
 
-        let plan = spawner.shell_plan(&spawner.route_for(None), None).unwrap();
+        let plan = spawner
+            .shell_plan(&spawner.route_for(None), None, vec![])
+            .unwrap();
         assert_eq!(
             plan.credentials,
             Some(Credentials {
@@ -1834,14 +1863,16 @@ mod tests {
 
         let declared = test_session("dev", 1000, Mechanism::Setuid, true);
         let plan = spawner
-            .shell_plan(&spawner.route_for(Some(&declared)), None)
+            .shell_plan(&spawner.route_for(Some(&declared)), None, vec![])
             .unwrap();
         assert!(plan.env.contains(&("HOME".into(), "/home/dev".into())));
         assert_eq!(plan.cwd, "/home/dev");
 
         // The floor keeps the container's own `HOME` and working directory:
         // it *is* the workload, not a person attaching as someone else.
-        let plan = spawner.shell_plan(&spawner.route_for(None), None).unwrap();
+        let plan = spawner
+            .shell_plan(&spawner.route_for(None), None, vec![])
+            .unwrap();
         assert!(plan.env.contains(&("HOME".into(), "/app".into())));
         assert_eq!(plan.cwd, "/app");
     }
@@ -1872,6 +1903,7 @@ mod tests {
             .shell_plan(
                 &spawner.route_for(Some(&session)),
                 Some(vec!["htop".into()]),
+                vec![],
             )
             .unwrap();
         assert_eq!(
@@ -1889,7 +1921,7 @@ mod tests {
 
         // With no command, `su -l` picks the account's own login shell.
         let plan = spawner
-            .shell_plan(&spawner.route_for(Some(&session)), None)
+            .shell_plan(&spawner.route_for(Some(&session)), None, vec![])
             .unwrap();
         assert_eq!(
             plan.argv,
@@ -1904,7 +1936,7 @@ mod tests {
         let spawner = vm_spawner();
         let session = test_session("dev", 1000, Mechanism::Setuid, true);
         let plan = spawner
-            .shell_plan(&spawner.route_for(Some(&session)), None)
+            .shell_plan(&spawner.route_for(Some(&session)), None, vec![])
             .unwrap();
         assert_eq!(plan.argv, Some(vec!["/bin/bash".into(), "-l".into()]));
         assert_eq!(
@@ -1920,12 +1952,66 @@ mod tests {
         assert!(plan.env.contains(&("TERM".into(), "xterm-256color".into())));
     }
 
+    /// The SSH facade's `env` requests are applied *over* whatever the
+    /// route already brings, and never instead of it (§19.3): the account's
+    /// own `HOME` survives a client that sent `LANG`.
+    #[test]
+    fn a_terminals_overrides_are_applied_over_the_routes_own_environment() {
+        let spawner = vm_spawner();
+        let session = test_session("dev", 1000, Mechanism::Setuid, true);
+        let plan = spawner
+            .shell_plan(
+                &spawner.route_for(Some(&session)),
+                None,
+                vec![("LANG".into(), "en_GB.UTF-8".into())],
+            )
+            .unwrap();
+        assert!(plan.env.contains(&("HOME".into(), "/home/dev".into())));
+        assert!(plan.env.contains(&("LANG".into(), "en_GB.UTF-8".into())));
+    }
+
+    /// `su -l` resets the environment as part of being a login, so overrides
+    /// ride the script it runs. With none, an attach stays a plain
+    /// interactive `su -l` — the login shell is not replaced by a script
+    /// just because the facade exists.
+    #[test]
+    fn the_pam_route_re_applies_overrides_inside_the_login() {
+        let spawner = vm_spawner();
+        let session = test_session(
+            "dev",
+            1000,
+            Mechanism::Pam {
+                su: "/bin/su".into(),
+            },
+            true,
+        );
+        let plan = spawner
+            .shell_plan(
+                &spawner.route_for(Some(&session)),
+                None,
+                vec![("LANG".into(), "en_GB.UTF-8".into())],
+            )
+            .unwrap();
+        assert_eq!(
+            plan.argv,
+            Some(vec![
+                "/bin/su".to_string(),
+                "-l".to_string(),
+                "dev".to_string(),
+                "-c".to_string(),
+                "export LANG='en_GB.UTF-8'; exec '/bin/bash' '-l'".to_string(),
+            ])
+        );
+    }
+
     /// The agent identity is unchanged by all of this: root, in /root, with
     /// no ids to drop and no login machinery involved.
     #[test]
     fn the_agent_identity_is_still_a_plain_root_shell() {
         let spawner = vm_spawner();
-        let plan = spawner.shell_plan(&spawner.route_for(None), None).unwrap();
+        let plan = spawner
+            .shell_plan(&spawner.route_for(None), None, vec![])
+            .unwrap();
         assert_eq!(plan.credentials, None);
         assert_eq!(plan.cwd, "/root");
         assert!(plan.env.contains(&("USER".into(), "root".into())));

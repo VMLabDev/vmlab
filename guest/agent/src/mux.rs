@@ -331,6 +331,7 @@ impl Mux {
                 cols,
                 rows,
                 command,
+                env,
                 logon,
             } => crate::terminal::open(
                 self,
@@ -341,6 +342,7 @@ impl Mux {
                     command,
                     cols,
                     rows,
+                    env,
                 },
             ),
             HostMsg::Resize { id, cols, rows } => self.resize(id, cols, rows),

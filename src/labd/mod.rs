@@ -17,10 +17,12 @@ mod lifecycle_tests;
 pub mod machine;
 pub mod netservices;
 pub mod network;
+pub mod one_shot;
 pub mod plan;
 pub mod playbook;
 pub mod pull_ledger;
 pub mod share_plan;
+pub mod ssh;
 pub mod state;
 pub mod vm;
 pub mod vm_agent;
@@ -562,7 +564,7 @@ impl Handler<LabRequest> for LabdHandler {
                 let session = on_machine(
                     &machine,
                     agent
-                        .open_terminal(cols, rows, None, logon)
+                        .open_terminal(cols, rows, None, vec![], logon)
                         .await
                         .map_err(CommandError::from),
                 )?;
@@ -570,6 +572,30 @@ impl Handler<LabRequest> for LabdHandler {
                 let path = m.term_session_sock(id);
                 vm_agent::expose_terminal_socket(session, path.clone()).await?;
                 Ok(json!({"session": id, "path": path}))
+            }
+            // The SSH facade (§19.3): the lab daemon terminates SSH itself
+            // and maps its channels onto the agent's, so the guest runs no
+            // sshd. What goes back is a unix socket path and nothing else —
+            // `vmlab ssh-proxy` pipes an `ssh` process's stdin/stdout onto
+            // it, so nothing listens on the host and no port is leased.
+            LabRequest::MachineSshOpen { machine } => {
+                let m = machine_of(lab, &machine)?;
+                let agent = m.agent().await?;
+                let labels: Vec<String> = m.logins().iter().map(|l| l.label.clone()).collect();
+                let key = ssh::host_key::load_or_mint(&lab.name, m.name(), &labels)
+                    .map_err(|e| CommandError::failed(format!("{e:#}")))?;
+                let events = lab.events.clone();
+                let spec = Arc::new(ssh::FacadeSpec {
+                    machine: m.name().to_string(),
+                    logins: m.logins().to_vec(),
+                    guest_os: m.guest_os(),
+                    key,
+                    host_user: ssh::host_user(),
+                    events: Arc::new(move |event, data| events.emit(event, data)),
+                });
+                let path = m.ssh_session_sock(rand::random());
+                ssh::expose_ssh_socket(spec, agent, path.clone()).await?;
+                Ok(json!({"path": path}))
             }
             LabRequest::MachineTtyResize {
                 machine,

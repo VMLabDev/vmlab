@@ -16,18 +16,23 @@ Consult them for prior art only — the PRD overrides anything they did.
 
 ## Status
 
-PRD implemented (M1–M6). **§19 (Dev machines) is mostly specified, not built**
-— the SSH facade and the workspace syncer are spec only; implementation is
-tracked by #78–#98. The `@dev` declaration (#80) and all three agent
-vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and `fileops`
-(#84) — the handle-based, offset-addressed, pipelined file RPC session that
-**replaced** the whole-file push/pull pair outright, carrying `vmlab cp`, the
-console's transfer, wscript push/pull and tree pushes. So is machine-level
-`login {}` (#81) on both guest families: the **Windows logon it mints** (#82)
-— the wire's per-open `logon`, `LogonUser`/`LoadUserProfileW`/linked-token
-minting, the (account, secret, machine) cache and `exec`/`shell`'s
-`--user`/`--password` — and the **Linux session** (#83): `su -l` where the
-guest has PAM, `setuid` where it does not, plus the container floor.
+PRD implemented (M1–M6). **§19 (Dev machines) is partly built** — the
+workspace syncer and the managed `~/.ssh/config` block are spec only;
+implementation is tracked by #78–#98. The `@dev` declaration (#80) and all
+three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
+`fileops` (#84) — the handle-based, offset-addressed, pipelined file RPC
+session that **replaced** the whole-file push/pull pair outright, carrying
+`vmlab cp`, the console's transfer, wscript push/pull and tree pushes. So is
+machine-level `login {}` (#81) on both guest families: the **Windows logon it
+mints** (#82) — the wire's per-open `logon`,
+`LogonUser`/`LoadUserProfileW`/linked-token minting, the (account, secret,
+machine) cache and `exec`/`shell`'s `--user`/`--password` — and the **Linux
+session** (#83): `su -l` where the guest has PAM, `setuid` where it does not,
+plus the container floor. **The SSH facade serves a shell** (#87,
+§19.3/ADR-0012): `machine.ssh_open` + `vmlab ssh-proxy`, `none` auth over a
+label selector, and the `session` vocabulary onto agent terminals and execs —
+SFTP (#88) and `direct-tcpip` (#89) refuse by name until their own tickets
+land.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
@@ -80,7 +85,9 @@ Module map under `src/`:
   (ADR-0010).
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;
-  `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18).
+  `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18);
+  `ssh/` is the SSH facade vmlab terminates on the host (§19.3, ADR-0012) —
+  no guest runs an sshd, and its refusals follow ADR-0013's invariant.
   Decisions the runtime used to make mid-flight are values computed before
   execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
   transports, gateway rules, the smbd port), `forward_plan.rs` (every port

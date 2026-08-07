@@ -14,15 +14,15 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::logon::MintedLogon;
 use super::port::wide;
-use super::proc::{Owned, create_as_user, env_block};
+use super::proc::{Owned, agent_env_block, create_as_user, env_block};
 use crate::spawn::{Spawned, TerminalSpec, command_line};
 
 /// Windows-side MOTD, written down the ConPTY input? No — ConPTY input is
@@ -47,6 +47,7 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
         command,
         cols,
         rows,
+        env,
     } = spec;
     let cmdline = match command {
         Some(argv) if !argv.is_empty() => command_line(&argv),
@@ -74,7 +75,7 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
     drop(in_read);
     drop(out_write);
 
-    let process = match spawn_with_conpty(&cmdline, pty.0, logon) {
+    let process = match spawn_with_conpty(&cmdline, pty.0, logon, &env) {
         Ok(v) => v,
         Err(e) => {
             // SAFETY: hpc came from CreatePseudoConsole above.
@@ -158,6 +159,7 @@ fn spawn_with_conpty(
     cmdline: &str,
     hpc: HPCON,
     logon: Option<&MintedLogon>,
+    env: &[(String, String)],
 ) -> std::io::Result<Owned> {
     // SAFETY: textbook STARTUPINFOEXW attribute-list dance; every pointer
     // lives across the create call.
@@ -197,7 +199,7 @@ fn spawn_with_conpty(
                 // The environment must come from the *loaded* profile, or
                 // every editor that writes under `$HOME` scribbles into
                 // `C:\Users\Default`.
-                match env_block(logon, &[]) {
+                match env_block(logon, env) {
                     Ok(env) => create_as_user(
                         logon,
                         cmdline,
@@ -212,14 +214,21 @@ fn spawn_with_conpty(
             None => {
                 let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
                 let mut cmd = wide(cmdline);
+                // The agent identity has no profile to load, so it simply
+                // inherits the agent's environment — a block is built only
+                // when the open carried overrides, keeping the common case
+                // a null pointer rather than a copy of our own environment.
+                let block = (!env.is_empty()).then(|| agent_env_block(env));
+                let flags = EXTENDED_STARTUPINFO_PRESENT
+                    | block.as_ref().map_or(0, |_| CREATE_UNICODE_ENVIRONMENT);
                 let ok = CreateProcessW(
                     std::ptr::null(),
                     cmd.as_mut_ptr(),
                     std::ptr::null(),
                     std::ptr::null(),
                     0,
-                    EXTENDED_STARTUPINFO_PRESENT,
-                    std::ptr::null(),
+                    flags,
+                    block.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()),
                     std::ptr::null(),
                     &si.StartupInfo,
                     &mut pi,

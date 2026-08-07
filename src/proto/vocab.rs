@@ -611,6 +611,20 @@ vocabulary! {
             #[serde(default)] user: Option<String>,
             #[serde(default)] password: Option<String>,
         },
+        /// Open an SSH facade connection for this machine, re-exposed as a
+        /// unix socket the caller pipes stdin/stdout onto (PRD §19.3). One
+        /// socket per connection, unlinked when it ends.
+        #[one_way(
+            "cli",
+            "The endpoint is a stdio `ProxyCommand` and nothing else \
+             (ADR-0012): the socket exists to be handed to an `ssh` process's \
+             stdin and stdout, and a browser has nothing to connect a stdio \
+             pipe to. Nothing listens on the host, so there is also no \
+             address a console could offer."
+        )]
+        MachineSshOpen = "machine.ssh_open" {
+            #[serde(alias = "vm", alias = "container")] machine: String,
+        },
         /// Resize an open terminal session.
         MachineTtyResize = "machine.tty_resize" {
             #[serde(alias = "vm", alias = "container")] machine: String,

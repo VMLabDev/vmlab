@@ -61,6 +61,12 @@ pub struct TerminalSpec {
     pub command: Option<Vec<String>>,
     pub cols: u16,
     pub rows: u16,
+    /// Applied *over* the environment the identity already brings, never
+    /// replacing it: a shell that lost the loaded profile's `USERPROFILE`
+    /// would write the developer's files into the wrong home (§19.2). The
+    /// SSH facade's `env` requests arrive here; everything vmlab opens on
+    /// its own behalf sends none.
+    pub env: Vec<(String, String)>,
 }
 
 /// A running process, with its stdio wired and its control hooks captured.

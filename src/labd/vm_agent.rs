@@ -22,8 +22,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::net::UnixListener;
+use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 
 use vmlab_agent_proto::fileops::{self, Op, OpenFlags, Reply, Request, Response};
@@ -420,12 +422,15 @@ impl AgentHandle {
     /// `logon` is who the shell runs as (§19.2), already resolved from the
     /// machine's declaration by [`crate::labd::identity::resolve`]; `None`
     /// is the agent identity, which is what everything vmlab does on its own
-    /// behalf passes.
+    /// behalf passes. `env` is applied over that identity's own environment
+    /// and is empty for everything but the SSH facade's `env` requests
+    /// (§19.3).
     pub async fn open_terminal(
         &self,
         cols: u16,
         rows: u16,
         command: Option<Vec<String>>,
+        env: Vec<(String, String)>,
         logon: Option<Logon>,
     ) -> Result<AgentSession> {
         self.open(|id| HostMsg::OpenTerminal {
@@ -433,6 +438,7 @@ impl AgentHandle {
             cols,
             rows,
             command,
+            env,
             logon,
         })
         .await
@@ -1685,54 +1691,52 @@ async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
 /// (or the shell exits) the session closes and the socket is unlinked.
 /// Nobody connecting within a minute also closes it.
 pub async fn expose_terminal_socket(session: AgentSession, sock_path: PathBuf) -> Result<()> {
-    let _ = std::fs::remove_file(&sock_path);
-    if let Some(parent) = sock_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("binding {}", sock_path.display()))?;
-    tokio::spawn(async move {
-        let mut session = session;
-        let accepted = tokio::time::timeout(Duration::from_secs(60), listener.accept()).await;
-        let stream = match accepted {
-            Ok(Ok((stream, _))) => stream,
-            _ => {
-                session.close().await;
-                let _ = std::fs::remove_file(&sock_path);
+    let idle = std::sync::Arc::new(tokio::sync::Mutex::new(Some(session)));
+    let abandoned = idle.clone();
+    crate::labd::one_shot::serve_one(
+        sock_path,
+        move |stream| async move {
+            let Some(mut session) = idle.lock().await.take() else {
                 return;
-            }
-        };
-        let (mut client_rx, mut client_tx) = stream.into_split();
-        let mut buf = [0u8; 8 * 1024];
-        loop {
-            tokio::select! {
-                n = client_rx.read(&mut buf) => {
-                    match n {
-                        Ok(0) | Err(_) => break, // client hung up
-                        Ok(n) => {
-                            if session.send(&buf[..n]).await.is_err() {
-                                break;
+            };
+            let (mut client_rx, mut client_tx) = stream.into_split();
+            let mut buf = [0u8; 8 * 1024];
+            loop {
+                tokio::select! {
+                    n = client_rx.read(&mut buf) => {
+                        match n {
+                            Ok(0) | Err(_) => break, // client hung up
+                            Ok(n) => {
+                                if session.send(&buf[..n]).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                     }
-                }
-                ev = session.recv() => {
-                    match ev {
-                        Some(SessionEvent::Data(b)) => {
-                            if client_tx.write_all(&b).await.is_err() {
-                                break;
+                    ev = session.recv() => {
+                        match ev {
+                            Some(SessionEvent::Data(b)) => {
+                                if client_tx.write_all(&b).await.is_err() {
+                                    break;
+                                }
                             }
+                            Some(SessionEvent::Exited(_)) | Some(SessionEvent::Error(_)) | None => break,
+                            Some(_) => {}
                         }
-                        Some(SessionEvent::Exited(_)) | Some(SessionEvent::Error(_)) | None => break,
-                        Some(_) => {}
                     }
                 }
             }
-        }
-        session.close().await;
-        let _ = std::fs::remove_file(&sock_path);
-    });
-    Ok(())
+            session.close().await;
+        },
+        // Nobody came: the shell the open already spawned has nothing to
+        // talk to, so it goes rather than lingering in the guest.
+        move || async move {
+            if let Some(session) = abandoned.lock().await.take() {
+                session.close().await;
+            }
+        },
+    )
+    .await
 }
 
 /// Match the first non-loopback IPv4 address reported for each requested
@@ -2425,7 +2429,10 @@ mod tests {
     async fn terminal_echoes_and_resizes() {
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
-        let mut session = agent.open_terminal(80, 24, None, None).await.unwrap();
+        let mut session = agent
+            .open_terminal(80, 24, None, vec![], None)
+            .await
+            .unwrap();
         match session.recv().await.unwrap() {
             SessionEvent::Data(b) => assert_eq!(b, b"prompt$ "),
             other => panic!("expected prompt, got {other:?}"),
@@ -2448,7 +2455,7 @@ mod tests {
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
         let Err(err) = agent
-            .open_terminal(80, 24, Some(vec!["/no/shell".into()]), None)
+            .open_terminal(80, 24, Some(vec!["/no/shell".into()]), vec![], None)
             .await
         else {
             panic!("expected open failure");
@@ -2850,7 +2857,10 @@ mod tests {
     async fn exposed_terminal_socket_bridges_a_client() {
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
-        let session = agent.open_terminal(80, 24, None, None).await.unwrap();
+        let session = agent
+            .open_terminal(80, 24, None, vec![], None)
+            .await
+            .unwrap();
         let work = tempfile::tempdir().unwrap();
         let sock = work.path().join("term-1.sock");
         expose_terminal_socket(session, sock.clone()).await.unwrap();

@@ -347,13 +347,17 @@ pub enum HostMsg {
     /// agent's default shell (absolute argv).
     ///
     /// `logon` is who the shell runs as; absent is the agent identity
-    /// (§19.2's floor).
+    /// (§19.2's floor). `env` is applied *over* whatever environment that
+    /// identity brings — an SSH client's `env` requests reach a shell this
+    /// way (§19.3), and everything vmlab opens on its own behalf sends none.
     OpenTerminal {
         id: u32,
         cols: u16,
         rows: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<(String, String)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         logon: Option<Logon>,
     },
@@ -783,6 +787,7 @@ mod tests {
                 cols: 120,
                 rows: 32,
                 command: None,
+                env: vec![],
                 logon: None,
             },
             HostMsg::OpenTerminal {
@@ -790,6 +795,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 command: Some(vec!["/bin/zsh".into(), "-l".into()]),
+                env: vec![("LANG".into(), "en_GB.UTF-8".into())],
                 logon: Some(Logon {
                     user: r"PROBE\dev".into(),
                     secret: "vmlab123!".into(),
@@ -1076,6 +1082,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 command: None,
+                env: vec![],
                 logon: None,
             }
         );

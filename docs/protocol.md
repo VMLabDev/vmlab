@@ -88,6 +88,7 @@ the code is the contract.
 | `machine.exec` | `machine: String`, `cmd: String`, `args: Vec<String>`, `timeout: u64`, `user: Option<String>`, `password: Option<String>` | `cli` | Run a command in the guest through the agent and collect its output. |
 | `machine.osinfo` | `machine: String`, `timeout: u64` | `cli` | What the guest OS says it is. |
 | `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16`, `user: Option<String>`, `password: Option<String>` | `cli`, `web` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
+| `machine.ssh_open` | `machine: String` | `cli` | Open an SSH facade connection for this machine, re-exposed as a unix socket the caller pipes stdin/stdout onto (PRD §19.3). One socket per connection, unlinked when it ends. |
 | `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli`, `web` | Resize an open terminal session. |
 | `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli`, `web` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
 | `machine.pull_file` | `machine: String`, `from: String`, `to: Option<String>` | `cli`, `web` | Copy a file out of the guest: to `to`, a host path the daemon can write, or — with `to` omitted — back inline as base64, for a caller that wants the bytes rather than a file on the daemon's host. |
@@ -137,6 +138,7 @@ Deliberate, with the reason recorded beside the declaration:
 - `machine.find_image` — How a script finds a control it cannot see. A console user clicks the one they can, on the VNC canvas.
 - `machine.exec` — The scripted counterpart to the console's interactive terminals: one command, its output collected, an exit code to branch on. The console opens a shell and lets a human type instead.
 - `machine.osinfo` — A live guest probe with a timeout, so it does not belong on a panel that refreshes; the status projection already carries what the console shows about a machine. Its CLI help calls it fit for scripting, which is what it is.
+- `machine.ssh_open` — The endpoint is a stdio `ProxyCommand` and nothing else (ADR-0012): the socket exists to be handed to an `ssh` process's stdin and stdout, and a browser has nothing to connect a stdio pipe to. Nothing listens on the host, so there is also no address a console could offer.
 - `machine.tail` — An open-ended stream of an arbitrary guest path, which is what a terminal is for. The console follows a machine's console log through `machine.logs`.
 - `machine.eventlog` — A stream into a terminal, for the same reason as `machine.tail`.
 - `playbook.list` — One flat table is the shape a shell wants. The console builds its playbook list from the lab's declarations directly and asks the daemon only which runs are in flight.
