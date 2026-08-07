@@ -76,10 +76,42 @@ pub struct LabRuntime {
     /// In-flight config-weave runs, one per machine (`up` and on-demand
     /// check/apply claim through the same registry).
     pub playbook_ops: crate::labd::playbook::PlaybookOps,
+    /// The workspace syncers, one per `@dev` machine carrying a workspace
+    /// (§19.6). Owned here rather than by the client that asked for the `up`:
+    /// a developer's source tree must not stop syncing because a terminal
+    /// closed.
+    pub workspaces: crate::labd::workspace::WorkspaceSyncers,
     /// This runtime as its own `Arc`. [`crate::labd::machine::LabServices`] is
     /// a `&self` interface (it has to be, to be object-safe), and the work
     /// behind two of its methods spawns tasks that outlive the call.
     me: std::sync::Weak<LabRuntime>,
+}
+
+/// The workspace syncer's route to one machine (§19.6).
+///
+/// A fresh file session per pass, opened as the machine's **default login** —
+/// the one named exception to vmlab's machinery running as the agent identity,
+/// because the syncer's whole output is the developer's own source tree, and
+/// files it wrote as `SYSTEM` or `root` would leave the developer owning none
+/// of it. No flag and no wscript override reaches here: this is not a person
+/// invoking a command, so the ladder starts and ends at the declaration.
+struct WorkspaceSessions {
+    machine: Arc<dyn Machine>,
+}
+
+#[async_trait::async_trait]
+impl crate::labd::workspace::syncer::GuestSessions for WorkspaceSessions {
+    async fn open(&self) -> Result<Box<dyn crate::labd::workspace::guest::GuestFs>> {
+        let logon = crate::labd::identity::resolve(
+            self.machine.name(),
+            self.machine.logins(),
+            self.machine.guest_os(),
+            None,
+            None,
+        )?;
+        let agent = self.machine.agent().await?;
+        Ok(Box::new(agent.open_fileops(logon).await?))
+    }
 }
 
 /// A live loopback forward backing a proxied web page.
@@ -409,6 +441,7 @@ impl LabRuntime {
             pre_provision: std::sync::RwLock::new(None),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
+            workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
         }))
     }
 
@@ -454,6 +487,7 @@ impl LabRuntime {
             pre_provision: std::sync::RwLock::new(None),
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
+            workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
         }))
     }
 
@@ -1025,11 +1059,20 @@ impl LabRuntime {
     /// `up <name>` re-materialises it (per-machine analogue of [`destroy`]).
     pub async fn destroy_machine(self: &Arc<Self>, name: &str) -> Result<()> {
         let m = self.machine(name)?;
+        self.workspaces.stop(name).await;
         m.stop(true).await?;
         // Settle before removing disks out from under a still-running QEMU.
         wait_settled(&*m).await;
         remove_tree(m.local_dir()).await?;
         let _ = remove_tree(m.run_dir()).await;
+        // The guest tree goes with the clone, so there is nothing left for
+        // the ledger to have agreed with (§19.6). Leaving it would let a
+        // re-materialised machine start from an agreement about a tree that
+        // no longer exists.
+        let _ = std::fs::remove_file(crate::labd::workspace::ledger::Ledger::path(
+            &self.lab_local,
+            name,
+        ));
         {
             let mut state = self.state.lock().await;
             let entry = state.machine_mut(name);
@@ -1366,6 +1409,12 @@ impl LabRuntime {
 
         self.warn_unattachable(&targets, &output).await;
 
+        // After provisioning, and only now: the syncer writes as the
+        // machine's default login, which the provisioning is what creates
+        // (§19.6). The task belongs to this daemon, so the `vmlab` process
+        // that asked for the `up` may exit without stopping it.
+        self.start_workspaces(&targets).await;
+
         self.events.emit("lab.up", json!({"vms": targets}));
         Ok(())
     }
@@ -1606,6 +1655,12 @@ impl LabRuntime {
             tracing::info!("{}: {}", skip.what, skip.why);
         }
 
+        // Before the machines go: a syncer whose guest has gone would spend
+        // its retry window failing to reach one.
+        for name in plan.machines() {
+            self.workspaces.stop(name).await;
+        }
+
         for wave in &plan.waves {
             let mut handles = Vec::new();
             for name in wave {
@@ -1633,6 +1688,7 @@ impl LabRuntime {
     /// Stop everything and delete clones, lab-local state, and dynamic net
     /// config (PRD §12).
     pub async fn destroy(self: &Arc<Self>) -> Result<()> {
+        self.workspaces.stop_all().await;
         self.down(&[], true).await?;
         // Wait for the exit monitors to settle before removing disks.
         for m in self.machines() {
@@ -1664,6 +1720,77 @@ impl LabRuntime {
                 .and_then(|m| m.profile())
                 .and_then(|name| self.profiles.get(&name).cloned())
         })
+    }
+
+    /// Start the workspace syncer for every `@dev` machine in `scope` that
+    /// declares one (§19.6). An empty `scope` means the whole lab.
+    ///
+    /// **Called after provisioning, not at machine-ready**: the syncer writes
+    /// as the machine's default login, and that account does not exist until
+    /// provisioning has created it.
+    ///
+    /// A workspace whose host directory is not there does not start, loudly.
+    /// Creating it would be worse than refusing: an empty canonical tree is a
+    /// tree the syncer would then propagate *as* empty.
+    async fn start_workspaces(self: &Arc<Self>, scope: &[String]) {
+        for dev in self.dev_machines() {
+            let Some(workspace) = dev.workspace.clone() else {
+                continue;
+            };
+            if !scope.is_empty() && !scope.contains(&dev.name) {
+                continue;
+            }
+            let Ok(machine) = self.machine(&dev.name) else {
+                continue;
+            };
+            let declared = self.root.join(&workspace);
+            let host_root = match declared.canonicalize() {
+                Ok(root) if root.is_dir() => root,
+                _ => {
+                    self.events.emit(
+                        "workspace.unavailable",
+                        json!({
+                            "machine": dev.name,
+                            "workspace": declared.display().to_string(),
+                            "reason": "the host workspace directory is not there",
+                        }),
+                    );
+                    continue;
+                }
+            };
+            // The syncer is the one piece of vmlab's machinery that runs as
+            // the machine's default login (§19.6). With none declared it can
+            // only run as the agent identity, and the whole tree lands owned
+            // by `root` or `SYSTEM` — which surfaces hours later as
+            // permission errors nobody can place, unless it is said here.
+            if crate::config::model::default_login(machine.logins()).is_none() {
+                self.events.emit(
+                    "workspace.identity",
+                    json!({
+                        "machine": dev.name,
+                        "reason": "no login {} is declared, so the workspace is written as the \
+                                   agent identity and the tree will not be owned by a developer \
+                                   account",
+                    }),
+                );
+            }
+            self.workspaces
+                .start(
+                    crate::labd::workspace::Workspace {
+                        machine: dev.name.clone(),
+                        ledger_path: crate::labd::workspace::ledger::Ledger::path(
+                            &self.lab_local,
+                            &dev.name,
+                        ),
+                        host_root,
+                        guest_root: dev.workspace_guest.clone(),
+                        max_file_bytes: self.host_cfg.workspace_max_file,
+                    },
+                    Arc::new(WorkspaceSessions { machine }),
+                    self.events.clone(),
+                )
+                .await;
+        }
     }
 
     /// The lab status projection (ADR-0004) — produced here, rendered unchanged

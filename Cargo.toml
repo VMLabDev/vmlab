@@ -96,8 +96,11 @@ zstd = "0.13"
 flate2 = "1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
-# `net` is for if_nametoindex (the afxdp tier's XDP map keys).
-nix = { version = "0.31", features = ["process", "signal", "user", "fs", "net"] }
+# `net` is for if_nametoindex (the afxdp tier's XDP map keys); `inotify` is
+# the workspace syncer's host-side watcher (§19.6), which registers per
+# directory rather than recursively so a guest-owned tree costs no watch
+# descriptors.
+nix = { version = "0.31", features = ["process", "signal", "user", "fs", "net", "inotify", "poll"] }
 image = { version = "0.25", default-features = false, features = ["png", "pnm", "bmp"] }
 # 0.13 renamed the `rustls-tls` feature to `rustls` and moved
 # `RequestBuilder::query` behind its own `query` feature.
@@ -129,6 +132,12 @@ command-fds = { version = "0.3", optional = true }
 # key and a client that negotiates compression over a unix socket gains
 # nothing.
 russh = { version = "0.62.5", default-features = false, features = ["ring"] }
+# ripgrep's own gitignore engine, for the workspace syncer's ignore rules
+# (PRD §19.6). Only `ignore::gitignore` is used — vmlab owns the walk, because
+# the syncer has to descend a directory to learn its rules. Not hand-rolled:
+# an ignore rule that silently means something slightly different from what
+# `git` reads is the silent-divergence failure class §19.6 exists to refuse.
+ignore = "0.4"
 
 [dev-dependencies]
 assert_cmd = "2"

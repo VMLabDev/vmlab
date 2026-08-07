@@ -31,4 +31,6 @@ type HostConfig {
   config_weave_bin_dir: utf8?
   @doc("File vmlab writes its managed SSH block into; default `~/.ssh/config`")
   ssh_config: utf8?
+  @doc("Workspace syncer per-file size guard; a larger file is refused by name; default `256MiB`")
+  workspace_max_file: std.ByteSize?
 }

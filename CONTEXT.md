@@ -83,6 +83,35 @@ touches it, and it does not survive a rebuild, correctly, because it is
 reconstructible.
 _Avoid_: ignored (that describes the rule, not the path), excluded
 
+**Ignore floor**:
+vmlab's own layer of the workspace ignore rules, under the repo's `.gitignore`
+and the developer's `.vmlabignore` and outranking both. It holds the syncer's
+own scratch names — an apply's temp file, the halt marker — so no repo rule and
+no negation can turn one of them into a sync object.
+_Avoid_: default ignores, built-in excludes
+
+**Size guard**:
+The workspace syncer's per-file cap, refused **before** transfer and naming the
+file, the rule and both ways out (an ignore rule, or a larger cap). Distinct
+from a **volume warning**: the guard refuses because a multi-gigabyte file
+nobody wrote a rule for is unwanted work, where a build burst is wanted work
+that happens to be large.
+_Avoid_: quota, limit (alone), throttle
+
+**Reconciliation**:
+What one **sync pass** decided, as a value: the actions to carry out, the
+paths adopted as agreed, the agreements to drop, the conflicts, and the files
+the **size guard** refused. Computed from host state, guest state and the
+**sync ledger**, with no I/O in it — so the rules that matter most are
+arithmetic rather than a property of a running lab.
+_Avoid_: diff, delta, changeset
+
+**Sync pass**:
+One reconciliation of a workspace end to end — walk the host, ask the guest
+about those paths, reconcile against the **sync ledger**, apply, record. The
+**seed** is simply the first one; there is no separate seeding mechanism.
+_Avoid_: sync cycle, run, tick
+
 ### Capabilities
 
 **Capability**:
@@ -250,8 +279,8 @@ context, credential
 **Plan**:
 A decision computed in full, as a value, before anything acts on it. Computing
 the plan does no I/O; carrying it out is a separate operation. **LabPlan**,
-**Share plan**, **Mount steps**, **Pull ledger** and **Forward plan** are the
-plans the lab daemon computes.
+**Share plan**, **Mount steps**, **Pull ledger**, **Forward plan** and the
+workspace **Reconciliation** are the plans the lab daemon computes.
 _Avoid_: strategy, intent, command object
 
 **LabPlan**:
