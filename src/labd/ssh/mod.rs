@@ -2,10 +2,11 @@
 //!
 //! No guest runs an sshd. vmlab terminates the protocol here, in the lab
 //! daemon, beside the agent client and the resolved logon, and maps SSH
-//! channels onto agent channels: `session` onto a terminal or an exec. The
-//! transport is the agent channel, so a machine on no segment at all is
-//! attachable, and a VM and a container micro-VM are attached to the same
-//! way.
+//! channels onto agent channels: `session` onto a terminal or an exec, and
+//! `direct-tcpip` onto a tunnel the *guest* dials. The transport is the agent
+//! channel, so a machine on no segment at all is attachable — including for
+//! `ssh -D`, whose destinations are reached from inside the guest — and a VM
+//! and a container micro-VM are attached to the same way.
 //!
 //! **The endpoint is a stdio `ProxyCommand` and nothing else.** One lab
 //! command ([`crate::proto::LabRequest::MachineSshOpen`]) returns the path of

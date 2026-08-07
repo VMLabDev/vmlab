@@ -15,8 +15,8 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use vmlab_agent_proto::{
-    AgentMsg, Frame, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, Logon, PROTO_VERSION,
-    encode_ctrl, encode_frame,
+    AgentMsg, ErrorCause, Frame, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, Logon,
+    PROTO_VERSION, encode_ctrl, encode_frame,
 };
 
 use super::*;
@@ -46,22 +46,48 @@ enum Opened {
         cols: u16,
         rows: u16,
     },
+    /// A dial the guest was asked to make, with the destination exactly as it
+    /// crossed — a name stays a name, because the guest is what resolves it.
+    Tunnel {
+        host: String,
+        port: u16,
+    },
 }
+
+/// How long a dial to a `slow.` destination takes to fail. Stands in for the
+/// agent's real dial budget, which is seconds.
+const SLOW_DIAL: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct AgentLog {
     opens: Mutex<Vec<Opened>>,
     /// Bytes the host sent towards the guest, per channel.
     input: Mutex<HashMap<u32, Vec<u8>>>,
+    /// Channels the host closed — the guest's only sign that a terminal,
+    /// an exec or a guest-side socket may be let go.
+    closed: Mutex<Vec<u32>>,
 }
 
-/// A guest agent that answers terminals and execs.
+/// A guest agent that answers terminals, execs and tunnels.
 ///
 /// A terminal echoes its keystrokes back — enough for a test to see bytes
 /// travel both ways through the facade — and exits with the code named by
 /// `exit <n>` typed into it. An exec writes a line to stdout, a line to
-/// stderr, and exits with the code its command line ends in.
+/// stderr, and exits with the code its command line ends in. A tunnel is an
+/// echo peer that half-closes when its client does, unless its destination is
+/// named `dead.<something>` or `slow.<something>` — the dial then fails the
+/// way a dead address does, at once or after spending a budget.
 async fn mock_agent() -> (tempfile::TempDir, AgentHandle, Arc<AgentLog>) {
+    mock_agent_with(EVERY_FEATURE).await
+}
+
+/// Everything this facade asks a guest for.
+const EVERY_FEATURE: &[&str] = &["terminal", "exec", "tunnel"];
+
+/// The same guest, declaring only `features` — which is how a test stands up
+/// an agent too old to serve one of the vocabularies (§19.4).
+async fn mock_agent_with(features: &[&str]) -> (tempfile::TempDir, AgentHandle, Arc<AgentLog>) {
+    let features: Vec<String> = features.iter().map(|f| f.to_string()).collect();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("agent.sock");
     let listener = tokio::net::UnixListener::bind(&path).expect("bind");
@@ -112,7 +138,7 @@ async fn mock_agent() -> (tempfile::TempDir, AgentHandle, Arc<AgentLog>) {
                                     proto_version: PROTO_VERSION,
                                     agent_version: "mock".into(),
                                     os: "linux".into(),
-                                    features: vec!["terminal".into(), "exec".into()],
+                                    features: features.clone(),
                                     token,
                                 })
                                 .await;
@@ -160,6 +186,51 @@ async fn mock_agent() -> (tempfile::TempDir, AgentHandle, Arc<AgentLog>) {
                                     .unwrap()
                                     .push(Opened::Resize { cols, rows });
                             }
+                            HostMsg::OpenTunnel { id, host, port } => {
+                                served.opens.lock().unwrap().push(Opened::Tunnel {
+                                    host: host.clone(),
+                                    port,
+                                });
+                                // Nothing answers a `dead.` or `slow.`
+                                // destination, and a dial that does not
+                                // succeed fails the channel with a
+                                // machine-readable cause — the distinction
+                                // the facade has to keep (§19.5).
+                                let dead = host.starts_with("dead.");
+                                let slow = host.starts_with("slow.");
+                                match dead || slow {
+                                    false => send(AgentMsg::Opened { id }).await,
+                                    true => {
+                                        let failure = send(AgentMsg::Error {
+                                            id: Some(id),
+                                            msg: format!(
+                                                "tunnel {host}:{port}: connection refused"
+                                            ),
+                                            cause: Some(ErrorCause::ConnectFailed),
+                                        });
+                                        // A `slow.` destination spends a
+                                        // dial budget before it fails, which
+                                        // is what a dead address really
+                                        // does. Spawned, because the guest
+                                        // goes on answering everything else
+                                        // while one channel is dialling.
+                                        match slow {
+                                            true => {
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(SLOW_DIAL).await;
+                                                    failure.await;
+                                                });
+                                            }
+                                            false => failure.await,
+                                        }
+                                    }
+                                }
+                            }
+                            // The peer answers the host's FIN with its own,
+                            // which is what makes a half-close observable
+                            // from the client's side.
+                            HostMsg::Eof { id } => send(AgentMsg::Eof { id }).await,
+                            HostMsg::Close { id } => served.closed.lock().unwrap().push(id),
                             _ => {}
                         }
                     }
@@ -278,7 +349,19 @@ async fn connect_with(
     logins: Vec<Login>,
     guest_os: GuestOs,
 ) -> anyhow::Result<Harness> {
-    let (agent_dir, agent, agent_log) = mock_agent().await;
+    connect_featured(username, logins, guest_os, EVERY_FEATURE).await
+}
+
+/// The same, against a guest whose agent declares only `features` — the
+/// facade degrades per channel, so what it still serves is as much of the
+/// contract as what it refuses.
+async fn connect_featured(
+    username: &str,
+    logins: Vec<Login>,
+    guest_os: GuestOs,
+    features: &[&str],
+) -> anyhow::Result<Harness> {
+    let (agent_dir, agent, agent_log) = mock_agent_with(features).await;
     let events: Recorded = Arc::new(Mutex::new(Vec::new()));
 
     let sink = events.clone();
@@ -386,6 +469,29 @@ struct RealSsh {
     port: u16,
     agent_log: Arc<AgentLog>,
     _agent_dir: tempfile::TempDir,
+}
+
+impl RealSsh {
+    /// An `ssh` aimed at this facade, with the options every one of these
+    /// tests needs and nothing else: vmlab owns its own `known_hosts`, so a
+    /// test must not touch the developer's, and that is not what is under
+    /// test.
+    fn ssh(&self) -> tokio::process::Command {
+        let mut ssh = tokio::process::Command::new("ssh");
+        ssh.args([
+            "-p",
+            &self.port.to_string(),
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+        ]);
+        ssh
+    }
+
+    fn opens(&self) -> Vec<Opened> {
+        self.agent_log.opens.lock().unwrap().clone()
+    }
 }
 
 /// Read from a channel until `want` bytes of data have arrived.
@@ -524,21 +630,9 @@ async fn a_real_openssh_client_is_shown_the_declared_logins() {
     let Some(facade) = openssh_reachable_facade(logins()).await else {
         return;
     };
-    let out = tokio::process::Command::new("ssh")
-        .args([
-            "-p",
-            &facade.port.to_string(),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "BatchMode=yes",
-            "-l",
-            "qa",
-            "127.0.0.1",
-            "true",
-        ])
+    let out = facade
+        .ssh()
+        .args(["-o", "BatchMode=yes", "-l", "qa", "127.0.0.1", "true"])
         .output()
         .await
         .expect("run ssh");
@@ -797,6 +891,223 @@ async fn many_session_channels_share_one_connection() {
 }
 
 // ---------------------------------------------------------------------------
+// `direct-tcpip`
+// ---------------------------------------------------------------------------
+
+/// The second channel type the facade answers, and the agent's tunnel is
+/// what answers it: the destination crosses verbatim — a name stays a name,
+/// because the *guest* resolves it — and the channel is then that
+/// connection's byte pipe.
+#[tokio::test]
+async fn direct_tcpip_dials_from_inside_the_guest_and_carries_bytes() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let mut channel = h
+        .session
+        .channel_open_direct_tcpip("db.internal", 5432, "127.0.0.1", 51000)
+        .await
+        .unwrap();
+
+    channel.data(&b"SELECT 1"[..]).await.unwrap();
+    assert_eq!(read_data(&mut channel, 8).await, b"SELECT 1");
+
+    assert_eq!(
+        h.opens(),
+        vec![Opened::Tunnel {
+            host: "db.internal".into(),
+            port: 5432,
+        }]
+    );
+}
+
+/// The acceptance criterion the ticket spends its words on: a failed
+/// guest-side connect is `SSH_OPEN_CONNECT_FAILED`, **not**
+/// `ADMINISTRATIVELY_PROHIBITED`. A SOCKS client has to tell "nothing is
+/// listening" from "vmlab refused you", and the prohibited code is spent on
+/// what vmlab genuinely refuses.
+#[tokio::test]
+async fn a_failed_guest_connect_is_connect_failed_and_not_prohibited() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let failure = h
+        .session
+        .channel_open_direct_tcpip("dead.internal", 5432, "127.0.0.1", 51000)
+        .await
+        .expect_err("a dead destination must not open a channel");
+
+    match failure {
+        // The code is the whole of what a client acts on, and it is the one
+        // this test exists for. The guest's own words ride with it in the
+        // failure's description — asserted against a real client in
+        // [`a_real_ssh_stdio_forward_is_told_why_the_dial_failed`], because
+        // russh's client keeps only the code for the four it recognises.
+        russh::Error::ChannelOpenFailure(reason) => assert_eq!(
+            reason.code(),
+            russh::ChannelOpenFailure::ConnectFailed.code(),
+            "a dead destination must not read as a refusal"
+        ),
+        other => panic!("expected a channel open failure, got {other:?}"),
+    }
+
+    // A closed port is ordinary — `ssh -D` dials whatever the developer's
+    // tooling asks for — so it is not one of vmlab's refusals and does not
+    // go on the lab event log.
+    assert_eq!(h.refusals(), Vec::<Value>::new());
+}
+
+/// A port outside the TCP range is answered the same way, and the guest is
+/// never asked to dial it: nothing can be listening there, which is a failed
+/// connect rather than anything vmlab refuses.
+#[tokio::test]
+async fn a_port_outside_the_tcp_range_is_a_failed_connect() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let failure = h
+        .session
+        .channel_open_direct_tcpip("db.internal", 70_000, "127.0.0.1", 51000)
+        .await
+        .expect_err("70000 is not a port");
+
+    match failure {
+        russh::Error::ChannelOpenFailure(reason) => assert_eq!(
+            reason.code(),
+            russh::ChannelOpenFailure::ConnectFailed.code()
+        ),
+        other => panic!("expected a channel open failure, got {other:?}"),
+    }
+    assert_eq!(h.opens(), Vec::new());
+}
+
+/// Each direction ends on its own: the client's EOF shuts the guest socket's
+/// write half, and the peer's answering FIN comes back as the channel's EOF
+/// rather than as its close.
+#[tokio::test]
+async fn a_tunnel_half_closes_in_each_direction() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let mut channel = h
+        .session
+        .channel_open_direct_tcpip("db.internal", 5432, "127.0.0.1", 51000)
+        .await
+        .unwrap();
+    channel.data(&b"ping"[..]).await.unwrap();
+    assert_eq!(read_data(&mut channel, 4).await, b"ping");
+
+    channel.eof().await.unwrap();
+    let mut saw_eof = false;
+    while let Some(msg) = channel.wait().await {
+        if matches!(msg, russh::ChannelMsg::Eof) {
+            saw_eof = true;
+            break;
+        }
+    }
+    assert!(saw_eof, "the guest's half-close never reached the client");
+}
+
+/// An agent too old to tunnel refuses `direct-tcpip` **by name**, telling the
+/// developer what to do about it — and goes on serving a shell, because the
+/// facade degrades per channel rather than per connection (§19.3).
+#[tokio::test]
+async fn direct_tcpip_refuses_by_name_without_the_tunnel_feature() {
+    let h = connect_featured("dev", logins(), GuestOs::Linux, &["terminal", "exec"])
+        .await
+        .unwrap();
+    let failure = h
+        .session
+        .channel_open_direct_tcpip("db.internal", 5432, "127.0.0.1", 51000)
+        .await
+        .expect_err("an agent with no tunnel must not open one");
+
+    match failure {
+        russh::Error::ChannelOpenFailure(reason) => assert_eq!(
+            reason.code(),
+            russh::ChannelOpenFailure::AdministrativelyProhibited.code(),
+            "vmlab's own refusal is prohibited, not a connect failure"
+        ),
+        other => panic!("expected a channel open failure, got {other:?}"),
+    }
+    let reason = h.refusals()[0]["reason"].as_str().unwrap().to_string();
+    assert!(reason.contains("repair-agent"), "{reason}");
+    assert_eq!(h.refusals()[0]["request"], "direct-tcpip");
+
+    let mut channel = h.session.channel_open_session().await.unwrap();
+    channel.request_shell(true).await.unwrap();
+    assert_eq!(read_data(&mut channel, 8).await, b"prompt$ ");
+}
+
+/// A connection that dies takes every channel on it down in the guest —
+/// tunnels included, and *because of* the tunnel rather than in spite of it.
+///
+/// This is the teardown the facade has instead of a close from the client:
+/// the connection ending drops the facade, which drops every channel's way
+/// to the guest, which is what winds each pump and its agent channel down.
+/// A tunnel pumping in its own task must therefore hold no share of that
+/// state — or one live `-D` stream would pin every idle shell's guest
+/// process and every other tunnel's guest socket open until the guest itself
+/// spoke.
+#[tokio::test]
+async fn a_lost_connection_closes_every_channel_in_the_guest() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let mut shell = h.session.channel_open_session().await.unwrap();
+    shell.request_shell(true).await.unwrap();
+    assert_eq!(read_data(&mut shell, 8).await, b"prompt$ ");
+    let mut tunnel = h
+        .session
+        .channel_open_direct_tcpip("db.internal", 5432, "127.0.0.1", 51000)
+        .await
+        .unwrap();
+    tunnel.data(&b"open"[..]).await.unwrap();
+    assert_eq!(read_data(&mut tunnel, 4).await, b"open");
+
+    let guest = h.agent_log.clone();
+    drop((shell, tunnel, h));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if guest.closed.lock().unwrap().len() == 2 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the guest was left holding {:?} of 2 channels",
+            guest.closed.lock().unwrap().len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Many tunnels ride one connection, and a dial in flight must not stall the
+/// ones behind it: `ssh -D` puts a channel there per TCP connection the
+/// developer's tooling makes, and a dead destination spends the guest's whole
+/// dial budget. So the dial cannot own the session loop, and this is the
+/// assertion that says so — the second channel opens and carries bytes while
+/// the first is still connecting.
+#[tokio::test]
+async fn a_dial_in_flight_does_not_block_the_connection() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let slow = h
+        .session
+        .channel_open_direct_tcpip("slow.internal", 5432, "127.0.0.1", 51000);
+    tokio::pin!(slow);
+    // Get the dial in flight without waiting for it.
+    tokio::select! {
+        answer = &mut slow => panic!("the slow dial answered at once: {answer:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+
+    let live = tokio::time::timeout(SLOW_DIAL / 4, async {
+        let mut channel = h
+            .session
+            .channel_open_direct_tcpip("db.internal", 5432, "127.0.0.1", 51001)
+            .await
+            .unwrap();
+        channel.data(&b"still here"[..]).await.unwrap();
+        read_data(&mut channel, 10).await
+    })
+    .await
+    .expect("a second tunnel must not wait behind the first one's dial");
+    assert_eq!(live, b"still here");
+
+    assert!(slow.await.is_err(), "the slow dial must still fail");
+}
+
+// ---------------------------------------------------------------------------
 // Refusals, and the invariant behind them
 // ---------------------------------------------------------------------------
 
@@ -945,16 +1256,9 @@ async fn a_real_openssh_client_authenticates_and_gets_an_exit_code() {
         return;
     };
 
-    let out = tokio::process::Command::new("ssh")
+    let out = facade
+        .ssh()
         .args([
-            "-p",
-            &facade.port.to_string(),
-            // vmlab owns its own known_hosts; a test must not touch the
-            // developer's, and this is not what is under test.
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
             // Everything a client could use to say "do not authenticate
             // like that", all at once.
             "-o",
@@ -990,12 +1294,137 @@ async fn a_real_openssh_client_authenticates_and_gets_an_exit_code() {
     assert!(stderr.ends_with("err\n"), "{stderr}");
 
     // And the username was read as a selector all the way through.
-    match &facade.agent_log.opens.lock().unwrap()[0] {
+    match &facade.opens()[0] {
         Opened::Exec { logon, argv, .. } => {
             assert_eq!(logon.as_ref().unwrap().user, r"PROBE\administrator");
             assert_eq!(argv[2], "printf out; exit 137");
         }
         other => panic!("{other:?}"),
+    }
+}
+
+/// `ssh -D` in front of the facade carries SOCKS traffic to a guest port.
+///
+/// This is the shape §19.3 calls mandatory rather than convenient: VS Code
+/// runs `ssh -T -D <port>` and rides its *entire* protocol over that dynamic
+/// forward, so what this test drives is what makes the editor work at all.
+/// Only the real binary can show it — the SOCKS server is OpenSSH's, not
+/// vmlab's, and the destination it hands over is a **name**, which the guest
+/// resolves.
+#[tokio::test]
+async fn a_real_ssh_dynamic_forward_carries_socks_traffic() {
+    let Some(facade) = openssh_reachable_facade(logins()).await else {
+        return;
+    };
+    let socks = free_port();
+    let mut ssh = facade
+        .ssh()
+        .args([
+            "-o",
+            "ExitOnForwardFailure=yes",
+            // `-T -N`: no terminal and no command, which is exactly the
+            // control connection a remote-dev client opens.
+            "-T",
+            "-N",
+            "-D",
+            &socks.to_string(),
+            "-l",
+            "dev",
+            "127.0.0.1",
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .expect("run ssh -D");
+
+    let mut socks = connect_when_listening(socks).await;
+    // SOCKS5, no authentication.
+    socks.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    socks.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x00]);
+
+    // CONNECT to a *name*, unresolved: the guest is what resolves it, which
+    // is why the host string crosses the agent channel verbatim.
+    let host = b"db.internal";
+    let mut request = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+    request.extend_from_slice(host);
+    request.extend_from_slice(&5432u16.to_be_bytes());
+    socks.write_all(&request).await.unwrap();
+    let mut reply = [0u8; 10];
+    socks.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05, "not a SOCKS5 reply: {reply:?}");
+
+    socks.write_all(b"hello").await.unwrap();
+    let mut echoed = [0u8; 5];
+    socks.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"hello");
+
+    assert_eq!(
+        facade.opens(),
+        vec![Opened::Tunnel {
+            host: "db.internal".into(),
+            port: 5432,
+        }]
+    );
+    let _ = ssh.kill().await;
+}
+
+/// And when the dial fails, the developer is told which failure it was and
+/// why, in the guest's own words.
+///
+/// `ssh -W` is a `direct-tcpip` on its own, which makes it the one place a
+/// real client narrates the open failure: the reason code prints by name, so
+/// "connect failed" rather than "administratively prohibited" is visible
+/// rather than only true, and the description a channel open failure carries
+/// is the only text SSH lets vmlab put in front of a developer here.
+#[tokio::test]
+async fn a_real_ssh_stdio_forward_is_told_why_the_dial_failed() {
+    let Some(facade) = openssh_reachable_facade(logins()).await else {
+        return;
+    };
+    let out = facade
+        .ssh()
+        .args([
+            "-o",
+            "LogLevel=VERBOSE",
+            "-l",
+            "dev",
+            "-W",
+            "dead.internal:5432",
+            "127.0.0.1",
+        ])
+        .output()
+        .await
+        .expect("run ssh -W");
+
+    assert!(!out.status.success(), "a dead destination must not forward");
+    let shown = String::from_utf8_lossy(&out.stderr);
+    assert!(shown.contains("connect failed"), "{shown}");
+    assert!(shown.contains("connection refused"), "{shown}");
+}
+
+/// A loopback port nothing is using, for a test that has to name one.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
+/// Connect to `port` once something is listening on it — `ssh -D` binds its
+/// SOCKS listener a moment after the process starts.
+async fn connect_when_listening(port: u16) -> tokio::net::TcpStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(stream) => return stream,
+            Err(e) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "nothing ever listened on {port}: {e}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
