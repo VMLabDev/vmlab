@@ -175,8 +175,10 @@ re-runs and automatic reboots.
 
 **vmlab-agent**:
 vmlab's first-party in-guest agent, reached over a virtio-serial port with no
-guest network involved. Powers readiness, exec, file transfer, terminals,
-tail, metrics, clipboard and **tunnels**, in both VMs and containers.
+guest network involved. Powers readiness, exec, **file operations**
+(`fileops`: handle-based, offset-addressed, pipelined — every transfer runs
+over it), terminals, tail, metrics, clipboard and **tunnels**, in both VMs
+and containers.
 _Avoid_: QGA, qemu-guest-agent (removed), guest tools
 
 **Event handler**:

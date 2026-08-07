@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -26,7 +26,9 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 
-pub use vmlab_agent_proto::watch::StatRecord;
+use vmlab_agent_proto::fileops::{self, Op, OpenFlags, Reply, Request, Response};
+pub use vmlab_agent_proto::fileops::{Attrs, ErrorCode};
+pub use vmlab_agent_proto::watch::{EntryKind, StatRecord};
 use vmlab_agent_proto::watch::{RecordDecoder, WatchRecord, encode_record};
 use vmlab_agent_proto::{
     AgentMsg, DiskUsage, ErrorCause, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
@@ -65,11 +67,6 @@ pub enum SessionEvent {
     Eof,
     /// Terminal shell / exec process ended.
     Exited(i32),
-    /// File transfer completed (both directions).
-    FileDone {
-        sha256: String,
-        len: u64,
-    },
     /// The agent failed this channel.
     Error(String),
 }
@@ -557,10 +554,28 @@ impl AgentHandle {
                 Some(SessionEvent::Error(msg)) => bail!("exec `{display}`: {msg}"),
                 // `exited` is what completes a collected exec; the output
                 // EOF just before it tells this caller nothing new.
-                Some(SessionEvent::Eof) | Some(SessionEvent::FileDone { .. }) => {}
+                Some(SessionEvent::Eof) => {}
                 None => bail!("agent channel closed during exec `{display}`"),
             }
         }
+    }
+
+    /// Open a file **RPC session** on the guest (PRD §19.5): handle-based,
+    /// offset-addressed and pipelined. Every transfer below runs over one,
+    /// and so does the SSH facade's SFTP — the facade transcodes rather than
+    /// adapting, so there is only ever one file vocabulary.
+    ///
+    /// `logon` is whose files these are (§19.2); `None` is the agent
+    /// identity, which is what vmlab's own machinery passes.
+    pub async fn open_fileops(&self, logon: Option<Logon>) -> Result<FileOps> {
+        if !self.has_feature(features::FILEOPS) {
+            bail!(
+                "this guest's agent has no `fileops` support — rebuild the template, or push the \
+                 shipped agent with `vmlab machine repair-agent`"
+            );
+        }
+        let session = self.open(|id| HostMsg::OpenFileOps { id, logon }).await?;
+        Ok(FileOps::start(session))
     }
 
     /// Push a host file into the guest, returning the verified digest+size.
@@ -570,52 +585,40 @@ impl AgentHandle {
         remote: &str,
         mode: Option<u32>,
     ) -> Result<(String, u64)> {
-        use sha2::{Digest, Sha256};
-        let mut file = tokio::fs::File::open(local)
-            .await
-            .with_context(|| format!("opening {}", local.display()))?;
-        let mut session = self
-            .open(|id| HostMsg::OpenFilePush {
-                id,
-                path: remote.to_string(),
-                mode,
-            })
-            .await?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            session.send(&buf[..n]).await?;
-        }
-        session.eof().await?;
-        let local_sha = hex::encode(hasher.finalize());
-        loop {
-            match session.recv().await {
-                Some(SessionEvent::FileDone { sha256, len }) => {
-                    if sha256 != local_sha {
-                        bail!("push {remote}: digest mismatch after transfer");
-                    }
-                    return Ok((sha256, len));
-                }
-                Some(SessionEvent::Error(msg)) => bail!("push {remote}: {msg}"),
-                Some(_) => {}
-                None => bail!("agent channel closed during push of {remote}"),
-            }
-        }
+        self.push_file_as(local, remote, mode, None).await
+    }
+
+    /// The same, as a declared account (§19.2).
+    pub async fn push_file_as(
+        &self,
+        local: &Path,
+        remote: &str,
+        mode: Option<u32>,
+        logon: Option<Logon>,
+    ) -> Result<(String, u64)> {
+        let ops = self.open_fileops(logon).await?;
+        ops.push(local, remote, mode).await
     }
 
     /// Push a host file or directory tree into the guest, returning
     /// `(files, bytes)`. Guest paths join with `/` (works on Windows too).
+    ///
+    /// The whole tree rides **one** channel: the walk is host-side already,
+    /// so what the guest sees is an explicit `mkdir` per directory and a
+    /// pipelined stream of writes — no per-file channel setup.
     pub async fn push_tree(&self, src: &Path, guest_dest: &str) -> Result<(usize, u64)> {
         let entries = walk_tree_for_push(src, guest_dest)?;
+        let ops = self.open_fileops(None).await?;
+        let mut made: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut bytes = 0u64;
         let files = entries.len();
         for (local, remote, mode) in entries {
-            let (_sha, len) = self.push_file(&local, &remote, mode).await?;
+            if let Some(parent) = guest_parent(&remote)
+                && made.insert(parent.clone())
+            {
+                ops.mkdir_p(&parent).await?;
+            }
+            let (_sha, len) = ops.push(&local, &remote, mode).await?;
             bytes += len;
         }
         Ok((files, bytes))
@@ -623,6 +626,16 @@ impl AgentHandle {
 
     /// Pull a guest file to the host, returning the verified digest+size.
     pub async fn pull_file(&self, remote: &str, local: &Path) -> Result<(String, u64)> {
+        self.pull_file_as(remote, local, None).await
+    }
+
+    /// The same, as a declared account (§19.2).
+    pub async fn pull_file_as(
+        &self,
+        remote: &str,
+        local: &Path,
+        logon: Option<Logon>,
+    ) -> Result<(String, u64)> {
         if let Some(parent) = local.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -631,7 +644,8 @@ impl AgentHandle {
         let file = tokio::fs::File::create(local)
             .await
             .with_context(|| format!("creating {}", local.display()))?;
-        self.pull_into(remote, &mut FileSink(file)).await
+        let ops = self.open_fileops(logon).await?;
+        ops.pull(remote, &mut FileSink(file)).await
     }
 
     /// Pull a guest file into memory, for a caller that wants the bytes rather
@@ -641,44 +655,24 @@ impl AgentHandle {
     /// chunk of memory rather than all of it, and the caller gets the limit by
     /// code instead of a file cut short.
     pub async fn pull_bytes(&self, remote: &str, limit: u64) -> Result<(String, Vec<u8>)> {
+        self.pull_bytes_as(remote, limit, None).await
+    }
+
+    /// The same, as a declared account (§19.2).
+    pub async fn pull_bytes_as(
+        &self,
+        remote: &str,
+        limit: u64,
+        logon: Option<Logon>,
+    ) -> Result<(String, Vec<u8>)> {
         let mut sink = MemorySink {
             remote: remote.to_string(),
             buf: Vec::new(),
             limit,
         };
-        let (sha256, _len) = self.pull_into(remote, &mut sink).await?;
+        let ops = self.open_fileops(logon).await?;
+        let (sha256, _len) = ops.pull(remote, &mut sink).await?;
         Ok((sha256, sink.buf))
-    }
-
-    /// The pull itself: stream the guest's bytes into `sink`, verifying the
-    /// digest the agent reports against the one we computed on the way.
-    async fn pull_into(&self, remote: &str, sink: &mut impl PullSink) -> Result<(String, u64)> {
-        use sha2::{Digest, Sha256};
-        let mut session = self
-            .open(|id| HostMsg::OpenFilePull {
-                id,
-                path: remote.to_string(),
-            })
-            .await?;
-        let mut hasher = Sha256::new();
-        loop {
-            match session.recv().await {
-                Some(SessionEvent::Data(b)) => {
-                    hasher.update(&b);
-                    sink.write(&b).await?;
-                }
-                Some(SessionEvent::FileDone { sha256, len }) => {
-                    sink.finish().await?;
-                    if hex::encode(hasher.finalize()) != sha256 {
-                        bail!("pull {remote}: digest mismatch after transfer");
-                    }
-                    return Ok((sha256, len));
-                }
-                Some(SessionEvent::Error(msg)) => bail!("pull {remote}: {msg}"),
-                Some(_) => {}
-                None => bail!("agent channel closed during pull of {remote}"),
-            }
-        }
     }
 
     /// Resize a terminal session.
@@ -790,10 +784,7 @@ impl AgentSession {
                 })
                 .await;
         }
-        if matches!(
-            ev,
-            SessionEvent::Exited(_) | SessionEvent::FileDone { .. } | SessionEvent::Error(_)
-        ) {
+        if matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_)) {
             self.closed = true; // agent already tore its side down
         }
         Some(ev)
@@ -858,6 +849,526 @@ impl Drop for AgentSession {
             let _ = handle.send_msg(&HostMsg::Close { id }).await;
         });
     }
+}
+
+/// One open `fileops` channel: a pipelined RPC session over the guest's
+/// filesystem (PRD §19.5).
+///
+/// **Many requests outstanding, replies matched by id and free to complete
+/// out of order.** That is the throughput decision rather than a nicety:
+/// against the round trip this channel measures, one-at-a-time would deliver
+/// under 1 MB/s where the raw channel does 80. A pump task owns the reading
+/// half and hands each reply to the call that is waiting for its id, so
+/// nothing here has to care what order the guest finished in.
+///
+/// Handles are the guest's and are scoped to the channel, so dropping this
+/// releases every file it had open.
+pub struct FileOps {
+    inner: Arc<FileOpsInner>,
+    /// Owns the session and demultiplexes its replies. Aborting it drops the
+    /// session, which closes the channel on the guest side.
+    pump: tokio::task::JoinHandle<()>,
+}
+
+struct FileOpsInner {
+    handle: AgentHandle,
+    id: u32,
+    credit: Arc<SendCredit>,
+    /// Held for the length of one record. Two concurrent calls must not
+    /// interleave their bytes inside the channel's byte stream.
+    wire: Mutex<()>,
+    pending: std::sync::Mutex<Pending>,
+    next_id: AtomicU64,
+}
+
+/// One reply, or the reason the channel will never produce it.
+type Answer = Result<(Reply, Vec<u8>), String>;
+
+/// Calls waiting for a reply, and the reason there will never be one.
+#[derive(Default)]
+struct Pending {
+    waiters: HashMap<u64, tokio::sync::oneshot::Sender<Answer>>,
+    /// Set once the channel has failed: later calls fail with it rather than
+    /// waiting for a reply that cannot come.
+    failed: Option<String>,
+}
+
+/// How many requests a transfer keeps outstanding, and how big each one is.
+/// The window is what turns the round trip from a per-chunk cost into a
+/// one-off; the chunk is inside [`fileops::MAX_DATA`], so one record never
+/// has to be split across two.
+const TRANSFER_WINDOW: usize = 16;
+const TRANSFER_CHUNK: usize = 64 * 1024;
+
+impl FileOps {
+    fn start(session: AgentSession) -> FileOps {
+        let inner = Arc::new(FileOpsInner {
+            handle: session.handle.clone(),
+            id: session.id,
+            credit: session.credit.clone(),
+            wire: Mutex::new(()),
+            pending: std::sync::Mutex::new(Pending::default()),
+            next_id: AtomicU64::new(1),
+        });
+        let pump = tokio::spawn(fileops_pump(session, inner.clone()));
+        FileOps { inner, pump }
+    }
+
+    /// Push a host file, verifying against the guest's own digest of what
+    /// landed on its disk — the strongest thing the retired whole-file
+    /// transfer offered, and what the workspace syncer leans on next (§19.5).
+    pub async fn push(
+        &self,
+        local: &Path,
+        remote: &str,
+        mode: Option<u32>,
+    ) -> Result<(String, u64)> {
+        use sha2::{Digest, Sha256};
+        let mut file = tokio::fs::File::open(local)
+            .await
+            .with_context(|| format!("opening {}", local.display()))?;
+        let handle = match self.open_for_push(remote, mode).await {
+            Ok(h) => h,
+            // The one recoverable open failure: the guest has no directory to
+            // put it in yet. Making the parents costs a round trip only where
+            // it is actually needed.
+            Err(e) if e.code == ErrorCode::NoSuchFile => {
+                if let Some(parent) = guest_parent(remote) {
+                    self.mkdir_p(&parent).await?;
+                }
+                self.open_for_push(remote, mode)
+                    .await
+                    .with_context(|| format!("push {remote}"))?
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("push {remote}"))),
+        };
+
+        let mut hasher = Sha256::new();
+        let mut offset = 0u64;
+        let mut inflight: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+        // The window is what pays the round trip once instead of per chunk:
+        // reading the next chunk overlaps the writes already on the wire.
+        let mut failure = None;
+        'push: loop {
+            let mut buf = vec![0u8; TRANSFER_CHUNK];
+            let n = match file.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    failure =
+                        Some(anyhow::Error::new(e).context(format!("reading {}", local.display())));
+                    break 'push;
+                }
+            };
+            if n == 0 {
+                break 'push;
+            }
+            buf.truncate(n);
+            hasher.update(&buf);
+            while inflight.len() >= TRANSFER_WINDOW {
+                if let Err(e) = join_one(&mut inflight).await {
+                    failure = Some(e);
+                    break 'push;
+                }
+            }
+            let inner = self.inner.clone();
+            let at = offset;
+            offset += n as u64;
+            inflight.spawn(async move {
+                inner
+                    .expect_ok(Op::Write { handle, offset: at }, &buf)
+                    .await
+                    .with_context(|| format!("writing at offset {at}"))
+            });
+        }
+        // Drain what is still on the wire — every one of them, not just up to
+        // the first that finishes.
+        while failure.is_none()
+            && let Some(joined) = inflight.join_next().await
+        {
+            failure = match joined {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e),
+                Err(e) => Some(anyhow!("{e}")),
+            };
+        }
+        inflight.shutdown().await;
+        // The handle is released either way: a failed push must not leave the
+        // guest holding a file open.
+        let closed = self.inner.expect_ok(Op::Close { handle }, &[]).await;
+        if let Some(e) = failure {
+            return Err(e.context(format!("push {remote}")));
+        }
+        closed.with_context(|| format!("push {remote}"))?;
+
+        let local_sha = hex::encode(hasher.finalize());
+        let (sha256, len) = self
+            .digest(remote)
+            .await
+            .with_context(|| format!("push {remote}"))?;
+        if sha256 != local_sha {
+            bail!("push {remote}: digest mismatch after transfer");
+        }
+        Ok((sha256, len))
+    }
+
+    async fn open_for_push(&self, remote: &str, mode: Option<u32>) -> Result<u64, FileOpsError> {
+        self.inner
+            .open_handle(Op::Open {
+                path: remote.to_string(),
+                flags: OpenFlags::create_truncate(),
+                mode,
+            })
+            .await
+    }
+
+    /// Pull a guest file into `sink`, verified against the guest's digest.
+    ///
+    /// Reads are issued a window ahead and reassembled in order: the sink is
+    /// sequential, but the round trips are not paid one at a time.
+    async fn pull(&self, remote: &str, sink: &mut impl PullSink) -> Result<(String, u64)> {
+        use sha2::{Digest, Sha256};
+        let attrs = self
+            .stat(remote)
+            .await
+            .with_context(|| format!("pull {remote}"))?;
+        if attrs.kind == EntryKind::Dir {
+            bail!("pull {remote}: is a directory");
+        }
+        let handle = self
+            .inner
+            .open_handle(Op::Open {
+                path: remote.to_string(),
+                flags: OpenFlags::read(),
+                mode: None,
+            })
+            .await
+            .with_context(|| format!("pull {remote}"))?;
+
+        let mut hasher = Sha256::new();
+        let mut got = 0u64;
+        let mut queued = 0u64;
+        let mut window: std::collections::VecDeque<tokio::task::JoinHandle<Result<Vec<u8>>>> =
+            std::collections::VecDeque::new();
+        let outcome = loop {
+            // Top the window up, but never past what the stat said the file
+            // holds: reads off the end cost a round trip each to learn
+            // nothing. Once `queued` has covered it the window stays empty
+            // and every further read goes one at a time below, which is how
+            // a file that grew under us still finishes.
+            while window.len() < TRANSFER_WINDOW && queued < attrs.size {
+                let inner = self.inner.clone();
+                let at = queued;
+                queued += TRANSFER_CHUNK as u64;
+                window.push_back(tokio::spawn(async move {
+                    inner
+                        .read_at(handle, at, TRANSFER_CHUNK as u32)
+                        .await
+                        .with_context(|| format!("reading at offset {at}"))
+                }));
+            }
+            let bytes = match window.pop_front() {
+                Some(next) => match next.await {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(e)) => break Err(e),
+                    Err(e) => break Err(anyhow!("{e}")),
+                },
+                None => match self.inner.read_at(handle, got, TRANSFER_CHUNK as u32).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => break Err(e),
+                },
+            };
+            // The agent fills a read or hits end-of-file, so anything short
+            // is the end — whether or not the stat agreed.
+            let done = bytes.len() < TRANSFER_CHUNK;
+            hasher.update(&bytes);
+            got += bytes.len() as u64;
+            if let Err(e) = sink.write(&bytes).await {
+                break Err(e);
+            }
+            if done {
+                break Ok(());
+            }
+        };
+        for task in window {
+            task.abort();
+        }
+        let closed = self.inner.expect_ok(Op::Close { handle }, &[]).await;
+        outcome.with_context(|| format!("pull {remote}"))?;
+        closed.with_context(|| format!("pull {remote}"))?;
+        sink.finish().await?;
+
+        let (sha256, len) = self
+            .digest(remote)
+            .await
+            .with_context(|| format!("pull {remote}"))?;
+        if hex::encode(hasher.finalize()) != sha256 || len != got {
+            bail!("pull {remote}: digest mismatch after transfer");
+        }
+        Ok((sha256, len))
+    }
+
+    /// The guest's own SHA-256 and length of what is at `path`.
+    pub async fn digest(&self, path: &str) -> Result<(String, u64)> {
+        match self
+            .inner
+            .call(
+                Op::Digest {
+                    path: path.to_string(),
+                },
+                &[],
+            )
+            .await?
+        {
+            (Reply::Digest { sha256, len }, _) => Ok((sha256, len)),
+            (other, _) => bail!("agent answered a digest with {other:?}"),
+        }
+    }
+
+    /// What is at `path`, following symlinks.
+    pub async fn stat(&self, path: &str) -> Result<Attrs> {
+        match self
+            .inner
+            .call(
+                Op::Stat {
+                    path: path.to_string(),
+                },
+                &[],
+            )
+            .await?
+        {
+            (Reply::Attrs { attrs }, _) => Ok(attrs),
+            (other, _) => bail!("agent answered a stat with {other:?}"),
+        }
+    }
+
+    /// Create `dir` and every missing parent, ignoring the ones already
+    /// there. Both guest separators are accepted, and a Windows drive root
+    /// (`C:`) is a place rather than a directory to create.
+    pub async fn mkdir_p(&self, dir: &str) -> Result<()> {
+        let sep = if dir.contains('/') { '/' } else { '\\' };
+        let mut prefix = String::new();
+        for part in dir.split(['/', '\\']) {
+            if part.is_empty() {
+                if prefix.is_empty() {
+                    prefix.push(sep); // an absolute Unix path's root
+                }
+                continue;
+            }
+            if !prefix.is_empty() && !prefix.ends_with(sep) {
+                prefix.push(sep);
+            }
+            prefix.push_str(part);
+            if part.ends_with(':') {
+                continue;
+            }
+            match self
+                .inner
+                .expect_ok(
+                    Op::Mkdir {
+                        path: prefix.clone(),
+                        mode: None,
+                        case_sensitive: false,
+                    },
+                    &[],
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    // Already there is the normal case, not a failure.
+                    if e.downcast_ref::<FileOpsError>()
+                        .is_none_or(|e| e.code != ErrorCode::AlreadyExists)
+                    {
+                        return Err(e.context(format!("creating guest directory {dir}")));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the channel now, rather than at drop.
+    pub async fn close(self) {
+        drop(self);
+    }
+}
+
+impl Drop for FileOps {
+    fn drop(&mut self) {
+        // Dropping the pump's session is what sends the `close`, which is
+        // what releases the guest's handles.
+        self.pump.abort();
+    }
+}
+
+impl FileOpsInner {
+    /// One request, awaited by id. The reply may arrive after replies to
+    /// requests sent later — that is the point.
+    async fn call(&self, op: Op, payload: &[u8]) -> Result<(Reply, Vec<u8>)> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.pending.lock_recover();
+            if let Some(failed) = &pending.failed {
+                bail!("{failed}");
+            }
+            pending.waiters.insert(id, tx);
+        }
+        if let Err(e) = self.send_record(&Request { id, op }, payload).await {
+            self.pending.lock_recover().waiters.remove(&id);
+            return Err(e);
+        }
+        match rx.await {
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(msg)) => bail!("{msg}"),
+            Err(_) => bail!("agent channel closed during a file operation"),
+        }
+    }
+
+    /// A call whose only success is [`Reply::Ok`].
+    async fn expect_ok(&self, op: Op, payload: &[u8]) -> Result<()> {
+        match self.call(op, payload).await? {
+            (Reply::Ok, _) => Ok(()),
+            (Reply::Error { code, msg }, _) => Err(anyhow::Error::new(FileOpsError { code, msg })),
+            (other, _) => bail!("agent answered with {other:?}"),
+        }
+    }
+
+    /// An open, keeping the coded failure a caller may recover from.
+    async fn open_handle(&self, op: Op) -> Result<u64, FileOpsError> {
+        match self.call(op, &[]).await {
+            Ok((Reply::Handle { handle }, _)) => Ok(handle),
+            Ok((Reply::Error { code, msg }, _)) => Err(FileOpsError { code, msg }),
+            Ok((other, _)) => Err(FileOpsError {
+                code: ErrorCode::Failure,
+                msg: format!("agent answered an open with {other:?}"),
+            }),
+            Err(e) => Err(FileOpsError {
+                code: ErrorCode::Failure,
+                msg: format!("{e:#}"),
+            }),
+        }
+    }
+
+    async fn read_at(&self, handle: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
+        match self
+            .call(
+                Op::Read {
+                    handle,
+                    offset,
+                    len,
+                },
+                &[],
+            )
+            .await?
+        {
+            (Reply::Data, bytes) => Ok(bytes),
+            (Reply::Error { code, msg }, _) => Err(anyhow::Error::new(FileOpsError { code, msg })),
+            (other, _) => bail!("agent answered a read with {other:?}"),
+        }
+    }
+
+    /// Put one record on the wire, chunked into the credit window and atomic
+    /// against the other calls sharing this channel.
+    async fn send_record(&self, request: &Request, payload: &[u8]) -> Result<()> {
+        let bytes = fileops::encode_record(request, payload);
+        let _wire = self.wire.lock().await;
+        let mut off = 0;
+        while off < bytes.len() {
+            let n = self.credit.take(bytes.len() - off).await;
+            if n == 0 {
+                bail!("agent channel closed");
+            }
+            self.handle.send_data(self.id, &bytes[off..off + n]).await?;
+            off += n;
+        }
+        Ok(())
+    }
+
+    /// Fail every waiting call, and everything that arrives after.
+    fn fail_all(&self, msg: String) {
+        let mut pending = self.pending.lock_recover();
+        pending.failed.get_or_insert(msg.clone());
+        for (_, waiter) in pending.waiters.drain() {
+            let _ = waiter.send(Err(msg.clone()));
+        }
+    }
+}
+
+/// A guest-side operation that failed, in the vocabulary the reply carried.
+/// `push` branches on it (a missing parent directory is recoverable); the
+/// SSH facade transcodes it into SFTP status codes.
+#[derive(Debug)]
+pub struct FileOpsError {
+    pub code: ErrorCode,
+    pub msg: String,
+}
+
+impl std::fmt::Display for FileOpsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for FileOpsError {}
+
+/// Own the session's reading half and hand every reply to the call waiting
+/// for its id. Nothing else reads the channel, so a reply is never stuck
+/// behind a caller that has gone away.
+async fn fileops_pump(mut session: AgentSession, inner: Arc<FileOpsInner>) {
+    let mut decoder = fileops::RecordDecoder::new();
+    loop {
+        match session.recv().await {
+            Some(SessionEvent::Data(bytes)) => {
+                decoder.push(&bytes);
+                loop {
+                    match decoder.next_record::<Response>() {
+                        Ok(Some((response, payload))) => {
+                            let waiter = inner.pending.lock_recover().waiters.remove(&response.id);
+                            if let Some(waiter) = waiter {
+                                let _ = waiter.send(Ok((response.reply, payload)));
+                            }
+                        }
+                        Ok(None) => break,
+                        // There is no resynchronisation point inside a
+                        // channel, so a record we cannot frame ends it.
+                        Err(e) => {
+                            inner.fail_all(e);
+                            return;
+                        }
+                    }
+                }
+            }
+            Some(SessionEvent::Error(msg)) => {
+                inner.fail_all(msg);
+                return;
+            }
+            None => {
+                inner.fail_all("agent closed the file channel".into());
+                return;
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Await one in-flight transfer chunk, flattening the join.
+async fn join_one(set: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
+    match set.join_next().await {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => Err(anyhow!("{e}")),
+        None => Ok(()),
+    }
+}
+
+/// The directory part of a guest path, in the guest's own spelling. `None`
+/// where the path names no directory at all.
+fn guest_parent(path: &str) -> Option<String> {
+    let cut = path.rfind(['/', '\\'])?;
+    if cut == 0 {
+        return None; // directly under the root: nothing to create
+    }
+    Some(path[..cut].to_string())
 }
 
 /// What a watch channel reports. Paths, never events: the guest's dirty set
@@ -1097,9 +1608,6 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
         }
         AgentMsg::Eof { id } => deliver(inner, id, SessionEvent::Eof).await,
         AgentMsg::Exited { id, code } => deliver(inner, id, SessionEvent::Exited(code)).await,
-        AgentMsg::FileDone { id, sha256, len } => {
-            deliver(inner, id, SessionEvent::FileDone { sha256, len }).await
-        }
         AgentMsg::WindowAdjust { id, bytes } => {
             if let Some(entry) = inner.sessions.lock().await.get(&id) {
                 entry.credit.grant(bytes);
@@ -1145,10 +1653,7 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
 /// Route a session event; a consumer stuck past [`STALL_TIMEOUT`] gets its
 /// session closed (the rest of the mux keeps flowing).
 async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
-    let terminal = matches!(
-        ev,
-        SessionEvent::Exited(_) | SessionEvent::FileDone { .. } | SessionEvent::Error(_)
-    );
+    let terminal = matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_));
     let tx = {
         let sessions = inner.sessions.lock().await;
         sessions.get(&id).map(|e| e.tx.clone())
@@ -1326,7 +1831,7 @@ mod tests {
             vec![
                 "terminal".into(),
                 "exec".into(),
-                "file".into(),
+                "fileops".into(),
                 "tunnel".into(),
                 "watch".into(),
             ],
@@ -1369,12 +1874,19 @@ mod tests {
             // Channel kinds the mock tracks.
             let mut terminals: Vec<u32> = Vec::new();
             let mut tunnels: Vec<u32> = Vec::new();
-            let mut pushes: HashMap<u32, Vec<u8>> = HashMap::new();
+            // File sessions: channel -> the in-memory filesystem it serves,
+            // its record decoder and its handle table.
+            let mut files: HashMap<u32, MockFiles> = HashMap::new();
             // Watch channels: the root the host named, its record decoder,
             // and how many drains it has asked for.
             let mut watches: HashMap<u32, (String, RecordDecoder, usize)> = HashMap::new();
             let mut pulled = b"pulled-file-content".repeat(1000);
             pulled.truncate(10_000);
+            let fs = MockFs::default();
+            fs.store
+                .lock()
+                .unwrap()
+                .insert("/guest/some-file".to_string(), pulled);
             loop {
                 let n = match rx.read(&mut buf).await {
                     Ok(0) | Err(_) => return,
@@ -1485,22 +1997,9 @@ mod tests {
                                         send(AgentMsg::Opened { id }).await;
                                     }
                                 }
-                                HostMsg::OpenFilePush { id, .. } => {
-                                    pushes.insert(id, Vec::new());
+                                HostMsg::OpenFileOps { id, logon } => {
+                                    files.insert(id, MockFiles::new(fs.clone(), logon));
                                     send(AgentMsg::Opened { id }).await;
-                                }
-                                HostMsg::OpenFilePull { id, .. } => {
-                                    send(AgentMsg::Opened { id }).await;
-                                    use sha2::{Digest, Sha256};
-                                    for chunk in pulled.chunks(4096) {
-                                        send_data(id, chunk.to_vec()).await;
-                                    }
-                                    send(AgentMsg::FileDone {
-                                        id,
-                                        sha256: hex::encode(Sha256::digest(&pulled)),
-                                        len: pulled.len() as u64,
-                                    })
-                                    .await;
                                 }
                                 // A watch: the root must exist, the channel
                                 // nudges once, and each drain is answered
@@ -1521,15 +2020,6 @@ mod tests {
                                     }
                                 }
                                 HostMsg::Eof { id } => {
-                                    if let Some(data) = pushes.remove(&id) {
-                                        use sha2::{Digest, Sha256};
-                                        send(AgentMsg::FileDone {
-                                            id,
-                                            sha256: hex::encode(Sha256::digest(&data)),
-                                            len: data.len() as u64,
-                                        })
-                                        .await;
-                                    }
                                     // A tunnel peer that sees the FIN shuts
                                     // its own write half — a half-close, not
                                     // the end of the channel.
@@ -1608,8 +2098,27 @@ mod tests {
                                         send_data(channel, chunk.to_vec()).await;
                                     }
                                 }
-                            } else if let Some(data) = pushes.get_mut(&channel) {
-                                data.extend(payload);
+                            } else if let Some(fs) = files.get_mut(&channel) {
+                                // Credit back what was consumed, like the
+                                // agent's own reader does: a transfer is
+                                // many times the initial window, so a mock
+                                // that never granted would simply stall.
+                                send(AgentMsg::WindowAdjust {
+                                    id: channel,
+                                    bytes: payload.len() as u64,
+                                })
+                                .await;
+                                // A file session: frame the requests out of
+                                // the stream and answer each by its own id,
+                                // deliberately in a shuffled order so the
+                                // host cannot rely on the one it asked in.
+                                for (response, bytes) in fs.serve(&payload) {
+                                    for chunk in
+                                        fileops::encode_record(&response, &bytes).chunks(4096)
+                                    {
+                                        send_data(channel, chunk.to_vec()).await;
+                                    }
+                                }
                             } else {
                                 // Echo terminal.
                                 send_data(channel, payload).await;
@@ -1621,6 +2130,213 @@ mod tests {
             }
         });
         (dir, path)
+    }
+
+    /// An in-memory guest filesystem behind one `fileops` channel: enough of
+    /// the vocabulary for a transfer, and it answers a batch of requests in
+    /// **reverse** order so a host that assumed replies come back in the
+    /// order it asked would fail here rather than in a guest.
+    struct MockFiles {
+        fs: MockFs,
+        handles: HashMap<u64, String>,
+        next_handle: u64,
+        decoder: fileops::RecordDecoder,
+        /// What the open said this session runs as, reportable through
+        /// `realpath("/who")` — the mock's way of showing the identity
+        /// actually reached the wire (§19.2).
+        who: String,
+    }
+
+    /// The guest's filesystem, shared by every session on one connection —
+    /// what one channel writes, the next can stat. Handles are deliberately
+    /// *not* shared: they are scoped to their channel.
+    #[derive(Clone, Default)]
+    struct MockFs {
+        store: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
+        dirs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    }
+
+    impl MockFiles {
+        fn new(fs: MockFs, logon: Option<Logon>) -> MockFiles {
+            MockFiles {
+                fs,
+                handles: HashMap::new(),
+                next_handle: 1,
+                decoder: fileops::RecordDecoder::new(),
+                who: logon
+                    .map(|l| format!("as:{}:{}", l.user, l.elevated))
+                    .unwrap_or_else(|| "as:agent".into()),
+            }
+        }
+
+        fn serve(&mut self, bytes: &[u8]) -> Vec<(Response, Vec<u8>)> {
+            self.decoder.push(bytes);
+            let mut out = Vec::new();
+            while let Some((request, payload)) = self
+                .decoder
+                .next_record::<Request>()
+                .expect("framed request")
+            {
+                let (reply, bytes) = self.op(request.op, payload);
+                out.push((
+                    Response {
+                        id: request.id,
+                        reply,
+                    },
+                    bytes,
+                ));
+            }
+            out.reverse();
+            out
+        }
+
+        fn op(&mut self, op: Op, payload: Vec<u8>) -> (Reply, Vec<u8>) {
+            let missing = |path: &str| Reply::Error {
+                code: ErrorCode::NoSuchFile,
+                msg: format!("no such file: {path}"),
+            };
+            match op {
+                Op::Open { path, flags, .. } => {
+                    if flags.create {
+                        // A push into a directory nobody made yet is the one
+                        // failure the host recovers from.
+                        if let Some(parent) = guest_parent(&path)
+                            && !self.fs.dirs.lock().unwrap().contains(&parent)
+                        {
+                            return (missing(&parent), Vec::new());
+                        }
+                        self.fs
+                            .store
+                            .lock()
+                            .unwrap()
+                            .insert(path.clone(), Vec::new());
+                    } else if !self.fs.store.lock().unwrap().contains_key(&path) {
+                        return (missing(&path), Vec::new());
+                    }
+                    let handle = self.next_handle;
+                    self.next_handle += 1;
+                    self.handles.insert(handle, path);
+                    (Reply::Handle { handle }, Vec::new())
+                }
+                Op::Write { handle, offset } => {
+                    let Some(path) = self.handles.get(&handle).cloned() else {
+                        return (
+                            Reply::Error {
+                                code: ErrorCode::BadHandle,
+                                msg: "no such handle".into(),
+                            },
+                            Vec::new(),
+                        );
+                    };
+                    let mut store = self.fs.store.lock().unwrap();
+                    let file = store.entry(path).or_default();
+                    let end = offset as usize + payload.len();
+                    if file.len() < end {
+                        file.resize(end, 0);
+                    }
+                    file[offset as usize..end].copy_from_slice(&payload);
+                    (Reply::Ok, Vec::new())
+                }
+                Op::Read {
+                    handle,
+                    offset,
+                    len,
+                } => {
+                    let store = self.fs.store.lock().unwrap();
+                    let Some(file) = self.handles.get(&handle).and_then(|p| store.get(p)) else {
+                        return (
+                            Reply::Error {
+                                code: ErrorCode::BadHandle,
+                                msg: "no such handle".into(),
+                            },
+                            Vec::new(),
+                        );
+                    };
+                    let from = (offset as usize).min(file.len());
+                    let to = (from + len as usize).min(file.len());
+                    (Reply::Data, file[from..to].to_vec())
+                }
+                Op::Close { handle } => {
+                    self.handles.remove(&handle);
+                    (Reply::Ok, Vec::new())
+                }
+                Op::Stat { path } | Op::Lstat { path } => {
+                    match self.fs.store.lock().unwrap().get(&path) {
+                        Some(file) => (
+                            Reply::Attrs {
+                                attrs: Attrs {
+                                    kind: EntryKind::File,
+                                    // A path named `shrinking` reports a size
+                                    // the file does not have — what a file
+                                    // truncated between the stat and the
+                                    // reads looks like to a puller.
+                                    size: if path.contains("shrinking") {
+                                        file.len() as u64 + (1 << 20)
+                                    } else {
+                                        file.len() as u64
+                                    },
+                                    mtime_ns: 1_700_000_000_000_000_000,
+                                    atime_ns: 1_700_000_000_000_000_000,
+                                    mode: Some(0o644),
+                                },
+                            },
+                            Vec::new(),
+                        ),
+                        None if self.fs.dirs.lock().unwrap().contains(&path) => (
+                            Reply::Attrs {
+                                attrs: Attrs {
+                                    kind: EntryKind::Dir,
+                                    size: 0,
+                                    mtime_ns: 0,
+                                    atime_ns: 0,
+                                    mode: Some(0o755),
+                                },
+                            },
+                            Vec::new(),
+                        ),
+                        None => (missing(&path), Vec::new()),
+                    }
+                }
+                Op::Mkdir { path, .. } => {
+                    if !self.fs.dirs.lock().unwrap().insert(path.clone()) {
+                        return (
+                            Reply::Error {
+                                code: ErrorCode::AlreadyExists,
+                                msg: format!("already exists: {path}"),
+                            },
+                            Vec::new(),
+                        );
+                    }
+                    (Reply::Ok, Vec::new())
+                }
+                Op::Digest { path } => match self.fs.store.lock().unwrap().get(&path) {
+                    Some(file) => {
+                        use sha2::{Digest, Sha256};
+                        (
+                            Reply::Digest {
+                                sha256: hex::encode(Sha256::digest(file)),
+                                len: file.len() as u64,
+                            },
+                            Vec::new(),
+                        )
+                    }
+                    None => (missing(&path), Vec::new()),
+                },
+                Op::Realpath { path } if path == "/who" => (
+                    Reply::Name {
+                        path: self.who.clone(),
+                    },
+                    Vec::new(),
+                ),
+                other => (
+                    Reply::Error {
+                        code: ErrorCode::Unsupported,
+                        msg: format!("the mock does not serve {other:?}"),
+                    },
+                    Vec::new(),
+                ),
+            }
+        }
     }
 
     /// QEMU's `server=on` chardev serves one client at a time: the next
@@ -1889,6 +2605,211 @@ mod tests {
         let coded = crate::proto::CommandError::from(err);
         assert_eq!(coded.code, crate::proto::ErrorCode::InvalidArgument);
         assert!(coded.message.contains("4096"), "{}", coded.message);
+    }
+
+    /// The throughput decision, asserted rather than assumed: a caller may
+    /// have many requests outstanding at once and the replies are matched by
+    /// id, so an agent that answers them in a different order (this mock
+    /// answers each batch backwards) is served correctly.
+    #[tokio::test]
+    async fn requests_pipeline_and_replies_may_come_back_out_of_order() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        ops.mkdir_p("/guest").await.unwrap();
+
+        // Sixteen opens in flight at once, each answered against its own id.
+        let mut inflight = Vec::new();
+        for i in 0..16u32 {
+            let inner = ops.inner.clone();
+            inflight.push(tokio::spawn(async move {
+                inner
+                    .open_handle(Op::Open {
+                        path: format!("/guest/f{i}"),
+                        flags: OpenFlags::create_truncate(),
+                        mode: None,
+                    })
+                    .await
+            }));
+        }
+        let mut handles = Vec::new();
+        for task in inflight {
+            handles.push(task.await.unwrap().expect("each open answers"));
+        }
+        handles.sort_unstable();
+        handles.dedup();
+        assert_eq!(handles.len(), 16, "every open got its own handle");
+    }
+
+    /// A transfer bigger than the in-flight window has to wait for **every**
+    /// write it issued, not just until one of them finishes — otherwise the
+    /// tail of the file is still on the wire when the push declares itself
+    /// done, and what lands is a file with holes in it.
+    #[tokio::test]
+    async fn a_push_past_the_window_waits_for_every_write_it_issued() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let local = work.path().join("big.bin");
+        // Several times the in-flight window, so writes are still queued when
+        // the local file runs out.
+        let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&local, &payload).unwrap();
+
+        let (sha, len) = agent
+            .push_file(&local, "/guest/big.bin", None)
+            .await
+            .unwrap();
+        use sha2::{Digest, Sha256};
+        assert_eq!(len, payload.len() as u64);
+        assert_eq!(sha, hex::encode(Sha256::digest(&payload)));
+
+        // And what came back is byte-for-byte what went out.
+        let back = work.path().join("back.bin");
+        agent.pull_file("/guest/big.bin", &back).await.unwrap();
+        assert_eq!(std::fs::read(&back).unwrap(), payload);
+    }
+
+    /// A file shorter than the stat that planned the reads must finish, not
+    /// spin: the reads are planned from a size that can be stale by the time
+    /// they run, so end-of-file is what the reads say, not what the stat did.
+    #[tokio::test]
+    async fn a_pull_finishes_when_the_file_is_shorter_than_its_stat() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+
+        // Seed a file whose stat over-reports (the mock lies about any path
+        // named `shrinking`).
+        let seed = work.path().join("seed.bin");
+        std::fs::write(&seed, vec![7u8; 5_000]).unwrap();
+        agent
+            .push_file(&seed, "/guest/shrinking.bin", None)
+            .await
+            .unwrap();
+
+        let out = work.path().join("out.bin");
+        let (_sha, len) = tokio::time::timeout(
+            Duration::from_secs(10),
+            agent.pull_file("/guest/shrinking.bin", &out),
+        )
+        .await
+        .expect("the pull must end rather than chase a size that is not there")
+        .unwrap();
+        assert_eq!(len, 5_000);
+        assert_eq!(std::fs::read(&out).unwrap(), vec![7u8; 5_000]);
+    }
+
+    /// §19.2: a file session is one of the four opens that carry the declared
+    /// login, and the triple goes across whole rather than as a handshake id.
+    #[tokio::test]
+    async fn a_file_session_carries_the_logon_the_host_resolved() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+
+        let ops = agent
+            .open_fileops(Some(Logon {
+                user: r"PROBE\dev".into(),
+                secret: "vmlab123!".into(),
+                elevated: true,
+            }))
+            .await
+            .unwrap();
+        let (reply, _) = ops
+            .inner
+            .call(
+                Op::Realpath {
+                    path: "/who".into(),
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            Reply::Name {
+                path: r"as:PROBE\dev:true".into()
+            }
+        );
+
+        // And vmlab's own machinery keeps the agent identity.
+        let ops = agent.open_fileops(None).await.unwrap();
+        let (reply, _) = ops
+            .inner
+            .call(
+                Op::Realpath {
+                    path: "/who".into(),
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            Reply::Name {
+                path: "as:agent".into()
+            }
+        );
+    }
+
+    /// A tree push rides one channel: the directories are explicit `mkdir`s
+    /// and the files stream through behind them, which is what makes the
+    /// migration off the whole-file transfer cheap (§19.5).
+    #[tokio::test]
+    async fn a_tree_push_makes_its_directories_and_lands_every_file() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("pkgs/nginx")).unwrap();
+        std::fs::write(src.path().join("playbook.wcl"), "root file").unwrap();
+        std::fs::write(src.path().join("pkgs/nginx/conf"), "nested file").unwrap();
+
+        let (files, bytes) = agent.push_tree(src.path(), "/weave/pb").await.unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(bytes, ("root file".len() + "nested file".len()) as u64);
+
+        // Both landed where the walk said them to, on a channel of their
+        // own — the handles died with the push, the files did not.
+        let ops = agent.open_fileops(None).await.unwrap();
+        assert_eq!(ops.stat("/weave/pb/playbook.wcl").await.unwrap().size, 9);
+        assert_eq!(
+            ops.stat("/weave/pb/pkgs/nginx/conf").await.unwrap().size,
+            11
+        );
+    }
+
+    /// An agent too old to serve `fileops` says so where the caller can act
+    /// on it, rather than opening a channel that never answers.
+    #[tokio::test]
+    async fn a_transfer_against_an_agent_without_the_feature_is_refused() {
+        let (_dir, path) = mock_agent_with(true, vec!["terminal".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let local = work.path().join("x.bin");
+        std::fs::write(&local, b"x").unwrap();
+        let err = agent
+            .push_file(&local, "/guest/x.bin", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("repair-agent"), "{err}");
+    }
+
+    /// Guest paths come in both spellings, and a Windows drive root is a
+    /// place rather than a directory anyone can create.
+    #[test]
+    fn a_guest_paths_parent_is_read_in_the_guests_own_spelling() {
+        assert_eq!(
+            guest_parent("/weave/pb/x.wcl").as_deref(),
+            Some("/weave/pb")
+        );
+        assert_eq!(
+            guest_parent(r"C:\src\app\x.rs").as_deref(),
+            Some(r"C:\src\app")
+        );
+        assert_eq!(guest_parent("C:/src/x").as_deref(), Some("C:/src"));
+        // Directly under the root, and no directory at all.
+        assert_eq!(guest_parent("/motd"), None);
+        assert_eq!(guest_parent("motd"), None);
     }
 
     #[tokio::test]

@@ -17,15 +17,17 @@ Consult them for prior art only — the PRD overrides anything they did.
 ## Status
 
 PRD implemented (M1–M6). **§19 (Dev machines) is mostly specified, not built**
-— the SSH facade, the agent's `fileops` vocabulary and the workspace syncer are
-all spec only; implementation is tracked by #78–#98. The `@dev` declaration
-(#80) and the agent's `tunnel` (#85) and `watch` (#86) vocabularies (§19.5) are
-built, as is machine-level `login {}` (#81), the **Windows logon it mints**
-(#82) — the wire's per-open `logon`, `LogonUser`/`LoadUserProfileW`/
-linked-token minting, the (account, secret, machine) cache and `exec`/`shell`'s
+— the SSH facade and the workspace syncer are spec only; implementation is
+tracked by #78–#98. The `@dev` declaration (#80) and all three agent
+vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and `fileops`
+(#84) — the handle-based, offset-addressed, pipelined file RPC session that
+**replaced** the whole-file push/pull pair outright, carrying `vmlab cp`, the
+console's transfer, wscript push/pull and tree pushes. So is machine-level
+`login {}` (#81) on both guest families: the **Windows logon it mints** (#82)
+— the wire's per-open `logon`, `LogonUser`/`LoadUserProfileW`/linked-token
+minting, the (account, secret, machine) cache and `exec`/`shell`'s
 `--user`/`--password` — and the **Linux session** (#83): `su -l` where the
-guest has PAM, `setuid` where it does not, plus the container floor. The
-person-invoked file transfer (#84) is not built.
+guest has PAM, `setuid` where it does not, plus the container floor.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
@@ -49,12 +51,14 @@ Module map under `src/`:
   crate), `build-asset.sh` (pinned Alpine, rootless build).
 - `agent_asset.rs` + `guest/agent`, `guest/agent-proto` — `vmlab-agent`, the
   in-guest agent on the `vmlab.agent.0` virtio-serial port: interactive
-  terminals (PTY/ConPTY), streaming exec, file transfer, tail, metrics,
-  clipboard, guest-side TCP tunnels (`tunnel.rs`, §19.5) and the recursive
+  terminals (PTY/ConPTY), streaming exec, tail, metrics, clipboard, the
+  handle-based file RPC session every transfer runs over (`fileops.rs`,
+  §19.5), guest-side TCP tunnels (`tunnel.rs`, §19.5) and the recursive
   tree `watch` backing the workspace syncer (`watch/`, §19.5) — only a
   tunnel's payload touches the guest network. `spawn.rs` is the one seam
-  every guest process and written file is created through (ADR-0015) and
-  each platform half mints §19.2's declared logins behind it:
+  every guest process is created through, and that a file session borrows
+  its identity from (ADR-0015); each platform half mints §19.2's declared
+  logins behind it:
   `windows/logon.rs` a token and a loaded profile, `linux/login.rs` a real
   login (PAM via `su -l`, else `setuid`) and the container floor. Baked into
   templates by

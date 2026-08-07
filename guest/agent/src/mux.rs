@@ -20,7 +20,12 @@ use vmlab_agent_proto::{
     OsInfo, PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame,
 };
 
-use crate::spawn::{Identity, ProcessSpec, Spawner, TerminalSpec};
+use crate::spawn::{ProcessSpec, Spawner, TerminalSpec};
+
+/// How a platform maps a host-supplied guest path. Shared rather than called
+/// through `&dyn Platform` because a file session keeps resolving paths long
+/// after the open returned.
+pub type PathResolver = Arc<dyn Fn(String) -> String + Send + Sync>;
 
 /// Host→guest bytes for one session, fed by the reader dispatch and drained
 /// by the session's input pump.
@@ -357,20 +362,15 @@ impl Mux {
             // not a process or a file, and the dial is portable — a
             // container micro-VM shares the guest's network stack anyway.
             HostMsg::OpenTunnel { id, host, port } => crate::tunnel::open(self, id, host, port),
-            // The whole-file transfer keeps the agent identity: it retires
-            // into `fileops` (§19.5, #84), which is where the person-invoked
-            // push and pull grow their `logon`.
-            HostMsg::OpenFilePush { id, path, mode } => crate::files::open_push(
+            // A file session takes the resolver rather than one resolved
+            // path: every request in it names its own (§19.5).
+            HostMsg::OpenFileOps { id, logon } => crate::fileops::open(
                 self,
                 platform.spawner(),
-                &Identity::Agent,
+                &logon.into(),
                 id,
-                platform.resolve_path(path),
-                mode,
+                platform.path_resolver(),
             ),
-            HostMsg::OpenFilePull { id, path } => {
-                crate::files::open_pull(self, id, platform.resolve_path(path))
-            }
             HostMsg::OpenTail { id, path, logon } => crate::tail::open(
                 self,
                 platform.spawner(),
@@ -414,13 +414,19 @@ pub trait Platform: Sync {
     fn os(&self) -> &'static str;
     fn features(&self) -> Vec<String>;
     /// The seam every guest-side process and file handle is created
-    /// through. Terminals, exec and file pushes all come from here, so
+    /// through. Terminals, exec and file sessions all come from here, so
     /// identity (PRD §19.2) is decided in one place.
     fn spawner(&self) -> &dyn Spawner;
-    /// Map a host-supplied guest path (file transfer, tail) — container mode
-    /// resolves it inside the container rootfs.
+    /// How host-supplied guest paths are mapped — container mode resolves
+    /// them inside the container rootfs. Handed out as a value because a
+    /// file session outlives the call that opened it and resolves a path per
+    /// request, not once.
+    fn path_resolver(&self) -> PathResolver {
+        Arc::new(|path| path)
+    }
+    /// Map one host-supplied guest path (tail, watch).
     fn resolve_path(&self, path: String) -> String {
-        path
+        (self.path_resolver())(path)
     }
     fn open_eventlog(&self, mux: &Mux, id: u32, filter: Option<String>);
     fn set_clipboard(&self, mux: &Mux, text: String);

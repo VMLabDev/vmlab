@@ -36,7 +36,7 @@ use std::time::Instant;
 use vmlab_agent_proto::Logon;
 
 use crate::logon::{Held, LogonCache, LogonKey};
-use crate::spawn::{Adopted, Adopter, Identity, WriteFile};
+use crate::spawn::{Adopted, Adopter, Identity};
 
 /// The `PATH` a login gets, from `login.defs`' own two answers: `ENV_SUPATH`
 /// for uid 0 and `ENV_PATH` for everyone else. Taken from there rather than
@@ -592,53 +592,6 @@ pub fn own_the_terminal(slave: impl AsFd, account: &Account) {
     );
 }
 
-/// Create a file the session owns, making its parent directories first.
-///
-/// The chown is the whole argument of §19.2's exception: a file the syncer or
-/// a push produced must be indistinguishable from one the developer's own
-/// shell wrote, or `.git` objects end up owned by a principal the user is
-/// not. Directories this creates are chowned too — a root-owned parent is the
-/// same failure one level up.
-pub fn create_file_as(path: &str, account: &Account) -> std::io::Result<Box<dyn WriteFile>> {
-    if let Some(parent) = Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        create_dirs_as(parent, account)?;
-    }
-    let file = crate::spawn::create_plain_file(path)?;
-    chown(file.as_file(), account)?;
-    Ok(Box::new(file))
-}
-
-/// `create_dir_all`, chowning the directories it actually created.
-fn create_dirs_as(dir: &Path, account: &Account) -> std::io::Result<()> {
-    if dir.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = dir.parent() {
-        create_dirs_as(parent, account)?;
-    }
-    match std::fs::create_dir(dir) {
-        Ok(()) => {
-            if let Ok(handle) = std::fs::File::open(dir) {
-                let _ = chown(&handle, account);
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(std::io::Error::new(e.kind(), format!("mkdir: {e}"))),
-    }
-}
-
-fn chown(file: &std::fs::File, account: &Account) -> std::io::Result<()> {
-    nix::unistd::fchown(
-        file.as_fd(),
-        Some(nix::unistd::Uid::from_raw(account.uid)),
-        Some(nix::unistd::Gid::from_raw(account.gid)),
-    )
-    .map_err(std::io::Error::from)
-}
-
 // ---- reading as the session ------------------------------------------------
 
 /// The thread is reading as a session; dropping this puts it back.
@@ -1066,12 +1019,20 @@ mod tests {
         assert!(logins.resolve(&Identity::Agent).unwrap().is_none());
     }
 
-    /// §19.2's exception: a file a push or the syncer produced must be
-    /// indistinguishable from one the developer's own shell wrote, parents
-    /// included.
+    /// §19.2's exception, at the seam that now delivers it: a file a push or
+    /// the syncer produced must be indistinguishable from one the
+    /// developer's own shell wrote, parents included.
+    ///
+    /// `fileops` creates through the adopter rather than through a handle the
+    /// seam hands back (#84), so what makes the file the session's is
+    /// `setfsuid`/`setfsgid` — the fs identity governs the owner of anything
+    /// the thread creates, not just what it may open. The build host is not
+    /// root, so the account can only be this uid; what the test pins is that
+    /// creation happens *under the guard*.
     #[test]
     fn a_created_file_and_the_directories_it_needed_belong_to_the_session() {
         use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let account = Account {
             name: "dev".into(),
@@ -1081,12 +1042,19 @@ mod tests {
             home: "/home/dev".into(),
             shell: "/bin/sh".into(),
         };
+
+        let adopter = adopter_as(account.clone(), None);
+        let adopted = adopter().unwrap();
+        // Exactly what a `fileops` worker does: `mkdir` per level, then the
+        // open that creates.
+        std::fs::create_dir(dir.path().join("deep")).unwrap();
+        std::fs::create_dir(dir.path().join("deep/tree")).unwrap();
         let path = dir.path().join("deep/tree/app.conf");
-        let mut file = create_file_as(path.to_str().unwrap(), &account).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(b"hello").unwrap();
         drop(file);
+        drop(adopted);
 
-        use std::os::unix::fs::MetadataExt;
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         assert_eq!(path.metadata().unwrap().uid(), account.uid);
         assert_eq!(

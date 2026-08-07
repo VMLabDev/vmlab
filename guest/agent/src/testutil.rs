@@ -7,6 +7,7 @@ use std::io::Write;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+use vmlab_agent_proto::fileops::{self, Request, Response};
 use vmlab_agent_proto::{AgentMsg, Frame, FrameDecoder, FrameKind};
 
 use crate::mux::Mux;
@@ -26,6 +27,24 @@ impl Write for CapturePort {
 pub struct Capture {
     rx: Receiver<Vec<u8>>,
     dec: FrameDecoder,
+    /// Reassembles a fileops channel's replies out of its byte stream.
+    ops: fileops::RecordDecoder,
+    /// Replies already decoded but not yet handed out — a pipelining test
+    /// gets several out of one frame.
+    pending: std::collections::VecDeque<(Response, Vec<u8>)>,
+}
+
+/// Put one fileops request on `channel`, framed the way the host frames it.
+pub fn ask(mux: &Mux, channel: u32, id: u64, op: fileops::Op) {
+    ask_with(mux, channel, id, op, b"");
+}
+
+/// The same, for the one request that carries bytes: a write.
+pub fn ask_with(mux: &Mux, channel: u32, id: u64, op: fileops::Op, payload: &[u8]) {
+    mux.route_input(
+        channel,
+        crate::mux::Input::Bytes(fileops::encode_record(&Request { id, op }, payload)),
+    );
 }
 
 pub fn capture_mux() -> (Mux, Capture) {
@@ -35,6 +54,8 @@ pub fn capture_mux() -> (Mux, Capture) {
         Capture {
             rx,
             dec: FrameDecoder::new(),
+            ops: fileops::RecordDecoder::new(),
+            pending: std::collections::VecDeque::new(),
         },
     )
 }
@@ -110,22 +131,31 @@ impl Capture {
         }
     }
 
-    /// Collect frames until `file_done`; returns (data, sha256, len).
-    pub fn until_file_done(&mut self, channel: u32) -> (Vec<u8>, String, u64) {
-        let mut data = Vec::new();
+    /// Next fileops reply on `channel`, with its raw payload. Replies are
+    /// free to arrive out of order, so a pipelining test matches on the id
+    /// rather than assuming the order it asked in.
+    pub fn fileops(&mut self, channel: u32) -> (Response, Vec<u8>) {
         loop {
+            if let Some(reply) = self.pending.pop_front() {
+                return reply;
+            }
             let f = self.frame();
             match f.kind {
-                FrameKind::Ctrl => match serde_json::from_slice::<AgentMsg>(&f.payload).unwrap() {
-                    AgentMsg::FileDone { id, sha256, len } if id == channel => {
-                        return (data, sha256, len);
+                // Only a failed *channel* arrives as a control message; a
+                // failed operation is a reply on the stream.
+                FrameKind::Ctrl => {
+                    if let AgentMsg::Error { msg, .. } =
+                        serde_json::from_slice::<AgentMsg>(&f.payload).unwrap()
+                    {
+                        panic!("agent failed the channel: {msg}");
                     }
-                    AgentMsg::Error { msg, .. } => panic!("agent error: {msg}"),
-                    _ => {}
-                },
+                }
                 _ => {
                     assert_eq!(f.channel, channel);
-                    data.extend(f.payload);
+                    self.ops.push(&f.payload);
+                    while let Some(reply) = self.ops.next_record::<Response>().unwrap() {
+                        self.pending.push_back(reply);
+                    }
                 }
             }
         }

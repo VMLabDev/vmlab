@@ -583,10 +583,14 @@ impl Handler<LabRequest> for LabdHandler {
                     .await?;
                 Ok(json!(true))
             }
-            // Fast binary file transfer over the agent channel. `from` is a
-            // host path the daemon can see (the CLI resolves it absolute
-            // first); `data` is inline base64 for callers that have bytes
-            // rather than a file.
+            // Fast binary file transfer over the guest's `fileops` channel
+            // (§19.5). `from` is a host path the daemon can see (the CLI
+            // resolves it absolute first); `data` is inline base64 for
+            // callers that have bytes rather than a file.
+            //
+            // A copy is something a *person* invokes, so it runs as the
+            // machine's declared login (§19.2) — the developer's files get
+            // the developer's owner, rather than landing as SYSTEM.
             LabRequest::MachinePushFile {
                 machine,
                 to,
@@ -594,7 +598,9 @@ impl Handler<LabRequest> for LabdHandler {
                 data,
                 mode,
             } => {
-                let agent = agent_of(lab, &machine).await?;
+                let m = machine_of(lab, &machine)?;
+                let logon = logon_for(m.as_ref(), None, None)?;
+                let agent = m.agent().await?;
                 let (sha256, len) = match data {
                     Some(data) => {
                         use base64::Engine as _;
@@ -613,16 +619,19 @@ impl Handler<LabRequest> for LabdHandler {
                             .join(format!("vmlab-cp-{}-{machine}", std::process::id()));
                         std::fs::write(&tmp, &bytes)
                             .map_err(|e| CommandError::failed(e.to_string()))?;
-                        let res = agent.push_file(&tmp, &to, mode).await;
+                        let res = agent.push_file_as(&tmp, &to, mode, logon).await;
                         let _ = std::fs::remove_file(&tmp);
-                        res?
+                        on_machine(&machine, Ok(res?))?
                     }
                     None => {
                         let from =
                             from.ok_or_else(|| CommandError::invalid("missing from or data"))?;
-                        agent
-                            .push_file(std::path::Path::new(&from), &to, mode)
-                            .await?
+                        on_machine(
+                            &machine,
+                            Ok(agent
+                                .push_file_as(std::path::Path::new(&from), &to, mode, logon)
+                                .await?),
+                        )?
                     }
                 };
                 Ok(json!({"sha256": sha256, "len": len}))
@@ -631,18 +640,27 @@ impl Handler<LabRequest> for LabdHandler {
             // omitting it hands the bytes back inline for a caller — a
             // browser — that has nowhere on this host to put them.
             LabRequest::MachinePullFile { machine, from, to } => {
-                let agent = agent_of(lab, &machine).await?;
+                let m = machine_of(lab, &machine)?;
+                let logon = logon_for(m.as_ref(), None, None)?;
+                let agent = m.agent().await?;
                 match to {
                     Some(to) => {
-                        let (sha256, len) =
-                            agent.pull_file(&from, std::path::Path::new(&to)).await?;
+                        let (sha256, len) = on_machine(
+                            &machine,
+                            Ok(agent
+                                .pull_file_as(&from, std::path::Path::new(&to), logon)
+                                .await?),
+                        )?;
                         Ok(json!({"sha256": sha256, "len": len}))
                     }
                     None => {
                         use base64::Engine as _;
-                        let (sha256, bytes) = agent
-                            .pull_bytes(&from, crate::proto::INLINE_FILE_LIMIT)
-                            .await?;
+                        let (sha256, bytes) = on_machine(
+                            &machine,
+                            Ok(agent
+                                .pull_bytes_as(&from, crate::proto::INLINE_FILE_LIMIT, logon)
+                                .await?),
+                        )?;
                         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                         Ok(json!({"sha256": sha256, "len": bytes.len(), "data": data}))
                     }

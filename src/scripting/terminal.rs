@@ -178,7 +178,7 @@ impl TerminalHandle {
                     return;
                 }
                 // A terminal ends by exiting, not by an output EOF.
-                Ok(Some(SessionEvent::Eof)) | Ok(Some(SessionEvent::FileDone { .. })) => {}
+                Ok(Some(SessionEvent::Eof)) => {}
             }
         }
     }

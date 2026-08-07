@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode, features};
 
 use crate::mux::{Mux, Platform};
-use crate::spawn::{Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile};
+use crate::spawn::{Adopter, Identity, ProcessSpec, Spawned, Spawner, TerminalSpec};
 
 /// One creation the seam was asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,14 +35,9 @@ pub enum Call {
         env: Vec<(String, String)>,
         cwd: Option<String>,
     },
-    CreateFile {
-        identity: Identity,
-        path: String,
-    },
-    /// A session asked for an identity to read through (`tail`).
-    Adopt {
-        identity: Identity,
-    },
+    /// A session asked for an identity to open files through (`tail`, and
+    /// every `fileops` session).
+    Adopt { identity: Identity },
 }
 
 /// The test's end of a process the fake handed out.
@@ -116,48 +111,12 @@ fn send(stream: &Arc<Mutex<Option<SyncSender<Vec<u8>>>>>, bytes: &[u8]) {
     }
 }
 
-/// The test's end of a file the fake opened for writing.
-#[derive(Clone, Default)]
-pub struct FakeFile {
-    bytes: Arc<Mutex<Vec<u8>>>,
-    mode: Arc<Mutex<Option<u32>>>,
-}
-
-impl FakeFile {
-    /// Bytes the session has written into the file so far.
-    pub fn bytes(&self) -> Vec<u8> {
-        self.bytes.lock().unwrap().clone()
-    }
-
-    /// The POSIX mode the session applied, if any.
-    pub fn mode(&self) -> Option<u32> {
-        *self.mode.lock().unwrap()
-    }
-}
-
-impl Write for FakeFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.bytes.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl WriteFile for FakeFile {
-    fn set_mode(&self, mode: u32) {
-        *self.mode.lock().unwrap() = Some(mode);
-    }
-}
-
 /// An in-memory [`Spawner`]: records what it was asked to create, hands back
 /// processes and files the test drives directly.
 #[derive(Default)]
 pub struct FakeSpawner {
     calls: Mutex<Vec<Call>>,
     processes: Mutex<Vec<FakeProcess>>,
-    files: Mutex<Vec<FakeFile>>,
     /// Creations queued to fail, oldest first. An empty queue succeeds.
     failures: Mutex<VecDeque<String>>,
 }
@@ -175,11 +134,6 @@ impl FakeSpawner {
     /// The `n`th process handed out (0-based).
     pub fn process(&self, n: usize) -> FakeProcess {
         self.processes.lock().unwrap()[n].clone()
-    }
-
-    /// The `n`th file handed out (0-based).
-    pub fn file(&self, n: usize) -> FakeFile {
-        self.files.lock().unwrap()[n].clone()
     }
 
     /// Make the next creation fail with `msg`.
@@ -266,19 +220,6 @@ impl Spawner for FakeSpawner {
             Some(e) => Err(e),
             None => Ok(self.hand_out(Shape::Piped)),
         }
-    }
-
-    fn create_file(&self, identity: &Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
-        self.calls.lock().unwrap().push(Call::CreateFile {
-            identity: identity.clone(),
-            path: path.to_string(),
-        });
-        if let Some(e) = self.next_failure() {
-            return Err(e);
-        }
-        let file = FakeFile::default();
-        self.files.lock().unwrap().push(file.clone());
-        Ok(Box::new(file))
     }
 
     fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter> {
