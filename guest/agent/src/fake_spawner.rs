@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
+use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode, features};
 
 use crate::mux::{Mux, Platform};
 use crate::spawn::{Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile};
@@ -297,7 +297,7 @@ impl Platform for TestPlatform {
         "test"
     }
     fn features(&self) -> Vec<String> {
-        vec!["terminal".into()]
+        vec![features::TERMINAL.to_string(), features::WATCH.to_string()]
     }
     fn spawner(&self) -> &dyn Spawner {
         self.spawner.as_ref()

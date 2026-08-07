@@ -471,7 +471,9 @@ mod tests {
                 assert_eq!(proto_version, PROTO_VERSION);
                 assert_eq!(token, "tok-1");
                 assert_eq!(os, "test");
-                assert_eq!(features, vec!["terminal".to_string()]);
+                // Spelled out rather than through `features::*`: what is
+                // asserted here is the spelling that lands on the wire.
+                assert_eq!(features, vec!["terminal".to_string(), "watch".to_string()]);
             }
             other => panic!("expected hello, got {other:?}"),
         }
