@@ -9,7 +9,6 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -18,16 +17,19 @@ use sha2::{Digest, Sha256};
 use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
 
 use crate::mux::{Input, Mux};
+use crate::spawn::{Identity, Spawner};
 
-pub fn open_push(mux: &Mux, id: u32, path: String, mode: Option<u32>) {
-    if let Some(parent) = Path::new(&path).parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        mux.send_error(Some(id), format!("push {path}: mkdir: {e}"));
-        return;
-    }
-    let mut file = match File::create(&path) {
+pub fn open_push(
+    mux: &Mux,
+    spawner: &dyn Spawner,
+    identity: Identity,
+    id: u32,
+    path: String,
+    mode: Option<u32>,
+) {
+    // The file is created through the seam: who owns the developer's files
+    // is the same per-channel decision as who a process runs as (PRD §19.2).
+    let mut file = match spawner.create_file(identity, &path) {
         Ok(f) => f,
         Err(e) => {
             mux.send_error(Some(id), format!("push {path}: {e}"));
@@ -64,7 +66,9 @@ pub fn open_push(mux: &Mux, id: u32, path: String, mode: Option<u32>) {
                         mux.remove_finished(id);
                         return;
                     }
-                    apply_mode(&file, mode);
+                    if let Some(mode) = mode {
+                        file.set_mode(mode);
+                    }
                     mux.send_ctrl(&AgentMsg::FileDone {
                         id,
                         sha256: hex(&hasher.finalize()),
@@ -137,17 +141,6 @@ pub fn open_pull(mux: &Mux, id: u32, path: String) {
         mux.remove_finished(id);
     });
 }
-
-#[cfg(unix)]
-fn apply_mode(file: &File, mode: Option<u32>) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(mode) = mode {
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
-    }
-}
-
-#[cfg(windows)]
-fn apply_mode(_file: &File, _mode: Option<u32>) {}
 
 pub fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()

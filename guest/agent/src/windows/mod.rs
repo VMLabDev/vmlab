@@ -18,11 +18,37 @@ pub use port::open_port;
 use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode, features};
 
 use crate::mux::Mux;
+use crate::spawn::{
+    Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile, create_file_as_agent,
+    piped_command,
+};
 
-pub struct WindowsPlatform;
+pub struct WindowsPlatform {
+    spawner: WindowsSpawner,
+}
+
+/// The Windows half of the process/handle seam: ConPTY terminals, piped
+/// exec, and the file writes behind `push`.
+pub struct WindowsSpawner;
 
 pub fn new_platform() -> WindowsPlatform {
-    WindowsPlatform
+    WindowsPlatform {
+        spawner: WindowsSpawner,
+    }
+}
+
+impl Spawner for WindowsSpawner {
+    fn terminal(&self, _identity: Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
+        conpty::spawn(spec)
+    }
+
+    fn exec(&self, _identity: Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
+        piped_command(spec)
+    }
+
+    fn create_file(&self, _identity: Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
+        create_file_as_agent(path)
+    }
 }
 
 impl WindowsPlatform {
@@ -55,15 +81,8 @@ impl crate::mux::Platform for WindowsPlatform {
         ]
     }
 
-    fn open_terminal(
-        &self,
-        mux: &Mux,
-        id: u32,
-        cols: u16,
-        rows: u16,
-        command: Option<Vec<String>>,
-    ) {
-        conpty::open_terminal(mux, id, cols, rows, command);
+    fn spawner(&self) -> &dyn Spawner {
+        &self.spawner
     }
 
     fn open_eventlog(&self, mux: &Mux, id: u32, filter: Option<String>) {

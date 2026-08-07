@@ -13,10 +13,16 @@ mod exec;
 mod files;
 mod metrics;
 mod mux;
+mod spawn;
 mod tail;
+mod terminal;
 mod tunnel;
 mod watch;
 
+#[cfg(test)]
+mod fake_spawner;
+#[cfg(test)]
+mod seam_test;
 #[cfg(test)]
 mod sessions_test;
 #[cfg(test)]

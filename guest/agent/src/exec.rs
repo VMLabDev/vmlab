@@ -2,9 +2,11 @@
 //! stdin = host DATA frames (EOF via the `eof` control), stdout = DATA
 //! frames back, stderr = DATA_ERR frames, an agent `eof` once both are
 //! drained, exit code via `exited`.
+//!
+//! The process comes from the [`Spawner`] seam, so this plumbing is the same
+//! on both guest targets.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -12,61 +14,46 @@ use std::thread;
 use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
 
 use crate::mux::{Input, Mux, pump_out};
+use crate::spawn::{Identity, ProcessSpec, Spawned, Spawner};
 
-pub fn open(
-    mux: &Mux,
-    id: u32,
-    argv: Vec<String>,
-    env: Vec<(String, String)>,
-    cwd: Option<String>,
-) {
-    if argv.is_empty() {
+pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: Identity, id: u32, spec: ProcessSpec) {
+    let Some(exe) = spec.argv.first().cloned() else {
         mux.send_error(Some(id), "exec: empty argv");
         return;
-    }
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+    };
+    let Spawned {
+        input,
+        output,
+        errors,
+        resize: _,
+        kill,
+        wait,
+    } = match spawner.exec(identity, spec) {
+        Ok(p) => p,
         Err(e) => {
-            mux.send_error(Some(id), format!("exec {}: {e}", argv[0]));
+            mux.send_error(Some(id), format!("exec {exe}: {e}"));
             return;
         }
     };
-    let mut stdin = child.stdin.take();
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
+    let mut stdin = Some(input);
 
-    // The kill closure fires on host `close`; skip it once the child has
-    // been reaped (its pid may be recycled).
+    // The kill hook fires on host `close`; skip it once the child has been
+    // reaped (its pid may be recycled).
     let done = Arc::new(AtomicBool::new(false));
-    let pid = child.id();
     let kill_done = done.clone();
-    let Some((input, credit)) = mux.register(
+    let kill: Arc<dyn Fn() + Send + Sync> = Arc::from(kill);
+    let session_kill = kill.clone();
+    let Some((host_input, credit)) = mux.register(
         id,
         None,
         Some(Box::new(move || {
             if !kill_done.load(Ordering::SeqCst) {
-                crate::platform::kill_process(pid);
+                session_kill();
             }
         })),
     ) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill();
+        wait();
         return;
     };
     mux.send_ctrl(&AgentMsg::Opened { id });
@@ -76,8 +63,8 @@ pub fn open(
         let mux = mux.clone();
         thread::spawn(move || {
             let mut window = RecvWindow::default();
-            for input in input {
-                match input {
+            for chunk in host_input {
+                match chunk {
                     Input::Bytes(b) => {
                         let Some(s) = stdin.as_mut() else { continue };
                         if s.write_all(&b).is_err() {
@@ -98,24 +85,26 @@ pub fn open(
     // stdout / stderr pumps.
     let out_pump = {
         let (mux, credit) = (mux.clone(), credit.clone());
-        thread::spawn(move || pump_out(&mux, id, FrameKind::Data, &credit, stdout))
+        thread::spawn(move || pump_out(&mux, id, FrameKind::Data, &credit, output))
     };
-    let err_pump = {
+    // An exec always asks the seam for piped stderr; an adapter that has
+    // none simply produces no DATA_ERR frames rather than taking the agent
+    // down.
+    let err_pump = errors.map(|errors| {
         let (mux, credit) = (mux.clone(), credit.clone());
-        thread::spawn(move || pump_out(&mux, id, FrameKind::DataErr, &credit, stderr))
-    };
+        thread::spawn(move || pump_out(&mux, id, FrameKind::DataErr, &credit, errors))
+    });
 
     // Reaper: wait for exit, let the output pumps flush what the pipes still
     // hold, then report and clean up.
     let mux = mux.clone();
     thread::spawn(move || {
-        let code = match child.wait() {
-            Ok(status) => exit_code(status),
-            Err(_) => 127,
-        };
+        let code = wait();
         done.store(true, Ordering::SeqCst);
         let _ = out_pump.join();
-        let _ = err_pump.join();
+        if let Some(err_pump) = err_pump {
+            let _ = err_pump.join();
+        }
         // Both pipes are drained: the channel's guest→host bytes are
         // complete. A consumer that only wants the output no longer has to
         // read `exited` to learn that.
@@ -123,18 +112,4 @@ pub fn open(
         mux.send_ctrl(&AgentMsg::Exited { id, code });
         mux.remove_finished(id);
     });
-}
-
-#[cfg(unix)]
-fn exit_code(status: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    status
-        .code()
-        .or_else(|| status.signal().map(|s| 128 + s))
-        .unwrap_or(127)
-}
-
-#[cfg(windows)]
-fn exit_code(status: std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or(127)
 }

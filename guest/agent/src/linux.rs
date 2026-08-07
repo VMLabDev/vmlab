@@ -11,7 +11,6 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -23,11 +22,14 @@ use nix::unistd::{ForkResult, Pid, chdir, chroot, execve, fork, setsid};
 use std::os::unix::fs::PermissionsExt;
 
 use vmlab_agent_proto::{
-    AgentMsg, DiskUsage, FrameKind, NetInterface, OsInfo, PORT_NAME, RecvWindow, ShutdownMode,
-    features,
+    AgentMsg, DiskUsage, NetInterface, OsInfo, PORT_NAME, ShutdownMode, features,
 };
 
-use crate::mux::{Input, Mux, pump_out};
+use crate::mux::Mux;
+use crate::spawn::{
+    Identity, ProcessSpec, Spawned, Spawner, TerminalSpec, WriteFile, create_file_as_agent,
+    piped_command,
+};
 
 const TERMINAL_MOTD: &str = concat!(
     "\n",
@@ -123,7 +125,15 @@ pub struct LinuxPlatform {
     clipboard: Option<ClipboardTool>,
     /// Container micro-VM mode (spawned by cinit): sessions run inside the
     /// container instead of the init namespace.
-    container: Option<ContainerCtx>,
+    container: Option<Arc<ContainerCtx>>,
+    spawner: LinuxSpawner,
+}
+
+/// The Linux half of the process/handle seam: PTY terminals, piped exec, and
+/// the file writes behind `push` — in the init namespace, or inside the
+/// container when cinit started us in container mode.
+pub struct LinuxSpawner {
+    container: Option<Arc<ContainerCtx>>,
 }
 
 /// Everything a container session spawn needs, prepared once at startup.
@@ -166,6 +176,7 @@ pub fn new_platform() -> LinuxPlatform {
     LinuxPlatform {
         clipboard: ClipboardTool::probe(),
         container: None,
+        spawner: LinuxSpawner { container: None },
     }
 }
 
@@ -184,15 +195,19 @@ pub fn new_platform_container(config_path: &str) -> LinuxPlatform {
             std::process::exit(1);
         })
     });
+    let container = Arc::new(ContainerCtx {
+        rootfs: cfg.rootfs,
+        setns,
+        setns_pid: cfg.setns_pid,
+        env: cfg.env,
+        workdir: cfg.workdir.unwrap_or_else(|| "/".to_string()),
+    });
     LinuxPlatform {
         clipboard: None,
-        container: Some(ContainerCtx {
-            rootfs: cfg.rootfs,
-            setns,
-            setns_pid: cfg.setns_pid,
-            env: cfg.env,
-            workdir: cfg.workdir.unwrap_or_else(|| "/".to_string()),
-        }),
+        container: Some(container.clone()),
+        spawner: LinuxSpawner {
+            container: Some(container),
+        },
     }
 }
 
@@ -217,39 +232,8 @@ impl crate::mux::Platform for LinuxPlatform {
         f
     }
 
-    fn open_exec(
-        &self,
-        mux: &Mux,
-        id: u32,
-        argv: Vec<String>,
-        env: Vec<(String, String)>,
-        cwd: Option<String>,
-    ) {
-        match &self.container {
-            None => crate::exec::open(mux, id, argv, env, cwd),
-            // Container: reroute through the nsexec trampoline (a re-exec of
-            // this binary that setns's, forks into the PID namespace,
-            // chroots, and execs) so the process genuinely lives inside the
-            // container while std::process handles the pipe plumbing.
-            Some(ctx) => {
-                if argv.is_empty() {
-                    mux.send_error(Some(id), "exec: empty argv");
-                    return;
-                }
-                let mut wrapped = vec![
-                    "/proc/self/exe".to_string(),
-                    "--nsexec".to_string(),
-                    ctx.setns_pid.unwrap_or(0).to_string(),
-                    ctx.rootfs.clone(),
-                    cwd.unwrap_or_else(|| ctx.workdir.clone()),
-                    "--".to_string(),
-                ];
-                wrapped.extend(argv);
-                let mut merged = container_env(ctx);
-                merged.extend(env);
-                crate::exec::open(mux, id, wrapped, merged, None);
-            }
-        }
+    fn spawner(&self) -> &dyn Spawner {
+        &self.spawner
     }
 
     fn resolve_path(&self, path: String) -> String {
@@ -257,108 +241,6 @@ impl crate::mux::Platform for LinuxPlatform {
             None => path,
             Some(ctx) => format!("{}/{}", ctx.rootfs, path.trim_start_matches('/')),
         }
-    }
-
-    fn open_terminal(
-        &self,
-        mux: &Mux,
-        id: u32,
-        cols: u16,
-        rows: u16,
-        command: Option<Vec<String>>,
-    ) {
-        let (shell, env) = match &self.container {
-            None => (command.or_else(default_shell), shell_env()),
-            Some(ctx) => (
-                command.or_else(|| container_shell(&ctx.rootfs)),
-                container_env_cstrings(ctx),
-            ),
-        };
-        let shell = match shell {
-            Some(s) if !s.is_empty() => s,
-            _ => {
-                mux.send_error(Some(id), "terminal: no shell found in this guest");
-                return;
-            }
-        };
-        let size = winsize(cols, rows);
-        let (master, pid) = match spawn_shell(&shell, &env, &size, self.container.as_ref()) {
-            Ok(v) => v,
-            Err(e) => {
-                mux.send_error(Some(id), format!("terminal: {e}"));
-                return;
-            }
-        };
-        let master = Arc::new(master);
-
-        let done = Arc::new(AtomicBool::new(false));
-        let resize_master = master.clone();
-        let kill_done = done.clone();
-        let Some((input, credit)) = mux.register(
-            id,
-            Some(Box::new(move |cols, rows| {
-                let ws = winsize(cols, rows);
-                // SAFETY: TIOCSWINSZ on a live PTY master with a valid size.
-                let _ = unsafe { tiocswinsz(resize_master.as_raw_fd(), &ws) };
-            })),
-            Some(Box::new(move || {
-                if !kill_done.load(Ordering::SeqCst) {
-                    let _ = kill(pid, Signal::SIGKILL);
-                }
-            })),
-        ) else {
-            let _ = kill(pid, Signal::SIGKILL);
-            let _ = waitpid(pid, None);
-            return;
-        };
-        mux.send_ctrl(&AgentMsg::Opened { id });
-
-        // Input pump: host bytes → PTY master.
-        {
-            let mux = mux.clone();
-            let master = master.clone();
-            thread::spawn(move || {
-                let mut window = RecvWindow::default();
-                for input in input {
-                    match input {
-                        Input::Bytes(b) => {
-                            // A dying shell may stop reading; dropped input
-                            // is fine, the session is ending anyway.
-                            let _ = write_all_fd(&master, &b);
-                            if let Some(grant) = window.recv(b.len()) {
-                                mux.send_ctrl(&AgentMsg::WindowAdjust { id, bytes: grant });
-                            }
-                        }
-                        Input::Eof => {}
-                    }
-                }
-            });
-        }
-
-        // Output pump: PTY master → host (EIO once the slave side closes).
-        let out_pump = {
-            let (mux, credit) = (mux.clone(), credit.clone());
-            let master = master.clone();
-            thread::spawn(move || {
-                let Ok(fd) = master.try_clone() else { return };
-                pump_out(&mux, id, FrameKind::Data, &credit, File::from(fd));
-            })
-        };
-
-        // Reaper: shell exited → flush output → report → clean up.
-        let mux = mux.clone();
-        thread::spawn(move || {
-            let code = match waitpid(pid, None) {
-                Ok(WaitStatus::Exited(_, code)) => code,
-                Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
-                _ => 127,
-            };
-            done.store(true, Ordering::SeqCst);
-            drop(master); // closes our master ref → output pump sees EOF/EIO
-            let _ = out_pump.join();
-            mux.send_ctrl(&AgentMsg::Exited { id, code });
-            mux.remove_finished(id);
-        });
     }
 
     fn open_eventlog(&self, mux: &Mux, id: u32, _filter: Option<String>) {
@@ -404,6 +286,96 @@ impl crate::mux::Platform for LinuxPlatform {
             }
         });
     }
+}
+
+impl Spawner for LinuxSpawner {
+    fn terminal(&self, _identity: Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
+        let (shell, env) = match &self.container {
+            None => (spec.command.or_else(default_shell), shell_env()),
+            Some(ctx) => (
+                spec.command.or_else(|| container_shell(&ctx.rootfs)),
+                container_env_cstrings(ctx),
+            ),
+        };
+        let shell = match shell {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no shell found in this guest",
+                ));
+            }
+        };
+        let size = winsize(spec.cols, spec.rows);
+        let (master, pid) = spawn_shell(&shell, &env, &size, self.container.as_deref())?;
+        // The master is shared: one dup drives keystrokes in, another the VT
+        // stream out, and the resize hook needs the fd itself.
+        let master = Arc::new(master);
+        let input = File::from(master.try_clone()?);
+        let output = File::from(master.try_clone()?);
+        let resize_master = master.clone();
+        Ok(Spawned {
+            input: Box::new(input),
+            output: Box::new(output),
+            errors: None,
+            resize: Some(Box::new(move |cols, rows| {
+                let ws = winsize(cols, rows);
+                // SAFETY: TIOCSWINSZ on a live PTY master with a valid size.
+                let _ = unsafe { tiocswinsz(resize_master.as_raw_fd(), &ws) };
+            })),
+            kill: Box::new(move || {
+                let _ = kill(pid, Signal::SIGKILL);
+            }),
+            wait: Box::new(move || {
+                let code = match waitpid(pid, None) {
+                    Ok(WaitStatus::Exited(_, code)) => code,
+                    Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                    _ => 127,
+                };
+                drop(master); // closes our master ref → output pump sees EOF/EIO
+                code
+            }),
+        })
+    }
+
+    fn exec(&self, _identity: Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
+        match &self.container {
+            None => piped_command(spec),
+            // Container: reroute through the nsexec trampoline (a re-exec of
+            // this binary that setns's, forks into the PID namespace,
+            // chroots, and execs) so the process genuinely lives inside the
+            // container while std::process handles the pipe plumbing.
+            Some(ctx) => {
+                let mut env = container_env(ctx);
+                env.extend(spec.env);
+                piped_command(ProcessSpec {
+                    argv: nsexec_argv(ctx, spec.argv, spec.cwd),
+                    env,
+                    cwd: None,
+                })
+            }
+        }
+    }
+
+    fn create_file(&self, _identity: Identity, path: &str) -> std::io::Result<Box<dyn WriteFile>> {
+        create_file_as_agent(path)
+    }
+}
+
+/// The trampoline command line `nsexec_main` parses back out: the holder
+/// pid (0 in idle mode), the rootfs, the working directory, then the
+/// caller's argv after a `--` separator.
+fn nsexec_argv(ctx: &ContainerCtx, argv: Vec<String>, cwd: Option<String>) -> Vec<String> {
+    let mut wrapped = vec![
+        "/proc/self/exe".to_string(),
+        "--nsexec".to_string(),
+        ctx.setns_pid.unwrap_or(0).to_string(),
+        ctx.rootfs.clone(),
+        cwd.unwrap_or_else(|| ctx.workdir.clone()),
+        "--".to_string(),
+    ];
+    wrapped.extend(argv);
+    wrapped
 }
 
 /// Guest NICs via getifaddrs: link-layer, IPv4 and IPv6 entries for one
@@ -789,18 +761,6 @@ pub fn nsexec_main(args: &[String]) -> ! {
     std::process::exit(127);
 }
 
-/// Write the whole buffer to a raw fd (PTY master writes can be short).
-fn write_all_fd(fd: &OwnedFd, mut buf: &[u8]) -> nix::Result<()> {
-    while !buf.is_empty() {
-        let n = nix::unistd::write(fd, buf)?;
-        if n == 0 {
-            return Err(nix::errno::Errno::EIO);
-        }
-        buf = &buf[n..];
-    }
-    Ok(())
-}
-
 fn write_all_raw(fd: libc::c_int, mut buf: &[u8]) -> bool {
     while !buf.is_empty() {
         // SAFETY: plain write(2) on a valid fd with an in-bounds buffer.
@@ -1107,21 +1067,52 @@ mod tests {
         )));
     }
 
+    /// A platform in container mode, sharing one context with its spawner
+    /// the way `new_platform_container` does.
+    fn container_platform(ctx: ContainerCtx) -> LinuxPlatform {
+        let ctx = Arc::new(ctx);
+        LinuxPlatform {
+            clipboard: None,
+            container: Some(ctx.clone()),
+            spawner: LinuxSpawner {
+                container: Some(ctx),
+            },
+        }
+    }
+
     #[test]
     fn container_platform_resolves_paths_into_rootfs() {
         use crate::mux::Platform as _;
-        let p = LinuxPlatform {
-            clipboard: None,
-            container: Some(test_ctx("/rootfs", vec![])),
-        };
+        let p = container_platform(test_ctx("/rootfs", vec![]));
         assert_eq!(
             p.resolve_path("/var/log/app.log".into()),
             "/rootfs/var/log/app.log"
         );
-        let host = LinuxPlatform {
-            clipboard: None,
-            container: None,
-        };
+        let host = new_platform();
         assert_eq!(host.resolve_path("/etc/passwd".into()), "/etc/passwd");
+    }
+
+    /// Container exec still goes through the nsexec trampoline — now behind
+    /// the seam rather than as a `Platform` override.
+    #[test]
+    fn container_exec_wraps_argv_for_the_nsexec_trampoline() {
+        let ctx = test_ctx("/rootfs", vec![]);
+        let argv = nsexec_argv(&ctx, vec!["ls".into(), "-l".into()], None);
+        assert_eq!(
+            argv,
+            vec![
+                "/proc/self/exe",
+                "--nsexec",
+                "0",
+                "/rootfs",
+                "/",
+                "--",
+                "ls",
+                "-l"
+            ]
+        );
+        // A host-supplied cwd wins over the container's workdir.
+        let argv = nsexec_argv(&ctx, vec!["ls".into()], Some("/work".into()));
+        assert_eq!(argv[4], "/work");
     }
 }
