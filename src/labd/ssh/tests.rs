@@ -1479,8 +1479,13 @@ async fn direct_tcpip_refuses_by_name_without_the_tunnel_feature() {
         other => panic!("expected a channel open failure, got {other:?}"),
     }
     let reason = h.refusals()[0]["reason"].as_str().unwrap().to_string();
-    assert!(reason.contains("repair-agent"), "{reason}");
     assert_eq!(h.refusals()[0]["request"], "direct-tcpip");
+    // §19.4's words: what is missing, and *both* remedies — the rebuild that
+    // is policy and the repair verb that is a tool, aimed at this machine.
+    assert!(reason.contains("`direct-tcpip`"), "{reason}");
+    assert!(reason.contains("serves no `tunnel`"), "{reason}");
+    assert!(reason.contains("rebuild the template"), "{reason}");
+    assert!(reason.contains("repair-agent dev01"), "{reason}");
 
     let mut channel = h.session.channel_open_session().await.unwrap();
     channel.request_shell(true).await.unwrap();
@@ -1629,6 +1634,31 @@ async fn an_unserved_subsystem_is_refused_by_name() {
             .contains("netconf")
     );
 }
+
+// ---------------------------------------------------------------------------
+// A stale agent (§19.4)
+// ---------------------------------------------------------------------------
+
+/// **The facade degrades per channel.** A machine whose agent predates §19 is
+/// still a perfectly good machine, and a shell on it is exactly as good as any
+/// other — nothing about a terminal needs `fileops` or `tunnel`.
+#[tokio::test]
+async fn a_stale_agent_still_serves_a_shell() {
+    let h = connect_featured("dev", logins(), GuestOs::Linux, &["terminal", "exec"])
+        .await
+        .unwrap();
+    let mut channel = h.session.channel_open_session().await.unwrap();
+    channel.request_shell(true).await.unwrap();
+    assert_eq!(read_data(&mut channel, 8).await, b"prompt$ ");
+    assert!(h.refusals().is_empty(), "{:?}", h.refusals());
+}
+
+// What such an agent genuinely cannot serve is refused by name, with both
+// remedies in the reason: `sftp` in
+// `an_agent_without_fileops_still_serves_a_shell_and_refuses_sftp_by_name`,
+// and `direct-tcpip` in
+// `direct_tcpip_refuses_by_name_without_the_tunnel_feature` — each beside the
+// channel it is about rather than duplicated here.
 
 /// Keepalive is answered with `SSH_MSG_REQUEST_FAILURE`, which *is* the
 /// correct answer and is what makes `ServerAliveInterval` work: the client

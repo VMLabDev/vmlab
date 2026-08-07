@@ -37,6 +37,14 @@ guest port with no guest network involved and a failed dial answers
 is answered host-side** (#88, `ssh/sftp.rs`): version 3, transcoded
 packet-for-request onto `fileops` under the connection's own logon, so `scp`
 and an editor's file explorer land on the same cached logon as the shell.
+**`attachable` and the failure ladder** (#90, §19.4): `tunnel && fileops`,
+reported by `vmlab machine capabilities` and carried in the status projection;
+silent at `validate`, a warning at `up`, hard at attach, and the facade
+degrading per channel — a stale agent still serves a shell, while the two
+channels that need what it lacks refuse by name. With it, `vmlab machine
+repair-agent`, which pushes the host's shipped agent into a running machine and
+marks it **diverged**; never automatic, and meaningless on a container, which
+it says.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
@@ -45,6 +53,10 @@ Module map under `src/`:
 - `dev.rs` — dev machines (§19.1): who carries `@dev`, which one is the lab's
   default, and the `@dev` > profile > floor resolution of its arguments —
   deliberately separate from the hardware resolver ADR-0008 owns.
+- `attach.rs` — `attachable` (§19.4) and the words every rung of its failure
+  ladder says: the one derivation over probed agent features, the refusal that
+  names both remedies, and the warning `up` prints. Nothing here is called by
+  `validate`, deliberately.
 - `profiles/` — guest OS profiles (WCL data, user-overridable).
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
   firmware lookup, process management; `container.rs` builds the micro-VM
@@ -91,7 +103,9 @@ Module map under `src/`:
   SMB integration, the lab runtime the wscript host binds to;
   `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18);
   `ssh/` is the SSH facade vmlab terminates on the host (§19.3, ADR-0012) —
-  no guest runs an sshd, and its refusals follow ADR-0013's invariant.
+  no guest runs an sshd, and its refusals follow ADR-0013's invariant;
+  `agent_repair.rs` is `machine.repair_agent` (§19.4), the plan for replacing
+  a guest's agent binary over its own channel and the divergence it records.
   Decisions the runtime used to make mid-flight are values computed before
   execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
   transports, gateway rules, the smbd port), `forward_plan.rs` (every port

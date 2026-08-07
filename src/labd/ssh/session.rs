@@ -141,6 +141,25 @@ impl Facade {
         );
     }
 
+    /// Why this connection cannot serve `what`, when the reason is that the
+    /// guest's agent does not serve `feature` (§19.4) — `None` when it does.
+    ///
+    /// **This is where the facade degrades per channel.** A stale agent still
+    /// gives a developer a shell, because a terminal asks nothing of the
+    /// features an attach needs; what it cannot serve is refused *by name*,
+    /// naming both remedies, rather than failing the whole connection over a
+    /// capability most of it never wanted.
+    fn agent_cannot_serve(&self, what: &str, feature: &str) -> Option<String> {
+        if self.agent.has_feature(feature) {
+            return None;
+        }
+        Some(crate::attach::refusal(
+            Some(&self.spec.machine),
+            what,
+            &[feature],
+        ))
+    }
+
     /// What the channel's `pty-req` and `env` left for the request that is
     /// about to start something on it, taken — or `None` where there is no
     /// such channel, or something already started on it.
@@ -585,6 +604,11 @@ impl Handler for Facade {
     /// destination policy applies to it: a dynamic forward dials whatever the
     /// developer's tooling asks for, and vmlab is not a security boundary
     /// (§1.2).
+    ///
+    /// A guest whose agent serves no `tunnel` is refused here, by name and
+    /// before anything is dialled, telling the developer to rebuild the
+    /// template or run the repair verb (§19.4). That refusal is the facade
+    /// degrading per channel: the same connection's shell is unaffected.
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: Channel<Msg>,
@@ -597,6 +621,16 @@ impl Handler for Facade {
     ) -> Result<(), Self::Error> {
         // The same backstop a `session` gets, for the same reason.
         if let Some(refusal) = self.refusal.clone() {
+            self.refuse_open("direct-tcpip", &refusal, reply).await;
+            return Ok(());
+        }
+        // §19.4, before the channel is booked or anything is dialled: an
+        // agent with no `tunnel` has nothing to dial *with*, and saying so by
+        // name — with both remedies — is more use than the connect failure a
+        // dial-that-cannot-happen would otherwise be reported as.
+        if let Some(refusal) =
+            self.agent_cannot_serve("`direct-tcpip`", vmlab_agent_proto::features::TUNNEL)
+        {
             self.refuse_open("direct-tcpip", &refusal, reply).await;
             return Ok(());
         }
@@ -815,6 +849,11 @@ impl Handler for Facade {
 
     /// `sftp` is served here, over `fileops`; anything else is refused
     /// because nothing in the client set sends it.
+    ///
+    /// A guest whose agent serves no `fileops` is refused by name inside
+    /// [`Self::start_sftp`], where the file session's own open reports it with
+    /// both of §19.4's remedies — so there is deliberately no second gate on
+    /// the way in.
     async fn subsystem_request(
         &mut self,
         channel: ChannelId,

@@ -31,6 +31,19 @@ pub struct MachineState {
     /// Snapshot name → record.
     #[serde(default)]
     pub snapshots: BTreeMap<String, SnapshotRecord>,
+    /// The agent version `vmlab machine repair-agent` pushed into this
+    /// machine, which is what makes it a **diverged machine** (PRD §19.4):
+    /// its guest content no longer matches the artefact it was created from,
+    /// because a verb deliberately changed it in place. `None` — the ordinary
+    /// case — is a machine still running what it was built with.
+    ///
+    /// Persisted rather than remembered, because divergence outlives the lab
+    /// daemon that caused it and outlives the machine's next boot; cleared by
+    /// [`crate::labd::lab::LabRuntime::destroy_machine`] along with the disks
+    /// the divergence lived on, since what comes back is a fresh clone of the
+    /// sealed artefact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repaired_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

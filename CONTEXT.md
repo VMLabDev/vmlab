@@ -90,6 +90,26 @@ Something one machine can do that another might not — a display, a clipboard,
 a Windows event log. Probed and reported, never inferred from whether the
 machine is a VM or a container.
 
+**Attachable**:
+A machine whose agent serves both `tunnel` and `fileops` — *this agent can
+serve an attach*, never *your attach will succeed*, since identity is declared
+separately. A **capability** computed over probed features, reported by
+`vmlab machine capabilities` and carried in **lab status**; deliberately not
+widened to `watch`, which is the **workspace syncer**'s different question.
+Where it is false, `validate` says nothing, `up` warns, and an attach fails —
+naming the rebuild and the **agent repair** verb.
+_Avoid_: attachable-ready, sshable, dev-ready
+
+**Agent repair**:
+Pushing the host's shipped agent binary into a running machine over the
+agent's own channel, replacing what its artefact baked. A tool, never a
+policy: it fires only when someone types it, because an automatic refresh
+would make a template's sealed `agent_version` a lie, and it makes the machine
+a **diverged machine**. Meaningless for a machine whose agent came with the
+host rather than with what it boots — a container micro-VM's — which is
+reported rather than implied.
+_Avoid_: update, upgrade, hot-patch, self-update
+
 **Display**:
 A machine's framebuffer, together with the keyboard, pointer, OCR and
 image-matching operations that read and drive it. Probed and reported like any
@@ -263,7 +283,9 @@ interface with no sshd in the guest: `session` channels are serviced by
 vmlab-agent, SFTP is terminated host-side over a **fileops session**, and
 `direct-tcpip` rides an SSH-scoped tunnel stream. It only ever *answers* a
 channel open, never initiates one (ADR-0013), which is why `-R`, agent
-forwarding and X11 are refused. See PRD §19.3 and ADR-0012.
+forwarding and X11 are refused. See PRD §19.3 and ADR-0012. It degrades **per
+channel**: a machine whose agent cannot serve an attach still serves a shell,
+and only what needs the missing feature is refused, by name (§19.4).
 _Avoid_: sshd, SSH server (implies guest-side), gateway, proxy
 
 **Host key**:
@@ -347,9 +369,11 @@ proxy
 **Diverged machine**:
 A running machine whose guest content no longer matches the template it was
 cloned from, because a vmlab verb deliberately changed it in place — today, only
-the agent repair verb. Divergence is always user-initiated and always reported;
-vmlab never diverges a machine on its own, because the template's sealed
-metadata is otherwise the truth about what a clone contains.
+the **agent repair** verb. Divergence is always user-initiated and always
+reported; vmlab never diverges a machine on its own, because the template's
+sealed metadata is otherwise the truth about what a clone contains. Recorded in
+the lab's own state and forgotten with the disks it lived on, so `destroy` +
+`up` is what puts a machine back on its sealed agent.
 _Avoid_: dirty, modified, patched, drifted (drift implies unnoticed)
 
 **Workspace syncer**:

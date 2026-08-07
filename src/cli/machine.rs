@@ -57,6 +57,9 @@ fn render_capabilities(caps: &Value) -> String {
         ("console log", flag("console_log")),
         ("reboot", flag("reboot")),
         ("healthcheck", flag("healthcheck")),
+        // What this agent can serve, never what your attach will do: the
+        // identity it runs as is declared separately (§19.4).
+        ("attachable", flag("attachable")),
         ("agent", agent.as_str()),
     ] {
         let _ = writeln!(out, "{label:<12} {value}");
@@ -144,6 +147,54 @@ fn human_bytes(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
+/// `vmlab machine repair-agent <machine>` — push the agent this vmlab ships
+/// into a running machine and mark it diverged (§19.4).
+///
+/// Deliberately a verb someone types. The agent enters a machine once, when
+/// its template is built; this changes a running machine in place, so the
+/// report says what landed *and* what the machine now is — a developer who
+/// forgets they ran it should be able to see it in `vmlab status`.
+pub fn cmd_repair_agent(machine_ref: &str, json: bool) -> Result<()> {
+    rt()?.block_on(async {
+        let (lab, machine) = split_vm_ref(machine_ref)?;
+        let (_name, client) = lab_client_for(lab).await?;
+        let report = client
+            .send(LabRequest::MachineRepairAgent { machine })
+            .await
+            .map_err(remote)?;
+        emit(json, &report, render_repair)
+    })
+}
+
+/// What the repair did, and what the machine is now.
+fn render_repair(report: &Value) -> String {
+    use std::fmt::Write as _;
+    let text = |key: &str| report[key].as_str().unwrap_or("?");
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "pushed {} to {} on \"{}\"",
+        text("pushed"),
+        text("installed_at"),
+        text("machine"),
+    );
+    let _ = writeln!(
+        out,
+        "agent  {} answering, attachable {}",
+        text("agent_version"),
+        yes_no(report["attachable"].as_bool().unwrap_or(false)),
+    );
+    // The consequence, not a footnote: this machine no longer matches what it
+    // was built from, and a rebuild is what puts that back.
+    let _ = writeln!(
+        out,
+        "\"{}\" is now diverged from its template — `vmlab vm destroy` + `vmlab up` \
+         puts it back on the sealed agent",
+        text("machine"),
+    );
+    out
+}
+
 /// `vmlab clipboard get <machine>` — the guest clipboard, verbatim on stdout.
 ///
 /// No trailing newline is added, so `vmlab clipboard get a | vmlab clipboard
@@ -195,7 +246,8 @@ pub fn cmd_clipboard_set(machine_ref: &str, text: Option<String>, json: bool) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{human_bytes, render_capabilities, render_stats, usage};
+    use super::{human_bytes, render_capabilities, render_repair, render_stats, usage};
+    use crate::labd::agent_repair::RepairReport;
     use crate::labd::machine::Capabilities;
     use crate::status::MachineKind;
     use serde_json::json;
@@ -212,6 +264,7 @@ mod tests {
             console_log: false,
             reboot: true,
             healthcheck: false,
+            attachable: false,
             agent: vec!["terminal".into(), "exec".into(), "metrics".into()],
         };
         let out = render_capabilities(&serde_json::to_value(caps).unwrap());
@@ -226,6 +279,37 @@ mod tests {
         );
     }
 
+    /// `attachable` is reported beside the probed flags and reads as one:
+    /// a developer asking "can I attach to this?" gets a yes or a no without
+    /// reading the feature list and applying §19.4's rule themselves.
+    #[test]
+    fn capabilities_report_attachable_as_a_flag_of_its_own() {
+        let stale = Capabilities {
+            kind: MachineKind::Vm,
+            display: false,
+            console_log: false,
+            reboot: true,
+            healthcheck: false,
+            attachable: false,
+            agent: vec!["terminal".into(), "exec".into()],
+        };
+        let out = render_capabilities(&serde_json::to_value(&stale).unwrap());
+        assert!(out.contains("attachable   no"), "got:\n{out}");
+
+        let current = Capabilities {
+            attachable: true,
+            agent: vec![
+                "terminal".into(),
+                "exec".into(),
+                "fileops".into(),
+                "tunnel".into(),
+            ],
+            ..stale
+        };
+        let out = render_capabilities(&serde_json::to_value(current).unwrap());
+        assert!(out.contains("attachable   yes"), "got:\n{out}");
+    }
+
     /// No agent answering is a live fact, not a missing field: it reads as a
     /// dash, so "probed and got nothing" cannot be mistaken for "not probed".
     #[test]
@@ -236,11 +320,40 @@ mod tests {
             console_log: true,
             reboot: false,
             healthcheck: true,
+            attachable: false,
             agent: Vec::new(),
         };
         let out = render_capabilities(&serde_json::to_value(caps).unwrap());
         assert!(out.contains("agent        -"), "got:\n{out}");
         assert!(out.contains("kind         container"), "got:\n{out}");
+    }
+
+    /// What a repair says it did — and what the machine now *is*. The
+    /// divergence is the consequence a developer must carry away from running
+    /// it, so it is a line of the report rather than something to go and look
+    /// up (§19.4).
+    #[test]
+    fn a_repair_reports_what_landed_and_that_the_machine_is_now_diverged() {
+        let out = render_repair(
+            &serde_json::to_value(RepairReport {
+                machine: "dev01".into(),
+                pushed: "agent=abc123".into(),
+                installed_at: r"C:\ProgramData\vmlab\vmlab-agent.exe".into(),
+                agent_version: "0.2.0".into(),
+                features: vec!["terminal".into(), "fileops".into(), "tunnel".into()],
+                attachable: true,
+            })
+            .unwrap(),
+        );
+        assert!(out.contains("pushed agent=abc123"), "got:\n{out}");
+        assert!(
+            out.contains(r"C:\ProgramData\vmlab\vmlab-agent.exe"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("agent  0.2.0 answering"), "got:\n{out}");
+        assert!(out.contains("attachable yes"), "got:\n{out}");
+        assert!(out.contains("diverged from its template"), "got:\n{out}");
+        assert!(out.contains("vmlab up"), "the way back is named: {out}");
     }
 
     /// Metrics arrive as bytes; a person reads sizes and a percentage.

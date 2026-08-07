@@ -404,6 +404,20 @@ pub enum MachineCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Push the agent this vmlab ships into a running machine, and mark that
+    /// machine diverged.
+    ///
+    /// A tool, not a policy: the agent normally enters a machine once, when
+    /// its template is built, and this changes the running machine in place so
+    /// the sealed `agent_version` no longer describes it. Nothing does this by
+    /// itself. Rebuilding the template is the other remedy, and the one that
+    /// keeps *same template → same machine* true.
+    RepairAgent {
+        machine: String,
+        /// Emit the raw JSON instead of a report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Guest clipboard access over the agent channel (no guest network involved).
@@ -568,6 +582,7 @@ pub fn run() -> ExitCode {
         Command::Machine { cmd } => match cmd {
             MachineCmd::Capabilities { machine, json } => machine::cmd_capabilities(&machine, json),
             MachineCmd::Stats { machine, json } => machine::cmd_stats(&machine, json),
+            MachineCmd::RepairAgent { machine, json } => machine::cmd_repair_agent(&machine, json),
         },
         Command::Clipboard { cmd } => match cmd {
             ClipboardCmd::Get { machine, json } => machine::cmd_clipboard_get(&machine, json),

@@ -1294,6 +1294,13 @@ impl super::machine::Machine for ContainerInstance {
         self.agent.clear_failure().await;
     }
 
+    /// A container micro-VM's agent is in the initramfs guest asset this host
+    /// installed, not in the image the container declares — so it tracks the
+    /// host's vmlab and cannot go stale (§19.4).
+    fn agent_origin(&self) -> super::machine::AgentOrigin {
+        super::machine::AgentOrigin::HostAsset
+    }
+
     async fn snapshot(&self, name: &str) -> Result<bool> {
         self.take_snapshot(name).await
     }

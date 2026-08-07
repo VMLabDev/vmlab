@@ -361,6 +361,22 @@ pub struct MachineStatus {
     /// normal. Lab-level, like `cached`: whether this is *the* dev machine
     /// depends on what the other machines declare.
     pub dev: Option<DevStatus>,
+    /// This machine's agent can serve an attach right now (§19.4):
+    /// [`crate::attach::attachable`] over the features it advertised at
+    /// handshake, and so `false` for a machine that is down or whose agent
+    /// has not answered. The projection carries it so the console and the
+    /// `dev` verbs do not each re-derive it, and `vmlab dev attach` has one
+    /// thing to wait for.
+    pub attachable: bool,
+    /// A vmlab verb deliberately changed this machine's guest content in
+    /// place, so the template's sealed metadata no longer describes what is
+    /// running (§19.4). Today only `vmlab machine repair-agent` sets it, and
+    /// nothing sets it by itself.
+    ///
+    /// Lab-level, like `cached`: divergence is recorded in the lab's own
+    /// state beside the machine's MACs and snapshot records, and is forgotten
+    /// with the artefacts a `destroy` removes.
+    pub agent_diverged: bool,
     #[serde(flatten)]
     pub detail: MachineDetail,
 }
@@ -586,7 +602,17 @@ pub(crate) mod fixtures {
             web: Vec::new(),
             cached: true,
             dev: None,
+            attachable: false,
+            agent_diverged: false,
             detail,
+        }
+    }
+
+    /// The same machine, with an agent that can serve an attach (§19.4).
+    pub(crate) fn attachable(machine: MachineStatus) -> MachineStatus {
+        MachineStatus {
+            attachable: true,
+            ..machine
         }
     }
 
@@ -802,6 +828,41 @@ mod tests {
         // No dev machine at all is the ordinary case, and answers cleanly.
         let plain = lab(vec![machine("dc01", PowerState::Running, true, vm())]);
         assert_eq!(plain.dev_machines().count(), 0);
+    }
+
+    /// `attachable` travels on the projection every surface already reads
+    /// (§19.4), so the console and the `dev` verbs do not each re-derive it —
+    /// and it is a per-machine answer, not a lab-wide one.
+    #[test]
+    fn the_projection_carries_attachable_per_machine() {
+        let status = lab(vec![
+            attachable(machine("dev01", PowerState::Running, true, vm())),
+            machine("stale", PowerState::Running, true, vm()),
+            machine("dc01", PowerState::Stopped, false, vm()),
+        ]);
+        assert!(status.machines[0].attachable);
+        // Running, ready, perfectly good — and still not attachable.
+        assert!(!status.machines[1].attachable);
+        assert_eq!(status.machines[1].label.text, "running");
+        assert!(!status.machines[2].attachable);
+
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["machines"][0]["attachable"], true);
+        assert_eq!(json["machines"][1]["attachable"], false);
+    }
+
+    /// Divergence is reported wherever machine state is (§19.4), and defaults
+    /// to the ordinary answer: nothing has changed this machine in place.
+    #[test]
+    fn the_projection_reports_a_diverged_machine() {
+        let mut diverged = machine("dev01", PowerState::Running, true, vm());
+        assert!(!diverged.agent_diverged, "nothing diverges by itself");
+        diverged.agent_diverged = true;
+        let status = lab(vec![diverged]);
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["machines"][0]["agent_diverged"], true);
+        let back: LabStatus = serde_json::from_value(json).unwrap();
+        assert!(back.machines[0].agent_diverged);
     }
 
     /// The wire shape: kind-specific fields sit alongside the common ones under

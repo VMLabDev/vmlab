@@ -76,6 +76,7 @@ export type LabCommand =
   | "machine.osinfo"
   | "machine.tty_open"
   | "machine.ssh_open"
+  | "machine.repair_agent"
   | "machine.tty_resize"
   | "machine.push_file"
   | "machine.pull_file"

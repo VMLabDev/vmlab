@@ -78,10 +78,39 @@ pub struct Capabilities {
     /// The machine declares a healthcheck, so [`Machine::health`] carries a
     /// verdict rather than only "is it ready".
     pub healthcheck: bool,
-    /// Agent features negotiated at handshake (`terminal`, `exec`, `file`,
-    /// `tail`, `metrics`, `clipboard`, `eventlog`). Empty when no agent is
-    /// answering — which is a live fact, not a property of the kind.
+    /// Agent features negotiated at handshake (`terminal`, `exec`, `fileops`,
+    /// `tail`, `metrics`, `clipboard`, `eventlog`, `tunnel`, `watch`). Empty
+    /// when no agent is answering — which is a live fact, not a property of
+    /// the kind.
     pub agent: Vec<String>,
+    /// This agent can serve an attach (§19.4): exactly `tunnel` and `fileops`,
+    /// both present. Never a promise that *your* attach will succeed —
+    /// identity is declared separately (§19.2) — and computed over the probed
+    /// features above rather than inferred from the kind
+    /// ([`crate::attach::attachable`]).
+    pub attachable: bool,
+}
+
+/// Where a machine's vmlab-agent came from — and so whether pushing the
+/// host's shipped binary into it means anything (PRD §19.4).
+///
+/// A capability, not a kind: the repair verb asks this rather than asking
+/// whether it is holding a container, so a future machine whose agent also
+/// ships with the host is answered correctly without a line changing in the
+/// verb (ADR-0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOrigin {
+    /// Sealed into the machine's own artefact at build time (§6.1, §7.4). It
+    /// is whatever that build baked, it *can* go stale, and the repair verb
+    /// exists so picking up an agent change does not cost a 15–45 minute
+    /// Windows rebuild.
+    Image,
+    /// Shipped with this host's vmlab and loaded at boot — a container
+    /// micro-VM's agent lives in the initramfs guest asset. It tracks the
+    /// host's installed vmlab and cannot go stale, so there is nothing to
+    /// repair: refreshing it means reinstalling the guest asset.
+    HostAsset,
 }
 
 /// What booting a machine needs from the lab around it.
@@ -332,6 +361,14 @@ pub trait Machine: Send + Sync + 'static {
     /// another task may be using.
     async fn clear_agent_failure(&self) {}
 
+    /// Where this machine's agent came from (§19.4). The default is the
+    /// ordinary case — an agent sealed into whatever the machine boots — so a
+    /// machine whose agent ships with the host says so rather than every other
+    /// machine having to say it does not.
+    fn agent_origin(&self) -> AgentOrigin {
+        AgentOrigin::Image
+    }
+
     /// Whether the agent answers a ping *right now* — unlike the sticky
     /// [`is_agent_up`](Machine::is_agent_up) this goes false mid-reboot.
     async fn agent_answering(&self) -> bool;
@@ -543,17 +580,29 @@ impl dyn Machine {
     /// Agent features come from a live handshake, so a machine that is up but
     /// not yet answering reports an empty list rather than a guess.
     pub async fn capabilities(self: &Arc<Self>) -> Capabilities {
-        let agent = match self.agent().await {
-            Ok(handle) => handle.info().features,
-            Err(_) => Vec::new(),
-        };
+        let agent = self.agent_features().await;
         Capabilities {
             kind: self.kind(),
             display: self.clone().display().is_some(),
             console_log: self.console_log(1).is_some(),
             reboot: self.can_reboot(),
             healthcheck: self.has_healthcheck(),
+            attachable: crate::attach::attachable(&agent),
             agent,
+        }
+    }
+
+    /// What this machine's agent advertised at handshake, or nothing at all
+    /// when none is answering — which is a live fact about the machine, not a
+    /// property of its kind.
+    ///
+    /// One probe behind both `attachable` answers ([`Capabilities`] and
+    /// [`MachineStatus`]), so the two can never disagree about the same
+    /// machine.
+    pub async fn agent_features(self: &Arc<Self>) -> Vec<String> {
+        match self.agent().await {
+            Ok(handle) => handle.info().features,
+            Err(_) => Vec::new(),
         }
     }
 
@@ -606,6 +655,10 @@ impl dyn Machine {
             // default dev machine depends on what the rest of the lab
             // declares, so `LabRuntime::status` fills this in (§19.1).
             dev: None,
+            attachable: crate::attach::attachable(&self.agent_features().await),
+            // Lab-level too: divergence is recorded in the lab's persisted
+            // state, which the machine does not hold (§19.4).
+            agent_diverged: false,
             detail,
         }
     }

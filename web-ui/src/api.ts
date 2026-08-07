@@ -147,6 +147,10 @@ export interface Capabilities {
   display: boolean;
   console_log: boolean;
   reboot: boolean;
+  /** This machine's agent can serve an attach (PRD §19.4): `tunnel` and
+   *  `fileops` both present. Never a promise that a given attach will
+   *  succeed — identity is declared separately. */
+  attachable: boolean;
   agent: string[];
 }
 export const machineCapabilities = (

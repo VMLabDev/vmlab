@@ -1689,6 +1689,8 @@ mod tests {
                     web: Vec::new(),
                     cached: true,
                     dev: None,
+                    attachable: false,
+                    agent_diverged: false,
                     detail,
                 }
             })
