@@ -20,8 +20,13 @@ PRD implemented (M1–M6). **§19 (Dev machines) is partly built** — the
 workspace syncer's later halves are spec only; implementation is tracked by
 #78–#98. The **workspace syncer's host-canonical half** (#93) is built: the
 ledger, the layered ignores, the size guard, the host watcher's per-path
-debounce and temp-then-rename applies as the machine's default login.
-Guest→host (#94), the Windows preconditions (#95), the conflict halt and its
+debounce and temp-then-rename applies as the machine's default login. So are
+the **Windows preconditions** (#95): the NTFS case-sensitivity flag on every
+directory the syncer creates including the workspace root, the collision
+refused by name where the flag cannot be set, the symlink attempted and warned
+about, the guest's `core.autocrlf` turned off, and the two degradations an
+`elevated = false` login brings, said up front.
+Guest→host (#94), the conflict halt and its
 verbs (#96) and snapshot bracketing (#97) are still spec. The `@dev`
 declaration (#80) and all
 three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
@@ -134,9 +139,10 @@ Module map under `src/`:
   ignore rules (`ignore.rs`), the host-side sync ledger (`ledger.rs`), the
   reconciliation as a value (`plan.rs`), the two sides' scans (`scan.rs`)
   over the one guest-side seam (`guest.rs`), temp-then-rename applies
-  (`apply.rs`), the host watcher and its per-path debounce (`watcher.rs`) and
-  the lab-daemon-owned loop (`syncer.rs`), which is the one piece of vmlab's
-  machinery running as the machine's default login.
+  (`apply.rs`), the host watcher and its per-path debounce (`watcher.rs`),
+  §19.6's three Windows actions as a value computed before the loop
+  (`windows.rs`) and the lab-daemon-owned loop (`syncer.rs`), which is the one
+  piece of vmlab's machinery running as the machine's default login.
   Decisions the runtime used to make mid-flight are values computed before
   execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
   transports, gateway rules, the smbd port), `forward_plan.rs` (every port

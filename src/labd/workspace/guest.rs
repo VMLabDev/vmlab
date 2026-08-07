@@ -30,7 +30,18 @@ pub trait GuestFs: Send + Sync {
     /// The guest's own SHA-256 of what is on its disk.
     async fn digest(&self, path: &str) -> Result<String>;
     /// Create a directory, treating an existing one as success.
+    ///
+    /// `case_sensitive` is §19.6's NTFS flag, which takes only while the
+    /// directory is empty — so it rides the creation, per directory, and
+    /// inheritance is never relied on.
     async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()>;
+    /// Create the workspace root, and any missing parent above it.
+    ///
+    /// The root is a directory the syncer creates, so it carries the flag like
+    /// every other one — without it the files at the top of the tree land in
+    /// the one directory nobody set it on. Its parents are not the workspace
+    /// and get nothing.
+    async fn mkdir_root(&self, path: &str, case_sensitive: bool) -> Result<()>;
     /// Send a host file's bytes to `remote`, verified against the guest's own
     /// digest of what landed.
     async fn push(&self, local: &Path, remote: &str) -> Result<()>;
@@ -61,6 +72,15 @@ impl GuestFs for FileOps {
         FileOps::mkdir(self, path, case_sensitive).await
     }
 
+    async fn mkdir_root(&self, path: &str, case_sensitive: bool) -> Result<()> {
+        // Deliberately not `mkdir_p` on the root itself: that would create the
+        // leaf without the flag, in the one window NTFS would have taken it.
+        if let Some(parent) = guest_parent(path) {
+            FileOps::mkdir_p(self, parent).await?;
+        }
+        FileOps::mkdir(self, path, case_sensitive).await
+    }
+
     async fn push(&self, local: &Path, remote: &str) -> Result<()> {
         FileOps::push(self, local, remote, None).await.map(|_| ())
     }
@@ -82,6 +102,15 @@ impl GuestFs for FileOps {
     }
 }
 
+/// The directory a guest path sits in, in whichever separator it came with.
+/// `None` where there is nothing above it to create — a Unix root, a Windows
+/// drive root, or a bare relative name.
+fn guest_parent(path: &str) -> Option<&str> {
+    let cut = path.rfind(['/', '\\'])?;
+    let parent = &path[..cut];
+    (!parent.is_empty() && !parent.ends_with(':')).then_some(parent)
+}
+
 /// A shared handle is a guest session too. Without this every holder of an
 /// `Arc<FakeGuest>` (or of a pooled real session) would hand-write nine
 /// forwarding methods to say nothing.
@@ -98,6 +127,9 @@ impl<T: GuestFs + ?Sized> GuestFs for std::sync::Arc<T> {
     }
     async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
         (**self).mkdir(path, case_sensitive).await
+    }
+    async fn mkdir_root(&self, path: &str, case_sensitive: bool) -> Result<()> {
+        (**self).mkdir_root(path, case_sensitive).await
     }
     async fn push(&self, local: &Path, remote: &str) -> Result<()> {
         (**self).push(local, remote).await
@@ -121,7 +153,7 @@ impl<T: GuestFs + ?Sized> GuestFs for std::sync::Arc<T> {
 #[cfg(test)]
 pub mod fake {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
     use anyhow::{Result, anyhow, bail};
@@ -150,6 +182,50 @@ pub mod fake {
         fail_push: Vec<String>,
         /// Paths the guest refuses to be read at all.
         unreadable: Vec<String>,
+        /// This guest's filesystem folds case, like a default NTFS volume:
+        /// two names differing only in case are one object — **except** in a
+        /// directory that was created with §19.6's flag.
+        folding: bool,
+        /// Directories created with the flag. Per directory, because that is
+        /// how NTFS carries it and because inheritance must not be relied on.
+        case_sensitive: BTreeSet<String>,
+        /// The guest will not take the flag at all: a filesystem with no
+        /// concept of it, or a Windows build without the component.
+        refuse_case_flag: bool,
+        /// …or will not take it at these directories only, which is what the
+        /// machine-wide probe cannot see coming.
+        refuse_case_flag_at: Vec<String>,
+        /// The guest cannot create symlinks — a non-elevated Windows login, or
+        /// an image §19.4's precondition does not hold for.
+        refuse_symlinks: bool,
+        /// Commands run against this guest, in order — the Windows
+        /// preconditions' one use of anything but the file seam.
+        commands: Vec<Vec<String>>,
+        /// How many of the next commands fail, standing in for a guest whose
+        /// `provision {}` has not installed git yet.
+        fail_runs: usize,
+    }
+
+    /// Which node a path names on this guest. On a folding guest a path whose
+    /// directory does not carry the flag lands on whatever is already there
+    /// under any casing; everywhere else the path is itself.
+    fn resolve(guest: &Guest, path: &str) -> String {
+        if !guest.folding {
+            return path.to_string();
+        }
+        let parent = match path.rfind('/') {
+            Some(cut) => &path[..cut],
+            None => "",
+        };
+        if guest.case_sensitive.contains(parent) {
+            return path.to_string();
+        }
+        guest
+            .nodes
+            .keys()
+            .find(|held| held.eq_ignore_ascii_case(path))
+            .cloned()
+            .unwrap_or_else(|| path.to_string())
     }
 
     /// A fake guest filesystem. Paths are whatever the caller passes, so the
@@ -227,6 +303,69 @@ pub mod fake {
                 .unreadable
                 .push(path.to_string());
         }
+
+        /// This guest's filesystem folds case, like a default NTFS volume.
+        pub fn folding(&self) -> &FakeGuest {
+            self.inner.lock().expect("fake guest").folding = true;
+            self
+        }
+
+        /// …and will not take the case-sensitivity flag either.
+        pub fn refuse_case_flag(&self) -> &FakeGuest {
+            self.inner.lock().expect("fake guest").refuse_case_flag = true;
+            self
+        }
+
+        /// …or will not take it at this one directory, which is the case the
+        /// machine-wide probe cannot see coming.
+        pub fn refuse_case_flag_at(&self, path: &str) -> &FakeGuest {
+            self.inner
+                .lock()
+                .expect("fake guest")
+                .refuse_case_flag_at
+                .push(path.to_string());
+            self
+        }
+
+        /// This guest cannot create symlinks.
+        pub fn refuse_symlinks(&self) -> &FakeGuest {
+            self.inner.lock().expect("fake guest").refuse_symlinks = true;
+            self
+        }
+
+        /// Record a command run against this guest, answering whether it
+        /// succeeded.
+        pub fn ran(&self, argv: Vec<String>) -> bool {
+            let mut guest = self.inner.lock().expect("fake guest");
+            guest.commands.push(argv);
+            match guest.fail_runs.checked_sub(1) {
+                Some(left) => {
+                    guest.fail_runs = left;
+                    false
+                }
+                None => true,
+            }
+        }
+
+        /// The next `n` commands fail — a guest git has not reached yet.
+        pub fn fail_runs(&self, n: usize) -> &FakeGuest {
+            self.inner.lock().expect("fake guest").fail_runs = n;
+            self
+        }
+
+        /// Every command run against this guest, in order.
+        pub fn commands(&self) -> Vec<Vec<String>> {
+            self.inner.lock().expect("fake guest").commands.clone()
+        }
+
+        /// Whether the directory at `path` was created case-sensitive.
+        pub fn is_case_sensitive(&self, path: &str) -> bool {
+            self.inner
+                .lock()
+                .expect("fake guest")
+                .case_sensitive
+                .contains(path)
+        }
     }
 
     #[async_trait]
@@ -236,7 +375,7 @@ pub mod fake {
             if guest.unreadable.iter().any(|p| p == path) {
                 bail!("permission denied: {path}");
             }
-            let Some((node, mtime_ns)) = guest.nodes.get(path) else {
+            let Some((node, mtime_ns)) = guest.nodes.get(&resolve(&guest, path)) else {
                 return Ok(None);
             };
             let (kind, size) = match node {
@@ -267,20 +406,35 @@ pub mod fake {
             if guest.unreadable.iter().any(|p| p == path) {
                 bail!("permission denied: {path}");
             }
-            match guest.nodes.get(path) {
+            match guest.nodes.get(&resolve(&guest, path)) {
                 Some((Node::File(bytes), _)) => Ok(hex::encode(Sha256::digest(bytes))),
                 _ => Err(anyhow!("no such file: {path}")),
             }
         }
 
-        async fn mkdir(&self, path: &str, _case_sensitive: bool) -> Result<()> {
+        async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
             let mut guest = self.inner.lock().expect("fake guest");
             guest.writes.push(path.to_string());
-            guest
-                .nodes
-                .entry(path.to_string())
-                .or_insert((Node::Dir, 0));
+            let refused =
+                guest.refuse_case_flag || guest.refuse_case_flag_at.iter().any(|p| p == path);
+            if case_sensitive && refused {
+                // As a real guest does: the directory is there and the flag
+                // is not, which is why the host has to fall back rather than
+                // assume either.
+                let key = resolve(&guest, path);
+                guest.nodes.entry(key).or_insert((Node::Dir, 0));
+                bail!("this guest cannot make a directory case-sensitive: {path}");
+            }
+            let key = resolve(&guest, path);
+            guest.nodes.entry(key).or_insert((Node::Dir, 0));
+            if case_sensitive {
+                guest.case_sensitive.insert(path.to_string());
+            }
             Ok(())
+        }
+
+        async fn mkdir_root(&self, path: &str, case_sensitive: bool) -> Result<()> {
+            GuestFs::mkdir(self, path, case_sensitive).await
         }
 
         async fn push(&self, local: &Path, remote: &str) -> Result<()> {
@@ -291,40 +445,48 @@ pub mod fake {
                 guest.fail_push.remove(at);
                 bail!("the channel dropped while pushing {remote}");
             }
-            guest
-                .nodes
-                .insert(remote.to_string(), (Node::File(bytes), 9));
+            let key = resolve(&guest, remote);
+            guest.nodes.insert(key, (Node::File(bytes), 9));
             Ok(())
         }
 
         async fn symlink(&self, target: &str, link: &str, _kind: LinkKind) -> Result<()> {
             let mut guest = self.inner.lock().expect("fake guest");
             guest.writes.push(link.to_string());
-            if guest.nodes.contains_key(link) {
+            if guest.refuse_symlinks {
+                bail!("a required privilege is not held by the client: {link}");
+            }
+            let key = resolve(&guest, link);
+            if guest.nodes.contains_key(&key) {
                 bail!("already exists: {link}");
             }
             guest
                 .nodes
-                .insert(link.to_string(), (Node::Symlink(target.to_string()), 9));
+                .insert(key, (Node::Symlink(target.to_string()), 9));
             Ok(())
         }
 
         async fn rename(&self, from: &str, to: &str) -> Result<()> {
             let mut guest = self.inner.lock().expect("fake guest");
-            let Some(node) = guest.nodes.remove(from) else {
+            let from = resolve(&guest, from);
+            let Some(node) = guest.nodes.remove(&from) else {
                 bail!("no such file: {from}");
             };
-            guest.nodes.insert(to.to_string(), node);
+            let to = resolve(&guest, to);
+            guest.nodes.insert(to, node);
             Ok(())
         }
 
         async fn remove(&self, path: &str) -> Result<()> {
-            self.inner.lock().expect("fake guest").nodes.remove(path);
+            let mut guest = self.inner.lock().expect("fake guest");
+            let key = resolve(&guest, path);
+            guest.nodes.remove(&key);
             Ok(())
         }
 
         async fn rmdir(&self, path: &str) -> Result<()> {
             let mut guest = self.inner.lock().expect("fake guest");
+            let path = resolve(&guest, path);
             let under = format!("{path}/");
             if guest.nodes.keys().any(|p| p.starts_with(&under)) {
                 // What a real guest answers when the directory still holds
@@ -334,7 +496,8 @@ pub mod fake {
                     msg: format!("directory not empty: {path}"),
                 }));
             }
-            guest.nodes.remove(path);
+            guest.nodes.remove(&path);
+            guest.case_sensitive.remove(&path);
             Ok(())
         }
     }

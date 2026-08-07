@@ -44,6 +44,7 @@ use super::ledger::Ledger;
 use super::plan::{Inputs, reconcile};
 use super::scan::{host_scan, probe_guest};
 use super::watcher::{Debounce, HostEvent, HostWatch, QUIET};
+use super::windows::{GuestRun, Learned, Preconditions, prepare_root, set_line_endings};
 use crate::labd::events::EventLog;
 
 /// How long to wait before retrying a pass that could not reach the guest.
@@ -63,13 +64,20 @@ pub struct Workspace {
     pub ledger_path: PathBuf,
     /// The size guard's per-file cap.
     pub max_file_bytes: u64,
+    /// What this guest costs the syncer (§19.6), resolved from the
+    /// declaration before the loop starts so no pass has to ask "am I on
+    /// Windows?" — and so the two degradations a non-elevated login brings are
+    /// said **up front** rather than discovered at a random path hours in.
+    pub preconditions: Preconditions,
 }
 
 /// How the syncer reaches a guest. A trait rather than a machine handle
-/// because what the syncer needs is exactly "a file session as the default
-/// login", and nothing else about a machine.
+/// because what the syncer needs of one is exactly two things and nothing
+/// else about a machine: a file session as the default login, which is the
+/// whole sync loop, and — through [`GuestRun`] — the one command §19.6's
+/// Windows preconditions run before it.
 #[async_trait]
-pub trait GuestSessions: Send + Sync {
+pub trait GuestSessions: GuestRun {
     /// Open a file session as the machine's **default login**.
     async fn open(&self) -> Result<Box<dyn GuestFs>>;
 }
@@ -145,6 +153,18 @@ async fn run(
         &workspace.host_root,
         &workspace.guest_root,
     );
+    // Before anything else, and before any of it can fail at a random path:
+    // the two ways a non-elevated Windows login degrades the workspace.
+    for degradation in workspace.preconditions.degradations() {
+        events.emit(
+            "workspace.degraded",
+            json!({"machine": workspace.machine, "reason": degradation}),
+        );
+    }
+    // What the declaration says, corrected by what the guest actually does —
+    // which every pass gets the chance to correct, because a machine still
+    // provisioning is the normal state to find rather than one to give up on.
+    let mut learned = Learned::from(workspace.preconditions);
     // The watcher outlives individual passes: stopping it would guarantee a
     // full rescan on the next one, and the pending set is what keeps the
     // window small.
@@ -176,6 +196,7 @@ async fn run(
                 &watch,
                 &debounce,
                 &mut ledger,
+                &mut learned,
             )
             .await
             {
@@ -234,6 +255,71 @@ async fn sleep_for(wake: Option<Duration>) {
     }
 }
 
+/// §19.6's Windows actions, ahead of the pass that depends on them.
+///
+/// **Before the plan, not after the applies.** Whether this guest will really
+/// make a directory case-sensitive is what decides whether a case collision is
+/// an ordinary pair of paths or a refusal, and a syncer that discovered the
+/// answer from a failed `mkdir` halfway through would already have landed one
+/// of the pair on top of the other. So the workspace root is prepared and the
+/// flag is probed first, and the plan is computed from what came back.
+///
+/// The line-ending setting is attempted every pass until it takes, because a
+/// machine whose git arrives later in `provision {}` is the normal case and
+/// giving up once would leave the tree quietly converting for the life of the
+/// machine. Its warning is said once, not once a pass.
+async fn preconditions(
+    workspace: &Workspace,
+    sessions: &dyn GuestSessions,
+    guest: &dyn GuestFs,
+    events: &EventLog,
+    learned: &mut Learned,
+) -> Result<()> {
+    let available = prepare_root(
+        guest,
+        &workspace.guest_root,
+        workspace.preconditions.case_sensitive_dirs,
+    )
+    .await?;
+    if available != learned.case_sensitive_dirs {
+        learned.case_sensitive_dirs = available;
+        if !available {
+            events.emit(
+                "workspace.degraded",
+                json!({
+                    "machine": workspace.machine,
+                    "path": workspace.guest_root,
+                    "reason": "this guest will not make a directory case-sensitive, so two host \
+                               paths differing only in case cannot both land and are refused by \
+                               name",
+                }),
+            );
+        }
+    }
+
+    if !learned.line_endings_off {
+        match set_line_endings(sessions).await {
+            None => learned.line_endings_off = true,
+            Some(why) if !learned.line_endings_said => {
+                learned.line_endings_said = true;
+                events.emit(
+                    "workspace.degraded",
+                    json!({
+                        "machine": workspace.machine,
+                        "reason": format!(
+                            "the guest's line-ending conversion is not off yet, so a guest-side \
+                             checkout would rewrite the whole tree to CRLF and sync every file \
+                             back as modified — retried every pass until it takes: {why}"
+                        ),
+                    }),
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// One reconciliation, end to end.
 async fn pass(
     workspace: &Workspace,
@@ -242,11 +328,13 @@ async fn pass(
     watch: &HostWatch,
     debounce: &Debounce,
     ledger: &mut Ledger,
+    learned: &mut Learned,
 ) -> Result<()> {
     let guest = sessions
         .open()
         .await
         .context("opening a file session as the machine's default login")?;
+    preconditions(workspace, sessions, guest.as_ref(), events, learned).await?;
 
     let root = workspace.host_root.clone();
     let scan_ledger = ledger.clone();
@@ -308,6 +396,7 @@ async fn pass(
         undecided: &undecided,
         guest_owned: &guest_owned,
         max_file_bytes: workspace.max_file_bytes,
+        case_folding: learned.case_folding(),
     });
 
     // Before the transfer, always, and naming the file and both ways out.
@@ -320,6 +409,22 @@ async fn pass(
                 "size": refusal.size,
                 "cap": refusal.cap,
                 "reason": refusal.to_string(),
+            }),
+        );
+    }
+    // Refuse-at-seed, loudly, naming every path: where the case-sensitivity
+    // flag could not be set, a collision is the one thing that must never be
+    // allowed to happen quietly.
+    // Its own event rather than the size guard's: the two refusals name
+    // different things and offer different ways out, and one payload shape
+    // that sometimes has a `size` is how a surface ends up sniffing keys.
+    for collision in &plan.collisions {
+        events.emit(
+            "workspace.case_collision",
+            json!({
+                "machine": workspace.machine,
+                "paths": collision.paths,
+                "reason": collision.to_string(),
             }),
         );
     }
@@ -358,10 +463,7 @@ async fn pass(
         &Target {
             host_root: workspace.host_root.clone(),
             guest_root: workspace.guest_root.clone(),
-            // The Windows preconditions — the case-sensitivity flag, the
-            // symlink warning, the guest's line-ending setting — are their
-            // own ticket; the flag rides this one value when they land.
-            case_sensitive_dirs: false,
+            case_sensitive_dirs: learned.case_sensitive_dirs,
         },
         &plan,
         ledger,
@@ -377,6 +479,25 @@ async fn pass(
                 "reason": "the host dropped this directory, but the guest still holds its own \
                            content in it",
             }),
+        );
+    }
+    // Attempted, and named where it did not take: §19.4 makes a
+    // symlink-capable image a precondition, and vmlab does not work around it
+    // silently.
+    for refused in &applied.symlinks_refused {
+        events.emit(
+            "workspace.symlink_refused",
+            json!({"machine": workspace.machine, "path": refused.path, "reason": refused.why}),
+        );
+    }
+    // One directory the guest would not take the flag on, where the probe
+    // said it would. Rare enough to be worth naming individually — the
+    // machine-wide answer was already settled before the plan.
+    for degraded in &applied.case_insensitive_dirs {
+        learned.case_sensitive_dirs = false;
+        events.emit(
+            "workspace.degraded",
+            json!({"machine": workspace.machine, "path": degraded.path, "reason": degraded.why}),
         );
     }
     for failure in &applied.failures {
@@ -428,6 +549,21 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl GuestRun for OneFake {
+        async fn run(&self, argv: Vec<String>) -> Result<super::super::windows::Ran> {
+            let ok = self.0.ran(argv);
+            Ok(super::super::windows::Ran {
+                exit_code: if ok { 0 } else { 127 },
+                stderr: if ok {
+                    String::new()
+                } else {
+                    "'git' is not recognized".into()
+                },
+            })
+        }
+    }
+
     fn workspace(dir: &std::path::Path, lab_local: &std::path::Path) -> Workspace {
         Workspace {
             machine: "dev01".into(),
@@ -435,7 +571,37 @@ mod tests {
             guest_root: "/src".into(),
             ledger_path: Ledger::path(lab_local, "dev01"),
             max_file_bytes: 1 << 30,
+            preconditions: Preconditions::default(),
         }
+    }
+
+    /// The same, on a machine whose guest family and login make §19.6's three
+    /// Windows actions apply.
+    fn windows_workspace(
+        dir: &std::path::Path,
+        lab_local: &std::path::Path,
+        windows: Preconditions,
+    ) -> Workspace {
+        Workspace {
+            preconditions: windows,
+            ..workspace(dir, lab_local)
+        }
+    }
+
+    /// Every event the lab emitted, as `(name, data)`.
+    fn events_of(state: &std::path::Path) -> Vec<(String, serde_json::Value)> {
+        let path = state.join("events.jsonl");
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .map(|ev| {
+                (
+                    ev["event"].as_str().unwrap_or_default().to_string(),
+                    ev["data"].clone(),
+                )
+            })
+            .collect()
     }
 
     /// Wait for a predicate to hold, so the test asserts on the syncer's
@@ -522,8 +688,16 @@ mod tests {
         let ledger = Ledger::load(&path, dir.path(), "/src");
         assert!(ledger.entries.contains_key("a.txt"));
 
-        // Restarting writes nothing new: both sides are already agreed.
-        let before = guest.writes().len();
+        // Restarting places nothing new: both sides are already agreed. Only
+        // the temp names count — the root is re-asserted every pass, which is
+        // one idempotent `mkdir` rather than a transfer.
+        let placed = |writes: Vec<String>| {
+            writes
+                .into_iter()
+                .filter(|w| w.contains(".vmlab-sync."))
+                .count()
+        };
+        let before = placed(guest.writes());
         syncers
             .start(
                 workspace(dir.path(), state.path()),
@@ -534,9 +708,323 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         syncers.stop("dev01").await;
         assert_eq!(
-            guest.writes().len(),
+            placed(guest.writes()),
             before,
             "a settled workspace re-pushed"
+        );
+    }
+
+    /// §19.6's third Windows action: git for Windows ships `core.autocrlf`
+    /// on, which would rewrite the whole tree on the first guest-side
+    /// checkout and sync every file back as modified.
+    #[tokio::test]
+    async fn a_windows_workspace_turns_the_guests_line_ending_conversion_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(
+                windows_workspace(
+                    dir.path(),
+                    state.path(),
+                    Preconditions {
+                        windows: true,
+                        case_sensitive_dirs: true,
+                        symlinks: true,
+                    },
+                ),
+                Arc::new(OneFake(guest.clone())),
+                events,
+            )
+            .await;
+
+        let set = {
+            let guest = guest.clone();
+            eventually(move || !guest.commands().is_empty()).await
+        };
+        assert!(set, "the guest's git config was never touched");
+        syncers.stop("dev01").await;
+        assert_eq!(
+            guest.commands(),
+            vec![
+                super::super::windows::GIT_LINE_ENDINGS
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+            ],
+            "once, and nothing else"
+        );
+    }
+
+    /// A guest whose git arrives later in `provision {}` is the normal case,
+    /// not a failure to give up on: the setting is retried until it takes,
+    /// and warned about **once** rather than once a pass.
+    #[tokio::test]
+    async fn the_line_ending_setting_is_retried_until_it_takes_and_warned_about_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        guest.fail_runs(1);
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(
+                windows_workspace(
+                    dir.path(),
+                    state.path(),
+                    Preconditions {
+                        windows: true,
+                        case_sensitive_dirs: true,
+                        symlinks: true,
+                    },
+                ),
+                Arc::new(OneFake(guest.clone())),
+                events,
+            )
+            .await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/a.txt").is_some()).await
+        };
+        assert!(seeded);
+
+        // A second pass, which is where the retry happens.
+        std::fs::write(dir.path().join("a.txt"), "again").unwrap();
+        let retried = {
+            let guest = guest.clone();
+            eventually(move || guest.commands().len() >= 2).await
+        };
+        assert!(retried, "the setting was attempted once and abandoned");
+        // A third pass must not attempt it a third time: it took.
+        std::fs::write(dir.path().join("a.txt"), "and again").unwrap();
+        let followed = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/a.txt").as_deref() == Some("and again")).await
+        };
+        assert!(followed);
+        syncers.stop("dev01").await;
+
+        assert_eq!(guest.commands().len(), 2, "it kept trying after it took");
+        assert_eq!(
+            events_of(state.path())
+                .iter()
+                .filter(|(name, _)| name == "workspace.degraded")
+                .count(),
+            1,
+            "warned once a pass rather than once"
+        );
+    }
+
+    /// A Linux guest costs none of the three: no flag to ask for, no
+    /// privilege to warn about, and git converts nothing.
+    #[tokio::test]
+    async fn a_linux_workspace_runs_no_guest_commands_and_reports_no_degradation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(
+                workspace(dir.path(), state.path()),
+                Arc::new(OneFake(guest.clone())),
+                events,
+            )
+            .await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/a.txt").is_some()).await
+        };
+        assert!(seeded);
+        syncers.stop("dev01").await;
+
+        assert_eq!(guest.commands(), Vec::<Vec<String>>::new());
+        assert!(
+            !events_of(state.path())
+                .iter()
+                .any(|(name, _)| name == "workspace.degraded")
+        );
+    }
+
+    /// **Up front, before either can fail at a random path hours in**: a
+    /// login declared `elevated = false` degrades the workspace in exactly
+    /// two named ways, and the syncer says both before its first pass.
+    #[tokio::test]
+    async fn a_non_elevated_login_reports_both_degradations_before_it_syncs_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(
+                windows_workspace(
+                    dir.path(),
+                    state.path(),
+                    Preconditions {
+                        windows: true,
+                        case_sensitive_dirs: false,
+                        symlinks: false,
+                    },
+                ),
+                Arc::new(OneFake(guest.clone())),
+                events,
+            )
+            .await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/a.txt").is_some()).await
+        };
+        assert!(seeded);
+        syncers.stop("dev01").await;
+
+        let emitted = events_of(state.path());
+        let degraded: Vec<&serde_json::Value> = emitted
+            .iter()
+            .filter(|(name, _)| name == "workspace.degraded")
+            .map(|(_, data)| data)
+            .collect();
+        assert_eq!(degraded.len(), 2, "{emitted:?}");
+        let said = format!("{degraded:?}");
+        assert!(said.contains("case-sensitive"), "{said}");
+        assert!(said.contains("symlink"), "{said}");
+
+        // And before anything was synced, not after it broke.
+        let first_sync = emitted
+            .iter()
+            .position(|(name, _)| name == "workspace.synced")
+            .expect("nothing synced");
+        let last_degraded = emitted
+            .iter()
+            .rposition(|(name, _)| name == "workspace.degraded")
+            .expect("nothing degraded");
+        assert!(last_degraded < first_sync, "reported after the fact");
+    }
+
+    /// The refusal that stands in for the flag, end to end: two paths
+    /// differing only in case reach the developer by name, and neither copy
+    /// is written.
+    #[tokio::test]
+    async fn a_case_collision_reaches_the_developer_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Foo.cs"), "upper").unwrap();
+        std::fs::write(dir.path().join("foo.cs"), "lower").unwrap();
+        std::fs::write(dir.path().join("ok.cs"), "fine").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        guest.folding();
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(
+                windows_workspace(
+                    dir.path(),
+                    state.path(),
+                    Preconditions {
+                        windows: true,
+                        case_sensitive_dirs: false,
+                        symlinks: false,
+                    },
+                ),
+                Arc::new(OneFake(guest.clone())),
+                events,
+            )
+            .await;
+        let landed = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/ok.cs").is_some()).await
+        };
+        assert!(landed, "the rest of the tree never arrived");
+        syncers.stop("dev01").await;
+
+        let refused: Vec<serde_json::Value> = events_of(state.path())
+            .into_iter()
+            .filter(|(name, _)| name == "workspace.case_collision")
+            .map(|(_, data)| data)
+            .collect();
+        assert!(!refused.is_empty(), "the collision was silent");
+        let said = refused[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(said.contains("Foo.cs") && said.contains("foo.cs"), "{said}");
+        assert!(guest.get("/src/Foo.cs").is_none(), "{:?}", guest.paths());
+        assert!(guest.get("/src/foo.cs").is_none());
+    }
+
+    /// **On the pass that needs it, not the one after.** A guest whose login
+    /// is elevated but whose filesystem will not take the flag is only found
+    /// out by asking, and asking *after* the seed would mean one of the
+    /// colliding pair had already landed on top of the other.
+    #[tokio::test]
+    async fn a_guest_that_lies_about_the_flag_still_refuses_on_the_first_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Foo.cs"), "upper").unwrap();
+        std::fs::write(dir.path().join("foo.cs"), "lower").unwrap();
+        std::fs::write(dir.path().join("ok.cs"), "fine").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        // Elevated, so the declaration promises the flag — and the guest's
+        // filesystem has no concept of it.
+        guest.folding().refuse_case_flag();
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(
+                windows_workspace(
+                    dir.path(),
+                    state.path(),
+                    Preconditions {
+                        windows: true,
+                        case_sensitive_dirs: true,
+                        symlinks: true,
+                    },
+                ),
+                Arc::new(OneFake(guest.clone())),
+                events,
+            )
+            .await;
+        let landed = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/ok.cs").is_some()).await
+        };
+        assert!(landed);
+        syncers.stop("dev01").await;
+
+        // Neither ever reached the guest — not "the second overwrote the
+        // first and the next pass complained".
+        assert!(guest.get("/src/Foo.cs").is_none(), "{:?}", guest.paths());
+        assert!(guest.get("/src/foo.cs").is_none());
+
+        let emitted = events_of(state.path());
+        assert!(
+            emitted
+                .iter()
+                .any(|(name, _)| name == "workspace.case_collision"),
+            "{emitted:?}"
+        );
+        // …and the guest disagreeing with its own declaration is itself said.
+        assert!(
+            emitted
+                .iter()
+                .any(|(name, data)| name == "workspace.degraded"
+                    && data["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("will not make a directory case-sensitive")),
+            "{emitted:?}"
         );
     }
 }

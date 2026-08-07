@@ -83,6 +83,11 @@ pub enum Action {
         target: String,
         host: Side,
         digest: String,
+        /// Windows picks a different object for a file link and a directory
+        /// link **at creation** and cannot infer which from a target that is
+        /// not there yet, so the kind has to be decided here — see
+        /// [`dir_link`]. Ignored outright on a Linux guest.
+        dir_link: bool,
     },
     /// Remove what the host no longer holds. **Host→guest deletes are
     /// unguarded** (§19.6): a `git checkout` removing 400 files just removes
@@ -157,6 +162,38 @@ impl std::fmt::Display for Oversize {
     }
 }
 
+/// Host paths that differ only in case, on a guest that folds case (§19.6).
+///
+/// **Refuse-at-seed is the fallback, not the policy.** The policy is the NTFS
+/// case-sensitive flag at every `mkdir`; this is what is left where the flag
+/// cannot be set, and the alternative is the second write silently landing on
+/// the first — the exact silent-divergence class the share transports were
+/// disqualified for. So neither copy is transferred and both names are said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collision {
+    /// What the colliding paths fold to — the key they were grouped on, not a
+    /// path either side holds.
+    pub folded: String,
+    /// Every host path folding onto it, in order.
+    pub paths: Vec<String>,
+}
+
+impl std::fmt::Display for Collision {
+    /// Names every path, and both ways out. Elevation is second because it is
+    /// not always the reason: a filesystem with no concept of the flag refuses
+    /// it however elevated the login is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} differ only in case and this guest cannot tell them apart, so none of them was \
+             transferred: rename them apart on the host, or make this guest able to hold \
+             case-sensitive directories — which needs the machine's default login to be \
+             `elevated = true` and a filesystem that takes the flag",
+            self.paths.join(", ")
+        )
+    }
+}
+
 /// A path the guest moved and the host did not. Left strictly alone by this
 /// direction; guest→host propagation is its own ticket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +219,9 @@ pub struct Plan {
     pub forget: Vec<String>,
     pub conflicts: Vec<Conflict>,
     pub oversize: Vec<Oversize>,
+    /// Host paths a case-folding guest cannot hold apart. Nothing is
+    /// transferred for any of them.
+    pub collisions: Vec<Collision>,
     pub pending_guest: Vec<PendingGuest>,
 }
 
@@ -195,6 +235,7 @@ impl Plan {
             && self.forget.is_empty()
             && self.conflicts.is_empty()
             && self.oversize.is_empty()
+            && self.collisions.is_empty()
     }
 }
 
@@ -226,6 +267,11 @@ pub struct Inputs<'a> {
     pub guest_owned: &'a BTreeSet<String>,
     /// The size guard's per-file cap.
     pub max_file_bytes: u64,
+    /// The guest folds two names differing only in case onto one object
+    /// (§19.6) — a Windows guest whose directories could not be made
+    /// case-sensitive. Host paths that collide under folding are refused by
+    /// name rather than raced onto one guest path.
+    pub case_folding: bool,
 }
 
 /// One side's position relative to the ledger.
@@ -297,8 +343,18 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
         .chain(inputs.ledger.entries.keys())
         .collect();
 
+    // Before anything is decided about them: a guest that folds case cannot
+    // hold `Foo.cs` and `foo.cs` apart, and the second write would land on the
+    // first in silence. Both are refused, by name.
+    plan.collisions = collisions(inputs);
+    let colliding: BTreeSet<&str> = plan
+        .collisions
+        .iter()
+        .flat_map(|c| c.paths.iter().map(String::as_str))
+        .collect();
+
     for path in paths {
-        if inputs.undecided.contains(path) {
+        if inputs.undecided.contains(path) || colliding.contains(path.as_str()) {
             continue;
         }
         // Leaving scope is free: out of the ledger, and out of both
@@ -366,7 +422,7 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
                         kind: guest.kind,
                     });
                 }
-                match place(path, state, inputs.max_file_bytes, was) {
+                match place(path, state, inputs, was) {
                     Ok(action) => creations.push(action),
                     Err(refusal) => plan.oversize.push(refusal),
                 }
@@ -426,8 +482,76 @@ fn settle_both(
     })
 }
 
+/// Every set of host paths a case-folding guest would land on one object.
+///
+/// Keyed on the whole relative path rather than per directory, because that is
+/// exactly the question being asked: two host paths that lower-case to the
+/// same string are two host paths that become one guest path — whether they
+/// differ in the file name or three directories up.
+fn collisions(inputs: &Inputs<'_>) -> Vec<Collision> {
+    if !inputs.case_folding {
+        return Vec::new();
+    }
+    let mut folded: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for path in inputs.host.keys() {
+        folded
+            .entry(path.to_lowercase())
+            .or_default()
+            .push(path.clone());
+    }
+    folded
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(folded, paths)| Collision { folded, paths })
+        .collect()
+}
+
+/// Which Windows object a link needs, decided **without following it**.
+///
+/// Never-follow is load-bearing — a link pointing at `/` that the syncer
+/// followed walks the entire host filesystem into the guest — so the target is
+/// resolved as a *string* against the link's own directory and looked up in
+/// the host tree the scan already produced. A target that is absolute, that
+/// escapes the workspace, or that names nothing the host holds gets a file
+/// link: it is going to dangle either way, and §19.6 says a dangling link is
+/// correct rather than something to interpret.
+fn dir_link(link: &str, target: &str, host: &BTreeMap<String, State>) -> bool {
+    // A drive letter, not any colon: `weird:name` is a perfectly legal
+    // relative name on the host this tree came off.
+    let drive_qualified =
+        target.as_bytes().get(1) == Some(&b':') && target.as_bytes()[0].is_ascii_alphabetic();
+    if target.starts_with('/') || target.starts_with('\\') || drive_qualified {
+        return false;
+    }
+    let mut parts: Vec<&str> = match link.rfind('/') {
+        Some(cut) => link[..cut].split('/').collect(),
+        None => Vec::new(),
+    };
+    for segment in target.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    // Out of the workspace, which the host tree cannot answer
+                    // for and the syncer will not walk to find out.
+                    return false;
+                }
+            }
+            segment => parts.push(segment),
+        }
+    }
+    host.get(&parts.join("/"))
+        .is_some_and(|state| state.kind == Kind::Dir)
+}
+
 /// The action that puts `state` on the guest, or the size guard's refusal.
-fn place(path: &str, state: &State, cap: u64, was: Option<&Agreed>) -> Result<Action, Oversize> {
+fn place(
+    path: &str,
+    state: &State,
+    inputs: &Inputs<'_>,
+    was: Option<&Agreed>,
+) -> Result<Action, Oversize> {
+    let cap = inputs.max_file_bytes;
     let host = state.side();
     match state.kind {
         Kind::Dir => Ok(Action::MakeDir {
@@ -450,12 +574,16 @@ fn place(path: &str, state: &State, cap: u64, was: Option<&Agreed>) -> Result<Ac
                 digest: digest_or_agreed(state, was),
             })
         }
-        Kind::Symlink => Ok(Action::PutSymlink {
-            path: path.to_string(),
-            target: state.target.clone().unwrap_or_default(),
-            host,
-            digest: digest_or_agreed(state, was),
-        }),
+        Kind::Symlink => {
+            let target = state.target.clone().unwrap_or_default();
+            Ok(Action::PutSymlink {
+                dir_link: dir_link(path, &target, inputs.host),
+                path: path.to_string(),
+                target,
+                host,
+                digest: digest_or_agreed(state, was),
+            })
+        }
     }
 }
 
@@ -556,7 +684,136 @@ mod tests {
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
             max_file_bytes: CAP,
+            case_folding: false,
         })
+    }
+
+    /// The same, against a guest that cannot tell `Foo.cs` from `foo.cs`.
+    fn run_folding(host: &BTreeMap<String, State>) -> Plan {
+        reconcile(&Inputs {
+            host,
+            guest: &BTreeMap::new(),
+            ledger: &ledger(&[]),
+            undecided: &BTreeSet::new(),
+            guest_owned: &BTreeSet::new(),
+            max_file_bytes: CAP,
+            case_folding: true,
+        })
+    }
+
+    /// **Where the flag cannot be set, a collision is a loud refusal naming
+    /// the paths** (§19.6). Never a quiet second write landing on the first,
+    /// which is the silent-divergence class this whole design rules out.
+    #[test]
+    fn a_case_collision_is_refused_by_name_where_the_guest_folds_case() {
+        let host = tree(&[
+            ("src", dir(10)),
+            ("src/Foo.cs", file(Some("aa"), 2, 11)),
+            ("src/foo.cs", file(Some("bb"), 2, 12)),
+            ("src/other.cs", file(Some("cc"), 2, 13)),
+        ]);
+        let plan = run_folding(&host);
+
+        assert_eq!(plan.collisions.len(), 1, "{:?}", plan.collisions);
+        assert_eq!(
+            plan.collisions[0].paths,
+            vec!["src/Foo.cs".to_string(), "src/foo.cs".to_string()]
+        );
+        let said = plan.collisions[0].to_string();
+        for path in ["src/Foo.cs", "src/foo.cs"] {
+            assert!(said.contains(path), "unnamed: {said}");
+        }
+        assert!(said.contains("elevated = true"), "no way out: {said}");
+
+        // Neither is transferred — picking one would be exactly the silent
+        // overwrite the refusal exists to prevent — and the rest still lands.
+        let touched: Vec<&str> = plan.actions.iter().map(Action::path).collect();
+        assert_eq!(touched, vec!["src", "src/other.cs"]);
+        assert!(!plan.nothing_to_record(), "a refusal is not nothing");
+    }
+
+    /// The collision is about the whole path, not just the file name: two
+    /// directories differing only in case are one guest directory too.
+    #[test]
+    fn a_directory_differing_only_in_case_collides_as_well() {
+        let host = tree(&[
+            ("Src", dir(10)),
+            ("src", dir(11)),
+            ("Src/a.rs", file(Some("aa"), 2, 12)),
+        ]);
+        let plan = run_folding(&host);
+        assert_eq!(
+            plan.collisions
+                .iter()
+                .map(|c| &c.folded)
+                .collect::<Vec<_>>(),
+            vec!["src"]
+        );
+        assert_eq!(
+            plan.actions.iter().map(Action::path).collect::<Vec<_>>(),
+            vec!["Src/a.rs"],
+        );
+    }
+
+    /// **The policy, not the fallback.** With the flag set the guest is
+    /// genuinely case-sensitive, so both names are ordinary paths and both are
+    /// transferred.
+    #[test]
+    fn a_case_sensitive_guest_carries_both_names_and_refuses_nothing() {
+        let host = tree(&[
+            ("src", dir(10)),
+            ("src/Foo.cs", file(Some("aa"), 2, 11)),
+            ("src/foo.cs", file(Some("bb"), 2, 12)),
+        ]);
+        let plan = run(&host, &BTreeMap::new(), &ledger(&[]));
+        assert!(plan.collisions.is_empty());
+        assert_eq!(
+            plan.actions.iter().map(Action::path).collect::<Vec<_>>(),
+            vec!["src", "src/Foo.cs", "src/foo.cs"],
+        );
+    }
+
+    /// Windows picks the object at creation and cannot infer it from a target
+    /// that is not there yet, so the plan decides — from the host tree it
+    /// already holds, and **never** by following the link.
+    #[test]
+    fn a_link_kind_is_decided_from_the_host_tree_rather_than_by_following_it() {
+        let host = tree(&[
+            ("pkg", dir(1)),
+            ("pkg/mod.rs", file(Some("aa"), 2, 1)),
+            ("here", link("pkg", 1)),
+            ("up", link("./pkg/../pkg", 1)),
+            ("at-file", link("pkg/mod.rs", 1)),
+            ("nowhere", link("gone", 1)),
+            ("outside", link("../elsewhere", 1)),
+            ("absolute", link("/usr/lib/foo", 1)),
+            ("drive", link("C:\\src\\pkg", 1)),
+            // A colon is a legal character in a host-side name, and only a
+            // drive letter makes one a Windows absolute path.
+            ("colon", dir(1)),
+            ("odd:name", dir(1)),
+            ("at-odd", link("odd:name", 1)),
+        ]);
+        let plan = run(&host, &BTreeMap::new(), &ledger(&[]));
+        let kinds: BTreeMap<&str, bool> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::PutSymlink { path, dir_link, .. } => Some((path.as_str(), *dir_link)),
+                _ => None,
+            })
+            .collect();
+        assert!(kinds["here"], "a link at a directory in the tree");
+        assert!(kinds["up"], "resolved as a string, not walked");
+        assert!(!kinds["at-file"]);
+        assert!(!kinds["nowhere"], "it is going to dangle either way");
+        assert!(!kinds["outside"], "the workspace ends at its root");
+        assert!(!kinds["absolute"]);
+        assert!(!kinds["drive"], "a drive-qualified target is absolute");
+        assert!(
+            kinds["at-odd"],
+            "a colon in a name does not make it a drive"
+        );
     }
 
     /// The seed *is* the first pass: an empty guest tree is the case where
@@ -582,6 +839,7 @@ mod tests {
                     target: "../lib".into(),
                     host: Side::new(6, 12),
                     digest: "digest-of:../lib".into(),
+                    dir_link: false,
                 },
                 Action::PutFile {
                     path: "src/main.rs".into(),
@@ -882,6 +1140,7 @@ mod tests {
                 target: "/usr/lib/foo".into(),
                 host: Side::new(12, 1),
                 digest: "digest-of:/usr/lib/foo".into(),
+                dir_link: false,
             }]
         );
     }
@@ -907,6 +1166,7 @@ mod tests {
                 target: "../new".into(),
                 host: Side::new(6, 900),
                 digest: "digest-of:../new".into(),
+                dir_link: false,
             }]
         );
     }
@@ -929,6 +1189,7 @@ mod tests {
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::from(["app.log".to_string()]),
             max_file_bytes: CAP,
+            case_folding: false,
         });
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert_eq!(plan.forget, vec!["app.log".to_string()]);
@@ -969,6 +1230,7 @@ mod tests {
             undecided: &BTreeSet::from(["a.sock".to_string()]),
             guest_owned: &BTreeSet::new(),
             max_file_bytes: CAP,
+            case_folding: false,
         });
         assert!(plan.nothing_to_record(), "{plan:?}");
         assert!(plan.forget.is_empty());

@@ -99,18 +99,44 @@ struct WorkspaceSessions {
     machine: Arc<dyn Machine>,
 }
 
-#[async_trait::async_trait]
-impl crate::labd::workspace::syncer::GuestSessions for WorkspaceSessions {
-    async fn open(&self) -> Result<Box<dyn crate::labd::workspace::guest::GuestFs>> {
-        let logon = crate::labd::identity::resolve(
+impl WorkspaceSessions {
+    /// Who the syncer is: the machine's **default login** (§19.2), the one
+    /// named exception to vmlab's machinery running as the agent identity.
+    fn logon(&self) -> Result<Option<vmlab_agent_proto::Logon>> {
+        crate::labd::identity::resolve(
             self.machine.name(),
             self.machine.logins(),
             self.machine.guest_os(),
             None,
             None,
-        )?;
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::labd::workspace::syncer::GuestSessions for WorkspaceSessions {
+    async fn open(&self) -> Result<Box<dyn crate::labd::workspace::guest::GuestFs>> {
+        let logon = self.logon()?;
         let agent = self.machine.agent().await?;
         Ok(Box::new(agent.open_fileops(logon).await?))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::labd::workspace::windows::GuestRun for WorkspaceSessions {
+    /// The Windows preconditions' one command, as the same login the syncer
+    /// writes as — because it is that login's `--global` git config a
+    /// guest-side checkout will read.
+    async fn run(&self, argv: Vec<String>) -> Result<crate::labd::workspace::windows::Ran> {
+        let logon = self.logon()?;
+        let agent = self.machine.agent().await?;
+        let out = agent
+            .exec(argv, Vec::new(), None, None, Duration::from_secs(60), logon)
+            .await?;
+        Ok(crate::labd::workspace::windows::Ran {
+            exit_code: out.exit_code,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 }
 
@@ -1413,7 +1439,7 @@ impl LabRuntime {
         // machine's default login, which the provisioning is what creates
         // (§19.6). The task belongs to this daemon, so the `vmlab` process
         // that asked for the `up` may exit without stopping it.
-        self.start_workspaces(&targets).await;
+        self.start_workspaces(&targets, &output).await;
 
         self.events.emit("lab.up", json!({"vms": targets}));
         Ok(())
@@ -1732,7 +1758,11 @@ impl LabRuntime {
     /// A workspace whose host directory is not there does not start, loudly.
     /// Creating it would be worse than refusing: an empty canonical tree is a
     /// tree the syncer would then propagate *as* empty.
-    async fn start_workspaces(self: &Arc<Self>, scope: &[String]) {
+    async fn start_workspaces(
+        self: &Arc<Self>,
+        scope: &[String],
+        output: &crate::scripting::OutputSink,
+    ) {
         for dev in self.dev_machines() {
             let Some(workspace) = dev.workspace.clone() else {
                 continue;
@@ -1774,6 +1804,20 @@ impl LabRuntime {
                     }),
                 );
             }
+            // §19.6, resolved from the declaration alone (ADR-0003): the
+            // guest family and the default login's elevation are what decide
+            // the three Windows actions, and the syncer should never have to
+            // ask.
+            let preconditions =
+                crate::labd::workspace::preconditions(machine.guest_os(), machine.logins());
+            // **Up front, on the terminal that asked for the `up`.** The
+            // event log alone would only reach someone already watching it,
+            // and the whole point is that both degradations otherwise fail at
+            // a random path hours in, looking like a vmlab bug. The syncer
+            // emits them too, for whoever attaches later.
+            for degradation in preconditions.degradations() {
+                output(format!("warning: {}: {degradation}\n", dev.name));
+            }
             self.workspaces
                 .start(
                     crate::labd::workspace::Workspace {
@@ -1785,6 +1829,7 @@ impl LabRuntime {
                         host_root,
                         guest_root: dev.workspace_guest.clone(),
                         max_file_bytes: self.host_cfg.workspace_max_file,
+                        preconditions,
                     },
                     Arc::new(WorkspaceSessions { machine }),
                     self.events.clone(),

@@ -44,10 +44,11 @@ pub struct Target {
     pub host_root: PathBuf,
     /// Where the working copy lands in the guest.
     pub guest_root: String,
-    /// Create directories case-sensitive. NTFS accepts the flag only while a
-    /// directory is empty, which the syncer's always is — and the Windows
-    /// preconditions that make it meaningful (the collision refusal, the
-    /// symlink warning, the guest's line-ending setting) are their own ticket.
+    /// Create directories case-sensitive (§19.6). NTFS accepts the flag only
+    /// while a directory is empty, which the syncer's always is, so it rides
+    /// every `mkdir` — **per directory, never by inheritance**, because
+    /// Microsoft's own documentation contradicts itself on whether
+    /// inheritance holds and setting it each time costs nothing.
     pub case_sensitive_dirs: bool,
 }
 
@@ -77,6 +78,16 @@ pub struct Applied {
     /// Directories the host dropped that the guest still holds its own
     /// content in — left standing, named, and out of the ledger.
     pub left_standing: Vec<String>,
+    /// Symlinks that were attempted and did not take (§19.6, §19.4). Held
+    /// apart from [`failures`](Applied::failures) because the remedy is not
+    /// the same: a symlink-capable image is a documented precondition, and
+    /// naming the link is how vmlab declines to work around it silently.
+    pub symlinks_refused: Vec<Failure>,
+    /// Directories that had to be created without the case-sensitivity flag
+    /// because the guest would not take it. The declaration said the flag was
+    /// available and the guest disagreed, so the workspace is degraded from
+    /// here on and collisions become refusals.
+    pub case_insensitive_dirs: Vec<Failure>,
     pub failures: Vec<Failure>,
 }
 
@@ -94,6 +105,11 @@ pub async fn apply(
     ledger: &mut Ledger,
 ) -> Applied {
     let mut done = Applied::default();
+
+    // The workspace root is already there, made with the flag by
+    // [`prepare_root`](super::windows::prepare_root) before the plan this is
+    // carrying out was computed — because whether the flag takes is one of
+    // that plan's inputs.
 
     // Adoptions are not applies: both sides already hold the same content, so
     // the agreement is all there is to record.
@@ -138,8 +154,7 @@ pub async fn apply(
                 // A directory needs no temp: creating one destroys nothing,
                 // and on NTFS the case-sensitivity flag can only be set on
                 // the directory that will actually hold the tree.
-                guest
-                    .mkdir(&guest_path, target.case_sensitive_dirs)
+                make_dir(guest, target, &guest_path, &mut done)
                     .await
                     .map(|()| (Kind::Dir, String::new(), *host))
             }
@@ -152,17 +167,33 @@ pub async fn apply(
                 target: link_target,
                 host,
                 digest,
+                dir_link,
                 ..
             } => place(
                 guest,
                 target,
                 path,
                 &guest_path,
-                Placing::Symlink(link_target),
+                Placing::Symlink(link_target, *dir_link),
             )
             .await
             .map(|()| (Kind::Symlink, digest.clone(), *host)),
         };
+
+        // A symlink that did not take is the one failure with its own name:
+        // §19.4 makes a symlink-capable image a precondition, and vmlab warns
+        // rather than working around it. Everything else about it is ordinary
+        // — nothing is agreed, so the next pass tries again.
+        if let (Action::PutSymlink { .. }, Err(e)) = (action, &outcome) {
+            done.symlinks_refused.push(Failure {
+                path: path.to_string(),
+                why: format!(
+                    "the guest would not create this symlink, which a dev-capable image must be \
+                     able to do (§19.4): {e:#}"
+                ),
+            });
+            continue;
+        }
 
         match outcome {
             Ok((kind, digest, host)) => {
@@ -205,10 +236,44 @@ pub async fn apply(
     done
 }
 
+/// Create one directory, asking for the case-sensitivity flag where the
+/// machine has been found to take it (§19.6).
+///
+/// The machine-wide answer is settled before the plan is even computed, so
+/// this is the odd directory that disagrees with it. Where the flag was asked
+/// for and refused, the directory is created **without** it and said out loud:
+/// failing the whole workspace over the flag would be worse than the collision
+/// it guards against, and a second attempt that finds the directory already
+/// there is success, so the fallback lands whether the first attempt got as
+/// far as creating it or not.
+async fn make_dir(
+    guest: &dyn GuestFs,
+    target: &Target,
+    guest_path: &str,
+    done: &mut Applied,
+) -> anyhow::Result<()> {
+    match guest.mkdir(guest_path, target.case_sensitive_dirs).await {
+        Ok(()) => Ok(()),
+        Err(refused) if !target.case_sensitive_dirs => Err(refused),
+        Err(refused) => {
+            guest.mkdir(guest_path, false).await.map_err(|_| refused)?;
+            done.case_insensitive_dirs.push(Failure {
+                path: guest_path.to_string(),
+                why: "this guest would not make the directory case-sensitive, so two host paths \
+                      differing only in case cannot both land in it and are refused by name"
+                    .into(),
+            });
+            Ok(())
+        }
+    }
+}
+
 /// What is being written into place.
 enum Placing<'a> {
     File,
-    Symlink(&'a str),
+    /// The target string, and whether Windows needs a directory link for it —
+    /// decided by the plan from the host tree, never by following the link.
+    Symlink(&'a str, bool),
 }
 
 /// Write it under a temp name in the target's own directory, then rename it
@@ -229,11 +294,14 @@ async fn place(
     let written = match what {
         Placing::File => guest.push(&target.host_root.join(rel), &temp).await,
         // Windows picks a different object for a file link and a directory
-        // link at creation, and vmlab never follows a link to find out which
-        // — that is the Windows preconditions' business, alongside the
-        // warning §19.4 says a failed symlink owes. On a Linux guest the kind
-        // is ignored outright.
-        Placing::Symlink(link) => guest.symlink(link, &temp, LinkKind::File).await,
+        // link at creation and cannot infer which from a target that is not
+        // there yet. The plan decided it from the host tree it already holds,
+        // without ever following the link. On a Linux guest the kind is
+        // ignored outright.
+        Placing::Symlink(link, dir) => {
+            let kind = if dir { LinkKind::Dir } else { LinkKind::File };
+            guest.symlink(link, &temp, kind).await
+        }
     };
     if let Err(e) = written {
         let _ = guest.remove(&temp).await;
@@ -294,8 +362,35 @@ mod tests {
         }
     }
 
+    /// The same guest, told apart by the flag the syncer asks for.
+    fn case_sensitive_target(root: &Path) -> Target {
+        Target {
+            case_sensitive_dirs: true,
+            ..target(root)
+        }
+    }
+
     /// One whole pass: scan the host, probe the guest, reconcile, apply.
     async fn pass(root: &Path, guest: &FakeGuest, ledger: &mut Ledger) -> Applied {
+        pass_onto(root, guest, ledger, target(root), false).await
+    }
+
+    async fn pass_onto(
+        root: &Path,
+        guest: &FakeGuest,
+        ledger: &mut Ledger,
+        mut target: Target,
+        case_folding: bool,
+    ) -> Applied {
+        // As the syncer does: the root, and what the guest will really take,
+        // before the plan that depends on it.
+        target.case_sensitive_dirs = super::super::windows::prepare_root(
+            guest,
+            &target.guest_root,
+            target.case_sensitive_dirs,
+        )
+        .await
+        .unwrap();
         let (scan, ignores) = host_scan(root, ledger, CAP).unwrap();
         let paths: BTreeSet<String> = scan
             .tree
@@ -323,8 +418,9 @@ mod tests {
             undecided: &undecided,
             guest_owned: &guest_owned,
             max_file_bytes: CAP,
+            case_folding,
         });
-        apply(guest, &target(root), &plan, ledger).await
+        apply(guest, &target, &plan, ledger).await
     }
 
     fn ledger_for(root: &Path) -> Ledger {
@@ -489,6 +585,7 @@ mod tests {
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
             max_file_bytes: CAP,
+            case_folding: false,
         });
         let done = apply(&guest, &target(dir.path()), &plan, &mut ledger).await;
 
@@ -635,6 +732,7 @@ mod tests {
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
             max_file_bytes: 4,
+            case_folding: false,
         });
         apply(&guest, &target(dir.path()), &plan, &mut ledger).await;
 
@@ -642,6 +740,176 @@ mod tests {
         assert!(guest.get("/src/small.rs").is_some());
         assert_eq!(plan.oversize.len(), 1);
         assert!(plan.oversize[0].to_string().contains("big.vhdx"));
+    }
+
+    /// **Every** directory the syncer creates carries the flag, including the
+    /// workspace root — and each one is set at its own creation, because
+    /// inheritance must not be relied on (§19.6).
+    #[tokio::test]
+    async fn every_directory_the_syncer_creates_is_made_case_sensitive() {
+        let dir = workspace(&[("a/b/c/deep.rs", "x"), ("top.rs", "y")]);
+        let guest = FakeGuest::new();
+        guest.folding();
+        let mut ledger = ledger_for(dir.path());
+
+        let done = pass_onto(
+            dir.path(),
+            &guest,
+            &mut ledger,
+            case_sensitive_target(dir.path()),
+            false,
+        )
+        .await;
+        assert_eq!(done.failures, vec![]);
+        assert_eq!(done.case_insensitive_dirs, vec![]);
+
+        for made in ["/src", "/src/a", "/src/a/b", "/src/a/b/c"] {
+            assert!(
+                guest.is_case_sensitive(made),
+                "{made} was created without the flag: {:?}",
+                guest.paths()
+            );
+        }
+    }
+
+    /// The acceptance case the flag exists for: two host paths differing only
+    /// in case both land, and neither overwrites the other.
+    #[tokio::test]
+    async fn two_paths_differing_only_in_case_both_land_and_neither_wins() {
+        let dir = workspace(&[("src/Foo.cs", "upper"), ("src/foo.cs", "lower")]);
+        let guest = FakeGuest::new();
+        // A default NTFS volume: one object for both names, unless the
+        // directory was made case-sensitive.
+        guest.folding();
+        let mut ledger = ledger_for(dir.path());
+
+        let done = pass_onto(
+            dir.path(),
+            &guest,
+            &mut ledger,
+            case_sensitive_target(dir.path()),
+            false,
+        )
+        .await;
+
+        assert_eq!(done.failures, vec![]);
+        assert_eq!(guest.text("/src/src/Foo.cs").as_deref(), Some("upper"));
+        assert_eq!(guest.text("/src/src/foo.cs").as_deref(), Some("lower"));
+        assert!(ledger.entries.contains_key("src/Foo.cs"));
+        assert!(ledger.entries.contains_key("src/foo.cs"));
+    }
+
+    /// Without the flag the same two names *are* one object — which is why
+    /// the refusal exists, and why this pass must never be what ships.
+    #[tokio::test]
+    async fn without_the_flag_the_second_write_would_land_on_the_first() {
+        let dir = workspace(&[("src/Foo.cs", "upper"), ("src/foo.cs", "lower")]);
+        let guest = FakeGuest::new();
+        guest.folding();
+        let mut ledger = ledger_for(dir.path());
+
+        // Which is exactly what `case_folding` refuses: nothing is written.
+        let done = pass_onto(dir.path(), &guest, &mut ledger, target(dir.path()), true).await;
+        assert_eq!(done.placed, 1, "only the directory");
+        assert!(
+            guest.get("/src/src/Foo.cs").is_none(),
+            "{:?}",
+            guest.paths()
+        );
+        assert!(guest.get("/src/src/foo.cs").is_none());
+        assert!(!ledger.entries.contains_key("src/Foo.cs"));
+        assert!(!ledger.entries.contains_key("src/foo.cs"));
+    }
+
+    /// One directory the guest refuses the flag on, where the machine-wide
+    /// probe said it would take it. The tree still lands — failing the whole
+    /// workspace over the flag is worse than the collision it guards against
+    /// — and the directory is named, so the refusal can take over from there.
+    #[tokio::test]
+    async fn a_directory_that_refuses_the_flag_still_lands_and_is_named() {
+        let dir = workspace(&[("pkg/app.js", "x")]);
+        let guest = FakeGuest::new();
+        guest.folding().refuse_case_flag_at("/src/pkg");
+        let mut ledger = ledger_for(dir.path());
+
+        let done = pass_onto(
+            dir.path(),
+            &guest,
+            &mut ledger,
+            case_sensitive_target(dir.path()),
+            false,
+        )
+        .await;
+
+        assert_eq!(done.failures, vec![], "the tree still landed");
+        assert_eq!(guest.text("/src/pkg/app.js").as_deref(), Some("x"));
+        let named: Vec<&str> = done
+            .case_insensitive_dirs
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(named, vec!["/src/pkg"]);
+        assert!(
+            done.case_insensitive_dirs[0].why.contains("case"),
+            "{:?}",
+            done.case_insensitive_dirs[0]
+        );
+        // …and the root, which did take it, is unaffected.
+        assert!(guest.is_case_sensitive("/src"));
+    }
+
+    /// **Attempted, and warned about by name** (§19.6/§19.4). Never worked
+    /// around silently, and never a halt: the rest of the tree still lands.
+    #[tokio::test]
+    async fn a_symlink_that_will_not_take_is_named_rather_than_worked_around() {
+        let dir = workspace(&[("src/real.rs", "x")]);
+        std::os::unix::fs::symlink("src/real.rs", dir.path().join("lib")).unwrap();
+        let guest = FakeGuest::new();
+        guest.refuse_symlinks();
+        let mut ledger = ledger_for(dir.path());
+
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+
+        assert_eq!(done.failures, vec![], "not an ordinary failure");
+        assert_eq!(done.symlinks_refused.len(), 1);
+        assert_eq!(done.symlinks_refused[0].path, "lib");
+        assert!(
+            done.symlinks_refused[0].why.contains("§19.4"),
+            "{:?}",
+            done.symlinks_refused[0]
+        );
+        // Nothing agreed, no leftover temp, and the rest of the tree landed.
+        assert!(!ledger.entries.contains_key("lib"));
+        assert!(
+            !guest.paths().iter().any(|p| p.contains(".vmlab-sync.")),
+            "{:?}",
+            guest.paths()
+        );
+        assert_eq!(guest.text("/src/src/real.rs").as_deref(), Some("x"));
+    }
+
+    /// **The syncer translates no bytes.** Git does all normalisation on both
+    /// sides, from settings that now agree; a syncer that rewrote line endings
+    /// would make the two sides' digests disagree forever.
+    #[tokio::test]
+    async fn the_syncer_translates_no_bytes_in_either_direction() {
+        let dir = workspace(&[
+            ("crlf.txt", "one\r\ntwo\r\n"),
+            ("lf.txt", "one\ntwo\n"),
+            ("mixed.txt", "one\r\ntwo\nthree\r"),
+        ]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        pass(dir.path(), &guest, &mut ledger).await;
+
+        for name in ["crlf.txt", "lf.txt", "mixed.txt"] {
+            let host = std::fs::read(dir.path().join(name)).unwrap();
+            assert_eq!(
+                guest.text(&format!("/src/{name}")).unwrap().as_bytes(),
+                host.as_slice(),
+                "{name} was rewritten across the seam"
+            );
+        }
     }
 
     /// The temp lives in the target's own directory, so the rename is atomic
