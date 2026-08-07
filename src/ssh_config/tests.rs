@@ -464,6 +464,59 @@ fn print_emits_the_stanza_and_the_editor_snippet() {
     assert!(!editor_snippet(&block.aliases_for("dev01"), false).contains("remotePlatform"));
 }
 
+/// §19.8 prints two things a developer will otherwise assume an offline
+/// guest has taken away from them: that their own dotfiles copy over the
+/// alias, and that a host-side service is reachable without a reverse tunnel
+/// vmlab refuses to serve.
+#[test]
+fn the_offline_guest_notes_name_both_routes_a_developer_would_assume_are_gone() {
+    // The Linux half: the exact `scp -r` line §19 prints, spelled against
+    // this machine's own alias so it is runnable as read.
+    let linux = offline_notes("vmlab-probe-dev02", false);
+    assert!(linux.contains("scp -r"), "{linux}");
+    assert!(linux.contains("vmlab-probe-dev02:"), "{linux}");
+    assert!(linux.contains("~/.config/nvim"), "{linux}");
+    // The other route: a NIC on a segment with egress, and *not* `ssh -R`,
+    // which §19.3 refuses.
+    assert!(linux.contains("egress"), "{linux}");
+    assert!(linux.contains("`ssh -R`"), "{linux}");
+
+    // A Windows dev machine gets the same two facts in its own spelling —
+    // `~/.config/nvim` is not a path it has.
+    let windows = offline_notes("vmlab-probe-dev01", true);
+    assert!(
+        windows.contains("scp ~/.gitconfig vmlab-probe-dev01:.gitconfig"),
+        "{windows}"
+    );
+    assert!(!windows.contains(".config/nvim"), "{windows}");
+    assert!(windows.contains("egress"), "{windows}");
+
+    // Neither spelling carries a placeholder: both lines are one command,
+    // runnable as read, which is why they are printed rather than documented.
+    for said in [&linux, &windows] {
+        assert!(!said.contains('…'), "a placeholder crept in: {said}");
+    }
+}
+
+/// The handover both surfaces print is one value, so `dev attach` and
+/// `ssh-config --print` cannot drift into saying different halves of it.
+#[test]
+fn the_attach_handover_is_the_snippet_and_the_notes_together() {
+    let said = attach_notes(&["vmlab-probe-dev01".to_string()], true);
+    assert!(said.contains("remote.SSH.localServerDownload"), "{said}");
+    assert!(said.contains("scp ~/.gitconfig"), "{said}");
+    assert!(said.contains("egress"), "{said}");
+
+    // A machine with no alias at all still gets the client-side half; there
+    // is simply nothing to spell an `scp` against.
+    let aliasless = attach_notes(&[], false);
+    assert!(
+        aliasless.contains("remote.SSH.localServerDownload"),
+        "{aliasless}"
+    );
+    assert!(!aliasless.contains("scp"), "{aliasless}");
+}
+
 /// A login label that cannot be one ssh_config token gets no alias of its
 /// own — the machine still attaches, and the file stays parseable.
 #[test]

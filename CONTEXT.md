@@ -377,6 +377,33 @@ The login carrying `default = true`, or — where none does — the only login t
 machine declares. The same implicit-lone rule as the **default dev machine**,
 and for the same reason: a lone declaration never has to meet the concept.
 
+**Script identity**:
+The wscript rung of the identity precedence ladder: `m.as_login(label)` /
+`m.as_account(user, password)`, which resolve a **login** the same way
+`--user`/`--password` do and hand back a *second handle onto the same machine*
+rather than switching this one. So an identity is said once and every call on
+the result — exec, file push, terminal — carries it. What makes a
+`provision {}` step able to address a **login**'s home directory before that
+account has ever logged on, and therefore the only route for anything that must
+land as the developer rather than as the machine. A **playbook** has no rung
+here at all.
+_Avoid_: run-as, impersonation, sudo (none of the three is a mode switch)
+
+**Declared placement**:
+Editor bits — extensions, plugins, per-user settings — put into a guest home by
+a template build or a lab `provision {}`, as opposed to hand-installed by a
+developer after attaching. Both declared placements re-apply across a
+per-machine `destroy` + `up` because a fresh clone is re-made and boots
+first-boot again; a hand-install does not. Hence: bake what the lab needs every
+developer to have, hand-install what you personally want today, and expect to
+redo it after a rebuild. A per-machine durable home overlay was rejected — it
+would reintroduce exactly the surviving guest-side state the **workspace**
+retired a disk to eliminate, and editor bits already have a canonical durable
+home. See PRD §19.8.
+_Avoid_: provisioning extensions (vmlab moves the bytes and never interprets
+them), editor hints, dotfiles (those are the developer's, and copy over the
+**alias**)
+
 **Agent identity**:
 What the guest agent itself runs as — SYSTEM on Windows, root on Linux. The
 floor when no login applies, and what vmlab's own machinery uses on its own

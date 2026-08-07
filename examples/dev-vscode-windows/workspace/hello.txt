@@ -1,0 +1,3 @@
+Edit this from the editor and watch it change on the host, and the other way
+round. The workspace syncs both ways (PRD §19.6); everything else in this lab
+is a declaration.

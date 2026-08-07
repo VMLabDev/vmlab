@@ -20,6 +20,7 @@ use crate::labd::guest_os::GuestOs;
 use crate::labd::lab::LabRuntime;
 use crate::labd::machine::{Machine, MachineKind};
 use crate::labd::vm::PowerState;
+use crate::labd::vm_agent::Logon;
 use crate::vision;
 
 pub use runner::{OutputSink, ScriptOwner, run_event_handler, run_script_file, run_script_source};
@@ -94,6 +95,17 @@ pub struct MachineHandle {
     /// first-boot script that reboots its guest can wait for it to come back.
     /// Everywhere else they mean full readiness.
     pub(crate) first_boot_gated: bool,
+    /// Who guest work through this handle runs as — the **wscript rung** of
+    /// §19.2's precedence ladder, resolved once by
+    /// [`MachineHandle::as_identity`].
+    ///
+    /// Every handle a script is handed starts `None`, the agent identity,
+    /// because a provision run *is* vmlab acting on its own behalf (§19.2).
+    /// A script that wants otherwise says so, and gets a second handle onto
+    /// the same machine rather than a mode switch on this one — which is what
+    /// makes `dev.exec(…)` and `dev.copy_to(…)` land under one identity
+    /// without either call repeating it.
+    pub(crate) logon: Option<Logon>,
 }
 
 /// A segment handle (PRD §10.2).
@@ -266,6 +278,58 @@ impl MachineHandle {
         self.machine.name()
     }
 
+    /// A second handle onto the same machine, whose guest work runs as
+    /// `selector` — the wscript rung of §19.2's precedence ladder.
+    ///
+    /// `selector` is a `login {}` label, the account name as an alias, or the
+    /// family floor (`SYSTEM` / `root`), which resolves back to the agent
+    /// identity. `password` is the pair's other half: the secret for an
+    /// account the lab file does not declare, or a rotated one.
+    ///
+    /// The resolution is [`crate::labd::identity::resolve`] and nothing else,
+    /// so a script and `vmlab exec --user` cannot disagree about what a label
+    /// names — including the loud failure on a selector nothing matches,
+    /// which is what stops a provision from silently writing into
+    /// `systemprofile` (§19.2).
+    ///
+    /// It resolves **here**, not at the call it precedes, because that is what
+    /// makes §19.8's guarantee usable: the handle is minted once and every
+    /// method on it — `exec`, `copy_to`, `terminal` — lands in the same
+    /// user's home, whether or not that profile existed a moment ago.
+    ///
+    /// **A deliberate divergence from the PRD's spelling.** §10.3 and §19.8
+    /// both describe this rung as `opts` on `exec` carrying `user`/`password`.
+    /// wscript host methods are fixed-arity with no named or optional
+    /// arguments and no overloading, so there is no `opts` bag to put them in;
+    /// the choice was a second method per arity (`exec_as`, `exec_as_timeout`,
+    /// and then one per file verb) or one handle carrying the identity. The
+    /// handle wins on the thing §19.8 actually asks for: an identity said once
+    /// covers `copy_to` and `terminal` too, and the editor bits a provision
+    /// places are files at least as often as they are commands. The rung, its
+    /// resolution and its precedence are unchanged — only where the pair is
+    /// written moves.
+    fn as_identity(&self, selector: &str, password: Option<&str>) -> Result<MachineHandle, String> {
+        let logon = crate::labd::identity::resolve(
+            self.name(),
+            self.machine.logins(),
+            self.machine.guest_os(),
+            Some(selector),
+            password,
+        )
+        .map_err(estr)?;
+        Ok(MachineHandle {
+            machine: self.machine.clone(),
+            runtime: self.runtime.clone(),
+            rt: self.rt.clone(),
+            // Shared, not fresh: it is one machine and one pointer, so a
+            // `mouse_move` on either handle is the position the other clicks.
+            last_pointer: self.last_pointer.clone(),
+            ref_base: self.ref_base.clone(),
+            first_boot_gated: self.first_boot_gated,
+            logon,
+        })
+    }
+
     /// Relative local paths resolve against the running script's directory.
     fn resolve_ref(&self, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
@@ -302,7 +366,7 @@ impl MachineHandle {
             let mut argv = vec![cmd];
             argv.extend(args);
             let r = agent
-                .exec(argv, vec![], None, None, timeout, None)
+                .exec(argv, vec![], None, None, timeout, self.logon.clone())
                 .await
                 .map_err(estr)?;
             Ok(ExecResult {
@@ -381,6 +445,9 @@ impl LabHandle {
             last_pointer: Default::default(),
             ref_base: self.ref_base.clone(),
             first_boot_gated,
+            // The agent identity, which is what everything vmlab does on its
+            // own behalf keeps (§19.2). A script asks for another by name.
+            logon: None,
         }
     }
 }
@@ -896,7 +963,7 @@ pub fn lab_module() -> Module {
                 h.block(async {
                     let agent = h.machine.agent().await.map_err(estr)?;
                     agent
-                        .push_file(&src, &guest_path, None)
+                        .push_file_as(&src, &guest_path, None, h.logon.clone())
                         .await
                         .map(|_| ())
                         .map_err(estr)
@@ -913,7 +980,7 @@ pub fn lab_module() -> Module {
                 h.block(async {
                     let agent = h.machine.agent().await.map_err(estr)?;
                     agent
-                        .pull_file(&guest_path, &out)
+                        .pull_file_as(&guest_path, &out, h.logon.clone())
                         .await
                         .map(|_| ())
                         .map_err(estr)
@@ -942,7 +1009,7 @@ pub fn lab_module() -> Module {
                             terminal::SCRIPT_ROWS,
                             None,
                             vec![],
-                            None,
+                            h.logon.clone(),
                         )
                         .await
                         .map_err(estr)
@@ -957,6 +1024,23 @@ pub fn lab_module() -> Module {
         .method("logins", |h: &MachineHandle| -> Vec<ScriptLogin> {
             script_logins(h.machine.logins(), h.machine.guest_os())
         })
+        // Identity (§19.2's wscript rung). Both return a second handle onto
+        // the same machine rather than switching this one, so the identity is
+        // said once and every call on the result carries it — which is what
+        // §19.8's "a provision step can address the dev login's home before
+        // that user has ever logged on" is spelled as.
+        .method(
+            "as_login",
+            |h: &MachineHandle, selector: String| -> Result<MachineHandle, String> {
+                h.as_identity(&selector, None)
+            },
+        )
+        .method(
+            "as_account",
+            |h: &MachineHandle, user: String, password: String| -> Result<MachineHandle, String> {
+                h.as_identity(&user, Some(&password))
+            },
+        )
         .method("stats", |h: &MachineHandle| -> Result<GuestStats, String> {
             h.block(async {
                 let agent = h.machine.agent().await.map_err(estr)?;
@@ -1200,6 +1284,42 @@ fn main(lab: Lab) {
 }
 "#;
         check_script_source(src).expect("m.logins() must be on every machine handle");
+    }
+
+    /// §19.8's one stated guarantee: a `provision {}` step can address the
+    /// dev login's home **before that user has ever logged on**. The script
+    /// rung of §19.2's ladder is what makes it true, so it has to be
+    /// spellable — `m.as_login(label)` for a declared identity, and
+    /// `m.as_account(user, password)` for one the lab file does not declare.
+    #[test]
+    fn a_script_can_run_guest_work_as_a_declared_login() {
+        let src = r#"
+use vmlab
+
+fn place_editor_bits(lab: Lab, m: Machine) {
+    let Ok(dev) = m.as_login("dev") else {
+        lab.log("no `dev` login declared")
+        return
+    }
+    // The write lands in the real dev user's home, whether or not that
+    // profile existed a moment ago (PRD §19.8).
+    let r = dev.exec("cmd", ["/c", "mkdir", "%USERPROFILE%\\.vscode\\extensions"])
+    let c = dev.copy_to("settings.json", "%APPDATA%\\Code\\User\\settings.json")
+    let Ok(t) = dev.terminal() else { return }
+    let done = t.close()
+}
+
+fn main(lab: Lab) {
+    let Ok(dc) = lab.vm("dc01") else { return }
+    place_editor_bits(lab, dc)
+    // An account the lab file never declared needs its secret with it, the
+    // same pair `vmlab exec --user/--password` takes.
+    let Ok(audit) = dc.as_account("PROBE\\audit", "s3cret") else { return }
+    let r = audit.exec("whoami", [])
+}
+"#;
+        check_script_source(src)
+            .expect("the wscript rung of §19.2's precedence ladder must be spellable");
     }
 
     /// What crosses to a script: the secret exactly as declared, and the two

@@ -1,0 +1,8 @@
+{
+  "//": "Machine-scoped VS Code settings, placed into PROBE\\dev's home by scripts/editor-bits.ws before that account has ever logged on (PRD §19.8). This is the *server* half; the client half is the snippet `vmlab dev attach` and `vmlab ssh-config --print` hand you.",
+  "files.eol": "\r\n",
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
+  "extensions.autoUpdate": false,
+  "extensions.autoCheckUpdates": false,
+  "telemetry.telemetryLevel": "off"
+}

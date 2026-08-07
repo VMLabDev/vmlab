@@ -749,11 +749,12 @@ fn attach_report(
         );
     }
     let _ = writeln!(out);
-    let _ = write!(
-        out,
-        "{}",
-        crate::ssh_config::editor_snippet(aliases, windows)
-    );
+    // The client-side snippet and the two routes off an offline guest
+    // (§19.8), against this machine's own aliases. They are printed rather
+    // than left to the docs because a developer who has just been handed an
+    // offline guest assumes both routes are gone, and the thing they reach
+    // for instead is the one §19.3 refuses.
+    let _ = write!(out, "{}", crate::ssh_config::attach_notes(aliases, windows));
     let _ = writeln!(out, "\nopening a shell on \"{machine}\"…");
     out
 }
@@ -921,6 +922,21 @@ mod tests {
         // it — and the client-side key both families need.
         assert!(out.contains("remote.SSH.localServerDownload"), "{out}");
         assert!(out.contains("\"vmlab-lab-dev01\": \"windows\""), "{out}");
+    }
+
+    /// §19.8's two prints: the offline guest has taken away neither the
+    /// developer's dotfiles nor the host-side service they were about to ask
+    /// for a reverse tunnel to. `attach` is where a developer meets the
+    /// machine, so it is where both are said.
+    #[test]
+    fn the_report_says_what_an_offline_guest_has_not_taken_away() {
+        let out = attach_report("dev02", &["vmlab-lab-dev02".into()], None, false);
+        assert!(
+            out.contains("scp -r ~/.config/nvim vmlab-lab-dev02:"),
+            "{out}"
+        );
+        assert!(out.contains("egress"), "{out}");
+        assert!(out.contains("`ssh -R` is refused"), "{out}");
     }
 
     /// A dev machine with a workspace gets the one sentence that makes

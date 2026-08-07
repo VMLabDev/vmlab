@@ -1170,9 +1170,12 @@ pub fn cmd_ssh_config(print: Option<&str>) -> Result<()> {
 
     print!("{}\n\n", managed.print(&block, machine)?);
     let family = guest_family(&file.lab, machine)?;
+    // The same handover `dev attach` prints (§19.8): `--print` is where a
+    // developer who will not read `~/.ssh/config` reads everything about this
+    // machine, so the two surfaces say one thing.
     print!(
         "{}",
-        crate::ssh_config::editor_snippet(
+        crate::ssh_config::attach_notes(
             &block.aliases_for(machine),
             family == crate::labd::guest_os::GuestOs::Windows
         )

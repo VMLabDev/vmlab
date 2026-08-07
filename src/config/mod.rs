@@ -699,4 +699,77 @@ template "base" {
         }
         assert!(checked >= 4, "expected example templates, found {checked}");
     }
+
+    /// Every shipped example **lab** must parse into the typed model, for the
+    /// same reason: an example nobody can run is documentation that lies.
+    ///
+    /// This is the parse half only — resolving a `template` needs a store,
+    /// which a unit test has no business having. The wscript half of the same
+    /// promise is `scripting::example_tests::shipped_examples_compile`.
+    #[test]
+    fn shipped_example_labs_parse() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(root).unwrap() {
+            let dir = entry.unwrap().path();
+            let wcl = dir.join(crate::paths::LAB_FILE);
+            if !wcl.is_file() {
+                continue;
+            }
+            let src = std::fs::read_to_string(&wcl).unwrap();
+            let lf = load_lab_source(&src, "vmlab.wcl", &dir)
+                .unwrap_or_else(|e| panic!("{}: {e:?}", wcl.display()));
+            assert!(
+                !lf.lab.name.is_empty(),
+                "{}: the lab has no name",
+                wcl.display()
+            );
+            checked += 1;
+        }
+        assert!(checked >= 6, "expected example labs, found {checked}");
+    }
+
+    /// The §19.8 worked examples carry the declarations they exist to
+    /// demonstrate: a `@dev` machine with a workspace and a `login {}`, on
+    /// **both** machine kinds — one contract, every machine kind, shown
+    /// rather than asserted.
+    #[test]
+    fn the_worked_examples_declare_a_dev_machine_of_each_kind() {
+        let load = |name: &str| {
+            let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples"))
+                .join(name);
+            let src = std::fs::read_to_string(dir.join(crate::paths::LAB_FILE)).unwrap();
+            load_lab_source(&src, "vmlab.wcl", &dir).unwrap().lab
+        };
+
+        for (example, machine, is_vm) in [
+            ("dev-vscode-windows", "dev01", true),
+            ("dev-neovim-container", "dev01", false),
+        ] {
+            let lab = load(example);
+            let m = lab.machine(machine).unwrap_or_else(|| {
+                panic!("{example} declares no machine `{machine}`");
+            });
+            let dev = m
+                .dev()
+                .unwrap_or_else(|| panic!("{example}/{machine} carries no @dev"));
+            assert!(
+                dev.workspace.is_some(),
+                "{example}: a worked example without a workspace demonstrates half of §19"
+            );
+            // The identity the editor bits land as — without it the provision
+            // runs as the machine and §19.8's guarantee is untested.
+            assert!(
+                m.logins().iter().any(|l| l.label == "dev"),
+                "{example}/{machine} declares no `dev` login"
+            );
+            // And the two are different machine kinds, which is the whole
+            // reason there are two examples.
+            assert_eq!(
+                matches!(m, crate::config::model::MachineCfg::Vm(_)),
+                is_vm,
+                "{example}: the pair must be split by machine kind"
+            );
+        }
+    }
 }
