@@ -104,6 +104,38 @@ pub struct Field {
     pub child: Option<ChildSlot>,
 }
 
+/// One decorator the schema declares (`@decorator("name")`), as WCL validates
+/// it: where it may be written, how often, and the arguments it takes.
+///
+/// A decorator declares its arguments as a block declares its fields: same
+/// types, same `@doc`, `@default` and `@options`. Each argument projects to
+/// the same [`Field`], so a surface renders it with the machinery it has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Decorator {
+    /// The spelling in a WCL file, without the `@`, e.g. `"one_of"`.
+    pub name: String,
+    /// The WCL type declaring it, e.g. `"RequiredGroup"`.
+    pub type_name: String,
+    /// The type's doc comment (the `//` lines above it).
+    pub doc: String,
+    /// The `@applies_to(on = […])` positions, e.g. `["block"]`. Empty when the
+    /// declaration names none — the decorator is then legal in every position.
+    pub positions: Vec<String>,
+    /// The `@applies_to(kinds = […])` block kinds. Empty means every kind.
+    pub kinds: Vec<String>,
+    /// `@decorator(…, repeatable = true)`: may be written more than once on
+    /// one node. Otherwise it may appear at most once.
+    pub repeatable: bool,
+    /// The declared arguments, in declaration order.
+    pub args: Vec<Field>,
+}
+
+impl Decorator {
+    pub fn arg(&self, name: &str) -> Option<&Field> {
+        self.args.iter().find(|a| a.name == name)
+    }
+}
+
 /// One block kind, as the schema declares it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Block {
@@ -116,6 +148,10 @@ pub struct Block {
     pub fields: Vec<Field>,
     /// `@one_of([…])` rules over this block's fields.
     pub required_groups: Vec<RequiredGroup>,
+    /// The names of the decorators an author may write on a block of this
+    /// kind, in schema declaration order. WCL decides applicability from each
+    /// declaration's `@applies_to`; this only reflects its answer.
+    pub decorators: Vec<String>,
 }
 
 impl Block {
@@ -140,6 +176,10 @@ pub struct SchemaProjection {
     pub roots: Vec<String>,
     /// Every block, in schema declaration order.
     pub blocks: Vec<Block>,
+    /// Every decorator the schema declares, in declaration order. WCL's own
+    /// built-in decorators (`@doc`, `@block`, `@children`, …) are not here:
+    /// they belong to the language, not to this schema.
+    pub decorators: Vec<Decorator>,
 }
 
 impl SchemaProjection {
@@ -167,12 +207,31 @@ impl SchemaProjection {
             })
             .collect();
 
+        // A decorator this schema declares, paired with the type declaring
+        // it. WCL's built-ins come through the same iterator; they are
+        // synthesised, so they span no source text, and an imported
+        // declaration belongs to another schema.
+        let declared: Vec<(String, wcl_lang::TypeDecl<'_>)> = doc
+            .declared_decorators()
+            .filter(|(_, decl)| !decl.is_imported() && !decl.span().is_empty())
+            .collect();
+
+        let decorators: Vec<Decorator> = declared
+            .iter()
+            .map(|(name, decl)| decorator(name, decl, &symbol_sets))
+            .collect();
+
         let blocks: Vec<Block> = doc
             .type_decls()
             .filter(|t| !t.is_imported())
             .filter_map(|decl| {
                 let kind = decorator_str(decl.decorators(), "block")?;
                 Some(Block {
+                    decorators: declared
+                        .iter()
+                        .filter(|(_, decl)| decl.decorator_applies_to("block", Some(&kind)))
+                        .map(|(name, _)| name.clone())
+                        .collect(),
                     kind,
                     type_name: decl.name_segments().join("."),
                     doc: decl.doc_comment().unwrap_or_default(),
@@ -204,11 +263,33 @@ impl SchemaProjection {
             })
             .unwrap_or_default();
 
-        Ok(SchemaProjection { roots, blocks })
+        Ok(SchemaProjection {
+            roots,
+            blocks,
+            decorators,
+        })
     }
 
     pub fn block(&self, kind: &str) -> Option<&Block> {
         self.blocks.iter().find(|b| b.kind == kind)
+    }
+
+    pub fn decorator(&self, name: &str) -> Option<&Decorator> {
+        self.decorators.iter().find(|d| d.name == name)
+    }
+
+    /// The decorators an author may write on a block of `kind`, in schema
+    /// declaration order. Empty for a kind the schema does not declare.
+    pub fn block_decorators(&self, kind: &str) -> Vec<&Decorator> {
+        self.block(kind)
+            .map(|block| {
+                block
+                    .decorators
+                    .iter()
+                    .filter_map(|name| self.decorator(name))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The option list of one field, e.g. `("gpu", "mode")`. Empty when the
@@ -225,6 +306,39 @@ impl SchemaProjection {
     /// default, does not exist, or its default is not numeric.
     pub fn default_number(&self, kind: &str, field: &str) -> Option<i64> {
         self.block(kind)?.field(field)?.default_number
+    }
+}
+
+/// Project one declared decorator. `name` is the spelling `@decorator("…")`
+/// gives it, which is not the declaring type's name.
+fn decorator(
+    name: &str,
+    decl: &wcl_lang::TypeDecl<'_>,
+    symbol_sets: &BTreeMap<String, Vec<String>>,
+) -> Decorator {
+    let applies_to = decl.decorators().find(|d| d.name() == "applies_to");
+    let applicability = |arg: &str| {
+        applies_to
+            .as_ref()
+            .and_then(|d| d.resolved_arg_value(arg).or_else(|| d.named_arg(arg)))
+            .and_then(Result::ok)
+            .and_then(|value| name_list(&value))
+            .unwrap_or_default()
+    };
+
+    Decorator {
+        name: name.to_string(),
+        type_name: decl.name_segments().join("."),
+        doc: decl.doc_comment().unwrap_or_default(),
+        positions: applicability("on"),
+        kinds: applicability("kinds"),
+        repeatable: matches!(
+            decl.decorators()
+                .find(|d| d.name() == "decorator")
+                .and_then(|d| d.named_arg("repeatable")),
+            Some(Ok(Value::Bool(true)))
+        ),
+        args: decl.fields().map(|f| field(&f, symbol_sets)).collect(),
     }
 }
 
@@ -316,7 +430,7 @@ fn classify(
             TypeRef::Builtin(BuiltinType::Utf8) => FieldType::TextList,
             _ => FieldType::Unknown,
         },
-        TypeRef::Named(path) => match path.join(".").as_str() {
+        TypeRef::Named { path, .. } => match path.join(".").as_str() {
             "std.ByteSize" => FieldType::ByteSize,
             "std.Duration" => FieldType::Duration,
             _ => FieldType::Unknown,
@@ -332,7 +446,7 @@ fn symbol_set_options(
     symbol_sets: &BTreeMap<String, Vec<String>>,
 ) -> Option<Vec<String>> {
     match ty {
-        TypeRef::Named(path) => symbol_sets.get(&path.join(".")).cloned(),
+        TypeRef::Named { path, .. } => symbol_sets.get(&path.join(".")).cloned(),
         _ => None,
     }
 }
@@ -409,6 +523,22 @@ fn as_i64(value: &Value) -> Option<i64> {
 fn string_list(value: &Value) -> Option<Vec<String>> {
     match value {
         Value::List(items) => items.iter().map(as_string).collect(),
+        _ => None,
+    }
+}
+
+/// A list of names, however they are spelled. `@applies_to` takes its
+/// positions as symbols (`:block`) and its kinds as strings (`"vm"`), and WCL
+/// accepts an identifier for either, so all four spellings read as the name.
+fn name_list(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::List(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Symbol(name) | Value::Identifier(name) => Some(name.clone()),
+                other => as_string(other),
+            })
+            .collect(),
         _ => None,
     }
 }
@@ -669,6 +799,111 @@ type Thing {
         assert_eq!(thing.field("count").unwrap().default.as_deref(), Some("7"));
         assert_eq!(thing.field("count").unwrap().default_number, Some(7));
         assert_eq!(thing.field("other").unwrap().default, None);
+    }
+
+    /// Every decorator the schema declares is projected the way its blocks
+    /// are: name, doc, applicability, cardinality and typed arguments.
+    #[test]
+    fn decorator_declarations_come_from_the_schema() {
+        let names: Vec<&str> = projection()
+            .decorators
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(names, ["options", "range", "one_of"]);
+
+        let options = projection().decorator("options").expect("@options");
+        assert_eq!(options.type_name, "FieldOptions");
+        assert!(options.doc.starts_with("The exact set of values"));
+        assert_eq!(options.positions, ["type_field"]);
+        assert!(options.kinds.is_empty(), "no kinds narrows nothing");
+        assert!(!options.repeatable);
+        let values = options.arg("values").expect("the values argument");
+        assert_eq!(values.ty, FieldType::TextList);
+        assert!(!values.optional);
+        assert_eq!(values.label_slot, Some(0));
+        assert_eq!(
+            values.doc,
+            "Every value the validator accepts, in the order a picker should offer them"
+        );
+
+        // An optional argument reads as optional, so a surface knows it may
+        // be left out.
+        let range = projection().decorator("range").expect("@range");
+        assert_eq!(range.arg("min").unwrap().ty, FieldType::Int);
+        assert!(!range.arg("min").unwrap().optional);
+        assert!(range.arg("max").unwrap().optional);
+
+        // `@one_of` is the one a block may carry more than once.
+        let one_of = projection().decorator("one_of").expect("@one_of");
+        assert_eq!(one_of.positions, ["type"]);
+        assert!(one_of.repeatable);
+        assert_eq!(one_of.arg("exclusive").unwrap().ty, FieldType::Bool);
+        assert!(one_of.arg("exclusive").unwrap().optional);
+    }
+
+    /// WCL's own decorators belong to the language. Projecting them would
+    /// offer every surface annotations no lab file has any business carrying.
+    #[test]
+    fn built_in_decorators_are_not_projected() {
+        for name in ["doc", "block", "children", "inline", "default", "decorator"] {
+            assert!(
+                projection().decorator(name).is_none(),
+                "@{name} is WCL's, not the schema's"
+            );
+        }
+    }
+
+    /// The schema's three decorators annotate the schema file itself, so no
+    /// block offers any of them — the list fills in when one declares
+    /// `@applies_to(on = [:block])`.
+    #[test]
+    fn a_block_carries_only_the_decorators_declared_for_its_kind() {
+        for block in &projection().blocks {
+            assert!(
+                block.decorators.is_empty(),
+                "{} offers {:?}",
+                block.kind,
+                block.decorators
+            );
+        }
+
+        let source = r#"
+@decorator("options") @applies_to(on = [:type_field])
+type FieldOptions { @inline(0) values: list<utf8> }
+@document type Doc {
+  @children("gizmo") gizmos: list<Gizmo>
+  @children("widget") widgets: list<Widget>
+}
+// Marks a gizmo for the dev machine.
+@decorator("dev", repeatable = true)
+@applies_to(on = [:block], kinds = ["gizmo"])
+type Dev {
+  @doc("Who to hand the machine to") @inline(0) owner: utf8
+  @doc("How to reach it") @options(["ssh", "rdp"]) @default("ssh") over: utf8?
+}
+// Legal anywhere, because it says nothing about where.
+@decorator("tag") type Tag { @inline(0) name: utf8 }
+@block("gizmo") type Gizmo { @doc("A field") flavour: utf8? }
+@block("widget") type Widget { @doc("A field") size: i64? }
+"#;
+        let projected = SchemaProjection::reflect(source, "test.wcl").expect("reflect");
+        assert_eq!(projected.block("gizmo").unwrap().decorators, ["dev", "tag"]);
+        assert_eq!(projected.block("widget").unwrap().decorators, ["tag"]);
+
+        let dev = projected.block_decorators("gizmo")[0];
+        assert_eq!(dev.name, "dev");
+        assert_eq!(dev.doc, "Marks a gizmo for the dev machine.");
+        assert_eq!(dev.kinds, ["gizmo"]);
+        assert!(dev.repeatable);
+        // An argument carries everything a block field carries.
+        let over = dev.arg("over").expect("the over argument");
+        assert_eq!(over.ty, FieldType::Enum);
+        assert_eq!(over.options, ["ssh", "rdp"]);
+        assert_eq!(over.default.as_deref(), Some("\"ssh\""));
+        assert_eq!(over.doc, "How to reach it");
+        assert!(over.optional);
+        assert!(!dev.arg("owner").unwrap().optional);
     }
 
     #[test]

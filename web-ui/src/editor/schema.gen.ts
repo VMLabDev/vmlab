@@ -77,6 +77,21 @@ export const REQUIRED_GROUPS: Record<string, RequiredGroup[]> = {
   "disk": [{ fields: ["size", "from"], exclusive: false }],
 };
 
+/** A decorator an author may write on a block, with one row per
+ *  declared argument. */
+export interface DecoratorDesc {
+  name: string;
+  /** The decorator declaration's doc comment. */
+  doc: string;
+  /** It may be written more than once on one block. */
+  repeatable: boolean;
+  fields: FieldDesc[];
+}
+
+/** The decorators each block kind accepts, keyed by block kind. */
+export const BLOCK_DECORATORS: Record<string, DecoratorDesc[]> = {
+};
+
 /** `vm` block fields. */
 export const VM_HARDWARE: FieldDesc[] = [
   { key: "nested", label: "Nested virt", doc: "Enable nested virtualisation (host CPU passthrough)", type: "flag" },
