@@ -95,6 +95,9 @@ fn spawn_agent(
         setns_pid,
         env: env.to_vec(),
         workdir: spec.workdir.clone(),
+        // §19.2's container floor: sessions land as the workload's own user
+        // unless a `login {}` says otherwise.
+        user: spec.user.clone(),
     };
     let json = match serde_json::to_string(&config) {
         Ok(j) => j,

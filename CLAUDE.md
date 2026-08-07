@@ -20,11 +20,12 @@ PRD implemented (M1–M6). **§19 (Dev machines) is mostly specified, not built*
 — the SSH facade, the agent's `fileops` vocabulary and the workspace syncer are
 all spec only; implementation is tracked by #78–#98. The `@dev` declaration
 (#80) and the agent's `tunnel` (#85) and `watch` (#86) vocabularies (§19.5) are
-built, as is machine-level `login {}` (#81) and the **Windows logon it mints**
+built, as is machine-level `login {}` (#81), the **Windows logon it mints**
 (#82) — the wire's per-open `logon`, `LogonUser`/`LoadUserProfileW`/
 linked-token minting, the (account, secret, machine) cache and `exec`/`shell`'s
-`--user`/`--password`. The Linux session (#83) and the person-invoked file
-transfer (#84) are not built: a declared logon on a Linux guest fails by name.
+`--user`/`--password` — and the **Linux session** (#83): `su -l` where the
+guest has PAM, `setuid` where it does not, plus the container floor. The
+person-invoked file transfer (#84) is not built.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
@@ -51,7 +52,12 @@ Module map under `src/`:
   terminals (PTY/ConPTY), streaming exec, file transfer, tail, metrics,
   clipboard, guest-side TCP tunnels (`tunnel.rs`, §19.5) and the recursive
   tree `watch` backing the workspace syncer (`watch/`, §19.5) — only a
-  tunnel's payload touches the guest network. Baked into templates by
+  tunnel's payload touches the guest network. `spawn.rs` is the one seam
+  every guest process and written file is created through (ADR-0015) and
+  each platform half mints §19.2's declared logins behind it:
+  `windows/logon.rs` a token and a loaded profile, `linux/login.rs` a real
+  login (PAM via `su -l`, else `setuid`) and the container floor. Baked into
+  templates by
   `template/agent_install.rs`; spawned by cinit inside container micro-VMs;
   `labd/vm_agent.rs` is the host-side client; `build-agent.sh` builds the
   per-target binaries (musl + windows-gnu).

@@ -99,16 +99,22 @@ fn floor(guest_os: GuestOs) -> &'static str {
 }
 
 fn as_logon(machine: &str, login: &Login, guest_os: GuestOs) -> Result<Logon> {
-    let Some(secret) = login.password.clone() else {
-        // §5.1 rejects this at validation on a Windows-family profile, so
-        // reaching it means a Linux machine whose login has no password —
-        // which the Linux session (#83) resolves without one.
-        bail!(
+    let secret = match (login.password.clone(), guest_os) {
+        (Some(secret), _) => secret,
+        // The agent is root and root needs no credential to become an
+        // account, which is the same fact that makes §19.2's container floor
+        // free. So a Linux `login {}` may declare the account alone.
+        (None, GuestOs::Linux) => String::new(),
+        // §5.1 rejects this at validation on a Windows-family profile: the
+        // agent is SYSTEM and every credential-free route is the one Windows
+        // OpenSSH's S4U logon already disqualified. Reaching it anyway is a
+        // refusal, not a passwordless logon.
+        (None, GuestOs::Windows) => bail!(
             "login `{}` on machine `{machine}` declares no password, and account `{}` \
              cannot be logged on without one",
             login.label,
             login.user
-        );
+        ),
     };
     Ok(Logon {
         user: login.user.clone(),
@@ -300,15 +306,29 @@ mod tests {
         assert!(!got.elevated);
     }
 
-    /// A Linux login may declare no password at all; nothing can log it on
-    /// until #83, so the refusal says which login and which machine rather
-    /// than sending a secretless triple the guest cannot use.
+    /// A Linux login may declare the account alone: the agent is root, and
+    /// root needs no credential to become it — the same fact that makes the
+    /// container floor free (§19.2).
     #[test]
-    fn a_login_with_no_password_fails_naming_the_login_and_the_machine() {
+    fn a_linux_login_needs_no_password() {
         let logins = vec![login("dev", "dev", None)];
-        let err = resolve("web01", &logins, GuestOs::Linux, None, None).unwrap_err();
+        let got = resolve("web01", &logins, GuestOs::Linux, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.user, "dev");
+        assert_eq!(got.secret, "");
+    }
+
+    /// On Windows there is no such route — §5.1 rejects a passwordless
+    /// `login {}` at validation, and reaching one anyway is a refusal naming
+    /// the login and the machine rather than a secretless triple the agent
+    /// could only fail on.
+    #[test]
+    fn a_windows_login_with_no_password_fails_naming_the_login_and_the_machine() {
+        let logins = vec![login("dev", r"PROBE\dev", None)];
+        let err = resolve("dc01", &logins, GuestOs::Windows, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("`dev`"), "{msg}");
-        assert!(msg.contains("`web01`"), "{msg}");
+        assert!(msg.contains("`dc01`"), "{msg}");
     }
 }

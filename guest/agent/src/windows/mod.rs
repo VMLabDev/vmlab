@@ -59,7 +59,7 @@ impl Spawner for WindowsSpawner {
         let held = self.logons.resolve(identity)?;
         let spawned = match held.as_deref() {
             Some(logon) => proc::spawn_piped(&logon.value, spec)?,
-            None => piped_command(spec)?,
+            None => piped_command(spec, |_| {})?,
         };
         Ok(hold_until_it_exits(spawned, held))
     }
