@@ -67,6 +67,17 @@ The dev machine carrying `@dev(default = true)`, or the only one carrying
 opens it — not per-developer. Which dev machine is *mine* is host-side state
 and deliberately not expressible in `vmlab.wcl`.
 
+**Dev selection**:
+Which dev machine is *mine* — one developer's answer, recorded by `vmlab dev
+use` in the lab's own gitignored `.vmlab/`, and forgotten with it by `destroy`.
+Per-developer by construction, which is exactly what the committed lab file
+cannot express, and keyless because it lives inside the lab it describes. It
+is one rung of a fixed ladder — argument, `VMLAB_DEV_MACHINE`, selection,
+**default dev machine** — every rung of which is checked rather than trusted:
+a rung naming a machine this lab does not offer is an error at that rung, never
+a fall through to the next. See PRD §19.7.
+_Avoid_: current dev machine, active machine, context (nothing is switched)
+
 **Workspace**:
 A dev machine's source tree: a guest-local working copy on the machine's own
 disk, of a host directory that is canonical. Declared with `@dev(workspace)`,

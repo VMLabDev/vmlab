@@ -50,16 +50,26 @@ channels that need what it lacks refuse by name. With it, `vmlab machine
 repair-agent`, which pushes the host's shipped agent into a running machine and
 marks it **diverged**; never automatic, and meaningless on a container, which
 it says. **The managed `~/.ssh/config` block** (#91, §19.7) carries the aliases
-every client picks out of, with `vmlab ssh` and `vmlab ssh-config` over it;
-`vmlab dev attach` / `dev use` (#92) are still spec.
+every client picks out of, with `vmlab ssh` and `vmlab ssh-config` over it.
+**`vmlab dev attach` and `dev use`** (#92, §19.7) close the cold-to-editing
+path: attach ups one machine, waits for `attachable` with the wait visible,
+prints the alias and the editor snippet, and `exec`s `ssh` — launching no
+editor and owning nothing the editor will still need; `dev use` records which
+dev machine is *mine* in the lab's gitignored `.vmlab/`, which `destroy`
+forgets with everything else there. With them the selection ladder (argument →
+`VMLAB_DEV_MACHINE` → `dev use` → the default `@dev`, else an error listing
+the candidates) and `ssh-proxy`'s refusal to do any lifecycle at all.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
   `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005)
   and `designer.rs` renders the console's inspector forms from it.
-- `dev.rs` — dev machines (§19.1): who carries `@dev`, which one is the lab's
+- `dev/` — dev machines (§19.1): who carries `@dev`, which one is the lab's
   default, and the `@dev` > profile > floor resolution of its arguments —
-  deliberately separate from the hardware resolver ADR-0008 owns.
+  deliberately separate from the hardware resolver ADR-0008 owns. `select.rs`
+  answers the other question, the one a committed `vmlab.wcl` cannot (§19.7):
+  which dev machine is *mine* — the fixed ladder, and the selection recorded
+  in the lab's own `.vmlab/`.
 - `attach.rs` — `attachable` (§19.4) and the words every rung of its failure
   ladder says: the one derivation over probed agent features, the refusal that
   names both remedies, and the warning `up` prints. Nothing here is called by
@@ -135,7 +145,8 @@ Module map under `src/`:
 - `smb/` — bundled-smbd shared folders; `steps.rs` owns the guest-side mount
   plan (virtiofs + SMB, per guest OS) the lab runtime only executes.
 - `oci/` — OCI registry push/pull (chunked, multi-arch).
-- `cli/` — the `vmlab` verb surface.
+- `cli/` — the `vmlab` verb surface; `dev.rs` is `vmlab dev` (§19.7), which
+  holds only what is meaningless for a machine that is not `@dev`.
 - `web/` — the `vmlab-web` binary (Actix-web): REST + WebSocket API over the
   proto client, an embedded SolidJS console UI (`web-ui/`, rust-embed), live
   noVNC over a `vnc.sock` WebSocket bridge, and username/password auth. Behind

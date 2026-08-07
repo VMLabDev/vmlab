@@ -35,7 +35,7 @@ pub fn lab_here() -> Result<(String, std::path::PathBuf)> {
     Ok((file.lab.name, root))
 }
 
-fn load_lab_here() -> Result<(crate::config::LabFile, std::path::PathBuf)> {
+pub(super) fn load_lab_here() -> Result<(crate::config::LabFile, std::path::PathBuf)> {
     let cwd = std::env::current_dir()?;
     let root = crate::paths::find_lab_root(&cwd)?;
     let file = load_lab_at(&root)?;
@@ -305,7 +305,7 @@ pub fn cmd_status(verbose: bool) -> Result<()> {
 /// A payload that will not parse is an error, not an empty lab: the daemon and
 /// this binary disagreeing about the shape is exactly the failure that once
 /// printed a status table with no rows in it.
-async fn lab_status(client: &LabClient) -> Result<LabStatus> {
+pub(super) async fn lab_status(client: &LabClient) -> Result<LabStatus> {
     let payload = client.send(LabRequest::Status {}).await.map_err(remote)?;
     serde_json::from_value(payload).context("the lab daemon reported a status vmlab cannot read")
 }
@@ -1057,18 +1057,19 @@ pub fn cmd_ssh(machine_ref: &str, cmd: Vec<String>) -> Result<()> {
         if file.lab.machine(&machine).is_none() {
             bail!("lab \"{name}\" declares no machine \"{machine}\"");
         }
-        let (managed, _, outcome) = crate::ssh_config::refresh_lab(&file.lab, &root)
+        let (managed, _, _) = crate::ssh_config::refresh_lab(&file.lab, &root)
             .context("the managed SSH block must be current before `ssh` can use it")?;
         let alias = crate::ssh_config::Alias {
             machine: machine.clone(),
             login: None,
         };
-        // A write verified itself; an unchanged block did not, and this is
-        // the one command that must not proceed on an alias OpenSSH resolves
-        // to somebody else's `ProxyCommand`.
-        if outcome == crate::ssh_config::Outcome::Unchanged {
-            managed.verify(&name, Some(&alias))?;
-        }
+        // **This** alias, whether or not anything was written. A write
+        // verifies the block's *first* alias, which in a lab of several
+        // machines is another machine's; and an unchanged block that has been
+        // losing to somebody's `Host *` all along would otherwise never say
+        // so. This is the one command that must not proceed on an alias
+        // OpenSSH resolves to somebody else's `ProxyCommand`.
+        managed.verify(&name, Some(&alias))?;
 
         // Liveness, from the daemon that is already up. No daemon at all
         // means nothing is running, which is the same refusal one step
@@ -1107,7 +1108,7 @@ pub fn cmd_ssh(machine_ref: &str, cmd: Vec<String>) -> Result<()> {
 /// Become `ssh`. Nothing after this line runs in this process — which is the
 /// point: signals, the terminal, `~.` and the exit code are the client's,
 /// exactly as if the developer had typed `ssh <alias>`.
-fn exec_ssh(alias: &str, cmd: &[String]) -> Result<()> {
+pub(super) fn exec_ssh(alias: &str, cmd: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
 
     let mut ssh = std::process::Command::new("ssh");
@@ -1179,16 +1180,32 @@ pub fn cmd_ssh_config(print: Option<&str>) -> Result<()> {
 /// `template = "x86_64/win"` is exactly the shape a Windows dev machine is
 /// declared in. Reading the store here is what `vmlab validate` already does
 /// for the same reason.
-fn guest_family(
+pub(super) fn guest_family(
     lab: &crate::config::model::Lab,
     machine: &str,
 ) -> Result<crate::labd::guest_os::GuestOs> {
-    use crate::config::model::{MachineCfg, TemplateRef};
-
     let found = lab
         .machine(machine)
         .ok_or_else(|| anyhow!("lab \"{}\" declares no machine \"{machine}\"", lab.name))?;
-    let profile = match found {
+    Ok(crate::labd::guest_os::guest_os_of(
+        effective_profile_name(found).as_deref(),
+    ))
+}
+
+/// A declared machine's **effective** guest OS profile name, resolved
+/// client-side the way `vmlab validate` resolves it: a VM usually names no
+/// profile of its own and inherits its template's (§5.2).
+///
+/// Shared by everything the CLI decides from a profile without a daemon in
+/// hand — the editor snippet's guest family, and the dev defaults §19.1 layers
+/// over a profile — so the two cannot disagree about which profile a machine
+/// is on.
+pub(super) fn effective_profile_name(
+    machine: crate::config::model::MachineCfg<'_>,
+) -> Option<String> {
+    use crate::config::model::{MachineCfg, TemplateRef};
+
+    match machine {
         MachineCfg::Container(c) => c.profile.clone(),
         MachineCfg::Vm(vm) => {
             let meta = match &vm.template {
@@ -1207,8 +1224,7 @@ fn guest_family(
             };
             crate::qemu::resolve::effective_profile_name(vm, meta.as_ref())
         }
-    };
-    Ok(crate::labd::guest_os::guest_os_of(profile.as_deref()))
+    }
 }
 
 /// `vmlab ssh-proxy [lab/]<machine>` — the `ProxyCommand` an `ssh` process
@@ -1222,18 +1238,48 @@ fn guest_family(
 /// "boot and wait" would be a silent multi-minute hang racing itself against
 /// the client's own connect timeout. It fails immediately instead, with a
 /// diagnostic that survives being printed into an editor's log (§19.7).
+///
+/// That is why it resolves its lab through [`daemon::try_lab_daemon`] and
+/// never [`daemon::ensure_lab_daemon`], and why it reads the lab file with
+/// [`lab_here`] rather than [`current_lab`]: starting a supervisor, starting a
+/// lab daemon and rewriting the developer's `~/.ssh/config` are all lifecycle,
+/// and all three would happen behind an editor that only asked for a socket.
 pub fn cmd_ssh_proxy(machine_ref: &str) -> Result<()> {
     rt()?.block_on(async {
         use tokio::io::AsyncWriteExt as _;
 
-        let (lab, machine) = split_vm_ref(machine_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
+        let (lab_ref, machine) = split_vm_ref(machine_ref)?;
+        let lab = match lab_ref {
+            Some(name) => name,
+            // The generated stanza always passes the qualified form; a bare
+            // name only arrives from a hand-written `ProxyCommand`, and then
+            // the cwd is the only thing that can say which lab.
+            None => {
+                lab_here()
+                    .map_err(|e| anyhow!(proxy_failure(&machine, &format!("{e:#}"))))?
+                    .0
+            }
+        };
+        let Some(client) = daemon::try_lab_daemon(&lab).await else {
+            bail!(proxy_failure(
+                &format!("{lab}/{machine}"),
+                &format!("lab \"{lab}\" is not running"),
+            ));
+        };
         let opened = client
             .send(LabRequest::MachineSshOpen {
                 machine: machine.clone(),
             })
             .await
-            .map_err(remote)?;
+            .map_err(|e| {
+                // The daemon's own error code is kept — the diagnostic is the
+                // message a human reads out of a log, not a different failure.
+                let failed = crate::proto::CommandError::from(e);
+                anyhow!(crate::proto::CommandError::new(
+                    failed.code,
+                    proxy_failure(&format!("{lab}/{machine}"), &failed.message),
+                ))
+            })?;
         let path = opened["path"]
             .as_str()
             .ok_or_else(|| anyhow!("lab daemon returned no socket for \"{machine}\""))?;
@@ -1257,6 +1303,25 @@ pub fn cmd_ssh_proxy(machine_ref: &str) -> Result<()> {
         copied.context("the SSH facade closed the connection")?;
         Ok(())
     })
+}
+
+/// What a failed `ssh-proxy` says, written for the place it will actually be
+/// read: an editor's log file, hours later, by someone who did not run the
+/// command (§19.7).
+///
+/// So it names itself, names what it was asked for, gives the reason it was
+/// handed, and says what to type — because the thing it deliberately did not
+/// do is the thing the reader has to do. A bare "connection closed" here is the
+/// failure this exists to avoid: it is what the *client* prints, and it says
+/// nothing about vmlab, the machine, or the lab.
+fn proxy_failure(target: &str, why: &str) -> String {
+    format!(
+        "vmlab ssh-proxy: cannot reach \"{target}\": {why}\n\
+         vmlab ssh-proxy never starts anything — an editor spawns it with no terminal and \
+         several at once, so booting a guest here would hang the connection until the client \
+         gave up. Bring the machine up in a terminal first (`vmlab dev attach`, or `vmlab up`), \
+         then reconnect."
+    )
 }
 
 /// `vmlab tail <vm> <path>` — follow a file inside the guest (tail -F
@@ -2392,6 +2457,29 @@ mod tests {
                 percent: 50,
             })
             .collect()
+    }
+
+    /// The proxy's diagnostic is written for an editor's log, so it carries
+    /// everything a reader who did not run it needs: that vmlab said it, what
+    /// was asked for, why it failed, and — because refusing lifecycle is the
+    /// whole design — what to type instead (§19.7).
+    #[test]
+    fn the_proxy_diagnostic_survives_an_editor_log() {
+        let said = super::proxy_failure("home/dev01", "lab \"home\" is not running");
+        assert!(
+            said.starts_with("vmlab ssh-proxy: "),
+            "names itself: {said}"
+        );
+        assert!(said.contains("\"home/dev01\""), "names the target: {said}");
+        assert!(
+            said.contains("lab \"home\" is not running"),
+            "carries the reason: {said}"
+        );
+        assert!(
+            said.contains("never starts anything"),
+            "says why it did not wait: {said}"
+        );
+        assert!(said.contains("vmlab dev attach"), "says what to do: {said}");
     }
 
     #[test]
