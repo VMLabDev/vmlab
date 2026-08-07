@@ -222,7 +222,7 @@ type SinkholeRule {
 // `src/dev.rs`. Any number of machines may carry it and zero is normal.
 @decorator("dev")
 @applies_to(on = [:block], kinds = ["vm", "container"])
-type DevMachine {
+type DevDeclaration {
   @doc("Make this the lab's default dev machine; at most one per lab, and the only `@dev` machine is it implicitly")
   default: bool?
   @doc("Host directory whose contents sync into the workspace, relative to the lab root")

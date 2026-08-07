@@ -28,13 +28,15 @@ use crate::profiles::Profile;
 /// profile — and a lab author who wants another path writes one.
 pub const WORKSPACE_GUEST_FLOOR: &str = "/src";
 
-/// One machine's `@dev` declaration, resolved.
+/// One machine's `@dev` declaration, resolved — the dev counterpart of
+/// [`ResolvedVm`](crate::qemu::resolve::ResolvedVm), and deliberately not the
+/// same resolver (ADR-0008).
 ///
 /// Note that `default` is a *lab-level* answer: a lone `@dev` machine is the
 /// default without declaring it, so this is not simply the decorator's
 /// argument read back.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DevMachine {
+pub struct ResolvedDev {
     /// The machine carrying the decorator.
     pub name: String,
     /// This is the lab's default dev machine.
@@ -53,8 +55,8 @@ pub struct DevMachine {
 /// template rather than its own block (§5.2), which only the caller can know.
 /// `None` — no profile at all, or one this build cannot find — resolves to the
 /// floor, which is the same answer a profile declaring no dev keys gives.
-pub fn resolve(name: &str, dev: &DevDecl, profile: Option<&Profile>) -> DevMachine {
-    DevMachine {
+fn resolve(name: &str, dev: &DevDecl, profile: Option<&Profile>) -> ResolvedDev {
+    ResolvedDev {
         name: name.to_string(),
         default: dev.default,
         workspace: dev.workspace.clone(),
@@ -78,8 +80,8 @@ pub fn resolve(name: &str, dev: &DevDecl, profile: Option<&Profile>) -> DevMachi
 pub fn machines<'a>(
     lab: &'a Lab,
     profile: impl Fn(MachineCfg<'a>) -> Option<Profile>,
-) -> Vec<DevMachine> {
-    let mut out: Vec<DevMachine> = lab
+) -> Vec<ResolvedDev> {
+    let mut out: Vec<ResolvedDev> = lab
         .machines()
         .filter_map(|m| {
             let dev = m.dev()?;
@@ -87,17 +89,27 @@ pub fn machines<'a>(
         })
         .collect();
     // The lone dev machine never has to meet the concept: it is the default
-    // implicitly, whether or not it says so.
+    // implicitly, whether or not it says so. That includes one that wrote
+    // `default = false` — "where none carries `default = true`, the only
+    // machine carrying `@dev`" is the whole rule, and the alternative is a
+    // lab with exactly one dev machine and no default to attach to.
     if out.len() == 1 {
         out[0].default = true;
     }
     out
 }
 
-/// The lab's default dev machine, or `None` — for a lab with no dev machine,
-/// or with several where none is declared the default.
-pub fn default(devs: &[DevMachine]) -> Option<&DevMachine> {
-    devs.iter().find(|d| d.default)
+impl From<ResolvedDev> for crate::status::DevStatus {
+    /// What `status` reports (ADR-0004). The host path crosses as text: the
+    /// projection is a wire type, and every surface that shows a workspace
+    /// shows the path the lab file wrote.
+    fn from(dev: ResolvedDev) -> Self {
+        Self {
+            default: dev.default,
+            workspace: dev.workspace.map(|p| p.display().to_string()),
+            workspace_guest: dev.workspace_guest,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -118,10 +130,23 @@ mod tests {
 
     /// Resolve a lab's dev machines against the shipped profiles, keyed by
     /// each machine's own `profile` — the layer between `@dev` and the floor.
-    fn resolved(src: &str) -> Vec<DevMachine> {
+    fn resolved(src: &str) -> Vec<ResolvedDev> {
         let lab = lab(src);
         let profiles = ProfileSet::shipped().unwrap();
-        machines(&lab, |m| m.profile().and_then(|p| profiles.get(p).cloned()))
+        machines(&lab, |m| {
+            // The declared profile only: a test lab has no template store to
+            // inherit one from, which is the layer `LabRuntime` supplies.
+            let declared = match m {
+                MachineCfg::Vm(v) => v.profile.as_deref(),
+                MachineCfg::Container(c) => c.profile.as_deref(),
+            };
+            declared.and_then(|p| profiles.get(p).cloned())
+        })
+    }
+
+    /// The lab's default dev machine, as every consumer reads it.
+    fn default_of(devs: &[ResolvedDev]) -> Option<&ResolvedDev> {
+        devs.iter().find(|d| d.default)
     }
 
     const DEV_VM: &str =
@@ -186,7 +211,7 @@ mod tests {
             "the undecorated machine is not a dev machine"
         );
         assert!(devs[0].default);
-        assert_eq!(default(&devs).map(|d| d.name.as_str()), Some("dev01"));
+        assert_eq!(default_of(&devs).map(|d| d.name.as_str()), Some("dev01"));
     }
 
     /// With more than one, the declaration decides — and nothing else does.
@@ -195,14 +220,14 @@ mod tests {
         let devs = resolved(&format!(
             "{DEV_VM}\n@dev(default = true) container \"buildbox\" {{ image = \"sdk:9.0\" profile = \"container\" }}"
         ));
-        assert_eq!(default(&devs).map(|d| d.name.as_str()), Some("buildbox"));
+        assert_eq!(default_of(&devs).map(|d| d.name.as_str()), Some("buildbox"));
 
         // None declared: there is no default, rather than a machine picked by
         // file order.
         let devs = resolved(&format!(
             "{DEV_VM}\n@dev container \"buildbox\" {{ image = \"sdk:9.0\" profile = \"container\" }}"
         ));
-        assert!(default(&devs).is_none());
+        assert!(default_of(&devs).is_none());
         assert!(devs.iter().all(|d| !d.default));
     }
 
@@ -211,6 +236,6 @@ mod tests {
     fn a_lab_with_no_dev_machine_resolves_to_nothing() {
         let devs = resolved(r#"vm "dc01" { template = "x86_64/win" }"#);
         assert!(devs.is_empty());
-        assert!(default(&devs).is_none());
+        assert!(default_of(&devs).is_none());
     }
 }

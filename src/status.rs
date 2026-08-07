@@ -786,7 +786,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["dev01", "buildbox"]
         );
-        assert_eq!(status.default_dev().map(|m| m.name.as_str()), Some("dev01"));
+        assert_eq!(
+            status
+                .dev_machines()
+                .find(|(_, d)| d.default)
+                .map(|(m, _)| m.name.as_str()),
+            Some("dev01")
+        );
         assert_eq!(
             status.machines[1].dev.as_ref().unwrap().workspace_guest,
             "C:\\src"
@@ -795,7 +801,6 @@ mod tests {
 
         // No dev machine at all is the ordinary case, and answers cleanly.
         let plain = lab(vec![machine("dc01", PowerState::Running, true, vm())]);
-        assert!(plain.default_dev().is_none());
         assert_eq!(plain.dev_machines().count(), 0);
     }
 

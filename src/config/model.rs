@@ -106,16 +106,6 @@ impl<'a> MachineCfg<'a> {
             MachineCfg::Container(c) => c.dev.as_ref(),
         }
     }
-
-    /// The guest OS profile this machine's own block names. A VM may inherit
-    /// one from its template instead, which only the template store can
-    /// answer — see [`crate::qemu::resolve::effective_profile_name`].
-    pub fn profile(&self) -> Option<&'a str> {
-        match self {
-            MachineCfg::Vm(v) => v.profile.as_deref(),
-            MachineCfg::Container(c) => c.profile.as_deref(),
-        }
-    }
 }
 
 /// A machine's `@dev` decorator, as written (§19.1). Every argument is

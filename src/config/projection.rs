@@ -846,6 +846,7 @@ type Thing {
         // position and the two machine kinds (PRD §19.1). Every argument is
         // optional — a bare `@dev` is a complete dev machine.
         let dev = projection().decorator("dev").expect("@dev");
+        assert_eq!(dev.type_name, "DevDeclaration");
         assert_eq!(dev.positions, ["block"]);
         assert_eq!(dev.kinds, ["vm", "container"]);
         assert!(!dev.repeatable);

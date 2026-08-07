@@ -26,7 +26,7 @@ use super::vm::{PowerState, VmDirs, VmInstance};
 use crate::config::LabFile;
 use crate::config::model::TemplateRef;
 use crate::profiles::ProfileSet;
-use crate::status::{DevStatus, LabStatus, SegmentFrames, SegmentStatus};
+use crate::status::{LabStatus, SegmentFrames, SegmentStatus};
 use crate::sync::LockRecover;
 use crate::template::TemplateStore;
 
@@ -1595,7 +1595,7 @@ impl LabRuntime {
     /// the already-resolved hardware rather than off the declaration, where a
     /// VM naming no `profile` of its own would land on the floor instead of on
     /// its guest OS's path.
-    fn dev_machines(&self) -> Vec<crate::dev::DevMachine> {
+    fn dev_machines(&self) -> Vec<crate::dev::ResolvedDev> {
         crate::dev::machines(&self.config.lab, |cfg| {
             self.machine(cfg.name())
                 .ok()
@@ -1623,11 +1623,8 @@ impl LabRuntime {
             status.dev = devs
                 .iter()
                 .find(|d| d.name == status.name)
-                .map(|d| DevStatus {
-                    default: d.default,
-                    workspace: d.workspace.as_ref().map(|p| p.display().to_string()),
-                    workspace_guest: d.workspace_guest.clone(),
-                });
+                .cloned()
+                .map(Into::into);
             machines.push(status);
         }
 
@@ -2311,7 +2308,15 @@ lab "t" {
             dev("db").is_none(),
             "an undecorated machine is not a dev machine"
         );
-        assert_eq!(status.default_dev().map(|m| m.name.as_str()), Some("dev01"));
+        assert_eq!(
+            status
+                .dev_machines()
+                .filter(|(_, d)| d.default)
+                .map(|(m, _)| m.name.as_str())
+                .collect::<Vec<_>>(),
+            ["dev01"],
+            "exactly one machine is the lab's default"
+        );
     }
 
     /// `depends_on` gates on readiness identically for both kinds. `web`
