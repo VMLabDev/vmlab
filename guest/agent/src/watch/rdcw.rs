@@ -155,6 +155,11 @@ fn run(watch: Arc<Watch>, dir: Arc<Dir>, mut dirs: Inventory) {
 /// Fold one reported entry into the dirty set.
 fn handle(watch: &Arc<Watch>, dirs: &mut Inventory, action: u32, rel: String) {
     watch.mark(rel.clone());
+    if watch.is_pruned(&rel) {
+        // A pruned directory is inert: never in the inventory, and never a
+        // reason to rescan when it goes.
+        return;
+    }
     match action {
         FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME if is_dir(watch, &rel) => {
             // A directory that appeared: nothing inside it was reported.
@@ -230,8 +235,7 @@ impl Inventory {
     fn remove_subtree(&mut self, rel: &str) -> bool {
         let known = self.0.remove(rel);
         if known {
-            self.0
-                .retain(|p| !(p.starts_with(rel) && p.as_bytes().get(rel.len()) == Some(&b'/')));
+            self.0.retain(|p| !super::is_at_or_below(p, rel));
         }
         known
     }

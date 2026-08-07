@@ -478,7 +478,6 @@ impl AgentHandle {
         self.open(|id| HostMsg::OpenTail { id, path }).await
     }
 
-    /// Follow the Windows event log.
     /// Watch the guest tree at `path` recursively (§19.5). `prune` is the
     /// host's list of root-relative directory prefixes the guest registers no
     /// watcher under — the host still owns globs, negations and semantics
@@ -502,6 +501,7 @@ impl AgentHandle {
         })
     }
 
+    /// Follow the Windows event log.
     pub async fn open_eventlog(&self, filter: Option<String>) -> Result<AgentSession> {
         self.open(|id| HostMsg::OpenEventLog { id, filter }).await
     }
@@ -848,7 +848,7 @@ impl Drop for AgentSession {
 /// coalesces, so a path created, modified and deleted inside one drain window
 /// has no single kind to report (§19.5).
 #[derive(Debug)]
-pub enum WatchEvent {
+pub enum WatchReport {
     /// The guest's dirty set went empty → non-empty. One nudge per drain
     /// window: drain now if idle, or let the burst batch itself.
     Dirty,
@@ -875,10 +875,11 @@ pub struct WatchSession {
 }
 
 impl WatchSession {
-    /// Swap the guest's dirty set out. At most one drain is outstanding — the
-    /// answer is the next [`WatchEvent::Batch`] or [`WatchEvent::Rescan`] —
-    /// and there is no ack for it, because a dropped channel already implies
-    /// a stat-walk, so the loss self-heals.
+    /// Swap the guest's dirty set out. At most one drain is outstanding; the
+    /// answer is one [`WatchReport::Batch`] or one [`WatchReport::Rescan`],
+    /// though a [`WatchReport::Dirty`] the guest sent before the drain reached
+    /// it can still arrive first. There is no ack for the answer, because a
+    /// dropped channel already implies a stat-walk, so the loss self-heals.
     pub async fn drain(&self) -> Result<()> {
         self.session
             .send(&encode_record(&WatchRecord::Drain))
@@ -887,16 +888,16 @@ impl WatchSession {
     }
 
     /// Next record. `None` once the channel (or connection) is gone.
-    pub async fn recv(&mut self) -> Option<WatchEvent> {
+    pub async fn recv(&mut self) -> Option<WatchReport> {
         loop {
             if let Some(record) = self.pending.pop_front() {
                 return Some(match record {
-                    WatchRecord::Dirty => WatchEvent::Dirty,
-                    WatchRecord::Batch { entries } => WatchEvent::Batch(entries),
-                    WatchRecord::Rescan => WatchEvent::Rescan,
+                    WatchRecord::Dirty => WatchReport::Dirty,
+                    WatchRecord::Batch { entries } => WatchReport::Batch(entries),
+                    WatchRecord::Rescan => WatchReport::Rescan,
                     // Host→agent only; an agent sending one is desynced.
                     WatchRecord::Drain => {
-                        WatchEvent::Error("agent sent a drain on a watch channel".into())
+                        WatchReport::Error("agent sent a drain on a watch channel".into())
                     }
                 });
             }
@@ -907,13 +908,13 @@ impl WatchSession {
                         match self.decoder.next_record() {
                             Ok(Some(record)) => self.pending.push_back(record),
                             Ok(None) => break,
-                            Err(e) => return Some(WatchEvent::Error(e)),
+                            Err(e) => return Some(WatchReport::Error(e)),
                         }
                     }
                 }
-                SessionEvent::Error(msg) => return Some(WatchEvent::Error(msg)),
+                SessionEvent::Error(msg) => return Some(WatchReport::Error(msg)),
                 other => {
-                    return Some(WatchEvent::Error(format!(
+                    return Some(WatchReport::Error(format!(
                         "unexpected {other:?} on a watch channel"
                     )));
                 }
@@ -1918,10 +1919,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(watch.recv().await, Some(WatchEvent::Dirty)));
+        assert!(matches!(watch.recv().await, Some(WatchReport::Dirty)));
 
         watch.drain().await.unwrap();
-        let Some(WatchEvent::Batch(entries)) = watch.recv().await else {
+        let Some(WatchReport::Batch(entries)) = watch.recv().await else {
             panic!("expected a batch");
         };
         assert_eq!(entries.len(), 3001);
@@ -1933,7 +1934,7 @@ mod tests {
         assert_eq!(last.stat.as_ref().unwrap().kind, EntryKind::File);
 
         watch.drain().await.unwrap();
-        assert!(matches!(watch.recv().await, Some(WatchEvent::Rescan)));
+        assert!(matches!(watch.recv().await, Some(WatchReport::Rescan)));
         watch.close().await;
     }
 

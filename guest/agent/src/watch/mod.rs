@@ -66,7 +66,6 @@ pub fn open(mux: &Mux, id: u32, root: String, prune: Vec<String>) {
         prune: prune.iter().map(|p| normalise(p)).collect(),
         set: DirtySet::default(),
         credit: Mutex::new(None),
-        send_lock: Mutex::new(()),
         stopped: AtomicBool::new(false),
         cancel: Mutex::new(None),
     });
@@ -104,6 +103,10 @@ pub fn open(mux: &Mux, id: u32, root: String, prune: Vec<String>) {
     }
     mux.send_ctrl(&AgentMsg::Opened { id });
 
+    thread::spawn({
+        let watch = watch.clone();
+        move || send_loop(watch)
+    });
     thread::spawn(move || drain_loop(watch, input));
 }
 
@@ -111,13 +114,8 @@ pub fn open(mux: &Mux, id: u32, root: String, prune: Vec<String>) {
 /// one the host sends; anything else means the stream is desynced, which is
 /// unrecoverable inside a channel (there is no resync point) and so fails it.
 ///
-/// This thread answers a drain inline, so it stops reading input while the
-/// batch is on the wire. That is why the vocabulary allows **one drain
-/// outstanding** and carries no request id to pipeline on: a host that sent
-/// drains without reading the answers would fill this channel's input queue,
-/// and the queue is what bounds it. Closing the channel unblocks it either
-/// way — a dead host cannot wedge the watch, only a live one that never
-/// reads.
+/// A drain is handed to the sender thread rather than answered here, so this
+/// thread keeps reading the channel while a batch is on the wire.
 fn drain_loop(watch: Arc<Watch>, input: std::sync::mpsc::Receiver<Input>) {
     let mut decoder = RecordDecoder::new();
     let mut window = RecvWindow::default();
@@ -132,7 +130,7 @@ fn drain_loop(watch: Arc<Watch>, input: std::sync::mpsc::Receiver<Input>) {
         decoder.push(&bytes);
         loop {
             match decoder.next_record() {
-                Ok(Some(WatchRecord::Drain)) => watch.drain(),
+                Ok(Some(WatchRecord::Drain)) => watch.set.request_drain(),
                 Ok(Some(other)) => {
                     watch.fail(format!("host sent {other:?} on a watch channel"));
                     return;
@@ -150,8 +148,8 @@ fn drain_loop(watch: Arc<Watch>, input: std::sync::mpsc::Receiver<Input>) {
     watch.stop();
 }
 
-/// One live watch channel. The backends mark paths on it; the drain loop
-/// swaps the set out.
+/// One live watch channel. The backends mark paths on it, the drain loop
+/// asks for the set, and one sender thread owns the wire.
 pub(crate) struct Watch {
     mux: Mux,
     id: u32,
@@ -161,9 +159,6 @@ pub(crate) struct Watch {
     prune: Vec<String>,
     set: DirtySet,
     credit: Mutex<Option<Arc<Credit>>>,
-    /// Serialises record writes: the backend thread's `Dirty` nudge and the
-    /// drain loop's batch would otherwise interleave mid-record.
-    send_lock: Mutex<()>,
     stopped: AtomicBool,
     cancel: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -174,32 +169,25 @@ impl Watch {
         &self.root
     }
 
-    /// Whether `rel` is at or below a pruned prefix. Both the marking and the
-    /// registration side ask this, so a pruned subtree is neither watched nor
-    /// reported.
+    /// Whether `rel` is at or below a pruned prefix. Registration, marking
+    /// and the backends' own bookkeeping all ask this, so a pruned subtree is
+    /// inert: never watched, never reported, and never a reason to rescan.
     pub(crate) fn is_pruned(&self, rel: &str) -> bool {
-        self.prune
-            .iter()
-            .any(|p| rel == p || rel.starts_with(p) && rel.as_bytes().get(p.len()) == Some(&b'/'))
+        self.prune.iter().any(|p| is_at_or_below(rel, p))
     }
 
-    /// Record a path as dirty, nudging the host on the empty → non-empty
-    /// transition.
+    /// Record a path as dirty.
     pub(crate) fn mark(&self, rel: String) {
         if self.is_pruned(&rel) {
             return;
         }
-        if self.set.mark(rel) {
-            self.send(&WatchRecord::Dirty);
-        }
+        self.set.mark(rel);
     }
 
     /// Coverage was lost: the next drain answers `Rescan` whatever else is in
     /// the set.
     pub(crate) fn overflow(&self) {
-        if self.set.overflow() {
-            self.send(&WatchRecord::Dirty);
-        }
+        self.set.overflow();
     }
 
     /// The watch root itself is gone — fail by name rather than reporting the
@@ -240,24 +228,13 @@ impl Watch {
         *self.cancel.lock().expect("cancel lock") = Some(cancel);
     }
 
-    /// Swap the set out and answer the host.
-    fn drain(&self) {
-        match self.set.swap() {
-            Drained::Rescan => self.send(&WatchRecord::Rescan),
-            Drained::Paths(paths) => {
-                let entries = paths.iter().map(|p| stat_record(&self.root, p)).collect();
-                self.send(&WatchRecord::Batch { entries });
-            }
-        }
-    }
-
-    /// Write one record to the channel, chunked into the credit window. A
-    /// record is atomic on the wire; a closed channel drops it.
+    /// Write one record to the channel, chunked into the credit window. Only
+    /// the sender thread calls this, so a record is atomic on the wire; a
+    /// closed channel drops it.
     fn send(&self, record: &WatchRecord) {
         let credit = self.credit.lock().expect("credit lock").clone();
         let Some(credit) = credit else { return };
         let bytes = encode_record(record);
-        let _lock = self.send_lock.lock().expect("send lock");
         let mut off = 0;
         while off < bytes.len() {
             let take = credit.take(bytes.len() - off);
@@ -271,24 +248,60 @@ impl Watch {
     }
 }
 
-/// The coalescing set. Holds paths, never events: a path created, modified
-/// and deleted inside one drain window has no single kind, so per-event kinds
-/// are not a rejected option but an incoherent one.
+/// The one thread that writes to a watch channel. Nothing else waits on
+/// credit: the backend threads must keep reading their platform's event queue
+/// (blocking one is what turns back-pressure into the queue overflow this
+/// design exists to avoid), and the drain loop must keep reading the channel.
+fn send_loop(watch: Arc<Watch>) {
+    while !watch.stopped() {
+        match watch.set.take_work() {
+            Some(Work::Nudge) => watch.send(&WatchRecord::Dirty),
+            Some(Work::Drain(Drained::Rescan)) => watch.send(&WatchRecord::Rescan),
+            Some(Work::Drain(Drained::Paths(paths))) => {
+                let entries = paths.iter().map(|p| stat_record(&watch.root, p)).collect();
+                watch.send(&WatchRecord::Batch { entries });
+            }
+            // Idle: nothing owed. Round again to recheck the channel.
+            None => {}
+        }
+    }
+}
+
+/// The coalescing set, and what the sender thread owes the host. Holds paths,
+/// never events: a path created, modified and deleted inside one drain window
+/// has no single kind, so per-event kinds are not a rejected option but an
+/// incoherent one.
 #[derive(Default)]
 struct DirtySet {
     state: Mutex<SetState>,
+    /// Woken whenever the sender thread has something to send.
+    work: std::sync::Condvar,
 }
 
 #[derive(Default)]
 struct SetState {
     paths: BTreeSet<String>,
     overflow: bool,
+    /// The set went empty → non-empty and the host has not been nudged yet.
+    nudge: bool,
+    /// The host asked for the set and has not been answered yet.
+    drain: bool,
 }
 
 impl SetState {
     /// Whether a drain right now would report anything.
     fn has_content(&self) -> bool {
         self.overflow || !self.paths.is_empty()
+    }
+
+    /// Take the window's contents, leaving an empty set behind.
+    fn swap(&mut self) -> Drained {
+        if self.overflow {
+            self.paths.clear();
+            self.overflow = false;
+            return Drained::Rescan;
+        }
+        Drained::Paths(std::mem::take(&mut self.paths))
     }
 }
 
@@ -298,43 +311,78 @@ enum Drained {
     Rescan,
 }
 
+/// What the sender thread owes the host.
+enum Work {
+    Nudge,
+    Drain(Drained),
+}
+
+/// How long the sender thread waits before rechecking whether the channel
+/// closed.
+const IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl DirtySet {
-    /// Add a path. Returns whether this was the empty → non-empty transition
-    /// (the host's one nudge per drain window).
-    fn mark(&self, rel: String) -> bool {
+    /// Add a path, nudging the host on the empty → non-empty transition —
+    /// once per drain window, so a build burst costs one nudge.
+    fn mark(&self, rel: String) {
         let mut state = self.state.lock().expect("dirty set");
-        let was_empty = !state.has_content();
-        if state.overflow {
-            return false; // already collapsed; paths are pointless work
+        if !state.has_content() {
+            state.nudge = true;
         }
-        if state.paths.len() >= DIRTY_SET_CAP && !state.paths.contains(&rel) {
-            // The cap is the batch bound too, so overflow frees the paths
-            // rather than holding a set the host will never receive.
-            state.paths.clear();
-            state.overflow = true;
-        } else {
-            state.paths.insert(rel);
+        if !state.overflow {
+            if state.paths.len() >= DIRTY_SET_CAP && !state.paths.contains(&rel) {
+                // The cap is the batch bound too, so overflow frees the paths
+                // rather than holding a set the host will never receive.
+                state.paths.clear();
+                state.overflow = true;
+            } else {
+                state.paths.insert(rel);
+            }
         }
-        was_empty
+        drop(state);
+        self.work.notify_all();
     }
 
-    /// Collapse to a rescan. Returns whether it was the transition.
-    fn overflow(&self) -> bool {
+    /// Collapse to a rescan.
+    fn overflow(&self) {
         let mut state = self.state.lock().expect("dirty set");
-        let was_empty = !state.has_content();
+        if !state.has_content() {
+            state.nudge = true;
+        }
         state.paths.clear();
         state.overflow = true;
-        was_empty
+        drop(state);
+        self.work.notify_all();
     }
 
-    /// Take the window's contents, leaving an empty set behind.
-    fn swap(&self) -> Drained {
+    /// The host asked for the set.
+    fn request_drain(&self) {
+        self.state.lock().expect("dirty set").drain = true;
+        self.work.notify_all();
+    }
+
+    /// Block until the sender thread owes the host something, or until
+    /// [`IDLE_WAIT`] passes with nothing owed. Swapping the set and clearing
+    /// the nudge happen together, so a mark that lands after a swap keeps its
+    /// nudge and one that lands before it rides the batch instead.
+    fn take_work(&self) -> Option<Work> {
         let mut state = self.state.lock().expect("dirty set");
-        if state.overflow {
-            *state = SetState::default();
-            return Drained::Rescan;
+        loop {
+            if state.drain {
+                state.drain = false;
+                state.nudge = false;
+                return Some(Work::Drain(state.swap()));
+            }
+            if state.nudge {
+                state.nudge = false;
+                return Some(Work::Nudge);
+            }
+            let (guard, timeout) = self.work.wait_timeout(state, IDLE_WAIT).expect("dirty set");
+            state = guard;
+            if timeout.timed_out() {
+                return None;
+            }
         }
-        Drained::Paths(std::mem::take(&mut state.paths))
     }
 }
 
@@ -382,6 +430,12 @@ fn normalise(rel: &str) -> String {
         .filter(|s| !s.is_empty() && *s != ".")
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Whether `rel` is `prefix` itself or sits under it. Compared at a path
+/// boundary, so `node_modules_two` is not under `node_modules`.
+pub(crate) fn is_at_or_below(rel: &str, prefix: &str) -> bool {
+    rel == prefix || rel.starts_with(prefix) && rel.as_bytes().get(prefix.len()) == Some(&b'/')
 }
 
 /// Join a directory's relative path with a child name.

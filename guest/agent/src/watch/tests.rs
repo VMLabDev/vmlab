@@ -13,23 +13,38 @@ use crate::testutil::{Capture, capture_mux};
 
 // --- the set ------------------------------------------------------------
 
+/// Whether the set owes the host a nudge, and clear it — what the sender
+/// thread does when it takes one.
+fn took_nudge(set: &DirtySet) -> bool {
+    let mut state = set.state.lock().unwrap();
+    std::mem::replace(&mut state.nudge, false)
+}
+
+fn drain(set: &DirtySet) -> Drained {
+    set.request_drain();
+    match set.take_work() {
+        Some(Work::Drain(drained)) => drained,
+        _ => panic!("a requested drain is the sender thread's first work"),
+    }
+}
+
 #[test]
 fn one_path_written_many_times_is_one_entry() {
     let set = DirtySet::default();
-    assert!(set.mark("src/main.rs".into()), "empty -> non-empty nudges");
+    set.mark("src/main.rs".into());
+    assert!(took_nudge(&set), "empty -> non-empty nudges");
     for _ in 0..400 {
-        assert!(
-            !set.mark("src/main.rs".into()),
-            "no second nudge inside one drain window"
-        );
+        set.mark("src/main.rs".into());
     }
-    assert!(!set.mark("src/other.rs".into()));
-    let Drained::Paths(paths) = set.swap() else {
+    set.mark("src/other.rs".into());
+    assert!(!took_nudge(&set), "no second nudge inside one drain window");
+    let Drained::Paths(paths) = drain(&set) else {
         panic!("expected paths")
     };
     assert_eq!(paths.len(), 2);
     // The window is over: the next path nudges again.
-    assert!(set.mark("src/main.rs".into()));
+    set.mark("src/main.rs".into());
+    assert!(took_nudge(&set));
 }
 
 #[test]
@@ -42,18 +57,36 @@ fn the_cap_collapses_the_batch_to_a_rescan_and_frees_the_paths() {
         set.state.lock().unwrap().paths.is_empty(),
         "an overflowed set holds no paths"
     );
-    assert!(matches!(set.swap(), Drained::Rescan));
+    assert!(matches!(drain(&set), Drained::Rescan));
     // Draining clears it: the next window starts fresh.
-    assert!(matches!(set.swap(), Drained::Paths(p) if p.is_empty()));
+    assert!(matches!(drain(&set), Drained::Paths(p) if p.is_empty()));
 }
 
 #[test]
 fn overflow_on_an_empty_set_still_nudges_once() {
     let set = DirtySet::default();
-    assert!(set.overflow());
-    assert!(!set.overflow());
-    assert!(!set.mark("late.rs".into()));
-    assert!(matches!(set.swap(), Drained::Rescan));
+    set.overflow();
+    assert!(took_nudge(&set));
+    set.overflow();
+    set.mark("late.rs".into());
+    assert!(!took_nudge(&set));
+    assert!(matches!(drain(&set), Drained::Rescan));
+}
+
+/// A batch answers every mark made before the swap, so the nudge that
+/// brought it is spent — but a mark that lands after the swap keeps its own,
+/// or the host would never hear about it.
+#[test]
+fn a_drain_spends_the_nudge_it_answers_and_no_other() {
+    let set = DirtySet::default();
+    set.mark("early.rs".into());
+    let Drained::Paths(paths) = drain(&set) else {
+        panic!("expected paths")
+    };
+    assert_eq!(paths.len(), 1);
+    assert!(!took_nudge(&set), "the batch carried it");
+    set.mark("late.rs".into());
+    assert!(took_nudge(&set));
 }
 
 #[test]
@@ -86,7 +119,6 @@ fn pruned_watch(prune: &[&str]) -> Watch {
         prune: prune.iter().map(|p| normalise(p)).collect(),
         set: DirtySet::default(),
         credit: Mutex::new(None),
-        send_lock: Mutex::new(()),
         stopped: AtomicBool::new(false),
         cancel: Mutex::new(None),
     }
@@ -361,6 +393,29 @@ fn a_pruned_subtree_gets_no_watcher() {
     assert!(entries.iter().any(|e| e.path == "src/watched.rs"));
     assert!(
         !entries.iter().any(|e| e.path.starts_with("node_modules")),
+        "pruned paths leaked: {entries:?}"
+    );
+}
+
+/// Renaming a pruned tree — `mv node_modules node_modules.bak` — must not
+/// cost a whole-tree rescan: the host asked for that subtree to be inert.
+#[test]
+fn renaming_a_pruned_directory_forces_no_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    let (mux, mut watcher) = open_watch(dir.path(), vec!["node_modules".into()]);
+
+    std::fs::rename(
+        dir.path().join("node_modules"),
+        dir.path().join("node_modules.bak"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/after.rs"), b"x").unwrap();
+
+    let entries = wait_for(&mux, &mut watcher, "src/after.rs");
+    assert!(
+        !entries.iter().any(|e| e.path.starts_with("node_modules/")),
         "pruned paths leaked: {entries:?}"
     );
 }

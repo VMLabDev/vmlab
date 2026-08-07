@@ -129,7 +129,9 @@ fn handle(
     // a path the host can stat and reconcile.
     let rel = join_rel(&dir, &name.to_string_lossy());
     watch.mark(rel.clone());
-    if !mask.contains(AddWatchFlags::IN_ISDIR) {
+    if !mask.contains(AddWatchFlags::IN_ISDIR) || watch.is_pruned(&rel) {
+        // A pruned directory is inert: never registered, and never a reason
+        // to rescan when it goes.
         return true;
     }
     if mask.intersects(AddWatchFlags::IN_CREATE.union(AddWatchFlags::IN_MOVED_TO)) {
@@ -204,9 +206,7 @@ impl Registry {
         let gone: Vec<String> = self
             .by_path
             .keys()
-            .filter(|p| {
-                *p == rel || p.starts_with(rel) && p.as_bytes().get(rel.len()) == Some(&b'/')
-            })
+            .filter(|p| super::is_at_or_below(p, rel))
             .cloned()
             .collect();
         for path in gone {
