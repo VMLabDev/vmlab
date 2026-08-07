@@ -176,6 +176,14 @@ pub fn windows_desktop_script_cmd(
 /// so the globally-visible drive letters authenticate without anyone
 /// running the desktop script. Re-registered on every mount, so a rotated
 /// credential (after `destroy`) heals on the next logon.
+///
+/// **The guest agent reads this value back.** A `Run` key needs a desktop
+/// session, and the logon the agent mints for an attached developer is not
+/// one (PRD §19.2's correction to §7.5) — so `windows/logon.rs` fetches this
+/// value and runs it inside each logon it mints. Changing the value's shape
+/// changes what the agent executes; changing its name or location means the
+/// agent finds nothing and an attached developer's mapped drive silently
+/// stops opening.
 pub fn windows_logon_cred_cmd(gateway: Ipv4Addr, user: &str, pass: &str) -> (String, Vec<String>) {
     (
         "reg".to_string(),

@@ -92,6 +92,14 @@ portable in `tunnel.rs` with no platform hook and no spawner.
   because the ticket scoped to writes, where ownership is what §19.2 argues
   about — but §19.2 lists `pull` as person-invoked, so the seam will need an
   open-for-read before that lands.
+
+  *Resolved differently by #82.* The seam grew `adopter`, not an
+  open-for-read: `tail` reopens its file across rotation, so one handle would
+  not have carried the identity far enough. The seam resolves the identity
+  once (where minting fails loudly) and lends it to the session's thread,
+  which then opens whatever it needs. `files::open_pull` still opens
+  directly — it retires into `fileops` (#84) rather than growing a logon
+  here.
 - Adapter drift, as ADR-0001 warns: `FakeSpawner`'s kill closes its output
   streams and reports 137 because that is what a SIGKILL'd shell does. If the
   real adapters stop behaving that way, the fake must follow.

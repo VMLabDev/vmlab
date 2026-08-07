@@ -578,6 +578,14 @@ vocabulary! {
             #[serde(default)] args: Vec<String>,
             /// Seconds before the guest command is given up on.
             #[serde(default = "default_exec_timeout")] timeout: u64,
+            /// Which of the machine's declared logins to run as — its label,
+            /// or the account name as an alias (PRD §19.2). Absent is the
+            /// machine's default login; `SYSTEM`/`root` is the agent
+            /// identity, which is what a machine declaring no login gets.
+            #[serde(default)] user: Option<String>,
+            /// The secret for an account the lab file does not declare, or
+            /// one whose declared password has been rotated.
+            #[serde(default)] password: Option<String>,
         },
         /// What the guest OS says it is.
         #[one_way(
@@ -598,6 +606,10 @@ vocabulary! {
             #[serde(alias = "vm", alias = "container")] machine: String,
             #[serde(default = "default_cols")] cols: u16,
             #[serde(default = "default_rows")] rows: u16,
+            /// Which of the machine's declared logins the shell runs as —
+            /// see [`LabRequest::MachineExec`].
+            #[serde(default)] user: Option<String>,
+            #[serde(default)] password: Option<String>,
         },
         /// Resize an open terminal session.
         MachineTtyResize = "machine.tty_resize" {

@@ -2,6 +2,11 @@
 //! then live appends, surviving rotation (new inode at the same path) and
 //! truncation. Polling keeps it portable and dependency-free; a quarter
 //! second is plenty for log-watching.
+//!
+//! A tail is person-invoked, so it carries an identity (PRD §19.2). It is
+//! the one session that opens rather than creates, and it reopens across
+//! rotation — so it borrows the identity from the seam for the life of its
+//! thread rather than taking a handle from it (see [`crate::spawn::Adopted`]).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -13,13 +18,23 @@ use std::time::Duration;
 use vmlab_agent_proto::{AgentMsg, FrameKind};
 
 use crate::mux::Mux;
+use crate::spawn::{Identity, Spawner};
 
 const POLL: Duration = Duration::from_millis(250);
 /// How much of an existing file to send up front.
 const BACKLOG: u64 = 64 * 1024;
 
-pub fn open(mux: &Mux, id: u32, path: String) {
-    let mut file = match File::open(&path) {
+pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, path: String) {
+    // Minting can fail — a missing account, a wrong secret — and §19.2 says
+    // that is loud rather than a silent fall back to the agent identity.
+    let adopter = match spawner.adopter(identity) {
+        Ok(a) => a,
+        Err(e) => {
+            mux.send_error(Some(id), format!("tail {path}: {e}"));
+            return;
+        }
+    };
+    let mut file = match adopter().and_then(|_adopted| File::open(&path)) {
         Ok(f) => f,
         Err(e) => {
             mux.send_error(Some(id), format!("tail {path}: {e}"));
@@ -39,6 +54,16 @@ pub fn open(mux: &Mux, id: u32, path: String) {
 
     let mux = mux.clone();
     thread::spawn(move || {
+        // Adopted for the thread's life, not just the first open: a rotated
+        // file is reopened below and must be read through the same eyes.
+        let _adopted = match adopter() {
+            Ok(a) => a,
+            Err(e) => {
+                mux.send_error(Some(id), format!("tail {path}: {e}"));
+                mux.remove_finished(id);
+                return;
+            }
+        };
         // Start BACKLOG bytes from the end (or the start of a small file).
         let mut pos = file
             .metadata()

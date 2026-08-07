@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
 use super::daemon::{self, abs_path, remote};
-use super::yes_no;
+use super::{As, yes_no};
 use crate::proto::client::{LabClient, SupClient};
 use crate::proto::{LabRequest, Region, SupRequest};
 use crate::status::{LabStatus, MachineDetail, MachineStatus};
@@ -797,11 +797,17 @@ pub fn cmd_machine_destroy(machine_ref: &str, noun: &str) -> Result<()> {
 
 /// `vmlab container exec` — the container spelling of [`cmd_exec`]; `usage`
 /// is the invocation the error message suggests.
-pub fn cmd_container_exec(container_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
+pub fn cmd_container_exec(
+    container_ref: &str,
+    timeout: u64,
+    cmd: Vec<String>,
+    run_as: As,
+) -> Result<()> {
     exec_on_machine(
         container_ref,
         timeout,
         cmd,
+        run_as,
         "vmlab container exec <container> -- <cmd> [args...]",
     )
 }
@@ -873,21 +879,26 @@ pub fn cmd_machine_ip(machine_ref: &str, nic: Option<usize>) -> Result<()> {
 /// container (vmlab-agent over the `vmlab.agent.0` port, PRD §18). Every
 /// attach opens a fresh session; the local terminal goes raw; `Ctrl-]`
 /// detaches, like telnet.
-pub fn cmd_container_shell(container_ref: &str) -> Result<()> {
-    rt()?.block_on(shell_on_machine(container_ref))
+pub fn cmd_container_shell(container_ref: &str, run_as: As) -> Result<()> {
+    rt()?.block_on(shell_on_machine(container_ref, run_as))
 }
 
 /// `vmlab shell <vm>` — attach an interactive shell inside the VM over the
-/// vmlab-agent channel (root on Linux, SYSTEM PowerShell on Windows). Every
-/// attach opens a fresh session; concurrent shells are independent.
-pub fn cmd_shell(vm_ref: &str) -> Result<()> {
-    rt()?.block_on(shell_on_machine(vm_ref))
+/// vmlab-agent channel. Every attach opens a fresh session; concurrent
+/// shells are independent.
+///
+/// The shell is the machine's default `login {}` where it declares one, and
+/// SYSTEM/root where it does not (PRD §19.2). `--user`/`--password` pick
+/// another identity, and `--user SYSTEM` (or `root`) is the agent identity
+/// by name.
+pub fn cmd_shell(vm_ref: &str, run_as: As) -> Result<()> {
+    rt()?.block_on(shell_on_machine(vm_ref, run_as))
 }
 
 /// Open an agent terminal on one machine and hand the local terminal over to
 /// it. Both shell verbs land here — a VM and a container serve the same
 /// request.
-async fn shell_on_machine(machine_ref: &str) -> Result<()> {
+async fn shell_on_machine(machine_ref: &str, run_as: As) -> Result<()> {
     let (lab, machine) = split_vm_ref(machine_ref)?;
     let (_name, client) = lab_client_for(lab).await?;
     // Open at the real terminal size so the first prompt lays out right.
@@ -899,6 +910,8 @@ async fn shell_on_machine(machine_ref: &str) -> Result<()> {
             machine: machine.clone(),
             cols,
             rows,
+            user: run_as.user,
+            password: run_as.password,
         })
         .await
         .map_err(remote)?;
@@ -1130,8 +1143,23 @@ pub fn cmd_vm_find_image(
     })
 }
 
-pub fn cmd_exec(vm_ref: &str, timeout: u64, cmd: Vec<String>) -> Result<()> {
-    exec_on_machine(vm_ref, timeout, cmd, "vmlab exec <vm> -- <cmd> [args...]")
+/// `vmlab exec <vm> -- <cmd>` — run one command in the guest and mirror its
+/// output and exit code.
+///
+/// **This stops being SYSTEM/root on a machine that declares a `login {}`**:
+/// it runs as that login, so pushing into `C:\Windows\System32` starts
+/// failing where it used to work. Only machines that opted in are affected,
+/// and it is what makes "I am the dev user on this box" true in every verb
+/// rather than in one (PRD §19.2). `--user SYSTEM` (or `root`) asks for the
+/// agent identity by name.
+pub fn cmd_exec(vm_ref: &str, timeout: u64, cmd: Vec<String>, run_as: As) -> Result<()> {
+    exec_on_machine(
+        vm_ref,
+        timeout,
+        cmd,
+        run_as,
+        "vmlab exec <vm> -- <cmd> [args...]",
+    )
 }
 
 /// Run a command in one machine's guest and mirror its output and exit code.
@@ -1141,6 +1169,7 @@ fn exec_on_machine(
     machine_ref: &str,
     timeout: u64,
     mut cmd: Vec<String>,
+    run_as: As,
     usage: &str,
 ) -> Result<()> {
     if cmd.is_empty() {
@@ -1157,6 +1186,8 @@ fn exec_on_machine(
                 cmd: program,
                 args,
                 timeout,
+                user: run_as.user,
+                password: run_as.password,
             })
             .await
             .map_err(remote)?;

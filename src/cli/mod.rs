@@ -157,20 +157,38 @@ pub enum Command {
         out: std::path::PathBuf,
     },
     /// Run a command in the guest via the agent
+    ///
+    /// On a machine that declares a `login {}` this stops being SYSTEM/root:
+    /// it runs as that login, so writing into `C:\Windows\System32` starts
+    /// failing where it used to work. `--user SYSTEM` (or `root`) is the old
+    /// behaviour, spelled out (PRD §19.2).
     Exec {
         vm: String,
         /// Seconds to wait for the command to finish
         #[arg(long, value_name = "SECS", default_value_t = 120)]
         timeout: u64,
+        #[command(flatten)]
+        run_as: As,
         /// Command and arguments (after --)
         #[arg(last = true)]
         cmd: Vec<String>,
     },
-    /// Attach an interactive shell inside a VM (root / SYSTEM PowerShell
-    /// over virtio-serial — works with no guest network; Ctrl-] detaches)
-    Shell { vm: String },
+    /// Attach an interactive shell inside a VM (the machine's default login,
+    /// else SYSTEM/root — over virtio-serial, so it works with no guest
+    /// network; Ctrl-] detaches)
+    Shell {
+        vm: String,
+        #[command(flatten)]
+        run_as: As,
+    },
     /// Copy files between host and guest (either side may be <vm>:<path>;
     /// parent directories are created)
+    ///
+    /// Still the agent identity (SYSTEM/root) even on a machine that
+    /// declares a `login {}`, unlike `exec` and `shell`: transfers move onto
+    /// the agent's file vocabulary before they can carry a login (PRD
+    /// §19.5). Until then a pushed file is owned by SYSTEM/root, not by the
+    /// login you would attach as.
     Cp {
         /// Source: a host path, or <vm>:<path> to pull from the guest
         src: String,
@@ -329,6 +347,8 @@ pub enum ContainerCmd {
         /// Seconds to wait for the command to finish
         #[arg(long, value_name = "SECS", default_value_t = 120)]
         timeout: u64,
+        #[command(flatten)]
+        run_as: As,
         /// Command and arguments (after --)
         #[arg(last = true)]
         cmd: Vec<String>,
@@ -346,7 +366,11 @@ pub enum ContainerCmd {
     /// Print a container's IP address
     Ip { container: String },
     /// Attach an interactive shell inside the container (Ctrl-] to detach)
-    Shell { container: String },
+    Shell {
+        container: String,
+        #[command(flatten)]
+        run_as: As,
+    },
 }
 
 /// Kind-neutral machine queries: a VM and a container answer both (PRD §18).
@@ -453,6 +477,28 @@ pub enum PlaybookCmd {
     },
 }
 
+/// Who a person-invoked verb runs as, as the command line spells it — the
+/// top rung of PRD §19.2's precedence ladder.
+///
+/// One value rather than two loose `Option<String>`s because the pair is
+/// meaningless split: a password without a user selects nothing, which is
+/// why clap requires the one with the other. Every verb that attaches
+/// flattens the same pair in, so the two flags read identically wherever
+/// they appear.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct As {
+    /// Run as this login: the label a `login {}` block declares, or the
+    /// account name as an alias. Defaults to the machine's default login;
+    /// `SYSTEM` (Windows) or `root` (Linux) is the agent identity (PRD
+    /// §19.2)
+    #[arg(long, value_name = "LOGIN")]
+    pub user: Option<String>,
+    /// Password for an account the lab file does not declare, or one whose
+    /// declared password has been rotated
+    #[arg(long, value_name = "PASSWORD", requires = "user")]
+    pub password: Option<String>,
+}
+
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -497,15 +543,18 @@ pub fn run() -> ExitCode {
             ContainerCmd::Exec {
                 container,
                 timeout,
+                run_as,
                 cmd,
-            } => lab::cmd_container_exec(&container, timeout, cmd),
+            } => lab::cmd_container_exec(&container, timeout, cmd, run_as),
             ContainerCmd::Logs {
                 container,
                 follow,
                 lines,
             } => lab::cmd_container_logs(&container, follow, lines),
             ContainerCmd::Ip { container } => lab::cmd_machine_ip(&container, None),
-            ContainerCmd::Shell { container } => lab::cmd_container_shell(&container),
+            ContainerCmd::Shell { container, run_as } => {
+                lab::cmd_container_shell(&container, run_as)
+            }
         },
         Command::Machine { cmd } => match cmd {
             MachineCmd::Capabilities { machine, json } => machine::cmd_capabilities(&machine, json),
@@ -547,8 +596,13 @@ pub fn run() -> ExitCode {
         Command::Wscripti { out } => crate::scripting::write_interface(&out)
             .map_err(anyhow::Error::from)
             .map(|()| println!("wrote {}", out.display())),
-        Command::Exec { vm, timeout, cmd } => lab::cmd_exec(&vm, timeout, cmd),
-        Command::Shell { vm } => lab::cmd_shell(&vm),
+        Command::Exec {
+            vm,
+            timeout,
+            run_as,
+            cmd,
+        } => lab::cmd_exec(&vm, timeout, cmd, run_as),
+        Command::Shell { vm, run_as } => lab::cmd_shell(&vm, run_as),
         Command::Cp { src, dest } => lab::cmd_cp(&src, &dest),
         Command::Tail { vm, path } => lab::cmd_tail(&vm, &path),
         Command::Eventlog { vm, filter } => lab::cmd_eventlog(&vm, filter.as_deref()),

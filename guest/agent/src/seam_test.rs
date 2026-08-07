@@ -7,7 +7,7 @@
 
 #![cfg(test)]
 
-use vmlab_agent_proto::{AgentMsg, Frame, FrameKind, HostMsg};
+use vmlab_agent_proto::{AgentMsg, Frame, FrameKind, HostMsg, Logon};
 
 use crate::fake_spawner::{Call, TestPlatform};
 use crate::mux::{Input, Mux};
@@ -36,6 +36,7 @@ fn terminal_exec_and_push_all_reach_the_seam_as_the_agent() {
             cols: 80,
             rows: 24,
             command: Some(vec!["/bin/sh".into()]),
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 1 });
@@ -48,6 +49,7 @@ fn terminal_exec_and_push_all_reach_the_seam_as_the_agent() {
             argv: vec!["/bin/echo".into(), "hi".into()],
             env: vec![("K".into(), "V".into())],
             cwd: Some("/tmp".into()),
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 2 });
@@ -86,6 +88,145 @@ fn terminal_exec_and_push_all_reach_the_seam_as_the_agent() {
     );
 }
 
+/// PRD §19.2: everything a person invokes carries the declared login. The
+/// open is self-contained (§19.5), so the agent reads the triple straight
+/// off the wire and never resolves a label or holds a handshake id.
+#[test]
+fn an_open_that_carries_a_logon_reaches_the_seam_as_that_account() {
+    let (mux, mut cap) = capture_mux();
+    let p = TestPlatform::new();
+    let dev = Logon {
+        user: r"PROBE\dev".into(),
+        secret: "vmlab123!".into(),
+        elevated: true,
+    };
+
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTerminal {
+            id: 1,
+            cols: 80,
+            rows: 24,
+            command: None,
+            logon: Some(dev.clone()),
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 1 });
+
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 2,
+            argv: vec!["whoami".into()],
+            env: vec![],
+            cwd: None,
+            logon: Some(dev.clone()),
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 2 });
+
+    assert_eq!(
+        p.spawner.calls(),
+        vec![
+            Call::Terminal {
+                identity: Identity::Declared(dev.clone()),
+                command: None,
+                cols: 80,
+                rows: 24,
+            },
+            Call::Exec {
+                identity: Identity::Declared(dev),
+                argv: vec!["whoami".into()],
+                env: vec![],
+                cwd: None,
+            },
+        ]
+    );
+}
+
+/// A `tail` is person-invoked too, but it opens rather than creates — so it
+/// takes the identity from the seam and reads through it (§19.2), while
+/// `watch` beside it produces none of the developer's files and stays on
+/// the agent identity.
+#[test]
+fn tail_reads_through_the_logon_and_watch_never_asks_for_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log");
+    std::fs::write(&path, "line\n").unwrap();
+    let (mux, mut cap) = capture_mux();
+    let p = TestPlatform::new();
+    let dev = Logon {
+        user: "dev".into(),
+        secret: "hunter2".into(),
+        elevated: false,
+    };
+
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTail {
+            id: 1,
+            path: path.to_str().unwrap().into(),
+            logon: Some(dev.clone()),
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 1 });
+    cap.data_until(1, b"line");
+
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenWatch {
+            id: 2,
+            path: dir.path().to_str().unwrap().into(),
+            prune: vec![],
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 2 });
+
+    assert_eq!(
+        p.spawner.calls(),
+        vec![Call::Adopt {
+            identity: Identity::Declared(dev),
+        }],
+        "watch must never reach the seam for an identity",
+    );
+}
+
+/// §19.2: a declared account that does not exist, or a wrong secret, fails
+/// naming the account — never a silent fall back to the agent identity,
+/// which would leave commands mysteriously running as SYSTEM.
+#[test]
+fn a_logon_that_cannot_be_minted_fails_the_channel_by_name() {
+    let (mux, mut cap) = capture_mux();
+    let p = TestPlatform::new();
+    p.spawner
+        .fail_next(r"logon PROBE\dev: The user name or password is incorrect. (os error 1326)");
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 1,
+            argv: vec!["whoami".into()],
+            env: vec![],
+            cwd: None,
+            logon: Some(Logon {
+                user: r"PROBE\dev".into(),
+                secret: "wrong".into(),
+                elevated: true,
+            }),
+        },
+    );
+    match cap.ctrl() {
+        AgentMsg::Error {
+            id: Some(1), msg, ..
+        } => assert!(msg.contains(r"PROBE\dev"), "{msg}"),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
 #[test]
 fn terminal_bridges_keystrokes_output_resize_and_exit() {
     let (mux, mut cap) = capture_mux();
@@ -98,6 +239,7 @@ fn terminal_bridges_keystrokes_output_resize_and_exit() {
             cols: 80,
             rows: 24,
             command: None,
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 1 });
@@ -130,6 +272,7 @@ fn terminal_close_kills_the_shell_through_the_seam() {
             cols: 80,
             rows: 24,
             command: None,
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 1 });
@@ -154,6 +297,7 @@ fn terminal_spawn_failure_reports_the_seam_error() {
             cols: 80,
             rows: 24,
             command: None,
+            logon: None,
         },
     );
     match cap.ctrl() {
@@ -180,6 +324,7 @@ fn exec_splits_stdout_and_stderr_and_closes_stdin_on_eof() {
             argv: vec!["/bin/cat".into()],
             env: vec![],
             cwd: None,
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
@@ -212,6 +357,7 @@ fn exec_spawn_failure_names_the_binary() {
             argv: vec!["/no/such/binary".into()],
             env: vec![],
             cwd: None,
+            logon: None,
         },
     );
     match cap.ctrl() {
@@ -236,6 +382,7 @@ fn exec_empty_argv_never_reaches_the_seam() {
             argv: vec![],
             env: vec![],
             cwd: None,
+            logon: None,
         },
     );
     match cap.ctrl() {

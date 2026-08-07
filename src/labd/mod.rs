@@ -10,6 +10,7 @@ pub mod events;
 pub mod forward_plan;
 pub mod guest_os;
 pub mod hypervisor;
+pub mod identity;
 pub mod lab;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -249,6 +250,32 @@ fn display_of(
         .ok_or_else(|| CommandError::unsupported(format!("machine `{name}` has no display")))
 }
 
+/// Who a person-invoked command on this machine runs as (PRD §19.2).
+///
+/// Resolved from the machine itself — its declared logins and its guest
+/// family — so a caller holding a machine has everything the answer needs,
+/// and a refusal names the account and the machine rather than falling back
+/// to the agent identity.
+fn logon_for(
+    m: &dyn crate::labd::machine::Machine,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> Result<Option<vm_agent::Logon>, CommandError> {
+    identity::resolve(m.name(), m.logins(), m.guest_os(), user, password)
+        .map_err(|e| CommandError::failed(format!("{e:#}")))
+}
+
+/// Name the machine on a failure the guest could only name the account for.
+///
+/// The other half of §19.2's "fails naming the account **and** the machine":
+/// the account that could not be logged on is the agent's to report — only
+/// it knows the account does not exist or the secret is wrong — and the
+/// machine is the host's, because the agent has never been told which one it
+/// serves.
+fn on_machine<T>(machine: &str, r: Result<T, CommandError>) -> Result<T, CommandError> {
+    r.map_err(|e| e.prefixed(machine))
+}
+
 /// The agent channel of the addressed machine.
 async fn agent_of(
     lab: &Arc<LabRuntime>,
@@ -476,19 +503,28 @@ impl Handler<LabRequest> for LabdHandler {
                 cmd,
                 args,
                 timeout,
+                user,
+                password,
             } => {
-                let agent = agent_of(lab, &machine).await?;
+                let m = machine_of(lab, &machine)?;
+                let logon = logon_for(m.as_ref(), user.as_deref(), password.as_deref())?;
+                let agent = m.agent().await?;
                 let mut argv = vec![cmd];
                 argv.extend(args);
-                let result = agent
-                    .exec(
-                        argv,
-                        vec![],
-                        None,
-                        None,
-                        std::time::Duration::from_secs(timeout),
-                    )
-                    .await?;
+                let result = on_machine(
+                    &machine,
+                    agent
+                        .exec(
+                            argv,
+                            vec![],
+                            None,
+                            None,
+                            std::time::Duration::from_secs(timeout),
+                            logon,
+                        )
+                        .await
+                        .map_err(CommandError::from),
+                )?;
                 Ok(json!({
                     "exit_code": result.exit_code,
                     "stdout": String::from_utf8_lossy(&result.stdout),
@@ -517,10 +553,19 @@ impl Handler<LabRequest> for LabdHandler {
                 machine,
                 cols,
                 rows,
+                user,
+                password,
             } => {
                 let m = machine_of(lab, &machine)?;
+                let logon = logon_for(m.as_ref(), user.as_deref(), password.as_deref())?;
                 let agent = m.agent().await?;
-                let session = agent.open_terminal(cols, rows, None).await?;
+                let session = on_machine(
+                    &machine,
+                    agent
+                        .open_terminal(cols, rows, None, logon)
+                        .await
+                        .map_err(CommandError::from),
+                )?;
                 let id = session.id;
                 let path = m.term_session_sock(id);
                 vm_agent::expose_terminal_socket(session, path.clone()).await?;
@@ -605,9 +650,14 @@ impl Handler<LabRequest> for LabdHandler {
             }
             // Follow a guest file (tail -F semantics), streamed as chunks
             // until the client hangs up or the machine stops.
+            // No logon: §19.2 puts `tail` among the things vmlab does on its
+            // own behalf, beside readiness and metrics — it reads a log and
+            // produces none of the developer's files. §19.5 still puts the
+            // field on the open, for the reads a person makes through the
+            // SSH facade (#87); this verb is not one of them.
             LabRequest::MachineTail { machine, path } => {
                 let m = machine_of(lab, &machine)?;
-                let session = m.agent().await?.open_tail(path).await?;
+                let session = m.agent().await?.open_tail(path, None).await?;
                 pump_session(session, m.as_ref(), stream).await
             }
             // Windows event log follow (agent `eventlog` feature).

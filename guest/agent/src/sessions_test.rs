@@ -40,6 +40,7 @@ fn terminal_runs_an_interactive_shell() {
                 "-c".into(),
                 "echo ready; read x; echo got:$x; exit 7".into(),
             ]),
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 1 });
@@ -70,6 +71,7 @@ fn terminal_resize_reaches_the_pty() {
                 // stty reads the PTY size; print it after the host resizes.
                 "read x; stty size; exit 0".into(),
             ]),
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 2 });
@@ -93,6 +95,7 @@ fn terminal_close_kills_the_shell() {
             cols: 80,
             rows: 24,
             command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()]),
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 3 });
@@ -122,6 +125,7 @@ fn exec_streams_stdio_and_exit_code() {
             ],
             env: vec![("VMLAB_TEST".into(), "1".into())],
             cwd: None,
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
@@ -149,6 +153,7 @@ fn exec_missing_binary_reports_error() {
             argv: vec!["/no/such/binary".into()],
             env: vec![],
             cwd: None,
+            logon: None,
         },
     );
     match cap.ctrl() {
@@ -256,6 +261,7 @@ fn tail_sends_backlog_then_appends() {
         HostMsg::OpenTail {
             id: 9,
             path: path.to_str().unwrap().into(),
+            logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 9 });

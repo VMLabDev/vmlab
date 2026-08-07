@@ -85,9 +85,9 @@ the code is the contract.
 | `machine.mouse_drag` | `machine: String`, `x1: i64`, `y1: i64`, `x2: i64`, `y2: i64` | `cli` | Press at one point, drag, release at another. |
 | `machine.ocr` | `machine: String`, `region: Option<Region>` | `cli` | Read text off the machine's display, whole screen or one region. |
 | `machine.find_image` | `machine: String`, `image: String`, `threshold: f64`, `region: Option<Region>` | `cli` | Find a template image on the machine's display; null when no match scores above `threshold`. |
-| `machine.exec` | `machine: String`, `cmd: String`, `args: Vec<String>`, `timeout: u64` | `cli` | Run a command in the guest through the agent and collect its output. |
+| `machine.exec` | `machine: String`, `cmd: String`, `args: Vec<String>`, `timeout: u64`, `user: Option<String>`, `password: Option<String>` | `cli` | Run a command in the guest through the agent and collect its output. |
 | `machine.osinfo` | `machine: String`, `timeout: u64` | `cli` | What the guest OS says it is. |
-| `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16` | `cli`, `web` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
+| `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16`, `user: Option<String>`, `password: Option<String>` | `cli`, `web` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
 | `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli`, `web` | Resize an open terminal session. |
 | `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli`, `web` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
 | `machine.pull_file` | `machine: String`, `from: String`, `to: Option<String>` | `cli`, `web` | Copy a file out of the guest: to `to`, a host path the daemon can write, or — with `to` omitted — back inline as base64, for a caller that wants the bytes rather than a file on the daemon's host. |

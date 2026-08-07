@@ -20,8 +20,10 @@ use windows_sys::Win32::System::Threading::{
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
+use super::logon::MintedLogon;
 use super::port::wide;
-use crate::spawn::{Spawned, TerminalSpec};
+use super::proc::{Owned, create_as_user, env_block};
+use crate::spawn::{Spawned, TerminalSpec, command_line};
 
 /// Windows-side MOTD, written down the ConPTY input? No — ConPTY input is
 /// keystrokes. The banner is printed by prepending an echo to the command
@@ -36,39 +38,18 @@ struct Pty(HPCON);
 unsafe impl Send for Pty {}
 unsafe impl Sync for Pty {}
 
-struct OwnedHandle(HANDLE);
-// SAFETY: raw handle owned exclusively.
-unsafe impl Send for OwnedHandle {}
-unsafe impl Sync for OwnedHandle {}
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        // SAFETY: we own it.
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
 /// Start a shell on a fresh pseudoconsole and wrap it as a seam
 /// [`Spawned`]: `input` is the ConPTY's keystroke pipe, `output` its VT
 /// stream, and `wait` closes the pseudoconsole once the shell exits — which
 /// is what ends the output pipe.
-pub fn spawn(spec: TerminalSpec) -> std::io::Result<Spawned> {
+pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result<Spawned> {
     let TerminalSpec {
         command,
         cols,
         rows,
     } = spec;
     let cmdline = match command {
-        Some(argv) if !argv.is_empty() => argv
-            .iter()
-            .map(|a| {
-                if a.contains(' ') {
-                    format!("\"{a}\"")
-                } else {
-                    a.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+        Some(argv) if !argv.is_empty() => command_line(&argv),
         _ => DEFAULT_SHELL.to_string(),
     };
 
@@ -93,7 +74,7 @@ pub fn spawn(spec: TerminalSpec) -> std::io::Result<Spawned> {
     drop(in_read);
     drop(out_write);
 
-    let (process, thread_h) = match spawn_with_conpty(&cmdline, pty.0) {
+    let process = match spawn_with_conpty(&cmdline, pty.0, logon) {
         Ok(v) => v,
         Err(e) => {
             // SAFETY: hpc came from CreatePseudoConsole above.
@@ -101,7 +82,6 @@ pub fn spawn(spec: TerminalSpec) -> std::io::Result<Spawned> {
             return Err(e);
         }
     };
-    drop(thread_h);
     let process = Arc::new(process);
 
     // SAFETY: both are fresh pipe handles we own; File assumes them.
@@ -170,10 +150,17 @@ fn pipe() -> std::io::Result<(PipeEnd, PipeEnd)> {
     Ok((PipeEnd(read, true), PipeEnd(write, true)))
 }
 
-/// CreateProcessW with the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute.
-fn spawn_with_conpty(cmdline: &str, hpc: HPCON) -> std::io::Result<(OwnedHandle, OwnedHandle)> {
+/// Start the shell on the pseudoconsole — `CreateProcessW` as the agent, or
+/// `CreateProcessAsUserW` where the channel resolved to a declared logon
+/// (PRD §19.2). The pseudoconsole attribute is the same either way; only the
+/// token, the environment and the starting directory differ.
+fn spawn_with_conpty(
+    cmdline: &str,
+    hpc: HPCON,
+    logon: Option<&MintedLogon>,
+) -> std::io::Result<Owned> {
     // SAFETY: textbook STARTUPINFOEXW attribute-list dance; every pointer
-    // lives across the CreateProcessW call.
+    // lives across the create call.
     unsafe {
         let mut attr_size: usize = 0;
         InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
@@ -200,26 +187,53 @@ fn spawn_with_conpty(cmdline: &str, hpc: HPCON) -> std::io::Result<(OwnedHandle,
         let mut si: STARTUPINFOEXW = std::mem::zeroed();
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         si.lpAttributeList = attrs;
-        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-        let mut cmd = wide(cmdline);
-        let ok = CreateProcessW(
-            std::ptr::null(),
-            cmd.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            EXTENDED_STARTUPINFO_PRESENT,
-            std::ptr::null(),
-            std::ptr::null(),
-            &si.StartupInfo,
-            &mut pi,
-        );
-        let err = std::io::Error::last_os_error();
+
+        // Both branches under the spawn lock: `CreateProcessAsUserW`
+        // inherits every inheritable handle in the process, so a terminal
+        // opening while an exec is wiring its pipes would swallow them.
+        let _spawn = super::proc::spawn_lock();
+        let spawned = match logon {
+            Some(logon) => {
+                // The environment must come from the *loaded* profile, or
+                // every editor that writes under `$HOME` scribbles into
+                // `C:\Users\Default`.
+                match env_block(logon, &[]) {
+                    Ok(env) => create_as_user(
+                        logon,
+                        cmdline,
+                        &env,
+                        logon.home.as_deref(),
+                        &si.StartupInfo,
+                        EXTENDED_STARTUPINFO_PRESENT,
+                    ),
+                    Err(e) => Err(e),
+                }
+            }
+            None => {
+                let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+                let mut cmd = wide(cmdline);
+                let ok = CreateProcessW(
+                    std::ptr::null(),
+                    cmd.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    EXTENDED_STARTUPINFO_PRESENT,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &si.StartupInfo,
+                    &mut pi,
+                );
+                if ok == 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    CloseHandle(pi.hThread);
+                    Ok(Owned(pi.hProcess))
+                }
+            }
+        };
         DeleteProcThreadAttributeList(attrs);
-        if ok == 0 {
-            return Err(err);
-        }
-        Ok((OwnedHandle(pi.hProcess), OwnedHandle(pi.hThread)))
+        spawned
     }
 }
 

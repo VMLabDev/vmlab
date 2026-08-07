@@ -318,18 +318,19 @@ impl Mux {
                     token,
                 });
             }
-            // Everything a person invokes will carry the machine's declared
-            // login (PRD §19.2); until those land, every channel resolves to
-            // the agent's own identity.
+            // Everything a person invokes carries the machine's declared
+            // login (PRD §19.2); an open with no `logon` is vmlab's own
+            // machinery and keeps the agent identity.
             HostMsg::OpenTerminal {
                 id,
                 cols,
                 rows,
                 command,
+                logon,
             } => crate::terminal::open(
                 self,
                 platform.spawner(),
-                Identity::Agent,
+                &logon.into(),
                 id,
                 TerminalSpec {
                     command,
@@ -338,10 +339,16 @@ impl Mux {
                 },
             ),
             HostMsg::Resize { id, cols, rows } => self.resize(id, cols, rows),
-            HostMsg::OpenExec { id, argv, env, cwd } => crate::exec::open(
+            HostMsg::OpenExec {
+                id,
+                argv,
+                env,
+                cwd,
+                logon,
+            } => crate::exec::open(
                 self,
                 platform.spawner(),
-                Identity::Agent,
+                &logon.into(),
                 id,
                 ProcessSpec { argv, env, cwd },
             ),
@@ -350,10 +357,13 @@ impl Mux {
             // not a process or a file, and the dial is portable — a
             // container micro-VM shares the guest's network stack anyway.
             HostMsg::OpenTunnel { id, host, port } => crate::tunnel::open(self, id, host, port),
+            // The whole-file transfer keeps the agent identity: it retires
+            // into `fileops` (§19.5, #84), which is where the person-invoked
+            // push and pull grow their `logon`.
             HostMsg::OpenFilePush { id, path, mode } => crate::files::open_push(
                 self,
                 platform.spawner(),
-                Identity::Agent,
+                &Identity::Agent,
                 id,
                 platform.resolve_path(path),
                 mode,
@@ -361,9 +371,13 @@ impl Mux {
             HostMsg::OpenFilePull { id, path } => {
                 crate::files::open_pull(self, id, platform.resolve_path(path))
             }
-            HostMsg::OpenTail { id, path } => {
-                crate::tail::open(self, id, platform.resolve_path(path))
-            }
+            HostMsg::OpenTail { id, path, logon } => crate::tail::open(
+                self,
+                platform.spawner(),
+                &logon.into(),
+                id,
+                platform.resolve_path(path),
+            ),
             HostMsg::OpenWatch { id, path, prune } => {
                 crate::watch::open(self, id, platform.resolve_path(path), prune)
             }
