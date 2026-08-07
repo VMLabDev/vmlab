@@ -119,6 +119,16 @@ pub struct Ledger {
     /// changed the rules*.
     #[serde(default)]
     pub ignore_digest: String,
+    /// The **prune list** last computed from those rules (§19.6) — the
+    /// directory prefixes the guest registers no watcher under.
+    ///
+    /// Remembered rather than recomputed on demand because of an ordering
+    /// fact: it has to be known *before* the watch opens, and the walk that
+    /// computes it happens inside a pass. Without it a restart would open the
+    /// watch on nothing and register a dependency tree it already knows to
+    /// skip — on Linux, one watch descriptor per directory of it.
+    #[serde(default)]
+    pub prune: Vec<String>,
     /// Keyed by `/`-separated path relative to the workspace root.
     pub entries: BTreeMap<String, Agreed>,
 }
@@ -132,6 +142,7 @@ impl Ledger {
             host_root: host_root.display().to_string(),
             guest_root: guest_root.to_string(),
             ignore_digest: String::new(),
+            prune: Vec::new(),
             entries: BTreeMap::new(),
         }
     }

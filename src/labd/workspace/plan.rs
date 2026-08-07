@@ -21,10 +21,21 @@
 //!   represented on one side can never look like a disagreement;
 //! - **file↔directory replacement is a conflict** where both sides moved.
 //!
-//! This ticket carries the **host→guest** direction. A path only the guest
-//! moved is recorded as [`Plan::pending_guest`] rather than acted on — it is
-//! left strictly alone, not lost, and the syncer says so out loud rather than
-//! leaving a developer with nothing happening.
+//! **Both directions are the same matrix.** One side changed and the other did
+//! not, so the action carries what changed to the side that did not — and
+//! which side that is rides the action as a [`Direction`] rather than forking
+//! into a second set of rules. Writing the guest→host half as its own pass
+//! would have doubled every rule above, and the two halves would have drifted
+//! at exactly the paths a conflict turns on.
+//!
+//! The asymmetries that *are* real live outside the matrix, and there are two.
+//! **Deletion guards**: host→guest deletes are unguarded, because the guest
+//! copy is the reconstructible one, where a guest→host bulk delete is what the
+//! halt (#96) exists to catch. And **a directory delete expands via the
+//! ledger**: the two platforms disagree on whether a delete reports its
+//! children, so the expansion is the ledger's list of what was agreed to be in
+//! there — which falls out here for free, because every ledger path is
+//! reconciled on every pass whether or not anything mentioned it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,27 +72,55 @@ impl State {
     }
 }
 
-/// One thing to do to the guest. Every apply is temp-name-then-rename in the
+/// Which way one action carries a change. The side it is carried *to* is the
+/// side that did not move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// The host changed: carry it into the guest's working copy.
+    ToGuest,
+    /// The guest changed: carry it onto the canonical copy. **This is where
+    /// authoring happens** — the developer is attached into the guest — so it
+    /// is the busy direction, not the exceptional one.
+    ToHost,
+}
+
+impl Direction {
+    /// Whether the moving side is the host — which is which of the ledger's
+    /// two `(size, mtime)` records the action's own belongs in.
+    pub fn source_is_host(self) -> bool {
+        matches!(self, Direction::ToGuest)
+    }
+}
+
+/// One thing to do to one side. Every apply is temp-name-then-rename in the
 /// target's own directory, and the ledger is written only after the rename —
 /// see [`apply`](super::apply).
+///
+/// `side` is always the **moving** side's own `(size, mtime)`, so the
+/// agreement can be recorded once the receiving side reports its own. The two
+/// are never compared to each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Create the directory. Carries the host's own `(size, mtime)` so the
-    /// agreement can be recorded once the guest reports its own.
-    MakeDir { path: String, host: Side },
+    /// Create the directory.
+    MakeDir {
+        direction: Direction,
+        path: String,
+        side: Side,
+    },
     /// Place the file's bytes.
     PutFile {
+        direction: Direction,
         path: String,
-        host: Side,
+        side: Side,
         digest: String,
     },
     /// Place the link verbatim. Never followed: a link pointing at `/` that
-    /// the syncer followed would walk the entire host filesystem into the
-    /// guest.
+    /// the syncer followed would walk an entire filesystem across the seam.
     PutSymlink {
+        direction: Direction,
         path: String,
         target: String,
-        host: Side,
+        side: Side,
         digest: String,
         /// Windows picks a different object for a file link and a directory
         /// link **at creation** and cannot infer which from a target that is
@@ -89,10 +128,18 @@ pub enum Action {
         /// [`dir_link`]. Ignored outright on a Linux guest.
         dir_link: bool,
     },
-    /// Remove what the host no longer holds. **Host→guest deletes are
-    /// unguarded** (§19.6): a `git checkout` removing 400 files just removes
-    /// them, because the guest copy is the reconstructible one.
-    Remove { path: String, kind: Kind },
+    /// Remove what the moving side no longer holds.
+    ///
+    /// **The guards on this are asymmetric on purpose** (§19.6), because the
+    /// two sides are not equally valuable: host→guest deletes are unguarded —
+    /// a `git checkout` removing 400 files just removes them — where a
+    /// guest→host *bulk* delete is what the conflict halt exists to catch. A
+    /// single deletion propagates immediately either way.
+    Remove {
+        direction: Direction,
+        path: String,
+        kind: Kind,
+    },
 }
 
 impl Action {
@@ -102,6 +149,15 @@ impl Action {
             | Action::PutFile { path, .. }
             | Action::PutSymlink { path, .. }
             | Action::Remove { path, .. } => path,
+        }
+    }
+
+    pub fn direction(&self) -> Direction {
+        match self {
+            Action::MakeDir { direction, .. }
+            | Action::PutFile { direction, .. }
+            | Action::PutSymlink { direction, .. }
+            | Action::Remove { direction, .. } => *direction,
         }
     }
 }
@@ -145,18 +201,25 @@ pub struct Conflict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Oversize {
     pub path: String,
+    /// Which side holds it, so the message names a place a developer can go
+    /// and look at.
+    pub direction: Direction,
     pub size: u64,
     pub cap: u64,
 }
 
 impl std::fmt::Display for Oversize {
     /// Names the file, the rule, and the two ways out — the point being not to
-    /// spend ten minutes pushing something nobody wanted.
+    /// spend ten minutes moving something nobody wanted.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let side = match self.direction {
+            Direction::ToGuest => "on the host",
+            Direction::ToHost => "in the guest",
+        };
         write!(
             f,
-            "{} is {} bytes, over the {}-byte workspace file cap: add an ignore rule for it in \
-             .vmlabignore, or raise `workspace_max_file` in the host config",
+            "{} is {} bytes {side}, over the {}-byte workspace file cap: add an ignore rule for \
+             it in .vmlabignore, or raise `workspace_max_file` in the host config",
             self.path, self.size, self.cap
         )
     }
@@ -194,15 +257,6 @@ impl std::fmt::Display for Collision {
     }
 }
 
-/// A path the guest moved and the host did not. Left strictly alone by this
-/// direction; guest→host propagation is its own ticket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingGuest {
-    pub path: String,
-    /// The guest deleted it, rather than changing it.
-    pub deleted: bool,
-}
-
 /// Everything one reconciliation decided.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -222,13 +276,10 @@ pub struct Plan {
     /// Host paths a case-folding guest cannot hold apart. Nothing is
     /// transferred for any of them.
     pub collisions: Vec<Collision>,
-    pub pending_guest: Vec<PendingGuest>,
 }
 
 impl Plan {
-    /// Nothing here changes the ledger. Deliberately silent about
-    /// [`pending_guest`](Plan::pending_guest), which records what this
-    /// direction leaves alone and so records nothing.
+    /// Nothing here changes the ledger.
     pub fn nothing_to_record(&self) -> bool {
         self.actions.is_empty()
             && self.adopt.is_empty()
@@ -243,8 +294,10 @@ impl Plan {
 pub struct Inputs<'a> {
     /// The host tree, ignores already applied, keyed by `/`-separated path.
     pub host: &'a BTreeMap<String, State>,
-    /// What the guest holds at the paths that were probed — the host's set
-    /// plus the ledger's. A guest-only path is not probed here at all.
+    /// What the guest holds — at the paths that were probed (the host's set,
+    /// the ledger's, and whatever the guest's watcher drained), or its whole
+    /// tree where a stat-walk ran. Ignores are applied to it **host-side**,
+    /// before it gets here.
     pub guest: &'a BTreeMap<String, State>,
     pub ledger: &'a Ledger,
     /// Paths one side could not be read for — a special file, or something
@@ -337,9 +390,14 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
     let mut removals: Vec<Action> = Vec::new();
     let mut creations: Vec<Action> = Vec::new();
 
+    // Every path any of the three knows about. The ledger's own entries are
+    // reconciled whether or not either side mentioned them, which is what
+    // makes a directory delete expand through the ledger rather than through
+    // an event stream the two platforms disagree about.
     let paths: BTreeSet<&String> = inputs
         .host
         .keys()
+        .chain(inputs.guest.keys())
         .chain(inputs.ledger.entries.keys())
         .collect();
 
@@ -388,41 +446,39 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
             continue;
         }
 
-        // Only the guest moved: left strictly alone by this direction.
-        if guest_moved.changed() {
-            plan.pending_guest.push(PendingGuest {
-                path: path.clone(),
-                deleted: guest_moved == Moved::Deleted,
-            });
+        // Exactly one side moved: carry it to the other. Which side that is
+        // is the only thing that differs between the two directions.
+        let (direction, moving, standing) = if host_moved.changed() {
+            (Direction::ToGuest, host, guest)
+        } else if guest_moved.changed() {
+            (Direction::ToHost, guest, host)
+        } else {
             continue;
-        }
+        };
 
-        if !host_moved.changed() {
-            continue;
-        }
-
-        // Only the host moved: propagate.
-        match host {
+        match moving {
             None => {
                 if let Some(was) = was {
                     removals.push(Action::Remove {
+                        direction,
                         path: path.clone(),
                         kind: was.kind,
                     });
                 }
             }
             Some(state) => {
-                // A kind replacement clears the old entry first; the guest
-                // cannot rename a file over a directory.
-                if let Some(guest) = guest
-                    && guest.kind != state.kind
+                // A kind replacement clears what is there first: neither side
+                // can rename a file over a directory.
+                if let Some(standing) = standing
+                    && standing.kind != state.kind
                 {
                     removals.push(Action::Remove {
+                        direction,
                         path: path.clone(),
-                        kind: guest.kind,
+                        kind: standing.kind,
                     });
                 }
-                match place(path, state, inputs, was) {
+                match place(direction, path, state, inputs, was) {
                     Ok(action) => creations.push(action),
                     Err(refusal) => plan.oversize.push(refusal),
                 }
@@ -544,43 +600,54 @@ fn dir_link(link: &str, target: &str, host: &BTreeMap<String, State>) -> bool {
         .is_some_and(|state| state.kind == Kind::Dir)
 }
 
-/// The action that puts `state` on the guest, or the size guard's refusal.
+/// The action that puts `state` on the other side, or the size guard's
+/// refusal.
 fn place(
+    direction: Direction,
     path: &str,
     state: &State,
     inputs: &Inputs<'_>,
     was: Option<&Agreed>,
 ) -> Result<Action, Oversize> {
     let cap = inputs.max_file_bytes;
-    let host = state.side();
+    let side = state.side();
     match state.kind {
         Kind::Dir => Ok(Action::MakeDir {
+            direction,
             path: path.to_string(),
-            host,
+            side,
         }),
         Kind::File => {
-            // Before transfer, always: the point is not to spend ten minutes
-            // pushing something unwanted and refuse afterwards.
+            // Before transfer, always, and in both directions: the point is
+            // not to spend ten minutes moving something unwanted and refuse
+            // afterwards.
             if state.size > cap {
                 return Err(Oversize {
                     path: path.to_string(),
+                    direction,
                     size: state.size,
                     cap,
                 });
             }
             Ok(Action::PutFile {
+                direction,
                 path: path.to_string(),
-                host,
+                side,
                 digest: digest_or_agreed(state, was),
             })
         }
         Kind::Symlink => {
             let target = state.target.clone().unwrap_or_default();
             Ok(Action::PutSymlink {
-                dir_link: dir_link(path, &target, inputs.host),
+                direction,
+                // Windows decides the object at creation, so only a link
+                // going *into* the guest needs the question answered — and it
+                // is answered from the host tree, never by following the
+                // link. The host takes whatever it is given.
+                dir_link: direction.source_is_host() && dir_link(path, &target, inputs.host),
                 path: path.to_string(),
                 target,
-                host,
+                side,
                 digest: digest_or_agreed(state, was),
             })
         }
@@ -831,19 +898,22 @@ mod tests {
             plan.actions,
             vec![
                 Action::MakeDir {
+                    direction: Direction::ToGuest,
                     path: "src".into(),
-                    host: Side::new(0, 10),
+                    side: Side::new(0, 10),
                 },
                 Action::PutSymlink {
+                    direction: Direction::ToGuest,
                     path: "src/lib".into(),
                     target: "../lib".into(),
-                    host: Side::new(6, 12),
+                    side: Side::new(6, 12),
                     digest: "digest-of:../lib".into(),
                     dir_link: false,
                 },
                 Action::PutFile {
+                    direction: Direction::ToGuest,
                     path: "src/main.rs".into(),
-                    host: Side::new(12, 11),
+                    side: Side::new(12, 11),
                     digest: "aa".into(),
                 },
             ]
@@ -915,8 +985,9 @@ mod tests {
         assert_eq!(
             plan.actions,
             vec![Action::PutFile {
+                direction: Direction::ToGuest,
                 path: "a.txt".into(),
-                host: Side::new(12, 900),
+                side: Side::new(12, 900),
                 digest: "new".into(),
             }]
         );
@@ -1025,12 +1096,14 @@ mod tests {
             run(&host, &guest, &l).actions,
             vec![
                 Action::Remove {
+                    direction: Direction::ToGuest,
                     path: "a".into(),
                     kind: Kind::File,
                 },
                 Action::MakeDir {
+                    direction: Direction::ToGuest,
                     path: "a".into(),
-                    host: Side::new(0, 900),
+                    side: Side::new(0, 900),
                 },
             ]
         );
@@ -1057,10 +1130,12 @@ mod tests {
             plan.actions,
             vec![
                 Action::Remove {
+                    direction: Direction::ToGuest,
                     path: "old/a.txt".into(),
                     kind: Kind::File,
                 },
                 Action::Remove {
+                    direction: Direction::ToGuest,
                     path: "old".into(),
                     kind: Kind::Dir,
                 },
@@ -1081,26 +1156,133 @@ mod tests {
         assert!(plan.actions.is_empty());
     }
 
-    /// This direction leaves a guest-side change strictly alone — but says so,
-    /// because from the developer's side an unpropagated edit is otherwise
-    /// nothing happening.
+    /// The direction the developer actually authors in: only the guest moved,
+    /// so it is carried onto the canonical copy by the same matrix that
+    /// carries the other way.
     #[test]
-    fn a_guest_only_change_is_left_alone_and_reported() {
+    fn a_guest_only_change_is_carried_onto_the_host() {
         let host = tree(&[("a.txt", file(None, 12, 100))]);
         let guest = tree(&[("a.txt", file(Some("g"), 20, 800))]);
         let l = ledger(&[(
             "a.txt",
             agreed(Kind::File, "old", Side::new(12, 100), Side::new(12, 50)),
         )]);
-        let plan = run(&host, &guest, &l);
-        assert!(plan.actions.is_empty());
         assert_eq!(
-            plan.pending_guest,
-            vec![PendingGuest {
+            run(&host, &guest, &l).actions,
+            vec![Action::PutFile {
+                direction: Direction::ToHost,
                 path: "a.txt".into(),
-                deleted: false,
+                side: Side::new(20, 800),
+                digest: "g".into(),
             }]
         );
+    }
+
+    /// A guest-created path is not in the host tree *or* the ledger, so it
+    /// only reaches the reconciliation at all because the guest's own set is
+    /// one of the three sources of paths. This is the ordinary case: the
+    /// developer created a file in the editor they are attached with.
+    #[test]
+    fn a_path_only_the_guest_has_is_created_on_the_host() {
+        let guest = tree(&[("new", dir(1)), ("new/mod.rs", file(Some("g"), 9, 800))]);
+        let plan = run(&BTreeMap::new(), &guest, &ledger(&[]));
+        assert_eq!(
+            plan.actions,
+            vec![
+                Action::MakeDir {
+                    direction: Direction::ToHost,
+                    path: "new".into(),
+                    side: Side::new(0, 1),
+                },
+                Action::PutFile {
+                    direction: Direction::ToHost,
+                    path: "new/mod.rs".into(),
+                    side: Side::new(9, 800),
+                    digest: "g".into(),
+                },
+            ]
+        );
+    }
+
+    /// **Renames are delete + create at the ledger level.** The two platforms
+    /// disagree about rename events, so depending on one would fork the
+    /// syncer by platform — which *one mechanism, every machine kind*
+    /// forbids. A delete and a create need no rename event at all.
+    #[test]
+    fn a_guest_side_rename_is_a_delete_and_a_create() {
+        let host = tree(&[("old.rs", file(None, 3, 100))]);
+        let guest = tree(&[("new.rs", file(Some("same"), 3, 800))]);
+        let l = ledger(&[(
+            "old.rs",
+            agreed(Kind::File, "same", Side::new(3, 100), Side::new(3, 50)),
+        )]);
+        assert_eq!(
+            run(&host, &guest, &l).actions,
+            vec![
+                Action::Remove {
+                    direction: Direction::ToHost,
+                    path: "old.rs".into(),
+                    kind: Kind::File,
+                },
+                Action::PutFile {
+                    direction: Direction::ToHost,
+                    path: "new.rs".into(),
+                    side: Side::new(3, 800),
+                    digest: "same".into(),
+                },
+            ]
+        );
+    }
+
+    /// **A directory delete expands via the ledger**, not the event stream:
+    /// the platforms disagree about whether children are reported, the ledger
+    /// knows exactly what was agreed to be in there, and anything else in
+    /// that directory was guest-created and unsynced anyway.
+    #[test]
+    fn a_guest_side_directory_delete_takes_what_the_ledger_says_was_in_it() {
+        let l = ledger(&[
+            (
+                "old",
+                agreed(Kind::Dir, "", Side::new(0, 1), Side::new(0, 1)),
+            ),
+            (
+                "old/a.rs",
+                agreed(Kind::File, "x", Side::new(1, 1), Side::new(1, 1)),
+            ),
+        ]);
+        let host = tree(&[("old", dir(1)), ("old/a.rs", file(None, 1, 1))]);
+        // The guest reports nothing at either path: the drain named the
+        // directory, and the ledger supplied the child.
+        let plan = run(&host, &BTreeMap::new(), &l);
+        assert_eq!(
+            plan.actions,
+            vec![
+                Action::Remove {
+                    direction: Direction::ToHost,
+                    path: "old/a.rs".into(),
+                    kind: Kind::File,
+                },
+                Action::Remove {
+                    direction: Direction::ToHost,
+                    path: "old".into(),
+                    kind: Kind::Dir,
+                },
+            ]
+        );
+    }
+
+    /// The size guard is symmetric and names the side, because a developer
+    /// told a file is too big has to know which tree to go and look in.
+    #[test]
+    fn the_size_guard_refuses_a_guest_file_and_says_where_it_is() {
+        let mut big = file(Some("b"), CAP + 1, 800);
+        big.oversize = true;
+        let plan = run(&BTreeMap::new(), &tree(&[("dump.vhdx", big)]), &ledger(&[]));
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.oversize.len(), 1);
+        let refusal = plan.oversize[0].to_string();
+        assert!(refusal.contains("in the guest"), "{refusal}");
+        assert!(refusal.contains(".vmlabignore"), "{refusal}");
     }
 
     /// The guard is per file and fires before the transfer, so the failure
@@ -1115,8 +1297,9 @@ mod tests {
         assert_eq!(
             plan.actions,
             vec![Action::PutFile {
+                direction: Direction::ToGuest,
                 path: "small.rs".into(),
-                host: Side::new(10, 1),
+                side: Side::new(10, 1),
                 digest: "s".into(),
             }]
         );
@@ -1136,9 +1319,10 @@ mod tests {
         assert_eq!(
             plan.actions,
             vec![Action::PutSymlink {
+                direction: Direction::ToGuest,
                 path: "lib".into(),
                 target: "/usr/lib/foo".into(),
-                host: Side::new(12, 1),
+                side: Side::new(12, 1),
                 digest: "digest-of:/usr/lib/foo".into(),
                 dir_link: false,
             }]
@@ -1162,9 +1346,10 @@ mod tests {
         assert_eq!(
             run(&host, &guest, &l).actions,
             vec![Action::PutSymlink {
+                direction: Direction::ToGuest,
                 path: "lib".into(),
                 target: "../new".into(),
-                host: Side::new(6, 900),
+                side: Side::new(6, 900),
                 digest: "digest-of:../new".into(),
                 dir_link: false,
             }]

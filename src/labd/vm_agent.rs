@@ -32,7 +32,9 @@ use vmlab_agent_proto::fileops::{self, Request, Response};
 // The file vocabulary itself, re-exported: the SSH facade's SFTP transcode
 // speaks it directly (§19.5), so it must not have to reach past this client
 // to name an operation.
-pub use vmlab_agent_proto::fileops::{Attrs, ErrorCode, LinkKind, Op, OpenFlags, Reply, SetAttrs};
+pub use vmlab_agent_proto::fileops::{
+    Attrs, DirEntry, ErrorCode, LinkKind, Op, OpenFlags, Reply, SetAttrs,
+};
 pub use vmlab_agent_proto::watch::{EntryKind, StatRecord};
 use vmlab_agent_proto::watch::{RecordDecoder, WatchRecord, encode_record};
 use vmlab_agent_proto::{
@@ -1114,6 +1116,59 @@ impl FileOps {
             bail!("pull {remote}: digest mismatch after transfer");
         }
         Ok((sha256, len))
+    }
+
+    /// Pull a guest file onto the host at `local`, verified against the
+    /// guest's own digest of what it read.
+    ///
+    /// The workspace syncer's half of the transfer pair (§19.6): the guest is
+    /// where the developer authors, so this is the direction that carries
+    /// their work onto the canonical copy, and it runs on the same session as
+    /// the stat-walk that decided to run it.
+    pub async fn pull_to(&self, remote: &str, local: &Path) -> Result<(String, u64)> {
+        let file = tokio::fs::File::create(local)
+            .await
+            .with_context(|| format!("creating {}", local.display()))?;
+        self.pull(remote, &mut FileSink(file)).await
+    }
+
+    /// Every entry in `dir`, each described by its own attributes and never
+    /// followed through a symlink.
+    ///
+    /// Streamed from the guest in [`READDIR_CHUNK`](fileops::READDIR_CHUNK)
+    /// slices and returned whole: a directory is the unit a walk descends,
+    /// and a caller that had to resume one would be writing the loop below a
+    /// second time.
+    pub async fn readdir(&self, dir: &str) -> Result<Vec<DirEntry>> {
+        let handle = self
+            .inner
+            .open_handle(Op::OpenDir {
+                path: dir.to_string(),
+            })
+            .await
+            .with_context(|| format!("reading directory {dir}"))?;
+        let mut all = Vec::new();
+        let outcome = loop {
+            match self.inner.call(Op::ReadDir { handle }, &[]).await {
+                Ok((Reply::Entries { entries, eof }, _)) => {
+                    all.extend(entries);
+                    if eof {
+                        break Ok(());
+                    }
+                }
+                Ok((Reply::Error { code, msg }, _)) => {
+                    break Err(anyhow::Error::new(FileOpsError { code, msg }));
+                }
+                Ok((other, _)) => break Err(anyhow!("agent answered a readdir with {other:?}")),
+                Err(e) => break Err(e),
+            }
+        };
+        // Released either way: a failed walk must not leave the guest holding
+        // a directory open for the life of the session.
+        let closed = self.inner.expect_ok(Op::Close { handle }, &[]).await;
+        outcome.with_context(|| format!("reading directory {dir}"))?;
+        closed.with_context(|| format!("reading directory {dir}"))?;
+        Ok(all)
     }
 
     /// One operation on this session, in the guest's own file vocabulary.
@@ -2296,6 +2351,9 @@ mod tests {
     struct MockFiles {
         fs: MockFs,
         handles: HashMap<u64, String>,
+        /// A directory handle's remaining entries, served a slice at a time
+        /// so a reader that stopped at the first reply would come up short.
+        dir_handles: HashMap<u64, std::collections::VecDeque<DirEntry>>,
         next_handle: u64,
         decoder: fileops::RecordDecoder,
         /// What the open said this session runs as, reportable through
@@ -2318,6 +2376,7 @@ mod tests {
             MockFiles {
                 fs,
                 handles: HashMap::new(),
+                dir_handles: HashMap::new(),
                 next_handle: 1,
                 decoder: fileops::RecordDecoder::new(),
                 who: logon
@@ -2415,7 +2474,73 @@ mod tests {
                 }
                 Op::Close { handle } => {
                     self.handles.remove(&handle);
+                    self.dir_handles.remove(&handle);
                     (Reply::Ok, Vec::new())
+                }
+                Op::OpenDir { path } => {
+                    if !self.fs.dirs.lock().unwrap().contains(&path) {
+                        return (missing(&path), Vec::new());
+                    }
+                    let mut entries: Vec<DirEntry> = Vec::new();
+                    let under = |child: &String| {
+                        child.rsplit_once('/').map(|(dir, name)| {
+                            (dir == path.trim_end_matches('/'), name.to_string())
+                        })
+                    };
+                    for (child, bytes) in self.fs.store.lock().unwrap().iter() {
+                        if let Some((true, name)) = under(child) {
+                            entries.push(DirEntry {
+                                name,
+                                attrs: Attrs {
+                                    kind: EntryKind::File,
+                                    size: bytes.len() as u64,
+                                    mtime_ns: 1_700_000_000_000_000_000,
+                                    atime_ns: 1_700_000_000_000_000_000,
+                                    mode: Some(0o644),
+                                },
+                            });
+                        }
+                    }
+                    for child in self.fs.dirs.lock().unwrap().iter() {
+                        if let Some((true, name)) = under(child) {
+                            entries.push(DirEntry {
+                                name,
+                                attrs: Attrs {
+                                    kind: EntryKind::Dir,
+                                    size: 0,
+                                    mtime_ns: 0,
+                                    atime_ns: 0,
+                                    mode: Some(0o755),
+                                },
+                            });
+                        }
+                    }
+                    entries.sort_by(|a, b| a.name.cmp(&b.name));
+                    let handle = self.next_handle;
+                    self.next_handle += 1;
+                    self.dir_handles.insert(handle, entries.into());
+                    (Reply::Handle { handle }, Vec::new())
+                }
+                Op::ReadDir { handle } => {
+                    let Some(left) = self.dir_handles.get_mut(&handle) else {
+                        return (
+                            Reply::Error {
+                                code: ErrorCode::BadHandle,
+                                msg: "no such directory handle".into(),
+                            },
+                            Vec::new(),
+                        );
+                    };
+                    // One entry a slice: a client that read only the first
+                    // reply would see a directory with one thing in it.
+                    let entries: Vec<DirEntry> = left.pop_front().into_iter().collect();
+                    (
+                        Reply::Entries {
+                            eof: left.is_empty(),
+                            entries,
+                        },
+                        Vec::new(),
+                    )
                 }
                 Op::Stat { path } | Op::Lstat { path } => {
                     match self.fs.store.lock().unwrap().get(&path) {
@@ -2737,6 +2862,54 @@ mod tests {
         let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
         assert_eq!(len, 10_000);
         assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+    }
+
+    /// The workspace syncer's guest→host transfer: the same verified pull,
+    /// on the session that decided to run it rather than on one of its own.
+    #[tokio::test]
+    async fn a_session_pulls_a_guest_file_onto_the_host() {
+        let (_dir, path) = mock_agent(true).await;
+        let work = tempfile::tempdir().unwrap();
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+
+        let dest = work.path().join("from-guest.bin");
+        let (sha, len) = ops.pull_to("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        let landed = std::fs::read(&dest).unwrap();
+        assert_eq!(landed.len(), 10_000);
+        use sha2::{Digest, Sha256};
+        assert_eq!(sha, hex::encode(Sha256::digest(&landed)));
+    }
+
+    /// A directory arrives whole, however many slices the guest streams it
+    /// in — the walk that reads it descends a directory at a time, and one
+    /// that stopped at the first slice would report a tree with one file in
+    /// it and delete the rest.
+    #[tokio::test]
+    async fn a_directory_is_read_to_its_end_rather_than_one_slice() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        ops.mkdir("/guest/tree", false).await.unwrap();
+        ops.mkdir("/guest/tree/sub", false).await.unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            let local = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(local.path(), name).unwrap();
+            ops.push(local.path(), &format!("/guest/tree/{name}"), None)
+                .await
+                .unwrap();
+        }
+
+        let entries = ops.readdir("/guest/tree").await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a.rs", "b.rs", "c.rs", "sub"]);
+        assert_eq!(entries[3].attrs.kind, EntryKind::Dir);
+        assert_eq!(entries[0].attrs.size, 4);
+
+        // A directory nobody made is an error rather than an empty tree: an
+        // empty answer would read as "the guest deleted everything".
+        assert!(ops.readdir("/guest/absent").await.is_err());
     }
 
     /// The inline form of a pull: the same transfer, verified the same way,

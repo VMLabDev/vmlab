@@ -30,7 +30,7 @@
 //! directory stays ignored**, exactly as `git` has it: a negation cannot
 //! re-include a file whose parent directory is gone from the set.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -96,6 +96,21 @@ pub struct Ignores {
     /// Every rule file's bytes, in path order — hashed into
     /// [`Ignores::digest`].
     sources: Vec<(String, Vec<u8>)>,
+    /// What the rules say about *directory prefixes*, as opposed to about
+    /// paths — the input to [`Ignores::prune_list`].
+    prune: PruneCandidates,
+}
+
+/// The raw material of the prune list: which prefixes the rules exclude, and
+/// where a negation names something inside one.
+#[derive(Debug, Default)]
+struct PruneCandidates {
+    /// Root-relative directory prefixes an ignore rule names literally.
+    excluded: BTreeSet<String>,
+    /// The literal head of every **anchored** negation — the part before its
+    /// first wildcard. An unanchored one (`!.env`) contributes nothing, for
+    /// the reason [`Ignores::prune_list`] gives.
+    negated: BTreeSet<String>,
 }
 
 impl Ignores {
@@ -114,6 +129,7 @@ impl Ignores {
             floor: builder.build().expect("the built-in floor builds"),
             dirs: BTreeMap::new(),
             sources: Vec::new(),
+            prune: PruneCandidates::default(),
         }
     }
 
@@ -146,6 +162,7 @@ impl Ignores {
                 builder
                     .add_line(Some(file.clone()), line)
                     .with_context(|| format!("in {}", file.display()))?;
+                self.prune.read_line(rel, line);
             }
             *slot = Some(
                 builder
@@ -211,6 +228,85 @@ impl Ignores {
         }
     }
 
+    /// The **prune list** the guest's watcher is handed (§19.6): root-relative
+    /// directory prefixes to register no watcher under.
+    ///
+    /// **Registration is a different act from filtering.** Filtering stays
+    /// here, host-side, whole — the guest is never asked to decide, for a file
+    /// it created itself, whether that file is in the synced set. What forces
+    /// pruning is a resource fact instead: `inotify` costs one watch
+    /// descriptor per directory where `ReadDirectoryChangesW` is a single
+    /// recursive handle, `max_user_watches` defaults to 8192, and a
+    /// `node_modules` tree is routinely tens of thousands of directories — so
+    /// an unpruned registration is *silently incomplete* on Linux, the exact
+    /// failure class that disqualified the share transports.
+    ///
+    /// Two sources, because the guest holds directories the host has never
+    /// seen — `node_modules` is guest-owned precisely so the guest can run its
+    /// own install into it:
+    ///
+    /// - the **rules**, which name a prefix whether or not anything is there
+    ///   host-side. This is the one that matters: it is what covers a
+    ///   dependency tree that exists only in the guest.
+    /// - `discovered`, the directories a host walk declined to enter, which
+    ///   catches what a rule matches at a depth its literal text does not
+    ///   name.
+    ///
+    /// Only *literal* prefixes are derived. A wildcard rule (`*.log`) names no
+    /// directory, and an unanchored one (`target`) is taken at the rule file's
+    /// own level: under-pruning costs watch descriptors on a tree that is
+    /// filtered host-side anyway, where over-pruning would silently stop
+    /// syncing a subtree, and only one of those two is recoverable.
+    ///
+    /// Two things take a candidate back off the list, and both are the same
+    /// refusal to let a prefix answer a question a rule set answers:
+    ///
+    /// - **the rules do not actually exclude it.** Every candidate is put back
+    ///   through [`verdict`](Ignores::verdict), so a path a later rule file
+    ///   negates (`.env`, the case §19.6 names) is never pruned. Pruning it
+    ///   would stop the guest reporting it at all — silently, on the one path
+    ///   the developer added a negation to get.
+    /// - **a negation reaches below it.** Only an *anchored* one counts:
+    ///   `!node_modules/.bin/tool` names something inside the excluded tree,
+    ///   where `!.env` cannot re-include anything under an excluded directory
+    ///   — git's rule, and `verdict`'s. Reading the unanchored form as
+    ///   reaching everywhere would disable pruning for the exact repo §19.6
+    ///   names as the common case.
+    pub fn prune_list(&self, discovered: &[String]) -> Vec<String> {
+        let mut prefixes: BTreeSet<&str> = self
+            .prune
+            .excluded
+            .iter()
+            .chain(discovered.iter())
+            .filter(|p| !p.is_empty())
+            .map(String::as_str)
+            .collect();
+        // The rules decide, not the pattern text: a prefix derived from a
+        // rule some other file negates is not excluded at all.
+        prefixes.retain(|prefix| self.verdict(prefix, true).is_guest_owned());
+        // A negation inside one: the guest is handed prefixes, not rules, and
+        // a prefix cannot carry "except this". Keeping the watcher on costs
+        // descriptors; taking it off would stop a path syncing.
+        prefixes.retain(|prefix| {
+            !self
+                .prune
+                .negated
+                .iter()
+                .any(|negated| at_or_below(negated, prefix))
+        });
+        // Shortest wins: `a` covers `a/b`, and sending both is the guest
+        // matching a prefix twice for nothing.
+        prefixes
+            .iter()
+            .filter(|prefix| {
+                !prefixes
+                    .iter()
+                    .any(|other| other != *prefix && at_or_below(prefix, other))
+            })
+            .map(|prefix| (*prefix).to_string())
+            .collect()
+    }
+
     /// The rules' own digest, which the ledger carries so a halt can say
     /// *these conflict because you just changed the rules* (§19.6).
     pub fn digest(&self) -> String {
@@ -232,6 +328,73 @@ impl Default for Ignores {
     fn default() -> Self {
         Ignores::new()
     }
+}
+
+impl PruneCandidates {
+    /// Take one line of one rule file, from the directory `dir` holds it in.
+    ///
+    /// Deliberately a *second* reading of the same text rather than something
+    /// asked of the matcher: a matcher answers "is this path ignored", and
+    /// what the prune list needs is "which directory does this rule name",
+    /// which is a property of the pattern and not of any path.
+    fn read_line(&mut self, dir: &str, line: &str) {
+        let line = line.trim_end();
+        let pattern = line.trim_start();
+        if pattern.is_empty() || pattern.starts_with('#') {
+            return;
+        }
+        let (negated, pattern) = match pattern.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, pattern),
+        };
+        // A trailing `/` is git's "directories only", which is the same
+        // prefix either way.
+        let pattern = pattern.trim_end_matches('/');
+        // A leading `/` anchors to the rule file's own directory, which is
+        // where every pattern with an inner separator is anchored anyway.
+        let anchored = pattern.starts_with('/') || pattern.trim_end_matches('/').contains('/');
+        let pattern = pattern.trim_start_matches('/');
+        if pattern.is_empty() || pattern.contains("..") {
+            return;
+        }
+        if negated {
+            // Only the literal head: `!build/*.env` still names `build`, and
+            // that is enough to keep the watcher on it.
+            if !anchored {
+                return;
+            }
+            let head: Vec<&str> = pattern
+                .split('/')
+                .take_while(|part| !is_glob(part))
+                .collect();
+            if !head.is_empty() {
+                self.negated.insert(join_rel(dir, &head.join("/")));
+            }
+            return;
+        }
+        // An exclusion has to name a directory outright to become a prefix:
+        // a wildcard segment could match anything at that level, and pruning
+        // on a guess would stop a synced subtree without a word.
+        if pattern.split('/').any(is_glob) {
+            return;
+        }
+        self.excluded.insert(join_rel(dir, pattern));
+    }
+}
+
+/// Whether a glob metacharacter makes this path segment unpredictable.
+fn is_glob(part: &str) -> bool {
+    part.contains(['*', '?', '[', ']', '\\'])
+}
+
+/// Whether `path` is `prefix` itself or lies under it — the same reading the
+/// agent's own prune match uses, so the two sides never disagree about what a
+/// prefix covers.
+fn at_or_below(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.as_bytes()[prefix.len()] == b'/')
 }
 
 /// `a/b/c` → `a/b`; a path with no separator → `""` (the root).
@@ -415,6 +578,109 @@ mod tests {
         );
         assert_eq!(set.verdict(".git/index", false), Verdict::Synced);
         assert_eq!(set.verdict(".git/HEAD", false), Verdict::Synced);
+    }
+
+    /// The prune list comes from the **rules**, not from the host tree —
+    /// which is the whole point of it. `node_modules` is guest-owned so the
+    /// guest can run its own install into it, so the tens of thousands of
+    /// directories that would exhaust `max_user_watches` exist *only*
+    /// guest-side and no host walk can ever discover them.
+    #[test]
+    fn the_prune_list_names_a_directory_the_host_has_never_seen() {
+        let dir = tmp();
+        let set = ignores(
+            dir.path(),
+            &[(".gitignore", "node_modules/\ntarget/\n*.log\n")],
+        );
+        assert_eq!(
+            set.prune_list(&[]),
+            vec!["node_modules".to_string(), "target".to_string()]
+        );
+    }
+
+    /// A wildcard rule names no directory, so it contributes no prefix: the
+    /// guest matches literal prefixes, and guessing which directory `build-*`
+    /// meant would take a watcher off a subtree that still syncs.
+    #[test]
+    fn a_wildcard_rule_contributes_no_prefix() {
+        let dir = tmp();
+        let set = ignores(dir.path(), &[(".gitignore", "*.log\nbuild-*/\n**/tmp\n")]);
+        assert!(set.prune_list(&[]).is_empty());
+    }
+
+    /// A rule in a nested rule file is a prefix from that file's own
+    /// directory, exactly as the rule itself is.
+    #[test]
+    fn a_nested_rule_file_names_prefixes_under_itself() {
+        let dir = tmp();
+        let set = ignores(
+            dir.path(),
+            &[(".gitignore", "target/\n"), ("web/.gitignore", "dist/\n")],
+        );
+        assert_eq!(
+            set.prune_list(&[]),
+            vec!["target".to_string(), "web/dist".to_string()]
+        );
+    }
+
+    /// An **anchored** negation naming something inside an excluded tree
+    /// takes it off the list: a prefix is all the guest gets, and a prefix
+    /// cannot say "except this".
+    #[test]
+    fn a_negation_reaching_below_a_prefix_keeps_the_watcher_on() {
+        let dir = tmp();
+        let set = ignores(
+            dir.path(),
+            &[
+                (".gitignore", "node_modules/\ntarget/\n"),
+                (".vmlabignore", "!node_modules/.bin/tool\n"),
+            ],
+        );
+        assert_eq!(set.prune_list(&[]), vec!["target".to_string()]);
+    }
+
+    /// The §19.6 common case, which must not disable pruning: `!.env` is
+    /// git's ordinary "this file is not ignored" and cannot re-include
+    /// anything under an excluded directory — the rule `verdict` already
+    /// holds — so it reaches below nothing.
+    #[test]
+    fn an_unanchored_negation_does_not_disable_pruning() {
+        let dir = tmp();
+        let set = ignores(
+            dir.path(),
+            &[
+                (".gitignore", "node_modules/\n.env\n"),
+                (".vmlabignore", "!.env\n"),
+            ],
+        );
+        assert_eq!(set.prune_list(&[]), vec!["node_modules".to_string()]);
+        assert_eq!(set.verdict(".env", false), Verdict::Synced);
+        assert_eq!(
+            set.verdict("node_modules/.env", false),
+            Verdict::GuestOwned,
+            "a negation cannot reach under an excluded directory"
+        );
+    }
+
+    /// What a host walk declined to enter joins the list, which is how a rule
+    /// that matches at a depth its own text does not name still prunes.
+    #[test]
+    fn what_the_host_walk_declined_to_enter_joins_the_list() {
+        let dir = tmp();
+        let set = ignores(dir.path(), &[(".gitignore", "target/\n")]);
+        assert_eq!(
+            set.prune_list(&["crates/api/target".to_string()]),
+            vec!["crates/api/target".to_string(), "target".to_string()]
+        );
+    }
+
+    /// The shortest prefix covers the rest: sending both is the guest
+    /// matching twice to reach the same answer.
+    #[test]
+    fn a_prefix_under_another_prefix_is_dropped() {
+        let dir = tmp();
+        let set = ignores(dir.path(), &[(".gitignore", "target/\ntarget/debug/\n")]);
+        assert_eq!(set.prune_list(&[]), vec!["target".to_string()]);
     }
 
     /// The rules' digest is part of the ledger, so it has to move when they

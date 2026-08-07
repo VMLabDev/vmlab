@@ -1,12 +1,14 @@
-//! Executing a reconciliation against the guest (PRD §19.6).
+//! Executing a reconciliation against both sides (PRD §19.6).
 //!
 //! Two invariants this module exists to hold, in this order:
 //!
 //! 1. **Every apply is temp-name-then-rename, with the temp in the same
-//!    directory as its target** — so the rename is atomic rather than a
-//!    cross-volume copy, and on Windows it inherits the case-sensitivity flag
-//!    set at `mkdir`. The temp name is in the ignore floor, so it never
-//!    becomes a sync object itself.
+//!    directory as its target** — in *both* directions, so the rename is
+//!    atomic rather than a cross-volume copy, and on Windows it inherits the
+//!    case-sensitivity flag set at `mkdir`. The temp name is in the ignore
+//!    floor, so it never becomes a sync object itself. Guest→host it is
+//!    load-bearing for a second reason: the target is the canonical copy, and
+//!    a torn half-written file there is the one loss nothing re-derives.
 //! 2. **The ledger records agreement only after the rename**, never after the
 //!    last write. Otherwise a crash between the two leaves the ledger claiming
 //!    agreement on a file that was never placed, the next pass concludes
@@ -28,14 +30,23 @@
 //! **Host→guest deletes are unguarded** (the guard on mass deletion is
 //! guest→host's, where the copy being replicated over is the canonical one):
 //! a `git checkout` removing 400 files just removes them.
+//!
+//! What the two directions do *not* share is where the receiving side's own
+//! `(size, mtime)` comes from: each is read back from the side that took the
+//! rename, because a side's record is only ever compared against itself.
+//!
+//! Both are equally **idempotent** — an already-absent removal and an
+//! already-present directory are the state the action asked for, so both are
+//! successes. Guest-side that rule lives one layer down, in the file session
+//! itself; host-side it is spelled out here, because `std::fs` has no opinion.
 
 use std::path::PathBuf;
 
 use super::guest::GuestFs;
 use super::ignore::TEMP_PREFIX;
 use super::ledger::{Agreed, Kind, Ledger, Side};
-use super::plan::{Action, Plan};
-use super::scan::join_guest;
+use super::plan::{Action, Direction, Plan};
+use super::scan::{join_guest, mtime_ns};
 use crate::labd::vm_agent::{ErrorCode, FileOpsError, LinkKind};
 
 /// Where a workspace's two copies live, and how the guest wants them made.
@@ -67,15 +78,29 @@ impl std::fmt::Display for Failure {
     }
 }
 
-/// What one pass actually did.
+/// What happened to one side's copy.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Applied {
+pub struct Counts {
     pub placed: usize,
     pub removed: usize,
+}
+
+impl Counts {
+    fn quiet(&self) -> bool {
+        self.placed == 0 && self.removed == 0
+    }
+}
+
+/// What one pass actually did. Counted per direction, because "the workspace
+/// moved 400 files" says nothing about which copy just changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub to_guest: Counts,
+    pub to_host: Counts,
     /// Paths adopted as agreed without a transfer, because both sides already
     /// held the same content.
     pub adopted: usize,
-    /// Directories the host dropped that the guest still holds its own
+    /// Directories one side dropped that the other still holds its own
     /// content in — left standing, named, and out of the ledger.
     pub left_standing: Vec<String>,
     /// Symlinks that were attempted and did not take (§19.6, §19.4). Held
@@ -91,7 +116,22 @@ pub struct Applied {
     pub failures: Vec<Failure>,
 }
 
-/// Carry out `plan` against the guest, updating `ledger` as each apply lands.
+impl Applied {
+    /// Whether anything at all moved, in either direction.
+    pub fn moved(&self) -> bool {
+        !self.to_guest.quiet() || !self.to_host.quiet() || self.adopted > 0
+    }
+
+    /// The tally the actions going this way land in.
+    fn counts(&mut self, direction: Direction) -> &mut Counts {
+        match direction {
+            Direction::ToGuest => &mut self.to_guest,
+            Direction::ToHost => &mut self.to_host,
+        }
+    }
+}
+
+/// Carry out `plan` against both sides, updating `ledger` as each apply lands.
 ///
 /// The ledger is mutated in place and left to the caller to persist; every
 /// entry in it by the time this returns is one whose rename completed. A pass
@@ -123,110 +163,75 @@ pub async fn apply(
 
     for action in &plan.actions {
         let path = action.path();
-        let guest_path = join_guest(&target.guest_root, path);
-        let outcome = match action {
-            Action::Remove { kind, .. } => {
-                let removed = match kind {
-                    Kind::Dir => guest.rmdir(&guest_path).await,
-                    _ => guest.remove(&guest_path).await,
-                };
-                match removed {
-                    Ok(()) => {
-                        ledger.entries.remove(path);
-                        done.removed += 1;
-                        continue;
-                    }
-                    // The guest still holds guest-owned content in there —
-                    // `node_modules` under a directory the host just dropped.
-                    // Neither direction touches guest-owned paths, so the
-                    // directory stays and the *agreement* about it goes: a
-                    // removal that can never succeed must not be retried on
-                    // every pass for the life of the machine.
-                    Err(e) if is_not_empty(&e) => {
-                        ledger.entries.remove(path);
-                        done.left_standing.push(path.to_string());
-                        continue;
-                    }
-                    Err(e) => Err(e),
-                }
+        let direction = action.direction();
+        let landed = match direction {
+            Direction::ToGuest => {
+                into_guest(guest, target, action, &mut done.case_insensitive_dirs).await
             }
-            Action::MakeDir { host, .. } => {
-                // A directory needs no temp: creating one destroys nothing,
-                // and on NTFS the case-sensitivity flag can only be set on
-                // the directory that will actually hold the tree.
-                make_dir(guest, target, &guest_path, &mut done)
-                    .await
-                    .map(|()| (Kind::Dir, String::new(), *host))
-            }
-            Action::PutFile { host, digest, .. } => {
-                place(guest, target, path, &guest_path, Placing::File)
-                    .await
-                    .map(|()| (Kind::File, digest.clone(), *host))
-            }
-            Action::PutSymlink {
-                target: link_target,
-                host,
-                digest,
-                dir_link,
-                ..
-            } => place(
-                guest,
-                target,
-                path,
-                &guest_path,
-                Placing::Symlink(link_target, *dir_link),
-            )
-            .await
-            .map(|()| (Kind::Symlink, digest.clone(), *host)),
+            Direction::ToHost => onto_host(guest, target, action).await,
         };
-
-        // A symlink that did not take is the one failure with its own name:
-        // §19.4 makes a symlink-capable image a precondition, and vmlab warns
-        // rather than working around it. Everything else about it is ordinary
-        // — nothing is agreed, so the next pass tries again.
-        if let (Action::PutSymlink { .. }, Err(e)) = (action, &outcome) {
-            done.symlinks_refused.push(Failure {
-                path: path.to_string(),
-                why: format!(
-                    "the guest would not create this symlink, which a dev-capable image must be \
-                     able to do (§19.4): {e:#}"
-                ),
-            });
-            continue;
-        }
-
-        match outcome {
-            Ok((kind, digest, host)) => {
-                // Only now, with the rename behind us: what the guest reports
-                // for its own copy is what the ledger records for the guest
-                // side, because a side's mtime is only ever compared against
-                // its own.
-                match guest.lstat(&guest_path).await {
-                    Ok(Some(attrs)) => {
+        match landed {
+            Ok(Landed::Removed) => {
+                ledger.entries.remove(path);
+                done.counts(direction).removed += 1;
+            }
+            // The other side still holds content of its own in there — a
+            // guest-owned `node_modules` under a directory the host just
+            // dropped, or a host-side `target/` under one the guest did.
+            // Neither direction touches guest-owned paths, so the directory
+            // stays and the *agreement* about it goes: a removal that can
+            // never succeed must not be retried on every pass for the life of
+            // the machine.
+            Ok(Landed::LeftStanding) => {
+                ledger.entries.remove(path);
+                done.left_standing.push(path.to_string());
+            }
+            Ok(Landed::Placed { kind, digest, side }) => {
+                // Only now, with the rename behind us: what the *receiving*
+                // side reports for its own copy is what the ledger records
+                // for that side, because a side's record is only ever
+                // compared against itself.
+                match receiving_side(guest, target, path, direction, kind).await {
+                    Ok(other) => {
+                        let (host, guest_side) = if direction.source_is_host() {
+                            (side, other)
+                        } else {
+                            (other, side)
+                        };
                         ledger.entries.insert(
                             path.to_string(),
                             Agreed {
                                 kind,
                                 digest,
                                 host,
-                                guest: Side::new(attrs.size, attrs.mtime_ns),
+                                guest: guest_side,
                             },
                         );
-                        done.placed += 1;
+                        done.counts(direction).placed += 1;
                     }
                     // Placed but unverifiable: leaving the agreement out is
                     // the safe direction — the next pass hashes both sides
                     // and adopts them if they match.
-                    Ok(None) => done.failures.push(Failure {
-                        path: path.to_string(),
-                        why: "the guest reports nothing there after the rename".into(),
-                    }),
                     Err(e) => done.failures.push(Failure {
                         path: path.to_string(),
-                        why: format!("placed, but the guest could not be re-read: {e:#}"),
+                        why: format!("{e:#}"),
                     }),
                 }
             }
+            // A symlink the *guest* would not create is the one failure with
+            // its own name: §19.4 makes a symlink-capable image a
+            // precondition, and vmlab warns rather than working around it.
+            // Only that way round — a link the host refuses is an ordinary
+            // host-side failure, and no image precondition is at stake.
+            // Everything else about it is ordinary too: nothing is agreed, so
+            // the next pass tries again.
+            Err(e) if refused_symlink(action) => done.symlinks_refused.push(Failure {
+                path: path.to_string(),
+                why: format!(
+                    "the guest would not create this symlink, which a dev-capable image must be \
+                     able to do (§19.4): {e:#}"
+                ),
+            }),
             Err(e) => done.failures.push(Failure {
                 path: path.to_string(),
                 why: format!("{e:#}"),
@@ -234,6 +239,11 @@ pub async fn apply(
         }
     }
     done
+}
+
+/// Whether a failed action was a link this guest was asked to create.
+fn refused_symlink(action: &Action) -> bool {
+    matches!(action, Action::PutSymlink { direction, .. } if direction.source_is_host())
 }
 
 /// Create one directory, asking for the case-sensitivity flag where the
@@ -250,14 +260,14 @@ async fn make_dir(
     guest: &dyn GuestFs,
     target: &Target,
     guest_path: &str,
-    done: &mut Applied,
+    degraded: &mut Vec<Failure>,
 ) -> anyhow::Result<()> {
     match guest.mkdir(guest_path, target.case_sensitive_dirs).await {
         Ok(()) => Ok(()),
         Err(refused) if !target.case_sensitive_dirs => Err(refused),
         Err(refused) => {
             guest.mkdir(guest_path, false).await.map_err(|_| refused)?;
-            done.case_insensitive_dirs.push(Failure {
+            degraded.push(Failure {
                 path: guest_path.to_string(),
                 why: "this guest would not make the directory case-sensitive, so two host paths \
                       differing only in case cannot both land in it and are refused by name"
@@ -265,6 +275,209 @@ async fn make_dir(
             });
             Ok(())
         }
+    }
+}
+
+/// What one action did to the side it was carried to.
+enum Landed {
+    Removed,
+    /// The directory could not go: the other side owns content in it.
+    LeftStanding,
+    Placed {
+        kind: Kind,
+        digest: String,
+        /// The **moving** side's own `(size, mtime)`.
+        side: Side,
+    },
+}
+
+/// Carry a host change into the guest's working copy.
+///
+/// `degraded` collects the directories this guest would not take §19.6's
+/// case-sensitivity flag on, where the machine-wide probe said it would: the
+/// tree still lands, and the workspace is degraded from there on.
+async fn into_guest(
+    guest: &dyn GuestFs,
+    target: &Target,
+    action: &Action,
+    degraded: &mut Vec<Failure>,
+) -> anyhow::Result<Landed> {
+    let path = action.path();
+    let guest_path = join_guest(&target.guest_root, path);
+    match action {
+        Action::Remove { kind, .. } => {
+            let removed = match kind {
+                Kind::Dir => guest.rmdir(&guest_path).await,
+                _ => guest.remove(&guest_path).await,
+            };
+            match removed {
+                Ok(()) => Ok(Landed::Removed),
+                Err(e) if is_not_empty(&e) => Ok(Landed::LeftStanding),
+                Err(e) => Err(e),
+            }
+        }
+        // A directory needs no temp: creating one destroys nothing, and on
+        // NTFS the case-sensitivity flag can only be set on the directory
+        // that will actually hold the tree.
+        Action::MakeDir { side, .. } => {
+            make_dir(guest, target, &guest_path, degraded)
+                .await
+                .map(|()| Landed::Placed {
+                    kind: Kind::Dir,
+                    digest: String::new(),
+                    side: *side,
+                })
+        }
+        Action::PutFile { side, digest, .. } => {
+            place_in_guest(guest, target, path, &guest_path, Placing::File)
+                .await
+                .map(|()| Landed::Placed {
+                    kind: Kind::File,
+                    digest: digest.clone(),
+                    side: *side,
+                })
+        }
+        Action::PutSymlink {
+            target: link_target,
+            side,
+            digest,
+            dir_link,
+            ..
+        } => place_in_guest(
+            guest,
+            target,
+            path,
+            &guest_path,
+            Placing::Symlink(link_target, *dir_link),
+        )
+        .await
+        .map(|()| Landed::Placed {
+            kind: Kind::Symlink,
+            digest: digest.clone(),
+            side: *side,
+        }),
+    }
+}
+
+/// Carry a guest change onto the canonical copy. Plain host filesystem work,
+/// under the same discipline: temp beside the target, then rename.
+async fn onto_host(
+    guest: &dyn GuestFs,
+    target: &Target,
+    action: &Action,
+) -> anyhow::Result<Landed> {
+    let path = action.path();
+    let host_path = target.host_root.join(path);
+    match action {
+        Action::Remove { kind, .. } => {
+            let removed = match kind {
+                Kind::Dir => std::fs::remove_dir(&host_path),
+                _ => std::fs::remove_file(&host_path),
+            };
+            match removed {
+                Ok(()) => Ok(Landed::Removed),
+                // Already gone is the state the action asked for.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Landed::Removed),
+                Err(e) if host_not_empty(&e) => Ok(Landed::LeftStanding),
+                Err(e) => Err(anyhow::Error::new(e).context(format!("removing {path}"))),
+            }
+        }
+        // A directory needs no temp here either: creating one destroys
+        // nothing, and one that is already there is the state the action
+        // asked for.
+        Action::MakeDir { side, .. } => {
+            let placed = Landed::Placed {
+                kind: Kind::Dir,
+                digest: String::new(),
+                side: *side,
+            };
+            match std::fs::create_dir(&host_path) {
+                Ok(()) => Ok(placed),
+                Err(_) if host_path.is_dir() => Ok(placed),
+                Err(e) => Err(anyhow::Error::new(e).context(format!("creating {path}"))),
+            }
+        }
+        Action::PutFile { side, digest, .. } => place_on_host(&host_path, |temp| {
+            let temp = temp.to_path_buf();
+            let remote = join_guest(&target.guest_root, path);
+            async move { guest.pull(&remote, &temp).await }
+        })
+        .await
+        .map(|()| Landed::Placed {
+            kind: Kind::File,
+            digest: digest.clone(),
+            side: *side,
+        }),
+        Action::PutSymlink {
+            target: link_target,
+            side,
+            digest,
+            ..
+        } => place_on_host(&host_path, |temp| {
+            let temp = temp.to_path_buf();
+            async move {
+                // Verbatim, and never followed. A guest-side link to
+                // `C:\Users\dev` lands host-side as that string and dangles,
+                // which is correct: vmlab moves what it is told to move and
+                // translates nothing.
+                std::os::unix::fs::symlink(link_target, &temp).map_err(|e| {
+                    anyhow::Error::new(e).context(format!("linking {}", temp.display()))
+                })
+            }
+        })
+        .await
+        .map(|()| Landed::Placed {
+            kind: Kind::Symlink,
+            digest: digest.clone(),
+            side: *side,
+        }),
+    }
+}
+
+/// The receiving side's own `(size, mtime)`, read back after the rename.
+async fn receiving_side(
+    guest: &dyn GuestFs,
+    target: &Target,
+    path: &str,
+    direction: Direction,
+    kind: Kind,
+) -> anyhow::Result<Side> {
+    match direction {
+        Direction::ToGuest => {
+            let guest_path = join_guest(&target.guest_root, path);
+            match guest.lstat(&guest_path).await {
+                Ok(Some(attrs)) => Ok(Side::new(attrs.size, attrs.mtime_ns)),
+                Ok(None) => Err(anyhow::anyhow!(
+                    "the guest reports nothing there after the rename"
+                )),
+                Err(e) => Err(e.context("placed, but the guest could not be re-read")),
+            }
+        }
+        Direction::ToHost => {
+            let host_path = target.host_root.join(path);
+            let meta = std::fs::symlink_metadata(&host_path).map_err(|e| {
+                anyhow::Error::new(e).context(
+                    "placed, but the host copy could not \
+                                                            be re-read",
+                )
+            })?;
+            Ok(Side::new(
+                host_size(&meta, &host_path, kind),
+                mtime_ns(&meta),
+            ))
+        }
+    }
+}
+
+/// What the host scan will report as this path's size next pass — the link
+/// *target's* length for a symlink, because a link's target string is its
+/// content and the two records have to be the same shape.
+fn host_size(meta: &std::fs::Metadata, path: &std::path::Path, kind: Kind) -> u64 {
+    match kind {
+        Kind::Symlink => std::fs::read_link(path)
+            .map(|t| t.to_string_lossy().len() as u64)
+            .unwrap_or(0),
+        _ => meta.len(),
     }
 }
 
@@ -276,10 +489,10 @@ enum Placing<'a> {
     Symlink(&'a str, bool),
 }
 
-/// Write it under a temp name in the target's own directory, then rename it
+/// Write it under a temp name in the guest's own directory, then rename it
 /// over. The failure path removes the temp: a half-written scratch file left
 /// in the tree is litter the developer would have to explain.
-async fn place(
+async fn place_in_guest(
     guest: &dyn GuestFs,
     target: &Target,
     rel: &str,
@@ -314,6 +527,35 @@ async fn place(
     Ok(())
 }
 
+/// The same discipline against the canonical copy: `write` fills a temp beside
+/// the target, and only a completed one is renamed over it.
+///
+/// This is the direction where it matters most. The target here is the copy
+/// that survives `destroy`, so a reader catching it half-written — a host-side
+/// `cargo build`, a `git status`, the developer's own editor — is reading the
+/// one copy nothing re-derives.
+async fn place_on_host<F, Fut>(host_path: &std::path::Path, write: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&std::path::Path) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let temp = host_temp(host_path);
+    let _ = std::fs::remove_file(&temp);
+    if let Some(parent) = host_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::Error::new(e).context(format!("creating {}", parent.display())))?;
+    }
+    if let Err(e) = write(&temp).await {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&temp, host_path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(anyhow::Error::new(e).context(format!("writing {}", host_path.display())));
+    }
+    Ok(())
+}
+
 /// The temp name for one target, in the target's own directory so the rename
 /// is atomic. Derived from the target rather than random, so a crashed pass
 /// leaves at most one leftover per path and the next pass reclaims it.
@@ -326,10 +568,32 @@ fn temp_beside(guest_path: &str) -> String {
     }
 }
 
+/// The same, for a host path: same directory, same derived name, same reason.
+///
+/// Built from the path's own bytes and joined onto its real parent rather than
+/// re-parsed out of a string, because a host filename need not be UTF-8 and a
+/// lossy one would name a temp in a directory that is not the target's.
+fn host_temp(host_path: &std::path::Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let tag = hex::encode(&Sha256::digest(host_path.as_os_str().as_bytes())[..8]);
+    let name = format!("{TEMP_PREFIX}{tag}");
+    match host_path.parent() {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 /// The guest still holds something of its own in there.
 fn is_not_empty(e: &anyhow::Error) -> bool {
     e.downcast_ref::<FileOpsError>()
         .is_some_and(|e| e.code == ErrorCode::NotEmpty)
+}
+
+/// The same, host-side: a directory the guest dropped that still holds a
+/// guest-owned `target/` the syncer has never touched.
+fn host_not_empty(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
 }
 
 #[cfg(test)]
@@ -372,15 +636,40 @@ mod tests {
 
     /// One whole pass: scan the host, probe the guest, reconcile, apply.
     async fn pass(root: &Path, guest: &FakeGuest, ledger: &mut Ledger) -> Applied {
-        pass_onto(root, guest, ledger, target(root), false).await
+        run_pass(root, guest, ledger, target(root), false, &[]).await
     }
 
+    /// The same, with `dirty` standing in for what the guest's own watcher
+    /// drained — the only way a path the host has never heard of enters a
+    /// pass at all.
+    async fn pass_with(
+        root: &Path,
+        guest: &FakeGuest,
+        ledger: &mut Ledger,
+        dirty: &[&str],
+    ) -> Applied {
+        run_pass(root, guest, ledger, target(root), false, dirty).await
+    }
+
+    /// The same, against a guest with §19.6's Windows semantics: the flag the
+    /// syncer asks for at every `mkdir`, and whether this guest folds case.
     async fn pass_onto(
+        root: &Path,
+        guest: &FakeGuest,
+        ledger: &mut Ledger,
+        target: Target,
+        case_folding: bool,
+    ) -> Applied {
+        run_pass(root, guest, ledger, target, case_folding, &[]).await
+    }
+
+    async fn run_pass(
         root: &Path,
         guest: &FakeGuest,
         ledger: &mut Ledger,
         mut target: Target,
         case_folding: bool,
+        dirty: &[&str],
     ) -> Applied {
         // As the syncer does: the root, and what the guest will really take,
         // before the plan that depends on it.
@@ -397,8 +686,9 @@ mod tests {
             .keys()
             .chain(ledger.entries.keys())
             .cloned()
+            .chain(dirty.iter().map(|p| (*p).to_string()))
             .collect();
-        let probe = super::super::scan::probe_guest(guest, "/src", &paths, ledger).await;
+        let probe = super::super::scan::probe_guest(guest, "/src", &paths, ledger, CAP).await;
         let undecided: BTreeSet<String> = scan
             .skipped
             .iter()
@@ -442,7 +732,7 @@ mod tests {
         );
         assert_eq!(guest.text("/src/README.md").as_deref(), Some("hi"));
         assert_eq!(guest.get("/src/src"), Some(Node::Dir));
-        assert_eq!(done.placed, 3);
+        assert_eq!(done.to_guest.placed, 3);
     }
 
     /// Every apply lands under a temp name in the target's own directory and
@@ -484,7 +774,7 @@ mod tests {
         guest.fail_push(&temp_beside("/src/a.txt"));
 
         let first = pass(dir.path(), &guest, &mut ledger).await;
-        assert_eq!(first.placed, 0);
+        assert_eq!(first.to_guest.placed, 0);
         assert_eq!(first.failures.len(), 1);
         assert_eq!(first.failures[0].path, "a.txt");
         assert!(!ledger.entries.contains_key("a.txt"), "nothing was agreed");
@@ -542,7 +832,7 @@ mod tests {
 
         std::fs::write(dir.path().join("a.txt"), "two").unwrap();
         let done = pass(dir.path(), &guest, &mut ledger).await;
-        assert_eq!(done.placed, 1);
+        assert_eq!(done.to_guest.placed, 1);
         assert_eq!(guest.text("/src/a.txt").as_deref(), Some("two"));
     }
 
@@ -557,7 +847,7 @@ mod tests {
 
         std::fs::remove_file(dir.path().join("a.txt")).unwrap();
         let done = pass(dir.path(), &guest, &mut ledger).await;
-        assert_eq!(done.removed, 1);
+        assert_eq!(done.to_guest.removed, 1);
         assert!(guest.get("/src/a.txt").is_none());
         assert!(!ledger.entries.contains_key("a.txt"));
         assert!(guest.get("/src/b.txt").is_some());
@@ -577,7 +867,7 @@ mod tests {
 
         let (scan, _) = host_scan(dir.path(), &ledger, CAP).unwrap();
         let paths: BTreeSet<String> = scan.tree.keys().cloned().collect();
-        let probe = super::super::scan::probe_guest(&guest, "/src", &paths, &ledger).await;
+        let probe = super::super::scan::probe_guest(&guest, "/src", &paths, &ledger, CAP).await;
         let plan = reconcile(&Inputs {
             host: &scan.tree,
             guest: &probe.tree,
@@ -680,7 +970,7 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
         let done = pass(dir.path(), &guest, &mut ledger).await;
 
-        assert_eq!(done.removed, 0, "the guest's copy was deleted");
+        assert_eq!(done.to_guest.removed, 0, "the guest's copy was deleted");
         assert_eq!(guest.text("/src/app.log").as_deref(), Some("logged"));
         assert!(dir.path().join("app.log").exists());
         assert!(!ledger.entries.contains_key("app.log"));
@@ -810,7 +1100,7 @@ mod tests {
 
         // Which is exactly what `case_folding` refuses: nothing is written.
         let done = pass_onto(dir.path(), &guest, &mut ledger, target(dir.path()), true).await;
-        assert_eq!(done.placed, 1, "only the directory");
+        assert_eq!(done.to_guest.placed, 1, "only the directory");
         assert!(
             guest.get("/src/src/Foo.cs").is_none(),
             "{:?}",
@@ -910,6 +1200,177 @@ mod tests {
                 "{name} was rewritten across the seam"
             );
         }
+    }
+
+    /// The direction the developer authors in. A guest-side edit lands on the
+    /// canonical copy, and the agreement records each side from that side —
+    /// the guest's from the guest, the host's read back after the rename.
+    #[tokio::test]
+    async fn a_guest_side_edit_lands_on_the_canonical_copy() {
+        let dir = workspace(&[("a.txt", "one")]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        pass(dir.path(), &guest, &mut ledger).await;
+
+        guest.file("/src/a.txt", "two", 4_242);
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+
+        assert_eq!(done.to_host.placed, 1);
+        assert_eq!(done.to_guest.placed, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "two"
+        );
+        let agreed = &ledger.entries["a.txt"];
+        assert_eq!(agreed.guest, Side::new(3, 4_242), "the guest's own record");
+        let meta = std::fs::symlink_metadata(dir.path().join("a.txt")).unwrap();
+        assert_eq!(agreed.host, Side::new(meta.len(), mtime_ns(&meta)));
+    }
+
+    /// A path only the guest has — the file the developer just created in
+    /// their editor — reaches the host through the drained set, with its
+    /// directory made first.
+    #[tokio::test]
+    async fn a_guest_created_tree_reaches_the_host() {
+        let dir = workspace(&[("keep.rs", "x")]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        pass(dir.path(), &guest, &mut ledger).await;
+
+        guest.dir("/src/feature");
+        guest.file("/src/feature/mod.rs", "pub fn f() {}", 9);
+        let done = pass_with(
+            dir.path(),
+            &guest,
+            &mut ledger,
+            &["feature", "feature/mod.rs"],
+        )
+        .await;
+
+        assert_eq!(done.failures, vec![]);
+        assert_eq!(done.to_host.placed, 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("feature/mod.rs")).unwrap(),
+            "pub fn f() {}"
+        );
+        assert!(ledger.entries.contains_key("feature/mod.rs"));
+    }
+
+    /// The temp-then-rename discipline, in the direction where it matters
+    /// most: the target is the copy that survives `destroy`, so nothing may
+    /// ever observe it half-written — and the temp is cleared either way.
+    #[tokio::test]
+    async fn a_pull_that_fails_leaves_the_canonical_copy_untouched() {
+        let dir = workspace(&[("a.txt", "host version")]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        pass(dir.path(), &guest, &mut ledger).await;
+
+        guest.file("/src/a.txt", "guest version", 4_242);
+        guest.fail_pull("/src/a.txt");
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+
+        assert_eq!(done.to_host.placed, 0);
+        assert_eq!(done.failures.len(), 1);
+        assert_eq!(done.failures[0].path, "a.txt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "host version",
+            "the canonical copy was written before the transfer finished"
+        );
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(TEMP_PREFIX))
+            .collect();
+        assert!(left.is_empty(), "a temp was left behind: {left:?}");
+
+        // Resume is re-transfer: the whole file again, from the start.
+        let second = pass(dir.path(), &guest, &mut ledger).await;
+        assert_eq!(second.failures, vec![]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "guest version"
+        );
+    }
+
+    /// A guest-side delete propagates immediately — the guard §19.6 puts on
+    /// this direction is about *mass*, and lands with the halt.
+    #[tokio::test]
+    async fn a_guest_side_delete_removes_the_host_copy_and_the_agreement() {
+        let dir = workspace(&[("a.txt", "one"), ("b.txt", "two")]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        pass(dir.path(), &guest, &mut ledger).await;
+
+        guest.unlink("/src/a.txt");
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+
+        assert_eq!(done.to_host.removed, 1);
+        assert!(!dir.path().join("a.txt").exists());
+        assert!(!ledger.entries.contains_key("a.txt"));
+        assert!(dir.path().join("b.txt").exists());
+    }
+
+    /// A guest-side symlink crosses verbatim in this direction too, and its
+    /// target is never translated — the same rule, the same way round.
+    #[tokio::test]
+    async fn a_guest_side_symlink_crosses_verbatim() {
+        let dir = workspace(&[("keep.rs", "x")]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        pass(dir.path(), &guest, &mut ledger).await;
+
+        guest.put(
+            "/src/lib",
+            super::super::guest::fake::Node::Symlink("C:\\Users\\dev\\lib".into()),
+            5,
+        );
+        let done = pass_with(dir.path(), &guest, &mut ledger, &["lib"]).await;
+
+        assert_eq!(done.failures, vec![]);
+        let link = std::fs::read_link(dir.path().join("lib")).unwrap();
+        assert_eq!(link.to_string_lossy(), "C:\\Users\\dev\\lib");
+        assert_eq!(ledger.entries["lib"].kind, Kind::Symlink);
+    }
+
+    /// The guest dropping a directory the *host* still holds guest-owned
+    /// content in leaves it standing, exactly as the mirror case does: a
+    /// removal that can never succeed must not be retried forever.
+    #[tokio::test]
+    async fn a_host_directory_holding_guest_owned_content_is_left_standing() {
+        let dir = workspace(&[(".gitignore", "target/\n"), ("pkg/app.js", "x")]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        pass(dir.path(), &guest, &mut ledger).await;
+        // Guest-owned host-side: the syncer has never touched it and never
+        // will, but it is still in the way of the directory's removal.
+        std::fs::create_dir_all(dir.path().join("pkg/target")).unwrap();
+        std::fs::write(dir.path().join("pkg/target/out"), "built").unwrap();
+
+        guest.unlink("/src/pkg/app.js");
+        guest.unlink("/src/pkg");
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+
+        assert_eq!(done.failures, vec![]);
+        assert_eq!(done.left_standing, vec!["pkg".to_string()]);
+        assert!(!dir.path().join("pkg/app.js").exists());
+        assert!(dir.path().join("pkg/target/out").exists());
+        assert!(!ledger.entries.contains_key("pkg"));
+
+        // The removal is not retried. The host does still hold the directory,
+        // so the ordinary one-side-changed rule puts it back in the guest —
+        // and then both sides agree and nothing moves again.
+        let again = pass(dir.path(), &guest, &mut ledger).await;
+        assert_eq!(
+            again.to_host.removed, 0,
+            "the impossible removal was retried"
+        );
+        assert_eq!(again.to_guest.placed, 1);
+        assert_eq!(
+            pass(dir.path(), &guest, &mut ledger).await,
+            Applied::default()
+        );
     }
 
     /// The temp lives in the target's own directory, so the rename is atomic

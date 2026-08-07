@@ -118,9 +118,13 @@ arithmetic rather than a property of a running lab.
 _Avoid_: diff, delta, changeset
 
 **Sync pass**:
-One reconciliation of a workspace end to end — walk the host, ask the guest
-about those paths, reconcile against the **sync ledger**, apply, record. The
-**seed** is simply the first one; there is no separate seeding mechanism.
+One reconciliation of a workspace end to end — walk the host, learn what the
+guest holds, reconcile against the **sync ledger**, apply, record. What the
+guest is asked is the difference between the steady state and the exception
+path: the pass **probes named paths** (the host's, the ledger's, and what the
+**drain** reported), except on a **watch discontinuity**, where it takes the
+**stat-walk**. The **seed** is simply the first one; there is no separate
+seeding mechanism.
 _Avoid_: sync cycle, run, tick
 
 ### Capabilities
@@ -495,6 +499,14 @@ to a rescan.
 The host swapping the dirty set out and receiving it as a batch of stat records,
 each the path plus its current kind, size and mtime — or a tombstone. At most
 one outstanding.
+
+**Direction**:
+Which way one reconciled action carries a change — to the guest, or to the
+host. A property of the action rather than of the pass: **both directions are
+the same matrix**, and only the deletion guards and the receiving side's own
+record differ between them. Authoring happens guest-side, so *to the host* is
+the busy direction rather than the exceptional one.
+_Avoid_: way, mode, upload/download (nothing here is a transfer's own idea)
 
 **Prune list**:
 Host-computed directory prefixes the guest never registers a watch on — ignored

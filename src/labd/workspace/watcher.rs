@@ -6,6 +6,14 @@
 //! reads a file mid-write — so a path is only reconciled once it has stopped
 //! moving. Everything still in flight is *deferred*, never guessed at.
 //!
+//! [`Debounce`] serves **both directions**: the same rule governs a path this
+//! watcher reported and a path the guest's own dirty set drained, because an
+//! editor writes a temp and renames it whichever side it is running on — and
+//! guest→host the torn read would land on the *canonical* copy. Deferring is
+//! also what makes a burst **de-prioritise rather than drop**: a path that
+//! keeps moving keeps waiting, and a single save elsewhere goes on ahead of
+//! it.
+//!
 //! **Registration is per directory and pruned.** `inotify` costs one watch
 //! descriptor per directory, `max_user_watches` defaults to 8192, and a
 //! `node_modules` tree is routinely tens of thousands of directories — so
@@ -316,7 +324,9 @@ mod tests {
     }
 
     /// Per path, not per tree: a burst under one subtree must not starve a
-    /// single save somewhere else.
+    /// single save somewhere else. The busy path is **de-prioritised, not
+    /// dropped** — it stays in flight, and the syncer picks it up on the pass
+    /// after it finally goes quiet.
     #[test]
     fn one_busy_path_does_not_hold_up_another() {
         let base = Instant::now();

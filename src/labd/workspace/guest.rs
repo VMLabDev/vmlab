@@ -18,17 +18,24 @@ use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::labd::vm_agent::{Attrs, FileOps, LinkKind};
+use crate::labd::vm_agent::{Attrs, DirEntry, FileOps, LinkKind, WatchReport, WatchSession};
 
 /// Everything the syncer can do to a guest tree.
 #[async_trait]
 pub trait GuestFs: Send + Sync {
     /// What is at `path` itself, never followed. `None` where nothing is.
     async fn lstat(&self, path: &str) -> Result<Option<Attrs>>;
+    /// Every entry in a directory, each with its own attributes and none of
+    /// them followed. The stat-walk's one primitive: the guest reports what
+    /// it holds and the **host** applies the ignore rules to the answer.
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>>;
     /// A symlink's target string, verbatim and untranslated.
     async fn readlink(&self, path: &str) -> Result<String>;
     /// The guest's own SHA-256 of what is on its disk.
     async fn digest(&self, path: &str) -> Result<String>;
+    /// Bring a guest file's bytes to `local`, verified against the guest's
+    /// own digest of what it read.
+    async fn pull(&self, remote: &str, local: &Path) -> Result<()>;
     /// Create a directory, treating an existing one as success.
     ///
     /// `case_sensitive` is §19.6's NTFS flag, which takes only while the
@@ -54,10 +61,31 @@ pub trait GuestFs: Send + Sync {
     async fn rmdir(&self, path: &str) -> Result<()>;
 }
 
+/// The other seam: the guest's own watcher, which is how a guest-side edit
+/// reaches the host at all.
+///
+/// Separate from [`GuestFs`] because its lifetime is: a file session is
+/// opened per pass and thrown away, where the watch outlives every pass —
+/// closing it between them would guarantee a stat-walk on the next one, which
+/// is the cost the dirty set exists to avoid.
+#[async_trait]
+pub trait GuestWatch: Send + Sync {
+    /// Swap the guest's dirty set out. At most one drain is outstanding, and
+    /// there is no ack for the answer: a dropped channel already means a
+    /// stat-walk, so the loss self-heals through a path that has to exist.
+    async fn drain(&self) -> Result<()>;
+    /// The next thing the channel says. `None` once it is gone.
+    async fn recv(&mut self) -> Option<WatchReport>;
+}
+
 #[async_trait]
 impl GuestFs for FileOps {
     async fn lstat(&self, path: &str) -> Result<Option<Attrs>> {
         FileOps::lstat(self, path).await
+    }
+
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>> {
+        FileOps::readdir(self, path).await
     }
 
     async fn readlink(&self, path: &str) -> Result<String> {
@@ -66,6 +94,10 @@ impl GuestFs for FileOps {
 
     async fn digest(&self, path: &str) -> Result<String> {
         FileOps::digest(self, path).await.map(|(sha256, _)| sha256)
+    }
+
+    async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
+        FileOps::pull_to(self, remote, local).await.map(|_| ())
     }
 
     async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
@@ -119,11 +151,17 @@ impl<T: GuestFs + ?Sized> GuestFs for std::sync::Arc<T> {
     async fn lstat(&self, path: &str) -> Result<Option<Attrs>> {
         (**self).lstat(path).await
     }
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>> {
+        (**self).readdir(path).await
+    }
     async fn readlink(&self, path: &str) -> Result<String> {
         (**self).readlink(path).await
     }
     async fn digest(&self, path: &str) -> Result<String> {
         (**self).digest(path).await
+    }
+    async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
+        (**self).pull(remote, local).await
     }
     async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
         (**self).mkdir(path, case_sensitive).await
@@ -148,16 +186,27 @@ impl<T: GuestFs + ?Sized> GuestFs for std::sync::Arc<T> {
     }
 }
 
+#[async_trait]
+impl GuestWatch for WatchSession {
+    async fn drain(&self) -> Result<()> {
+        WatchSession::drain(self).await
+    }
+
+    async fn recv(&mut self) -> Option<WatchReport> {
+        WatchSession::recv(self).await
+    }
+}
+
 /// An in-memory guest tree, for the tests that have to watch what the syncer
 /// actually does to one.
 #[cfg(test)]
 pub mod fake {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Mutex;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::sync::{Arc, Mutex};
 
     use anyhow::{Result, anyhow, bail};
-    use vmlab_agent_proto::watch::EntryKind;
+    use vmlab_agent_proto::watch::{EntryKind, Stat, StatRecord};
 
     use crate::labd::vm_agent::{ErrorCode, FileOpsError};
 
@@ -180,6 +229,8 @@ pub mod fake {
         writes: Vec<String>,
         /// Paths whose next push fails, standing in for a dropped channel.
         fail_push: Vec<String>,
+        /// Paths whose pull fails, the same thing in the other direction.
+        fail_pull: Vec<String>,
         /// Paths the guest refuses to be read at all.
         unreadable: Vec<String>,
         /// This guest's filesystem folds case, like a default NTFS volume:
@@ -226,6 +277,17 @@ pub mod fake {
             .find(|held| held.eq_ignore_ascii_case(path))
             .cloned()
             .unwrap_or_else(|| path.to_string())
+    }
+
+    /// A node's wire kind and size, the same answer an `lstat` and a
+    /// directory listing must give about it.
+    fn describe(node: &Node) -> (EntryKind, u64) {
+        match node {
+            Node::File(bytes) => (EntryKind::File, bytes.len() as u64),
+            Node::Dir => (EntryKind::Dir, 0),
+            Node::Symlink(target) => (EntryKind::Symlink, target.len() as u64),
+            Node::Special => (EntryKind::Other, 0),
+        }
     }
 
     /// A fake guest filesystem. Paths are whatever the caller passes, so the
@@ -292,6 +354,15 @@ pub mod fake {
                 .lock()
                 .expect("fake guest")
                 .fail_push
+                .push(path.to_string());
+        }
+
+        /// The next pull of `path` fails, as a dropped channel would.
+        pub fn fail_pull(&self, path: &str) {
+            self.inner
+                .lock()
+                .expect("fake guest")
+                .fail_pull
                 .push(path.to_string());
         }
 
@@ -366,6 +437,152 @@ pub mod fake {
                 .case_sensitive
                 .contains(path)
         }
+
+        /// Remove a path, as a guest-side `rm` would.
+        pub fn unlink(&self, path: &str) {
+            let mut guest = self.inner.lock().expect("fake guest");
+            let key = resolve(&guest, path);
+            guest.nodes.remove(&key);
+        }
+    }
+
+    /// The guest's watcher, as a test drives it: mark a path and the channel
+    /// nudges, exactly as the agent's dirty set does on its empty →
+    /// non-empty transition.
+    ///
+    /// Shared rather than owned by the session, because the thing a test
+    /// wants to do — write a file guest-side and say the guest noticed — has
+    /// to reach a watch the syncer is already holding.
+    #[derive(Debug)]
+    pub struct FakeWatcher {
+        guest: Arc<FakeGuest>,
+        root: String,
+        state: Mutex<WatchState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct WatchState {
+        dirty: BTreeSet<String>,
+        /// Coverage was lost: the next drain answers `Rescan` whatever else
+        /// is in the set, which is the agent's own rule.
+        overflow: bool,
+        outbox: VecDeque<WatchReport>,
+        drains: usize,
+        closed: bool,
+    }
+
+    impl FakeWatcher {
+        pub fn new(guest: Arc<FakeGuest>, root: &str) -> Arc<FakeWatcher> {
+            Arc::new(FakeWatcher {
+                guest,
+                root: root.to_string(),
+                state: Mutex::new(WatchState::default()),
+            })
+        }
+
+        /// The guest noticed something at `rel` — a path relative to the
+        /// watch root, which is what crosses the seam.
+        pub fn mark(&self, rel: &str) {
+            let mut state = self.state.lock().expect("fake watch");
+            let quiet = state.dirty.is_empty() && !state.overflow;
+            state.dirty.insert(rel.to_string());
+            if quiet {
+                state.outbox.push_back(WatchReport::Dirty);
+            }
+        }
+
+        /// Coverage was lost, whichever of the three ways.
+        pub fn overflow(&self) {
+            let mut state = self.state.lock().expect("fake watch");
+            let quiet = state.dirty.is_empty() && !state.overflow;
+            state.overflow = true;
+            if quiet {
+                state.outbox.push_back(WatchReport::Dirty);
+            }
+        }
+
+        /// The channel died — an agent restart, a torn connection.
+        pub fn fail(&self, why: &str) {
+            self.state
+                .lock()
+                .expect("fake watch")
+                .outbox
+                .push_back(WatchReport::Error(why.to_string()));
+        }
+
+        pub fn drains(&self) -> usize {
+            self.state.lock().expect("fake watch").drains
+        }
+
+        /// One session on this watcher.
+        pub fn session(self: &Arc<Self>) -> Box<dyn GuestWatch> {
+            Box::new(FakeWatch(self.clone()))
+        }
+
+        /// What the agent would report for one dirty path: its current stat,
+        /// or a tombstone where it is gone.
+        fn record(&self, rel: &str) -> StatRecord {
+            let path = super::super::scan::join_guest(&self.root, rel);
+            let guest = self.guest.inner.lock().expect("fake guest");
+            match guest.nodes.get(&resolve(&guest, &path)) {
+                Some((node, mtime_ns)) => {
+                    let (kind, size) = describe(node);
+                    StatRecord {
+                        path: rel.to_string(),
+                        stat: Some(Stat {
+                            kind,
+                            size,
+                            mtime_ns: *mtime_ns,
+                        }),
+                    }
+                }
+                None => StatRecord::tombstone(rel),
+            }
+        }
+    }
+
+    struct FakeWatch(Arc<FakeWatcher>);
+
+    #[async_trait]
+    impl GuestWatch for FakeWatch {
+        async fn drain(&self) -> Result<()> {
+            let (paths, overflowed) = {
+                let mut state = self.0.state.lock().expect("fake watch");
+                state.drains += 1;
+                let overflowed = std::mem::take(&mut state.overflow);
+                (std::mem::take(&mut state.dirty), overflowed)
+            };
+            // The set is stat-ed at drain time, not at mark time: a path
+            // written and deleted inside one window has one answer, and it is
+            // the one the guest holds now.
+            let report = if overflowed {
+                WatchReport::Rescan
+            } else {
+                WatchReport::Batch(paths.iter().map(|rel| self.0.record(rel)).collect())
+            };
+            self.0
+                .state
+                .lock()
+                .expect("fake watch")
+                .outbox
+                .push_back(report);
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Option<WatchReport> {
+            loop {
+                {
+                    let mut state = self.0.state.lock().expect("fake watch");
+                    if let Some(report) = state.outbox.pop_front() {
+                        return Some(report);
+                    }
+                    if state.closed {
+                        return None;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
     }
 
     #[async_trait]
@@ -378,12 +595,7 @@ pub mod fake {
             let Some((node, mtime_ns)) = guest.nodes.get(&resolve(&guest, path)) else {
                 return Ok(None);
             };
-            let (kind, size) = match node {
-                Node::File(bytes) => (EntryKind::File, bytes.len() as u64),
-                Node::Dir => (EntryKind::Dir, 0),
-                Node::Symlink(target) => (EntryKind::Symlink, target.len() as u64),
-                Node::Special => (EntryKind::Other, 0),
-            };
+            let (kind, size) = describe(node);
             Ok(Some(Attrs {
                 kind,
                 size,
@@ -393,10 +605,59 @@ pub mod fake {
             }))
         }
 
+        async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>> {
+            let guest = self.inner.lock().expect("fake guest");
+            if guest.unreadable.iter().any(|p| p == path) {
+                bail!("permission denied: {path}");
+            }
+            let dir = resolve(&guest, path);
+            if !matches!(guest.nodes.get(&dir), Some((Node::Dir, _))) {
+                bail!("not a directory: {path}");
+            }
+            let under = format!("{}/", dir.trim_end_matches('/'));
+            let mut entries = Vec::new();
+            for (child, (node, mtime_ns)) in guest.nodes.iter() {
+                let Some(name) = child.strip_prefix(&under) else {
+                    continue;
+                };
+                if name.contains('/') {
+                    continue;
+                }
+                let (kind, size) = describe(node);
+                entries.push(DirEntry {
+                    name: name.to_string(),
+                    attrs: Attrs {
+                        kind,
+                        size,
+                        mtime_ns: *mtime_ns,
+                        atime_ns: *mtime_ns,
+                        mode: Some(0o644),
+                    },
+                });
+            }
+            Ok(entries)
+        }
+
         async fn readlink(&self, path: &str) -> Result<String> {
             match self.get(path) {
                 Some(Node::Symlink(target)) => Ok(target),
                 _ => Err(anyhow!("not a symlink: {path}")),
+            }
+        }
+
+        async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
+            let mut guest = self.inner.lock().expect("fake guest");
+            if guest.unreadable.iter().any(|p| p == remote) {
+                bail!("permission denied: {remote}");
+            }
+            if let Some(at) = guest.fail_pull.iter().position(|p| p == remote) {
+                guest.fail_pull.remove(at);
+                bail!("the channel dropped while pulling {remote}");
+            }
+            let key = resolve(&guest, remote);
+            match guest.nodes.get(&key) {
+                Some((Node::File(bytes), _)) => Ok(std::fs::write(local, bytes)?),
+                _ => Err(anyhow!("no such file: {remote}")),
             }
         }
 
@@ -441,6 +702,24 @@ pub mod fake {
             let bytes = std::fs::read(local)?;
             let mut guest = self.inner.lock().expect("fake guest");
             guest.writes.push(remote.to_string());
+            // What the real session does when the guest has no directory to
+            // put it in: make the parents. The workspace root itself arrives
+            // this way, since it is never an entry in the host's own tree.
+            let mut prefix = String::new();
+            for part in remote.trim_end_matches('/').split('/') {
+                if prefix.is_empty() && part.is_empty() {
+                    prefix.push('/');
+                    continue;
+                }
+                if !prefix.is_empty() && !prefix.ends_with('/') {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                if prefix == remote {
+                    break;
+                }
+                guest.nodes.entry(prefix.clone()).or_insert((Node::Dir, 0));
+            }
             if let Some(at) = guest.fail_push.iter().position(|p| p == remote) {
                 guest.fail_push.remove(at);
                 bail!("the channel dropped while pushing {remote}");
