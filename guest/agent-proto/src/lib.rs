@@ -29,6 +29,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod watch;
+
 /// Version of this contract. The agent reports it in [`AgentMsg::Hello`]; the
 /// host refuses to drive an agent speaking a different version.
 ///
@@ -63,6 +65,9 @@ pub mod features {
     pub const EVENTLOG: &str = "eventlog";
     /// Guest-side TCP tunnels ([`HostMsg::OpenTunnel`], PRD §19.5).
     pub const TUNNEL: &str = "tunnel";
+    /// The recursive guest tree watch backing the workspace syncer
+    /// (§19.4, [`crate::watch`]).
+    pub const WATCH: &str = "watch";
 }
 
 /// How `vmlab-cinit` tells a container micro-VM's agent about the container
@@ -364,6 +369,23 @@ pub enum HostMsg {
     OpenTail {
         id: u32,
         path: String,
+    },
+    /// Watch the tree at `path` recursively on channel `id`, which becomes a
+    /// stream of length-prefixed [`watch`] records rather than a byte
+    /// stream. `prune` is a list of root-relative, `/`-separated directory
+    /// prefixes no watcher is registered under — the host computes it from
+    /// its own ignore rules, so the guest is handed the answer and never
+    /// asked the question (§19.6).
+    ///
+    /// It carries no `logon`: a watcher *observes*, producing none of the
+    /// developer's files, so §19.2's rule puts it on the agent identity —
+    /// which also makes coverage complete by construction rather than
+    /// bounded by what one account can traverse.
+    OpenWatch {
+        id: u32,
+        path: String,
+        #[serde(default)]
+        prune: Vec<String>,
     },
     /// Follow the Windows event log (XML-rendered events as DATA frames).
     /// `filter` is an XPath query, default `*` on the System channel.
@@ -738,6 +760,11 @@ mod tests {
                 id: 7,
                 filter: None,
             },
+            HostMsg::OpenWatch {
+                id: 8,
+                path: "/home/dev/work".into(),
+                prune: vec!["node_modules".into(), "target/debug".into()],
+            },
             HostMsg::SetClipboard { text: "hi".into() },
             HostMsg::GetClipboard,
             HostMsg::SubscribeMetrics { interval_secs: 5 },
@@ -885,6 +912,21 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HostMsg::NetInfo).unwrap(),
             r#"{"cmd":"net_info"}"#
+        );
+    }
+
+    /// §19.5: a watcher observes — it produces none of the developer's
+    /// files, so the open runs as the agent identity and grows no `logon`.
+    #[test]
+    fn open_watch_carries_no_logon() {
+        assert_eq!(
+            serde_json::to_string(&HostMsg::OpenWatch {
+                id: 8,
+                path: "/home/dev/work".into(),
+                prune: vec![],
+            })
+            .unwrap(),
+            r#"{"cmd":"open_watch","id":8,"path":"/home/dev/work","prune":[]}"#
         );
     }
 

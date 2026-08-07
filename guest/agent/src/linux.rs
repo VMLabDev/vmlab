@@ -209,6 +209,7 @@ impl crate::mux::Platform for LinuxPlatform {
             features::TAIL.to_string(),
             features::METRICS.to_string(),
             features::TUNNEL.to_string(),
+            features::WATCH.to_string(),
         ];
         if self.clipboard.is_some() {
             f.push(features::CLIPBOARD.to_string());

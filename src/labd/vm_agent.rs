@@ -26,6 +26,8 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 
+pub use vmlab_agent_proto::watch::StatRecord;
+use vmlab_agent_proto::watch::{RecordDecoder, WatchRecord, encode_record};
 use vmlab_agent_proto::{
     AgentMsg, DiskUsage, ErrorCause, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
     PROTO_VERSION, RecvWindow, encode_ctrl, encode_frame, features,
@@ -476,6 +478,29 @@ impl AgentHandle {
         self.open(|id| HostMsg::OpenTail { id, path }).await
     }
 
+    /// Watch the guest tree at `path` recursively (§19.5). `prune` is the
+    /// host's list of root-relative directory prefixes the guest registers no
+    /// watcher under — the host still owns globs, negations and semantics
+    /// entirely; the guest is handed a list, never asked a question.
+    ///
+    /// The open carries no `logon`: a watcher produces none of the
+    /// developer's files, so it runs as the agent identity, which also makes
+    /// coverage complete by construction rather than bounded by what one
+    /// account can traverse.
+    pub async fn open_watch(&self, path: String, prune: Vec<String>) -> Result<WatchSession> {
+        if !self.has_feature(vmlab_agent_proto::features::WATCH) {
+            bail!("the guest agent has no `watch` support — rebuild the template to update it");
+        }
+        let session = self
+            .open(|id| HostMsg::OpenWatch { id, path, prune })
+            .await?;
+        Ok(WatchSession {
+            session,
+            decoder: RecordDecoder::new(),
+            pending: std::collections::VecDeque::new(),
+        })
+    }
+
     /// Follow the Windows event log.
     pub async fn open_eventlog(&self, filter: Option<String>) -> Result<AgentSession> {
         self.open(|id| HostMsg::OpenEventLog { id, filter }).await
@@ -816,6 +841,89 @@ impl Drop for AgentSession {
             handle.inner.sessions.lock().await.remove(&id);
             let _ = handle.send_msg(&HostMsg::Close { id }).await;
         });
+    }
+}
+
+/// What a watch channel reports. Paths, never events: the guest's dirty set
+/// coalesces, so a path created, modified and deleted inside one drain window
+/// has no single kind to report (§19.5).
+#[derive(Debug)]
+pub enum WatchReport {
+    /// The guest's dirty set went empty → non-empty. One nudge per drain
+    /// window: drain now if idle, or let the burst batch itself.
+    Dirty,
+    /// The answer to a [`WatchSession::drain`]: one record per dirty path,
+    /// each the path plus its current stat, or a tombstone if it is gone.
+    Batch(Vec<StatRecord>),
+    /// The answer to a drain when coverage was lost — a platform event queue
+    /// overflowed, the guest's set hit its cap, or a subtree vanished without
+    /// per-child events. All of them mean the same thing to the host: run the
+    /// stat-walk. It never needs to know which fired.
+    Rescan,
+    /// The channel failed. The watch root vanishing arrives here naming the
+    /// root, rather than as a batch of tombstones for everything under it.
+    Error(String),
+}
+
+/// One open watch channel. Its records ride the channel's own credit window
+/// rather than the control channel: a 30 000-path batch is megabytes of JSON,
+/// and control frames are not flow-controlled.
+pub struct WatchSession {
+    session: AgentSession,
+    decoder: RecordDecoder,
+    pending: std::collections::VecDeque<WatchRecord>,
+}
+
+impl WatchSession {
+    /// Swap the guest's dirty set out. At most one drain is outstanding; the
+    /// answer is one [`WatchReport::Batch`] or one [`WatchReport::Rescan`],
+    /// though a [`WatchReport::Dirty`] the guest sent before the drain reached
+    /// it can still arrive first. There is no ack for the answer, because a
+    /// dropped channel already implies a stat-walk, so the loss self-heals.
+    pub async fn drain(&self) -> Result<()> {
+        self.session
+            .send(&encode_record(&WatchRecord::Drain))
+            .await
+            .context("requesting a watch drain")
+    }
+
+    /// Next record. `None` once the channel (or connection) is gone.
+    pub async fn recv(&mut self) -> Option<WatchReport> {
+        loop {
+            if let Some(record) = self.pending.pop_front() {
+                return Some(match record {
+                    WatchRecord::Dirty => WatchReport::Dirty,
+                    WatchRecord::Batch { entries } => WatchReport::Batch(entries),
+                    WatchRecord::Rescan => WatchReport::Rescan,
+                    // Host→agent only; an agent sending one is desynced.
+                    WatchRecord::Drain => {
+                        WatchReport::Error("agent sent a drain on a watch channel".into())
+                    }
+                });
+            }
+            match self.session.recv().await? {
+                SessionEvent::Data(bytes) => {
+                    self.decoder.push(&bytes);
+                    loop {
+                        match self.decoder.next_record() {
+                            Ok(Some(record)) => self.pending.push_back(record),
+                            Ok(None) => break,
+                            Err(e) => return Some(WatchReport::Error(e)),
+                        }
+                    }
+                }
+                SessionEvent::Error(msg) => return Some(WatchReport::Error(msg)),
+                other => {
+                    return Some(WatchReport::Error(format!(
+                        "unexpected {other:?} on a watch channel"
+                    )));
+                }
+            }
+        }
+    }
+
+    pub async fn close(self) {
+        self.session.close().await;
     }
 }
 
@@ -1189,6 +1297,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use vmlab_agent_proto::Frame;
+    use vmlab_agent_proto::watch::{EntryKind, Stat};
 
     const HANDSHAKE: Duration = Duration::from_secs(5);
 
@@ -1203,6 +1312,7 @@ mod tests {
                 "exec".into(),
                 "file".into(),
                 "tunnel".into(),
+                "watch".into(),
             ],
         )
         .await
@@ -1244,6 +1354,9 @@ mod tests {
             let mut terminals: Vec<u32> = Vec::new();
             let mut tunnels: Vec<u32> = Vec::new();
             let mut pushes: HashMap<u32, Vec<u8>> = HashMap::new();
+            // Watch channels: the root the host named, its record decoder,
+            // and how many drains it has asked for.
+            let mut watches: HashMap<u32, (String, RecordDecoder, usize)> = HashMap::new();
             let mut pulled = b"pulled-file-content".repeat(1000);
             pulled.truncate(10_000);
             loop {
@@ -1362,6 +1475,24 @@ mod tests {
                                     })
                                     .await;
                                 }
+                                // A watch: the root must exist, the channel
+                                // nudges once, and each drain is answered
+                                // with a batch (then a rescan).
+                                HostMsg::OpenWatch { id, path, prune } => {
+                                    if path.contains("vanished") {
+                                        send(AgentMsg::Error {
+                                            id: Some(id),
+                                            msg: format!("watch root {path} is gone"),
+                                            cause: None,
+                                        })
+                                        .await;
+                                    } else {
+                                        assert_eq!(prune, vec!["node_modules".to_string()]);
+                                        watches.insert(id, (path, RecordDecoder::new(), 0));
+                                        send(AgentMsg::Opened { id }).await;
+                                        send_data(id, encode_record(&WatchRecord::Dirty)).await;
+                                    }
+                                }
                                 HostMsg::Eof { id } => {
                                     if let Some(data) = pushes.remove(&id) {
                                         use sha2::{Digest, Sha256};
@@ -1424,7 +1555,33 @@ mod tests {
                             }
                         }
                         FrameKind::Data => {
-                            if let Some(data) = pushes.get_mut(&channel) {
+                            if let Some((root, decoder, drains)) = watches.get_mut(&channel) {
+                                decoder.push(&payload);
+                                while let Some(record) = decoder.next_record().unwrap() {
+                                    assert_eq!(record, WatchRecord::Drain);
+                                    *drains += 1;
+                                    let answer = if *drains == 1 {
+                                        // Big enough to span many frames, so
+                                        // the host reassembles one record out
+                                        // of the channel's byte stream.
+                                        let mut entries = vec![StatRecord::tombstone("gone.txt")];
+                                        entries.extend((0..3000).map(|i| StatRecord {
+                                            path: format!("{root}/f{i}"),
+                                            stat: Some(Stat {
+                                                kind: EntryKind::File,
+                                                size: i,
+                                                mtime_ns: 1_700_000_000_000_000_000,
+                                            }),
+                                        }));
+                                        WatchRecord::Batch { entries }
+                                    } else {
+                                        WatchRecord::Rescan
+                                    };
+                                    for chunk in encode_record(&answer).chunks(4096) {
+                                        send_data(channel, chunk.to_vec()).await;
+                                    }
+                                }
+                            } else if let Some(data) = pushes.get_mut(&channel) {
                                 data.extend(payload);
                             } else {
                                 // Echo terminal.
@@ -1748,6 +1905,65 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// The whole watch contract from the host's side: one nudge, a drain
+    /// answered with stat records reassembled out of the channel's byte
+    /// stream, and a second drain answered with the one overflow value.
+    #[tokio::test]
+    async fn watch_nudges_then_drains_into_records_and_a_rescan() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut watch = agent
+            .open_watch("/home/dev/work".into(), vec!["node_modules".into()])
+            .await
+            .unwrap();
+
+        assert!(matches!(watch.recv().await, Some(WatchReport::Dirty)));
+
+        watch.drain().await.unwrap();
+        let Some(WatchReport::Batch(entries)) = watch.recv().await else {
+            panic!("expected a batch");
+        };
+        assert_eq!(entries.len(), 3001);
+        // A tombstone is the absence of a stat, not a kind of its own.
+        assert_eq!(entries[0].path, "gone.txt");
+        assert_eq!(entries[0].stat, None);
+        let last = entries.last().unwrap();
+        assert_eq!(last.path, "/home/dev/work/f2999");
+        assert_eq!(last.stat.as_ref().unwrap().kind, EntryKind::File);
+
+        watch.drain().await.unwrap();
+        assert!(matches!(watch.recv().await, Some(WatchReport::Rescan)));
+        watch.close().await;
+    }
+
+    /// The root vanishing fails the channel by name, so a halt can say *the
+    /// workspace directory is gone* rather than *the guest deleted 4 000
+    /// files*.
+    #[tokio::test]
+    async fn a_vanished_watch_root_fails_the_open_by_name() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let Err(err) = agent
+            .open_watch("/home/dev/vanished".into(), vec!["node_modules".into()])
+            .await
+        else {
+            panic!("expected the open to fail");
+        };
+        assert!(err.to_string().contains("/home/dev/vanished"), "{err}");
+    }
+
+    /// An agent too old to watch says so where the caller can act on it,
+    /// instead of timing out on a channel that never opens.
+    #[tokio::test]
+    async fn watching_an_agent_without_the_feature_is_refused() {
+        let (_dir, path) = mock_agent_with(true, vec!["terminal".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let Err(err) = agent.open_watch("/home/dev/work".into(), vec![]).await else {
+            panic!("expected the open to be refused");
+        };
+        assert!(err.to_string().contains("rebuild the template"), "{err}");
     }
 
     #[test]

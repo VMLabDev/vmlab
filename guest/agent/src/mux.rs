@@ -339,6 +339,9 @@ impl Mux {
             HostMsg::OpenTail { id, path } => {
                 crate::tail::open(self, id, platform.resolve_path(path))
             }
+            HostMsg::OpenWatch { id, path, prune } => {
+                crate::watch::open(self, id, platform.resolve_path(path), prune)
+            }
             HostMsg::OpenEventLog { id, filter } => platform.open_eventlog(self, id, filter),
             HostMsg::SetClipboard { text } => platform.set_clipboard(self, text),
             HostMsg::GetClipboard => platform.get_clipboard(self),
