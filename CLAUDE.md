@@ -33,8 +33,10 @@ plus the container floor. **The SSH facade serves a shell** (#87,
 label selector, and the `session` vocabulary onto agent terminals and execs.
 **`direct-tcpip` rides the agent tunnel** (#89), so `ssh -D`/`-W` reach a
 guest port with no guest network involved and a failed dial answers
-`SSH_OPEN_CONNECT_FAILED` rather than the prohibited code; SFTP (#88) still
-refuses by name until its own ticket lands.
+`SSH_OPEN_CONNECT_FAILED` rather than the prohibited code. **`subsystem sftp`
+is answered host-side** (#88, `ssh/sftp.rs`): version 3, transcoded
+packet-for-request onto `fileops` under the connection's own logon, so `scp`
+and an editor's file explorer land on the same cached logon as the shell.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;

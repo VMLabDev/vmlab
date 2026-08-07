@@ -3,9 +3,10 @@
 //! Every SSH request the facade answers turns into something the agent
 //! already does: `shell` into `OpenTerminal`, `exec` into `OpenExec` (or
 //! into a terminal hosting the command, where the client asked for one),
-//! `window-change` into `Resize`, `direct-tcpip` into `OpenTunnel`, and the
-//! agent's exit code into `exit-status`. Everything else is refused — see
-//! [`super`] for the one invariant that decides which.
+//! `window-change` into `Resize`, `direct-tcpip` into `OpenTunnel`,
+//! `subsystem sftp` into a `fileops` session ([`super::sftp`] holds that
+//! transcode), and the agent's exit code into `exit-status`. Everything else
+//! is refused — see [`super`] for the one invariant that decides which.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,7 +36,11 @@ const INFLIGHT_CHUNKS: usize = 1;
 const DEFAULT_SIZE: (u16, u16) = (80, 24);
 
 /// What a session channel carries towards the guest once it has started.
-enum ToGuest {
+///
+/// `pub(super)` because `subsystem sftp` is served by [`super::sftp`] off the
+/// same channel: the client's bytes reach the transcode the same way they
+/// reach a shell, and by the same depth-1 route.
+pub(super) enum ToGuest {
     Data(Vec<u8>),
     Eof,
     Resize(u16, u16),
@@ -52,6 +57,13 @@ struct ClientChannel {
     size: Option<(u16, u16)>,
     env: Vec<(String, String)>,
     to_guest: Option<mpsc::Sender<ToGuest>>,
+}
+
+/// What `pty-req` and `env` left on a channel, taken by the request that
+/// starts something on it.
+struct Pending {
+    size: Option<(u16, u16)>,
+    env: Vec<(String, String)>,
 }
 
 /// The server side of one SSH connection.
@@ -129,6 +141,36 @@ impl Facade {
         );
     }
 
+    /// What the channel's `pty-req` and `env` left for the request that is
+    /// about to start something on it, taken — or `None` where there is no
+    /// such channel, or something already started on it.
+    ///
+    /// One shell, one command or one subsystem per channel; a second request
+    /// on a started channel is a client bug, not something to race, and a
+    /// `direct-tcpip` was started at its open.
+    fn claim(&mut self, channel: ChannelId) -> Option<Pending> {
+        let mut channels = self.channels.lock_recover();
+        let chan = channels.get_mut(&channel)?;
+        if chan.to_guest.is_some() {
+            return None;
+        }
+        Some(Pending {
+            size: chan.size,
+            env: std::mem::take(&mut chan.env),
+        })
+    }
+
+    /// Mark `channel` started, handing back the end the client's bytes will
+    /// arrive on. A channel that went away under the open keeps nothing, and
+    /// the receiver ends with the sender that is dropped here.
+    fn mark_started(&mut self, channel: ChannelId) -> mpsc::Receiver<ToGuest> {
+        let (tx, rx) = mpsc::channel(INFLIGHT_CHUNKS);
+        if let Some(chan) = self.channels.lock_recover().get_mut(&channel) {
+            chan.to_guest = Some(tx);
+        }
+        rx
+    }
+
     /// Start an agent session on `channel` and pump it until it ends.
     async fn start(
         &mut self,
@@ -136,19 +178,7 @@ impl Facade {
         session: &mut Session,
         start: Start,
     ) -> Result<(), russh::Error> {
-        let prepared = {
-            let mut channels = self.channels.lock_recover();
-            match channels.get_mut(&channel) {
-                // One shell or one command per channel; a second request on
-                // a started channel is a client bug, not something to race,
-                // and a `direct-tcpip` was started at its open.
-                Some(chan) if chan.to_guest.is_none() => {
-                    Some((chan.size, std::mem::take(&mut chan.env)))
-                }
-                _ => None,
-            }
-        };
-        let Some((pty, env)) = prepared else {
+        let Some(Pending { size: pty, env }) = self.claim(channel) else {
             session.channel_failure(channel)?;
             return Ok(());
         };
@@ -167,13 +197,50 @@ impl Facade {
             }
         };
 
-        let (tx, rx) = mpsc::channel(INFLIGHT_CHUNKS);
-        if let Some(chan) = self.channels.lock_recover().get_mut(&channel) {
-            chan.to_guest = Some(tx);
-        }
+        let rx = self.mark_started(channel);
         session.channel_success(channel)?;
         if let Some(handle) = self.handle().await {
             tokio::spawn(pump(agent_session, rx, handle, channel, Carries::Session));
+        }
+        Ok(())
+    }
+
+    /// `subsystem sftp`, answered host-side over a `fileops` session
+    /// (§19.3, §19.5). See [`super::sftp`] for the transcode itself.
+    async fn start_sftp(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        // The `env` a client sent goes nowhere: a file session spawns no
+        // process, so there is no environment to apply it over.
+        if self.claim(channel).is_none() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+        // **The property this whole ticket is about**: the file session is
+        // opened with the connection's own logon, so it resolves the same
+        // (account, secret) as the shell and lands on the same cached logon,
+        // the same `LogonId` and the same view of mapped drives (§19.2). One
+        // value, carried by both opens — true by construction rather than by
+        // discipline.
+        let ops = match self.agent.open_fileops(self.logon.clone()).await {
+            Ok(ops) => ops,
+            // §19.3's per-channel degradation: an agent with no `fileops`
+            // still serves a shell, and `sftp` refuses **by name** — the
+            // message names the capability and the repair verb, so a
+            // developer is told what to do rather than watching an editor
+            // hang.
+            Err(e) => {
+                self.spec.refused("subsystem sftp", &format!("{e:#}"));
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+        };
+        let rx = self.mark_started(channel);
+        session.channel_success(channel)?;
+        if let Some(handle) = self.handle().await {
+            tokio::spawn(super::sftp::serve(ops, rx, handle, channel));
         }
         Ok(())
     }
@@ -746,14 +813,17 @@ impl Handler for Facade {
         Ok(())
     }
 
-    /// `sftp` is a separate ticket (#88); anything else is refused because
-    /// nothing in the client set sends it.
+    /// `sftp` is served here, over `fileops`; anything else is refused
+    /// because nothing in the client set sends it.
     async fn subsystem_request(
         &mut self,
         channel: ChannelId,
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if name == "sftp" {
+            return self.start_sftp(channel, session).await;
+        }
         self.spec.refused(
             "subsystem",
             &format!("`{name}` is not served by this facade"),

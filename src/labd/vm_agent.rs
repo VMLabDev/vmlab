@@ -28,8 +28,11 @@ use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 
-use vmlab_agent_proto::fileops::{self, Op, OpenFlags, Reply, Request, Response};
-pub use vmlab_agent_proto::fileops::{Attrs, ErrorCode};
+use vmlab_agent_proto::fileops::{self, Request, Response};
+// The file vocabulary itself, re-exported: the SSH facade's SFTP transcode
+// speaks it directly (§19.5), so it must not have to reach past this client
+// to name an operation.
+pub use vmlab_agent_proto::fileops::{Attrs, ErrorCode, LinkKind, Op, OpenFlags, Reply, SetAttrs};
 pub use vmlab_agent_proto::watch::{EntryKind, StatRecord};
 use vmlab_agent_proto::watch::{RecordDecoder, WatchRecord, encode_record};
 use vmlab_agent_proto::{
@@ -1111,6 +1114,20 @@ impl FileOps {
             bail!("pull {remote}: digest mismatch after transfer");
         }
         Ok((sha256, len))
+    }
+
+    /// One operation on this session, in the guest's own file vocabulary.
+    ///
+    /// The transfers above are the convenient callers; the SSH facade's SFTP
+    /// (§19.3) is the one that needs the vocabulary itself, because it
+    /// *transcodes* rather than adapts — one client packet onto one of these
+    /// and one reply back, with nothing in between inventing a file
+    /// abstraction of its own.
+    ///
+    /// A failed operation is `Ok(Reply::Error { .. })`: the channel is
+    /// unaffected, and only a channel that has died is `Err`.
+    pub async fn request(&self, op: Op, payload: &[u8]) -> Result<(Reply, Vec<u8>)> {
+        self.inner.call(op, payload).await
     }
 
     /// The guest's own SHA-256 and length of what is at `path`.
