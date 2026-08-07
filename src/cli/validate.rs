@@ -114,6 +114,13 @@ pub fn validate_source(content: &str, root: &Path) -> std::result::Result<(), Ve
 
 pub fn cmd_validate() -> Result<()> {
     let file = validate_current()?;
+    // A lab that validates is a lab that loaded, and §19.7 says every such
+    // command registers it in the managed SSH block — so a fresh clone is in
+    // the editor's host picker after the first thing a developer runs in it.
+    // The lab file itself is still untouched, which is what "no side effects"
+    // is about.
+    let root = crate::paths::find_lab_root(&std::env::current_dir()?)?;
+    crate::ssh_config::refresh_or_warn(&file.lab, &root);
     println!(
         "ok: lab \"{}\" — {} vm(s), {} container(s), {} segment(s)",
         file.lab.name,

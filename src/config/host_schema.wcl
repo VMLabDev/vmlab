@@ -29,4 +29,6 @@ type HostConfig {
   oci_chunk_size: std.ByteSize?
   @doc("Directory holding config-weave guest binaries; default `~/.local/share/config-weave/bin`")
   config_weave_bin_dir: utf8?
+  @doc("File vmlab writes its managed SSH block into; default `~/.ssh/config`")
+  ssh_config: utf8?
 }

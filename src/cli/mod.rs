@@ -181,6 +181,28 @@ pub enum Command {
         #[command(flatten)]
         run_as: As,
     },
+    /// Attach over the SSH facade: refresh the managed `~/.ssh/config` block,
+    /// then hand over to the system `ssh` (PRD §19.7)
+    ///
+    /// Not a second SSH client — one implementation of the client side, and
+    /// it is the one editors already use. Refuses on a stopped machine and
+    /// never starts one, like `console` and `exec`.
+    Ssh {
+        /// [lab/]machine — a bare name inside a lab directory, or the
+        /// qualified form from anywhere
+        machine: String,
+        /// Command and arguments to run instead of a shell (after --)
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Refresh the managed `~/.ssh/config` block for the lab in this
+    /// directory (PRD §19.7)
+    SshConfig {
+        /// Print one machine's stanza and the editor settings snippet, for a
+        /// client that will not read the file
+        #[arg(long, value_name = "MACHINE")]
+        print: Option<String>,
+    },
     /// The `ProxyCommand` target: pipe stdin/stdout onto a machine's SSH
     /// facade (PRD §19.3). Hidden — spawned by `ssh`, never typed.
     #[command(hide = true)]
@@ -627,6 +649,8 @@ pub fn run() -> ExitCode {
             cmd,
         } => lab::cmd_exec(&vm, timeout, cmd, run_as),
         Command::Shell { vm, run_as } => lab::cmd_shell(&vm, run_as),
+        Command::Ssh { machine, cmd } => lab::cmd_ssh(&machine, cmd),
+        Command::SshConfig { print } => lab::cmd_ssh_config(print.as_deref()),
         Command::SshProxy { machine } => lab::cmd_ssh_proxy(&machine),
         Command::Cp { src, dest } => lab::cmd_cp(&src, &dest),
         Command::Tail { vm, path } => lab::cmd_tail(&vm, &path),

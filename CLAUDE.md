@@ -17,8 +17,8 @@ Consult them for prior art only — the PRD overrides anything they did.
 ## Status
 
 PRD implemented (M1–M6). **§19 (Dev machines) is partly built** — the
-workspace syncer and the managed `~/.ssh/config` block are spec only;
-implementation is tracked by #78–#98. The `@dev` declaration (#80) and all
+workspace syncer is spec only; implementation is tracked by #78–#98. The
+`@dev` declaration (#80) and all
 three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
 `fileops` (#84) — the handle-based, offset-addressed, pipelined file RPC
 session that **replaced** the whole-file push/pull pair outright, carrying
@@ -44,7 +44,9 @@ degrading per channel — a stale agent still serves a shell, while the two
 channels that need what it lacks refuse by name. With it, `vmlab machine
 repair-agent`, which pushes the host's shipped agent into a running machine and
 marks it **diverged**; never automatic, and meaningless on a container, which
-it says.
+it says. **The managed `~/.ssh/config` block** (#91, §19.7) carries the aliases
+every client picks out of, with `vmlab ssh` and `vmlab ssh-config` over it;
+`vmlab dev attach` / `dev use` (#92) are still spec.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
@@ -57,6 +59,13 @@ Module map under `src/`:
   ladder says: the one derivation over probed agent features, the refusal that
   names both remedies, and the warning `up` prints. Nothing here is called by
   `validate`, deliberately.
+- `ssh_config/` — the managed `~/.ssh/config` block (§19.7): vmlab's whole
+  host-side footprint, generated client-side from the lab file the CLI has in
+  hand. `block.rs` is the text (markers, per-lab sections, stanzas) and
+  `mod.rs` the writer — `flock`, atomic rename onto the *resolved* path, a
+  re-hoist and an `ssh -G` check. Every path it touches is a field on
+  `Managed`, which is both the host config's location override and the seam
+  the tests run against a temporary home.
 - `profiles/` — guest OS profiles (WCL data, user-overridable).
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
   firmware lookup, process management; `container.rs` builds the micro-VM

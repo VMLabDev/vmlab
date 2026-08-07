@@ -12,13 +12,38 @@ use crate::proto::client::{LabClient, SupClient};
 use crate::proto::{LabRequest, Region, SupRequest};
 use crate::status::{LabStatus, MachineDetail, MachineStatus};
 
-/// Resolve the current lab (name + root) from cwd, like git.
+/// Resolve the current lab (name + root) from cwd, like git — and register
+/// it in the managed SSH block on the way past.
+///
+/// **Any command that successfully loads a lab refreshes the block** (§19.7),
+/// which is what makes working inside a lab directory enough to put its
+/// machines in an editor's host picker. Rendering and comparing costs a read;
+/// a write happens only on a real difference. A failure here **warns**: the
+/// command the developer actually ran is not about SSH, and `vmlab ssh` fails
+/// hard for itself where the alias is load-bearing.
 pub fn current_lab() -> Result<(String, std::path::PathBuf)> {
+    let (file, root) = load_lab_here()?;
+    crate::ssh_config::refresh_or_warn(&file.lab, &root);
+    Ok((file.lab.name, root))
+}
+
+/// The same resolution with no side effect at all — for the long-lived
+/// callers (`vmlab-web`) that read a lab without being a command a developer
+/// typed in its directory.
+pub fn lab_here() -> Result<(String, std::path::PathBuf)> {
+    let (file, root) = load_lab_here()?;
+    Ok((file.lab.name, root))
+}
+
+fn load_lab_here() -> Result<(crate::config::LabFile, std::path::PathBuf)> {
     let cwd = std::env::current_dir()?;
     let root = crate::paths::find_lab_root(&cwd)?;
-    let file =
-        crate::config::load_lab_root(&root).map_err(|e| anyhow!("{:?}", miette::Report::new(e)))?;
-    Ok((file.lab.name, root))
+    let file = load_lab_at(&root)?;
+    Ok((file, root))
+}
+
+fn load_lab_at(root: &std::path::Path) -> Result<crate::config::LabFile> {
+    crate::config::load_lab_root(root).map_err(|e| anyhow!("{:?}", miette::Report::new(e)))
 }
 
 /// Resolve a `[lab/]vm` reference (PRD §9.3): with a slash the lab is
@@ -197,9 +222,48 @@ pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
     })
 }
 
+/// Every alias a lab (or one machine in it) publishes, for the withdrawal
+/// `destroy` performs.
+///
+/// Best effort by construction: a lab whose file no longer loads still has
+/// muxes to kill, and the bare alias is the one every client actually uses.
+fn aliases_to_withdraw(
+    lab: &str,
+    root: Option<&std::path::Path>,
+    machine: Option<&str>,
+) -> Vec<String> {
+    let declared = root
+        .and_then(|root| Some((load_lab_at(root).ok()?, root)))
+        .map(|(file, root)| {
+            let block = crate::ssh_config::LabBlock::of(&file.lab, root);
+            match machine {
+                Some(m) => block.aliases_for(m),
+                None => block.alias_names(),
+            }
+        });
+    match declared {
+        Some(aliases) if !aliases.is_empty() => aliases,
+        _ => machine
+            .map(|m| {
+                vec![
+                    crate::ssh_config::Alias {
+                        machine: m.to_string(),
+                        login: None,
+                    }
+                    .name(lab),
+                ]
+            })
+            .unwrap_or_default(),
+    }
+}
+
 pub fn cmd_destroy() -> Result<()> {
     rt()?.block_on(async {
         let (name, root) = current_lab()?;
+        // Before anything is torn down, and while the stanzas still resolve:
+        // `ssh -O exit` is the tool's own way to kill a multiplexer, and it
+        // reads the alias out of the block to find the socket (§19.7).
+        crate::ssh_config::withdraw(&aliases_to_withdraw(&name, Some(&root), None));
         // Destroy needs a daemon (to stop VMs and delete state) even if one
         // isn't currently running — .vmlab may still hold clones.
         let lab_local = crate::paths::lab_local_dir(&root);
@@ -726,6 +790,7 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
     rt()?.block_on(async {
         let labs = registry_labs().await?;
         let root = root_for(&labs, name);
+        crate::ssh_config::withdraw(&aliases_to_withdraw(name, root.as_deref(), None));
         match daemon::try_lab_daemon(name).await {
             Some(client) => {
                 client.send(LabRequest::Destroy {}).await.map_err(remote)?;
@@ -794,7 +859,12 @@ pub fn cmd_machine_power(machine_ref: &str, op: PowerOp, force: bool) -> Result<
 pub fn cmd_machine_destroy(machine_ref: &str, noun: &str) -> Result<()> {
     rt()?.block_on(async {
         let (lab, machine) = split_vm_ref(machine_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
+        let (name, client) = lab_client_for(lab).await?;
+        // The mux goes first, while the alias still resolves (§19.7). The
+        // stanza itself stays — a destroyed machine is still a *declared*
+        // one, and the host key it will present next time is unchanged.
+        let root = root_for(&registry_labs().await?, &name);
+        crate::ssh_config::withdraw(&aliases_to_withdraw(&name, root.as_deref(), Some(&machine)));
         client
             .send(LabRequest::MachineDestroy {
                 machine: machine.clone(),
@@ -950,6 +1020,195 @@ async fn shell_on_machine(machine_ref: &str, run_as: As) -> Result<()> {
         resize,
     )
     .await
+}
+
+/// `vmlab ssh [lab/]<machine> [-- cmd]` — refresh the managed block, then
+/// hand the terminal to the **system `ssh`** against the generated alias
+/// (§19.7).
+///
+/// Not a second SSH client: one implementation of the client side, and it is
+/// the one editors already use — so a developer's `Host *` settings,
+/// `ssh_config` habits and `ssh` version are the ones in play, and a failure
+/// here is a failure they can reproduce with `ssh <alias>`.
+///
+/// **The refresh fails hard.** Everywhere else a failed write warns, because
+/// the command was about something else; here the alias *is* the command, and
+/// a stale or displaced block would otherwise send `ssh` somewhere unrelated
+/// (§19.7's ladder).
+///
+/// **It refuses on a stopped machine and never starts one**, matching
+/// `console` and `exec` — which is also why it asks a daemon that is already
+/// running rather than spawning one to be told no.
+pub fn cmd_ssh(machine_ref: &str, cmd: Vec<String>) -> Result<()> {
+    let (lab_ref, machine) = split_vm_ref(machine_ref)?;
+    let alias = rt()?.block_on(async {
+        let (name, root) = match &lab_ref {
+            None => lab_here()?,
+            // `<lab>/<machine>` from anywhere: the registry is what knows
+            // where a lab by that name lives (ADR-0011).
+            Some(name) => {
+                let root = root_for(&registry_labs().await?, name)
+                    .ok_or_else(|| anyhow!("lab \"{name}\" is not running"))?;
+                (name.clone(), root)
+            }
+        };
+
+        let file = load_lab_at(&root)?;
+        if file.lab.machine(&machine).is_none() {
+            bail!("lab \"{name}\" declares no machine \"{machine}\"");
+        }
+        let (managed, _, outcome) = crate::ssh_config::refresh_lab(&file.lab, &root)
+            .context("the managed SSH block must be current before `ssh` can use it")?;
+        let alias = crate::ssh_config::Alias {
+            machine: machine.clone(),
+            login: None,
+        };
+        // A write verified itself; an unchanged block did not, and this is
+        // the one command that must not proceed on an alias OpenSSH resolves
+        // to somebody else's `ProxyCommand`.
+        if outcome == crate::ssh_config::Outcome::Unchanged {
+            managed.verify(&name, Some(&alias))?;
+        }
+
+        // Liveness, from the daemon that is already up. No daemon at all
+        // means nothing is running, which is the same refusal one step
+        // earlier and without starting anything.
+        let Some(client) = daemon::try_lab_daemon(&name).await else {
+            bail!(
+                "lab \"{name}\" is not running — `vmlab ssh` never starts a machine; \
+                 run `vmlab up {machine}` first"
+            );
+        };
+        let status = lab_status(&client).await?;
+        let found = status
+            .machines
+            .iter()
+            .find(|m| m.name == machine)
+            .ok_or_else(|| {
+                anyhow!(
+                    "the daemon for lab \"{name}\" does not know machine \"{machine}\" — it \
+                     predates an edit to {}; run `vmlab lab restart {name}`",
+                    crate::paths::LAB_FILE
+                )
+            })?;
+        if found.state != crate::status::PowerState::Running {
+            bail!(
+                "machine \"{machine}\" is {} — `vmlab ssh` never starts a machine; \
+                 run `vmlab up {machine}` first",
+                found.label.text
+            );
+        }
+        Ok(alias.name(&name))
+    })?;
+
+    exec_ssh(&alias, &cmd)
+}
+
+/// Become `ssh`. Nothing after this line runs in this process — which is the
+/// point: signals, the terminal, `~.` and the exit code are the client's,
+/// exactly as if the developer had typed `ssh <alias>`.
+fn exec_ssh(alias: &str, cmd: &[String]) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut ssh = std::process::Command::new("ssh");
+    ssh.arg(alias).args(cmd);
+    Err(anyhow!("running ssh: {}", ssh.exec()))
+}
+
+/// `vmlab ssh-config [--print <machine>]` — refresh the managed block for the
+/// lab in this directory (§19.7).
+///
+/// The verb exists for the two moments the ambient refresh cannot serve: when
+/// the developer wants to *know* the block is current, and when their client
+/// will not read `~/.ssh/config` at all, which is what `--print` is for
+/// (§19.8). Its own failure is loud, because the write is what was asked for.
+pub fn cmd_ssh_config(print: Option<&str>) -> Result<()> {
+    let (_name, root) = lab_here()?;
+    let file = load_lab_at(&root)?;
+    let (managed, block, outcome) = crate::ssh_config::refresh_lab(&file.lab, &root)?;
+
+    // A login the block could not give an alias is said out loud here, at the
+    // verb whose job the block is — an identity missing from the editor's
+    // picker for a reason nobody ever states is the failure this avoids.
+    for (machine, label) in &block.unaliasable {
+        eprintln!(
+            "vmlab: machine \"{machine}\": login \"{label}\" gets no alias — the label has to be \
+             one ssh_config word (letters, digits, `-`, `_`, `.`). Attach with \
+             `ssh -l \"{label}\" {}`.",
+            crate::ssh_config::Alias {
+                machine: machine.clone(),
+                login: None
+            }
+            .name(&block.lab)
+        );
+    }
+
+    let Some(machine) = print else {
+        println!(
+            "{} — {} ({} alias{} for lab \"{}\")",
+            managed.path.display(),
+            match outcome {
+                crate::ssh_config::Outcome::Wrote => "block updated",
+                crate::ssh_config::Outcome::Unchanged => "block already current",
+            },
+            block.aliases.len(),
+            if block.aliases.len() == 1 { "" } else { "es" },
+            block.lab
+        );
+        return Ok(());
+    };
+
+    print!("{}\n\n", managed.print(&block, machine)?);
+    let family = guest_family(&file.lab, machine)?;
+    print!(
+        "{}",
+        crate::ssh_config::editor_snippet(
+            &block.aliases_for(machine),
+            family == crate::labd::guest_os::GuestOs::Windows
+        )
+    );
+    Ok(())
+}
+
+/// Which guest family a declared machine runs — the one thing the editor
+/// snippet needs, since `remote.SSH.remotePlatform` exists for Windows and
+/// nothing else (§19.8).
+///
+/// Resolved through the **effective** profile, not the declared one: a VM
+/// usually names no profile at all and inherits its template's (§5.2), and
+/// `template = "x86_64/win"` is exactly the shape a Windows dev machine is
+/// declared in. Reading the store here is what `vmlab validate` already does
+/// for the same reason.
+fn guest_family(
+    lab: &crate::config::model::Lab,
+    machine: &str,
+) -> Result<crate::labd::guest_os::GuestOs> {
+    use crate::config::model::{MachineCfg, TemplateRef};
+
+    let found = lab
+        .machine(machine)
+        .ok_or_else(|| anyhow!("lab \"{}\" declares no machine \"{machine}\"", lab.name))?;
+    let profile = match found {
+        MachineCfg::Container(c) => c.profile.clone(),
+        MachineCfg::Vm(vm) => {
+            let meta = match &vm.template {
+                TemplateRef::Store {
+                    arch,
+                    name,
+                    version,
+                } => crate::template::TemplateStore::new(crate::paths::template_store_dir())
+                    .resolve(arch, name, version.as_deref())
+                    .ok()
+                    .map(|t| t.meta),
+                // A registry reference not yet pulled, and `scratch`, have no
+                // template layer to inherit from; the VM's own word is all
+                // there is.
+                _ => None,
+            };
+            crate::qemu::resolve::effective_profile_name(vm, meta.as_ref())
+        }
+    };
+    Ok(crate::labd::guest_os::guest_os_of(profile.as_deref()))
 }
 
 /// `vmlab ssh-proxy [lab/]<machine>` — the `ProxyCommand` an `ssh` process

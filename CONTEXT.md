@@ -288,6 +288,26 @@ channel**: a machine whose agent cannot serve an attach still serves a shell,
 and only what needs the missing feature is refused, by name (§19.4).
 _Avoid_: sshd, SSH server (implies guest-side), gateway, proxy
 
+**Managed block**:
+The marker-fenced region vmlab owns inside the developer's own
+`~/.ssh/config` — its whole host-side footprint, and the only file it writes
+outside its own directories. Deterministically ordered, refreshed by any
+command that loads a lab, written only on a real difference, pruned by lab
+root, and re-hoisted to the top of the file on every write so OpenSSH's
+first-value-wins rule keeps it in effect. There is no vmlab-owned config file
+and no `Include`: a client that cannot follow one is the reason. See PRD
+§19.7.
+_Avoid_: ssh config file (that is the developer's), include file, snippet
+
+**Alias**:
+One `Host` entry in the managed block: `vmlab-<lab>-<machine>`, plus
+`vmlab-<lab>-<machine>-<label>` for each non-default **login**. Covers
+*declared* machines, not running ones — it means "this machine exists in this
+lab", never "it is attachable right now". `<lab>/<machine>` is the argument
+form `vmlab ssh` and `ssh-proxy` take, and is disqualified as an alias because
+the slash would land in the mux socket path.
+_Avoid_: host entry, hostname (the stanza sets no `HostName`)
+
 **Host key**:
 The SSH identity the facade presents, minted per (lab, machine) into vmlab's
 own state directory beside a `known_hosts` vmlab also owns. It survives

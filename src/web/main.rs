@@ -141,7 +141,12 @@ async fn main() -> ExitCode {
 
     // The lab in the working directory (if any) is the default; the switcher
     // also lists every lab the supervisor knows about.
-    let default_lab = vmlab::cli::lab::current_lab().ok();
+    //
+    // `lab_here`, not `current_lab`: reading a lab does not make this server
+    // a command a developer typed in its directory, and the console stays out
+    // of the SSH path (§19.7) — a long-lived daemon is the last thing that
+    // should be rewriting `~/.ssh/config` behind them.
+    let default_lab = vmlab::cli::lab::lab_here().ok();
     match &default_lab {
         Some((name, root)) => println!("vmlab-web: default lab `{name}` ({})", root.display()),
         None => {
