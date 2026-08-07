@@ -88,7 +88,24 @@ editor and owning nothing the editor will still need; `dev use` records which
 dev machine is *mine* in the lab's gitignored `.vmlab/`, which `destroy`
 forgets with everything else there. With them the selection ladder (argument →
 `VMLAB_DEV_MACHINE` → `dev use` → the default `@dev`, else an error listing
-the candidates) and `ssh-proxy`'s refusal to do any lifecycle at all.
+the candidates) and `ssh-proxy`'s refusal to do any lifecycle at all. **The two
+worked examples run end to end** (#98, §19.8), demonstrating the parity claim
+rather than asserting it — `examples/dev-vscode-windows` (a Windows domain
+member, VS Code Remote-SSH, a minted domain logon, an offline segment) and
+`examples/dev-neovim-container` (a Linux container micro-VM, a TUI over the
+facade's own session channel, the container identity floor), split by machine
+kind so *one contract, every machine kind* is shown. Both place editor bits
+into the dev login's home **before that user has ever logged on**, through the
+**wscript rung** of §19.2's ladder that carries them — `m.as_login(label)` /
+`m.as_account(user, password)`, a second handle onto the same machine whose
+every call (exec, `copy_to`, terminal) lands under that identity — and through
+`provision {}`, never `playbook {}`, which has no rung on the ladder at all.
+Both READMEs record the durability rule (bake / hand-install / redo after a
+rebuild) and the two riders §19.8 left open, each with the run that would
+confirm it named. `dev attach` and `ssh-config --print` print the two things an
+offline guest looks like it has taken away and has not: personal config copies
+over the alias with `scp`, and a host-side service is reached by a NIC on a
+segment with egress rather than by the `ssh -R` §19.3 refuses.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
@@ -110,7 +127,10 @@ Module map under `src/`:
   `mod.rs` the writer — `flock`, atomic rename onto the *resolved* path, a
   re-hoist and an `ssh -G` check. Every path it touches is a field on
   `Managed`, which is both the host config's location override and the seam
-  the tests run against a temporary home.
+  the tests run against a temporary home. It also holds the two things every
+  attaching surface prints (§19.8): the editor settings snippet, and the
+  offline-guest notes — `scp` over the alias, and NAT egress rather than the
+  refused `ssh -R`.
 - `profiles/` — guest OS profiles (WCL data, user-overridable).
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
   firmware lookup, process management; `container.rs` builds the micro-VM
@@ -182,7 +202,10 @@ Module map under `src/`:
   execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
   transports, gateway rules, the smbd port), `forward_plan.rs` (every port
   forward), `pull_ledger.rs` (deferred download lifecycle).
-- `scripting/` — wscript host module (lab/VM/segment API), provisions, handlers.
+- `scripting/` — wscript host module (lab/VM/segment API), provisions, handlers;
+  `as_login`/`as_account` are §19.2's wscript rung, a second `MachineHandle`
+  carrying a resolved logon so a provision can write into a login's home
+  before that account has ever logged on (§19.8).
 - `smb/` — bundled-smbd shared folders; `steps.rs` owns the guest-side mount
   plan (virtiofs + SMB, per guest OS) the lab runtime only executes.
 - `oci/` — OCI registry push/pull (chunked, multi-arch).

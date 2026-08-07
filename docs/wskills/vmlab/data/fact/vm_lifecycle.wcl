@@ -20,6 +20,8 @@ fact vm_lifecycle {
         ["`m.is_healthy()`", "`bool`", "Latest healthcheck verdict; a machine declaring none counts healthy once ready"],
         ["`m.logs(lines: int)`", "`Result[string, string]`", "Tail of the console log — a container's captured stdout/stderr, a VM's serial log"],
         ["`m.logins()`", "`List[Login]`", "The identities the machine declares with `login {}` (§19.2). Read from the lab file, so it answers on a stopped machine"],
+        ["`m.as_login(selector: string)`", "`Result[Machine, string]`", "A second handle onto the same machine, whose guest work runs as that **login** — a label, the account name, or the family floor (`SYSTEM`/`root`). Fails naming the machine on a selector nothing matches"],
+        ["`m.as_account(user: string, password: string)`", "`Result[Machine, string]`", "The same, for an account the lab file does not declare, or one whose declared secret has been rotated"],
       ]
     }
     p <<PROSE
@@ -29,6 +31,16 @@ account the lab file declares, instead of the password living in two places
 that drift. The secret crosses as written — `none` where the author declared
 none, never an empty string. `elevated` and `default` cross *resolved*, so a
 lone login reports `default == true` without the lab file saying so.
+PROSE
+    p <<PROSE
+`as_login` / `as_account` are the wscript rung of §19.2's precedence ladder,
+resolved exactly as `vmlab exec --user/--password` resolves it. They return a
+handle rather than switching this one, so an identity is said once and every
+call on the result — `exec`, `copy_to`, `terminal` — carries it. That is what
+lets a `provision {}` step address a login's home directory **before that
+account has ever logged on** (§19.8), which is the only route for anything
+that must land as the developer rather than as the machine. A `playbook {}`
+has no rung here at all.
 PROSE
     p <<PROSE
 Inside a machine's **own** first-boot script the readiness pair is special-cased:

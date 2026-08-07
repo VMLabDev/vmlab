@@ -1,0 +1,61 @@
+// Worked example (PRD §19.8): **Neovim on a Linux container micro-VM.**
+//
+// The twin of ../dev-vscode-windows, and structurally its opposite: no
+// client/server split, no marketplace, no minted domain logon — a TUI over
+// the SSH facade's own `session` channel, plugins that are `git clone`s
+// under `~/.local/share/nvim`, and the container identity floor.
+//
+// Two examples split by machine kind so *one contract, every machine kind* is
+// shown rather than asserted. Two Windows examples would exercise the same
+// code path twice.
+//
+// No template to build — a container is pulled like a docker image and run
+// inside a micro-VM, so it is a lab machine in every respect: same segments,
+// DNS, snapshots, agent channel, SSH facade and workspace syncer as a VM.
+//
+//   vmlab up
+//   vmlab dev attach          # waits for `attachable`, prints the alias, opens a shell
+//   nvim /src/hello.lua       # …or from the alias directly:  ssh <alias> -t nvim /src
+//
+// The workspace is ./workspace on the host, landing at /src in the guest.
+
+import <vmlab.wcl>
+
+lab "dev-neovim-container" {
+
+  // This segment *has* egress, and the example needs it exactly twice: the
+  // package install and the plugin clone. Egress is also §19.8's answer to
+  // "how does a guest with no route of its own reach a host-side service" —
+  // a mirror, a proxy, a licence server. NAT terminates guest flows
+  // in-process and proxies them over ordinary host sockets, so anything
+  // addressed off-segment reaches the host's own address. `ssh -R` is
+  // refused (§19.3) and is not what that needs.
+  segment "lan" {
+    subnet = "10.62.0.0/24"
+    nat    = true
+  }
+
+  @dev(default = true, workspace = "./workspace")
+  container "dev01" {
+    image   = "alpine:3.22"
+    profile = "container"
+    // Neovim wants more than the profile's floor, and a container names its
+    // own size when the profile's is not the right one.
+    cpus    = 2
+    memory  = 1GiB
+    // `:idle` keeps the micro-VM up for attaching without running the
+    // image's entrypoint — a dev container has no service to be.
+    mode    = :idle
+    nic { segment = "lan" }
+
+    // The container identity floor (§19.2): the agent is root and root needs
+    // no credential to become an account, so a Linux `login {}` may declare
+    // the account alone. Its Windows twin cannot — every credential-free
+    // route there is the one Windows OpenSSH's S4U logon already
+    // disqualified, and `elevated` is a validation error on this side.
+    login "dev" { user = "dev" default = true }
+
+    provision "scripts/dev-user.ws" { }
+    provision "scripts/editor-bits.ws" { }
+  }
+}

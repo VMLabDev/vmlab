@@ -571,3 +571,56 @@ pub fn editor_snippet(aliases: &[String], windows: bool) -> String {
     out.push_str("\n}\n");
     out
 }
+
+/// The two things §19.8 makes every attaching surface say, because a
+/// developer who has just been told the guest is offline will otherwise
+/// assume both are gone.
+///
+/// Neither is a feature: SFTP already rides the alias (§19.3's `subsystem
+/// sftp`, answered host-side onto `fileops`), and NAT egress already
+/// terminates guest flows in-process, so a host-side service is an ordinary
+/// off-segment address. They are printed because *nothing* about an offline
+/// guest suggests either, and the thing a developer reaches for instead —
+/// `ssh -R` — is the one §19.3 refuses.
+///
+/// `alias` is the machine's own, and the `scp` line is one command with no
+/// placeholder in it — runnable as read rather than a shape to adapt, which
+/// is the whole reason it is printed instead of documented.
+pub fn offline_notes(alias: &str, windows: bool) -> String {
+    // The dotfiles line, in the guest's own spelling: a Windows dev machine
+    // has no `~/.config/nvim`, and printing one there would teach the wrong
+    // path on the machine §19 exists for.
+    let dotfiles = if windows {
+        format!("scp ~/.gitconfig {alias}:.gitconfig")
+    } else {
+        format!("scp -r ~/.config/nvim {alias}:.config/nvim")
+    };
+    format!(
+        "Personal config copies over the alias — SFTP rides it, offline guest or not:\n  \
+         {dotfiles}\n\
+         A host-side service (a mirror, a proxy, a licence server) is reached by giving this \
+         machine a\nNIC on a segment with egress: NAT terminates guest flows in-process, so \
+         anything off-segment\nreaches the host's own address. `ssh -R` is refused (§19.3) and \
+         is not what this needs.\n"
+    )
+}
+
+/// Everything §19.8 hands a developer at the moment they meet a dev machine:
+/// the client-side [`editor_snippet`], then the [`offline_notes`].
+///
+/// One function rather than each surface pairing them itself, because the
+/// pairing is the contract — `dev attach` and `ssh-config --print` are the
+/// same handover said at two moments, and a third surface should not have to
+/// rediscover which half to print.
+///
+/// `aliases` is one machine's, base alias first ([`LabBlock::aliases_for`]).
+/// An empty list is a machine with no alias at all, which gets the snippet
+/// and nothing to spell an `scp` against.
+pub fn attach_notes(aliases: &[String], windows: bool) -> String {
+    let mut out = editor_snippet(aliases, windows);
+    if let Some(alias) = aliases.first() {
+        out.push('\n');
+        out.push_str(&offline_notes(alias, windows));
+    }
+    out
+}
