@@ -97,6 +97,35 @@ impl<'a> MachineCfg<'a> {
             MachineCfg::Container(c) => &c.playbooks,
         }
     }
+
+    /// The `@dev` decorator this machine carries, if any (§19.1). `None` on
+    /// an ordinary machine, which is most of them.
+    pub fn dev(&self) -> Option<&'a DevDecl> {
+        match self {
+            MachineCfg::Vm(v) => v.dev.as_ref(),
+            MachineCfg::Container(c) => c.dev.as_ref(),
+        }
+    }
+}
+
+/// A machine's `@dev` decorator, as written (§19.1). Every argument is
+/// optional; a bare `@dev` is a complete, attachable dev machine, and the
+/// unset arguments resolve `@dev` > profile > floor in [`crate::dev`].
+#[derive(Debug, Clone)]
+pub struct DevDecl {
+    /// Span of the decorator itself, so a diagnostic points at `@dev(…)`
+    /// rather than at the whole machine block.
+    pub span: Span,
+    /// `default = true`: the lab file's choice of default dev machine. Note
+    /// that a lone `@dev` machine is the default implicitly, so this being
+    /// `false` does not mean "not the default" — [`crate::dev`] decides.
+    pub default: bool,
+    /// Host directory whose contents sync into the workspace, relative to
+    /// the lab root (§19.6). `None` = no workspace, and nothing to sync.
+    pub workspace: Option<PathBuf>,
+    /// Guest path the workspace lands at. `None` = inherit from the profile,
+    /// then the floor.
+    pub workspace_guest: Option<String>,
 }
 
 impl Lab {
@@ -304,6 +333,8 @@ pub struct Vm {
     /// Configuration steps for this VM, in declaration order (§10).
     pub provisions: Vec<Provision>,
     pub playbooks: Vec<Playbook>,
+    /// The `@dev` decorator on this VM, if it carries one (§19.1).
+    pub dev: Option<DevDecl>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +506,8 @@ pub struct Container {
     /// Configuration steps for this container, in declaration order (§10).
     pub provisions: Vec<Provision>,
     pub playbooks: Vec<Playbook>,
+    /// The `@dev` decorator on this container, if it carries one (§19.1).
+    pub dev: Option<DevDecl>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

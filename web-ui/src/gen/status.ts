@@ -18,6 +18,33 @@ health: boolean | null,
 exit_code: number | null, };
 
 /**
+ * A machine's `@dev` declaration, resolved (PRD §19.1).
+ *
+ * Widening the machine projection rather than standing up a second status
+ * verb is the whole point of ADR-0004: `vmlab status`, the REST endpoint and
+ * the console all learn which machine is the dev machine from the value they
+ * already read, with no second code path to keep in step.
+ */
+export type DevStatus = { 
+/**
+ * This is the lab's **default** dev machine — declared `default = true`,
+ * or the only machine carrying `@dev` (§19.1). At most one machine in a
+ * lab reports `true`; `vmlab validate` rejects a second.
+ */
+default: boolean, 
+/**
+ * Host directory the workspace syncs from, as declared — relative to the
+ * lab root (§19.6). `None` = this dev machine declares no workspace.
+ */
+workspace: string | null, 
+/**
+ * Guest path the workspace lands at, resolved `@dev` > profile > floor.
+ * Always answered: a dev machine has a workspace path even where nothing
+ * declared one.
+ */
+workspace_guest: string, };
+
+/**
  * Everything `status` reports about one lab.
  */
 export type LabStatus = { lab: string, 
@@ -97,7 +124,14 @@ ip: string | null, nics: Array<NicStatus>, web: Array<WebPageStatus>,
  * registry download is still pending — lab-level knowledge, filled in by
  * the lab runtime rather than by the machine itself.
  */
-cached: boolean, } & ({ "kind": "vm" } & VmStatus | { "kind": "container" } & ContainerStatus);
+cached: boolean, 
+/**
+ * The `@dev` declaration this machine carries, resolved (§19.1). `None`
+ * on an ordinary machine, which is most of them — zero dev machines is
+ * normal. Lab-level, like `cached`: whether this is *the* dev machine
+ * depends on what the other machines declare.
+ */
+dev: DevStatus | null, } & ({ "kind": "vm" } & VmStatus | { "kind": "container" } & ContainerStatus);
 
 /**
  * One NIC's addressing.

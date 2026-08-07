@@ -18,14 +18,18 @@ Consult them for prior art only — the PRD overrides anything they did.
 
 PRD implemented (M1–M6). **§19 (Dev machines) is mostly specified, not built**
 — the SSH facade, the agent's `fileops` vocabulary and the workspace syncer are
-all spec only; implementation is tracked by #78–#98. The agent's `tunnel` (#85)
-and `watch` (#86) vocabularies (§19.5) are built, as is machine-level
-`login {}` (#81) — its declaration, §5.1 rules and `m.logins()` accessor;
-nothing mints a logon from it yet. Module map under `src/`:
+all spec only; implementation is tracked by #78–#98. The `@dev` declaration
+(#80) and the agent's `tunnel` (#85) and `watch` (#86) vocabularies (§19.5) are
+built, as is machine-level `login {}` (#81) — its declaration, §5.1 rules and
+`m.logins()` accessor; nothing mints a logon from it yet. Module map under
+`src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
   `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005)
   and `designer.rs` renders the console's inspector forms from it.
+- `dev.rs` — dev machines (§19.1): who carries `@dev`, which one is the lab's
+  default, and the `@dev` > profile > floor resolution of its arguments —
+  deliberately separate from the hardware resolver ADR-0008 owns.
 - `profiles/` — guest OS profiles (WCL data, user-overridable).
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
   firmware lookup, process management; `container.rs` builds the micro-VM

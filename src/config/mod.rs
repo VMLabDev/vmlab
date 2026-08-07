@@ -507,16 +507,17 @@ lab "l" {
         );
     }
 
-    /// A decorator nothing declares is a typo, not an annotation WCL ignores.
+    /// A decorator nothing declares is a typo, not an annotation WCL ignores
+    /// — `@dve` for the `@dev` the schema does declare (PRD §19.1).
     #[test]
     fn rejects_an_undeclared_decorator_on_a_block() {
         let src =
-            "import <vmlab.wcl>\nlab \"x\" {\n  @dev\n  vm \"a\" { template = \"x86_64/t\" }\n}\n";
+            "import <vmlab.wcl>\nlab \"x\" {\n  @dve\n  vm \"a\" { template = \"x86_64/t\" }\n}\n";
         let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
         assert!(
             err.issues
                 .iter()
-                .any(|i| i.message.contains("'dev'") && i.message.contains("@decorator")),
+                .any(|i| i.message.contains("'dve'") && i.message.contains("@decorator")),
             "expected the undeclared decorator to be named, got: {:?}",
             err.issues
         );
@@ -538,54 +539,50 @@ lab "l" {
         );
     }
 
-    /// A lab file may declare decorators of its own; a declared decorator's
-    /// arguments are typed, so a wrong-typed or unknown one is an error.
+    /// A declared decorator's arguments are typed, so a wrong-typed or
+    /// unknown one is an error — `@dev`'s own, since the schema declares it
+    /// (PRD §19.1).
     #[test]
     fn rejects_wrong_typed_and_unknown_decorator_arguments() {
-        let declaration =
-            "@decorator(\"dev\")\ntype Dev {\n  @inline(0) owner: utf8\n  port: i64?\n}\n";
-        let wrong_type = format!(
-            "import <vmlab.wcl>\n{declaration}lab \"x\" {{\n  @dev(42)\n  vm \"a\" {{ template = \"x86_64/t\" }}\n}}\n"
-        );
-        let err = load_lab_source(&wrong_type, "<test>", Path::new("/tmp")).unwrap_err();
+        let wrong_type = "import <vmlab.wcl>\nlab \"x\" {\n  @dev(default = 42)\n  vm \"a\" { template = \"x86_64/t\" }\n}\n";
+        let err = load_lab_source(wrong_type, "<test>", Path::new("/tmp")).unwrap_err();
         assert!(
             err.issues
                 .iter()
-                .any(|i| i.message.contains("'owner'") && i.message.contains("utf8")),
+                .any(|i| i.message.contains("'default'") && i.message.contains("bool")),
             "expected a typed-argument error, got: {:?}",
             err.issues
         );
 
-        let unknown_arg = format!(
-            "import <vmlab.wcl>\n{declaration}lab \"x\" {{\n  @dev(\"wil\", prot = 22)\n  vm \"a\" {{ template = \"x86_64/t\" }}\n}}\n"
-        );
-        let err = load_lab_source(&unknown_arg, "<test>", Path::new("/tmp")).unwrap_err();
+        let unknown_arg = "import <vmlab.wcl>\nlab \"x\" {\n  @dev(worksapce = \"./src\")\n  vm \"a\" { template = \"x86_64/t\" }\n}\n";
+        let err = load_lab_source(unknown_arg, "<test>", Path::new("/tmp")).unwrap_err();
         assert!(
             err.issues
                 .iter()
-                .any(|i| i.message.contains("'prot'") && i.message.contains("not declared")),
+                .any(|i| i.message.contains("'worksapce'") && i.message.contains("not declared")),
             "expected an unknown-argument error, got: {:?}",
             err.issues
         );
     }
 
     /// `@applies_to` narrows a decorator to the block kinds it is meant for,
-    /// and the error points at the decorator rather than at the block.
+    /// and the error points at the decorator rather than at the block. `@dev`
+    /// names `vm` and `container`, so it is rejected on every other kind —
+    /// `nic {}` is §19.1's own example.
     #[test]
     fn rejects_a_decorator_on_a_block_kind_it_does_not_apply_to() {
         let src = "import <vmlab.wcl>\n\
-                   @decorator(\"dev\")\n\
-                   @applies_to(on = [:block], kinds = [\"vm\"])\n\
-                   type Dev {}\n\
                    lab \"x\" {\n  \
-                     @dev\n  \
-                     container \"c\" { image = \"nginx\" }\n\
+                     vm \"a\" { template = \"x86_64/t\"\n    \
+                       @dev\n    \
+                       nic { nat = true }\n  \
+                     }\n\
                    }\n";
         let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
         let use_site = src.rfind("@dev").expect("the decorator use site");
         assert!(
             err.issues.iter().any(|issue| {
-                issue.message.contains("container")
+                issue.message.contains("nic")
                     && issue.span.is_some_and(|span| span.offset() == use_site + 1)
             }),
             "expected a kind-applicability error spanning the decorator, got: {:?}",
@@ -593,13 +590,12 @@ lab "l" {
         );
     }
 
-    /// A decorator that is not declared `repeatable` may appear once per node.
+    /// A decorator that is not declared `repeatable` may appear once per node,
+    /// so `@dev @dev` on one machine is an error rather than a second reading
+    /// of the same declaration.
     #[test]
     fn rejects_a_repeated_at_most_once_decorator() {
         let src = "import <vmlab.wcl>\n\
-                   @decorator(\"dev\")\n\
-                   @applies_to(on = [:block], kinds = [\"vm\"])\n\
-                   type Dev {}\n\
                    lab \"x\" {\n  \
                      @dev\n  \
                      @dev\n  \
@@ -613,6 +609,41 @@ lab "l" {
             "expected a cardinality error, got: {:?}",
             err.issues
         );
+    }
+
+    /// The declaration itself: `@dev` on both machine kinds, every argument
+    /// optional, and the arguments landing in the model (PRD §19.1).
+    #[test]
+    fn dev_decorators_extract_on_both_machine_kinds() {
+        let src = r#"import <vmlab.wcl>
+lab "x" {
+  @dev(default = true, workspace = "./src", workspace_guest = "C:\\src")
+  vm "dev01" { template = "x86_64/win" }
+  @dev
+  container "buildbox" { image = "sdk:9.0" }
+  vm "dc01" { template = "x86_64/win" }
+}
+"#;
+        let lf = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap();
+        let dev01 = lf.lab.vms[0].dev.as_ref().expect("@dev on the vm");
+        assert!(dev01.default);
+        assert_eq!(dev01.workspace.as_deref(), Some(Path::new("./src")));
+        assert_eq!(dev01.workspace_guest.as_deref(), Some("C:\\src"));
+        // The span is the decorator's, so a diagnostic points at `@dev(…)`
+        // rather than at the machine block around it.
+        assert_eq!(dev01.span.0, src.find("@dev(").unwrap());
+
+        // A bare `@dev` carries nothing and is still a dev machine.
+        let bare = lf.lab.containers[0]
+            .dev
+            .as_ref()
+            .expect("@dev on the container");
+        assert!(!bare.default);
+        assert!(bare.workspace.is_none());
+        assert!(bare.workspace_guest.is_none());
+
+        // And an undecorated machine is not one.
+        assert!(lf.lab.vms[1].dev.is_none());
     }
 
     #[test]

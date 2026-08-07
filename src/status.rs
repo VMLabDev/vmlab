@@ -316,6 +316,28 @@ impl MachineDetail {
     }
 }
 
+/// A machine's `@dev` declaration, resolved (PRD §19.1).
+///
+/// Widening the machine projection rather than standing up a second status
+/// verb is the whole point of ADR-0004: `vmlab status`, the REST endpoint and
+/// the console all learn which machine is the dev machine from the value they
+/// already read, with no second code path to keep in step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+pub struct DevStatus {
+    /// This is the lab's **default** dev machine — declared `default = true`,
+    /// or the only machine carrying `@dev` (§19.1). At most one machine in a
+    /// lab reports `true`; `vmlab validate` rejects a second.
+    pub default: bool,
+    /// Host directory the workspace syncs from, as declared — relative to the
+    /// lab root (§19.6). `None` = this dev machine declares no workspace.
+    pub workspace: Option<String>,
+    /// Guest path the workspace lands at, resolved `@dev` > profile > floor.
+    /// Always answered: a dev machine has a workspace path even where nothing
+    /// declared one.
+    pub workspace_guest: String,
+}
+
 /// One machine's line in `status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web-ui/src/gen/status.ts")]
@@ -334,6 +356,11 @@ pub struct MachineStatus {
     /// registry download is still pending — lab-level knowledge, filled in by
     /// the lab runtime rather than by the machine itself.
     pub cached: bool,
+    /// The `@dev` declaration this machine carries, resolved (§19.1). `None`
+    /// on an ordinary machine, which is most of them — zero dev machines is
+    /// normal. Lab-level, like `cached`: whether this is *the* dev machine
+    /// depends on what the other machines declare.
+    pub dev: Option<DevStatus>,
     #[serde(flatten)]
     pub detail: MachineDetail,
 }
@@ -357,6 +384,23 @@ impl MachineStatus {
             MachineDetail::Container(c) => Some(c),
             MachineDetail::Vm(_) => None,
         }
+    }
+}
+
+impl LabStatus {
+    /// Every dev machine in the lab, in the order `machines` reports them.
+    pub fn dev_machines(&self) -> impl Iterator<Item = (&MachineStatus, &DevStatus)> {
+        self.machines
+            .iter()
+            .filter_map(|m| m.dev.as_ref().map(|dev| (m, dev)))
+    }
+
+    /// The lab's default dev machine (§19.1), or `None` — no dev machine, or
+    /// several with none declared the default.
+    pub fn default_dev(&self) -> Option<&MachineStatus> {
+        self.dev_machines()
+            .find(|(_, dev)| dev.default)
+            .map(|m| m.0)
     }
 }
 
@@ -541,7 +585,21 @@ pub(crate) mod fixtures {
             nics: Vec::new(),
             web: Vec::new(),
             cached: true,
+            dev: None,
             detail,
+        }
+    }
+
+    /// The same machine, designated a dev machine (§19.1) — `default` says
+    /// whether it is *the* one.
+    pub(crate) fn dev(machine: MachineStatus, default: bool) -> MachineStatus {
+        MachineStatus {
+            dev: Some(DevStatus {
+                default,
+                workspace: Some("./src".into()),
+                workspace_guest: "C:\\src".into(),
+            }),
+            ..machine
         }
     }
 
@@ -701,6 +759,49 @@ mod tests {
             ]);
             assert!(!status.all_stopped(), "state {state:?}");
         }
+    }
+
+    /// Which machine is the dev machine is answered by the projection every
+    /// surface already reads (§19.1), so nothing re-derives it from a lab
+    /// file — and a machine carrying no `@dev` simply says nothing.
+    #[test]
+    fn the_projection_names_the_dev_machine() {
+        let status = lab(vec![
+            machine("dc01", PowerState::Running, true, vm()),
+            dev(machine("dev01", PowerState::Running, true, vm()), true),
+            dev(
+                machine(
+                    "buildbox",
+                    PowerState::Stopped,
+                    false,
+                    container(None, None),
+                ),
+                false,
+            ),
+        ]);
+        assert_eq!(
+            status
+                .dev_machines()
+                .map(|(m, _)| m.name.as_str())
+                .collect::<Vec<_>>(),
+            ["dev01", "buildbox"]
+        );
+        assert_eq!(
+            status
+                .dev_machines()
+                .find(|(_, d)| d.default)
+                .map(|(m, _)| m.name.as_str()),
+            Some("dev01")
+        );
+        assert_eq!(
+            status.machines[1].dev.as_ref().unwrap().workspace_guest,
+            "C:\\src"
+        );
+        assert!(status.machines[0].dev.is_none());
+
+        // No dev machine at all is the ordinary case, and answers cleanly.
+        let plain = lab(vec![machine("dc01", PowerState::Running, true, vm())]);
+        assert_eq!(plain.dev_machines().count(), 0);
     }
 
     /// The wire shape: kind-specific fields sit alongside the common ones under

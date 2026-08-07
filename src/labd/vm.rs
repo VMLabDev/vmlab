@@ -901,6 +901,12 @@ impl super::machine::Machine for VmInstance {
         super::guest_os::guest_os_of(self.template().resolved.profile.as_deref())
     }
 
+    /// Resolved rather than declared: a VM naming no `profile` of its own
+    /// inherits its template's (§5.2).
+    fn profile(&self) -> Option<String> {
+        self.template().resolved.profile.clone()
+    }
+
     fn nics(&self) -> &[model::Nic] {
         &self.cfg.nics
     }

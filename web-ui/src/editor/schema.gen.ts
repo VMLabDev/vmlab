@@ -90,6 +90,12 @@ export interface DecoratorDesc {
 
 /** The decorators each block kind accepts, keyed by block kind. */
 export const BLOCK_DECORATORS: Record<string, DecoratorDesc[]> = {
+  "vm": [
+    { name: "dev", doc: "Designates this machine as a development environment (PRD §19.1): vmlab\npublishes it as an SSH endpoint an editor attaches *into*, and syncs a\nworkspace onto it. A decorator rather than a child block because it states\nsomething *about* the machine — nothing it carries is a setting the guest\never sees.\n\nEvery argument is optional and a bare `@dev` is a complete, attachable dev\nmachine; unset arguments resolve `@dev` > profile > vmlab floor, in\n`src/dev.rs`. Any number of machines may carry it and zero is normal.", repeatable: false, fields: [{ key: "default", label: "Default", doc: "Make this the lab's default dev machine; at most one per lab, and the only `@dev` machine is it implicitly", type: "flag" }, { key: "workspace", label: "Workspace", doc: "Host directory whose contents sync into the workspace, relative to the lab root", type: "text" }, { key: "workspace_guest", label: "Workspace guest", doc: "Guest path the workspace lands at; inherited from the profile (`C:\\src` / `/src`) if omitted", type: "text" }] },
+  ],
+  "container": [
+    { name: "dev", doc: "Designates this machine as a development environment (PRD §19.1): vmlab\npublishes it as an SSH endpoint an editor attaches *into*, and syncs a\nworkspace onto it. A decorator rather than a child block because it states\nsomething *about* the machine — nothing it carries is a setting the guest\never sees.\n\nEvery argument is optional and a bare `@dev` is a complete, attachable dev\nmachine; unset arguments resolve `@dev` > profile > vmlab floor, in\n`src/dev.rs`. Any number of machines may carry it and zero is normal.", repeatable: false, fields: [{ key: "default", label: "Default", doc: "Make this the lab's default dev machine; at most one per lab, and the only `@dev` machine is it implicitly", type: "flag" }, { key: "workspace", label: "Workspace", doc: "Host directory whose contents sync into the workspace, relative to the lab root", type: "text" }, { key: "workspace_guest", label: "Workspace guest", doc: "Guest path the workspace lands at; inherited from the profile (`C:\\src` / `/src`) if omitted", type: "text" }] },
+  ],
 };
 
 /** `vm` block fields. */

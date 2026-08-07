@@ -811,7 +811,7 @@ type Thing {
             .iter()
             .map(|d| d.name.as_str())
             .collect();
-        assert_eq!(names, ["options", "range", "one_of"]);
+        assert_eq!(names, ["options", "range", "one_of", "dev"]);
 
         let options = projection().decorator("options").expect("@options");
         assert_eq!(options.type_name, "FieldOptions");
@@ -841,6 +841,19 @@ type Thing {
         assert!(one_of.repeatable);
         assert_eq!(one_of.arg("exclusive").unwrap().ty, FieldType::Bool);
         assert!(one_of.arg("exclusive").unwrap().optional);
+
+        // `@dev` is the one a lab file carries, so it names the block
+        // position and the two machine kinds (PRD §19.1). Every argument is
+        // optional — a bare `@dev` is a complete dev machine.
+        let dev = projection().decorator("dev").expect("@dev");
+        assert_eq!(dev.type_name, "DevDeclaration");
+        assert_eq!(dev.positions, ["block"]);
+        assert_eq!(dev.kinds, ["vm", "container"]);
+        assert!(!dev.repeatable);
+        assert_eq!(dev.arg("default").unwrap().ty, FieldType::Bool);
+        assert_eq!(dev.arg("workspace").unwrap().ty, FieldType::Text);
+        assert_eq!(dev.arg("workspace_guest").unwrap().ty, FieldType::Text);
+        assert!(dev.args.iter().all(|a| a.optional), "{:?}", dev.args);
     }
 
     /// WCL's own decorators belong to the language. Projecting them would
@@ -855,18 +868,17 @@ type Thing {
         }
     }
 
-    /// The schema's three decorators annotate the schema file itself, so no
-    /// block offers any of them — the list fills in when one declares
-    /// `@applies_to(on = [:block])`.
+    /// The schema's three metadata decorators annotate the schema file
+    /// itself, so no block offers them; `@dev` names `on = [:block]` and two
+    /// kinds, so exactly those two blocks offer it.
     #[test]
     fn a_block_carries_only_the_decorators_declared_for_its_kind() {
         for block in &projection().blocks {
-            assert!(
-                block.decorators.is_empty(),
-                "{} offers {:?}",
-                block.kind,
-                block.decorators
-            );
+            let expected: &[&str] = match block.kind.as_str() {
+                "vm" | "container" => &["dev"],
+                _ => &[],
+            };
+            assert_eq!(block.decorators, expected, "on block `{}`", block.kind);
         }
 
         let source = r#"

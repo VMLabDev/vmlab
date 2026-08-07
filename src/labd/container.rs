@@ -1118,6 +1118,12 @@ impl super::machine::Machine for ContainerInstance {
         super::guest_os::GuestOs::Linux
     }
 
+    /// A container has no template layer, so its own block is the only place
+    /// a profile can come from (§18).
+    fn profile(&self) -> Option<String> {
+        self.cfg.profile.clone()
+    }
+
     fn nics(&self) -> &[model::Nic] {
         &self.cfg.nics
     }
@@ -1428,6 +1434,7 @@ mod tests {
             logins: vec![],
             provisions: vec![],
             playbooks: vec![],
+            dev: None,
         }
     }
 

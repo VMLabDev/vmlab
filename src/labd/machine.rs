@@ -147,6 +147,14 @@ pub trait Machine: Send + Sync + 'static {
     fn arch(&self) -> String;
     /// Guest OS family, for callers that must shape a command line for it.
     fn guest_os(&self) -> GuestOs;
+    /// The guest OS profile this machine effectively runs (§5.3) — a VM's may
+    /// have come from its template rather than from its own block, which only
+    /// the machine can answer. `None` when nothing named one.
+    ///
+    /// Asked for by the profile-sourced layer of a resolution the machine
+    /// itself takes no part in — the dev defaults in [`crate::dev`] are the
+    /// first — so the answer is the profile, not the thing resolved from it.
+    fn profile(&self) -> Option<String>;
     fn nics(&self) -> &[model::Nic];
     fn macs(&self) -> &[MacAddr];
     fn web_pages(&self) -> &[model::WebPage];
@@ -538,8 +546,9 @@ impl dyn Machine {
 
     /// This machine's line in `status`.
     ///
-    /// `cached` is left true here: whether a registry download is still pending
-    /// is lab-level knowledge, and [`super::lab::LabRuntime::status`] fills it
+    /// `cached` and `dev` are left empty here: whether a registry download is
+    /// still pending, and which machine is the lab's dev machine, are both
+    /// lab-level knowledge, and [`super::lab::LabRuntime::status`] fills them
     /// in.
     pub async fn status(self: &Arc<Self>) -> MachineStatus {
         let ready = self.is_ready().await;
@@ -580,6 +589,10 @@ impl dyn Machine {
                 })
                 .collect(),
             cached: true,
+            // Lab-level, like `cached`: `@dev` is per-machine but *the*
+            // default dev machine depends on what the rest of the lab
+            // declares, so `LabRuntime::status` fills this in (§19.1).
+            dev: None,
             detail,
         }
     }

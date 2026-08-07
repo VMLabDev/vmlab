@@ -298,6 +298,36 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
         }
     }
 
+    // Dev machines (PRD §19.1), in their own section rather than as a column
+    // on every machine: most labs have none, and the two things worth naming —
+    // which one is *the* dev machine, and where its workspace lands — do not
+    // fit a shared row.
+    let devs: Vec<_> = status.dev_machines().collect();
+    if !devs.is_empty() {
+        let name_w = column_width("DEV", devs.iter().map(|(m, _)| m.name.len()));
+        let ws_w = column_width(
+            "WORKSPACE",
+            devs.iter()
+                .map(|(_, d)| or_dash(d.workspace.as_deref()).len()),
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  {:<name_w$} {:<8} {:<ws_w$} GUEST WORKSPACE",
+            "DEV", "DEFAULT", "WORKSPACE"
+        );
+        for (m, dev) in &devs {
+            let _ = writeln!(
+                out,
+                "  {:<name_w$} {:<8} {:<ws_w$} {}",
+                m.name,
+                yes_no(dev.default),
+                or_dash(dev.workspace.as_deref()),
+                dev.workspace_guest,
+            );
+        }
+    }
+
     if !status.segments.is_empty() {
         let name_w = column_width("SEGMENT", status.segments.iter().map(|s| s.name.len()));
         let _ = writeln!(out);
@@ -1657,6 +1687,42 @@ mod tests {
         assert!(out.contains("10.0.0.5"), "got:\n{out}");
         // The raw power state is not in the default table.
         assert!(!out.contains("state="), "got:\n{out}");
+    }
+
+    /// `vmlab status` names which machine is the dev machine, off the same
+    /// projection the console reads (§19.1) — and says nothing at all about
+    /// dev machines in a lab that has none, which is most labs.
+    #[test]
+    fn the_status_table_names_the_dev_machine() {
+        use crate::status::fixtures::dev;
+        let out = render_status(
+            &lab(vec![
+                addressed("dc01", PowerState::Running, true, vm()),
+                dev(addressed("dev01", PowerState::Running, true, vm()), true),
+                dev(
+                    addressed("buildbox", PowerState::Running, true, container(None, None)),
+                    false,
+                ),
+            ]),
+            false,
+        );
+        assert!(out.contains("DEV"), "got:\n{out}");
+        assert!(out.contains("GUEST WORKSPACE"), "got:\n{out}");
+        assert!(
+            out.contains("dev01    yes      ./src     C:\\src"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("buildbox no       ./src     C:\\src"),
+            "got:\n{out}"
+        );
+
+        // A lab with no dev machine gets no section at all.
+        let plain = render_status(
+            &lab(vec![addressed("dc01", PowerState::Running, true, vm())]),
+            false,
+        );
+        assert!(!plain.contains("DEV"), "got:\n{plain}");
     }
 
     /// `--verbose` is where the raw power state went when `STATE`/`READY`

@@ -15,6 +15,10 @@ profile "windows-11" {
   display     = "virtio-vga"
   cpus        = 4
   memory      = 8GiB
+  // Where an `@dev` workspace lands when the decorator names no
+  // `workspace_guest` (§19.1) — the key is guest-OS-shaped, which is why it
+  // is profile-sourced.
+  workspace_guest = "C:\\src"
 }
 
 profile "windows-10" {
@@ -28,6 +32,7 @@ profile "windows-10" {
   display     = "virtio-vga"
   cpus        = 4
   memory      = 8GiB
+  workspace_guest = "C:\\src"
 }
 
 profile "windows-server" {
@@ -41,6 +46,7 @@ profile "windows-server" {
   display     = "virtio-vga"
   cpus        = 4
   memory      = 8GiB
+  workspace_guest = "C:\\src"
 }
 
 profile "windows-legacy" {
@@ -54,6 +60,7 @@ profile "windows-legacy" {
   display     = "std"
   cpus        = 2
   memory      = 2GiB
+  workspace_guest = "C:\\src"
 }
 
 profile "windows-9x" {
@@ -70,6 +77,7 @@ profile "windows-9x" {
   // Real-mode DOS/9x TUIs (fdisk, setup) drop QMP send-key events between menu
   // redraws; drive their keyboard over VNC instead, which lands reliably.
   input_transport = "vnc"
+  workspace_guest = "C:\\src"
 }
 
 profile "linux-modern" {
@@ -88,6 +96,7 @@ profile "linux-modern" {
   // Kernel ≥5.4 ships the virtiofs client — `transport = "auto"` shares
   // mount natively instead of over SMB (§7.5).
   virtiofs    = true
+  workspace_guest = "/src"
 }
 
 profile "linux-generic" {
@@ -101,6 +110,7 @@ profile "linux-generic" {
   display     = "std"
   cpus        = 2
   memory      = 2GiB
+  workspace_guest = "/src"
 }
 
 profile "container" {
@@ -114,6 +124,7 @@ profile "container" {
   // ~/.config/vmlab/profiles to change the default for every lab.
   cpus   = 1
   memory = 256MiB
+  workspace_guest = "/src"
 }
 
 profile "custom" {

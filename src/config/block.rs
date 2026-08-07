@@ -118,6 +118,51 @@ fn must_be_one_of(name: &str, allowed: &str, got: &str) -> String {
     format!("`{name}` must be one of {allowed}, got `{got}`")
 }
 
+// ---- coercions -------------------------------------------------------------
+//
+// One evaluated value, narrowed to a type, wording its own failure. Free
+// functions rather than methods because both readers below run them — a block
+// field and a decorator argument are declared the same way and must therefore
+// misread the same way (ADR-0006).
+
+fn coerce_string(name: &str, v: Spanned<Value>, issues: &mut IssueList) -> Option<Spanned<String>> {
+    match v.value {
+        Value::Utf8(s) | Value::Ascii(s) | Value::Identifier(s) => Some(Spanned::new(s, v.span)),
+        other => {
+            issues.push(Issue::at(v.span, wrong_type(name, "a string", &other)));
+            None
+        }
+    }
+}
+
+fn coerce_bool(name: &str, v: Spanned<Value>, issues: &mut IssueList) -> Option<Spanned<bool>> {
+    match v.value {
+        Value::Bool(b) => Some(Spanned::new(b, v.span)),
+        other => {
+            issues.push(Issue::at(v.span, wrong_type(name, "a bool", &other)));
+            None
+        }
+    }
+}
+
+/// One evaluated value, or the issue its evaluation raised. `None` for an
+/// explicit `none`, which reads as "unset" everywhere.
+fn evaluated(
+    name: &str,
+    span: Span,
+    value: Result<Value, impl std::fmt::Display>,
+    issues: &mut IssueList,
+) -> Option<Spanned<Value>> {
+    match value {
+        Ok(Value::None) => None,
+        Ok(v) => Some(Spanned::new(v, span)),
+        Err(e) => {
+            issues.push(Issue::at(span, format!("cannot evaluate `{name}`: {e}")));
+            None
+        }
+    }
+}
+
 // ---- the extractor ---------------------------------------------------------
 
 /// Span of a block, for a caller holding the block rather than a reader.
@@ -187,6 +232,22 @@ impl<'b, 'i> Reader<'b, 'i> {
         self.block.blocks()
     }
 
+    /// One decorator written on this block (`@dev(default = true)`), if it
+    /// carries it. The arguments are read through [`DecoratorReader`], which
+    /// coerces and words issues exactly as the field getters here do.
+    ///
+    /// Whether the decorator may be written at all, whether its arguments
+    /// are named and typed correctly, and whether it may be repeated are
+    /// WCL's checks against the declaration, not ours (§19.1) — by the time
+    /// a reader sees one, only the mapping into the model is left.
+    pub fn decorator<'r>(&'r mut self, name: &str) -> Option<DecoratorReader<'b, 'r>> {
+        let decorator = self.block.decorators().find(|d| d.name() == name)?;
+        Some(DecoratorReader {
+            decorator,
+            issues: self.issues,
+        })
+    }
+
     // ---- issues -------------------------------------------------------
 
     /// Borrow the issue list — for a reader over a child block, or for a
@@ -219,27 +280,12 @@ impl<'b, 'i> Reader<'b, 'i> {
     pub fn value(&mut self, name: &str) -> Option<Spanned<Value>> {
         let field = self.block.field(name)?;
         let span = (field.span().start, field.span().end);
-        match field.value() {
-            Ok(Value::None) => None,
-            Ok(v) => Some(Spanned::new(v.clone(), span)),
-            Err(e) => {
-                self.issue_at(span, format!("cannot evaluate `{name}`: {e}"));
-                None
-            }
-        }
+        evaluated(name, span, field.value().cloned(), self.issues)
     }
 
     pub fn string(&mut self, name: &str) -> Option<Spanned<String>> {
         let v = self.value(name)?;
-        match v.value {
-            Value::Utf8(s) | Value::Ascii(s) | Value::Identifier(s) => {
-                Some(Spanned::new(s, v.span))
-            }
-            other => {
-                self.issue_at(v.span, wrong_type(name, "a string", &other));
-                None
-            }
-        }
+        coerce_string(name, v, self.issues)
     }
 
     /// A string field that must be there.
@@ -249,13 +295,7 @@ impl<'b, 'i> Reader<'b, 'i> {
 
     pub fn bool(&mut self, name: &str) -> Option<Spanned<bool>> {
         let v = self.value(name)?;
-        match v.value {
-            Value::Bool(b) => Some(Spanned::new(b, v.span)),
-            other => {
-                self.issue_at(v.span, wrong_type(name, "a bool", &other));
-                None
-            }
-        }
+        coerce_bool(name, v, self.issues)
     }
 
     /// An integer of any width, widened to `i64`.
@@ -479,6 +519,52 @@ impl<'b, 'i> Reader<'b, 'i> {
                 None
             }
         }
+    }
+}
+
+/// Typed, span-carrying, issue-accumulating access to one decorator written
+/// on a block — [`Reader`]'s counterpart for the arguments of `@dev(…)`.
+///
+/// Decorator arguments are declared exactly as block fields are (same types,
+/// same `@doc`, same optionality), so they are read exactly as block fields
+/// are and a mistake in one reads like a mistake in the other. Only the
+/// getters the schema's decorators actually need are here; add the next one
+/// when a decorator declares it.
+pub struct DecoratorReader<'b, 'i> {
+    decorator: wcl_lang::Decorator<'b>,
+    issues: &'i mut IssueList,
+}
+
+impl DecoratorReader<'_, '_> {
+    /// Span of the decorator itself — where an issue about it as a whole
+    /// goes, and what the model records so a later diagnostic can point at
+    /// `@dev(…)` rather than at the machine block around it.
+    pub fn span(&self) -> Span {
+        let s = self.decorator.span();
+        (s.start, s.end)
+    }
+
+    /// One named argument's evaluated value. `None` for an argument that is
+    /// not written, an explicit `none`, or one that fails to evaluate (which
+    /// reports an issue).
+    pub fn value(&mut self, name: &str) -> Option<Spanned<Value>> {
+        let arg = self.decorator.named().find(|a| a.name() == name)?;
+        let span = (arg.span().start, arg.span().end);
+        evaluated(name, span, arg.value(), self.issues)
+    }
+
+    pub fn string(&mut self, name: &str) -> Option<Spanned<String>> {
+        let v = self.value(name)?;
+        coerce_string(name, v, self.issues)
+    }
+
+    pub fn bool(&mut self, name: &str) -> Option<Spanned<bool>> {
+        let v = self.value(name)?;
+        coerce_bool(name, v, self.issues)
+    }
+
+    pub fn path(&mut self, name: &str) -> Option<Spanned<PathBuf>> {
+        self.string(name).map(|s| s.map(PathBuf::from))
     }
 }
 
