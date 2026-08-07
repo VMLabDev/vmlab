@@ -98,6 +98,16 @@ impl<'a> MachineCfg<'a> {
         }
     }
 
+    /// The identities this machine declares, in declaration order (§19.2).
+    /// Empty on a machine that declares none, which attaches as the agent
+    /// identity.
+    pub fn logins(&self) -> &'a [Login] {
+        match self {
+            MachineCfg::Vm(v) => &v.logins,
+            MachineCfg::Container(c) => &c.logins,
+        }
+    }
+
     /// The `@dev` decorator this machine carries, if any (§19.1). `None` on
     /// an ordinary machine, which is most of them.
     pub fn dev(&self) -> Option<&'a DevDecl> {

@@ -12,7 +12,9 @@ pub const LAB_FILE: &str = "vmlab.wcl";
 /// Lab-local working directory beside the lab file.
 pub const LAB_DIR: &str = ".vmlab";
 
-fn home() -> PathBuf {
+/// The user's home directory. `/` when `HOME` is unset, which is what every
+/// XDG fallback below already assumes.
+pub fn home() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -75,6 +77,15 @@ pub fn runtime_dir() -> PathBuf {
             PathBuf::from(format!("/tmp/vmlab-{uid}"))
         }
     }
+}
+
+/// `$XDG_RUNTIME_DIR/vmlab/ssh` — the SSH multiplexer sockets the managed
+/// block's `ControlPath` names (PRD §19.7), and the advisory lock its writer
+/// serialises on. Under the runtime directory because that is where every
+/// other vmlab control socket already lives, and because `%C` plus this
+/// prefix is the whole of a path bounded by construction.
+pub fn ssh_runtime_dir() -> PathBuf {
+    runtime_dir().join("ssh")
 }
 
 /// Supervisor control socket.

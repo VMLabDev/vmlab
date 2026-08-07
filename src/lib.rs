@@ -48,6 +48,9 @@ pub mod hardware {
 mod qmp;
 mod scripting;
 mod smb;
+/// The managed `~/.ssh/config` block (§19.7): host-side, client-generated,
+/// and the one artefact vmlab writes outside its own directories.
+pub mod ssh_config;
 mod supervisor;
 mod sync;
 pub mod template;
