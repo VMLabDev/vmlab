@@ -30,6 +30,7 @@ use crate::config::LabFile;
 use crate::dev::ResolvedDev;
 use crate::dev::select::{self, Selected};
 use crate::labd::machine::Capabilities;
+use crate::labd::workspace::diff::{Diff, SideCopy};
 use crate::labd::workspace::plan::Winner;
 use crate::proto::LabRequest;
 use crate::proto::client::LabClient;
@@ -220,9 +221,11 @@ pub fn cmd_dev_sync_diff(machine: Option<String>, paths: Vec<String>) -> Result<
             .await
             .map_err(remote)
     })?;
-    let diff: DiffReply = serde_json::from_value(payload)
+    // The producer's own type, so a field renamed in `workspace::diff` stops
+    // this compiling rather than quietly becoming "no guest copy" (ADR-0004).
+    let diff: Diff = serde_json::from_value(payload)
         .context("the lab daemon reported a diff vmlab cannot read")?;
-    print!("{}", render_diff(&machine, &diff));
+    print!("{}", render_diff(&diff));
     Ok(())
 }
 
@@ -366,44 +369,20 @@ fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
     out
 }
 
-/// What `workspace.diff` answers with, as this surface reads it.
-#[derive(serde::Deserialize)]
-struct DiffReply {
-    host_root: String,
-    guest_root: String,
-    files: Vec<DiffSides>,
-}
-
-#[derive(serde::Deserialize)]
-struct DiffSides {
-    path: String,
-    host: Option<DiffCopy>,
-    guest: Option<DiffCopy>,
-    identical: bool,
-}
-
-#[derive(serde::Deserialize)]
-struct DiffCopy {
-    size: u64,
-    digest: String,
-    text: Option<String>,
-    omitted: Option<String>,
-}
-
 /// Both copies, side by side, as text.
 ///
 /// A unified diff where both sides are readable text and a description
 /// otherwise — because the question this verb answers is *what does the guest
 /// hold*, and for a 4 GB file or a binary the honest answer is its size and its
 /// digest rather than its bytes.
-fn render_diff(machine: &str, diff: &DiffReply) -> String {
+fn render_diff(diff: &Diff) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "host {}  ⟷  \"{machine}\":{}",
-        diff.host_root, diff.guest_root
+        "host {}  ⟷  \"{}\":{}",
+        diff.host_root, diff.machine, diff.guest_root
     );
     for file in &diff.files {
         let _ = writeln!(out, "\n=== {}", file.path);
@@ -428,7 +407,7 @@ fn render_diff(machine: &str, diff: &DiffReply) -> String {
             }
             (Some(_), Some(_)) => {}
         }
-        let text = |copy: &Option<DiffCopy>| -> Option<String> {
+        let text = |copy: &Option<SideCopy>| -> Option<String> {
             copy.as_ref().and_then(|copy| copy.text.clone())
         };
         match (text(&file.host), text(&file.guest)) {
@@ -463,10 +442,12 @@ fn render_diff(machine: &str, diff: &DiffReply) -> String {
 
 /// The most lines either side may have before the diff gives up on being one.
 ///
-/// The comparison below is quadratic in the line count, which is fine for
-/// source files and not fine for a 200 000-line generated one — and a diff
-/// nobody would read is not worth a second of CPU.
-const DIFF_LINES: usize = 5_000;
+/// The comparison below is quadratic in **memory** as well as time — one `u32`
+/// per pair of lines — so the cap is what bounds a `dev sync diff` on a
+/// generated file to a few megabytes rather than a few hundred. Past it both
+/// copies are still on this host and the developer's own tool is better at it
+/// anyway.
+const DIFF_LINES: usize = 2_000;
 
 /// A unified diff of two texts, `-` host and `+` guest.
 ///
@@ -486,8 +467,10 @@ fn unified(host: &str, guest: &str) -> String {
             b.len(),
         );
     }
-    // lcs[i][j] = the longest common subsequence of a[i..] and b[j..].
-    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    // lcs[i][j] = the longest common subsequence of a[i..] and b[j..]. `u32`
+    // rather than `usize` because this table is the whole memory cost, and
+    // DIFF_LINES caps either side well inside it.
+    let mut lcs = vec![vec![0u32; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
         for j in (0..b.len()).rev() {
             lcs[i][j] = if a[i] == b[j] {
@@ -751,6 +734,7 @@ fn attach_report(
 mod tests {
     use super::*;
     use crate::dev::select::Source;
+    use crate::labd::workspace::diff::Sides;
     use crate::status::fixtures::{attachable, container, machine, vm};
 
     fn resolved(workspace: Option<&str>) -> ResolvedDev {
@@ -928,7 +912,6 @@ mod tests {
     /// One machine's syncer, halted on two paths.
     fn halted_sync() -> WorkspaceSyncStatus {
         WorkspaceSyncStatus {
-            halted: true,
             halt: Some(
                 "the workspace on \"dev01\" has stopped, both directions, on 2 conflicting paths"
                     .into(),
@@ -992,7 +975,6 @@ mod tests {
         let said = sync_report(
             "dev01",
             &WorkspaceSyncStatus {
-                halted: false,
                 halt: None,
                 conflicts: Vec::new(),
                 conflicts_total: 0,
@@ -1027,7 +1009,6 @@ mod tests {
         let said = sync_report(
             "dev01",
             &WorkspaceSyncStatus {
-                halted: false,
                 halt: None,
                 conflicts: Vec::new(),
                 conflicts_total: 0,
@@ -1043,18 +1024,19 @@ mod tests {
     /// otherwise attach twice to see both.
     #[test]
     fn the_diff_shows_both_copies_as_a_unified_diff() {
-        let reply = DiffReply {
+        let reply = Diff {
+            machine: "dev01".into(),
             host_root: "/lab/src".into(),
             guest_root: "/src".into(),
-            files: vec![DiffSides {
+            files: vec![Sides {
                 path: "main.rs".into(),
-                host: Some(DiffCopy {
+                host: Some(SideCopy {
                     size: 20,
                     digest: "a".repeat(64),
                     text: Some("fn main() {\n    host();\n}\n".into()),
                     omitted: None,
                 }),
-                guest: Some(DiffCopy {
+                guest: Some(SideCopy {
                     size: 21,
                     digest: "b".repeat(64),
                     text: Some("fn main() {\n    guest();\n}\n".into()),
@@ -1063,7 +1045,7 @@ mod tests {
                 identical: false,
             }],
         };
-        let said = render_diff("dev01", &reply);
+        let said = render_diff(&reply);
         assert!(said.contains("=== main.rs"), "{said}");
         assert!(said.contains("  -    host();"), "{said}");
         assert!(said.contains("  +    guest();"), "{said}");
@@ -1074,12 +1056,13 @@ mod tests {
     /// sides are still compared by the thing that answers the question.
     #[test]
     fn an_undiffable_pair_is_described_rather_than_printed() {
-        let reply = DiffReply {
+        let reply = Diff {
+            machine: "dev01".into(),
             host_root: "/lab/src".into(),
             guest_root: "/src".into(),
-            files: vec![DiffSides {
+            files: vec![Sides {
                 path: "disk.vhdx".into(),
-                host: Some(DiffCopy {
+                host: Some(SideCopy {
                     size: 4_000_000_000,
                     digest: String::new(),
                     text: None,
@@ -1089,7 +1072,7 @@ mod tests {
                 identical: false,
             }],
         };
-        let said = render_diff("dev01", &reply);
+        let said = render_diff(&reply);
         assert!(said.contains("the guest does not hold it"), "{said}");
         assert!(said.contains("over the inline cap"), "{said}");
     }
@@ -1099,18 +1082,19 @@ mod tests {
     /// empty diff.
     #[test]
     fn identical_copies_are_reported_as_the_resolution_they_are() {
-        let reply = DiffReply {
+        let reply = Diff {
+            machine: "dev01".into(),
             host_root: "/lab/src".into(),
             guest_root: "/src".into(),
-            files: vec![DiffSides {
+            files: vec![Sides {
                 path: "a.rs".into(),
-                host: Some(DiffCopy {
+                host: Some(SideCopy {
                     size: 4,
                     digest: "c".repeat(64),
                     text: Some("same".into()),
                     omitted: None,
                 }),
-                guest: Some(DiffCopy {
+                guest: Some(SideCopy {
                     size: 4,
                     digest: "c".repeat(64),
                     text: Some("same".into()),
@@ -1119,7 +1103,7 @@ mod tests {
                 identical: true,
             }],
         };
-        let said = render_diff("dev01", &reply);
+        let said = render_diff(&reply);
         assert!(said.contains("identical"), "{said}");
         assert!(said.contains("adopts them as agreed"), "{said}");
     }

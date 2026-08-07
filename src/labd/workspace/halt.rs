@@ -56,6 +56,15 @@ use super::plan::{BulkDelete, Conflict, Plan};
 /// itself into the other tree is worse than no signal at all.
 pub const MARKER: &str = ".vmlab-sync-halt";
 
+/// How many halted paths the marker lists.
+///
+/// Capped for the case §19.6 names as rare and self-inflicted: un-ignoring a
+/// populated `node_modules` halts on tens of thousands of paths, and a marker
+/// listing all of them would be a multi-megabyte untracked file dropped into
+/// the developer's editor — the opposite of the small, noticeable thing this is
+/// meant to be. What is dropped is always said to have been dropped.
+const LISTED: usize = 200;
+
 /// One machine's workspace, stopped.
 ///
 /// It **names the machine** because two dev machines may share one host
@@ -181,8 +190,17 @@ pub fn marker(halt: &Halt) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", halt.headline());
     let _ = writeln!(out);
-    for (path, why) in halt.reasons() {
+    let reasons = halt.reasons();
+    for (path, why) in reasons.iter().take(LISTED) {
         let _ = writeln!(out, "  {path}  —  {why}");
+    }
+    if reasons.len() > LISTED {
+        let _ = writeln!(
+            out,
+            "  … and {} more, not listed here — `vmlab dev sync status` on the host has them all, \
+             and resolving the batch needs no list at all",
+            reasons.len() - LISTED,
+        );
     }
     let _ = writeln!(out);
     let _ = writeln!(
@@ -307,6 +325,30 @@ mod tests {
         assert_eq!(halt.paths(), vec!["a.rs".to_string(), "b.rs".into()]);
         assert!(halt.headline().contains("\"dev01\""));
         assert!(marker(&halt).contains("a.rs"));
+    }
+
+    /// The 30 000-file case §19.6 calls rare and self-inflicted: the marker
+    /// stays a file a developer notices rather than becoming a megabyte of
+    /// untracked noise, and it says what it left out.
+    #[test]
+    fn a_very_large_halt_caps_the_marker_and_says_it_did() {
+        let halt = Halt {
+            machine: "dev01".into(),
+            conflicts: (0..30_000)
+                .map(|i| {
+                    conflict(
+                        &format!("node_modules/p{i}/index.js"),
+                        ConflictKind::BothCreated,
+                    )
+                })
+                .collect(),
+            bulk_delete: None,
+            rules_changed: true,
+        };
+        let said = marker(&halt);
+        assert!(said.len() < 32_768, "the marker is {} bytes", said.len());
+        assert!(said.contains("and 29800 more"), "{said}");
+        assert!(said.contains("node_modules/p0/index.js"), "{said}");
     }
 
     /// A reconciliation that agrees with itself is not a halt, and there is

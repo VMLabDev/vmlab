@@ -1881,11 +1881,7 @@ impl LabRuntime {
         })?;
         let syncer = self.workspaces.expect(machine).await?;
         let paths = match all {
-            true => syncer
-                .report()
-                .halt
-                .map(|halt| halt.paths())
-                .unwrap_or_default(),
+            true => syncer.halted_paths(),
             false => paths,
         };
         if paths.is_empty() {
@@ -1903,15 +1899,14 @@ impl LabRuntime {
     /// the one thing that knows a workspace's two roots without being told —
     /// which keeps `dev sync diff` from doing path arithmetic a `@dev` edit
     /// could invalidate.
-    pub async fn workspace_diff(&self, machine: &str, paths: Vec<String>) -> Result<Value> {
+    pub async fn workspace_diff(
+        &self,
+        machine: &str,
+        paths: Vec<String>,
+    ) -> Result<crate::labd::workspace::diff::Diff> {
         let syncer = self.workspaces.expect(machine).await?;
-        let workspace = syncer.workspace.clone();
         let paths = match paths.is_empty() {
-            true => syncer
-                .report()
-                .halt
-                .map(|halt| halt.paths())
-                .unwrap_or_default(),
+            true => syncer.halted_paths(),
             false => paths,
         };
         if paths.is_empty() {
@@ -1920,30 +1915,15 @@ impl LabRuntime {
                  path to compare one anyway"
             );
         }
-        let m = self.machine(machine)?;
-        let sessions = WorkspaceSessions { machine: m };
+        // The one thing this layer contributes: the session, as the machine's
+        // own default login, so a diff reads what the syncer would write.
+        let sessions = WorkspaceSessions {
+            machine: self.machine(machine)?,
+        };
         let guest = crate::labd::workspace::syncer::GuestSessions::open(&sessions)
             .await
             .context("opening a file session as the machine's default login")?;
-        let scratch = tempfile::tempdir().context("a host scratch directory for the guest copy")?;
-        let mut files = Vec::new();
-        for (n, path) in paths.iter().enumerate() {
-            files.push(
-                crate::labd::workspace::diff::one(
-                    guest.as_ref(),
-                    &workspace,
-                    path,
-                    &scratch.path().join(format!("{n}")),
-                )
-                .await,
-            );
-        }
-        Ok(json!({
-            "machine": machine,
-            "host_root": workspace.host_root.display().to_string(),
-            "guest_root": workspace.guest_root,
-            "files": files,
-        }))
+        crate::labd::workspace::diff::all(guest.as_ref(), &syncer.workspace, &paths).await
     }
 
     /// The lab status projection (ADR-0004) — produced here, rendered unchanged

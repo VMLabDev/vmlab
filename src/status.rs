@@ -353,11 +353,13 @@ pub struct DevStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web-ui/src/gen/status.ts")]
 pub struct WorkspaceSyncStatus {
-    /// The whole workspace is stopped, both directions, on this machine.
-    pub halted: bool,
     /// The one line that says what happened, naming the machine — two dev
     /// machines may share one host workspace, and one halting must not read
     /// as the other's.
+    ///
+    /// Present *is* halted: a separate `halted` flag beside it would be a
+    /// second copy of the same fact, and two fields that can disagree about
+    /// whether a workspace is stopped is worse than either answer.
     pub halt: Option<String>,
     /// Every halted path with the sentence that explains it, capped — see
     /// `total` for how many there really are.
@@ -710,7 +712,6 @@ pub(crate) mod fixtures {
         MachineStatus {
             dev: Some(DevStatus {
                 sync: Some(WorkspaceSyncStatus {
-                    halted: true,
                     halt: Some(format!(
                         "the workspace on \"{}\" has stopped, both directions, on {} conflicting \
                          paths",

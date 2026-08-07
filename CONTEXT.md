@@ -495,7 +495,7 @@ in the loop: the `.git` mutable set while a lock is held on either side, and
 both directions between an overflow and the completed rescan. It clears itself.
 Never a **sync halt**, which needs an answer, and never a **skip**, which is
 permanent for as long as its cause is.
-_Avoid_: wait, block, pause
+_Avoid_: halt, blocked, stalled (all three read as needing a developer)
 
 **Resolution**:
 A developer's answer to a halted path: `--host` keeps the canonical copy,

@@ -216,7 +216,6 @@ impl Report {
     /// silent-incompleteness class §19.6 keeps refusing.
     pub fn project(&self) -> crate::status::WorkspaceSyncStatus {
         crate::status::WorkspaceSyncStatus {
-            halted: self.halt.is_some(),
             halt: self.halt.as_ref().map(Halt::headline),
             conflicts: self
                 .halt
@@ -296,6 +295,19 @@ impl Syncer {
 
     fn publish(&self, report: Report) {
         *self.report.lock().expect("workspace report") = report;
+    }
+
+    /// Every path this machine's workspace is currently halted on — what
+    /// `--all` expands to and what `dev sync diff` defaults to.
+    ///
+    /// Answered here rather than assembled by the caller because a caller's
+    /// list is a snapshot of a projection it polled, and acting on a stale one
+    /// is a developer answering a question that has since changed.
+    pub fn halted_paths(&self) -> Vec<String> {
+        self.report()
+            .halt
+            .map(|halt| halt.paths())
+            .unwrap_or_default()
     }
 
     fn take_resolutions(&self) -> BTreeMap<String, Winner> {
@@ -1471,6 +1483,23 @@ mod tests {
         check()
     }
 
+    /// The same, where the question has to be *asked* — a syncer's report
+    /// lives behind an async lookup, so `eventually`'s sync closure cannot
+    /// reach it.
+    async fn eventually_async<F, Fut>(mut check: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..200 {
+            if check().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        check().await
+    }
+
     /// The whole acceptance case in one: the declared workspace appears in
     /// the guest, and a later host-side edit lands too — with the loop owned
     /// by nothing but the lab daemon.
@@ -2082,12 +2111,17 @@ mod tests {
         assert!(last_degraded < first_sync, "reported after the fact");
     }
 
-    /// Seed a one-file workspace and hand back everything a halt test needs.
-    async fn halted_lab(
+    /// Start a syncer over the host tree already laid out in `dir`, and wait
+    /// until `landed` — a guest path — proves the seed went through.
+    ///
+    /// Every halt test starts from an *agreed* workspace, because a halt is
+    /// about two sides diverging from something they had settled: seeding is
+    /// the precondition rather than the subject.
+    async fn seeded_lab(
         dir: &std::path::Path,
         state: &std::path::Path,
+        landed: &str,
     ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>) {
-        std::fs::write(dir.join("main.rs"), "agreed").unwrap();
         let guest = Arc::new(FakeGuest::new());
         let (events, _rx) = EventLog::recording("lab", state.join("events.jsonl"));
         let syncers = WorkspaceSyncers::default();
@@ -2096,11 +2130,21 @@ mod tests {
             .start(workspace(dir, state), sessions.clone(), events)
             .await;
         let seeded = {
-            let guest = guest.clone();
-            eventually(move || guest.text("/src/main.rs").is_some()).await
+            let (guest, landed) = (guest.clone(), landed.to_string());
+            eventually(move || guest.get(&landed).is_some()).await
         };
-        assert!(seeded, "the seed never landed");
+        assert!(seeded, "the seed never landed: {:?}", guest.paths());
         (syncers, guest, sessions)
+    }
+
+    /// The one-file version, which is every test whose subject is one path
+    /// both sides moved.
+    async fn halted_lab(
+        dir: &std::path::Path,
+        state: &std::path::Path,
+    ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>) {
+        std::fs::write(dir.join("main.rs"), "agreed").unwrap();
+        seeded_lab(dir, state, "/src/main.rs").await
     }
 
     /// Both sides edit the same file to different content, which is the
@@ -2111,17 +2155,16 @@ mod tests {
         sessions.watcher.mark("main.rs");
     }
 
-    /// Wait for the machine's syncer to report a halt.
-    async fn halt_of(syncers: &WorkspaceSyncers) -> Option<Halt> {
-        let mut found = None;
-        for _ in 0..200 {
-            found = syncers.get("dev01").await.and_then(|s| s.report().halt);
-            if found.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        found
+    /// Wait for one machine's syncer to report a halt.
+    async fn halt_of(syncers: &WorkspaceSyncers, machine: &str) -> Option<Halt> {
+        eventually_async(|| async {
+            syncers
+                .get(machine)
+                .await
+                .is_some_and(|s| s.report().halt.is_some())
+        })
+        .await;
+        syncers.get(machine).await.and_then(|s| s.report().halt)
     }
 
     /// **Halt and surface.** Both copies survive untouched, both directions
@@ -2137,7 +2180,7 @@ mod tests {
         std::fs::write(dir.path().join("other.rs"), "host only").unwrap();
         diverge(dir.path(), &guest, &sessions);
 
-        let halt = halt_of(&syncers).await.expect("nothing halted");
+        let halt = halt_of(&syncers, "dev01").await.expect("nothing halted");
         assert_eq!(halt.machine, "dev01");
         assert_eq!(halt.paths(), vec!["main.rs".to_string()]);
 
@@ -2181,7 +2224,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
         diverge(dir.path(), &guest, &sessions);
-        halt_of(&syncers).await.expect("nothing halted");
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
 
         let marker = format!("/src/{}", halt::MARKER);
         let written = {
@@ -2223,7 +2266,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
         diverge(dir.path(), &guest, &sessions);
-        halt_of(&syncers).await.expect("nothing halted");
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
 
         let syncer = syncers.get("dev01").await.expect("no syncer");
         let report = syncer
@@ -2247,28 +2290,19 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
         diverge(dir.path(), &guest, &sessions);
-        halt_of(&syncers).await.expect("nothing halted");
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
 
         std::fs::write(dir.path().join("main.rs"), "settled by hand").unwrap();
         guest.file("/src/main.rs", "settled by hand", 900);
         sessions.watcher.mark("main.rs");
 
-        let cleared = {
-            let syncers = &syncers;
-            let mut cleared = false;
-            for _ in 0..200 {
-                if syncers
-                    .get("dev01")
-                    .await
-                    .is_some_and(|s| s.report().halt.is_none())
-                {
-                    cleared = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            cleared
-        };
+        let cleared = eventually_async(|| async {
+            syncers
+                .get("dev01")
+                .await
+                .is_some_and(|s| s.report().halt.is_none())
+        })
+        .await;
         assert!(cleared, "the halt outlived the disagreement");
         assert!(
             guest.text(&format!("/src/{}", halt::MARKER)).is_none(),
@@ -2285,25 +2319,10 @@ mod tests {
     async fn a_guest_side_mass_deletion_halts_before_it_reaches_the_canonical_copy() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        let guest = Arc::new(FakeGuest::new());
         for i in 0..40 {
             std::fs::write(dir.path().join(format!("f{i:02}.rs")), "content").unwrap();
         }
-        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
-        let syncers = WorkspaceSyncers::default();
-        let sessions = OneFake::new(guest.clone());
-        syncers
-            .start(
-                workspace(dir.path(), state.path()),
-                sessions.clone(),
-                events,
-            )
-            .await;
-        let seeded = {
-            let guest = guest.clone();
-            eventually(move || guest.text("/src/f39.rs").is_some()).await
-        };
-        assert!(seeded, "the seed never landed");
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/f39.rs").await;
 
         // `rm -rf *` in the guest.
         for i in 0..40 {
@@ -2311,7 +2330,7 @@ mod tests {
             sessions.watcher.mark(&format!("f{i:02}.rs"));
         }
 
-        let halt = halt_of(&syncers)
+        let halt = halt_of(&syncers, "dev01")
             .await
             .expect("the mass deletion was not caught");
         assert!(halt.bulk_delete.is_some(), "{halt:?}");
@@ -2347,22 +2366,8 @@ mod tests {
         std::fs::write(dir.path().join(".git/index"), "agreed").unwrap();
         std::fs::write(dir.path().join("main.rs"), "code").unwrap();
 
-        let guest = Arc::new(FakeGuest::new());
-        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
-        let syncers = WorkspaceSyncers::default();
-        let sessions = OneFake::new(guest.clone());
-        syncers
-            .start(
-                workspace(dir.path(), state.path()),
-                sessions.clone(),
-                events,
-            )
-            .await;
-        let seeded = {
-            let guest = guest.clone();
-            eventually(move || guest.text("/src/.git/index").is_some()).await
-        };
-        assert!(seeded, "the seed never landed: {:?}", guest.paths());
+        let (syncers, guest, sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/.git/index").await;
 
         // Guest-side git takes the lock and starts rewriting.
         guest.file("/src/.git/index.lock", "pid", 600);
@@ -2409,6 +2414,53 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    /// A resolution is carried out **while the workspace is still halted on
+    /// other paths**, or per-path `--host`/`--guest` would be a flag that does
+    /// nothing until the last one — and it lands even where the directory it
+    /// belongs in went with the rest of the guest's deletion, because both
+    /// sides' applies make the parents they need.
+    #[tokio::test]
+    async fn one_resolution_lands_while_the_rest_of_the_batch_is_still_halted() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/a.rs"), "agreed").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "agreed").unwrap();
+
+        let (syncers, guest, sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/pkg/a.rs").await;
+
+        // The guest drops the whole directory while the host edits what was
+        // in it; and a second path diverges, so the halt outlives the first
+        // resolution.
+        std::fs::write(dir.path().join("pkg/a.rs"), "the host's version").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "host").unwrap();
+        guest.unlink("/src/pkg/a.rs");
+        guest.unlink("/src/pkg");
+        guest.file("/src/other.rs", "guest", 500);
+        for path in ["pkg", "pkg/a.rs", "other.rs"] {
+            sessions.watcher.mark(path);
+        }
+        let halt = halt_of(&syncers, "dev01").await.expect("nothing halted");
+        assert!(halt.paths().contains(&"pkg/a.rs".to_string()), "{halt:?}");
+
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        let report = syncer
+            .resolve(vec!["pkg/a.rs".into()], Winner::Host)
+            .await
+            .expect("the resolution never completed");
+        assert_eq!(
+            guest.text("/src/pkg/a.rs").as_deref(),
+            Some("the host's version"),
+            "the resolution never landed: {:?}",
+            guest.paths()
+        );
+        // …and the workspace is still stopped on the path nobody answered for.
+        let halt = report.halt.expect("the rest of the batch resumed unasked");
+        assert_eq!(halt.paths(), vec!["other.rs".to_string()]);
+        syncers.stop("dev01").await;
+    }
+
     /// **Entering scope is a conflict**, and the halt says the rules changed.
     ///
     /// The files most likely to be un-ignored are `.env`, local certs and
@@ -2424,22 +2476,7 @@ mod tests {
         std::fs::write(dir.path().join(".env"), "HOST=canonical").unwrap();
         std::fs::write(dir.path().join("app.rs"), "code").unwrap();
 
-        let guest = Arc::new(FakeGuest::new());
-        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
-        let syncers = WorkspaceSyncers::default();
-        let sessions = OneFake::new(guest.clone());
-        syncers
-            .start(
-                workspace(dir.path(), state.path()),
-                sessions.clone(),
-                events,
-            )
-            .await;
-        let seeded = {
-            let guest = guest.clone();
-            eventually(move || guest.text("/src/app.rs").is_some()).await
-        };
-        assert!(seeded, "the seed never landed");
+        let (syncers, guest, _sessions) = seeded_lab(dir.path(), state.path(), "/src/app.rs").await;
         // Guest-owned, so the guest has been holding its own all along.
         assert!(guest.get("/src/.env").is_none());
         guest.file("/src/.env", "GUEST=the one that works here", 400);
@@ -2447,7 +2484,7 @@ mod tests {
         // The developer wants it guest-side after all.
         std::fs::write(dir.path().join(".gitignore"), "").unwrap();
 
-        let halt = halt_of(&syncers)
+        let halt = halt_of(&syncers, "dev01")
             .await
             .expect("entering scope did not halt");
         assert_eq!(halt.paths(), vec![".env".to_string()]);
@@ -2526,19 +2563,9 @@ mod tests {
         a_guest.file("/src/main.rs", "dev01's version", 500);
         a.watcher.mark("main.rs");
 
-        let halted = {
-            let syncers = &syncers;
-            let mut found = None;
-            for _ in 0..200 {
-                found = syncers.get("dev01").await.and_then(|s| s.report().halt);
-                if found.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            found
-        };
-        let halted = halted.expect("dev01 never halted");
+        let halted = halt_of(&syncers, "dev01")
+            .await
+            .expect("dev01 never halted");
         assert_eq!(
             halted.machine, "dev01",
             "the halt does not name the machine"

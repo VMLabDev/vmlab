@@ -280,13 +280,13 @@ export type WorkspaceSkipStatus = { path: string, reason: string, };
  */
 export type WorkspaceSyncStatus = { 
 /**
- * The whole workspace is stopped, both directions, on this machine.
- */
-halted: boolean, 
-/**
  * The one line that says what happened, naming the machine — two dev
  * machines may share one host workspace, and one halting must not read
  * as the other's.
+ *
+ * Present *is* halted: a separate `halted` flag beside it would be a
+ * second copy of the same fact, and two fields that can disagree about
+ * whether a workspace is stopped is worse than either answer.
  */
 halt: string | null, 
 /**

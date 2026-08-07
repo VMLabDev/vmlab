@@ -975,10 +975,12 @@ impl Handler<LabRequest> for LabdHandler {
                     .map_err(|e| CommandError::failed(format!("{e:#}")))?,
             )
             .unwrap_or_default()),
-            LabRequest::WorkspaceDiff { machine, paths } => Ok(lab
-                .workspace_diff(&machine, paths)
-                .await
-                .map_err(|e| CommandError::failed(format!("{e:#}")))?),
+            LabRequest::WorkspaceDiff { machine, paths } => Ok(serde_json::to_value(
+                lab.workspace_diff(&machine, paths)
+                    .await
+                    .map_err(|e| CommandError::failed(format!("{e:#}")))?,
+            )
+            .unwrap_or_default()),
             LabRequest::Shutdown {} => {
                 tracing::info!("lab daemon shutdown requested");
                 let lab = lab.clone();

@@ -18,7 +18,7 @@ import type { MachineStatus } from "../gen/status";
  */
 export default function WorkspaceSync(props: { machine: MachineStatus }) {
   const sync = () => props.machine.dev?.sync ?? undefined;
-  const halted = () => sync()?.halted === true;
+  const halted = () => sync()?.halt != null;
   // Everything the syncer declined to do, in one list. Each of these is
   // normal and none of them is a halt — but a syncer that stops touching a
   // path without saying so is the silent failure §19.6 exists to rule out.

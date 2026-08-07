@@ -18,7 +18,8 @@
 
 use std::path::Path;
 
-use serde::Serialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use super::guest::GuestFs;
 use super::scan::join_guest;
@@ -33,12 +34,29 @@ use super::syncer::Workspace;
 /// exists for wanting the file itself.
 const INLINE: u64 = 4 << 20;
 
+/// Every path one `dev sync diff` asked about, and the two roots they are
+/// relative to.
+///
+/// A **typed** reply rather than a hand-built JSON object, and the reason is
+/// ADR-0004's: the CLI deserialises this very type, so a field renamed here
+/// stops the renderer compiling instead of quietly becoming "no guest copy".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diff {
+    pub machine: String,
+    /// The canonical directory, as a path on this host — where the developer
+    /// can simply go and look.
+    pub host_root: String,
+    /// The working copy's root inside the guest, which they cannot.
+    pub guest_root: String,
+    pub files: Vec<Sides>,
+}
+
 /// One workspace path, from both sides.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sides {
     pub path: String,
-    pub host: Option<Copy>,
-    pub guest: Option<Copy>,
+    pub host: Option<SideCopy>,
+    pub guest: Option<SideCopy>,
     /// The two copies hold the same bytes. Worth saying outright: it is the
     /// state a developer reaches by resolving a halt **by hand**, and the one
     /// the next pass adopts as agreed.
@@ -47,8 +65,11 @@ pub struct Sides {
 
 /// What one side holds — or why it could not be read, which is a different
 /// thing from holding nothing and must never be reported as one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Copy {
+///
+/// `SideCopy` rather than the domain's own word, which is `copy`: a type named
+/// `Copy` shadows `std::marker::Copy` for everything in this module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideCopy {
     pub size: u64,
     pub digest: String,
     /// The content, where it is text and within the cap.
@@ -57,8 +78,8 @@ pub struct Copy {
     pub omitted: Option<String>,
 }
 
-impl Copy {
-    fn of(bytes: &[u8]) -> Copy {
+impl SideCopy {
+    fn of(bytes: &[u8]) -> SideCopy {
         use sha2::{Digest as _, Sha256};
         let digest = hex::encode(Sha256::digest(bytes));
         let size = bytes.len() as u64;
@@ -69,7 +90,7 @@ impl Copy {
             Ok(text) if !bytes.contains(&0) => Some(text.to_string()),
             _ => None,
         };
-        Copy {
+        SideCopy {
             size,
             digest,
             omitted: text.is_none().then(|| "it is not text".to_string()),
@@ -77,8 +98,8 @@ impl Copy {
         }
     }
 
-    fn unreadable(why: String) -> Copy {
-        Copy {
+    fn unreadable(why: String) -> SideCopy {
+        SideCopy {
             size: 0,
             digest: String::new(),
             text: None,
@@ -86,8 +107,8 @@ impl Copy {
         }
     }
 
-    fn too_large(size: u64) -> Copy {
-        Copy {
+    fn too_large(size: u64) -> SideCopy {
+        SideCopy {
             size,
             digest: String::new(),
             text: None,
@@ -97,6 +118,25 @@ impl Copy {
             )),
         }
     }
+}
+
+/// Read every path from both sides, as one reply.
+///
+/// The scratch directory the guest's copies are pulled through is this
+/// function's own, and goes when it returns: a diff is a read, and reading must
+/// leave nothing behind on either side any more than a halt does.
+pub async fn all(guest: &dyn GuestFs, workspace: &Workspace, paths: &[String]) -> Result<Diff> {
+    let scratch = tempfile::tempdir().context("a host scratch directory for the guest copy")?;
+    let mut files = Vec::with_capacity(paths.len());
+    for (n, path) in paths.iter().enumerate() {
+        files.push(one(guest, workspace, path, &scratch.path().join(n.to_string())).await);
+    }
+    Ok(Diff {
+        machine: workspace.machine.clone(),
+        host_root: workspace.host_root.display().to_string(),
+        guest_root: workspace.guest_root.clone(),
+        files,
+    })
 }
 
 /// Read one path from both sides. `scratch` is a host path the guest's copy is
@@ -118,61 +158,69 @@ pub async fn one(guest: &dyn GuestFs, workspace: &Workspace, rel: &str, scratch:
     }
 }
 
-fn host_side(path: &Path) -> Option<Copy> {
+fn host_side(path: &Path) -> Option<SideCopy> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => return Some(Copy::unreadable(format!("host: cannot read it ({e})"))),
+        Err(e) => return Some(SideCopy::unreadable(format!("host: cannot read it ({e})"))),
     };
     if meta.is_dir() {
-        return Some(Copy::unreadable("host: it is a directory".into()));
+        return Some(SideCopy::unreadable("host: it is a directory".into()));
     }
     if meta.is_symlink() {
         return Some(match std::fs::read_link(path) {
-            Ok(target) => Copy::of(target.to_string_lossy().as_bytes()),
-            Err(e) => Copy::unreadable(format!("host: cannot read the link target ({e})")),
+            Ok(target) => SideCopy::of(target.to_string_lossy().as_bytes()),
+            Err(e) => SideCopy::unreadable(format!("host: cannot read the link target ({e})")),
         });
     }
     if meta.len() > INLINE {
-        return Some(Copy::too_large(meta.len()));
+        return Some(SideCopy::too_large(meta.len()));
     }
     match std::fs::read(path) {
-        Ok(bytes) => Some(Copy::of(&bytes)),
-        Err(e) => Some(Copy::unreadable(format!("host: cannot read it ({e})"))),
+        Ok(bytes) => Some(SideCopy::of(&bytes)),
+        Err(e) => Some(SideCopy::unreadable(format!("host: cannot read it ({e})"))),
     }
 }
 
-async fn guest_side(guest: &dyn GuestFs, path: &str, scratch: &Path) -> Option<Copy> {
+async fn guest_side(guest: &dyn GuestFs, path: &str, scratch: &Path) -> Option<SideCopy> {
     let attrs = match guest.lstat(path).await {
         Ok(Some(attrs)) => attrs,
         Ok(None) => return None,
-        Err(e) => return Some(Copy::unreadable(format!("guest: cannot read it ({e:#})"))),
+        Err(e) => {
+            return Some(SideCopy::unreadable(format!(
+                "guest: cannot read it ({e:#})"
+            )));
+        }
     };
     use crate::labd::vm_agent::EntryKind;
     match attrs.kind {
-        EntryKind::Dir => return Some(Copy::unreadable("guest: it is a directory".into())),
+        EntryKind::Dir => return Some(SideCopy::unreadable("guest: it is a directory".into())),
         EntryKind::Other => {
-            return Some(Copy::unreadable(
+            return Some(SideCopy::unreadable(
                 "guest: not a file, directory or symlink".into(),
             ));
         }
         EntryKind::Symlink => {
             return Some(match guest.readlink(path).await {
-                Ok(target) => Copy::of(target.as_bytes()),
-                Err(e) => Copy::unreadable(format!("guest: cannot read the link target ({e:#})")),
+                Ok(target) => SideCopy::of(target.as_bytes()),
+                Err(e) => {
+                    SideCopy::unreadable(format!("guest: cannot read the link target ({e:#})"))
+                }
             });
         }
         EntryKind::File => {}
     }
     if attrs.size > INLINE {
-        return Some(Copy::too_large(attrs.size));
+        return Some(SideCopy::too_large(attrs.size));
     }
     if let Err(e) = guest.pull(path, scratch).await {
-        return Some(Copy::unreadable(format!("guest: cannot read it ({e:#})")));
+        return Some(SideCopy::unreadable(format!(
+            "guest: cannot read it ({e:#})"
+        )));
     }
     Some(match std::fs::read(scratch) {
-        Ok(bytes) => Copy::of(&bytes),
-        Err(e) => Copy::unreadable(format!("guest: the pulled copy could not be read ({e})")),
+        Ok(bytes) => SideCopy::of(&bytes),
+        Err(e) => SideCopy::unreadable(format!("guest: the pulled copy could not be read ({e})")),
     })
 }
 

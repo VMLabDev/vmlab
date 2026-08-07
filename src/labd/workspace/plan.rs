@@ -709,28 +709,41 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
 
 /// Take guest→host removals back out of the plan where there are too many of
 /// them, leaving everything else — including every host→guest removal, and
-/// every deletion the developer has already resolved — exactly where it was.
+/// every deletion the developer has already answered for — where it was.
+///
+/// **What trips the guard is the mass, and a resolution releases one path from
+/// it — it never re-argues the threshold.** Recounting only the unanswered
+/// removals would mean that saying yes to *some* of a 40-file deletion drops the
+/// count back under the floor and lets the other 39 through unasked, which is
+/// the one outcome this guard exists to make impossible.
 fn withhold_bulk_delete(removals: &mut Vec<Action>, inputs: &Inputs<'_>) -> Option<BulkDelete> {
-    let guarded = |action: &Action| {
-        matches!(action, Action::Remove { direction: Direction::ToHost, path, .. }
-            if inputs.resolved.get(path) != Some(&Winner::Guest))
+    let onto_host = |action: &&Action| {
+        matches!(
+            action,
+            Action::Remove {
+                direction: Direction::ToHost,
+                ..
+            }
+        )
     };
-    let count = removals.iter().filter(|a| guarded(a)).count();
-    if !BulkDelete::triggered(count, inputs.ledger.entries.len()) {
+    let mass = removals.iter().filter(onto_host).count();
+    if !BulkDelete::triggered(mass, inputs.ledger.entries.len()) {
         return None;
     }
-    let mut paths = Vec::with_capacity(count);
+    let mut paths = Vec::new();
     removals.retain(|action| {
-        if !guarded(action) {
+        if !onto_host(&action) || inputs.resolved.get(action.path()) == Some(&Winner::Guest) {
             return true;
         }
         paths.push(action.path().to_string());
         false
     });
     paths.sort();
-    Some(BulkDelete {
-        paths,
+    // Every one of them answered: the mass tripped the guard, and there is
+    // nothing left it is still holding back.
+    (!paths.is_empty()).then_some(BulkDelete {
         agreed: inputs.ledger.entries.len(),
+        paths,
     })
 }
 
@@ -1930,9 +1943,8 @@ mod tests {
     /// syncer declining to replicate it.
     #[test]
     fn a_guest_side_mass_deletion_is_withheld_rather_than_replicated() {
-        let (host, guest, l) = agreed_tree(40);
+        let (host, _, l) = agreed_tree(40);
         let plan = run(&host, &BTreeMap::new(), &l);
-        let _ = guest;
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         let bulk = plan.bulk_delete.clone().expect("the guard never fired");
         assert_eq!(bulk.paths.len(), 40);
@@ -1985,6 +1997,27 @@ mod tests {
                 .iter()
                 .all(|a| matches!(a, Action::Remove { .. }))
         );
+    }
+
+    /// Resolving *part* of a withheld mass deletion must not release the rest:
+    /// the guard fired on the mass, and a developer who approved 21 paths has
+    /// said nothing at all about the other 19.
+    #[test]
+    fn a_partly_resolved_mass_deletion_still_withholds_what_was_not_answered() {
+        let (host, _, l) = agreed_tree(40);
+        let some: BTreeMap<String, Winner> = host
+            .keys()
+            .take(21)
+            .map(|path| (path.clone(), Winner::Guest))
+            .collect();
+        let plan = run_resolved(&host, &BTreeMap::new(), &l, &some);
+        let bulk = plan
+            .bulk_delete
+            .clone()
+            .expect("the remainder was released");
+        assert_eq!(bulk.paths.len(), 19);
+        assert_eq!(plan.actions.len(), 21, "the answered ones still go");
+        assert!(plan.halts());
     }
 
     /// **Volume warns and continues.** Every action it counted is still in
