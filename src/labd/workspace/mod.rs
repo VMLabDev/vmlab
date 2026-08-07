@@ -20,8 +20,16 @@
 //! - [`ledger`] — the agreement point: a content digest per path plus **each
 //!   side's own** size and mtime. Lab-local per (machine, workspace), so
 //!   `destroy` wipes it.
+//! - [`locks`] — `.git`'s mutable set and the **deferral** a held `*.lock`
+//!   buys it: timing that clears itself, never a conflict rule.
 //! - [`plan`] — reconciliation as a value (ADR-0003): host state, guest state
-//!   and the ledger in, actions and conflicts out, no I/O anywhere in it.
+//!   and the ledger in, actions and conflicts out, no I/O anywhere in it. A
+//!   developer's resolution goes in the same way, so `--host` is decided by
+//!   the same matrix as everything else.
+//! - [`halt`] — what a conflicting reconciliation *is*: the whole workspace
+//!   stopped, both directions, on one machine, naming every path in the batch
+//!   — plus the marker file the guest gets, because on that side of ADR-0013's
+//!   invariant a halt is otherwise nothing happening.
 //! - [`apply`] — the executor: temp-name-then-rename in the same directory,
 //!   with the ledger written only **after** the rename.
 //! - [`watcher`] — the host-side watcher whose per-path debounce keeps the
@@ -38,9 +46,12 @@
 //! guest tree is simply the case where every host path has no counterpart.
 
 pub mod apply;
+pub mod diff;
 pub mod guest;
+pub mod halt;
 pub mod ignore;
 pub mod ledger;
+pub mod locks;
 pub mod plan;
 pub mod scan;
 pub mod syncer;

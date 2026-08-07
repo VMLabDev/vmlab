@@ -87,6 +87,10 @@ pub struct HostScan {
     /// a rule matching at a depth its own text does not name.
     pub pruned: Vec<String>,
     pub skipped: Vec<Skip>,
+    /// Git lock files this side is holding right now (§19.6). They never sync
+    /// — the ignore floor sees to that — and their *presence* is the only
+    /// thing read off them: it defers `.git`'s mutable set until git lets go.
+    pub locks: BTreeSet<String>,
 }
 
 /// What the guest holds at the paths it was asked about.
@@ -94,6 +98,9 @@ pub struct HostScan {
 pub struct GuestProbe {
     pub tree: BTreeMap<String, State>,
     pub skipped: Vec<Skip>,
+    /// As [`HostScan::locks`], for the other side. A lock is one side's local
+    /// claim, so either side holding one defers the set for both.
+    pub locks: BTreeSet<String>,
 }
 
 /// Walk the host tree, applying the ignore rules as the descent learns them.
@@ -148,6 +155,10 @@ pub fn host_scan(root: &Path, ledger: &Ledger, max_file_bytes: u64) -> Result<(H
                 // own diverging content here, so neither direction descends.
                 if kind == Kind::Dir {
                     scan.pruned.push(rel);
+                } else if super::locks::is_lock(&rel) {
+                    // Ignored *and* noticed: it must never cross the seam, and
+                    // its presence is what defers `.git`'s mutable set.
+                    scan.locks.insert(rel);
                 }
                 continue;
             }
@@ -260,6 +271,36 @@ pub async fn probe_guest(
     probe
 }
 
+/// Which of these guest-side lock paths are still there.
+///
+/// The steady state never walks, so a lock the guest took is only known from
+/// the watcher having named it — and a watcher names a path *once*, at the
+/// moment it appeared. A lock held across several passes therefore has to be
+/// re-asked about rather than re-reported, which is what this is for: the
+/// caller keeps the candidates it has seen and drops the ones this answers
+/// `None` for.
+///
+/// An unreadable lock counts as held. The deferral costs a pass; guessing that
+/// an unanswerable path is absent would carry half of `.git` mid-rewrite.
+pub async fn guest_locks(
+    files: &dyn GuestFs,
+    guest_root: &str,
+    candidates: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    futures::stream::iter(candidates.iter().cloned())
+        .map(|rel| async move {
+            let held = !matches!(files.lstat(&join_guest(guest_root, &rel)).await, Ok(None));
+            (rel, held)
+        })
+        .buffered(PROBE_WINDOW)
+        .collect::<Vec<(String, bool)>>()
+        .await
+        .into_iter()
+        .filter(|(_, held)| *held)
+        .map(|(rel, _)| rel)
+        .collect()
+}
+
 /// The **stat-walk**: what the guest holds, everywhere, as its own tree.
 ///
 /// The guest reports; the **host** applies the ignore set on receipt and asks
@@ -335,7 +376,12 @@ pub async fn guest_walk(
                 let is_dir = entry.attrs.kind == crate::labd::vm_agent::EntryKind::Dir;
                 if ignores.verdict(&rel, is_dir) == Verdict::GuestOwned {
                     // Guest-owned: the guest holds its own diverging content
-                    // here on purpose, and the walk does not descend it.
+                    // here on purpose, and the walk does not descend it. A
+                    // lock is the one thing read off this side of the line —
+                    // never carried, only noticed.
+                    if super::locks::is_lock(&rel) {
+                        probe.locks.insert(rel);
+                    }
                     continue;
                 }
                 match classify(rel, &entry.attrs, ledger, max_file_bytes) {

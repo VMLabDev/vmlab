@@ -767,6 +767,56 @@ vocabulary! {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
 
+        /// Run a workspace sync pass now and answer with what it decided
+        /// (PRD §19.6). What `vmlab dev sync flush` and `status --wait` are.
+        #[one_way(
+            "cli",
+            "The console already has the answer: a syncer's report is part of \
+             the machine's status projection, which the console polls. What \
+             this adds is *waiting for a pass*, which is a terminal's idiom — \
+             a page that blocks for up to two minutes on a guest that has \
+             stopped answering is a page nobody wants."
+        )]
+        WorkspaceFlush = "workspace.flush" {
+            #[serde(alias = "vm", alias = "container")] machine: String,
+        },
+        /// Say which side wins at halted paths, and carry it out (§19.6).
+        ///
+        /// `paths` empty with `all` set takes the whole batch — the 30 000-file
+        /// case is one `.vmlabignore` edit away and nobody is going to type it.
+        #[one_way(
+            "cli",
+            "§19.6 states it outright: the console reads the halt and does not \
+             act on it. Resolution is a per-path judgement about a developer's \
+             own working copy, made beside the two directories in question, and \
+             the copy that loses is not recoverable from vmlab — which is a \
+             decision for a terminal in the lab directory, not a button."
+        )]
+        WorkspaceResolve = "workspace.resolve" {
+            #[serde(alias = "vm", alias = "container")] machine: String,
+            #[serde(default)] paths: Vec<String>,
+            #[serde(default)] all: bool,
+            /// `host` or `guest`.
+            winner: String,
+        },
+        /// Bring the guest's copy of one workspace path to the host (§19.6).
+        ///
+        /// The host copy is a plain directory on the developer's own
+        /// workstation, so only the *guest* side is behind the seam — which is
+        /// the whole reason this verb exists rather than "attach and look".
+        #[one_way(
+            "cli",
+            "It answers with the guest's bytes for a host-side `diff`, whose \
+             audience is a terminal. A console showing two versions of a source \
+             file is a diff viewer, which is the editor's job — and the editor \
+             is already attached into the guest."
+        )]
+        WorkspaceDiff = "workspace.diff" {
+            #[serde(alias = "vm", alias = "container")] machine: String,
+            /// Workspace-relative paths; empty means every halted path.
+            #[serde(default)] paths: Vec<String>,
+        },
+
         /// Tear the lab daemon down; the reply is sent before it exits.
         Shutdown = "shutdown" {},
     }

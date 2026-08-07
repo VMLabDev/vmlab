@@ -30,9 +30,19 @@ preconditions** (#95): the NTFS case-sensitivity flag on every directory the
 syncer creates including the workspace root, the collision refused by name
 where the flag cannot be set, the symlink attempted and warned about, the
 guest's `core.autocrlf` turned off, and the two degradations an
-`elevated = false` login brings, said up front. The conflict halt and its
-verbs (#96, which owns the guest→host bulk-delete guard) and snapshot
-bracketing (#97) are still spec. The `@dev`
+`elevated = false` login brings, said up front. So is **the conflict halt**
+(#96): a conflict stops the whole workspace, both directions, on **one**
+machine, naming every path in the batch — scan-then-halt, because a host-side
+`git pull` collides in batches — writing no conflict copy, keeping the watch
+running, and leaving both copies exactly where they were. A **marker file** at
+the guest's workspace root is the only signal that side of ADR-0013's invariant
+can get; resolution is host-side necessarily, through `vmlab dev sync
+status/flush/diff/resolve`, with `--host`/`--guest`/`--all` and a free third
+route — make the two sides identical by hand — that needs no verb. With it the
+**guest→host bulk-delete guard** (a proportion with a floor; host→guest deletes
+stay unguarded), the **volume warning** that names a subtree and never halts,
+and the `.git` **lock deferral** that clears itself. The console reads the halt
+and offers no resolution. Snapshot bracketing (#97) is still spec. The `@dev`
 declaration (#80) and all
 three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
 `fileops` (#84) — the handle-based, offset-addressed, pipelined file RPC
@@ -147,10 +157,13 @@ Module map under `src/`:
   and the stat-walk) over the one guest-side seam (`guest.rs`),
   temp-then-rename applies on both sides (`apply.rs`), the host watcher and
   the per-path debounce both directions use (`watcher.rs`), §19.6's three
-  Windows actions as a value computed before the loop (`windows.rs`) and the
-  lab-daemon-owned loop (`syncer.rs`), which drains the guest's dirty set,
-  holds the rescan barrier, and is the one piece of vmlab's machinery running
-  as the machine's default login.
+  Windows actions as a value computed before the loop (`windows.rs`), the
+  halt and the guest marker file it writes (`halt.rs`), `.git`'s mutable set
+  and the deferral a held lock buys it (`locks.rs`), the two copies
+  `dev sync diff` brings together (`diff.rs`), and the lab-daemon-owned loop
+  (`syncer.rs`), which drains the guest's dirty set, holds the rescan barrier
+  and the halt, serves the `dev sync` verbs, and is the one piece of vmlab's
+  machinery running as the machine's default login.
   Decisions the runtime used to make mid-flight are values computed before
   execution (ADR-0003): `plan.rs` (wave ordering), `share_plan.rs` (share
   transports, gateway rules, the smbd port), `forward_plan.rs` (every port
@@ -160,7 +173,9 @@ Module map under `src/`:
   plan (virtiofs + SMB, per guest OS) the lab runtime only executes.
 - `oci/` — OCI registry push/pull (chunked, multi-arch).
 - `cli/` — the `vmlab` verb surface; `dev.rs` is `vmlab dev` (§19.7), which
-  holds only what is meaningless for a machine that is not `@dev`.
+  holds only what is meaningless for a machine that is not `@dev` — `attach`,
+  `use`, and the `sync` verbs a halt is resolved through (§19.6), which live
+  here because ADR-0013 leaves no guest→host control path to offer them from.
 - `web/` — the `vmlab-web` binary (Actix-web): REST + WebSocket API over the
   proto client, an embedded SolidJS console UI (`web-ui/`, rust-embed), live
   noVNC over a `vnc.sock` WebSocket bridge, and username/password auth. Behind

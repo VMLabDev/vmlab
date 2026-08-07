@@ -26,6 +26,7 @@ import LogPanel from "./LogPanel";
 import MachinePullStatus from "./MachinePullStatus";
 import PlaybookPanel from "./PlaybookPanel";
 import TerminalPanel from "./TerminalPanel";
+import WorkspaceSync from "./WorkspaceSync";
 
 export default function ContainerView() {
   const [tab, setTab] = createSignal<"console" | "terminal" | "log" | "playbook">("console");
@@ -158,6 +159,7 @@ export default function ContainerView() {
                 the detail view, per the vocabulary decision on issue #7. */}
             <KV k="Power state" v={ctr()!.state} />
           </Card>
+          <WorkspaceSync machine={ctr()!} />
           <Show when={playbooksFor(ctr()!.name).length > 0}>
             <Card title="Playbooks">
               <For each={playbooksFor(ctr()!.name)}>

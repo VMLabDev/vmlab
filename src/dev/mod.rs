@@ -113,6 +113,10 @@ impl From<ResolvedDev> for crate::status::DevStatus {
             default: dev.default,
             workspace: dev.workspace.map(|p| p.display().to_string()),
             workspace_guest: dev.workspace_guest,
+            // Filled in by the lab runtime, which is the only thing that holds
+            // a running syncer — the declaration knows a workspace was asked
+            // for, not what became of it.
+            sync: None,
         }
     }
 }

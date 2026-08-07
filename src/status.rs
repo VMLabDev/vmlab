@@ -336,6 +336,77 @@ pub struct DevStatus {
     /// Always answered: a dev machine has a workspace path even where nothing
     /// declared one.
     pub workspace_guest: String,
+    /// What this machine's workspace syncer last decided (§19.6). `None` where
+    /// no syncer is running — the machine is down, or declares no workspace.
+    pub sync: Option<WorkspaceSyncStatus>,
+}
+
+/// One machine's workspace syncer, as every surface reads it (PRD §19.6).
+///
+/// **The console displays the halt and offers no resolution.** That is not a
+/// gap in the console: resolution is host-side *necessarily* — ADR-0013's
+/// invariant leaves no guest→host control path — and it is a per-path judgement
+/// about a developer's own working copy, made next to the two directories in
+/// question. So the projection carries everything needed to *show* a halt and
+/// nothing that acts on one; `vmlab dev sync resolve` is the only way to pick a
+/// side, from a terminal in the lab directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+pub struct WorkspaceSyncStatus {
+    /// The whole workspace is stopped, both directions, on this machine.
+    pub halted: bool,
+    /// The one line that says what happened, naming the machine — two dev
+    /// machines may share one host workspace, and one halting must not read
+    /// as the other's.
+    pub halt: Option<String>,
+    /// Every halted path with the sentence that explains it, capped — see
+    /// `total` for how many there really are.
+    pub conflicts: Vec<WorkspaceConflictStatus>,
+    /// How many paths the halt covers, whether or not they all fit above.
+    pub conflicts_total: usize,
+    /// The routes out, in words. Carried so a surface never has to compose
+    /// them and the console can *show* the remedy it does not offer.
+    pub resolve: Option<String>,
+    /// The last pass carried an unusual amount of work under one subtree. A
+    /// warning: everything it counted was still carried.
+    pub volume: Option<String>,
+    /// Both directions are waiting on a stat-walk, and why — the overflow
+    /// symptom, as a state rather than as a pause.
+    pub rescan: Option<String>,
+    /// How many watch discontinuities this syncer has answered with a walk.
+    /// Repeated ones are the symptom a single lost event is not.
+    #[ts(type = "number")]
+    pub rescans: u64,
+    /// Paths neither direction touched, by name — special files, and anything
+    /// the syncer's login could not open. Loud by design: a `.sock` in the
+    /// tree must not stop a dev machine, and must not vanish quietly either.
+    pub skipped: Vec<WorkspaceSkipStatus>,
+    /// `.git`'s mutable set, waiting on a lock held on one side. Timing, not a
+    /// conflict: nothing needs resolving and it clears itself.
+    pub deferred: Vec<String>,
+    /// The last pass could not finish. Not a halt — nothing was agreed, so the
+    /// next pass starts over.
+    pub trouble: Option<String>,
+    /// Passes completed, so a surface can tell "in step" from "has never
+    /// managed one".
+    #[ts(type = "number")]
+    pub passes: u64,
+}
+
+/// One halted path and why it is halted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+pub struct WorkspaceConflictStatus {
+    pub path: String,
+    pub reason: String,
+}
+
+/// One path neither direction touched, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+pub struct WorkspaceSkipStatus {
+    pub path: String,
+    pub reason: String,
 }
 
 /// One machine's line in `status`.
@@ -624,6 +695,46 @@ pub(crate) mod fixtures {
                 default,
                 workspace: Some("./src".into()),
                 workspace_guest: "C:\\src".into(),
+                sync: None,
+            }),
+            ..machine
+        }
+    }
+
+    /// The same dev machine, with its workspace halted on `paths` (§19.6).
+    pub(crate) fn halted(machine: MachineStatus, paths: &[&str]) -> MachineStatus {
+        let dev = machine
+            .dev
+            .clone()
+            .expect("a workspace needs a dev machine");
+        MachineStatus {
+            dev: Some(DevStatus {
+                sync: Some(WorkspaceSyncStatus {
+                    halted: true,
+                    halt: Some(format!(
+                        "the workspace on \"{}\" has stopped, both directions, on {} conflicting \
+                         paths",
+                        machine.name,
+                        paths.len(),
+                    )),
+                    conflicts: paths
+                        .iter()
+                        .map(|path| WorkspaceConflictStatus {
+                            path: (*path).to_string(),
+                            reason: "both sides changed it since they last agreed".into(),
+                        })
+                        .collect(),
+                    conflicts_total: paths.len(),
+                    resolve: Some("`vmlab dev sync resolve <path> --host` or `--guest`".into()),
+                    volume: None,
+                    rescan: None,
+                    rescans: 0,
+                    skipped: Vec::new(),
+                    deferred: Vec::new(),
+                    trouble: None,
+                    passes: 4,
+                }),
+                ..dev
             }),
             ..machine
         }

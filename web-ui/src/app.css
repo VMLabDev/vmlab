@@ -1101,3 +1101,22 @@
 .fs-row.muted { color: var(--fg-3); }
 .fs-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fs-size { color: var(--fg-3); font-size: var(--fs-xs); font-family: var(--font-mono); }
+
+/* The workspace syncer's card (PRD §19.6). A halt is the one thing here a
+   developer has to act on, and the console deliberately only *shows* it —
+   resolution is host-side, so the remedy is printed rather than offered. */
+.ws-halt {
+  display: flex; align-items: flex-start; gap: var(--sp-2);
+  margin: 0 0 var(--sp-2); color: var(--danger-fg); font-size: var(--fs-sm);
+}
+.ws-line {
+  display: flex; align-items: flex-start; gap: var(--sp-2);
+  margin: var(--sp-2) 0 0; color: var(--fg-3); font-size: var(--fs-xs);
+}
+.ws-paths { list-style: none; margin: 0; padding: 0; }
+.ws-paths li {
+  display: flex; flex-direction: column; gap: 2px; padding: var(--sp-1) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.ws-paths code { font-family: var(--font-mono); font-size: var(--fs-xs); }
+.ws-paths span { color: var(--fg-3); font-size: var(--fs-xs); }
