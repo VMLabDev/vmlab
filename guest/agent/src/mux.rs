@@ -20,6 +20,8 @@ use vmlab_agent_proto::{
     OsInfo, PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame,
 };
 
+use crate::spawn::{Identity, ProcessSpec, Spawner, TerminalSpec};
+
 /// Host→guest bytes for one session, fed by the reader dispatch and drained
 /// by the session's input pump.
 pub enum Input {
@@ -77,7 +79,7 @@ struct Session {
     input: Option<SyncSender<Input>>,
     credit: Arc<Credit>,
     /// Applies a terminal resize (PTY sessions only).
-    resize: Option<Box<dyn Fn(u16, u16) + Send>>,
+    resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
     /// Force-stops the session's work (kill the process, stop the tail).
     /// Pump threads notice via closed channels/credit and exit.
     kill: Option<Box<dyn FnOnce() + Send>>,
@@ -166,7 +168,7 @@ impl Mux {
     pub fn register(
         &self,
         id: u32,
-        resize: Option<Box<dyn Fn(u16, u16) + Send>>,
+        resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
         kill: Option<Box<dyn FnOnce() + Send>>,
     ) -> Option<(Receiver<Input>, Arc<Credit>)> {
         let mut sessions = self.inner.sessions.lock().unwrap();
@@ -316,23 +318,46 @@ impl Mux {
                     token,
                 });
             }
+            // Everything a person invokes will carry the machine's declared
+            // login (PRD §19.2); until those land, every channel resolves to
+            // the agent's own identity.
             HostMsg::OpenTerminal {
                 id,
                 cols,
                 rows,
                 command,
-            } => platform.open_terminal(self, id, cols, rows, command),
+            } => crate::terminal::open(
+                self,
+                platform.spawner(),
+                Identity::Agent,
+                id,
+                TerminalSpec {
+                    command,
+                    cols,
+                    rows,
+                },
+            ),
             HostMsg::Resize { id, cols, rows } => self.resize(id, cols, rows),
-            HostMsg::OpenExec { id, argv, env, cwd } => {
-                platform.open_exec(self, id, argv, env, cwd)
-            }
+            HostMsg::OpenExec { id, argv, env, cwd } => crate::exec::open(
+                self,
+                platform.spawner(),
+                Identity::Agent,
+                id,
+                ProcessSpec { argv, env, cwd },
+            ),
             HostMsg::Eof { id } => self.route_input(id, Input::Eof),
-            // No platform hook: the dial is portable, and a container
-            // micro-VM shares the guest's network stack anyway.
+            // No spawner and no platform hook: a tunnel creates a socket,
+            // not a process or a file, and the dial is portable — a
+            // container micro-VM shares the guest's network stack anyway.
             HostMsg::OpenTunnel { id, host, port } => crate::tunnel::open(self, id, host, port),
-            HostMsg::OpenFilePush { id, path, mode } => {
-                crate::files::open_push(self, id, platform.resolve_path(path), mode)
-            }
+            HostMsg::OpenFilePush { id, path, mode } => crate::files::open_push(
+                self,
+                platform.spawner(),
+                Identity::Agent,
+                id,
+                platform.resolve_path(path),
+                mode,
+            ),
             HostMsg::OpenFilePull { id, path } => {
                 crate::files::open_pull(self, id, platform.resolve_path(path))
             }
@@ -371,22 +396,10 @@ impl Mux {
 pub trait Platform: Sync {
     fn os(&self) -> &'static str;
     fn features(&self) -> Vec<String>;
-    /// Spawn a shell on a PTY/ConPTY bridged to channel `id`; must register
-    /// the session, emit `Opened`, and emit `Exited` + remove when the shell
-    /// ends.
-    fn open_terminal(&self, mux: &Mux, id: u32, cols: u16, rows: u16, command: Option<Vec<String>>);
-    /// Streaming exec. The default spawns on the platform directly;
-    /// container mode reroutes through the namespace/chroot trampoline.
-    fn open_exec(
-        &self,
-        mux: &Mux,
-        id: u32,
-        argv: Vec<String>,
-        env: Vec<(String, String)>,
-        cwd: Option<String>,
-    ) {
-        crate::exec::open(mux, id, argv, env, cwd);
-    }
+    /// The seam every guest-side process and file handle is created
+    /// through. Terminals, exec and file pushes all come from here, so
+    /// identity (PRD §19.2) is decided in one place.
+    fn spawner(&self) -> &dyn Spawner;
     /// Map a host-supplied guest path (file transfer, tail) — container mode
     /// resolves it inside the container rootfs.
     fn resolve_path(&self, path: String) -> String {
@@ -431,86 +444,20 @@ pub fn pump_out(mux: &Mux, id: u32, kind: FrameKind, credit: &Credit, mut src: i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
-
-    struct NullPlatform;
-    impl Platform for NullPlatform {
-        fn os(&self) -> &'static str {
-            "test"
-        }
-        fn features(&self) -> Vec<String> {
-            vec!["terminal".into()]
-        }
-        fn open_terminal(&self, _: &Mux, _: u32, _: u16, _: u16, _: Option<Vec<String>>) {}
-        fn open_eventlog(&self, mux: &Mux, id: u32, _: Option<String>) {
-            mux.send_error(Some(id), "unsupported");
-        }
-        fn set_clipboard(&self, _: &Mux, _: String) {}
-        fn get_clipboard(&self, mux: &Mux) {
-            mux.send_error(None, "unsupported");
-        }
-        fn net_info(&self) -> Result<Vec<NetInterface>, String> {
-            Ok(vec![NetInterface {
-                name: "eth0".into(),
-                mac: Some("52:54:00:00:00:01".into()),
-                ipv4: vec!["10.0.0.2".into()],
-                ipv6: vec![],
-            }])
-        }
-        fn os_info(&self) -> Result<OsInfo, String> {
-            Ok(OsInfo {
-                id: "test".into(),
-                name: "Test OS".into(),
-                version: "1".into(),
-                kernel: "0.0".into(),
-                arch: "x86_64".into(),
-                hostname: "testhost".into(),
-            })
-        }
-        fn shutdown(&self, _: &Mux, _: ShutdownMode) {}
-    }
-
-    /// A Write that forwards every produced frame to a channel for
-    /// inspection.
-    struct CapturePort(std::sync::mpsc::Sender<Vec<u8>>);
-    impl Write for CapturePort {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let _ = self.0.send(buf.to_vec());
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_mux() -> (Mux, std::sync::mpsc::Receiver<Vec<u8>>) {
-        let (tx, rx) = channel();
-        (Mux::new(CapturePort(tx)), rx)
-    }
-
-    fn next_ctrl(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> AgentMsg {
-        let mut dec = vmlab_agent_proto::FrameDecoder::new();
-        loop {
-            let bytes = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            dec.push(&bytes);
-            if let Some(f) = dec.next_frame() {
-                assert_eq!(f.kind, FrameKind::Ctrl);
-                return serde_json::from_slice(&f.payload).unwrap();
-            }
-        }
-    }
+    use crate::fake_spawner::TestPlatform;
+    use crate::testutil::capture_mux;
 
     #[test]
     fn hello_resets_and_echoes_token() {
-        let (mux, rx) = capture_mux();
+        let (mux, mut cap) = capture_mux();
         mux.handle_msg(
             HostMsg::Hello {
                 proto_version: PROTO_VERSION,
                 token: "tok-1".into(),
             },
-            &NullPlatform,
+            &TestPlatform::new(),
         );
-        match next_ctrl(&rx) {
+        match cap.ctrl() {
             AgentMsg::Hello {
                 proto_version,
                 token,
@@ -529,16 +476,16 @@ mod tests {
 
     #[test]
     fn ping_pongs() {
-        let (mux, rx) = capture_mux();
-        mux.handle_msg(HostMsg::Ping, &NullPlatform);
-        assert_eq!(next_ctrl(&rx), AgentMsg::Pong);
+        let (mux, mut cap) = capture_mux();
+        mux.handle_msg(HostMsg::Ping, &TestPlatform::new());
+        assert_eq!(cap.ctrl(), AgentMsg::Pong);
     }
 
     #[test]
     fn net_info_replies_with_interfaces() {
-        let (mux, rx) = capture_mux();
-        mux.handle_msg(HostMsg::NetInfo, &NullPlatform);
-        match next_ctrl(&rx) {
+        let (mux, mut cap) = capture_mux();
+        mux.handle_msg(HostMsg::NetInfo, &TestPlatform::new());
+        match cap.ctrl() {
             AgentMsg::NetInfo { interfaces } => {
                 assert_eq!(interfaces.len(), 1);
                 assert_eq!(interfaces[0].name, "eth0");
@@ -549,9 +496,9 @@ mod tests {
 
     #[test]
     fn os_info_replies_with_info() {
-        let (mux, rx) = capture_mux();
-        mux.handle_msg(HostMsg::OsInfo, &NullPlatform);
-        match next_ctrl(&rx) {
+        let (mux, mut cap) = capture_mux();
+        mux.handle_msg(HostMsg::OsInfo, &TestPlatform::new());
+        match cap.ctrl() {
             AgentMsg::OsInfo { info } => assert_eq!(info.id, "test"),
             other => panic!("expected os_info, got {other:?}"),
         }
@@ -559,15 +506,15 @@ mod tests {
 
     #[test]
     fn shutdown_acks_before_executing() {
-        let (mux, rx) = capture_mux();
+        let (mux, mut cap) = capture_mux();
         mux.handle_msg(
             HostMsg::Shutdown {
                 mode: ShutdownMode::Reboot,
             },
-            &NullPlatform,
+            &TestPlatform::new(),
         );
         assert_eq!(
-            next_ctrl(&rx),
+            cap.ctrl(),
             AgentMsg::ShuttingDown {
                 mode: ShutdownMode::Reboot
             }
@@ -576,11 +523,11 @@ mod tests {
 
     #[test]
     fn duplicate_channel_id_is_an_error() {
-        let (mux, rx) = capture_mux();
+        let (mux, mut cap) = capture_mux();
         let first = mux.register(7, None, None);
         assert!(first.is_some());
         assert!(mux.register(7, None, None).is_none());
-        match next_ctrl(&rx) {
+        match cap.ctrl() {
             AgentMsg::Error { id: Some(7), .. } => {}
             other => panic!("expected error for id 7, got {other:?}"),
         }
@@ -588,7 +535,7 @@ mod tests {
 
     #[test]
     fn channel_zero_cannot_be_a_session() {
-        let (mux, _rx) = capture_mux();
+        let (mux, _cap) = capture_mux();
         assert!(mux.register(0, None, None).is_none());
     }
 
@@ -617,7 +564,7 @@ mod tests {
 
     #[test]
     fn remove_kills_and_closes() {
-        let (mux, _rx) = capture_mux();
+        let (mux, _cap) = capture_mux();
         let killed = Arc::new(Mutex::new(false));
         let k = killed.clone();
         let (input, credit) = mux
@@ -634,7 +581,7 @@ mod tests {
 
     #[test]
     fn route_input_reaches_session_and_ignores_strays() {
-        let (mux, _rx) = capture_mux();
+        let (mux, _cap) = capture_mux();
         let (input, _credit) = mux.register(9, None, None).unwrap();
         mux.route_input(9, Input::Bytes(b"abc".to_vec()));
         mux.route_input(9, Input::Eof);
@@ -648,21 +595,17 @@ mod tests {
 
     #[test]
     fn pump_out_respects_credit_and_frames_data() {
-        let (mux, rx) = capture_mux();
+        let (mux, mut cap) = capture_mux();
         let (_input, credit) = mux.register(5, None, None).unwrap();
         let data = vec![7u8; 100_000]; // > one frame, < initial window
         pump_out(&mux, 5, FrameKind::Data, &credit, &data[..]);
-        let mut dec = vmlab_agent_proto::FrameDecoder::new();
         let mut got = Vec::new();
         while got.len() < data.len() {
-            let bytes = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            dec.push(&bytes);
-            while let Some(f) = dec.next_frame() {
-                assert_eq!(f.kind, FrameKind::Data);
-                assert_eq!(f.channel, 5);
-                assert!(f.payload.len() <= MAX_PAYLOAD);
-                got.extend(f.payload);
-            }
+            let f = cap.frame();
+            assert_eq!(f.kind, FrameKind::Data);
+            assert_eq!(f.channel, 5);
+            assert!(f.payload.len() <= MAX_PAYLOAD);
+            got.extend(f.payload);
         }
         assert_eq!(got, data);
     }

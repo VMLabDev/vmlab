@@ -22,6 +22,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0012](0012-vmlab-terminates-ssh-on-the-host.md) | vmlab terminates SSH on the host | Accepted |
 | [0013](0013-the-host-opens-channels-the-guest-answers.md) | The host opens channels, the guest answers | Accepted |
 | [0014](0014-the-workspace-is-a-guest-local-copy-of-a-canonical-host-tree.md) | The workspace is a guest-local copy of a canonical host tree | Accepted |
+| [0015](0015-one-guest-side-spawner-seam-carries-identity.md) | One guest-side Spawner seam, and identity is its parameter | Accepted |
 
 ## Format
 

@@ -205,6 +205,16 @@ exit classification, readiness and teardown ordering sit above.
 Two adapters, both live: QEMU in production, the fake in the lifecycle tests.
 _Avoid_: driver, backend, runtime
 
+**Spawner**:
+The guest-side counterpart of the Hypervisor seam, inside vmlab-agent: the one
+place a guest process or a written file handle is created. Every call takes an
+**Identity** — who the work runs as — so terminals, exec and file pushes all
+answer that question in one place rather than three. It hands back its own
+**Spawned** handle (stdio, resize, kill, wait) rather than a child process or a
+PTY, so an adapter can be entirely in-memory. Three adapters, all live: Linux
+and Windows in production, the fake in the session tests.
+_Avoid_: launcher, process factory, executor
+
 **Plan**:
 A decision computed in full, as a value, before anything acts on it. Computing
 the plan does no I/O; carrying it out is a separate operation. **LabPlan**,

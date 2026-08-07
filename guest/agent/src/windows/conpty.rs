@@ -1,14 +1,12 @@
-//! ConPTY terminal sessions: CreatePseudoConsole hosting PowerShell, pipes
-//! pumped to/from the agent channel. Works from a session-0 SYSTEM service —
-//! ConPTY does not need an interactive session (Win32-OpenSSH runs exactly
-//! this way).
+//! ConPTY terminals: CreatePseudoConsole hosting PowerShell, with its pipes
+//! handed to the spawner seam as a running process. Works from a
+//! session-0 SYSTEM service — ConPTY does not need an interactive session
+//! (Win32-OpenSSH runs exactly this way).
 
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
 use windows_sys::Win32::System::Console::{
@@ -22,10 +20,8 @@ use windows_sys::Win32::System::Threading::{
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
-use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
-
 use super::port::wide;
-use crate::mux::{Input, Mux, pump_out};
+use crate::spawn::{Spawned, TerminalSpec};
 
 /// Windows-side MOTD, written down the ConPTY input? No — ConPTY input is
 /// keystrokes. The banner is printed by prepending an echo to the command
@@ -51,20 +47,16 @@ impl Drop for OwnedHandle {
     }
 }
 
-pub fn open_terminal(mux: &Mux, id: u32, cols: u16, rows: u16, command: Option<Vec<String>>) {
-    match spawn(mux, id, cols, rows, command) {
-        Ok(()) => {}
-        Err(e) => mux.send_error(Some(id), format!("terminal: {e}")),
-    }
-}
-
-fn spawn(
-    mux: &Mux,
-    id: u32,
-    cols: u16,
-    rows: u16,
-    command: Option<Vec<String>>,
-) -> std::io::Result<()> {
+/// Start a shell on a fresh pseudoconsole and wrap it as a seam
+/// [`Spawned`]: `input` is the ConPTY's keystroke pipe, `output` its VT
+/// stream, and `wait` closes the pseudoconsole once the shell exits — which
+/// is what ends the output pipe.
+pub fn spawn(spec: TerminalSpec) -> std::io::Result<Spawned> {
+    let TerminalSpec {
+        command,
+        cols,
+        rows,
+    } = spec;
     let cmdline = match command {
         Some(argv) if !argv.is_empty() => argv
             .iter()
@@ -112,13 +104,17 @@ fn spawn(
     drop(thread_h);
     let process = Arc::new(process);
 
-    let done = Arc::new(AtomicBool::new(false));
+    // SAFETY: both are fresh pipe handles we own; File assumes them.
+    let input = unsafe { File::from_raw_handle(in_write.take() as _) };
+    let output = unsafe { File::from_raw_handle(out_read.take() as _) };
+
     let resize_pty = pty.clone();
-    let kill_done = done.clone();
     let kill_process = process.clone();
-    let Some((input, credit)) = mux.register(
-        id,
-        Some(Box::new(move |cols, rows| {
+    Ok(Spawned {
+        input: Box::new(input),
+        output: Box::new(output),
+        errors: None,
+        resize: Some(Box::new(move |cols, rows| {
             let size = COORD {
                 X: cols.max(2) as i16,
                 Y: rows.max(2) as i16,
@@ -126,72 +122,25 @@ fn spawn(
             // SAFETY: live HPCON until the session's reaper closes it.
             unsafe { ResizePseudoConsole(resize_pty.0, size) };
         })),
-        Some(Box::new(move || {
-            if !kill_done.load(Ordering::SeqCst) {
-                // SAFETY: live process handle held by the Arc.
-                unsafe { TerminateProcess(kill_process.0, 137) };
-            }
-        })),
-    ) else {
-        // SAFETY: our handles.
-        unsafe {
-            TerminateProcess(process.0, 137);
-            ClosePseudoConsole(pty.0);
-        }
-        return Ok(());
-    };
-    mux.send_ctrl(&AgentMsg::Opened { id });
-
-    // Input pump: host bytes → ConPTY input pipe.
-    {
-        let mux = mux.clone();
-        // SAFETY: in_write is a fresh pipe handle we own; File assumes it.
-        let mut writer = unsafe { File::from_raw_handle(in_write.take() as _) };
-        thread::spawn(move || {
-            use std::io::Write;
-            let mut window = RecvWindow::default();
-            for input in input {
-                match input {
-                    Input::Bytes(b) => {
-                        let _ = writer.write_all(&b);
-                        if let Some(grant) = window.recv(b.len()) {
-                            mux.send_ctrl(&AgentMsg::WindowAdjust { id, bytes: grant });
-                        }
-                    }
-                    Input::Eof => {}
-                }
-            }
-        });
-    }
-
-    // Output pump: ConPTY output pipe → host.
-    let out_pump = {
-        let (mux, credit) = (mux.clone(), credit.clone());
-        // SAFETY: out_read is a fresh pipe handle we own; File assumes it.
-        let reader = unsafe { File::from_raw_handle(out_read.take() as _) };
-        thread::spawn(move || pump_out(&mux, id, FrameKind::Data, &credit, reader))
-    };
-
-    // Reaper.
-    let mux = mux.clone();
-    thread::spawn(move || {
-        // SAFETY: live process handle.
-        let code = unsafe {
-            WaitForSingleObject(process.0, INFINITE);
-            let mut code: u32 = 127;
-            GetExitCodeProcess(process.0, &mut code);
-            code as i32
-        };
-        done.store(true, Ordering::SeqCst);
-        // Closing the pseudoconsole tears down conhost and closes the output
-        // pipe, ending the pump.
-        // SAFETY: single close of the HPCON we created.
-        unsafe { ClosePseudoConsole(pty.0) };
-        let _ = out_pump.join();
-        mux.send_ctrl(&AgentMsg::Exited { id, code });
-        mux.remove_finished(id);
-    });
-    Ok(())
+        kill: Box::new(move || {
+            // SAFETY: live process handle held by the Arc.
+            unsafe { TerminateProcess(kill_process.0, 137) };
+        }),
+        wait: Box::new(move || {
+            // SAFETY: live process handle.
+            let code = unsafe {
+                WaitForSingleObject(process.0, INFINITE);
+                let mut code: u32 = 127;
+                GetExitCodeProcess(process.0, &mut code);
+                code as i32
+            };
+            // Closing the pseudoconsole tears down conhost and closes the
+            // output pipe, ending the caller's output pump.
+            // SAFETY: single close of the HPCON we created.
+            unsafe { ClosePseudoConsole(pty.0) };
+            code
+        }),
+    })
 }
 
 struct PipeEnd(HANDLE, bool);
