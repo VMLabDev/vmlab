@@ -625,6 +625,21 @@ vocabulary! {
         MachineSshOpen = "machine.ssh_open" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
+        /// Push the host's shipped vmlab-agent into a running machine and
+        /// mark it **diverged** (PRD §19.4). Never fires by itself: an
+        /// automatic refresh would make the template's sealed
+        /// `agent_version` a lie.
+        #[one_way(
+            "cli",
+            "A deliberate, machine-changing act with a rebuild as its \
+             alternative — the console offering it as a button would invite \
+             exactly the reflex the verb exists to keep manual, and its \
+             audience is whoever is iterating on the agent itself, at a \
+             terminal."
+        )]
+        MachineRepairAgent = "machine.repair_agent" {
+            #[serde(alias = "vm", alias = "container")] machine: String,
+        },
         /// Resize an open terminal session.
         MachineTtyResize = "machine.tty_resize" {
             #[serde(alias = "vm", alias = "container")] machine: String,

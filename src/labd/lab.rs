@@ -1032,12 +1032,37 @@ impl LabRuntime {
         let _ = remove_tree(m.run_dir()).await;
         {
             let mut state = self.state.lock().await;
-            m.forget_artefacts(state.machine_mut(name)).await;
+            let entry = state.machine_mut(name);
+            // The disks a repair changed in place are gone, so the divergence
+            // they carried goes with them: what comes back is the artefact's
+            // own agent again (§19.4).
+            entry.repaired_agent = None;
+            m.forget_artefacts(entry).await;
             state.save(&self.lab_local)?;
         }
         self.events.emit(
             &format!("{}.destroyed", m.event_subject()),
             json!({ m.event_subject(): name.to_string() }),
+        );
+        Ok(())
+    }
+
+    /// Record that a machine now runs an agent this host pushed into it, which
+    /// is what makes it a **diverged machine** (§19.4).
+    ///
+    /// Persisted, because divergence outlives this daemon and the machine's
+    /// next boot: the template's sealed `agent_version` no longer describes
+    /// what is inside the clone, and every surface reporting that machine's
+    /// state says so until its disks are destroyed.
+    pub async fn record_agent_repair(&self, machine: &str, agent_version: &str) -> Result<()> {
+        {
+            let mut state = self.state.lock().await;
+            state.machine_mut(machine).repaired_agent = Some(agent_version.to_string());
+            state.save(&self.lab_local)?;
+        }
+        self.events.emit(
+            "machine.agent_repaired",
+            json!({"vm": machine, "machine": machine, "agent_version": agent_version}),
         );
         Ok(())
     }
@@ -1339,8 +1364,45 @@ impl LabRuntime {
 
         self.install_forwards(&targets).await;
 
+        self.warn_unattachable(&targets, &output).await;
+
         self.events.emit("lab.up", json!({"vms": targets}));
         Ok(())
+    }
+
+    /// §19.4's middle rung: `up` warns about a machine whose agent cannot
+    /// serve an attach, and never fails over it.
+    ///
+    /// Here rather than at `validate` because the handshake is part of
+    /// readiness, so by now the features are *probed* rather than inferred
+    /// from a sealed version string; and a warning rather than an error
+    /// because the SSH facade is a general capability — a machine nothing can
+    /// attach to is still a perfectly good machine, and its shell still works.
+    ///
+    /// Only machines whose agent actually answered are considered. A machine
+    /// still booting, or one whose guest profile has no agent channel at all,
+    /// has told us nothing about its features, and guessing from silence is
+    /// the inference this ladder exists to avoid.
+    ///
+    /// **Every machine, not only the `@dev` ones.** Scoping it to dev machines
+    /// was the quieter reading and is wrong: the SSH facade is a *general*
+    /// capability of every machine (§19.3), so "nothing can attach to this"
+    /// is news about any of them. It also self-clears — the warning exists for
+    /// a machine whose agent answered and is old, which stops the moment its
+    /// template is rebuilt.
+    async fn warn_unattachable(&self, targets: &[String], output: &crate::scripting::OutputSink) {
+        for name in targets {
+            let Ok(m) = self.machine(name) else { continue };
+            let Ok(agent) = m.agent().await else { continue };
+            let Some(warning) = crate::attach::warning(name, &agent.info().features) else {
+                continue;
+            };
+            output(format!("{warning}\n"));
+            self.events.emit(
+                "machine.not_attachable",
+                json!({"vm": name, "machine": name, "reason": warning}),
+            );
+        }
     }
 
     /// Wire up every forward `scope` requires — segment `forward {}` blocks
@@ -1614,6 +1676,18 @@ impl LabRuntime {
         // (§19.1) — a lab-scoped answer, so it is resolved once here rather
         // than asked of each machine.
         let devs = self.dev_machines();
+        // Which machines a repair verb changed in place (§19.4) — recorded in
+        // the lab's persisted state, so it is read once here rather than
+        // asked of each machine, which does not hold it.
+        let diverged: Vec<String> = {
+            let state = self.state.lock().await;
+            state
+                .machines
+                .iter()
+                .filter(|(_, s)| s.repaired_agent.is_some())
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
         let mut machines = Vec::new();
         for m in self.machines() {
             let mut status = m.status().await;
@@ -1625,6 +1699,7 @@ impl LabRuntime {
                 .find(|d| d.name == status.name)
                 .cloned()
                 .map(Into::into);
+            status.agent_diverged = diverged.contains(&status.name);
             machines.push(status);
         }
 
@@ -2036,6 +2111,10 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         seq: Arc<AtomicUsize>,
         dir: PathBuf,
+        /// A guest agent answering on this machine's behalf, for the
+        /// questions that are about what the agent said (§19.4). `None` — the
+        /// usual case for a double — is a machine with no agent at all.
+        agent: Option<super::super::vm_agent::AgentHandle>,
     }
 
     impl FakeMachine {
@@ -2053,7 +2132,20 @@ mod tests {
                 log: shared.log.clone(),
                 seq: shared.seq.clone(),
                 dir: shared.dir.join(name),
+                agent: None,
             })
+        }
+
+        /// The same double, with a guest agent answering for it.
+        fn with_agent(
+            name: &str,
+            kind: MachineKind,
+            shared: &Shared,
+            agent: super::super::vm_agent::AgentHandle,
+        ) -> Arc<Self> {
+            let mut me = Arc::into_inner(Self::new(name, kind, shared)).expect("sole owner");
+            me.agent = Some(agent);
+            Arc::new(me)
         }
 
         async fn note(&self, what: &str) {
@@ -2177,7 +2269,9 @@ mod tests {
         }
 
         async fn agent(&self) -> Result<super::super::vm_agent::AgentHandle> {
-            bail!("{}: no agent in a double", self.name)
+            self.agent
+                .clone()
+                .ok_or_else(|| anyhow!("{}: no agent in a double", self.name))
         }
         async fn agent_answering(&self) -> bool {
             *self.ready.read().await
@@ -2219,6 +2313,77 @@ mod tests {
 
     fn quiet() -> crate::scripting::OutputSink {
         Arc::new(|_| {})
+    }
+
+    /// An output sink that keeps what was printed, for the tests that are
+    /// about what `up` *said*.
+    fn recording() -> (
+        crate::scripting::OutputSink,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        (
+            Arc::new(move |line: String| sink.lock().expect("sink lock").push(line)),
+            lines,
+        )
+    }
+
+    /// A guest agent that answers a handshake advertising `features`, and a
+    /// ping, and nothing else — which is every question §19.4 asks of one.
+    async fn mock_agent(sock: PathBuf, features: &[&str]) -> super::super::vm_agent::AgentHandle {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use vmlab_agent_proto::{
+            AgentMsg, Frame, FrameDecoder, FrameKind, HostMsg, PROTO_VERSION, encode_ctrl,
+        };
+
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind the mock agent");
+        let features: Vec<String> = features.iter().map(|f| f.to_string()).collect();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut dec = FrameDecoder::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => dec.push(&buf[..n]),
+                }
+                while let Some(Frame { kind, payload, .. }) = dec.next_frame() {
+                    if kind != FrameKind::Ctrl {
+                        continue;
+                    }
+                    let Ok(msg) = serde_json::from_slice::<HostMsg>(&payload) else {
+                        continue;
+                    };
+                    let reply = match msg {
+                        HostMsg::Hello { token, .. } => AgentMsg::Hello {
+                            proto_version: PROTO_VERSION,
+                            agent_version: "mock".into(),
+                            os: "linux".into(),
+                            features: features.clone(),
+                            token,
+                        },
+                        HostMsg::Ping => AgentMsg::Pong,
+                        // A guest on no segment still answers the question,
+                        // and answering it is what keeps a caller that asks
+                        // (the forward plan does) from waiting out its
+                        // timeout.
+                        HostMsg::NetInfo => AgentMsg::NetInfo {
+                            interfaces: Vec::new(),
+                        },
+                        _ => continue,
+                    };
+                    if stream.write_all(&encode_ctrl(&reply)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        super::super::vm_agent::AgentHandle::connect(&sock, Duration::from_secs(5))
+            .await
+            .expect("connect the mock agent")
     }
 
     #[tokio::test]
@@ -2319,6 +2484,62 @@ lab "t" {
         );
     }
 
+    /// A machine the repair verb changed in place is reported diverged
+    /// wherever machine state is (§19.4), and the record survives a daemon
+    /// that reloads the lab's state — divergence outlives the process that
+    /// caused it.
+    ///
+    /// Destroying the machine's disks forgets it, because the divergence
+    /// *was* those disks: what comes back is a clone of the sealed template
+    /// again, running the agent that template baked.
+    #[tokio::test]
+    async fn a_repaired_machine_is_diverged_until_its_disks_are_destroyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let dev01 = FakeMachine::new("dev01", MachineKind::Vm, &sh);
+        let db = FakeMachine::new("db", MachineKind::Container, &sh);
+        let src = r#"import <vmlab.wcl>
+lab "t" {
+  container "dev01" { image = "a:1" }
+  container "db" { image = "b:1" }
+}"#;
+        let lab = lab_of(dir.path(), src, vec![dev01.clone(), db.clone()]);
+
+        let diverged = |status: &LabStatus, name: &str| {
+            status
+                .machines
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .agent_diverged
+        };
+        assert!(
+            !diverged(&lab.status().await, "dev01"),
+            "nothing diverges by itself"
+        );
+
+        lab.record_agent_repair("dev01", "agent=abc")
+            .await
+            .expect("record the repair");
+        let status = lab.status().await;
+        assert!(diverged(&status, "dev01"));
+        assert!(!diverged(&status, "db"), "one machine, not the lab");
+
+        // A second daemon over the same lab directory reads the same answer.
+        let reopened = lab_of(
+            dir.path(),
+            src,
+            vec![
+                FakeMachine::new("dev01", MachineKind::Vm, &sh),
+                FakeMachine::new("db", MachineKind::Container, &sh),
+            ],
+        );
+        assert!(diverged(&reopened.status().await, "dev01"));
+
+        lab.destroy_machine("dev01").await.expect("destroy");
+        assert!(!diverged(&lab.status().await, "dev01"));
+    }
+
     /// `depends_on` gates on readiness identically for both kinds. `web`
     /// depends on `db`, so `db` must be *ready* — not merely started — before
     /// `web` starts, whether `db` is a VM or a container.
@@ -2376,6 +2597,67 @@ lab "t" { container "leaf" { image = "x:1" } }"#,
             start.elapsed() < Duration::from_secs(1),
             "up waited on a machine nothing depends on"
         );
+    }
+
+    /// §19.4's middle rung. `up` warns about a machine whose agent cannot
+    /// serve an attach — by then the features are probed rather than inferred
+    /// — and **brings the lab up anyway**: the facade is a general capability,
+    /// so a machine nothing can attach to is still a perfectly good machine.
+    ///
+    /// The lab holds one of each on purpose: the machine that can serve an
+    /// attach must draw no warning at all, or the warning would be noise the
+    /// developer learns to skip.
+    #[tokio::test]
+    async fn up_warns_about_a_machine_that_cannot_serve_an_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let stale = FakeMachine::with_agent(
+            "stale",
+            MachineKind::Vm,
+            &sh,
+            mock_agent(dir.path().join("stale.sock"), &["terminal", "exec"]).await,
+        );
+        let current = FakeMachine::with_agent(
+            "dev01",
+            MachineKind::Vm,
+            &sh,
+            mock_agent(
+                dir.path().join("dev01.sock"),
+                &["terminal", "exec", "tunnel", "fileops"],
+            )
+            .await,
+        );
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  container "stale" { image = "a:1" }
+  container "dev01" { image = "b:1" }
+}"#,
+            vec![stale.clone(), current.clone()],
+        );
+
+        let (sink, printed) = recording();
+        lab.up(&[], sink)
+            .await
+            .expect("a stale agent must not fail `up`");
+
+        let said = printed.lock().unwrap().join("");
+        let warned: Vec<&str> = said.lines().filter(|l| l.starts_with("warning:")).collect();
+        assert_eq!(warned.len(), 1, "one warning, for one machine: {said:?}");
+        assert!(warned[0].contains("\"stale\""), "{said:?}");
+        assert!(
+            warned[0].contains("serves no `tunnel` and `fileops`"),
+            "{said:?}"
+        );
+        assert!(warned[0].contains("repair-agent stale"), "{said:?}");
+        assert!(
+            !said.contains("dev01"),
+            "the attachable machine drew a warning: {said:?}"
+        );
+        // And it really did come up.
+        assert_eq!(stale.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(current.starts.load(Ordering::SeqCst), 1);
     }
 
     /// `down` runs the waves leaves-first: a dependency outlives the machines

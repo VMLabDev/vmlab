@@ -5,6 +5,7 @@
 //! rest stays crate-internal and is reached via `crate::…` as before.
 
 pub mod agent_asset;
+pub mod attach;
 pub mod cli;
 pub mod config;
 pub mod dev;

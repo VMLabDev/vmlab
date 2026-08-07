@@ -942,3 +942,31 @@ async fn a_missing_guest_asset_fails_the_start() {
     assert_eq!(ctr.state().await, PowerState::Stopped);
     assert!(hv.live_helpers().await.is_empty());
 }
+
+/// **The repair verb is a VM statement** (§19.4). A container micro-VM's agent
+/// lives in the initramfs guest asset this host installed, so it tracks the
+/// running vmlab and cannot go stale — and the verb says exactly that, rather
+/// than implying a container author has a rebuild to perform or quietly doing
+/// nothing.
+///
+/// Asked of the machine, not of its kind: what the verb reads is
+/// [`Machine::agent_origin`], which is why a future machine whose agent also
+/// ships with the host is answered correctly without the verb changing.
+#[tokio::test]
+async fn repairing_a_containers_agent_is_meaningless_and_says_so() {
+    let dirs = Dirs::new();
+    let (ctr, _hv) = container(&dirs, WORKLOAD, Script::healthy());
+    let (cbs, _observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("start");
+
+    let m: Arc<dyn Machine> = ctr.clone();
+    let err = super::agent_repair::repair(&m)
+        .await
+        .expect_err("a container has nothing to repair");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("guest asset"), "{msg}");
+    assert!(msg.contains("cannot go stale"), "{msg}");
+    assert!(!msg.contains("rebuild the template"), "{msg}");
+
+    ctr.stop(true).await.expect("stop");
+}

@@ -131,7 +131,27 @@ cached: boolean,
  * normal. Lab-level, like `cached`: whether this is *the* dev machine
  * depends on what the other machines declare.
  */
-dev: DevStatus | null, } & ({ "kind": "vm" } & VmStatus | { "kind": "container" } & ContainerStatus);
+dev: DevStatus | null, 
+/**
+ * This machine's agent can serve an attach right now (§19.4):
+ * [`crate::attach::attachable`] over the features it advertised at
+ * handshake, and so `false` for a machine that is down or whose agent
+ * has not answered. The projection carries it so the console and the
+ * `dev` verbs do not each re-derive it, and `vmlab dev attach` has one
+ * thing to wait for.
+ */
+attachable: boolean, 
+/**
+ * A vmlab verb deliberately changed this machine's guest content in
+ * place, so the template's sealed metadata no longer describes what is
+ * running (§19.4). Today only `vmlab machine repair-agent` sets it, and
+ * nothing sets it by itself.
+ *
+ * Lab-level, like `cached`: divergence is recorded in the lab's own
+ * state beside the machine's MACs and snapshot records, and is forgotten
+ * with the artefacts a `destroy` removes.
+ */
+agent_diverged: boolean, } & ({ "kind": "vm" } & VmStatus | { "kind": "container" } & ContainerStatus);
 
 /**
  * One NIC's addressing.

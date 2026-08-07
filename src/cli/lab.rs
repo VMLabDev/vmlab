@@ -313,15 +313,19 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "  {:<name_w$} {:<8} {:<ws_w$} GUEST WORKSPACE",
-            "DEV", "DEFAULT", "WORKSPACE"
+            "  {:<name_w$} {:<8} {:<7} {:<ws_w$} GUEST WORKSPACE",
+            "DEV", "DEFAULT", "ATTACH", "WORKSPACE"
         );
         for (m, dev) in &devs {
+            // ATTACH is `attachable` (§19.4) — whether this machine's agent
+            // can serve an attach at all, which is the question asked here
+            // and not, ever, whether *your* attach will succeed.
             let _ = writeln!(
                 out,
-                "  {:<name_w$} {:<8} {:<ws_w$} {}",
+                "  {:<name_w$} {:<8} {:<7} {:<ws_w$} {}",
                 m.name,
                 yes_no(dev.default),
+                yes_no(m.attachable),
                 or_dash(dev.workspace.as_deref()),
                 dev.workspace_guest,
             );
@@ -389,11 +393,18 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
 /// built from, plus whatever its kind alone can report.
 fn machine_detail(m: &MachineStatus) -> String {
     let mut detail = format!(
-        "state={} ready={} cached={}",
+        "state={} ready={} cached={} attachable={}",
         m.state,
         yes_no(m.ready),
-        yes_no(m.cached)
+        yes_no(m.cached),
+        yes_no(m.attachable),
     );
+    // Only where it is true: a machine nothing has changed in place is the
+    // ordinary case, and saying so on every line would bury the one that
+    // matters (§19.4).
+    if m.agent_diverged {
+        detail.push_str(" diverged=yes");
+    }
     let mut field = |k: &str, v: String| detail.push_str(&format!(" {k}={v}"));
     match &m.detail {
         MachineDetail::Vm(vm) => {
@@ -1788,11 +1799,11 @@ mod tests {
         assert!(out.contains("DEV"), "got:\n{out}");
         assert!(out.contains("GUEST WORKSPACE"), "got:\n{out}");
         assert!(
-            out.contains("dev01    yes      ./src     C:\\src"),
+            out.contains("dev01    yes      no      ./src     C:\\src"),
             "got:\n{out}"
         );
         assert!(
-            out.contains("buildbox no       ./src     C:\\src"),
+            out.contains("buildbox no       no      ./src     C:\\src"),
             "got:\n{out}"
         );
 
@@ -1802,6 +1813,28 @@ mod tests {
             false,
         );
         assert!(!plain.contains("DEV"), "got:\n{plain}");
+    }
+
+    /// The `ATTACH` column is `attachable` off the projection (§19.4), not a
+    /// second opinion assembled here: a dev machine whose agent serves the
+    /// attach pair reads `yes`, and the one beside it whose agent is stale
+    /// reads `no` while still being listed as a perfectly good machine.
+    #[test]
+    fn the_dev_section_reports_attachable() {
+        use crate::status::fixtures::{attachable, dev};
+        let out = render_status(
+            &lab(vec![
+                dev(
+                    attachable(addressed("dev01", PowerState::Running, true, vm())),
+                    true,
+                ),
+                dev(addressed("stale", PowerState::Running, true, vm()), false),
+            ]),
+            false,
+        );
+        assert!(out.contains("ATTACH"), "got:\n{out}");
+        assert!(out.contains("dev01 yes      yes"), "got:\n{out}");
+        assert!(out.contains("stale no       no"), "got:\n{out}");
     }
 
     /// `--verbose` is where the raw power state went when `STATE`/`READY`
@@ -1817,14 +1850,35 @@ mod tests {
         );
         assert!(
             out.contains(
-                "state=running ready=no cached=yes arch=x86_64 cpus=4 memory=8GiB agent=0.1.0"
+                "state=running ready=no cached=yes attachable=no arch=x86_64 cpus=4 \
+                 memory=8GiB agent=0.1.0"
             ),
             "got:\n{out}"
         );
         assert!(
-            out.contains("state=stopping ready=no cached=yes health=- exit=-"),
+            out.contains("state=stopping ready=no cached=yes attachable=no health=- exit=-"),
             "got:\n{out}"
         );
+    }
+
+    /// A machine a repair verb changed in place says so wherever its state is
+    /// reported (§19.4) — and a machine nothing has touched, which is every
+    /// other machine, says nothing rather than carrying `diverged=no` on every
+    /// line.
+    #[test]
+    fn verbose_names_a_diverged_machine_and_only_that_one() {
+        let mut diverged = addressed("dev01", PowerState::Running, true, vm());
+        diverged.agent_diverged = true;
+        let out = render_status(
+            &lab(vec![
+                diverged,
+                addressed("dc01", PowerState::Running, true, vm()),
+            ]),
+            true,
+        );
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("state=")).collect();
+        assert!(lines[0].contains("diverged=yes"), "got:\n{out}");
+        assert!(!lines[1].contains("diverged"), "got:\n{out}");
     }
 
     /// A machine with no address reads as `-` rather than shifting the columns.

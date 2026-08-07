@@ -3,6 +3,7 @@
 //! events. One process per running lab, spawned and reaped by the
 //! supervisor; the CLI talks to it directly for lab-scoped operations.
 
+pub mod agent_repair;
 pub mod container;
 pub mod container_ctl;
 pub mod display;
@@ -276,6 +277,65 @@ fn logon_for(
 /// serves.
 fn on_machine<T>(machine: &str, r: Result<T, CommandError>) -> Result<T, CommandError> {
     r.map_err(|e| e.prefixed(machine))
+}
+
+/// The agent channel an attach is served over, or §19.4's hard failure.
+///
+/// **The top rung of the ladder.** A machine with no agent answering cannot
+/// serve an attach *at all* — not a shell, not a file, not a forward — so the
+/// connection is refused whole rather than degraded per channel, and it is
+/// refused in the same words a stale agent's `sftp` is: what is missing, and
+/// both remedies. A template built with `agent = false` arrives here, which is
+/// how it "fails attach through the same path" as one whose agent is merely
+/// old.
+///
+/// A machine that is simply **not running** gets its own reason back
+/// unchanged: nothing about rebuilding a template helps a machine that is off,
+/// and telling someone to do it would be the ladder's words in the one place
+/// they are wrong.
+async fn attach_agent_of(
+    m: &Arc<dyn crate::labd::machine::Machine>,
+    name: &str,
+) -> Result<vm_agent::AgentHandle, CommandError> {
+    let origin = m.agent_origin();
+    m.agent()
+        .await
+        .map_err(|e| CommandError::failed(attach_failure(name, origin, &e)))
+}
+
+/// What an attach that could not reach an agent says, given why — and given
+/// where this machine's agent came from.
+///
+/// Split out from [`attach_agent_of`] because *which* reason earns §19.4's
+/// remedies is the decision worth pinning, and both exceptions are about
+/// remedies that would not be true:
+///
+/// - a machine that is simply **not running** gets its own reason back
+///   unchanged, because nothing about rebuilding a template helps a machine
+///   that is off;
+/// - a machine whose agent **ships with the host** has neither remedy — there
+///   is no artefact to rebuild and nothing to push — so it is told what its
+///   silence actually means rather than being sent after a rebuild it does not
+///   have to perform.
+fn attach_failure(
+    machine: &str,
+    origin: crate::labd::machine::AgentOrigin,
+    e: &anyhow::Error,
+) -> String {
+    use crate::labd::machine::{AgentOrigin, AgentUnavailable};
+    let reason = format!("{e:#}");
+    match (AgentUnavailable::of(e), origin) {
+        (Some(AgentUnavailable::NotRunning(_)) | None, _) => reason,
+        (Some(_), AgentOrigin::HostAsset) => format!(
+            "{reason}\n\"{machine}\": its agent comes with this host's vmlab rather than with \
+             anything it boots, so there is nothing to rebuild or repair — an agent that is \
+             not answering here is a machine to restart, or a guest asset to reinstall (§19.4)"
+        ),
+        (Some(_), AgentOrigin::Image) => format!(
+            "{reason}\n{}",
+            crate::attach::refusal(Some(machine), "an attach", &crate::attach::ATTACH_FEATURES)
+        ),
+    }
 }
 
 /// The agent channel of the addressed machine.
@@ -580,7 +640,7 @@ impl Handler<LabRequest> for LabdHandler {
             // it, so nothing listens on the host and no port is leased.
             LabRequest::MachineSshOpen { machine } => {
                 let m = machine_of(lab, &machine)?;
-                let agent = m.agent().await?;
+                let agent = attach_agent_of(&m, &machine).await?;
                 let labels: Vec<String> = m.logins().iter().map(|l| l.label.clone()).collect();
                 let key = ssh::host_key::load_or_mint(&lab.name, m.name(), &labels)
                     .map_err(|e| CommandError::failed(format!("{e:#}")))?;
@@ -596,6 +656,20 @@ impl Handler<LabRequest> for LabdHandler {
                 let path = m.ssh_session_sock(rand::random());
                 ssh::expose_ssh_socket(spec, agent, path.clone()).await?;
                 Ok(json!({"path": path}))
+            }
+            // Rebuild is policy, repair is a tool (§19.4). It is a command
+            // and never a reflex: nothing else in the daemon calls this, and
+            // a machine it succeeds on is diverged from what it was built
+            // from until its disks are destroyed.
+            LabRequest::MachineRepairAgent { machine } => {
+                let m = machine_of(lab, &machine)?;
+                let report = agent_repair::repair(&m)
+                    .await
+                    .map_err(|e| CommandError::failed(format!("{e:#}")))?;
+                lab.record_agent_repair(&machine, &report.pushed)
+                    .await
+                    .map_err(|e| CommandError::failed(format!("{e:#}")))?;
+                Ok(serde_json::to_value(report).unwrap_or_default())
             }
             LabRequest::MachineTtyResize {
                 machine,
@@ -897,9 +971,58 @@ impl Handler<LabRequest> for LabdHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::handler_matches;
+    use super::{attach_failure, handler_matches};
     use crate::config::model::Handler;
+    use crate::labd::machine::{AgentOrigin, AgentUnavailable};
     use std::path::PathBuf;
+
+    fn no_agent_answered(machine: &str) -> anyhow::Error {
+        anyhow::Error::from(AgentUnavailable::Handshake {
+            machine: machine.into(),
+            message: "no vmlab-agent answered on the agent channel".into(),
+        })
+    }
+
+    /// §19.4's top rung. A machine whose agent never answered — a template
+    /// built with `agent = false`, or one whose agent is gone — cannot serve
+    /// an attach at all, and fails hard naming **both** remedies: the same
+    /// words, through the same path, as a stale agent's refused `sftp`.
+    #[test]
+    fn an_attach_with_no_agent_answering_fails_naming_both_remedies() {
+        let said = attach_failure("dev01", AgentOrigin::Image, &no_agent_answered("dev01"));
+        assert!(said.contains("no vmlab-agent answered"), "{said}");
+        assert!(said.contains("rebuild the template"), "{said}");
+        assert!(said.contains("repair-agent dev01"), "{said}");
+
+        // A vintage guest with no agent channel at all is the same answer:
+        // not attachable, and told what would change that.
+        let vintage = anyhow::Error::from(AgentUnavailable::NoChannel("dos".into()));
+        assert!(attach_failure("dos", AgentOrigin::Image, &vintage).contains("repair-agent dos"));
+    }
+
+    /// …but a machine that is simply off is told it is off. Nothing about
+    /// rebuilding a template helps a stopped machine, and saying it would be
+    /// the ladder's words in the one place they are wrong.
+    #[test]
+    fn an_attach_on_a_stopped_machine_is_not_told_to_rebuild_anything() {
+        let stopped = anyhow::Error::from(AgentUnavailable::NotRunning("dev01".into()));
+        let said = attach_failure("dev01", AgentOrigin::Image, &stopped);
+        assert_eq!(said, "dev01: not running");
+    }
+
+    /// Neither remedy exists for a machine whose agent ships with the host: a
+    /// container micro-VM has no artefact to rebuild and nothing to push into
+    /// it, so sending its author after either would be the ladder's words in
+    /// the second place they are wrong (§19.4).
+    #[test]
+    fn an_attach_to_a_silent_container_is_told_what_its_silence_means() {
+        let said = attach_failure("web", AgentOrigin::HostAsset, &no_agent_answered("web"));
+        assert!(said.contains("no vmlab-agent answered"), "{said}");
+        assert!(said.contains("nothing to rebuild or repair"), "{said}");
+        assert!(!said.contains("rebuild the template"), "{said}");
+        assert!(!said.contains("repair-agent"), "{said}");
+        assert!(said.contains("guest asset"), "{said}");
+    }
 
     #[test]
     fn event_handler_target_filter_is_optional_and_exact() {

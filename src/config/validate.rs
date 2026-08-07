@@ -1650,6 +1650,33 @@ lab "l" {
         assert_eq!(issue.span.map(|s| s.offset()), Some(second));
     }
 
+    /// §19.4's bottom rung: **`validate` says nothing about agent
+    /// capability.** It is a config check with no side effects, and the only
+    /// statically available signal is the template's sealed `agent_version` —
+    /// a free-form string, so comparing it is *inference*, which the
+    /// capability doctrine rejects, and it would be `validate`'s first
+    /// guest-content check. A dev machine on a template that records an
+    /// ancient agent, or none at all, validates clean; the failure lands at
+    /// `up` (a warning) and at attach (hard).
+    #[test]
+    fn validate_says_nothing_about_agent_capability() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  @dev(default = true) vm "dev01" { template = "x86_64/t" }
+}"#;
+        for agent_version in [None, Some("agent=ancient".to_string())] {
+            let ctx = Hardware::with_meta(TemplateMeta {
+                agent_version,
+                ..blank_meta("x86_64", "t", None)
+            });
+            let issues: Vec<String> = hw_errs(&ctx, src);
+            assert!(
+                issues.is_empty(),
+                "validate grew a guest-content check: {issues:#?}"
+            );
+        }
+    }
+
     /// Everything else about `@dev` is legal: any number of dev machines,
     /// none or one declaring the default, and a bare `@dev` on either kind.
     #[test]
