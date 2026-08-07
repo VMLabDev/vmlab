@@ -30,9 +30,11 @@ machine) cache and `exec`/`shell`'s `--user`/`--password` — and the **Linux
 session** (#83): `su -l` where the guest has PAM, `setuid` where it does not,
 plus the container floor. **The SSH facade serves a shell** (#87,
 §19.3/ADR-0012): `machine.ssh_open` + `vmlab ssh-proxy`, `none` auth over a
-label selector, and the `session` vocabulary onto agent terminals and execs —
-SFTP (#88) and `direct-tcpip` (#89) refuse by name until their own tickets
-land.
+label selector, and the `session` vocabulary onto agent terminals and execs.
+**`direct-tcpip` rides the agent tunnel** (#89), so `ssh -D`/`-W` reach a
+guest port with no guest network involved and a failed dial answers
+`SSH_OPEN_CONNECT_FAILED` rather than the prohibited code; SFTP (#88) still
+refuses by name until its own ticket lands.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;

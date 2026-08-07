@@ -1,23 +1,24 @@
-//! One SSH connection, and the agent channels its `session` channels ride.
+//! One SSH connection, and the agent channels its channels ride.
 //!
 //! Every SSH request the facade answers turns into something the agent
 //! already does: `shell` into `OpenTerminal`, `exec` into `OpenExec` (or
 //! into a terminal hosting the command, where the client asked for one),
-//! `window-change` into `Resize`, and the agent's exit code into
-//! `exit-status`. Everything else is refused — see [`super`] for the one
-//! invariant that decides which.
+//! `window-change` into `Resize`, `direct-tcpip` into `OpenTunnel`, and the
+//! agent's exit code into `exit-status`. Everything else is refused — see
+//! [`super`] for the one invariant that decides which.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use russh::server::{Auth, Handler, Msg, Session};
-use russh::{Channel, ChannelId, Disconnect, Pty};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, Pty};
 use tokio::sync::{mpsc, watch};
 
 use super::FacadeSpec;
 use crate::labd::guest_os::GuestOs;
 use crate::labd::identity;
-use crate::labd::vm_agent::{AgentHandle, AgentSession, Logon, SessionEvent};
+use crate::labd::vm_agent::{AgentHandle, AgentSession, Logon, SessionEvent, TunnelError};
+use crate::sync::LockRecover;
 
 /// How many chunks of client bytes may be in flight towards the agent.
 ///
@@ -40,12 +41,14 @@ enum ToGuest {
     Resize(u16, u16),
 }
 
-/// One `session` channel, from open to `shell`/`exec`.
+/// One channel a client opened, and the way to the agent channel behind it.
 ///
-/// `pty-req` and `env` arrive *before* the request that starts anything, so
-/// what they carry waits here until it does.
+/// A `session` starts empty and gains its way to the guest at `shell` or
+/// `exec`; `pty-req` and `env` arrive *before* that request, so what they
+/// carry waits here until it does. A `direct-tcpip` has neither — it is
+/// wired up at open, and nothing else ever applies to it.
 #[derive(Default)]
-struct SessionChannel {
+struct ClientChannel {
     size: Option<(u16, u16)>,
     env: Vec<(String, String)>,
     to_guest: Option<mpsc::Sender<ToGuest>>,
@@ -62,7 +65,10 @@ pub struct Facade {
     /// over, and this is what the developer is told. While it is set nothing
     /// is ever served — see `auth_none`.
     refusal: Option<String>,
-    channels: HashMap<ChannelId, SessionChannel>,
+    /// Shared because a tunnel's dial runs off the session loop and has to
+    /// retire its own entry when it fails — the only channel open the facade
+    /// answers from somewhere other than the handler itself.
+    channels: Arc<Mutex<HashMap<ChannelId, ClientChannel>>>,
     handle: watch::Receiver<Option<russh::server::Handle>>,
 }
 
@@ -77,7 +83,7 @@ impl Facade {
             agent,
             logon: None,
             refusal: None,
-            channels: HashMap::new(),
+            channels: Arc::new(Mutex::new(HashMap::new())),
             handle,
         }
     }
@@ -97,6 +103,22 @@ impl Facade {
             .clone()
     }
 
+    /// Refuse a channel open in vmlab's own words, and record it.
+    ///
+    /// A channel open failure is the one refusal SSH lets vmlab put text on,
+    /// so both halves of §19.3's answer happen here: the developer's client
+    /// is told, and the lab event log keeps it from being visible only in one
+    /// terminal.
+    async fn refuse_open(
+        &self,
+        request: &str,
+        reason: &str,
+        reply: russh::server::ChannelOpenHandle,
+    ) {
+        reply.reject(prohibited(reason)).await;
+        self.spec.refused(request, reason);
+    }
+
     /// Record a request refused because serving it would need a channel the
     /// facade opens — the one thing ADR-0013 says it never does. See
     /// [`no_channel_for`].
@@ -114,18 +136,22 @@ impl Facade {
         session: &mut Session,
         start: Start,
     ) -> Result<(), russh::Error> {
-        let Some(chan) = self.channels.get_mut(&channel) else {
+        let prepared = {
+            let mut channels = self.channels.lock_recover();
+            match channels.get_mut(&channel) {
+                // One shell or one command per channel; a second request on
+                // a started channel is a client bug, not something to race,
+                // and a `direct-tcpip` was started at its open.
+                Some(chan) if chan.to_guest.is_none() => {
+                    Some((chan.size, std::mem::take(&mut chan.env)))
+                }
+                _ => None,
+            }
+        };
+        let Some((pty, env)) = prepared else {
             session.channel_failure(channel)?;
             return Ok(());
         };
-        if chan.to_guest.is_some() {
-            // One shell or one command per channel; a second request on a
-            // started channel is a client bug, not something to race.
-            session.channel_failure(channel)?;
-            return Ok(());
-        }
-        let pty = chan.size;
-        let env = std::mem::take(&mut chan.env);
 
         let agent = self.agent.clone();
         let logon = self.logon.clone();
@@ -142,12 +168,12 @@ impl Facade {
         };
 
         let (tx, rx) = mpsc::channel(INFLIGHT_CHUNKS);
-        if let Some(chan) = self.channels.get_mut(&channel) {
+        if let Some(chan) = self.channels.lock_recover().get_mut(&channel) {
             chan.to_guest = Some(tx);
         }
         session.channel_success(channel)?;
         if let Some(handle) = self.handle().await {
-            tokio::spawn(pump(agent_session, rx, handle, channel));
+            tokio::spawn(pump(agent_session, rx, handle, channel, Carries::Session));
         }
         Ok(())
     }
@@ -156,11 +182,12 @@ impl Facade {
     /// started — a client may send data before `shell`, and dropping it is
     /// the honest answer when there is nothing to receive it.
     async fn forward(&mut self, channel: ChannelId, msg: ToGuest) {
-        if let Some(tx) = self
+        let to_guest = self
             .channels
+            .lock_recover()
             .get(&channel)
-            .and_then(|chan| chan.to_guest.clone())
-        {
+            .and_then(|chan| chan.to_guest.clone());
+        if let Some(tx) = to_guest {
             let _ = tx.send(msg).await;
         }
     }
@@ -236,6 +263,30 @@ fn no_channel_for(what: &str, channel_type: &str) -> String {
     )
 }
 
+/// vmlab refusing the open, in its own words.
+///
+/// A channel open failure is the one refusal SSH lets vmlab put text on, so
+/// the reason travels with the code rather than only reaching the lab event
+/// log. `Other` carries the description; the code is unchanged, so a client
+/// reads it as the `ADMINISTRATIVELY_PROHIBITED` it is.
+fn prohibited(reason: &str) -> ChannelOpenFailure {
+    with_words(ChannelOpenFailure::AdministrativelyProhibited, reason)
+}
+
+/// The guest dialled and nothing answered — which is *not* a refusal, and
+/// must not be dressed as one: a SOCKS client has to tell "nothing is
+/// listening" from "vmlab refused you", and only the code says which.
+fn connect_failed(reason: &str) -> ChannelOpenFailure {
+    with_words(ChannelOpenFailure::ConnectFailed, reason)
+}
+
+fn with_words(failure: ChannelOpenFailure, reason: &str) -> ChannelOpenFailure {
+    ChannelOpenFailure::Other {
+        code: failure.code(),
+        reason: reason.to_string(),
+    }
+}
+
 /// The argv that runs one client-sent command line through a shell in the
 /// guest.
 ///
@@ -260,6 +311,20 @@ fn shell_command(guest_os: GuestOs, line: &str) -> Vec<String> {
     }
 }
 
+/// What a channel carries, which is the whole of the difference between the
+/// two channel types the facade answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carries {
+    /// A `session`: stdout and stderr are separate streams and the guest's
+    /// exit code is an `exit-status`.
+    Session,
+    /// A `direct-tcpip`: one byte stream each way and nothing else. Whatever
+    /// rides it is the client's own protocol — a SOCKS conversation, an
+    /// editor's — so vmlab never writes a word of its own into it, and there
+    /// is no exit code to report because a TCP connection does not have one.
+    Tunnel,
+}
+
 /// Carry one channel both ways until either end finishes.
 ///
 /// The agent session lives here and nowhere else: one owner, no lock, and
@@ -270,6 +335,7 @@ async fn pump(
     mut from_client: mpsc::Receiver<ToGuest>,
     handle: russh::server::Handle,
     channel: ChannelId,
+    carries: Carries,
 ) {
     loop {
         tokio::select! {
@@ -295,17 +361,21 @@ async fn pump(
                         break;
                     }
                 }
-                Some(SessionEvent::Stderr(bytes)) => {
-                    // Extended data code 1 is stderr; nothing else is
-                    // defined, and `ssh` splits on exactly this.
+                // Extended data code 1 is stderr; nothing else is defined,
+                // and `ssh` splits on exactly this. A tunnel has no second
+                // stream and the agent never gives it one.
+                Some(SessionEvent::Stderr(bytes)) if carries == Carries::Session => {
                     if handle.extended_data(channel, 1, bytes).await.is_err() {
                         break;
                     }
                 }
+                Some(SessionEvent::Stderr(_)) => {}
                 Some(SessionEvent::Eof) => {
+                    // On a tunnel this is the guest peer's FIN, and the
+                    // channel stays open the other way for it (§19.5).
                     let _ = handle.eof(channel).await;
                 }
-                Some(SessionEvent::Exited(code)) => {
+                Some(SessionEvent::Exited(code)) if carries == Carries::Session => {
                     // `exit-status` and never `exit-signal`: the agent
                     // reports `128 + signal` rather than a signal name, so
                     // `ssh guest 'kill -9 $$'` reports 137 — the honest
@@ -319,8 +389,18 @@ async fn pump(
                     let _ = handle.close(channel).await;
                     return;
                 }
-                Some(SessionEvent::Error(e)) => {
+                // A tunnel has no exit code, so an agent that somehow sends
+                // one is simply the connection ending.
+                Some(SessionEvent::Exited(_)) => break,
+                Some(SessionEvent::Error(e)) if carries == Carries::Session => {
                     let _ = handle.extended_data(channel, 1, format!("vmlab: {e}\n")).await;
+                    break;
+                }
+                // The same failure on a tunnel is only a closed channel:
+                // writing vmlab's words into it would corrupt the bytes
+                // whatever rides it is in the middle of.
+                Some(SessionEvent::Error(e)) => {
+                    tracing::debug!(error = %e, "the guest end of a tunnel failed");
                     break;
                 }
                 None => break,
@@ -397,9 +477,9 @@ impl Handler for Facade {
         Ok(())
     }
 
-    /// `session`, and no other channel type is opened by a client the facade
-    /// serves. `direct-tcpip` joins it when the guest tunnel lands (#89);
-    /// everything else is refused by the invariant.
+    /// `session` and `direct-tcpip` are the two channel types a client the
+    /// facade serves ever opens; everything else is refused by the
+    /// invariant.
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
@@ -411,30 +491,36 @@ impl Handler for Facade {
         // reaching here at all means a client that ignored it. A channel
         // open failure is the one refusal that carries a description, so it
         // says the same thing rather than failing blankly.
-        if let Some(refusal) = &self.refusal {
-            let refusal = refusal.clone();
-            reply
-                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
-            self.spec.refused("session", &refusal);
+        if let Some(refusal) = self.refusal.clone() {
+            self.refuse_open("session", &refusal, reply).await;
             return Ok(());
         }
         // Many `session` channels per connection are expected, not a
         // surprise: `ControlMaster` exists to put them there, and an editor
         // opens one per terminal it shows.
         self.channels
-            .insert(channel.id(), SessionChannel::default());
+            .lock_recover()
+            .insert(channel.id(), ClientChannel::default());
         reply.accept().await;
         Ok(())
     }
 
-    /// `direct-tcpip` is the second channel type the facade will answer —
-    /// VS Code rides its whole protocol over `ssh -T -D` — and it lands with
-    /// the agent tunnel (#89). Until then it is refused by name rather than
-    /// silently, so an editor that needs it fails legibly.
+    /// `direct-tcpip` onto the agent's tunnel: the guest dials, and the
+    /// channel is that connection's byte pipe (§19.5).
+    ///
+    /// Mandatory rather than a convenience. VS Code runs `ssh -T -D <port>`
+    /// and rides its *entire* protocol over that SOCKS forward, so refusing
+    /// this does not degrade the editor — it breaks it.
+    ///
+    /// The destination crosses verbatim, name and all, because the guest's
+    /// own resolver is what turns it into an address — which is what makes a
+    /// SOCKS request for a hostname mean what the developer meant. No
+    /// destination policy applies to it: a dynamic forward dials whatever the
+    /// developer's tooling asks for, and vmlab is not a security boundary
+    /// (§1.2).
     async fn channel_open_direct_tcpip(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         host_to_connect: &str,
         port_to_connect: u32,
         _originator_address: &str,
@@ -442,15 +528,102 @@ impl Handler for Facade {
         reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.spec.refused(
-            "direct-tcpip",
-            &format!(
-                "this vmlab does not forward {host_to_connect}:{port_to_connect} into the guest yet"
-            ),
+        // The same backstop a `session` gets, for the same reason.
+        if let Some(refusal) = self.refusal.clone() {
+            self.refuse_open("direct-tcpip", &refusal, reply).await;
+            return Ok(());
+        }
+        let host = host_to_connect.to_string();
+        let Ok(port) = u16::try_from(port_to_connect) else {
+            // Nothing can be listening outside the TCP port range, which
+            // makes this a failed connect rather than something vmlab
+            // refuses.
+            reply
+                .reject(connect_failed(&format!(
+                    "{host}:{port_to_connect} is not a TCP port"
+                )))
+                .await;
+            return Ok(());
+        };
+
+        // The dial runs off the session loop, because it is the one thing
+        // here that takes seconds: the guest resolves the name and connects,
+        // and a dead destination spends the agent's whole dial budget.
+        // Holding the loop for that would freeze every other channel on the
+        // connection — and `ssh -D` puts one there per TCP connection the
+        // developer's tooling makes.
+        //
+        // The channel's entry is made *here* rather than in the task, so the
+        // first `data` after the client sees the confirmation always finds
+        // somewhere to go; the task retires it again if the dial fails,
+        // since a rejected channel is never closed.
+        let id = channel.id();
+        let (tx, rx) = mpsc::channel(INFLIGHT_CHUNKS);
+        self.channels.lock_recover().insert(
+            id,
+            ClientChannel {
+                to_guest: Some(tx),
+                ..ClientChannel::default()
+            },
         );
-        reply
-            .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-            .await;
+
+        let agent = self.agent.clone();
+        let spec = self.spec.clone();
+        // Weak, and never strong: the connection dying drops the `Facade`,
+        // which drops the map, which drops every channel's sender and is
+        // what winds each pump — and its agent channel — down. A strong
+        // handle here would outlive the facade for as long as this tunnel
+        // pumps, and hold *every* other channel's sender open with it.
+        let channels = Arc::downgrade(&self.channels);
+        let handle = self.handle().await;
+        tokio::spawn(async move {
+            match agent.open_tunnel(host.clone(), port).await {
+                Ok(tunnel) => {
+                    reply.accept().await;
+                    if let Some(handle) = handle {
+                        pump(tunnel, rx, handle, id, Carries::Tunnel).await;
+                    }
+                }
+                Err(failure) => {
+                    // A rejected channel is never closed, so the entry the
+                    // dial was given up front is retired here instead —
+                    // unless the connection already went, which retired all
+                    // of them.
+                    if let Some(channels) = channels.upgrade() {
+                        channels.lock_recover().remove(&id);
+                    }
+                    match failure {
+                        // "Nothing is listening" and "vmlab refused you" are
+                        // different answers, and a SOCKS client has to be
+                        // able to tell them apart — so a failed dial is the
+                        // connect-failure code and never the prohibited one,
+                        // which is spent on what vmlab genuinely refuses.
+                        //
+                        // It is deliberately not on the lab event log
+                        // either: a dynamic forward dials whatever it is
+                        // asked to, a closed port is ordinary, and the
+                        // failure's own words reach the client on the open
+                        // failure that carries them.
+                        TunnelError::ConnectFailed(why) => {
+                            tracing::debug!(machine = %spec.machine, %host, port, reason = %why, "a guest dial failed");
+                            reply.reject(connect_failed(&why)).await;
+                        }
+                        // Everything that is not a dial: an agent with no
+                        // `tunnel` — which says so by name, telling the
+                        // developer to rebuild the template or run the
+                        // repair verb, while the shell the facade can still
+                        // serve carries on — and the channel simply never
+                        // coming up. Neither reached a destination, so
+                        // neither may borrow the connect-failure code, and
+                        // the reason travels with the refusal.
+                        TunnelError::Refused(why) => {
+                            reply.reject(prohibited(&why)).await;
+                            spec.refused("direct-tcpip", &why);
+                        }
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
@@ -460,7 +633,7 @@ impl Handler for Facade {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         // Dropping the sender ends the pump, which closes the agent session.
-        self.channels.remove(&channel);
+        self.channels.lock_recover().remove(&channel);
         Ok(())
     }
 
@@ -479,9 +652,13 @@ impl Handler for Facade {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Awaiting the pump here is the backpressure: russh re-grants the
-        // SSH window when this returns, and this returns when the agent has
-        // taken the bytes.
+        // Awaiting the pump here is the backpressure. russh re-grants the
+        // SSH window before it calls this, so the grant is not what waits —
+        // the *reading* is: this returns only once the agent has taken the
+        // bytes, and until it does russh reads nothing more off the
+        // transport. That is what keeps §19.3's coupling: `labd` holds one
+        // chunk, and the client is stopped by TCP rather than by a buffer
+        // the lab daemon grew.
         self.forward(channel, ToGuest::Data(data.to_vec())).await;
         Ok(())
     }
@@ -500,7 +677,7 @@ impl Handler for Facade {
         // The size is all the agent's terminal takes: `TERM` and the mode
         // flags are the guest shell's business, and the agent hosts a real
         // PTY/ConPTY that sets its own sane modes.
-        match self.channels.get_mut(&channel) {
+        match self.channels.lock_recover().get_mut(&channel) {
             Some(chan) => {
                 chan.size = Some((col_width.max(1) as u16, row_height.max(1) as u16));
                 session.channel_success(channel)?;
@@ -520,7 +697,7 @@ impl Handler for Facade {
         variable_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        match self.channels.get_mut(&channel) {
+        match self.channels.lock_recover().get_mut(&channel) {
             Some(chan) => {
                 if super::env_allowed(variable_name) {
                     chan.env
@@ -561,7 +738,7 @@ impl Handler for Facade {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let (cols, rows) = (col_width.max(1) as u16, row_height.max(1) as u16);
-        if let Some(chan) = self.channels.get_mut(&channel) {
+        if let Some(chan) = self.channels.lock_recover().get_mut(&channel) {
             chan.size = Some((cols, rows));
         }
         self.forward(channel, ToGuest::Resize(cols, rows)).await;
