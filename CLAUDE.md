@@ -17,10 +17,11 @@ Consult them for prior art only — the PRD overrides anything they did.
 ## Status
 
 PRD implemented (M1–M6). **§19 (Dev machines) is mostly specified, not built**
-— the SSH facade, machine-level `login {}`, the agent's `fileops` vocabulary
-and the workspace syncer are all spec only; implementation is tracked by
-#78–#98. The agent's `tunnel` (#85) and `watch` (#86) vocabularies (§19.5) are
-built. Module map under `src/`:
+— the SSH facade, the agent's `fileops` vocabulary and the workspace syncer are
+all spec only; implementation is tracked by #78–#98. The agent's `tunnel` (#85)
+and `watch` (#86) vocabularies (§19.5) are built, as is machine-level
+`login {}` (#81) — its declaration, §5.1 rules and `m.logins()` accessor;
+nothing mints a logon from it yet. Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
   `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005)

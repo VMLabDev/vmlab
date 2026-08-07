@@ -706,6 +706,7 @@ mod tests {
                 "share",
                 "media",
                 "web",
+                "login",
                 "provision",
                 "playbook"
             ]

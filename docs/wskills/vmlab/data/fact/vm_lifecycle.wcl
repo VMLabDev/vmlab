@@ -19,8 +19,17 @@ fact vm_lifecycle {
         ["`m.ip_nic(nic: int)`", "`Result[string, string]`", "By NIC index (0-based)"],
         ["`m.is_healthy()`", "`bool`", "Latest healthcheck verdict; a machine declaring none counts healthy once ready"],
         ["`m.logs(lines: int)`", "`Result[string, string]`", "Tail of the console log — a container's captured stdout/stderr, a VM's serial log"],
+        ["`m.logins()`", "`List[Login]`", "The identities the machine declares with `login {}` (§19.2). Read from the lab file, so it answers on a stopped machine"],
       ]
     }
+    p <<PROSE
+`Login` carries `label`, `user`, `password: Option[string]`, `elevated` and
+`default`. Reading it is what lets a provision script create **exactly** the
+account the lab file declares, instead of the password living in two places
+that drift. The secret crosses as written — `none` where the author declared
+none, never an empty string. `elevated` and `default` cross *resolved*, so a
+lone login reports `default == true` without the lab file saying so.
+PROSE
     p <<PROSE
 Inside a machine's **own** first-boot script the readiness pair is special-cased:
 `is_ready()` / `wait_ready()` mean "does the agent answer right now", because the

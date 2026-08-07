@@ -192,6 +192,21 @@ let ex_gpu = <<'WCL'
 gpu { mode = "passthrough" address = "0000:01:00.0" }   // or mode = "virgl" | "vulkan"
 WCL
 
+let ex_login = <<'WCL'
+// Machine-level identity (PRD §19.2). The label is what an SSH username
+// selects; the secret is written plainly, because the lab's own provisioning
+// created the account and already carries the same string.
+// On a Windows-family profile every login needs a `password`. `elevated`
+// (default true) selects the linked token, so one account can be declared
+// twice at two elevations — the labels are what tell them apart, and they
+// must be unique on a machine.
+login "dev"      { user = "PROBE\\dev" password = "vmlab123!" default = true }
+login "dev-user" { user = "PROBE\\dev" password = "vmlab123!" elevated = false }
+// On a Linux-family profile `elevated` is a validation error, and the secret
+// is only needed where something authenticates against it.
+login "ops" { user = "ops" }
+WCL
+
 let ex_provision = <<'WCL'
 // Declared inside the vm/container it configures; runs once that machine is
 // ready, at this position among its steps.
@@ -262,6 +277,7 @@ let example_for = fn(k: utf8) -> list<utf8> {
     "share"     => [ex_share],
     "media"     => [ex_media],
     "gpu"       => [ex_gpu],
+    "login"     => [ex_login],
     "provision" => [ex_provision],
     "on"        => [ex_on],
     "template"  => [ex_template],

@@ -504,6 +504,7 @@ pub static UNFORMED: &[Unformed] = &[
     unformed("vm", "name", LABEL),
     unformed("container", "name", LABEL),
     unformed("web", "name", LABEL),
+    unformed("login", "label", LABEL),
     unformed("provision", "script", LABEL),
     unformed("playbook", "path", LABEL),
     unformed("var", "name", LABEL),
@@ -558,6 +559,13 @@ pub static UNFORMED: &[Unformed] = &[
     unformed("forward", "proto", RAW_ONLY),
     unformed("route", "dest", RAW_ONLY),
     unformed("route", "via", RAW_ONLY),
+    // Identity (§19.2) has no inspector yet: the SSH facade that consumes a
+    // login is not built, so the designer would offer a control for something
+    // no surface reads.
+    unformed("login", "user", RAW_ONLY),
+    unformed("login", "password", RAW_ONLY),
+    unformed("login", "elevated", RAW_ONLY),
+    unformed("login", "default", RAW_ONLY),
     unformed("media", "kind", RAW_ONLY),
     unformed("media", "from", RAW_ONLY),
     unformed("media", "label", RAW_ONLY),

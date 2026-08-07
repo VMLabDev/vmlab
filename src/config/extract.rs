@@ -547,6 +547,24 @@ fn extract_web_auth(b: &Block, page: &str, issues: &mut IssueList) -> Option<Web
     }
 }
 
+/// A machine's `login {}` block (§19.2). `elevated` and `default` stay
+/// optional in the model: both rules that read them ask whether the author
+/// *wrote* the field, not what it would resolve to.
+fn extract_login(b: &Block, issues: &mut IssueList) -> Option<Login> {
+    let mut r = Reader::new(b, issues);
+    let label = r.label();
+    let span = r.span();
+    let user = r.required_string("user");
+    Some(Login {
+        label: label?,
+        user: user?.value,
+        password: r.string("password").unspan(),
+        elevated: r.bool("elevated").unspan(),
+        default: r.bool("default").unspan(),
+        span,
+    })
+}
+
 fn extract_disk_block(b: &Block, issues: &mut IssueList) -> Option<DiskBlock> {
     let mut r = Reader::new(b, issues);
     let name = r.label();
@@ -661,6 +679,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let mut shares = Vec::new();
     let mut media = Vec::new();
     let mut web = Vec::new();
+    let mut logins = Vec::new();
     let mut provisions = Vec::new();
     let mut playbooks = Vec::new();
     for child in r.children() {
@@ -685,6 +704,11 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
             "web" => {
                 if let Some(w) = extract_web(&child, r.issues()) {
                     web.push(w);
+                }
+            }
+            "login" => {
+                if let Some(l) = extract_login(&child, r.issues()) {
+                    logins.push(l);
                 }
             }
             "provision" => {
@@ -727,6 +751,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         shares,
         media,
         web,
+        logins,
         provisions,
         playbooks,
     })
@@ -761,6 +786,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
     let mut ports = Vec::new();
     let mut healthcheck = None;
     let mut web = Vec::new();
+    let mut logins = Vec::new();
     let mut provisions = Vec::new();
     let mut playbooks = Vec::new();
     for child in r.children() {
@@ -785,6 +811,11 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
             "web" => {
                 if let Some(w) = extract_web(&child, r.issues()) {
                     web.push(w);
+                }
+            }
+            "login" => {
+                if let Some(l) = extract_login(&child, r.issues()) {
+                    logins.push(l);
                 }
             }
             "provision" => {
@@ -821,6 +852,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         ports,
         healthcheck,
         web,
+        logins,
         provisions,
         playbooks,
     })
