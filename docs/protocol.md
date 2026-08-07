@@ -108,6 +108,9 @@ the code is the contract.
 | `snapshot.restore` | `name: String`, `machine: Option<String>` | `cli`, `web` | Restore one machine, or every machine when `machine` is omitted. |
 | `snapshot.delete` | `machine: String`, `name: String` | `cli`, `web` | Delete one machine's snapshot. |
 | `snapshot.list` | `machine: String` | `cli`, `web` | One machine's snapshots. |
+| `workspace.flush` | `machine: String` | `cli` | Run a workspace sync pass now and answer with what it decided (PRD §19.6). What `vmlab dev sync flush` and `status --wait` are. |
+| `workspace.resolve` | `machine: String`, `paths: Vec<String>`, `all: bool`, `winner: String` | `cli` | Say which side wins at halted paths, and carry it out (§19.6). `paths` empty with `all` set takes the whole batch — the 30 000-file case is one `.vmlabignore` edit away and nobody is going to type it. |
+| `workspace.diff` | `machine: String`, `paths: Vec<String>` | `cli` | Bring the guest's copy of one workspace path to the host (§19.6). The host copy is a plain directory on the developer's own workstation, so only the *guest* side is behind the seam — which is the whole reason this verb exists rather than "attach and look". |
 | `shutdown` | — | `cli`, `daemon` | Tear the lab daemon down; the reply is sent before it exits. |
 
 ## Coverage
@@ -144,6 +147,9 @@ Deliberate, with the reason recorded beside the declaration:
 - `machine.tail` — An open-ended stream of an arbitrary guest path, which is what a terminal is for. The console follows a machine's console log through `machine.logs`.
 - `machine.eventlog` — A stream into a terminal, for the same reason as `machine.tail`.
 - `playbook.list` — One flat table is the shape a shell wants. The console builds its playbook list from the lab's declarations directly and asks the daemon only which runs are in flight.
+- `workspace.flush` — The console already has the answer: a syncer's report is part of the machine's status projection, which the console polls. What this adds is *waiting for a pass*, which is a terminal's idiom — a page that blocks for up to two minutes on a guest that has stopped answering is a page nobody wants.
+- `workspace.resolve` — §19.6 states it outright: the console reads the halt and does not act on it. Resolution is a per-path judgement about a developer's own working copy, made beside the two directories in question, and the copy that loses is not recoverable from vmlab — which is a decision for a terminal in the lab directory, not a button.
+- `workspace.diff` — It answers with the guest's bytes for a host-side `diff`, whose audience is a terminal. A console showing two versions of a source file is a diff viewer, which is the editor's job — and the editor is already attached into the guest.
 - `version` — What `vmlab daemon status` prints: which build of the supervisor is running on this host, asked by whoever is standing in front of it.
 - `lab.ensure` — Spawning-or-finding a lab daemon belongs in one place, and that place is the helper in `src/cli/daemon.rs` — the web layer calls it rather than asking the supervisor itself. One call site is the decision; the scan reports it as the CLI because that is where the helper lives.
 - `lab.release` — The other half of `lab.ensure`, and a shell's alone: a command finishes and gives the daemon back. The console does not finish, and leaves it up for the next request.

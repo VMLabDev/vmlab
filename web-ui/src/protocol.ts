@@ -95,6 +95,9 @@ export type LabCommand =
   | "snapshot.restore"
   | "snapshot.delete"
   | "snapshot.list"
+  | "workspace.flush"
+  | "workspace.resolve"
+  | "workspace.diff"
   | "shutdown"
 ;
 

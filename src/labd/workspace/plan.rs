@@ -30,12 +30,20 @@
 //!
 //! The asymmetries that *are* real live outside the matrix, and there are two.
 //! **Deletion guards**: host→guest deletes are unguarded, because the guest
-//! copy is the reconstructible one, where a guest→host bulk delete is what the
-//! halt (#96) exists to catch. And **a directory delete expands via the
-//! ledger**: the two platforms disagree on whether a delete reports its
-//! children, so the expansion is the ledger's list of what was agreed to be in
-//! there — which falls out here for free, because every ledger path is
-//! reconciled on every pass whether or not anything mentioned it.
+//! copy is the reconstructible one, where a guest→host bulk delete is
+//! [withheld](BulkDelete) past a proportion with a floor — the guard is about
+//! *mass*, so a single deletion still propagates. And **a directory delete
+//! expands via the ledger**: the two platforms disagree on whether a delete
+//! reports its children, so the expansion is the ledger's list of what was
+//! agreed to be in there — which falls out here for free, because every ledger
+//! path is reconciled on every pass whether or not anything mentioned it.
+//!
+//! **A resolution is an input, not an act** (§19.6). `vmlab dev sync resolve`
+//! does not move a file; it records which side wins at a path, and the next
+//! reconciliation turns that path's conflict into the ordinary one-sided
+//! propagation the winner's change would have been. So every resolution route
+//! is decided by the same matrix as everything else, and the two routes cannot
+//! disagree about what "the host wins" means.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -160,6 +168,16 @@ impl Action {
             | Action::Remove { direction, .. } => *direction,
         }
     }
+
+    /// How much this action moves across the seam — the **moving** side's own
+    /// size, since that is the copy being read. A directory and a removal move
+    /// nothing.
+    fn bytes(&self) -> u64 {
+        match self {
+            Action::PutFile { side, .. } | Action::PutSymlink { side, .. } => side.size,
+            Action::MakeDir { .. } | Action::Remove { .. } => 0,
+        }
+    }
 }
 
 /// Why two sides cannot both be right.
@@ -193,6 +211,139 @@ impl std::fmt::Display for ConflictKind {
 pub struct Conflict {
     pub path: String,
     pub kind: ConflictKind,
+}
+
+/// Which side a developer said wins at a halted path (§19.6).
+///
+/// The two named routes; the third needs no verb and no value — making both
+/// sides identical by hand lands in [`Settled::Adopt`] on the next pass, which
+/// is why it costs nothing to offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Winner {
+    /// The canonical copy wins: carry it into the guest.
+    Host,
+    /// The guest's working copy wins: carry it onto the canonical copy. This
+    /// is also what releases a withheld [`BulkDelete`].
+    Guest,
+}
+
+impl Winner {
+    /// The spelling the wire and the CLI flag share, so neither invents one.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Winner::Host => "host",
+            Winner::Guest => "guest",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Winner> {
+        match word {
+            "host" => Some(Winner::Host),
+            "guest" => Some(Winner::Guest),
+            _ => None,
+        }
+    }
+}
+
+/// Guest→host deletions withheld because there are too many of them (§19.6).
+///
+/// **The guards on deletion are asymmetric on purpose, because the two sides
+/// are not equally valuable**: the guest is reconstructible and the host is
+/// not, so a `git checkout` removing 400 guest-side files just removes them
+/// where the same mass arriving from the guest stops the workspace. This does
+/// not exist for deliberate deletion — a single deletion propagates
+/// immediately, and so does any batch under the floor — it exists for the
+/// guest doing something catastrophic and the syncer faithfully replicating it
+/// onto the copy nothing re-derives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkDelete {
+    /// Every path that would have been removed from the canonical copy.
+    pub paths: Vec<String>,
+    /// How many paths the ledger held agreement about, which is what the
+    /// proportion is *of*.
+    pub agreed: usize,
+}
+
+/// The floor: below this many paths a deletion is ordinary work whatever the
+/// repository's size, so a bare proportion — which would let a ten-file
+/// project lose everything — never fires on its own.
+pub const BULK_DELETE_FLOOR: usize = 20;
+
+/// The proportion: above the floor, the question is whether *most* of what the
+/// two sides had agreed just vanished, which is what an `rm -rf` in the
+/// workspace looks like and what deleting a feature's directory does not.
+pub const BULK_DELETE_PROPORTION: f64 = 0.5;
+
+impl BulkDelete {
+    /// Whether this many guest→host removals, against this much agreement, is
+    /// mass rather than work.
+    fn triggered(removals: usize, agreed: usize) -> bool {
+        removals > BULK_DELETE_FLOOR && removals as f64 > agreed as f64 * BULK_DELETE_PROPORTION
+    }
+}
+
+impl std::fmt::Display for BulkDelete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the guest deleted {} of the {} paths this workspace had agreed on, which is a rewrite \
+             of the canonical copy rather than an edit: nothing was removed on the host",
+            self.paths.len(),
+            self.agreed,
+        )
+    }
+}
+
+/// One pass carrying an unusual amount of work, under one subtree (§19.6).
+///
+/// **Volume warns and continues; it never halts.** The distinction is what the
+/// two guards are *for*: the size guard refuses because a 4 GB `.vhdx` is
+/// unwanted work, where a build burst is wanted work that happens to be large.
+/// Halting here would let a `cargo build` into an un-ignored `target/` stop the
+/// dev machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Volume {
+    /// The subtree the work is concentrated in — the deepest prefix that still
+    /// holds nearly all of it, so the rule it suggests is the rule a developer
+    /// would actually write. Empty means the work is spread across the whole
+    /// workspace, where no one rule would help.
+    pub prefix: String,
+    pub paths: usize,
+    pub bytes: u64,
+}
+
+/// How many paths in one pass make a burst worth a word.
+pub const VOLUME_PATHS: usize = 1_000;
+
+/// …or how many bytes.
+pub const VOLUME_BYTES: u64 = 256 << 20;
+
+/// How much of a directory's volume one child has to hold for the warning to
+/// point at the child instead — which is what turns `crates` into
+/// `crates/api/target`.
+const VOLUME_DOMINANT: f64 = 0.9;
+
+impl std::fmt::Display for Volume {
+    /// Names the path and suggests the rule, because a warning about volume
+    /// that does not say what to ignore is a warning nobody can act on.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mib = self.bytes / (1 << 20);
+        if self.prefix.is_empty() {
+            return write!(
+                f,
+                "this pass is carrying {} paths ({mib} MiB) spread across the whole workspace — \
+                 syncing continues, but a burst this size is usually build output that wants a \
+                 .vmlabignore rule",
+                self.paths,
+            );
+        }
+        write!(
+            f,
+            "this pass is carrying {} paths ({mib} MiB) under {} — syncing continues, and adding \
+             `{}/` to .vmlabignore makes that subtree guest-owned if it is build output",
+            self.paths, self.prefix, self.prefix,
+        )
+    }
 }
 
 /// A file the size guard refuses, **before** transfer. Per file, so the
@@ -272,10 +423,17 @@ pub struct Plan {
     /// guest-owned.
     pub forget: Vec<String>,
     pub conflicts: Vec<Conflict>,
+    /// Guest→host removals the mass guard withheld. They are **not** in
+    /// `actions`: nothing is deleted from the canonical copy until a developer
+    /// says so.
+    pub bulk_delete: Option<BulkDelete>,
     pub oversize: Vec<Oversize>,
     /// Host paths a case-folding guest cannot hold apart. Nothing is
     /// transferred for any of them.
     pub collisions: Vec<Collision>,
+    /// An unusual amount of work in one pass, if there was any. A warning and
+    /// nothing else — every action it counted is still in `actions`.
+    pub volume: Option<Volume>,
 }
 
 impl Plan {
@@ -285,8 +443,38 @@ impl Plan {
             && self.adopt.is_empty()
             && self.forget.is_empty()
             && self.conflicts.is_empty()
+            && self.bulk_delete.is_none()
             && self.oversize.is_empty()
             && self.collisions.is_empty()
+    }
+
+    /// Whether this reconciliation stops the workspace (§19.6) — a conflict in
+    /// either direction, or a withheld mass deletion. Both are one halt with
+    /// one resolution surface, because a halted workspace has no granularity
+    /// left to argue about.
+    pub fn halts(&self) -> bool {
+        !self.conflicts.is_empty() || self.bulk_delete.is_some()
+    }
+
+    /// The same plan with only the work a **halted** pass may still do.
+    ///
+    /// Two things survive a halt, and neither moves a byte the developer did
+    /// not ask for. Ledger-only work does: adopting two sides that already
+    /// hold identical content is what makes *make them the same by hand* a
+    /// resolution route needing no verb. And an action at a **resolved** path
+    /// does, because a resolution is the developer's own instruction — without
+    /// it, a batch halt could only ever be cleared all at once, and per-path
+    /// `--host`/`--guest` would be a flag that does nothing until the last one.
+    pub fn while_halted(&self, resolved: &BTreeMap<String, Winner>) -> Plan {
+        Plan {
+            actions: self
+                .actions
+                .iter()
+                .filter(|action| resolved.contains_key(action.path()))
+                .cloned()
+                .collect(),
+            ..self.clone()
+        }
     }
 }
 
@@ -318,6 +506,11 @@ pub struct Inputs<'a> {
     /// host-side delete, and take the guest's copy with it — which is the
     /// opposite of what un-ignoring a path is for.
     pub guest_owned: &'a BTreeSet<String>,
+    /// Paths a developer has already said which side wins at (§19.6), from
+    /// `vmlab dev sync resolve`. A resolution turns that path's conflict into
+    /// the ordinary propagation the winner's own change would have been, and
+    /// releases it from the mass-deletion guard's count.
+    pub resolved: &'a BTreeMap<String, Winner>,
     /// The size guard's per-file cap.
     pub max_file_bytes: u64,
     /// The guest folds two names differing only in case onto one object
@@ -435,7 +628,19 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
             continue;
         }
 
-        if host_moved.changed() && guest_moved.changed() {
+        // Both moved. A resolution the developer has already given makes this
+        // the one-sided case below — the winner is the side that moves — so
+        // there is no second set of rules for "what `--host` does".
+        // A resolution for a path nothing has moved at is spent: it was
+        // carried out by an earlier pass, or the developer made the two sides
+        // agree by hand in the meantime. Either way it must not re-place a
+        // file neither side asked about.
+        let resolution = inputs
+            .resolved
+            .get(path)
+            .copied()
+            .filter(|_| host_moved.changed() || guest_moved.changed());
+        if host_moved.changed() && guest_moved.changed() && resolution.is_none() {
             match settle_both(path, host, guest, was) {
                 Settled::Adopt(agreed) => plan.adopt.push((path.clone(), agreed)),
                 Settled::Conflict(kind) => plan.conflicts.push(Conflict {
@@ -448,12 +653,12 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
 
         // Exactly one side moved: carry it to the other. Which side that is
         // is the only thing that differs between the two directions.
-        let (direction, moving, standing) = if host_moved.changed() {
-            (Direction::ToGuest, host, guest)
-        } else if guest_moved.changed() {
-            (Direction::ToHost, guest, host)
-        } else {
-            continue;
+        let (direction, moving, standing) = match resolution {
+            Some(Winner::Host) => (Direction::ToGuest, host, guest),
+            Some(Winner::Guest) => (Direction::ToHost, guest, host),
+            None if host_moved.changed() => (Direction::ToGuest, host, guest),
+            None if guest_moved.changed() => (Direction::ToHost, guest, host),
+            None => continue,
         };
 
         match moving {
@@ -490,9 +695,114 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
     // children on the way in.
     removals.sort_by(|a, b| b.path().cmp(a.path()));
     creations.sort_by(|a, b| a.path().cmp(b.path()));
+
+    // The one place the two directions are not the same rule: mass arriving
+    // *from* the guest is withheld, because the copy it would be replicated
+    // onto is the one nothing re-derives.
+    plan.bulk_delete = withhold_bulk_delete(&mut removals, inputs);
+
     plan.actions = removals;
     plan.actions.extend(creations);
+    plan.volume = volume(&plan.actions);
     plan
+}
+
+/// Take guest→host removals back out of the plan where there are too many of
+/// them, leaving everything else — including every host→guest removal, and
+/// every deletion the developer has already answered for — where it was.
+///
+/// **What trips the guard is the mass, and a resolution releases one path from
+/// it — it never re-argues the threshold.** Recounting only the unanswered
+/// removals would mean that saying yes to *some* of a 40-file deletion drops the
+/// count back under the floor and lets the other 39 through unasked, which is
+/// the one outcome this guard exists to make impossible.
+fn withhold_bulk_delete(removals: &mut Vec<Action>, inputs: &Inputs<'_>) -> Option<BulkDelete> {
+    let onto_host = |action: &&Action| {
+        matches!(
+            action,
+            Action::Remove {
+                direction: Direction::ToHost,
+                ..
+            }
+        )
+    };
+    let mass = removals.iter().filter(onto_host).count();
+    if !BulkDelete::triggered(mass, inputs.ledger.entries.len()) {
+        return None;
+    }
+    let mut paths = Vec::new();
+    removals.retain(|action| {
+        if !onto_host(&action) || inputs.resolved.get(action.path()) == Some(&Winner::Guest) {
+            return true;
+        }
+        paths.push(action.path().to_string());
+        false
+    });
+    paths.sort();
+    // Every one of them answered: the mass tripped the guard, and there is
+    // nothing left it is still holding back.
+    (!paths.is_empty()).then_some(BulkDelete {
+        agreed: inputs.ledger.entries.len(),
+        paths,
+    })
+}
+
+/// The subtree one pass's work is concentrated in, where there is enough of it
+/// to be worth saying (§19.6).
+///
+/// The prefix is found by descending from the root while one child still holds
+/// nearly all of its parent's work, which is what makes the suggestion
+/// `crates/api/target` rather than `crates`. Naming the deepest prefix outright
+/// would suggest `target/debug/deps`, and naming the shallowest would suggest
+/// ignoring the repository.
+fn volume(actions: &[Action]) -> Option<Volume> {
+    let bytes: u64 = actions.iter().map(Action::bytes).sum();
+    if actions.len() < VOLUME_PATHS && bytes < VOLUME_BYTES {
+        return None;
+    }
+    let mut prefix = String::new();
+    let mut here: Vec<&str> = actions.iter().map(Action::path).collect();
+    loop {
+        let mut children: BTreeMap<&str, usize> = BTreeMap::new();
+        for path in &here {
+            let rest = &path[prefix.len().min(path.len())..];
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            let Some(head) = rest.split('/').next().filter(|head| !head.is_empty()) else {
+                continue;
+            };
+            *children.entry(head).or_default() += 1;
+        }
+        let dominant = children
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .filter(|(_, count)| *count as f64 >= here.len() as f64 * VOLUME_DOMINANT);
+        let Some((head, _)) = dominant else { break };
+        let deeper = if prefix.is_empty() {
+            head.to_string()
+        } else {
+            format!("{prefix}/{head}")
+        };
+        here.retain(|path| at_or_below(path, &deeper));
+        // Nothing is *under* it: the work is at that path, so the directory
+        // holding it is what a rule would name.
+        if here.iter().all(|path| *path == deeper) {
+            break;
+        }
+        prefix = deeper;
+    }
+    Some(Volume {
+        prefix,
+        paths: actions.len(),
+        bytes,
+    })
+}
+
+/// Whether `path` is `prefix` itself or lies under it.
+fn at_or_below(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.as_bytes()[prefix.len()] == b'/')
 }
 
 /// The outcome for a path both sides moved.
@@ -744,12 +1054,23 @@ mod tests {
     }
 
     fn run(host: &BTreeMap<String, State>, guest: &BTreeMap<String, State>, l: &Ledger) -> Plan {
+        run_resolved(host, guest, l, &BTreeMap::new())
+    }
+
+    /// The same, with the developer having already said who wins where.
+    fn run_resolved(
+        host: &BTreeMap<String, State>,
+        guest: &BTreeMap<String, State>,
+        l: &Ledger,
+        resolved: &BTreeMap<String, Winner>,
+    ) -> Plan {
         reconcile(&Inputs {
             host,
             guest,
             ledger: l,
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
+            resolved,
             max_file_bytes: CAP,
             case_folding: false,
         })
@@ -763,9 +1084,36 @@ mod tests {
             ledger: &ledger(&[]),
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
+            resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding: true,
         })
+    }
+
+    /// One resolution, as `vmlab dev sync resolve` records it.
+    fn resolved(entries: &[(&str, Winner)]) -> BTreeMap<String, Winner> {
+        entries
+            .iter()
+            .map(|(path, winner)| ((*path).to_string(), *winner))
+            .collect()
+    }
+
+    /// A ledger of `n` agreed files, and both sides holding them — the tree a
+    /// mass deletion is a proportion *of*.
+    fn agreed_tree(n: usize) -> (BTreeMap<String, State>, BTreeMap<String, State>, Ledger) {
+        let mut host = BTreeMap::new();
+        let mut guest = BTreeMap::new();
+        let mut l = Ledger::new(Path::new("/lab/src"), "/src");
+        for i in 0..n {
+            let path = format!("f{i:04}.rs");
+            host.insert(path.clone(), file(None, 3, 100));
+            guest.insert(path.clone(), file(None, 3, 50));
+            l.entries.insert(
+                path,
+                agreed(Kind::File, "x", Side::new(3, 100), Side::new(3, 50)),
+            );
+        }
+        (host, guest, l)
     }
 
     /// **Where the flag cannot be set, a collision is a loud refusal naming
@@ -1066,6 +1414,36 @@ mod tests {
             ConflictKind::ModifiedAndDeleted
         );
         assert!(guest_modified.actions.is_empty());
+    }
+
+    /// **Mode-only changes are not conflicts and are not synced**, and the
+    /// reason is structural rather than a branch: neither the ledger nor a
+    /// side's state carries a mode at all, so a bit that cannot be represented
+    /// on one side can never look like a disagreement. `chmod +x` moves
+    /// `ctime`, which nothing here reads.
+    #[test]
+    fn a_mode_change_is_invisible_to_the_reconciliation() {
+        let host = tree(&[("run.sh", file(Some("same"), 12, 100))]);
+        let guest = tree(&[("run.sh", file(Some("same"), 12, 50))]);
+        let l = ledger(&[(
+            "run.sh",
+            agreed(Kind::File, "same", Side::new(12, 100), Side::new(12, 50)),
+        )]);
+        assert!(run(&host, &guest, &l).nothing_to_record());
+        // The type says it, so it cannot drift back in: a `State` has a kind,
+        // a size, an mtime, a digest and a link target, and no mode.
+        let state = file(Some("same"), 12, 100);
+        assert_eq!(
+            state,
+            State {
+                kind: Kind::File,
+                size: 12,
+                mtime_ns: 100,
+                digest: Some("same".into()),
+                target: None,
+                oversize: false,
+            }
+        );
     }
 
     #[test]
@@ -1373,6 +1751,7 @@ mod tests {
             ledger: &l,
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::from(["app.log".to_string()]),
+            resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding: false,
         });
@@ -1414,11 +1793,285 @@ mod tests {
             ledger: &l,
             undecided: &BTreeSet::from(["a.sock".to_string()]),
             guest_owned: &BTreeSet::new(),
+            resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding: false,
         });
         assert!(plan.nothing_to_record(), "{plan:?}");
         assert!(plan.forget.is_empty());
+    }
+
+    /// A halt is the whole workspace, both directions, and it names every
+    /// conflicting path in the batch — a host-side `git pull` collides in
+    /// batches, and halting on the first would turn one pull into thirty
+    /// resolve-and-resume round trips.
+    #[test]
+    fn a_batch_of_conflicts_is_reported_whole_rather_than_one_at_a_time() {
+        let mut host = BTreeMap::new();
+        let mut guest = BTreeMap::new();
+        let mut l = ledger(&[]);
+        for i in 0..5 {
+            let path = format!("src/f{i}.rs");
+            host.insert(path.clone(), file(Some("host"), 4, 900));
+            guest.insert(path.clone(), file(Some("guest"), 5, 800));
+            l.entries.insert(
+                path,
+                agreed(Kind::File, "old", Side::new(3, 100), Side::new(3, 50)),
+            );
+        }
+        let plan = run(&host, &guest, &l);
+        assert!(plan.halts());
+        assert_eq!(plan.conflicts.len(), 5, "{:?}", plan.conflicts);
+        // Neither copy is written and neither is deleted: the two copies
+        // already exist, one per side, and no third file is invented.
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+    }
+
+    /// **A resolution is an input.** `--host` makes the path the ordinary
+    /// one-sided host change it would have been, in the same matrix — and
+    /// `--guest` the mirror of it.
+    #[test]
+    fn a_resolution_turns_a_conflict_into_the_winners_own_propagation() {
+        let host = tree(&[("a.txt", file(Some("h"), 20, 900))]);
+        let guest = tree(&[("a.txt", file(Some("g"), 21, 800))]);
+        let l = ledger(&[(
+            "a.txt",
+            agreed(Kind::File, "old", Side::new(12, 100), Side::new(12, 50)),
+        )]);
+
+        let won_host = run_resolved(&host, &guest, &l, &resolved(&[("a.txt", Winner::Host)]));
+        assert!(won_host.conflicts.is_empty(), "{:?}", won_host.conflicts);
+        assert_eq!(
+            won_host.actions,
+            vec![Action::PutFile {
+                direction: Direction::ToGuest,
+                path: "a.txt".into(),
+                side: Side::new(20, 900),
+                digest: "h".into(),
+            }]
+        );
+
+        let won_guest = run_resolved(&host, &guest, &l, &resolved(&[("a.txt", Winner::Guest)]));
+        assert_eq!(
+            won_guest.actions,
+            vec![Action::PutFile {
+                direction: Direction::ToHost,
+                path: "a.txt".into(),
+                side: Side::new(21, 800),
+                digest: "g".into(),
+            }]
+        );
+    }
+
+    /// Deletion is a resolution route like any other: the side that deleted
+    /// can win, and so can the side that did not — which puts the file back.
+    #[test]
+    fn a_modified_and_deleted_conflict_resolves_either_way() {
+        let l = ledger(&[(
+            "a.txt",
+            agreed(Kind::File, "old", Side::new(12, 100), Side::new(12, 50)),
+        )]);
+        let host = tree(&[("a.txt", file(Some("h"), 20, 900))]);
+
+        let guest_wins = run_resolved(
+            &host,
+            &BTreeMap::new(),
+            &l,
+            &resolved(&[("a.txt", Winner::Guest)]),
+        );
+        assert_eq!(
+            guest_wins.actions,
+            vec![Action::Remove {
+                direction: Direction::ToHost,
+                path: "a.txt".into(),
+                kind: Kind::File,
+            }]
+        );
+
+        let host_wins = run_resolved(
+            &host,
+            &BTreeMap::new(),
+            &l,
+            &resolved(&[("a.txt", Winner::Host)]),
+        );
+        assert_eq!(
+            host_wins.actions,
+            vec![Action::PutFile {
+                direction: Direction::ToGuest,
+                path: "a.txt".into(),
+                side: Side::new(20, 900),
+                digest: "h".into(),
+            }]
+        );
+    }
+
+    /// A resolution that has already been carried out is spent: neither side
+    /// has moved since, so it must not re-place a file nobody asked about.
+    #[test]
+    fn a_resolution_at_a_settled_path_does_nothing() {
+        let host = tree(&[("a.txt", file(None, 12, 100))]);
+        let guest = tree(&[("a.txt", file(None, 12, 50))]);
+        let l = ledger(&[(
+            "a.txt",
+            agreed(Kind::File, "same", Side::new(12, 100), Side::new(12, 50)),
+        )]);
+        let plan = run_resolved(&host, &guest, &l, &resolved(&[("a.txt", Winner::Host)]));
+        assert!(plan.nothing_to_record(), "{plan:?}");
+    }
+
+    /// **The guard is about mass.** A single deletion propagates immediately,
+    /// and so does a batch under the floor, whatever proportion of a small
+    /// project it happens to be.
+    #[test]
+    fn a_single_guest_side_deletion_still_propagates() {
+        let (host, mut guest, l) = agreed_tree(4);
+        guest.remove("f0000.rs");
+        let plan = run(&host, &guest, &l);
+        assert!(plan.bulk_delete.is_none(), "{:?}", plan.bulk_delete);
+        assert_eq!(
+            plan.actions,
+            vec![Action::Remove {
+                direction: Direction::ToHost,
+                path: "f0000.rs".into(),
+                kind: Kind::File,
+            }]
+        );
+    }
+
+    /// Past the floor *and* the proportion, the canonical copy is left exactly
+    /// as it was: this is the guest doing something catastrophic and the
+    /// syncer declining to replicate it.
+    #[test]
+    fn a_guest_side_mass_deletion_is_withheld_rather_than_replicated() {
+        let (host, _, l) = agreed_tree(40);
+        let plan = run(&host, &BTreeMap::new(), &l);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        let bulk = plan.bulk_delete.clone().expect("the guard never fired");
+        assert_eq!(bulk.paths.len(), 40);
+        assert_eq!(bulk.agreed, 40);
+        assert!(plan.halts());
+        let said = bulk.to_string();
+        assert!(said.contains("40 of the 40"), "{said}");
+    }
+
+    /// The floor is what keeps a ten-file project from being halted for
+    /// ordinary work; the proportion is what keeps a large one from losing
+    /// everything under it.
+    #[test]
+    fn the_threshold_is_a_proportion_with_a_floor() {
+        assert!(!BulkDelete::triggered(9, 10), "a small project's own work");
+        assert!(
+            !BulkDelete::triggered(30, 1_000),
+            "3% of a large repository is a directory, not a rewrite"
+        );
+        assert!(BulkDelete::triggered(600, 1_000));
+        assert!(BulkDelete::triggered(21, 21));
+    }
+
+    /// **Host→guest deletes are unguarded**: the guest copy is the
+    /// reconstructible one, so a `git checkout` removing 400 files just
+    /// removes them.
+    #[test]
+    fn a_host_side_mass_deletion_is_not_guarded_at_all() {
+        let (_, guest, l) = agreed_tree(40);
+        let plan = run(&BTreeMap::new(), &guest, &l);
+        assert!(plan.bulk_delete.is_none());
+        assert_eq!(plan.actions.len(), 40);
+        assert!(!plan.halts());
+    }
+
+    /// `--all --guest` is the way out: a resolved deletion leaves the count
+    /// the guard is computed from, so saying yes to the batch propagates it.
+    #[test]
+    fn resolving_the_mass_deletion_toward_the_guest_lets_it_through() {
+        let (host, _, l) = agreed_tree(40);
+        let all: BTreeMap<String, Winner> = host
+            .keys()
+            .map(|path| (path.clone(), Winner::Guest))
+            .collect();
+        let plan = run_resolved(&host, &BTreeMap::new(), &l, &all);
+        assert!(plan.bulk_delete.is_none(), "{:?}", plan.bulk_delete);
+        assert_eq!(plan.actions.len(), 40);
+        assert!(
+            plan.actions
+                .iter()
+                .all(|a| matches!(a, Action::Remove { .. }))
+        );
+    }
+
+    /// Resolving *part* of a withheld mass deletion must not release the rest:
+    /// the guard fired on the mass, and a developer who approved 21 paths has
+    /// said nothing at all about the other 19.
+    #[test]
+    fn a_partly_resolved_mass_deletion_still_withholds_what_was_not_answered() {
+        let (host, _, l) = agreed_tree(40);
+        let some: BTreeMap<String, Winner> = host
+            .keys()
+            .take(21)
+            .map(|path| (path.clone(), Winner::Guest))
+            .collect();
+        let plan = run_resolved(&host, &BTreeMap::new(), &l, &some);
+        let bulk = plan
+            .bulk_delete
+            .clone()
+            .expect("the remainder was released");
+        assert_eq!(bulk.paths.len(), 19);
+        assert_eq!(plan.actions.len(), 21, "the answered ones still go");
+        assert!(plan.halts());
+    }
+
+    /// **Volume warns and continues.** Every action it counted is still in
+    /// the plan, and the warning names the subtree a rule would name — the
+    /// deepest prefix that still holds nearly all of the work.
+    #[test]
+    fn a_burst_warns_by_subtree_and_carries_every_path_anyway() {
+        let mut host = BTreeMap::new();
+        host.insert("crates".to_string(), dir(1));
+        host.insert("crates/api".to_string(), dir(1));
+        host.insert("crates/api/target".to_string(), dir(1));
+        // Two profiles under it, so the descent stops where the work splits
+        // rather than running on to the busiest leaf — `target/` is the rule a
+        // developer would write, `target/debug/` is not.
+        for (profile, count) in [("debug", VOLUME_PATHS), ("release", VOLUME_PATHS / 4)] {
+            for i in 0..count {
+                host.insert(
+                    format!("crates/api/target/{profile}/o{i:05}.o"),
+                    file(Some("o"), 4_096, 1),
+                );
+            }
+        }
+        let plan = run(&host, &BTreeMap::new(), &ledger(&[]));
+        let volume = plan.volume.clone().expect("no warning");
+        assert_eq!(volume.prefix, "crates/api/target");
+        assert_eq!(plan.actions.len(), host.len(), "it dropped work");
+        assert!(!plan.halts(), "volume never halts");
+        let said = volume.to_string();
+        assert!(said.contains("crates/api/target"), "{said}");
+        assert!(said.contains(".vmlabignore"), "{said}");
+    }
+
+    /// An ordinary pass says nothing: a warning that fires on every save is a
+    /// warning nobody reads.
+    #[test]
+    fn an_ordinary_pass_raises_no_volume_warning() {
+        let host = tree(&[("a.rs", file(Some("a"), 12, 1))]);
+        assert!(run(&host, &BTreeMap::new(), &ledger(&[])).volume.is_none());
+    }
+
+    /// Work spread evenly across the tree has no one subtree to name, and the
+    /// warning says so rather than suggesting a rule that would ignore the
+    /// repository.
+    #[test]
+    fn a_burst_with_no_dominant_subtree_names_no_rule() {
+        let mut host = BTreeMap::new();
+        for i in 0..VOLUME_PATHS + 10 {
+            host.insert(format!("d{i:05}/f.rs"), file(Some("o"), 8, 1));
+        }
+        let volume = run(&host, &BTreeMap::new(), &ledger(&[]))
+            .volume
+            .expect("no warning");
+        assert_eq!(volume.prefix, "");
+        assert!(!volume.to_string().contains("adding"), "{volume:?}");
     }
 
     /// The pre-filter decides only whether to hash, and each side asks it

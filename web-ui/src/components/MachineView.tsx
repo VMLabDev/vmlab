@@ -28,6 +28,7 @@ import GuestStats from "./GuestStats";
 import LogPanel from "./LogPanel";
 import PlaybookPanel from "./PlaybookPanel";
 import TerminalPanel from "./TerminalPanel";
+import WorkspaceSync from "./WorkspaceSync";
 
 export default function MachineView() {
   const [tab, setTab] = createSignal<"console" | "terminal" | "log" | "playbook">("console");
@@ -186,6 +187,7 @@ export default function MachineView() {
             <KV k="Agent" v={vm()!.agent_version ?? "none"} />
             <KV k="Power state" v={vm()!.state} />
           </Card>
+          <WorkspaceSync machine={vm()!} />
           <Show when={playbooksFor(vm()!.name).length > 0}>
             <Card title="Playbooks">
               <For each={playbooksFor(vm()!.name)}>

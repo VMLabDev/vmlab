@@ -489,6 +489,46 @@ naming every conflicting path in the batch. Distinct from a **deferral** — the
 clears itself with no developer action.
 _Avoid_: pause, error state, conflict mode
 
+**Deferral**:
+A path or a direction the syncer is leaving alone *for now*, with no developer
+in the loop: the `.git` mutable set while a lock is held on either side, and
+both directions between an overflow and the completed rescan. It clears itself.
+Never a **sync halt**, which needs an answer, and never a **skip**, which is
+permanent for as long as its cause is.
+_Avoid_: halt, blocked, stalled (all three read as needing a developer)
+
+**Resolution**:
+A developer's answer to a halted path: `--host` keeps the canonical copy,
+`--guest` keeps the working copy, and making both sides identical by hand needs
+no verb at all. **An input, not an act** — it is handed to the next
+reconciliation, which turns that path into the ordinary one-sided propagation
+the winner's own change would have been. Host-side necessarily: ADR-0013 leaves
+no guest→host control path to offer it from.
+_Avoid_: merge, fix, override
+
+**Halt marker**:
+The file a halt writes at the guest's workspace root, listing the halted paths.
+In the **ignore floor**, so it never syncs. It exists because from inside the
+guest a halt is otherwise *nothing happening*, on the one side no control path
+reaches; its `git status` noise is the point.
+_Avoid_: lock file, sentinel, status file
+
+**Bulk-delete guard**:
+The threshold — a proportion of the ledger, with a floor — past which
+**guest→host** deletions are withheld and the workspace halts. Asymmetric on
+purpose: the guest copy is reconstructible and the canonical one is not, so
+host→guest deletes are unguarded. About mass, not about deletion: a single
+deletion propagates immediately.
+_Avoid_: delete protection, safety limit
+
+**Volume warning**:
+One pass carrying an unusual amount of work under one subtree, named with the
+`.vmlabignore` rule that would make it guest-owned. **Warns and continues**,
+always: a build burst is wanted work that happens to be large, and halting on it
+would let a `cargo build` stop a dev machine. Distinct from the **size guard**,
+which refuses.
+_Avoid_: throttle, rate limit, overload
+
 **Dirty set**:
 The guest-side, deduplicated set of paths the agent's watcher has touched since
 the last drain. A set, not a queue: it holds paths, not events, so no platform

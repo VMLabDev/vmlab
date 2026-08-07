@@ -1851,6 +1851,81 @@ impl LabRuntime {
         }
     }
 
+    /// Run one machine's sync pass now and answer with what it decided
+    /// (§19.6) — `vmlab dev sync flush`.
+    pub async fn workspace_flush(
+        &self,
+        machine: &str,
+    ) -> Result<crate::status::WorkspaceSyncStatus> {
+        let syncer = self.workspaces.expect(machine).await?;
+        Ok(syncer.pass_now().await?.project())
+    }
+
+    /// Say which side wins at halted paths and carry it out (§19.6).
+    ///
+    /// `--all` is expanded **here**, from the halt the daemon is holding,
+    /// rather than from a list the client assembled: a client's list is a
+    /// snapshot of a projection it polled, and resolving against a stale one
+    /// would be a developer answering a question that has since changed.
+    pub async fn workspace_resolve(
+        &self,
+        machine: &str,
+        paths: Vec<String>,
+        all: bool,
+        winner: &str,
+    ) -> Result<crate::status::WorkspaceSyncStatus> {
+        let winner = crate::labd::workspace::plan::Winner::parse(winner).ok_or_else(|| {
+            anyhow::anyhow!(
+                "a workspace conflict is resolved toward `host` or `guest`, not {winner:?}"
+            )
+        })?;
+        let syncer = self.workspaces.expect(machine).await?;
+        let paths = match all {
+            true => syncer.halted_paths(),
+            false => paths,
+        };
+        if paths.is_empty() {
+            anyhow::bail!(
+                "there is nothing to resolve on \"{machine}\": its workspace is not halted, or the \
+                 halt cleared while you were deciding"
+            );
+        }
+        Ok(syncer.resolve(paths, winner).await?.project())
+    }
+
+    /// Bring the guest's copy of workspace paths to the host (§19.6).
+    ///
+    /// Both sides come back together, read by the daemon, because the daemon is
+    /// the one thing that knows a workspace's two roots without being told —
+    /// which keeps `dev sync diff` from doing path arithmetic a `@dev` edit
+    /// could invalidate.
+    pub async fn workspace_diff(
+        &self,
+        machine: &str,
+        paths: Vec<String>,
+    ) -> Result<crate::labd::workspace::diff::Diff> {
+        let syncer = self.workspaces.expect(machine).await?;
+        let paths = match paths.is_empty() {
+            true => syncer.halted_paths(),
+            false => paths,
+        };
+        if paths.is_empty() {
+            anyhow::bail!(
+                "\"{machine}\"'s workspace is not halted, so there is nothing to diff — name a \
+                 path to compare one anyway"
+            );
+        }
+        // The one thing this layer contributes: the session, as the machine's
+        // own default login, so a diff reads what the syncer would write.
+        let sessions = WorkspaceSessions {
+            machine: self.machine(machine)?,
+        };
+        let guest = crate::labd::workspace::syncer::GuestSessions::open(&sessions)
+            .await
+            .context("opening a file session as the machine's default login")?;
+        crate::labd::workspace::diff::all(guest.as_ref(), &syncer.workspace, &paths).await
+    }
+
     /// The lab status projection (ADR-0004) — produced here, rendered unchanged
     /// by the CLI, the REST surface and the console.
     pub async fn status(&self) -> LabStatus {
@@ -1873,6 +1948,10 @@ impl LabRuntime {
                 .map(|(name, _)| name.clone())
                 .collect()
         };
+        // What each machine's workspace syncer last decided (§19.6) — read
+        // once here for the same reason as the two above: a syncer belongs to
+        // the lab, not to the machine it writes into.
+        let syncing = self.workspaces.reports().await;
         let mut machines = Vec::new();
         for m in self.machines() {
             let mut status = m.status().await;
@@ -1883,7 +1962,11 @@ impl LabRuntime {
                 .iter()
                 .find(|d| d.name == status.name)
                 .cloned()
-                .map(Into::into);
+                .map(crate::status::DevStatus::from)
+                .map(|dev| crate::status::DevStatus {
+                    sync: syncing.get(&status.name).map(|report| report.project()),
+                    ..dev
+                });
             status.agent_diverged = diverged.contains(&status.name);
             machines.push(status);
         }

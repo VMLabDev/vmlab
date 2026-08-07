@@ -953,6 +953,34 @@ impl Handler<LabRequest> for LabdHandler {
                 Ok(json!(true))
             }
             LabRequest::SnapshotList { machine } => Ok(lab.snapshots(&machine).await?),
+
+            // The three `dev sync` verbs that need the daemon (§19.6).
+            // `status` is not among them: a syncer's report is part of the
+            // machine's status projection, so asking for it twice would be two
+            // answers to keep in step (ADR-0004).
+            LabRequest::WorkspaceFlush { machine } => Ok(serde_json::to_value(
+                lab.workspace_flush(&machine)
+                    .await
+                    .map_err(|e| CommandError::failed(format!("{e:#}")))?,
+            )
+            .unwrap_or_default()),
+            LabRequest::WorkspaceResolve {
+                machine,
+                paths,
+                all,
+                winner,
+            } => Ok(serde_json::to_value(
+                lab.workspace_resolve(&machine, paths, all, &winner)
+                    .await
+                    .map_err(|e| CommandError::failed(format!("{e:#}")))?,
+            )
+            .unwrap_or_default()),
+            LabRequest::WorkspaceDiff { machine, paths } => Ok(serde_json::to_value(
+                lab.workspace_diff(&machine, paths)
+                    .await
+                    .map_err(|e| CommandError::failed(format!("{e:#}")))?,
+            )
+            .unwrap_or_default()),
             LabRequest::Shutdown {} => {
                 tracing::info!("lab daemon shutdown requested");
                 let lab = lab.clone();

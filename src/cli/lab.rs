@@ -393,6 +393,15 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
                 or_dash(dev.workspace.as_deref()),
                 dev.workspace_guest,
             );
+            // A halted workspace is the one thing in this section a developer
+            // has to act on, so it goes under its own machine's row rather
+            // than into a column: it is a sentence, it is rare, and `vmlab
+            // status` is where somebody looks when their editor has stopped
+            // seeing their edits (§19.6).
+            if let Some(halt) = dev.sync.as_ref().and_then(|sync| sync.halt.as_ref()) {
+                let _ = writeln!(out, "      {halt}");
+                let _ = writeln!(out, "      `vmlab dev sync status {}` says more", m.name);
+            }
         }
     }
 
@@ -2137,6 +2146,31 @@ mod tests {
             false,
         );
         assert!(!plain.contains("DEV"), "got:\n{plain}");
+    }
+
+    /// A halted workspace surfaces here, because `vmlab status` is where
+    /// somebody looks when their editor has stopped seeing their edits — and
+    /// a syncer that stopped quietly is the failure §19.6 exists to rule out.
+    /// It halts **one machine**, so the machine beside it says nothing.
+    #[test]
+    fn a_halted_workspace_is_named_under_its_own_machine() {
+        use crate::status::fixtures::{dev, halted};
+        let out = render_status(
+            &lab(vec![
+                halted(
+                    dev(addressed("dev01", PowerState::Running, true, vm()), true),
+                    &["src/main.rs", ".env"],
+                ),
+                dev(addressed("dev02", PowerState::Running, true, vm()), false),
+            ]),
+            false,
+        );
+        assert!(
+            out.contains("the workspace on \"dev01\" has stopped"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("vmlab dev sync status dev01"), "got:\n{out}");
+        assert!(!out.contains("dev02\" has stopped"), "got:\n{out}");
     }
 
     /// The `ATTACH` column is `attachable` off the projection (§19.4), not a

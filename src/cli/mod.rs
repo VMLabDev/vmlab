@@ -315,6 +315,65 @@ pub enum DevCmd {
     /// Per-developer by construction: `vmlab.wcl` is committed, so it cannot
     /// say it. `vmlab destroy` forgets the selection.
     Use { machine: String },
+    /// The workspace syncer: what it is doing, and what to do about a halt
+    /// (PRD §19.6)
+    Sync {
+        #[command(subcommand)]
+        cmd: DevSyncCmd,
+    },
+}
+
+/// `vmlab dev sync` (PRD §19.6) — reading a workspace syncer, and resolving a
+/// halt.
+///
+/// **Resolution is host-side, necessarily.** ADR-0013's invariant is that the
+/// host opens channels and the guest answers, so there is no guest→host control
+/// path at all: a `vmlab` inside the dev machine could not call back even if one
+/// were shipped. That is why these are typed in the lab directory rather than
+/// in the shell `dev attach` drops you into — and why the console shows a halt
+/// but offers no button.
+#[derive(Subcommand)]
+pub enum DevSyncCmd {
+    /// What the syncer last decided: halted paths, warnings, and what it
+    /// skipped by name
+    Status {
+        /// Which dev machine (default: $VMLAB_DEV_MACHINE, then the
+        /// `vmlab dev use` selection, then the lab's default `@dev` machine)
+        machine: Option<String>,
+    },
+    /// Run a sync pass now and wait for it, rather than for the next edit
+    Flush { machine: Option<String> },
+    /// Show the guest's copy of a path beside the host's
+    ///
+    /// The host copy is a directory on this workstation; only the guest's is
+    /// behind the seam, which is what this brings across. With no path it
+    /// takes every halted one.
+    Diff {
+        /// Workspace-relative paths (default: every halted path)
+        paths: Vec<String>,
+        #[arg(long)]
+        machine: Option<String>,
+    },
+    /// Pick which side wins at a halted path, and carry it out
+    ///
+    /// The copy that loses is overwritten and is not recoverable from vmlab.
+    /// Making both sides identical by hand is a third route needing no verb:
+    /// the next pass adopts them as agreed.
+    Resolve {
+        /// Workspace-relative paths (omit with `--all`)
+        paths: Vec<String>,
+        /// The canonical host copy wins: carry it into the guest
+        #[arg(long, conflicts_with = "guest")]
+        host: bool,
+        /// The guest's working copy wins: carry it onto the canonical copy
+        #[arg(long)]
+        guest: bool,
+        /// Every halted path, as the halt currently stands
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        machine: Option<String>,
+    },
 }
 
 /// Per-VM power control and interaction (PRD §12, §10.3).
@@ -686,6 +745,18 @@ pub fn run() -> ExitCode {
         Command::Dev { cmd } => match cmd {
             DevCmd::Attach { machine } => dev::cmd_dev_attach(machine),
             DevCmd::Use { machine } => dev::cmd_dev_use(&machine),
+            DevCmd::Sync { cmd } => match cmd {
+                DevSyncCmd::Status { machine } => dev::cmd_dev_sync_status(machine),
+                DevSyncCmd::Flush { machine } => dev::cmd_dev_sync_flush(machine),
+                DevSyncCmd::Diff { paths, machine } => dev::cmd_dev_sync_diff(machine, paths),
+                DevSyncCmd::Resolve {
+                    paths,
+                    host,
+                    guest,
+                    all,
+                    machine,
+                } => dev::cmd_dev_sync_resolve(machine, paths, host, guest, all),
+            },
         },
         Command::Cp { src, dest } => lab::cmd_cp(&src, &dest),
         Command::Tail { vm, path } => lab::cmd_tail(&vm, &path),

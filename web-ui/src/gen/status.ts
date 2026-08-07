@@ -42,7 +42,12 @@ workspace: string | null,
  * Always answered: a dev machine has a workspace path even where nothing
  * declared one.
  */
-workspace_guest: string, };
+workspace_guest: string, 
+/**
+ * What this machine's workspace syncer last decided (§19.6). `None` where
+ * no syncer is running — the machine is down, or declares no workspace.
+ */
+sync: WorkspaceSyncStatus | null, };
 
 /**
  * Everything `status` reports about one lab.
@@ -251,3 +256,86 @@ agent_version: string | null, };
  * launch link.
  */
 export type WebPageStatus = { name: string, port: number, path: string, };
+
+/**
+ * One halted path and why it is halted.
+ */
+export type WorkspaceConflictStatus = { path: string, reason: string, };
+
+/**
+ * One path neither direction touched, and why.
+ */
+export type WorkspaceSkipStatus = { path: string, reason: string, };
+
+/**
+ * One machine's workspace syncer, as every surface reads it (PRD §19.6).
+ *
+ * **The console displays the halt and offers no resolution.** That is not a
+ * gap in the console: resolution is host-side *necessarily* — ADR-0013's
+ * invariant leaves no guest→host control path — and it is a per-path judgement
+ * about a developer's own working copy, made next to the two directories in
+ * question. So the projection carries everything needed to *show* a halt and
+ * nothing that acts on one; `vmlab dev sync resolve` is the only way to pick a
+ * side, from a terminal in the lab directory.
+ */
+export type WorkspaceSyncStatus = { 
+/**
+ * The one line that says what happened, naming the machine — two dev
+ * machines may share one host workspace, and one halting must not read
+ * as the other's.
+ *
+ * Present *is* halted: a separate `halted` flag beside it would be a
+ * second copy of the same fact, and two fields that can disagree about
+ * whether a workspace is stopped is worse than either answer.
+ */
+halt: string | null, 
+/**
+ * Every halted path with the sentence that explains it, capped — see
+ * `total` for how many there really are.
+ */
+conflicts: Array<WorkspaceConflictStatus>, 
+/**
+ * How many paths the halt covers, whether or not they all fit above.
+ */
+conflicts_total: number, 
+/**
+ * The routes out, in words. Carried so a surface never has to compose
+ * them and the console can *show* the remedy it does not offer.
+ */
+resolve: string | null, 
+/**
+ * The last pass carried an unusual amount of work under one subtree. A
+ * warning: everything it counted was still carried.
+ */
+volume: string | null, 
+/**
+ * Both directions are waiting on a stat-walk, and why — the overflow
+ * symptom, as a state rather than as a pause.
+ */
+rescan: string | null, 
+/**
+ * How many watch discontinuities this syncer has answered with a walk.
+ * Repeated ones are the symptom a single lost event is not.
+ */
+rescans: number, 
+/**
+ * Paths neither direction touched, by name — special files, and anything
+ * the syncer's login could not open. Loud by design: a `.sock` in the
+ * tree must not stop a dev machine, and must not vanish quietly either.
+ */
+skipped: Array<WorkspaceSkipStatus>, 
+/**
+ * `.git`'s mutable set, waiting on a lock held on one side. Timing, not a
+ * conflict: nothing needs resolving and it clears itself.
+ */
+deferred: Array<string>, 
+/**
+ * The last pass could not finish. Not a halt — nothing was agreed, so the
+ * next pass starts over.
+ */
+trouble: string | null, 
+/**
+ * Passes completed, so a surface can tell "in step" from "has never
+ * managed one".
+ */
+passes: number, };

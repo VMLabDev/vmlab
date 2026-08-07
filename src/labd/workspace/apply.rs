@@ -707,6 +707,7 @@ mod tests {
             ledger,
             undecided: &undecided,
             guest_owned: &guest_owned,
+            resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding,
         });
@@ -874,6 +875,7 @@ mod tests {
             ledger: &ledger,
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
+            resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding: false,
         });
@@ -1021,6 +1023,7 @@ mod tests {
             ledger: &ledger,
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
+            resolved: &BTreeMap::new(),
             max_file_bytes: 4,
             case_folding: false,
         });
