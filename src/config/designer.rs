@@ -1186,11 +1186,38 @@ type Dev {
         );
     }
 
-    /// The schema declares no block decorator yet (PRD §19's `@dev` is the
-    /// first), so the console's record is empty rather than wrong.
+    /// `@dev` is the schema's one block decorator (PRD §19.1), so the two
+    /// machine kinds — and only they — offer it in the inspector, with no
+    /// entry in this file: its arguments' controls, help and optionality are
+    /// the schema's, exactly as a block field's are.
     #[test]
-    fn the_schema_declares_no_block_decorator_yet() {
-        assert!(decorators().is_empty());
+    fn the_machine_kinds_offer_the_dev_decorator() {
+        let rendered = decorators();
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|e| e.block.as_str())
+                .collect::<Vec<_>>(),
+            ["vm", "container"]
+        );
+        for entry in &rendered {
+            let dev = &entry.decorators[0];
+            assert_eq!(entry.decorators.len(), 1);
+            assert_eq!(dev.name, "dev");
+            assert!(!dev.repeatable);
+            assert_eq!(
+                dev.fields
+                    .iter()
+                    .map(|f| f.key.as_str())
+                    .collect::<Vec<_>>(),
+                ["default", "workspace", "workspace_guest"]
+            );
+            assert_eq!(dev.fields[0].control, Control::Flag);
+            assert_eq!(dev.fields[1].control, Control::Text);
+            // Every argument is optional: a bare `@dev` is a complete dev
+            // machine, so the inspector must never mark one required.
+            assert!(dev.fields.iter().all(|f| !f.required), "{:?}", dev.fields);
+        }
     }
 
     #[test]

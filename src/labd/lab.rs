@@ -26,7 +26,7 @@ use super::vm::{PowerState, VmDirs, VmInstance};
 use crate::config::LabFile;
 use crate::config::model::TemplateRef;
 use crate::profiles::ProfileSet;
-use crate::status::{LabStatus, SegmentFrames, SegmentStatus};
+use crate::status::{DevStatus, LabStatus, SegmentFrames, SegmentStatus};
 use crate::sync::LockRecover;
 use crate::template::TemplateStore;
 
@@ -1588,18 +1588,46 @@ impl LabRuntime {
         Ok(())
     }
 
+    /// The lab's dev machines, resolved (§19.1).
+    ///
+    /// The profile a machine's dev defaults fall back to is its **effective**
+    /// one, which for a VM may have come from its template — so it is read off
+    /// the already-resolved hardware rather than off the declaration, where a
+    /// VM naming no `profile` of its own would land on the floor instead of on
+    /// its guest OS's path.
+    fn dev_machines(&self) -> Vec<crate::dev::DevMachine> {
+        crate::dev::machines(&self.config.lab, |cfg| {
+            self.machine(cfg.name())
+                .ok()
+                .and_then(|m| m.profile())
+                .and_then(|name| self.profiles.get(&name).cloned())
+        })
+    }
+
     /// The lab status projection (ADR-0004) — produced here, rendered unchanged
     /// by the CLI, the REST surface and the console.
     pub async fn status(&self) -> LabStatus {
         // One projection for both kinds: each adapter fills its own variant
         // (see `Machine::status_detail`), so a machine is described in exactly
         // one place.
+        // Which machines carry `@dev`, and which of them is *the* dev machine
+        // (§19.1) — a lab-scoped answer, so it is resolved once here rather
+        // than asked of each machine.
+        let devs = self.dev_machines();
         let mut machines = Vec::new();
         for m in self.machines() {
             let mut status = m.status().await;
             // Lab-level, not machine-level: is this machine's template/image
             // download still pending? Drives the "Download" button.
             status.cached = !self.pulls.lock_recover().is_pending(&status.name);
+            status.dev = devs
+                .iter()
+                .find(|d| d.name == status.name)
+                .map(|d| DevStatus {
+                    default: d.default,
+                    workspace: d.workspace.as_ref().map(|p| p.display().to_string()),
+                    workspace_guest: d.workspace_guest.clone(),
+                });
             machines.push(status);
         }
 
@@ -2064,6 +2092,11 @@ mod tests {
         fn guest_os(&self) -> super::super::guest_os::GuestOs {
             super::super::guest_os::GuestOs::Linux
         }
+        /// A double runs no guest, so it names no profile and anything
+        /// resolved through one lands on its floor.
+        fn profile(&self) -> Option<String> {
+            None
+        }
         fn nics(&self) -> &[crate::config::model::Nic] {
             &[]
         }
@@ -2231,6 +2264,54 @@ lab "t" {
 
         assert_eq!(container.starts.load(Ordering::SeqCst), 1);
         assert_eq!(container.state().await, PowerState::Running);
+    }
+
+    /// `@dev` reaches every surface through the status projection (§19.1,
+    /// ADR-0004): the runtime resolves it once here, for both machine kinds,
+    /// and nothing downstream re-reads the lab file to find the dev machine.
+    #[tokio::test]
+    async fn status_carries_the_dev_machines_and_names_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let dev01 = FakeMachine::new("dev01", MachineKind::Vm, &sh);
+        let buildbox = FakeMachine::new("buildbox", MachineKind::Container, &sh);
+        let db = FakeMachine::new("db", MachineKind::Container, &sh);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  @dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+  @dev container "buildbox" { image = "sdk:9.0" }
+  container "db" { image = "db:1" }
+}"#,
+            vec![dev01, buildbox, db],
+        );
+
+        let status = lab.status().await;
+        let dev = |name: &str| {
+            status
+                .machines
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .dev
+                .clone()
+        };
+        let declared = dev("dev01").expect("dev01 carries @dev");
+        assert!(declared.default);
+        assert_eq!(declared.workspace.as_deref(), Some("./src"));
+        // A double names no profile, so the guest path is vmlab's floor.
+        assert_eq!(declared.workspace_guest, crate::dev::WORKSPACE_GUEST_FLOOR);
+
+        let bare = dev("buildbox").expect("buildbox carries @dev");
+        assert!(!bare.default, "the declared default wins");
+        assert!(bare.workspace.is_none());
+
+        assert!(
+            dev("db").is_none(),
+            "an undecorated machine is not a dev machine"
+        );
+        assert_eq!(status.default_dev().map(|m| m.name.as_str()), Some("dev01"));
     }
 
     /// `depends_on` gates on readiness identically for both kinds. `web`

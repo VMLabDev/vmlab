@@ -1688,6 +1688,7 @@ mod tests {
                     nics: Vec::new(),
                     web: Vec::new(),
                     cached: true,
+                    dev: None,
                     detail,
                 }
             })

@@ -7,6 +7,7 @@
 pub mod agent_asset;
 pub mod cli;
 pub mod config;
+pub mod dev;
 pub mod guest_asset;
 mod hashing;
 pub mod lab_init;

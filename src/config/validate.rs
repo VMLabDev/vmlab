@@ -391,6 +391,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     }
 
     check_dependency_cycles(lab, &mut issues);
+    check_dev_defaults(lab, &mut issues);
 
     // -- per-machine configuration steps ------------------------------------
     // `provision`/`playbook` blocks live inside the vm/container they
@@ -1238,6 +1239,33 @@ fn check_web_pages(
     }
 }
 
+/// A lab has at most one default dev machine (§19.1).
+///
+/// This is the *only* `@dev` rule §5.1 owns. The decorator's own errors — an
+/// undeclared `@dve`, a wrong-typed or unknown argument, `@dev` on a `nic {}`,
+/// a repeated `@dev @dev` — come from WCL, which validates an instance
+/// decorator against its declaration. What WCL cannot see is this one, because
+/// it spans two machine blocks: the same class as the duplicate-static-IP rule
+/// above. The message names both machines, since the point is that the reader
+/// has to choose between them.
+fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
+    let mut declared = lab
+        .machines()
+        .filter_map(|m| m.dev().filter(|d| d.default).map(|d| (m.name(), d.span)));
+    let Some((first, _)) = declared.next() else {
+        return;
+    };
+    for (name, span) in declared {
+        issues.push(Issue::at(
+            span,
+            format!(
+                "\"{name}\" and \"{first}\" both declare `@dev(default = true)` — a lab has at \
+                 most one default dev machine (PRD §19.1)"
+            ),
+        ));
+    }
+}
+
 fn check_dns_label(name: &str, span: Span, what: &str, issues: &mut IssueList) {
     let ok = !name.is_empty()
         && name.len() <= 63
@@ -1592,6 +1620,50 @@ lab "l" {
 }"#,
             "duplicate MAC",
         );
+    }
+
+    /// §19.1's one cross-block rule: two default dev machines, named. Both
+    /// kinds carry `@dev`, so the pair may straddle them.
+    #[test]
+    fn two_default_dev_machines_are_rejected_naming_both() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  @dev(default = true) vm "dev01" { template = "x86_64/t" }
+  @dev(default = true) container "buildbox" { image = "sdk:9.0" }
+}"#;
+        let es = errs(src);
+        let found = es
+            .iter()
+            .find(|m| m.contains("default dev machine"))
+            .unwrap_or_else(|| panic!("expected a duplicate-default error, got: {es:#?}"));
+        assert!(
+            found.contains("dev01") && found.contains("buildbox"),
+            "{found}"
+        );
+
+        // The issue points at the second decorator, not at the machine block.
+        let second = src.rfind("@dev(default = true)").unwrap();
+        let issue = validate(&lab(src), &Permissive)
+            .into_iter()
+            .find(|i| i.message.contains("default dev machine"))
+            .expect("the issue");
+        assert_eq!(issue.span.map(|s| s.offset()), Some(second));
+    }
+
+    /// Everything else about `@dev` is legal: any number of dev machines,
+    /// none or one declaring the default, and a bare `@dev` on either kind.
+    #[test]
+    fn dev_machines_are_otherwise_unconstrained() {
+        for lab_src in [
+            r#"@dev vm "dev01" { template = "x86_64/t" }"#,
+            r#"@dev vm "dev01" { template = "x86_64/t" }
+               @dev container "buildbox" { image = "sdk:9.0" }"#,
+            r#"@dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+               @dev container "buildbox" { image = "sdk:9.0" }"#,
+        ] {
+            let es = errs(&format!("import <vmlab.wcl>\nlab \"l\" {{\n{lab_src}\n}}"));
+            assert!(es.is_empty(), "{lab_src} → {es:#?}");
+        }
     }
 
     #[test]

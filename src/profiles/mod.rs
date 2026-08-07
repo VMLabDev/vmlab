@@ -78,6 +78,12 @@ pub struct Profile {
     /// the virtio-win driver + WinFsp on Windows) — makes it a candidate
     /// for `transport = "auto"` shares (§7.5).
     pub virtiofs: bool,
+    /// Guest path an `@dev` workspace lands at when the decorator names none
+    /// (§19.1). Guest-OS-shaped — `C:\src` on Windows, `/src` on Linux —
+    /// which is why it is profile-sourced rather than a constant. `None`
+    /// means the floor applies, never that the profile cannot host a dev
+    /// machine ([`crate::dev`]).
+    pub workspace_guest: Option<String>,
 }
 
 /// The full profile set: shipped profiles plus user overrides/extensions.
@@ -223,6 +229,7 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             .unspan()
             .unwrap_or_default(),
         virtiofs: r.bool("virtiofs").unspan().unwrap_or(false),
+        workspace_guest: r.string("workspace_guest").unspan(),
     };
     Some(Profile {
         name: name?,

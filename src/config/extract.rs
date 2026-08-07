@@ -673,6 +673,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let tpm = r.bool("tpm").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
     let qemu_args = r.string_list("qemu_args");
+    let dev = extract_dev(&mut r);
     let mut gpu = None;
     let mut nics = Vec::new();
     let mut extra_disks = Vec::new();
@@ -754,6 +755,21 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         logins,
         provisions,
         playbooks,
+        dev,
+    })
+}
+
+/// The `@dev` decorator on a machine block (§19.1). One mapping for both
+/// kinds: `@dev` says the same thing on a `vm` as on a `container`, and the
+/// difference between the two guests is absorbed by the profile the
+/// arguments resolve against, never by a branch here.
+fn extract_dev(r: &mut Reader) -> Option<DevDecl> {
+    let mut d = r.decorator("dev")?;
+    Some(DevDecl {
+        span: d.span(),
+        default: d.bool("default").unspan().unwrap_or(false),
+        workspace: d.path("workspace").unspan(),
+        workspace_guest: d.string("workspace_guest").unspan(),
     })
 }
 
@@ -780,6 +796,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
     let cpus = r.int_at_least("cpus", 1).unspan();
     let memory = r.size("memory").unspan();
     let depends_on = r.string_list("depends_on");
+    let dev = extract_dev(&mut r);
     let mut nics = Vec::new();
     let mut env = Vec::new();
     let mut volumes = Vec::new();
@@ -855,6 +872,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         logins,
         provisions,
         playbooks,
+        dev,
     })
 }
 

@@ -208,6 +208,29 @@ type SinkholeRule {
   @options(["nxdomain", "zero"]) @default("nxdomain") mode: utf8?
 }
 
+// ── Machine decorators ───────────────────────────────────────────────────────
+// Written on a machine in a `vmlab.wcl`, unlike the projection metadata above.
+
+// Designates this machine as a development environment (PRD §19.1): vmlab
+// publishes it as an SSH endpoint an editor attaches *into*, and syncs a
+// workspace onto it. A decorator rather than a child block because it states
+// something *about* the machine — nothing it carries is a setting the guest
+// ever sees.
+//
+// Every argument is optional and a bare `@dev` is a complete, attachable dev
+// machine; unset arguments resolve `@dev` > profile > vmlab floor, in
+// `src/dev.rs`. Any number of machines may carry it and zero is normal.
+@decorator("dev")
+@applies_to(on = [:block], kinds = ["vm", "container"])
+type DevMachine {
+  @doc("Make this the lab's default dev machine; at most one per lab, and the only `@dev` machine is it implicitly")
+  default: bool?
+  @doc("Host directory whose contents sync into the workspace, relative to the lab root")
+  workspace: utf8?
+  @doc("Guest path the workspace lands at; inherited from the profile (`C:\\src` / `/src`) if omitted")
+  workspace_guest: utf8?
+}
+
 @block("vm")
 type Vm {
   @doc("VM name (DNS label); unique per lab; the inline block label")

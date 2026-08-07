@@ -22,4 +22,9 @@ type Profile {
   agent_channel: bool?  // virtio-serial guest agent channel (default true)
   input_transport: utf8?  // "qmp" (default) | "vnc" — scripted input path (§10.3)
   virtiofs: bool?       // guest mounts virtiofs natively (default false) — §7.5 share transport
+  // Dev-machine defaults (§19.1). Guest-OS-shaped, which is why they are
+  // profile-sourced: a workspace path is `C:\src` on Windows and `/src` on
+  // Linux. A profile setting none of them still hosts a dev machine — a
+  // missing key means the vmlab floor applies (src/dev.rs).
+  workspace_guest: utf8?  // guest path an `@dev` workspace lands at
 }
