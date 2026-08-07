@@ -7,6 +7,8 @@
 //! "the request was answered the way SSH means it".
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +16,7 @@ use russh::client;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use vmlab_agent_proto::fileops;
 use vmlab_agent_proto::{
     AgentMsg, ErrorCause, Frame, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, Logon,
     PROTO_VERSION, encode_ctrl, encode_frame,
@@ -21,7 +24,7 @@ use vmlab_agent_proto::{
 
 use super::*;
 use crate::config::model::Login;
-use crate::labd::vm_agent::AgentHandle;
+use crate::labd::vm_agent::{AgentHandle, Attrs, EntryKind, ErrorCode, Op, Reply};
 
 // ---------------------------------------------------------------------------
 // The mock agent
@@ -40,6 +43,11 @@ enum Opened {
     Exec {
         argv: Vec<String>,
         env: Vec<(String, String)>,
+        logon: Option<Logon>,
+    },
+    /// A `fileops` session — what `subsystem sftp` opens, and the record that
+    /// shows whose files it is about to touch (§19.2).
+    FileOps {
         logon: Option<Logon>,
     },
     Resize {
@@ -68,7 +76,24 @@ struct AgentLog {
     closed: Mutex<Vec<u32>>,
 }
 
-/// A guest agent that answers terminals, execs and tunnels.
+/// Whether the mock guest gives a file session credit for more bytes.
+///
+/// Withheld is the guest that has stopped keeping up: it takes what it is
+/// given and grants nothing back. That is the stall the facade must not buffer
+/// through — the two stacked flow-control layers have to stay stacked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Credit {
+    Granted,
+    Withheld,
+}
+
+/// The directory a mock guest's files live in — a real one, so a test can run
+/// the actual `scp` and `sftp` binaries and then look at what landed.
+fn guest_root(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("guest")
+}
+
+/// A guest agent that answers terminals, execs, tunnels and file sessions.
 ///
 /// A terminal echoes its keystrokes back — enough for a test to see bytes
 /// travel both ways through the facade — and exits with the code named by
@@ -76,19 +101,30 @@ struct AgentLog {
 /// stderr, and exits with the code its command line ends in. A tunnel is an
 /// echo peer that half-closes when its client does, unless its destination is
 /// named `dead.<something>` or `slow.<something>` — the dial then fails the
-/// way a dead address does, at once or after spending a budget.
+/// way a dead address does, at once or after spending a budget. A `fileops`
+/// session is served against a **real directory**, because a transcode can
+/// only be checked against the clients it exists for, and those clients want
+/// files.
 async fn mock_agent() -> (tempfile::TempDir, AgentHandle, Arc<AgentLog>) {
     mock_agent_with(EVERY_FEATURE).await
 }
 
 /// Everything this facade asks a guest for.
-const EVERY_FEATURE: &[&str] = &["terminal", "exec", "tunnel"];
+const EVERY_FEATURE: &[&str] = &["terminal", "exec", "tunnel", "fileops"];
 
 /// The same guest, declaring only `features` — which is how a test stands up
 /// an agent too old to serve one of the vocabularies (§19.4).
 async fn mock_agent_with(features: &[&str]) -> (tempfile::TempDir, AgentHandle, Arc<AgentLog>) {
+    mock_agent_like(features, Credit::Granted).await
+}
+
+async fn mock_agent_like(
+    features: &[&str],
+    credit: Credit,
+) -> (tempfile::TempDir, AgentHandle, Arc<AgentLog>) {
     let features: Vec<String> = features.iter().map(|f| f.to_string()).collect();
     let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(guest_root(dir.path())).expect("guest root");
     let path = dir.path().join("agent.sock");
     let listener = tokio::net::UnixListener::bind(&path).expect("bind");
     let log = Arc::new(AgentLog::default());
@@ -117,6 +153,8 @@ async fn mock_agent_with(features: &[&str]) -> (tempfile::TempDir, AgentHandle, 
 
         let mut dec = FrameDecoder::new();
         let mut buf = [0u8; 8192];
+        // One file session per channel, exactly as the guest scopes them.
+        let mut files: HashMap<u32, MockFiles> = HashMap::new();
         loop {
             let n = match rx.read(&mut buf).await {
                 Ok(0) | Err(_) => return,
@@ -142,6 +180,11 @@ async fn mock_agent_with(features: &[&str]) -> (tempfile::TempDir, AgentHandle, 
                                     token,
                                 })
                                 .await;
+                            }
+                            HostMsg::OpenFileOps { id, logon } => {
+                                served.opens.lock().unwrap().push(Opened::FileOps { logon });
+                                files.insert(id, MockFiles::default());
+                                send(AgentMsg::Opened { id }).await;
                             }
                             HostMsg::OpenTerminal {
                                 id,
@@ -234,6 +277,28 @@ async fn mock_agent_with(features: &[&str]) -> (tempfile::TempDir, AgentHandle, 
                             _ => {}
                         }
                     }
+                    FrameKind::Data if files.contains_key(&channel) => {
+                        let session = files.get_mut(&channel).expect("the session just matched");
+                        // A guest with no credit to give takes the bytes and
+                        // says nothing: the facade must stall against it
+                        // rather than absorb the difference.
+                        if credit == Credit::Withheld {
+                            continue;
+                        }
+                        // Credit back what was consumed, like the agent's own
+                        // reader does — a transfer is many times the initial
+                        // window, so a mock that never granted would stall.
+                        send(AgentMsg::WindowAdjust {
+                            id: channel,
+                            bytes: payload.len() as u64,
+                        })
+                        .await;
+                        for (response, bytes) in session.serve(&payload) {
+                            for chunk in fileops::encode_record(&response, &bytes).chunks(4096) {
+                                send_data(FrameKind::Data, channel, chunk.to_vec()).await;
+                            }
+                        }
+                    }
                     FrameKind::Data => {
                         served
                             .input
@@ -267,6 +332,328 @@ async fn mock_agent_with(features: &[&str]) -> (tempfile::TempDir, AgentHandle, 
         .await
         .expect("connect the mock agent");
     (dir, agent, log)
+}
+
+// ---------------------------------------------------------------------------
+// The mock agent's file session
+// ---------------------------------------------------------------------------
+
+/// One open `fileops` channel on the mock, served against the real
+/// filesystem.
+///
+/// Real files rather than an in-memory map: the transcode's whole job is to be
+/// what `scp` and an editor expect, and the only way to check that is to let
+/// those binaries move actual files and then look at what is on disk.
+///
+/// It answers a batch of framed requests in **reverse** order, so a transcode
+/// that assumed replies come back in the order it asked would fail here rather
+/// than against a guest.
+#[derive(Default)]
+struct MockFiles {
+    decoder: fileops::RecordDecoder,
+    handles: HashMap<u64, MockHandle>,
+    next_handle: u64,
+}
+
+enum MockHandle {
+    File(std::fs::File),
+    Dir {
+        entries: Vec<fileops::DirEntry>,
+        at: usize,
+    },
+}
+
+impl MockFiles {
+    fn serve(&mut self, bytes: &[u8]) -> Vec<(fileops::Response, Vec<u8>)> {
+        self.decoder.push(bytes);
+        let mut out = Vec::new();
+        while let Some((request, payload)) = self
+            .decoder
+            .next_record::<fileops::Request>()
+            .expect("framed request")
+        {
+            let (reply, bytes) = self.op(request.op, payload);
+            out.push((
+                fileops::Response {
+                    id: request.id,
+                    reply,
+                },
+                bytes,
+            ));
+        }
+        out.reverse();
+        out
+    }
+
+    fn insert(&mut self, handle: MockHandle) -> Reply {
+        self.next_handle += 1;
+        self.handles.insert(self.next_handle, handle);
+        Reply::Handle {
+            handle: self.next_handle,
+        }
+    }
+
+    fn file(&self, handle: u64) -> Result<&std::fs::File, Reply> {
+        match self.handles.get(&handle) {
+            Some(MockHandle::File(file)) => Ok(file),
+            _ => Err(Reply::Error {
+                code: ErrorCode::BadHandle,
+                msg: "no such handle on this channel".into(),
+            }),
+        }
+    }
+
+    fn op(&mut self, op: Op, payload: Vec<u8>) -> (Reply, Vec<u8>) {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+
+        let plain = |reply| (reply, Vec::new());
+        // The path goes in the message, as the guest's own does: a client
+        // pipelining 64 requests cannot tell from the id alone which file
+        // "permission denied" was about.
+        let attempt = |path: &str, r: std::io::Result<()>| match r {
+            Ok(()) => (Reply::Ok, Vec::new()),
+            Err(e) => (failed_at(path, &e), Vec::new()),
+        };
+        match op {
+            Op::Open { path, flags, mode } => {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.read(flags.read || !(flags.write || flags.append))
+                    .write(flags.write)
+                    .append(flags.append)
+                    .truncate(flags.truncate)
+                    .create(flags.create && !flags.exclusive)
+                    .create_new(flags.exclusive);
+                if let Some(mode) = mode {
+                    opts.mode(mode);
+                }
+                match opts.open(&path) {
+                    Ok(file) => plain(self.insert(MockHandle::File(file))),
+                    Err(e) => plain(failed_at(&path, &e)),
+                }
+            }
+            Op::Close { handle } => match self.handles.remove(&handle) {
+                Some(_) => plain(Reply::Ok),
+                None => plain(Reply::Error {
+                    code: ErrorCode::BadHandle,
+                    msg: "no such handle on this channel".into(),
+                }),
+            },
+            Op::Read {
+                handle,
+                offset,
+                len,
+            } => match self.file(handle) {
+                Err(e) => plain(e),
+                Ok(file) => {
+                    let mut buf = vec![0u8; len as usize];
+                    let mut done = 0;
+                    while done < buf.len() {
+                        match file.read_at(&mut buf[done..], offset + done as u64) {
+                            Ok(0) => break,
+                            Ok(n) => done += n,
+                            Err(e) => return plain(failed(&e)),
+                        }
+                    }
+                    buf.truncate(done);
+                    (Reply::Data, buf)
+                }
+            },
+            Op::Write { handle, offset } => match self.file(handle) {
+                Err(e) => plain(e),
+                Ok(file) => attempt("", file.write_all_at(&payload, offset)),
+            },
+            Op::Fstat { handle } => match self.file(handle) {
+                Err(e) => plain(e),
+                Ok(file) => match file.metadata() {
+                    Ok(meta) => plain(Reply::Attrs {
+                        attrs: attrs_of(&meta),
+                    }),
+                    Err(e) => plain(failed(&e)),
+                },
+            },
+            Op::Fsetstat { handle, attrs } => match self.file(handle) {
+                Err(e) => plain(e),
+                Ok(file) => {
+                    if let Some(size) = attrs.size
+                        && let Err(e) = file.set_len(size)
+                    {
+                        return plain(failed(&e));
+                    }
+                    if let Some(mode) = attrs.mode
+                        && let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(mode))
+                    {
+                        return plain(failed(&e));
+                    }
+                    attempt("", set_times(file, attrs.atime_ns, attrs.mtime_ns))
+                }
+            },
+            Op::Stat { path } => match std::fs::metadata(&path) {
+                Ok(meta) => plain(Reply::Attrs {
+                    attrs: attrs_of(&meta),
+                }),
+                Err(e) => plain(failed_at(&path, &e)),
+            },
+            Op::Lstat { path } => match std::fs::symlink_metadata(&path) {
+                Ok(meta) => plain(Reply::Attrs {
+                    attrs: attrs_of(&meta),
+                }),
+                Err(e) => plain(failed_at(&path, &e)),
+            },
+            Op::Setstat { path, attrs } => {
+                if let Some(mode) = attrs.mode
+                    && let Err(e) =
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                {
+                    return plain(failed_at(&path, &e));
+                }
+                if attrs.size.is_none() && attrs.mtime_ns.is_none() && attrs.atime_ns.is_none() {
+                    return plain(Reply::Ok);
+                }
+                match std::fs::OpenOptions::new().write(true).open(&path) {
+                    Err(e) => plain(failed_at(&path, &e)),
+                    Ok(file) => {
+                        if let Some(size) = attrs.size
+                            && let Err(e) = file.set_len(size)
+                        {
+                            return plain(failed_at(&path, &e));
+                        }
+                        attempt(&path, set_times(&file, attrs.atime_ns, attrs.mtime_ns))
+                    }
+                }
+            }
+            Op::OpenDir { path } => match std::fs::read_dir(&path) {
+                Err(e) => plain(failed_at(&path, &e)),
+                Ok(iter) => {
+                    let entries = iter
+                        .flatten()
+                        .filter_map(|entry| {
+                            let meta = entry.metadata().ok()?;
+                            Some(fileops::DirEntry {
+                                name: entry.file_name().to_string_lossy().into_owned(),
+                                attrs: attrs_of(&meta),
+                            })
+                        })
+                        .collect();
+                    plain(self.insert(MockHandle::Dir { entries, at: 0 }))
+                }
+            },
+            Op::ReadDir { handle } => match self.handles.get_mut(&handle) {
+                Some(MockHandle::Dir { entries, at }) => {
+                    let end = (*at + fileops::READDIR_CHUNK).min(entries.len());
+                    let slice = entries[*at..end].to_vec();
+                    *at = end;
+                    plain(Reply::Entries {
+                        entries: slice,
+                        eof: end == entries.len(),
+                    })
+                }
+                _ => plain(Reply::Error {
+                    code: ErrorCode::BadHandle,
+                    msg: "not a directory handle".into(),
+                }),
+            },
+            Op::Mkdir { path, mode, .. } => {
+                if let Err(e) = std::fs::create_dir(&path) {
+                    return plain(failed_at(&path, &e));
+                }
+                match mode {
+                    Some(mode) => attempt(
+                        &path,
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)),
+                    ),
+                    None => plain(Reply::Ok),
+                }
+            }
+            Op::Rmdir { path } => attempt(&path, std::fs::remove_dir(&path)),
+            Op::Remove { path } => attempt(&path, std::fs::remove_file(&path)),
+            Op::Rename { from, to } => attempt(&from, std::fs::rename(&from, &to)),
+            Op::Realpath { path } => plain(Reply::Name {
+                path: std::fs::canonicalize(&path)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(path),
+            }),
+            Op::Symlink { target, link, .. } => {
+                attempt(&link, std::os::unix::fs::symlink(&target, &link))
+            }
+            Op::Readlink { path } => match std::fs::read_link(&path) {
+                Ok(target) => plain(Reply::Name {
+                    path: target.to_string_lossy().into_owned(),
+                }),
+                Err(e) => plain(failed_at(&path, &e)),
+            },
+            Op::Digest { path } => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    use sha2::{Digest, Sha256};
+                    plain(Reply::Digest {
+                        sha256: hex::encode(Sha256::digest(&bytes)),
+                        len: bytes.len() as u64,
+                    })
+                }
+                Err(e) => plain(failed_at(&path, &e)),
+            },
+        }
+    }
+}
+
+fn failed(e: &std::io::Error) -> Reply {
+    Reply::Error {
+        code: ErrorCode::of(e),
+        msg: e.to_string(),
+    }
+}
+
+/// The same, naming the path — which is what the guest's own file session
+/// does, and what a client pipelining 64 requests needs to tell them apart.
+fn failed_at(path: &str, e: &std::io::Error) -> Reply {
+    Reply::Error {
+        code: ErrorCode::of(e),
+        msg: match path.is_empty() {
+            true => e.to_string(),
+            false => format!("{path}: {e}"),
+        },
+    }
+}
+
+fn set_times(
+    file: &std::fs::File,
+    atime_ns: Option<i64>,
+    mtime_ns: Option<i64>,
+) -> std::io::Result<()> {
+    if atime_ns.is_none() && mtime_ns.is_none() {
+        return Ok(());
+    }
+    let at = |ns: i64| std::time::UNIX_EPOCH + Duration::from_nanos(ns.unsigned_abs());
+    let mut times = std::fs::FileTimes::new();
+    if let Some(ns) = atime_ns {
+        times = times.set_accessed(at(ns));
+    }
+    if let Some(ns) = mtime_ns {
+        times = times.set_modified(at(ns));
+    }
+    file.set_times(times)
+}
+
+fn attrs_of(meta: &std::fs::Metadata) -> Attrs {
+    use std::os::unix::fs::PermissionsExt;
+    let nanos = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0)
+    };
+    Attrs {
+        kind: if meta.is_dir() {
+            EntryKind::Dir
+        } else if meta.is_symlink() {
+            EntryKind::Symlink
+        } else {
+            EntryKind::File
+        },
+        size: meta.len(),
+        mtime_ns: nanos(meta.modified()),
+        atime_ns: nanos(meta.accessed()),
+        mode: Some(meta.permissions().mode() & 0o7777),
+    }
 }
 
 /// The exit code an exec's command line asks for: the number after its last
@@ -304,7 +691,7 @@ fn logins() -> Vec<Login> {
 type Recorded = Arc<Mutex<Vec<(String, Value)>>>;
 
 struct Harness {
-    _agent_dir: tempfile::TempDir,
+    agent_dir: tempfile::TempDir,
     agent_log: Arc<AgentLog>,
     events: Recorded,
     session: client::Handle<Client>,
@@ -361,7 +748,30 @@ async fn connect_featured(
     guest_os: GuestOs,
     features: &[&str],
 ) -> anyhow::Result<Harness> {
-    let (agent_dir, agent, agent_log) = mock_agent_with(features).await;
+    connect_like(username, logins, guest_os, features, Credit::Granted).await
+}
+
+/// The same, against a guest that takes a file session's bytes and grants
+/// credit for none — the stall the facade must not buffer through (§19.3).
+async fn connect_stalled(username: &str, logins: Vec<Login>) -> anyhow::Result<Harness> {
+    connect_like(
+        username,
+        logins,
+        GuestOs::Linux,
+        EVERY_FEATURE,
+        Credit::Withheld,
+    )
+    .await
+}
+
+async fn connect_like(
+    username: &str,
+    logins: Vec<Login>,
+    guest_os: GuestOs,
+    features: &[&str],
+    credit: Credit,
+) -> anyhow::Result<Harness> {
+    let (agent_dir, agent, agent_log) = mock_agent_like(features, credit).await;
     let events: Recorded = Arc::new(Mutex::new(Vec::new()));
 
     let sink = events.clone();
@@ -382,7 +792,7 @@ async fn connect_featured(
         anyhow::bail!("auth refused");
     }
     Ok(Harness {
-        _agent_dir: agent_dir,
+        agent_dir,
         agent_log,
         events,
         session,
@@ -390,6 +800,11 @@ async fn connect_featured(
 }
 
 impl Harness {
+    /// The directory the mock guest's files live in.
+    fn guest(&self) -> PathBuf {
+        guest_root(self.agent_dir.path())
+    }
+
     fn opens(&self) -> Vec<Opened> {
         self.agent_log.opens.lock().unwrap().clone()
     }
@@ -441,11 +856,7 @@ async fn expect_refused(channel: &mut russh::Channel<client::Msg>) {
 /// facade is transport-agnostic — [`serve_connection`] takes any stream —
 /// and nothing in the product ever binds a port (ADR-0012).
 async fn openssh_reachable_facade(logins: Vec<Login>) -> Option<RealSsh> {
-    if std::process::Command::new("ssh")
-        .arg("-V")
-        .output()
-        .is_err()
-    {
+    if openssh_version().is_none() {
         eprintln!("no ssh(1) on this host — skipping the OpenSSH interop test");
         return None;
     }
@@ -455,20 +866,65 @@ async fn openssh_reachable_facade(logins: Vec<Login>) -> Option<RealSsh> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
     let port = listener.local_addr().ok()?.port();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let _ = serve_connection(spec, agent, stream).await;
+        // One connection per client invocation, and a `scp` up followed by a
+        // `scp` down is two — served against the same mock guest, so the
+        // second sees what the first wrote.
+        while let Ok((stream, _)) = listener.accept().await {
+            let spec = spec.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                let _ = serve_connection(spec, agent, stream).await;
+            });
+        }
     });
     Some(RealSsh {
         port,
         agent_log,
-        _agent_dir: agent_dir,
+        agent_dir,
     })
+}
+
+/// The major version of the `ssh(1)` on this host, or `None` where there is
+/// none. `scp` speaks SFTP by default from OpenSSH 9.0, which is what makes
+/// `scp` a test of this transcode at all.
+fn openssh_version() -> Option<u32> {
+    // `ssh -V` prints to stderr.
+    let out = std::process::Command::new("ssh").arg("-V").output().ok()?;
+    let shown = String::from_utf8_lossy(&out.stderr).into_owned();
+    shown
+        .split("OpenSSH_")
+        .nth(1)?
+        .split(['.', 'p', ' '])
+        .next()?
+        .parse()
+        .ok()
 }
 
 struct RealSsh {
     port: u16,
     agent_log: Arc<AgentLog>,
-    _agent_dir: tempfile::TempDir,
+    agent_dir: tempfile::TempDir,
+}
+
+impl RealSsh {
+    /// The directory the mock guest's files live in.
+    fn guest(&self) -> PathBuf {
+        guest_root(self.agent_dir.path())
+    }
+
+    /// The options that keep a test off the developer's own `known_hosts`.
+    fn args(&self, port_flag: &str) -> Vec<String> {
+        vec![
+            port_flag.into(),
+            self.port.to_string(),
+            "-o".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+        ]
+    }
 }
 
 impl RealSsh {
@@ -1158,15 +1614,20 @@ async fn x11_is_refused_by_the_invariant() {
     );
 }
 
-/// `subsystem sftp` refuses by name until #88 builds it, so a client that
-/// needs it fails legibly rather than hanging.
+/// `sftp` is the only subsystem the facade serves; anything else is refused
+/// **by name**, so a client that needs one fails legibly rather than hanging.
 #[tokio::test]
 async fn an_unserved_subsystem_is_refused_by_name() {
     let h = connect_as("dev", logins()).await.unwrap();
     let mut channel = h.session.channel_open_session().await.unwrap();
-    channel.request_subsystem(true, "sftp").await.unwrap();
+    channel.request_subsystem(true, "netconf").await.unwrap();
     expect_refused(&mut channel).await;
-    assert!(h.refusals()[0]["reason"].as_str().unwrap().contains("sftp"));
+    assert!(
+        h.refusals()[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("netconf")
+    );
 }
 
 /// Keepalive is answered with `SSH_MSG_REQUEST_FAILURE`, which *is* the
@@ -1196,6 +1657,671 @@ async fn no_more_sessions_does_not_close_the_door() {
     let mut channel = h.session.channel_open_session().await.unwrap();
     channel.request_shell(true).await.unwrap();
     assert_eq!(read_data(&mut channel, 8).await, b"prompt$ ");
+}
+
+// ---------------------------------------------------------------------------
+// `subsystem sftp`, transcoded onto `fileops`
+// ---------------------------------------------------------------------------
+
+use super::sftp::{kind, status};
+
+/// A minimal SFTP client over one channel: enough to send a packet and read
+/// the reply, so a test can assert on the wire the facade actually writes.
+///
+/// The real `scp` and `sftp` binaries drive the transcode further down this
+/// file; this is for the answers only a hand-built packet can ask for — a
+/// Windows drive letter on a Linux test host, an extension no client of ours
+/// sends, a push with no reader.
+struct Sftp {
+    stream: russh::ChannelStream<client::Msg>,
+    next_id: u32,
+}
+
+impl Sftp {
+    /// Open `subsystem sftp` and do the version handshake.
+    async fn open(session: &client::Handle<Client>) -> Sftp {
+        let channel = session.channel_open_session().await.unwrap();
+        channel.request_subsystem(true, "sftp").await.unwrap();
+        let mut sftp = Sftp {
+            stream: channel.into_stream(),
+            next_id: 0,
+        };
+        let mut body = Vec::new();
+        put_u32(&mut body, 3);
+        sftp.write(kind::INIT, &body).await;
+        let (kind, body) = sftp.reply().await;
+        assert_eq!(kind, super::sftp::kind::VERSION);
+        assert_eq!(u32::from_be_bytes(body[..4].try_into().unwrap()), 3);
+        sftp
+    }
+
+    async fn write(&mut self, kind: u8, body: &[u8]) {
+        let mut packet = Vec::new();
+        put_u32(&mut packet, (body.len() + 1) as u32);
+        packet.push(kind);
+        packet.extend_from_slice(body);
+        self.stream.write_all(&packet).await.unwrap();
+    }
+
+    /// One reply packet: its type, and everything after it.
+    async fn reply(&mut self) -> (u8, Vec<u8>) {
+        let mut len = [0u8; 4];
+        self.stream.read_exact(&mut len).await.unwrap();
+        let mut packet = vec![0u8; u32::from_be_bytes(len) as usize];
+        self.stream.read_exact(&mut packet).await.unwrap();
+        (packet[0], packet[1..].to_vec())
+    }
+
+    /// One request, one reply. The id is the caller's business only when it
+    /// is checking that the reply echoes it, which [`Sftp::reply`] leaves
+    /// visible in the body.
+    async fn ask(&mut self, kind: u8, args: &[u8]) -> (u8, Vec<u8>) {
+        self.next_id += 1;
+        let mut body = Vec::new();
+        put_u32(&mut body, self.next_id);
+        body.extend_from_slice(args);
+        self.write(kind, &body).await;
+        self.reply().await
+    }
+
+    /// A request whose only acceptable answer is a handle.
+    async fn handle(&mut self, kind: u8, args: &[u8]) -> Vec<u8> {
+        match self.ask(kind, args).await {
+            (kind::HANDLE, body) => body[8..].to_vec(),
+            (kind, body) => panic!("expected a handle, got type {kind}: {body:?}"),
+        }
+    }
+
+    /// The status code a reply carries, and the words with it.
+    async fn status(&mut self, kind: u8, args: &[u8]) -> (u32, String) {
+        match self.ask(kind, args).await {
+            (kind::STATUS, body) => (
+                u32::from_be_bytes(body[4..8].try_into().unwrap()),
+                read_str(&body[8..]).0,
+            ),
+            (kind, body) => panic!("expected a status, got type {kind}: {body:?}"),
+        }
+    }
+}
+
+fn put_u32(out: &mut Vec<u8>, n: u32) {
+    out.extend_from_slice(&n.to_be_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(&n.to_be_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u32(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_bytes(out, s.as_bytes());
+}
+
+/// One argument list holding just a path. A request that also carries an
+/// attribute block appends its own.
+fn path_args(path: &Path) -> Vec<u8> {
+    let mut args = Vec::new();
+    put_str(&mut args, &path.to_string_lossy());
+    args
+}
+
+/// A length-prefixed string, and where it ended.
+fn read_str(bytes: &[u8]) -> (String, usize) {
+    let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+    (
+        String::from_utf8_lossy(&bytes[4..4 + len]).into_owned(),
+        4 + len,
+    )
+}
+
+/// The names a `NAME` reply carries: `(filename, longname)` per entry.
+fn read_names(body: &[u8]) -> Vec<(String, String)> {
+    let count = u32::from_be_bytes(body[4..8].try_into().unwrap()) as usize;
+    let mut at = 8;
+    let mut names = Vec::new();
+    for _ in 0..count {
+        let (name, used) = read_str(&body[at..]);
+        at += used;
+        let (long, used) = read_str(&body[at..]);
+        at += used;
+        // The attribute block, skipped: only its flags are fixed here, and
+        // every field this facade sets is checked in `read_attrs`.
+        let flags = u32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+        at += 4 + attr_len(flags);
+        names.push((name, long));
+    }
+    names
+}
+
+/// How many bytes of attribute block follow the flags word.
+fn attr_len(flags: u32) -> usize {
+    let mut len = 0;
+    if flags & 0x1 != 0 {
+        len += 8; // size
+    }
+    if flags & 0x2 != 0 {
+        len += 8; // uid + gid
+    }
+    if flags & 0x4 != 0 {
+        len += 4; // permissions
+    }
+    if flags & 0x8 != 0 {
+        len += 8; // atime + mtime
+    }
+    len
+}
+
+/// `(size, permissions)` out of an `ATTRS` reply.
+fn read_attrs(body: &[u8]) -> (u64, u32) {
+    let flags = u32::from_be_bytes(body[4..8].try_into().unwrap());
+    assert_eq!(flags & 0x1, 0x1, "size is always reported");
+    assert_eq!(flags & 0x4, 0x4, "permissions are always reported");
+    (
+        u64::from_be_bytes(body[8..16].try_into().unwrap()),
+        u32::from_be_bytes(body[16..20].try_into().unwrap()),
+    )
+}
+
+/// A `write` packet's arguments, for the tests that push bytes by hand.
+fn write_args(handle: &[u8], offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut args = Vec::new();
+    put_bytes(&mut args, handle);
+    put_u64(&mut args, offset);
+    put_bytes(&mut args, data);
+    args
+}
+
+/// **The property this ticket exists for** (§19.2): file operations resolve
+/// the same (account, secret) as the shell.
+///
+/// One connection, a shell channel and an sftp channel, and the *same* logon
+/// on both opens — which is what makes them land on one cached logon, one
+/// `LogonId` and one view of mapped drives. It is true by construction here
+/// rather than by discipline: there is one resolved logon on a connection and
+/// both opens carry it.
+#[tokio::test]
+async fn file_operations_run_under_the_same_logon_as_the_shell() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let channel = h.session.channel_open_session().await.unwrap();
+    channel.request_shell(true).await.unwrap();
+    let shell = h
+        .wait_for_open(|o| matches!(o, Opened::Terminal { .. }))
+        .await;
+
+    let _sftp = Sftp::open(&h.session).await;
+    let files = h
+        .wait_for_open(|o| matches!(o, Opened::FileOps { .. }))
+        .await;
+
+    match (shell, files) {
+        (Opened::Terminal { logon: shell, .. }, Opened::FileOps { logon: files }) => {
+            assert_eq!(shell.as_ref().unwrap().user, r"PROBE\dev");
+            assert_eq!(shell, files, "sftp must be the shell's logon, not another");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// And a `-l admin` connection's file session is *that* identity — the
+/// selector reaches the file session the same way it reaches the shell.
+#[tokio::test]
+async fn a_login_label_selects_the_file_sessions_identity_too() {
+    let h = connect_as("admin", logins()).await.unwrap();
+    let _sftp = Sftp::open(&h.session).await;
+    match h
+        .wait_for_open(|o| matches!(o, Opened::FileOps { .. }))
+        .await
+    {
+        Opened::FileOps { logon } => assert_eq!(logon.unwrap().user, r"PROBE\administrator"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// §19.3's per-channel degradation: an agent too old for `fileops` still
+/// serves a shell, and `subsystem sftp` refuses **by name**, naming the
+/// capability and the repair verb rather than leaving an editor to hang.
+#[tokio::test]
+async fn an_agent_without_fileops_still_serves_a_shell_and_refuses_sftp_by_name() {
+    let h = connect_featured(
+        "dev",
+        logins(),
+        GuestOs::Linux,
+        &["terminal", "exec", "tunnel"],
+    )
+    .await
+    .unwrap();
+
+    let mut sftp = h.session.channel_open_session().await.unwrap();
+    sftp.request_subsystem(true, "sftp").await.unwrap();
+    expect_refused(&mut sftp).await;
+
+    let refusal = h.refusals()[0].clone();
+    assert_eq!(refusal["request"], "subsystem sftp");
+    let reason = refusal["reason"].as_str().unwrap();
+    assert!(reason.contains("fileops"), "{reason}");
+    assert!(reason.contains("repair-agent"), "{reason}");
+
+    // The shell is untouched: the facade degrades per channel, not per
+    // connection.
+    let mut shell = h.session.channel_open_session().await.unwrap();
+    shell.request_shell(true).await.unwrap();
+    assert_eq!(read_data(&mut shell, 8).await, b"prompt$ ");
+}
+
+/// The whole vocabulary §19.5 names `fileops` for, driven from the client's
+/// side and checked against what actually landed in the guest's directory.
+#[tokio::test]
+async fn the_transcode_covers_the_vocabulary_a_client_issues() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let root = h.guest();
+    let mut sftp = Sftp::open(&h.session).await;
+
+    // realpath, which is the first thing every client sends.
+    let (kind, body) = sftp.ask(kind::REALPATH, &path_args(&root)).await;
+    assert_eq!(kind, super::sftp::kind::NAME);
+    assert_eq!(read_names(&body)[0].0, root.to_string_lossy());
+
+    // open → write → write → close, at explicit offsets.
+    let file = root.join("hello.txt");
+    let mut args = path_args(&file);
+    put_u32(&mut args, 0x2 | 0x8 | 0x10); // write | create | truncate
+    put_u32(&mut args, 0x4); // permissions follow
+    put_u32(&mut args, 0o640);
+    let handle = sftp.handle(kind::OPEN, &args).await;
+    assert_eq!(
+        sftp.status(kind::WRITE, &write_args(&handle, 0, b"hello "))
+            .await
+            .0,
+        status::OK
+    );
+    assert_eq!(
+        sftp.status(kind::WRITE, &write_args(&handle, 6, b"world"))
+            .await
+            .0,
+        status::OK
+    );
+    let mut close = Vec::new();
+    put_bytes(&mut close, &handle);
+    assert_eq!(sftp.status(kind::CLOSE, &close).await.0, status::OK);
+    assert_eq!(std::fs::read(&file).unwrap(), b"hello world");
+
+    // stat: the size and the mode the open asked for, with the file type put
+    // back into the permission bits a client branches on.
+    let (kind, body) = sftp.ask(kind::STAT, &path_args(&file)).await;
+    assert_eq!(kind, super::sftp::kind::ATTRS);
+    assert_eq!(read_attrs(&body), (11, 0o100_640));
+
+    // read, and the empty read past the end that is how a client learns where
+    // the file stopped.
+    let mut args = path_args(&file);
+    put_u32(&mut args, 0x1); // read
+    put_u32(&mut args, 0); // no attributes
+    let handle = sftp.handle(kind::OPEN, &args).await;
+    let mut read = Vec::new();
+    put_bytes(&mut read, &handle);
+    put_u64(&mut read, 0);
+    put_u32(&mut read, 4096);
+    let (kind, body) = sftp.ask(super::sftp::kind::READ, &read).await;
+    assert_eq!(kind, super::sftp::kind::DATA);
+    assert_eq!(read_str(&body[4..]).0, "hello world");
+    let mut read = Vec::new();
+    put_bytes(&mut read, &handle);
+    put_u64(&mut read, 11);
+    put_u32(&mut read, 4096);
+    assert_eq!(sftp.status(kind::READ, &read).await.0, status::EOF);
+    let mut close = Vec::new();
+    put_bytes(&mut close, &handle);
+    sftp.status(kind::CLOSE, &close).await;
+
+    // mkdir, rename, and a directory listing that reports what moved into it.
+    let dir = root.join("src");
+    let mut args = path_args(&dir);
+    put_u32(&mut args, 0x4);
+    put_u32(&mut args, 0o755);
+    assert_eq!(sftp.status(kind::MKDIR, &args).await.0, status::OK);
+    let moved = dir.join("hello.txt");
+    let mut args = path_args(&file);
+    args.extend(path_args(&moved));
+    assert_eq!(sftp.status(kind::RENAME, &args).await.0, status::OK);
+
+    let handle = sftp.handle(kind::OPENDIR, &path_args(&dir)).await;
+    let mut read = Vec::new();
+    put_bytes(&mut read, &handle);
+    let (kind, body) = sftp.ask(super::sftp::kind::READDIR, &read).await;
+    assert_eq!(kind, super::sftp::kind::NAME);
+    let entries = read_names(&body);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, "hello.txt");
+    assert!(entries[0].1.starts_with("-rw-r-----"), "{}", entries[0].1);
+    // The listing ends with a status, because version 3 has no `eof` field.
+    let mut read = Vec::new();
+    put_bytes(&mut read, &handle);
+    assert_eq!(sftp.status(kind::READDIR, &read).await.0, status::EOF);
+    let mut close = Vec::new();
+    put_bytes(&mut close, &handle);
+    sftp.status(kind::CLOSE, &close).await;
+
+    // symlink and readlink. OpenSSH sends the target first — the reverse of
+    // the draft — and a link whose target is a file gets a file link.
+    let link = dir.join("link.txt");
+    let mut args = path_args(&moved);
+    args.extend(path_args(&link));
+    assert_eq!(sftp.status(kind::SYMLINK, &args).await.0, status::OK);
+    let (kind, body) = sftp
+        .ask(super::sftp::kind::READLINK, &path_args(&link))
+        .await;
+    assert_eq!(kind, super::sftp::kind::NAME);
+    assert_eq!(read_names(&body)[0].0, moved.to_string_lossy());
+    // lstat sees the link itself; stat follows it.
+    let (_, body) = sftp.ask(kind::LSTAT, &path_args(&link)).await;
+    assert_eq!(read_attrs(&body).1 & 0o170_000, 0o120_000);
+    let (_, body) = sftp.ask(kind::STAT, &path_args(&link)).await;
+    assert_eq!(read_attrs(&body).1 & 0o170_000, 0o100_000);
+
+    // setstat, then remove and rmdir — and the failure a client must be able
+    // to tell apart from every other failure.
+    let mut args = path_args(&moved);
+    put_u32(&mut args, 0x4);
+    put_u32(&mut args, 0o600);
+    assert_eq!(sftp.status(kind::SETSTAT, &args).await.0, status::OK);
+    let (_, body) = sftp.ask(kind::STAT, &path_args(&moved)).await;
+    assert_eq!(read_attrs(&body).1, 0o100_600);
+
+    assert_eq!(
+        sftp.status(kind::REMOVE, &path_args(&link)).await.0,
+        status::OK
+    );
+    assert_eq!(
+        sftp.status(kind::REMOVE, &path_args(&moved)).await.0,
+        status::OK
+    );
+    assert_eq!(
+        sftp.status(kind::RMDIR, &path_args(&dir)).await.0,
+        status::OK
+    );
+    assert!(!dir.exists());
+
+    let (code, msg) = sftp.status(kind::STAT, &path_args(&moved)).await;
+    assert_eq!(code, status::NO_SUCH_FILE);
+    assert!(msg.contains("hello.txt"), "{msg}");
+}
+
+/// `realpath` is the guest's answer, carried back verbatim — which is the
+/// whole reason §19.5 says the facade *transcodes* rather than adapts. A tidier
+/// abstraction discovers at this exact point that it cannot express a Windows
+/// drive letter.
+#[tokio::test]
+async fn realpath_carries_a_windows_drive_letter_back_verbatim() {
+    let h = connect_with("dev", logins(), GuestOs::Windows)
+        .await
+        .unwrap();
+    // The mock answers `realpath` with what the path canonicalises to, and a
+    // Windows path on this host canonicalises to itself — which is exactly
+    // the shape a Windows guest sends back, backslashes and all.
+    let mut sftp = Sftp::open(&h.session).await;
+    let mut args = Vec::new();
+    put_str(&mut args, r"C:\Users\dev\project");
+    let (kind, body) = sftp.ask(kind::REALPATH, &args).await;
+    assert_eq!(kind, super::sftp::kind::NAME);
+    assert_eq!(read_names(&body)[0].0, r"C:\Users\dev\project");
+}
+
+/// An extension nothing in the client set needs is answered by name.
+///
+/// This is the one refusal in the whole facade the protocol lets vmlab
+/// narrate itself: a status carries a message where a channel-request failure
+/// does not (§19.3).
+#[tokio::test]
+async fn an_extension_is_refused_in_vmlabs_own_words() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let mut sftp = Sftp::open(&h.session).await;
+    let mut args = Vec::new();
+    put_str(&mut args, "statvfs@openssh.com");
+    put_str(&mut args, "/");
+    let (code, msg) = sftp.status(200, &args).await; // SSH_FXP_EXTENDED
+    assert_eq!(code, status::OP_UNSUPPORTED);
+    assert!(msg.contains("vmlab"), "{msg}");
+}
+
+/// **The coupling §19.3 calls a requirement**: the facade must never grant SSH
+/// window it cannot back with agent credit.
+///
+/// The guest here takes the bytes and never grants credit for more, which is
+/// the shape of a guest that has stopped keeping up. The naive facade
+/// acknowledges the client generously and buffers the difference inside
+/// `labd` — against a tens-of-megabytes editor-server push, an unbounded
+/// buffer in a long-lived process. So: push far more than any window, and
+/// assert the client is *stopped*, having handed over a bounded amount.
+#[tokio::test]
+async fn a_push_a_stalled_guest_cannot_take_stops_rather_than_buffering() {
+    let h = connect_stalled("dev", logins()).await.unwrap();
+
+    let channel = h.session.channel_open_session().await.unwrap();
+    channel.request_subsystem(true, "sftp").await.unwrap();
+    let mut stream = channel.into_stream();
+
+    let sent = Arc::new(AtomicUsize::new(0));
+    let pushing = sent.clone();
+    let push = async move {
+        // The handle is never answered — the guest is not replying — so the
+        // write packets name one the guest will reject if it ever wakes up.
+        // What is under test is how many bytes the *facade* takes before it
+        // stops taking them.
+        let payload = vec![b'x'; 32 * 1024];
+        let mut offset = 0u64;
+        loop {
+            let mut body = Vec::new();
+            put_u32(&mut body, 1);
+            body.extend(write_args(&1u64.to_be_bytes(), offset, &payload));
+            let mut packet = Vec::new();
+            put_u32(&mut packet, (body.len() + 1) as u32);
+            packet.push(kind::WRITE);
+            packet.extend(body);
+            if stream.write_all(&packet).await.is_err() {
+                return;
+            }
+            offset += payload.len() as u64;
+            pushing.fetch_add(packet.len(), Ordering::SeqCst);
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(3), push).await;
+
+    // The bound is the two windows plus the requests between them, not the
+    // transfer: an SSH window, one chunk in flight towards the file session,
+    // and the outstanding operations each waiting on the guest's own credit.
+    let sent = sent.load(Ordering::SeqCst);
+    assert!(sent > 0, "the facade took nothing at all");
+    assert!(
+        sent < 4 * 1024 * 1024,
+        "the facade took {sent} bytes from a guest that granted credit for none — \
+         that difference is a buffer in labd"
+    );
+}
+
+/// A large transfer does not starve an interactive session on the same
+/// connection (§19.3).
+///
+/// The transfer and the shell are separate channels with separate pumps, and
+/// the connection's read loop only ever waits for the guest to take one chunk
+/// — so a shell keeps round-tripping while megabytes move beside it.
+#[tokio::test]
+async fn a_large_transfer_does_not_starve_an_interactive_session() {
+    let h = connect_as("dev", logins()).await.unwrap();
+    let root = h.guest();
+
+    let mut shell = h.session.channel_open_session().await.unwrap();
+    shell.request_shell(true).await.unwrap();
+    assert_eq!(read_data(&mut shell, 8).await, b"prompt$ ");
+
+    let mut sftp = Sftp::open(&h.session).await;
+    let file = root.join("big.bin");
+    let mut args = path_args(&file);
+    put_u32(&mut args, 0x2 | 0x8 | 0x10);
+    put_u32(&mut args, 0);
+    let handle = sftp.handle(kind::OPEN, &args).await;
+
+    let transfer = tokio::spawn(async move {
+        let payload = vec![b'z'; 32 * 1024];
+        // 8 MiB: many times either window, so the transfer is genuinely in
+        // flight for the whole of the interactive traffic below.
+        for i in 0..256u64 {
+            let (code, msg) = sftp
+                .status(kind::WRITE, &write_args(&handle, i * 32 * 1024, &payload))
+                .await;
+            assert_eq!(code, status::OK, "{msg}");
+        }
+        sftp
+    });
+
+    // Every keystroke comes back while that runs, and none of them waits long.
+    for i in 0..20 {
+        let typed = format!("echo {i}\r");
+        shell.data(typed.as_bytes()).await.unwrap();
+        let echoed =
+            tokio::time::timeout(Duration::from_secs(5), read_data(&mut shell, typed.len()))
+                .await
+                .unwrap_or_else(|_| panic!("keystroke {i} never came back while the transfer ran"));
+        assert_eq!(echoed, typed.as_bytes());
+    }
+
+    transfer.await.unwrap();
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 8 * 1024 * 1024);
+}
+
+// ---------------------------------------------------------------------------
+// A real `scp` and a real `sftp`
+// ---------------------------------------------------------------------------
+
+/// `scp` in both directions, with the binary the developer actually types.
+///
+/// `scp` has spoken SFTP since OpenSSH 9.0, so this is a test of the
+/// transcode and not of a legacy protocol: it opens, writes, sets attributes
+/// and closes on the way up, and stats, opens and reads on the way down.
+#[tokio::test]
+async fn scp_moves_a_file_in_both_directions() {
+    let Some(facade) = openssh_reachable_facade(logins()).await else {
+        return;
+    };
+    if openssh_version().unwrap_or(0) < 9 {
+        eprintln!("ssh(1) predates scp-over-SFTP — skipping");
+        return;
+    }
+    let host = tempfile::tempdir().unwrap();
+    let source = host.path().join("payload.bin");
+    // Bigger than one SFTP read, so the transfer is many requests rather than
+    // one.
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&source, &bytes).unwrap();
+    let landed = facade.guest().join("payload.bin");
+
+    let mut up = facade.args("-P");
+    up.push("-s".into()); // the SFTP protocol, said out loud
+    up.push(source.to_string_lossy().into_owned());
+    up.push(format!("dev@127.0.0.1:{}", landed.display()));
+    let out = tokio::process::Command::new("scp")
+        .args(&up)
+        .output()
+        .await
+        .expect("run scp");
+    assert!(
+        out.status.success(),
+        "scp up failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&landed).unwrap(), bytes);
+
+    let back = host.path().join("back.bin");
+    let mut down = facade.args("-P");
+    down.push("-s".into());
+    down.push(format!("dev@127.0.0.1:{}", landed.display()));
+    down.push(back.to_string_lossy().into_owned());
+    let out = tokio::process::Command::new("scp")
+        .args(&down)
+        .output()
+        .await
+        .expect("run scp");
+    assert!(
+        out.status.success(),
+        "scp down failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&back).unwrap(), bytes);
+
+    // And both invocations ran as the selected identity, not as the agent.
+    let opens = facade.agent_log.opens.lock().unwrap().clone();
+    let sessions: Vec<_> = opens
+        .iter()
+        .filter_map(|o| match o {
+            Opened::FileOps { logon } => Some(logon.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sessions.len(), 2, "one file session per scp: {opens:?}");
+    for logon in sessions {
+        assert_eq!(logon.unwrap().user, r"PROBE\dev");
+    }
+}
+
+/// The `sftp` binary, driven through a batch of what a developer types.
+///
+/// A batch aborts on the first failure and exits non-zero, so the exit code
+/// alone is the assertion that every one of these was answered the way the
+/// client expected.
+#[tokio::test]
+async fn sftp_runs_a_batch_of_what_a_developer_types() {
+    let Some(facade) = openssh_reachable_facade(logins()).await else {
+        return;
+    };
+    let host = tempfile::tempdir().unwrap();
+    let source = host.path().join("notes.txt");
+    std::fs::write(&source, b"one\ntwo\nthree\n").unwrap();
+    let guest = facade.guest();
+    let batch = host.path().join("batch");
+    std::fs::write(
+        &batch,
+        format!(
+            "mkdir {dir}\n\
+             put {src} {dir}/notes.txt\n\
+             ls -l {dir}\n\
+             rename {dir}/notes.txt {dir}/renamed.txt\n\
+             chmod 600 {dir}/renamed.txt\n\
+             get {dir}/renamed.txt {back}\n\
+             rm {dir}/renamed.txt\n\
+             rmdir {dir}\n",
+            dir = guest.join("work").display(),
+            src = source.display(),
+            back = host.path().join("back.txt").display(),
+        ),
+    )
+    .unwrap();
+
+    let mut args = facade.args("-P");
+    args.push("-b".into());
+    args.push(batch.to_string_lossy().into_owned());
+    args.push("dev@127.0.0.1".into());
+    let out = tokio::process::Command::new("sftp")
+        .args(&args)
+        .output()
+        .await
+        .expect("run sftp");
+    assert!(
+        out.status.success(),
+        "sftp batch failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(host.path().join("back.txt")).unwrap(),
+        b"one\ntwo\nthree\n"
+    );
+    assert!(
+        !guest.join("work").exists(),
+        "the batch cleaned up after it"
+    );
 }
 
 // ---------------------------------------------------------------------------

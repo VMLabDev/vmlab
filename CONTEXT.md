@@ -263,8 +263,7 @@ interface with no sshd in the guest: `session` channels are serviced by
 vmlab-agent, SFTP is terminated host-side over a **fileops session**, and
 `direct-tcpip` rides an SSH-scoped tunnel stream. It only ever *answers* a
 channel open, never initiates one (ADR-0013), which is why `-R`, agent
-forwarding and X11 are refused. See PRD §19.3 and ADR-0012. _`session` and
-`direct-tcpip` are built; SFTP refuses by name until its own ticket lands._
+forwarding and X11 are refused. See PRD §19.3 and ADR-0012.
 _Avoid_: sshd, SSH server (implies guest-side), gateway, proxy
 
 **Host key**:
