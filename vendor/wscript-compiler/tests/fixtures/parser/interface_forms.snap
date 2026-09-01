@@ -1,0 +1,9 @@
+struct Pane [] opaque
+impl Pane
+  fn title(..)
+mod term
+  const MAX: int
+  fn clear() -> _ <decl>
+
+--- diagnostics ---
+(none)

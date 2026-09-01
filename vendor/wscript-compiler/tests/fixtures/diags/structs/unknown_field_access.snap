@@ -1,0 +1,4 @@
+E0244  3:4-3:5
+  no field `z` on `P`
+  help: available fields: x, y
+

@@ -1,0 +1,4 @@
+E0226  1:17-1:23
+  `return` without a value in a function returning `int`
+  help: write `return <value>`
+

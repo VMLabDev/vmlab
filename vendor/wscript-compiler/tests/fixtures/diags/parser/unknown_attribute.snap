@@ -1,0 +1,4 @@
+E0103  1:1-1:11
+  unknown attribute `nonsense`
+  help: the only attributes supported are `#[derive(...)]` and `#[opaque]` (interface files)
+

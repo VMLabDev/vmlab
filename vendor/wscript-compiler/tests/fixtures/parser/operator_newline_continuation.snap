@@ -1,0 +1,16 @@
+fn main() -> _
+  let sum:_ =
+    binary Add  @2:15-4:10 #5
+      int 1  @2:15-2:16 #1
+      binary Mul  @3:9-4:10 #4
+        int 2  @3:9-3:10 #2
+        int 3  @4:9-4:10 #3
+  let logic:_ =
+    binary Or  @5:17-7:10 #11
+      binary And  @5:17-6:10 #9
+        path a  @5:17-5:18 #7
+        path b  @6:9-6:10 #8
+      path c  @7:9-7:10 #10
+
+--- diagnostics ---
+(none)

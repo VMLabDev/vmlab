@@ -1,0 +1,2 @@
+/* never closed
+fn main() {}

@@ -1,0 +1,84 @@
+struct S []
+  a: int
+  c: string
+enum E
+  A { x: int }
+  B(int)
+  C
+units Dur: int [ms, us]
+  int 1  @20:10-20:11 #1
+  int 2  @21:10-21:11 #2
+fn tuple(v:List[int], g:fn(int) -> int) -> int
+  expr
+    int 0  @25:62-25:63 #3
+fn generic(x:T) -> T
+  expr
+    path x  @27:30-27:31 #5
+fn broken(a:int) -> int
+  expr
+    int 0  @29:36-29:37 #7
+fn main() -> _
+  let list:_ =
+    list  @32:16-32:24 #11
+      int 1  @32:17-32:18 #9
+      int 3  @32:22-32:23 #10
+  let map:_ =
+    map  @33:15-33:34 #15
+      str "a"  @33:18-33:21 #13
+      int 1  @33:23-33:24 #14
+  let lit:_ =
+    structlit S  @34:15-34:39 #19
+      .a =
+        int 1  @34:22-34:23 #17
+      .c =
+        str "x"  @34:34-34:37 #18
+  let call:_ =
+    call  @35:16-35:27 #23
+      path broken  @35:16-35:22 #21
+      int 1  @35:23-35:24 #22
+  let clo:_ =
+    closure |x:_|  @36:15-36:22 #26
+      path x  @36:21-36:22 #25
+  expr
+    match  @37:5-41:6 #37
+      path lit  @37:11-37:14 #28
+      arm S { a: a }
+        int 0  @38:23-38:24 #31
+      arm E::B(1)
+        int 1  @39:22-39:23 #34
+      arm _
+        int 2  @40:14-40:15 #36
+
+--- diagnostics ---
+E0100  8:5-8:6
+  expected `,` or `}` in struct declaration, found `b`
+E0100  9:5-9:6
+  expected field name, found `:`
+E0100  14:17-14:18
+  expected `,` or `}` in variant field list, found `y`
+E0100  15:11-15:15
+  expected `,` or `)` in variant payload, found `bool`
+E0100  22:5-22:6
+  expected unit name, found `=`
+E0100  25:22-25:26
+  expected `,` or `]` in type arguments, found `bool`
+E0100  25:39-25:43
+  expected `,` or `)` in function type, found `bool`
+E0100  27:14-27:15
+  expected `,` or `]` in type parameter list, found `U`
+E0100  29:18-29:19
+  expected `,` or `)` in parameter list, found `b`
+E0100  32:19-32:20
+  expected `,` or `]` in list literal, found integer literal
+E0100  33:26-33:29
+  expected `,` or `}` in map literal, found string literal
+E0100  34:25-34:26
+  expected `,` or `}` in struct literal, found `b`
+E0100  35:25-35:26
+  expected `,` or `)` in argument list, found integer literal
+E0100  36:18-36:19
+  expected `,` or `|` in closure parameters, found `y`
+E0100  38:16-38:17
+  expected `,` or `}` in struct pattern, found `b`
+E0100  39:16-39:17
+  expected `,` or `)` in pattern, found integer literal

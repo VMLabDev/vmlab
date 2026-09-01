@@ -1,0 +1,4 @@
+E0227  1:16-1:17
+  an `if` condition must be `bool`, found `int`
+  help: wscript has no truthiness: write an explicit comparison
+

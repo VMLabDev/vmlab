@@ -1,0 +1,4 @@
+E0003  1:21-1:25
+  invalid unicode escape: missing closing `}`
+  help: write the code point in braces, e.g. `\u{1F600}`
+

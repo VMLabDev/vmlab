@@ -1,0 +1,4 @@
+E0227  1:19-1:22
+  a `while` condition must be `bool`, found `string`
+  help: wscript has no truthiness: write an explicit comparison
+

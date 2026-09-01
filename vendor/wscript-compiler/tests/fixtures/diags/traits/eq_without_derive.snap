@@ -1,0 +1,4 @@
+E0235  2:21-2:45
+  `==` on `P` requires an `Eq` implementation
+  help: add `#[derive(Eq)]` to `P`, or `impl Eq for P`; for reference identity use `same(a, b)` (PRD §3.7)
+

@@ -1,0 +1,4 @@
+E0202  1:8-1:11
+  the type name `Map` is already defined
+  help: type names must be unique across the script, host-registered types, and built-ins
+

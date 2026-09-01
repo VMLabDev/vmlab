@@ -1,0 +1,4 @@
+E0245  1:13-1:21
+  strings cannot be indexed directly
+  help: use `s.chars()` for a List[char] or `s.slice(start, end)` for a substring
+

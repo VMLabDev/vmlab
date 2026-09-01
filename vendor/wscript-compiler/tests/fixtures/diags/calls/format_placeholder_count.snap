@@ -1,0 +1,4 @@
+E0239  1:23-1:30
+  format template has 2 placeholders but 1 argument was given
+  help: each `{}` or `{:spec}` consumes one argument; escape literal braces as `{{` and `}}`
+

@@ -1,0 +1,4 @@
+E0112  1:37-1:38
+  a closure with a declared return type needs a block body
+  help: write `|x| -> int { ... }`
+

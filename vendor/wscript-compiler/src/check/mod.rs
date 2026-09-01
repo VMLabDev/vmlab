@@ -4,10 +4,14 @@
 //! bytecode emitter consumes. All host signatures are known before any
 //! script code is checked (PRD §2's key invariant).
 
+mod env;
 mod expr;
+mod index;
 mod infer;
 mod methods;
+mod ops;
 mod pat;
+pub(crate) mod resolve;
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,9 +26,12 @@ use wscript_core::span::Span;
 use wscript_core::types::{FnSig, Type};
 
 use crate::ast::*;
+use env::{Env, FnFrame};
 use infer::Infer;
 
+pub use index::{Completion, CompletionKind, Editor, Index, Symbol, render_sig};
 pub use infer::subst_params;
+pub use methods::builtin_methods;
 
 pub type LocalId = u32;
 
@@ -62,6 +69,41 @@ pub enum PreludeFn {
     Float,
 }
 
+impl PreludeFn {
+    /// Every prelude function. `ALL` and [`PreludeFn::name`] are what an
+    /// editor enumerates; the checker resolves names through the same
+    /// pair, so a new prelude function reaches both at once.
+    pub const ALL: &'static [PreludeFn] = &[
+        PreludeFn::Print,
+        PreludeFn::Println,
+        PreludeFn::Str,
+        PreludeFn::Fmt,
+        PreludeFn::Same,
+        PreludeFn::Weak,
+        PreludeFn::Int,
+        PreludeFn::Float,
+    ];
+
+    /// How the function is spelled in a script.
+    pub fn name(self) -> &'static str {
+        match self {
+            PreludeFn::Print => "print",
+            PreludeFn::Println => "println",
+            PreludeFn::Str => "str",
+            PreludeFn::Fmt => "fmt",
+            PreludeFn::Same => "same",
+            PreludeFn::Weak => "weak",
+            PreludeFn::Int => "int",
+            PreludeFn::Float => "float",
+        }
+    }
+
+    /// The prelude function `name` spells, if it spells one.
+    pub fn from_name(name: &str) -> Option<PreludeFn> {
+        PreludeFn::ALL.iter().copied().find(|p| p.name() == name)
+    }
+}
+
 /// What a call expression lowers to.
 #[derive(Debug, Clone)]
 pub enum CallKind {
@@ -75,9 +117,6 @@ pub enum CallKind {
     },
     /// Calling a function value: callee is evaluated.
     Value,
-    /// `Duration::ms(n)` — not a call at all: the argument is scaled into
-    /// base units inline. The factor is in `CheckResult::unit_convs`.
-    UnitConv,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +167,7 @@ pub enum PrimKind {
 }
 
 /// Resolved lowering of a binary operator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOpKind {
     IntArith(BinOp),
     FloatArith(BinOp),
@@ -168,7 +207,7 @@ pub enum BinOpKind {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOpKind {
     NegInt,
     NegFloat,
@@ -205,8 +244,9 @@ pub struct ClosureRes {
     pub proto: u32,
 }
 
-/// Where a function's AST lives (the emitter walks it by this reference).
-#[derive(Debug, Clone, Copy)]
+/// Where a function's AST lives (the emitter walks it by this reference,
+/// and the editor's index names a declared function by it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FnSource {
     /// `files[file].items[item]` is an `Item::Fn`.
     Top { file: usize, item: usize },
@@ -271,6 +311,76 @@ pub struct Derives {
     pub clone: bool,
 }
 
+/// How one expression node lowers to bytecode.
+///
+/// One per node, replacing thirteen parallel `HashMap<NodeId, _>` side
+/// tables. Payloads that used to need a second lookup are inline:
+/// `CallKind::UnitConv` had its factor in `unit_convs`, and `struct_lits`
+/// had its field permutation in `field_orders`.
+///
+/// Adding a language construct adds a variant here, and every consumer
+/// stops compiling until it is handled — which is the point.
+///
+/// Patterns lower differently (they test and bind rather than produce a
+/// value) and have their own space: [`PatLowering`].
+#[derive(Debug, Clone)]
+pub enum Lowering {
+    Var(VarRes),
+    Path(PathRes),
+    Call(CallKind),
+    /// `Duration::ms(n)` / `d.ms` — scaled inline; neither a call nor a
+    /// field access at runtime.
+    UnitConv(ConvKind),
+    Method(MethodRes),
+    /// Struct/enum field read → runtime field index.
+    Field {
+        idx: u16,
+    },
+    Index(IndexKind),
+    BinOp(BinOpKind),
+    UnOp(UnOpKind),
+    /// The struct, plus the runtime field index of each field *as written*.
+    StructLit {
+        res: StructLitRes,
+        order: Vec<u16>,
+    },
+    /// A suffixed literal, already folded to a base-unit constant.
+    QuantityLit(Factor),
+    For(ForKind),
+    Try(TryKind),
+    Closure(ClosureRes),
+}
+
+/// How one pattern node lowers to bytecode.
+///
+/// The counterpart of [`Lowering`] for the pattern space, replacing four
+/// parallel side tables. A pattern's identity and its field permutation
+/// used to be recorded by different functions — `check_pattern_fields` is
+/// shared by struct patterns and struct-variant patterns, so it could not
+/// know which it was completing. It now *returns* the order and each
+/// caller writes one complete value, so no node is ever half-lowered.
+///
+/// Patterns that only test a value (`_`, `1`, `true`, `'c'`, `"s"`) and
+/// plain bindings lower from their `PatternKind` alone and record nothing;
+/// a binding's local slot lives in `decl_locals`.
+#[derive(Debug, Clone)]
+pub enum PatLowering {
+    /// A variant pattern, or a bare binding that names a unit variant.
+    /// `order` is the runtime field index of each field *as written*, and
+    /// is empty for unit and tuple variants.
+    Variant {
+        def: DefId,
+        tag: u32,
+        order: Vec<u16>,
+    },
+    /// A struct pattern, with the runtime field index of each field *as
+    /// written*.
+    Struct { def: DefId, order: Vec<u16> },
+    /// A suffixed literal in pattern position, already folded to a
+    /// base-unit constant. The expression form is [`Lowering::QuantityLit`].
+    QuantityLit(Factor),
+}
+
 /// Everything the checker learned, keyed by AST node ids.
 #[derive(Default)]
 pub struct CheckResult {
@@ -278,35 +388,16 @@ pub struct CheckResult {
     pub diags: Vec<Diagnostic>,
     /// Type of every expression node (fully resolved).
     pub types: HashMap<NodeId, Type>,
-    /// Variable references (`Path` exprs that name a local or capture).
-    pub var_refs: HashMap<NodeId, VarRes>,
+    /// How each expression node lowers. Private: reach it through
+    /// [`CheckResult::lowering`], so a missing entry surfaces as an
+    /// internal error rather than a silently-wrong instruction.
+    lowerings: HashMap<NodeId, Lowering>,
     /// Local slot for `let` statements, `for` loop variables and pattern
     /// bindings (keyed by stmt id / for-expr id / pattern id).
     pub decl_locals: HashMap<NodeId, LocalId>,
-    pub paths: HashMap<NodeId, PathRes>,
-    pub calls: HashMap<NodeId, CallKind>,
-    pub methods: HashMap<NodeId, MethodRes>,
-    /// Field expr → runtime field index.
-    pub fields: HashMap<NodeId, u16>,
-    /// Unit-family conversions: `d.ms` (field exprs) and `Duration::ms(n)`
-    /// (call exprs) → the constant scale to apply.
-    pub unit_convs: HashMap<NodeId, ConvKind>,
-    /// Suffixed literals (`500ms`), already folded to a base-unit constant.
-    pub quantity_lits: HashMap<NodeId, Factor>,
-    pub struct_lits: HashMap<NodeId, StructLitRes>,
-    /// Struct literal / struct pattern: for each field as written, the
-    /// runtime field index.
-    pub field_orders: HashMap<NodeId, Vec<u16>>,
-    pub indexes: HashMap<NodeId, IndexKind>,
-    pub bin_ops: HashMap<NodeId, BinOpKind>,
-    pub un_ops: HashMap<NodeId, UnOpKind>,
-    pub for_kinds: HashMap<NodeId, ForKind>,
-    pub try_kinds: HashMap<NodeId, TryKind>,
-    /// Variant patterns (and bindings reinterpreted as unit variants).
-    pub pattern_variants: HashMap<NodeId, (DefId, u32)>,
-    /// Struct patterns → the struct def they destructure.
-    pub pattern_structs: HashMap<NodeId, DefId>,
-    pub closures: HashMap<NodeId, ClosureRes>,
+    /// How each pattern node lowers. Private, like `lowerings`: reach it
+    /// through [`CheckResult::pat_lowering`].
+    pat_lowerings: HashMap<NodeId, PatLowering>,
     /// Exprs needing a `MakeDyn` wrap after evaluation → vtable id.
     pub dyn_wraps: HashMap<NodeId, u32>,
     pub fn_infos: Vec<FnInfo>,
@@ -317,43 +408,18 @@ pub struct CheckResult {
     pub impl_maps: ImplMaps,
     pub exports: HashMap<String, (u32, FnSig)>,
     /// Reference → definition span (locals and script functions), for the
-    /// LSP's goto-definition.
+    /// LSP's goto-definition. Keyed by the *use* site.
     pub def_spans: HashMap<NodeId, Span>,
+    /// Def → the span of its own declared name, keyed by the def rather
+    /// than by a use of it. Script defs only: host registrations have no
+    /// source.
+    pub def_decl_spans: HashMap<DefId, Span>,
     /// Script methods per type (inherent + trait impls), for the LSP's
     /// completion.
     pub methods_by_type: HashMap<DefId, Vec<(String, FnSig)>>,
 }
 
 // ----------------------------------------------------------------- scope
-
-#[derive(Clone)]
-struct Binding {
-    local: LocalId,
-    ty: Type,
-    /// Definition span (for the LSP's goto-definition).
-    #[allow(dead_code)] // consumed by the LSP (M6)
-    span: Span,
-}
-
-struct Scope {
-    bindings: HashMap<String, Binding>,
-    /// Index into `fn_states` of the owning function.
-    fn_depth: usize,
-}
-
-struct LoopCtx {
-    has_break: bool,
-}
-
-struct FnState {
-    ret: Type,
-    n_locals: u32,
-    captured: HashSet<LocalId>,
-    captures: Vec<CapSrc>,
-    /// Dedup: (owner fn depth, local) → capture slot.
-    capture_map: HashMap<(usize, LocalId), u16>,
-    loops: Vec<LoopCtx>,
-}
 
 /// Item imported via `use module::item`.
 #[derive(Clone)]
@@ -387,8 +453,12 @@ pub struct Checker<'a> {
     /// All files of the program: (module name, AST). Index 0 is the
     /// entry file; the module name of the entry is unused.
     pub(crate) files: &'a [(String, &'a SourceFile)],
-    /// File whose items/bodies are currently being processed.
-    pub(crate) cur_file: usize,
+    /// File whose items/bodies are currently being processed. Every bare
+    /// name is resolved against it — `file`, `fn_by_name`, `module_ref`
+    /// and `imported` all index by it — so after construction it has
+    /// exactly one writer, [`Checker::in_file`], which restores the
+    /// previous file on exit.
+    cur_file: usize,
     pub(crate) reg: &'a Registry,
     pub(crate) out: CheckResult,
     pub(crate) infer: Infer,
@@ -408,10 +478,6 @@ pub struct Checker<'a> {
     pub(crate) inherent: HashMap<DefId, HashMap<String, u32>>,
     /// Associated functions (no-self fns in inherent impls): `Type::func`.
     pub(crate) assoc: HashMap<DefId, HashMap<String, u32>>,
-    /// Type parameters in scope — set while resolving a generic fn's
-    /// signature and while checking its body. `Type::Param(i)` indexes
-    /// this list (rigid: unifies only with itself).
-    pub(crate) current_type_params: Vec<(String, Option<BoundKind>)>,
     /// Generic calls whose instantiation wasn't resolved at the callsite:
     /// re-checked (bounds + inference) when the enclosing top-level fn
     /// finishes. (call span, fn name, type_params, fresh instantiation).
@@ -426,8 +492,9 @@ pub struct Checker<'a> {
     unit_suffixes: HashMap<String, Vec<DefId>>,
 
     // body-checking state
-    scopes: Vec<Scope>,
-    fn_states: Vec<FnState>,
+    /// Lexical scopes, function frames, loops and type parameters. Entered
+    /// through `in_scope` / `in_fn` / `in_loop` / `with_type_params`.
+    pub(crate) env: Env,
     /// Nodes whose recorded types must be finalized when the current
     /// top-level function completes (inference vars are per top-level fn).
     nodes_this_fn: Vec<NodeId>,
@@ -438,12 +505,186 @@ pub struct Checker<'a> {
     /// > rejected there in v1).
     pub(crate) or_depth: u32,
     /// Current `check_expr` recursion depth — capped so a pathologically
-    /// deep AST produces E0271 instead of overflowing the stack (the
+    /// deep AST produces E0114 instead of overflowing the stack (the
     /// parser bounds its own recursion, but builds operator/postfix
     /// chains like `x[0][0]…` iteratively).
     pub(crate) expr_depth: u32,
-    /// E0271 already reported — deeper nodes error silently.
+    /// E0114 already reported — deeper nodes error silently.
     pub(crate) expr_depth_reported: bool,
+}
+
+impl CheckResult {
+    /// How `node` lowers.
+    ///
+    /// `None` means a checker bug: emit runs only after diagnostics are
+    /// error-free, so every node it reaches was resolved. Consumers report
+    /// that as an internal error rather than lowering something plausible
+    /// — the previous side tables degraded to `LoadUnit` instead, which
+    /// produced a wrong program with no diagnostic.
+    pub fn lowering(&self, node: NodeId) -> Option<&Lowering> {
+        self.lowerings.get(&node)
+    }
+
+    pub(crate) fn set_lowering(&mut self, node: NodeId, lowering: Lowering) {
+        self.lowerings.insert(node, lowering);
+    }
+
+    /// How pattern `node` lowers.
+    ///
+    /// `None` is meaningful here, unlike [`CheckResult::lowering`]: the
+    /// patterns that need no resolution (`_`, literals, plain bindings)
+    /// record nothing. It is a checker bug only for the pattern kinds that
+    /// do — variant, struct and unit-literal patterns.
+    pub fn pat_lowering(&self, node: NodeId) -> Option<&PatLowering> {
+        self.pat_lowerings.get(&node)
+    }
+
+    pub(crate) fn set_pat_lowering(&mut self, node: NodeId, lowering: PatLowering) {
+        self.pat_lowerings.insert(node, lowering);
+    }
+
+    /// Simulate the checker dropping a resolution, so the emitter's
+    /// internal-error path can be tested. There is no other way to reach
+    /// it: every real path records one.
+    #[cfg(test)]
+    pub(crate) fn drop_a_bin_op(&mut self) -> bool {
+        let node = self
+            .lowerings
+            .iter()
+            .find(|(_, l)| matches!(l, Lowering::BinOp(_)))
+            .map(|(n, _)| *n);
+        node.is_some_and(|n| self.lowerings.remove(&n).is_some())
+    }
+
+    /// The pattern-space counterpart of [`CheckResult::drop_a_bin_op`].
+    #[cfg(test)]
+    pub(crate) fn drop_a_pat_variant(&mut self) -> bool {
+        let node = self
+            .pat_lowerings
+            .iter()
+            .find(|(_, l)| matches!(l, PatLowering::Variant { .. }))
+            .map(|(n, _)| *n);
+        node.is_some_and(|n| self.pat_lowerings.remove(&n).is_some())
+    }
+
+    // Typed projections of [`Lowering`], for consumers that already know
+    // which shape a node must have because they matched its `ExprKind`.
+    // These read one map; the enum remains the single place a lowering is
+    // stored and the single place it is written.
+
+    pub fn var_ref(&self, node: NodeId) -> Option<&VarRes> {
+        match self.lowering(node)? {
+            Lowering::Var(v) => Some(v),
+            _ => None,
+        }
+    }
+    pub fn path_res(&self, node: NodeId) -> Option<&PathRes> {
+        match self.lowering(node)? {
+            Lowering::Path(p) => Some(p),
+            _ => None,
+        }
+    }
+    pub fn call(&self, node: NodeId) -> Option<&CallKind> {
+        match self.lowering(node)? {
+            Lowering::Call(c) => Some(c),
+            _ => None,
+        }
+    }
+    pub fn unit_conv(&self, node: NodeId) -> Option<ConvKind> {
+        match self.lowering(node)? {
+            Lowering::UnitConv(c) => Some(*c),
+            _ => None,
+        }
+    }
+    pub fn method(&self, node: NodeId) -> Option<&MethodRes> {
+        match self.lowering(node)? {
+            Lowering::Method(m) => Some(m),
+            _ => None,
+        }
+    }
+    pub fn field_idx(&self, node: NodeId) -> Option<u16> {
+        match self.lowering(node)? {
+            Lowering::Field { idx } => Some(*idx),
+            _ => None,
+        }
+    }
+    pub fn index(&self, node: NodeId) -> Option<&IndexKind> {
+        match self.lowering(node)? {
+            Lowering::Index(k) => Some(k),
+            _ => None,
+        }
+    }
+    pub fn bin_op(&self, node: NodeId) -> Option<BinOpKind> {
+        match self.lowering(node)? {
+            Lowering::BinOp(k) => Some(*k),
+            _ => None,
+        }
+    }
+    pub fn un_op(&self, node: NodeId) -> Option<UnOpKind> {
+        match self.lowering(node)? {
+            Lowering::UnOp(k) => Some(*k),
+            _ => None,
+        }
+    }
+    pub fn struct_lit(&self, node: NodeId) -> Option<(&StructLitRes, &[u16])> {
+        match self.lowering(node)? {
+            Lowering::StructLit { res, order } => Some((res, order)),
+            _ => None,
+        }
+    }
+    pub fn quantity_lit(&self, node: NodeId) -> Option<Factor> {
+        match self.lowering(node)? {
+            Lowering::QuantityLit(f) => Some(*f),
+            _ => None,
+        }
+    }
+    pub fn for_kind(&self, node: NodeId) -> Option<&ForKind> {
+        match self.lowering(node)? {
+            Lowering::For(k) => Some(k),
+            _ => None,
+        }
+    }
+    pub fn try_kind(&self, node: NodeId) -> Option<&TryKind> {
+        match self.lowering(node)? {
+            Lowering::Try(k) => Some(k),
+            _ => None,
+        }
+    }
+    pub fn closure(&self, node: NodeId) -> Option<&ClosureRes> {
+        match self.lowering(node)? {
+            Lowering::Closure(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    // The same projections over [`PatLowering`]. Each returns the whole
+    // payload of one variant, so a consumer that needs a variant's tag
+    // *and* its field order reads them together — the pair the checker
+    // wrote as one value is never re-correlated by two lookups.
+
+    /// The enum def and tag a variant pattern selects, plus the runtime
+    /// index of each named field as written (empty unless it is a struct
+    /// variant).
+    pub fn pat_variant(&self, node: NodeId) -> Option<(DefId, u32, &[u16])> {
+        match self.pat_lowering(node)? {
+            PatLowering::Variant { def, tag, order } => Some((*def, *tag, order)),
+            _ => None,
+        }
+    }
+    /// The struct def a struct pattern destructures, plus the runtime
+    /// index of each field as written.
+    pub fn pat_struct(&self, node: NodeId) -> Option<(DefId, &[u16])> {
+        match self.pat_lowering(node)? {
+            PatLowering::Struct { def, order } => Some((*def, order)),
+            _ => None,
+        }
+    }
+    pub fn pat_quantity_lit(&self, node: NodeId) -> Option<Factor> {
+        match self.pat_lowering(node)? {
+            PatLowering::QuantityLit(f) => Some(*f),
+            _ => None,
+        }
+    }
 }
 
 pub fn check(file: &SourceFile, registry: &Registry) -> CheckResult {
@@ -463,6 +704,7 @@ pub fn check_files<'a>(files: &'a [(String, &'a SourceFile)], registry: &Registr
         .collect();
     let mut checker = Checker {
         files,
+        // Arbitrary: every reader of `cur_file` runs inside `in_file`.
         cur_file: 0,
         reg: registry,
         out: CheckResult {
@@ -477,14 +719,12 @@ pub fn check_files<'a>(files: &'a [(String, &'a SourceFile)], registry: &Registr
         script_modules,
         inherent: HashMap::new(),
         assoc: HashMap::new(),
-        current_type_params: Vec::new(),
         pending_instantiations: Vec::new(),
         trait_impls: HashMap::new(),
         derives: HashMap::new(),
         vtable_cache: HashMap::new(),
         unit_suffixes: HashMap::new(),
-        scopes: Vec::new(),
-        fn_states: Vec::new(),
+        env: Env::default(),
         nodes_this_fn: Vec::new(),
         must_resolve: Vec::new(),
         or_depth: 0,
@@ -493,6 +733,28 @@ pub fn check_files<'a>(files: &'a [(String, &'a SourceFile)], registry: &Registr
     };
     checker.run();
     checker.out
+}
+
+impl resolve::TypeScope for Checker<'_> {
+    fn type_named(&self, name: &str) -> Option<DefId> {
+        self.type_names.get(name).copied()
+    }
+
+    fn defs(&self) -> &DefTable {
+        &self.out.defs
+    }
+
+    fn report(&mut self, d: Diagnostic) {
+        self.out.diags.push(d);
+    }
+
+    fn type_param(&self, name: &str) -> Option<u32> {
+        self.env
+            .type_params()
+            .iter()
+            .position(|(n, _)| n == name)
+            .map(|i| i as u32)
+    }
 }
 
 impl<'a> Checker<'a> {
@@ -520,9 +782,14 @@ impl<'a> Checker<'a> {
         self.infer.resolve(t).display(&self.out.defs)
     }
 
+    /// The AST of one file of the program, by index.
+    pub(crate) fn ast(&self, file: usize) -> &'a SourceFile {
+        self.files[file].1
+    }
+
     /// The file currently being processed.
     pub(crate) fn file(&self) -> &'a SourceFile {
-        self.files[self.cur_file].1
+        self.ast(self.cur_file)
     }
 
     fn run(&mut self) {
@@ -538,8 +805,7 @@ impl<'a> Checker<'a> {
             Checker::collect_fns,
         ] {
             for fi in 0..self.files.len() {
-                self.cur_file = fi;
-                pass(self);
+                self.in_file(fi, pass);
             }
         }
         self.validate_script_imports();
@@ -679,7 +945,7 @@ impl<'a> Checker<'a> {
                 None
             } else {
                 self.reg
-                    .modules
+                    .modules()
                     .iter()
                     .position(|m| m.name == u.module.name)
             };
@@ -694,7 +960,7 @@ impl<'a> Checker<'a> {
                             continue;
                         }
                         let known: Vec<&str> =
-                            self.reg.modules.iter().map(|m| m.name.as_str()).collect();
+                            self.reg.modules().iter().map(|m| m.name.as_str()).collect();
                         let span = u.module.span;
                         let name = u.module.name.clone();
                         self.error_help(
@@ -723,12 +989,10 @@ impl<'a> Checker<'a> {
                 }
                 Some(item_name) => match mref {
                     ModuleRef::Host(mod_idx) => {
-                        let module = &self.reg.modules[mod_idx];
-                        if let Some((_, _, idx, _)) =
-                            module.fns.iter().find(|(n, ..)| *n == item_name.name)
-                        {
+                        let module = &self.reg.modules()[mod_idx];
+                        if let Some(f) = module.fns.iter().find(|f| f.name == item_name.name) {
                             self.imports[self.cur_file]
-                                .insert(item_name.name.clone(), Imported::HostFn(*idx));
+                                .insert(item_name.name.clone(), Imported::HostFn(f.host_idx));
                         } else if let Some((_, ty, c)) =
                             module.consts.iter().find(|(n, ..)| *n == item_name.name)
                         {
@@ -798,10 +1062,9 @@ impl<'a> Checker<'a> {
 
     fn collect_type_names(&mut self) {
         for item in &self.file().items {
-            let (name, span, kind) = match item {
+            let (name, kind) = match item {
                 Item::Struct(s) => (
                     &s.name,
-                    s.span,
                     DefKind::Struct(StructDef {
                         name: s.name.name.clone(),
                         fields: vec![],
@@ -812,7 +1075,6 @@ impl<'a> Checker<'a> {
                 ),
                 Item::Enum(e) => (
                     &e.name,
-                    e.span,
                     DefKind::Enum(EnumDef {
                         name: e.name.name.clone(),
                         variants: vec![],
@@ -822,7 +1084,6 @@ impl<'a> Checker<'a> {
                 ),
                 Item::Trait(t) => (
                     &t.name,
-                    t.span,
                     DefKind::Trait(TraitDef {
                         name: t.name.name.clone(),
                         methods: vec![],
@@ -831,7 +1092,6 @@ impl<'a> Checker<'a> {
                 ),
                 Item::Units(u) => (
                     &u.name,
-                    u.span,
                     DefKind::Unit(UnitDef {
                         name: u.name.name.clone(),
                         base: Type::Int,
@@ -868,8 +1128,11 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
-            let _ = span;
             let id = self.out.defs.push(kind);
+            // Recorded here, where the declaration is in hand: re-deriving
+            // it later by scanning an AST is how it came to be read out of
+            // the wrong file (#23).
+            self.out.def_decl_spans.insert(id, name.span);
             self.type_names.insert(name.name.clone(), id);
         }
     }
@@ -1265,9 +1528,7 @@ impl<'a> Checker<'a> {
             // Generic fns: validate the type-parameter list and resolve
             // the signature with those params in scope.
             let type_params = self.collect_type_params(f);
-            self.current_type_params = type_params.clone();
-            let sig = self.fn_decl_sig(f, None);
-            self.current_type_params.clear();
+            let sig = self.with_type_params(type_params.clone(), |c| c.fn_decl_sig(f, None));
             for (i, (name, _)) in type_params.iter().enumerate() {
                 if !sig_mentions_param(&sig, i as u32) {
                     let span = f
@@ -1719,7 +1980,15 @@ impl<'a> Checker<'a> {
     fn validate_derives(&mut self) {
         let entries: Vec<(DefId, Derives)> = self.derives.iter().map(|(k, v)| (*k, *v)).collect();
         for (id, d) in entries {
-            let span = self.def_decl_span(id);
+            // Derives are recorded only for script structs and enums, so
+            // `collect_type_names` has already captured a span for every
+            // id here. If that ever stops holding, fail loudly in tests
+            // rather than silently reinstate the misplaced caret this map
+            // exists to remove; a release build still reports the error,
+            // because dropping it would let an invalid derive compile.
+            let decl_span = self.out.def_decl_spans.get(&id).copied();
+            debug_assert!(decl_span.is_some(), "no declaration span for def {id:?}");
+            let span = decl_span.unwrap_or(Span::DUMMY);
             if d.eq && !self.fields_satisfy(id, |c, t| c.eq_able(t)) {
                 let name = self.out.defs.name_of(id).to_string();
                 self.error_help(
@@ -1752,21 +2021,6 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn def_decl_span(&self, id: DefId) -> Span {
-        for item in &self.file().items {
-            match item {
-                Item::Struct(s) if self.type_names.get(&s.name.name) == Some(&id) => {
-                    return s.name.span;
-                }
-                Item::Enum(e) if self.type_names.get(&e.name.name) == Some(&id) => {
-                    return e.name.span;
-                }
-                _ => {}
-            }
-        }
-        Span::DUMMY
-    }
-
     fn fields_satisfy(&self, id: DefId, pred: impl Fn(&Self, &Type) -> bool) -> bool {
         match self.out.defs.get(id) {
             DefKind::Struct(s) => s.fields.iter().all(|(_, t)| pred(self, t)),
@@ -1795,11 +2049,7 @@ impl<'a> Checker<'a> {
     /// Does the in-scope type parameter `i` carry (at least) `need`?
     /// `Ord` implies `Eq`.
     pub(crate) fn param_has_bound(&self, i: u32, need: BoundKind) -> bool {
-        match self
-            .current_type_params
-            .get(i as usize)
-            .and_then(|(_, b)| *b)
-        {
+        match self.env.type_params().get(i as usize).and_then(|(_, b)| *b) {
             Some(BoundKind::Ord) => matches!(need, BoundKind::Ord | BoundKind::Eq),
             Some(b) => b == need,
             None => false,
@@ -1809,7 +2059,8 @@ impl<'a> Checker<'a> {
     /// The declared name of the in-scope type parameter `i` (for
     /// diagnostics), falling back to the display letter.
     pub(crate) fn param_name(&self, i: u32) -> String {
-        self.current_type_params
+        self.env
+            .type_params()
             .get(i as usize)
             .map(|(n, _)| n.clone())
             .unwrap_or_else(|| Type::Param(i).display(&self.out.defs))
@@ -1902,202 +2153,7 @@ impl<'a> Checker<'a> {
     // ------------------------------------------------------------- types
 
     pub(crate) fn resolve_type(&mut self, t: &TypeExpr) -> Type {
-        match &t.kind {
-            TypeExprKind::Unit => Type::Unit,
-            TypeExprKind::Error => Type::Error,
-            TypeExprKind::Name(ident) => match ident.name.as_str() {
-                "int" => Type::Int,
-                "float" => Type::Float,
-                "bool" => Type::Bool,
-                "char" => Type::Char,
-                "unit" => Type::Unit,
-                "string" => Type::Str,
-                "List" | "Map" | "Option" | "Result" | "weak" => {
-                    let span = t.span;
-                    let name = ident.name.clone();
-                    let arity = match ident.name.as_str() {
-                        "Map" | "Result" => 2,
-                        _ => 1,
-                    };
-                    self.error_help(
-                        "E0210",
-                        span,
-                        format!("`{name}` requires type arguments"),
-                        format!(
-                            "write `{name}[{}]`",
-                            (0..arity).map(|_| "T").collect::<Vec<_>>().join(", ")
-                        ),
-                    );
-                    Type::Error
-                }
-                other => {
-                    // In-scope generic type parameters resolve first
-                    // (shadowing an existing type name is an error at the
-                    // declaration, so no ambiguity survives here).
-                    if let Some(i) = self
-                        .current_type_params
-                        .iter()
-                        .position(|(n, _)| n == other)
-                    {
-                        return Type::Param(i as u32);
-                    }
-                    match self.type_names.get(other) {
-                        Some(&id) => match self.out.defs.get(id) {
-                            DefKind::Trait(_) => {
-                                let span = ident.span;
-                                let msg =
-                                    format!("trait `{other}` cannot be used as a type directly");
-                                self.error_help(
-                                    "E0211",
-                                    span,
-                                    msg,
-                                    format!("use `dyn {other}` for a dynamically dispatched value"),
-                                );
-                                Type::Error
-                            }
-                            _ => Type::Named(id),
-                        },
-                        None => {
-                            let span = ident.span;
-                            let msg = format!("unknown type `{other}`");
-                            self.error("E0212", span, msg);
-                            Type::Error
-                        }
-                    }
-                }
-            },
-            TypeExprKind::App(ident, args) => {
-                let mut arg_tys: Vec<Type> = args.iter().map(|a| self.resolve_type(a)).collect();
-                let expect = |me: &mut Self, n: usize, arg_tys: &mut Vec<Type>| {
-                    if arg_tys.len() != n {
-                        let span = t.span;
-                        let msg = format!(
-                            "`{}` takes {n} type argument{}, found {}",
-                            ident.name,
-                            if n == 1 { "" } else { "s" },
-                            arg_tys.len()
-                        );
-                        me.error("E0210", span, msg);
-                        arg_tys.resize(n, Type::Error);
-                    }
-                };
-                match ident.name.as_str() {
-                    "List" => {
-                        expect(self, 1, &mut arg_tys);
-                        Type::List(Box::new(arg_tys.remove(0)))
-                    }
-                    "Option" => {
-                        expect(self, 1, &mut arg_tys);
-                        Type::Option(Box::new(arg_tys.remove(0)))
-                    }
-                    "weak" => {
-                        expect(self, 1, &mut arg_tys);
-                        let inner = arg_tys.remove(0);
-                        if !self.is_reference_type(&inner) {
-                            let span = t.span;
-                            let msg = format!(
-                                "`weak[{}]` is invalid: weak references only apply to \
-                                 reference types",
-                                self.ty_str(&inner)
-                            );
-                            self.error_help(
-                                "E0213",
-                                span,
-                                msg,
-                                "structs, enums, List, Map and functions can be weakly \
-                                 referenced; primitives and strings cannot",
-                            );
-                        }
-                        Type::Weak(Box::new(inner))
-                    }
-                    "Map" => {
-                        expect(self, 2, &mut arg_tys);
-                        let v = arg_tys.remove(1);
-                        let k = arg_tys.remove(0);
-                        if !matches!(
-                            k,
-                            Type::Int | Type::Bool | Type::Char | Type::Str | Type::Error
-                        ) {
-                            let span = args.first().map(|a| a.span).unwrap_or(t.span);
-                            let msg = format!("`{}` cannot be a map key", self.ty_str(&k));
-                            self.error_help(
-                                "E0214",
-                                span,
-                                msg,
-                                "map keys must be int, bool, char, or string",
-                            );
-                        }
-                        Type::Map(Box::new(k), Box::new(v))
-                    }
-                    "Result" => {
-                        expect(self, 2, &mut arg_tys);
-                        let e = arg_tys.remove(1);
-                        let ok = arg_tys.remove(0);
-                        Type::Result(Box::new(ok), Box::new(e))
-                    }
-                    other => {
-                        let span = t.span;
-                        let msg = format!("`{other}` does not take type arguments");
-                        let help = if self.current_type_params.iter().any(|(n, _)| n == other) {
-                            "type parameters do not take type arguments".to_string()
-                        } else {
-                            "user-defined generic *types* are not supported yet; generic \
-                             functions are — declare type parameters on the function: \
-                             `fn f[T](x: T)`"
-                                .to_string()
-                        };
-                        self.error_help("E0215", span, msg, help);
-                        Type::Error
-                    }
-                }
-            }
-            TypeExprKind::Fn(params, ret) => {
-                let params: Vec<Type> = params.iter().map(|p| self.resolve_type(p)).collect();
-                let ret = match ret {
-                    Some(r) => self.resolve_type(r),
-                    None => Type::Unit,
-                };
-                Type::Fn(Box::new(FnSig::new(params, ret)))
-            }
-            TypeExprKind::Dyn(ident) => match self.type_names.get(&ident.name) {
-                Some(&id) if self.out.defs.as_trait(id).is_some() => {
-                    if self.out.defs.as_trait(id).is_some_and(|t| t.operator) {
-                        let span = ident.span;
-                        let msg =
-                            format!("operator trait `{}` cannot be used as `dyn`", ident.name);
-                        self.error("E0211", span, msg);
-                        return Type::Error;
-                    }
-                    Type::Dyn(id)
-                }
-                Some(_) => {
-                    let span = ident.span;
-                    let msg = format!("`{}` is not a trait", ident.name);
-                    self.error("E0211", span, msg);
-                    Type::Error
-                }
-                None => {
-                    let span = ident.span;
-                    let msg = format!("unknown trait `{}`", ident.name);
-                    self.error("E0212", span, msg);
-                    Type::Error
-                }
-            },
-        }
-    }
-
-    pub(crate) fn is_reference_type(&self, t: &Type) -> bool {
-        matches!(
-            t,
-            Type::List(_)
-                | Type::Map(..)
-                | Type::Named(_)
-                | Type::Fn(_)
-                | Type::Dyn(_)
-                | Type::Option(_)
-                | Type::Result(..)
-                | Type::Error
-        )
+        resolve::resolve_type(self, t)
     }
 
     // ----------------------------------------------------------- vtables
@@ -2130,60 +2186,50 @@ impl<'a> Checker<'a> {
         self.infer.reset();
         self.nodes_this_fn.clear();
         let info = self.out.fn_infos[proto as usize].clone();
-        // Generic fns: their rigid type parameters are in scope for the
-        // whole body (cleared after finalize below).
-        self.current_type_params = info.type_params.clone();
-        let source = info.source;
-        let (decl, _item_idx) = match source {
-            FnSource::Top { file, item } => {
-                self.cur_file = file;
-                match &self.file().items[item] {
-                    Item::Fn(f) => (f, item),
-                    _ => return,
-                }
-            }
-            FnSource::Method { file, item, fn_idx } => {
-                self.cur_file = file;
-                match &self.file().items[item] {
-                    Item::Impl(im) => (&im.fns[fn_idx], item),
-                    _ => return,
-                }
-            }
+        // Bodies are checked after the per-file item passes, so the
+        // declaring file comes from the fn's own source — `cur_file` is
+        // established from it rather than consulted.
+        let (file, decl) = match info.source {
+            FnSource::Top { file, item } => match &self.ast(file).items[item] {
+                Item::Fn(f) => (file, f),
+                _ => return,
+            },
+            FnSource::Method { file, item, fn_idx } => match &self.ast(file).items[item] {
+                Item::Impl(im) => (file, &im.fns[fn_idx]),
+                _ => return,
+            },
             FnSource::Closure { .. } | FnSource::Synthesized => return,
         };
 
-        self.fn_states.push(FnState {
-            ret: info.sig.ret.clone(),
-            n_locals: 0,
-            captured: HashSet::new(),
-            captures: Vec::new(),
-            capture_map: HashMap::new(),
-            loops: Vec::new(),
-        });
-        self.push_scope();
-        for (i, p) in decl.params.iter().enumerate() {
-            let ty = info.sig.params.get(i).cloned().unwrap_or(Type::Error);
-            self.declare_local(&p.name, ty);
-        }
-
         let ret = info.sig.ret.clone();
-        let body_ty = self.check_block(&decl.body, Some(&ret));
-        self.unify_or_err(
-            &ret,
-            &body_ty,
-            last_meaningful_span(&decl.body).unwrap_or(decl.sig_span),
-            "function body does not match the declared return type",
-        );
+        let param_tys = info.sig.params.clone();
+        // Generic fns: their rigid type parameters are in scope for the
+        // whole body *and* for `finalize_types`, which reports uninferable
+        // parameters by name. Keeping both inside one scope is what makes
+        // that ordering lexical rather than remembered.
+        self.in_file(file, |c| {
+            c.with_type_params(info.type_params.clone(), |c| {
+                let (_, frame) = c.in_fn(ret.clone(), |c| {
+                    for (i, p) in decl.params.iter().enumerate() {
+                        let ty = param_tys.get(i).cloned().unwrap_or(Type::Error);
+                        c.declare_local(&p.name, ty);
+                    }
+                    let body_ty = c.check_block(&decl.body, Some(&ret));
+                    c.unify_or_err(
+                        &ret,
+                        &body_ty,
+                        last_meaningful_span(&decl.body).unwrap_or(decl.sig_span),
+                        "function body does not match the declared return type",
+                    );
+                });
+                let fi = &mut c.out.fn_infos[proto as usize];
+                fi.n_locals = frame.n_locals;
+                fi.captured = frame.captured;
+                fi.pending = false;
 
-        self.pop_scope();
-        let state = self.fn_states.pop().unwrap();
-        let fi = &mut self.out.fn_infos[proto as usize];
-        fi.n_locals = state.n_locals;
-        fi.captured = state.captured;
-        fi.pending = false;
-
-        self.finalize_types();
-        self.current_type_params.clear();
+                c.finalize_types();
+            });
+        });
     }
 
     /// After a top-level function (and its closures) is checked, substitute
@@ -2262,80 +2308,70 @@ impl<'a> Checker<'a> {
         }
     }
 
-    // -------------------------------------------------- scopes & locals
+    // ------------------------------------- files, scopes, frames, loops
+    //
+    // Entry is scoped: the callback receives `&mut Checker`, so the push
+    // and the matching pop cannot drift apart. A guard cannot be used —
+    // holding `&mut` to the field it saves would block the `&mut self`
+    // the body needs.
 
-    pub(crate) fn push_scope(&mut self) {
-        self.scopes.push(Scope {
-            bindings: HashMap::new(),
-            fn_depth: self.fn_states.len() - 1,
-        });
+    /// Check `f` with `file` as the current file, restoring the previous
+    /// one on exit. The one writer of [`Checker::cur_file`].
+    fn in_file<T>(&mut self, file: usize, f: impl FnOnce(&mut Self) -> T) -> T {
+        let prev = std::mem::replace(&mut self.cur_file, file);
+        let out = f(self);
+        self.cur_file = prev;
+        out
     }
 
-    pub(crate) fn pop_scope(&mut self) {
-        self.scopes.pop();
+    /// Check `f` inside a fresh lexical scope.
+    pub(crate) fn in_scope<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.env.push_scope();
+        let out = f(self);
+        self.env.pop_scope();
+        out
+    }
+
+    /// Check `f` inside a fresh function frame and its body scope,
+    /// returning what the frame contributes to its `FnInfo`.
+    pub(crate) fn in_fn<T>(&mut self, ret: Type, f: impl FnOnce(&mut Self) -> T) -> (T, FnFrame) {
+        self.env.push_fn(ret);
+        self.env.push_scope();
+        let out = f(self);
+        self.env.pop_scope();
+        (out, self.env.pop_fn())
+    }
+
+    /// Check `f` inside a loop; the flag reports whether it contained a
+    /// `break`.
+    pub(crate) fn in_loop<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, bool) {
+        self.env.enter_loop();
+        let out = f(self);
+        (out, self.env.exit_loop())
+    }
+
+    /// Check `f` with `params` as the rigid type parameters in scope.
+    pub(crate) fn with_type_params<T>(
+        &mut self,
+        params: Vec<(String, Option<BoundKind>)>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.env.push_type_params(params);
+        let out = f(self);
+        self.env.pop_type_params();
+        out
     }
 
     pub(crate) fn declare_local(&mut self, name: &Ident, ty: Type) -> LocalId {
-        let state = self.fn_states.last_mut().unwrap();
-        let local = state.n_locals;
-        state.n_locals += 1;
-        self.scopes.last_mut().unwrap().bindings.insert(
-            name.name.clone(),
-            Binding {
-                local,
-                ty,
-                span: name.span,
-            },
-        );
-        local
+        self.env.declare(name, ty)
     }
 
-    /// Resolve a variable name, wiring captures through any intervening
-    /// closures. Returns the reference kind and the variable's type.
     pub(crate) fn lookup_var(&mut self, name: &str) -> Option<(VarRes, Type)> {
-        let current_depth = self.fn_states.len() - 1;
-        // Find the binding, innermost scope first.
-        let mut found: Option<(usize, Binding)> = None;
-        for scope in self.scopes.iter().rev() {
-            if let Some(b) = scope.bindings.get(name) {
-                found = Some((scope.fn_depth, b.clone()));
-                break;
-            }
-        }
-        let (owner_depth, binding) = found?;
-        if owner_depth == current_depth {
-            return Some((VarRes::Local(binding.local), binding.ty));
-        }
-        // Captured: mark the local in its owner and thread capture slots
-        // through every closure between owner and current.
-        self.fn_states[owner_depth].captured.insert(binding.local);
-        let mut src = CapSrc::Local(binding.local);
-        let mut slot = 0u16;
-        for depth in (owner_depth + 1)..=current_depth {
-            let key = (owner_depth, binding.local);
-            let state = &mut self.fn_states[depth];
-            slot = match state.capture_map.get(&key) {
-                Some(&s) => s,
-                None => {
-                    let s = state.captures.len() as u16;
-                    state.captures.push(src);
-                    state.capture_map.insert(key, s);
-                    s
-                }
-            };
-            src = CapSrc::Capture(slot);
-        }
-        Some((VarRes::Capture(slot), binding.ty))
+        self.env.lookup(name)
     }
 
-    /// Span of a local's definition (for LSP goto-definition).
     pub(crate) fn lookup_var_span(&self, name: &str) -> Option<Span> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(b) = scope.bindings.get(name) {
-                return Some(b.span);
-            }
-        }
-        None
+        self.env.lookup_span(name)
     }
 
     // ----------------------------------------------------- type recording
@@ -2395,7 +2431,7 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn module_is_registered(&self, name: &str) -> bool {
-        self.reg.modules.iter().any(|m| m.name == name)
+        self.reg.modules().iter().any(|m| m.name == name)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2410,68 +2446,41 @@ impl<'a> Checker<'a> {
         })
     }
 
-    pub(crate) fn prelude_fn(name: &str) -> Option<PreludeFn> {
-        Some(match name {
-            "print" => PreludeFn::Print,
-            "println" => PreludeFn::Println,
-            "str" => PreludeFn::Str,
-            "fmt" => PreludeFn::Fmt,
-            "same" => PreludeFn::Same,
-            "weak" => PreludeFn::Weak,
-            "int" => PreludeFn::Int,
-            "float" => PreludeFn::Float,
-            _ => return None,
-        })
-    }
-
     pub(crate) fn current_ret(&self) -> Type {
-        self.fn_states
-            .last()
-            .map(|s| s.ret.clone())
-            .unwrap_or(Type::Error)
-    }
-
-    pub(crate) fn enter_loop(&mut self) {
-        self.fn_states
-            .last_mut()
-            .unwrap()
-            .loops
-            .push(LoopCtx { has_break: false });
-    }
-
-    /// Returns whether the loop contained a `break`.
-    pub(crate) fn exit_loop(&mut self) -> bool {
-        self.fn_states
-            .last_mut()
-            .unwrap()
-            .loops
-            .pop()
-            .map(|l| l.has_break)
-            .unwrap_or(false)
+        self.env.current_ret()
     }
 
     pub(crate) fn mark_break(&mut self, span: Span) -> bool {
-        match self.fn_states.last_mut().unwrap().loops.last_mut() {
-            Some(l) => {
-                l.has_break = true;
-                true
-            }
-            None => {
-                self.error("E0221", span, "`break` outside of a loop");
-                false
-            }
+        if self.env.mark_break() {
+            return true;
         }
+        self.error("E0221", span, "`break` outside of a loop");
+        false
     }
 
-    pub(crate) fn in_loop(&self) -> bool {
-        self.fn_states.last().is_some_and(|s| !s.loops.is_empty())
+    pub(crate) fn inside_loop(&self) -> bool {
+        self.env.inside_loop()
     }
 
     // -------------------------------------------------- closure checking
 
-    /// Begin checking a closure body: allocates its proto and state.
-    pub(crate) fn begin_closure(&mut self, node: NodeId, sig: FnSig, span: Span) -> u32 {
+    /// Allocate a closure's proto, check its body inside a fresh frame,
+    /// and write the frame back into the proto's `FnInfo`.
+    ///
+    /// One call rather than the previous four (`begin_closure`,
+    /// `set_closure_ret`, `declare_local` per parameter, `end_closure`),
+    /// where the return type had to be supplied separately or every
+    /// `return` in the body silently resolved against `Type::Error`.
+    pub(crate) fn in_closure<T>(
+        &mut self,
+        node: NodeId,
+        sig: FnSig,
+        span: Span,
+        params: &[(&Ident, Type)],
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> (T, u32) {
         let proto = self.out.fn_infos.len() as u32;
+        let ret = sig.ret.clone();
         self.out.fn_infos.push(FnInfo {
             name: format!("<closure@{}>", span.lo),
             sig,
@@ -2483,30 +2492,18 @@ impl<'a> Checker<'a> {
             span,
             pending: true,
         });
-        self.fn_states.push(FnState {
-            ret: Type::Error, // set by caller once known
-            n_locals: 0,
-            captured: HashSet::new(),
-            captures: Vec::new(),
-            capture_map: HashMap::new(),
-            loops: Vec::new(),
+        let (out, frame) = self.in_fn(ret, |c| {
+            for (name, ty) in params {
+                c.declare_local(name, ty.clone());
+            }
+            f(c)
         });
-        self.push_scope();
-        proto
-    }
-
-    pub(crate) fn set_closure_ret(&mut self, ret: Type) {
-        self.fn_states.last_mut().unwrap().ret = ret;
-    }
-
-    pub(crate) fn end_closure(&mut self, proto: u32) {
-        self.pop_scope();
-        let state = self.fn_states.pop().unwrap();
         let fi = &mut self.out.fn_infos[proto as usize];
-        fi.n_locals = state.n_locals;
-        fi.captured = state.captured;
-        fi.captures = state.captures;
+        fi.n_locals = frame.n_locals;
+        fi.captured = frame.captured;
+        fi.captures = frame.captures;
         fi.pending = false;
+        (out, proto)
     }
 }
 

@@ -1,0 +1,8 @@
+E0220  1:13-1:46
+  type mismatch: expected `unit`, found `bool`
+  help: function body does not match the declared return type
+
+E0242  1:26-1:34
+  `contains` requires `fn(int) -> int` elements to support `==`
+  help: element types must be primitives, strings, or Eq types
+

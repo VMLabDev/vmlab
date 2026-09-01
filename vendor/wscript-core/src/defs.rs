@@ -314,6 +314,15 @@ impl DefTable {
         }
     }
 
+    /// The definition of that name, whatever kind it is. Names are unique
+    /// across kinds — a script cannot declare a struct and a trait called
+    /// the same thing — so there is nothing to disambiguate.
+    pub fn id_of(&self, name: &str) -> Option<DefId> {
+        (0..self.defs.len())
+            .map(|i| DefId(i as u32))
+            .find(|&id| self.name_of(id) == name)
+    }
+
     pub fn trait_name(&self, id: DefId) -> &str {
         self.name_of(id)
     }
@@ -380,6 +389,23 @@ impl DefTable {
     }
 
     /// Find a host-registered def by its Rust `TypeId`.
+    /// The def a script-visible type name refers to.
+    ///
+    /// Names are unique across the table — host registration asserts it
+    /// (`assert_name_free`) and the checker rejects a script declaration
+    /// that shadows one — so there is exactly one answer, or none.
+    pub fn by_name(&self, name: &str) -> Option<DefId> {
+        self.defs
+            .iter()
+            .position(|d| match d {
+                DefKind::Struct(s) => s.name == name,
+                DefKind::Enum(e) => e.name == name,
+                DefKind::Trait(t) => t.name == name,
+                DefKind::Unit(u) => u.name == name,
+            })
+            .map(|i| DefId(i as u32))
+    }
+
     pub fn by_rust_type(&self, ty: std::any::TypeId) -> Option<DefId> {
         self.defs
             .iter()

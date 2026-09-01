@@ -1,0 +1,4 @@
+E0271  interface 1:7-1:15
+  `units` declarations are not allowed in an interface file
+  help: this declaration in the .wscripti interface file could not be registered
+

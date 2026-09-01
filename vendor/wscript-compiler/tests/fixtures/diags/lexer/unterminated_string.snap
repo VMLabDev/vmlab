@@ -1,0 +1,8 @@
+E0100  1:11-1:12
+  unclosed block: missing `}`
+  help: the parser expected different syntax here; see the language tour
+
+E0002  1:21-1:26
+  unterminated string literal
+  help: close the string with `"` before the end of the line
+

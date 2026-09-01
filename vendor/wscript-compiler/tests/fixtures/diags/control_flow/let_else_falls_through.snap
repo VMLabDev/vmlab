@@ -1,0 +1,4 @@
+E0222  1:47-1:50
+  the `else` block of `let ... else` must diverge
+  help: end it with `return`, `break`, or `continue`
+

@@ -1,0 +1,4 @@
+E0104  1:9-1:13
+  `self` parameter outside an `impl` or `trait` block
+  help: `self` is only valid as the first parameter of a method
+

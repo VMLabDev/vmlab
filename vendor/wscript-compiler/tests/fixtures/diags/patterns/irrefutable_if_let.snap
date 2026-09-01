@@ -1,0 +1,4 @@
+W0001 warning  1:20-1:21
+  irrefutable pattern in `if let`: the branch always runs
+  help: this pattern always matches
+

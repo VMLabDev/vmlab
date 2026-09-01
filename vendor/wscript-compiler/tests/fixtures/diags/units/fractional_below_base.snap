@@ -1,0 +1,4 @@
+E0269  2:21-2:26
+  `0.5ns` is not a whole number of `ns`
+  help: `Duration` is backed by `int`, so every value must land on a whole `ns`
+

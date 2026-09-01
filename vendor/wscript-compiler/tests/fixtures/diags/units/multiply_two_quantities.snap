@@ -1,0 +1,4 @@
+E0234  2:21-2:29
+  cannot multiply `Duration` by `Duration`
+  help: multiplying two unit values would produce a new dimension, which this release does not model — scale by a plain number instead
+

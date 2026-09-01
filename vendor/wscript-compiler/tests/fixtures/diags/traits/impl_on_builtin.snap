@@ -1,0 +1,4 @@
+E0206  1:6-1:12
+  cannot write an impl block for built-in type `Option`
+  help: impl blocks target script-declared struct or enum types
+

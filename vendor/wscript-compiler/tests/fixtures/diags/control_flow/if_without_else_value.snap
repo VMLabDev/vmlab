@@ -1,0 +1,4 @@
+E0224  2:11-2:16
+  `if` without `else` evaluates to unit, but the branch has type `int`
+  help: add an `else` branch, or discard the value
+

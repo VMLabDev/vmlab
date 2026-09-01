@@ -28,6 +28,7 @@ pub struct Compiled {
 
 /// A failed compilation, with everything a renderer needs to point
 /// diagnostics at the right file of a multi-file program.
+#[derive(Debug)]
 pub struct CompileFailure {
     pub diags: Vec<Diagnostic>,
     pub sources: Vec<(String, String)>,
@@ -130,7 +131,7 @@ fn load_imports(
         let from = files[i].display.clone();
         for (module_name, path_lit, span) in imports {
             let is_path = path_lit.is_some();
-            if !is_path && registry.modules.iter().any(|m| m.name == module_name) {
+            if !is_path && registry.modules().iter().any(|m| m.name == module_name) {
                 continue; // host module wins
             }
             let spec = match &path_lit {
@@ -274,7 +275,18 @@ pub fn compile_entry(
             });
         }
         let asts: Vec<&ast::SourceFile> = files.iter().map(|f| &f.parse.file).collect();
-        let mut unit = emit::emit_files(&asts, &checked);
+        let (mut unit, ices) = emit::emit_files(&asts, &checked);
+        // A node the checker should have resolved but did not. The script
+        // is fine; the compiler is not. Surfaced as a diagnostic so an
+        // embedder gets an error rather than a wrong program.
+        if !ices.is_empty() {
+            diags.extend(ices);
+            return Err(CompileFailure {
+                diags,
+                sources: files.into_iter().map(|f| (f.display, f.src)).collect(),
+                source_map,
+            });
+        }
         unit.source_map = source_map;
         Ok(Compiled {
             unit,
@@ -289,9 +301,28 @@ pub fn compile_entry(
 pub struct Analysis {
     pub parse: ParseOutput,
     pub check: check::CheckResult,
+    /// Position lookups over the analysed files — what an editor asks its
+    /// questions of. Built here rather than in `check` because only an
+    /// analysis wants it, and because the traversal needs the pipeline's
+    /// stack rather than the caller's.
+    pub index: check::Index,
     /// File layout of the analysis (entry first). Single-file analyses
     /// have one entry at base 0.
     pub source_map: SourceMap,
+    /// Every analyzed file's (display path, source text) in span-address
+    /// order, matching `source_map` — what a renderer needs to point a
+    /// diagnostic at the imported file it actually came from, instead of
+    /// dropping it for landing outside the entry.
+    pub sources: Vec<(String, String)>,
+}
+
+impl Analysis {
+    /// The editor's view of this analysis: position index, check tables
+    /// and host registrations, together. Every question an editor asks
+    /// needs all three, so they are not offered separately.
+    pub fn editor<'a>(&'a self, registry: &'a Registry) -> check::Editor<'a> {
+        check::Editor::new(&self.index, &self.check, registry)
+    }
 }
 
 pub fn analyze(source: &str, registry: &Registry) -> Analysis {
@@ -338,6 +369,7 @@ pub fn analyze_entry(
             .iter()
             .map(|f| (f.module_name.clone(), &f.parse.file))
             .collect();
+        let index = check::Index::build(&refs);
         let mut check = check::check_files(&refs, registry);
         check.diags.extend(load_diags);
         // Parse diags of IMPORTED files surface too (they explain
@@ -361,11 +393,17 @@ pub fn analyze_entry(
                 })
                 .collect(),
         };
+        let sources = files
+            .iter()
+            .map(|f| (f.display.clone(), f.src.clone()))
+            .collect();
         let parse = files.swap_remove(0).parse;
         Analysis {
             parse,
             check,
+            index,
             source_map,
+            sources,
         }
     })
 }

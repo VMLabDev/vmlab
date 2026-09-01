@@ -1,0 +1,4 @@
+E0248  1:22-1:23
+  `int` is not iterable
+  help: `for` iterates over ranges (a..b), List (elements), Map (keys), and string (chars)
+

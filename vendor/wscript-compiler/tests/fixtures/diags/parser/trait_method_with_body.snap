@@ -1,0 +1,4 @@
+E0107  1:29-1:30
+  default method bodies are not supported in v1
+  help: declare the signature only; implement it in `impl Trait for Type` blocks
+

@@ -1,0 +1,4 @@
+E0246  2:21-2:39
+  `Duration` is a unit family and has no fields
+  help: write a value with a unit suffix (`5ns`) or convert one: `Duration::ns(n)`
+

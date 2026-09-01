@@ -1,0 +1,4 @@
+E0221  1:13-1:18
+  `break` outside of a loop
+  help: `break`/`continue` only work inside while/loop/for bodies
+

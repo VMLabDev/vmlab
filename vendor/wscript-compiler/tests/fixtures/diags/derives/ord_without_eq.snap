@@ -1,0 +1,4 @@
+E0204  1:10-1:13
+  deriving `Ord` also requires deriving `Eq`
+  help: write `#[derive(Eq, Ord)]`
+

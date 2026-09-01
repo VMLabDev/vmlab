@@ -1,0 +1,4 @@
+E0209  2:8-2:9
+  cannot derive `Eq` for `P`: not all fields support `==`
+  help: every field must be a primitive, string, container of comparable values, or a type that itself implements Eq
+

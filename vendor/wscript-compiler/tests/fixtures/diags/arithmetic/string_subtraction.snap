@@ -1,0 +1,4 @@
+E0234  1:20-1:29
+  no `-` operator for `string`
+  help: strings support `+` for concatenation only
+

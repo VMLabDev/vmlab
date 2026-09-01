@@ -1,0 +1,4 @@
+E0241  2:4-2:8
+  no method `nope` on `List[int]`
+  help: see the stdlib reference for the built-in methods of this type
+

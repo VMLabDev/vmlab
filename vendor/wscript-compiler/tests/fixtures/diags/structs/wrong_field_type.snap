@@ -1,0 +1,8 @@
+E0220  2:13-2:31
+  type mismatch: expected `unit`, found `P`
+  help: function body does not match the declared return type
+
+E0220  2:26-2:29
+  type mismatch: expected `int`, found `string`
+  help: the value's type must match what the context expects
+

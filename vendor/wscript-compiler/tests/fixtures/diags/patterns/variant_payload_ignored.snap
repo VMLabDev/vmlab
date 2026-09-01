@@ -1,0 +1,8 @@
+E0261  2:26-2:27
+  variant `A` has a payload of 1 field
+  help: destructure the payload, or use `_` to ignore it
+
+W0002 warning  2:35-2:36
+  unreachable match arm: previous patterns already cover this case
+  help: remove the unreachable arm or reorder the patterns
+

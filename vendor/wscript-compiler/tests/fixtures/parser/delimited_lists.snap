@@ -1,0 +1,50 @@
+struct P []
+  x: int
+  y: int
+enum E
+  A
+  B(int, bool)
+  C { v: bool }
+fn f(a:int, b:string) -> List[int]
+  let list:_ =
+    list  @5:16-5:25 #4
+      int 1  @5:17-5:18 #1
+      int 2  @5:20-5:21 #2
+      int 3  @5:23-5:24 #3
+  let map:_ =
+    map  @6:15-6:34 #10
+      str "a"  @6:18-6:21 #6
+      int 1  @6:23-6:24 #7
+      str "b"  @6:26-6:29 #8
+      int 2  @6:31-6:32 #9
+  let lit:_ =
+    structlit P  @7:15-7:31 #14
+      .x =
+        int 1  @7:22-7:23 #12
+      .y =
+        int 2  @7:28-7:29 #13
+  let call:_ =
+    call  @8:16-8:27 #19
+      path f  @8:16-8:17 #16
+      int 1  @8:18-8:19 #17
+      str "two"  @8:21-8:26 #18
+  let closure:_ =
+    closure |x:int, y:int|  @9:19-9:41 #24
+      binary Add  @9:36-9:41 #23
+        path x  @9:36-9:37 #21
+        path y  @9:40-9:41 #22
+  expr
+    match  @10:5-14:6 #36
+      path E::A  @10:11-10:15 #26
+      arm E::B(n, b)
+        path n  @11:23-11:24 #30
+      arm E::C { v: v }
+        int 1  @12:23-12:24 #33
+      arm _
+        int 0  @13:14-13:15 #35
+  expr
+    list  @15:5-15:8 #38
+      int 1  @15:6-15:7 #37
+
+--- diagnostics ---
+(none)

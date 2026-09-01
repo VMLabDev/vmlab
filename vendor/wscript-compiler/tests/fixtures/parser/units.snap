@@ -1,0 +1,18 @@
+units Duration: int [ns, ms, s]
+  int 1  @2:10-2:11 #1
+  int 1000000  @3:10-3:19 #2
+  binary Mul  @4:9-4:19 #5
+    int 1000  @4:9-4:14 #3
+    path ms  @4:17-4:19 #4
+fn f(d:Duration) -> int
+  expr
+    match  @8:5-11:6 #12
+      path d  @8:11-8:12 #6
+      arm 500ms
+        int 1  @9:18-9:19 #8
+      arm _
+        field .ms  @10:14-10:21 #11
+          quantity 1.5 s  @10:14-10:18 #10
+
+--- diagnostics ---
+(none)

@@ -1,0 +1,4 @@
+E0260  1:20-1:74
+  non-exhaustive match: pattern `Some(None)` is not covered
+  help: add an arm matching `Some(None)`, or a trailing `_ => ...` arm; note that arms with `if` guards never count toward exhaustiveness (matching on `Option[Option[int]]`)
+

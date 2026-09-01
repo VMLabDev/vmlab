@@ -1,0 +1,2 @@
+units X: string { a = 1 }
+fn main() {}

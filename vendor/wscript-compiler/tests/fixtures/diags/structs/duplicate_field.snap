@@ -1,0 +1,4 @@
+E0203  1:20-1:21
+  duplicate field `x`
+  help: names must be unique within a declaration
+

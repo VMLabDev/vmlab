@@ -1,0 +1,4 @@
+E0220  2:33-2:37
+  type mismatch: expected `int`, found `string`
+  help: the error type propagated by `?` must match the function's error type
+

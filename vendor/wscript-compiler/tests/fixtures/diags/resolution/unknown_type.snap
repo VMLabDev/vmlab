@@ -1,0 +1,4 @@
+E0212  1:14-1:17
+  unknown type `Wat`
+  help: check the spelling; types must be declared or host-registered
+

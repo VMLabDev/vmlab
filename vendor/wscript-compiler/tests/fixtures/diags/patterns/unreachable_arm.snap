@@ -1,0 +1,4 @@
+W0002 warning  1:38-1:39
+  unreachable match arm: previous patterns already cover this case
+  help: remove the unreachable arm or reorder the patterns
+

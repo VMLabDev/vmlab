@@ -1,0 +1,4 @@
+E0262  2:21-2:27
+  unknown unit `xyz`
+  help: declare one with `units Name: int { ... }`
+

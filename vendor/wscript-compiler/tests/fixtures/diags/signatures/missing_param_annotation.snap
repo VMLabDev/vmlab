@@ -1,0 +1,4 @@
+E0105  1:6-1:7
+  parameter `x` is missing a type annotation
+  help: annotations are required on function parameters: `name: type` (PRD §3.3)
+

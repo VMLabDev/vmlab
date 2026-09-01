@@ -1,0 +1,4 @@
+E0249  2:17-2:21
+  `?` on an Option requires the function to return Option, but it returns `int`
+  help: change the return type to `Option[...]`, or handle the None case with `match`/`if let`
+

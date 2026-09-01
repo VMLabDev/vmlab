@@ -1,0 +1,4 @@
+E0232  2:24-2:25
+  enum `E` has no variant `Z`
+  help: check the enum declaration for the available variants
+

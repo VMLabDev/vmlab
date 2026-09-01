@@ -1,0 +1,4 @@
+E0264  1:10-1:16
+  a unit family must be backed by `int` or `float`, found `string`
+  help: unit values are stored as their backing number, so only the two numeric types work
+

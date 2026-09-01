@@ -1,0 +1,4 @@
+E0102  1:1-1:4
+  expected an item, found `let`
+  help: top-level code lives in functions; script execution starts at `fn main()`
+

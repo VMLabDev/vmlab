@@ -1,0 +1,4 @@
+E0220  2:5-2:8
+  type mismatch: expected `int`, found `string`
+  help: list indices are `int`
+

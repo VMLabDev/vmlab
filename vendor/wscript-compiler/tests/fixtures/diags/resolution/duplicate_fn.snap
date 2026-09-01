@@ -1,0 +1,4 @@
+E0205  2:4-2:7
+  duplicate function `dup`
+  help: this name is already defined; pick a different one
+

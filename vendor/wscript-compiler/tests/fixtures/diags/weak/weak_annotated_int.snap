@@ -1,0 +1,8 @@
+E0213  1:20-1:29
+  `weak[int]` is invalid: weak references only apply to reference types
+  help: structs, enums, List, Map and functions can be weakly referenced; primitives and strings cannot
+
+E0213  1:37-1:38
+  cannot create a weak reference to `int`
+  help: weak references apply to structs, enums, List, Map, and functions (PRD §4.2)
+

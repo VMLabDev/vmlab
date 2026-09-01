@@ -1,0 +1,4 @@
+E0234  2:21-2:27
+  no `+` operator for `int` and `Duration`
+  help: a number can only scale a unit value: `Duration * n` or `n * Duration`
+

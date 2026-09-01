@@ -1,0 +1,17 @@
+fn main() -> _
+  let x:_ =
+    list  @8:21-8:25 #2
+      int 1  @8:22-8:23 #1
+fn later() -> int
+  expr
+    int 7  @11:21-11:22 #5
+fn caller(a:int) -> int
+  expr
+    call  @13:35-13:42 #8
+      path later  @13:35-13:40 #7
+
+--- diagnostics ---
+E0100  8:24-8:25
+  expected `,` or `]` in list literal, found integer literal
+E0100  13:18-13:19
+  expected `,` or `)` in parameter list, found `b`

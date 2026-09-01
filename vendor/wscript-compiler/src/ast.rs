@@ -50,6 +50,11 @@ pub struct ModDecl {
 pub struct ConstDecl {
     pub name: Ident,
     pub ty: TypeExpr,
+    /// `= 16` — the value. `const` items exist only in `.wscripti`
+    /// interface files, where the value is what the host registered and
+    /// therefore what `wscript check` must fold; `None` means the
+    /// declaration omitted it, which the loader reports.
+    pub value: Option<Expr>,
     pub doc: Option<String>,
     pub span: Span,
 }
@@ -464,4 +469,254 @@ pub enum VariantPatArgs {
         fields: Vec<(Ident, Pattern)>,
         has_rest: bool,
     },
+}
+
+// ------------------------------------------------------------- traversal
+//
+// One structural walk of the tree, so consumers that only need to reach
+// every node do not each hand-roll a match over `ExprKind`. Before this
+// existed there were three such walks — the emitter's closure finder, the
+// LSP's span index, and the golden renderer — and two ended in a catch-all
+// arm, so a new expression form silently stopped being visited.
+//
+// Override the `visit_*` method you care about and call the matching
+// `walk_*` to keep descending; the default methods do exactly that.
+
+/// A read-only structural traversal of the AST.
+///
+/// The default methods recurse into children, so an implementation only
+/// overrides what it needs:
+///
+/// ```ignore
+/// struct Spans(Vec<(Span, NodeId)>);
+/// impl<'a> Visit<'a> for Spans {
+///     fn visit_expr(&mut self, e: &'a Expr) {
+///         self.0.push((e.span, e.id));
+///         walk_expr(self, e);
+///     }
+/// }
+/// ```
+pub trait Visit<'a>: Sized {
+    fn visit_item(&mut self, item: &'a Item) {
+        walk_item(self, item);
+    }
+    fn visit_block(&mut self, block: &'a Block) {
+        walk_block(self, block);
+    }
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        walk_stmt(self, stmt);
+    }
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        walk_expr(self, expr);
+    }
+    fn visit_pattern(&mut self, pat: &'a Pattern) {
+        walk_pattern(self, pat);
+    }
+}
+
+pub fn walk_file<'a, V: Visit<'a>>(v: &mut V, file: &'a SourceFile) {
+    for item in &file.items {
+        v.visit_item(item);
+    }
+}
+
+pub fn walk_item<'a, V: Visit<'a>>(v: &mut V, item: &'a Item) {
+    match item {
+        Item::Fn(f) => v.visit_block(&f.body),
+        Item::Impl(im) => {
+            for f in &im.fns {
+                v.visit_block(&f.body);
+            }
+        }
+        // Factors are ordinary expressions the checker const-evaluates.
+        Item::Units(u) => {
+            for entry in &u.units {
+                v.visit_expr(&entry.factor);
+            }
+        }
+        Item::Mod(m) => {
+            for item in &m.items {
+                v.visit_item(item);
+            }
+        }
+        Item::Use(_) | Item::Struct(_) | Item::Enum(_) | Item::Trait(_) | Item::Const(_) => {}
+    }
+}
+
+pub fn walk_block<'a, V: Visit<'a>>(v: &mut V, block: &'a Block) {
+    for stmt in &block.stmts {
+        v.visit_stmt(stmt);
+    }
+}
+
+pub fn walk_stmt<'a, V: Visit<'a>>(v: &mut V, stmt: &'a Stmt) {
+    match stmt {
+        Stmt::Let { init, .. } => v.visit_expr(init),
+        Stmt::LetElse {
+            pat,
+            init,
+            else_block,
+            ..
+        } => {
+            v.visit_pattern(pat);
+            v.visit_expr(init);
+            v.visit_block(else_block);
+        }
+        Stmt::Expr { expr, .. } => v.visit_expr(expr),
+    }
+}
+
+pub fn walk_expr<'a, V: Visit<'a>>(v: &mut V, expr: &'a Expr) {
+    match &expr.kind {
+        // Interpolation holes are children; every consumer used to have to
+        // remember that separately.
+        ExprKind::StrInterp(parts) => {
+            for part in parts {
+                if let InterpPart::Hole(h) = part {
+                    v.visit_expr(h);
+                }
+            }
+        }
+        ExprKind::Unary { expr: inner, .. } | ExprKind::Try(inner) => v.visit_expr(inner),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            v.visit_expr(lhs);
+            v.visit_expr(rhs);
+        }
+        ExprKind::Assign { target, value, .. } => {
+            v.visit_expr(target);
+            v.visit_expr(value);
+        }
+        ExprKind::Call { callee, args } => {
+            v.visit_expr(callee);
+            for a in args {
+                v.visit_expr(a);
+            }
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            v.visit_expr(recv);
+            for a in args {
+                v.visit_expr(a);
+            }
+        }
+        ExprKind::Field { obj, .. } => v.visit_expr(obj),
+        ExprKind::Index { obj, idx } => {
+            v.visit_expr(obj);
+            v.visit_expr(idx);
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for (_, value) in fields {
+                v.visit_expr(value);
+            }
+        }
+        ExprKind::ListLit(items) => {
+            for i in items {
+                v.visit_expr(i);
+            }
+        }
+        ExprKind::MapLit(entries) => {
+            for (k, value) in entries {
+                v.visit_expr(k);
+                v.visit_expr(value);
+            }
+        }
+        ExprKind::If { cond, then, else_ } => {
+            v.visit_expr(cond);
+            v.visit_block(then);
+            if let Some(e) = else_ {
+                v.visit_expr(e);
+            }
+        }
+        ExprKind::IfLet {
+            pat,
+            scrutinee,
+            then,
+            else_,
+        } => {
+            v.visit_pattern(pat);
+            v.visit_expr(scrutinee);
+            v.visit_block(then);
+            if let Some(e) = else_ {
+                v.visit_expr(e);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            v.visit_expr(scrutinee);
+            for arm in arms {
+                v.visit_pattern(&arm.pat);
+                if let Some(g) = &arm.guard {
+                    v.visit_expr(g);
+                }
+                v.visit_expr(&arm.body);
+            }
+        }
+        ExprKind::While { cond, body } => {
+            v.visit_expr(cond);
+            v.visit_block(body);
+        }
+        ExprKind::Loop { body } => v.visit_block(body),
+        ExprKind::For { iter, body, .. } => {
+            v.visit_expr(iter);
+            v.visit_block(body);
+        }
+        ExprKind::Range { lo, hi, .. } => {
+            v.visit_expr(lo);
+            v.visit_expr(hi);
+        }
+        ExprKind::Return(value) => {
+            if let Some(value) = value {
+                v.visit_expr(value);
+            }
+        }
+        ExprKind::Block(b) => v.visit_block(b),
+        ExprKind::Closure { body, .. } => v.visit_expr(body),
+        // Leaves. Listed rather than caught by `_` so a new expression form
+        // is a compile error here, which is the point of this module.
+        ExprKind::IntLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::QuantityLit { .. }
+        | ExprKind::BoolLit(_)
+        | ExprKind::CharLit(_)
+        | ExprKind::StrLit(_)
+        | ExprKind::UnitLit
+        | ExprKind::Path(_)
+        | ExprKind::Break
+        | ExprKind::Continue
+        | ExprKind::Error => {}
+    }
+}
+
+pub fn walk_pattern<'a, V: Visit<'a>>(v: &mut V, pat: &'a Pattern) {
+    match &pat.kind {
+        PatternKind::Variant { args, .. } => match args {
+            VariantPatArgs::Tuple(pats) => {
+                for p in pats {
+                    v.visit_pattern(p);
+                }
+            }
+            VariantPatArgs::Struct { fields, .. } => {
+                for (_, p) in fields {
+                    v.visit_pattern(p);
+                }
+            }
+            VariantPatArgs::Unit => {}
+        },
+        PatternKind::Struct { fields, .. } => {
+            for (_, p) in fields {
+                v.visit_pattern(p);
+            }
+        }
+        PatternKind::Or(alts) => {
+            for p in alts {
+                v.visit_pattern(p);
+            }
+        }
+        PatternKind::Wildcard
+        | PatternKind::Binding(_)
+        | PatternKind::IntLit(_)
+        | PatternKind::QuantityLit { .. }
+        | PatternKind::BoolLit(_)
+        | PatternKind::CharLit(_)
+        | PatternKind::StrLit(_)
+        | PatternKind::Error => {}
+    }
 }

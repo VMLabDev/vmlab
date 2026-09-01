@@ -1,0 +1,4 @@
+E0270  1:5-1:12
+  `mod` blocks are only valid in `.wscripti` interface files
+  help: modules are registered by the host (PRD §3.9); scripts import them with `use`
+

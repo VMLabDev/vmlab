@@ -23,7 +23,7 @@ use crate::defs::{DefId, DefTable};
 use crate::host::{
     FromValue, HostCallable, HostCtx, HostError, IntoValue, ScriptOpaque, ScriptType, type_mismatch,
 };
-use crate::registry::{HostFnEntry, HostMethod, ModuleDef, Registry};
+use crate::registry::{HostFnDecl, HostFnEntry, ModuleDef, Registry};
 use crate::types::{FnSig, Type};
 use crate::value::Value;
 
@@ -35,6 +35,9 @@ struct StagedFn {
     sig: SigFn,
     imp: Arc<dyn HostCallable>,
     doc: Option<String>,
+    /// `None` from `fn_`, which declares no names at all — distinct from
+    /// `Some(vec![])`, which declares that there are none to give.
+    params: Option<Vec<String>>,
 }
 
 struct StagedMethod {
@@ -43,6 +46,33 @@ struct StagedMethod {
     sig: SigFn,
     imp: Arc<dyn HostCallable>,
     doc: Option<String>,
+    /// See [`StagedFn::params`].
+    params: Option<Vec<String>>,
+}
+
+/// Declared names must line up with the closure's real parameters, or the
+/// interface and every hover built from it lie. A host programming error,
+/// caught at registration time, never at script runtime — and checked in
+/// release too, because an embedder shipping a lying interface is the case
+/// that matters.
+///
+/// Returns the names to record: nothing declared, nothing recorded.
+fn declared_params(
+    kind: &str,
+    name: &str,
+    params: Option<Vec<String>>,
+    sig: &FnSig,
+) -> Vec<String> {
+    let Some(params) = params else {
+        return Vec::new();
+    };
+    assert!(
+        params.len() == sig.params.len(),
+        "{kind} `{name}` declares {} parameter name(s) but takes {}",
+        params.len(),
+        sig.params.len()
+    );
+    params
 }
 
 /// A named collection of host functions, constants and types. Build one,
@@ -83,7 +113,9 @@ impl Module {
         self
     }
 
-    /// Register a host function under this module.
+    /// Register a host function under this module. Parameters are
+    /// positional in the generated interface and in editor hovers — use
+    /// [`Module::fn_named`] wherever argument order can be confused.
     pub fn fn_<M: 'static, F: HostFunction<M>>(
         &mut self,
         name: impl Into<String>,
@@ -94,6 +126,30 @@ impl Module {
             sig: Box::new(F::sig),
             imp: f.into_callable(),
             doc: self.next_doc.take(),
+            params: None,
+        });
+        self
+    }
+
+    /// Register a host function, declaring its parameter names:
+    /// `m.fn_named("atan2", ["y", "x"], |y: f64, x: f64| y.atan2(x))`.
+    ///
+    /// The names travel with the closure they name; they reach the
+    /// `.wscripti` interface and editor hover, where positional `a0`/`a1`
+    /// placeholders would otherwise leave `atan2(y, x)` indistinguishable
+    /// from `atan2(x, y)`. The count must match the closure's arity.
+    pub fn fn_named<M: 'static, F: HostFunction<M>>(
+        &mut self,
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = impl Into<String>>,
+        f: F,
+    ) -> &mut Self {
+        self.fns.push(StagedFn {
+            name: name.into(),
+            sig: Box::new(F::sig),
+            imp: f.into_callable(),
+            doc: self.next_doc.take(),
+            params: Some(params.into_iter().map(Into::into).collect()),
         });
         self
     }
@@ -132,27 +188,39 @@ impl Module {
         }
         for staged in self.fns {
             let sig = (staged.sig)(&mut reg.defs);
+            let params = declared_params("fn", &staged.name, staged.params, &sig);
             let idx = reg.push_host_fn(HostFnEntry {
                 sig: sig.clone(),
                 imp: staged.imp,
             });
-            def.fns.push((staged.name, sig, idx, staged.doc));
+            def.fns.push(HostFnDecl {
+                name: staged.name,
+                sig,
+                host_idx: idx,
+                doc: staged.doc,
+                params,
+            });
         }
         for m in self.methods {
             let type_def = (m.register)(&mut reg.defs);
             let sig = (m.sig)(&mut reg.defs);
+            let params = declared_params("method", &m.name, m.params, &sig);
             let idx = reg.push_host_fn(HostFnEntry {
                 sig: sig.clone(),
                 imp: m.imp,
             });
-            reg.methods.entry(type_def).or_default().push(HostMethod {
-                name: m.name,
-                sig,
-                host_idx: idx,
-                doc: m.doc,
-            });
+            reg.push_method(
+                type_def,
+                HostFnDecl {
+                    name: m.name,
+                    sig,
+                    host_idx: idx,
+                    doc: m.doc,
+                    params,
+                },
+            );
         }
-        reg.modules.push(def);
+        reg.push_module(def);
     }
 }
 
@@ -189,6 +257,28 @@ impl<'m, T: ScriptType + 'static> TypeBuilder<'m, T> {
             sig: Box::new(F::sig),
             imp: f.into_callable(),
             doc: self.module.next_doc.take(),
+            params: None,
+        });
+        self
+    }
+
+    /// Register a method, declaring its parameter names (the receiver is
+    /// not one of them):
+    /// `.method_named("get", ["key"], |v: &DynValue, key: &str| …)`.
+    /// See [`Module::fn_named`].
+    pub fn method_named<M: 'static, F: HostMethodFn<T, M>>(
+        &mut self,
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = impl Into<String>>,
+        f: F,
+    ) -> &mut Self {
+        self.module.methods.push(StagedMethod {
+            register: Box::new(|defs| nominal_id::<T>(defs)),
+            name: name.into(),
+            sig: Box::new(F::sig),
+            imp: f.into_callable(),
+            doc: self.module.next_doc.take(),
+            params: Some(params.into_iter().map(Into::into).collect()),
         });
         self
     }

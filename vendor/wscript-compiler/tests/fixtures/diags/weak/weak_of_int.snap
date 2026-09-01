@@ -1,0 +1,4 @@
+E0213  1:18-1:19
+  cannot create a weak reference to `int`
+  help: weak references apply to structs, enums, List, Map, and functions (PRD §4.2)
+

@@ -1,0 +1,4 @@
+E0225  1:21-1:25
+  range expressions are only usable as `for` loop iterables in v1
+  help: write `for i in a..b { ... }`
+

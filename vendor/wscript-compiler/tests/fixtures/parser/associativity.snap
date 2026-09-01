@@ -1,0 +1,34 @@
+fn main() -> _
+  let sub:_ =
+    binary Sub  @2:15-2:24 #5
+      binary Sub  @2:15-2:20 #3
+        int 1  @2:15-2:16 #1
+        int 2  @2:19-2:20 #2
+      int 3  @2:23-2:24 #4
+  let div:_ =
+    binary Div  @3:15-3:24 #11
+      binary Div  @3:15-3:20 #9
+        int 8  @3:15-3:16 #7
+        int 4  @3:19-3:20 #8
+      int 2  @3:23-3:24 #10
+  let and:_ =
+    binary And  @4:15-4:26 #17
+      binary And  @4:15-4:21 #15
+        path a  @4:15-4:16 #13
+        path b  @4:20-4:21 #14
+      path c  @4:25-4:26 #16
+  let or:_ =
+    binary Or  @5:14-5:25 #23
+      binary Or  @5:14-5:20 #21
+        path a  @5:14-5:15 #19
+        path b  @5:19-5:20 #20
+      path c  @5:24-5:25 #22
+  let cmp:_ =
+    binary Lt  @6:15-6:24 #29
+      binary Lt  @6:15-6:20 #27
+        path a  @6:15-6:16 #25
+        path b  @6:19-6:20 #26
+      path c  @6:23-6:24 #28
+
+--- diagnostics ---
+(none)

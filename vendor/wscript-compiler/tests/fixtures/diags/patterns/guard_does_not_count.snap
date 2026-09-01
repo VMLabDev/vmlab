@@ -1,0 +1,4 @@
+E0260  2:13-2:80
+  non-exhaustive match: pattern `E::C { .. }` is not covered
+  help: add an arm matching `E::C { .. }`, or a trailing `_ => ...` arm; note that arms with `if` guards never count toward exhaustiveness (matching on `E`)
+

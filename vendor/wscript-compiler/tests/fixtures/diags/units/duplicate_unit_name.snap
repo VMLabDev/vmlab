@@ -1,0 +1,4 @@
+E0265  1:23-1:24
+  duplicate unit `a`
+  help: each unit may be declared once per family
+

@@ -1,0 +1,8 @@
+E0251  1:13-1:26
+  cannot infer the type of this binding
+  help: add a type annotation: `let name: Type = ...`
+
+E0250  1:22-1:23
+  cannot infer the type of closure parameter `x`
+  help: add an annotation: `|x: int| ...` (closure parameters are inferred only where the context determines them, PRD §3.3)
+

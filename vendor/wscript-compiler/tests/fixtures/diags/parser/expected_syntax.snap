@@ -1,0 +1,8 @@
+E0100  1:10-1:11
+  expected parameter name, found `{`
+  help: the parser expected different syntax here; see the language tour
+
+E0100  1:10-1:11
+  expected `,` or `)` in parameter list, found `{`
+  help: the parser expected different syntax here; see the language tour
+

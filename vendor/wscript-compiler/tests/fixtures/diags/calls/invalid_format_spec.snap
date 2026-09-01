@@ -1,0 +1,4 @@
+E0243  1:23-1:29
+  invalid format spec in template: unknown format type `q` (expected `x`, `X`, `b` or `o`)
+  help: the spec grammar is `{:[[fill]align][0][width][.prec][type]}` with align `< ^ >` and type `x X b o`
+

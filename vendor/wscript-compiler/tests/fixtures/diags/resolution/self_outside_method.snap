@@ -1,0 +1,4 @@
+E0228  1:21-1:25
+  `self` is only available inside methods
+  help: methods are functions in `impl` blocks whose first parameter is `self`
+

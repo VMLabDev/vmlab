@@ -1,0 +1,4 @@
+E0252  2:13-2:20
+  cannot infer type parameter `T` of `empty`
+  help: annotate the binding or a surrounding expression so the parameter is determined
+

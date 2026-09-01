@@ -1,0 +1,4 @@
+E0109  1:23-1:26
+  expected end of statement, found `let`
+  help: statements end at a newline; use `;` to put several on one line
+

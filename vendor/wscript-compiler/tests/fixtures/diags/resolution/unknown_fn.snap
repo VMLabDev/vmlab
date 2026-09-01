@@ -1,0 +1,4 @@
+E0230  1:13-1:20
+  cannot find function `missing`
+  help: functions must be declared in the script or imported from a registered module
+

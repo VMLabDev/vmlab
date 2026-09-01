@@ -1,0 +1,4 @@
+E0215  2:20-2:28
+  `Box` does not take type arguments
+  help: user-defined generic *types* are not supported yet; generic functions are — declare type parameters on the function: `fn f[T](x: T)`
+

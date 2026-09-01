@@ -1,0 +1,8 @@
+E0007  1:23-1:24
+  unexpected character `§`
+  help: this character is not part of wscript's syntax
+
+E0109  1:25-1:26
+  expected end of statement, found integer literal
+  help: statements end at a newline; use `;` to put several on one line
+

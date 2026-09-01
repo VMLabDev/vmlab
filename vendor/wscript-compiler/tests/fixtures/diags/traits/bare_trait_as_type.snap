@@ -1,0 +1,4 @@
+E0211  3:9-3:14
+  trait `Speak` cannot be used as a type directly
+  help: use `dyn Speak` for a dynamically dispatched value
+

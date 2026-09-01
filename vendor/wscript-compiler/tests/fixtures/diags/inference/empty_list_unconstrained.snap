@@ -1,0 +1,4 @@
+E0251  1:13-1:23
+  cannot infer the type of this binding
+  help: add a type annotation: `let name: Type = ...`
+

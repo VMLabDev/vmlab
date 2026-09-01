@@ -17,6 +17,7 @@ pub mod source_map;
 pub mod span;
 pub mod types;
 pub mod value;
+pub mod verify;
 
 pub use bytecode::{Builtin, CallTarget, CompiledUnit, Const, FnProto, Instr};
 pub use defs::{DefId, DefKind, DefTable, EnumDef, StructDef, TraitDef, VariantDef, VariantKind};

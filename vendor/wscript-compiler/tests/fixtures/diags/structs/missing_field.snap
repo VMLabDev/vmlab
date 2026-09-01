@@ -1,0 +1,8 @@
+E0247  2:13-2:23
+  missing fields in `P` literal: y
+  help: every field must be initialized
+
+E0220  2:13-2:23
+  type mismatch: expected `unit`, found `P`
+  help: function body does not match the declared return type
+

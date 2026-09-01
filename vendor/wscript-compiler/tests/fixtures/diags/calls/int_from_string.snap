@@ -1,0 +1,4 @@
+E0240  1:25-1:28
+  `int()` cannot convert from `string`
+  help: int() accepts int, float (truncates), and char (code point); to parse a string use `s.parse_int()`
+

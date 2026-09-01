@@ -1,0 +1,4 @@
+E0231  1:21-1:31
+  path has too many segments
+  help: paths are at most `module::Type::Variant`
+

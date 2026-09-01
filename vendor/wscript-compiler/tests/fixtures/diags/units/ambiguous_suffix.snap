@@ -1,0 +1,4 @@
+E0260  3:21-3:23
+  `u` is a unit of `A` and `B`
+  help: annotate the binding (`let x: A = ...`) or convert explicitly with `A::u(...)`
+

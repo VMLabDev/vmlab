@@ -1,0 +1,4 @@
+E0268  1:27-1:30
+  a float factor in an `int`-backed unit family
+  help: int-backed families take whole factors; back the family with `float` if you need fractions
+

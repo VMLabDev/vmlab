@@ -1,0 +1,4 @@
+E0267  1:7-1:8
+  unit family `X` has more than one base unit
+  help: `a`, `b` all have the factor 1; exactly one may
+

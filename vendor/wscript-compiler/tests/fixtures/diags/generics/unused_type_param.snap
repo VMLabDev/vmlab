@@ -1,0 +1,8 @@
+E0255  1:11-1:12
+  type parameter `T` is never used in the signature
+  help: every type parameter must appear in a parameter type or the return type (there is no explicit instantiation syntax)
+
+E0252  2:13-2:22
+  cannot infer type parameter `T` of `unused`
+  help: annotate the binding or a surrounding expression so the parameter is determined
+

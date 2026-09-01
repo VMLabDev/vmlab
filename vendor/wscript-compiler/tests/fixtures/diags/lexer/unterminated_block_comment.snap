@@ -1,0 +1,4 @@
+E0001  1:1-3:1
+  unterminated block comment
+  help: close the comment with `*/`
+

@@ -1,0 +1,14 @@
+fn ok() -> int
+  expr
+    int 1  @1:18-1:19 #1
+struct Good []
+  v: int
+fn broken() -> _
+
+--- diagnostics ---
+E0100  3:12-3:13
+  expected parameter name, found `{`
+E0100  3:12-3:13
+  expected `,` or `)` in parameter list, found `{`
+E0100  3:12-3:13
+  unclosed block: missing `}`

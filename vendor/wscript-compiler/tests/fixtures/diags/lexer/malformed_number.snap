@@ -1,0 +1,4 @@
+E0006  1:21-1:23
+  invalid hex literal
+  help: hex literals look like `0xFF` and must fit in 64 bits
+

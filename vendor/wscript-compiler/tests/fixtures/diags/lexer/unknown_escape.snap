@@ -1,0 +1,4 @@
+E0004  1:21-1:24
+  unknown escape sequence `\q`
+  help: supported escapes: \n \t \r \0 \\ \" \' \u{...}
+

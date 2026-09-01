@@ -12,7 +12,7 @@ use wscript_core::types::Type;
 
 use crate::ast::*;
 
-use super::Checker;
+use super::{Checker, PatLowering};
 
 // ------------------------------------------------------------ checking
 
@@ -29,7 +29,14 @@ impl<'a> Checker<'a> {
                 {
                     match kind {
                         VariantKind::Unit => {
-                            self.out.pattern_variants.insert(pat.id, (def, tag));
+                            self.out.set_pat_lowering(
+                                pat.id,
+                                PatLowering::Variant {
+                                    def,
+                                    tag,
+                                    order: Vec::new(),
+                                },
+                            );
                             return;
                         }
                         _ => {
@@ -72,7 +79,8 @@ impl<'a> Checker<'a> {
                 };
                 match folded {
                     Factor::Int(_) => {
-                        self.out.quantity_lits.insert(pat.id, folded);
+                        self.out
+                            .set_pat_lowering(pat.id, PatLowering::QuantityLit(folded));
                         self.unify_or_err(
                             &Type::Named(def),
                             expected,
@@ -192,10 +200,11 @@ impl<'a> Checker<'a> {
             pat.span,
             "the pattern's enum must match the scrutinee type",
         );
-        self.out.pattern_variants.insert(pat.id, (def, tag));
         let payload = self.variant_payload_types(def, tag, expected);
-        match (kind, args) {
-            (VariantKind::Unit, VariantPatArgs::Unit) => {}
+        // The field order of a struct variant; empty for every other shape.
+        // Collected first so the lowering below is written in one piece.
+        let order = match (kind, args) {
+            (VariantKind::Unit, VariantPatArgs::Unit) => Vec::new(),
             (VariantKind::Tuple, VariantPatArgs::Tuple(pats)) => {
                 if pats.len() != n_fields {
                     let n = vname.name.clone();
@@ -215,6 +224,7 @@ impl<'a> Checker<'a> {
                 for p in pats.iter().skip(payload.len()) {
                     self.check_pattern(p, &Type::Error);
                 }
+                Vec::new()
             }
             (VariantKind::Struct, VariantPatArgs::Struct { fields, has_rest }) => {
                 let decl: Vec<(String, Type)> = self
@@ -228,11 +238,12 @@ impl<'a> Checker<'a> {
                     .map(|(n, _)| n.clone())
                     .zip(payload.iter().cloned())
                     .collect();
-                self.check_pattern_fields(pat, &decl, fields, *has_rest, &vname.name);
+                self.check_pattern_fields(pat, &decl, fields, *has_rest, &vname.name)
             }
             (VariantKind::Unit, _) => {
                 let n = vname.name.clone();
                 self.error("E0264", pat.span, format!("variant `{n}` has no payload"));
+                Vec::new()
             }
             (VariantKind::Tuple, _) => {
                 let n = vname.name.clone();
@@ -242,6 +253,7 @@ impl<'a> Checker<'a> {
                     format!("variant `{n}` is a tuple variant"),
                     format!("write `{n}(...)`"),
                 );
+                Vec::new()
             }
             (VariantKind::Struct, _) => {
                 let n = vname.name.clone();
@@ -251,8 +263,11 @@ impl<'a> Checker<'a> {
                     format!("variant `{n}` has named fields"),
                     format!("write `{n} {{ ... }}`"),
                 );
+                Vec::new()
             }
-        }
+        };
+        self.out
+            .set_pat_lowering(pat.id, PatLowering::Variant { def, tag, order });
     }
 
     fn check_struct_pattern(
@@ -298,12 +313,18 @@ impl<'a> Checker<'a> {
             pat.span,
             "the pattern's type must match the scrutinee type",
         );
-        self.out.pattern_structs.insert(pat.id, def);
-        self.check_pattern_fields(pat, &decl, fields, has_rest, &ty_ident.name);
+        let order = self.check_pattern_fields(pat, &decl, fields, has_rest, &ty_ident.name);
+        self.out
+            .set_pat_lowering(pat.id, PatLowering::Struct { def, order });
     }
 
     /// Shared field handling for struct patterns and struct-variant
     /// patterns: resolves indices, recurses, enforces completeness.
+    ///
+    /// Returns the runtime field index of each field as written, rather
+    /// than recording it: only the caller knows whether the pattern is a
+    /// `Struct` or a `Variant`, so only the caller can write a complete
+    /// [`PatLowering`].
     fn check_pattern_fields(
         &mut self,
         pat: &Pattern,
@@ -311,7 +332,7 @@ impl<'a> Checker<'a> {
         fields: &[(Ident, Pattern)],
         has_rest: bool,
         what: &str,
-    ) {
+    ) -> Vec<u16> {
         let mut order: Vec<u16> = Vec::with_capacity(fields.len());
         let mut seen = vec![false; decl.len()];
         for (fname, sub) in fields {
@@ -360,7 +381,7 @@ impl<'a> Checker<'a> {
                 );
             }
         }
-        self.out.field_orders.insert(pat.id, order);
+        order
     }
 
     /// Conservative refutability test (used for `if let` / `let else`
@@ -438,33 +459,32 @@ impl<'a> Checker<'a> {
         let mut result: Option<Type> = None;
         let mut unguarded: Vec<Vec<DPat>> = Vec::new();
         for arm in arms {
-            self.push_scope();
-            self.check_pattern(&arm.pat, &scrut_ty);
-            let row = vec![self.lower_pattern(&arm.pat)];
-            if !unguarded.is_empty()
-                && self
-                    .is_useful(&unguarded, &row, std::slice::from_ref(&rt))
-                    .is_none()
-            {
-                self.warn(
-                    "W0002",
-                    arm.pat.span,
-                    "unreachable match arm: previous patterns already cover this case",
-                );
-            }
-            let guarded = match &arm.guard {
-                Some(g) => {
-                    let gt = self.check_expr(g, Some(&Type::Bool));
-                    self.unify_or_err(&Type::Bool, &gt, g.span, "match guards are `bool`");
-                    true
+            let body_ty = self.in_scope(|c| {
+                c.check_pattern(&arm.pat, &scrut_ty);
+                let row = vec![c.lower_pattern(&arm.pat)];
+                if !unguarded.is_empty()
+                    && c.is_useful(&unguarded, &row, std::slice::from_ref(&rt))
+                        .is_none()
+                {
+                    c.warn(
+                        "W0002",
+                        arm.pat.span,
+                        "unreachable match arm: previous patterns already cover this case",
+                    );
                 }
-                None => false,
-            };
-            if !guarded {
-                unguarded.push(row);
-            }
-            let body_ty = self.check_expr(&arm.body, expect);
-            self.pop_scope();
+                let guarded = match &arm.guard {
+                    Some(g) => {
+                        let gt = c.check_expr(g, Some(&Type::Bool));
+                        c.unify_or_err(&Type::Bool, &gt, g.span, "match guards are `bool`");
+                        true
+                    }
+                    None => false,
+                };
+                if !guarded {
+                    unguarded.push(row);
+                }
+                c.check_expr(&arm.body, expect)
+            });
             let body_rt = self.resolve(&body_ty);
             if !matches!(body_rt, Type::Never) {
                 result = Some(match result {
@@ -509,8 +529,8 @@ impl<'a> Checker<'a> {
     fn lower_pattern(&self, pat: &Pattern) -> DPat {
         match &pat.kind {
             PatternKind::Wildcard | PatternKind::Error => DPat::Wild,
-            PatternKind::Binding(_) => match self.out.pattern_variants.get(&pat.id) {
-                Some(&(def, tag)) => DPat::Ctor(
+            PatternKind::Binding(_) => match self.out.pat_variant(pat.id) {
+                Some((def, tag, _)) => DPat::Ctor(
                     Ctor::Variant {
                         def,
                         tag,
@@ -523,15 +543,15 @@ impl<'a> Checker<'a> {
             PatternKind::IntLit(n) => DPat::Ctor(Ctor::Int(*n), vec![]),
             // Unit patterns are erased to their base-unit constant, so they
             // share the int ctor space (and its exhaustiveness rules).
-            PatternKind::QuantityLit { .. } => match self.out.quantity_lits.get(&pat.id) {
-                Some(Factor::Int(n)) => DPat::Ctor(Ctor::Int(*n), vec![]),
+            PatternKind::QuantityLit { .. } => match self.out.pat_quantity_lit(pat.id) {
+                Some(Factor::Int(n)) => DPat::Ctor(Ctor::Int(n), vec![]),
                 _ => DPat::Wild,
             },
             PatternKind::BoolLit(b) => DPat::Ctor(Ctor::Bool(*b), vec![]),
             PatternKind::CharLit(c) => DPat::Ctor(Ctor::Char(*c), vec![]),
             PatternKind::StrLit(s) => DPat::Ctor(Ctor::Str(s.clone()), vec![]),
             PatternKind::Variant { args, .. } => {
-                let Some(&(def, tag)) = self.out.pattern_variants.get(&pat.id) else {
+                let Some((def, tag, order)) = self.out.pat_variant(pat.id) else {
                     return DPat::Wild;
                 };
                 let arity = self.variant_arity(def, tag);
@@ -544,20 +564,13 @@ impl<'a> Checker<'a> {
                         }
                     }
                     VariantPatArgs::Struct { fields, .. } => {
-                        let order = self.out.field_orders.get(&pat.id);
-                        for (i, (_, p)) in fields.iter().enumerate() {
-                            if let Some(&idx) = order.and_then(|o| o.get(i))
-                                && (idx as usize) < arity
-                            {
-                                sub[idx as usize] = self.lower_pattern(p);
-                            }
-                        }
+                        self.scatter_named_fields(fields, order, &mut sub);
                     }
                 }
                 DPat::Ctor(Ctor::Variant { def, tag, arity }, sub)
             }
             PatternKind::Struct { fields, .. } => {
-                let Some(&def) = self.out.pattern_structs.get(&pat.id) else {
+                let Some((def, order)) = self.out.pat_struct(pat.id) else {
                     return DPat::Wild;
                 };
                 let arity = self
@@ -567,17 +580,24 @@ impl<'a> Checker<'a> {
                     .map(|s| s.fields.len())
                     .unwrap_or(0);
                 let mut sub = vec![DPat::Wild; arity];
-                let order = self.out.field_orders.get(&pat.id);
-                for (i, (_, p)) in fields.iter().enumerate() {
-                    if let Some(&idx) = order.and_then(|o| o.get(i))
-                        && (idx as usize) < arity
-                    {
-                        sub[idx as usize] = self.lower_pattern(p);
-                    }
-                }
+                self.scatter_named_fields(fields, order, &mut sub);
                 DPat::Ctor(Ctor::Struct { def, arity }, sub)
             }
             PatternKind::Or(alts) => DPat::Or(alts.iter().map(|a| self.lower_pattern(a)).collect()),
+        }
+    }
+
+    /// Place each named field's sub-pattern at its declared position in
+    /// `sub` (the matrix wants declaration order, not written order).
+    /// Fields the checker could not resolve carry `u16::MAX` and stay
+    /// wildcards, as do positions the pattern did not mention.
+    fn scatter_named_fields(&self, fields: &[(Ident, Pattern)], order: &[u16], sub: &mut [DPat]) {
+        for (i, (_, p)) in fields.iter().enumerate() {
+            if let Some(&idx) = order.get(i)
+                && (idx as usize) < sub.len()
+            {
+                sub[idx as usize] = self.lower_pattern(p);
+            }
         }
     }
 

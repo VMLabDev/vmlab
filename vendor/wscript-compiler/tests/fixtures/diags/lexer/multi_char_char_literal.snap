@@ -1,0 +1,12 @@
+E0005  1:21-1:23
+  unterminated char literal
+  help: char literals hold exactly one character, e.g. `'a'`
+
+E0109  1:23-1:24
+  expected end of statement, found `b`
+  help: statements end at a newline; use `;` to put several on one line
+
+E0005  1:24-1:26
+  unterminated char literal
+  help: char literals hold exactly one character, e.g. `'a'`
+

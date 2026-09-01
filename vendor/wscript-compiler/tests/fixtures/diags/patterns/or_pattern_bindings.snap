@@ -1,0 +1,12 @@
+E0262  2:41-2:42
+  binding `n` is not allowed inside an or-pattern in v1
+  help: split the alternatives into separate match arms
+
+E0262  2:51-2:52
+  binding `n` is not allowed inside an or-pattern in v1
+  help: split the alternatives into separate match arms
+
+E0230  2:57-2:58
+  cannot find value `n` in this scope
+  help: check the spelling; variables must be declared with `let` before use
+

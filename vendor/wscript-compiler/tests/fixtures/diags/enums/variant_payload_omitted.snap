@@ -1,0 +1,4 @@
+E0233  2:21-2:25
+  variant `A` takes a payload
+  help: write `E::A(...)`
+

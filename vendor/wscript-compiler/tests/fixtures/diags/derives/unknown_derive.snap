@@ -1,0 +1,4 @@
+E0204  1:10-1:14
+  cannot derive `Hash`
+  help: derivable traits are: Eq, Ord, Display, Clone (PRD §3.8)
+

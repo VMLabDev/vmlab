@@ -1,7 +1,7 @@
 # Patched wscript crates
 
 `wscript-core` and `wscript-compiler` are vendored from wscript commit
-`c631c6b724ebcc38a9ae53235b20bf10ba64dc51`. The only functional delta is
+`ddb6d9fedc77e68736a1281eaf8a122250f40aa3`. The only functional delta is
 host-registered nominal type aliases, used to keep the historical wscript
 `Vm` name compatible with `Machine`.
 

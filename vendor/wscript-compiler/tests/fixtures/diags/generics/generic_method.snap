@@ -1,0 +1,4 @@
+E0254  2:13-2:16
+  generic methods are not supported yet
+  help: only top-level `fn`s take type parameters in this release
+

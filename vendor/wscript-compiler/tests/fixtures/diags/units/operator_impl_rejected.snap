@@ -1,0 +1,4 @@
+E0206  2:6-2:9
+  cannot implement `Add` for the unit family `Duration`
+  help: `Duration` already has arithmetic, comparison and equality from its backing number; only `Display` can be overridden
+

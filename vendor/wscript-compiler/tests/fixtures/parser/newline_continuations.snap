@@ -1,0 +1,22 @@
+fn main() -> _
+  let s:_ =
+    method .to_upper  @2:13-3:20 #2
+      str "x"  @2:13-2:16 #1
+  expr
+    if  @4:5-9:6 #16
+      binary Eq  @4:8-4:16 #6
+        path s  @4:8-4:9 #4
+        str "X"  @4:13-4:16 #5
+      expr
+        call  @5:9-5:19 #9
+          path println  @5:9-5:16 #7
+          path s  @5:17-5:18 #8
+    else
+      block  @7:10-9:6 #15
+        expr
+          call  @8:9-8:22 #13
+            path println  @8:9-8:16 #11
+            str "no"  @8:17-8:21 #12
+
+--- diagnostics ---
+(none)

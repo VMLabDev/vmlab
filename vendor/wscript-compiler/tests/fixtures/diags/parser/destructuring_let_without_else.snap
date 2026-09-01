@@ -1,0 +1,8 @@
+E0110  1:13-1:34
+  destructuring `let` requires an `else` block in v1
+  help: write `let pat = expr else { ... }`; the else block must diverge (return, break, or continue)
+
+E0222  1:13-1:34
+  the `else` block of `let ... else` must diverge
+  help: end it with `return`, `break`, or `continue`
+

@@ -1,0 +1,4 @@
+E0266  1:27-1:28
+  the factor for `b` must be a positive, finite number
+  help: a factor says how many base units one of this unit is worth
+

@@ -1,0 +1,4 @@
+E0255  1:9-1:10
+  duplicate type parameter `T`
+  help: a type parameter is declared once, must appear in the signature, and must not share a name with a type
+

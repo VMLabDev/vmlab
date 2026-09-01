@@ -1,0 +1,21 @@
+enum E
+  A
+  B(int)
+  C { v: bool }
+fn f(e:E) -> int
+  expr
+    match  @4:5-9:6 #16
+      path e  @4:11-4:12 #1
+      arm E::A
+        int 0  @5:17-5:18 #3
+      arm E::B(n) | E::B(_)
+        path n  @6:30-6:31 #9
+      arm E::C { v: v }
+        guard
+          path v  @7:23-7:24 #12
+        int 1  @7:28-7:29 #13
+      arm _
+        int 2  @8:14-8:15 #15
+
+--- diagnostics ---
+(none)

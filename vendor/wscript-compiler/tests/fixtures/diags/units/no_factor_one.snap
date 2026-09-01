@@ -1,0 +1,4 @@
+E0267  1:7-1:8
+  unit family `X` has no base unit
+  help: exactly one unit must have the factor 1 — values are stored in it
+

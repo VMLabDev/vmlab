@@ -9,6 +9,64 @@ pub enum StrPart {
     Hole(Vec<Token>),
 }
 
+/// Declares the keyword spellings once: the lexer's lookup and the list an
+/// editor offers for completion are generated together, so a new keyword
+/// cannot reach the language and miss the editor.
+///
+/// Interface-only keywords are separated because they are not part of the
+/// script surface — `mod` and `const` appear in `.wscripti` files (PRD §9.1)
+/// and nowhere a script author writes.
+macro_rules! keywords {
+    (
+        script { $( $text:literal => $variant:ident, )* }
+        interface { $( $itext:literal => $ivariant:ident, )* }
+    ) => {
+        impl TokenKind {
+            /// The keyword `text` spells, if it spells one.
+            pub fn keyword(text: &str) -> Option<TokenKind> {
+                Some(match text {
+                    $( $text => TokenKind::$variant, )*
+                    $( $itext => TokenKind::$ivariant, )*
+                    _ => return None,
+                })
+            }
+        }
+
+        /// Every keyword a script may contain.
+        pub const SCRIPT_KEYWORDS: &[&str] = &[ $($text),* ];
+    };
+}
+
+keywords! {
+    script {
+        "let" => KwLet,
+        "fn" => KwFn,
+        "struct" => KwStruct,
+        "enum" => KwEnum,
+        "trait" => KwTrait,
+        "impl" => KwImpl,
+        "for" => KwFor,
+        "in" => KwIn,
+        "while" => KwWhile,
+        "loop" => KwLoop,
+        "if" => KwIf,
+        "else" => KwElse,
+        "match" => KwMatch,
+        "return" => KwReturn,
+        "break" => KwBreak,
+        "continue" => KwContinue,
+        "use" => KwUse,
+        "true" => KwTrue,
+        "false" => KwFalse,
+        "dyn" => KwDyn,
+        "self" => KwSelf,
+    }
+    interface {
+        "mod" => KwMod,
+        "const" => KwConst,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // literals

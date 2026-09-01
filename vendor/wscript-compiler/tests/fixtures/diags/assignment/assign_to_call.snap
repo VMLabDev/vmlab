@@ -1,0 +1,4 @@
+E0236  2:13-2:16
+  invalid assignment target
+  help: only variables, fields, and list/map elements can be assigned
+

@@ -1,0 +1,4 @@
+E0234  3:21-3:29
+  cannot divide `Duration` by `Size`
+  help: dividing across unit families would produce a new dimension, which this release does not model
+

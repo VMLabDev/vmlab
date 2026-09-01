@@ -1,0 +1,4 @@
+E0260  1:20-1:44
+  non-exhaustive match: pattern `false` is not covered
+  help: add an arm matching `false`, or a trailing `_ => ...` arm; note that arms with `if` guards never count toward exhaustiveness (matching on `bool`)
+

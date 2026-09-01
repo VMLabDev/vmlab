@@ -1,0 +1,4 @@
+E0223  4:15-4:25
+  `D` does not implement trait `Speak`
+  help: add `impl Speak for D { ... }`
+

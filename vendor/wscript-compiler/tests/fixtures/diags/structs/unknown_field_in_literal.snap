@@ -1,0 +1,8 @@
+E0220  2:13-2:35
+  type mismatch: expected `unit`, found `P`
+  help: function body does not match the declared return type
+
+E0247  2:29-2:30
+  `P` has no field `z`
+  help: available fields: x, y
+

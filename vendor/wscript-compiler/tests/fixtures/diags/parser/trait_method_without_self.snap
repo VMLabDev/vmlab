@@ -1,0 +1,4 @@
+E0106  1:14-1:15
+  trait methods must take `self` as their first parameter
+  help: write `fn name(self, ...)`
+

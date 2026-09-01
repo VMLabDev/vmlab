@@ -1,0 +1,30 @@
+struct P []
+  x: int
+  y: int
+enum E
+  A
+  B(int)
+fn main() -> _
+  let list:_ =
+    list  @5:16-5:26 #4
+      int 1  @5:17-5:18 #1
+      int 2  @5:20-5:21 #2
+      int 3  @5:23-5:24 #3
+  let map:_ =
+    map  @6:15-6:27 #8
+      str "a"  @6:18-6:21 #6
+      int 1  @6:23-6:24 #7
+  let lit:_ =
+    structlit P  @7:15-7:32 #12
+      .x =
+        int 1  @7:22-7:23 #10
+      .y =
+        int 2  @7:28-7:29 #11
+  let call:_ =
+    call  @8:16-8:24 #17
+      path f  @8:16-8:17 #14
+      int 1  @8:18-8:19 #15
+      int 2  @8:21-8:22 #16
+
+--- diagnostics ---
+(none)

@@ -1,0 +1,4 @@
+E0214  1:24-1:27
+  `float` cannot be a map key
+  help: map keys must be int, bool, char, or string
+

@@ -1,0 +1,4 @@
+E0208  3:20-3:41
+  method `speak` does not match the trait signature
+  help: trait `Speak` declares `fn speak() -> string`
+

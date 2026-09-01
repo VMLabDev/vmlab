@@ -1,0 +1,4 @@
+E0206  2:20-2:22
+  `ms` is a unit of `Duration` and cannot also be a method
+  help: `Duration::ms(n)` already converts a number into `Duration`
+

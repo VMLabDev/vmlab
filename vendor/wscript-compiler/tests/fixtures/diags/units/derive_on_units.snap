@@ -1,0 +1,4 @@
+E0101  2:7-2:8
+  `#[derive(...)]` is not allowed on a unit family
+  help: unit values compare, order, clone and display as their backing number already
+
