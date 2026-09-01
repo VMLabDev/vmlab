@@ -13,18 +13,12 @@ jobs:
   check:
     name: fmt + lint + test
     runs-on: ubuntu-latest
-    # pnpm/action-setup's default store lives under its own node_modules; the
-    # @forge git deps then build inside a node_modules path, where TypeScript's
-    # wildcard matching silently skips source files and the packages ship stub
-    # .d.ts files. The justfile passes this through to `pnpm install`.
-    env:
-      PNPM_STORE_DIR: ${{ github.workspace }}/../pnpm-store
     steps:
       - uses: actions/checkout@v7
       # vmlab's tests probe the host for the tools it drives — QEMU emulators +
       # firmware (x86 OVMF, aarch64 AAVMF, riscv EDK2), swtpm, the ISO/floppy
       # builders (xorriso/mtools), the SMB server, and tesseract for OCR — so
-      # install them (mirrors the Containerfile runtime deps).
+      # install them.
       - name: Install runtime deps
         run: |
           sudo apt-get update
@@ -39,33 +33,16 @@ jobs:
           components: rustfmt, clippy
       - uses: taiki-e/install-action@just
       - uses: Swatinem/rust-cache@v2
-      # pnpm (major pinned): the @forge/* deps are git-subdir deps npm can't do.
-      # No lockfile on purpose — pnpm installs FROM a lockfile fetch path: git
-      # deps as the raw monorepo (web-ui/.gitignore); fresh resolution is
-      # correct, and the @forge revs are pinned in package.json.
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 10
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       # One part of the merge bar per step; `just ci::check` runs the same set
-      # in one go. Installing and building the frontend (rust-embed needs
-      # web-ui/dist at compile time to lint --all-features) is a dependency of
-      # the recipes themselves, so there is nothing to do here first.
+      # in one go.
       - run: just ci::fmt-check
       - run: just ci::lint
       - run: just ci::test
-      - run: just ci::web-ui-check
-      # The console's status types are generated from src/status.rs; a
-      # producer-side change that was not regenerated fails here.
-      - run: just ci::status-types-verify
 
   # The guest-side crates (cinit, agent, and their proto contracts) are
   # standalone — never swept into the host build — so lint/test them and the
   # agent's cross targets (musl, windows-gnu) explicitly. cargo check on the
-  # Windows target type-checks without needing a linker; the full binaries
-  # link in the Containerfile's guest stage.
+  # Windows target type-checks without needing a linker.
   guest-crates:
     name: guest crates (cinit + agent)
     runs-on: ubuntu-latest
@@ -200,17 +177,13 @@ jobs:
           SUMMARY
 
   # ── Binary ────────────────────────────────────────────────────────────────
-  # Build the version-stamped `vmlab` CLI and the `vmlab-web` UI server for
-  # Linux x86_64 (vmlab drives QEMU/KVM, so Linux is the only target). Both are
-  # uploaded for the release job.
+  # Build the version-stamped `vmlab` CLI for Linux x86_64 (vmlab drives
+  # QEMU/KVM, so Linux is the only target). It is uploaded for the release job.
   build:
     name: Build vmlab (${{ matrix.target }})
     needs: [version, check]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ${{ matrix.os }}
-    # See the check job: the default pnpm store breaks the @forge git deps.
-    env:
-      PNPM_STORE_DIR: ${{ github.workspace }}/../pnpm-store
     strategy:
       fail-fast: false
       matrix:
@@ -224,12 +197,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@just
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 10
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - uses: Swatinem/rust-cache@v2
         with:
           key: build-${{ matrix.target }}
@@ -239,20 +206,14 @@ jobs:
           sed -i '0,/^version = ".*"$/s//version = "'"$V"'"/' Cargo.toml
       - name: Build CLI
         run: cargo build --bin vmlab --release --target ${{ matrix.target }}
-      # The web UI is embedded into vmlab-web (rust-embed), so build it first.
-      - run: just web-ui-build
-      - name: Build web server
-        run: cargo build --bin vmlab-web --features web --release --target ${{ matrix.target }}
       - name: Stage assets
         run: |
           V="${{ needs.version.outputs.version }}"
           cp "target/${{ matrix.target }}/release/vmlab" "vmlab-$V-${{ matrix.suffix }}"
-          cp "target/${{ matrix.target }}/release/vmlab-web" "vmlab-web-$V-${{ matrix.suffix }}"
       - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
-          # Matches both vmlab-<v>-<suffix> and vmlab-web-<v>-<suffix>.
-          path: vmlab-*-${{ matrix.suffix }}
+          path: vmlab-${{ needs.version.outputs.version }}-${{ matrix.suffix }}
           retention-days: 1
 
   # ── Release ───────────────────────────────────────────────────────────────
@@ -271,7 +232,6 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: dist
-          # Only the staged binaries — not the image job's .dockerbuild record.
           pattern: bin-*
       - name: Tag
         run: |
@@ -287,52 +247,3 @@ jobs:
           prerelease: ${{ needs.version.outputs.prerelease }}
           generate_release_notes: true
           files: dist/**/*
-
-  # ── Container image ───────────────────────────────────────────────────────
-  # Build the version-stamped image (CLI + web UI) and push it to GHCR as
-  # ghcr.io/<owner>/vmlab:<version> (+ :latest), per release — matching the docs
-  # (docs/pages/vmlab/index.wcl). The Containerfile builds from source,
-  # so this recompiles independently of the `build` job; GHA layer cache speeds
-  # up repeat runs. linux/amd64 only (vmlab drives QEMU/KVM → Linux x86_64).
-  image:
-    name: Build & push container image
-    needs: [version, check]
-    if: needs.version.outputs.do_release == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - name: Stamp version
-        run: |
-          V="${{ needs.version.outputs.version }}"
-          sed -i '0,/^version = ".*"$/s//version = "'"$V"'"/' Cargo.toml
-      - name: Image ref (lowercase owner)
-        id: img
-        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vmlab" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
-        # Skip the .dockerbuild build-record artifact (the release job would
-        # otherwise try to download it).
-        env:
-          DOCKER_BUILD_RECORD_UPLOAD: "false"
-        with:
-          context: .
-          file: Containerfile
-          push: true
-          tags: |
-            ${{ steps.img.outputs.ref }}:${{ needs.version.outputs.version }}
-            ${{ steps.img.outputs.ref }}:latest
-          # Links the GHCR package to this repo (and inherits its visibility).
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

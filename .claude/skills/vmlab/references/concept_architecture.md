@@ -1,19 +1,19 @@
 # How vmlab fits together
 
-_The big picture: front ends, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the two guest channels._
+_The big picture: the CLI, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the two guest channels._
 
-Every vmlab feature hangs off one spine: front ends talk a JSON-lines protocol
+Every vmlab feature hangs off one spine: the CLI talks a JSON-lines protocol
 to a small daemon tree, which owns the QEMU processes and everything around
 them.
 
 
 ![diagram](../_wdoc/concept_architecture-diagram-1.svg)
 
-Both front ends speak the same unix-socket protocol to the supervisor; each running lab gets its own daemon, and each daemon owns its lab's QEMU processes.
+The CLI speaks a unix-socket protocol to the supervisor; each running lab gets its own daemon, and each daemon owns its lab's QEMU processes.
 
-**Front ends.** The `vmlab` CLI and the [vmlab-web](../references/entity_vmlab_web.md) server
-are peers: both speak the same protocol, so anything the CLI does the web
-console can do. Daemons auto-start on first use — there is no setup step.
+**Front end.** The `vmlab` CLI is the one front end; it speaks the daemon
+protocol and does nothing the daemons cannot. Daemons auto-start on first
+use — there is no setup step.
 
 **The daemon tier.** The supervisor `vmlabd` tracks the host-wide lab
 registry and global concerns; one **lab daemon** per running lab owns that
@@ -57,8 +57,6 @@ lab keeps its disposable working data in its own
 - [Linked clones](../references/concept_linked_clones.md)
 
 - [vmlab-agent](../references/entity_vmlab_agent.md)
-
-- [vmlab-web](../references/entity_vmlab_web.md)
 
 - [Filesystem layout](../references/fact_paths_table.md)
 

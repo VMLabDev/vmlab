@@ -426,15 +426,6 @@ impl Registry {
         Ok(self.resolve_manifest_meta(arch).await?.1.version)
     }
 
-    /// The whole-image digest this reference publishes for `arch` — the
-    /// SHA-256 of the assembled `disk.qcow2`, read from the manifest without
-    /// downloading anything. `None` when the manifest predates the
-    /// annotation. This is what a stored disk is checked against.
-    pub async fn published_disk_digest(&self, arch: Option<&str>) -> Result<Option<String>> {
-        let (manifest, _) = self.resolve_manifest_meta(arch).await?;
-        Ok(manifest.whole_digest().map(str::to_string))
-    }
-
     /// Pull the reference for `arch` into `dest_store`. Fetches the tag
     /// (resolving the index when present — `arch` required unless single),
     /// verifies the manifest is a vmlab artifact, downloads chunks in

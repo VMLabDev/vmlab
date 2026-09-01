@@ -21,9 +21,8 @@ requirements; it is the source of truth for design and scope.
 curl -fsSL https://vmlab.io/install.sh | sh -s -- --pre   # vmlab is pre-release only for now
 ```
 
-This drops `vmlab` and `vmlab-web` into `~/.local/bin`. Or build from source
-(see [Building](#building)), or skip installing entirely and use the
-[container image](#container-image).
+This drops `vmlab` into `~/.local/bin`. Or build from source (see
+[Building](#building)).
 
 ## Architecture
 
@@ -130,20 +129,6 @@ micro-VMs get it injected at boot. Guests that cannot run it (vintage OSes,
 `agent = false`) are still fully scriptable through the screen — keystrokes,
 mouse, image matching and OCR — they just never report ready.
 
-## The web console
-
-```sh
-vmlab-web                     # http://127.0.0.1:7878
-```
-
-`vmlab-web` serves the whole lab from a browser over the same daemon protocol
-the CLI uses: live desktops and agent terminals, a visual topology designer
-over `vmlab.wcl`, a whole-lab file editor with a playbook designer, template
-builds and OCI publishing, log streams, and guest-served web UIs proxied into
-sandboxed tabs. It binds loopback by default and requires a login on any
-other bind (`VMLAB_WEB_USER` / `VMLAB_WEB_PASSWORD`). Built behind the
-optional `web` feature; see [`docker/README.md`](docker/README.md).
-
 ## Examples
 
 Worked examples under `examples/`, all built and run end-to-end:
@@ -158,10 +143,6 @@ Worked examples under `examples/`, all built and run end-to-end:
 | `alpine-arm64/` | An emulated aarch64 guest on an x86 host, NAT + SSH forward |
 | `riscv64-ubuntu/` | An emulated riscv64 guest (needs `qemu-system-riscv64` ≥ 8.1 and riscv64 UEFI firmware) |
 | `peer-a/` + `peer-b/` | Cross-instance L2 peering: a `global` segment with `connect {}` bridging two supervisors over a PSK-authenticated trunk (PRD §9.2) — `just peer-demo` |
-
-`docker/` holds the Compose stack's sample lab (`docker/lab`, a VM plus a
-container, playbooks and a share) and **ad-demo** (`docker/labs/ad-demo`), a
-two-VM Active Directory lab converged entirely by config-weave playbooks.
 
 ## CLI
 
@@ -194,7 +175,6 @@ two-VM Active Directory lab converged entirely by config-weave playbooks.
 | `vmlab template build / list / rm / clean / export / import` | Template store |
 | `vmlab template push / pull / search / login` | OCI registry distribution |
 | `vmlab template registry list / add / remove` | Shared registry namespaces |
-| `vmlab-web` | The browser console (separate binary) |
 
 The supervisor starts on demand; `vmlab daemon start / stop / status` exists as
 a hidden escape hatch.
@@ -211,19 +191,17 @@ just ci::check # the merge bar: everything a change must pass before it can merg
 just ci        # list the gate's parts — run one on its own with `just ci::lint`
 ```
 
-`just ci::check` is self-sufficient from a clean checkout (it builds the web UI
-that `vmlab-web` embeds, and installs its dependencies) and reports a missing
+`just ci::check` is self-sufficient from a clean checkout and reports a missing
 tool as a missing tool. It covers clippy, `cargo fmt --check`, the test suite,
-the web UI typecheck, the standalone guest crates, and the committed BPF
-objects — the last of which needs a one-time `just ebpf-tools`.
+the standalone guest crates, and the committed BPF objects — the last of which
+needs a one-time `just ebpf-tools`.
 
 Runtime tools expected on the host: `qemu-system-<arch>`, `qemu-img`, `swtpm`,
 `tesseract` (OCR), an ISO tool (`xorriso`/`genisoimage`), `mtools` +
 `mkfs.vfat` (floppy building), `sqfstar` from `squashfs-tools` (required for
 containers), and a VNC viewer (`remote-viewer` preferred) for `vmlab console`.
 Shared folders use `virtiofsd` when host and guest both support it and fall
-back to a bundled unprivileged `smbd`, so having both covers every guest. The
-official container image bundles them all.
+back to a bundled unprivileged `smbd`, so having both covers every guest.
 
 ## Networking
 
@@ -241,37 +219,6 @@ macvlan and no privileges; host access from Windows rides port-forwards plus
 WSL's localhost forwarding; `vmlab console --tcp` bridges the VNC display to a
 localhost port for a Windows-side viewer; and `$XDG_RUNTIME_DIR` is created if
 absent at daemon start.
-
-## Container image
-
-The image ships both binaries and defaults to the web console on port 7878.
-The Compose stack is the shortest path — it wires the sample lab, the ad-demo
-lab, a shared folder and the template volume:
-
-```sh
-docker compose up --build           # then open http://localhost:7878
-```
-
-See [`docker/README.md`](docker/README.md) for the full tour. Plain
-`docker run` works too:
-
-```sh
-# Web console
-docker run --rm -p 7878:7878 --device /dev/kvm --device /dev/net/tun \
-  --cap-add BPF --cap-add NET_ADMIN -e VMLAB_FASTPATH=auto \
-  -e VMLAB_WEB_USER=admin -e VMLAB_WEB_PASSWORD=secret \
-  -v "$PWD":/lab vmlab
-
-# CLI (override the default command)
-docker run --rm -it --device /dev/kvm \
-  -v ~/.local/share/vmlab/templates:/root/.local/share/vmlab/templates \
-  -v "$PWD":/lab -w /lab vmlab vmlab up
-```
-
-`--device /dev/kvm` is the only host grant required for KVM acceleration;
-without it vmlab falls back to TCG (slow but functional). The optional eBPF
-network fast path uses `/dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`, as shown
-above. No `--privileged` or host network mode is required.
 
 [wcl]: https://github.com/wiltaylor/wcl
 [wscript]: https://github.com/Configweave/wscript

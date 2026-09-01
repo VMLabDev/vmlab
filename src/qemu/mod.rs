@@ -13,6 +13,4 @@ pub use cmdline::{
     qemu_arch,
 };
 pub use process::Proc;
-pub use resolve::{
-    ResolvedContainer, ResolvedVm, inherited_container, inherited_vm, resolve_container, resolve_vm,
-};
+pub use resolve::{ResolvedContainer, ResolvedVm, resolve_container, resolve_vm};

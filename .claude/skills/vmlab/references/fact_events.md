@@ -11,7 +11,7 @@ Events fire `on "<event>" {}` handlers and arrive in `fn handle(event: Event, la
 | `container.starting` | A container's micro-VM has begun booting |
 | `container.ready` | The container process started (and its healthcheck passed, when declared) |
 | `container.stopped` | A container stopped for good (carries `exit_code`) |
-| `container.crashed` | A container exited abnormally (`restarting: true` when the restart policy respawns it) |
+| `container.crashed` | A container exited abnormally |
 | `container.unhealthy` | A container's healthcheck failed `retries` times in a row |
 | `lab.up` | The lab finished coming up |
 | `lab.down` | The lab stopped |

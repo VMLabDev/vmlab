@@ -30,16 +30,12 @@ Targeting is structural: the machine that declares the block is the one the
 play converges. That is also where its **variables** live — \`var "name"
 { value = "…" }` children become `--var name=value\` for that machine's run
 only, so one play can converge several machines with different hostnames,
-credentials or paths. The designer's play card lists every targeted machine
-with an editable variable list under each.
+credentials or paths.
 
 Playbooks also run inside [template builds](../references/concept_template_builds.md): a
 `template {}` may declare `playbook {}` blocks that apply to the build VM,
 again interleaved with provisions, with steps streaming as structured build
-progress. In the [web console](../references/concept_web_console.md), machine pages grow a
-**Playbook** tab (check/apply with live output), the designer shows playbook
-nodes on the canvas, and the Files tab edits playbook folders directly —
-including config-weave package search/add buttons and a repos manager.
+progress.
 
 
 ## Related
@@ -51,7 +47,5 @@ including config-weave package search/add buttons and a repos manager.
 - [Provisions & event handlers](../references/concept_provisions.md)
 
 - [Template build flow](../references/concept_template_builds.md)
-
-- [The web console](../references/concept_web_console.md)
 
 [← Back to SKILL.md](../SKILL.md)

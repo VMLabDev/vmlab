@@ -4,7 +4,7 @@ _data type_
 
 An image-match or OCR hit: bounding box, score, center point (cx/cy) and OCR text.
 
-Returned by the image-matching and text-matching `Vm` methods (`wait_for_image`, `find_image`, `wait_for_text`, …).
+Returned by the image-matching and text-matching `Machine` methods (`wait_for_image`, `find_image`, `wait_for_text`, …).
 
 ```rust
 struct Match { x: int, y: int, w: int, h: int, score: float,
@@ -16,8 +16,8 @@ Feed `cx`/`cy` straight to `vm.mouse_move`. For `wait_for_text` hits only `text`
 
 ## Related
 
-- [Vm](../references/entity_vm_api.md)
+- [Machine](../references/entity_vm_api.md)
 
-- [Vm: screen, image matching & OCR methods](../references/fact_vm_vision.md)
+- [Machine: screen, image matching & OCR methods](../references/fact_vm_vision.md)
 
 [← Back to SKILL.md](../SKILL.md)

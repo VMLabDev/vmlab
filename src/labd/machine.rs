@@ -52,9 +52,7 @@ use super::vm_agent::AgentHandle;
 /// The status vocabulary this seam reports in. Declared with the projection
 /// (ADR-0004) because it is what reaches the CLI, the REST surface and the
 /// console; re-exported here because this is where machines produce it.
-pub use crate::status::{
-    MachineDetail, MachineKind, MachineLabel, MachineStatus, NicStatus, WebPageStatus,
-};
+pub use crate::status::{MachineDetail, MachineKind, MachineLabel, MachineStatus, NicStatus};
 
 /// How long [`Machine::poweroff`] waits for the emulator to actually go.
 pub(super) const POWEROFF_SETTLE: Duration = Duration::from_secs(30);
@@ -64,8 +62,8 @@ pub(super) const POWEROFF_SETTLE: Duration = Duration::from_secs(30);
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What a machine can do beyond the universal operations, probed rather than
-/// inferred. Drives `machine.capabilities`, which is how the web console
-/// decides whether to offer a console tab, a clipboard button or a log view.
+/// inferred. Drives `machine.capabilities`, which is how a surface decides
+/// whether to offer a console, a clipboard or a log view.
 ///
 /// `Deserialize` because a client reads it back: `vmlab dev attach` waits on
 /// the probed feature list, and reading it as the producer's own type is what
@@ -191,11 +189,9 @@ pub trait Machine: Send + Sync + 'static {
     fn profile(&self) -> Option<String>;
     fn nics(&self) -> &[model::Nic];
     fn macs(&self) -> &[MacAddr];
-    fn web_pages(&self) -> &[model::WebPage];
     /// The identities this machine declares (§19.2), in declaration order.
-    /// Reported by the machine and not looked up in the lab file, for the
-    /// same reason [`web_pages`](Machine::web_pages) is: a caller holding a
-    /// machine has everything about it.
+    /// Reported by the machine and not looked up in the lab file: a caller
+    /// holding a machine has everything about it.
     fn logins(&self) -> &[model::Login];
     /// Host socket re-exposing one agent terminal session as a raw byte pipe.
     fn term_session_sock(&self, id: u32) -> PathBuf;
@@ -646,15 +642,6 @@ impl dyn Machine {
             ready,
             ip: assigned.iter().flatten().next().cloned(),
             nics,
-            web: self
-                .web_pages()
-                .iter()
-                .map(|w| WebPageStatus {
-                    name: w.name.clone(),
-                    port: w.port,
-                    path: w.path.clone(),
-                })
-                .collect(),
             cached: true,
             // Lab-level, like `cached`: `@dev` is per-machine but *the*
             // default dev machine depends on what the rest of the lab

@@ -1,7 +1,7 @@
 concept wsl2 {
   name     = "WSL2"
   summary  = "WSL2 is a first-class host — no tap/bridge/macvlan and no CAP_NET_ADMIN; reach guests via port forwards."
-  related  = [containers, networking]
+  related  = [networking, fastpath]
   audience = :both
   body {
     p <<PROSE

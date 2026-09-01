@@ -19,7 +19,7 @@ full machine parity with zero extra privileges:
   lab-wide, identical to VMs.
 - **The same automation.** The [vmlab-agent](../references/entity_vmlab_agent.md) runs inside
   the micro-VM, so `vmlab container exec`/`shell`, `vmlab osinfo`, clipboard,
-  wscript [`Container` handles](../references/entity_container_api.md), playbooks and file copy
+  the wscript [machine handle](../references/entity_vm_api.md), playbooks and file copy
   all work — network or no network.
 - **Volumes & ports.** Named or bind volumes ride virtiofs (CIFS fallback),
   and `port {}` blocks are sugar for segment forwards.
@@ -27,7 +27,9 @@ full machine parity with zero extra privileges:
 
 ```wcl
 container "db" {
-  image = "postgres:17"
+  image   = "postgres:17"
+  profile = "container"
+  memory  = 1GiB
   nic    { segment = "corp" }
   env    { name = "POSTGRES_PASSWORD" value = "lab" }
   volume { name = "pgdata" target = "/var/lib/postgresql/data" }
@@ -36,7 +38,7 @@ container "db" {
 
 Declare one with a [`container {}` block](../references/entity_container_block.md); drive it
 with `vmlab container <verb>`, the wscript
-[`Container` API](../references/entity_container_api.md), or its page in the web console.
+[container tour of the machine API](../references/entity_container_api.md), or its page in the web console.
 Images pull from any registry (digest-pinned in lab state), and `mode = :idle`
 boots the environment without starting the workload — handy as a toolbox
 machine.
@@ -46,7 +48,7 @@ machine.
 
 - [container {} block](../references/entity_container_block.md)
 
-- [Container](../references/entity_container_api.md)
+- [Container handle](../references/entity_container_api.md)
 
 - [How vmlab fits together](../references/concept_architecture.md)
 

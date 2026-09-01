@@ -19,7 +19,7 @@ container micro-VMs carry it; playbooks push over the same channel.
 | Consumer | Surface |
 | --- | --- |
 | CLI | `vmlab exec` / `shell` / `cp` / `tail` / `eventlog`; `vmlab container exec` / `shell` (see the CLI reference) |
-| wscript | `vm.exec` / `exec_timeout` / `copy_to` / `copy_from` / `terminal()` / `stats()` — [method tables](../references/fact_vm_agent.md); containers expose the same via the [Container handle](../references/entity_container_api.md) |
+| wscript | `m.exec` / `exec_timeout` / `copy_to` / `copy_from` / `terminal()` / `stats()` on any [Machine](../references/entity_vm_api.md) — [method tables](../references/fact_vm_agent.md) |
 | Web console | Machine **Terminal** tabs, guest metrics meters, clipboard sync |
 
 **How it gets into guests.** Template builds auto-attach a \*\*VMLAB bootstrap
@@ -38,9 +38,9 @@ only screen-driven automation — and the VM never reports ready.
 
 ## Related
 
-- [Vm: guest agent methods (exec, files, terminal, stats)](../references/fact_vm_agent.md)
+- [Machine: guest agent methods (exec, files, terminal, stats)](../references/fact_vm_agent.md)
 
-- [Container](../references/entity_container_api.md)
+- [Container handle](../references/entity_container_api.md)
 
 - [template {} block](../references/entity_template_block.md)
 

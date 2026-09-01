@@ -51,7 +51,7 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
   lp_hero "Orchestrate virtual machine labs from your terminal." {
     badge    = "Declarative VM labs · QEMU/KVM"
     lede     = "vmlab turns a single `vmlab.wcl` into a running fleet of machines — VMs, containers, networks and provisioning, wired automatically. Boot, snapshot, and tear down complex topologies with one command."
-    footnote = "Open source · MIT · Linux, or Windows 11 via WSL 2 or Docker"
+    footnote = "Open source · MIT · Linux, or Windows 11 via WSL 2"
     lp_cta "Get started"         { href = "#start"  primary = true }
     lp_cta "Read the reference"  { href = "./wskills/vmlab/" }
   }
@@ -143,10 +143,6 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
       icon = "lucide.list-checks"
       body = "Declare [config-weave](https://github.com/Configweave/config-weave) playbooks inside the machine they converge. `vmlab up` applies them, reboots when a step demands it, and `vmlab playbook check` reports drift without changing anything."
     }
-    lp_feature "Browser console" {
-      icon = "lucide.monitor"
-      body = "`vmlab-web` serves the whole lab from one port: live desktops, terminals, a visual topology designer, a file editor, playbook authoring and log streams — over the same API the CLI uses."
-    }
   }
 
   lp_cards {
@@ -161,7 +157,7 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
     id      = start
     eyebrow = "Getting started"
     title   = "Install it and boot your first lab."
-    lede    = "Needs `/dev/kvm` (on WSL 2 enable nested virtualisation). Or skip the install and run the container image, which starts the web console on port 7878: `docker run --rm -p 7878:7878 --device /dev/kvm ghcr.io/vmlabdev/vmlab`. Append a command to get the CLI instead."
+    lede    = "Needs `/dev/kvm` (on WSL 2 enable nested virtualisation)."
 
     lp_step "Install the CLI"                { command = "curl -fsSL https://vmlab.io/install.sh | sh" }
     lp_step "Write a lab, then validate it"  { command = "vmlab validate" }

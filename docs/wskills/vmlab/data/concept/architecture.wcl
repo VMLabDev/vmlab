@@ -1,11 +1,11 @@
 concept architecture {
   name     = "How vmlab fits together"
-  summary  = "The big picture: front ends, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the two guest channels."
-  related  = [daemon_model, networking, templates, linked_clones, vmlab_agent, vmlab_web, paths_table, dot_vmlab, template_store]
+  summary  = "The big picture: the CLI, the two-tier daemon, QEMU processes, the userspace network fabric, templates and clones, and the two guest channels."
+  related  = [daemon_model, networking, templates, linked_clones, vmlab_agent, paths_table, dot_vmlab, template_store]
   audience = :both
   body {
     p <<PROSE
-Every vmlab feature hangs off one spine: front ends talk a JSON-lines protocol
+Every vmlab feature hangs off one spine: the CLI talks a JSON-lines protocol
 to a small daemon tree, which owns the QEMU processes and everything around
 them.
 PROSE
@@ -16,10 +16,9 @@ PROSE
       direction = :top_to_bottom
       layer_gap = 60.0
       node_gap  = 30.0
-      desc      = "vmlab CLI and vmlab-web talk over the unix-socket protocol to the vmlabd supervisor, which runs one lab daemon per running lab; each lab daemon owns that lab's QEMU processes."
+      desc      = "The vmlab CLI talks over the unix-socket protocol to the vmlabd supervisor, which runs one lab daemon per running lab; each lab daemon owns that lab's QEMU processes."
 
       process "vmlab CLI" { id = cli  width = 120.0  height = 44.0  class = ["wdoc-process"] }
-      process "vmlab-web" { id = web  width = 120.0  height = 44.0  class = ["wdoc-process"] }
       process "vmlabd (supervisor)"     { id = sup   width = 160.0  height = 44.0  class = ["wdoc-process"] }
       process "lab daemon \"ad-demo\"" { id = lab1  width = 170.0  height = 44.0  class = ["wdoc-process"] }
       process "lab daemon \"scratch\"" { id = lab2  width = 170.0  height = 44.0  class = ["wdoc-process"] }
@@ -27,17 +26,16 @@ PROSE
       terminator "QEMU × M" { id = q2  width = 110.0  height = 44.0  class = ["wdoc-terminator"] }
 
       cli -> sup :flow
-      web -> sup :flow
       sup -> lab1 :flow
       sup -> lab2 :flow
       lab1 -> q1 :flow
       lab2 -> q2 :flow
     }
-    p "Both front ends speak the same unix-socket protocol to the supervisor; each running lab gets its own daemon, and each daemon owns its lab's QEMU processes."
+    p "The CLI speaks a unix-socket protocol to the supervisor; each running lab gets its own daemon, and each daemon owns its lab's QEMU processes."
     p <<'PROSE'
-**Front ends.** The `vmlab` CLI and the [vmlab-web](entity_vmlab_web) server
-are peers: both speak the same protocol, so anything the CLI does the web
-console can do. Daemons auto-start on first use — there is no setup step.
+**Front end.** The `vmlab` CLI is the one front end; it speaks the daemon
+protocol and does nothing the daemons cannot. Daemons auto-start on first
+use — there is no setup step.
 
 **The daemon tier.** The supervisor `vmlabd` tracks the host-wide lab
 registry and global concerns; one **lab daemon** per running lab owns that

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use wcl_lang::{Block, Document};
 
-use super::block::{Reader, Spanned, Unspan, span_of};
+use super::block::{Reader, Spanned, Unspan};
 use super::model::*;
 use super::{Issue, IssueList};
 
@@ -384,169 +384,6 @@ fn extract_media(b: &Block, issues: &mut IssueList) -> Option<Media> {
     })
 }
 
-fn extract_web(b: &Block, issues: &mut IssueList) -> Option<WebPage> {
-    let mut r = Reader::new(b, issues);
-    let name = r.label();
-    let span = r.span();
-    let port = r.required("port", |r, n| r.port(n));
-    let path = match r.string("path") {
-        Some(p) if !p.value.is_empty() => {
-            if p.value.starts_with('/') {
-                p.value
-            } else {
-                format!("/{}", p.value)
-            }
-        }
-        _ => "/".to_string(),
-    };
-    // The auth block's diagnostics name the page they are about; an
-    // unnamed page still gets them, under the placeholder.
-    let page = name.clone().unwrap_or_else(|| "?".to_string());
-    let mut auth = None;
-    let mut auth_span = None;
-    for child in r.children() {
-        if child.kind() == "auth" {
-            auth_span = Some(span_of(&child));
-            auth = extract_web_auth(&child, &page, r.issues());
-        }
-    }
-    Some(WebPage {
-        name: name?,
-        span,
-        port: port?.value,
-        path,
-        auth,
-        auth_span,
-    })
-}
-
-/// Parse a `web`'s nested `auth {}` block into the typed method enum,
-/// enforcing per-method required fields and flagging fields the chosen
-/// method ignores (local-consistency checks, like `extract_share`).
-fn extract_web_auth(b: &Block, page: &str, issues: &mut IssueList) -> Option<WebAuth> {
-    #[derive(Clone, Copy)]
-    enum Method {
-        Basic,
-        Bearer,
-        Header,
-        Ntlm,
-        Form,
-    }
-    let mut r = Reader::new(b, issues);
-    let method = r
-        .symbol(
-            "method",
-            &[
-                ("basic", Method::Basic),
-                ("bearer", Method::Bearer),
-                ("header", Method::Header),
-                ("ntlm", Method::Ntlm),
-                ("form", Method::Form),
-            ],
-        )?
-        .value;
-    // Fields each method uses; anything else set is a mistake worth flagging.
-    let used: &[&str] = match method {
-        Method::Basic => &["method", "username", "password"],
-        Method::Bearer => &["method", "token"],
-        Method::Header => &["method", "header", "value"],
-        Method::Ntlm => &["method", "username", "password", "domain"],
-        Method::Form => &[
-            "method",
-            "username",
-            "password",
-            "login_path",
-            "login_method",
-            "login_body",
-            "login_content_type",
-            "fail_redirect",
-        ],
-    };
-    const ALL: &[&str] = &[
-        "username",
-        "password",
-        "domain",
-        "token",
-        "header",
-        "value",
-        "login_path",
-        "login_method",
-        "login_body",
-        "login_content_type",
-        "fail_redirect",
-    ];
-    let method_name = match method {
-        Method::Basic => "basic",
-        Method::Bearer => "bearer",
-        Method::Header => "header",
-        Method::Ntlm => "ntlm",
-        Method::Form => "form",
-    };
-    for f in ALL {
-        if r.has(f) && !used.contains(f) {
-            r.issue(format!(
-                "web page `{page}`: field `{f}` is not used by auth method `:{method_name}`"
-            ));
-        }
-    }
-    fn req(r: &mut Reader, field: &str, page: &str, method: &str) -> Option<String> {
-        match r.string(field) {
-            Some(s) if !s.value.is_empty() => Some(s.value),
-            _ => {
-                r.issue(format!(
-                    "web page `{page}`: auth method `:{method}` requires `{field}`"
-                ));
-                None
-            }
-        }
-    }
-    match method {
-        Method::Basic => Some(WebAuth::Basic {
-            username: req(&mut r, "username", page, method_name)?,
-            password: req(&mut r, "password", page, method_name)?,
-        }),
-        Method::Bearer => Some(WebAuth::Bearer {
-            token: req(&mut r, "token", page, method_name)?,
-        }),
-        Method::Header => Some(WebAuth::Header {
-            name: req(&mut r, "header", page, method_name)?,
-            value: req(&mut r, "value", page, method_name)?,
-        }),
-        Method::Ntlm => Some(WebAuth::Ntlm {
-            username: req(&mut r, "username", page, method_name)?,
-            password: req(&mut r, "password", page, method_name)?,
-            domain: r.string("domain").unspan(),
-        }),
-        Method::Form => {
-            let login_method = match r.string("login_method").unspan() {
-                None => "POST".to_string(),
-                Some(m) => {
-                    let up = m.to_ascii_uppercase();
-                    if up != "GET" && up != "POST" {
-                        r.issue(format!(
-                            "web page `{page}`: `login_method` must be GET or POST, got `{m}`"
-                        ));
-                    }
-                    up
-                }
-            };
-            let login_content_type = r
-                .string("login_content_type")
-                .unspan()
-                .unwrap_or_else(|| "application/x-www-form-urlencoded".to_string());
-            Some(WebAuth::Form {
-                username: req(&mut r, "username", page, method_name)?,
-                password: req(&mut r, "password", page, method_name)?,
-                login_path: req(&mut r, "login_path", page, method_name)?,
-                login_method,
-                login_body: req(&mut r, "login_body", page, method_name)?,
-                login_content_type,
-                fail_redirect: r.string("fail_redirect").unspan(),
-            })
-        }
-    }
-}
-
 /// A machine's `login {}` block (§19.2). `elevated` and `default` stay
 /// optional in the model: both rules that read them ask whether the author
 /// *wrote* the field, not what it would resolve to.
@@ -679,7 +516,6 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let mut extra_disks = Vec::new();
     let mut shares = Vec::new();
     let mut media = Vec::new();
-    let mut web = Vec::new();
     let mut logins = Vec::new();
     let mut provisions = Vec::new();
     let mut playbooks = Vec::new();
@@ -700,11 +536,6 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
             "media" => {
                 if let Some(m) = extract_media(&child, r.issues()) {
                     media.push(m);
-                }
-            }
-            "web" => {
-                if let Some(w) = extract_web(&child, r.issues()) {
-                    web.push(w);
                 }
             }
             "login" => {
@@ -751,7 +582,6 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         extra_disks,
         shares,
         media,
-        web,
         logins,
         provisions,
         playbooks,
@@ -802,7 +632,6 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
     let mut volumes = Vec::new();
     let mut ports = Vec::new();
     let mut healthcheck = None;
-    let mut web = Vec::new();
     let mut logins = Vec::new();
     let mut provisions = Vec::new();
     let mut playbooks = Vec::new();
@@ -825,11 +654,6 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
                 }
             }
             "healthcheck" => healthcheck = extract_healthcheck(&child, r.issues()),
-            "web" => {
-                if let Some(w) = extract_web(&child, r.issues()) {
-                    web.push(w);
-                }
-            }
             "login" => {
                 if let Some(l) = extract_login(&child, r.issues()) {
                     logins.push(l);
@@ -868,7 +692,6 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         volumes,
         ports,
         healthcheck,
-        web,
         logins,
         provisions,
         playbooks,

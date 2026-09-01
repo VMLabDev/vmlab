@@ -1,8 +1,7 @@
-//! Supervisor-side template operations for the web UI (PRD §6): list a lab's
-//! `template {}` blocks, query registry status, and run builds/pushes as
-//! background tasks. Progress streams as `template.op.*` events on the
-//! supervisor broadcast (the web events channel forwards them verbatim), with
-//! an in-memory log ring so a reconnecting UI can replay the tail.
+//! Supervisor-side, lab-scoped template operations (PRD §6): list a lab's
+//! `template {}` blocks and run builds as background tasks. Progress streams
+//! as `template.op.*` events on the supervisor broadcast, with an in-memory
+//! log ring per operation.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -104,29 +103,6 @@ impl TemplateOps {
         }
     }
 
-    pub fn console_path(
-        &self,
-        lab: &str,
-        arch: &str,
-        template: &str,
-    ) -> Result<PathBuf, CommandError> {
-        let ops = self.inner.lock_recover();
-        let op = ops
-            .get(&(lab.to_string(), arch.to_string(), template.to_string()))
-            .ok_or_else(|| {
-                CommandError::not_found(format!("no operation running for `{arch}/{template}`"))
-            })?;
-        let path = op.console.as_ref().ok_or_else(|| {
-            CommandError::conflict(format!("console for `{arch}/{template}` is not ready"))
-        })?;
-        if !path.exists() {
-            return Err(CommandError::conflict(format!(
-                "console for `{arch}/{template}` is no longer available"
-            )));
-        }
-        Ok(path.clone())
-    }
-
     /// Cancel the operation claiming `(lab, arch, template)`, provided it is
     /// the `kind` the caller means to stop — stopping a build and stopping a
     /// push are different requests, and answering the wrong one would cancel
@@ -161,34 +137,6 @@ impl TemplateOps {
             Some(op) => json!({"kind": op.kind, "started": op.started.to_rfc3339()}),
             None => Value::Null,
         }
-    }
-
-    /// All running operations for `lab` with their log tails
-    /// (`template.op_status` — reconnecting UIs resync from this).
-    pub fn status(&self, lab: &str) -> Value {
-        let ops = self.inner.lock_recover();
-        let mut rows: Vec<Value> = ops
-            .iter()
-            .filter(|((l, _, _), _)| l == lab)
-            .map(|((_, arch, template), op)| {
-                json!({
-                    "arch": arch,
-                    "template": template,
-                    "kind": op.kind,
-                    "started": op.started.to_rfc3339(),
-                    "log_tail": op.log.iter().collect::<Vec<_>>(),
-                    "steps": op.steps.iter().collect::<Vec<_>>(),
-                    "console_ready": op.console.as_ref().is_some_and(|path| path.exists()),
-                })
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            a["template"]
-                .as_str()
-                .cmp(&b["template"].as_str())
-                .then_with(|| a["arch"].as_str().cmp(&b["arch"].as_str()))
-        });
-        Value::Array(rows)
     }
 }
 
@@ -292,47 +240,6 @@ pub async fn list(
         })
         .collect();
     Ok(Value::Array(rows))
-}
-
-/// `template.remote`: the concrete version tags (and their arches) published
-/// under the template's registry, newest first.
-pub async fn remote(
-    root: PathBuf,
-    template: String,
-    arch: Option<String>,
-) -> Result<Value, CommandError> {
-    use futures::StreamExt as _;
-
-    let def = {
-        let template = template.clone();
-        tokio::task::spawn_blocking(move || find_def(&root, None, &template, arch.as_deref()))
-            .await
-            .map_err(|e| e.to_string())??
-    };
-    let Some(repo) = def.registry else {
-        return Err(CommandError::invalid(format!(
-            "template `{template}` has no `registry` set"
-        )));
-    };
-    let registry = crate::oci::Registry::new(&repo).map_err(|e| format!("{e:#}"))?;
-    let tags = registry.list_tags().await.map_err(|e| format!("{e:#}"))?;
-    // Concrete versions start with a digit; `latest`/`latest-prerelease` are
-    // moving aliases of one of them.
-    let mut versions: Vec<String> = tags
-        .into_iter()
-        .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .collect();
-    versions.sort_by(|a, b| crate::template::store::compare_versions(b, a));
-
-    let registry = &registry;
-    let rows: Vec<Value> = futures::stream::iter(versions.into_iter().map(|tag| async move {
-        let arches = registry.index_arches(&tag).await.unwrap_or_default();
-        json!({"tag": tag, "arches": arches})
-    }))
-    .buffered(8)
-    .collect()
-    .await;
-    Ok(json!({"registry": repo, "tags": rows}))
 }
 
 /// `template.build`: kick off a background build of `template` from the lab's
@@ -461,96 +368,6 @@ pub fn stop_build(
     Ok(json!({"stopping": true}))
 }
 
-/// `template.push`: kick off a background push of a locally stored version
-/// (default: the newest) to the template's registry.
-pub async fn start_push(
-    sup: Arc<Supervisor>,
-    lab: String,
-    root: PathBuf,
-    template: String,
-    arch: Option<String>,
-    version: Option<String>,
-) -> Result<Value, CommandError> {
-    let (resolved, repo) = {
-        let (root, template, arch) = (root.clone(), template.clone(), arch.clone());
-        tokio::task::spawn_blocking(move || -> Result<_, CommandError> {
-            let def = find_def(&root, None, &template, arch.as_deref())?;
-            let store = TemplateStore::new(crate::paths::template_store_dir());
-            let resolved = store
-                .resolve(&def.arch, &def.name, version.as_deref())
-                .map_err(|e| CommandError::not_found(format!("{e:#}")))?;
-            let repo = resolved
-                .meta
-                .registry
-                .clone()
-                .or(def.registry)
-                .ok_or_else(|| {
-                    CommandError::invalid("no push target — set `registry` in the template")
-                })?;
-            Ok((resolved, repo))
-        })
-        .await
-        .map_err(|e| e.to_string())??
-    };
-    let version = resolved.meta.version.clone();
-    let arch = resolved.meta.arch.clone();
-    let target = crate::oci::with_version_tag(&repo, &version).map_err(|e| format!("{e:#}"))?;
-
-    let guard = sup.template_ops.try_begin(&lab, &arch, &template, "push")?;
-    sup.emit(Event::new(
-        "template.op.start",
-        &*lab,
-        json!({"template": template, "arch": arch, "kind": "push", "version": version}),
-    ));
-
-    let log = op_sink(
-        sup.clone(),
-        lab.clone(),
-        arch.clone(),
-        template.clone(),
-        "push",
-    );
-    let started_version = version.clone();
-    tokio::spawn(async move {
-        let _guard = guard;
-        let push_arch = resolved.meta.arch.clone();
-        let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
-        log(format!(
-            "pushing {push_arch}/{template}@{version} to {target}\n"
-        ));
-        // No source-repo annotation: the daemon's cwd says nothing about the
-        // template's git origin (the CLI detects it from the caller's cwd).
-        let result = crate::template::oci_bridge::push(
-            &resolved.dir,
-            &target,
-            host_cfg.oci_chunk_size,
-            &push_arch,
-            None,
-            Some("latest"),
-        )
-        .await;
-        match result {
-            Ok(()) => sup.emit(Event::new(
-                "template.op.done",
-                &*lab,
-                json!({"template": template, "arch": arch, "kind": "push", "version": version}),
-            )),
-            Err(e) => {
-                let mut error = format!("{e:#}");
-                if error.contains("401") || error.to_lowercase().contains("unauthorized") {
-                    error.push_str(" — run `vmlab template login <registry>` on the host");
-                }
-                sup.emit(Event::new(
-                    "template.op.error",
-                    &*lab,
-                    json!({"template": template, "arch": arch, "kind": "push", "error": error}),
-                ));
-            }
-        }
-    });
-    Ok(json!({"started": true, "version": started_version}))
-}
-
 /// An [`OutputSink`](crate::scripting::OutputSink) that appends to the op's
 /// log ring and broadcasts each line as a `template.op.log` event.
 pub(super) fn op_sink(
@@ -610,28 +427,6 @@ mod tests {
     }
 
     #[test]
-    fn log_ring_caps_and_status_reports_tail() {
-        let ops = TemplateOps::default();
-        let _guard = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
-        for i in 0..(LOG_CAP + 10) {
-            ops.append_log("lab1", "x86_64", "base", &format!("line {i}"));
-        }
-        let status = ops.status("lab1");
-        let rows = status.as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["template"], "base");
-        assert_eq!(rows[0]["arch"], "x86_64");
-        assert_eq!(rows[0]["kind"], "build");
-        let tail = rows[0]["log_tail"].as_array().unwrap();
-        assert_eq!(tail.len(), LOG_CAP);
-        assert_eq!(tail[0], "line 10");
-        assert_eq!(tail[LOG_CAP - 1], format!("line {}", LOG_CAP + 9));
-        // Logs to a template with no running op are dropped, not panics.
-        ops.append_log("lab1", "x86_64", "ghost", "ignored");
-        assert!(ops.status("lab2").as_array().unwrap().is_empty());
-    }
-
-    #[test]
     fn op_of_reflects_running_state() {
         let ops = TemplateOps::default();
         assert_eq!(ops.op_of("lab1", "x86_64", "base"), Value::Null);
@@ -639,24 +434,6 @@ mod tests {
         let op = ops.op_of("lab1", "x86_64", "base");
         assert_eq!(op["kind"], "push");
         assert!(op["started"].as_str().is_some());
-    }
-
-    #[test]
-    fn console_is_exposed_only_while_ready_build_is_running() {
-        let ops = TemplateOps::default();
-        let guard = ops.try_begin("lab1", "x86_64", "base", "build").unwrap();
-        assert!(ops.console_path("lab1", "x86_64", "base").is_err());
-        assert_eq!(ops.status("lab1")[0]["console_ready"], false);
-
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("vnc.sock");
-        std::fs::write(&socket, "test").unwrap();
-        ops.set_console("lab1", "x86_64", "base", socket.clone());
-        assert_eq!(ops.console_path("lab1", "x86_64", "base").unwrap(), socket);
-        assert_eq!(ops.status("lab1")[0]["console_ready"], true);
-
-        drop(guard);
-        assert!(ops.console_path("lab1", "x86_64", "base").is_err());
     }
 
     #[tokio::test]

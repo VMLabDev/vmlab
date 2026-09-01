@@ -19,18 +19,15 @@ vmlab fastpath        # which tier is active, and why the others are not
 The mode comes from the `fastpath` host-config knob, overridden by
 `VMLAB_FASTPATH` (`auto` | `off` | `sockmap` | `afxdp`). `auto` considers only
 afxdp — sockmap measured slower than the userspace switch on typical hosts, so
-it is explicit-only. The web console's topbar shows the active tier as a
-badge (`GET /api/fastpath`). In containers, grant `/dev/net/tun`, `CAP_BPF`
-and `CAP_NET_ADMIN` to enable acceleration — see
-[Run vmlab in a container](../references/process_run_in_container.md).
+it is explicit-only. `vmlab fastpath` shows the active tier.
 
 
 ## Related
 
 - [Networking model](../references/concept_networking.md)
 
-- [Running vmlab in a container](../references/concept_containers.md)
-
 - [Host config](../references/concept_host_config.md)
+
+- [WSL2](../references/concept_wsl2.md)
 
 [← Back to SKILL.md](../SKILL.md)

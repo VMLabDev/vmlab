@@ -1,12 +1,12 @@
 //! The **forward plan**: every host→guest port forward a lab's machines
 //! require, worked out as one value.
 //!
-//! Three near-identical routines used to install these — one for segment
-//! `forward {}` blocks, one for container `port {}` blocks, one for `web {}`
-//! pages — each resolving a machine its own way, each taking its lease
-//! address, each priming a hardware address and installing a rule. Their
-//! differences were incidental: what a forward *is* does not depend on which
-//! block declared it.
+//! Two near-identical routines used to install these — one for segment
+//! `forward {}` blocks, one for container `port {}` blocks — each resolving
+//! a machine its own way, each taking its lease address, each priming a
+//! hardware address and installing a rule. Their differences were
+//! incidental: what a forward *is* does not depend on which block declared
+//! it.
 //!
 //! Here they are one plan. Lease resolution is the only genuinely runtime
 //! input and it arrives as data, so the plan is computable with no network:
@@ -33,8 +33,6 @@ pub enum ForwardSource {
     Declared,
     /// A container `port {}` block — sugar for the same machinery (PRD §18).
     ContainerPort,
-    /// The loopback forward backing a proxied `web {}` page.
-    WebPage { page: String },
 }
 
 impl ForwardSource {
@@ -43,7 +41,6 @@ impl ForwardSource {
         match self {
             ForwardSource::Declared => "forward".to_string(),
             ForwardSource::ContainerPort => "container port".to_string(),
-            ForwardSource::WebPage { page } => format!("web page \"{page}\""),
         }
     }
 }
@@ -53,11 +50,6 @@ impl ForwardSource {
 pub enum HostBinding {
     /// A declared port on every interface.
     Port(u16),
-    /// An ephemeral loopback port: the executor binds `127.0.0.1:0` and reads
-    /// the number back, because the web-page proxy needs it before the
-    /// forward starts. Ephemeral bindings cannot collide, so they take no
-    /// part in [`HostPortConflict`] detection.
-    Ephemeral,
 }
 
 /// One forward to install.
@@ -117,8 +109,8 @@ pub struct ForwardInputs<'a> {
 
 impl ForwardInputs<'_> {
     /// The segment a machine's forwards ride: its first NIC's. `None` when it
-    /// has no NIC — validation requires one for ports and web pages, so this
-    /// only fires on a lab that got past validation with neither.
+    /// has no NIC — validation requires one for ports, so this only fires on
+    /// a lab that got past validation without one.
     fn first_segment(&self, machine: &str) -> Option<&str> {
         self.lab
             .machine(machine)?
@@ -143,8 +135,7 @@ struct Draft {
 /// machines; empty means the whole lab.
 ///
 /// Order is declaration order: segment `forward {}` blocks first, then
-/// container `port {}` blocks, then `web {}` pages — VMs before containers
-/// within each.
+/// container `port {}` blocks.
 pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
     let mut plan = ForwardPlan::default();
     let in_scope = |machine: &str| scope.is_empty() || scope.iter().any(|m| m == machine);
@@ -202,64 +193,8 @@ pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
         }
     }
 
-    // `web {}` pages take an ephemeral loopback port the console proxies to.
-    for m in inputs.lab.machines() {
-        if !in_scope(m.name()) {
-            continue;
-        }
-        for page in m.web() {
-            let source = ForwardSource::WebPage {
-                page: page.name.clone(),
-            };
-            let Some(segment) = segment_or_skip(&mut plan, inputs, m.name(), &source) else {
-                continue;
-            };
-            push(
-                &mut plan,
-                inputs,
-                Draft {
-                    machine: m.name().to_string(),
-                    segment,
-                    host: HostBinding::Ephemeral,
-                    guest_port: page.port,
-                    proto: Proto::Tcp,
-                    source,
-                },
-            );
-        }
-    }
-
     resolve_conflicts(&mut plan);
     plan
-}
-
-/// The single forward backing one declared web page, or why there isn't one.
-/// The console asks for these one at a time, so it gets the one rule rather
-/// than the whole plan.
-pub fn web_page(inputs: &ForwardInputs, machine: &str, page: &str) -> Result<ForwardRule, String> {
-    let Some(declared) = inputs.lab.machine(machine) else {
-        return Err(format!(
-            "no machine \"{machine}\" in lab \"{}\"",
-            inputs.lab.name
-        ));
-    };
-    if !declared.web().iter().any(|p| p.name == page) {
-        return Err(format!("no web page \"{page}\" on \"{machine}\""));
-    }
-    let plan = plan(inputs, &[machine.to_string()]);
-    let wanted = ForwardSource::WebPage {
-        page: page.to_string(),
-    };
-    if let Some(rule) = plan.rules.into_iter().find(|r| r.source == wanted) {
-        return Ok(rule);
-    }
-    // Declared but not planned — the plan recorded why.
-    Err(plan
-        .skipped
-        .iter()
-        .find(|s| s.what.contains(&format!("web page \"{page}\"")))
-        .map(|s| s.why.clone())
-        .unwrap_or_else(|| format!("web page \"{page}\" on \"{machine}\" cannot be forwarded")))
 }
 
 /// The machine's first NIC's segment, recording a skip when it has none.
@@ -312,9 +247,8 @@ fn push(plan: &mut ForwardPlan, inputs: &ForwardInputs, draft: Draft) {
 fn resolve_conflicts(plan: &mut ForwardPlan) {
     let mut claims: std::collections::BTreeMap<u16, Vec<usize>> = Default::default();
     for (i, r) in plan.rules.iter().enumerate() {
-        if let HostBinding::Port(p) = r.host {
-            claims.entry(p).or_default().push(i);
-        }
+        let HostBinding::Port(p) = r.host;
+        claims.entry(p).or_default().push(i);
     }
     let mut dropped: Vec<usize> = Vec::new();
     for (host_port, claimants) in claims {
@@ -364,7 +298,7 @@ mod tests {
         MacAddr([0x52, 0x54, 0, 0, 0, last])
     }
 
-    /// A lab drawing a forward from all three sources at once.
+    /// A lab drawing a forward from both sources at once.
     fn every_source() -> Lab {
         lab_of(
             r#"import <vmlab.wcl>
@@ -372,9 +306,7 @@ lab "l" {
   segment "lan" { subnet = "10.0.0.0/24" nat = true
     forward { host_port = 8080 to = "web:80" }
   }
-  vm "web" { template = "x86_64/t" nic { segment = "lan" }
-    web "admin" { port = 9000 }
-  }
+  vm "web" { template = "x86_64/t" nic { segment = "lan" } }
   container "cache" { image = "redis" nic { segment = "lan" }
     port { host = 6379 container = 6379 }
   }
@@ -396,7 +328,7 @@ lab "l" {
         ForwardInputs { lab, observed }
     }
 
-    /// One plan, all three sources — the whole point of collapsing the three
+    /// One plan, both sources — the whole point of collapsing the two
     /// routines. Nothing may be missed because it was declared elsewhere.
     #[test]
     fn every_source_lands_in_one_plan() {
@@ -406,13 +338,7 @@ lab "l" {
         let sources: Vec<&ForwardSource> = p.rules.iter().map(|r| &r.source).collect();
         assert_eq!(
             sources,
-            vec![
-                &ForwardSource::Declared,
-                &ForwardSource::ContainerPort,
-                &ForwardSource::WebPage {
-                    page: "admin".into()
-                },
-            ],
+            vec![&ForwardSource::Declared, &ForwardSource::ContainerPort],
             "{p:#?}"
         );
         assert!(p.skipped.is_empty(), "{:#?}", p.skipped);
@@ -439,19 +365,6 @@ lab "l" {
         assert_eq!(port.prime_mac, Some(mac(11)));
     }
 
-    /// A web page binds an ephemeral loopback port, so the console can read
-    /// the number back before the forward starts.
-    #[test]
-    fn a_web_page_binds_an_ephemeral_port() {
-        let lab = every_source();
-        let obs = leased(&[("web", 10)]);
-        let rule = web_page(&inputs(&lab, &obs), "web", "admin").unwrap();
-        assert_eq!(rule.host, HostBinding::Ephemeral);
-        assert_eq!(rule.guest_port, 9000);
-        assert_eq!(rule.proto, Proto::Tcp);
-        assert_eq!(rule.segment, "lan");
-    }
-
     /// A forward for a machine with no lease is named, not dropped.
     #[test]
     fn a_missing_lease_is_reported_not_skipped_silently() {
@@ -464,28 +377,8 @@ lab "l" {
             "only the container port is installable: {p:#?}"
         );
         let reasons: Vec<&str> = p.skipped.iter().map(|s| s.why.as_str()).collect();
-        assert_eq!(reasons.len(), 2, "the declared forward and the web page");
+        assert_eq!(reasons.len(), 1, "the declared forward");
         assert!(reasons.iter().all(|r| r.contains("no lease")), "{p:#?}");
-        assert!(p.skipped.iter().any(|s| s.what.contains("web page")));
-    }
-
-    /// And the console gets the same reason when it asks for the one page.
-    #[test]
-    fn a_web_page_without_a_lease_says_why() {
-        let lab = every_source();
-        let obs = leased(&[]);
-        let err = web_page(&inputs(&lab, &obs), "web", "admin").unwrap_err();
-        assert!(err.contains("no lease"), "{err}");
-    }
-
-    #[test]
-    fn an_undeclared_web_page_is_named() {
-        let lab = every_source();
-        let obs = leased(&[("web", 10)]);
-        let err = web_page(&inputs(&lab, &obs), "web", "nope").unwrap_err();
-        assert!(err.contains("no web page \"nope\""), "{err}");
-        let err = web_page(&inputs(&lab, &obs), "ghost", "admin").unwrap_err();
-        assert!(err.contains("no machine \"ghost\""), "{err}");
     }
 
     /// Two machines claiming one host port collide. Caught here, with both
@@ -512,25 +405,6 @@ lab "l" {
             p.conflicts[0].claimants,
             ["a: forward".to_string(), "b: container port".to_string()]
         );
-    }
-
-    /// Ephemeral bindings never collide, however many pages a lab declares.
-    #[test]
-    fn ephemeral_web_forwards_never_conflict() {
-        let lab = lab_of(
-            r#"import <vmlab.wcl>
-lab "l" {
-  segment "lan" { subnet = "10.0.0.0/24" nat = true }
-  vm "a" { template = "x86_64/t" nic { segment = "lan" }
-    web "one" { port = 80 }
-    web "two" { port = 80 }
-  }
-}"#,
-        );
-        let obs = leased(&[("a", 10)]);
-        let p = plan(&inputs(&lab, &obs), &[]);
-        assert_eq!(p.rules.len(), 2);
-        assert!(p.conflicts.is_empty(), "{p:#?}");
     }
 
     /// A scoped plan — what a single container's readiness recomputes —

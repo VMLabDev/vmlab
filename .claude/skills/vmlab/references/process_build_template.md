@@ -48,6 +48,7 @@ $ vmlab template list
 
 > [!TIP]
 > **Verification**
+>
 > `vmlab template list` shows the new `<arch>/<name>@<version>` ref, and a lab VM referencing it passes `vmlab validate`.
 
 ## Related

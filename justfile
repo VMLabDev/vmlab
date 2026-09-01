@@ -26,11 +26,6 @@ test: ci::test
 fmt:
 	cargo fmt
 
-# Build the official runtime container image: `vmlab` CLI + `vmlab-web` (PRD §14)
-[group('build')]
-image tag='vmlab:latest':
-	docker build -t {{tag}} -f Containerfile .
-
 # Install the vmlab binary into the user profile (~/.cargo/bin)
 [group('build')]
 install:
@@ -46,7 +41,7 @@ guest-build arch='x86_64 aarch64':
 agent-build target='':
 	./guest/build-agent.sh {{target}}
 
-# Rewrite the generated protocol reference and console types (ADR-0007)
+# Rewrite the generated protocol reference (ADR-0007)
 [group('build')]
 proto-generate:
 	VMLAB_WRITE_PROTOCOL_DOCS=1 cargo test --lib proto::report::tests::generated_artefacts_are_current
@@ -56,11 +51,6 @@ proto-generate:
 guest-install: guest-build agent-build
 	mkdir -p ~/.local/share/vmlab/guest
 	cp -r guest/dist/* ~/.local/share/vmlab/guest/
-
-# Rebuild the committed console artefact from the Schema projection (ADR-0005)
-[group('build')]
-schema-gen:
-	VMLAB_BLESS=1 cargo test --lib config::designer::tests::console_artefact_is_current
 
 # The eBPF fast-path programs (ebpf/ workspace) need the nightly pinned in
 # ebpf/rust-toolchain.toml plus bpf-linker built against that same toolchain
@@ -146,116 +136,7 @@ docs-serve comment="false" port="auto":
 skill-build: wskill-check
 	wcl wdoc skill docs/wskills/vmlab/wdoc/skill/main.wcl --out .claude/skills/vmlab
 
-# Render the wskill book to docs/help — embedded into vmlab-web as the in-app /help
-[group('docs')]
-help-build:
-	wcl wdoc build docs/wskills/vmlab/wdoc/book/main.wcl --out docs/help
-
-# Remove generated site + wskill projections + the in-app help render
+# Remove generated site + wskill projections
 [group('docs')]
 docs-clean:
 	rm -rf docs/_site docs/wskills/vmlab/out
-	find docs/help -mindepth 1 -not -name .gitkeep -delete
-
-# `web-ui-install` and `web-ui-build` are imported from .just/shared.just — the
-# gate needs them, and a module cannot depend on a root recipe.
-
-# Pin the @forge/* deps to a new forge rev (updates package.json + the
-# pnpm-workspace.yaml prepare allowlist together, then reinstalls)
-[group('web')]
-web-ui-forge-bump rev:
-	cd web-ui && sed -i -E 's|(github:wiltaylor/forge#)[0-9a-f]{40}|\1{{rev}}|g' package.json && \
-		sed -i -E 's|(codeload.github.com/wiltaylor/forge/tar.gz/)[0-9a-f]{40}|\1{{rev}}|g; s|(github:wiltaylor/forge#)[0-9a-f]{40}|\1{{rev}}|g' pnpm-workspace.yaml && \
-		pnpm install
-
-# Build the vmlab-web binary (frontend + help book first, then the embedded server)
-[group('web')]
-web-build: web-ui-build help-build
-	cargo build --features web --bin vmlab-web
-
-# Build and run vmlab-web against the lab in `dir` (Ctrl-C to stop)
-[group('web')]
-web-serve dir='examples/mixed-lab': web-build
-	cd {{dir}} && {{justfile_directory()}}/target/debug/vmlab-web
-
-# Rebuild/install the x86_64 guest and run vmlab-web; restart existing containers from the UI.
-[group('web')]
-web-serve-guest dir='examples/mixed-lab': web-build (guest-build 'x86_64')
-	mkdir -p ~/.local/share/vmlab/guest/x86_64
-	cp -r guest/dist/x86_64/. ~/.local/share/vmlab/guest/x86_64/
-	cd {{dir}} && {{justfile_directory()}}/target/debug/vmlab-web
-
-# Stop any running vmlab-web server (useful when it was started in the background)
-[group('web')]
-web-stop:
-	pkill -x vmlab-web && echo "vmlab-web stopped" || echo "vmlab-web not running"
-
-# Launch two isolated vmlab instances (peer-a on :7871, peer-b on :7872, state under .vmlab-peer-demo/) bridged by a local cross-host trunk — the remote-vmlab peering demo
-[group('web')]
-peer-demo: web-build build
-	#!/usr/bin/env bash
-	set -euo pipefail
-	root="{{justfile_directory()}}"
-	for side in a b; do
-		base="$root/.vmlab-peer-demo/$side"
-		mkdir -p "$base/run" "$base/state" "$base/config/vmlab"
-		if [ "$side" = a ]; then trunk=13947; web=7871; else trunk=13948; web=7872; fi
-		printf 'import <vmlab-host.wcl>\nhost {\n  psk        = "peer-demo"\n  trunk_port = %s\n}\n' "$trunk" \
-			> "$base/config/vmlab/config.wcl"
-		# The XDG env separates every socket/registry/log between the two
-		# instances and is inherited by the daemons vmlab-web spawns;
-		# XDG_DATA_HOME stays shared so one template pull serves both sides.
-		( cd "$root/examples/peer-$side" && \
-			XDG_RUNTIME_DIR="$base/run" XDG_STATE_HOME="$base/state" XDG_CONFIG_HOME="$base/config" \
-			"$root/target/debug/vmlab-web" --port "$web" >>"$base/web.log" 2>&1 & \
-			echo $! > "$base/web.pid" )
-		echo "peer-$side: http://localhost:$web   (trunk :$trunk, home $base)"
-	done
-	echo "bring both labs up, then:  watch the remote-vmlab LEDs — and stop one side to see them drop"
-
-# Stop the peer-demo instances (web servers + their supervisors/lab daemons)
-[group('web')]
-peer-demo-stop:
-	#!/usr/bin/env bash
-	root="{{justfile_directory()}}"
-	for side in a b; do
-		base="$root/.vmlab-peer-demo/$side"
-		if [ -f "$base/web.pid" ] && kill "$(cat "$base/web.pid")" 2>/dev/null; then
-			echo "peer-$side web stopped"
-		else
-			echo "peer-$side web not running"
-		fi
-		rm -f "$base/web.pid"
-		XDG_RUNTIME_DIR="$base/run" XDG_STATE_HOME="$base/state" XDG_CONFIG_HOME="$base/config" \
-			"$root/target/debug/vmlab" daemon stop >/dev/null 2>&1 || true
-	done
-
-# Print the newest config-weave release tag. Prereleases included — that is
-# where its new features land, and the API's /releases/latest skips them.
-# Resolved host-side so the tag lands in the image's build args: baking it
-# into the cache key is what makes a new release rebuild that layer.
-[private]
-config-weave-tag:
-	@body="$(curl -fsSL https://api.github.com/repos/Configweave/config-weave/releases)"; \
-		printf '%s\n' "$body" | grep -m1 '"tag_name"' | cut -d'"' -f4
-
-# Build + start the Docker web UI stack (serves the UI on :7878)
-[group('web')]
-compose-up:
-	CONFIG_WEAVE_RELEASE="$(just config-weave-tag)" docker compose up --build
-
-# Stop the stack, rebuild the runtime image from the current tree (host + guest asset, newest config-weave), and start it detached; follow with `docker compose logs -f`
-[group('web')]
-compose-rebuild: compose-down
-	CONFIG_WEAVE_RELEASE="$(just config-weave-tag)" docker compose up -d --build
-	@echo "web UI: http://localhost:7878"
-
-# Stop and remove the Docker web UI stack
-[group('web')]
-compose-down:
-	docker compose down
-
-# Run the Vite dev server with hot reload (proxies to a running vmlab-web on :7878)
-[group('web')]
-web-dev:
-	cd web-ui && pnpm dev

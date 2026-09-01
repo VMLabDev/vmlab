@@ -570,15 +570,7 @@ mod tests {
             kinds.len(),
             super::super::SCHEMA_WCL.matches("@block(\"").count()
         );
-        for kind in [
-            "lab",
-            "segment",
-            "vm",
-            "container",
-            "volume",
-            "auth",
-            "source",
-        ] {
+        for kind in ["lab", "segment", "vm", "container", "volume", "source"] {
             assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
         }
     }
@@ -667,10 +659,6 @@ mod tests {
             projection().options("container", "mode"),
             ["workload", "idle"]
         );
-        assert_eq!(
-            projection().options("auth", "method"),
-            ["basic", "bearer", "header", "ntlm", "form"]
-        );
         // Every closed field carries a non-empty set, and only closed fields do.
         for block in &projection().blocks {
             for field in &block.fields {
@@ -705,7 +693,6 @@ mod tests {
                 "disk",
                 "share",
                 "media",
-                "web",
                 "login",
                 "provision",
                 "playbook"

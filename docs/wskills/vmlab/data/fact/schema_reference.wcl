@@ -144,18 +144,6 @@ healthcheck {
 }
 WCL
 
-let ex_web = <<'WCL'
-web "admin" { port = 8080  path = "/manage" }   // proxied into the web console
-WCL
-
-let ex_auth = <<'WCL'
-auth { method = :basic  username = "admin" password = "s3cret" }
-auth { method = :bearer token = "eyJ…" }
-auth { method = :ntlm   username = "Administrator" password = "…" domain = "CORP" }
-auth { method = :form   username = "admin" password = "…"
-       login_path = "/login" login_body = "user={user}&pass={pass}" }
-WCL
-
 let ex_playbook = <<'WCL'
 // Declared inside the vm/container it converges.
 playbook "playbooks/domain" { play = "dc" }
@@ -269,8 +257,6 @@ let example_for = fn(k: utf8) -> list<utf8> {
     "volume"      => [ex_volume],
     "port"        => [ex_port],
     "healthcheck" => [ex_healthcheck],
-    "web"       => [ex_web],
-    "auth"      => [ex_auth],
     "playbook"  => [ex_playbook],
     "var"       => [ex_var],
     "disk"      => [ex_disk],
@@ -318,7 +304,7 @@ fact schema_reference {
             p "Example:"
             code "wcl" { source = ex }
           }
-          // Deepest tier: a playbook's `var`, a web page's `auth`.
+          // Deepest tier: a playbook's `var`.
           wdoc_repeater { each = nested_blocks(n2)  as = :n3
             h5 $"`${blk_kind(n3)}` (in `${blk_kind(n2)}`)"
             type_table { type = n3 }

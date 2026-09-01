@@ -1132,10 +1132,6 @@ impl super::machine::Machine for ContainerInstance {
         &self.macs
     }
 
-    fn web_pages(&self) -> &[model::WebPage] {
-        &self.cfg.web
-    }
-
     fn logins(&self) -> &[model::Login] {
         &self.cfg.logins
     }
@@ -1437,7 +1433,6 @@ mod tests {
             volumes: vec![],
             ports: vec![],
             healthcheck: None,
-            web: vec![],
             logins: vec![],
             provisions: vec![],
             playbooks: vec![],

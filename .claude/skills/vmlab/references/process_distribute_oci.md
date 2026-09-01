@@ -23,6 +23,7 @@ $ vmlab template login ghcr.io -u myuser -p <token>
 
 > [!NOTE]
 > **Docker creds reused**
+>
 > If the machine already has a `docker login` for the registry, no separate login is needed.
 
 Run `vmlab template login <registry>` (persists to ~/.docker/config.json).
@@ -43,12 +44,14 @@ $ vmlab template pull ghcr.io/owner/linux-modern:1.0 --arch x86_64
 
 > [!WARNING]
 > **Arch is never assumed**
+>
 > Pulling an ambiguous multi-arch index without --arch is an error.
 
 On the target machine, `vmlab template pull <ref>` reassembles the chunks and verifies the whole-image SHA-256 before installing to the store. A registry ref used directly in a lab is pulled on `vmlab up` if absent.
 
 > [!TIP]
 > **Verification**
+>
 > `vmlab template list` on the target machine shows the pulled `<arch>/<name>@<version>` ref.
 
 ## Related

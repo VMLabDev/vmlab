@@ -120,11 +120,11 @@ Templates end to end: what they are, declaring and building them, how clones boo
 
 _OCI containers as first-class lab machines, each in its own micro-VM._
 
-The container story (PRD §18): why micro-VMs, the `container {}` block, and the wscript `Container` handle.
+The container story (PRD §18): why micro-VMs, the `container {}` block, and containers on the one wscript machine handle.
 
 - [Lab containers](references/concept_lab_containers.md)
 - [container {} block](references/entity_container_block.md)
-- [Container](references/entity_container_api.md)
+- [Container handle](references/entity_container_api.md)
 
 ### Automation
 
@@ -148,14 +148,14 @@ _The statically typed scripting language: types, functions, matching, modules, s
 
 #### The vmlab API
 
-_The Lab / Vm / Segment handles and their method groups, plus the result types._
+_The Lab / Machine / Segment handles and their method groups, plus the result types._
 - [Lab](references/entity_lab_api.md)
-- [Vm](references/entity_vm_api.md)
-- [Vm: lifecycle & state methods](references/fact_vm_lifecycle.md)
-- [Vm: snapshot methods](references/fact_vm_snapshots.md)
-- [Vm: keyboard & mouse methods](references/fact_vm_input.md)
-- [Vm: screen, image matching & OCR methods](references/fact_vm_vision.md)
-- [Vm: guest agent methods (exec, files, terminal, stats)](references/fact_vm_agent.md)
+- [Machine](references/entity_vm_api.md)
+- [Machine: lifecycle & state methods](references/fact_vm_lifecycle.md)
+- [Machine: snapshot methods](references/fact_vm_snapshots.md)
+- [Machine: keyboard & mouse methods](references/fact_vm_input.md)
+- [Machine: screen, image matching & OCR methods](references/fact_vm_vision.md)
+- [Machine: guest agent methods (exec, files, terminal, stats)](references/fact_vm_agent.md)
 - [vmlab-agent](references/entity_vmlab_agent.md)
 - [Segment](references/entity_seg_api.md)
 - [Match](references/entity_match_type.md)
@@ -172,30 +172,16 @@ _The declared automation: provision scripts on `up`, lifecycle event handlers, a
 - [Playbooks (config-weave)](references/concept_playbooks.md)
 - [playbook {} block](references/entity_playbook_block.md)
 
-### The web console
-
-_Manage labs from the browser: the vmlab-web server, the console UI, its API, and proxied guest web pages._
-
-Everything around `vmlab-web`: the console tour, launching and securing the server, the REST + WebSocket API, and `web {}` blocks that proxy guest HTTP UIs into the console.
-
-- [The web console](references/concept_web_console.md)
-- [vmlab-web](references/entity_vmlab_web.md)
-- [Serve the web console](references/process_serve_web_console.md)
-- [vmlab-web: the REST + WebSocket API](references/fact_web_api.md)
-- [web {} block](references/entity_web_block.md)
-
 ### Operations & hosting
 
-_Run vmlab anywhere: the everyday lifecycle, host config, profiles, containers, WSL2, and the network fast path._
+_Run vmlab anywhere: the everyday lifecycle, host config, profiles, WSL2, and the network fast path._
 
-Running labs day to day — the full lifecycle runbook — plus host-side concerns: the optional host config, guest OS profiles, hosting vmlab itself in a container or on WSL2, eBPF acceleration, and what `vmlab validate` checks.
+Running labs day to day — the full lifecycle runbook — plus host-side concerns: the optional host config, guest OS profiles, running on WSL2, eBPF acceleration, and what `vmlab validate` checks.
 
 - [Bring a lab up and tear it down](references/process_golden_path.md)
 - [Host config](references/concept_host_config.md)
 - [Guest OS profiles](references/concept_profiles.md)
 - [Shipped guest OS profiles](references/fact_profiles_table.md)
-- [Running vmlab in a container](references/concept_containers.md)
-- [Run vmlab in a container](references/process_run_in_container.md)
 - [WSL2](references/concept_wsl2.md)
 - [Network fast path (eBPF)](references/concept_fastpath.md)
 - [What `vmlab validate` checks](references/fact_validate_checks.md)

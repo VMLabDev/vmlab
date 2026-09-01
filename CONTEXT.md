@@ -177,8 +177,8 @@ template is never written to. Short form "clone" is fine.
 The local template store. Every write goes through the supervisor's `store.*`
 and `template.*` commands, so there is one implementation of each; the store's
 own file lock is what serialises them. Reads are lock-free, and a daemon that
-already holds the store open — a lab daemon binding a clone, the web process
-listing versions — still reads it directly. See ADR-0010.
+already holds the store open — a lab daemon binding a clone — still reads it
+directly. See ADR-0010.
 _Avoid_: cache, registry (a registry is remote)
 
 **OCI artifact**:
@@ -314,7 +314,7 @@ Guest-side knowledge lives here, not in the lab daemon.
 
 **Pull ledger**:
 The lifecycle and progress of template and image downloads — pending, active,
-done, errored, cancelled — as a value the console and CLI both read.
+done, errored, cancelled — as a value the CLI reads.
 
 **Forward plan**:
 The port-forward rules a lab's machines require, resolved to leases and
@@ -442,7 +442,7 @@ _Avoid_: setuid (that is the fallback, not the concept), impersonation
 One agent channel serving file requests as an RPC session: handle-based,
 offset-addressed, pipelined with out-of-order replies, records framed inside the
 channel's own credit window. Opened per SFTP session by the SSH facade and per
-transfer by the console and the workspace syncer; handles are scoped to the
+transfer by `vmlab cp` and the workspace syncer; handles are scoped to the
 channel and die with it.
 _Avoid_: file channel (it carries requests, not one file's bytes), SFTP channel
 (SFTP is terminated host-side and never reaches the guest)
@@ -621,12 +621,8 @@ optionality, default, doc string, option list, nesting and cardinality, plus
 every decorator the schema declares (where it may be written, how often, and
 its typed arguments) —
 **reflected** from `schema.wcl` rather than restated (`src/config/projection.rs`),
-and read by everything that needs the schema's shape: the designer's forms
-(`src/config/designer.rs`, rendered into `web-ui/src/editor/schema.gen.ts`), the
-console's pickers (`/api/catalog/meta`), and the rendered reference. The
-console's configuration types still mirror the DTO rather than the projection;
-now that the **Block extractor** has landed, that is the next slice. See
-ADR-0005.
+and read by everything that needs the schema's shape, the rendered reference
+above all. See ADR-0005.
 _Avoid_: DTO, view model, descriptor table
 
 **Block extractor**:
@@ -639,9 +635,9 @@ _Avoid_: parser (wcl parses; this reads a parsed block), deserializer
 
 **Lab status**:
 The typed projection of a lab's machines, segments and pulls that the lab
-daemon produces once and the CLI, REST surface and web console each render
-unchanged. Carries the state-to-label derivation, so all three surfaces speak
-one vocabulary. See ADR-0004.
+daemon produces once and every surface renders unchanged. Carries the
+state-to-label derivation, so every surface speaks one vocabulary. See
+ADR-0004.
 _Avoid_: state (a machine has a power state), snapshot, summary
 
 **Request vocabulary**:
@@ -657,7 +653,7 @@ under it)
 Carrying a file's bytes *in* a wire message rather than beside it:
 `machine.push_file` with `data`, and `machine.pull_file` with no host path.
 It is the only form available to a caller that holds bytes and no path the
-daemon can see — a browser, above all. Bounded by `proto::INLINE_FILE_LIMIT`,
+daemon can see. Bounded by `proto::INLINE_FILE_LIMIT`,
 which the transport's request cap is derived from, so exceeding it is refused
 by code rather than truncated; the host-path forms stream and have no ceiling.
 _Avoid_: upload/download (neither says which side holds the file), base64
@@ -665,14 +661,14 @@ transfer (the encoding is incidental)
 
 **Error code**:
 The machine-readable half of a failed reply, beside the human-readable message.
-The code is the contract — it decides the REST surface's HTTP status and the
-CLI's exit code — and the message is free to be reworded.
+The code is the contract — it decides the CLI's exit code — and the message
+is free to be reworded.
 _Avoid_: error type, status (a status is a lab's or machine's condition)
 
 **Surface**:
-Something a person or a program drives vmlab through: the CLI, the REST API,
-the web console. Each adapts the request vocabulary; none holds its own list of
-commands. Which surface reaches which command is the coverage report in
+Something a person or a program drives vmlab through: the CLI, or one daemon
+calling another. Each adapts the request vocabulary; none holds its own list
+of commands. Which surface reaches which command is the coverage report in
 `docs/protocol.md`.
 _Avoid_: frontend, client (a client is the protocol's connection object)
 
@@ -684,18 +680,8 @@ deliberate one carries `#[one_way("surface", "why")]` and an open gap carries
 `#[one_way_gap("surface", N)]`, naming the issue tracking whether it should
 close. The report renders the two as separate lists, and the build fails while
 a one-way command carries neither. See ADR-0007.
-_Avoid_: dead command (that is one with no caller at all), CLI-only /
-console-only (name the surface the report names)
-
-**Web console**:
-The browser UI served by `vmlab-web`: lab overview, visual designer, file and
-log editors, per-machine consoles, terminals and guest file transfer, template
-builds, playbooks, and proxied guest web pages.
-_Avoid_: dashboard, portal, frontend
-
-**Guest web page**:
-An HTTP UI served inside a guest and declared with a `web {}` block; the web
-console proxies it into a sandboxed iframe tab.
+_Avoid_: dead command (that is one with no caller at all), CLI-only (name the
+surface the report names)
 
 ### Networking and storage transports
 

@@ -1,34 +1,22 @@
 //! **Lab status** — the typed projection every surface renders (ADR-0004).
 //!
-//! The lab daemon produces one [`LabStatus`] per `status` call; the CLI table,
-//! the REST endpoint and the web console all consume *this* value rather than
-//! reading keys out of a hand-built JSON object. Two rules keep it honest:
+//! The lab daemon produces one [`LabStatus`] per `status` call; every consumer
+//! reads *this* value rather than keys out of a hand-built JSON object. Two
+//! rules keep it honest:
 //!
 //! - **Kind-specific fields are modelled, not mapped.** A VM's template and a
 //!   container's health live in [`MachineDetail`]'s variants, so a field
 //!   belonging to one kind cannot be read from the other and a rename is a
 //!   compile error at every consumer — the failure that once rendered the CLI's
-//!   status table as nothing and left the web layer's reload guard disarmed.
+//!   status table as nothing.
 //! - **Surfaces render, they do not derive.** The step from raw power state,
 //!   readiness and health to the words a user sees happens once, in
-//!   [`MachineLabel::derive`], so `vmlab status` and the console cannot describe
-//!   the same lab differently.
-//!
-//! The console's TypeScript types are generated from these declarations by
-//! `just status-types-build` (ts-rs), which writes `web-ui/src/gen/status.ts`
-//! — hence the `../` in every `export_to`: ts-rs resolves it against its default
-//! `bindings/` directory under the crate root. `just ci::check` fails if the
-//! committed file no longer matches the types here.
-//!
-//! The `#[ts(type = "number")]` on the 64-bit counters is the one place the
-//! generated types are told something: ts-rs defaults `u64` to `bigint`, but
-//! `serde_json` writes a plain JSON number and `JSON.parse` reads one back, so
-//! `bigint` would describe a value the console never receives.
+//!   [`MachineLabel::derive`], so no two surfaces can describe the same lab
+//!   differently.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 // ---- vocabulary -------------------------------------------------------------
 
@@ -36,8 +24,7 @@ use ts_rs::TS;
 ///
 /// Reported in the projection for detail views and `vmlab status --verbose`;
 /// what a surface shows by default is the derived [`MachineLabel`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerState {
     Stopped,
@@ -64,8 +51,7 @@ impl fmt::Display for PowerState {
 /// a code path for driving it: that difference belongs on
 /// [`Machine`](crate::labd::machine::Machine), as a capability or as
 /// implementation behind it (ADR-0002).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MachineKind {
     Vm,
@@ -83,8 +69,7 @@ impl fmt::Display for MachineKind {
 
 /// How much attention a [`MachineLabel`] deserves, derived with it so a badge
 /// colour is not a second opinion about what the state means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     /// Up and doing its job.
@@ -103,8 +88,7 @@ pub enum Severity {
 /// "booting" are the same power state, and the difference is the one users ask
 /// about. Carries the exit code where it has one, so the console can style
 /// `exited (1)` without re-deriving the sentence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LabelState {
     /// Running, ready, and not failing a healthcheck.
@@ -160,8 +144,7 @@ impl fmt::Display for LabelState {
 /// `text` travels on the wire already rendered rather than being rebuilt per
 /// surface — that is what stops `vmlab status` and the console from wording the
 /// same machine differently.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineLabel {
     #[serde(flatten)]
     pub state: LabelState,
@@ -217,8 +200,7 @@ impl fmt::Display for MachineLabel {
 // ---- machines ---------------------------------------------------------------
 
 /// One NIC's addressing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NicStatus {
     /// `None` on a NAT-only NIC that joins no segment.
     pub segment: Option<String>,
@@ -228,25 +210,13 @@ pub struct NicStatus {
     pub ip: Option<String>,
 }
 
-/// A guest web page — no credentials; the browser only needs enough to build a
-/// launch link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
-pub struct WebPageStatus {
-    pub name: String,
-    pub port: u16,
-    pub path: String,
-}
-
 /// What a VM has and a container does not.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmStatus {
     pub template: String,
     pub arch: Option<String>,
     pub cpus: Option<u32>,
     /// Bytes.
-    #[ts(type = "number | null")]
     pub memory: Option<u64>,
     /// The vmlab-agent stamp baked into the template; `None` on vintage guests
     /// and pre-agent templates, which have no interactive terminal.
@@ -254,8 +224,7 @@ pub struct VmStatus {
 }
 
 /// What a container has and a VM does not.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerStatus {
     pub image: String,
     /// The digest actually running, pinned at first start.
@@ -273,8 +242,7 @@ pub struct ContainerStatus {
 /// pick an icon. Capabilities — a display, a clipboard, an event log — are
 /// probed and reported through `machine.capabilities`; they never add a variant
 /// (**CONTEXT.md**).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MachineDetail {
     Vm(VmStatus),
@@ -322,8 +290,7 @@ impl MachineDetail {
 /// verb is the whole point of ADR-0004: `vmlab status`, the REST endpoint and
 /// the console all learn which machine is the dev machine from the value they
 /// already read, with no second code path to keep in step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevStatus {
     /// This is the lab's **default** dev machine — declared `default = true`,
     /// or the only machine carrying `@dev` (§19.1). At most one machine in a
@@ -350,8 +317,7 @@ pub struct DevStatus {
 /// question. So the projection carries everything needed to *show* a halt and
 /// nothing that acts on one; `vmlab dev sync resolve` is the only way to pick a
 /// side, from a terminal in the lab directory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSyncStatus {
     /// The one line that says what happened, naming the machine — two dev
     /// machines may share one host workspace, and one halting must not read
@@ -382,7 +348,6 @@ pub struct WorkspaceSyncStatus {
     pub reseed: Option<String>,
     /// How many watch discontinuities this syncer has answered with a walk.
     /// Repeated ones are the symptom a single lost event is not.
-    #[ts(type = "number")]
     pub rescans: u64,
     /// Paths neither direction touched, by name — special files, and anything
     /// the syncer's login could not open. Loud by design: a `.sock` in the
@@ -400,29 +365,25 @@ pub struct WorkspaceSyncStatus {
     pub trouble: Option<String>,
     /// Passes completed, so a surface can tell "in step" from "has never
     /// managed one".
-    #[ts(type = "number")]
     pub passes: u64,
 }
 
 /// One halted path and why it is halted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConflictStatus {
     pub path: String,
     pub reason: String,
 }
 
 /// One path neither direction touched, and why.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSkipStatus {
     pub path: String,
     pub reason: String,
 }
 
 /// One machine's line in `status`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineStatus {
     pub name: String,
     /// The derived label — what a surface shows.
@@ -433,7 +394,6 @@ pub struct MachineStatus {
     /// First live address, across all NICs.
     pub ip: Option<String>,
     pub nics: Vec<NicStatus>,
-    pub web: Vec<WebPageStatus>,
     /// Whether this machine's template or image is already local. False while a
     /// registry download is still pending — lab-level knowledge, filled in by
     /// the lab runtime rather than by the machine itself.
@@ -510,24 +470,18 @@ impl LabStatus {
 /// fabric is shedding frames under load — the thing that makes guest transfers
 /// mysteriously slow, and which the daemon has always measured but only the CLI
 /// ever showed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentFrames {
-    #[ts(type = "number")]
     pub forwarded: u64,
-    #[ts(type = "number")]
     pub flooded: u64,
-    #[ts(type = "number")]
     pub dropped: u64,
     /// Forwarded in-kernel by the fast path (already counted in `forwarded`);
     /// 0 on a pure-userspace switch.
-    #[ts(type = "number")]
     pub offloaded: u64,
 }
 
 /// One virtual segment's line in `status`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentStatus {
     pub name: String,
     pub subnet: String,
@@ -552,8 +506,7 @@ pub struct SegmentStatus {
 /// `container.pull.progress`), so the two cannot name the same download
 /// differently — the console's hand-written copy of this had drifted to
 /// `"template" | "image"` and would never have matched a container's pull.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PullKind {
     /// A VM disk template from a registry.
@@ -592,16 +545,13 @@ impl fmt::Display for PullKind {
 ///
 /// Reported in `status` as well as through events, so a surface that connects
 /// mid-pull still shows progress rather than a machine that looks stuck.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullStatus {
     pub machine: String,
     pub kind: PullKind,
     pub reference: String,
-    #[ts(type = "number")]
     pub bytes_done: u64,
     /// 0 until the registry has told us how big the artefact is.
-    #[ts(type = "number")]
     pub bytes_total: u64,
     pub percent: u32,
 }
@@ -609,14 +559,12 @@ pub struct PullStatus {
 // ---- the lab ----------------------------------------------------------------
 
 /// Everything `status` reports about one lab.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../web-ui/src/gen/status.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabStatus {
     pub lab: String,
     /// VMs and containers in one collection, in declaration order. A surface
-    /// that groups by kind filters this on the `kind` tag — the console does,
-    /// once, in `web-ui/src/status.ts` — rather than reading a second list the
-    /// daemon would have to keep consistent with the first.
+    /// that groups by kind filters this on the `kind` tag rather than reading
+    /// a second list the daemon would have to keep consistent with the first.
     pub machines: Vec<MachineStatus>,
     pub segments: Vec<SegmentStatus>,
     /// The lab has clones, container overlays or named volumes on disk — i.e.
@@ -626,9 +574,9 @@ pub struct LabStatus {
 }
 
 impl LabStatus {
-    /// Whether nothing in this lab is running — the question the web layer's
-    /// reload guard asks, since the daemon cannot re-adopt a live QEMU process
-    /// across a restart.
+    /// Whether nothing in this lab is running — the question a daemon restart
+    /// guard asks, since the daemon cannot re-adopt a live QEMU process across
+    /// a restart.
     ///
     /// Every non-stopped state blocks, not just `Running`: a machine mid-boot
     /// has a process the restart would orphan just the same.
@@ -640,9 +588,6 @@ impl LabStatus {
 /// Projection values to assert against, for every test in this crate that
 /// renders or reads a status — the point of the projection being a value is
 /// that a surface can be exercised without a lab (ADR-0004).
-///
-/// The web binary keeps its own copy: it links the ordinary library, not this
-/// test build, so it cannot see anything behind `cfg(test)` here.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
@@ -681,7 +626,6 @@ pub(crate) mod fixtures {
             ready,
             ip: None,
             nics: Vec::new(),
-            web: Vec::new(),
             cached: true,
             dev: None,
             attachable: false,

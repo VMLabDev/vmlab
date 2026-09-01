@@ -52,10 +52,6 @@ pub struct LabRuntime {
     /// and container `port {}` blocks alike — removed and re-installed when
     /// a restart brings a new lease, so a forward never points at a stale IP.
     machine_forwards: Mutex<std::collections::HashMap<String, Vec<(String, u64)>>>,
-    /// Loopback forwards backing proxied web pages, keyed by (machine, page).
-    /// Revalidated on each `web.forward` (lease IP compare) so restarts and
-    /// re-leases self-heal without hooking start events.
-    web_forwards: Mutex<std::collections::HashMap<(String, String), WebForward>>,
     /// Kept for post-pull re-resolution (deferred templates fold their meta
     /// into the hardware resolution only once pulled).
     profiles: ProfileSet,
@@ -151,14 +147,6 @@ impl crate::labd::workspace::windows::GuestRun for WorkspaceSessions {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
-}
-
-/// A live loopback forward backing a proxied web page.
-struct WebForward {
-    segment: String,
-    id: u64,
-    addr: std::net::SocketAddr,
-    guest_ip: std::net::Ipv4Addr,
 }
 
 /// See [`LabRuntime::pre_provision`].
@@ -473,7 +461,6 @@ impl LabRuntime {
             events,
             smb: Mutex::new(None),
             machine_forwards: Mutex::new(std::collections::HashMap::new()),
-            web_forwards: Mutex::new(std::collections::HashMap::new()),
             profiles: profiles.clone(),
             pulls: std::sync::Mutex::new(PullLedger::new(pending)),
             pull_lock: Mutex::new(()),
@@ -519,7 +506,6 @@ impl LabRuntime {
             events,
             smb: Mutex::new(None),
             machine_forwards: Mutex::new(std::collections::HashMap::new()),
-            web_forwards: Mutex::new(std::collections::HashMap::new()),
             profiles,
             pulls: std::sync::Mutex::new(PullLedger::new(BTreeMap::new())),
             pull_lock: Mutex::new(()),
@@ -1193,18 +1179,13 @@ impl LabRuntime {
         observed
     }
 
-    /// Install one planned forward, returning its id and — for an ephemeral
-    /// binding — the loopback address it landed on.
+    /// Install one planned forward, returning its id.
     ///
     /// The single executor behind every forward the lab installs, whether it
-    /// came from a segment `forward {}`, a container `port {}` or a `web {}`
-    /// page. Priming the NAT engine with the lease MAC happens for all three:
-    /// a machine that never originates egress is otherwise unreachable.
-    async fn install_forward(
-        &self,
-        net: &LabNetwork,
-        rule: &ForwardRule,
-    ) -> Result<(u64, Option<std::net::SocketAddr>), String> {
+    /// came from a segment `forward {}` or a container `port {}`. Priming the
+    /// NAT engine with the lease MAC happens for both: a machine that never
+    /// originates egress is otherwise unreachable.
+    async fn install_forward(&self, net: &LabNetwork, rule: &ForwardRule) -> Result<u64, String> {
         let services = net
             .segments
             .get(&rule.segment)
@@ -1218,24 +1199,9 @@ impl LabRuntime {
         if let Some(mac) = rule.prime_mac {
             services.learn_mac(rule.guest_ip, mac);
         }
-        match rule.host {
-            HostBinding::Port(port) => {
-                let host_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
-                let id =
-                    services.add_forward(host_addr, rule.guest_ip, rule.guest_port, rule.proto)?;
-                Ok((id, None))
-            }
-            HostBinding::Ephemeral => {
-                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-                    .await
-                    .map_err(|e| format!("web forward bind failed: {e}"))?;
-                let addr = listener
-                    .local_addr()
-                    .map_err(|e| format!("web forward addr failed: {e}"))?;
-                let id = services.add_forward_bound(listener, rule.guest_ip, rule.guest_port)?;
-                Ok((id, Some(addr)))
-            }
-        }
+        let HostBinding::Port(port) = rule.host;
+        let host_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+        services.add_forward(host_addr, rule.guest_ip, rule.guest_port, rule.proto)
     }
 
     /// Announce everything a plan left out, and every host port it found
@@ -1259,91 +1225,6 @@ impl LabRuntime {
                 json!({"host_port": conflict.host_port, "claimants": conflict.claimants}),
             );
         }
-    }
-
-    /// Ensure a loopback forward exists for a declared web page and return
-    /// its bound host address, the guest IP, port, and the page's auth spec.
-    /// The forward is cached per (machine, page) and revalidated against the
-    /// current lease so restarts self-heal. Errors (unknown page, no lease,
-    /// no NAT) are surfaced to the proxy, which maps them to a 502.
-    pub async fn ensure_web_forward(
-        self: &Arc<Self>,
-        machine: &str,
-        page: &str,
-    ) -> Result<serde_json::Value> {
-        let observed = self.forward_observations(&[machine.to_string()]).await;
-        let rule = forward_plan::web_page(
-            &forward_plan::ForwardInputs {
-                lab: &self.config.lab,
-                observed: &observed,
-            },
-            machine,
-            page,
-        )
-        .map_err(|e| anyhow!(e))?;
-        let auth = self.web_page_auth(machine, page);
-
-        let key = (machine.to_string(), page.to_string());
-        // Cache hit whose lease still matches → reuse the live forward.
-        {
-            let cache = self.web_forwards.lock().await;
-            if let Some(f) = cache.get(&key)
-                && f.guest_ip == rule.guest_ip
-            {
-                return Ok(json!({
-                    "addr": f.addr.to_string(),
-                    "guest_ip": rule.guest_ip.to_string(),
-                    "port": rule.guest_port,
-                    "auth": auth,
-                }));
-            }
-        }
-
-        let net = self.network.lock().await;
-        // Drop a stale forward (lease moved / machine restarted).
-        if let Some(old) = self.web_forwards.lock().await.remove(&key)
-            && let Some(s) = net
-                .segments
-                .get(&old.segment)
-                .and_then(|s| s.services.as_ref())
-        {
-            s.remove_forward(old.id);
-        }
-        let (id, addr) = self.install_forward(&net, &rule).await.map_err(|e| {
-            anyhow!(
-                "web page \"{page}\" needs NAT/egress on segment \"{}\": {e}",
-                rule.segment
-            )
-        })?;
-        let addr = addr.expect("an ephemeral binding reports its address");
-        self.web_forwards.lock().await.insert(
-            key,
-            WebForward {
-                segment: rule.segment,
-                id,
-                addr,
-                guest_ip: rule.guest_ip,
-            },
-        );
-        Ok(json!({
-            "addr": addr.to_string(),
-            "guest_ip": rule.guest_ip.to_string(),
-            "port": rule.guest_port,
-            "auth": auth,
-        }))
-    }
-
-    /// The credentials the console's proxy injects for a declared page. Not
-    /// part of the forward — the rule says where to send bytes, this says
-    /// how to log in once they arrive.
-    fn web_page_auth(&self, machine: &str, page: &str) -> Option<crate::config::model::WebAuth> {
-        self.config
-            .lab
-            .machine(machine)?
-            .web()
-            .iter()
-            .find(|p| p.name == page)
-            .and_then(|p| p.auth.clone())
     }
 
     /// `vmlab up [vm...]` (PRD §7.2, §10.4): start in depends_on waves and
@@ -1513,14 +1394,8 @@ impl LabRuntime {
         );
         self.announce_forward_plan(&plan);
 
-        // Web pages bind on demand (`ensure_web_forward`) — the console needs
-        // the ephemeral port back, and nothing wants one until it is opened.
         let mut installable: BTreeMap<&str, Vec<&ForwardRule>> = BTreeMap::new();
-        for rule in plan
-            .rules
-            .iter()
-            .filter(|r| r.host != HostBinding::Ephemeral)
-        {
+        for rule in plan.rules.iter() {
             installable
                 .entry(rule.machine.as_str())
                 .or_default()
@@ -1542,7 +1417,7 @@ impl LabRuntime {
             let mut installed = Vec::new();
             for rule in rules {
                 match self.install_forward(&net, rule).await {
-                    Ok((id, _)) => installed.push((rule.segment.clone(), id)),
+                    Ok(id) => installed.push((rule.segment.clone(), id)),
                     Err(e) => self.events.emit(
                         "forward.skipped",
                         json!({
@@ -2566,9 +2441,6 @@ mod tests {
             &[]
         }
         fn macs(&self) -> &[crate::config::model::MacAddr] {
-            &[]
-        }
-        fn web_pages(&self) -> &[crate::config::model::WebPage] {
             &[]
         }
         fn logins(&self) -> &[crate::config::model::Login] {

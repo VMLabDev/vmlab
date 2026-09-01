@@ -16,7 +16,11 @@ Consult them for prior art only — the PRD overrides anything they did.
 
 ## Status
 
-PRD implemented (M1–M6). **§19 (Dev machines) is partly built** — the
+PRD implemented (M1–M6). **The browser console (`vmlab-web`, `web-ui/`, the
+`web {}` block) and the official runtime container image (§14) were removed
+before the first release** — the CLI is the only front end, and a native
+install beside QEMU the supported path; OCI *template* distribution and
+`container {}` machines stay. **§19 (Dev machines) is partly built** — the
 workspace syncer's later halves are spec only; implementation is tracked by
 #78–#98. The **workspace syncer syncs both ways** (#93, #94): the ledger, the
 layered ignores, the size guard, the two watchers' per-path debounce and
@@ -41,8 +45,8 @@ status/flush/diff/resolve`, with `--host`/`--guest`/`--all` and a free third
 route — make the two sides identical by hand — that needs no verb. With it the
 **guest→host bulk-delete guard** (a proportion with a floor; host→guest deletes
 stay unguarded), the **volume warning** that names a subtree and never halts,
-and the `.git` **lock deferral** that clears itself. The console reads the halt
-and offers no resolution. So is **snapshot bracketing** (#97): vmlab performs a
+and the `.git` **lock deferral** that clears itself. So is **snapshot
+bracketing** (#97): vmlab performs a
 restore, so it brackets it — capture **pre-flight flushes and refuses with no
 escape flag** where the guest holds work the canonical copy has never seen, and
 restore takes the syncer off the workspace, rewinds, and puts it back owing a
@@ -57,7 +61,7 @@ declaration (#80) and all
 three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
 `fileops` (#84) — the handle-based, offset-addressed, pipelined file RPC
 session that **replaced** the whole-file push/pull pair outright, carrying
-`vmlab cp`, the console's transfer, wscript push/pull and tree pushes. So is
+`vmlab cp`, wscript push/pull and tree pushes. So is
 machine-level `login {}` (#81) on both guest families: the **Windows logon it
 mints** (#82) — the wire's per-open `logon`,
 `LogonUser`/`LoadUserProfileW`/linked-token minting, the (account, secret,
@@ -109,8 +113,7 @@ segment with egress rather than by the `ssh -R` §19.3 refuses.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
-  `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005)
-  and `designer.rs` renders the console's inspector forms from it.
+  `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005).
 - `dev/` — dev machines (§19.1): who carries `@dev`, which one is the lab's
   default, and the `@dev` > profile > floor resolution of its arguments —
   deliberately separate from the hardware resolver ADR-0008 owns. `select.rs`
@@ -167,10 +170,10 @@ Module map under `src/`:
 - `proto/` — JSON-lines daemon wire protocol (client + server). `vocab.rs`
   holds the typed request vocabulary every surface constructs through
   (ADR-0007) and `error.rs` the error codes replies carry; `report.rs`
-  generates `docs/protocol.md` and `web-ui/src/protocol.ts` from them
-  (`just proto-generate`).
+  generates `docs/protocol.md` from them (`just proto-generate`).
 - `supervisor/` — `vmlabd`: lab registry, global segments, watchdogs;
-  `templates.rs` runs lab-scoped builds/pushes for the console and `store.rs`
+  `templates.rs` runs lab-scoped builds/pushes as background operations
+  (`vmlab template build` rides it) and `store.rs`
   the store- and registry-scoped operations behind every `vmlab template` verb
   (ADR-0010).
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
@@ -213,11 +216,6 @@ Module map under `src/`:
   holds only what is meaningless for a machine that is not `@dev` — `attach`,
   `use`, and the `sync` verbs a halt is resolved through (§19.6), which live
   here because ADR-0013 leaves no guest→host control path to offer them from.
-- `web/` — the `vmlab-web` binary (Actix-web): REST + WebSocket API over the
-  proto client, an embedded SolidJS console UI (`web-ui/`, rust-embed), live
-  noVNC over a `vnc.sock` WebSocket bridge, and username/password auth. Behind
-  the optional `web` feature; the crate also exposes a `[lib]` so this binary
-  reuses `proto`/`paths`/`cli`.
 
 `docs/vmlab-prd.md` remains the binding contract; section refs (`§N`) appear
 throughout the code and commit messages.

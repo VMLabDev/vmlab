@@ -854,17 +854,11 @@ impl Handler<LabRequest> for LabdHandler {
                 Ok(json!(true))
             }
 
-            // Ensure a loopback forward for a declared web page; the web
-            // server's proxy dials the returned addr. Reply carries the
-            // page's auth spec (host socket only — never to the browser).
-            LabRequest::WebForward { machine, page } => {
-                Ok(lab.ensure_web_forward(&machine, &page).await?)
-            }
             // config-weave playbooks (declared with `playbook {}` blocks):
             // list the lab's assignments, and run check/apply on demand
             // against one machine — the playbook folder is re-pushed each
             // run, so this is the edit→check dev loop. Progress streams as
-            // chunks here and as `playbook.op.*` events for the web UI.
+            // chunks here and as `playbook.op.*` events.
             LabRequest::PlaybookList {} => {
                 // One row per (machine, playbook block) — the blocks live
                 // inside the machine they configure.
@@ -923,7 +917,6 @@ impl Handler<LabRequest> for LabdHandler {
                 )
                 .await
             }
-            LabRequest::PlaybookOpStatus {} => Ok(lab.playbook_ops.status()),
             LabRequest::SnapshotTake { name, machine } => match machine {
                 Some(machine) => {
                     let online = lab.snapshot(&machine, &name).await?;

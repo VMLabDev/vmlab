@@ -35,6 +35,4 @@ vmlab down                      # graceful stop; clones retained
 
 - [wscript: overview](../references/concept_wscript_overview.md)
 
-- [The web console](../references/concept_web_console.md)
-
 [← Back to SKILL.md](../SKILL.md)

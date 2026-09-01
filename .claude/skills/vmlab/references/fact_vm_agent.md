@@ -1,4 +1,4 @@
-# Vm: guest agent methods (exec, files, terminal, stats)
+# Machine: guest agent methods (exec, files, terminal, stats)
 
 Exec, file copy, interactive terminals and stats all run over the
 **vmlab-agent** channel (a dedicated `vmlab.agent.0` virtio-serial port baked
@@ -8,12 +8,14 @@ carries `agent_version`.
 
 | Method | Returns | Notes |
 | --- | --- | --- |
-| `vm.exec(cmd: string, args: List[string])` | `Result[ExecResult, string]` | 120 s timeout |
-| `vm.exec_timeout(cmd, args, timeout_secs: int)` | `Result[ExecResult, string]` | Custom timeout |
-| `vm.copy_to(local: string, guest_path: string)` | `Result[unit, string]` | local relative to lab root; guest path absolute |
-| `vm.copy_from(guest_path: string, local: string)` | `Result[unit, string]` | Parent dirs created on host |
-| `vm.terminal()` | `Result[Term, string]` | Fresh interactive shell: root bash on Linux, SYSTEM PowerShell on Windows; 120×32 PTY |
-| `vm.stats()` | `Result[GuestStats, string]` | Live guest metrics sampled in the guest |
+| `m.exec(cmd: string, args: List[string])` | `Result[ExecResult, string]` | 120 s timeout |
+| `m.exec_timeout(cmd, args, timeout_secs: int)` | `Result[ExecResult, string]` | Custom timeout |
+| `m.copy_to(local: string, guest_path: string)` | `Result[unit, string]` | local relative to lab root; guest path absolute |
+| `m.copy_from(guest_path: string, local: string)` | `Result[unit, string]` | Parent dirs created on host |
+| `m.terminal()` | `Result[Term, string]` | Fresh interactive shell as this handle's identity — the agent's own (root bash on Linux, SYSTEM PowerShell on Windows) unless the handle came from `as_login`; 120×32 PTY |
+| `m.stats()` | `Result[GuestStats, string]` | Live guest metrics sampled in the guest |
+
+Every method in this table runs as the handle's identity: the agent's own, or the **login** an [`as_login`](../references/fact_vm_lifecycle.md) handle carries (§19.2).
 
 Exec returns an [ExecResult](../references/entity_exec_result_type.md) (`exit_code`, `stdout`, `stderr`). `GuestStats` has `cpu_pct: float`, `mem_used`/`mem_total` (bytes) and `disks: List[DiskStat]` (`mount`, `used`, `total`). Containers expose the same `terminal()`/`stats()` (see [Container](../references/entity_container_api.md)).
 
@@ -47,7 +49,7 @@ lab.log("cpu " + s.cpu_pct + "%, mem " + s.mem_used + "/" + s.mem_total)
 
 ## Related
 
-- [Vm](../references/entity_vm_api.md)
+- [Machine](../references/entity_vm_api.md)
 
 - [ExecResult](../references/entity_exec_result_type.md)
 

@@ -706,18 +706,6 @@ vocabulary! {
             #[serde(default)] follow: bool,
         },
 
-        /// Ensure a loopback forward for a declared web page and return the
-        /// address to dial, plus the page's auth spec (host-side only).
-        #[one_way(
-            "web",
-            "A loopback forward for a guest's web page exists to be dialled by \
-             a browser, and the console is the only surface with one."
-        )]
-        WebForward = "web.forward" {
-            machine: String,
-            page: String,
-        },
-
         /// Every playbook assignment in the lab, one row per (machine, block).
         #[one_way(
             "cli",
@@ -738,15 +726,6 @@ vocabulary! {
             #[serde(default)] playbook: Option<String>,
             #[serde(default)] play: Option<String>,
         },
-        /// Which playbook runs are in flight.
-        #[one_way(
-            "web",
-            "A poller's question. A CLI `check` or `apply` streams its own run \
-             and holds the terminal until it ends, so it never has to ask what \
-             is happening."
-        )]
-        PlaybookOpStatus = "playbook.op_status" {},
-
         /// Snapshot one machine, or the whole lab when `machine` is omitted.
         SnapshotTake = "snapshot.take" {
             name: String,
@@ -920,21 +899,6 @@ vocabulary! {
             /// The file declaring them; `root`'s `vmlab.wcl` when omitted.
             #[serde(default)] file: Option<std::path::PathBuf>,
         },
-        /// What the registry holds for one declared template.
-        #[one_way(
-            "web",
-            "Which versions a template's own registry publishes, so the \
-             console can offer them beside the local ones. A shell asks a \
-             namespace what is in it (`registry.search`) or the store what it \
-             holds (`store.list --remote`); neither is a lab declaration's \
-             view of its own registry."
-        )]
-        TemplateRemote = "template.remote" {
-            lab: String,
-            root: std::path::PathBuf,
-            template: String,
-            #[serde(default)] arch: Option<String>,
-        },
         /// Start building one declared template.
         TemplateBuild = "template.build" {
             lab: String,
@@ -952,44 +916,6 @@ vocabulary! {
             arch: String,
             template: String,
         },
-        /// Start pushing one built template to its registry.
-        #[one_way(
-            "web",
-            "The console pushes a template a lab declares to the registry that \
-             declaration names. A shell pushes a store reference wherever it \
-             is told, and annotates the package with the git origin of the \
-             directory it was run in — neither of which a lab declaration has, \
-             so `store.push` carries them."
-        )]
-        TemplatePush = "template.push" {
-            lab: String,
-            root: std::path::PathBuf,
-            template: String,
-            #[serde(default)] arch: Option<String>,
-            #[serde(default)] version: Option<String>,
-        },
-        /// Which template builds and pushes are in flight for one lab.
-        #[one_way(
-            "web",
-            "A poller's question. A CLI build or push follows its own \
-             operation's events and holds the terminal until it ends, so it \
-             never has to ask what is happening."
-        )]
-        TemplateOpStatus = "template.op_status" {
-            lab: String,
-        },
-        /// The socket serving a running build's console, for the web viewer.
-        #[one_way(
-            "web",
-            "A raw VNC socket exists to be bridged into a browser canvas, and \
-             the console is the only surface with one."
-        )]
-        TemplateConsolePath = "template.console_path" {
-            lab: String,
-            arch: String,
-            template: String,
-        },
-
         /// Every template in the store, with its size and, on request,
         /// whether that exact version is published.
         #[one_way(

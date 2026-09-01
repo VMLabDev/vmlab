@@ -12,8 +12,8 @@ Examples: `"ctrl-alt-del"`, `"enter"`, `"shift-f5"`. `vm.type_text` is US-ASCII 
 
 ## Related
 
-- [Vm](../references/entity_vm_api.md)
+- [Machine](../references/entity_vm_api.md)
 
-- [Vm: keyboard & mouse methods](../references/fact_vm_input.md)
+- [Machine: keyboard & mouse methods](../references/fact_vm_input.md)
 
 [← Back to SKILL.md](../SKILL.md)

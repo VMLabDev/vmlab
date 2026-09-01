@@ -1,7 +1,7 @@
 concept playbooks {
   name     = "Playbooks (config-weave)"
   summary  = "Declarative guest configuration via config-weave: playbook {} blocks apply on `vmlab up` interleaved with provisions, re-run on demand with `vmlab playbook check|apply`, and drive template builds."
-  related  = [automation_overview, playbook_block, provisions, template_builds, web_console]
+  related  = [automation_overview, playbook_block, provisions, template_builds]
   audience = :both
   body {
     p <<PROSE
@@ -33,16 +33,12 @@ Targeting is structural: the machine that declares the block is the one the
 play converges. That is also where its **variables** live — `var "name"
 { value = "…" }` children become `--var name=value` for that machine's run
 only, so one play can converge several machines with different hostnames,
-credentials or paths. The designer's play card lists every targeted machine
-with an editable variable list under each.
+credentials or paths.
 
 Playbooks also run inside [template builds](concept_template_builds): a
 `template {}` may declare `playbook {}` blocks that apply to the build VM,
 again interleaved with provisions, with steps streaming as structured build
-progress. In the [web console](concept_web_console), machine pages grow a
-**Playbook** tab (check/apply with live output), the designer shows playbook
-nodes on the canvas, and the Files tab edits playbook folders directly —
-including config-weave package search/add buttons and a repos manager.
+progress.
 PROSE
   }
 }

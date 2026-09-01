@@ -15,6 +15,7 @@
 | Events | Every `on` event name is known, and `targets` is only declared on machine-scoped events (`vm.*` / `container.*` / `snapshot.*`) |
 | Playbooks | The folder and its `playbook.wcl` exist; `var` names are WCL identifiers, and no name is declared twice within one `playbook` block |
 | Shares | A machine declaring an SMB-capable share (`transport` `smb` or the default `auto`) has a NIC on a segment |
+| Logins | On a Windows-family profile every `login` has a `password`; on a Linux-family one none declares `elevated`; labels are unique per machine and at most one sets `default = true` (§19.2). A profile that names no family (`custom`, or a registry template's) triggers neither family rule |
 
 ## Related
 

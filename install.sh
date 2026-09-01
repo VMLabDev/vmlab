@@ -1,6 +1,5 @@
 #!/bin/sh
-# install.sh — install the `vmlab` CLI (and the `vmlab-web` UI server, when the
-# release ships it) from a GitHub release.
+# install.sh — install the `vmlab` CLI from a GitHub release.
 #
 #   curl -fsSL https://vmlab.io/install.sh | sh                       # latest stable
 #   curl -fsSL https://vmlab.io/install.sh | sh -s -- --pre           # latest pre-release
@@ -16,7 +15,7 @@
 #   --help          show this help
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
-# Linux, or on Windows via WSL 2 / Docker). It needs /dev/kvm plus QEMU and the
+# Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
 # usual guest tooling at runtime — see https://vmlab.io for the full list.
 
 set -eu
@@ -31,7 +30,7 @@ PRE=0
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -75,9 +74,9 @@ case "$os" in
   $SOURCE_BUILD"
     suffix="linux-x86_64" ;;
   Darwin)
-    err "no macOS build — vmlab drives QEMU/KVM and runs on Linux (or Windows via WSL 2 / Docker)." ;;
+    err "no macOS build — vmlab drives QEMU/KVM and runs on Linux (or Windows via WSL 2)." ;;
   *)
-    err "unsupported platform: $os/$arch — vmlab runs on Linux (or Windows via WSL 2 / Docker)." ;;
+    err "unsupported platform: $os/$arch — vmlab runs on Linux (or Windows via WSL 2)." ;;
 esac
 
 # ── Resolve version ─────────────────────────────────────────────────────────
@@ -112,23 +111,6 @@ mv "$tmp" "$BIN_DIR/vmlab"
 trap - EXIT INT TERM
 
 printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
-
-# ── vmlab-web (web UI server) ────────────────────────────────────────────────
-# Best-effort companion: older releases may not ship it, so a missing asset is
-# a note, not a failure.
-web_asset="vmlab-web-${ver}-${suffix}"
-web_url="https://github.com/$REPO/releases/download/$tag/$web_asset"
-web_tmp="$(mktemp)"
-trap 'rm -f "$web_tmp"' EXIT INT TERM
-if download_file "$web_url" "$web_tmp" 2>/dev/null; then
-  chmod +x "$web_tmp"
-  mv "$web_tmp" "$BIN_DIR/vmlab-web"
-  printf 'Installed: %s\n' "$("$BIN_DIR/vmlab-web" --version 2>/dev/null || echo "$BIN_DIR/vmlab-web")"
-else
-  rm -f "$web_tmp"
-  printf 'note: vmlab-web (web UI) is not available for %s — skipping\n' "$tag"
-fi
-trap - EXIT INT TERM
 
 # ── PATH hint ───────────────────────────────────────────────────────────────
 case ":$PATH:" in

@@ -1,11 +1,11 @@
 //! What the protocol can do, in one place (ADR-0007).
 //!
 //! Because the vocabulary is enumerable, the protocol's reference
-//! documentation, its coverage report, and the console's request types can all
-//! be generated from it rather than restated by hand. The generated files are
-//! checked in; `just proto-generate` rewrites them and `cargo test` fails when
-//! they are stale, so a command added to the vocabulary cannot quietly reach
-//! only half the surfaces.
+//! documentation and its coverage report can both be generated from it rather
+//! than restated by hand. The generated file is checked in; `just
+//! proto-generate` rewrites it and `cargo test` fails when it is stale, so a
+//! command added to the vocabulary cannot quietly reach only half the
+//! surfaces.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -14,8 +14,6 @@ use super::{ArgSpec, CommandSpec, ErrorCode, LabRequest, OneWay, SupRequest, Wir
 
 /// The generated protocol reference and coverage report.
 pub const MARKDOWN_PATH: &str = "docs/protocol.md";
-/// The generated console-side protocol types.
-pub const TYPESCRIPT_PATH: &str = "web-ui/src/protocol.ts";
 
 const GENERATED_BANNER: &str = "generated from `src/proto/vocab.rs` — run `just proto-generate`";
 
@@ -34,19 +32,12 @@ pub struct Surface {
     pub blurb: &'static str,
 }
 
-/// Every surface the report accounts for. The console is not scanned
-/// separately: it reaches the daemon only through the REST layer, so what
-/// `web` calls is exactly what a console user can reach.
+/// Every surface the report accounts for.
 pub const SURFACES: &[Surface] = &[
     Surface {
         name: "cli",
         roots: &[("src/cli", None), ("src/template/cli.rs", None)],
         blurb: "the `vmlab` verb surface",
-    },
-    Surface {
-        name: "web",
-        roots: &[("src/web", None)],
-        blurb: "the REST/WebSocket API, and so the console",
     },
     Surface {
         name: "daemon",
@@ -56,27 +47,6 @@ pub const SURFACES: &[Surface] = &[
         ],
         blurb: "one daemon calling another",
     },
-];
-
-/// The REST endpoints that project a slice of the vocabulary onto a path
-/// segment, as `(segment, wire command)`.
-///
-/// The console's action unions are generated from these, so it no longer
-/// declares its own. Every command named here is checked against the
-/// vocabulary, which is what stops the two drifting apart.
-pub const LAB_ACTIONS: &[(&str, &str)] = &[
-    ("up", "up"),
-    ("down", "down"),
-    ("destroy", "destroy"),
-    ("pull", "pull"),
-];
-
-/// As [`LAB_ACTIONS`], for `POST /api/labs/{lab}/machines/{machine}/{action}`.
-pub const MACHINE_ACTIONS: &[(&str, &str)] = &[
-    ("start", "machine.start"),
-    ("stop", "machine.stop"),
-    ("restart", "machine.restart"),
-    ("destroy", "machine.destroy"),
 ];
 
 /// Which surfaces call each command, keyed by `Vocabulary::Variant`.
@@ -136,8 +106,8 @@ fn collect_rust_sources(path: &Path, out: &mut String) {
     }
 }
 
-/// `stringify!` on a type puts spaces around punctuation; the report and the
-/// generated TypeScript both want it back the way it was written.
+/// `stringify!` on a type puts spaces around punctuation; the report wants it
+/// back the way it was written.
 fn tidy_type(ty: &str) -> String {
     ty.replace(" :: ", "::")
         .replace(" < ", "<")
@@ -274,25 +244,6 @@ pub fn protocol_markdown(repo: &Path) -> String {
         }
         push_one_way_lists(&mut out, &only);
     }
-
-    out.push_str("## REST action segments\n\n");
-    out.push_str(
-        "The REST layer projects a slice of the vocabulary onto URL path segments. The console's\n\
-         action types are generated from these, so it holds no command list of its own.\n\n",
-    );
-    for (title, actions) in [
-        ("`POST /api/labs/{lab}/{action}`", LAB_ACTIONS),
-        (
-            "`POST /api/labs/{lab}/machines/{machine}/{action}`",
-            MACHINE_ACTIONS,
-        ),
-    ] {
-        out.push_str(&format!("{title}\n\n| segment | command |\n|---|---|\n"));
-        for (segment, cmd) in actions {
-            out.push_str(&format!("| `{segment}` | `{cmd}` |\n"));
-        }
-        out.push('\n');
-    }
     out
 }
 
@@ -361,77 +312,6 @@ fn http_status_name(code: ErrorCode) -> String {
     format!("{status} {phrase}").trim_end().to_string()
 }
 
-/// The console's protocol types, generated from the vocabulary.
-///
-/// The console speaks REST, not the wire, so what it needs from the protocol
-/// is the error codes it branches on and the action segments it posts to —
-/// both of which used to be hand-written string unions in `api.ts`.
-pub fn protocol_typescript() -> String {
-    let mut out = String::new();
-    out.push_str(&format!("// {GENERATED_BANNER}\n"));
-    out.push_str("//\n// Edit the vocabulary, not this file.\n\n");
-
-    out.push_str(
-        "/** Why a request failed. The daemon sends this alongside the message, and the REST\n\
-         \u{20}*  layer maps it to the HTTP status — so branch on the code, never on the prose. */\n",
-    );
-    out.push_str("export type ErrorCode =\n");
-    for code in ErrorCode::ALL {
-        out.push_str(&format!("  | \"{}\"\n", code.as_str()));
-    }
-    out.push_str(";\n\n");
-
-    out.push_str("/** An error body from any `/api` endpoint. */\n");
-    out.push_str("export interface ApiError {\n  error: string;\n  code?: ErrorCode;\n}\n\n");
-
-    out.push_str(
-        "/** The most one guest file transfer may carry inline, in bytes. The console shows\n\
-         \u{20}*  this before a transfer is attempted; the daemon refuses anything over it. */\n",
-    );
-    out.push_str(&format!(
-        "export const INLINE_FILE_LIMIT = {};\n\n",
-        super::INLINE_FILE_LIMIT
-    ));
-
-    for (name, actions, doc) in [
-        (
-            "LabAction",
-            LAB_ACTIONS,
-            "Lab-wide actions: `POST /api/labs/{lab}/{action}`.",
-        ),
-        (
-            "MachineAction",
-            MACHINE_ACTIONS,
-            "Per-machine actions: `POST /api/labs/{lab}/machines/{machine}/{action}`.",
-        ),
-    ] {
-        out.push_str(&format!("/** {doc} */\nexport type {name} =\n"));
-        for (segment, cmd) in actions {
-            out.push_str(&format!("  /** `{cmd}` */\n  | \"{segment}\"\n"));
-        }
-        out.push_str(";\n\n");
-    }
-
-    for (name, specs) in [
-        ("LabCommand", LabRequest::COMMANDS),
-        ("SupervisorCommand", SupRequest::COMMANDS),
-    ] {
-        out.push_str(&format!(
-            "/** Every command the {} socket serves. */\nexport type {name} =\n",
-            if name == "LabCommand" {
-                "lab daemon's"
-            } else {
-                "supervisor"
-            }
-        ));
-        for spec in specs {
-            out.push_str(&format!("  | \"{}\"\n", spec.cmd));
-        }
-        out.push_str(";\n\n");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,40 +321,23 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// The generated files are checked in so a reader (and a reviewer) sees
+    /// The generated file is checked in so a reader (and a reviewer) sees
     /// the protocol without running anything, and so a command that reaches
     /// only one surface shows up in review as a diff.
     ///
     /// `just proto-generate` sets `VMLAB_WRITE_PROTOCOL_DOCS` and rewrites
-    /// them; without it this only checks.
+    /// it; without it this only checks.
     #[test]
     fn generated_artefacts_are_current() {
         let write = std::env::var_os("VMLAB_WRITE_PROTOCOL_DOCS").is_some();
-        for (path, want) in [
-            (MARKDOWN_PATH, protocol_markdown(repo())),
-            (TYPESCRIPT_PATH, protocol_typescript()),
-        ] {
-            let full = repo().join(path);
-            if write {
-                std::fs::write(&full, &want).expect("writing the generated file");
-                continue;
-            }
-            let on_disk = std::fs::read_to_string(&full).unwrap_or_default();
-            assert_eq!(on_disk, want, "{path} is stale — run `just proto-generate`");
+        let (path, want) = (MARKDOWN_PATH, protocol_markdown(repo()));
+        let full = repo().join(path);
+        if write {
+            std::fs::write(&full, &want).expect("writing the generated file");
+            return;
         }
-    }
-
-    /// The REST action tables name real commands. Rename one in the
-    /// vocabulary and this fails, rather than the console silently posting to
-    /// an endpoint that no longer maps anywhere.
-    #[test]
-    fn rest_action_tables_name_real_commands() {
-        for (segment, cmd) in LAB_ACTIONS.iter().chain(MACHINE_ACTIONS) {
-            assert!(
-                LabRequest::spec(cmd).is_some(),
-                "action `{segment}` maps to `{cmd}`, which is not in the lab vocabulary"
-            );
-        }
+        let on_disk = std::fs::read_to_string(&full).unwrap_or_default();
+        assert_eq!(on_disk, want, "{path} is stale — run `just proto-generate`");
     }
 
     /// Every command that claims to be one-way, with the claim.
@@ -519,41 +382,12 @@ mod tests {
         }
     }
 
-    /// The ratchet. A command reachable from exactly one surface says which
-    /// kind of one-way it is, so adding a command with a single caller is a
-    /// decision made at declaration time rather than a fact a later audit
-    /// discovers. That audit has run three times (#8, #24, #33); this is what
-    /// stops a fourth.
-    ///
-    /// `#24` in the message is the issue that classified this list. A new gap
-    /// names whichever issue tracks it — #37, #38 and #39 are what #24 split
-    /// into.
-    #[test]
-    fn every_one_way_command_records_why() {
-        let usage = command_usage(repo());
-        let bare: Vec<&str> = LabRequest::COMMANDS
-            .iter()
-            .chain(SupRequest::COMMANDS)
-            .filter(|spec| spec.one_way.is_none() && usage[spec.variant].len() == 1)
-            .map(|spec| spec.cmd)
-            .collect();
-        assert!(
-            bare.is_empty(),
-            "reachable from one surface and saying nothing about why: {bare:?}\n\
-             Annotate each in `src/proto/vocab.rs`, beside its doc comment, with either\n\
-             `#[one_way(\"surface\", \"why it belongs there and nowhere else\")]` if that is a\n\
-             decision, or `#[one_way_gap(\"surface\", N)]`, naming the issue tracking it, if\n\
-             nobody wrote the other half yet.",
-        );
-    }
-
     /// The report is only worth reading if it reflects real callers, so check
     /// the scan against a command each surface is known to make.
     #[test]
     fn the_usage_scan_finds_real_callers() {
         let usage = command_usage(repo());
         assert!(usage["Up"].contains("cli"), "the CLI brings labs up");
-        assert!(usage["MachineStart"].contains("web"), "so does the console");
         assert!(
             usage["GlobalAttach"].contains("daemon"),
             "a lab daemon attaches its own global segments"

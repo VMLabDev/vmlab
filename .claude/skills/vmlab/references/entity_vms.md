@@ -43,13 +43,12 @@ vm "name" {
   // The machine's own setup, applied on `up` in declaration order.
   playbook  "playbooks/base"    { play = "member" }   // declarative, config-weave
   provision "scripts/setup.ws"  { }                   // imperative, wscript
-  web "admin" { port = 8080 }                         // proxied into the web console
 }
 ```
 
 Extra `disk {}` and a `gpu {}` block are declared inline; networking is per-`nic {}` (see [the NIC block](../references/entity_nic_block.md)).
 
-The setup that runs on a machine is declared **inside** it: [`provision {}`](../references/entity_provision_block.md), [`playbook {}`](../references/entity_playbook_block.md) and [`web {}`](../references/entity_web_block.md) are children of the `vm {}` (and of `container {}`), applied in declaration order. There is no lab-level provision list.
+The setup that runs on a machine is declared **inside** it: [`provision {}`](../references/entity_provision_block.md) and [`playbook {}`](../references/entity_playbook_block.md) are children of the `vm {}` (and of `container {}`), applied in declaration order. There is no lab-level provision list.
 
 A VM must have a NIC on a segment if it declares any SMB share — including the default `transport = "auto"`, which can still fall back to SMB at start. `transport = "virtiofs"` needs no networking at all.
 

@@ -16,7 +16,7 @@ vm "dc01" {
 }
 ```
 
-**Provision failures fail `vmlab up`.** A machine's steps gate `depends_on`: anything depending on `dc01` starts only after dc01's provisions and playbooks have finished. Inside the script, `lab.this_vm()` returns the owning VM (containers have no VM handle, so it is unavailable there), while `lab.vm("name")` reaches any other machine — a script that stands up a DC and then joins a member is still one script, declared on whichever machine should gate it. The same block inside a `template {}` runs on the build VM.
+**Provision failures fail `vmlab up`.** A machine's steps gate `depends_on`: anything depending on `dc01` starts only after dc01's provisions and playbooks have finished. Inside the script, `lab.this_vm()` returns the owning machine — VM or container alike — while `lab.machine("name")` reaches any other — a script that stands up a DC and then joins a member is still one script, declared on whichever machine should gate it. The same block inside a `template {}` runs on the build VM.
 
 ## Related
 

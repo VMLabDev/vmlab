@@ -378,32 +378,6 @@ impl PlaybookOps {
             None => Value::Null,
         }
     }
-
-    /// All in-flight runs with log tails (`playbook.op_status` — the resync
-    /// source for reconnecting UIs).
-    pub fn status(&self) -> Value {
-        let inner = self.inner.lock_recover();
-        let mut rows: Vec<Value> = inner
-            .ops
-            .iter()
-            .map(|(machine, op)| {
-                json!({
-                    "machine": machine,
-                    "playbook": op.playbook,
-                    "play": op.play,
-                    "kind": op.kind,
-                    "op_id": op.op_id,
-                    "started": op.started.to_rfc3339(),
-                    "log_tail": op.log.iter().collect::<Vec<_>>(),
-                    "phase": op.phase,
-                    "reboot_attempt": op.reboot_attempt,
-                    "reboot_max": MAX_REBOOTS,
-                })
-            })
-            .collect();
-        rows.sort_by(|a, b| a["machine"].as_str().cmp(&b["machine"].as_str()));
-        Value::Array(rows)
-    }
 }
 
 /// Releases a [`PlaybookOps`] claim on drop.

@@ -915,10 +915,6 @@ impl super::machine::Machine for VmInstance {
         &self.macs
     }
 
-    fn web_pages(&self) -> &[model::WebPage] {
-        &self.cfg.web
-    }
-
     fn logins(&self) -> &[model::Login] {
         &self.cfg.logins
     }

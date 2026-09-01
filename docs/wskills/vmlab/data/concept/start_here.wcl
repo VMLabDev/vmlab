@@ -1,7 +1,7 @@
 concept start_here {
   name     = "Start here"
   summary  = "Getting started using VMLab."
-  related  = [vmlab_wcl, golden_path, architecture, templates, wscript_overview, web_console]
+  related  = [vmlab_wcl, golden_path, architecture, templates, wscript_overview]
   audience = :both
   body {
     p <<PROSE

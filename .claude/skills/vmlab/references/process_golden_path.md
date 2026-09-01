@@ -23,6 +23,7 @@ $ vmlab validate
 
 > [!NOTE]
 > **Always validate first**
+>
 > Schema + semantic checks with no side effects, including a full wscript type-check of every provision/handler. Run it after every edit.
 
 Run `vmlab validate`. Fix any schema or semantic error before booting.
@@ -53,12 +54,14 @@ $ vmlab destroy       # stop + DELETE clones and lab-local state
 
 > [!WARNING]
 > **down vs destroy**
+>
 > `down` keeps the linked clones so you can resume. `destroy` deletes them and lab-local `.vmlab/` state — only when you mean it.
 
 Use `vmlab down` for a graceful stop that retains clones. Use `vmlab destroy` only to delete the clones and lab-local state entirely.
 
 > [!TIP]
 > **Verification**
+>
 > `vmlab status` reports the expected VM/segment states and `ready` flags; provisions completed without failing `vmlab up`.
 
 ## Related

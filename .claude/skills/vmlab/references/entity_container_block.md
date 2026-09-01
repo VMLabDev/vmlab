@@ -2,7 +2,7 @@
 
 _wcl block_
 
-Declares an OCI container in a lab: image reference, env/volumes/ports/healthcheck, restart policy — run in a micro-VM on the same segments as VMs.
+Declares an OCI container in a lab: image reference, env/volumes/ports/healthcheck — run in a micro-VM on the same segments as VMs.
 
 A `container {}` block inside a `lab {}` runs a standard OCI container image
 (docker-style: `nginx:1.27`, `ghcr.io/owner/app@sha256:…`; Docker Hub shorthand
@@ -15,8 +15,9 @@ point of view it is just another machine (PRD §18).
 ```wcl
 container "web" {
   image      = "nginx:1.27"
+  profile    = "container"               // micro-VM hardware floor
+  memory     = 512MiB                    // overrides the profile
   depends_on = ["db"]                    // VM or container names — one namespace
-  restart    = "on-failure"              // "no" (default) | "on-failure" | "always"
   nic    { segment = "corp" ip = "10.50.0.20" }
   env    { name = "MODE" value = "prod" }
   volume { name = "data" target = "/var/lib/data" }        // named, lab-scoped
@@ -28,8 +29,9 @@ container "web" {
 
 ```wcl
 container "toolbox" {
-  image = "ubuntu:24.04"
-  mode  = :idle                          // do not run the image entrypoint/cmd
+  image   = "ubuntu:24.04"
+  profile = "container"
+  mode    = :idle                        // do not run the image entrypoint/cmd
 }
 ```
 
@@ -41,11 +43,20 @@ reachable with `vmlab container exec` / `cp` over the agent channel. The image
 digest resolved at first pull is pinned in lab state (never re-pulled
 implicitly); `vmlab container destroy` or editing `image =` clears the pin.
 Readiness gates on the process starting plus the first passing healthcheck;
-`restart` respawns with backoff on exit. Containers snapshot with \*\*full VM
-parity\*\* — offline and online, standalone or as part of a lab-wide
+an exited process remains stopped until it is explicitly started. Containers
+snapshot with **full VM parity** — offline and online, standalone or as part of a lab-wide
 `vmlab snapshot` — and volumes ride virtiofs (CIFS fallback), like
 [shares](../references/entity_shares.md). Named volumes survive `down` and per-container
 destroy; lab `destroy` removes them.
+
+**Sizing the micro-VM.** `cpus` and `memory` resolve through the same
+precedence chain as a VM's — declaration first, then the named `profile` (a
+container has no template layer). There is no built-in default, because what a
+micro-VM needs depends entirely on its image: a container that neither
+declares a size nor names a profile supplying one fails `vmlab validate`,
+rather than silently booting into a guess it will OOM under. The shipped
+`container` profile carries the conservative floor (1 vCPU, 256MiB); drop your
+own into `~/.config/vmlab/profiles/` to change it lab-wide.
 
 With `mode = :idle`, the root filesystem, volumes, networking and guest agent
 come up without starting the image entrypoint or command. Readiness gates on
@@ -65,6 +76,6 @@ with `vmlab container exec` or from provision scripts.
 
 - [segment {} block](../references/entity_segment_block.md)
 
-- [Container](../references/entity_container_api.md)
+- [Container handle](../references/entity_container_api.md)
 
 [← Back to SKILL.md](../SKILL.md)

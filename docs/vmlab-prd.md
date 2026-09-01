@@ -350,7 +350,7 @@ SMB is affected.
 **Server implementation.** No mature embeddable SMB *server* library exists in the Rust ecosystem (clients only, verified at time of writing), so this is the largest single engineering component the feature implies. Two permitted strategies behind the identical WCL/user surface:
 
 1. **Embedded minimal SMB server in the daemon** — the design goal: SMB2 (negotiate/session(NTLMv2)/tree/create/read/write/query-directory/close + signing) plus the **SMB1/NT1 dialect for `smb1` shares** — a second, older protocol surface (different framing, NTLMv1/LM auth) that materially enlarges this component; no oplocks, no DFS. Self-contained, no dependencies.
-2. **Bundled `smbd` as an interim backend** — the daemon generates config, runs Samba unprivileged on a localhost high port, and the switch proxies the segment gateway's port 445 to it. Samba still ships an SMB1 server behind explicit configuration (`server min protocol`), so this backend covers `smb1` shares from day one. Cost: a Samba dependency (bundled in the container image; documented host package otherwise) — **⚠ verify at implementation** that the bundled/target Samba build retains NT1 support, since distros increasingly trim it.
+2. **Bundled `smbd` as an interim backend** — the daemon generates config, runs Samba unprivileged on a localhost high port, and the switch proxies the segment gateway's port 445 to it. Samba still ships an SMB1 server behind explicit configuration (`server min protocol`), so this backend covers `smb1` shares from day one. Cost: a Samba dependency (a documented host package) — **⚠ verify at implementation** that the bundled/target Samba build retains NT1 support, since distros increasingly trim it.
 
 The PRD permits shipping 2 first and replacing with 1 later — including a hybrid where the embedded server handles SMB2 shares and `smb1` shares route to smbd; the user surface must not change between strategies.
 
@@ -641,13 +641,15 @@ Everything above was chosen to be WSL2-clean, but to state it once: KVM requires
 
 ## 14. Official container image
 
-vmlab ships an official Docker/OCI **runtime image** (distinct from template artifacts, §6.4) containing the vmlab binary plus its full runtime dependency set: QEMU (system emulators for supported arches), OVMF/SeaBIOS firmware, swtpm, Tesseract, passt/slirp, and a VNC-capable toolchain. Published per release alongside the binary (e.g. `ghcr.io/<owner>/vmlab:<version>`).
-
-- **Acceleration.** With `--device /dev/kvm` the container runs KVM-accelerated like a native install. Without it, vmlab falls back to TCG with a loud warning — slow but functional, which matters for environments without KVM exposure.
-- **Privileges.** The default userspace network fabric needs **no** `--privileged`, extra capabilities, or host network mode — `/dev/kvm` is the only grant for KVM acceleration. Opting into the eBPF fast path additionally grants `/dev/net/tun`, `CAP_BPF`, and `CAP_NET_ADMIN`; probing still falls back to userspace when unavailable.
-- **State.** Documented volume mounts for the template store (`~/.local/share/vmlab/templates`) and the lab directory; everything else is container-ephemeral by design. Host access to guests rides vmlab port-forwards mapped out with ordinary `-p` flags.
-- **Entrypoint.** Defaults to the supervisor in the foreground (lab daemons are its children); `docker exec` (or a second container sharing the socket volume) drives the CLI. A one-shot mode (`vmlab up && vmlab script ...` then exit) suits CI.
-- **Primary use cases:** CI pipelines running full lab tests, trying vmlab without installing QEMU, and pinning a known-good QEMU version independent of the host distro.
+**Removed from scope before the first release.** vmlab no longer ships a
+Docker/OCI runtime image, a Containerfile or a Compose stack; the CLI is the
+only deliverable, and a native install beside the host's QEMU (plus the
+runtime tools the CLI reports missing by name) is the supported path. The
+guarantees the image used to be the proof of still hold on any host: `/dev/kvm`
+is the only grant KVM acceleration needs, TCG is the loud-warning fallback
+without it, and the default network fabric needs no privileges at all (§1.1,
+§13). Template artifacts in OCI registries (§6.4) and `container {}` machines
+(§18) are unrelated to this image and remain.
 
 ---
 
@@ -658,7 +660,7 @@ vmlab ships an official Docker/OCI **runtime image** (distinct from template art
 3. **M3 — Network fabric:** named segments, DHCP + reservations + option 121, DNS + registration + forwarding, port forwards, console/VNC.
 4. **M4 — Template builds + shares:** ISO sources w/ URL+hash, media building, build scripts, export/import, profiles complete incl. legacy, SMB shared folders (smbd backend acceptable initially per §7.5).
 5. **M5 — Advanced networking + events:** global segments, cross-host attach, inter-segment routing, filtering/redirection + runtime mutation, event handlers, watchdogs, OCR.
-6. **M6 — Distribution:** OCI push/pull with chunking and multi-arch indexes, registry auth, lab references to registry templates, official container image.
+6. **M6 — Distribution:** OCI push/pull with chunking and multi-arch indexes, registry auth, lab references to registry templates. (The official container image was later dropped, §14.)
 
 ## 16. Resolved decisions
 
@@ -723,11 +725,10 @@ shares served by the lab daemon at the segment gateway — the same
 bundled-`smbd` mechanism as §7.5 shared folders — mounted by cinit over
 CIFS once the network is up. No 9p device is ever attached (it would add a
 migration blocker and break online snapshots, §7.3). Ownership on volume
-files is mount-level, not per-file container uid/gid. This preserves the §14
-baseline guarantee: containers work inside the official image with **no**
-`--privileged` or added capabilities — `/dev/kvm` only, with TCG fallback
-without it. The optional eBPF network fast path uses the additional grants
-documented in §14.
+files is mount-level, not per-file container uid/gid. This preserves the
+rootless baseline (§1.1, §13): containers need **no** `--privileged` or added
+capabilities — `/dev/kvm` only, with TCG fallback without it. The optional
+eBPF network fast path uses its own narrowly scoped grants.
 
 **Networking.** A container NIC is a VM NIC: the same `-netdev stream` unix
 socket into the segment switch, the same DHCP lease/reservation, DNS
@@ -890,9 +891,8 @@ impossible.
 
 **`@dev` is projected and designable like any other part of the schema**
 (ADR-0005). WCL's decorator-schema introspection returns declarations in the
-same shape `projection.rs` already consumes for block fields, so the console's
-inspector, the catalog metadata and the rendered reference all reach it with no
-special case.
+same shape `projection.rs` already consumes for block fields, so the rendered
+reference reaches it with no special case.
 
 **Validation.** The decorator's own errors — an undeclared `@dve`, a wrong-typed
 or unknown argument, `@dev` on a `nic {}`, a repeated `@dev @dev` — come from
@@ -943,8 +943,7 @@ a flag, not a schema addition.
 
 **Everything a person invokes defaults to the declared login; everything vmlab
 does on its own behalf keeps the agent identity.** Person-invoked: `vmlab ssh`
-and the facade, `exec`, `shell`, `push`/`pull`, the console's terminals and file
-transfer. vmlab's own: `provision {}`/`playbook {}` steps, share mounting,
+and the facade, `exec`, `shell`, `push`/`pull`. vmlab's own: `provision {}`/`playbook {}` steps, share mounting,
 readiness, metrics, tail, shutdown. The dividing argument is the bootstrap and
 it is decisive rather than stylistic — `PROBE\dev` does not exist until
 provisioning creates it, so a lab whose provisioning ran as the declared login
@@ -1268,8 +1267,8 @@ handshake:**
 | `watch` | the recursive guest tree watch backing the workspace syncer |
 
 `tunnel` and `fileops` are named separately rather than as one coarse `ssh`
-because they have independent consumers — the console's file transfer has no
-interest in tunnels. `watch` lives in **the agent**, not a second guest binary:
+because they have independent consumers — `vmlab cp` has no interest in
+tunnels. `watch` lives in **the agent**, not a second guest binary:
 a separate daemon would be a second thing to bake into every template, a second
 install path, a second skew axis and a second thing the repair verb must know
 about, for code that has to sit on the same channel anyway. **User-logon spawning
@@ -1374,8 +1373,8 @@ properties §19 fixes:
    file-vs-directory at creation and a dangling link does not reveal it.
 
 **One file vocabulary, not two.** The whole-file, path-addressed
-`OpenFilePush`/`OpenFilePull` pair and its `file` feature **retire**; the
-console's transfer, the wscript push/pull, tree pushes and provisioning all move
+`OpenFilePush`/`OpenFilePull` pair and its `file` feature **retire**; `vmlab
+cp`, the wscript push/pull, tree pushes and provisioning all move
 onto `fileops`. Keeping both would hand every future consumer a choice, and the
 syncer — the third consumer — needs `stat`, mtimes and offset writes, so it
 would straddle them; it would also mean two guest-side write paths on each of
@@ -2027,13 +2026,12 @@ or compose existing commands. `vmlab ssh-proxy` is **one** new command, the
 proxy's channel to the machine's agent (§19.3), and the syncer's `status`/`flush`
 are **two**. Dev-ness in `vmlab status` is a projection widening, not a command.
 
-**The console stays out of the SSH path.** It gets sync state, and the alias as
-copyable status data, and no SSH affordance of its own: it already has real
-terminals over the agent, so an SSH channel would be a second path to the same
-screen — and the facade's whole point is a stdio pipe for a *local* editor, which
-a browser has nothing to connect to. **Sync-conflict resolution is CLI-only**:
-the console reads the halt and does not act on it. So `ssh-proxy` is a deliberate
-one-way command carrying a genuine reason rather than a gap. Note also that
+**No other surface joins the SSH path.** The facade's whole point is a stdio
+pipe for a *local* editor, so no vmlab surface beyond `ssh-proxy` offers an SSH
+affordance of its own. (The browser console this paragraph once excused was
+removed before release; the reasoning stands without it.) **Sync-conflict
+resolution is CLI-only.** So `ssh-proxy` is a deliberate one-way command
+carrying a genuine reason rather than a gap. Note also that
 today's `vmlab shell` runs as the agent identity, so `vmlab ssh` is not a
 duplicate path — it is a **different identity to the same guest**.
 

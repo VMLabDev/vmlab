@@ -27,23 +27,19 @@ the code is the contract.
 
 | command | arguments | called by | what it does |
 |---|---|---|---|
-| `ping` | — | `cli`, `daemon`, `web` | Liveness check; answers `"pong"`. |
+| `ping` | — | `cli`, `daemon` | Liveness check; answers `"pong"`. |
 | `version` | — | `cli` | The supervisor's own build version. |
-| `fastpath` | — | `cli`, `web` | Which network fast-path tier this host selected (PRD §9.1), and why the skipped tiers were unavailable. |
-| `status` | — | `cli`, `web` | Every lab in the registry. |
+| `fastpath` | — | `cli` | Which network fast-path tier this host selected (PRD §9.1), and why the skipped tiers were unavailable. |
+| `status` | — | `cli` | Every lab in the registry. |
 | `lab.ensure` | `name: String`, `root: std::path::PathBuf` | `cli` | Spawn (or find) a lab's daemon; answers with its socket path. |
 | `lab.release` | `name: String` | `cli` | Stop a lab's daemon, after `down` or `destroy`. |
-| `lab.restart` | `name: String`, `root: std::path::PathBuf` | `cli`, `web` | Restart a lab's daemon so it re-reads its config; answers with the new socket path. |
+| `lab.restart` | `name: String`, `root: std::path::PathBuf` | `cli` | Restart a lab's daemon so it re-reads its config; answers with the new socket path. |
 | `global.attach` | `name: String`, `subnet: Option<Ipv4Net>`, `peer: Option<String>` | `daemon` | Join a global segment (PRD §9.2), creating it on first use; answers with the trunk socket to bridge to. |
 | `global.detach` | `name: String` | `daemon` | Leave a global segment. |
 | `global.list` | — | `daemon` | Every global segment this host knows. |
-| `template.list` | `lab: String`, `root: std::path::PathBuf`, `file: Option<std::path::PathBuf>` | `cli`, `web` | The templates a file declares, with their store and build state. |
-| `template.remote` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>` | `web` | What the registry holds for one declared template. |
-| `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>` | `cli`, `web` | Start building one declared template. |
-| `template.stop_build` | `lab: String`, `arch: String`, `template: String` | `cli`, `web` | Abort a running build. |
-| `template.push` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>` | `web` | Start pushing one built template to its registry. |
-| `template.op_status` | `lab: String` | `web` | Which template builds and pushes are in flight for one lab. |
-| `template.console_path` | `lab: String`, `arch: String`, `template: String` | `web` | The socket serving a running build's console, for the web viewer. |
+| `template.list` | `lab: String`, `root: std::path::PathBuf`, `file: Option<std::path::PathBuf>` | `cli` | The templates a file declares, with their store and build state. |
+| `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>` | `cli` | Start building one declared template. |
+| `template.stop_build` | `lab: String`, `arch: String`, `template: String` | `cli` | Abort a running build. |
 | `store.list` | `remote: bool` | `cli` | Every template in the store, with its size and, on request, whether that exact version is published. |
 | `store.remove` | `reference: String`, `force: bool` | `cli` | Remove one exact store version `<arch>/<name>@<version>`. |
 | `store.prune` | `filter: Option<String>`, `keep: usize`, `apply: bool`, `force: bool` | `cli` | Plan a prune of superseded builds, and carry it out when `apply`. |
@@ -63,23 +59,23 @@ the code is the contract.
 
 | command | arguments | called by | what it does |
 |---|---|---|---|
-| `ping` | — | `cli`, `daemon`, `web` | Liveness check; answers `"pong"`. |
-| `status` | — | `cli`, `web` | The whole lab's runtime status: machines, segments, readiness. |
-| `dns.table` | — | `cli`, `web` | The DNS zones the lab's segments serve. |
-| `up` | `machines: Vec<String>` | `cli`, `web` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
-| `pull` | `machines: Vec<String>` | `cli`, `web` | Download every pending template and image without starting anything, over the code path `up` runs first. |
-| `pull.cancel` | `machine: String` | `cli`, `web` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
+| `ping` | — | `cli`, `daemon` | Liveness check; answers `"pong"`. |
+| `status` | — | `cli` | The whole lab's runtime status: machines, segments, readiness. |
+| `dns.table` | — | `cli` | The DNS zones the lab's segments serve. |
+| `up` | `machines: Vec<String>` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
+| `pull` | `machines: Vec<String>` | `cli` | Download every pending template and image without starting anything, over the code path `up` runs first. |
+| `pull.cancel` | `machine: String` | `cli` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
 | `run` | `script: String` | `cli` | Run an ad-hoc wscript against the lab (PRD §12), streaming output. |
-| `down` | `machines: Vec<String>`, `force: bool` | `cli`, `web` | Stop the lab, or just the named machines (empty = all). |
-| `destroy` | — | `cli`, `web` | Stop the lab and delete everything it materialised. |
-| `machine.start` | `machine: String` | `cli`, `web` | Start one machine, pulling its template or image first. |
-| `machine.stop` | `machine: String`, `force: bool` | `cli`, `web` | Stop one machine; `force` kills instead of the graceful ladder. |
-| `machine.restart` | `machine: String`, `force: bool` | `cli`, `web` | Stop one machine, wait for it to settle, and boot it again. |
-| `machine.destroy` | `machine: String` | `cli`, `web` | Stop one machine and delete everything it materialised. |
-| `machine.capabilities` | `machine: String` | `cli`, `web` | What this machine can do beyond the universal commands, probed live: a display, a console log, in-place reboot, and whichever features its agent negotiated. |
+| `down` | `machines: Vec<String>`, `force: bool` | `cli` | Stop the lab, or just the named machines (empty = all). |
+| `destroy` | — | `cli` | Stop the lab and delete everything it materialised. |
+| `machine.start` | `machine: String` | `cli` | Start one machine, pulling its template or image first. |
+| `machine.stop` | `machine: String`, `force: bool` | `cli` | Stop one machine; `force` kills instead of the graceful ladder. |
+| `machine.restart` | `machine: String`, `force: bool` | `cli` | Stop one machine, wait for it to settle, and boot it again. |
+| `machine.destroy` | `machine: String` | `cli` | Stop one machine and delete everything it materialised. |
+| `machine.capabilities` | `machine: String` | `cli` | What this machine can do beyond the universal commands, probed live: a display, a console log, in-place reboot, and whichever features its agent negotiated. |
 | `machine.ip` | `machine: String`, `nic: Option<usize>` | `cli` | The machine's guest IP, optionally for one NIC index. |
-| `machine.screenshot` | `machine: String`, `path: String` | `cli`, `web` | Write a PNG of the machine's framebuffer to a host path. |
-| `machine.sendkeys` | `machine: String`, `keys: String` | `cli`, `web` | Send a key chord to the machine's display. |
+| `machine.screenshot` | `machine: String`, `path: String` | `cli` | Write a PNG of the machine's framebuffer to a host path. |
+| `machine.sendkeys` | `machine: String`, `keys: String` | `cli` | Send a key chord to the machine's display. |
 | `machine.mouse_move` | `machine: String`, `x: i64`, `y: i64` | `cli` | Move the pointer to an absolute framebuffer position. |
 | `machine.mouse_click` | `machine: String`, `button: String`, `x: Option<i64>`, `y: Option<i64>` | `cli` | Click a mouse button, optionally moving there first (both `x` and `y`, or neither). |
 | `machine.mouse_drag` | `machine: String`, `x1: i64`, `y1: i64`, `x2: i64`, `y2: i64` | `cli` | Press at one point, drag, release at another. |
@@ -87,27 +83,25 @@ the code is the contract.
 | `machine.find_image` | `machine: String`, `image: String`, `threshold: f64`, `region: Option<Region>` | `cli` | Find a template image on the machine's display; null when no match scores above `threshold`. |
 | `machine.exec` | `machine: String`, `cmd: String`, `args: Vec<String>`, `timeout: u64`, `user: Option<String>`, `password: Option<String>` | `cli` | Run a command in the guest through the agent and collect its output. |
 | `machine.osinfo` | `machine: String`, `timeout: u64` | `cli` | What the guest OS says it is. |
-| `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16`, `user: Option<String>`, `password: Option<String>` | `cli`, `web` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
+| `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16`, `user: Option<String>`, `password: Option<String>` | `cli` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
 | `machine.ssh_open` | `machine: String` | `cli` | Open an SSH facade connection for this machine, re-exposed as a unix socket the caller pipes stdin/stdout onto (PRD §19.3). One socket per connection, unlinked when it ends. |
 | `machine.repair_agent` | `machine: String` | `cli` | Push the host's shipped vmlab-agent into a running machine and mark it **diverged** (PRD §19.4). Never fires by itself: an automatic refresh would make the template's sealed `agent_version` a lie. |
-| `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli`, `web` | Resize an open terminal session. |
-| `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli`, `web` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
-| `machine.pull_file` | `machine: String`, `from: String`, `to: Option<String>` | `cli`, `web` | Copy a file out of the guest: to `to`, a host path the daemon can write, or — with `to` omitted — back inline as base64, for a caller that wants the bytes rather than a file on the daemon's host. |
+| `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli` | Resize an open terminal session. |
+| `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
+| `machine.pull_file` | `machine: String`, `from: String`, `to: Option<String>` | `cli` | Copy a file out of the guest: to `to`, a host path the daemon can write, or — with `to` omitted — back inline as base64, for a caller that wants the bytes rather than a file on the daemon's host. |
 | `machine.tail` | `machine: String`, `path: String` | `cli` | Follow a guest file (`tail -F` semantics), streamed as chunks until the caller hangs up or the machine stops. |
 | `machine.eventlog` | `machine: String`, `filter: Option<String>` | `cli` | Follow the Windows event log, streamed as chunks. |
-| `machine.stats` | `machine: String` | `cli`, `web` | Latest guest metrics; subscribes the sampler on first use. |
-| `machine.clipboard_get` | `machine: String` | `cli`, `web` | Read the guest clipboard. |
-| `machine.clipboard_set` | `machine: String`, `text: String` | `cli`, `web` | Write the guest clipboard. |
-| `machine.logs` | `machine: String`, `lines: usize`, `follow: bool` | `cli`, `web` | The machine's console log: the last `lines`, then, with `follow`, streamed growth until the machine stops. |
-| `web.forward` | `machine: String`, `page: String` | `web` | Ensure a loopback forward for a declared web page and return the address to dial, plus the page's auth spec (host-side only). |
+| `machine.stats` | `machine: String` | `cli` | Latest guest metrics; subscribes the sampler on first use. |
+| `machine.clipboard_get` | `machine: String` | `cli` | Read the guest clipboard. |
+| `machine.clipboard_set` | `machine: String`, `text: String` | `cli` | Write the guest clipboard. |
+| `machine.logs` | `machine: String`, `lines: usize`, `follow: bool` | `cli` | The machine's console log: the last `lines`, then, with `follow`, streamed growth until the machine stops. |
 | `playbook.list` | — | `cli` | Every playbook assignment in the lab, one row per (machine, block). |
-| `playbook.check` | `machine: String`, `playbook: Option<String>`, `play: Option<String>` | `cli`, `web` | Dry-run a playbook against one machine, streaming its output. |
-| `playbook.apply` | `machine: String`, `playbook: Option<String>`, `play: Option<String>` | `cli`, `web` | Apply a playbook to one machine, streaming its output. |
-| `playbook.op_status` | — | `web` | Which playbook runs are in flight. |
-| `snapshot.take` | `name: String`, `machine: Option<String>` | `cli`, `web` | Snapshot one machine, or the whole lab when `machine` is omitted. |
-| `snapshot.restore` | `name: String`, `machine: Option<String>`, `discard: bool` | `cli`, `web` | Restore one machine, or every machine when `machine` is omitted. `discard` is §19.6's explicit discard flag: a restore rewinds a dev machine's workspace and re-converges it from the host, which destroys the guest copy of every conflicting path, so a halted workspace refuses until this says so. It defaults to `false` and means nothing for a machine without a workspace. |
-| `snapshot.delete` | `machine: String`, `name: String` | `cli`, `web` | Delete one machine's snapshot. |
-| `snapshot.list` | `machine: String` | `cli`, `web` | One machine's snapshots. |
+| `playbook.check` | `machine: String`, `playbook: Option<String>`, `play: Option<String>` | `cli` | Dry-run a playbook against one machine, streaming its output. |
+| `playbook.apply` | `machine: String`, `playbook: Option<String>`, `play: Option<String>` | `cli` | Apply a playbook to one machine, streaming its output. |
+| `snapshot.take` | `name: String`, `machine: Option<String>` | `cli` | Snapshot one machine, or the whole lab when `machine` is omitted. |
+| `snapshot.restore` | `name: String`, `machine: Option<String>`, `discard: bool` | `cli` | Restore one machine, or every machine when `machine` is omitted. `discard` is §19.6's explicit discard flag: a restore rewinds a dev machine's workspace and re-converges it from the host, which destroys the guest copy of every conflicting path, so a halted workspace refuses until this says so. It defaults to `false` and means nothing for a machine without a workspace. |
+| `snapshot.delete` | `machine: String`, `name: String` | `cli` | Delete one machine's snapshot. |
+| `snapshot.list` | `machine: String` | `cli` | One machine's snapshots. |
 | `workspace.flush` | `machine: String` | `cli` | Run a workspace sync pass now and answer with what it decided (PRD §19.6). What `vmlab dev sync flush` and `status --wait` are. |
 | `workspace.resolve` | `machine: String`, `paths: Vec<String>`, `all: bool`, `winner: String` | `cli` | Say which side wins at halted paths, and carry it out (§19.6). `paths` empty with `all` set takes the whole batch — the 30 000-file case is one `.vmlabignore` edit away and nobody is going to type it. |
 | `workspace.diff` | `machine: String`, `paths: Vec<String>` | `cli` | Bring the guest's copy of one workspace path to the host (§19.6). The host copy is a plain directory on the developer's own workstation, so only the *guest* side is behind the seam — which is the whole reason this verb exists rather than "attach and look". |
@@ -116,7 +110,6 @@ the code is the contract.
 ## Coverage
 
 - `cli` — the `vmlab` verb surface (`src/cli`, `src/template/cli.rs`)
-- `web` — the REST/WebSocket API, and so the console (`src/web`)
 - `daemon` — one daemon calling another (`src/labd`, `src/supervisor`)
 
 Asymmetry is not automatically wrong — some commands only make sense from one place.
@@ -167,16 +160,42 @@ Deliberate, with the reason recorded beside the declaration:
 - `registry.namespace_add` — Namespace settings, for the reason on `registry.namespaces`.
 - `registry.namespace_remove` — Namespace settings, for the reason on `registry.namespaces`.
 
-### Reachable only from `web`
+Neither, which the build rejects:
 
-Deliberate, with the reason recorded beside the declaration:
-
-- `web.forward` — A loopback forward for a guest's web page exists to be dialled by a browser, and the console is the only surface with one.
-- `playbook.op_status` — A poller's question. A CLI `check` or `apply` streams its own run and holds the terminal until it ends, so it never has to ask what is happening.
-- `template.remote` — Which versions a template's own registry publishes, so the console can offer them beside the local ones. A shell asks a namespace what is in it (`registry.search`) or the store what it holds (`store.list --remote`); neither is a lab declaration's view of its own registry.
-- `template.push` — The console pushes a template a lab declares to the registry that declaration names. A shell pushes a store reference wherever it is told, and annotates the package with the git origin of the directory it was run in — neither of which a lab declaration has, so `store.push` carries them.
-- `template.op_status` — A poller's question. A CLI build or push follows its own operation's events and holds the terminal until it ends, so it never has to ask what is happening.
-- `template.console_path` — A raw VNC socket exists to be bridged into a browser canvas, and the console is the only surface with one.
+- `status`
+- `dns.table`
+- `up`
+- `pull`
+- `pull.cancel`
+- `down`
+- `destroy`
+- `machine.start`
+- `machine.stop`
+- `machine.restart`
+- `machine.destroy`
+- `machine.capabilities`
+- `machine.screenshot`
+- `machine.sendkeys`
+- `machine.tty_open`
+- `machine.tty_resize`
+- `machine.push_file`
+- `machine.pull_file`
+- `machine.stats`
+- `machine.clipboard_get`
+- `machine.clipboard_set`
+- `machine.logs`
+- `playbook.check`
+- `playbook.apply`
+- `snapshot.take`
+- `snapshot.restore`
+- `snapshot.delete`
+- `snapshot.list`
+- `fastpath`
+- `status`
+- `lab.restart`
+- `template.list`
+- `template.build`
+- `template.stop_build`
 
 ### Reachable only from `daemon`
 
@@ -185,27 +204,4 @@ Deliberate, with the reason recorded beside the declaration:
 - `global.attach` — Daemon-internal: a lab daemon joins a global segment because a lab declared one, so there is nothing for a person to ask for.
 - `global.detach` — The other half of `global.attach`, and daemon-internal for the same reason.
 - `global.list` — A lab daemon reads it to fold each segment's peer state into the lab status projection, which is how both other surfaces already see it.
-
-## REST action segments
-
-The REST layer projects a slice of the vocabulary onto URL path segments. The console's
-action types are generated from these, so it holds no command list of its own.
-
-`POST /api/labs/{lab}/{action}`
-
-| segment | command |
-|---|---|
-| `up` | `up` |
-| `down` | `down` |
-| `destroy` | `destroy` |
-| `pull` | `pull` |
-
-`POST /api/labs/{lab}/machines/{machine}/{action}`
-
-| segment | command |
-|---|---|
-| `start` | `machine.start` |
-| `stop` | `machine.stop` |
-| `restart` | `machine.restart` |
-| `destroy` | `machine.destroy` |
 

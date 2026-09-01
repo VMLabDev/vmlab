@@ -1,7 +1,7 @@
 concept fastpath {
   name     = "Network fast path (eBPF)"
   summary  = "Optional kernel-accelerated tiers above the userspace switch: AF_XDP (picked by auto) and sockmap (explicit-only); probed at startup, falling back to userspace."
-  related  = [networking, containers, host_config]
+  related  = [networking, host_config, wsl2]
   audience = :both
   body {
     p <<PROSE
@@ -22,10 +22,7 @@ SH
 The mode comes from the `fastpath` host-config knob, overridden by
 `VMLAB_FASTPATH` (`auto` | `off` | `sockmap` | `afxdp`). `auto` considers only
 afxdp — sockmap measured slower than the userspace switch on typical hosts, so
-it is explicit-only. The web console's topbar shows the active tier as a
-badge (`GET /api/fastpath`). In containers, grant `/dev/net/tun`, `CAP_BPF`
-and `CAP_NET_ADMIN` to enable acceleration — see
-[Run vmlab in a container](process_run_in_container).
+it is explicit-only. `vmlab fastpath` shows the active tier.
 PROSE
   }
 }

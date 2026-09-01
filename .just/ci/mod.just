@@ -5,11 +5,9 @@
 # one definition of what each part does. The exit code is the only signal a
 # caller needs.
 #
-# The gate is self-sufficient from a clean checkout: `lint` and `test` compile
-# vmlab-web, whose rust-embed folder is web-ui/dist, so they build the frontend
-# first, and `web-ui-check` installs the frontend's dependencies. External
-# tooling is guarded by the require-* helpers in ../shared.just, so a missing
-# tool reports as a missing tool rather than as a confusing build failure.
+# The gate is self-sufficient from a clean checkout. External tooling is
+# guarded by the require-* helpers in ../shared.just, so a missing tool reports
+# as a missing tool rather than as a confusing build failure.
 #
 # Deliberately outside the bar: the privileged fast-path tests
 # (`just fastpath-test` — sudo, CAP_BPF, an XDP-capable kernel), the guest asset
@@ -28,11 +26,11 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: lint fmt-check test web-ui-check guest-check status-types-verify ebpf-verify
+check: lint fmt-check test guest-check ebpf-verify
 
-# Run clippy with warnings as errors (--all-features covers the web binary)
+# Run clippy with warnings as errors
 [group('ci')]
-lint: require-cargo web-ui-build
+lint: require-cargo
 	cargo clippy --all-targets --all-features -- -D warnings
 
 # Verify formatting without changing files
@@ -40,15 +38,10 @@ lint: require-cargo web-ui-build
 fmt-check: require-cargo
 	cargo fmt --check
 
-# Run the test suite (--all-features covers the web binary's tests)
+# Run the test suite
 [group('ci')]
-test: require-cargo web-ui-build
+test: require-cargo
 	cargo test --all-features
-
-# Typecheck the web UI (`vite build` strips types without checking them)
-[group('ci')]
-web-ui-check: require-pnpm web-ui-deps-ensure
-	cd web-ui && pnpm typecheck
 
 # Format check, lint and test one guest-side crate
 [group('ci')]
@@ -60,11 +53,6 @@ guest-crate-check crate: require-cargo
 # Check every guest-side crate (standalone workspaces the host build never sweeps in)
 [group('ci')]
 guest-check: (guest-crate-check 'cinit-proto') (guest-crate-check 'cinit') (guest-crate-check 'agent-proto') (guest-crate-check 'agent')
-
-# Verify the committed console status types match the Rust projection
-[group('ci')]
-status-types-verify: status-types-build
-	git diff --exit-code web-ui/src/gen/
 
 # Verify the committed BPF objects match the ebpf/ sources
 [group('ci')]

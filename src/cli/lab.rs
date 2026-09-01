@@ -27,9 +27,8 @@ pub fn current_lab() -> Result<(String, std::path::PathBuf)> {
     Ok((file.lab.name, root))
 }
 
-/// The same resolution with no side effect at all — for the long-lived
-/// callers (`vmlab-web`) that read a lab without being a command a developer
-/// typed in its directory.
+/// The same resolution with no side effect at all — for callers that read a
+/// lab without being a command a developer typed in its directory.
 pub fn lab_here() -> Result<(String, std::path::PathBuf)> {
     let (file, root) = load_lab_here()?;
     Ok((file.lab.name, root))

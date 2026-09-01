@@ -51,9 +51,7 @@ beat the playbook's own `vars {}` defaults.
 On `vmlab up`, a machine's playbooks and provisions apply \*\*interleaved in
 declaration order\*\* — a provision after a playbook sees the converged guest —
 and `depends_on` waves gate on the whole set. Re-run any declaration later with
-`vmlab playbook check|apply <machine>`, or from the machine's **Playbook** tab
-in the web console ([concept](../references/concept_playbooks.md)); the designer's play card
-lists every targeted machine with its variables.
+`vmlab playbook check|apply <machine>` ([concept](../references/concept_playbooks.md)).
 
 
 ## Related

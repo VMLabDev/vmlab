@@ -1,12 +1,18 @@
-# Container
+# Container handle
 
 _api object_
 
-A container handle obtained from lab.container(name): lifecycle, snapshots, exec, file copy, logs, health, interactive terminal and stats — the VM API minus display/input.
+lab.container(name) returns the same Machine handle a VM does — this page is the container-flavoured tour of it, plus the one capability containers do not report.
 
-A `Container` handle is returned by `lab.container(name)` (or `lab.containers()`).
-It mirrors the `Vm` handle's lifecycle, snapshot and guest-agent surface; there
-are no input or screen methods (containers have no display).
+`lab.container(name)` (or `lab.containers()`) returns a [Machine](../references/entity_vm_api.md)
+— the same handle `lab.vm(name)` returns, with the same methods. The kind check
+is there so naming a VM gives you "that's a vm" rather than "no such machine".
+
+The screen and input methods exist on it like everything else. Calling one on a
+container fails at call time with \*"machine `web` has no display"\*: no container
+reports a display today, but that is a fact about the machine, not a rule about
+the kind — a container running a display server would report one, and the same
+script would then work unchanged.
 
 
 | Method | Meaning |
@@ -23,7 +29,7 @@ are no input or screen methods (containers have no display).
 | `copy_to(local, path)` / `copy_from(path, local)` | File copy in/out of the container filesystem |
 | `logs(lines)` | Tail of the container's stdout/stderr (the serial console log) |
 | `terminal()` | Interactive send/expect shell inside the container's PID namespace (the workload is PID 1) — a [Term](../references/fact_vm_agent.md) handle |
-| `stats()` | Live `GuestStats` (cpu/mem/disks), as on [Vm](../references/fact_vm_agent.md) |
+| `stats()` | Live `GuestStats` (cpu/mem/disks) — see [Guest agent](../references/fact_vm_agent.md) |
 
 ```wscript
 use vmlab
@@ -42,12 +48,12 @@ fn main(lab: Lab) {
 
 - [Lab](../references/entity_lab_api.md)
 
-- [Vm](../references/entity_vm_api.md)
+- [Machine](../references/entity_vm_api.md)
 
 - [container {} block](../references/entity_container_block.md)
 
 - [ExecResult](../references/entity_exec_result_type.md)
 
-- [Vm: guest agent methods (exec, files, terminal, stats)](../references/fact_vm_agent.md)
+- [Machine: guest agent methods (exec, files, terminal, stats)](../references/fact_vm_agent.md)
 
 [← Back to SKILL.md](../SKILL.md)

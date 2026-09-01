@@ -206,7 +206,7 @@ sinkhole { pattern = "*.telemetry.com" mode = "nxdomain" }   // or mode = "zero"
 | `extra_disks` | `disk` | yes | Additional disks beyond the primary disk |
 | `shares` | `share` | yes | SMB shared folders (require ≥1 NIC) |
 | `media` | `media` | yes | ISO/floppy images built from a folder |
-| `web` | `web` | yes | HTTP UIs served in the guest, proxied into the web console (require ≥1 NIC) |
+| `logins` | `login` | yes | Identities a surface attaches to this VM as; without one every verb keeps the agent identity |
 | `provisions` | `provision` | yes | wscript provision scripts run on `vmlab up` once this VM is ready, interleaved with its playbooks in declaration order |
 | `playbooks` | `playbook` | yes | config-weave playbooks applied to this VM on `vmlab up`, interleaved with its provisions in declaration order |
 
@@ -292,9 +292,15 @@ share { host = "./old"  guest = "X:" smb1 = true }   // legacy dialect for XP/20
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `kind` | `utf8` | yes | Image kind: `iso` \| `floppy` (required) |
-| `from` | `utf8` | yes | Source folder built into the image; must exist (required) |
-| `label` | `utf8` | no | Volume label for the image |
+| `query` | `utf8` | yes |  |
+| `sites` | `list<symbol>` | no |  |
+
+#### Child blocks
+
+| Slot | Accepts | Multiple | Description |
+| --- | --- | --- | --- |
+| `classes` | `class` | yes |  |
+| `bases` | `base` | yes |  |
 
 Example:
 
@@ -303,51 +309,31 @@ media { kind = "iso"    from = "./unattend/" label = "CIDATA" }
 media { kind = "floppy" from = "./drivers/"  label = "DRV" }
 ```
 
-#### `web` (in `vm`)
+#### `login` (in `vm`)
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `name` | `utf8` | yes | Page name (DNS label); unique per machine; the inline block label |
-| `port` | `i64` | yes | Guest TCP port serving the HTTP UI (1–65535) (required) |
-| `path` | `utf8` | no | Initial path opened in the console (default `/`) |
-
-#### Child blocks
-
-| Slot | Accepts | Multiple | Description |
-| --- | --- | --- | --- |
-| `auth` | `auth` | no | Credentials the proxy injects so the guest app's own login never prompts |
+| `label` | `utf8` | yes | Identity label — what an SSH username selects it by, e.g. `dev`; unique per machine; the inline block label |
+| `user` | `utf8` | yes | Guest account to log on as, e.g. `PROBE\dev` (required) |
+| `password` | `utf8` | no | The account's password, plainly; required on a Windows-family profile |
+| `elevated` | `bool` | no | Run the session elevated (default true); Windows-only — declaring it on a Linux-family profile is an error |
+| `default` | `bool` | no | Make this the machine's default identity; implied when the machine declares exactly one login |
 
 Example:
 
 ```wcl
-web "admin" { port = 8080  path = "/manage" }   // proxied into the web console
-```
-
-##### `auth` (in `web`)
-
-| Property | Type | Required | Description |
-| --- | --- | --- | --- |
-| `method` | `WebAuthMethod` | yes | Method: `:basic` \| `:bearer` \| `:header` \| `:ntlm` (IIS/AD integrated) \| `:form` (cookie capture) (required) |
-| `username` | `utf8` | no | Username — `:basic`, `:ntlm`, `:form` |
-| `password` | `utf8` | no | Password — `:basic`, `:ntlm`, `:form` |
-| `domain` | `utf8` | no | NTLM domain, e.g. `CORP` — `:ntlm` (optional) |
-| `token` | `utf8` | no | Static bearer token — `:bearer` |
-| `header` | `utf8` | no | Header name, e.g. `X-Api-Key` — `:header` |
-| `value` | `utf8` | no | Header value — `:header` |
-| `login_path` | `utf8` | no | Login request path, e.g. `/login` — `:form` (required) |
-| `login_method` | `utf8` | no | Login HTTP method: `POST` (default) \| `GET` — `:form` |
-| `login_body` | `utf8` | no | Login body template; `{user}`/`{pass}` are substituted and escaped — `:form` (required) |
-| `login_content_type` | `utf8` | no | Login body content type: `application/x-www-form-urlencoded` (default) \| `application/json` — `:form` |
-| `fail_redirect` | `utf8` | no | Redirect-Location substring that means 'not logged in' (401/403 always retrigger) — `:form` |
-
-Example:
-
-```wcl
-auth { method = :basic  username = "admin" password = "s3cret" }
-auth { method = :bearer token = "eyJ…" }
-auth { method = :ntlm   username = "Administrator" password = "…" domain = "CORP" }
-auth { method = :form   username = "admin" password = "…"
-       login_path = "/login" login_body = "user={user}&pass={pass}" }
+// Machine-level identity (PRD §19.2). The label is what an SSH username
+// selects; the secret is written plainly, because the lab's own provisioning
+// created the account and already carries the same string.
+// On a Windows-family profile every login needs a `password`. `elevated`
+// (default true) selects the linked token, so one account can be declared
+// twice at two elevations — the labels are what tell them apart, and they
+// must be unique on a machine.
+login "dev"      { user = "PROBE\\dev" password = "vmlab123!" default = true }
+login "dev-user" { user = "PROBE\\dev" password = "vmlab123!" elevated = false }
+// On a Linux-family profile `elevated` is a validation error, and the secret
+// is only needed where something authenticates against it.
+login "ops" { user = "ops" }
 ```
 
 #### `provision` (in `vm`)
@@ -456,8 +442,9 @@ Example:
 container "web" {
   image      = "nginx:1.27"              // docker.io shorthand; @sha256:… pins
   mode       = :workload                  // :workload (default) | :idle
+  profile    = "container"               // micro-VM hardware floor (§5.3)
+  memory     = 512MiB                    // overrides the profile; cpus likewise
   depends_on = ["db"]                    // VM or container names — one namespace
-  restart    = "on-failure"              // "no" (default) | "on-failure" | "always"
   nic    { segment = "corp" ip = "10.50.0.20" }
   env    { name = "MODE" value = "prod" }
   volume { name = "data" target = "/var/lib/data" }
@@ -550,51 +537,31 @@ healthcheck {
 }
 ```
 
-#### `web` (in `container`)
+#### `login` (in `container`)
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `name` | `utf8` | yes | Page name (DNS label); unique per machine; the inline block label |
-| `port` | `i64` | yes | Guest TCP port serving the HTTP UI (1–65535) (required) |
-| `path` | `utf8` | no | Initial path opened in the console (default `/`) |
-
-#### Child blocks
-
-| Slot | Accepts | Multiple | Description |
-| --- | --- | --- | --- |
-| `auth` | `auth` | no | Credentials the proxy injects so the guest app's own login never prompts |
+| `label` | `utf8` | yes | Identity label — what an SSH username selects it by, e.g. `dev`; unique per machine; the inline block label |
+| `user` | `utf8` | yes | Guest account to log on as, e.g. `PROBE\dev` (required) |
+| `password` | `utf8` | no | The account's password, plainly; required on a Windows-family profile |
+| `elevated` | `bool` | no | Run the session elevated (default true); Windows-only — declaring it on a Linux-family profile is an error |
+| `default` | `bool` | no | Make this the machine's default identity; implied when the machine declares exactly one login |
 
 Example:
 
 ```wcl
-web "admin" { port = 8080  path = "/manage" }   // proxied into the web console
-```
-
-##### `auth` (in `web`)
-
-| Property | Type | Required | Description |
-| --- | --- | --- | --- |
-| `method` | `WebAuthMethod` | yes | Method: `:basic` \| `:bearer` \| `:header` \| `:ntlm` (IIS/AD integrated) \| `:form` (cookie capture) (required) |
-| `username` | `utf8` | no | Username — `:basic`, `:ntlm`, `:form` |
-| `password` | `utf8` | no | Password — `:basic`, `:ntlm`, `:form` |
-| `domain` | `utf8` | no | NTLM domain, e.g. `CORP` — `:ntlm` (optional) |
-| `token` | `utf8` | no | Static bearer token — `:bearer` |
-| `header` | `utf8` | no | Header name, e.g. `X-Api-Key` — `:header` |
-| `value` | `utf8` | no | Header value — `:header` |
-| `login_path` | `utf8` | no | Login request path, e.g. `/login` — `:form` (required) |
-| `login_method` | `utf8` | no | Login HTTP method: `POST` (default) \| `GET` — `:form` |
-| `login_body` | `utf8` | no | Login body template; `{user}`/`{pass}` are substituted and escaped — `:form` (required) |
-| `login_content_type` | `utf8` | no | Login body content type: `application/x-www-form-urlencoded` (default) \| `application/json` — `:form` |
-| `fail_redirect` | `utf8` | no | Redirect-Location substring that means 'not logged in' (401/403 always retrigger) — `:form` |
-
-Example:
-
-```wcl
-auth { method = :basic  username = "admin" password = "s3cret" }
-auth { method = :bearer token = "eyJ…" }
-auth { method = :ntlm   username = "Administrator" password = "…" domain = "CORP" }
-auth { method = :form   username = "admin" password = "…"
-       login_path = "/login" login_body = "user={user}&pass={pass}" }
+// Machine-level identity (PRD §19.2). The label is what an SSH username
+// selects; the secret is written plainly, because the lab's own provisioning
+// created the account and already carries the same string.
+// On a Windows-family profile every login needs a `password`. `elevated`
+// (default true) selects the linked token, so one account can be declared
+// twice at two elevations — the labels are what tell them apart, and they
+// must be unique on a machine.
+login "dev"      { user = "PROBE\\dev" password = "vmlab123!" default = true }
+login "dev-user" { user = "PROBE\\dev" password = "vmlab123!" elevated = false }
+// On a Linux-family profile `elevated` is a validation error, and the secret
+// is only needed where something authenticates against it.
+login "ops" { user = "ops" }
 ```
 
 #### `provision` (in `container`)
@@ -774,9 +741,15 @@ ISO/floppy image built from a folder.
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `kind` | `utf8` | yes | Image kind: `iso` \| `floppy` (required) |
-| `from` | `utf8` | yes | Source folder built into the image; must exist (required) |
-| `label` | `utf8` | no | Volume label for the image |
+| `query` | `utf8` | yes |  |
+| `sites` | `list<symbol>` | no |  |
+
+#### Child blocks
+
+| Slot | Accepts | Multiple | Description |
+| --- | --- | --- | --- |
+| `classes` | `class` | yes |  |
+| `bases` | `base` | yes |  |
 
 Example:
 
@@ -898,6 +871,8 @@ disk "formatted" { from = "./payload/" }  // folder copied onto a fresh FAT file
 | `fastpath` | `utf8` | no | Network fast path: `auto` (probe; default), `off`, `sockmap`, or `afxdp` |
 | `oci_chunk_size` | `std.ByteSize` | no | OCI layer chunk size for template push; default `512MiB` |
 | `config_weave_bin_dir` | `utf8` | no | Directory holding config-weave guest binaries; default `~/.local/share/config-weave/bin` |
+| `ssh_config` | `utf8` | no | File vmlab writes its managed SSH block into; default `~/.ssh/config` |
+| `workspace_max_file` | `std.ByteSize` | no | Workspace syncer per-file size guard; a larger file is refused by name; default `256MiB` |
 
 Example:
 

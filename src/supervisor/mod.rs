@@ -478,7 +478,7 @@ impl Handler<SupRequest> for SupervisorHandler {
                 sup.release_lab(&name).await?;
                 Ok(json!(true))
             }
-            // Restart a lab daemon so it re-reads its config (web "reload").
+            // Restart a lab daemon so it re-reads its config.
             SupRequest::LabRestart { name, root } => {
                 let sock = sup.restart_lab(&name, root).await?;
                 Ok(json!({"socket": sock}))
@@ -493,18 +493,12 @@ impl Handler<SupRequest> for SupervisorHandler {
                 Ok(json!(true))
             }
             SupRequest::GlobalList {} => Ok(json!(sup.globals.list().await)),
-            // Template operations for the web Templates page (PRD §6). All
+            // Template operations on a lab's declarations (PRD §6). All
             // take `lab` + `root` like `lab.ensure`, so the supervisor works
             // for labs it never started.
             SupRequest::TemplateList { lab, root, file } => {
                 templates::list(lab, root, file, sup.template_ops.clone()).await
             }
-            SupRequest::TemplateRemote {
-                lab: _,
-                root,
-                template,
-                arch,
-            } => templates::remote(root, template, arch).await,
             SupRequest::TemplateBuild {
                 lab,
                 root,
@@ -520,22 +514,6 @@ impl Handler<SupRequest> for SupervisorHandler {
                 arch,
                 template,
             } => templates::stop_build(sup.clone(), lab, arch, template),
-            SupRequest::TemplatePush {
-                lab,
-                root,
-                template,
-                arch,
-                version,
-            } => templates::start_push(sup.clone(), lab, root, template, arch, version).await,
-            SupRequest::TemplateOpStatus { lab } => Ok(sup.template_ops.status(&lab)),
-            SupRequest::TemplateConsolePath {
-                lab,
-                arch,
-                template,
-            } => {
-                let path = sup.template_ops.console_path(&lab, &arch, &template)?;
-                Ok(json!(path.to_string_lossy()))
-            }
             // The template store and its registries (PRD §3, §6): the
             // supervisor is the only thing that opens either.
             SupRequest::StoreList { remote } => store::list(remote).await,

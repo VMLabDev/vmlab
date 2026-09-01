@@ -298,14 +298,14 @@ mod tests {
                     host_path: PathBuf::from("/home/u/proj/src"),
                     readonly: false,
                     smb1,
-                    allowed_user: "vmlab-web".to_string(),
+                    allowed_user: "labuser".to_string(),
                 },
                 ShareDef {
                     name: "data".to_string(),
                     host_path: PathBuf::from("/home/u/datasets"),
                     readonly: true,
                     smb1,
-                    allowed_user: "vmlab-web".to_string(),
+                    allowed_user: "labuser".to_string(),
                 },
             ],
         }
@@ -338,7 +338,7 @@ mod tests {
         assert!(conf.contains("read only = no")); // src
         assert!(conf.contains("read only = yes")); // data
         // scoping
-        assert!(conf.contains("valid users = vmlab-web"));
+        assert!(conf.contains("valid users = labuser"));
         assert!(conf.contains("guest ok = no"));
     }
 

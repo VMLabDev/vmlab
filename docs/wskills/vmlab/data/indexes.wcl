@@ -95,23 +95,13 @@ index ix_automation {
   }
 }
 
-index ix_web {
-  name     = "The web console"
-  summary  = "Manage labs from the browser: the vmlab-web server, the console UI, its API, and proxied guest web pages."
-  related  = [web_console, vmlab_web, serve_web_console, web_api, web_block]
-  audience = :both
-  body {
-    p "Everything around `vmlab-web`: the console tour, launching and securing the server, the REST + WebSocket API, and `web {}` blocks that proxy guest HTTP UIs into the console."
-  }
-}
-
 index ix_operations {
   name     = "Operations & hosting"
-  summary  = "Run vmlab anywhere: the everyday lifecycle, host config, profiles, containers, WSL2, and the network fast path."
-  related  = [golden_path, host_config, profiles, profiles_table, containers, run_in_container, wsl2, fastpath, validate_checks]
+  summary  = "Run vmlab anywhere: the everyday lifecycle, host config, profiles, WSL2, and the network fast path."
+  related  = [golden_path, host_config, profiles, profiles_table, wsl2, fastpath, validate_checks]
   audience = :both
   body {
-    p "Running labs day to day — the full lifecycle runbook — plus host-side concerns: the optional host config, guest OS profiles, hosting vmlab itself in a container or on WSL2, eBPF acceleration, and what `vmlab validate` checks."
+    p "Running labs day to day — the full lifecycle runbook — plus host-side concerns: the optional host config, guest OS profiles, running on WSL2, eBPF acceleration, and what `vmlab validate` checks."
   }
 }
 

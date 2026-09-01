@@ -18,6 +18,6 @@ See [the lifecycle events](../references/fact_events.md) for the `name` values a
 
 - [Lifecycle events](../references/fact_events.md)
 
-- [Vm](../references/entity_vm_api.md)
+- [Machine](../references/entity_vm_api.md)
 
 [← Back to SKILL.md](../SKILL.md)

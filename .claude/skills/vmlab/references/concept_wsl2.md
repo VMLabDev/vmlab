@@ -12,8 +12,8 @@ grows as `.vmlab/` clones grow, so the `host.disk_low` watchdog matters more her
 
 ## Related
 
-- [Running vmlab in a container](../references/concept_containers.md)
-
 - [Networking model](../references/concept_networking.md)
+
+- [Network fast path (eBPF)](../references/concept_fastpath.md)
 
 [← Back to SKILL.md](../SKILL.md)
