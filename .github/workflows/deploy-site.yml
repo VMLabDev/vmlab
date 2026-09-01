@@ -19,7 +19,7 @@ env:
   CARGO_TERM_COLOR: always
   # Pin the wcl CLI to the same rev vmlab uses for wcl_lang in Cargo.toml, so
   # the site renders with the wdoc version it was authored against.
-  WCL_REV: ecf0390703ef56436fe3074ca098fe6865495a4d
+  WCL_REV: e7d95a4c8191a28d53ffd8f63f67a2777aed1819
 
 jobs:
   deploy:

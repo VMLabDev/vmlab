@@ -31,7 +31,7 @@ default = ["ebpf"]
 ebpf = ["dep:aya", "dep:vmlab-tap", "dep:command-fds"]
 
 [dependencies]
-wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "e9636a2ac10a4f5b1a69c13a2212e35cb5a64e62" }
+wcl_lang = { git = "https://github.com/wiltaylor/wcl.git", rev = "e7d95a4c8191a28d53ffd8f63f67a2777aed1819" }
 wscript = { git = "https://github.com/Configweave/wscript.git", rev = "c631c6b724ebcc38a9ae53235b20bf10ba64dc51" }
 # Host <-> micro-VM init contract (container.json + the ctl channel) for OCI
 # containers in labs. Shared with the guest init (guest/cinit); plain serde,
