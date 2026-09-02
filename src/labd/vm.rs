@@ -21,6 +21,14 @@ use super::hypervisor::{Control, Hypervisor, Process};
 /// provision through a Windows specialize/OOBE pass and a settle reboot.
 pub const VM_READY_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long a stop waits for the power state to reach `Stopped` after QEMU has
+/// already exited. Nothing is being asked of the guest here — the wait is on
+/// vmlab's own exit monitor, which tears the machine's shares, network and
+/// smbd down before it publishes the state. Ten seconds was enough on an idle
+/// host and not on a busy one, where a template build would seal its image and
+/// then fail on `still Stopping after 10s`.
+const STOP_SETTLE: Duration = Duration::from_secs(120);
+
 /// What to tell a user whose guest has no answering vmlab-agent.
 const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the template likely predates \
      agent support) — rebuild it with `vmlab template build`";
@@ -707,7 +715,7 @@ impl VmInstance {
         if force {
             proc.kill().await;
             let _ = proc.wait_exit(Duration::from_secs(10)).await;
-            return self.settle_stopped(Duration::from_secs(10)).await;
+            return self.settle_stopped(STOP_SETTLE).await;
         }
 
         // Rung 1: guest agent shutdown. The state is already Stopping so
@@ -737,7 +745,7 @@ impl VmInstance {
                     .is_ok()
                 && proc.wait_exit(Duration::from_secs(30)).await.is_ok()
             {
-                return self.settle_stopped(Duration::from_secs(10)).await;
+                return self.settle_stopped(STOP_SETTLE).await;
             }
         }
 
@@ -747,7 +755,7 @@ impl VmInstance {
         if let Some(control) = self.control.lock().await.clone() {
             let _ = control.powerdown().await;
             if proc.wait_exit(Duration::from_secs(30)).await.is_ok() {
-                return self.settle_stopped(Duration::from_secs(10)).await;
+                return self.settle_stopped(STOP_SETTLE).await;
             }
         }
 
@@ -755,7 +763,7 @@ impl VmInstance {
         tracing::warn!("{}: graceful stop timed out, killing", self.cfg.name);
         proc.kill().await;
         let _ = proc.wait_exit(Duration::from_secs(10)).await;
-        self.settle_stopped(Duration::from_secs(10)).await
+        self.settle_stopped(STOP_SETTLE).await
     }
 
     /// Wait for the exit monitor to settle the power state — the interface's
