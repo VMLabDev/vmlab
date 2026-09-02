@@ -217,7 +217,9 @@ Profiles bundle known-good hardware defaults. Starter set (final list and exact 
 |---|---|---|---|---|
 | `windows-11` | q35 | OVMF + secure boot | swtpm 2.0 | virtio disk/net (with driver media support during template build), QXL or virtio-gpu, virtio-serial agent channel |
 | `windows-server` | q35 | OVMF | swtpm 2.0 | as above |
-| `windows-legacy` | i440fx or q35 | SeaBIOS | none | IDE/SATA disk, e1000 NIC, std VGA — for XP/7/2008-era guests with no virtio drivers |
+| `windows-legacy` | i440fx or q35 | SeaBIOS | none | IDE/SATA disk, e1000 NIC, std VGA — for Vista/7/2008-era guests with no virtio storage/net drivers at install time; virtio-serial agent channel (virtio-win covers this era) |
+| `windows-xp` | i440fx | SeaBIOS | none | as `windows-legacy`, but `agent_transport = "isa-serial"`: NT4 through XP/2003 have no virtio drivers at all, so the legacy agent (§7.4) speaks over a 16550 on COM1 |
+| `windows-9x` | i440fx | SeaBIOS | none | IDE disk, PCnet NIC, Cirrus VGA, VNC input, `isa-serial` agent channel — DOS, Windows 3.x through ME |
 | `linux-modern` | q35 | OVMF | none | virtio everything |
 | `linux-generic` | q35 | SeaBIOS | none | virtio disk/net, conservative elsewhere — older or unusual distros |
 | `custom` | nothing assumed | — | — | user supplies everything via VM/template attributes and `qemu_args` |
@@ -301,6 +303,8 @@ Snapshots use **qcow2-internal snapshots wherever the mechanism supports the cas
 
 The vmlab guest agent (`vmlab-agent`, one multiplexed virtio-serial channel — `vmlab.agent.0`) is the channel for: readiness detection, interactive terminals, streaming command execution with captured stdout/stderr/exit code, digest-verified file transfer in both directions, log tailing, metrics, clipboard, structured OS info, per-NIC IP address reporting, and graceful shutdown/reboot. Template builds stage the agent binaries plus an install script on an auto-attached **VMLAB bootstrap ISO**; the template's unattended-install hook (cloud-init runcmd, installer late-commands, autounattend first-logon) runs the script, and the build verifies the agent's handshake before sealing. A VM without an agent still works for screen-driven automation but never reports **ready** — provision scripts targeting it must rely on screen/time waits.
 
+**The legacy tier.** A profile names the agent channel's device with `agent_transport`: `"virtio-serial"` (the default, above), `"isa-serial"`, or `"none"` (no agent is possible; the guest is screen-driven and never reports ready). With `isa-serial` the same host socket is wired to a 16550 UART on COM1, the serial console log moves to COM2, and the guest runs **`vmlab-agent-legacy`** (`guest/agent-legacy`): the same wire protocol, in C89 because Rust has no supported target for NT4 through XP/2003, Windows 9x/ME or DOS. It advertises one feature, `exec`, and refuses every other open by name on the channel that asked, so the §19.4 ladder degrades truthfully — readiness, `vmlab exec`, `os_info` and the stop ladder work; a terminal, `vmlab cp`, `dev attach` and `repair-agent` say what is missing. A `logon` on an exec is refused: nothing in that tier mints one. Two limits are deliberate: QEMU times UART transmit to the baud rate (about 11 KB/s at 115200), which is why no file transfer is offered; and DOS runs one program at a time, so on DOS the agent is the foreground program, output arrives after the command exits, stdin is acknowledged and discarded, and the agent answers nothing else while a command runs. The bootstrap ISO carries the three legacy builds (`legacy/nt`, `legacy/9x`, `legacy/dos`, 8.3-safe because DOS reads no Joliet) with an install script each; `install.cmd` defers to the NT one on a 4.x/5.x kernel. A Linux guest too old for virtio-serial needs no C agent: `vmlab-agent` takes COM1 itself when the VM has no virtio-serial controller, with its full feature set at serial speed.
+
 §19 adds three capabilities to the agent, advertised as feature strings —
 `tunnel`, `fileops` and `watch` (§19.4) — and **retires the whole-file,
 path-addressed transfer** above onto `fileops`, keeping its guest-computed
@@ -354,7 +358,7 @@ SMB is affected.
 
 The PRD permits shipping 2 first and replacing with 1 later — including a hybrid where the embedded server handles SMB2 shares and `smb1` shares route to smbd; the user surface must not change between strategies.
 
-**XP-era caveat, stated honestly:** the vmlab guest agent does not target XP/2003-era guests (no virtio-serial drivers, ancient toolchains), so vmlab's automatic agent-driven mounting won't apply. For those guests the mount is performed by the provision script through the screen-automation surface (§10.3 keystrokes — `net use X: \\<gateway>\<share> /user:...`), which is exactly the kind of guest those APIs exist for. The docs should include this as a worked example.
+**XP-era caveat, stated honestly:** XP/2003-era guests carry the legacy agent over COM1 (§7.4), which serves `exec` and nothing else, so vmlab's agent-driven mounting applies to them through an exec'd `net use X: \\<gateway>\<share> /user:...` rather than through the file session a modern guest gets; the mount step is the same one the provision script would type. DOS guests have no SMB client worth automating, and stay screen-driven for whatever their template does with the network. The docs should include the XP mount as a worked example.
 
 **Constraints, stated plainly:**
 

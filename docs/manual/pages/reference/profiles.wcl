@@ -62,7 +62,7 @@ profile "<name>" {
   display         = "virtio-vga"
   cpus            = 2
   memory          = 4GiB
-  agent_channel   = true
+  agent_transport = "virtio-serial"
   input_transport = "qmp"
   virtiofs        = false
   workspace_guest = "/src"
@@ -83,7 +83,8 @@ SRC
       | "`display`" | "utf8" | "QEMU default" | "Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`." |
       | "`cpus`" | "i64" | "unset" | "Default vCPU count, at least 1." |
       | "`memory`" | "ByteSize" | "unset" | "Default RAM, for example `4GiB`." |
-      | "`agent_channel`" | "bool" | "`true`" | "Attach the virtio-serial guest agent channel." |
+      | "`agent_transport`" | "utf8" | "`virtio-serial`" | "The guest agent channel's device: `virtio-serial`, `isa-serial` (a 16550 on COM1 for the legacy agent; the serial log moves to COM2), or `none` (no agent; never ready by handshake)." |
+      | "`agent_channel`" | "bool" | "unset" | "Superseded by `agent_transport`; still accepted: `true` reads as `virtio-serial`, `false` as `none`, and `agent_transport` wins when both are present." |
       | "`input_transport`" | "utf8" | "`qmp`" | "How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path." |
       | "`virtiofs`" | "bool" | "`false`" | "The guest mounts virtiofs natively, so `transport = \"auto\"` shares use it instead of SMB." |
       | "`workspace_guest`" | "utf8" | "unset" | "Guest path an `@dev` workspace lands at when the decorator names none." |

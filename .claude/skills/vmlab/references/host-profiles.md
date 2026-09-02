@@ -194,7 +194,7 @@ in the config.
 | `firmware`, `secure_boot`, `tpm` | OVMF or SeaBIOS, secure boot under OVMF, and an swtpm 2.0 device. |
 | `disk_bus`, `nic_model`, `display` | The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std` or `cirrus-vga`. |
 | `cpus`, `memory` | The hardware floor a VM or container inherits when neither its block nor its template says. |
-| `agent_channel` | Whether the VM gets the virtio-serial channel the guest agent talks over. Default true. |
+| `agent_transport` | The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias. |
 | `input_transport` | How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc` (see snapshots-vision.md). |
 | `virtiofs` | Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = "auto"` shares (see shares-media.md). |
 | `workspace_guest` | The guest path an `@dev` workspace lands at when the decorator names none (see dev-machines.md). |
@@ -286,7 +286,7 @@ profile "<name>" {
   display         = "virtio-vga"
   cpus            = 2
   memory          = 4GiB
-  agent_channel   = true
+  agent_transport = "virtio-serial"
   input_transport = "qmp"
   virtiofs        = false
   workspace_guest = "/src"
@@ -306,7 +306,8 @@ profile "<name>" {
 | `display` | utf8 | QEMU default | Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`. |
 | `cpus` | i64 | unset | Default vCPU count, at least 1. |
 | `memory` | ByteSize | unset | Default RAM, for example `4GiB`. |
-| `agent_channel` | bool | `true` | Attach the virtio-serial guest agent channel. |
+| `agent_transport` | utf8 | `virtio-serial` | The guest agent channel's device: `virtio-serial`, `isa-serial` (a 16550 on COM1 for the legacy agent; the serial log moves to COM2), or `none` (no agent; never ready by handshake). |
+| `agent_channel` | bool | unset | Superseded by `agent_transport`; still accepted: `true` reads as `virtio-serial`, `false` as `none`, and `agent_transport` wins when both are present. |
 | `input_transport` | utf8 | `qmp` | How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path. |
 | `virtiofs` | bool | `false` | The guest mounts virtiofs natively, so `transport = "auto"` shares use it instead of SMB. |
 | `workspace_guest` | utf8 | unset | Guest path an `@dev` workspace lands at when the decorator names none. |
@@ -324,8 +325,9 @@ still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` mach
 | `windows-11` | q35 | ovmf | true | true | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
 | `windows-10` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
 | `windows-server` | q35 | ovmf | false | true | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
-| `windows-legacy` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | XP, 7 and 2008-era guests with no virtio drivers. |
-| `windows-9x` | pc | seabios | false | false | ide | pcnet | cirrus-vga | 1 | 256MiB | `input_transport = "vnc"`. DOS, Windows 3.x to ME and 2000-era guests. |
+| `windows-legacy` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | Vista, 7 and 2008-era guests; virtio-serial agent (virtio-win covers this era). |
+| `windows-xp` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | `agent_transport = "isa-serial"`: NT4 through XP/2003, the legacy agent on COM1. |
+| `windows-9x` | pc | seabios | false | false | ide | pcnet | cirrus-vga | 1 | 256MiB | `input_transport = "vnc"`, `agent_transport = "isa-serial"`. DOS, Windows 3.x to ME. |
 | `linux-modern` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 2 | 4GiB | `virtiofs = true`. |
 | `linux-generic` | q35 | seabios | false | false | virtio | virtio-net-pci | std | 2 | 2GiB | Older or unusual distros. |
 | `container` | | | | | | | | 1 | 256MiB | Micro-VM size for an OCI container; nothing else applies to a container. |
@@ -404,7 +406,7 @@ profile "windows-server" {
 }
 
 profile "windows-legacy" {
-  description = "XP/7/2008-era guests with no virtio drivers: i440fx, SeaBIOS, IDE disk, e1000 NIC, std VGA"
+  description = "Vista/7/2008-era guests with no virtio storage/net drivers at install time: i440fx, SeaBIOS, IDE disk, e1000 NIC, std VGA; virtio-serial agent channel (virtio-win covers this era)"
   machine     = "pc"
   firmware    = "seabios"
   secure_boot = false
@@ -414,6 +416,21 @@ profile "windows-legacy" {
   display     = "std"
   cpus        = 2
   memory      = 2GiB
+  workspace_guest = "C:\\src"
+}
+
+profile "windows-xp" {
+  description = "NT4 through XP/2003: i440fx, SeaBIOS, IDE disk, e1000 NIC, std VGA; no virtio drivers at all, so the agent channel is a 16550 on COM1 (the legacy agent)"
+  machine     = "pc"
+  firmware    = "seabios"
+  secure_boot = false
+  tpm         = false
+  disk_bus    = "ide"
+  nic_model   = "e1000"
+  display     = "std"
+  cpus        = 2
+  memory      = 2GiB
+  agent_transport = "isa-serial"
   workspace_guest = "C:\\src"
 }
 

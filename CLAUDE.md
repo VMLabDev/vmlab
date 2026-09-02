@@ -110,6 +110,13 @@ confirm it named. `dev attach` and `ssh-config --print` print the two things an
 offline guest looks like it has taken away and has not: personal config copies
 over the alias with `scp`, and a host-side service is reached by a NIC on a
 segment with egress rather than by the `ssh -R` §19.3 refuses.
+**The legacy agent tier is built** (#125–#131): `agent_transport` on the
+profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
+`guest/agent-legacy` serving `exec` only over COM1, the bootstrap ISO's
+`legacy/` builds and install scripts, and the Rust agent's own serial fallback
+for old Linux. Verified live on FreeDOS; the NT build is verified under Wine,
+and the 9x build awaits a guest (#128).
+
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
@@ -147,6 +154,14 @@ Module map under `src/`:
 - `guest_asset.rs` + `guest/` — the container micro-VM kernel/initramfs:
   `vmlab-cinit` (guest PID 1), `cinit-proto` (host↔init contract, shared
   crate), `build-asset.sh` (pinned Alpine, rootless build).
+- `guest/agent-legacy` + `guest/build-agent-legacy.sh` — `vmlab-agent-legacy`,
+  the C89 agent for guests with no virtio-serial (§7.4's legacy tier: NT4
+  through XP/2003, Windows 9x/ME, DOS), speaking the same protocol over a
+  16550 on COM1 (`agent_transport = "isa-serial"`) and advertising `exec`
+  only; one polling loop (`agent.c`) behind three adapters (`plat_win32.c`,
+  `plat_dos.c`, `plat_posix.c`). Conformance runs the POSIX build through
+  the daemon's own client in `src/labd/legacy_agent_tests.rs`. Staged on
+  the bootstrap ISO under `legacy/` with an install script each.
 - `agent_asset.rs` + `guest/agent`, `guest/agent-proto` — `vmlab-agent`, the
   in-guest agent on the `vmlab.agent.0` virtio-serial port: interactive
   terminals (PTY/ConPTY), streaming exec, tail, metrics, clipboard, the

@@ -28,7 +28,7 @@ DOC
       | "`firmware`, `secure_boot`, `tpm`" | "OVMF or SeaBIOS, secure boot under OVMF, and an swtpm 2.0 device." |
       | "`disk_bus`, `nic_model`, `display`" | "The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std` or `cirrus-vga`." |
       | "`cpus`, `memory`" | "The hardware floor a VM or container inherits when neither its block nor its template says." |
-      | "`agent_channel`" | "Whether the VM gets the virtio-serial channel the guest agent talks over. Default true." |
+      | "`agent_transport`" | "The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias." |
       | "`input_transport`" | "How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc`. See [Screens, input and vision](guide_vision)." |
       | "`virtiofs`" | "Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = \"auto\"` shares. See [Shared folders](guide_shares)." |
       | "`workspace_guest`" | "The guest path an `@dev` workspace lands at when the decorator names none. See [Dev machines and the workspace syncer](guide_dev)." |
@@ -51,8 +51,9 @@ DOC
       | "`windows-11`" | "q35" | "OVMF, secure boot" | "yes" | "virtio disk and NIC, virtio-vga" | "`C:\\src`" |
       | "`windows-10`" | "q35" | "OVMF" | "no" | "virtio disk and NIC, virtio-vga" | "`C:\\src`" |
       | "`windows-server`" | "q35" | "OVMF" | "yes" | "virtio disk and NIC, virtio-vga" | "`C:\\src`" |
-      | "`windows-legacy`" | "pc" | "SeaBIOS" | "no" | "IDE disk, e1000 NIC, std VGA, for XP/7/2008-era guests with no virtio drivers" | "`C:\\src`" |
-      | "`windows-9x`" | "pc" | "SeaBIOS" | "no" | "IDE disk, PCnet NIC, Cirrus VGA, VNC input, 1 CPU and 256 MiB" | "`C:\\src`" |
+      | "`windows-legacy`" | "pc" | "SeaBIOS" | "no" | "IDE disk, e1000 NIC, std VGA, for Vista/7/2008-era guests; virtio-serial agent" | "`C:\\src`" |
+      | "`windows-xp`" | "pc" | "SeaBIOS" | "no" | "as `windows-legacy`, with the agent on COM1 (`isa-serial`): NT4 through XP/2003" | "`C:\\src`" |
+      | "`windows-9x`" | "pc" | "SeaBIOS" | "no" | "IDE disk, PCnet NIC, Cirrus VGA, VNC input, agent on COM1, 1 CPU and 256 MiB" | "`C:\\src`" |
       | "`linux-modern`" | "q35" | "OVMF" | "no" | "virtio everything, native virtiofs" | "`/src`" |
       | "`linux-generic`" | "q35" | "SeaBIOS" | "no" | "virtio disk and NIC, std VGA, conservative elsewhere" | "`/src`" |
       | "`container`" | "" | "" | "" | "size only: 1 CPU and 256 MiB, the micro-VM floor" | "`/src`" |
@@ -68,6 +69,19 @@ display to choose; it is deliberately an order of magnitude below the VM
 floor, and a container raises it with its own `memory`. `custom` sets nothing
 at all, so QEMU's defaults apply to whatever the VM and template leave unset.
 The shipped file is `src/profiles/shipped.wcl` in the repository.
+DOC
+
+  p <<'DOC'
+`windows-xp` and `windows-9x` name `agent_transport = "isa-serial"`: their
+guests have no virtio drivers, so the agent channel is a 16550 on COM1 and
+the guest runs the legacy agent, a small C program that speaks the same
+protocol and serves `exec` only. `vmlab exec`, readiness and the stop ladder
+work on such a guest; a terminal, `vmlab cp` and `vmlab dev attach` refuse by
+name. On DOS the agent is the foreground program, and a command's output
+arrives after it exits. The bootstrap ISO carries the legacy builds with an
+install script each, so a template's own install hook, or a provision typing
+`D:\INSTALL.BAT`, puts it in place. See [Templates and the
+store](guide_templates).
 DOC
 
   h2 "Overriding with user profiles"

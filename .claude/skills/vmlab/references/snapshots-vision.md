@@ -154,6 +154,9 @@ sends keysyms and pointer events the way a real viewer does. The shipped
 `windows-9x` profile uses VNC because real-mode DOS and Windows 9x setup
 screens drop QMP key events between menu redraws; a USB-HID-only guest that
 ignores the PS/2 keyboard also needs it. The script API is the same either way.
+Input over the screen is how a DOS or 9x guest gets its legacy agent installed in
+the first place; once it answers, `exec` is available on that guest too (see
+host-profiles.md, `agent_transport`).
 
 ### Key chords
 
