@@ -328,6 +328,7 @@ still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` mach
 | `windows-legacy` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | Vista, 7 and 2008-era guests; virtio-serial agent (virtio-win covers this era). |
 | `windows-xp` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | `agent_transport = "isa-serial"`: NT4 through XP/2003, the legacy agent on COM1. |
 | `windows-9x` | pc | seabios | false | false | ide | pcnet | cirrus-vga | 1 | 256MiB | `input_transport = "vnc"`, `agent_transport = "isa-serial"`. DOS, Windows 3.x to ME. |
+| `templeos` | pc | seabios | false | false | ide | e1000 | std | 2 | 512MiB | `agent_transport = "isa-serial"`. TempleOS: the HolyC agent on COM1; no network by design. |
 | `linux-modern` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 2 | 4GiB | `virtiofs = true`. |
 | `linux-generic` | q35 | seabios | false | false | virtio | virtio-net-pci | std | 2 | 2GiB | Older or unusual distros. |
 | `container` | | | | | | | | 1 | 256MiB | Micro-VM size for an OCI container; nothing else applies to a container. |

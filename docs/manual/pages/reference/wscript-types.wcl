@@ -367,6 +367,34 @@ fn main(lab: Lab) {
 SRC
   }
 
+  h2 "vmlab::templeos_agent_script"
+  p "The vmlab agent for TempleOS, as text to type at its shell."
+  code wscript { source = "fn templeos_agent_script() -> Result[string, string]" }
+  p <<DOC
+    TempleOS reads no ISO 9660 and has no network, so the bootstrap ISO
+    cannot carry the agent in and the screen is the only way. This returns
+    the HolyC source as `A("…")` statements that accumulate in a buffer,
+    then the `FileWrite` to `~/VmlabAgt.HC`, the `#include`, and
+    `VmlabAgentInstall` — which appends the include and the spawn to
+    `~/MakeHome.HC`, so the agent starts at every boot, and starts it now so
+    a build verifies the handshake without a reboot. It fails when the agent
+    asset is missing, naming the searched paths.
+  DOC
+  p <<DOC
+    Roughly twelve thousand keystrokes, about eight minutes at 40 ms, once
+    per template build. The machine must use the QMP input transport, the
+    default: over VNC, TempleOS sees each shift a keystroke late and shifted
+    characters land on the wrong key.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("temple") else { return }
+    let Ok(script) = vmlab::templeos_agent_script() else { return }
+    vm.type_text_paced(script, 40).expect("typing the agent")
+}
+SRC
+  }
+
   h2 "vmlab::env"
   p "Read an environment variable of the lab daemon's process."
   code wscript { source = "fn env(name: string) -> string" }

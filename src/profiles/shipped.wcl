@@ -96,6 +96,20 @@ profile "windows-9x" {
   workspace_guest = "C:\\src"
 }
 
+profile "templeos" {
+  description = "TempleOS: i440fx, SeaBIOS, IDE disk, std VGA (it drives VBE directly), no network by design; the agent channel is a 16550 on COM1 for the HolyC agent"
+  machine     = "pc"
+  firmware    = "seabios"
+  secure_boot = false
+  tpm         = false
+  disk_bus    = "ide"
+  nic_model   = "e1000"
+  display     = "std"
+  cpus        = 2
+  memory      = 512MiB
+  agent_transport = "isa-serial"
+}
+
 profile "linux-modern" {
   description = "Modern Linux: q35, OVMF, virtio everything"
   machine     = "q35"

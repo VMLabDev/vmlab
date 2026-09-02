@@ -68,13 +68,16 @@ pub async fn verify(
     };
 
     let info = handle.info();
-    let legacy = info.agent_version.starts_with("agent-legacy=");
+    // The Rust agent stamps `agent=<rev>`; every legacy-tier agent stamps
+    // its own name (`agent-legacy=`, `agent-templeos=`).
+    let legacy = !info.agent_version.starts_with("agent=");
     let os = match (info.os.as_str(), legacy) {
         ("windows", false) => AgentOs::Windows,
         // The NT and 9x builds both say "windows"; their stamps are one
         // build's, so either staged flavour names it.
         ("windows", true) => AgentOs::WindowsNt,
         ("dos", _) => AgentOs::Dos,
+        ("templeos", _) => AgentOs::TempleOs,
         _ => AgentOs::Linux,
     };
     // The staged stamp identifies what the ISO carried; the handshake's own

@@ -31,6 +31,9 @@ pub enum AgentOs {
     /// Windows 95/98/ME.
     Windows9x,
     Dos,
+    /// TempleOS: the agent is HolyC source (`guest/agent-templeos`), typed
+    /// into the guest over the screen since TempleOS reads no ISO 9660.
+    TempleOs,
 }
 
 impl AgentOs {
@@ -41,6 +44,7 @@ impl AgentOs {
             AgentOs::WindowsNt => "windows-nt",
             AgentOs::Windows9x => "windows-9x",
             AgentOs::Dos => "dos",
+            AgentOs::TempleOs => "templeos",
         }
     }
 
@@ -50,12 +54,17 @@ impl AgentOs {
             AgentOs::Windows => "vmlab-agent.exe",
             AgentOs::WindowsNt | AgentOs::Windows9x => "vmlab-agent-legacy.exe",
             AgentOs::Dos => "VMLABAGT.EXE",
+            AgentOs::TempleOs => "VmlabAgt.HC",
         }
     }
 
-    /// Whether this flavour is the legacy C agent.
+    /// Whether this flavour is a legacy-tier agent (C, or HolyC) rather than
+    /// the Rust `vmlab-agent`.
     pub fn is_legacy(self) -> bool {
-        matches!(self, AgentOs::WindowsNt | AgentOs::Windows9x | AgentOs::Dos)
+        matches!(
+            self,
+            AgentOs::WindowsNt | AgentOs::Windows9x | AgentOs::Dos | AgentOs::TempleOs
+        )
     }
 
     /// The dist directory under `agent/`. The Rust agent is built per guest
@@ -67,6 +76,7 @@ impl AgentOs {
             AgentOs::WindowsNt => "windows-nt-x86".into(),
             AgentOs::Windows9x => "windows-9x-x86".into(),
             AgentOs::Dos => "dos-i386".into(),
+            AgentOs::TempleOs => "templeos".into(),
         }
     }
 
@@ -153,9 +163,57 @@ fn find_in(dirs: &[PathBuf], os: AgentOs, arch: &str) -> Result<AgentAsset> {
     )
 }
 
+/// The text a provision types at the TempleOS shell to land the agent:
+/// every line of `source` as an `A("…")` statement into a buffer, then one
+/// `FileWrite` to `~/VmlabAgt.HC`, the include, and the spawn. Comment-only
+/// and blank lines are dropped because every character costs a keystroke.
+/// TempleOS reads no ISO 9660 and has no network, so the screen is the one
+/// way in, and this is the shape that survives a shell that compiles each
+/// line as it lands (PRD §7.4).
+pub fn templeos_typescript(source: &str) -> String {
+    let mut out = String::new();
+    out.push_str("U8 *g_src=MAlloc(200000);I64 g_n=0;\n");
+    out.push_str("U0 A(U8 *s){I64 l=StrLen(s);MemCpy(g_src+g_n,s,l);g_n+=l;g_src[g_n++]='\\n';}\n");
+    for line in source.lines() {
+        let line = line.trim_end();
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        out.push_str("A(\"");
+        for c in line.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                c => out.push(c),
+            }
+        }
+        out.push_str("\");\n");
+    }
+    out.push_str("FileWrite(\"~/VmlabAgt.HC\",g_src,g_n);Free(g_src);\n");
+    out.push_str("#include \"~/VmlabAgt\"\n");
+    out.push_str("VmlabAgentInstall;\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The typescript quotes what HolyC would misread and drops what costs
+    /// keystrokes for nothing.
+    #[test]
+    fn templeos_typescript_escapes_and_prunes() {
+        let src = "// header\n\nU0 F(){ \"say \\\"hi\\\"\\n\"; }\n  // trailing\n";
+        let ts = templeos_typescript(src);
+        let lines: Vec<&str> = ts.lines().collect();
+        assert_eq!(
+            lines[2],
+            "A(\"U0 F(){ \\\"say \\\\\\\"hi\\\\\\\"\\\\n\\\"; }\");"
+        );
+        assert_eq!(lines.len(), 6, "{ts}");
+        assert!(ts.ends_with("#include \"~/VmlabAgt\"\nVmlabAgentInstall;\n"));
+    }
 
     fn write_asset(dir: &std::path::Path, key: &str, binary: &str, version: Option<&str>) {
         let d = dir.join("agent").join(key);

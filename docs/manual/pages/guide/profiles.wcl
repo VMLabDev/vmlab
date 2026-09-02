@@ -54,6 +54,7 @@ DOC
       | "`windows-legacy`" | "pc" | "SeaBIOS" | "no" | "IDE disk, e1000 NIC, std VGA, for Vista/7/2008-era guests; virtio-serial agent" | "`C:\\src`" |
       | "`windows-xp`" | "pc" | "SeaBIOS" | "no" | "as `windows-legacy`, with the agent on COM1 (`isa-serial`): NT4 through XP/2003" | "`C:\\src`" |
       | "`windows-9x`" | "pc" | "SeaBIOS" | "no" | "IDE disk, PCnet NIC, Cirrus VGA, VNC input, agent on COM1, 1 CPU and 256 MiB" | "`C:\\src`" |
+      | "`templeos`" | "pc" | "SeaBIOS" | "no" | "IDE disk, std VGA, no network by design, agent on COM1" | "" |
       | "`linux-modern`" | "q35" | "OVMF" | "no" | "virtio everything, native virtiofs" | "`/src`" |
       | "`linux-generic`" | "q35" | "SeaBIOS" | "no" | "virtio disk and NIC, std VGA, conservative elsewhere" | "`/src`" |
       | "`container`" | "" | "" | "" | "size only: 1 CPU and 256 MiB, the micro-VM floor" | "`/src`" |
@@ -82,6 +83,18 @@ arrives after it exits. The bootstrap ISO carries the legacy builds with an
 install script each, so a template's own install hook, or a provision typing
 `D:\INSTALL.BAT`, puts it in place. See [Templates and the
 store](guide_templates).
+DOC
+
+  p <<'DOC'
+The `templeos` profile is the same bargain in another language. Its agent is
+HolyC, compiled by the guest, and a command is HolyC source rather than a
+program name, as in `vmlab exec temple -- 'Dir;'`. TempleOS reads no ISO 9660
+and has no network, so the agent cannot ride the bootstrap ISO; a provision
+types it in with `vmlab::templeos_agent_script()`, which also registers it to
+start at every boot. It is **unfinished**: the guest answers the handshake and
+reports `exec`, but capturing a command's output is not working yet, so an
+exec returns empty. The shipped TempleOS template therefore still sets
+`agent = false`.
 DOC
 
   h2 "Overriding with user profiles"

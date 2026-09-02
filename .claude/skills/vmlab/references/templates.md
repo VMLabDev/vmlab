@@ -120,6 +120,14 @@ no unattended hook, so its provision types the install line over the screen, for
 example `D:\INSTALL.BAT` from the CD, or `A:\INSTALL.BAT` from a floppy `media`
 block. The scripts probe drives A, D, E and F for their source.
 
+TempleOS is the exception that proves the rule: it reads no ISO 9660 and has no
+network, so nothing can be carried in. Its agent is HolyC, and a provision types
+it at the shell with `vmlab::templeos_agent_script()` (wscript-lab-api.md), which
+also registers it in `~/MakeHome.HC` so it starts at every boot. A command on
+that guest is HolyC source, as in `vmlab exec temple -- 'Dir;'`. It is
+unfinished: the handshake and the feature ladder work, but output capture does
+not, so an exec returns empty and the shipped template keeps `agent = false`.
+
 ### Versions
 
 The block's `version` is a fixed prefix identifying the upstream release. vmlab

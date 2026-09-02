@@ -20,6 +20,8 @@
 //! legacy/nt/vmlab-agent-legacy.exe  (when built; PRD §7.4's legacy tier)
 //! legacy/9x/vmlab-agent-legacy.exe  (when built)
 //! legacy/dos/VMLABAGT.EXE       (when built; 8.3 throughout, DOS reads no Joliet)
+//! legacy/temple/VmlabAgt.HC     (the HolyC source; TempleOS reads no ISO 9660,
+//!                               so a provision types it — for the record only)
 //! VERSION                       staged asset stamps, one `<os> <stamp>` line each
 //! ```
 //!
@@ -87,7 +89,12 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
     let legacy_capable = matches!(arch, "x86" | "x86_64");
     let mut flavours = vec![AgentOs::Linux, AgentOs::Windows];
     if legacy_capable {
-        flavours.extend([AgentOs::WindowsNt, AgentOs::Windows9x, AgentOs::Dos]);
+        flavours.extend([
+            AgentOs::WindowsNt,
+            AgentOs::Windows9x,
+            AgentOs::Dos,
+            AgentOs::TempleOs,
+        ]);
     }
     let mut versions = Vec::new();
     let mut missing = Vec::new();
@@ -100,6 +107,7 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
                     AgentOs::WindowsNt => dir.join("legacy").join("nt"),
                     AgentOs::Windows9x => dir.join("legacy").join("9x"),
                     AgentOs::Dos => dir.join("legacy").join("dos"),
+                    AgentOs::TempleOs => dir.join("legacy").join("temple"),
                 }
                 .join(os.binary());
                 std::fs::create_dir_all(sub.parent().unwrap())?;
@@ -175,6 +183,7 @@ mod tests {
             ("windows-nt-x86", "vmlab-agent-legacy.exe"),
             ("windows-9x-x86", "vmlab-agent-legacy.exe"),
             ("dos-i386", "VMLABAGT.EXE"),
+            ("templeos", "VmlabAgt.HC"),
             ("linux-aarch64", "vmlab-agent"),
         ] {
             let d = assets.path().join("agent").join(key);
@@ -188,6 +197,7 @@ mod tests {
         assert!(staged.dir.join("legacy/nt/vmlab-agent-legacy.exe").exists());
         assert!(staged.dir.join("legacy/9x/vmlab-agent-legacy.exe").exists());
         assert!(staged.dir.join("legacy/dos/VMLABAGT.EXE").exists());
+        assert!(staged.dir.join("legacy/temple/VmlabAgt.HC").exists());
         assert_eq!(
             staged.version_for(AgentOs::WindowsNt),
             Some("agent-legacy=xyz")

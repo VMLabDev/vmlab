@@ -162,6 +162,12 @@ Module map under `src/`:
   `plat_dos.c`, `plat_posix.c`). Conformance runs the POSIX build through
   the daemon's own client in `src/labd/legacy_agent_tests.rs`. Staged on
   the bootstrap ISO under `legacy/` with an install script each.
+- `guest/agent-templeos` — `VmlabAgt.HC`, the same agent for TempleOS in
+  HolyC (the guest compiles it). A command is HolyC source run through
+  `ExePrint`; it reaches the guest by being typed at its shell
+  (`vmlab::templeos_agent_script`), TempleOS reading no ISO 9660.
+  **Unfinished**: handshake and ladder verified live, output capture is not
+  (it works in a task with a window, not in the agent's spawned task).
 - `agent_asset.rs` + `guest/agent`, `guest/agent-proto` — `vmlab-agent`, the
   in-guest agent on the `vmlab.agent.0` virtio-serial port: interactive
   terminals (PTY/ConPTY), streaming exec, tail, metrics, clipboard, the

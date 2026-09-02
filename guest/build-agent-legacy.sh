@@ -12,6 +12,8 @@
 #   dos-i386         DOS (32-bit, DOS/32A extender bound in) — OpenWatcom v2;
 #                    skipped with a warning when OpenWatcom is absent
 #   linux-x86        the POSIX build, host cc; also the conformance binary
+#   templeos         guest/agent-templeos/VmlabAgt.HC, stamped — HolyC source is
+#                    the artefact; TempleOS compiles it itself
 #
 # OpenWatcom is found through $WATCOM, else ~/.local/opt/open-watcom-v2
 # (the unpacked ow-snapshot.tar.xz from the project's GitHub releases).
@@ -129,14 +131,25 @@ build_one() {
       echo "$stamp" >"$out/VERSION"
       log "$key: $(du -h "$out/vmlab-agent-legacy" | cut -f1) → $out/vmlab-agent-legacy"
       ;;
-    *) die "unknown target key '$key' (known: windows-nt-x86 windows-9x-x86 dos-i386 linux-x86)" ;;
+    templeos)
+      local out="$DIST_DIR/templeos"
+      # The stamp names the flavour: verify tells agents apart by it.
+      stamp="${stamp/agent-legacy=/agent-templeos=}"
+      mkdir -p "$out"
+      sed "s/^#define VA_VERSION .*/#define VA_VERSION  \"$stamp\"/" \
+        "$SCRIPT_DIR/agent-templeos/VmlabAgt.HC" >"$out/VmlabAgt.HC"
+      grep -q "\"$stamp\"" "$out/VmlabAgt.HC" || die "VA_VERSION stamp not applied"
+      echo "$stamp" >"$out/VERSION"
+      log "$key: $(du -h "$out/VmlabAgt.HC" | cut -f1) → $out/VmlabAgt.HC"
+      ;;
+    *) die "unknown target key '$key' (known: windows-nt-x86 windows-9x-x86 dos-i386 linux-x86 templeos)" ;;
   esac
 }
 
 main() {
   mkdir -p "$DIST_DIR"
   local -a keys=("$@")
-  [[ ${#keys[@]} -gt 0 ]] || keys=(windows-nt-x86 windows-9x-x86 dos-i386 linux-x86)
+  [[ ${#keys[@]} -gt 0 ]] || keys=(windows-nt-x86 windows-9x-x86 dos-i386 linux-x86 templeos)
   local key
   for key in "${keys[@]}"; do
     build_one "$key"

@@ -473,6 +473,18 @@ pub fn lab_module() -> Module {
         std::env::var(name).unwrap_or_default()
     });
 
+    // The TempleOS agent as text to type at its shell (PRD §7.4): TempleOS
+    // reads no ISO 9660 and has no network, so a template's provision lands
+    // the agent with `vm.type_text_paced(vmlab::templeos_agent_script(), 40)`.
+    m.fn_("templeos_agent_script", || -> Result<String, String> {
+        let asset =
+            crate::agent_asset::ensure_agent_asset(crate::agent_asset::AgentOs::TempleOs, "x86_64")
+                .map_err(|e| format!("{e:#}"))?;
+        let src = String::from_utf8(asset.read().map_err(|e| format!("{e:#}"))?)
+            .map_err(|_| "the TempleOS agent source is not UTF-8".to_string())?;
+        Ok(crate::agent_asset::templeos_typescript(&src))
+    });
+
     // -- Lab (§10.1) ---------------------------------------------------------
     m.ty::<LabHandle>()
         .method("name", |l: &LabHandle| l.runtime.name.clone())
