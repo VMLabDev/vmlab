@@ -730,10 +730,96 @@ static void register_9x_service(void)
         rsp(0, 1);
 }
 
+/* `--install`: register this binary, at its current path, to start with
+ * the machine — an SCM service on NT (no `sc.exe` needed, which NT4 and
+ * 2000 lack), the RunServices key on 9x — and start it now. */
+typedef SC_HANDLE(WINAPI *OpenSCManagerFn)(LPCSTR, LPCSTR, DWORD);
+typedef SC_HANDLE(WINAPI *CreateServiceFn)(SC_HANDLE, LPCSTR, LPCSTR, DWORD, DWORD, DWORD,
+                                           DWORD, LPCSTR, LPCSTR, LPDWORD, LPCSTR, LPCSTR,
+                                           LPCSTR);
+typedef SC_HANDLE(WINAPI *OpenServiceFn)(SC_HANDLE, LPCSTR, DWORD);
+typedef BOOL(WINAPI *ChangeServiceConfigFn)(SC_HANDLE, DWORD, DWORD, DWORD, LPCSTR, LPCSTR,
+                                            LPDWORD, LPCSTR, LPCSTR, LPCSTR, LPCSTR);
+typedef BOOL(WINAPI *StartServiceFn)(SC_HANDLE, DWORD, LPCSTR *);
+typedef BOOL(WINAPI *CloseServiceHandleFn)(SC_HANDLE);
+
+static int install_nt_service(const char *exe)
+{
+    HMODULE adv = LoadLibraryA("advapi32.dll");
+    OpenSCManagerFn open_scm = (OpenSCManagerFn)GetProcAddress(adv, "OpenSCManagerA");
+    CreateServiceFn create = (CreateServiceFn)GetProcAddress(adv, "CreateServiceA");
+    OpenServiceFn open_svc = (OpenServiceFn)GetProcAddress(adv, "OpenServiceA");
+    ChangeServiceConfigFn change = (ChangeServiceConfigFn)GetProcAddress(adv, "ChangeServiceConfigA");
+    StartServiceFn start = (StartServiceFn)GetProcAddress(adv, "StartServiceA");
+    CloseServiceHandleFn close_h = (CloseServiceHandleFn)GetProcAddress(adv, "CloseServiceHandle");
+    SC_HANDLE scm, svc;
+    if (!open_scm || !create || !open_svc || !change || !start || !close_h) {
+        fprintf(stderr, "install: service APIs unavailable\n");
+        return 1;
+    }
+    scm = open_scm(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!scm) {
+        fprintf(stderr, "install: OpenSCManager failed: %lu\n", (unsigned long)GetLastError());
+        return 1;
+    }
+    svc = create(scm, "vmlab-agent", "vmlab guest agent (legacy, COM1)", SERVICE_ALL_ACCESS,
+                 SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, exe,
+                 NULL, NULL, NULL, NULL, NULL);
+    if (!svc && GetLastError() == ERROR_SERVICE_EXISTS) {
+        /* A rebuild: point the existing service at this binary. */
+        svc = open_svc(scm, "vmlab-agent", SERVICE_ALL_ACCESS);
+        if (svc)
+            change(svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                   exe, NULL, NULL, NULL, NULL, NULL, NULL);
+    }
+    if (!svc) {
+        fprintf(stderr, "install: CreateService failed: %lu\n", (unsigned long)GetLastError());
+        close_h(scm);
+        return 1;
+    }
+    if (!start(svc, 0, NULL) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING)
+        fprintf(stderr, "install: StartService failed: %lu\n", (unsigned long)GetLastError());
+    close_h(svc);
+    close_h(scm);
+    printf("vmlab-agent service installed: %s\n", exe);
+    return 0;
+}
+
+static int install_9x(const char *exe)
+{
+    HKEY key;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    static char cmd[1024];
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+                        "Software\\Microsoft\\Windows\\CurrentVersion\\RunServices", 0, NULL,
+                        0, KEY_WRITE, NULL, &key, NULL) != ERROR_SUCCESS) {
+        fprintf(stderr, "install: cannot open RunServices\n");
+        return 1;
+    }
+    RegSetValueExA(key, "vmlab-agent", 0, REG_SZ, (const BYTE *)exe, (DWORD)strlen(exe) + 1);
+    RegCloseKey(key);
+    /* Start it now, detached, so the build's handshake needs no reboot. */
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    _snprintf(cmd, sizeof cmd, "\"%s\"", exe);
+    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    printf("vmlab-agent registered in RunServices: %s\n", exe);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int i;
     is_win9x = (GetVersion() & 0x80000000UL) != 0;
+    if (argc == 2 && strcmp(argv[1], "--install") == 0) {
+        static char exe[MAX_PATH];
+        GetModuleFileNameA(NULL, exe, sizeof exe);
+        return is_win9x ? install_9x(exe) : install_nt_service(exe);
+    }
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--console") == 0) {
             console_mode = 1;
@@ -745,7 +831,8 @@ int main(int argc, char **argv)
             if (log_file != INVALID_HANDLE_VALUE)
                 SetFilePointer(log_file, 0, NULL, FILE_END);
         } else {
-            fprintf(stderr, "usage: vmlab-agent-legacy [--console] [--port COMn] [--log file]\n");
+            fprintf(stderr, "usage: vmlab-agent-legacy [--console] [--port COMn] [--log file]\n"
+                            "       vmlab-agent-legacy --install\n");
             return 2;
         }
     }

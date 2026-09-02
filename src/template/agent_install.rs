@@ -68,17 +68,26 @@ pub async fn verify(
     };
 
     let info = handle.info();
-    let os = if info.os == "windows" {
-        AgentOs::Windows
-    } else {
-        AgentOs::Linux
+    let legacy = info.agent_version.starts_with("agent-legacy=");
+    let os = match (info.os.as_str(), legacy) {
+        ("windows", false) => AgentOs::Windows,
+        // The NT and 9x builds both say "windows"; their stamps are one
+        // build's, so either staged flavour names it.
+        ("windows", true) => AgentOs::WindowsNt,
+        ("dos", _) => AgentOs::Dos,
+        _ => AgentOs::Linux,
     };
     // The staged stamp identifies what the ISO carried; the handshake's own
-    // version is the fallback if the flavour somehow wasn't staged.
-    let version = staged
-        .version_for(os)
-        .map(str::to_string)
-        .unwrap_or(info.agent_version);
+    // version is the fallback if the flavour somehow wasn't staged — and is
+    // the answer for the legacy agent, whose stamp *is* its version string.
+    let version = if legacy {
+        info.agent_version
+    } else {
+        staged
+            .version_for(os)
+            .map(str::to_string)
+            .unwrap_or(info.agent_version)
+    };
     log(format!(
         "agent: verified ({} {}, agent answering)\n",
         os.key(),

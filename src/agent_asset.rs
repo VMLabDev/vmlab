@@ -18,11 +18,19 @@ use anyhow::{Context, Result, bail};
 
 const VERSION_FILE: &str = "VERSION";
 
-/// Guest OS flavour of the agent binary.
+/// Guest OS flavour of the agent binary. The first two are the Rust
+/// `vmlab-agent`; the rest are `vmlab-agent-legacy` (guest/agent-legacy,
+/// `guest/build-agent-legacy.sh`), the C agent for guests with no
+/// virtio-serial (PRD §7.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentOs {
     Linux,
     Windows,
+    /// NT4 through XP/2003.
+    WindowsNt,
+    /// Windows 95/98/ME.
+    Windows9x,
+    Dos,
 }
 
 impl AgentOs {
@@ -30,13 +38,43 @@ impl AgentOs {
         match self {
             AgentOs::Linux => "linux",
             AgentOs::Windows => "windows",
+            AgentOs::WindowsNt => "windows-nt",
+            AgentOs::Windows9x => "windows-9x",
+            AgentOs::Dos => "dos",
         }
     }
 
-    fn binary(self) -> &'static str {
+    pub fn binary(self) -> &'static str {
         match self {
             AgentOs::Linux => "vmlab-agent",
             AgentOs::Windows => "vmlab-agent.exe",
+            AgentOs::WindowsNt | AgentOs::Windows9x => "vmlab-agent-legacy.exe",
+            AgentOs::Dos => "VMLABAGT.EXE",
+        }
+    }
+
+    /// Whether this flavour is the legacy C agent.
+    pub fn is_legacy(self) -> bool {
+        matches!(self, AgentOs::WindowsNt | AgentOs::Windows9x | AgentOs::Dos)
+    }
+
+    /// The dist directory under `agent/`. The Rust agent is built per guest
+    /// arch; the legacy agent is 32-bit x86 for every guest it targets (an
+    /// x64 XP runs it under WOW64), so its keys are fixed.
+    fn dist_key(self, arch: &str) -> String {
+        match self {
+            AgentOs::Linux | AgentOs::Windows => format!("{}-{arch}", self.key()),
+            AgentOs::WindowsNt => "windows-nt-x86".into(),
+            AgentOs::Windows9x => "windows-9x-x86".into(),
+            AgentOs::Dos => "dos-i386".into(),
+        }
+    }
+
+    fn build_hint(self, key: &str) -> String {
+        if self.is_legacy() {
+            format!("guest/build-agent-legacy.sh {key}")
+        } else {
+            format!("guest/build-agent.sh {key}")
         }
     }
 }
@@ -85,7 +123,7 @@ pub(crate) fn candidate_dirs() -> Vec<PathBuf> {
 }
 
 fn find_in(dirs: &[PathBuf], os: AgentOs, arch: &str) -> Result<AgentAsset> {
-    let key = format!("{}-{arch}", os.key());
+    let key = os.dist_key(arch);
     let mut searched = Vec::new();
     for base in dirs {
         let dir = base.join("agent").join(&key);
@@ -104,9 +142,14 @@ fn find_in(dirs: &[PathBuf], os: AgentOs, arch: &str) -> Result<AgentAsset> {
         .collect::<Vec<_>>()
         .join(", ");
     bail!(
-        "no vmlab-agent binary for {key}; searched: {searched}. Build one with \
-         `guest/build-agent.sh {key}` and install it into one of those directories \
-         (or point VMLAB_GUEST_ASSET_DIR at guest/dist)."
+        "no {} binary for {key}; searched: {searched}. Build one with `{}` and install \
+         it into one of those directories (or point VMLAB_GUEST_ASSET_DIR at guest/dist).",
+        if os.is_legacy() {
+            "vmlab-agent-legacy"
+        } else {
+            "vmlab-agent"
+        },
+        os.build_hint(&key)
     )
 }
 
@@ -138,6 +181,46 @@ mod tests {
         let win = find_in(&dirs, AgentOs::Windows, "x86_64").unwrap();
         assert!(win.path.ends_with("agent/windows-x86_64/vmlab-agent.exe"));
         assert_eq!(win.version, "unknown");
+    }
+
+    /// The legacy flavours have fixed 32-bit keys whatever the guest arch.
+    #[test]
+    fn finds_legacy_flavours_at_their_fixed_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_asset(
+            tmp.path(),
+            "windows-nt-x86",
+            "vmlab-agent-legacy.exe",
+            Some("agent-legacy=1"),
+        );
+        write_asset(tmp.path(), "windows-9x-x86", "vmlab-agent-legacy.exe", None);
+        write_asset(tmp.path(), "dos-i386", "VMLABAGT.EXE", None);
+        let dirs = vec![tmp.path().to_path_buf()];
+        for arch in ["x86", "x86_64"] {
+            let nt = find_in(&dirs, AgentOs::WindowsNt, arch).unwrap();
+            assert!(
+                nt.path
+                    .ends_with("agent/windows-nt-x86/vmlab-agent-legacy.exe")
+            );
+            assert_eq!(nt.version, "agent-legacy=1");
+            assert!(find_in(&dirs, AgentOs::Windows9x, arch).is_ok());
+            assert!(
+                find_in(&dirs, AgentOs::Dos, arch)
+                    .unwrap()
+                    .path
+                    .ends_with("agent/dos-i386/VMLABAGT.EXE")
+            );
+        }
+        let err = find_in(
+            &[tempfile::tempdir().unwrap().path().to_path_buf()],
+            AgentOs::Dos,
+            "x86",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("build-agent-legacy.sh dos-i386"),
+            "{err}"
+        );
     }
 
     #[test]
