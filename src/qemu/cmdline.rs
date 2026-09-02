@@ -309,13 +309,26 @@ pub fn build_args(
             // a unit the first already holds and QEMU refuses the whole
             // command line with "IDE unit 1 is in use". A legacy Windows build
             // carries exactly two — the install ISO and vmlab's bootstrap ISO
-            // — so address both explicitly, past the units the IDE disks above
-            // already claimed.
+            // — so address both explicitly.
+            //
+            // Three usable slots, not four: with no `-nodefaults`, QEMU puts
+            // its own empty CD-ROM on the secondary master (ide.1 unit 0), so
+            // that one is spoken for however few devices we attach. The IDE
+            // disks auto-place from the front of the same list.
+            const LEGACY_IDE_SLOTS: [(usize, usize); 3] = [(0, 0), (0, 1), (1, 1)];
             let slot = sata_disks + i;
+            let (bus, unit) = *LEGACY_IDE_SLOTS.get(slot).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: {} IDE disk(s) and {} CD-ROM(s) need more slots than a legacy IDE \
+                     bus has — QEMU's own CD-ROM holds ide.1 unit 0. Use a q35 profile, or \
+                     fewer attachments.",
+                    vm.name,
+                    sata_disks,
+                    paths.cdroms.len()
+                )
+            })?;
             a.push(format!(
-                "ide-cd,drive=cd{i},bus=ide.{},unit={}{boot}",
-                slot / 2,
-                slot % 2
+                "ide-cd,drive=cd{i},bus=ide.{bus},unit={unit}{boot}"
             ));
         }
     }
@@ -741,8 +754,13 @@ mod tests {
             "/lab/.vmlab/media/vmlab.iso".into(),
         ];
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        // disk0 holds ide.0 unit 0, so the CD-ROMs follow it.
+        // disk0 holds ide.0 unit 0 and QEMU's own default CD-ROM holds
+        // ide.1 unit 0, so ours take the two slots either side of it.
         assert!(s.contains("ide-cd,drive=cd0,bus=ide.0,unit=1"), "{s}");
-        assert!(s.contains("ide-cd,drive=cd1,bus=ide.1,unit=0"), "{s}");
+        assert!(s.contains("ide-cd,drive=cd1,bus=ide.1,unit=1"), "{s}");
+        assert!(
+            !s.contains("bus=ide.1,unit=0"),
+            "ide.1 unit 0 is QEMU's own default CD-ROM: {s}"
+        );
     }
 }
