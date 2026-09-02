@@ -14,6 +14,8 @@ pub mod hypervisor;
 pub mod identity;
 pub mod lab;
 #[cfg(test)]
+mod legacy_agent_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 pub mod machine;
 pub mod netservices;

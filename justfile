@@ -41,6 +41,11 @@ guest-build arch='x86_64 aarch64':
 agent-build target='':
 	./guest/build-agent.sh {{target}}
 
+# Build the legacy C agent for NT/9x/DOS guests (all targets; missing toolchains skip)
+[group('build')]
+agent-legacy-build target='':
+	./guest/build-agent-legacy.sh {{target}}
+
 # Rewrite the generated protocol reference (ADR-0007)
 [group('build')]
 proto-generate:
@@ -48,7 +53,7 @@ proto-generate:
 
 # Build + install the guest asset and agent binaries into ~/.local/share/vmlab/guest
 [group('build')]
-guest-install: guest-build agent-build
+guest-install: guest-build agent-build agent-legacy-build
 	mkdir -p ~/.local/share/vmlab/guest
 	cp -r guest/dist/* ~/.local/share/vmlab/guest/
 
