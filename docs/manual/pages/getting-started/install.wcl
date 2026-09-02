@@ -173,10 +173,10 @@ SRC
     `sha256sum`, `cargo`, `rustup` and `git` on the host, plus the
     `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` Rust targets
     installed with `rustup target add`. `guest/build-agent.sh` cross-compiles
-    the agent for Linux x86_64, aarch64 and riscv64 and for Windows x86_64.
-    The Windows target needs `x86_64-w64-mingw32-gcc` from mingw-w64 and is
-    skipped with a warning when it is absent. The riscv64 target is
-    best-effort and skipped the same way.
+    the agent for Linux x86_64, aarch64 and riscv64 and for Windows x86_64
+    and x86. The Windows targets need `x86_64-w64-mingw32-gcc` and
+    `i686-w64-mingw32-gcc` from mingw-w64 and are skipped with a warning
+    when absent. The riscv64 target is best-effort and skipped the same way.
   DOC
 
   p "You do not need the assets for every workflow."

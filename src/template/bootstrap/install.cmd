@@ -7,9 +7,13 @@ rem A 5.x (2000/XP/2003) or 4.x (NT4) kernel has no virtio-serial and gets
 rem the legacy agent on COM1 instead (PRD §7.4).
 ver | find "Version 5." >nul && goto legacy
 ver | find "Version 4." >nul && goto legacy
+rem The ISO carries the agent for the template's arch under windows\<arch>;
+rem the native cmd's PROCESSOR_ARCHITECTURE says which (x86 or AMD64).
+set VMLAB_ARCH=x86_64
+if /i "%PROCESSOR_ARCHITECTURE%"=="x86" set VMLAB_ARCH=x86
 set VMLAB_DIR=C:\ProgramData\vmlab
 if not exist "%VMLAB_DIR%" mkdir "%VMLAB_DIR%"
-copy /y "%~dp0windows\x86_64\vmlab-agent.exe" "%VMLAB_DIR%\vmlab-agent.exe"
+copy /y "%~dp0windows\%VMLAB_ARCH%\vmlab-agent.exe" "%VMLAB_DIR%\vmlab-agent.exe"
 if errorlevel 1 exit /b 1
 rem `sc create` fails when the service exists (rebuilds); reconfigure then.
 sc create vmlab-agent binPath= C:\ProgramData\vmlab\vmlab-agent.exe start= auto

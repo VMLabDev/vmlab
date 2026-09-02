@@ -13,6 +13,9 @@
 #   windows-x86_64  x86_64-pc-windows-gnu       (static CRT; needs mingw-w64,
 #                   skipped with a warning when x86_64-w64-mingw32-gcc is
 #                   absent)
+#   windows-x86     i686-pc-windows-gnu         (static CRT; 32-bit Vista
+#                   and later — older NT is the legacy tier, PRD §7.4; needs
+#                   i686-w64-mingw32-gcc, skipped with a warning when absent)
 #   linux-x86       i686-unknown-linux-musl     (static; optional — a 32-bit
 #                   guest too old for virtio-serial serves on COM1 instead,
 #                   PRD §7.4; skipped with a warning when not installed)
@@ -51,8 +54,9 @@ target_spec() {
     linux-aarch64) echo "aarch64-unknown-linux-musl|vmlab-agent|1" ;;
     linux-riscv64) echo "riscv64gc-unknown-linux-musl|vmlab-agent|0" ;;
     windows-x86_64) echo "x86_64-pc-windows-gnu|vmlab-agent.exe|0" ;;
+    windows-x86) echo "i686-pc-windows-gnu|vmlab-agent.exe|0" ;;
     linux-x86) echo "i686-unknown-linux-musl|vmlab-agent|0" ;;
-    *) die "unknown target key '$1' (known: linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 linux-x86)" ;;
+    *) die "unknown target key '$1' (known: linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 windows-x86 linux-x86)" ;;
   esac
 }
 
@@ -68,8 +72,13 @@ build_one() {
     log "skipping $key: rust target $target not installed (rustup target add $target)"
     return 0
   fi
-  if [[ "$key" == windows-* ]] && ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-    log "skipping $key: x86_64-w64-mingw32-gcc not found (install mingw-w64)"
+  local mingw_cc=""
+  case "$key" in
+    windows-x86_64) mingw_cc="x86_64-w64-mingw32-gcc" ;;
+    windows-x86) mingw_cc="i686-w64-mingw32-gcc" ;;
+  esac
+  if [[ -n "$mingw_cc" ]] && ! command -v "$mingw_cc" >/dev/null 2>&1; then
+    log "skipping $key: $mingw_cc not found (install mingw-w64)"
     return 0
   fi
 
@@ -88,6 +97,9 @@ build_one() {
       ;;
     windows-x86_64)
       env_args+=("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static")
+      ;;
+    windows-x86)
+      env_args+=("CARGO_TARGET_I686_PC_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static")
       ;;
   esac
 
@@ -108,7 +120,7 @@ main() {
   command -v rustup >/dev/null 2>&1 || die "missing host tool: rustup"
   mkdir -p "$DIST_DIR"
   local -a keys=("$@")
-  [[ ${#keys[@]} -gt 0 ]] || keys=(linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 linux-x86)
+  [[ ${#keys[@]} -gt 0 ]] || keys=(linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 windows-x86 linux-x86)
   local key
   for key in "${keys[@]}"; do
     build_one "$key"
