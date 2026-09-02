@@ -304,7 +304,19 @@ pub fn build_args(
                 sata_disks + i
             ));
         } else {
-            a.push(format!("ide-cd,drive=cd{i}{boot}"));
+            // Legacy `pc`: two units per IDE bus, but QEMU's auto-placement
+            // does not advance past the first bus, so a second CD-ROM asks for
+            // a unit the first already holds and QEMU refuses the whole
+            // command line with "IDE unit 1 is in use". A legacy Windows build
+            // carries exactly two — the install ISO and vmlab's bootstrap ISO
+            // — so address both explicitly, past the units the IDE disks above
+            // already claimed.
+            let slot = sata_disks + i;
+            a.push(format!(
+                "ide-cd,drive=cd{i},bus=ide.{},unit={}{boot}",
+                slot / 2,
+                slot % 2
+            ));
         }
     }
 
@@ -712,5 +724,25 @@ mod tests {
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(s.contains("ide-cd,drive=cd0,bus=ide.0"), "{s}");
         assert!(s.contains("ide-cd,drive=cd1,bus=ide.1"), "{s}");
+    }
+
+    /// The same on a legacy `pc` machine, where the IDE disk holds a unit and
+    /// the two CD-ROMs must take the ones after it. QEMU's auto-placement does
+    /// not advance past the first bus, so it refuses the second CD with "IDE
+    /// unit 1 is in use" — which failed every legacy Windows build, each of
+    /// which carries an install ISO and vmlab's bootstrap ISO.
+    #[test]
+    fn legacy_pc_cdroms_take_the_units_after_the_ide_disk() {
+        let vm = resolved("windows-legacy", "x86_64");
+        assert!(!vm.machine.starts_with("q35"), "profile must be legacy pc");
+        let mut p = paths();
+        p.cdroms = vec![
+            "/isos/installer.iso".into(),
+            "/lab/.vmlab/media/vmlab.iso".into(),
+        ];
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        // disk0 holds ide.0 unit 0, so the CD-ROMs follow it.
+        assert!(s.contains("ide-cd,drive=cd0,bus=ide.0,unit=1"), "{s}");
+        assert!(s.contains("ide-cd,drive=cd1,bus=ide.1,unit=0"), "{s}");
     }
 }
