@@ -1,0 +1,396 @@
+page ref_ws_types {
+  title = "wscript API: Term, types and the vmlab module"
+  chapter_header "wscript API: Term, types and the vmlab module" {
+    kicker       = "Reference · reference"
+    reading_time = "10 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    This chapter covers the rest of the wscript surface: `Term`, the
+    send/expect handle [Machine.terminal](ref_ws_machine) returns; the six
+    record types methods return or handlers receive; and the two functions
+    on the `vmlab` module itself. The [scripting guide](guide_scripting)
+    explains where scripts run. The handles are in
+    [wscript API: Lab and Segment](ref_ws_lab) and
+    [wscript API: Machine](ref_ws_machine).
+  DOC
+
+  p <<DOC
+    The record types are plain structs: a script reads their fields
+    directly, as `r.exit_code` or `login.password`. They are never
+    constructed by a script. The signatures use the parameter names the host
+    registers; the generated interface file spells them `a0`, `a1` and so
+    on.
+  DOC
+
+  h2 "Term.send"
+  p "Send raw text to the shell."
+  code wscript { source = "fn send(self, text: string) -> Result[unit, string]" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`text`" | "string" | "The bytes to write to the PTY, exactly as given. No newline is added." |
+  }
+  p <<DOC
+    Use this for control characters and partial input; the example below
+    sends Ctrl-C as the byte 0x03. It fails with "<machine>: terminal session is closed" after
+    `Term.close` or after the shell has exited, and with the agent's error if
+    the write fails.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    let Ok(t) = vm.terminal() else { return }
+    let s = t.send("\u{3}")
+    t.close()
+}
+SRC
+  }
+
+  h2 "Term.send_line"
+  p "Send a line of input followed by Enter."
+  code wscript { source = "fn send_line(self, text: string) -> Result[unit, string]" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`text`" | "string" | "The line to type." |
+  }
+  p <<DOC
+    Writes `text` and a carriage return, which is what a PTY expects from
+    Enter and works for POSIX shells and PowerShell alike. The errors are
+    those of `Term.send`.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    let Ok(t) = vm.terminal() else { return }
+    let s = t.send_line("systemctl restart app")
+    t.close()
+}
+SRC
+  }
+
+  h2 "Term.read"
+  p "Take whatever output the shell has produced so far."
+  code wscript { source = "fn read(self) -> string" }
+  p <<DOC
+    Drains output already queued, waiting at most about 50 milliseconds for
+    more, and returns it, clearing the buffer. It does not wait for a
+    prompt; use `Term.expect` for that. It never fails: a closed session
+    returns what was left in the buffer, or an empty string.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    let Ok(t) = vm.terminal() else { return }
+    vmlab::sleep_ms(500)
+    lab.log(t.read())
+    t.close()
+}
+SRC
+  }
+
+  h2 "Term.expect"
+  p "Wait until the output matches a regular expression and return the text up to the end of the match."
+  code wscript { source = "fn expect(self, pattern: string, timeout_secs: int) -> Result[string, string]" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`pattern`" | "string" | "A regular expression, matched anywhere in the accumulated output." |
+      | "`timeout_secs`" | "int" | "How long to wait, in seconds." |
+  }
+  p <<DOC
+    Output accumulates in a buffer. On a match the text through the end of
+    the match is consumed and returned, and what follows stays for the next
+    call, so successive expects walk the stream. The buffer holds the raw PTY
+    stream, prompts and escape sequences included, so match on something
+    stable. It fails with "bad pattern: <reason>" for an invalid expression,
+    with "<machine>: timed out after <n>s waiting for /<pattern>/; tail:
+    <text>" at the deadline, and with "<machine>: terminal ended (<why>)
+    before /<pattern>/ matched; tail: <text>" when the shell exits or the
+    agent channel closes first. The tail is the last few hundred bytes of
+    unmatched output, for debugging.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    let Ok(t) = vm.terminal() else { return }
+    let s = t.send_line("hostname")
+    match t.expect("box", 10) {
+        Ok(out) => lab.log("saw: " + out),
+        Err(e) => lab.log(e),
+    }
+    t.close()
+}
+SRC
+  }
+
+  h2 "Term.resize"
+  p "Resize the session's PTY."
+  code wscript { source = "fn resize(self, cols: int, rows: int) -> Result[unit, string]" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`cols`" | "int" | "The new width in columns. Clamped to at least 2." |
+      | "`rows`" | "int" | "The new height in rows. Clamped to at least 2." |
+  }
+  p <<DOC
+    A session opens at 120 by 32, which is wide enough that prompts rarely
+    wrap mid-pattern. It fails on a closed session and with the agent's
+    error otherwise.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    let Ok(t) = vm.terminal() else { return }
+    let rz = t.resize(200, 50)
+    t.close()
+}
+SRC
+  }
+
+  h2 "Term.close"
+  p "End the session and kill the shell."
+  code wscript { source = "fn close(self)" }
+  p <<DOC
+    Closing is deterministic; a handle that goes out of scope without it is
+    closed when the script's VM collects it. Closing twice is harmless. It
+    never fails. After it, `Term.send`, `Term.send_line` and `Term.resize`
+    fail with "terminal session is closed" and `Term.expect` reports the
+    session ended with reason "closed".
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    let Ok(t) = vm.terminal() else { return }
+    t.close()
+}
+SRC
+  }
+
+  h2 "Match"
+  p "Where an image or text was found on the display, returned by the screen-matching methods."
+  code wscript { source = <<'SRC'
+struct Match {
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    score: float,
+    cx: int,
+    cy: int,
+    text: string,
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`x`" | "int" | "0" | "Left edge of the match, in framebuffer pixels." |
+      | "`y`" | "int" | "0" | "Top edge of the match." |
+      | "`w`" | "int" | "0" | "Width of the matched region; the reference image's width." |
+      | "`h`" | "int" | "0" | "Height of the matched region." |
+      | "`score`" | "float" | "1.0" | "The similarity score, 0 to 1." |
+      | "`cx`" | "int" | "0" | "Horizontal centre, for `Machine.mouse_move`." |
+      | "`cy`" | "int" | "0" | "Vertical centre." |
+      | "`text`" | "string" | "empty" | "The matched text, set only by `Machine.wait_for_text`." |
+  }
+  p <<DOC
+    From `wait_for_image`, `wait_for_image_opts`, `wait_for_any` and
+    `find_image` the position fields describe the match and `text` is empty.
+    From `wait_for_text` only `text` is meaningful: the position fields are
+    0 and the score is 1, because OCR does not report a location. The
+    defaults column shows those filler values.
+  DOC
+
+  h2 "ExecResult"
+  p "What a guest command produced, returned by `Machine.exec` and `Machine.exec_timeout`."
+  code wscript { source = <<'SRC'
+struct ExecResult {
+    exit_code: int,
+    stdout: string,
+    stderr: string,
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`exit_code`" | "int" | "none" | "The process's exit code. Non-zero is not an error to the call." |
+      | "`stdout`" | "string" | "none" | "Captured standard output, decoded as UTF-8 with invalid bytes replaced." |
+      | "`stderr`" | "string" | "none" | "Captured standard error, decoded the same way." |
+  }
+  p <<DOC
+    Every field is always set. Branch on `exit_code` for the command's own
+    verdict; the call's `Result` reports only whether the command could be
+    run at all.
+  DOC
+
+  h2 "Login"
+  p "One identity the lab file declares for a machine, returned by `Machine.logins`."
+  code wscript { source = <<'SRC'
+struct Login {
+    label: string,
+    user: string,
+    password: Option[string],
+    elevated: bool,
+    default: bool,
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`label`" | "string" | "none" | "The name an SSH username or `--user` selects this identity by." |
+      | "`user`" | "string" | "none" | "The guest account, for example `PROBE\\dev`." |
+      | "`password`" | "Option[string]" | "`None`" | "The declared secret exactly as written, or `None` where the author declared none. Never an empty string." |
+      | "`elevated`" | "bool" | "true on Windows, false on Linux" | "Whether sessions as this login run elevated. Resolved: an undeclared value takes the guest family's default. Elevation is Windows-only, so a Linux login that never declared it reports false." |
+      | "`default`" | "bool" | "resolved" | "Whether this is the machine's default identity, with the lone-login rule applied: a machine's only login is the default without saying so." |
+  }
+  p <<DOC
+    `password` is `None` rather than empty so that a script never passes an
+    empty secret to an account-creation command by accident. `elevated` and
+    `default` cross resolved rather than as written, so a script asking "is
+    this the default" gets the answer vmlab acts on. See
+    [Logins and the SSH facade](guide_logins) and the `login {}` block in
+    [vm and its children](ref_vm).
+  DOC
+
+  h2 "GuestStats"
+  p "One sample of guest metrics, returned by `Machine.stats`."
+  code wscript { source = <<'SRC'
+struct GuestStats {
+    cpu_pct: float,
+    mem_used: int,
+    mem_total: int,
+    disks: List[DiskStat],
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`cpu_pct`" | "float" | "none" | "CPU use across the guest, in percent." |
+      | "`mem_used`" | "int" | "none" | "Memory in use, in bytes." |
+      | "`mem_total`" | "int" | "none" | "Memory the guest sees, in bytes." |
+      | "`disks`" | "List[DiskStat]" | "empty" | "One entry per mounted filesystem." |
+  }
+  p <<DOC
+    The sample comes from the agent's metrics feature; `vmlab machine
+    capabilities` says whether a machine's agent offers it.
+  DOC
+
+  h2 "DiskStat"
+  p "One mounted filesystem inside `GuestStats`."
+  code wscript { source = <<'SRC'
+struct DiskStat {
+    mount: string,
+    used: int,
+    total: int,
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`mount`" | "string" | "none" | "The mount point, such as `/` or `C:\\`." |
+      | "`used`" | "int" | "none" | "Bytes in use." |
+      | "`total`" | "int" | "none" | "The filesystem's size in bytes." |
+  }
+
+  h2 "Event"
+  p "The payload an event handler receives as its first argument."
+  code wscript { source = <<'SRC'
+struct Event {
+    name: string,
+    vm: string,
+    data: string,
+}
+
+fn handle(event: Event, lab: Lab) { }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "string" | "none" | "The event name, such as `vm.crashed`. See [Events](ref_events)." |
+      | "`vm`" | "string" | "empty" | "The machine the event concerns: the payload's `vm` key, else its `container` key, else empty." |
+      | "`data`" | "string" | "`{}`" | "The whole payload as JSON text." |
+  }
+  p <<DOC
+    A handler is bound with an `on {}` block in the lab file, see
+    [Events and handlers](guide_events), and runs `fn handle(event: Event,
+    lab: Lab)` on a lab handle with no owning machine. Handler failures are
+    logged and never fatal. `vm` is filled from the `vm` or `container` key
+    only, so an event that names its subject as `machine` alone leaves it
+    empty; the daemons set both keys on such events for that reason. `data`
+    carries every other field for a handler to parse.
+  DOC
+  code wscript { source = <<'SRC'
+fn handle(event: Event, lab: Lab) {
+    lab.log("event " + event.name + " on " + event.vm)
+    if event.name == "vm.crashed" {
+        let Ok(m) = lab.machine(event.vm) else { return }
+        let shot = m.screenshot("")
+    }
+}
+SRC
+  }
+
+  h2 "vmlab::sleep_ms"
+  p "Pause the script."
+  code wscript { source = "fn sleep_ms(ms: int)" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`ms`" | "int" | "How long to sleep, in milliseconds. A negative value returns at once." |
+  }
+  p <<DOC
+    Blocks the script's thread; the lab daemon keeps running. Prefer the
+    waiting methods, `Machine.wait_ready`, `Machine.wait_for_image`,
+    `Term.expect`, where one fits, and use this for polling loops around
+    `Machine.exec`.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let vm = lab.this_vm().expect("no target vm")
+    for i in 0..10 {
+        match vm.exec("cmd.exe", ["/c", "if exist C:\\done (exit 0) else (exit 1)"]) {
+            Ok(r) => { if r.exit_code == 0 { return } }
+            Err(e) => lab.log("waiting: " + e),
+        }
+        vmlab::sleep_ms(1000)
+    }
+}
+SRC
+  }
+
+  h2 "vmlab::env"
+  p "Read an environment variable of the lab daemon's process."
+  code wscript { source = "fn env(name: string) -> string" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`name`" | "string" | "The variable's name." |
+  }
+  p <<DOC
+    Returns the value, or an empty string when it is unset, so a script
+    cannot tell an unset variable from an empty one. The environment is the
+    daemon's, which inherits from the `vmlab` invocation that started it,
+    not necessarily from the shell running `vmlab up` now. It exists so a
+    build or provision script can carry an operator toggle without a schema
+    change, such as a `VMLAB_SKIP_UPDATES=1` that lets a template build
+    skip its update pass.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    if vmlab::env("VMLAB_SKIP_UPDATES") == "1" {
+        lab.log("skipping updates")
+        return
+    }
+}
+SRC
+  }
+}

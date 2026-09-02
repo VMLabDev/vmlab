@@ -1,0 +1,55 @@
+page cmd_tail {
+  title = "vmlab tail"
+  chapter_header "vmlab tail" {
+    kicker       = "Commands · reference"
+    reading_time = "3 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab tail` follows a file inside a guest over the vmlab agent channel,
+    with `tail -F` semantics: it keeps reading as the file grows and follows
+    it across truncation and replacement. No guest network and no guest
+    shell are needed.
+  DOC
+
+  code sh { source = "vmlab tail <VM> <PATH>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The machine, as `[lab/]name`." |
+      | "`<PATH>`" | "Guest file path." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The command asks the lab daemon to open a tail session on the machine's
+    agent and prints each chunk as it arrives, flushing after every chunk so
+    a pipe sees lines promptly. It runs until you press Ctrl-C, the machine
+    stops, or the agent reports an error on the session. The daemon checks
+    the machine's state every half second and ends the stream when it is no
+    longer running.
+  DOC
+
+  p <<DOC
+    The path is read by the agent's own identity, SYSTEM or root, so files a
+    user cannot read are still followed. This is the verb for a guest log
+    that has no host-side copy; the lab's own event log and a VM's serial
+    and QEMU logs are read host-side by [vmlab logs](cmd_logs).
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab tail dc01 C:/Windows/debug/netsetup.log
+vmlab tail nix01 /var/log/messages
+SRC
+  }
+
+  p <<DOC
+    Exit status is 0 when the stream ends. `not_found` (4) means the lab
+    declares no machine by that name. `failed` (1) covers a machine that is
+    not running, an agent that does not answer, and a session error such as
+    a path the agent cannot open.
+  DOC
+}

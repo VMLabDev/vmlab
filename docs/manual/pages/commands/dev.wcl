@@ -1,0 +1,320 @@
+page cmd_dev {
+  title = "vmlab dev"
+  chapter_header "vmlab dev" {
+    kicker       = "Commands · reference"
+    reading_time = "14 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab dev` holds the verbs that mean nothing for a machine that is not
+    `@dev`: attaching to a [dev machine](guide_dev) from cold, recording
+    which dev machine is yours, and reading or resolving the
+    [workspace syncer](guide_dev). The SSH facade is a general capability,
+    so [vmlab ssh](cmd_ssh) and [vmlab ssh-config](cmd_ssh_config) stay top
+    level.
+  DOC
+
+  code sh { source = "vmlab dev <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`attach`" | "Up the dev machine, wait until it is attachable, and become a shell on it." |
+      | "`use`" | "Record which dev machine is yours, in the lab's gitignored `.vmlab/`." |
+      | "`sync`" | "The workspace syncer: what it is doing, and what to do about a halt." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Every verb here that takes an optional machine resolves it through one
+    ladder: the argument, then `VMLAB_DEV_MACHINE`, then the `dev use`
+    selection, then the lab's default `@dev` machine. A rung that names a
+    machine which is not a dev machine in this lab is an error that says
+    which rung and lists the candidates. When no rung names one and no
+    machine is the default, the error lists the dev machines and the three
+    ways to pick one. A lab with no `@dev` machine at all says so.
+  DOC
+
+  p <<DOC
+    Exit status is 0 on success. The selection ladder, the lab file, and
+    the managed SSH block are checked locally and fail with 1. Requests the
+    verbs send carry the codes in
+    [Wire protocol and error codes](ref_protocol): `not_found` (4) when the
+    daemon does not know the machine, and `failed` (1) for everything the
+    syncer refuses, since the workspace verbs answer every refusal as
+    `failed` with the reason in the message.
+  DOC
+
+  h2 "vmlab dev attach"
+
+  code sh { source = "vmlab dev attach [MACHINE]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`[MACHINE]`" | "Which dev machine. Default: `VMLAB_DEV_MACHINE`, then the `vmlab dev use` selection, then the lab's default `@dev` machine." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    `attach` is cold to editing in one command. It validates the lab file,
+    resolves the machine, refreshes the managed SSH block and checks this
+    machine's alias with `ssh -G`, all before anything boots, so an attach
+    that could not work fails before a machine is started. It prints which
+    machine it is attaching to and which rung chose it, so a surprise can be
+    interrupted before the wrong guest boots.
+  DOC
+
+  p <<DOC
+    It then ups this machine alone, not the lab, streaming `up`'s output,
+    and waits until the machine is `attachable` as
+    [vmlab machine capabilities](cmd_machine) reports it. The wait is
+    visible: each distinct stage is printed once, such as waiting for the
+    machine to run, to become ready, or for its agent to answer. A running,
+    ready machine whose agent answers without the `tunnel` and `fileops`
+    features is refused with both remedies, rebuilding the template or
+    `vmlab machine repair-agent`. The wait gives up after 300 seconds past
+    `up` and says what it was still waiting for.
+  DOC
+
+  p <<DOC
+    On `attachable` it prints the SSH alias and every labelled alias beside
+    it, a reminder that vmlab launches no editor, a note that agent
+    forwarding refuses silently, a note that the workspace syncer belongs to
+    the lab daemon and survives the shell when the machine declares a
+    workspace, and the same editor snippet and offline notes as
+    `ssh-config --print`. Then the process becomes `ssh <alias>`. Nothing
+    of vmlab survives to own anything the editor still needs.
+  DOC
+
+  code sh { source = <<'SRC'
+cd examples/dev-vscode-windows
+vmlab dev attach
+vmlab dev attach dev01
+SRC
+  }
+
+  p <<DOC
+    Exit status is `ssh`'s once the shell has started. Before that, the
+    ladder, validation, and the block check exit 1; the `up` and the
+    capability probe carry `failed` (1) and `not_found` (4); a refused or
+    timed-out wait exits 1.
+  DOC
+
+  h2 "vmlab dev use"
+
+  code sh { source = "vmlab dev use <MACHINE>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "The dev machine to record." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    `use` records which dev machine is yours in the lab's own gitignored
+    `.vmlab/` directory, in the file `dev-machine`. The lab file is
+    committed and shared, so it cannot say this; the selection is
+    per-developer by construction. The verb validates the lab first, because
+    a selection against a lab that does not validate is a promise vmlab
+    cannot keep, then checks the name through the same ladder `attach`
+    uses, so what `use` accepts and what `attach <machine>` accepts are one
+    answer. It needs no daemon and starts nothing.
+  DOC
+
+  p <<DOC
+    It prints the lab, the machine, and the file the selection went in, and
+    reminds you that `vmlab destroy` forgets it with everything else in
+    `.vmlab/`, and that running `use` again changes it.
+  DOC
+
+  code sh { source = "vmlab dev use buildbox" }
+
+  p "Exit status is 0 on success and 1 for a lab that does not validate or a name that is not a dev machine."
+
+  h2 "vmlab dev sync"
+
+  code sh { source = "vmlab dev sync <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`status`" | "What the syncer last decided: halted paths, warnings, and what it skipped by name." |
+      | "`flush`" | "Run a sync pass now and wait for it, rather than for the next edit." |
+      | "`diff`" | "Show the guest's copy of a path beside the host's." |
+      | "`resolve`" | "Pick which side wins at a halted path, and carry it out." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Resolution is host-side, necessarily. The host opens channels and the
+    guest answers, so there is no guest-to-host control path: a `vmlab`
+    inside the dev machine could not call back. These verbs are typed in the
+    lab directory, not in the shell `attach` drops you into. The guest's
+    only signal of a halt is the marker file `.vmlab-sync-halt` at its
+    workspace root, which lists the halted paths.
+  DOC
+
+  p <<DOC
+    All four verbs talk to a lab daemon that is already running and never
+    start one: a syncer exists only while its machine is up, so starting a
+    daemon would boot a lab in order to answer no. A lab that is not running
+    is refused with a pointer to `vmlab up` and `vmlab dev attach`. A machine
+    that is up but declares no `@dev(workspace = …)`, or is not up, is
+    refused with `has no workspace syncer running`.
+  DOC
+
+  h2 "vmlab dev sync status"
+
+  code sh { source = "vmlab dev sync status [MACHINE]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`[MACHINE]`" | "Which dev machine. Default: `VMLAB_DEV_MACHINE`, then the `vmlab dev use` selection, then the lab's default `@dev` machine." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    `status` reads the syncer's report off the lab status projection, the
+    same value the console shows, and prints it in the order it matters.
+    First the halt, whole, when there is one: the headline names the machine
+    and how many paths conflict, or the bulk-delete guard that tripped, then
+    each halted path with its reason, a count of any not listed, and the
+    routes out. Without a halt the first line says the workspace is in step
+    with its pass count, or is a number of paths behind the canonical copy,
+    or has not completed a pass yet.
+  DOC
+
+  p <<DOC
+    Then everything the syncer declined to do or is waiting on, each by
+    name: a `waiting` line while both directions wait on a stat-walk, a
+    `re-seeding` line while the bracket after a snapshot restore runs, a
+    `volume` warning naming a subtree that carried an unusual amount of
+    work, a `trouble` line when the last pass could not finish, the count
+    of watch discontinuities answered with a full walk, `.git` paths
+    deferred while a lock is held, paths not yet carried across that a
+    snapshot capture would refuse on, and paths not synced by name with
+    their reasons, such as a socket or a file over the size guard.
+  DOC
+
+  code sh { source = <<'SRC'
+$ vmlab dev sync status
+the workspace on "dev01" has stopped, both directions, on 2 conflicting paths
+
+  src/main.rs
+      both sides changed it since they last agreed
+  README.md
+      both sides changed it since they last agreed
+
+`vmlab dev sync diff <path>` shows the guest copy host-side; `vmlab dev sync resolve <path> --host` or `--guest` picks a side, and `--all` takes the batch. Making both sides identical by hand needs no verb at all — the next pass adopts them as agreed. Both copies are still where they were: a halt writes neither and deletes neither.
+SRC
+  }
+
+  p "Exit status is 0 on success and 1 when the lab is not running or the machine has no syncer."
+
+  h2 "vmlab dev sync flush"
+
+  code sh { source = "vmlab dev sync flush [MACHINE]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`[MACHINE]`" | "Which dev machine, through the same ladder as `status`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    `flush` asks the syncer to run a pass now, waits for that pass to
+    complete, and prints the same report `status` prints, so the effect of
+    the flush is visible. It is the pass a snapshot capture runs first, and
+    the way to make a host edit land before the debounce would. A halted
+    workspace stays halted: a flush carries nothing across a halt. The wait
+    gives up after 120 seconds and says to check `vmlab status` for whether
+    the machine is still answering.
+  DOC
+
+  code sh { source = "vmlab dev sync flush dev01" }
+
+  p "Exit status is 0 on success and `failed` (1) when the pass does not complete or the machine has no syncer."
+
+  h2 "vmlab dev sync diff"
+
+  code sh { source = "vmlab dev sync diff [OPTIONS] [PATHS]..." }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`[PATHS]...`" | "Workspace-relative paths. Default: every halted path." |
+      | "`--machine <MACHINE>`" | "Which dev machine, through the same ladder as `status`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    `diff` brings the guest's copy of each path to the host and shows it
+    beside the host's. The host copy is a directory on this workstation;
+    only the guest's is behind the seam, which is why the verb exists rather
+    than attaching and looking. With no path and no halt it is refused,
+    because there is nothing to name.
+  DOC
+
+  p <<DOC
+    The output opens with the host root and the guest root, then one section
+    per path. Two identical copies say so, and that the next pass adopts them
+    with no verb. A path one side lacks says which. Two readable text copies
+    print as a unified diff, `-` for host lines and `+` for guest lines, up
+    to 2000 lines a side; past that, or for a binary or a file the guest
+    would not send whole, each side prints its size and digest prefix and
+    why it was not shown.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab dev sync diff
+vmlab dev sync diff src/main.rs --machine dev01
+SRC
+  }
+
+  p "Exit status is 0 on success and `failed` (1) when no path is named and nothing is halted, or the guest copy cannot be read."
+
+  h2 "vmlab dev sync resolve"
+
+  code sh { source = "vmlab dev sync resolve [OPTIONS] [PATHS]..." }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`[PATHS]...`" | "Workspace-relative paths. Omit with `--all`." |
+      | "`--host`" | "The canonical host copy wins: carry it into the guest." |
+      | "`--guest`" | "The guest's working copy wins: carry it onto the canonical copy." |
+      | "`--all`" | "Every halted path, as the halt currently stands." |
+      | "`--machine <MACHINE>`" | "Which dev machine, through the same ladder as `status`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    `resolve` records which side wins at the named paths and runs a pass
+    that carries it out, then prints the report. There is no default side:
+    exactly one of `--host` and `--guest` is required, and the two conflict.
+    Paths are required unless `--all` is given, which the daemon expands
+    from the halt it is holding, so a thirty-thousand-file halt needs no
+    list. `--all` on a workspace that is not halted is refused with
+    `there is nothing to resolve`. Named paths are recorded as given, and
+    the pass that follows carries the chosen side across at each of them.
+  DOC
+
+  callout "The losing copy is overwritten" {
+    kind = :warning
+    body = "The copy that loses is overwritten and is not recoverable from vmlab. Run `vmlab dev sync diff` first. Making both sides identical by hand is a third route that needs no verb: the next pass adopts them as agreed."
+  }
+
+  code sh { source = <<'SRC'
+vmlab dev sync resolve src/main.rs --guest
+vmlab dev sync resolve --all --host
+SRC
+  }
+
+  p "Exit status is 0 on success, 1 when no side or no path is given, and `failed` (1) when the workspace is not halted or the pass does not complete."
+}

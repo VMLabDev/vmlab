@@ -1,0 +1,76 @@
+page cmd_ssh_config {
+  title = "vmlab ssh-config"
+  chapter_header "vmlab ssh-config" {
+    kicker       = "Commands · reference"
+    reading_time = "4 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab ssh-config` refreshes the managed block vmlab keeps in
+    `~/.ssh/config` for the lab of the current directory, and with `--print`
+    emits one machine's stanzas together with the editor settings snippet.
+    The block is vmlab's whole host-side SSH footprint: one `Host` stanza per
+    declared machine and per declared login, each with a `ProxyCommand` onto
+    the SSH facade described in [Logins and the SSH facade](guide_logins).
+  DOC
+
+  code sh { source = "vmlab ssh-config [OPTIONS]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`--print <MACHINE>`" | "Print one machine's stanza and the editor settings snippet, for a client that will not read the file." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Any command that loads a lab refreshes the block on the way past and only
+    warns when that fails. This verb exists for the two moments the ambient
+    refresh cannot serve: when you want to know the block is current, and
+    when your client will not read `~/.ssh/config` at all. Its own failure
+    is an error, because the write is what was asked for.
+  DOC
+
+  p <<DOC
+    The block is generated from the lab file, not from running machines, so
+    every declared machine has an alias whether or not it is up. Aliases are
+    `vmlab-<lab>-<machine>` for the machine's default identity and
+    `vmlab-<lab>-<machine>-<label>` for each `login {}` label, so
+    attaching as another account is a pick in an editor's host list. A login
+    whose label is not one `ssh_config` word gets no alias, and the command
+    says so on standard error with the `ssh -l` form to use instead. The
+    write takes a lock, renames a temporary file onto the resolved path, and
+    checks the first alias with `ssh -G`. Where the block lives is a field in
+    the [host configuration](guide_host).
+  DOC
+
+  p <<DOC
+    Without `--print` the command prints the config path, whether the block
+    was updated or was already current, and how many aliases the lab
+    contributes. With `--print` it prints the machine's stanzas as they
+    appear in the block, then the VS Code `settings.json` snippet, which sets
+    `remote.SSH.localServerDownload` to `always` and, for a Windows guest,
+    `remote.SSH.remotePlatform` per alias, and then two notes: personal
+    config copies over the alias with `scp`, and a host-side service is
+    reached by giving the machine a NIC on a segment with egress rather than
+    by `ssh -R`, which the facade refuses. [vmlab dev attach](cmd_dev)
+    prints the same handover.
+  DOC
+
+  code sh { source = <<'SRC'
+$ vmlab ssh-config
+/home/wil/.ssh/config — block already current (4 aliases for lab "dev-vscode-windows")
+$ vmlab ssh-config --print dev01
+SRC
+  }
+
+  p <<DOC
+    Exit status is 0 on success. The command sends no daemon request, so
+    every failure exits 1: no lab in the current directory, a lab file that
+    does not load, a block that cannot be written, an `ssh -G` check that
+    resolves another `ProxyCommand`, or a `--print` machine the lab does not
+    declare.
+  DOC
+}

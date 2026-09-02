@@ -217,6 +217,11 @@ Module map under `src/`:
   `use`, and the `sync` verbs a halt is resolved through (§19.6), which live
   here because ADR-0013 leaves no guest→host control path to offer them from.
 
+The user manual is a wdoc book at `docs/manual/` (`just manual-build`,
+`just manual-serve`; audited with `/technical-book audit`, whose surface
+extractor is `scripts/manual-surface.py`). The website entry is `docs/main.wcl`
+(`just docs-build` renders the landing page and the manual under `/manual/`).
+
 `docs/vmlab-prd.md` remains the binding contract; section refs (`§N`) appear
 throughout the code and commit messages.
 

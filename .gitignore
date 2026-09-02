@@ -8,9 +8,8 @@
 *.wscripti
 examples/**/.vmlab/
 
-# Generated documentation site + wskill projections (regenerate with `just docs-build` / `just skill-build`).
+# Generated documentation site (regenerate with `just docs-build`).
 /docs/_site
-/docs/wskills/*/out
 .playwright-cli/
 
 # config-weave's package-repo clones, written beside a playbook whenever

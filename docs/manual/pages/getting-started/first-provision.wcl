@@ -1,0 +1,201 @@
+// Getting started: a provision script that configures a guest on `up` and on demand.
+page gs_first_provision {
+  title = "Automate a guest with a script"
+  chapter_header "Automate a guest with a script" {
+    kicker       = "Getting started · tutorial"
+    reading_time = "9 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A provision script is a [wscript](guide_scripting) file declared inside
+    the machine it configures. vmlab runs it during `vmlab up` once that
+    machine is ready. In this tutorial you write one that waits for the guest,
+    runs a command, copies a file in and captures the screen, then run the
+    same script again on demand with `vmlab script`.
+  DOC
+
+  h2 "Before you start"
+
+  list {
+    li "You have completed [Your first VM](gs_first_vm), or have any lab with one Linux VM that reports ready. The lab file below is that tutorial's, extended."
+    li "The guest has a display. Screenshots need one, and every VM has one. A container does not, so the screenshot step would fail there by naming the missing capability."
+  }
+
+  h2 "Start from a real one"
+
+  p <<DOC
+    The `alpine-registry` example ships a provision that does the first two
+    things this tutorial needs: it waits for readiness and runs a command.
+    Read it before writing your own.
+  DOC
+
+  code rust {
+    filename    = "examples/alpine-registry/scripts/setup.ws"
+    source_file = "../../examples/alpine-registry/scripts/setup.ws"
+    dedent      = true
+  }
+
+  p "Four things in this file are the shape of every provision script."
+
+  list {
+    li "`use vmlab` imports the host module, which provides `vmlab::sleep_ms` and the other helpers in [wscript API: Term, types and the vmlab module](ref_ws_types)."
+    li "`fn main(lab: Lab)` is the entry point. vmlab calls it with the [Lab handle](ref_ws_lab), from which the script reaches every machine and segment by name."
+    li "Methods that can fail return `Result`. The `?` operator propagates an error string out of `setup`, and `expect` in `main` turns it into a failed provision, which fails `vmlab up` with that message."
+    li "`wait_ready(600)` blocks until the guest agent answers or 600 seconds pass. A provision runs after its machine is ready, so the call is instant during `up`, but it makes the script correct under `vmlab script` too, where nothing has waited for you."
+  }
+
+  h2 "Write the script"
+
+  p <<DOC
+    In the directory holding the `first-vm` lab file, create `scripts/setup.ws`
+    and a file to copy in, `scripts/files/motd`.
+  DOC
+
+  code sh { source = <<'SRC'
+mkdir -p scripts/files
+printf 'provisioned by vmlab\n' > scripts/files/motd
+SRC
+  }
+
+  code rust { filename = "scripts/setup.ws" source = <<'SRC'
+// Wait for the guest, run a command, copy a file in, capture the screen.
+
+use vmlab
+
+fn setup(lab: Lab) -> Result[unit, string] {
+    let alp = lab.vm("alp")?
+
+    alp.wait_ready(600)?
+    lab.log("alp is ready at " + alp.ip()?)
+
+    // exec: program and argument list, captured stdout/stderr/exit code.
+    let rel = alp.exec("/bin/cat", ["/etc/alpine-release"])?
+    if rel.exit_code != 0 {
+        return Err("could not read the release: " + rel.stderr)
+    }
+    lab.log("alpine release: " + rel.stdout.trim())
+
+    // copy_to: a host path relative to this script, to an absolute guest path.
+    alp.copy_to("files/motd", "/etc/motd")?
+    let motd = alp.exec("/bin/cat", ["/etc/motd"])?
+    lab.log("guest motd: " + motd.stdout.trim())
+
+    // screenshot: a PNG under the lab's .vmlab/screenshots/ when the path is "".
+    let shot = alp.screenshot("")?
+    lab.log("screen captured to " + shot)
+    Ok(())
+}
+
+fn main(lab: Lab) {
+    setup(lab).expect("first-vm setup failed")
+}
+SRC
+  }
+
+  p "Three details are easy to get wrong."
+
+  list {
+    li "`exec` takes a program and a list of arguments, not a shell line. To run a pipeline or use a shell feature, call the shell: `alp.exec(\"/bin/sh\", [\"-c\", \"...\"])`. The default timeout is 120 seconds; `exec_timeout` takes a third argument in seconds."
+    li "Relative host paths in `copy_to`, `copy_from`, `screenshot` and the image-matching methods resolve against the directory the script lives in, not the lab root. That is why the file is at `scripts/files/motd` and the script names it as `files/motd`."
+    li "`screenshot(\"\")` picks a timestamped name under the lab-local `.vmlab/screenshots/` directory and returns the path. Pass a path to choose the file yourself."
+  }
+
+  h2 "Declare it on the machine"
+
+  p "Add a `provision {}` block to the VM. The path is relative to the lab root."
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+import <vmlab.wcl>
+
+lab "first-vm" {
+
+  vm "alp" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+    arch     = "x86_64"
+    memory   = 1GiB
+    nic { nat = true }
+
+    provision "scripts/setup.ws" { }
+  }
+}
+SRC
+  }
+
+  p <<DOC
+    `validate` compiles the script as part of validating the lab file, so a
+    syntax error or a call to a method that does not exist is reported before
+    anything boots.
+  DOC
+
+  code sh { source = "vmlab validate" }
+
+  callout "The script compiles" {
+    kind = :success
+    body = "`vmlab validate` reports the lab as ok with one VM. A typo in the script is reported here, with its line."
+  }
+
+  h2 "Run it with up"
+
+  code sh { source = "vmlab up" }
+
+  p <<DOC
+    `up` boots the VM, waits until it is ready, and then runs the provision.
+    Each `lab.log` line appears in the terminal as the script reaches it.
+    Every `up` runs the steps again, whether or not the VM was already
+    running, so keep scripts safe to repeat. Copying the same file twice is harmless. Creating an account twice
+    is not, and the [mixed-lab](apx_examples) example shows the guard pattern,
+    checking the guest's state before changing it.
+  DOC
+
+  p "Confirm the two side effects from the host."
+
+  code sh { source = <<'SRC'
+vmlab exec alp -- cat /etc/motd
+ls .vmlab/screenshots/
+SRC
+  }
+
+  callout "The guest is provisioned" {
+    kind = :success
+    body = "`/etc/motd` in the guest reads `provisioned by vmlab`, and `.vmlab/screenshots/` holds a PNG named after the VM and the time."
+  }
+
+  h2 "Run it again on demand"
+
+  p <<DOC
+    Any script can be run ad hoc against the running lab. `vmlab script`
+    takes a path relative to the lab root and calls its `main` with the same
+    lab handle a provision gets.
+  DOC
+
+  code sh { source = "vmlab script scripts/setup.ws" }
+
+  p <<DOC
+    The one difference is ownership. A provision belongs to the machine that
+    declared it, and `lab.this_vm()` returns that machine. Under `vmlab
+    script` there is no owning machine and `this_vm()` returns an error. The
+    script above uses `lab.vm(\"alp\")` so it works both ways.
+  DOC
+
+  p <<DOC
+    Provisions and playbooks are the two kinds of setup step, and they run
+    interleaved in declaration order. The other place scripts run is an
+    `on {}` handler, which reacts to an event such as `vm.crashed`. See
+    [Playbooks](guide_playbooks) and [Events and handlers](guide_events).
+  DOC
+
+  callout "Provisions run as the agent identity" {
+    kind = :note
+    body = "With no `login {}` on the machine, `exec` and `copy_to` run as root or SYSTEM. To write into a user's home as that user, declare a login and take a second handle with `as_login`. [Attach an editor to a dev machine](gs_dev_attach) uses it, and [Logins and the SSH facade](guide_logins) explains the rules."
+  }
+
+  h2 "Next steps"
+
+  list {
+    li "[Guest automation with wscript](guide_scripting) covers the execution model, error handling, the terminal API and multi-machine orchestration."
+    li "[Screens, input and vision](guide_vision) shows `wait_for_text`, `wait_for_image`, keystrokes and mouse input, for guests where the agent is not there yet."
+    li "[wscript API: Machine](ref_ws_machine) lists every method on the machine handle, and [vmlab script](cmd_script) documents the verb."
+  }
+}

@@ -1,0 +1,70 @@
+page cmd_cp {
+  title = "vmlab cp"
+  chapter_header "vmlab cp" {
+    kicker       = "Commands · reference"
+    reading_time = "4 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab cp` copies a file or a tree between the host and a guest over the
+    vmlab agent's file session, with no guest network and no share involved.
+    Either side may be a guest reference spelled `<vm>:<path>`; the other is
+    a host path. Parent directories on the receiving side are created.
+  DOC
+
+  code sh { source = "vmlab cp <SRC> <DEST>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<SRC>`" | "Source: a host path, or `<vm>:<path>` to pull from the guest." |
+      | "`<DEST>`" | "Destination: `<vm>:<path>` to push, or a host path when pulling." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The guest side is recognised by splitting on the first colon, so a
+    Windows path keeps its drive letter: `box:C:/weave` is the machine `box`
+    and the guest path `C:/weave`. The `<vm>` part accepts the `[lab/]name`
+    form. When neither side is a guest reference the command is refused
+    locally. A push whose host source does not exist is refused before any
+    request is sent.
+  DOC
+
+  p <<DOC
+    A push sends one file, or walks a directory and sends every file under
+    it to the matching path below the guest destination, one request per
+    file, keeping each file's mode. The daemon opens the host file itself,
+    so the path is made absolute first, and verifies the digest end to end.
+    It prints `pushed <bytes> bytes to <vm>:<path>` for a file and
+    `pushed <n> file(s), <bytes> bytes to <vm>:<path>` for a tree.
+  DOC
+
+  p <<DOC
+    A pull copies one guest file to the host path. When the host destination
+    is an existing directory the guest file's name is kept under it. It
+    prints `pulled <bytes> bytes to <path>`.
+  DOC
+
+  callout "Transfers run as the agent identity" {
+    kind = :note
+    body = "`cp` still runs as SYSTEM or root even on a machine that declares a `login {}`, unlike `exec` and `shell`. A pushed file is owned by the agent identity, not by the login you would attach as. To write into a login's home as that login, use `scp` over the SSH alias, or the `as_login` handle in a provision script (see [Logins and the SSH facade](guide_logins))."
+  }
+
+  code sh { source = <<'SRC'
+vmlab cp ./tools/ dc01:C:/tools
+vmlab cp dc01:C:/Windows/debug/netsetup.log ./logs/
+vmlab cp mixed-lab/nix01:/etc/nixos/configuration.nix ./configuration.nix
+SRC
+  }
+
+  p <<DOC
+    Exit status is 0 on success. `not_found` (4) means the lab declares no
+    machine by that name. `failed` (1) covers a machine that is not running,
+    an agent that does not answer, a guest path that cannot be opened, and
+    a digest mismatch. A malformed pair of arguments or a missing host
+    source exits 1 before any request is sent.
+  DOC
+}

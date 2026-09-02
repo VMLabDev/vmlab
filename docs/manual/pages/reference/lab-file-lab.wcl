@@ -1,0 +1,362 @@
+page ref_lab {
+  title = "Lab file: lab and segment"
+  chapter_header "Lab file: lab and segment" {
+    kicker       = "Reference · reference"
+    reading_time = "14 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    This chapter is the field-by-field reference for the top of a lab file:
+    the `lab {}` block, its `segment {}` children, and the network rule
+    blocks a segment or a lab carries. The [lab file guide](guide_lab_file)
+    explains how the pieces fit together; the [networking guide](guide_networking)
+    explains what the segment fields do on the wire. The machine blocks are in
+    [vm and its children](ref_vm), [container and its children](ref_container)
+    and [template and source](ref_template).
+  DOC
+
+  h2 "How the file is found"
+  p <<DOC
+    A lab is a directory containing a file named `vmlab.wcl`. Every lab-scoped
+    verb walks up from the current directory, the way `git` finds its
+    repository, and uses the first directory that holds one as the lab root.
+    Relative paths in the file resolve against that root. If no ancestor holds
+    a `vmlab.wcl`, the verb fails with an error naming the directory it
+    started from.
+  DOC
+  p <<DOC
+    The first line of the file must be `import <vmlab.wcl>`, which loads the
+    schema every block below is checked against. A file without the import is
+    rejected before anything else is read. A lab file declares exactly one
+    `lab {}` block; a file with none, or with two, is rejected. It may also
+    declare `template {}` blocks beside the lab, which
+    [template and source](ref_template) describes.
+  DOC
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+import <vmlab.wcl>
+
+lab "demo" {
+  segment "lan" { nat = true }
+  vm "box" {
+    template = "x86_64/ubuntu-24.04"
+    nic { segment = "lan" }
+  }
+}
+SRC
+  }
+  p <<DOC
+    Two kinds of rule apply to what you write. The schema rejects unknown
+    fields, wrong types and missing required child blocks as the file is
+    parsed. `vmlab validate` then runs the semantic rules listed under each
+    entry below, reports every problem it finds in one pass, and every other
+    verb runs the same checks before it touches a machine. See
+    [vmlab validate](cmd_validate).
+  DOC
+  callout "Value types" { kind = :info body = <<DOC
+    `utf8` is a quoted string. `bool` is `true` or `false`. `i64` is an
+    integer. `ByteSize` is an integer with a unit, such as `8GiB` or `512MiB`.
+    `Duration` is an integer with a unit, such as `10s`. `list<utf8>` is a
+    bracketed list of strings, such as `["dc01", "dc02"]`.
+  DOC
+  }
+
+  h2 "lab {}"
+  p <<DOC
+    The one lab a file declares. The inline label is the lab's name, which
+    becomes part of every guest hostname and is unique on the host.
+  DOC
+  code wcl { source = <<'SRC'
+lab "<name>" {
+  gui = false
+  segment "…" { … }
+  vm "…" { … }
+  container "…" { … }
+  record { … }
+  sinkhole { … }
+  on "…" { … }
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "utf8 (label)" | "required" | "Lab name, a DNS label of at most 63 characters; the inline block label." |
+      | "`gui`" | "bool" | "unset" | "Default for all VMs: open a VNC viewer on `up`. A VM's own `gui` overrides it." |
+      | "`segment {}`" | "children" | "none" | "Virtual L2 network segments in this lab." |
+      | "`vm {}`" | "children" | "none" | "The VMs in this lab." |
+      | "`container {}`" | "children" | "none" | "OCI containers in this lab, each run in a micro-VM." |
+      | "`on {}`" | "children" | "none" | "Lifecycle event handlers. A handler failure is logged, never fatal." |
+      | "`record {}`" | "children" | "none" | "Lab-wide static DNS entries; wildcards allowed." |
+      | "`sinkhole {}`" | "children" | "none" | "Lab-wide DNS sinkholes." |
+  }
+  p <<DOC
+    Validation checks the name is a DNS label: letters, digits and hyphens
+    only, not starting or ending with a hyphen, at most 63 characters. VM and
+    container names share one namespace inside the lab, so a `vm` and a
+    `container` with the same name is an error. A lab with no machines is
+    valid.
+  DOC
+  code wcl {
+    filename    = "examples/mixed-lab/vmlab.wcl"
+    source_file = "../../examples/mixed-lab/vmlab.wcl"
+  }
+
+  h2 "segment {}"
+  p <<DOC
+    One virtual L2 switch owned by the lab daemon, or by the supervisor when
+    `global = true`. Machines attach to it with `nic {}` blocks. A segment
+    with no fields gets an auto-allocated subnet, DHCP and DNS from the daemon,
+    and no internet egress.
+  DOC
+  code wcl { source = <<'SRC'
+segment "<name>" {
+  subnet    = "10.50.0.0/24"
+  global    = false
+  dhcp      = true
+  nat       = false
+  mtu       = 1500
+  routes_to = ["other"]
+  dns      { … }
+  connect  { … }
+  route    { … }
+  record   { … }
+  forward  { … }
+  block    { … }
+  redirect { … }
+  sinkhole { … }
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "utf8 (label)" | "required" | "Segment name, a DNS label, unique per lab; the inline block label." |
+      | "`subnet`" | "utf8" | "auto" | "IPv4 CIDR. Auto-allocated as a /24 from the host pool if omitted." |
+      | "`global`" | "bool" | "`false`" | "Owned by the supervisor and shared across labs." |
+      | "`dhcp`" | "bool" | "`true`" | "Enable DHCP on this segment." |
+      | "`nat`" | "bool" | "`false`" | "Enable NAT internet egress for this segment." |
+      | "`mtu`" | "i64" | "9000 or 1500" | "Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` or `global` segment, else 1500." |
+      | "`routes_to`" | "list<utf8>" | "none" | "Names of other segments the daemon routes to. Inter-segment routing is opt-in per segment." |
+      | "`dns {}`" | "child" | "none" | "DNS service override: hand out another server, or opt out." |
+      | "`connect {}`" | "child" | "none" | "Cross-host segment peer over TCP, authenticated by the PSK from host config." |
+      | "`route {}`" | "children" | "none" | "Guest routes pushed via DHCP option 121." |
+      | "`record {}`" | "children" | "none" | "Static DNS entries for this segment; wildcards allowed." |
+      | "`forward {}`" | "children" | "none" | "Host-to-guest port forwards." |
+      | "`block {}`" | "children" | "none" | "L3 block rules at the switch." |
+      | "`redirect {}`" | "children" | "none" | "L3 DNAT redirect rules." |
+      | "`sinkhole {}`" | "children" | "none" | "DNS sinkhole rules." |
+  }
+  p <<DOC
+    The daemon claims the first usable address of the subnet as the segment
+    gateway. DHCP, DNS, NAT and shared folders are all served there. The host
+    pool the automatic /24 comes from is `subnet_pool` in the
+    [host configuration file](ref_host).
+  DOC
+  p "Validation enforces these rules:"
+  list {
+    li "The name is a DNS label and no other segment in the lab has it."
+    li "`subnet` is a well-formed CIDR, and no two declared subnets overlap."
+    li "`mtu` is between 576 and 65535."
+    li "Every name in `routes_to` is a segment declared in this lab."
+    li "A `connect {}` child requires `global = true`; on a lab-local segment it would be ignored, so it is refused."
+    li "A segment with a machine gateway (a `nic` with `gateway = true`) cannot also set `nat = true`, and cannot be `global`."
+  }
+  code wcl {
+    filename    = "examples/ad-lab/vmlab.wcl"
+    source_file = "../../examples/ad-lab/vmlab.wcl"
+    anchor      = "segment-corp"
+    dedent      = true
+  }
+
+  h2 "dns {}"
+  p <<DOC
+    Overrides the DNS server a segment hands out over DHCP. Use it when a
+    guest, such as a domain controller, owns name resolution for the segment.
+    At most one per segment.
+  DOC
+  code wcl { source = <<'SRC'
+dns {
+  server  = "10.50.0.10"
+  enabled = true
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`server`" | "utf8" | "the daemon" | "IPv4 address of the DNS server to hand out via DHCP instead of the daemon." |
+      | "`enabled`" | "bool" | "`true`" | "Hand out a DNS server at all. `false` suppresses the DHCP DNS option." |
+  }
+  p <<DOC
+    `server` must parse as an IPv4 address. The daemon's own resolver keeps
+    answering on the gateway address either way; the block only changes what
+    guests are told to use.
+  DOC
+
+  h2 "connect {}"
+  p <<DOC
+    Bridges this segment to the same segment on another host. The two
+    supervisors tunnel L2 frames over TCP, authenticated by the pre-shared key
+    both hosts set in their host config. At most one per segment.
+  DOC
+  code wcl { source = <<'SRC'
+connect { host = "helios:13947" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`host`" | "utf8" | "required" | "Remote supervisor as `host[:port]` to bridge this segment with." |
+  }
+  p <<DOC
+    Validation requires the segment to be `global = true` and `host` to be
+    non-empty. The port defaults to the remote's `trunk_port`, which is 13947
+    unless its host config changes it. Set `psk` in the
+    [host configuration file](ref_host) on both sides.
+  DOC
+  code wcl {
+    filename    = "examples/peer-a/vmlab.wcl"
+    source_file = "../../examples/peer-a/vmlab.wcl"
+    anchor      = "segment-wan"
+    dedent      = true
+  }
+
+  h2 "route {}"
+  p <<DOC
+    A static route pushed to every guest on the segment at lease time, as
+    DHCP option 121. This is how a router VM becomes the path to another
+    segment.
+  DOC
+  code wcl { source = <<'SRC'
+route { dest = "10.60.0.0/24" via = "10.50.0.254" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`dest`" | "utf8" | "required" | "Destination CIDR, for example `10.60.0.0/24`." |
+      | "`via`" | "utf8" | "required" | "Gateway IPv4 address the route points at." |
+  }
+  p <<DOC
+    `dest` must parse as a CIDR and `via` as an IPv4 address. A guest with
+    `dhcp = false` on its segment never receives the route.
+  DOC
+
+  h2 "record {}"
+  p <<DOC
+    A static DNS entry. Inside a `segment {}` it answers on that segment;
+    inside `lab {}` it answers on every segment of the lab.
+  DOC
+  code wcl { source = <<'SRC'
+record { name = "*.internal" ip = "10.50.0.10" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "utf8" | "required" | "DNS name to resolve. Wildcards are allowed, for example `*.internal`." |
+      | "`ip`" | "utf8" | "required" | "IPv4 address the name resolves to." |
+  }
+  p <<DOC
+    `ip` must parse as an IPv4 address. Records are only seen by guests using
+    the segment's DNS; a segment whose `dns {}` hands out another server
+    bypasses them.
+  DOC
+
+  h2 "forward {}"
+  p <<DOC
+    A host-to-guest port forward. The daemon listens on the host port and
+    proxies into the segment, which is the path for RDP, SSH and web UIs from
+    the host.
+  DOC
+  code wcl { source = <<'SRC'
+forward { host_port = 13389 to = "dc01:3389" proto = "tcp" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`host_port`" | "i64" | "required" | "Host port to listen on, 1 to 65535. Unique across the lab." |
+      | "`to`" | "utf8" | "required" | "Target as `vm:port`. The machine must be declared in this lab." |
+      | "`proto`" | "utf8" | "`tcp`" | "Protocol: `tcp`, `udp` or `both`." |
+  }
+  p <<DOC
+    Validation requires `to` to have the form `name:port` with a numeric port,
+    the name to be a VM or container in this lab, and `host_port` to be unused
+    by every other `forward` and every container `port {}` in the lab, since
+    both compile into the same forward machinery.
+  DOC
+  code wcl {
+    filename    = "examples/mixed-lab/vmlab.wcl"
+    source_file = "../../examples/mixed-lab/vmlab.wcl"
+    anchor      = "segment-lan"
+    dedent      = true
+  }
+
+  h2 "block {}"
+  p <<DOC
+    An L3 rule that drops traffic to or from a CIDR at the switch, answering
+    with ICMP unreachable or TCP RST where it can so guests fail fast.
+  DOC
+  code wcl { source = <<'SRC'
+block { cidr = "203.0.113.0/24" proto = "tcp" port = 443 }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`cidr`" | "utf8" | "required" | "IPv4 CIDR to drop traffic to and from." |
+      | "`proto`" | "utf8" | "any" | "Protocol to scope the rule: `tcp`, `udp` or `icmp`." |
+      | "`port`" | "i64" | "any" | "Port to scope the rule, 1 to 65535. Requires `proto`." |
+  }
+  p <<DOC
+    `cidr` must parse as a CIDR. Redirect rules are evaluated before block
+    rules; within a layer the most specific match wins, and ties go to
+    declaration order. Scripts can add and remove rules at runtime; see
+    [Guest automation with wscript](guide_scripting).
+  DOC
+
+  h2 "redirect {}"
+  p <<DOC
+    An L3 DNAT rule. Traffic to one destination is rewritten to another, and
+    the daemon keeps the connection state to rewrite the return path.
+  DOC
+  code wcl { source = <<'SRC'
+redirect { from = "10.50.0.10:443" to = "10.50.0.99:8443" proto = "tcp" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`from`" | "utf8" | "required" | "Match destination as `ip[:port]`." |
+      | "`to`" | "utf8" | "required" | "Rewrite destination to `ip[:port]`." |
+      | "`proto`" | "utf8" | "any" | "Protocol to scope the rule: `tcp` or `udp`." |
+  }
+  p <<DOC
+    Both addresses must parse as an IPv4 address with an optional numeric
+    port. A rule without a port matches every port.
+  DOC
+
+  h2 "sinkhole {}"
+  p <<DOC
+    A DNS sinkhole. Names matching the pattern get NXDOMAIN, or resolve to
+    0.0.0.0 in `zero` mode. Inside a `segment {}` it applies there; inside
+    `lab {}` it applies to every segment.
+  DOC
+  code wcl { source = <<'SRC'
+sinkhole { pattern = "*.telemetry.example.com" mode = "nxdomain" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`pattern`" | "utf8" | "required" | "DNS name pattern to sink; wildcards allowed." |
+      | "`mode`" | "utf8" | "`nxdomain`" | "Response: `nxdomain`, or `zero` to resolve to 0.0.0.0." |
+  }
+  p <<DOC
+    Validation rejects an empty pattern. Like records, a sinkhole is only
+    effective for guests that use the segment's DNS.
+  DOC
+}

@@ -1,0 +1,160 @@
+page guide_events {
+  title = "Events and handlers"
+  chapter_header "Events and handlers" {
+    kicker       = "The guide · explanation"
+    reading_time = "7 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+Every lab daemon emits structured events as things happen: a machine
+starting, becoming ready, stopping or crashing; a lab coming up or down; a
+snapshot taken; a playbook converging; the disk running low. Any
+unrecoverable error is an event before it is a failure. Each event goes three
+places at once: the daemon's live broadcast stream, which CLI subscribers and
+the supervisor's host-wide aggregate read; the lab's append-only event
+history; and the tracing log. An `on {}` block in the lab file binds an event
+to a wscript handler. This chapter explains the stream, the handlers, the
+watchdogs and the logs. The full event list with payloads is in
+[Events](ref_events).
+DOC
+
+  h2 "The event stream"
+
+  p <<'DOC'
+An event is a name, the lab it came from, a timestamp and a JSON payload.
+Machine events carry the machine's name under `vm`, or under `container` for
+a container. The names a handler may bind are a closed list, and `vmlab
+validate` rejects an `on {}` that names anything else:
+DOC
+
+  table {
+    rows:
+      | "Event" | "When" |
+      | "`vm.starting`, `vm.ready`, `vm.stopped`, `vm.crashed`" | "A VM's lifecycle. `vm.stopped` follows every exit; `vm.crashed` precedes it when QEMU died rather than being asked to stop." |
+      | "`container.starting`, `container.ready`, `container.stopped`, `container.crashed`, `container.unhealthy`" | "A container's lifecycle, plus its healthcheck turning unhealthy. See [Lab containers](guide_containers)." |
+      | "`lab.up`, `lab.down`" | "The end of an `up` and of a `down`, with the machines involved." |
+      | "`lab.daemon_crashed`" | "Emitted by the supervisor when a lab daemon dies unexpectedly; the lab is marked failed and not restarted." |
+      | "`snapshot.created`, `snapshot.restored`" | "A snapshot taken or restored on a machine. See [Snapshots](guide_snapshots)." |
+      | "`template.built`" | "A template build sealed. See [Templates and the store](guide_templates)." |
+      | "`playbook.applied`, `playbook.failed`" | "A play converged, or a run ended non-zero or failed to run. See [Playbooks](guide_playbooks)." |
+      | "`host.disk_low`" | "The free-space watchdog crossed its threshold." |
+  }
+
+  p <<'DOC'
+Other events reach the stream and the history but cannot be bound: the SSH
+facade's `ssh.refused` for every channel or request it refuses, the workspace
+syncer's `workspace.halted`, `workspace.synced`, `workspace.rescan`,
+`workspace.deferred`, `workspace.skipped`, `workspace.refused`,
+`workspace.volume` and their siblings, the per-step `playbook.op.*` progress,
+and `smb.started` and `smb.failed` from the shared-folder service. They exist
+so that a refusal or a skip is visible somewhere other than one developer's
+terminal, and `vmlab logs` shows them.
+DOC
+
+  h2 "Handlers"
+
+  p <<'DOC'
+An `on "<event>" { run = "<script.ws>" }` block at lab level binds the event
+to a handler script. The script's entry point is
+`fn handle(event: Event, lab: Lab)`: `event.name` is the event, `event.vm` is
+the machine's name for machine events and empty otherwise, and `event.data`
+is the JSON payload as text. `lab` is the same handle a provision gets, so a
+handler can screenshot the machine that crashed, copy files off it, or start
+it again; see [Guest automation with wscript](guide_scripting).
+DOC
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+lab "ad-lab" {
+  // …
+  on "vm.crashed"    { run = "scripts/collect-dumps.ws" }
+  on "host.disk_low" { run = "scripts/alert.ws" }
+}
+SRC
+  }
+
+  code ws { filename = "scripts/collect-dumps.ws" source = <<'SRC'
+use vmlab
+
+fn handle(event: Event, lab: Lab) {
+    lab.log("crash handler fired for " + event.vm + " (" + event.name + ")")
+    let Ok(vm) = lab.vm(event.vm) else { return }
+    match vm.screenshot("") {
+        Ok(path) => lab.log("saved crash screenshot: " + path),
+        Err(e) => lab.log("could not screenshot: " + e),
+    }
+}
+SRC
+  }
+
+  p <<'DOC'
+`targets = ["dc01", "web"]` narrows a handler to named machines; with no
+`targets` it handles every occurrence. Only machine-scoped events accept
+targets, the `vm.`, `container.` and `snapshot.` families, and `validate`
+rejects targets on a lab-wide event such as `host.disk_low`. The handler's
+path is relative to the lab root, must exist, and is compiled by `validate`
+along with every other script.
+DOC
+
+  p <<'DOC'
+The lab daemon subscribes to its own stream and, for each event, runs every
+matching handler as its own task. Handlers run concurrently with each other
+and with whatever caused the event, and shutdown waits a bounded time for
+in-flight handlers rather than killing them. **Handler failures are logged,
+never fatal**: a compile error, a runtime error or an unreadable script is a
+warning in the daemon log and nothing else stops. There is no restart policy
+in the daemon; a handler that wants one calls `machine.start()` itself, which
+is what the crash handler in `examples/mixed-lab` demonstrates for a container.
+DOC
+
+  callout "Handlers run at the lab daemon, not on your terminal" {
+    kind = :info
+    body = "A handler's `lab.log` output lands in the lab daemon's own process log, `labd-<lab>.log` under `~/.local/state/vmlab/`, tagged with the `handler` target, not on the CLI that happened to trigger the event."
+  }
+
+  h2 "Watchdogs"
+
+  p <<'DOC'
+Two free-space watchdogs run, both governed by `disk_low_percent` in the
+[host configuration](guide_host), default 10 percent, and both checking once
+a minute. The supervisor watches the filesystem holding the template store,
+since pulls and builds land there. Each lab daemon watches the filesystem
+holding its own `.vmlab/` directory, since linked clones grow with use. Each
+emits `host.disk_low` with the path and the free percentage when free space
+drops below the threshold, once, and re-arms only when space recovers above
+it, so a full disk does not flood the stream. The lab daemon's copy is the one
+an `on "host.disk_low"` handler sees.
+DOC
+
+  p <<'DOC'
+The supervisor is also the watchdog over lab daemons. It reaps a daemon on
+`down` or `destroy`, and if one dies unexpectedly it emits
+`lab.daemon_crashed`, marks the lab failed, and does not restart it; see
+[How vmlab runs a lab](guide_architecture).
+DOC
+
+  h2 "Logs"
+
+  p <<'DOC'
+Everything is logged as JSON lines under `~/.local/state/vmlab/labs/<lab>/`:
+the event history in `events.jsonl`, the lab log in `lab.log` with provision
+output, and per machine a serial log, QEMU's stdout and
+stderr, and swtpm's log for a VM, or the console log for a container. The
+files vmlab appends to itself roll over at a fixed size, keeping one previous
+generation as `<name>.1`. Provision output is also streamed live to the CLI
+that ran `up`.
+DOC
+
+  p <<'DOC'
+`vmlab logs [lab/][machine]` dumps or follows them. With no target it takes
+the current directory's lab, with a machine it narrows to that machine's
+files, `-f` keeps following and picks up machines that start later, `-n` sets
+the history shown, and `--output jsonl` emits the raw lines instead of the
+pretty rendering. Event lines are rendered as a timestamp plus a flattened
+`event key=value …` summary; every other stream passes through verbatim. See
+[vmlab logs](cmd_logs). Two related verbs read inside the guest rather than
+about it: [vmlab tail](cmd_tail) follows a file in the guest over the agent,
+and [vmlab eventlog](cmd_eventlog) follows a Windows guest's event log.
+DOC
+}

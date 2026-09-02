@@ -1,0 +1,139 @@
+page guide_profiles {
+  title = "Guest OS profiles"
+  chapter_header "Guest OS profiles" {
+    kicker       = "The guide · explanation"
+    reading_time = "6 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+A profile is a named bundle of known-good defaults for one family of guest
+operating system: which QEMU machine type, which firmware, whether there is a
+TPM, which disk bus and NIC model the guest has drivers for, how scripted
+input reaches it, and where a dev workspace lands. Profiles are data, not
+code: they ship as WCL, and you can override or extend them from your own
+config directory. This chapter explains what a profile decides, the shipped
+set, how a user profile replaces a shipped one, and where a profile sits in
+the resolution chain. Every field is in
+[Guest OS profile files](ref_profiles).
+DOC
+
+  h2 "What a profile decides"
+
+  table {
+    rows:
+      | "Field" | "Decides" |
+      | "`machine`" | "The QEMU machine type: `q35` or `pc` (i440fx)." |
+      | "`firmware`, `secure_boot`, `tpm`" | "OVMF or SeaBIOS, secure boot under OVMF, and an swtpm 2.0 device." |
+      | "`disk_bus`, `nic_model`, `display`" | "The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std` or `cirrus-vga`." |
+      | "`cpus`, `memory`" | "The hardware floor a VM or container inherits when neither its block nor its template says." |
+      | "`agent_channel`" | "Whether the VM gets the virtio-serial channel the guest agent talks over. Default true." |
+      | "`input_transport`" | "How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc`. See [Screens, input and vision](guide_vision)." |
+      | "`virtiofs`" | "Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = \"auto\"` shares. See [Shared folders](guide_shares)." |
+      | "`workspace_guest`" | "The guest path an `@dev` workspace lands at when the decorator names none. See [Dev machines and the workspace syncer](guide_dev)." |
+  }
+
+  p <<'DOC'
+The profile also classifies the guest as Windows-family or Linux-family, which
+is what the `login {}` validation rules and the Windows preconditions of the
+workspace syncer key on. A profile does not install the agent; that happens
+once, at template build, when the build stages the agent binaries on the
+bootstrap ISO and the template's unattended-install hook runs the install
+script. See [Templates and the store](guide_templates).
+DOC
+
+  h2 "The shipped set"
+
+  table {
+    rows:
+      | "Profile" | "Machine" | "Firmware" | "TPM" | "Devices" | "Workspace" |
+      | "`windows-11`" | "q35" | "OVMF, secure boot" | "yes" | "virtio disk and NIC, virtio-vga" | "`C:\\src`" |
+      | "`windows-10`" | "q35" | "OVMF" | "no" | "virtio disk and NIC, virtio-vga" | "`C:\\src`" |
+      | "`windows-server`" | "q35" | "OVMF" | "yes" | "virtio disk and NIC, virtio-vga" | "`C:\\src`" |
+      | "`windows-legacy`" | "pc" | "SeaBIOS" | "no" | "IDE disk, e1000 NIC, std VGA, for XP/7/2008-era guests with no virtio drivers" | "`C:\\src`" |
+      | "`windows-9x`" | "pc" | "SeaBIOS" | "no" | "IDE disk, PCnet NIC, Cirrus VGA, VNC input, 1 CPU and 256 MiB" | "`C:\\src`" |
+      | "`linux-modern`" | "q35" | "OVMF" | "no" | "virtio everything, native virtiofs" | "`/src`" |
+      | "`linux-generic`" | "q35" | "SeaBIOS" | "no" | "virtio disk and NIC, std VGA, conservative elsewhere" | "`/src`" |
+      | "`container`" | "" | "" | "" | "size only: 1 CPU and 256 MiB, the micro-VM floor" | "`/src`" |
+      | "`custom`" | "" | "" | "" | "nothing assumed; supply everything on the VM or template and through `qemu_args`" | "floor" |
+  }
+
+  p <<'DOC'
+`linux-modern` requests a VGA-compatible virtio GPU on x86 and downgrades to
+`virtio-gpu-pci` automatically on the non-x86 `virt` machine, which has no
+legacy VGA. The `container` profile carries only a size because a container
+micro-VM boots vmlab's own guest asset and has no firmware, disk bus or
+display to choose; it is deliberately an order of magnitude below the VM
+floor, and a container raises it with its own `memory`. `custom` sets nothing
+at all, so QEMU's defaults apply to whatever the VM and template leave unset.
+The shipped file is `src/profiles/shipped.wcl` in the repository.
+DOC
+
+  h2 "Overriding with user profiles"
+
+  p <<'DOC'
+vmlab loads the shipped set, then every `*.wcl` file in
+`~/.config/vmlab/profiles/`, in sorted filename order. Each file starts with
+`import <vmlab-profile.wcl>` and contains `profile "<name>" { … }` blocks. A
+user profile whose name matches a shipped one **replaces it entirely**, field
+by field from scratch, rather than merging: a file that redefines
+`windows-11` with only `machine = "pc"` produces a `windows-11` with no
+firmware, no TPM and no device choices. Copy the shipped block and edit it. A
+new name extends the set and is usable from any lab's `profile =`.
+DOC
+
+  code wcl { filename = "~/.config/vmlab/profiles/mine.wcl" source = <<'SRC'
+import <vmlab-profile.wcl>
+
+profile "freebsd" {
+  description = "FreeBSD: q35, SeaBIOS, virtio disk and NIC"
+  machine     = "q35"
+  firmware    = "seabios"
+  disk_bus    = "virtio"
+  nic_model   = "virtio-net-pci"
+  display     = "std"
+  cpus        = 2
+  memory      = 2GiB
+  workspace_guest = "/usr/src"
+}
+SRC
+  }
+
+  p <<'DOC'
+A profile file is validated with the same wording as a lab file: an unknown
+field, a value outside its set such as `machine = "vax"`, a `cpus` below 1 or
+a missing import are all reported at their line, and every mistake in a file
+is reported in one pass. A lab naming a profile that does not exist fails
+`vmlab validate`.
+DOC
+
+  callout "Change the container floor for every lab" {
+    kind = :tip
+    body = "Dropping your own `container` profile into the profiles directory raises the micro-VM defaults for every lab on this host, which is simpler than adding `memory = …` to each container block."
+  }
+
+  h2 "Where a profile sits in the chain"
+
+  p <<'DOC'
+Hardware resolves **VM block, then template, then profile**. A value set on
+the `vm {}` wins; a value not set there comes from the hardware the template
+recorded when it was built; a value not set there comes from the profile, and
+the profile's defaults are the floor. The profile itself is usually inherited
+from the template rather than named on the VM, and it is required on a
+`scratch` VM, which has no template layer. A template build resolves the
+build VM's hardware the same way, block over source template, with the
+template's own `profile` supplying the floor. `secure_boot = true` on a VM
+whose firmware resolves to SeaBIOS is a validation error, and because either
+value may have been inherited, the message names the layer each came from.
+DOC
+
+  p <<'DOC'
+Two things a profile supplies resolve through their own chains, not the
+hardware one. A dev machine's `workspace_guest` resolves `@dev` argument,
+then profile, then the `/src` floor, and a profile with no dev keys still
+hosts a dev machine. A container's `cpus` and `memory` come from its block or
+its profile, and one of the two must supply each; there is no template layer
+and no vmlab floor, so a container naming no profile must set both.
+DOC
+}

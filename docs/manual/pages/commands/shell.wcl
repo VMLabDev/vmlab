@@ -1,0 +1,65 @@
+page cmd_shell {
+  title = "vmlab shell"
+  chapter_header "vmlab shell" {
+    kicker       = "Commands · reference"
+    reading_time = "4 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab shell` attaches an interactive shell inside a machine over the
+    vmlab agent's virtio-serial channel. No guest network is involved and no
+    guest sshd exists. Every attach opens a fresh terminal session, so
+    several shells on one machine are independent. `vmlab container shell`
+    is the same verb under the container noun.
+  DOC
+
+  code sh { source = "vmlab shell [OPTIONS] <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The machine, as `[lab/]name`." |
+      | "`--user <LOGIN>`" | "Run as this login: the label a `login {}` block declares, or the account name as an alias. Default: the machine's default login. `SYSTEM` on Windows or `root` on Linux is the agent identity." |
+      | "`--password <PASSWORD>`" | "Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The command reads the terminal's size, asks the lab daemon to open an
+    agent terminal at that size under the chosen login, and connects the
+    terminal to the unix socket the daemon exposes for the session. It
+    prints `connected to \"<machine>\" — escape character is ^]` and then
+    hands the terminal over: keystrokes go to the guest, and a resize on the
+    host is forwarded to the session. The shell is a PTY on Linux and a
+    ConPTY on Windows.
+  DOC
+
+  p <<DOC
+    Ctrl-] detaches and leaves the guest shell to end on its own. Exiting the
+    guest shell ends the session and returns to the prompt. The identity is
+    the machine's default `login {}` when it declares one and the agent's
+    own identity otherwise, following [Logins and the SSH facade](guide_logins);
+    `--user` and `--password` behave as they do for [vmlab exec](cmd_exec).
+  DOC
+
+  p <<DOC
+    For a dev machine, [vmlab ssh](cmd_ssh) and [vmlab dev attach](cmd_dev)
+    give the same shell over the SSH facade, which is what an editor uses.
+    This verb needs no SSH client and no managed config block.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab shell nix01
+vmlab shell --user admin dc01
+SRC
+  }
+
+  p <<DOC
+    Exit status is 0 when the session ends normally. `not_found` (4) means
+    the lab declares no machine by that name. `failed` (1) covers a machine
+    that is not running, an agent that does not answer, and a login that
+    cannot be minted.
+  DOC
+}

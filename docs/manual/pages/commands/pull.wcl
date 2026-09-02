@@ -1,0 +1,70 @@
+page cmd_pull {
+  title = "vmlab pull"
+  chapter_header "vmlab pull" {
+    kicker       = "Commands · reference"
+    reading_time = "3 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab pull` downloads every registry [template](guide_registries) and
+    container image the lab still needs, without starting any machine. It is
+    the part of [vmlab up](cmd_up) that can take a long time, split out so
+    you can run it ahead of time or on a metered link.
+  DOC
+
+  code sh { source = "vmlab pull [VMS]..." }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`[VMS]...`" | "Machines to pull for. With none given, every machine in the lab." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  h2 "What it does"
+
+  p <<DOC
+    Like `up`, the verb validates the lab file first and starts the lab daemon
+    if none is running. The daemon then runs the same deferred-download step
+    `up` runs, streaming a progress line per download to the terminal and the
+    same progress events to the [event feed](guide_events). A template lands
+    in the store under its resolved name and version; a container image lands
+    in the digest-addressed image cache. When nothing is pending the verb
+    returns at once. On success it prints `lab "<name>": templates ready`.
+  DOC
+
+  p <<DOC
+    Pressing Ctrl-C cancels the downloads rather than abandoning them. The
+    daemon outlives this process, so an interrupt that simply walked away
+    would leave transfers running with nobody watching. The cancel only
+    covers the machines this invocation asked for, so interrupting
+    `vmlab pull web` does not take down a download another terminal started.
+    The verb then exits with `interrupted — cancelled the download for ...`.
+    A cancelled download stays pending in the daemon's ledger; the next `up`
+    or `pull` retries it from scratch.
+  DOC
+
+  callout "Templates from the local store need no pull" {
+    kind = :info
+    body = "Only `template = \"registry/...\"` references and container images are downloaded. A template you built with `vmlab template build` is already in the store, and `pull` has nothing to do for it."
+  }
+
+  h2 "Examples"
+
+  p "Fetch everything the lab needs before a demo:"
+  code sh { source = "vmlab pull" }
+
+  p "Fetch only the image one container uses:"
+  code sh { source = "vmlab pull web" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 when every download completed or nothing was pending. A
+    validation failure, an unreachable registry, a failed download and an
+    interrupt all exit 1 (`failed`). Exit 5 (`conflict`) means the supervisor
+    tracks a lab with this name from another directory. A usage error exits 2.
+  DOC
+}

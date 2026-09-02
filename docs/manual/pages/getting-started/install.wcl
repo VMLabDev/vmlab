@@ -1,0 +1,241 @@
+// Getting started: install the CLI, the runtime tools and the guest assets.
+page gs_install {
+  title = "Install"
+  chapter_header "Install" {
+    kicker       = "Getting started · tutorial"
+    reading_time = "7 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    This tutorial puts the `vmlab` binary on your host, installs the tools it
+    drives, and explains where the guest-side assets come from. At the end
+    `vmlab --version` prints a version and your host is ready for
+    [Your first lab](gs_first_lab).
+  DOC
+
+  h2 "Before you start"
+
+  list {
+    li "A Linux host, or Windows with WSL 2. There is no macOS build, because vmlab drives QEMU/KVM."
+    li "`/dev/kvm` present and writable by your user. Without it every guest is emulated, which is far slower. On WSL 2 this needs the nested-virtualisation setting described at the end of this chapter."
+    li "A package manager that can install QEMU. The package names below are Debian and Ubuntu names. Other distributions ship the same tools under different names."
+    li "`curl` or `wget` for the installer, and a Rust toolchain only if you build from source."
+  }
+
+  h2 "Install the CLI"
+
+  p <<DOC
+    The installer downloads a prebuilt Linux x86_64 binary from the GitHub
+    release and places it in `~/.local/bin`. vmlab publishes pre-releases only,
+    so pass `--pre`. Without it the installer looks for a stable release, finds
+    none, and stops with a message telling you to add the flag.
+  DOC
+
+  code sh { source = "curl -fsSL https://vmlab.io/install.sh | sh -s -- --pre" }
+
+  p <<DOC
+    To pin a version, pass `--version <X>` with a release tag instead of
+    `--pre`, or set `VMLAB_VERSION`. To
+    install somewhere other than `~/.local/bin`, pass `--bin-dir <dir>` or set
+    `VMLAB_INSTALL_DIR`. If the target directory is not on your `PATH`, the
+    installer prints the `export` line to add.
+  DOC
+
+  h3 "Build from source instead"
+
+  p <<DOC
+    The prebuilt binary exists for Linux x86_64 only. On any other Linux
+    architecture, or if you want the current main branch, build with cargo.
+    The source tree pins its WCL and wscript dependencies by git revision, so
+    no sibling checkouts are needed.
+  DOC
+
+  code sh { source = "cargo install --git https://github.com/VMLabDev/vmlab --locked" }
+
+  p <<DOC
+    From a checkout, `just build` runs `cargo build` and `just install` runs
+    `cargo install --path . --locked`, which places the binary in
+    `~/.cargo/bin`.
+  DOC
+
+  p "Confirm the binary runs."
+
+  code sh { source = "vmlab --version" }
+
+  callout "vmlab is installed" {
+    kind = :success
+    body = "`vmlab --version` prints a version string. If the shell reports `command not found`, add the install directory to your `PATH` and open a new shell."
+  }
+
+  h2 "Install the runtime tools"
+
+  p <<DOC
+    vmlab does not bundle QEMU. It finds the emulators, firmware and helper
+    tools on your `PATH` and in the standard firmware directories. The package
+    list below is the one vmlab's own test suite installs on Ubuntu. It covers
+    every guest architecture and every feature described in this manual.
+  DOC
+
+  code sh { source = <<'SRC'
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  qemu-system-x86 qemu-system-arm qemu-system-misc qemu-utils \
+  ovmf seabios swtpm \
+  qemu-efi-aarch64 qemu-efi-riscv64 \
+  tesseract-ocr passt \
+  xorriso mtools dosfstools samba
+SRC
+  }
+
+  table {
+    rows:
+      | "Package" | "Provides" | "Needed for" |
+      | "`qemu-system-x86`, `qemu-system-arm`, `qemu-system-misc`" | "`qemu-system-x86_64`, `qemu-system-aarch64`, `qemu-system-riscv64`" | "Running guests. Install only the architectures you use." |
+      | "`qemu-utils`" | "`qemu-img`" | "Every disk operation: clones, snapshots, template builds" |
+      | "`ovmf`, `seabios`, `qemu-efi-aarch64`, `qemu-efi-riscv64`" | "UEFI and BIOS firmware per architecture" | "Booting any guest; `firmware = \"ovmf\"` is the default on modern profiles" |
+      | "`swtpm`" | "A software TPM 2.0" | "Guests with `tpm = true`, which Windows 11 and Server 2025 require" |
+      | "`passt`" | "Userspace networking helper" | "The network fabric" |
+      | "`xorriso`, `mtools`, `dosfstools`" | "ISO and floppy builders" | "`media {}` blocks and the bootstrap ISO every template build attaches" |
+      | "`samba`" | "`smbd`" | "Shared folders on guests without virtiofs support" |
+      | "`tesseract-ocr`" | "`tesseract`" | "`vmlab vm ocr` and `wait_for_text` in scripts" |
+  }
+
+  p <<DOC
+    Two more tools are optional. `sqfstar` from `squashfs-tools` is required
+    the first time you run a container, because vmlab flattens the image's
+    layers into a squashfs. A VNC viewer is required for `vmlab console` and
+    `gui = true`; `remote-viewer` from `virt-viewer` is preferred because it
+    dials the display's unix socket directly, and `gvncviewer` or `vncviewer`
+    work over a local TCP bridge. Shared folders use `virtiofsd` when the host
+    and guest both support it and fall back to the bundled `smbd` otherwise,
+    so installing both covers every guest.
+  DOC
+
+  p <<DOC
+    vmlab checks for a missing tool when it first needs it, not at install
+    time. `vmlab validate` does not probe the host. A missing emulator is
+    reported by `vmlab up`, a missing `sqfstar` by the first container start,
+    and a missing viewer by `vmlab console`.
+  DOC
+
+  callout "Runtime tools are installed" {
+    kind = :success
+    body = "`qemu-system-x86_64 --version` and `qemu-img --version` both print a version. `ls /dev/kvm` shows the device."
+  }
+
+  h2 "Get the guest assets"
+
+  p <<DOC
+    Two things run inside guests that are not part of the `vmlab` binary. The
+    first is the **micro-VM guest asset**, a pinned Alpine kernel and an
+    initramfs holding vmlab's own init, which boots every
+    [lab container](guide_containers). The second is the **agent binary**,
+    `vmlab-agent`, one per guest OS and architecture, which a
+    [template build](guide_templates) bakes into the image from a bootstrap
+    ISO. vmlab looks for both under one directory tree, in this order.
+  DOC
+
+  table {
+    rows:
+      | "Location" | "When it is used" |
+      | "`$VMLAB_GUEST_ASSET_DIR/`" | "An explicit override, when the variable is set" |
+      | "`/usr/share/vmlab/guest/`" | "A system-wide install" |
+      | "`~/.local/share/vmlab/guest/`" | "The per-user data directory" |
+  }
+
+  p <<DOC
+    Inside that tree the micro-VM asset lives at `<arch>/vmlinuz`,
+    `<arch>/initramfs.img` and `<arch>/VERSION`, and the agent at
+    `agent/<os>-<arch>/vmlab-agent` or `vmlab-agent.exe` with its own
+    `VERSION`.
+  DOC
+
+  p <<DOC
+    The release installer ships the CLI binary only. It does not place guest
+    assets, so on a fresh host there are none. You build them from a source
+    checkout with one recipe, which runs both build scripts and copies the
+    result into `~/.local/share/vmlab/guest/`.
+  DOC
+
+  code sh { source = <<'SRC'
+git clone https://github.com/VMLabDev/vmlab
+cd vmlab
+just guest-install
+SRC
+  }
+
+  p <<DOC
+    `guest/build-asset.sh` fetches pinned Alpine packages, verifies their
+    checksums, and assembles the kernel and initramfs for x86_64 and aarch64.
+    It runs without root and needs `curl`, `tar`, `gzip`, `cpio`,
+    `sha256sum`, `cargo`, `rustup` and `git` on the host, plus the
+    `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` Rust targets
+    installed with `rustup target add`. `guest/build-agent.sh` cross-compiles
+    the agent for Linux x86_64, aarch64 and riscv64 and for Windows x86_64.
+    The Windows target needs `x86_64-w64-mingw32-gcc` from mingw-w64 and is
+    skipped with a warning when it is absent. The riscv64 target is
+    best-effort and skipped the same way.
+  DOC
+
+  p "You do not need the assets for every workflow."
+
+  list {
+    li "A VM cloned from a template pulled from a registry needs neither. The agent is already inside the pulled image. [Your first VM](gs_first_vm) works on a host with no assets."
+    li "A container needs the micro-VM asset for its architecture. Without it the first container start fails, naming every directory it searched and the build script to run."
+    li "A template build from an ISO needs the agent binary for the guest's architecture, unless the template sets `agent = false`. Without it the build fails before booting anything, with the same kind of message."
+  }
+
+  callout "Guest assets are in place" {
+    kind = :success
+    body = "`ls ~/.local/share/vmlab/guest/` lists `x86_64` and `agent`. `cat ~/.local/share/vmlab/guest/x86_64/VERSION` prints a version stamp."
+  }
+
+  h2 "On WSL 2"
+
+  p <<DOC
+    vmlab treats WSL 2 as a first-class host. Its network fabric creates no
+    tap or bridge devices and needs no privileges, which is what makes the
+    Windows kernel a non-issue. Two things are specific to WSL 2.
+  DOC
+
+  p <<'DOC'
+    **Nested virtualisation must be on.** `/dev/kvm` appears inside the WSL
+    distribution only when the WSL VM itself exposes virtualisation. Add the
+    setting to `%UserProfile%\.wslconfig` on the Windows side, then restart
+    WSL with `wsl --shutdown`.
+  DOC
+
+  code ini { filename = ".wslconfig" source = <<'SRC'
+[wsl2]
+nestedVirtualization=true
+SRC
+  }
+
+  p <<DOC
+    **Viewers live on the Windows side.** `vmlab console --tcp` bridges a
+    VM's VNC display to a localhost port and prints the address, so a Windows
+    VNC client can attach through WSL's localhost forwarding. Port forwards
+    declared in the lab file reach the Windows side the same way.
+  DOC
+
+  p <<DOC
+    vmlab creates `$XDG_RUNTIME_DIR` at daemon start when a WSL session lacks
+    it. The full list of host settings, including the viewer choice and the
+    template store location, is in [Host configuration and WSL 2](guide_host).
+  DOC
+
+  callout "Emulation is not a substitute for KVM" {
+    kind = :warning
+    body = "If `/dev/kvm` is missing, vmlab still runs guests under pure emulation. A Windows installer under emulation takes hours rather than minutes, and template builds time out. Confirm the device exists before building anything."
+  }
+
+  h2 "Next steps"
+
+  list {
+    li "[Your first lab](gs_first_lab) brings up a container on a NAT segment and walks through the lifecycle verbs."
+    li "[Your first VM](gs_first_vm) pulls a template from a public registry and runs a Linux VM from it, with no template build."
+    li "[Host configuration and WSL 2](guide_host) covers every host-level setting, including where the store and the guest assets live."
+  }
+}

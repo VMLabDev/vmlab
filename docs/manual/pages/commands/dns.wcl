@@ -1,0 +1,77 @@
+page cmd_dns {
+  title = "vmlab dns"
+  chapter_header "vmlab dns" {
+    kicker       = "Commands · reference"
+    reading_time = "3 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab dns` prints the DNS zones the current lab's
+    [segments](guide_networking) serve: every exact record, wildcard and
+    sinkhole, in the order the resolver consults them. It is the thing to
+    read when a guest cannot resolve a peer.
+  DOC
+
+  code sh { source = "vmlab dns [OPTIONS]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`--json`" | "Emit the raw JSON instead of a table." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  h2 "What it prints"
+
+  p <<DOC
+    The verb starts the lab daemon if none is running and asks it for the
+    DNS table. Segments with no local zone, global segments and segments with
+    `dns { enabled = false }`, serve nothing and are not listed; with no
+    serving segment at all the verb prints `no segment in this lab serves
+    DNS`.
+  DOC
+
+  p <<DOC
+    Each serving segment gets a heading `segment "<name>" — zone <suffix>` and
+    a table of `NAME`, `IP` and `KIND`. Exact records come first, sorted by
+    name, with kind `static` for a record the lab file declares and `dynamic`
+    for one a DHCP lease registered; then wildcards with kind `wildcard`; then
+    sinkholes with `-` for the address and kind `sinkhole/<mode>`, since a
+    sinkhole answers with nothing and `NXDOMAIN` and `0.0.0.0` fail
+    differently in a guest. A zone with no rules prints `(no records)`.
+  DOC
+
+  p <<DOC
+    With `--json` the daemon's reply is printed verbatim as pretty JSON, an
+    object with a `segments` array whose entries carry `segment` and a `zone`
+    with `suffix`, `records`, `wildcards` and `sinkholes`.
+  DOC
+
+  h2 "Examples"
+
+  code sh { source = "vmlab dns" }
+
+  code sh { source = <<'SRC'
+segment "corp" — zone vmlab.internal
+  NAME                              IP          KIND
+  client01.ad-lab.vmlab.internal    10.10.0.50  dynamic
+  dc01.ad-lab.vmlab.internal        10.10.0.10  static
+  *.corp.example                    10.10.0.10  wildcard
+  *.telemetry.example.com           -           sinkhole/nxdomain
+SRC
+  }
+
+  p "Feed the table to a script:"
+  code sh { source = "vmlab dns --json | jq '.segments[].zone.records[]'" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 when the table was printed. A lab directory that cannot
+    be found, or a daemon that could not be started or answered with a
+    failure, exits 1 (`failed`). Exit 5 (`conflict`) means the supervisor
+    tracks a lab with this name from another directory. A usage error exits 2.
+  DOC
+}

@@ -1,0 +1,140 @@
+page ref_paths {
+  title = "Files and directories"
+  chapter_header "Files and directories" {
+    kicker       = "Appendices · reference"
+    reading_time = "9 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    This chapter lists every host path vmlab reads or writes, and the
+    environment variables that move them. vmlab follows the XDG base
+    directory convention: data, state, configuration and runtime files live
+    under four roots, each overridable by its XDG variable. Everything a lab
+    materialises lives beside the lab file in `.vmlab/`, which
+    [How vmlab runs a lab](guide_architecture) explains and
+    `vmlab destroy` removes.
+  DOC
+
+  h2 "The four roots"
+  table {
+    rows:
+      | "Root" | "Default" | "Override" | "Holds" |
+      | "Data" | "`~/.local/share/vmlab`" | "`XDG_DATA_HOME`" | "The template store, the container-image cache, guest assets, build caches." |
+      | "State" | "`~/.local/state/vmlab`" | "`XDG_STATE_HOME`" | "Daemon logs, per-lab logs and event history, the lab registry, SSH host keys." |
+      | "Config" | "`~/.config/vmlab`" | "`XDG_CONFIG_HOME`" | "The host configuration file, registry namespaces, profile overrides." |
+      | "Runtime" | "`$XDG_RUNTIME_DIR/vmlab`" | "`XDG_RUNTIME_DIR`" | "Every control socket. Falls back to `/tmp/vmlab-<uid>` when the variable is unset, as on some WSL setups." |
+  }
+  p <<DOC
+    An XDG variable that is set but empty is treated as unset. `HOME` unset
+    resolves to `/`. The runtime root is created private to the user, mode
+    0700, and vmlab refuses to put sockets into one owned by somebody else,
+    because a client that can connect to a control socket can run scripts
+    in the lab and read and write guest files. The data, state and config
+    roots are not tightened, since they hold no control interface and are
+    legitimately shared in some deployments.
+  DOC
+
+  h2 "Data"
+  table {
+    rows:
+      | "Path" | "Holds" |
+      | "`templates/`" | "The template store, laid out as `<arch>/<name>/<version>/` with `disk.qcow2` and `template.wcl` in each. See [Templates and the store](guide_templates)." |
+      | "`templates/.lock`" | "The advisory lock every store mutation holds." |
+      | "`templates/.oci-pull/`" | "Staging for a registry pull in progress." |
+      | "`oci/`" | "The digest-addressed container-image cache: `blobs/sha256/`, `images/sha256/<manifest>/` with `manifest.json`, `config.json` and `rootfs.sqfs`, and `refs/<host>/<repo>/<tag>` recording the last digest a tag resolved to. See [Lab containers](guide_containers)." |
+      | "`guest/<arch>/`" | "The container micro-VM kernel and initramfs, and `guest/agent/<os>-<arch>/` the guest agent binaries, when installed here rather than under `/usr/share/vmlab/guest`." |
+      | "`cache/artefacts/`" | "Content-addressed downloads a template build's `source {}` fetched." |
+      | "`cache/builds/`" | "Working directories of template builds." |
+      | "`cache/oci-push/`" | "Working directory of a registry push." |
+      | "`~/.local/share/config-weave/bin`" | "Where the playbook engine's guest binaries are looked for, unless `VMLAB_CONFIG_WEAVE_DIR` says otherwise. See [Playbooks](guide_playbooks)." |
+  }
+
+  h2 "State"
+  table {
+    rows:
+      | "Path" | "Holds" |
+      | "`vmlabd.log`" | "The supervisor's log." |
+      | "`labd-<lab>.log`" | "One lab daemon's log." |
+      | "`labs.json`" | "The supervisor's lab registry." |
+      | "`labs/<lab>/events.jsonl`" | "The lab's event history, one JSON object per line. See [Events](ref_events)." |
+      | "`labs/<lab>/lab.log`" | "Provision and script output." |
+      | "`labs/<lab>/vms/<vm>/`" | "`serial.log`, `qemu.log` and `swtpm.log` for one VM." |
+      | "`labs/<lab>/containers/<name>/console.log`" | "The micro-VM kernel log with the container's stdout and stderr." |
+      | "`ssh/known_hosts`" | "The `known_hosts` the managed SSH block points clients at." |
+      | "`ssh/<lab>/<machine>`" | "The SSH facade's host key for one machine. See [Logins and the SSH facade](guide_logins)." |
+  }
+  p <<DOC
+    `events.jsonl` and `lab.log` roll over at 16 MiB, keeping one previous
+    generation as `<name>.1`. `vmlab logs` reads these files directly; there
+    is no daemon call for logs.
+  DOC
+
+  h2 "Configuration"
+  table {
+    rows:
+      | "Path" | "Holds" |
+      | "`config.wcl`" | "The host configuration file. See [Host configuration file](ref_host)." |
+      | "`registries.json`" | "The searchable OCI namespaces `vmlab template registry` manages. See [Distributing templates over registries](guide_registries)." |
+      | "`profiles/`" | "User overrides of the shipped guest OS profiles. See [Guest OS profiles](guide_profiles)." |
+      | "`~/.docker/config.json`" | "Registry credentials, read and written Docker-style so an existing login works. `DOCKER_CONFIG` names a different directory. Credential helpers named there are invoked." |
+      | "`~/.ssh/config`" | "The managed block `vmlab ssh-config` writes between its markers. The host config's `ssh_config` field moves it." |
+  }
+
+  h2 "Runtime sockets"
+  table {
+    rows:
+      | "Path" | "Holds" |
+      | "`vmlabd.sock`" | "The supervisor's control socket." |
+      | "`labs/<lab>/control.sock`" | "One lab daemon's control socket." |
+      | "`labs/<lab>/vms/<vm>/`" | "`qmp.sock`, `agent.sock`, `vnc.sock`, `tpm.sock`, one `nic<i>.sock` per NIC, one `vfs<i>.sock` per virtiofs share, and a `term-<id>.sock` per open terminal." |
+      | "`labs/<lab>/containers/<name>/`" | "`qmp.sock`, `ctl.sock`, `agent.sock`, `nic<i>.sock`, `vfs<i>.sock` and `term-<id>.sock`." |
+      | "`global/<segment>.sock`" | "The trunk socket a lab daemon bridges to for a global segment. See [Networking](guide_networking)." |
+      | "`ssh/`" | "The `ControlPath` multiplexer sockets the managed SSH block names, and `config.lock`, the lock its writer takes." |
+  }
+
+  h2 "The lab directory"
+  p <<DOC
+    A lab is any directory holding a `vmlab.wcl`. Every lab-scoped verb finds
+    it by walking up from the current directory. Beside it, vmlab keeps
+    `.vmlab/`, which should be in the lab's `.gitignore`.
+  DOC
+  table {
+    rows:
+      | "Path under `.vmlab/`" | "Holds" |
+      | "`state.json`" | "Persisted lab state: snapshot records, pinned artefacts, agent repairs." |
+      | "`vms/<vm>/`" | "`disk0.qcow2`, the linked clone; `OVMF_VARS.fd`; `tpm-state/`; `firstboot.done` once the first-boot provision has run." |
+      | "`containers/<name>/`" | "`scratch.qcow2`, the writable overlay, and `container.json`." |
+      | "`media/`" | "ISO and floppy images built from `media {}` folders, content-addressed. See [Lab file: vm and its children](ref_vm)." |
+      | "`volumes/`" | "Named container volumes." |
+      | "`smb/`" | "The bundled smbd's configuration and state. See [Shared folders](guide_shares)." |
+      | "`workspace/<machine>.json`" | "The workspace syncer's ledger for one dev machine. See [Dev machines and the workspace syncer](guide_dev)." |
+      | "`screenshots/`" | "Where `Machine.screenshot` writes when given no path." |
+      | "`dev-machine`" | "The selection `vmlab dev use` records." |
+  }
+  p <<DOC
+    `VMLAB_WORK_DIR` relocates the whole directory: with it set, the lab's
+    working data lives at `$VMLAB_WORK_DIR/<lab-dir-name>-<hash>/`, where the
+    hash is twelve hex characters of the lab root's canonical path, so
+    several labs can share one base without colliding. The lab file itself
+    stays where it is. This keeps disk clones off a slow filesystem such as
+    a bind mount.
+  DOC
+
+  h2 "Environment variables"
+  table {
+    rows:
+      | "Variable" | "Effect" |
+      | "`XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`" | "Move the four roots above." |
+      | "`HOME`" | "The base of every default root." |
+      | "`VMLAB_WORK_DIR`" | "Relocates every lab's `.vmlab/` under one base, as described above." |
+      | "`VMLAB_GUEST_ASSET_DIR`" | "Searched first for the micro-VM kernel and initramfs (`<arch>/`) and the agent binaries (`agent/<os>-<arch>/`), before `/usr/share/vmlab/guest` and the data root's `guest/`." |
+      | "`VMLAB_CONFIG_WEAVE_DIR`" | "Where the playbook engine's guest binaries are, instead of `~/.local/share/config-weave/bin`." |
+      | "`VMLAB_VIRTIOFSD`" | "The `virtiofsd` binary to use, before searching `PATH`." |
+      | "`VMLAB_FASTPATH`" | "Overrides the host config's `fastpath`: `auto`, `off`, `sockmap` or `afxdp`. A malformed value is ignored with a warning. See [Host configuration and WSL 2](guide_host)." |
+      | "`VMLAB_DEV_MACHINE`" | "Which dev machine `vmlab dev` verbs mean, second on the selection ladder after an explicit argument. See [vmlab dev](cmd_dev)." |
+      | "`DOCKER_CONFIG`" | "The directory holding `config.json` with registry credentials." |
+      | "`PATH`" | "Searched for the emulator, `qemu-img`, `swtpm`, `virtiofsd` and `ssh`." |
+  }
+}

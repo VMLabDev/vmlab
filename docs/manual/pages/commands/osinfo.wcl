@@ -1,0 +1,45 @@
+page cmd_osinfo {
+  title = "vmlab osinfo"
+  chapter_header "vmlab osinfo" {
+    kicker       = "Commands · reference"
+    reading_time = "2 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab osinfo` prints what a guest's operating system says it is, as
+    reported by the vmlab agent, as one JSON object. It is written for
+    machine consumption: a tool that drives vmlab polls it to detect agent
+    readiness and to pick a guest binary.
+  DOC
+
+  code sh { source = "vmlab osinfo <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The machine, as `[lab/]name`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The command asks the machine's agent with a 30-second timeout and prints
+    the answer on one line. The object has the fields `id`, `name`,
+    `version`, `kernel`, `arch`, and `hostname`. Unlike most verbs this one
+    always prints JSON; there is no table form and no `--json` flag.
+  DOC
+
+  code sh { source = <<'SRC'
+$ vmlab osinfo nix01
+{"arch":"x86_64","hostname":"nix01","id":"nixos","kernel":"6.12.20","name":"NixOS","version":"25.05"}
+SRC
+  }
+
+  p <<DOC
+    Exit status is 0 on success. `not_found` (4) means the lab declares no
+    machine by that name. `failed` (1) covers a machine that is not running
+    and an agent that does not answer within the timeout, which is what a
+    guest still booting looks like.
+  DOC
+}

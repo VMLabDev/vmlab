@@ -1,0 +1,106 @@
+page ref_host {
+  title = "Host configuration file"
+  chapter_header "Host configuration file" {
+    kicker       = "Reference · reference"
+    reading_time = "5 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    The host configuration file holds the settings that belong to this
+    machine rather than to any lab: the subnet pool, the DNS suffix, the
+    pre-shared key for cross-host segments, the viewer command, and the
+    workspace syncer's size guard. [Host configuration and WSL 2](guide_host)
+    explains when to change each one; this chapter lists the fields.
+  DOC
+
+  h2 "Where it lives"
+  p <<DOC
+    The file is `config.wcl` in vmlab's XDG config directory, which is
+    `~/.config/vmlab/` unless `XDG_CONFIG_HOME` moves it. See
+    [Files and directories](ref_paths). It is optional: when the file is
+    absent every default applies. When present it must start with
+    `import <vmlab-host.wcl>`, and a file without the import is rejected
+    with an error naming the missing line. The daemons read it when they
+    start, so a change takes effect on the next `vmlab up` after the
+    supervisor restarts.
+  DOC
+  code wcl { filename = "~/.config/vmlab/config.wcl" source = <<'SRC'
+import <vmlab-host.wcl>
+
+host {
+  subnet_pool = "10.99.0.0/16"
+  dns_suffix  = "lab.local"
+  psk         = "shared-secret"
+  viewer      = "vncviewer {}"
+}
+SRC
+  }
+
+  h2 "host {}"
+  p <<DOC
+    The one block the file carries. Every field is an override: an absent
+    field leaves the default in place, and a malformed one is reported with
+    its line rather than silently ignored.
+  DOC
+  code wcl { source = <<'SRC'
+host {
+  subnet_pool          = "10.213.0.0/16"
+  dns_suffix           = "vmlab.internal"
+  dns_upstream         = "1.1.1.1:53"
+  disk_low_percent     = 10
+  psk                  = "…"
+  trunk_port           = 13947
+  viewer               = "vncviewer {}"
+  fastpath             = "auto"
+  oci_chunk_size       = 512MiB
+  config_weave_bin_dir = "~/.local/share/config-weave/bin"
+  ssh_config           = "~/.ssh/config"
+  workspace_max_file   = 256MiB
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`subnet_pool`" | "utf8" | "`10.213.0.0/16`" | "CIDR the automatic /24 segment subnets are carved from." |
+      | "`dns_suffix`" | "utf8" | "`vmlab.internal`" | "Suffix for auto-registered machine names, `<vm>.<lab>.<suffix>`." |
+      | "`dns_upstream`" | "utf8" | "host resolver" | "Upstream resolver as `ip[:port]` for queries the lab DNS cannot answer." |
+      | "`disk_low_percent`" | "i64" | "`10`" | "Free-space percentage, 0 to 100, below which the `host.disk_low` watchdog fires." |
+      | "`psk`" | "utf8" | "none" | "Pre-shared key for cross-host segment links. Set the same value on both hosts." |
+      | "`trunk_port`" | "i64" | "`13947`" | "TCP port the supervisor listens on for inbound cross-host segment trunks, 1 to 65535." |
+      | "`viewer`" | "utf8" | "none" | "VNC viewer command; `{}` is replaced by the target." |
+      | "`fastpath`" | "utf8" | "`auto`" | "Network fast path: `auto` probes, `off` forces userspace, `sockmap` and `afxdp` force a kernel tier." |
+      | "`oci_chunk_size`" | "ByteSize" | "`512MiB`" | "OCI layer chunk size for `vmlab template push`." |
+      | "`config_weave_bin_dir`" | "utf8" | "`~/.local/share/config-weave/bin`" | "Directory holding the config-weave guest binaries playbooks push." |
+      | "`ssh_config`" | "utf8" | "`~/.ssh/config`" | "File vmlab writes its managed SSH block into." |
+      | "`workspace_max_file`" | "ByteSize" | "`256MiB`" | "Workspace syncer per-file size guard. A larger file is refused by name." |
+  }
+  p "The parser enforces these rules, and reports every violation in one pass:"
+  list {
+    li "`subnet_pool` is a well-formed CIDR."
+    li "`disk_low_percent` is between 0 and 100."
+    li "`trunk_port` is between 1 and 65535."
+    li "`fastpath` is one of `auto`, `off`, `sockmap`, `afxdp`. The `VMLAB_FASTPATH` environment variable selects the same values."
+    li "`oci_chunk_size` and `workspace_max_file` are non-negative sizes."
+    li "A field the schema does not name is rejected with its position."
+  }
+  p <<DOC
+    `ssh_config` is a location, not a switch: the block is written to the
+    named file and the `ssh -G` check still runs, so a block placed
+    somewhere OpenSSH does not read warns rather than pretending to work. See
+    [vmlab ssh-config](cmd_ssh_config). `workspace_max_file` is host config
+    rather than a `@dev` argument because the cap is about this developer's
+    link to the guest, not the lab everyone shares; the refusal message names
+    the field. See [Dev machines and the workspace syncer](guide_dev).
+  DOC
+  callout "A neutral fast path" { kind = :info body = <<DOC
+    `auto` never selects `sockmap`; it was measured slower than the userspace
+    fabric and exists for explicit evaluation. Both kernel tiers need CAP_BPF
+    and CAP_NET_ADMIN, and a daemon that cannot prove a tier works on its host
+    falls back to userspace silently. `vmlab fastpath` reports the tier in
+    use.
+  DOC
+  }
+}

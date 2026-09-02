@@ -1,0 +1,144 @@
+page cmd_playbook {
+  title = "vmlab playbook"
+  chapter_header "vmlab playbook" {
+    kicker       = "Commands · reference"
+    reading_time = "5 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab playbook` runs the config-weave [playbooks](guide_playbooks) a
+    lab declares with `playbook {}` blocks against its machines, on demand.
+    `up` applies them once in declaration order; these verbs are the
+    edit-then-check loop after that.
+  DOC
+
+  code sh { source = "vmlab playbook <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`list`" | "List the lab's playbook blocks and any in-flight runs." |
+      | "`check`" | "Report drift without changing the guest (re-pushes the playbook first)." |
+      | "`apply`" | "Push the playbook and converge the guest (auto-reboots on demand)." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    `list` works on the lab in the current directory. `check` and `apply`
+    take a machine reference of the form `[lab/]machine`; a bare name is
+    resolved against the current directory's lab, and the lab daemon is
+    started if none is running.
+  DOC
+
+  h2 "vmlab playbook list"
+
+  code sh { source = "vmlab playbook list" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Prints one line per `playbook {}` block, `<machine> → <path> play
+    <play>`, followed by an indented `var <name>=<value>` line for each
+    variable override the block declares, and, when a run is in progress on
+    that machine, `<check|apply> running since <time>`. A lab with no blocks
+    prints `no playbook blocks declared in this lab`.
+  DOC
+
+  h2 "vmlab playbook check"
+
+  code sh { source = "vmlab playbook check [OPTIONS] <MACHINE>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "Machine (`[lab/]name`)." |
+      | "`--playbook <PLAYBOOK>`" | "Playbook folder path, when several target this machine." |
+      | "`--play <PLAY>`" | "Play name, when several target this machine." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Pushes the playbook folder into the guest again, so an edit on the host
+    is what gets checked, and runs config-weave in check mode: it reports
+    which steps have drifted and changes nothing. Config-weave's own output
+    streams to the terminal as it runs. When a final report comes back the
+    verb prints a one-line summary, `check: N ok · N changed · ...`, counting
+    steps by status.
+  DOC
+
+  p <<DOC
+    Which block runs is resolved from the machine's `playbook {}` blocks.
+    With exactly one there is nothing to choose. With several, `--playbook`
+    and `--play` narrow the choice, and a machine that still matches more
+    than one block, or none, is refused with the candidates named. Only one
+    run may be in flight per machine; a second `check` or `apply` while one
+    runs is refused with `<kind> of <path> play <play> already running for
+    "<machine>"`.
+  DOC
+
+  h2 "vmlab playbook apply"
+
+  code sh { source = "vmlab playbook apply [OPTIONS] <MACHINE>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "Machine (`[lab/]name`)." |
+      | "`--playbook <PLAYBOOK>`" | "Playbook folder path, when several target this machine." |
+      | "`--play <PLAY>`" | "Play name, when several target this machine." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Pushes the playbook and runs config-weave in apply mode, converging the
+    guest. When a step asks for a reboot the daemon reboots the guest, waits
+    for it to come back, and resumes, up to three times; a guest still
+    asking for a reboot after that fails the run with exit 3. The summary
+    line adds `rebooted N time(s)` when any reboot happened. Selection and the one-run
+    rule are the same as for `check`. This is the same run `up` performs for
+    each block, so a failing `apply` is also what fails an `up`.
+  DOC
+
+  h2 "Examples"
+
+  p "See what the lab would configure:"
+  code sh { source = "vmlab playbook list" }
+
+  code sh { source = <<'SRC'
+dc01 → playbooks/domain play forest
+  var domain=corp.example
+client01 → playbooks/workstation play join
+SRC
+  }
+
+  p "Edit a playbook on the host, then see the drift before applying:"
+  code sh { source = <<'SRC'
+vmlab playbook check client01
+vmlab playbook apply client01
+SRC
+  }
+
+  p "Pick one of several plays that target a machine:"
+  code sh { source = "vmlab playbook apply --playbook playbooks/workstation --play harden client01" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status for `check` and `apply` mirrors config-weave's when the run
+    completes: 0 when every step is ok or converged, 1 when a step errored,
+    2 when the playbook failed validation, and 3 when a reboot was still
+    required after the bounded retries. Before a run starts, exit 4
+    (`not_found`) means the machine is not declared or no single playbook
+    block matched the selection, and exit 5 (`conflict`) means a run is
+    already in flight on that machine. A machine that is not running, an
+    agent that does not answer, or a push that fails exits 1 (`failed`).
+    `list` exits 0 whether or not the lab declares any block, and 1 when the
+    lab cannot be reached. A usage error exits 2.
+  DOC
+}

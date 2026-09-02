@@ -1,0 +1,207 @@
+// Getting started: build a template from an installer ISO and clone a VM from it.
+page gs_first_template {
+  title = "Build a template from an ISO"
+  chapter_header "Build a template from an ISO" {
+    kicker       = "Getting started · tutorial"
+    reading_time = "10 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A [template](guide_templates) is a sealed base disk in your local store,
+    keyed by architecture, name and version. Every VM in a lab is a linked
+    clone of one. In this tutorial you build a template from the Ubuntu Server
+    24.04 installer ISO using the example shipped with vmlab, watch the build
+    run, and then clone a VM from it in a lab of your own.
+  DOC
+
+  p <<DOC
+    The example does an unattended install. A `cloudinit/` folder is packed
+    into a small ISO that Ubuntu's installer picks up as an autoinstall
+    source, and a short wscript answers the one confirmation prompt by reading
+    the screen. The same pattern, installer media plus answer file plus a
+    script that drives the screen, builds every template under
+    `examples/templates/`, including Windows Server.
+  DOC
+
+  h2 "Before you start"
+
+  list {
+    li "vmlab is installed with the runtime tools. `xorriso` and `mtools` are needed here, because the build packs two ISOs: the cloud-init folder and vmlab's own bootstrap ISO."
+    li "The agent binary for Linux x86_64 is installed under `~/.local/share/vmlab/guest/agent/linux-x86_64/`. The build stages it on the bootstrap ISO and refuses to start without it. [Install](gs_install) explains how to build the guest assets."
+    li "`/dev/kvm` is available. The install takes several minutes under KVM and far longer under emulation."
+    li "About 3 GB of free disk for the ISO download and 20 GB for the build disk. The sealed template is much smaller than the working disk."
+    li "A checkout of the vmlab source, for the example directory: `git clone https://github.com/VMLabDev/vmlab`."
+  }
+
+  h2 "Read the template definition"
+
+  p "Change into the example directory and open its lab file."
+
+  code sh { source = "cd vmlab/examples/templates/ubuntu-24.04" }
+
+  code wcl {
+    filename    = "examples/templates/ubuntu-24.04/vmlab.wcl"
+    source_file = "../../examples/templates/ubuntu-24.04/vmlab.wcl"
+    dedent      = true
+  }
+
+  p "A `template {}` block has four parts."
+
+  list {
+    li "**Identity and hardware.** `arch` selects the QEMU emulator. `version` is the version prefix the build stamps. `profile = \"linux-modern\"` supplies the machine type, firmware and device models for the build VM, and `cpus`, `memory` and `disk` size it. The hardware is recorded in the template's metadata and becomes the inheritance layer every clone starts from."
+    li "**`source \"iso\"`.** What the build boots. A `url` with a `sha256` is downloaded into the artefact cache and verified before use. A local `path` works too. The other three source kinds are `qcow2`, an existing disk image; `template`, a layered build on top of a template already in the store; and `scratch`, a blank disk."
+    li "**Attachments.** `media { kind = \"iso\" from = \"./cloudinit/\" label = \"CIDATA\" }` builds the folder into an ISO with that volume label at build time. `nic { nat = true }` gives the build VM egress so the installer can fetch packages."
+    li "**`provision \"scripts/install.ws\"`.** The wscript that drives the build. It runs against a lab containing the single build VM, named `build`."
+  }
+
+  p "The script is short. It uses the screen, not the agent, because the agent does not exist until the installer has put it there."
+
+  code rust {
+    filename    = "examples/templates/ubuntu-24.04/scripts/install.ws"
+    source_file = "../../examples/templates/ubuntu-24.04/scripts/install.ws"
+    dedent      = true
+  }
+
+  p <<DOC
+    `wait_for_text` OCRs the screen until a regular expression matches or the
+    timeout passes. `send_keys` and `type_text` inject input. `wait_shutdown`
+    blocks until the guest powers itself off, which the autoinstall's
+    `shutdown: poweroff` line does at the end of the install. The agent is
+    installed by the guest itself: a `late-commands` entry in
+    `cloudinit/user-data` mounts the bootstrap ISO vmlab attaches under the
+    label `VMLAB` and runs its `install.sh` into the target filesystem.
+  DOC
+
+  callout "The agent comes from the guest's own install hook" {
+    kind = :note
+    body = "vmlab attaches the bootstrap ISO to every template build and verifies the agent's handshake before sealing. It does not push the agent in itself, because there is no channel into a guest until the agent is running. Each OS has its own hook: a cloud-init `late-commands` or `runcmd`, or a Windows `FirstLogonCommands` entry in `autounattend.xml`."
+  }
+
+  h2 "Build it"
+
+  code sh { source = <<'SRC'
+vmlab validate
+vmlab template build
+SRC
+  }
+
+  p <<DOC
+    `template build` reads every `template {}` block in `./vmlab.wcl`, or
+    the file named with `-f`, and builds each in turn. Pass a name to build
+    only one. The build streams its progress, and each `lab.log` line in the
+    script appears as it runs. To watch the installer, set `gui = true` on the
+    template block and a viewer opens on the build VM.
+  DOC
+
+  p "The build proceeds through these stages."
+
+  list {
+    style = :numbered
+    li "Download the ISO into the artefact cache and verify its SHA-256, or reuse the cached copy."
+    li "Pack `cloudinit/` and the bootstrap ISO. Create the 20 GiB working disk."
+    li "Boot the build VM from the installer ISO with the hardware from the profile and the two built ISOs attached."
+    li "Run `scripts/install.ws`: confirm the autoinstall, then wait for the guest to power off."
+    li "Boot once more and wait for the agent's handshake. This proves the sealed image will report ready as a clone."
+    li "Flatten the working disk and move it with its metadata into the store."
+  }
+
+  p <<DOC
+    The whole run takes several minutes. A failed build leaves nothing in the
+    store, so you can fix the definition and run it again. `vmlab template
+    stop ubuntu-24.04` cancels a build in progress.
+  DOC
+
+  p <<DOC
+    The version the build stamps is the block's `version` with a build
+    counter appended: the first build of `24.04.4` is `24.04.4.0`, the next
+    is `24.04.4.1`. Pass `--version` to pin an exact string instead. A version
+    already in the store is refused rather than overwritten.
+  DOC
+
+  code sh { source = "vmlab template list" }
+
+  callout "The template is in the store" {
+    kind = :success
+    body = "`vmlab template list` shows a row for `ubuntu-24.04` with arch `x86_64`, version `24.04.4.0` and its size on disk."
+  }
+
+  h2 "Use it in a lab"
+
+  p "In a new directory, declare a VM that names the template by its store reference."
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+import <vmlab.wcl>
+
+lab "ubuntu-lab" {
+
+  segment "lan" {
+    subnet = "10.91.0.0/24"
+    nat    = true
+    forward { host_port = 12222 to = "srv:22" }
+  }
+
+  vm "srv" {
+    template = "x86_64/ubuntu-24.04"
+    memory   = 2GiB
+    nic { segment = "lan" ip = "10.91.0.10" }
+  }
+}
+SRC
+  }
+
+  p <<DOC
+    A store reference is `<arch>/<name>[@<version>]`. With no version the
+    newest build is used. `@24.04.4` selects the newest build under that
+    prefix, and `@24.04.4.0` pins one exactly. `cpus`, the firmware and the
+    device models are inherited from the template, which recorded them at
+    build time. Only `memory` is overridden here.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab validate
+vmlab up
+vmlab exec srv -- lsb_release -a
+SRC
+  }
+
+  p <<DOC
+    `validate` confirms the template exists in the store before `up` tries to
+    clone it. The clone boots and reports ready as soon as the baked agent
+    answers. The template's autoinstall created a user `vmlab` with password
+    `vmlab`, so the forward on port 12222 gives you SSH into the guest too.
+  DOC
+
+  code sh { source = "ssh vmlab@localhost -p 12222" }
+
+  callout "A VM runs from your own template" {
+    kind = :success
+    body = "`vmlab status` shows `srv` ready at `10.91.0.10`, and `lsb_release` reports Ubuntu 24.04."
+  }
+
+  h2 "Keep the store tidy"
+
+  p <<DOC
+    Every build adds a version. `vmlab template clean` prunes superseded
+    builds, keeping the newest per template. It only prints what it would
+    remove until you add `--yes`, and it skips a build that still backs a
+    clone unless you add `--force`.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab template clean
+vmlab template clean --yes
+SRC
+  }
+
+  h2 "Next steps"
+
+  list {
+    li "[Automate a guest with a script](gs_first_provision) puts a provision script on a VM so the guest is configured on every `up`."
+    li "[Templates and the store](guide_templates) explains layered builds, the `scratch` source, first-boot scripts, export and import."
+    li "[Distributing templates over registries](guide_registries) shows how to push this template to a registry so a lab file can reference it by URL."
+    li "The other definitions under `examples/templates/` build Fedora, AlmaLinux, Arch, openSUSE and Windows Server 2025. [Example labs](apx_examples) describes each."
+    li "[Lab file: template and source](ref_template) and [vmlab template](cmd_template) are the reference for what you used here."
+  }
+}

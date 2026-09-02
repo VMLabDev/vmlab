@@ -109,34 +109,36 @@ lab-destroy dir='examples/mixed-lab': release
 [group('lab')]
 winsrv-desktop: (lab-up 'examples/winsrv-desktop')
 
-# The website + vmlab wskill are authored in wdoc and rendered by the `wcl` CLI.
-# Install it from https://wcl.dev (or `cargo install --git …/wcl wcl`).
+# The website and the manual are authored in wdoc and rendered by the `wcl`
+# CLI. Install it from https://wcl.dev (or `cargo install --git …/wcl wcl`).
 
-# Validate the vmlab wskill model and every projection template
+# Validate the manual's WCL without rendering it
 [group('docs')]
-wskill-check:
-	wcl check docs/wskills/vmlab/wskill.wcl
-	wcl check docs/wskills/vmlab/wdoc/book/main.wcl
-	wcl check docs/wskills/vmlab/wdoc/skill/main.wcl
-	wcl check docs/wskills/vmlab/wdoc/presentation/main.wcl
-	wcl check docs/wskills/vmlab/wdoc/training/main.wcl
+manual-check:
+	wcl check docs/manual/main.wcl
 
-# Build the documentation website to docs/_site (landing + embedded reference book, deck, and course)
+# Build the manual alone to docs/_site/manual
 [group('docs')]
-docs-build: wskill-check
+manual-build:
+	wcl wdoc build docs/manual/main.wcl --out docs/_site/manual
+
+# Serve the manual locally with live reload (`just manual-serve 9090` pins a port)
+[group('docs')]
+manual-serve port="auto":
+	wcl wdoc serve docs/manual/main.wcl --addr {{ if port == "auto" { "auto" } else { "127.0.0.1:" + port } }}
+
+# Build the documentation website to docs/_site (landing at /, the manual at /manual/)
+[group('docs')]
+docs-build:
 	wcl wdoc build docs/main.wcl --out docs/_site
+	wcl wdoc build docs/manual/main.wcl --out docs/_site/manual
 
 # Serve the website locally with live reload; pass `true` to enable comment review mode, and a port to pin one (`just docs-serve true 9090`). Default `auto` picks the first free port near 8080 and prints the URL
 [group('docs')]
 docs-serve comment="false" port="auto":
 	wcl wdoc serve docs/main.wcl --addr {{ if port == "auto" { "auto" } else { "127.0.0.1:" + port } }} {{ if comment == "true" { "--comment" } else { "" } }}
 
-# Regenerate the Claude Code skill at .claude/skills/vmlab from the wskill (single source)
-[group('docs')]
-skill-build: wskill-check
-	wcl wdoc skill docs/wskills/vmlab/wdoc/skill/main.wcl --out .claude/skills/vmlab
-
-# Remove generated site + wskill projections
+# Remove the generated site
 [group('docs')]
 docs-clean:
-	rm -rf docs/_site docs/wskills/vmlab/out
+	rm -rf docs/_site

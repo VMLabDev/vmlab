@@ -1,0 +1,97 @@
+page cmd_clipboard {
+  title = "vmlab clipboard"
+  chapter_header "vmlab clipboard" {
+    kicker       = "Commands · reference"
+    reading_time = "3 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab clipboard` reads or writes a guest's clipboard over the
+    [guest agent](guide_architecture) channel. No guest network is involved,
+    so it works on a machine with no NIC at all.
+  DOC
+
+  code sh { source = "vmlab clipboard <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`get`" | "Write the guest clipboard to stdout, with no trailing newline added." |
+      | "`set`" | "Set the guest clipboard from TEXT, or from stdin when TEXT is omitted." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Both subcommands take a machine reference of the form `[lab/]machine`.
+    A bare name is resolved against the lab in the current directory, and the
+    lab daemon is started if none is running. The qualified form addresses a
+    lab that is already running from any directory and never starts one. The
+    machine must be running with an agent that advertises the `clipboard`
+    feature; see [vmlab machine capabilities](cmd_machine).
+  DOC
+
+  h2 "vmlab clipboard get"
+
+  code sh { source = "vmlab clipboard get [OPTIONS] <MACHINE>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "The machine, as `[lab/]name`." |
+      | "`--json`" | "Emit the raw JSON string instead of the bare text." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The guest's clipboard text is written to stdout byte for byte. No newline
+    is appended, so what you pipe on is exactly what the guest held. With
+    `--json` the text is printed as one JSON string literal instead. The
+    agent is given 10 seconds to answer.
+  DOC
+
+  h2 "vmlab clipboard set"
+
+  code sh { source = "vmlab clipboard set [OPTIONS] <MACHINE> [TEXT]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "The machine, as `[lab/]name`." |
+      | "`[TEXT]`" | "The text to copy. Omit it to read stdin." |
+      | "`--json`" | "Emit the raw JSON reply instead of a confirmation." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    With a `TEXT` argument that text becomes the guest's clipboard. Without
+    one, stdin is read to end of file and passed through verbatim, trailing
+    newline included, so `vmlab clipboard get a | vmlab clipboard set b`
+    round-trips exactly. Use `echo -n` when you do not want the newline
+    `echo` adds. On success the verb prints `copied N bytes to "<machine>"
+    clipboard`; with `--json` it prints the daemon's reply, which is `true`.
+  DOC
+
+  h2 "Examples"
+
+  p "Move a password from one guest to another without typing it:"
+  code sh { source = "vmlab clipboard get dc01 | vmlab clipboard set client01" }
+
+  p "Paste a host file's content into a guest:"
+  code sh { source = "vmlab clipboard set client01 < notes.txt" }
+
+  p "Read a guest's clipboard into a shell variable:"
+  code sh { source = "token=$(vmlab clipboard get buildbox)" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 when the clipboard was read or written. Exit 4
+    (`not_found`) means the lab declares no machine by that name. A machine
+    that is not running, an agent that is not answering or lacks the
+    `clipboard` feature, and a request that times out all exit 1 (`failed`).
+    A qualified reference to a lab that is not running exits 1. A usage
+    error exits 2.
+  DOC
+}

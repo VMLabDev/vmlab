@@ -1,0 +1,85 @@
+page cmd_down {
+  title = "vmlab down"
+  chapter_header "vmlab down" {
+    kicker       = "Commands · reference"
+    reading_time = "3 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab down` stops the machines of the [lab](guide_lab_file) in the
+    current directory, gracefully by default, and keeps their clones so the
+    next [vmlab up](cmd_up) boots the same disks.
+  DOC
+
+  code sh { source = "vmlab down [OPTIONS] [VMS]..." }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`[VMS]...`" | "Machines to stop. With none given, every machine in the lab." |
+      | "`--force`" | "Hard kill instead of the graceful ladder." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  h2 "What it does"
+
+  p <<DOC
+    The verb talks only to a lab daemon that is already running; it never
+    starts one. With no daemon it releases the lab at the supervisor, which
+    reaps any QEMU, swtpm, virtiofsd or smbd process an earlier daemon left
+    behind, prints `lab "<name>" is not running (any orphaned processes were
+    reaped)` and exits 0.
+  DOC
+
+  p <<DOC
+    Stopping is the mirror of `up`. A subset pulls in its dependents, and
+    the waves run leaves first, so a domain controller outlives the members
+    that need it to shut down cleanly. `vmlab down dc01` therefore also stops
+    everything that depends on `dc01`. Before any machine goes, the workspace
+    syncer for each dev machine in the plan is stopped, so it does not spend
+    its retry window looking for a guest that has gone. See
+    [Dev machines and the workspace syncer](guide_dev).
+  DOC
+
+  p "Each VM stops through the graceful ladder described in the [lifecycle guide](guide_architecture):"
+
+  list {
+    style = :numbered
+    li "A shutdown request to the guest agent, waiting up to 30 seconds for QEMU to exit."
+    li "An ACPI power-down through the QEMU control channel, waiting another 30 seconds."
+    li "A hard kill."
+  }
+
+  p <<DOC
+    A [container](guide_containers) asks its init to signal the entrypoint and
+    power off after the image's stop grace, then falls through to the agent and
+    to a kill. `--force` skips the ladder and kills immediately; the guest gets
+    no chance to flush, so a qcow2 clone can lose unflushed writes.
+  DOC
+
+  p <<DOC
+    A full `down` (no machine names) also stops the bundled SMB server, so it
+    does not hold its port against the next `up`. A partial `down` keeps
+    shares served for the machines still running. The lab daemon itself stays
+    up; use [vmlab lab stop](cmd_lab) to stop a lab by name from another
+    directory, or [vmlab destroy](cmd_destroy) to remove everything.
+  DOC
+
+  h2 "Examples"
+
+  p "Stop the whole lab, keeping clones:"
+  code sh { source = "vmlab down" }
+
+  p "Kill one hung machine without waiting for the ladder:"
+  code sh { source = "vmlab down --force buildbox" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 when every machine in the plan stopped, and 0 when no lab
+    daemon was running. A machine that fails to stop, or a lab directory that
+    cannot be found, exits 1 (`failed`). A usage error exits 2.
+  DOC
+}

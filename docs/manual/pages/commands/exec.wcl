@@ -1,0 +1,71 @@
+page cmd_exec {
+  title = "vmlab exec"
+  chapter_header "vmlab exec" {
+    kicker       = "Commands · reference"
+    reading_time = "5 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab exec` runs one command inside a guest through the vmlab agent and
+    mirrors its standard output, standard error, and exit code. It rides the
+    agent's virtio-serial channel, so it works on a machine with no guest
+    network. A VM and a container answer the same request; `vmlab container
+    exec` is the same verb under the container noun.
+  DOC
+
+  code sh { source = "vmlab exec [OPTIONS] <VM> [-- <CMD>...]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The machine, as `[lab/]name`." |
+      | "`[CMD]...`" | "Command and arguments, after `--`." |
+      | "`--timeout <SECS>`" | "Seconds to wait for the command to finish. Default: 120." |
+      | "`--user <LOGIN>`" | "Run as this login: the label a `login {}` block declares, or the account name as an alias. Default: the machine's default login. `SYSTEM` on Windows or `root` on Linux is the agent identity." |
+      | "`--password <PASSWORD>`" | "Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The first word after `--` is the program and the rest are its arguments;
+    nothing is passed through a shell, so quote and glob on the host side or
+    invoke a shell explicitly. The command is refused locally when nothing
+    follows `--`. Standard output goes to the terminal's standard output and
+    standard error to its standard error, so the two can be redirected
+    separately.
+  DOC
+
+  p <<DOC
+    Which account the command runs as follows the ladder in
+    [Logins and the SSH facade](guide_logins). On a machine that declares a
+    `login {}`, the command runs as that login rather than as the agent, so
+    writing into a system directory starts failing where it used to work.
+    `--user SYSTEM` or `--user root` is the old behaviour, spelled out.
+    `--user` also accepts an account the lab file never declared when
+    `--password` is given. A logon that cannot be minted fails naming the
+    account and the machine.
+  DOC
+
+  p <<DOC
+    When the command has not exited by `--timeout`, the daemon stops waiting
+    and reports the timeout as a failure. A guest exit code other than zero becomes this command's
+    exit status, so a script can test the guest command's result directly.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab exec dc01 -- powershell -NoProfile -Command "Get-Service ntds | Select Status"
+vmlab exec --user admin dc01 -- cmd /c whoami
+vmlab exec --timeout 600 nix01 -- nix-build default.nix
+SRC
+  }
+
+  p <<DOC
+    Exit status is 0 when the guest command exits 0, and the guest's own exit
+    code otherwise. `not_found` (4) means the lab declares no machine by that
+    name. `failed` (1) covers a machine that is not running, an agent that
+    does not answer, a login that cannot be minted, and a timeout. An empty
+    command exits 1 before any request is sent.
+  DOC
+}

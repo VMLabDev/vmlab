@@ -1,0 +1,192 @@
+page guide_vision {
+  title = "Screens, input and vision"
+  chapter_header "Screens, input and vision" {
+    kicker       = "The guide · explanation"
+    reading_time = "9 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+A VM always has a display, served over VNC on a unix socket, whether or not a
+viewer is attached. That is what lets a [wscript](guide_scripting) drive a
+guest before it has an agent: type into an installer, wait for a dialog to
+appear, click a button found by image. This chapter explains the input path,
+the key chord and typing syntax, screenshots, template matching and OCR. The
+methods are all on the `Machine` handle; their signatures are in
+[wscript API: Machine](ref_ws_machine). On a machine with no display, a VM
+built with none or a container, every method here fails at call time with
+"machine `name` has no display".
+DOC
+
+  h2 "How input reaches the guest"
+
+  p <<'DOC'
+Scripted keyboard and mouse input goes through one of two transports, chosen
+by the machine's [profile](guide_profiles). The default, `input_transport =
+"qmp"`, sends QMP `send-key` events, which drive the PS/2 keyboard. The
+alternative, `"vnc"`, connects to the VM's own VNC socket and sends keysyms
+and pointer events the way a real viewer does. The shipped `windows-9x`
+profile uses VNC because real-mode DOS and Windows 9x setup screens drop QMP
+key events between menu redraws; a USB-HID-only guest that ignores the PS/2
+keyboard also needs it. The script API is the same either way.
+DOC
+
+  h2 "Key chords"
+
+  p <<'DOC'
+`m.send_keys("ctrl-alt-del")` presses a chord: the key names joined by `-`,
+all pressed together for one event. Names are case-insensitive and follow QMP
+`send-key` naming with common aliases:
+DOC
+
+  table {
+    rows:
+      | "Name" | "Accepted spellings" |
+      | "modifiers" | "`ctrl` / `control`, `alt`, `shift`, `win` / `super` / `meta`" |
+      | "editing" | "`enter` / `return`, `tab`, `backspace`, `space`, `esc` / `escape`, `del` / `delete`, `insert`" |
+      | "navigation" | "`up`, `down`, `left`, `right`, `home`, `end`, `pgup` / `pageup`, `pgdn` / `pagedown`" |
+      | "function keys" | "`f1` to `f12`" |
+      | "single characters" | "any one letter or digit, e.g. `ctrl-c`, `alt-f4`" |
+      | "others" | "`menu`, `print`, `pause`, `caps_lock`, `num_lock`, `scroll_lock`" |
+  }
+
+  p <<'DOC'
+An unknown name fails with "unknown key `x` in chord" and an empty chord is
+refused. Because `-` is the separator, the minus key itself is typed with
+`type_text("-")` rather than sent as a chord.
+DOC
+
+  h2 "Typing text"
+
+  p <<'DOC'
+`m.type_text(text)` types literal text one character at a time, pausing 35 ms
+between characters. `m.type_text_paced(text, delay_ms)` sets the pause, for
+installers that drop keys when they arrive too fast. A newline in the text
+presses Enter and a tab presses Tab. The keyboard map is US layout: letters,
+digits and the shifted punctuation on a US keyboard all work, and any other
+character fails with "cannot type character … (US layout only)". Uppercase
+letters and symbols are sent as shift chords, so the guest must be on a US
+layout too or they arrive wrong.
+DOC
+
+  code ws { source = <<'SRC'
+let k = vm.send_keys("ctrl-alt-del")
+let t = vm.type_text("Password1!\n")
+SRC
+  }
+
+  h2 "The mouse"
+
+  p <<'DOC'
+`m.mouse_move(x, y)` moves the pointer to absolute screen coordinates.
+`m.mouse_click(button)` clicks `"left"`, `"right"` or `"middle"` at the
+position the preceding move set; the handle remembers the last pointer
+position, so a click never needs coordinates of its own. `m.mouse_drag(x1, y1,
+x2, y2)` presses the left button at the first point, moves in a few steps,
+and releases at the second. All
+three go through whichever input transport the profile chose.
+DOC
+
+  h2 "Screenshots"
+
+  p <<'DOC'
+`m.screenshot(path)` writes the current framebuffer as a PNG and returns the
+path it wrote. With an empty string it chooses a name of the form
+`<machine>-<timestamp>.png` under `screenshots/` in the lab's own
+`.vmlab/` directory; with a relative path it writes beside the running script.
+QEMU's own screendump is a PPM, and the image loader sniffs formats by
+content rather than extension, so a screenshot, a PNG crop and a BMP are all
+accepted anywhere a reference image is expected.
+DOC
+
+  h2 "Template matching"
+
+  p <<'DOC'
+Template matching finds a small reference image inside the screen. The
+reference is a crop you take once, by hand, of the thing you want to wait for:
+an "Install now" button, a login prompt, a completed progress bar. By
+convention reference images live in a directory beside the script, and a
+relative path resolves against the script's directory.
+DOC
+
+  p <<'DOC'
+`m.wait_for_image(ref, timeout_secs)` grabs the screen once a second until the
+reference appears, and returns a `Match` or an error saying how long it waited
+and on which machine. `m.wait_for_any([refs], timeout_secs)` does the same for
+several references and returns the first found. `m.find_image(ref)` is a single
+grab with no wait and returns `Option[Match]`. `m.wait_for_image_opts(ref,
+timeout_secs, threshold, region)` exposes the two options the others fix:
+DOC
+
+  list {
+    li "**threshold** is the minimum similarity score, default 0.9. Scores are zero-mean normalised cross-correlation values where 1.0 is a perfect match, compared against the threshold with no rescaling. Matching is done in grayscale."
+    li "**region** is `[x, y, w, h]` restricting the search to part of the screen, or an empty list for the whole screen. A list of any other length is an error. Coordinates in the returned `Match` are always absolute screen coordinates, even when a region was given."
+  }
+
+  p <<'DOC'
+A `Match` carries the top-left `x`, `y`, the template's `w`, `h`, the `score`,
+and the centre `cx`, `cy`, so a found image anchors a click:
+DOC
+
+  code ws { source = <<'SRC'
+match vm.wait_for_image("images/install-now.png", 300) {
+    Ok(m) => {
+        let mv = vm.mouse_move(m.cx, m.cy)
+        let cl = vm.mouse_click("left")
+    }
+    Err(e) => lab.log(e),
+}
+SRC
+  }
+
+  p <<'DOC'
+The search is two-stage so it stays fast on an HD screen: a coarse pass on a
+4x downscaled copy keeps the eight best candidates, and each is refined at
+full resolution within a few pixels. A reference with no variance at all, a
+solid colour, has no defined correlation and falls back to a mean absolute
+difference score against the same threshold. Crop references with some
+texture in them, and crop tightly: a reference larger than the screen or the
+region can never match.
+DOC
+
+  callout "Crop from the same display size" {
+    kind = :tip
+    body = "Matching is not scale-invariant. Take reference crops from a screenshot of the same VM at the same resolution the script will run against, or the score never reaches the threshold."
+  }
+
+  h2 "OCR"
+
+  p <<'DOC'
+`m.ocr()` returns the text on screen and `m.ocr_region([x, y, w, h])` the
+text in one region, both as tesseract's output verbatim, trailing whitespace
+included. vmlab drives the `tesseract` binary as a subprocess with page
+segmentation mode 6, which assumes one uniform block of text and suits console
+and dialog screenshots. If the binary is not on `PATH` the call fails with a
+message telling you to install tesseract-ocr. A region whose origin lies
+outside the image is an error; a region that runs past the edge is clipped.
+DOC
+
+  p <<'DOC'
+`m.wait_for_text(pattern, timeout_secs)` grabs the screen once a second, runs
+OCR over the whole of it and returns as soon as the regex matches. The
+returned `Match` carries the matched text in `text` and zero for the position
+fields, because OCR does not report where on screen it read a line. OCR is
+fuzzy: different tesseract versions read edge glyphs differently, so match a
+distinctive word rather than a whole sentence, and prefer image matching where
+you can crop a stable reference.
+DOC
+
+  h2 "Choosing between them"
+
+  p <<'DOC'
+Once a guest has the agent, `exec` and `wait_ready` are faster and more
+reliable than anything on the screen, and a VM without an agent never reports
+ready, so a script targeting one relies on screen and time waits alone. Use the
+screen for the part of a template build before the agent is installed and for
+the rare interactive step no command line reaches. Image matching is exact and
+fast but tied to one look; OCR survives theme and resolution changes but is
+slower and approximate. Both are available in every GPU mode, because the VM
+always renders to a host-side framebuffer that VNC and screenshots read.
+DOC
+}

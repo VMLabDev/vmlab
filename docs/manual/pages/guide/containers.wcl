@@ -1,0 +1,202 @@
+page guide_containers {
+  title = "Lab containers"
+  chapter_header "Lab containers" {
+    kicker       = "The guide · explanation"
+    reading_time = "10 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A lab may declare OCI **containers** beside its VMs. A `container` block
+    names a standard image, `nginx:1.27` or `ghcr.io/owner/app@sha256:…`,
+    and carries compose-style configuration: environment variables, volumes,
+    port forwards, a healthcheck, and `nic` blocks identical to a VM's. What
+    makes a lab container different from `docker run` is where it runs:
+    every container is a machine in a micro-VM, so it has the same segments,
+    DNS, snapshots and agent channel as a VM. This chapter explains that
+    mechanism. The fields are in [Lab file: container and its children](ref_container)
+    and the verbs in [vmlab container](cmd_container).
+  DOC
+
+  code wcl {
+    filename    = "examples/mixed-lab/vmlab.wcl"
+    source_file = "../../examples/mixed-lab/vmlab.wcl"
+    dedent      = true
+  }
+
+  h2 "The micro-VM"
+
+  p <<DOC
+    Each container boots a pinned Alpine `linux-virt` kernel and a
+    purpose-built initramfs, passed to QEMU directly with `-kernel` and
+    `-initrd`. PID 1 in that guest is `vmlab-cinit`, vmlab's own init. It
+    mounts the image's root filesystem read-only, lays a writable scratch
+    disk over it with overlayfs, opens a control channel to the host on the
+    `vmlab.ctl.0` virtio-serial port, and waits for the host to push the
+    container's specification: the resolved command, environment, user,
+    working directory, mounts and NICs. It then mounts volumes, brings the
+    network up, spawns `vmlab-agent`, and executes the workload in its own
+    namespaces.
+  DOC
+
+  p <<DOC
+    The micro-VM's `cpus` and `memory` resolve through the same chain as a
+    VM's, minus the template layer: the block, then its `profile`. There is
+    no built-in default, because what a micro-VM needs depends entirely on
+    its image, so a container that names neither a size nor a profile
+    supplying one is a validation error rather than a guess that OOMs. The
+    shipped `container` profile carries a floor of one vCPU and 256 MiB.
+  DOC
+
+  p <<DOC
+    Nothing here needs privileges. The host uses `/dev/kvm` when it is
+    available and falls back to TCG when it is not, and no `--privileged` or
+    added capability is ever required.
+  DOC
+
+  h2 "Pulling and flattening an image"
+
+  p <<DOC
+    An image reference resolves like a registry template. Docker Hub
+    shorthand is normalised, so `nginx` means
+    `registry-1.docker.io/library/nginx`. A tag is resolved against the
+    registry to a manifest digest, a multi-arch index is resolved to the
+    host's platform, and every blob is digest-verified as it streams. The
+    supervisor pre-pulls images before the lab daemon starts, reporting
+    `container.pull.*` progress events.
+  DOC
+
+  p <<DOC
+    The image's layers are then **flattened** into one squashfs file, with
+    OCI whiteout semantics applied at the tar level: a `.wh.<name>` entry
+    deletes a lower path, an opaque marker drops everything beneath a
+    directory, and the highest layer wins a path present in several. The
+    layers are streamed rather than unpacked, first to survey which entries
+    survive and verify each layer's `diff_id`, then to emit the survivors
+    straight into `sqfstar`. The tree never touches disk, and no host
+    privilege is needed for ownership or device nodes.
+  DOC
+
+  p <<DOC
+    The result is cached under `~/.local/share/vmlab/oci/` by manifest
+    digest, with the same lock and stage-then-rename discipline as the
+    template store. A digest reference, or a tag whose cached resolution is
+    still installed, is satisfied fully offline. When the registry is
+    unreachable, a tag falls back to its cached resolution with a warning.
+  DOC
+
+  h3 "The pin"
+
+  p <<DOC
+    The digest resolved at first pull is **pinned** in the lab's state and
+    never re-pulled implicitly, so a `nginx:1.27` that moves upstream does
+    not change under a running lab. `vmlab container destroy`, or editing
+    the `image =` line, clears the pin; the next `up` resolves afresh. Every
+    snapshot records the pin it was taken against, because a scratch overlay
+    means nothing without the same read-only root, and a restore under a
+    different pin fails, naming both digests.
+  DOC
+
+  h2 "Configuration"
+
+  p <<DOC
+    `env` blocks pass variables to the container process. `entrypoint`,
+    `command`, `workdir` and `user` override the image's own, in the exec
+    form you would write in a compose file. `user` takes `uid[:gid]` or a
+    name the image's `/etc/passwd` knows.
+  DOC
+
+  p <<DOC
+    A `volume` block is either a host bind, `host = "./data"` relative to the
+    lab root, or a **named volume**, `name = "db"`, kept under the lab's
+    `.vmlab/` and shared by name between containers. Named volumes survive
+    `down` and per-container destroy, and only lab `destroy` removes them.
+    Volumes attach as vhost-user-fs devices, one `virtiofsd` per volume,
+    mounted natively by cinit before the network is even up. A host with no
+    `virtiofsd` binary falls back to SMB shares served by the lab daemon at
+    the segment gateway, mounted over CIFS once the network is up, exactly
+    as [Shared folders](guide_shares) describes for VMs. Ownership on
+    volume files is mount-level, not per-file container uid and gid.
+  DOC
+
+  p <<DOC
+    A `port` block is sugar for a segment `forward` to this container. It
+    is installed against the container's lease when it turns ready and
+    reinstalled after a restart. Because volumes and ports both need the
+    segment gateway, a container declaring either must have at least one
+    NIC. A container with no NIC is otherwise valid: air-gapped, still
+    reachable with `exec`, `cp` and `logs` over the agent channel.
+  DOC
+
+  h2 "Workload and idle mode"
+
+  p <<DOC
+    The default mode, `:workload`, runs the image's process, and the
+    container's lifecycle is that process's: when it exits, cinit reports
+    the exit and powers the micro-VM off. `mode = :idle` boots the micro-VM,
+    mounts everything and starts the agent, but never runs the entrypoint.
+    The container then stays up for `exec`, `shell` and an SSH attach until
+    you stop it. That is what a [dev container](guide_dev) wants, since it
+    has no service to be, and the neovim example in this manual declares it.
+  DOC
+
+  h2 "Readiness and health"
+
+  p <<DOC
+    Readiness is two-stage. The first stage is cinit reporting `started`, or
+    `idle` in idle mode. The second, when the block declares a
+    `healthcheck`, is the first passing probe: the command runs inside the
+    container at the declared interval, after the start period, and a
+    consecutive-failure count marks the container `unhealthy`. In idle mode
+    there is no workload to prove liveness, so the second stage waits for
+    the agent instead.
+  DOC
+
+  p <<DOC
+    Readiness is deliberately not gated on the agent in workload mode. The
+    entrypoint runs regardless, as it would under Docker, and an agent
+    hiccup must not wedge a `depends_on` wave. The agent is polled
+    separately and gates only `exec` and `cp`. The events
+    `container.starting`, `ready`, `stopped`, `crashed` and `unhealthy` are
+    bindable with `on`, exactly like their VM counterparts, and readiness
+    gates the dependents of a container the same way a VM's does.
+  DOC
+
+  h2 "Stopping, logs and snapshots"
+
+  p <<DOC
+    The stop ladder mirrors a VM's: a stop signal to the process with a
+    grace period, then a guest shutdown, then a kill. The container's stdout
+    and stderr are the micro-VM's serial console, so `vmlab container logs`
+    shows the kernel's boot messages and then the process's output, and
+    `-f` follows it.
+  DOC
+
+  p <<DOC
+    Containers snapshot with full VM parity. An offline snapshot captures the
+    scratch disk; an online one captures scratch, RAM and device state, both
+    as qcow2-internal snapshots of the per-container scratch disk, with the
+    immutable root outside the snapshot. Restoring an online snapshot
+    resumes the process mid-flight. Volume contents are host state, outside
+    snapshot scope, as [Snapshots](guide_snapshots) explains.
+  DOC
+
+  h2 "The container identity floor"
+
+  p <<DOC
+    Every session into a container lands as some account, and when the
+    container declares no `login` that account is the **container floor**:
+    the user cinit resolved for the workload, which is the declared `user`,
+    else the image's `USER`, else root. This is devcontainers' `remoteUser`
+    idea, and it costs nothing because Linux needs no credential to become
+    that user. A `login` block on a container may therefore declare the
+    account alone, with no password. [Logins and the SSH facade](guide_logins)
+    covers the rest of the identity ladder.
+  DOC
+
+  callout "What is not supported" {
+    kind = :info
+    body = "Cross-arch containers, where the image arch differs from the host's, are out of scope, as is a native container runtime backend. A container always runs in a micro-VM."
+  }
+}

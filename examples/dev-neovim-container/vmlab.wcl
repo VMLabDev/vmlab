@@ -35,6 +35,7 @@ lab "dev-neovim-container" {
     nat    = true
   }
 
+  // ANCHOR: dev01
   @dev(default = true, workspace = "./workspace")
   container "dev01" {
     image   = "alpine:3.22"
@@ -58,4 +59,5 @@ lab "dev-neovim-container" {
     provision "scripts/dev-user.ws" { }
     provision "scripts/editor-bits.ws" { }
   }
+  // ANCHOR_END: dev01
 }

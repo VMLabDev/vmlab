@@ -4,9 +4,9 @@ A single-host VM lab orchestrator: labs and virtual networks declared in WCL,
 reusable disk templates built locally or distributed over OCI registries, and
 guest automation written in wscript.
 
-This is the canonical glossary. `docs/wskills/vmlab/data/reference/glossary.wcl`
-restates the user-facing subset for the rendered wskill and site; when the two
-disagree, this file wins.
+This is the canonical glossary. The manual's glossary
+(`docs/manual/pages/appendices/glossary.wcl`) restates the user-facing subset;
+when the two disagree, this file wins.
 
 ## Language
 

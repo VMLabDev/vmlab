@@ -1,0 +1,241 @@
+// Getting started: a VM from a registry template, its console, screen and snapshots.
+page gs_first_vm {
+  title = "Your first VM"
+  chapter_header "Your first VM" {
+    kicker       = "Getting started · tutorial"
+    reading_time = "9 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    In this tutorial you run a full virtual machine without building
+    anything. The VM's `template` field names a template published on a
+    public OCI registry, and `vmlab up` pulls it into your local store the
+    first time. You then open a shell in the guest, attach its console, take
+    a screenshot, and take and restore a snapshot.
+  DOC
+
+  h2 "Before you start"
+
+  list {
+    li "vmlab is installed with the runtime tools from [Install](gs_install). No guest assets are needed: the pulled template already carries the agent."
+    li "`/dev/kvm` is available. The template is x86_64, so it runs under KVM on an x86_64 host."
+    li "Internet access from the host, to pull from `ghcr.io`. The template is small, and the pull takes a few tens of seconds."
+    li "A VNC viewer for the console step. `remote-viewer` from `virt-viewer` is the one vmlab prefers. The step also shows the path with no viewer at all."
+  }
+
+  h2 "Write the lab file"
+
+  p "Create a new directory with this `vmlab.wcl`."
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+import <vmlab.wcl>
+
+lab "first-vm" {
+
+  vm "alp" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"
+    arch     = "x86_64"
+    memory   = 1GiB
+    nic { nat = true }
+  }
+}
+SRC
+  }
+
+  p <<DOC
+    `template` is an OCI registry reference of the form
+    `host/owner/[group/]name[:tag]`. With no tag it tracks the moving
+    `latest` tag, the newest stable version of the published template.
+    `:latest-prerelease` tracks pre-releases and `:<version>` pins one.
+    A registry reference always needs `arch`, because one tag can carry
+    several architectures and vmlab never assumes the host's.
+  DOC
+
+  p <<DOC
+    `nic { nat = true }` is shorthand for attaching the VM to the lab's
+    built-in NAT segment, so you do not have to declare one. The guest gets a
+    DHCP lease and internet egress. `memory = 1GiB` overrides the size the
+    template recorded; `cpus` and everything else are inherited from the
+    template and, below it, from its guest OS profile. See
+    [Lab file: vm and its children](ref_vm) for the whole surface.
+  DOC
+
+  h2 "Bring it up"
+
+  code sh { source = <<'SRC'
+vmlab validate
+vmlab up
+SRC
+  }
+
+  p <<DOC
+    `up` resolves the tag, finds no matching version in the local store,
+    pulls the template, installs it under `x86_64/alpine-3.23@<version>`, and
+    creates the VM as a linked clone of it. The clone is a qcow2 file whose
+    backing file is the sealed template, so it starts small and the template
+    is never modified. The VM boots and `up` waits until the guest agent
+    answers, which is what **ready** means.
+  DOC
+
+  p <<DOC
+    A cached version is reused on every later `up` and never re-pulled
+    implicitly. To fetch a template without starting anything, for instance
+    ahead of a trip, run `vmlab pull`. To see what the store holds, list it.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab status
+vmlab template list
+SRC
+  }
+
+  callout "The VM is running" {
+    kind = :success
+    body = "`vmlab status` shows `alp` running and ready with an address. `vmlab template list` shows `x86_64/alpine-3.23` with the version that was pulled."
+  }
+
+  h2 "Open a shell"
+
+  p <<DOC
+    `vmlab shell` attaches an interactive terminal inside the guest over the
+    agent's virtio-serial channel. No SSH and no guest network are involved,
+    so it works even on a VM with no NIC. This VM declares no `login {}`, so
+    the shell runs as the agent's identity, which is root on Linux.
+  DOC
+
+  code sh { source = "vmlab shell alp" }
+
+  p "Inside the guest, confirm where you are, then detach with Ctrl-]. Detaching leaves the VM running."
+
+  code sh { source = <<'SRC'
+cat /etc/alpine-release
+ip addr show eth0
+SRC
+  }
+
+  p "For a single command, use `exec` instead. Its exit code becomes the exit code of `vmlab exec`."
+
+  code sh { source = "vmlab exec alp -- uname -a" }
+
+  h2 "Attach the console"
+
+  p <<DOC
+    Every VM has a VNC display served on a unix socket whether or not anyone
+    is looking at it. `vmlab console` attaches a viewer to it. vmlab picks the
+    viewer from your host configuration, else the first of `remote-viewer`,
+    `gvncviewer` and `vncviewer` on your `PATH`. Closing the viewer window
+    only disconnects. The VM keeps running.
+  DOC
+
+  code sh { source = "vmlab console alp" }
+
+  p <<DOC
+    You see the Alpine login prompt on the virtual screen. With no viewer
+    installed, or on WSL 2 where the viewer lives on the Windows side, ask
+    for a TCP bridge instead. vmlab forwards the display to a localhost port
+    and prints the address for you to point any VNC client at.
+  DOC
+
+  code sh { source = "vmlab console --tcp alp" }
+
+  p <<DOC
+    To open a viewer automatically on every `up`, set `gui = true` on the VM
+    or on the lab. The VM still runs headless; the viewer is a separate client
+    process.
+  DOC
+
+  h2 "Take a screenshot"
+
+  p <<DOC
+    The same display that the console shows can be captured to a PNG at any
+    moment. This is the basis of screen-driven automation, where a script
+    waits for an image or a piece of text to appear.
+  DOC
+
+  code sh { source = "vmlab vm screenshot alp login.png" }
+
+  p <<DOC
+    Open `login.png` and you see the same login prompt. With `tesseract`
+    installed, `vmlab vm ocr alp` reads the text off the screen instead, and
+    `vmlab vm sendkeys alp <chord>` types into it. [Screens, input and
+    vision](guide_vision) covers the whole surface.
+  DOC
+
+  callout "You have three doors into the guest" {
+    kind = :success
+    body = "You have run a command over the agent, watched the screen over VNC, and captured it to a file."
+  }
+
+  h2 "Snapshot and restore"
+
+  p <<DOC
+    A [snapshot](guide_snapshots) records a machine's disk, and if the machine
+    is running, its RAM and device state too. Every snapshot remembers the
+    power state it was taken in. Restoring an online snapshot resumes the
+    guest exactly where it was; restoring an offline one leaves it powered
+    off. Write a marker file in the guest, take a snapshot, delete the marker,
+    then restore.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab exec alp -- sh -c 'echo before > /root/marker'
+vmlab snapshot create clean --vm alp
+vmlab snapshot list alp
+SRC
+  }
+
+  p <<DOC
+    `--vm alp` narrows the snapshot to one machine. Without it, `snapshot
+    create` captures every VM and container in the lab under one name.
+    Consistency across machines in a lab-wide snapshot is best-effort, not
+    coordinated. Now change the guest and roll it back.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab exec alp -- rm /root/marker
+vmlab snapshot restore clean --vm alp
+vmlab exec alp -- cat /root/marker
+SRC
+  }
+
+  p <<DOC
+    The last command prints `before`. The VM was running when the snapshot
+    was taken, so it is running again after the restore, with the marker
+    back. Delete the snapshot when you no longer need it.
+  DOC
+
+  code sh { source = "vmlab snapshot delete alp clean" }
+
+  callout "Snapshots are not a workspace backup" {
+    kind = :note
+    body = "On a dev machine the workspace is re-converged from the host after a restore rather than rolled back with the disk. The source of truth for a workspace is the host directory. See [Dev machines and the workspace syncer](guide_dev)."
+  }
+
+  h2 "Clean up"
+
+  code sh { source = <<'SRC'
+vmlab down
+vmlab destroy
+SRC
+  }
+
+  p <<DOC
+    `destroy` deletes the clone and the lab-local state. The pulled template
+    stays in the store, so the next `up` of any lab that names it starts
+    without a download. To remove it, find its version with `vmlab template
+    list` and remove that reference.
+  DOC
+
+  code sh { source = "vmlab template rm x86_64/alpine-3.23@<version>" }
+
+  h2 "Next steps"
+
+  list {
+    li "[Build a template from an ISO](gs_first_template) makes your own template from installer media, so any operating system can be a lab machine."
+    li "[Distributing templates over registries](guide_registries) explains tags, multi-arch indexes, pushing your own templates and searching a registry."
+    li "[Snapshots](guide_snapshots) explains online and offline snapshots, what a lab-wide snapshot guarantees, and how snapshots interact with shared folders."
+    li "[vmlab vm](cmd_vm), [vmlab snapshot](cmd_snapshot) and [vmlab console](cmd_console) document the verbs used here."
+  }
+}

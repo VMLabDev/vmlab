@@ -1,4 +1,0 @@
-// process — one import per entry (runbooks of ordered steps).
-import "./golden_path.wcl"
-import "./build_template.wcl"
-import "./distribute_oci.wcl"

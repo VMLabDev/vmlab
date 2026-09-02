@@ -1,0 +1,157 @@
+page guide_playbooks {
+  title = "Playbooks"
+  chapter_header "Playbooks" {
+    kicker       = "The guide · explanation"
+    reading_time = "7 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+A playbook is a config-weave play applied inside a guest. Where a
+[provision script](guide_scripting) is imperative, a playbook is declarative
+convergence: it describes the state a machine should be in, `check` reports
+the drift and `apply` closes it. vmlab does not interpret the playbook; it
+pushes config-weave and the playbook folder into the guest, runs the guest
+binary, streams its progress, and reboots the guest when the play asks. This
+chapter explains the declaration, how the binary is found, the run itself,
+reboots, and how playbooks order against provisions. The block's fields are in
+[Lab file: vm and its children](ref_vm), and the verbs in
+[vmlab playbook](cmd_playbook).
+DOC
+
+  h2 "Declaring one"
+
+  p <<'DOC'
+A `playbook {}` block is declared inside the `vm {}` or `container {}` it
+converges, or inside a `template {}` for the build VM. Its label is the
+playbook folder, relative to the lab root, and the folder must contain a
+`playbook.wcl`. `play` names the play inside it. `var` children are variable
+overrides scoped to this machine's run.
+DOC
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+vm "buildbox" {
+  template = "x86_64/linux-modern"
+  nic { nat = true }
+
+  provision "scripts/setup.ws" { }
+  playbook "playbooks/baseline" {
+    play = "baseline"
+    var "tz" { value = "UTC" }
+  }
+}
+SRC
+  }
+
+  p <<'DOC'
+Each `var` becomes a `--var name=value` argument on the guest command line,
+in declaration order. The value is passed through verbatim with no shell in
+between, so config-weave applies its usual rule: it reads the value as a WCL
+expression where it can, so `3` is an integer and `true` a boolean, and as a
+string otherwise. That is how one play takes different settings on different
+machines. `vmlab validate` rejects a variable name that is not a WCL
+identifier and a name set twice on one block.
+DOC
+
+  h2 "Where the binary comes from"
+
+  p <<'DOC'
+config-weave is not bundled with vmlab. It cross-builds exactly two guest
+targets, both x86_64: one for Linux and one for Windows. vmlab looks for them
+in a directory resolved in this order:
+DOC
+
+  list { style = :numbered
+    li "`config_weave_bin_dir` in the [host configuration](guide_host) file."
+    li "The `VMLAB_CONFIG_WEAVE_DIR` environment variable."
+    li "`~/.local/share/config-weave/bin`, which is where config-weave's own `just install` puts them."
+  }
+
+  p <<'DOC'
+Before anything boots, `vmlab up` checks that the binary each targeted
+machine will need exists on the host and fails naming it if not. A guest whose
+architecture is not x86_64 cannot run a playbook at all.
+DOC
+
+  h2 "What a run does"
+
+  p <<'DOC'
+A run, whether from `vmlab up` or from `vmlab playbook check` or `apply`,
+waits for the machine's agent, then does four things in order.
+DOC
+
+  list { style = :numbered
+    li "**Ensure the guest binary.** vmlab remembers the SHA-256 of the binary it last pushed to each machine and probes the guest with `config-weave version`. It pushes again when the host binary changed or the probe fails, which is what happens after a snapshot restore rolls the disk back under a warm cache. The host-side files are named `config-weave-linux-x86_64` and `config-weave-windows-x86_64.exe`; in the guest they land at `/weave/config-weave` on Linux and `C:\\weave\\config-weave.exe` on Windows, with playbook folders under `/weave/playbooks` and `C:\\weave\\playbooks` beside them."
+    li "**Push the playbook folder, every time.** The guest copy is removed and re-pushed on each run so deleted source files never linger. The lab-relative path is flattened into one guest directory name, `playbooks/baseline` becoming `playbooks__baseline`, so two playbooks in one lab cannot collide. A fast edit-then-run loop is the point of always pushing."
+    li "**Run the verb.** The guest command is `config-weave check|apply <dir> <play> --json --events-ndjson` plus the `--var` pairs. Progress events arrive on stderr as JSON lines and are rendered into human lines on the CLI stream and the lab log; the final `--json` report on stdout is parsed and attached to the completion event."
+    li "**Report the verdict.** Infrastructure failures, a push that will not land or a guest that stops answering, are errors. config-weave's own verdict comes back as its exit code: 0 for converged, 1 for a step error, 2 for a validation failure, and 3 for reboot still required."
+  }
+
+  p <<'DOC'
+Both push steps retry with backoff, five attempts over roughly 36 seconds,
+because a Windows guest can hold a freshly written file briefly: a lingering
+config-weave process or antivirus scanning the new binary shows up as a
+"file in use" sharing violation, and the pushes are idempotent. Every retry
+is announced so a streamed run shows what it is waiting on. One config-weave
+invocation has a hard ceiling of one hour.
+DOC
+
+  p <<'DOC'
+Only one run per machine is in flight at a time; a second `apply` against a
+machine already converging is refused rather than queued. The run emits
+`playbook.op.start`, `playbook.op.log`, `playbook.op.step`,
+`playbook.op.phase`, `playbook.op.done` or `playbook.op.error` as it goes,
+and then `playbook.applied` on a converged apply or `playbook.failed` on any
+non-zero exit or error. The last two are the ones an `on {}` handler may bind;
+see [Events and handlers](guide_events).
+DOC
+
+  h2 "Reboots"
+
+  p <<'DOC'
+When `apply` exits 3, the play needs a reboot to finish. vmlab reboots the
+guest through the agent, waits for the agent to stop answering and then to
+answer again, and runs the same apply once more. It does this at most three
+times; if the play still reports reboot-required after the third, the run
+returns exit 3 and says it gave up. The wait for the guest to come back is
+bounded at ten minutes and narrated every thirty seconds, because a domain
+controller's first post-promotion boot can be quiet for a long time and would
+otherwise read as a hang. A `check` never reboots.
+DOC
+
+  p <<'DOC'
+A container micro-VM cannot reboot in place: it restarts from a fresh rootfs,
+so an apply that asks for a reboot on a container fails with a message saying
+so rather than looping.
+DOC
+
+  h2 "Ordering with provisions"
+
+  p <<'DOC'
+Provisions and playbooks are one ordered list per machine. They run in the
+order their blocks appear inside that machine, once it is ready, and a
+machine that depends on another waits until that machine's whole list has
+completed. So in the example above `scripts/setup.ws` runs, then the
+`baseline` play, and only then does anything with `depends_on = ["buildbox"]`
+start. A template's playbooks interleave with its provisions the same way
+during a build, with steps streamed as build progress.
+DOC
+
+  p <<'DOC'
+Both run as the machine's agent identity, SYSTEM on Windows and root on
+Linux. A playbook has no user parameter and no rung on the
+[identity ladder](guide_logins), which is a real limit: the agent identity can
+write into a profile directory that already exists but cannot create one or
+set its ownership, so a play that writes into a user's home half-works on an
+existing profile and fails on a fresh domain user. Anything that must land as
+a particular login belongs in a provision script using `as_login`. Use a
+playbook for what is done *to* the machine: packages, services, registry
+settings, the toolchain.
+DOC
+
+  callout "Playbooks on demand" {
+    kind = :tip
+    body = "`vmlab playbook apply <machine>` re-pushes and re-runs a declared playbook without a full `vmlab up`, and `vmlab playbook check <machine>` reports drift without changing anything. When a machine declares more than one, `--playbook` and `--play` pick which; the error names the candidates otherwise."
+  }
+}

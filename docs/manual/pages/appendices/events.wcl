@@ -1,0 +1,180 @@
+page ref_events {
+  title = "Events"
+  chapter_header "Events" {
+    kicker       = "Appendices · reference"
+    reading_time = "12 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    This chapter lists every event the daemons emit, grouped by area, with
+    the fields each payload carries and when it fires. The
+    [events guide](guide_events) explains how to bind a handler script to
+    one and what a handler may do; [Event](ref_ws_types) is the record a
+    handler receives.
+  DOC
+
+  h2 "Shape and delivery"
+  p <<DOC
+    An event is one JSON object with four fields: `event`, the name; `lab`,
+    the lab it belongs to, omitted for host-scoped events; `data`, the
+    payload object, omitted when there is none; and `ts`, a UTC timestamp.
+    A lab daemon writes every event it emits to three places: its tracing
+    log, the lab's `events.jsonl` under the state directory (see
+    [Files and directories](ref_paths)), and its broadcast stream, which
+    the supervisor folds into a host-wide aggregate. A subscriber attaches at
+    either level. `vmlab logs` reads the history file.
+  DOC
+  p <<DOC
+    A handler script sees the machine an event concerns as `event.vm`,
+    taken from the payload's `vm` key, else its `container` key, else
+    empty. Events whose natural subject is `machine` set `vm` as well so a
+    handler can look the machine up.
+  DOC
+  code json { source = <<'SRC'
+{"event":"vm.ready","lab":"demo","data":{"vm":"dc01"},"ts":"2026-09-02T10:14:03.512Z"}
+SRC
+  }
+
+  h2 "Lab lifecycle"
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`lab.up`" | "`vms`: the names started" | "`vmlab up` finished, after provisioning and workspace start." |
+      | "`lab.down`" | "none" | "`vmlab down` finished; also on the way through `destroy`." |
+      | "`lab.daemon_crashed`" | "none; `lab` names the lab" | "Emitted by the supervisor when a lab daemon's socket is gone or unresponsive. The registry entry is marked failed." |
+      | "`host.disk_low`" | "`path`, `free_percent`" | "Every sixty seconds while free space under the lab's `.vmlab/` is below the host config threshold. The supervisor emits the same event, with an empty `lab`, for the filesystem holding the template store." |
+
+  }
+  h2 "Machines"
+  p <<DOC
+    VM events carry `vm`; container events carry `container`. `reason` on a
+    stop is `requested`, `guest_initiated` or `crashed`; `status` is the
+    emulator's exit status and `exit_code` the container's.
+  DOC
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`vm.starting`" | "`vm`" | "The VM's start began, after any deferred template download." |
+      | "`vm.ready`" | "`vm`" | "The agent handshake completed, or an online snapshot finished loading, or the first-boot provision completed and was sealed. For a container in that last case the key is `container`." |
+      | "`vm.crashed`" | "`vm`, `reason`, `status`" | "The emulator exited without being asked. Always followed by `vm.stopped`." |
+      | "`vm.stopped`" | "`vm`, `reason`, `status`" | "The emulator exited for any reason." |
+      | "`vm.destroyed`" | "`vm`" | "`vmlab vm destroy` removed the VM's clones, run directory and workspace ledger." |
+      | "`container.starting`" | "`container`" | "The container's start began, after the image pull." |
+      | "`container.ready`" | "`container`" | "The micro-VM reported ready; port forwards are installed next." |
+      | "`container.crashed`" | "`container`, `reason`, `exit_code`" | "The container exited without being asked. Always followed by `container.stopped`." |
+      | "`container.stopped`" | "`container`, `reason`, `exit_code`" | "The container exited for any reason." |
+      | "`container.unhealthy`" | "`container`" | "The container's healthcheck reported not healthy." |
+      | "`container.destroyed`" | "`container`" | "`vmlab container destroy` removed everything the container materialised." |
+      | "`machine.not_attachable`" | "`vm`, `machine`, `reason`" | "During `up`, a machine whose agent answered lacks a feature the SSH facade needs. See [Logins and the SSH facade](guide_logins)." |
+      | "`machine.agent_repaired`" | "`vm`, `machine`, `agent_version`" | "`vmlab machine repair-agent` pushed the host's agent; the machine is now diverged from its template." |
+      | "`ssh.refused`" | "`vm`, `machine`, `request`, `reason`" | "The SSH facade refused an authentication, channel or request. `request` is the SSH name, `reason` vmlab's words." |
+      | "`share.unmountable`" | "`vm`, `reason`" | "The mount plan holds a share this guest cannot mount. See [Shared folders](guide_shares)." |
+
+  }
+  h2 "Snapshots"
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`snapshot.created`" | "`vm`, `name`, `online`" | "A snapshot was taken, of a VM or a container alike, after the workspace pre-flight flush." |
+      | "`snapshot.restored`" | "`vm`, `name`, `online`" | "A snapshot was restored, after the pin check and the syncer bracket." |
+  }
+  p "Deleting a snapshot emits nothing."
+
+  h2 "Downloads"
+  p <<DOC
+    Deferred downloads emit under two prefixes: `template.pull` for a VM's
+    disk image and `container.pull` for a container image. The subject key
+    is `vm` or `container` to match, and one event is emitted per machine
+    waiting on the download.
+  DOC
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`template.pull.start`, `container.pull.start`" | "`vm` or `container`, `reference`, `arch`" | "A download began." |
+      | "`template.pull.progress`, `container.pull.progress`" | "subject, `reference`, `bytes_done`, `bytes_total`, `percent`, and `chunk`, `chunks` for a template or `layer`, `layers` for an image" | "The transport reported progress." |
+      | "`template.pull.done`, `container.pull.done`" | "subject, `reference`" | "The download completed." |
+      | "`template.pull.cancelled`, `container.pull.cancelled`" | "subject, `reference`" | "The `vmlab pull` waiting on it was interrupted. The job stays pending for a retry." |
+      | "`template.pull.error`, `container.pull.error`" | "subject, `reference`, `error`" | "The download failed. The job stays pending." |
+
+  }
+  h2 "Networking and shares"
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`smb.started`" | "`port`" | "The bundled smbd came up on that host port for the lab's shares." |
+      | "`smb.failed`" | "`error`" | "The share plan could not be computed, or smbd failed to start on every candidate port." |
+      | "`forward.skipped`" | "`what`, `reason`" | "The forward plan dropped a declared forward, or installing one failed at runtime." |
+      | "`forward.conflict`" | "`host_port`, `claimants`" | "Two declarations claim the same host port." |
+      | "`segment.peer.up`" | "`segment`, `peer`, `direction`" | "A cross-host trunk for a global segment came up. Host-scoped: emitted by the supervisor with no `lab`." |
+      | "`segment.peer.down`" | "`segment`, `peer`, `direction`" | "A trunk slot cleared, or the segment was torn down." |
+
+  }
+  h2 "Playbooks"
+  p <<DOC
+    Every `playbook.op.*` event carries `machine`, `playbook` (the path),
+    `play` and `op_id`, plus the fields below. See [Playbooks](guide_playbooks).
+  DOC
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`playbook.op.start`" | "base, `mode`: `apply` or `check`" | "A run was admitted." |
+      | "`playbook.op.log`" | "base, `line`" | "One human-readable line from the run." |
+      | "`playbook.op.phase`" | "base, `phase`: `running` or `rebooting`, `attempt`, `max`" | "The run changed phase, so a reboot shows as one rather than a stall." |
+      | "`playbook.op.step`" | "base, `cw`: the engine's structured event" | "One structured line from the guest engine." |
+      | "`playbook.op.done`" | "base, `exit_code`, `reboots`, `report`" | "The run finished without an infrastructure error, whatever its exit code." |
+      | "`playbook.op.error`" | "base, `error`" | "The agent, the push or the exec failed." |
+      | "`playbook.applied`" | "`machine`, `playbook`, `play`" | "An apply exited 0." |
+      | "`playbook.failed`" | "`machine`, `playbook`, `play`, `mode`, and `exit_code` when the run ran" | "The run exited non-zero, or failed before it could run." |
+
+  }
+  h2 "Template builds and pushes"
+  p <<DOC
+    The supervisor emits these for `vmlab template build` and
+    `vmlab template push`. Every payload carries `template`, `arch` and
+    `kind`, which is `build` or `push`. See
+    [Templates and the store](guide_templates).
+  DOC
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`template.op.start`" | "base; `version` for a push" | "A build or push was admitted." |
+      | "`template.op.console`" | "base" | "The build VM's console socket is available." |
+      | "`template.op.step`" | "base, `event`, `data`" | "The build's synthetic lab emitted a `playbook.*` event, forwarded with its name and payload inside." |
+      | "`template.op.log`" | "base, `line`" | "One non-blank output line from a build or push." |
+      | "`template.op.done`" | "base, `version`" | "The build sealed that version, or the push completed." |
+      | "`template.op.cancelled`" | "base; `version` for a push" | "The `vmlab template build` or `push` driving it was interrupted, and the supervisor aborted the operation." |
+      | "`template.op.error`" | "base, `error`; `version` for a push" | "The build or push failed." |
+      | "`template.built`" | "`arch`, `name`, `version`" | "The template landed in the store. Emitted on the build's own synthetic lab, so it appears in that lab's history file rather than in the supervisor stream." |
+
+  }
+  h2 "Workspace syncer"
+  p <<DOC
+    Every workspace event carries `machine`. See
+    [Dev machines and the workspace syncer](guide_dev) for what each
+    condition means and how it is resolved.
+  DOC
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`workspace.identity`" | "`reason`" | "At `up`, the dev machine declares no default login, so the tree lands owned by the agent identity." |
+      | "`workspace.unavailable`" | "`workspace`, `reason`" | "The declared host workspace directory does not exist." |
+      | "`workspace.degraded`" | "`reason`, and `path` where one directory is meant" | "A precondition could not be met: a non-elevated Windows login, a directory that refuses the case-sensitivity flag, or line-ending conversion that could not be turned off." |
+      | "`workspace.stopped`" | "`reason`" | "The host file watcher could not start; the syncer gave up." |
+      | "`workspace.deferred`" | "`reason`, `retry_in_s`; or `reason`, `paths` for a held `.git` lock" | "A pass, the guest watch or the post-restore re-convergence failed and will be retried; or paths under a `.git` lock were left for the next pass." |
+      | "`workspace.rescan`" | "`reason`" | "The guest watch overflowed or its channel dropped, so the guest tree is walked again and both directions block until it completes." |
+      | "`workspace.unwatched`" | "`directory`" | "A host subtree could not be registered with the watcher." |
+      | "`workspace.skipped`" | "`path`, `reason`" | "A walk skipped a path." |
+      | "`workspace.refused`" | "`path`, `size`, `cap`, `reason`" | "A file exceeds the size cap and was refused before transfer." |
+      | "`workspace.case_collision`" | "`paths`, `reason`" | "Two paths differ only in case where the guest cannot tell them apart." |
+      | "`workspace.volume`" | "`path`, `paths`, `bytes`, `reason`" | "A large burst of changes under one prefix. A warning; it never halts." |
+      | "`workspace.halted`" | "`reason`, `rules_changed`, `paths` (each `path` and `reason`, capped), `total`, `resolve`" | "Conflicting changes on both sides halted the whole workspace until `vmlab dev sync resolve`." |
+      | "`workspace.left_standing`" | "`path`, `reason`" | "One side dropped a directory the other still has content in." |
+      | "`workspace.symlink_refused`" | "`path`, `reason`" | "The guest would not take a symlink." |
+      | "`workspace.failed`" | "`path`, `reason`" | "One apply failed, or the halt marker could not be written into the guest." |
+      | "`workspace.synced`" | "`guest_placed`, `guest_removed`, `host_placed`, `host_removed`, `adopted`" | "A pass moved something." |
+      | "`workspace.reseed_owed`" | "`workspace`, `reason`" | "A restore failed after the ledger was marked rewound, so the re-seed still runs." |
+      | "`workspace.reconverged`" | "`placed`, `removed`, `adopted`, `reason`" | "The post-restore re-seed completed." |
+}
+}

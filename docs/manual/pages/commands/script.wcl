@@ -1,0 +1,56 @@
+page cmd_script {
+  title = "vmlab script"
+  chapter_header "vmlab script" {
+    kicker       = "Commands · reference"
+    reading_time = "3 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab script` runs an ad-hoc [wscript](guide_scripting) file against the
+    lab of the current directory. The script runs inside the lab daemon, with
+    the same `lab` binding a `provision {}` block or an event handler gets,
+    and its output streams back to the terminal as it is produced.
+  DOC
+
+  code sh { source = "vmlab script <SCRIPT>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<SCRIPT>`" | "Script path, relative to the lab root." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The path is resolved against the lab root, the directory holding
+    `vmlab.wcl`, not against the shell's directory, so the same command works
+    from any subdirectory of the lab. The command checks the file exists
+    before it asks anything and refuses with `script <path> not found under
+    <root>` when it does not. It then starts the supervisor and the lab
+    daemon if they are not running, sends the `run` request, and prints each
+    chunk of output as it arrives. Machines the script touches must already
+    be up; the script itself can start them through the
+    [Lab API](ref_ws_lab).
+  DOC
+
+  p <<DOC
+    The console runs declared playbooks and never a scratch script, so
+    `script` is reachable only from the CLI: the file comes from the caller's
+    disk and its output belongs to the terminal that ran it.
+  DOC
+
+  code sh { source = <<'SRC'
+cd examples/ad-lab
+vmlab up
+vmlab script scripts/collect-dumps.ws
+SRC
+  }
+
+  p <<DOC
+    Exit status is 0 when the script completes. A script that raises, or a
+    call inside it that fails, ends the run with `failed` (1). A missing file
+    or a daemon that does not start exits 1 before any request is sent.
+  DOC
+}

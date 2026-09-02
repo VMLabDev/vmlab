@@ -16,6 +16,7 @@ lab "mixed-lab" {
 
   gui = true  # open a VNC viewer for each guest on `vmlab up`
 
+  # ANCHOR: segment-lan
   segment "lan" {
     subnet = "10.70.0.0/24"
     nat = true  # apt needs egress
@@ -24,7 +25,9 @@ lab "mixed-lab" {
       to = "nix01:80"
     }  # host → nginx
   }
+  # ANCHOR_END: segment-lan
 
+  # ANCHOR: vm-winsrv
   vm "winsrv" {
     template = "x86_64/windows-server-2025"
     cpus = 4
@@ -41,6 +44,7 @@ lab "mixed-lab" {
     # Runs once winsrv is ready; nix01 depends on it, so it waits.
     provision "scripts/setup.ws" { }
   }
+  # ANCHOR_END: vm-winsrv
 
   vm "nix01" {
     template = "x86_64/ubuntu-24.04"
@@ -53,6 +57,7 @@ lab "mixed-lab" {
 
   # An OCI container on the same segment: pulled like a docker image,
   # run in a micro-VM, resolvable as web.mixed-lab.<suffix> from the VMs.
+  # ANCHOR: container-web
   container "web" {
     image = "nginx:1.27"
     # The micro-VM's size comes from the profile; declare `cpus`/`memory`
@@ -71,6 +76,7 @@ lab "mixed-lab" {
       interval = 5s
     }
   }
+  # ANCHOR_END: container-web
 
   on "vm.crashed" {
     run = "scripts/on-crash.ws"

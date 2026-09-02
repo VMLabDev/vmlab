@@ -1,0 +1,327 @@
+// Getting started: mark a machine @dev, attach an editor over the SSH facade, edit a synced workspace.
+page gs_dev_attach {
+  title = "Attach an editor to a dev machine"
+  chapter_header "Attach an editor to a dev machine" {
+    kicker       = "Getting started · tutorial"
+    reading_time = "10 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A [dev machine](guide_dev) is any VM or container marked `@dev`. vmlab
+    publishes it as an SSH endpoint your editor attaches into, and keeps a
+    **workspace** on it, a guest-local copy of a directory on the host, in
+    step with the host in both directions. In this tutorial you mark a
+    container `@dev`, attach to it in one command, reach it from a plain
+    `ssh`, edit files on either side and watch them arrive on the other, and
+    read what the syncer is doing.
+  DOC
+
+  p <<DOC
+    The lab is a trimmed version of the `dev-neovim-container` example that
+    ships with vmlab. The example adds Neovim and a plugin; this tutorial
+    keeps only the parts every dev machine has.
+  DOC
+
+  h2 "Before you start"
+
+  list {
+    li "vmlab is installed with the micro-VM guest asset in place, so containers boot. [Your first lab](gs_first_lab) covers the same ground."
+    li "Internet access from the host, to pull `alpine:3.22`."
+    li "An `ssh` client on the host. vmlab does not ship one; it writes a block into `~/.ssh/config` and hands over to yours."
+    li "Optionally, an editor with remote SSH support, such as VS Code with Remote-SSH or any editor that opens files over `ssh`."
+  }
+
+  h2 "Write the lab file"
+
+  p "In a new directory, create the lab file and the workspace directory it names."
+
+  code sh { source = <<'SRC'
+mkdir -p workspace scripts
+printf 'print("hello from the workspace")\n' > workspace/hello.lua
+SRC
+  }
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+import <vmlab.wcl>
+
+lab "first-dev" {
+
+  segment "lan" {
+    subnet = "10.62.0.0/24"
+    nat    = true
+  }
+
+  @dev(default = true, workspace = "./workspace")
+  container "dev01" {
+    image   = "alpine:3.22"
+    profile = "container"
+    cpus    = 2
+    memory  = 1GiB
+    mode    = :idle
+    nic { segment = "lan" }
+
+    login "dev" { user = "dev" default = true }
+
+    provision "scripts/dev-user.ws" { }
+  }
+}
+SRC
+  }
+
+  p "The new pieces, compared with [Your first lab](gs_first_lab)."
+
+  list {
+    li "`@dev(...)` is a decorator on the machine. `workspace = \"./workspace\"` names the host directory to sync, relative to the lab root. The guest path defaults from the profile, `/src` on Linux and `C:\\src` on Windows; set `workspace_guest` to change it. `default = true` makes this the lab's default dev machine, which matters once a lab has more than one."
+    li "`mode = :idle` keeps the micro-VM up without running the image's entrypoint. A dev container has no service to be."
+    li "`login \"dev\" { user = \"dev\" default = true }` declares the account every surface attaches as: `ssh`, `vmlab exec`, `vmlab shell` and the syncer itself. On a Linux machine the agent is root and needs no credential to become an account, so no password is declared. A Windows login needs one."
+    li "The provision creates that account. vmlab declares logins but does not create accounts; the lab's own provisioning does, and this is the script that does it."
+  }
+
+  p "Create the provision script. It runs as the agent identity, root, which is right for installing packages and creating an account."
+
+  code rust { filename = "scripts/dev-user.ws" source = <<'SRC'
+// Create the account the lab file declares, as the machine.
+
+use vmlab
+
+fn sh(m: Machine, script: string, timeout: int) -> Result[string, string] {
+    let r = m.exec_timeout("/bin/sh", ["-c", script], timeout)?
+    if r.exit_code != 0 {
+        return Err(fmt("`{}` exited {}: {}", script, r.exit_code, r.stderr))
+    }
+    Ok(r.stdout)
+}
+
+fn setup(lab: Lab) -> Result[unit, string] {
+    let dev01 = lab.container("dev01")?
+    dev01.wait_ready(600)?
+    for login in dev01.logins() {
+        sh(dev01, "id -u " + login.user + " >/dev/null 2>&1 || adduser -D -s /bin/sh " + login.user, 120)?
+        lab.log("account " + login.user + " exists")
+    }
+    Ok(())
+}
+
+fn main(lab: Lab) {
+    setup(lab).expect("dev01 account setup failed")
+}
+SRC
+  }
+
+  p <<DOC
+    `dev01.logins()` reads the `login {}` declarations from the lab file, so
+    the account name lives in one place. The `id -u ... ||` guard makes the
+    script safe to run on every `up`.
+  DOC
+
+  code sh { source = "vmlab validate" }
+
+  callout "The lab file validates" {
+    kind = :success
+    body = "`vmlab validate` reports one container. It also writes the managed block into `~/.ssh/config`: any command that loads a lab file does."
+  }
+
+  h2 "Attach in one command"
+
+  code sh { source = "vmlab dev attach" }
+
+  p <<DOC
+    `dev attach` is cold-to-editing in one command. It brings the machine up
+    if it is down, runs the provision, waits until the machine is
+    **attachable**, prints the SSH alias and an editor settings snippet, and
+    then becomes a shell on the machine as the `dev` login. With no argument
+    it picks the machine from a fixed ladder: `VMLAB_DEV_MACHINE`, then a
+    `vmlab dev use` selection, then the lab's default `@dev` machine.
+  DOC
+
+  p <<DOC
+    Attachable means the agent negotiated the two features the facade needs
+    for file access and port tunnels, `fileops` and `tunnel`. A container
+    always has them because its agent is the one vmlab ships. On a VM built
+    from an old template, `vmlab machine capabilities dev01` shows what is
+    missing and `vmlab machine repair-agent` pushes the current agent in.
+  DOC
+
+  p "In the shell that opens, look at the workspace."
+
+  code sh { source = <<'SRC'
+id -un
+ls /src
+cat /src/hello.lua
+SRC
+  }
+
+  p <<DOC
+    `id -un` prints `dev`. `/src` holds `hello.lua`, placed there by the
+    syncer's first pass. Leave the shell with `exit`. The machine keeps
+    running and the syncer keeps running: it belongs to the lab daemon, not
+    to the shell.
+  DOC
+
+  callout "You are attached" {
+    kind = :success
+    body = "`vmlab status` shows `dev01` ready and attachable. `dev attach` printed the alias `vmlab-first-dev-dev01`."
+  }
+
+  h2 "Reach it with plain ssh"
+
+  p <<DOC
+    The alias is a stanza in a marker-fenced block vmlab owns inside
+    `~/.ssh/config`. The stanza's `ProxyCommand` is a hidden vmlab verb, so
+    the system `ssh` connects through the facade with no guest network and no
+    sshd in the guest. Anything that reads `~/.ssh/config` can use it.
+  DOC
+
+  code sh { source = <<'SRC'
+ssh vmlab-first-dev-dev01 id -un
+vmlab ssh dev01 -- uname -a
+SRC
+  }
+
+  p <<DOC
+    `vmlab ssh` is not a second SSH client. It refreshes the managed block and
+    then hands over to the system `ssh` against the alias. Unlike `dev attach`
+    it refuses if the machine is down and never starts one, the way `exec`
+    and `console` behave. Copying files works the same way, because the
+    facade answers `sftp` on the host.
+  DOC
+
+  code sh { source = "scp workspace/hello.lua vmlab-first-dev-dev01:/tmp/hello.lua" }
+
+  p <<DOC
+    To see the stanza and the editor snippet again, for a client that will
+    not read the config file, print them.
+  DOC
+
+  code sh { source = "vmlab ssh-config --print dev01" }
+
+  p <<DOC
+    The block is written from the lab file the CLI has in hand, whenever a
+    command loads a lab, and is deterministically ordered by lab, machine and
+    login label. It covers declared machines, not running ones, so the alias
+    stays in your editor's host list while the machine is down. A stanza is
+    dropped when its lab root no longer holds a `vmlab.wcl`. vmlab refuses to
+    touch the file if its markers are mangled, and names the file and line.
+  DOC
+
+  h2 "Open your editor"
+
+  p <<DOC
+    `dev attach` launches no editor and knows none. Open yours and pick
+    `vmlab-first-dev-dev01` out of its SSH host list, then open `/src`. The
+    snippet `dev attach` printed sets `remote.SSH.localServerDownload` to
+    `always` for VS Code, so a segment without egress does not block the
+    server install. For a terminal editor, run it over the alias directly.
+  DOC
+
+  code sh { source = "ssh vmlab-first-dev-dev01 -t vi /src/hello.lua" }
+
+  h2 "Edit on either side"
+
+  p <<DOC
+    The host directory is canonical and the guest copy is a working copy.
+    Edit on the host and the change lands in the guest; build in the guest
+    and the output lands on the host. Try both.
+  DOC
+
+  code sh { source = <<'SRC'
+printf 'print("edited on the host")\n' > workspace/hello.lua
+vmlab ssh dev01 -- cat /src/hello.lua
+vmlab ssh dev01 -- sh -c 'echo built > /src/out.txt'
+cat workspace/out.txt
+SRC
+  }
+
+  p <<DOC
+    Each side has a watcher, and a changed path is applied on the other side
+    after a short per-path debounce, by writing a temporary file and renaming
+    it into place. Ignore rules come from the repo tree, not the lab file: a
+    built-in floor, then the workspace's `.gitignore`, then a `.vmlabignore`
+    for the difference, including `!` negations for gitignored files the
+    guest does need, such as a `.env`. An ignored path is not skipped but
+    **guest-owned**: `node_modules` is the proving case, where the guest runs
+    its own install and keeps guest-native binaries there.
+  DOC
+
+  callout "Both directions work" {
+    kind = :success
+    body = "The host edit reached `/src/hello.lua`, and the file written in the guest appeared in `./workspace/`."
+  }
+
+  h2 "Read what the syncer is doing"
+
+  code sh { source = "vmlab dev sync status" }
+
+  p <<DOC
+    `status` reports what the syncer last decided: paths it holds a halt on,
+    warnings such as a subtree large enough to be worth naming, and the
+    special files it skipped by name. `flush` runs a pass now and waits for
+    it rather than for the next edit.
+  DOC
+
+  code sh { source = "vmlab dev sync flush" }
+
+  p <<DOC
+    If the same path changes on both sides between passes, the syncer
+    **halts** that machine's workspace in both directions, names every path
+    in the batch, writes no conflict copy, and leaves both copies where they
+    were. `dev sync diff` brings the guest copy across to compare, and `dev
+    sync resolve --host` or `--guest` picks a winner per path, or `--all` for
+    every halted path. Making the two sides identical by hand is a third
+    route that needs no verb. [Dev machines and the workspace
+    syncer](guide_dev) walks through a halt.
+  DOC
+
+  callout "Snapshots are not a workspace backup" {
+    kind = :warning
+    body = "A snapshot restore rewinds the machine and then re-converges the guest workspace from the host copy. Work that exists only in the guest and has never reached the host is what `snapshot create` flushes first and refuses on if it cannot. Keep the host directory under version control."
+  }
+
+  h2 "Rebuild without losing the workspace"
+
+  p <<DOC
+    There is no rebuild verb because two existing verbs are one. Destroying
+    the machine takes its clone and the guest working copy; the next `up`
+    provisions a fresh one and the syncer seeds it again from the host.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab container destroy dev01
+vmlab dev attach
+SRC
+  }
+
+  p <<DOC
+    Everything the provision declared is back, and `/src` holds the host
+    directory's current contents. Anything you installed by hand in the guest
+    is gone. That is the durability rule: bake what every developer needs
+    into the image or a provision, hand-install what you want today, and
+    expect to redo the latter after a rebuild.
+  DOC
+
+  h2 "Clean up"
+
+  code sh { source = <<'SRC'
+vmlab down
+vmlab destroy
+SRC
+  }
+
+  p <<DOC
+    `destroy` also forgets a `vmlab dev use` selection, which lives in the
+    lab's gitignored `.vmlab/`. The `./workspace` directory on the host is
+    untouched, and the alias leaves `~/.ssh/config` the next time a command
+    loads a lab and finds this directory no longer has a `vmlab.wcl`.
+  DOC
+
+  h2 "Next steps"
+
+  list {
+    li "[Dev machines and the workspace syncer](guide_dev) explains the workspace model, the Windows preconditions, the halt and the snapshot bracketing in full."
+    li "[Logins and the SSH facade](guide_logins) covers how a login is minted on Windows and Linux, what `elevated` means, and what the facade refuses and why."
+    li "The `examples/dev-vscode-windows` example is the Windows twin: a domain member, VS Code Remote-SSH and a minted domain logon. [Example labs](apx_examples) describes both."
+    li "[vmlab dev](cmd_dev), [vmlab ssh](cmd_ssh) and [vmlab ssh-config](cmd_ssh_config) document the verbs."
+  }
+}

@@ -1,0 +1,502 @@
+page guide_dev {
+  title = "Dev machines and the workspace syncer"
+  chapter_header "Dev machines and the workspace syncer" {
+    kicker       = "The guide · explanation"
+    reading_time = "18 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+Any lab machine, VM or container, Windows or Linux, can be the lab's
+development environment. Mark it `@dev` and vmlab publishes it as an SSH
+endpoint an editor attaches *into*: the language server, the build, the
+debugger and the terminal all run guest-side, against real guest paths, the
+real toolchain and, where the lab has one, the real domain identity. The
+target is parity with what devcontainers give a Linux developer, for a Windows
+application on a real domain. This chapter explains the declaration, what the
+guest must have, the managed SSH config block, `dev attach` and `dev use`,
+and the workspace syncer that keeps a host directory and a guest working copy
+in step. The [tutorial](gs_dev_attach) walks the cold-to-editing path once;
+the verbs are in [vmlab dev](cmd_dev).
+DOC
+
+  h2 "The @dev declaration"
+
+  p <<'DOC'
+`@dev` is a decorator on a `vm` or `container` block, not a child block,
+because it states something *about* the machine rather than configuring
+something inside it; nothing it carries is a setting the guest sees. Any
+number of machines may carry it and zero is normal. Its arguments are all
+optional, and a bare `@dev` is a complete, attachable dev machine.
+DOC
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+@dev(default = true, workspace = "./src", workspace_guest = "C:\\src")
+vm "dev01" {
+  template   = "x86_64/windows-server-2025"
+  depends_on = ["dc01"]
+  nic { segment = "corp" }
+  login "dev" { user = "PROBE\\dev" password = "vmlab123!" }
+}
+
+@dev(workspace = "./src")
+container "buildbox" {
+  image = "mcr.microsoft.com/dotnet/sdk:9.0"
+  cpus = 4  memory = 4GiB
+  nic { segment = "corp" }
+}
+SRC
+  }
+
+  table {
+    rows:
+      | "Argument" | "Meaning" |
+      | "`default`" | "Make this the lab's default dev machine. At most one per lab. The only `@dev` machine in a lab is the default implicitly, even if it wrote `default = false`; with several and none marked, there is no default." |
+      | "`workspace`" | "Host directory to sync into the guest, relative to the lab root. Without it the machine is still attachable and has no workspace." |
+      | "`workspace_guest`" | "Guest path the workspace lands at. Resolved `@dev` argument, then the profile's `workspace_guest`, then the floor `/src`." |
+  }
+
+  p <<'DOC'
+Unset arguments resolve **`@dev` argument, then profile, then floor**. The
+default is profile-sourced because it is guest-OS-shaped: the shipped Windows
+profiles say `C:\src` and the Linux ones `/src`. A profile with no dev keys
+still hosts a dev machine; a missing key means the floor applies, never that
+the profile cannot be a dev target. This resolver is deliberately separate
+from the hardware resolver. "First in file order wins" was rejected for the
+default because declaration order already means something in vmlab and a
+block reorder would silently move it.
+DOC
+
+  p <<'DOC'
+Three things were kept off the decorator on purpose. Editor hints: the SSH
+endpoint is the whole contract and vmlab learns no editor. Ports: a dev
+machine's ports are ordinary `port {}` and `forward {}` declarations, and
+`ssh -L` over the facade is the ad-hoc path. Toolchain and package lists: that
+is [provision](guide_scripting) and [playbook](guide_playbooks). A
+distributable [template](guide_registries) is vmlab's answer to devcontainer
+features, installed once at build time and pulled by every developer.
+DOC
+
+  h2 "attachable and the failure ladder"
+
+  p <<'DOC'
+The guest needs two things: the agent and the toolchain. There is no sshd to
+install and the workspace path is created by the syncer. The agent advertises
+three feature strings in its handshake: `tunnel` serves the facade's
+`direct-tcpip`, `fileops` serves host-side SFTP and every transfer, and
+`watch` serves the workspace syncer. **`attachable` means exactly `tunnel`
+and `fileops` are both present**: this agent can serve an attach, never that
+your attach will succeed, because identity is declared separately. It does not
+widen to cover `watch`; the syncer checks `watch && fileops` for itself. A
+template built with `agent = false` reports `false` through the same path as
+one whose agent is merely old. `vmlab machine capabilities` reports it and
+`vmlab status` carries it.
+DOC
+
+  p "A machine whose agent predates these features fails where it costs least and says most:"
+
+  list {
+    li "**`validate` says nothing.** It has no side effects, and the only static signal is the template's free-form `agent_version` string. Comparing that would be inference."
+    li "**`up` warns.** The handshake is part of readiness, so by then the features are honestly probed. The warning says a shell still works and names both remedies."
+    li "**Attach fails hard.** `vmlab dev attach` refuses, naming what the agent does not serve and both remedies: rebuild the template to bake in the shipped agent, or push it into the running machine with `vmlab machine repair-agent`. The facade itself degrades per channel, so an old agent still serves a shell while `sftp` and `direct-tcpip` refuse by name."
+  }
+
+  p <<'DOC'
+Rebuild is policy; repair is a tool. The agent enters an image once, at build,
+and `repair-agent` pushes the host's shipped agent over the agent's own
+channel and marks the machine **diverged**, because the template's sealed
+`agent_version` no longer describes it. Nothing does this by itself. It is
+meaningless on a container, whose agent lives in the initramfs vmlab ships
+and tracks the installed vmlab; the verb says so. Two further preconditions
+of a dev-capable image: the guest must be symlink-capable, on Windows through
+`SeCreateSymbolicLinkPrivilege` or Developer Mode, and a full Linux VM's kernel
+must be recent enough that `inotify` survives an overlayfs copy-up. See
+[vmlab machine](cmd_machine).
+DOC
+
+  h2 "The managed SSH config block"
+
+  p <<'DOC'
+vmlab's whole host-side footprint is one marker-fenced block inside your own
+`~/.ssh/config`, between `# BEGIN vmlab managed block` and `# END vmlab
+managed block`. A separate file behind an `Include` was rejected on evidence:
+JetBrains Toolbox's importer does not follow `Include`, and a private file
+reached with `-F` would keep `vmlab ssh` working while every editor saw
+nothing. Sharing one path means a broken block breaks `vmlab ssh` too, at a
+terminal that can explain it. The `ssh_config` key in the
+[host configuration](guide_host) relocates the file vmlab writes into; it is a
+location knob with one code path behind it, and the check below still runs.
+DOC
+
+  p <<'DOC'
+Stanzas cover **declared** machines, not running ones, because an empty
+picker at the moment you want it helps nobody. Any command that successfully
+loads a lab renders the block and writes it only on a real difference, so
+working inside a lab directory is enough to register it; a failed write warns,
+except at `vmlab ssh` and `vmlab dev attach` where the alias is load-bearing
+and the command fails with the reason. The alias is `vmlab-<lab>-<machine>`,
+plus `vmlab-<lab>-<machine>-<label>` for each non-default login, so "attach
+as admin" is a pick in an editor's host list. Each stanza sets a
+`ProxyCommand` running `vmlab ssh-proxy <lab>/<machine>`, `User <label>` on a
+labelled alias, vmlab's own `UserKnownHostsFile` with
+`StrictHostKeyChecking accept-new`, and `ControlMaster auto` with a
+`ControlPath` of `$XDG_RUNTIME_DIR/vmlab/ssh/%C` and `ControlPersist 10m`.
+`%C` is OpenSSH's own bounded token, which keeps the socket path inside the
+unix socket limit on any home directory. No `HostName` is set: the proxy is
+the connection.
+DOC
+
+  p <<'DOC'
+The writer's discipline is the feature, because its failure mode is eating
+someone's SSH config: an advisory lock across the read-modify-write, a temp
+file in the same directory fsynced and renamed onto the *resolved* path so a
+dotfiles symlink stays a symlink, an absent file created `0600`, deterministic
+ordering by lab, machine and label so a tracked config diffs only when
+something changed, and a refusal naming file and line on markers it cannot
+read. Each lab's section carries the lab's canonical root in a comment, and a
+root that no longer holds a `vmlab.wcl` has its section dropped on the next
+write. Every write re-hoists vmlab's region to the top, because OpenSSH takes
+the first value for each keyword and an earlier `Host *` would silently win,
+then runs `ssh -G <alias>` and errors naming the keyword that beat it if the
+resolved `proxycommand` is not vmlab's. `vmlab ssh-config` refreshes the
+block by hand and `--print <machine>` emits one stanza plus the editor
+settings snippet for a client that will not read the file. See
+[vmlab ssh-config](cmd_ssh_config).
+DOC
+
+  h2 "dev attach, dev use and which machine is mine"
+
+  p <<'DOC'
+`vmlab dev attach [machine]` is cold-to-editing in one command: it ups the
+machine, waits until it is attachable with the wait visible, prints the alias
+and the editor settings snippet and the offline-guest notes, and then `exec`s
+the system `ssh` so it becomes a shell on the machine. It launches no editor
+and knows none; you open your own editor and pick the alias out of its host
+list. Because it becomes a shell, the syncer is not tied to it: the syncer is
+owned by the lab daemon and keeps running when the shell closes. `vmlab ssh`
+by contrast refuses on a stopped machine, and `ssh-proxy` never does lifecycle
+at all.
+DOC
+
+  p <<'DOC'
+A committed `vmlab.wcl` cannot say which dev machine is *yours*, so that is
+host-side state. `vmlab dev use <machine>` records it in the lab's own
+gitignored `.vmlab/` directory, in a file named `dev-machine`, which makes it
+per-developer by construction; `vmlab destroy` clears `.vmlab/` and forgets
+it. When a `dev` verb needs a machine and none was named it climbs a fixed
+ladder and never guesses:
+DOC
+
+  list { style = :numbered
+    li "an explicit argument,"
+    li "the `VMLAB_DEV_MACHINE` environment variable,"
+    li "the `vmlab dev use` selection,"
+    li "the lab's default dev machine (`@dev(default = true)`, or the lone `@dev`),"
+    li "otherwise an error listing the candidates."
+  }
+
+  p <<'DOC'
+Every rung that names a machine is checked rather than trusted: a rung naming
+something that is not a dev machine in this lab is an error at that rung,
+never a silent fall-through, so an environment variable left over from another
+lab cannot land you somewhere nothing said out loud. The output says which
+rung answered. There is no `dev list` or `dev status`; `vmlab status` shows
+dev-ness and `attachable` for every machine. There is no `rebuild` verb
+either: `vmlab vm destroy <m>` then `vmlab up <m>` is re-clone plus
+re-provision, and the workspace survives it.
+DOC
+
+  h2 "The workspace"
+
+  p <<'DOC'
+**The workspace is a guest-local working copy on the machine's own disk; the
+host directory is canonical; a vmlab-integrated syncer keeps them in step.**
+Neither obvious alternative works. A [shared folder](guide_shares) cannot
+carry a watched source tree: host-side edits do not reach
+`ReadDirectoryChangesW` over virtiofs or SMB, nor `inotify` over virtiofs on
+Linux, and both fail silently, with the watcher armed and quiet and the
+language server simply no longer re-analysing. Source kept guest-side alone
+fails the other way: `destroy` is a first-class verb on disposable clones and
+a snapshot restore would roll uncommitted work back with the machine. With the
+host canonical, `destroy` loses nothing and a restore re-converges the guest
+from the host. `share {}` stays exactly as useful as it was for datasets,
+installers and build output; the line is a watched source tree.
+DOC
+
+  p <<'DOC'
+The syncer is a task in the lab daemon, started by `up` **after
+provisioning** rather than at machine-ready, and it runs as the machine's
+default login: the one exception to vmlab's own machinery keeping the agent
+identity, because it produces the developer's files, and the account it
+writes as does not exist until provisioning creates it. Ownership always
+matches whoever will attach. One pass walks the host, learns what the guest
+holds, reconciles, applies and saves the ledger. The seed is simply the first
+pass.
+DOC
+
+  h3 "The ledger and what a conflict is"
+
+  p <<'DOC'
+The agreement point is a **host-side sync ledger** under the lab's `.vmlab/`,
+one per (machine, workspace), so `destroy` wipes it. It holds one record per
+relative path: a content digest plus **each side's own** size and mtime as a
+change detector. A host mtime is never compared to a guest mtime, only to the
+host's own recorded value, because a restored guest resumes with a clock
+behind the host and every file it holds would look older; that alone rules out
+newest-wins. Digest is the truth and the stat pair is only a pre-filter, since
+a same-size in-place write is exactly what the share transports were caught
+missing. A missing ledger is not a decision: on first run, or after a wiped
+`.vmlab/` with a live guest, paths whose digests match are adopted as agreed
+and paths that differ take the ordinary conflict path, rather than a blind
+host-to-guest seed eating a developer's work.
+DOC
+
+  p <<'DOC'
+Per path, each side is unchanged, modified, deleted or replaced by the other
+kind relative to the ledger. One side changed: propagate. Both changed:
+conflict, with four riders. Both modified to identical content is not a
+conflict and transfers nothing, which is common after a host-side `git
+checkout` lands bytes the guest already had. Modified on one side and deleted
+on the other is a conflict, not delete-wins, because deletion is unrecoverable.
+Mode-only changes are not conflicts and are not synced across kinds. A file
+replaced by a directory, or the reverse, is a conflict.
+DOC
+
+  h3 "Ignore rules and the prune list"
+
+  p <<'DOC'
+Ignore rules live in the tree, not in the lab file: a built-in floor, then the
+repo's `.gitignore`, then `.vmlabignore` for the delta including `!`
+negations. What you do not want to sync is almost exactly what you do not
+commit, and `.vmlabignore` covers where "almost" fails: a gitignored `.env`,
+a local cert or `appsettings.Development.json` that the app needs guest-side
+takes a negation. Precedence is git's own, deepest file first, `.vmlabignore`
+beating `.gitignore` in one directory, and a path under an ignored directory
+staying ignored. The floor covers the syncer's own scratch names and
+`.git/**/*.lock`, and no repo rule may override it.
+DOC
+
+  p <<'DOC'
+An ignored path is not skipped, it is **guest-owned**: `node_modules` is the
+proving case, where the guest runs its own install and holds guest-native
+binaries, diverging permanently and on purpose. Neither direction ever
+touches one. The host computes a coarse **prune list**, ignored directory
+prefixes with no negation below them, and hands it to the agent when the
+watch opens, so no watcher is registered under them. That matters because
+`inotify` costs one watch descriptor per directory against a default limit of
+8192, so an unpruned registration would be silently incomplete on Linux. The
+guest is never asked to decide what is in the synced set; it is handed a
+list.
+DOC
+
+  p <<'DOC'
+When the rules change under the syncer, leaving scope is free: a newly
+guest-owned path leaves the ledger and both copies stay. Entering scope is a
+conflict, because no agreement exists and both sides may hold content, so
+un-ignoring a populated directory halts naming every file in it. The rules'
+own digest is part of the ledger, so the halt can say these conflict because
+you just changed the rules.
+DOC
+
+  h3 "Both directions"
+
+  p <<'DOC'
+Host changes arrive from vmlab's own watcher. Guest changes arrive from the
+agent's **dirty set**: the agent holds a coalescing set of paths that changed,
+sends a single nudge when the set goes from empty to non-empty, and the host
+drains it. A drained record is the path plus its current stat, or a tombstone
+if the path is gone, so no platform event kind ever crosses the seam and
+`inotify` and `ReadDirectoryChangesW` disagreeing about renames never becomes
+a vocabulary problem. Both directions get the same per-path debounce, a quiet
+period before a path is read, because editors write a temp and rename and
+compilers write in chunks, and a torn read guest-to-host would land on the
+canonical copy. A path that keeps moving keeps waiting, so a burst under one
+subtree de-prioritises rather than starving a single save elsewhere.
+DOC
+
+  p <<'DOC'
+Every apply is temp-name-then-rename in the target's own directory, and the
+ledger records agreement only after the rename, never after the last write.
+Renames are delete plus create at the ledger level; a directory delete
+expands via the ledger, not the event stream. Symlinks sync verbatim and are
+never followed; their target string is content, untranslated across the seam.
+Special files, FIFOs, sockets, device nodes and non-symlink reparse points, are
+skipped loudly and never enter the ledger, and so is a drained path the login
+cannot read, because a build leaving a root-owned artefact in the tree must
+not stop the dev machine.
+DOC
+
+  h3 "The stat-walk"
+
+  p <<'DOC'
+The steady state never walks the tree; it probes named paths. A full guest
+**stat-walk**, where the guest reports every path's kind, size and mtime and
+the host applies the ignore set on receipt and asks for digests only for
+suspects, runs on a watch discontinuity and nowhere else: first sync, ledger
+loss, an overflow, a dropped channel. That list is exactly the list of watch
+discontinuities, which is why there is no resync token. An overflow, on either
+platform or in the agent's own capped set, collapses to a single rescan value
+that warns, forces the walk and never halts. **The rescan is a barrier in both
+directions**: between the overflow and the completed walk the host does not
+know the guest moved, so propagating host-to-guest meanwhile would overwrite
+guest work silently through the ledger with no conflict raised. It is a
+deferral, needing no developer action, and it clears itself.
+DOC
+
+  h3 "Windows preconditions"
+
+  p "A Windows guest costs the syncer three actions, each a precondition of the mechanism, so vmlab does them rather than documenting them:"
+
+  list { style = :numbered
+    li "**The NTFS case-sensitive flag on every directory the syncer creates, at creation**, including the workspace root. The host can hold `Foo.cs` and `foo.cs`; a default Windows guest cannot, and the second write would silently land on the first. The flag only takes on an empty directory, which the syncer's always are, and inheritance is not relied on. Where it cannot be set, a case collision at that path is a loud refusal by name. This also makes a shared `.git/config` with one `core.ignorecase` right on both sides."
+    li "**Symlinks attempted, with a warning by name on failure.** A symlink-capable image is a documented precondition."
+    li "**`core.autocrlf = false` in the guest's global git config**, set as the default login. Git for Windows ships it `true`, which would rewrite the working tree to CRLF on the first guest-side checkout, sync every file back as modified, and halt the workspace if the host had touched anything. The syncer translates nothing; bytes cross verbatim and git normalises on both sides from settings that agree."
+  }
+
+  p <<'DOC'
+A Windows dev login declared `elevated = false` degrades the workspace in
+exactly two ways, no case-sensitive directories and no symlinks, and the
+syncer says so up front rather than at a random path hours in. Line-ending
+policy belongs in each side's global git config, never the repo's, because
+the home directory is guest-local and `.git/config` is shared;
+`.gitattributes` is the escape for genuine CRLF needs.
+DOC
+
+  h3 "The conflict halt"
+
+  p <<'DOC'
+The developer authors guest-side; the host is doing durability work, not
+authorship. The host-side writer set is small: git operations, occasional
+tooling, vmlab's own restore. **A conflict is therefore an anomaly**, which
+licenses an expensive, loud, safe policy over a winner rule that must be right
+thousands of times a day. That policy is **halt and surface**: the whole
+workspace stops, both directions, on one machine, naming every conflicting
+path in the batch. A pass scans and reconciles before it applies anything, so
+the halt is computed from a whole reconciliation, and a host-side `git pull`
+that collides in batches is one halt rather than thirty resolve-and-resume
+round trips. Ten conflicts do not become a bigger hammer.
+DOC
+
+  p <<'DOC'
+While halted, the watch keeps running and the host keeps draining the guest's
+dirty set into its own pending set, so a long halt costs no rescan and edits
+made during it drain normally on resume. No conflict copy is written: the two
+copies already exist, one per side, and a halt writes neither and deletes
+neither. The scope is one machine's workspace; two dev machines may share one
+host workspace because the host is a hub rather than a peer, each with its own
+ledger, and one halting must not stop the other. The halt message names the
+machine.
+DOC
+
+  p <<'DOC'
+From inside the guest a halt is otherwise nothing happening, and there is no
+guest-to-host control path to say otherwise, so the halt writes a marker file,
+`.vmlab-sync-halt`, at the guest's workspace root, listing up to 200 of the
+halted paths and saying how many it left out. It is in the ignore floor so it
+never syncs, and its `git status` noise is the point: it is the developer
+noticing. Resolution is host-side, necessarily, and the routes are:
+DOC
+
+  table {
+    rows:
+      | "Verb" | "What it does" |
+      | "`vmlab dev sync status`" | "What the syncer last decided: halted paths, volume warnings, rescan symptoms, and what it skipped by name. Capped at 500 entries, saying what was dropped." |
+      | "`vmlab dev sync flush`" | "Run a sync pass now and wait for it, rather than for the next edit." |
+      | "`vmlab dev sync diff [paths]`" | "Bring the guest's copy of a path host-side beside the host's. With no path it takes every halted one. Neither copy is changed; a copy over 4 MiB or not text is described by size and digest instead." |
+      | "`vmlab dev sync resolve --host | --guest [paths] | --all`" | "Pick which side wins at a halted path and carry it out. The losing copy is overwritten and not recoverable from vmlab. `--all` takes every halted path as the halt stands." |
+  }
+
+  p <<'DOC'
+A free third route needs no verb: make the two sides identical by hand and
+the next pass adopts them as agreed. These verbs live under `vmlab dev`
+because a workspace exists only for a dev machine, and a `--machine` flag or
+the selection ladder picks which. See [vmlab dev](cmd_dev).
+DOC
+
+  h3 "Guards that are not halts"
+
+  p <<'DOC'
+**The size guard refuses loudly, per file, before transfer.** A file over the
+`workspace_max_file` cap in the host configuration, 256 MiB by default, is
+never hashed or sent; the refusal names the file and the cap and states the
+two ways out, an ignore rule or a raised cap. It exists to catch the 4 GB
+`.vhdx` nobody wrote a rule for. **Volume warns and never halts**: a pass
+moving over a thousand paths or 256 MiB, dominated by one subtree, names that
+subtree and suggests a `.vmlabignore` rule, because a build burst into an
+un-ignored `target/` is wanted work that happens to be large.
+DOC
+
+  p <<'DOC'
+**The guest-to-host bulk-delete guard** is asymmetric on purpose: host-to-guest
+deletes are unguarded, and a `git checkout` removing 400 guest files just
+removes them, but guest-to-host deletions past a threshold are withheld and
+halt. The threshold is a proportion with a floor: more than 20 paths and more
+than half of what the ledger had agreed on. A fixed count would punish large
+repos and a bare proportion would let a ten-file project lose everything. A
+single deletion still propagates immediately. `--guest` on the halt is what
+releases the withheld removals.
+DOC
+
+  p <<'DOC'
+**`.git` syncs bidirectionally**, because the guest can stay offline while the
+host has the network, so a host-side `git fetch` is a first-class operation,
+and because a coding agent inside the dev machine commits and branches with no
+host shell. Most of `.git` is content-addressed or write-once and syncs
+freely. The mutable set, `index`, `HEAD`, `ORIG_HEAD`, `FETCH_HEAD`,
+`packed-refs`, `config`, and everything under `refs/` and `logs/`, is
+**deferred** while a `*.lock` is held on either side. Lock files themselves
+never sync. That deferral is timing, not a conflict rule: nothing is reported,
+nothing needs resolving, and the loop looks again after a second so a lock
+released in the guest does not stall until the next unrelated edit. Running
+git on both sides at once can still reach an ordinary halt, where both copies
+survive.
+DOC
+
+  h3 "Snapshots bracket the syncer"
+
+  p <<'DOC'
+A restore rewinds the guest by hundreds of files at once, which a naive
+syncer cannot tell from the developer having edited them and would push onto
+the canonical copy. vmlab performs the restore, so it brackets it. Capture
+first flushes, and **refuses with no escape flag** if the guest holds work the
+canonical copy has never seen, whether a halt stands or the pass could not
+finish. Restore refuses while a halt stands, and `--discard-guest-changes` is
+the one escape: it throws the guest copy of every halted path away, by name.
+Restore then takes the syncer off the workspace, rewinds, and puts it back
+owing a **re-seed**: a host-only, digest-based reconcile that overwrites
+anything differing from host truth, deletes anything the ledger does not hold,
+transfers nothing else, and emits no guest-to-host action at all. It compares
+by digest because a restored guest's clock runs behind the host. It completes
+before the watch reopens, and it replaces the stat-walk rather than following
+one. Both the owed re-seed and the halt a restore refuses on ride the ledger,
+because a restore does not need a running machine. Every surface that takes or
+restores one says the same sentence, and the [Snapshots](guide_snapshots)
+chapter repeats it.
+DOC
+
+  callout "Snapshots are not a workspace backup" {
+    kind = :warning
+    body = "A dev machine's source lives on the host, which is what survives `destroy` and what a restore re-converges the guest from. A snapshot holds the guest's copy at that moment and nothing more; do not rely on one to keep uncommitted work."
+  }
+
+  h2 "Editors and the offline guest"
+
+  p <<'DOC'
+vmlab publishes SSH and nothing else, so any SSH-capable client attaches, but
+for a Windows dev machine the set that works is narrower: plain `ssh`, `scp`,
+`sftp` and VS Code Remote-SSH work on both guest families; JetBrains Toolbox,
+JetBrains Gateway and Zed serve a Linux dev machine only. The guest can stay
+offline. The settings snippet `dev attach` and `ssh-config --print` print
+sets VS Code's `remote.SSH.localServerDownload` to `always`, so the client
+downloads its server and pushes it over `scp`, and `remote.SSH.remotePlatform`
+to `windows` for a Windows alias. Extensions and plugins live in the guest
+home, outside the workspace, so they survive reboot, `down`/`up` and restore
+to a later snapshot, and die on `destroy` plus `up`. Bake what the lab needs
+every developer to have; hand-install what you personally want today, and
+expect to redo it after a rebuild. The two worked examples,
+`examples/dev-vscode-windows` and `examples/dev-neovim-container`, place editor
+bits into the dev login's home from a `provision {}` using `as_login`, before
+that user has ever logged on; see [Example labs](apx_examples).
+DOC
+}

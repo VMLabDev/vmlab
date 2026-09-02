@@ -1,0 +1,79 @@
+page cmd_validate {
+  title = "vmlab validate"
+  chapter_header "vmlab validate" {
+    kicker       = "Commands · reference"
+    reading_time = "3 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab validate` checks the [lab file](guide_lab_file) in the current
+    directory against the schema, the semantic rules of the product contract,
+    the local template store and the guest OS [profiles](guide_profiles), and
+    changes nothing. Every side-effecting verb runs the same check first, so
+    this is the way to see what `up` would refuse before it refuses it.
+  DOC
+
+  code sh { source = "vmlab validate" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  h2 "What it checks"
+
+  p <<DOC
+    The verb finds the lab root by walking up from the current directory
+    to a `vmlab.wcl`, the way `git` finds a repository. It then parses and
+    schema-checks the file and runs the semantic validation, which resolves
+    each VM's template through the store the way `up` will, so a version pin
+    resolves the same way and a half-installed store entry reads as absent.
+    Container hardware is resolved against the host architecture and the
+    profile set. Every provision script the lab names is compiled by the
+    wscript host, so a syntax error in a script is reported here rather than
+    at the moment `up` reaches it. A registry template that has not been
+    pulled yet is not an error; it is a deferred download.
+  DOC
+
+  p <<DOC
+    On success the verb prints one line, `ok: lab "<name>" — N vm(s), N
+    container(s), N segment(s)`. On failure it prints every issue as a
+    report with the offending text underlined in the source, and prints
+    nothing else.
+  DOC
+
+  p <<DOC
+    One thing does happen on success: the lab is registered in the managed
+    block of `~/.ssh/config`, because every command that loads a lab does
+    that (see [vmlab ssh-config](cmd_ssh_config)). The lab file itself is not
+    written, which is what "no side effects" refers to. A failure to write the
+    block is a warning, not an error.
+  DOC
+
+  p <<DOC
+    Nothing here probes a running machine. In particular the attachability
+    of a dev machine (see [Logins and the SSH facade](guide_logins)) is
+    checked at `up` and at attach, deliberately not at `validate`, because it
+    depends on a live agent handshake.
+  DOC
+
+  h2 "Examples"
+
+  code sh { source = "vmlab validate" }
+
+  code sh { source = <<'SRC'
+ok: lab "mixed-lab" — 2 vm(s), 1 container(s), 2 segment(s)
+SRC
+  }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 when the lab file is valid. Any issue, a missing lab
+    file, or a profile set that cannot be loaded exits 1 (`failed`). A usage
+    error exits 2.
+  DOC
+}

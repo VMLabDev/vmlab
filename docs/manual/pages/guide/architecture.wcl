@@ -1,0 +1,194 @@
+page guide_architecture {
+  title = "How vmlab runs a lab"
+  chapter_header "How vmlab runs a lab" {
+    kicker       = "The guide · explanation"
+    reading_time = "9 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    vmlab is a single-host lab orchestrator. You declare a **lab** — machines
+    and the virtual networks between them — in one file, and vmlab boots it
+    on QEMU/KVM, driven directly over QMP with no libvirt in between. This
+    chapter explains the processes that do that work, where they keep their
+    state, and how they talk to each other. It is the map the rest of the
+    guide assumes.
+  DOC
+
+  h2 "Three processes"
+
+  p <<DOC
+    vmlab is a two-tier daemon system with a thin client in front of it. The
+    `vmlab` command you type is a client. It never runs a VM itself.
+  DOC
+
+  list {
+    li "**The supervisor, `vmlabd`.** One per user, started automatically by the CLI the first time it is needed. It keeps the registry of running labs, owns the [global segments](guide_networking) that span labs, serialises every write to the [template store](guide_templates), runs host-level watchdogs such as `host.disk_low`, and aggregates the [event stream](guide_events) of every lab on the host."
+    li "**The lab daemon.** One per running lab, spawned by the supervisor on `vmlab up` and reaped on `down` or `destroy`. It owns everything lab-scoped: the QEMU processes, their QMP and agent channels, the lab's segments with their DHCP, DNS, NAT and rules, clones, snapshots, lab state, the wscript runtime, and the workspace syncer of any [dev machine](guide_dev)."
+    li "**The CLI.** It connects to the supervisor for discovery and host-scoped verbs, then talks directly to the lab daemon's socket for anything lab-scoped. Nothing proxies the hot path."
+  }
+
+  diagram {
+    width = 560  height = 330
+    layout = :layered  layer_gap = 34.0  node_gap = 46.0
+    desc = "The CLI discovers a lab through the supervisor, then talks to the lab daemon directly; each lab daemon owns its own QEMU processes."
+    process "vmlab CLI"            { id = cli width = 150.0 }
+    process "vmlabd (supervisor)"  { id = sup width = 170.0 }
+    process "lab daemon (lab A)"   { id = labA width = 160.0 }
+    process "lab daemon (lab B)"   { id = labB width = 160.0 }
+    process "QEMU per machine"     { id = qemuA width = 150.0 }
+    process "QEMU per machine"     { id = qemuB width = 150.0 }
+    edges = [
+      { source: "cli", destination: "sup",  kind: :flow, label: "discover" },
+      { source: "sup", destination: "labA", kind: :flow, label: "spawn / reap" },
+      { source: "sup", destination: "labB", kind: :flow, label: "spawn / reap" },
+      { source: "cli", destination: "labA", kind: :flow, label: "lab ops" },
+      { source: "labA", destination: "qemuA", kind: :flow, label: "QMP" },
+      { source: "labB", destination: "qemuB", kind: :flow, label: "QMP" }
+    ]
+  }
+
+  p <<DOC
+    The split exists for fault and contention isolation. A lab daemon that
+    dies takes only its lab with it. The supervisor notices, emits
+    `lab.daemon_crashed`, and marks the lab failed. It does not restart the
+    lab on its own. Other labs, and the supervisor itself, are unaffected.
+  DOC
+
+  h3 "A lab name is a host-wide identity"
+
+  p <<DOC
+    The supervisor's registry, the lab's runtime directory, its control
+    socket and its process markers are all keyed by the lab's declared name,
+    not by the directory it lives in. Two directories that declare the same
+    lab name cannot run at once on one host. When you `up` the second, the
+    supervisor answers with a `conflict` error that names the other root and
+    the two remedies: stop that lab, or rename this one. This rule is what
+    makes the [SSH aliases](guide_logins) `vmlab-<lab>-<machine>` unambiguous.
+  DOC
+
+  h2 "The wire protocol"
+
+  p <<DOC
+    Every control connection is a unix domain socket carrying JSON lines. A
+    request is a `cmd` string with an `args` object. A reply carries either
+    `ok` or an `err` message with a machine-readable `code`. The code is the
+    contract: it decides the CLI's exit status, while the message may be
+    reworded freely. The same protocol carries request and response,
+    a subscribable event stream, and streamed output for long operations such
+    as template builds and provision runs. The supervisor and the lab daemons
+    speak it to each other as well.
+  DOC
+
+  p <<DOC
+    Every command a daemon serves, its arguments, and which surface calls it
+    are listed in [Wire protocol and error codes](ref_protocol). That table is
+    generated from the code, so it cannot drift from what the daemons accept.
+  DOC
+
+  h2 "Where things live"
+
+  p <<DOC
+    vmlab follows the XDG base directory convention, and every path below
+    honours the corresponding environment variable. The full list, including
+    the sockets and log files, is in [Files and directories](ref_paths).
+  DOC
+
+  table {
+    rows:
+      | "Path" | "What is there" |
+      | "`<lab>/vmlab.wcl`" | "The lab definition. The CLI finds it by walking up from the current directory, the way git finds a repository." |
+      | "`<lab>/.vmlab/`" | "Lab-local working data: linked-clone disks, snapshot data, built ISO and floppy images, TPM state, persisted lab state, the workspace sync ledger and the `dev use` selection. Safe to delete when the lab is down. Gitignore it." |
+      | "`~/.local/share/vmlab/templates/`" | "The template store, laid out as `<arch>/<name>/<version>/`." |
+      | "`~/.local/share/vmlab/oci/`" | "The digest-addressed cache of pulled container images." |
+      | "`~/.local/state/vmlab/`" | "Daemon state, per-lab and per-machine logs as JSON lines, event history, SSH host keys." |
+      | "`~/.config/vmlab/`" | "The [host configuration](guide_host) file and user profile overrides." |
+      | "`$XDG_RUNTIME_DIR/vmlab/`" | "`vmlabd.sock`, and `labs/<lab>/` holding each lab daemon's `control.sock` and its per-machine QMP, agent, NIC and VNC sockets." |
+  }
+
+  p <<DOC
+    The runtime directory is created private to your user, because a client
+    that can reach a control socket can run scripts in the lab and read and
+    write guest files. Where `XDG_RUNTIME_DIR` is unset, which some WSL
+    setups leave it, vmlab falls back to a uid-scoped directory under `/tmp`
+    and refuses one owned by anyone else.
+  DOC
+
+  callout "Relocating the working data" {
+    kind = :tip
+    body = "Set `VMLAB_WORK_DIR` to move every lab's `.vmlab/` under one base directory. Each lab gets a subdirectory named after its root plus a short hash, so two labs never collide. The lab file stays where it is."
+  }
+
+  h2 "What a machine is"
+
+  p <<DOC
+    A lab boots two kinds of machine. A **VM** is booted from a
+    [template](guide_templates): a sealed qcow2 in the store. A
+    **container** is booted from an OCI image inside a micro-VM, as
+    [Lab containers](guide_containers) explains. Both attach to the same
+    segments, register in the same DNS, take the same snapshots and are
+    driven through the same agent. Where this manual says *machine*, it
+    means either.
+  DOC
+
+  h3 "Linked clones"
+
+  p <<DOC
+    A VM's disk is a qcow2 **linked clone**: a copy-on-write overlay whose
+    backing file is the template's disk in the store. The template is never
+    written to. Clones live in `.vmlab/` and are disposable. `vmlab down`
+    powers the lab off and keeps them, `vmlab destroy` deletes them, and the
+    next `up` makes fresh ones. Because a clone leans on its template,
+    removing a template still backing a clone is refused unless you force
+    it.
+  DOC
+
+  h3 "The guest agent"
+
+  p <<DOC
+    Every machine runs `vmlab-agent`, reached over one multiplexed
+    virtio-serial port named `vmlab.agent.0`. No guest network is involved.
+    The agent is the channel for readiness, streaming command execution,
+    interactive terminals, file operations, log tailing, metrics, clipboard,
+    OS information, per-NIC address reporting and graceful shutdown. Templates
+    bake it in during the build. Container micro-VMs get it from vmlab's own
+    init, which spawns it beside the workload.
+  DOC
+
+  p <<DOC
+    A machine is **ready** when its agent answers the handshake. A lab is
+    **up** when every machine is ready and every provision script has
+    completed. A VM built without an agent still works for screen-driven
+    automation, as [Screens, input and vision](guide_vision) describes, but
+    it never reports ready, so scripts targeting it must wait on the screen
+    or on time.
+  DOC
+
+  callout "The host opens channels; the guest answers" {
+    kind = :note
+    body = "Every channel to a guest is opened from the host side and answered by the agent. Nothing in a guest can open a connection back to vmlab. This one rule is why the SSH facade refuses `ssh -R`, why a halted workspace can only be resolved from the host, and why a guest with no network is still fully driveable."
+  }
+
+  h2 "What happens on `vmlab up`"
+
+  p <<DOC
+    The CLI locates `vmlab.wcl`, validates it as [The lab file](guide_lab_file)
+    describes, and asks the supervisor to ensure a lab daemon for that name.
+    The supervisor pre-pulls any registry templates or container images the
+    lab needs, then spawns the daemon. The daemon computes its plan as a value
+    before it starts anything: the waves of machines `depends_on` implies,
+    the [share plan](guide_shares), and the [forward plan](guide_networking).
+    It assembles the network fabric, creates the clones, launches one QEMU per
+    machine, waits for each agent, mounts shares, runs each machine's
+    provision steps in declaration order, and reports the lab up. Provision
+    output streams live to your terminal and into the lab log.
+  DOC
+
+  p <<DOC
+    The reverse verbs are just as plain. `down` walks the stop ladder on every
+    machine, agent shutdown, then ACPI, then a kill after a timeout, and asks
+    the supervisor to release the daemon. `destroy` does the same and then
+    removes everything in `.vmlab/`.
+  DOC
+}

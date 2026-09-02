@@ -1,0 +1,186 @@
+page guide_lab_file {
+  title = "The lab file"
+  chapter_header "The lab file" {
+    kicker       = "The guide · explanation"
+    reading_time = "10 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A lab is one file, `vmlab.wcl`, written in WCL. It declares the lab's
+    name, its machines, its segments and the automation that runs when the
+    lab comes up. Everything else has a default: a lab with one VM and no
+    network declarations still boots, gets an address and resolves names.
+    This chapter explains the shape of the file, what nests where, how vmlab
+    checks it, and how a value you leave out is filled in. The exact fields
+    of every block are in the reference chapters, starting with
+    [Lab file: lab and segment](ref_lab).
+  DOC
+
+  h2 "The import and the `lab` block"
+
+  p <<DOC
+    Every lab file starts with `import <vmlab.wcl>`. That line binds the file
+    to vmlab's schema, so the WCL parser itself rejects an unknown block or
+    attribute before vmlab reads anything. A file without it is not a lab
+    file. After the import comes one `lab "<name>" { ... }` block. The name is
+    a DNS label, because it appears in every machine's DNS name, and it is
+    the lab's identity on the host, as [How vmlab runs a lab](guide_architecture)
+    explains.
+  DOC
+
+  code wcl {
+    filename    = "examples/mixed-lab/vmlab.wcl"
+    source_file = "../../examples/mixed-lab/vmlab.wcl"
+    dedent      = true
+  }
+
+  h2 "What nests where"
+
+  p <<DOC
+    The `lab` block holds four kinds of child: segments, machines, event
+    handlers, and lab-wide DNS entries. Machines in turn hold the things that
+    belong to one machine. The rule of thumb is that a block lives inside the
+    thing it configures, so there is nothing to cross-reference by name.
+  DOC
+
+  table {
+    rows:
+      | "Block" | "Nests in" | "What it declares" |
+      | "`segment`" | "`lab`" | "A virtual L2 switch, with its subnet, DHCP, DNS, NAT, guest routes, forwards and L3 rules. See [Networking](guide_networking)." |
+      | "`vm`" | "`lab`" | "A VM booted from a template's linked clone, with its hardware and its children below. See [Lab file: vm and its children](ref_vm)." |
+      | "`container`" | "`lab`" | "An OCI image run in a micro-VM, with env, volumes, ports and a healthcheck. See [Lab containers](guide_containers)." |
+      | "`on`" | "`lab`" | "An event handler: a wscript script bound to an event name. See [Events and handlers](guide_events)." |
+      | "`record`, `sinkhole`" | "`lab` or `segment`" | "Static DNS entries and DNS sinkholes, lab-wide or per segment." |
+      | "`nic`" | "`vm`, `container`, `template`" | "A network interface on a segment. A machine with no `nic` blocks has no network hardware at all." |
+      | "`share`" | "`vm`" | "A host directory mounted in the guest. See [Shared folders](guide_shares)." |
+      | "`disk`, `media`, `gpu`" | "`vm` (and `template` for disks and media)" | "Extra disks, ISO and floppy images built from folders, and GPU acceleration." |
+      | "`login`" | "`vm`, `container`" | "A labelled identity a surface attaches as. See [Logins and the SSH facade](guide_logins)." |
+      | "`provision`, `playbook`" | "`vm`, `container`, `template`" | "Configuration steps run once the machine is ready, in declaration order. See [Guest automation with wscript](guide_scripting) and [Playbooks](guide_playbooks)." |
+      | "`template`" | "the document, beside `lab`" | "A buildable template definition. See [Templates and the store](guide_templates)." |
+  }
+
+  p <<DOC
+    Configuration steps are the clearest case of the nesting rule. A
+    `provision` or `playbook` block is declared inside the machine it
+    configures. That machine is the target, so there is no `target =` field
+    to get wrong. A machine's steps run in the order its blocks appear, once
+    the machine is ready. Across machines they follow the order the machine
+    blocks appear, with `depends_on` gating when each becomes eligible. A
+    dependent waits for its dependency to be ready *and* for that
+    dependency's steps to finish.
+  DOC
+
+  h2 "Connectivity is always explicit"
+
+  p <<DOC
+    A machine with no `nic` blocks is air-gapped. It still boots, still
+    answers the agent, and can still be driven with `exec` and `cp`, because
+    the agent rides virtio-serial rather than the network. Connectivity is a
+    ladder you climb by declaration: nothing, then `nic { nat = true }` for
+    internet-only access on the lab's built-in NAT segment, then a `nic` on a
+    declared segment. [Networking](guide_networking) walks each rung.
+  DOC
+
+  h2 "Validation"
+
+  p <<DOC
+    `vmlab validate` evaluates the file against the schema and then applies
+    every rule that can be checked without touching QEMU. Every other verb
+    runs the same checks first and stops before any side effect on an error.
+    The checks fall into two layers.
+  DOC
+
+  p <<DOC
+    **The schema layer** is WCL's own: unknown blocks and attributes, wrong
+    types, a required field missing, a value outside a declared range or
+    option set. The schema declares these with decorators on each field, and
+    the reference chapters reflect every one of them.
+  DOC
+
+  p "**The semantic layer** is vmlab's, and includes:"
+
+  list {
+    li "A template reference that is archless or malformed, or names a template not in the store and not a registry reference."
+    li "A `nic` naming a segment the lab does not declare, a static `ip` outside its segment's subnet, or a duplicate static IP or MAC."
+    li "A cycle in `depends_on`, or a dependency naming a machine that does not exist."
+    li "A `provision`, `playbook` or `on` handler whose file is missing, and any wscript that does not compile."
+    li "A `scratch` VM missing `arch`, `profile` or `disk`, and a `disk` size on a cloned VM."
+    li "`secure_boot = true` on a VM whose firmware resolves to SeaBIOS. Either value may have been inherited, so the message names the layer each came from."
+    li "A `share` that is not explicitly virtiofs, a container `volume`, or a container `port` on a machine with no NIC, because SMB shares, volumes and forwards need a segment to reach the gateway on."
+    li "A container that neither declares `cpus` and `memory` nor names a profile supplying them."
+    li "A playbook `var` whose name is not a WCL identifier, or is set twice on one block."
+    li "The dev-machine rules: more than one `@dev(default = true)`, a Windows `login` without a `password`, `elevated` on a Linux-family profile, and more than one `login` with `default = true` on a machine."
+  }
+
+  callout "What validation deliberately does not check" {
+    kind = :note
+    body = "`@dev` on a machine whose agent cannot serve an attach is not a validation error. The agent's features are only known once it is running, so that failure is reported by `vmlab up` as a warning and by an attach as a refusal, as [Dev machines and the workspace syncer](guide_dev) explains."
+  }
+
+  h2 "How a value resolves"
+
+  p <<DOC
+    Most hardware fields on a `vm` block are optional. A value you do not
+    set comes from the template's recorded hardware, and a value not recorded
+    there comes from the [guest OS profile](guide_profiles). The profile's
+    defaults are the floor. The precedence is fixed:
+  DOC
+
+  code text { source = "VM block  >  template  >  profile" }
+
+  p <<DOC
+    A template records its hardware when it is sealed, so a VM cloned from a
+    template built with `memory = 4GiB` boots with four gibibytes unless the
+    `vm` block says otherwise. The profile is a live layer, not frozen into
+    the template: editing a profile reaches every VM that still resolves a
+    field down to it.
+  DOC
+
+  p <<DOC
+    Two machine kinds shorten the chain. A `scratch` VM has no template, so
+    its chain is VM block then profile, which is why validation insists on
+    `arch`, `profile` and `disk`. A container has no template either: its
+    `cpus` and `memory` come from the block or from its profile, and the
+    shipped `container` profile supplies a floor of one vCPU and 256 MiB.
+    One resolver implements this precedence for both machine kinds, and no
+    other surface reimplements it.
+  DOC
+
+  h2 "Decorators"
+
+  p <<DOC
+    A decorator is written on a machine block and states something *about*
+    the machine rather than configuring something inside it. vmlab ships one:
+    `@dev`, which marks a VM or container as a dev machine that vmlab
+    publishes as an SSH endpoint and syncs a workspace onto. Every argument is
+    optional. A bare `@dev` is a complete dev machine, and unset arguments
+    resolve `@dev` then profile then vmlab's own floor.
+  DOC
+
+  code wcl {
+    filename    = "examples/dev-neovim-container/vmlab.wcl"
+    source_file = "../../examples/dev-neovim-container/vmlab.wcl"
+    anchor      = "dev01"
+    dedent      = true
+  }
+
+  p <<DOC
+    `default = true` names the lab's default dev machine, which is the same
+    for everyone who opens the file. Which dev machine is *yours* is not a
+    property of the file, and [Dev machines and the workspace syncer](guide_dev)
+    explains where it is recorded instead. The decorator's arguments are
+    listed with the machine blocks in [Lab file: vm and its children](ref_vm).
+  DOC
+
+  h2 "Addressing a lab from the command line"
+
+  p <<DOC
+    The CLI finds the lab from your current directory by walking up to the
+    nearest `vmlab.wcl`. Within it, machine verbs take a bare machine name.
+    From anywhere else, or when several labs run at once, address a machine
+    as `lab/machine`. Machine names are scoped per lab, and VMs and
+    containers share one namespace, so `web` can be either kind but not both.
+  DOC
+}

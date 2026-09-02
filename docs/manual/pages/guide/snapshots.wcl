@@ -1,0 +1,169 @@
+page guide_snapshots {
+  title = "Snapshots"
+  chapter_header "Snapshots" {
+    kicker       = "The guide · explanation"
+    reading_time = "9 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A snapshot captures a machine so you can return to it later: a known
+    good state before an experiment, a checkpoint mid-way through a long
+    install, a domain just after promotion. vmlab takes them online or
+    offline, per machine or across a whole lab, and restores each to the
+    power state it was captured in. This chapter explains the mechanism,
+    its limits, and what a restore does to a dev machine's workspace, which
+    is the one place a snapshot is not what it looks like. The verbs are in
+    [vmlab snapshot](cmd_snapshot).
+  DOC
+
+  h2 "Online and offline"
+
+  p <<DOC
+    An **offline** snapshot, taken while the machine is powered off,
+    captures disk state only. An **online** snapshot, taken while it runs,
+    captures disk, RAM and device state, and pauses the guest only for as
+    long as the save takes. Every snapshot records the machine's power state
+    at capture, and a restore does the right thing with it: restoring an
+    online snapshot resumes the machine exactly where it was, and restoring
+    an offline one leaves it powered off. A machine mid-transition, still
+    starting or stopping, is refused until it settles.
+  DOC
+
+  p <<DOC
+    Both kinds are **qcow2-internal** snapshots, so the on-disk footprint is
+    the clone file itself and the linked-clone backing chain is untouched.
+    An online snapshot is written through QMP's `snapshot-save` into the
+    primary disk, covering every disk the machine has; an offline one is
+    written with `qemu-img` to each disk in turn. Snapshots are named,
+    listed and deleted per machine. When an online snapshot is restored,
+    the daemon drops its agent connection before resuming, because the
+    rewound guest replays serial bytes the host already consumed, and
+    reconnects on next use.
+  DOC
+
+  p <<DOC
+    Containers snapshot with the same verbs and the same semantics. The
+    per-container scratch disk holds the snapshot, the image's read-only
+    root is outside it, and each snapshot records the image digest it was
+    taken against. [Lab containers](guide_containers) explains the pin.
+  DOC
+
+  h2 "Lab-wide snapshots"
+
+  p <<DOC
+    `vmlab snapshot create <name>` with no `--vm` captures every VM and
+    container in the lab under one name, and `restore` with no `--vm`
+    restores them all. Consistency across machines is best-effort: each
+    machine is captured in turn, not at one coordinated instant, so two
+    machines mid-conversation may land a few moments apart. A test that
+    depends on cross-machine consistency should quiesce the guests first.
+  DOC
+
+  h2 "What a snapshot does not hold"
+
+  callout "Shares, volumes and workspaces are host state" {
+    kind = :warning
+    body = "A shared folder's contents, a container volume's contents, and a dev machine's workspace all live on the host. A restore never rolls any of them back. Only what is on the machine's own disk, and in its RAM for an online snapshot, returns to the captured state."
+  }
+
+  p <<DOC
+    Shares stay snapshot-compatible on both transports: SMB carries no
+    device state, and a virtiofs share's daemon transfers its session state
+    through the snapshot's migration stream, so an online restore finds its
+    open handles intact. The files, though, are whatever they are on the
+    host now. The same holds for a container's volumes.
+  DOC
+
+  h2 "Snapshots and a dev workspace"
+
+  p <<DOC
+    A [dev machine](guide_dev) holds a **workspace**: a guest-local working
+    copy of a host directory that is canonical, kept in step both ways by
+    vmlab's syncer. A restore rewinds that guest copy by hundreds of files at
+    once, and a naive bidirectional syncer cannot tell that apart from the
+    developer having edited hundreds of files. It would carry the old
+    versions onto the canonical copy, silently. Because vmlab performs the
+    restore, it can **bracket** it, and the bracket has two asymmetric
+    halves.
+  DOC
+
+  h3 "Capture flushes, and refuses with no escape"
+
+  p <<DOC
+    Before a capture, the syncer flushes the workspace so the snapshot is
+    coherent with the host tree. If the guest still holds work the canonical
+    copy has never seen, the capture **refuses**, naming the outstanding
+    paths, the first twenty and then how many more. Any of these refuses it:
+    a standing conflict halt, a pass that could not finish because the guest
+    stopped answering, a pending rescan or re-seed, paths the flush did not
+    carry, and a workspace that has never completed a pass at all. A stopped
+    machine is judged from its ledger, and refuses on the two states the
+    ledger still records: a halt, and an owed re-seed.
+  DOC
+
+  p <<DOC
+    There is no flag to override this, because there is no case for one. A
+    snapshot of a tree the host has never seen is a snapshot that restores
+    somewhere meaningless, holding a version of the repository that exists
+    nowhere else. The fix is to let the flush finish or to resolve the halt,
+    which is what you wanted anyway. A named skip, such as a socket in the
+    tree or a root-owned build artefact, is permanent and normal and does
+    not refuse.
+  DOC
+
+  h3 "Restore takes the syncer off, rewinds, and re-seeds"
+
+  p <<DOC
+    A restore suspends the syncer before anything is rolled back, so no
+    pass already scanning can finish against a guest rewound underneath it.
+    It then restores the machine and puts the syncer back owing a
+    **re-seed**: a host-only, digest-based reconcile that carries the guest
+    tree back to the canonical copy. Each word matters.
+  DOC
+
+  list {
+    li "**Host-only.** The re-seed emits no guest-to-host action at all, so rolled-back state cannot reach the canonical copy. The guest tree is walked only to decide what to overwrite and delete."
+    li "**By digest.** A restored guest's clock runs behind the host, so a same-size in-place write compares identical on size and mtime. The re-seed compares content, never timestamps."
+    li "**Before the watch reopens.** Otherwise the syncer's own writes would fill the fresh dirty set with thousands of self-inflicted paths."
+  }
+
+  p <<DOC
+    The re-seed replaces the stat-walk the syncer would otherwise run on a
+    watch discontinuity, rather than following one: the walk asks what the
+    guest did while nobody was looking, and here vmlab already knows. That a
+    re-seed is owed rides the ledger in the lab's `.vmlab/`, because a
+    restore does not need a running machine; a stopped dev machine restored
+    now re-seeds when it next starts.
+  DOC
+
+  h3 "The one escape flag"
+
+  p <<DOC
+    A restore refuses while a conflict **halt** stands on the workspace,
+    because a restore discards the guest side of every halted path by
+    design, and each of those paths is a file you were going to be asked
+    about. Refusing outright would be obstruction, since wanting to throw
+    the guest copy away is often why you restore, so the refusal has one
+    escape: `--discard-guest-changes`, or `restore_discarding_workspace`
+    from a script. Passing it throws away the guest copy of every
+    conflicting path and lets the restore proceed. A restore that is refused
+    leaves the machine exactly as it was.
+  DOC
+
+  callout "Snapshots are not a workspace backup" {
+    kind = :warning
+    body = "A dev machine's source lives on the host, which is what survives `destroy` and what a restore re-converges the guest from. A snapshot holds the guest copy of the workspace as it was, and a restore replaces it with the host's current tree. Every surface that takes or restores a snapshot repeats this sentence, because a developer who believes a snapshot holds their edits has believed something this design deliberately does not offer."
+  }
+
+  h2 "Headroom"
+
+  p <<DOC
+    Linked clones grow as guests write, and internal snapshots grow with
+    them. The supervisor watches free space on the filesystems holding
+    `.vmlab/` and the store and emits `host.disk_low` below the threshold set
+    by `disk_low_percent` in the [host configuration](guide_host), which a
+    handler can act on as [Events and handlers](guide_events) describes.
+  DOC
+}

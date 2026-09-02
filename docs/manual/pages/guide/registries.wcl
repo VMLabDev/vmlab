@@ -1,0 +1,153 @@
+page guide_registries {
+  title = "Distributing templates over registries"
+  chapter_header "Distributing templates over registries" {
+    kicker       = "The guide · explanation"
+    reading_time = "7 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    The online way to share a [template](guide_templates) is an OCI
+    registry: GHCR, Docker Hub, Harbor, or any self-hosted registry that
+    speaks the OCI distribution API. vmlab publishes a template as an OCI
+    **artifact**, not as a container image, and this chapter explains what
+    that means, how a multi-gigabyte disk is carried, how tags map onto
+    versions and architectures, and how credentials are found. The verbs are
+    documented in [vmlab template](cmd_template).
+  DOC
+
+  h2 "An artifact, not an image"
+
+  p <<DOC
+    A pushed template is an OCI manifest whose `artifactType` is a
+    vmlab-specific string, whose config blob is the template's metadata, and
+    whose layers are the disk in pieces, each with a vmlab media type. The
+    typing is the point. A `docker pull` of a vmlab reference fails fast as
+    "not a container image" rather than half-working, and `vmlab template
+    pull` refuses a manifest whose artifact type is not vmlab's rather than
+    installing a container's layers as a disk. The media type strings are
+    frozen: they are part of the on-the-wire contract and never change.
+  DOC
+
+  h3 "Chunking"
+
+  p <<DOC
+    The qcow2 is split into fixed-size chunks, 512 MiB by default, each
+    compressed with zstd and pushed as one ordered layer blob. The manifest's
+    annotations record the chunk count, the chunk size, the total size and
+    the digest of the assembled, uncompressed image. A pull downloads the
+    chunks, reassembles them in order and verifies the whole-image digest
+    before installing to the store. Everything streams through bounded
+    buffers, so a 64 GiB image never lands in memory.
+  DOC
+
+  p <<DOC
+    The size is chosen for GHCR, the expected home for most templates, which
+    enforces a per-layer size limit and a per-upload timeout. The timeout is
+    the binding constraint on realistic upstream bandwidth, and 512 MiB
+    clears it with a wide margin while keeping retries cheap. Change it with
+    `oci_chunk_size` in the [host configuration](guide_host).
+  DOC
+
+  h2 "Addressing"
+
+  p <<DOC
+    A registry reference is `registry/owner/name[:tag]`, and the registry
+    host is always explicit. vmlab treats the first path segment as a host
+    only when it looks like one: it contains a dot, a colon, or is exactly
+    `localhost`. A bare `owner/name` is rejected with a message asking for a
+    registry, so nothing ever reaches Docker Hub by accident.
+  DOC
+
+  p <<DOC
+    The tag is the template version. A push of `x86_64/ubuntu-24.04@24.04.4.1`
+    to `ghcr.io/owner/ubuntu-24.04` lands at the tag `24.04.4.1`, and a pull
+    of that reference installs the template into the store as
+    `x86_64/ubuntu-24.04@24.04.4.1`, with the originating reference recorded
+    in its metadata. The store name is the last path component of the
+    repository.
+  DOC
+
+  h3 "Moving tags and prefixes"
+
+  p <<DOC
+    Every push also re-points a moving alias. By default that is `latest`;
+    with `--prerelease` it is `latest-prerelease` instead, so a pre-release
+    never displaces the stable pointer. When a lab references a registry
+    template by a moving alias, or by a build-counter prefix such as
+    `26100.1742`, vmlab resolves it against the registry's published tags to
+    a concrete version before pulling, and a concrete version already in the
+    store is used offline without contacting the registry at all.
+  DOC
+
+  h2 "Multi-arch"
+
+  p <<DOC
+    A tag may resolve through an OCI image index keyed by platform
+    architecture. This maps the store's arch dimension onto OCI's own
+    multi-platform mechanism: a push of the `aarch64` build of a template
+    adds a platform entry to the index beside the `x86_64` one. Consistent
+    with the store, the arch is always explicit. `vmlab template pull`
+    requires `--arch` when the tag resolves to an index with more than one
+    platform, and never silently assumes the host's.
+  DOC
+
+  h2 "Push and pull"
+
+  p <<DOC
+    `vmlab template push <arch>/<name>[@<version>] [target]` publishes a
+    store entry. The target defaults to the `registry` field the template
+    block declared, which the metadata records, so a template built for a
+    known home needs no argument. `--source` links the package to a source
+    repository URL, and defaults to the `origin` remote of the directory you
+    run it in when that resolves to a web URL. The push is performed by the
+    supervisor, streams progress to your terminal, and can be stopped from
+    another terminal with `vmlab template stop`.
+  DOC
+
+  p <<DOC
+    `vmlab template pull <registry/owner/name:version>` installs into the
+    store and refuses to replace a version already there unless you pass
+    `--overwrite`. A lab file can skip the explicit pull: a `vm` whose
+    `template` is a registry reference, with an `arch` beside it, is pulled
+    by the supervisor before the lab daemon starts, with progress events you
+    can watch, and never re-pulled once present.
+  DOC
+
+  callout "Updates are explicit" {
+    kind = :note
+    body = "A template present in the store is never re-pulled implicitly, even when the registry has a newer build under the same moving tag. Run `vmlab pull` in the lab, or `vmlab template pull`, to fetch a newer version. Existing clones keep backing onto the version they were created from."
+  }
+
+  h2 "Credentials"
+
+  p <<DOC
+    vmlab reuses the Docker credential configuration already on the machine,
+    so a `ghcr.io` login you made for `docker` just works. It reads
+    `~/.docker/config.json`, or `$DOCKER_CONFIG/config.json`, and honours
+    both the inline `auths` entries and the `credHelpers` and `credsStore`
+    fields, invoking the named `docker-credential-<helper>` binary the way
+    Docker does. Registries that answer with a Bearer challenge get the
+    standard token flow. A missing credential is never fatal: anonymous pulls
+    of public templates must work, so it simply means an anonymous request.
+  DOC
+
+  p <<DOC
+    For a machine with no Docker tooling, `vmlab template login <registry>
+    --username <user> --password <secret>` validates the credential against
+    the registry and stores it in the same Docker config file, so a later
+    push or pull finds it.
+  DOC
+
+  h2 "Finding templates"
+
+  p <<DOC
+    `vmlab template search` lists the templates published under a registry
+    namespace, filtered by a name substring, an arch, and whether you want VM
+    templates or container images. The namespaces it searches are host-level
+    settings managed with `vmlab template registry add | list | remove`.
+    They are search roots, not secrets: credentials stay in the Docker
+    config and are looked up by registry host.
+  DOC
+}

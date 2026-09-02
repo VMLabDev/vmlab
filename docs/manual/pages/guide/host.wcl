@@ -1,0 +1,150 @@
+page guide_host {
+  title = "Host configuration and WSL 2"
+  chapter_header "Host configuration and WSL 2" {
+    kicker       = "The guide · explanation"
+    reading_time = "8 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+Almost everything vmlab needs is in the lab file. What is left is per-host:
+where it may allocate subnets from, which VNC viewer to launch, how big a
+chunk to push to a registry, where the config-weave binaries are, which file
+carries the managed SSH block. Those live in one optional host configuration
+file. This chapter explains that file, the directories vmlab uses, what changes
+when the host is WSL 2, and how vmlab picks between KVM and TCG. Every field is
+in [Host configuration file](ref_host) and every path in
+[Files and directories](ref_paths).
+DOC
+
+  h2 "The host config file"
+
+  p <<'DOC'
+vmlab reads `~/.config/vmlab/config.wcl`, honouring `XDG_CONFIG_HOME`. The
+file is optional and every field in it is an override, so an absent file
+means all defaults. It must start with `import <vmlab-host.wcl>` and contain
+one `host { … }` block. A malformed value is reported at its line with the
+same wording a lab file gets, and every mistake in the file is reported in
+one pass. The errors surface where a lab is loaded, so a broken file fails
+`vmlab up` with its lines named; the daemon processes themselves fall back to
+defaults for a file they cannot read.
+DOC
+
+  code wcl { filename = "~/.config/vmlab/config.wcl" source = <<'SRC'
+import <vmlab-host.wcl>
+
+host {
+  subnet_pool        = "10.99.0.0/16"
+  dns_suffix         = "lab.local"
+  disk_low_percent   = 5
+  viewer             = "remote-viewer vnc://{}"
+  oci_chunk_size     = 128MiB
+  workspace_max_file = 2GiB
+}
+SRC
+  }
+
+  table {
+    rows:
+      | "Field" | "What it sets" | "Default" |
+      | "`subnet_pool`" | "The CIDR segments with no `subnet` are auto-allocated from, one /24 each. See [Networking](guide_networking)." | "`10.213.0.0/16`" |
+      | "`dns_suffix`" | "The suffix under which every machine's name is registered in segment DNS." | "`vmlab.internal`" |
+      | "`dns_upstream`" | "The resolver `ip[:port]` segment DNS forwards to." | "the host's resolver" |
+      | "`disk_low_percent`" | "The free-space percentage below which the `host.disk_low` watchdog fires. See [Events and handlers](guide_events)." | "`10`" |
+      | "`psk`" | "The pre-shared key that authenticates cross-host segment trunks." | "none" |
+      | "`trunk_port`" | "The TCP port the supervisor listens on for inbound cross-host trunks." | "`13947`" |
+      | "`viewer`" | "The VNC viewer command; `{}` is replaced by the target." | "auto-detected" |
+      | "`fastpath`" | "The network fast path: `auto`, `off`, `sockmap` or `afxdp`. See [vmlab fastpath](cmd_fastpath)." | "`auto`" |
+      | "`oci_chunk_size`" | "The layer chunk size a template push uses. See [Distributing templates over registries](guide_registries)." | "`512MiB`" |
+      | "`config_weave_bin_dir`" | "The directory holding the config-weave guest binaries. See [Playbooks](guide_playbooks)." | "`~/.local/share/config-weave/bin`" |
+      | "`ssh_config`" | "The file vmlab writes its managed SSH block into. See [Dev machines and the workspace syncer](guide_dev)." | "`~/.ssh/config`" |
+      | "`workspace_max_file`" | "The workspace syncer's per-file size guard; a larger file is refused by name." | "`256MiB`" |
+  }
+
+  p <<'DOC'
+Two of these are location knobs with one code path behind them rather than
+switches. `ssh_config` moves the managed block, and the `ssh -G` check still
+runs against the new file, so a block redirected somewhere OpenSSH does not
+read warns honestly. `config_weave_bin_dir` is the first rung of a three-rung
+lookup, ahead of the `VMLAB_CONFIG_WEAVE_DIR` environment variable and the
+XDG default. `workspace_max_file` is host config rather than a `@dev`
+argument because the cap is about your link to your guest, not about the lab
+everyone shares, and the refusal message names it so "raise the cap" points
+somewhere.
+DOC
+
+  h3 "The viewer"
+
+  p <<'DOC'
+`vmlab console` and `gui = true` launch a viewer chosen the same way. An
+explicit `viewer` in the host config wins and is dialled at the VNC unix
+socket directly. Otherwise vmlab takes the first of `remote-viewer`,
+`gvncviewer` and `vncviewer` found on `PATH`; all three are driven over a
+localhost TCP bridge to the socket, held open by a detached helper that exits
+when the viewer window closes, so neither command ties up the terminal. With
+no viewer at all, or with `--tcp`, `vmlab console` bridges the socket to a
+localhost port and prints the address for you to point any VNC client at.
+Closing a viewer only disconnects; the VM keeps running, always headless
+behind VNC. See [vmlab console](cmd_console).
+DOC
+
+  h2 "Directories"
+
+  p "vmlab follows the XDG layout and honours each variable that overrides it:"
+
+  table {
+    rows:
+      | "Path" | "Holds" |
+      | "`~/.config/vmlab/`" | "`config.wcl` and the `profiles/` directory of user [profiles](guide_profiles)." |
+      | "`~/.local/share/vmlab/`" | "The template store under `templates/` and the container image cache under `oci/`." |
+      | "`~/.local/share/config-weave/bin/`" | "Where config-weave's own install puts its guest binaries." |
+      | "`~/.local/state/vmlab/`" | "Daemon state, per-lab logs and event history." |
+      | "`$XDG_RUNTIME_DIR/vmlab/`" | "Control sockets: the supervisor's, each lab's, and per-VM QMP, agent and VNC sockets, plus the SSH multiplexer sockets under `ssh/`." |
+      | "`<lab>/.vmlab/`" | "The lab's own working data: disk clones, built media, TPM state, persisted state, sync ledgers and the `dev use` selection. Gitignore it." |
+  }
+
+  p <<'DOC'
+The runtime directory is a full-privilege interface, since a client that can
+connect to a lab socket runs scripts in the lab and reads and writes guest
+files. vmlab creates it `0700`, tightens an existing one, and refuses one
+owned by someone else. `VMLAB_WORK_DIR` relocates every lab's `.vmlab/` under
+one base, namespaced by lab name and a hash of its root, which keeps the
+write-heavy working data off a slow filesystem while the lab file stays put.
+DOC
+
+  h2 "WSL 2"
+
+  p <<'DOC'
+vmlab was designed to be clean on WSL 2, and the choices that make it so are
+the same ones that make it need no privileges elsewhere: the network fabric is
+userspace with no tap, bridge or macvlan, and the only kernel grant KVM needs
+is `/dev/kvm`. Four things are specific to WSL 2.
+DOC
+
+  list {
+    li "**Nested virtualisation must be enabled** in `.wslconfig` for `/dev/kvm` to exist inside the distribution. Without it every VM runs under TCG."
+    li "**`XDG_RUNTIME_DIR` may be missing.** Some WSL setups do not set it; vmlab falls back to `/tmp/vmlab-<uid>`, created private and refused if owned by anyone else. The SSH `ControlPath` lives under the same directory."
+    li "**The viewer lives on the Windows side.** Run `vmlab console --tcp` to get a localhost address and point a Windows VNC client at it; WSL's localhost forwarding carries it across. Host access to guest services works the same way, through [port forwards](guide_networking) and localhost forwarding."
+    li "**The disk-space watchdog matters more.** WSL 2's ext4 VHDX grows and does not shrink, and linked clones grow with use, so `disk_low_percent` and the `host.disk_low` event are worth handling."
+  }
+
+  h2 "KVM or TCG"
+
+  p <<'DOC'
+For each machine vmlab picks the accelerator once: KVM when `/dev/kvm` can be
+opened and the guest architecture is the host's, TCG otherwise. TCG is full
+emulation, slow but functional, and vmlab warns loudly when it falls back,
+naming the machine and the architecture. Two cases hit it on purpose: a
+foreign-architecture guest such as an aarch64 or riscv64 template on an x86_64
+host, which can only ever be emulated, and a host with no `/dev/kvm`. Give an
+emulated guest a couple of minutes to boot. Nested virtualisation inside a
+guest is separate: `nested = true` on a VM passes the host CPU through, which
+is what exposes VMX or SVM to the guest.
+DOC
+
+  callout "A missing /dev/kvm is the first thing to check" {
+    kind = :note
+    body = "If every VM is slow and `vmlab logs` shows the TCG fallback warning for x86_64 guests, the host lacks KVM: on WSL 2 enable nested virtualisation in `.wslconfig`, on a bare host check that your user can open `/dev/kvm`. See [Troubleshooting](apx_troubleshooting)."
+  }
+}

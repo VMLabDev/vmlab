@@ -61,6 +61,7 @@ lab "dev-vscode-windows" {
   // publishes it as an SSH endpoint an editor attaches into, and syncs
   // ./workspace onto it. Nothing the decorator carries is a setting the
   // guest ever sees.
+  // ANCHOR: dev01
   @dev(default = true, workspace = "./workspace")
   vm "dev01" {
     template   = "x86_64/windows-server-2025"
@@ -84,4 +85,5 @@ lab "dev-vscode-windows" {
     provision "scripts/join-domain.ws" { }
     provision "scripts/editor-bits.ws" { }
   }
+  // ANCHOR_END: dev01
 }

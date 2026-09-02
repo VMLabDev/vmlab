@@ -1,0 +1,122 @@
+page cmd_status {
+  title = "vmlab status"
+  chapter_header "vmlab status" {
+    kicker       = "Commands · reference"
+    reading_time = "4 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab status` reports what every machine in the current
+    [lab](guide_lab_file) is doing, its IP address, the state of each
+    [segment](guide_networking), and any download in flight. It reads the lab
+    daemon's status projection and never starts anything.
+  DOC
+
+  code sh { source = "vmlab status [OPTIONS]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`-v`, `--verbose`" | "Add the raw power state, readiness, and each machine's kind-specific detail (template/hardware, image/health/last exit)." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  h2 "What it prints"
+
+  p <<DOC
+    With no lab daemon running the verb prints `lab "<name>": not running`
+    and exits 0. Otherwise it prints up to four sections, each omitted when
+    empty.
+  DOC
+
+  h3 "Machines"
+
+  p <<DOC
+    One row per machine with the columns `NAME`, `KIND` (`vm` or
+    `container`), `STATUS`, `IP` and `TEMPLATE/IMAGE`. `STATUS` is a label
+    the daemon derives from the power state, readiness and health, so every
+    surface words a machine the same way:
+  DOC
+
+  table {
+    rows:
+      | "Label" | "Meaning" |
+      | "`starting`" | "The process is being launched, or a container is up but its entrypoint has not signalled ready." |
+      | "`booting`" | "A VM is running but its guest agent has not answered yet." |
+      | "`running`" | "Running and ready." |
+      | "`unhealthy`" | "A container is ready but its declared healthcheck is failing." |
+      | "`stopping`" | "The stop ladder is in progress." |
+      | "`stopped`" | "Powered off." |
+      | "`exited (N)`" | "A container's entrypoint exited with a non-zero code." |
+  }
+
+  p <<DOC
+    `IP` is the first NIC with a lease, as reported by the guest agent, or
+    `-` before the guest is ready. With `--verbose` a second line under each
+    machine carries `state=`, `ready=`, `cached=` and `attachable=`, plus
+    `diverged=yes` on a machine whose agent was replaced by
+    [vmlab machine repair-agent](cmd_machine). A VM then adds `arch`, `cpus`,
+    `memory` and `agent` (the sealed agent version); a container adds
+    `health`, `exit` and `digest`.
+  DOC
+
+  h3 "Dev machines"
+
+  p <<DOC
+    Labs with `@dev` machines get a second table: `DEV`, `DEFAULT` (whether it
+    is the lab's default dev machine), `ATTACH` (whether its agent can serve an
+    attach at all), `WORKSPACE` (the host directory) and `GUEST WORKSPACE`.
+    A halted workspace syncer prints its halt sentence under the machine's
+    row, followed by `vmlab dev sync status <machine>` as the place to read
+    more. See [Dev machines and the workspace syncer](guide_dev) and
+    [vmlab dev](cmd_dev).
+  DOC
+
+  h3 "Segments"
+
+  p <<DOC
+    One row per lab segment: `SEGMENT`, `SUBNET`, `GATEWAY`, `NAT/DHCP` as
+    `on/off` pairs, `DROPPED` (frames the switch shed on this segment; anything
+    other than 0 means the fabric is losing frames under load) and `PEER`
+    (the cross-host trunk target and whether it is `up` or `down`).
+  DOC
+
+  h3 "Downloads"
+
+  p <<DOC
+    While a template or image is downloading, a table of `MACHINE`, `PULLING`
+    (`template` or `container`), `PERCENT` and `REFERENCE` shows what an `up`
+    that looks stuck is waiting on. See [vmlab pull](cmd_pull).
+  DOC
+
+  h2 "Examples"
+
+  code sh { source = "vmlab status" }
+
+  code sh { source = <<'SRC'
+lab "ad-lab"
+
+  NAME     KIND      STATUS   IP           TEMPLATE/IMAGE
+  dc01     vm        running  10.10.0.10   x86_64/winsrv2022
+  client01 vm        booting  -            x86_64/win11
+  buildbox vm        stopped  -            x86_64/ubuntu
+
+  SEGMENT SUBNET         GATEWAY    NAT/DHCP DROPPED    PEER
+  corp    10.10.0.0/24   10.10.0.1  on/on    0          -
+SRC
+  }
+
+  p "Show the raw state behind each label:"
+  code sh { source = "vmlab status -v" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0, including when the lab is not running. A lab directory
+    that cannot be found, or a daemon whose status reply this binary cannot
+    read (a version mismatch between CLI and daemon), exits 1 (`failed`). A
+    usage error exits 2.
+  DOC
+}

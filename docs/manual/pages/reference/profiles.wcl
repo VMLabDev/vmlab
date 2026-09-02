@@ -1,0 +1,145 @@
+page ref_profiles {
+  title = "Guest OS profile files"
+  chapter_header "Guest OS profile files" {
+    kicker       = "Reference · reference"
+    reading_time = "7 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A guest OS profile is a named bundle of known-good hardware defaults.
+    It is the floor of the hardware resolution chain: a value not set on the
+    VM and not recorded by its template comes from the profile. Profiles are
+    data, shipped as WCL and extensible from a directory in your config.
+    [Guest OS profiles](guide_profiles) explains when to write one; this
+    chapter lists the fields, the shipped set and where user files go.
+  DOC
+
+  h2 "Where profiles live"
+  p <<DOC
+    The shipped profiles are compiled into the binary. User profiles are
+    `*.wcl` files in the `profiles` directory of vmlab's XDG config
+    directory, `~/.config/vmlab/profiles/` by default; see
+    [Files and directories](ref_paths). Every file there is loaded in sorted
+    filename order after the shipped set, and a `profile` whose name matches
+    a shipped one replaces it entirely rather than merging with it. A file
+    must start with `import <vmlab-profile.wcl>`; one without the import is
+    rejected, and so is any file with an unknown field, a bad keyword or a
+    wrong type, with the line named.
+  DOC
+  code wcl { filename = "~/.config/vmlab/profiles/mine.wcl" source = <<'SRC'
+import <vmlab-profile.wcl>
+
+profile "freebsd" {
+  description = "FreeBSD 14: q35, SeaBIOS, virtio disk and NIC"
+  machine     = "q35"
+  firmware    = "seabios"
+  disk_bus    = "virtio"
+  nic_model   = "virtio-net-pci"
+  display     = "std"
+  cpus        = 2
+  memory      = 2GiB
+}
+SRC
+  }
+
+  h2 "profile {}"
+  p <<DOC
+    One profile. Every field is optional. A field left unset means the
+    QEMU default applies for that device, which is what the shipped `custom`
+    profile relies on.
+  DOC
+  code wcl { source = <<'SRC'
+profile "<name>" {
+  description     = "…"
+  machine         = "q35"
+  firmware        = "ovmf"
+  secure_boot     = false
+  tpm             = false
+  disk_bus        = "virtio"
+  nic_model       = "virtio-net-pci"
+  display         = "virtio-vga"
+  cpus            = 2
+  memory          = 4GiB
+  agent_channel   = true
+  input_transport = "qmp"
+  virtiofs        = false
+  workspace_guest = "/src"
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "utf8 (label)" | "required" | "Profile name, what a `vm`, `container` or `template` names in `profile =`; the inline block label." |
+      | "`description`" | "utf8" | "none" | "Human-readable summary. Parsed and kept; no verb surfaces it yet." |
+      | "`machine`" | "utf8" | "QEMU default" | "Machine type: `q35`, or `pc` for i440fx." |
+      | "`firmware`" | "utf8" | "QEMU default" | "Firmware: `ovmf` or `seabios`." |
+      | "`secure_boot`" | "bool" | "unset" | "Enable secure boot; OVMF only." |
+      | "`tpm`" | "bool" | "unset" | "Attach a swtpm 2.0 device." |
+      | "`disk_bus`" | "utf8" | "QEMU default" | "Primary disk bus: `virtio`, `ide` or `sata`." |
+      | "`nic_model`" | "utf8" | "QEMU default" | "NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`." |
+      | "`display`" | "utf8" | "QEMU default" | "Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`." |
+      | "`cpus`" | "i64" | "unset" | "Default vCPU count, at least 1." |
+      | "`memory`" | "ByteSize" | "unset" | "Default RAM, for example `4GiB`." |
+      | "`agent_channel`" | "bool" | "`true`" | "Attach the virtio-serial guest agent channel." |
+      | "`input_transport`" | "utf8" | "`qmp`" | "How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path." |
+      | "`virtiofs`" | "bool" | "`false`" | "The guest mounts virtiofs natively, so `transport = \"auto\"` shares use it instead of SMB." |
+      | "`workspace_guest`" | "utf8" | "unset" | "Guest path an `@dev` workspace lands at when the decorator names none." |
+  }
+  p <<DOC
+    The parser enforces the keyword sets above for `machine`, `firmware`,
+    `disk_bus` and `input_transport`, `cpus` at least 1, and a non-negative
+    `memory`. `nic_model` and `display` are passed to QEMU as written. A
+    profile that sets no `workspace_guest` still hosts a dev machine; the
+    floor of `/src` applies. On a non-x86 `virt` machine a `virtio-vga`
+    display is downgraded to `virtio-gpu-pci`, which has no legacy VGA.
+  DOC
+  p <<DOC
+    The profile a machine resolves against is the one it names, else the one
+    its template recorded, else the default. Validation reports an unknown
+    profile name on the block that names it. A `login {}` block's family
+    rules read the resolved profile's name: `windows*` is Windows, `linux*`
+    is Linux, and any other name is unknown and gets neither rule.
+  DOC
+
+  h2 "Shipped profiles"
+  p <<DOC
+    The shipped set, with the values each one carries. A blank cell means
+    the field is unset. Every Windows profile lands an `@dev` workspace at
+    `C:\\src` and every Linux one at `/src`.
+  DOC
+  table {
+    rows:
+      | "Profile" | "Machine" | "Firmware" | "Secure boot" | "TPM" | "Disk bus" | "NIC model" | "Display" | "CPUs" | "Memory" | "Other" |
+      | "`windows-11`" | "q35" | "ovmf" | "true" | "true" | "virtio" | "virtio-net-pci" | "virtio-vga" | "4" | "8GiB" | "" |
+      | "`windows-10`" | "q35" | "ovmf" | "false" | "false" | "virtio" | "virtio-net-pci" | "virtio-vga" | "4" | "8GiB" | "" |
+      | "`windows-server`" | "q35" | "ovmf" | "false" | "true" | "virtio" | "virtio-net-pci" | "virtio-vga" | "4" | "8GiB" | "" |
+      | "`windows-legacy`" | "pc" | "seabios" | "false" | "false" | "ide" | "e1000" | "std" | "2" | "2GiB" | "XP, 7 and 2008-era guests with no virtio drivers." |
+      | "`windows-9x`" | "pc" | "seabios" | "false" | "false" | "ide" | "pcnet" | "cirrus-vga" | "1" | "256MiB" | "`input_transport = \"vnc\"`. DOS, Windows 3.x to ME and 2000-era guests." |
+      | "`linux-modern`" | "q35" | "ovmf" | "false" | "false" | "virtio" | "virtio-net-pci" | "virtio-vga" | "2" | "4GiB" | "`virtiofs = true`." |
+      | "`linux-generic`" | "q35" | "seabios" | "false" | "false" | "virtio" | "virtio-net-pci" | "std" | "2" | "2GiB" | "Older or unusual distros." |
+      | "`container`" | "" | "" | "" | "" | "" | "" | "" | "1" | "256MiB" | "Micro-VM size for an OCI container; nothing else applies to a container." |
+      | "`custom`" | "" | "" | "" | "" | "" | "" | "" | "" | "" | "Nothing assumed; supply everything on the VM or template and in `qemu_args`." |
+  }
+  p <<DOC
+    The `container` profile carries only a size because a container micro-VM
+    boots the guest asset directly and has no firmware, disk bus, display or
+    NIC model to choose. Its floor is an order of magnitude below a VM's on
+    purpose: the micro-VM runs one process, not an operating system. Raise it
+    per container with `cpus` and `memory`, or drop your own `container`
+    profile into the user directory to change the default for every lab.
+  DOC
+  callout "Overriding replaces, it does not merge" { kind = :warning body = <<DOC
+    A user profile named `windows-11` replaces the shipped one completely. A
+    file holding only `profile "windows-11" { machine = "pc" }` leaves that
+    profile with no firmware, disk bus or memory. Copy the full shipped block
+    and change the fields you need.
+  DOC
+  }
+  code wcl {
+    filename    = "src/profiles/shipped.wcl"
+    source_file = "../../src/profiles/shipped.wcl"
+  }
+}

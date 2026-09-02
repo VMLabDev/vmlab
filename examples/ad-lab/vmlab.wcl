@@ -7,12 +7,14 @@ import <vmlab.wcl>
 
 lab "ad-lab" {
 
+  // ANCHOR: segment-corp
   segment "corp" {
     subnet = "10.50.0.0/24"
     // Hand out the DC as DNS instead of the daemon (AD owns DNS).
     dns { server = "10.50.0.10" }
     route { dest = "10.60.0.0/24" via = "10.50.0.254" }
   }
+  // ANCHOR_END: segment-corp
 
   segment "dmz" { }
 
@@ -38,6 +40,8 @@ lab "ad-lab" {
     nic { nat = true }
   }
 
+  // ANCHOR: handlers
   on "vm.crashed"    { run = "scripts/collect-dumps.ws" }
   on "host.disk_low" { run = "scripts/alert.ws" }
+  // ANCHOR_END: handlers
 }

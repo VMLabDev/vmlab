@@ -1,0 +1,193 @@
+// The vmlab manual.
+//
+//   wcl wdoc serve docs/manual/main.wcl --addr auto
+//   wcl wdoc build docs/manual/main.wcl --out docs/_site/manual
+//
+// One `page` per chapter under pages/<part>/. The `toc` below is the reading
+// order and the only ordering. `source_file` paths in every chapter resolve
+// against this file, so a listing quotes `../../examples/...` and `../../src/...`.
+import <wdoc.wcl>
+
+// Front matter.
+import "./pages/intro.wcl"
+
+// Part I — Getting started.
+import "./pages/getting-started/install.wcl"
+import "./pages/getting-started/first-lab.wcl"
+import "./pages/getting-started/first-vm.wcl"
+import "./pages/getting-started/first-template.wcl"
+import "./pages/getting-started/first-provision.wcl"
+import "./pages/getting-started/dev-attach.wcl"
+
+// Part II — The guide.
+import "./pages/guide/architecture.wcl"
+import "./pages/guide/lab-file.wcl"
+import "./pages/guide/templates.wcl"
+import "./pages/guide/registries.wcl"
+import "./pages/guide/networking.wcl"
+import "./pages/guide/containers.wcl"
+import "./pages/guide/shares.wcl"
+import "./pages/guide/snapshots.wcl"
+import "./pages/guide/scripting.wcl"
+import "./pages/guide/vision.wcl"
+import "./pages/guide/playbooks.wcl"
+import "./pages/guide/logins.wcl"
+import "./pages/guide/dev.wcl"
+import "./pages/guide/profiles.wcl"
+import "./pages/guide/host.wcl"
+import "./pages/guide/events.wcl"
+
+// Part III — Reference. Every h2 in these chapters is one symbol of the
+// product surface; topical reference (events, paths, the protocol) lives in
+// the appendices for that reason.
+import "./pages/reference/lab-file-lab.wcl"
+import "./pages/reference/lab-file-vm.wcl"
+import "./pages/reference/lab-file-container.wcl"
+import "./pages/reference/lab-file-template.wcl"
+import "./pages/reference/host-config.wcl"
+import "./pages/reference/profiles.wcl"
+import "./pages/reference/wscript-lab.wcl"
+import "./pages/reference/wscript-machine.wcl"
+import "./pages/reference/wscript-types.wcl"
+
+// Part IV — Commands.
+import "./pages/commands/up.wcl"
+import "./pages/commands/down.wcl"
+import "./pages/commands/pull.wcl"
+import "./pages/commands/destroy.wcl"
+import "./pages/commands/status.wcl"
+import "./pages/commands/validate.wcl"
+import "./pages/commands/vm.wcl"
+import "./pages/commands/container.wcl"
+import "./pages/commands/machine.wcl"
+import "./pages/commands/clipboard.wcl"
+import "./pages/commands/dns.wcl"
+import "./pages/commands/lab.wcl"
+import "./pages/commands/snapshot.wcl"
+import "./pages/commands/playbook.wcl"
+import "./pages/commands/template.wcl"
+import "./pages/commands/console.wcl"
+import "./pages/commands/script.wcl"
+import "./pages/commands/exec.wcl"
+import "./pages/commands/shell.wcl"
+import "./pages/commands/ssh.wcl"
+import "./pages/commands/ssh-config.wcl"
+import "./pages/commands/dev.wcl"
+import "./pages/commands/cp.wcl"
+import "./pages/commands/tail.wcl"
+import "./pages/commands/eventlog.wcl"
+import "./pages/commands/osinfo.wcl"
+import "./pages/commands/logs.wcl"
+import "./pages/commands/fastpath.wcl"
+
+// Part V — Appendices.
+import "./pages/appendices/troubleshooting.wcl"
+import "./pages/appendices/glossary.wcl"
+import "./pages/appendices/examples.wcl"
+import "./pages/appendices/events.wcl"
+import "./pages/appendices/paths.wcl"
+import "./pages/appendices/protocol.wcl"
+
+// The house theme: the shipped palette, the standard's typography.
+theme house {
+  extends = :forge
+  metrics {
+    body_size   = "15px"
+    line_height = "1.55"
+    measure     = "58rem"
+    h1 = "1.95rem"  h2 = "1.45rem"  h3 = "1.15rem"
+    h4 = "1.05rem"  h5 = "0.95rem"  h6 = "0.85rem"
+  }
+}
+
+site manual {
+  default_template = :book
+  title            = "vmlab Manual"
+  theme            = :house
+  theme_toggle     = true
+  search           = true
+
+  toc {
+    chapter "Introduction" { page = intro }
+
+    chapter "Getting started" {
+      chapter "Install"                              { page = gs_install }
+      chapter "Your first lab"                       { page = gs_first_lab }
+      chapter "Your first VM"                        { page = gs_first_vm }
+      chapter "Build a template from an ISO"         { page = gs_first_template }
+      chapter "Automate a guest with a script"       { page = gs_first_provision }
+      chapter "Attach an editor to a dev machine"    { page = gs_dev_attach }
+    }
+
+    chapter "The guide" {
+      chapter "How vmlab runs a lab"                 { page = guide_architecture }
+      chapter "The lab file"                         { page = guide_lab_file }
+      chapter "Templates and the store"              { page = guide_templates }
+      chapter "Distributing templates over registries" { page = guide_registries }
+      chapter "Networking"                           { page = guide_networking }
+      chapter "Lab containers"                       { page = guide_containers }
+      chapter "Shared folders"                       { page = guide_shares }
+      chapter "Snapshots"                            { page = guide_snapshots }
+      chapter "Guest automation with wscript"        { page = guide_scripting }
+      chapter "Screens, input and vision"            { page = guide_vision }
+      chapter "Playbooks"                            { page = guide_playbooks }
+      chapter "Logins and the SSH facade"            { page = guide_logins }
+      chapter "Dev machines and the workspace syncer" { page = guide_dev }
+      chapter "Guest OS profiles"                    { page = guide_profiles }
+      chapter "Host configuration and WSL 2"         { page = guide_host }
+      chapter "Events and handlers"                  { page = guide_events }
+    }
+
+    chapter "Reference" {
+      chapter "Lab file: lab and segment"            { page = ref_lab }
+      chapter "Lab file: vm and its children"        { page = ref_vm }
+      chapter "Lab file: container and its children" { page = ref_container }
+      chapter "Lab file: template and source"        { page = ref_template }
+      chapter "Host configuration file"              { page = ref_host }
+      chapter "Guest OS profile files"               { page = ref_profiles }
+      chapter "wscript API: Lab and Segment"         { page = ref_ws_lab }
+      chapter "wscript API: Machine"                 { page = ref_ws_machine }
+      chapter "wscript API: Term, types and the vmlab module" { page = ref_ws_types }
+    }
+
+    chapter "Commands" {
+      chapter "vmlab up"         { page = cmd_up }
+      chapter "vmlab down"       { page = cmd_down }
+      chapter "vmlab pull"       { page = cmd_pull }
+      chapter "vmlab destroy"    { page = cmd_destroy }
+      chapter "vmlab status"     { page = cmd_status }
+      chapter "vmlab validate"   { page = cmd_validate }
+      chapter "vmlab vm"         { page = cmd_vm }
+      chapter "vmlab container"  { page = cmd_container }
+      chapter "vmlab machine"    { page = cmd_machine }
+      chapter "vmlab clipboard"  { page = cmd_clipboard }
+      chapter "vmlab dns"        { page = cmd_dns }
+      chapter "vmlab lab"        { page = cmd_lab }
+      chapter "vmlab snapshot"   { page = cmd_snapshot }
+      chapter "vmlab playbook"   { page = cmd_playbook }
+      chapter "vmlab template"   { page = cmd_template }
+      chapter "vmlab console"    { page = cmd_console }
+      chapter "vmlab script"     { page = cmd_script }
+      chapter "vmlab exec"       { page = cmd_exec }
+      chapter "vmlab shell"      { page = cmd_shell }
+      chapter "vmlab ssh"        { page = cmd_ssh }
+      chapter "vmlab ssh-config" { page = cmd_ssh_config }
+      chapter "vmlab dev"        { page = cmd_dev }
+      chapter "vmlab cp"         { page = cmd_cp }
+      chapter "vmlab tail"       { page = cmd_tail }
+      chapter "vmlab eventlog"   { page = cmd_eventlog }
+      chapter "vmlab osinfo"     { page = cmd_osinfo }
+      chapter "vmlab logs"       { page = cmd_logs }
+      chapter "vmlab fastpath"   { page = cmd_fastpath }
+    }
+
+    chapter "Appendices" {
+      chapter "Troubleshooting"  { page = apx_troubleshooting }
+      chapter "Glossary"         { page = apx_glossary }
+      chapter "Example labs"     { page = apx_examples }
+      chapter "Events"           { page = ref_events }
+      chapter "Files and directories" { page = ref_paths }
+      chapter "Wire protocol and error codes" { page = ref_protocol }
+    }
+  }
+}

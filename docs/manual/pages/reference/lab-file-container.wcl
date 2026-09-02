@@ -1,0 +1,200 @@
+page ref_container {
+  title = "Lab file: container and its children"
+  chapter_header "Lab file: container and its children" {
+    kicker       = "Reference · reference"
+    reading_time = "10 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    This chapter is the field-by-field reference for the `container {}`
+    block and the children only a container carries: `env`, `volume`, `port`
+    and `healthcheck`. A container also takes `login {}`, `nic {}`,
+    `provision {}` and `playbook {}`, which mean the same thing as on a VM and
+    are documented in [vm and its children](ref_vm). It may carry the `@dev`
+    decorator described there too. What a container is, and how it runs as a
+    micro-VM, is in [Lab containers](guide_containers).
+  DOC
+
+  h2 "container {}"
+  p <<DOC
+    An OCI container run inside a micro-VM. It attaches to segments exactly
+    like a VM, registers in DNS as `<name>.<lab>.<suffix>`, and joins the
+    same `depends_on` waves. A container with no NICs is air-gapped but
+    still reachable with `exec` and `cp` over the agent channel.
+  DOC
+  code wcl { source = <<'SRC'
+container "<name>" {
+  image      = "nginx:1.27"
+  mode       = :workload
+  entrypoint = ["/bin/sh", "-c"]
+  command    = ["…"]
+  workdir    = "/app"
+  user       = "1000:1000"
+  profile    = "container"
+  cpus       = 1
+  memory     = 256MiB
+  depends_on = ["db"]
+  nic         { … }
+  env         { … }
+  volume      { … }
+  port        { … }
+  healthcheck { … }
+  login "…"   { … }
+  provision "…" { … }
+  playbook "…"  { … }
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "utf8 (label)" | "required" | "Container name, a DNS label, unique per lab. VMs and containers share one namespace; the inline block label." |
+      | "`image`" | "utf8" | "required" | "OCI image reference, for example `nginx:1.27` or `ghcr.io/owner/app@sha256:…`." |
+      | "`mode`" | "symbol" | "`:workload`" | "`:workload` starts the OCI process; `:idle` keeps the micro-VM available for exec without running it." |
+      | "`entrypoint`" | "list<utf8>" | "image default" | "Override the image entrypoint, in exec form." |
+      | "`command`" | "list<utf8>" | "image default" | "Override the image cmd, in exec form." |
+      | "`workdir`" | "utf8" | "image default" | "Working directory inside the container." |
+      | "`user`" | "utf8" | "image default" | "User to run as: `uid[:gid]` or a name from the image." |
+      | "`profile`" | "utf8" | "none" | "Guest profile supplying micro-VM hardware defaults, for example `container`." |
+      | "`cpus`" | "i64" | "from profile" | "vCPU count for the micro-VM, greater than 0. One of this field or the profile must supply it." |
+      | "`memory`" | "ByteSize" | "from profile" | "RAM for the micro-VM, for example `512MiB`. One of this field or the profile must supply it." |
+      | "`depends_on`" | "list<utf8>" | "none" | "VM or container names to wait for before this one. No cycles." |
+      | "`nic {}`" | "children" | "none" | "Network interfaces. None means air-gapped; exec and copy still work via the agent." |
+      | "`env {}`" | "children" | "none" | "Environment variables passed to the container process." |
+      | "`volume {}`" | "children" | "none" | "Host binds and named volumes mounted into the container." |
+      | "`port {}`" | "children" | "none" | "Host-to-container port forwards; sugar for a segment `forward` to this container." |
+      | "`healthcheck {}`" | "child" | "none" | "Health probe gating readiness. Without one the container is ready once its process starts." |
+      | "`login {}`" | "children" | "none" | "Identities a surface attaches to this container as. Without one it falls to the user cinit resolves." |
+      | "`provision {}`" | "children" | "none" | "wscript scripts run on `vmlab up` once this container is ready, interleaved with its playbooks in declaration order." |
+      | "`playbook {}`" | "children" | "none" | "config-weave playbooks applied on `vmlab up`, interleaved with its provisions in declaration order." |
+  }
+  p <<DOC
+    The image reference is parsed like a registry template reference: a
+    first path segment with a dot, a colon or `localhost` is a registry host,
+    and Docker Hub shorthand normalises to `registry-1.docker.io`. A digest
+    must be `@sha256:` followed by 64 hex characters. The digest resolved at
+    first pull is pinned in lab state and never re-pulled implicitly.
+  DOC
+  p "Validation enforces these rules:"
+  list {
+    li "The name is a DNS label and no VM or container in the lab has it."
+    li "`image` is non-empty, has no whitespace, and any digest is well formed."
+    li "`profile`, if set, names a known profile. `cpus` and `memory` both resolve through the container block, then the profile; a container that neither declares a size nor names a profile supplying one is an error rather than a guess."
+    li "An `:idle` container cannot declare `entrypoint`, `command` or a `healthcheck`."
+    li "A container with `port {}` blocks needs at least one NIC; forwards need a segment to reach it over."
+    li "A container with `volume {}` blocks needs at least one NIC; volumes mount over the network from the segment gateway."
+    li "Every name in `depends_on` exists, with no cycle across VMs and containers."
+    li "`login {}` blocks are judged against the Linux family regardless of the profile named: `elevated` is rejected and `password` is optional."
+  }
+  code wcl {
+    filename    = "examples/mixed-lab/vmlab.wcl"
+    source_file = "../../examples/mixed-lab/vmlab.wcl"
+    anchor      = "container-web"
+    dedent      = true
+  }
+  p "A dev container uses `:idle` mode, since it has no service to be, and a `login` for the account an editor attaches as."
+  code wcl {
+    filename    = "examples/dev-neovim-container/vmlab.wcl"
+    source_file = "../../examples/dev-neovim-container/vmlab.wcl"
+    anchor      = "dev01"
+    dedent      = true
+  }
+
+  h2 "env {}"
+  p "One environment variable passed to the container process."
+  code wcl { source = <<'SRC'
+env { name = "NGINX_PORT" value = "8080" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "utf8" | "required" | "Variable name." |
+      | "`value`" | "utf8" | "required" | "Variable value." |
+  }
+  p "A name that is empty or contains `=` is rejected."
+
+  h2 "volume {}"
+  p <<DOC
+    A mount into the container: a host directory bound by path, or a named
+    volume kept under the lab directory. Exactly one of `host` and `name` is
+    set.
+  DOC
+  code wcl { source = <<'SRC'
+volume { host = "./site" target = "/usr/share/nginx/html" read_only = true }
+volume { name = "pgdata" target = "/var/lib/postgresql/data" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`host`" | "utf8" | "none" | "Host path to bind-mount, relative to the lab root. One of `host` or `name` is required." |
+      | "`name`" | "utf8" | "none" | "Named volume kept under the lab dir, shared by name, retained until lab destroy. One of `host` or `name`." |
+      | "`target`" | "utf8" | "required" | "Absolute mount path inside the container." |
+      | "`read_only`" | "bool" | "`false`" | "Mount read-only." |
+  }
+  p <<DOC
+    Validation rejects a volume with both `host` and `name`, or neither. A
+    `host` path must be a directory under the lab root. A `name` becomes a
+    directory name, so it cannot be empty, `.`, `..`, or contain a slash.
+    `target` must start with `/`. Named volumes are lab-scoped: they survive
+    `down` and a per-container destroy, and only lab `destroy` removes them.
+    Volume contents are outside snapshot scope.
+  DOC
+
+  h2 "port {}"
+  p <<DOC
+    A host-to-container port forward. It compiles into the same forward
+    machinery as a segment `forward {}` and is installed against the
+    container's lease when it becomes ready.
+  DOC
+  code wcl { source = <<'SRC'
+port { host = 18081 container = 80 proto = "tcp" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`host`" | "i64" | "required" | "Host port to listen on, 1 to 65535. Unique across the lab." |
+      | "`container`" | "i64" | "required" | "Container port to forward to, 1 to 65535." |
+      | "`proto`" | "utf8" | "`tcp`" | "Protocol: `tcp`, `udp` or `both`." |
+  }
+  p <<DOC
+    The host port must be unused by every other `port {}` and every segment
+    `forward {}` in the lab, and the container needs a NIC.
+  DOC
+
+  h2 "healthcheck {}"
+  p <<DOC
+    A probe run inside the container. Readiness is two-stage: the process
+    starts, then the first probe passes. Only then does the container count as
+    ready for `depends_on` waves. Consecutive failures past `retries` fire
+    `container.unhealthy`.
+  DOC
+  code wcl { source = <<'SRC'
+healthcheck {
+  command      = ["curl", "-fsS", "http://localhost/"]
+  interval     = 10s
+  timeout      = 5s
+  retries      = 3
+  start_period = 10s
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`command`" | "list<utf8>" | "required" | "Probe command run inside the container, in exec form. Exit 0 means healthy." |
+      | "`interval`" | "Duration" | "`10s`" | "Time between probes." |
+      | "`timeout`" | "Duration" | "`5s`" | "Per-probe timeout." |
+      | "`retries`" | "i64" | "`3`" | "Consecutive failures before unhealthy." |
+      | "`start_period`" | "Duration" | "`10s`" | "Grace period after start before failures count." |
+  }
+  p <<DOC
+    Validation requires a non-empty `command`, `interval` and `timeout`
+    greater than zero, `retries` at least 1, and a non-negative
+    `start_period`. An `:idle` container cannot declare one.
+  DOC
+}

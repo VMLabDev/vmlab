@@ -1,0 +1,15 @@
+# Skill configuration. Each skill owns one top-level key.
+technical-book:
+  path: docs/manual
+  topology: in-product
+  # Tutorial commands are written by hand; nothing runs them in CI.
+  tutorial_assurance: advisory
+  # One JSON object per line: every `vmlab` verb, every lab-file / host /
+  # profile block, and every wscript host method. Needs `cargo build` first.
+  extractor: python3 scripts/manual-surface.py
+  # vmlab is pre-1.0 and keeps no per-symbol version history, so a reference
+  # entry carries no "since".
+  reference_entries:
+    symbol:
+      since:
+        severity: "off"

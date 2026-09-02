@@ -1,0 +1,183 @@
+page cmd_machine {
+  title = "vmlab machine"
+  chapter_header "vmlab machine" {
+    kicker       = "Commands · reference"
+    reading_time = "6 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab machine` asks a machine, VM or [container](guide_containers), what
+    it can do and how it is doing, and holds the one verb that changes a
+    running machine's [guest agent](guide_architecture) in place. Both kinds
+    answer the same commands.
+  DOC
+
+  code sh { source = "vmlab machine <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`capabilities`" | "What a machine can do beyond the universal commands, probed live: a display, a console log, in-place reboot, a healthcheck, and whichever features its agent negotiated." |
+      | "`stats`" | "Latest guest metrics: CPU, memory and mounted filesystems." |
+      | "`repair-agent`" | "Push the agent this vmlab ships into a running machine, and mark that machine diverged." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Every subcommand takes a machine reference of the form `[lab/]machine`.
+    A bare name is resolved against the lab in the current directory, and the
+    lab daemon is started if none is running. The qualified form addresses a
+    lab that is already running from any directory and never starts one.
+    Each subcommand renders a report for a person by default and prints the
+    daemon's payload as pretty JSON under `--json`.
+  DOC
+
+  h2 "vmlab machine capabilities"
+
+  code sh { source = "vmlab machine capabilities [OPTIONS] <MACHINE>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "The machine, as `[lab/]name`." |
+      | "`--json`" | "Emit the raw JSON instead of a report." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Reports what this machine can serve, probed live rather than inferred
+    from its kind, one line per capability:
+  DOC
+
+  table {
+    rows:
+      | "Line" | "Meaning" |
+      | "`kind`" | "`vm` or `container`." |
+      | "`display`" | "`yes` when the machine has a framebuffer, so the display subcommands of [vmlab vm](cmd_vm) and the console work." |
+      | "`console log`" | "`yes` when a console log is readable from the host, as `vmlab container logs` reads it." |
+      | "`reboot`" | "`yes` when the guest can reboot in place and come back." |
+      | "`healthcheck`" | "`yes` when the machine declares a healthcheck, so its status carries a verdict." |
+      | "`attachable`" | "`yes` when the agent negotiated both `tunnel` and `fileops`, the two features an attach over the SSH facade needs." |
+      | "`agent`" | "The features the agent negotiated at handshake, comma-separated, or `-` when no agent is answering." |
+  }
+
+  p <<DOC
+    Agent features come from a live handshake, so a machine that is up but
+    not yet answering reports `-`, which reads differently from a feature
+    list that lacks something. The possible features are `terminal`, `exec`,
+    `fileops`, `tail`, `metrics`, `clipboard`, `eventlog`, `tunnel` and
+    `watch`. `attachable` says whether this agent can serve an attach at all,
+    never whether your attach will succeed: identity is declared separately.
+    See [Logins and the SSH facade](guide_logins) for the failure ladder built
+    on this flag.
+  DOC
+
+  h2 "vmlab machine stats"
+
+  code sh { source = "vmlab machine stats [OPTIONS] <MACHINE>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "The machine, as `[lab/]name`." |
+      | "`--json`" | "Emit the raw JSON instead of a report." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Prints the guest's latest metrics: a `cpu` line as a percentage, a
+    `memory` line as `used / total (pct%)`, and one `disk <mount>` line per
+    mounted filesystem in the same form. Sizes are rendered in binary units;
+    a filesystem whose total the guest has not reported shows only the used
+    figure. The agent is given 10 seconds to answer.
+  DOC
+
+  p <<DOC
+    Reading is not free of side effects. It subscribes the daemon's sampler,
+    so a machine nothing had asked about starts being sampled every two
+    seconds from the first read. The JSON form carries `cpu_pct`, `mem_used`,
+    `mem_total` and a `disks` array of `mount`, `used` and `total`, all in
+    bytes.
+  DOC
+
+  h2 "vmlab machine repair-agent"
+
+  code sh { source = "vmlab machine repair-agent [OPTIONS] <MACHINE>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "The machine, as `[lab/]name`." |
+      | "`--json`" | "Emit the raw JSON instead of a report." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Pushes the agent binary this `vmlab` ships into a running machine over
+    the machine's own agent channel, restarts the agent, and records the
+    machine as **diverged**. The agent normally enters a machine once, when
+    its [template](guide_templates) is built, and the template's sealed
+    `agent_version` describes every clone of it. After a repair that is no
+    longer true for this clone, so [vmlab status](cmd_status) shows
+    `diverged=yes` under `-v` until the disks are destroyed. Nothing runs
+    this by itself; it is a tool, not a policy. Rebuilding the template is
+    the other remedy and the one that keeps "same template, same machine"
+    true.
+  DOC
+
+  p <<DOC
+    The report says what landed and what the machine now is: `pushed <version>
+    to <path> on "<machine>"`, then `agent <version> answering, attachable
+    yes|no`, then `"<machine>" is now diverged from its template — vmlab vm
+    destroy + vmlab up puts it back on the sealed agent`. The JSON form
+    carries `machine`, `pushed`, `installed_at`, `agent_version`, `features`
+    and `attachable`.
+  DOC
+
+  p <<DOC
+    The machine must be running with its agent answering, and that agent
+    must serve `fileops`, because the binary rides the agent's own file
+    vocabulary. An agent too old to serve it cannot be replaced this way at
+    all; the verb refuses and names the rebuild as the only remedy.
+  DOC
+
+  callout "Meaningless on a container" {
+    kind = :error
+    body = "A lab container's agent lives in the initramfs guest asset this host installed, not in anything the container boots, so it already tracks the vmlab you are running and cannot go stale. The verb refuses and says so instead of pushing anything. Refreshing it means reinstalling the guest asset."
+  }
+
+  h2 "Examples"
+
+  p "Check why an editor cannot attach to a dev machine:"
+  code sh { source = "vmlab machine capabilities dev01" }
+
+  code sh { source = <<'SRC'
+kind         vm
+display      yes
+console log  yes
+reboot       yes
+healthcheck  no
+attachable   no
+agent        terminal, exec, tail, metrics, clipboard
+SRC
+  }
+
+  p "Watch memory on a build box:"
+  code sh { source = "watch -n 2 vmlab machine stats buildbox" }
+
+  p "Bring a stale agent up to date without rebuilding the template:"
+  code sh { source = "vmlab machine repair-agent dev01" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 on success. Exit 4 (`not_found`) means the lab declares
+    no machine by that name. A machine that is not running, an agent that
+    does not answer or lacks the `metrics` feature, a push that fails, and a
+    repair attempted on a container all exit 1 (`failed`). Exit 5
+    (`conflict`) means the supervisor tracks a lab with this name from
+    another directory. A usage error exits 2.
+  DOC
+}

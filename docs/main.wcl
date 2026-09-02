@@ -1,42 +1,40 @@
 // vmlab's website, authored in wdoc and rendered by the `wcl` CLI.
 //
-//   wcl wdoc serve docs/main.wcl                 # / = landing, /wskills/vmlab/ = reference book
+//   wcl wdoc serve docs/main.wcl                       # / = landing
 //   wcl wdoc build docs/main.wcl --out docs/_site
-//     → docs/_site/index.html          vmlab landing (website template)
-//       docs/_site/wskills/vmlab/…     vmlab reference (the vmlab wskill's book)
-//       docs/_site/decks/vmlab/…       the overview deck
-//       docs/_site/training/vmlab/…    the hands-on training course
+//     → docs/_site/index.html                          vmlab landing (website template)
+//   wcl wdoc build docs/manual/main.wcl --out docs/_site/manual
+//     → docs/_site/manual/…                            the vmlab manual (book template)
+//
+// The landing and the manual are two documents, built into one tree by two
+// invocations (`just docs-build` runs both). They are not one document on
+// purpose: a multi-site document requires every page to name its `sites`,
+// so folding the manual in here would make every chapter carry
+// `sites = [:manual]` and stop the manual building on its own. Instead the
+// manual keeps its own entry, and every link to it from the landing is the
+// hand-written `./manual/` — the mount point, which a build tree never knows.
 //
 // The single `import <wdoc.wcl>` pulls in the embedded wdoc standard library, so
 // every stdlib block (page / h1..h6 / p / code / callout / table / column / …) is
 // in scope here and in every imported page.
 import <wdoc.wcl>
 
-// The reference content lives in a wskill — a self-contained WCL model under
-// docs/wskills/, projected into a book, a Claude Code skill, an overview deck,
-// and a training course. `include` builds every member's view under its output
-// prefix; the landing page lists them via `included_sites(...)`. Members that
-// lack an optional view (its entry file doesn't exist) are skipped silently.
-include "wskills" { entry = "wdoc/book/main.wcl" }
-include "wskills" { entry = "wdoc/presentation/main.wcl"  prefix = "decks" }
-include "wskills" { entry = "wdoc/training/main.wcl"      prefix = "training" }
-
 // The vmlab landing: the `website` template (sticky header + banner/footer
-// regions + theme toggle), its content authored from the landing components in
-// pages/vmlab/landing-parts.wcl. `root = true` serves it at `/`; the reference
-// book renders under `/wskills/vmlab/`.
+// slots + theme toggle), its content authored from the landing components in
+// pages/vmlab/landing-parts.wcl. One document, one site, so it renders at
+// the output root without `root`.
 site vmlab {
   default_template = :website
   title            = "vmlab"
-  root             = true
   theme            = :nord
   accent           = :cyan
   theme_toggle     = true
   // Flat anchor menu (the single landing page carries every section);
   // dropdown menus are a `webpage`-template feature, so keep it flat.
+  // `Reference` leaves the document, so it is a plain relative href.
   menu {
     item "Features"        { href = "#features" }
-    item "Reference"       { href = "./wskills/vmlab/" }
+    item "Reference"       { href = "./manual/" }
     item "Getting started" { href = "#start" }
     item "Source"          { href = "https://github.com/VMLabDev/vmlab" }
   }

@@ -1,0 +1,123 @@
+// Front matter: what vmlab is, who it is for, and how this manual is laid out.
+page intro {
+  title = "Introduction"
+  chapter_header "Introduction" {
+    kicker       = "Introduction · explanation"
+    reading_time = "6 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    vmlab is a single-host lab orchestrator for QEMU/KVM. You declare a **lab**
+    in one file, `vmlab.wcl`, and vmlab brings it up as a unit: the virtual
+    machines, the containers, the networks between them, and the scripts that
+    configure the guests once they boot. There is no libvirt in the path. vmlab
+    drives QEMU directly over QMP and talks to each guest over its own agent.
+  DOC
+
+  h2 "What a lab is made of"
+
+  p <<DOC
+    A lab is a named group of machines and segments, defined in
+    [WCL](guide_lab_file), a typed configuration language. vmlab validates the
+    whole file against a schema before it starts anything, so a mistyped field
+    or a NIC on a segment that does not exist is reported before a single
+    QEMU process runs.
+  DOC
+
+  list {
+    li "A **segment** is a virtual L2 network with its own DHCP, DNS, NAT and port forwards. See [Networking](guide_networking)."
+    li "A **VM** is a linked clone of a **template**, a sealed base disk you build once from installer media or pull from a registry. See [Templates and the store](guide_templates) and [Distributing templates over registries](guide_registries)."
+    li "A **container** is an OCI image run inside its own micro-VM, so it sits on the same segments and has the same snapshots and agent channel as a VM. See [Lab containers](guide_containers)."
+    li "**Provision scripts** and **playbooks** configure a guest after it boots. Provisions are wscript, an imperative language with a typed guest API. Playbooks are config-weave plays with a drift check. See [Guest automation with wscript](guide_scripting) and [Playbooks](guide_playbooks)."
+    li "**Snapshots**, both online and offline, are taken per machine or lab-wide. See [Snapshots](guide_snapshots)."
+    li "A **dev machine** is any VM or container marked `@dev`. vmlab publishes it as an SSH endpoint your editor attaches into and keeps a workspace on it in step with a directory on the host. See [Dev machines and the workspace syncer](guide_dev)."
+  }
+
+  p <<DOC
+    Every guest is reached through exactly two doors. QMP carries power state,
+    devices and the screen. The **agent**, `vmlab-agent`, runs inside the guest
+    on a virtio-serial port and carries command execution, file transfer,
+    interactive terminals, log tailing and readiness. The agent never touches
+    the guest's network, so an air-gapped machine is as scriptable as one with
+    internet egress. A guest that cannot run the agent is still driven through
+    the screen with keystrokes, image matching and OCR. See
+    [Screens, input and vision](guide_vision).
+  DOC
+
+  p <<DOC
+    The **SSH facade** is how editors reach a machine. vmlab terminates SSH on
+    the host and serves each channel through the agent, so no guest runs an
+    sshd and no guest network is involved. Which account you land on is a
+    `login {}` the lab file declares. See [Logins and the SSH facade](guide_logins).
+  DOC
+
+  h2 "Who this manual is for"
+
+  p <<DOC
+    You build and run virtual machines on a Linux workstation and want the
+    whole environment written down in a file you can commit, share and rebuild.
+    Typical readers are engineers standing up a Windows domain to test against,
+    a cluster of Linux hosts to rehearse a deployment on, a disposable
+    development box an editor attaches into, or a security lab that must stay
+    off the network.
+  DOC
+
+  p <<DOC
+    The manual assumes you are comfortable in a shell and have used a
+    hypervisor before. It does not assume you know WCL or wscript. The tutorials
+    introduce each as it is needed, and the reference chapters define every
+    field and function.
+  DOC
+
+  h2 "How this manual is organised"
+
+  p "The manual has five parts. Read them in order the first time, then use the reference and command chapters as a lookup."
+
+  list {
+    style = :numbered
+    li "**[Getting started](gs_install)** is a sequence of tutorials. You install vmlab, bring up a lab with one container, run a VM from a registry template, build a template from an ISO, write a provision script, and attach an editor to a dev machine. Each tutorial ends with a working lab on your host."
+    li "**[The guide](guide_architecture)** explains how vmlab works and why: the two daemons, the lab file, templates, networking, containers, shared folders, snapshots, scripting, vision, playbooks, logins, dev machines, profiles, host configuration and events."
+    li "**[Reference](ref_lab)** defines every block and field of the lab file, the host configuration file, the guest OS profiles, every function of the wscript API, the events, the files vmlab writes, and the wire protocol with its error codes."
+    li "**[Commands](cmd_up)** documents each `vmlab` verb with its synopsis, options and exit status, one chapter per top-level verb."
+    li "**[Appendices](apx_troubleshooting)** hold the troubleshooting guide, the glossary, and a tour of the example labs shipped with the source."
+  }
+
+  h2 "Platform requirements at a glance"
+
+  p <<DOC
+    vmlab runs on Linux, or on Windows inside WSL 2. It needs `/dev/kvm` for
+    native acceleration. Guests may be x86_64, aarch64 or riscv64. A guest whose
+    architecture matches the host runs under KVM. Any other architecture is
+    emulated, which works but is slow. [Install](gs_install) lists the exact
+    packages. [Host configuration and WSL 2](guide_host) covers the WSL 2
+    setup, where nested virtualisation must be switched on for `/dev/kvm` to
+    appear.
+  DOC
+
+  table {
+    rows:
+      | "Tool" | "What vmlab uses it for" |
+      | "`qemu-system-<arch>`, `qemu-img`" | "Running guests and managing qcow2 disks" |
+      | "OVMF, AAVMF, SeaBIOS" | "Guest firmware, per architecture" |
+      | "`swtpm`" | "A TPM 2.0 device for guests that want one" |
+      | "`passt`" | "Part of the userspace network fabric" |
+      | "`xorriso`, `mtools`, `mkfs.vfat`" | "Building ISO and floppy images from folders" |
+      | "`smbd` from Samba, `virtiofsd`" | "Shared folders" |
+      | "`sqfstar` from squashfs-tools" | "Flattening container images for micro-VMs" |
+      | "`tesseract`" | "OCR of the guest screen" |
+      | "A VNC viewer" | "`vmlab console` and `gui = true`" |
+  }
+
+  p <<DOC
+    The network fabric is entirely userspace. vmlab creates no tap devices, no
+    bridges and needs no capabilities, which is what makes it work unchanged
+    under WSL 2.
+  DOC
+
+  callout "Pre-release software" {
+    kind = :info
+    body = "vmlab ships pre-releases only. The installer needs the `--pre` flag, and the version string this manual is written against is the one in the header of every chapter."
+  }
+}

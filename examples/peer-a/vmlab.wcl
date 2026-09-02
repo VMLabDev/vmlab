@@ -21,11 +21,13 @@ import <vmlab.wcl>
 
 lab "peer-a" {
 
+  // ANCHOR: segment-wan
   segment "wan" {
     subnet = "10.99.0.0/24"
     global = true
     connect { host = "127.0.0.1:13948" }   // side B's trunk_port
   }
+  // ANCHOR_END: segment-wan
 
   vm "a1" {
     template = "ghcr.io/vmlabdev/vmlab-templates/alpine-3.23"

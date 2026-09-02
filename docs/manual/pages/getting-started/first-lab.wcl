@@ -1,0 +1,252 @@
+// Getting started: one container on one NAT segment, and the lifecycle verbs.
+page gs_first_lab {
+  title = "Your first lab"
+  chapter_header "Your first lab" {
+    kicker       = "Getting started · tutorial"
+    reading_time = "8 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    In this tutorial you write a lab file with one segment and one container
+    running nginx, bring it up, reach it from the host through a port forward,
+    run a command inside it, and take it down again. Along the way you meet
+    every lifecycle verb: `validate`, `up`, `status`, `down` and `destroy`.
+  DOC
+
+  p <<DOC
+    A [container](guide_containers) is the quickest machine to start with
+    because there is nothing to build. vmlab pulls the image like a docker
+    client would and runs it inside a small micro-VM with vmlab's own init.
+  DOC
+
+  h2 "Before you start"
+
+  list {
+    li "vmlab is installed and `vmlab --version` works. See [Install](gs_install)."
+    li "The micro-VM guest asset for x86_64 is in place under `~/.local/share/vmlab/guest/x86_64/`. Containers boot from it."
+    li "`sqfstar` from `squashfs-tools` is on your `PATH`. vmlab flattens the pulled image with it."
+    li "Internet access from the host, to pull the `nginx:1.27` image from Docker Hub."
+    li "Host port 18081 is free."
+  }
+
+  h2 "Write the lab file"
+
+  p <<DOC
+    Create an empty directory and put a file named `vmlab.wcl` in it. vmlab
+    finds the lab file by walking up from the current directory, the way git
+    finds `.git`, so every command in this tutorial runs from inside that
+    directory.
+  DOC
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+import <vmlab.wcl>
+
+lab "first-lab" {
+
+  segment "lan" {
+    subnet = "10.90.0.0/24"
+    nat    = true
+  }
+
+  container "web" {
+    image   = "nginx:1.27"
+    profile = "container"
+    nic { segment = "lan" }
+    port { host = 18081 container = 80 }
+    healthcheck {
+      command  = ["curl", "-fsS", "http://localhost/"]
+      interval = 5s
+    }
+  }
+}
+SRC
+  }
+
+  p "Each line does one thing."
+
+  list {
+    li "`import <vmlab.wcl>` brings in the schema. Every lab file starts with it, and it is what lets `validate` reject a misspelt field."
+    li "`lab \"first-lab\"` names the lab. The name is a DNS label. It appears in `vmlab lab list` and in the DNS suffix guests resolve each other under."
+    li "`segment \"lan\"` declares a virtual L2 network with the subnet `10.90.0.0/24`. DHCP is on by default. `nat = true` gives machines on the segment internet egress through the host."
+    li "`container \"web\"` runs the image `nginx:1.27`. `profile = \"container\"` supplies the micro-VM's CPU and memory defaults. A container must get its size from a profile or declare `cpus` and `memory` itself."
+    li "`nic { segment = \"lan\" }` attaches the container to the segment with a dynamic DHCP lease."
+    li "`port { host = 18081 container = 80 }` forwards host port 18081 to port 80 inside the container. It is shorthand for a `forward {}` block on the segment."
+    li "`healthcheck {}` runs `curl` inside the container every five seconds. The container is **ready** once the probe passes for the first time. Without a healthcheck a container is ready as soon as its process starts."
+  }
+
+  p <<DOC
+    Every field of these blocks, with its type and default, is in
+    [Lab file: lab and segment](ref_lab) and
+    [Lab file: container and its children](ref_container).
+  DOC
+
+  h2 "Validate it"
+
+  p <<DOC
+    `vmlab validate` parses the file, checks it against the schema, and runs
+    the semantic checks: the segment the NIC names exists, the port is unique
+    across the lab, the container has a size. It starts nothing and writes
+    nothing.
+  DOC
+
+  code sh { source = "vmlab validate" }
+
+  p <<DOC
+    A clean run prints one line, `ok: lab "first-lab" — 0 vm(s), 1
+    container(s), 1 segment(s)`, and exits 0. An error names the file, the
+    line and what is wrong. Try misspelling `segment` as `segmnet` inside
+    the `nic` block and run it again to see the shape of a schema error, then
+    put it back.
+  DOC
+
+  callout "The lab file validates" {
+    kind = :success
+    body = "`vmlab validate` exits 0 with no errors."
+  }
+
+  h2 "Bring it up"
+
+  code sh { source = "vmlab up" }
+
+  p <<DOC
+    The first `up` starts the supervisor daemon, `vmlabd`, if it is not
+    already running, starts a lab daemon for this lab, pulls the nginx image,
+    flattens it, boots the micro-VM, and waits for the healthcheck to pass.
+    Progress streams to the terminal. The pull happens once; the flattened
+    image is cached by digest and later runs skip it.
+  DOC
+
+  p <<DOC
+    `up` returns when every machine is ready and every provision script has
+    finished. This lab has no provision scripts, so it returns as soon as the
+    healthcheck passes. The lab keeps running after the command exits. It is
+    owned by the lab daemon, not by your terminal.
+  DOC
+
+  h2 "Look at it"
+
+  code sh { source = "vmlab status" }
+
+  p <<DOC
+    `status` prints one row per machine with what it is doing and its IP
+    address, and one row per segment. Add `-v` for the raw power state, the
+    readiness flag and the container's image, health and last exit code.
+  DOC
+
+  code sh { source = "vmlab status -v" }
+
+  p "Two more verbs answer narrower questions. The container's address on its own, and the log of its console, which carries the kernel messages and the process's stdout and stderr."
+
+  code sh { source = <<'SRC'
+vmlab container ip web
+vmlab container logs web -n 50
+SRC
+  }
+
+  callout "The lab is up" {
+    kind = :success
+    body = "`vmlab status` shows `web` running and ready with an address in `10.90.0.0/24`."
+  }
+
+  h2 "Reach it from the host"
+
+  p <<DOC
+    The `port {}` block made the host listen on 18081 and forward to the
+    container. Fetch the default nginx page.
+  DOC
+
+  code sh { source = "curl http://localhost:18081/" }
+
+  p <<DOC
+    The response is nginx's welcome page. The forward is served by the lab
+    daemon's userspace network stack, so nothing on the host was configured
+    to make this work: no iptables rule, no bridge, no capability.
+  DOC
+
+  h2 "Run a command inside it"
+
+  p <<DOC
+    Commands reach the guest over the agent's virtio-serial channel, not over
+    the network. `vmlab container exec` runs one command and mirrors its
+    output and exit code. Everything after `--` is the command.
+  DOC
+
+  code sh { source = "vmlab container exec web -- nginx -v" }
+
+  p <<DOC
+    `vmlab exec` does the same thing and accepts a container name as well as a
+    VM name. The two verbs share one implementation. Both wait up to 120
+    seconds by default; `--timeout <SECS>` changes that.
+  DOC
+
+  code sh { source = "vmlab exec web -- cat /etc/os-release" }
+
+  p "For an interactive session, attach a shell. Press Ctrl-] to detach and leave the container running."
+
+  code sh { source = "vmlab container shell web" }
+
+  p <<DOC
+    With no `login {}` block on the machine, `exec` and `shell` run as the
+    agent's own identity, which is root in a container.
+    [Logins and the SSH facade](guide_logins) explains how to declare the
+    account a surface attaches as.
+  DOC
+
+  h2 "Take it down"
+
+  code sh { source = "vmlab down" }
+
+  p <<DOC
+    `down` stops every machine gracefully and keeps their state. For a
+    container that means its scratch disk survives, so files you wrote inside
+    it are still there after the next `up`. The lab daemon exits. `vmlab
+    status` from this directory now prints `lab "first-lab": not running`.
+  DOC
+
+  p "Bring it back up to confirm the state is intact, then take it down again."
+
+  code sh { source = <<'SRC'
+vmlab up
+curl http://localhost:18081/
+vmlab down
+SRC
+  }
+
+  p <<DOC
+    The second `up` is faster. The image is cached and there is no
+    healthcheck history to wait for beyond the first pass.
+  DOC
+
+  h2 "Destroy it"
+
+  code sh { source = "vmlab destroy" }
+
+  p <<DOC
+    `destroy` stops the lab if it is running and then deletes everything vmlab
+    created for it: the container's scratch state, the lab-local `.vmlab/`
+    directory beside the lab file, and any dynamically added network rules.
+    The lab file itself and the cached image are untouched. The next `up`
+    starts from a fresh container.
+  DOC
+
+  callout "destroy is not undoable" {
+    kind = :warning
+    body = "Anything written inside a machine's disk is gone after `destroy`. Keep data you care about on the host, in a `share {}` or a `volume {}`, or copy it out with `vmlab cp` first."
+  }
+
+  callout "You have completed the lifecycle" {
+    kind = :success
+    body = "The directory holds only `vmlab.wcl`. `vmlab lab list` no longer shows `first-lab`."
+  }
+
+  h2 "Next steps"
+
+  list {
+    li "[Your first VM](gs_first_vm) adds a full virtual machine to a lab, pulled from a public registry, and introduces the console, screenshots and snapshots."
+    li "[Lab containers](guide_containers) explains the micro-VM, the `:idle` mode for a container that is a shell rather than a service, volumes and environment variables."
+    li "[Networking](guide_networking) covers segments in depth: static IPs, DNS records, routes between segments, block and redirect rules."
+    li "[vmlab up](cmd_up) and [vmlab container](cmd_container) document every option of the verbs you used."
+  }
+}

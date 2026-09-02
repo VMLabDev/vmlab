@@ -1,0 +1,78 @@
+page cmd_ssh {
+  title = "vmlab ssh"
+  chapter_header "vmlab ssh" {
+    kicker       = "Commands · reference"
+    reading_time = "5 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab ssh` attaches to a machine over the SSH facade the lab daemon
+    terminates on the host, described in
+    [Logins and the SSH facade](guide_logins). It refreshes the managed
+    block in `~/.ssh/config`, checks the machine is running, and then
+    replaces itself with the system `ssh` against the machine's alias. It is
+    not a second SSH client: the `ssh` in play is the one your editor uses,
+    with your own `Host *` settings, so a failure here reproduces as
+    `ssh <alias>`.
+  DOC
+
+  code sh { source = "vmlab ssh <MACHINE> [-- <CMD>...]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "`[lab/]machine`: a bare name inside a lab directory, or the qualified form from anywhere." |
+      | "`[CMD]...`" | "Command and arguments to run instead of a shell, after `--`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    A bare name is looked up in the lab of the current directory. The
+    qualified `lab/machine` form is resolved through the supervisor's lab
+    registry, so it works from any directory but only for a lab whose daemon
+    is running. The lab file must declare the machine.
+  DOC
+
+  p <<DOC
+    The refresh of the managed block fails hard here, where every other verb
+    only warns, because the alias is the command. After writing, the command
+    runs `ssh -G` on this machine's alias and refuses when something earlier
+    in the config, an `Include`, or a system file resolves a different
+    `ProxyCommand`; the refusal names the file and line that won. The alias
+    is `vmlab-<lab>-<machine>`, with `-<label>` appended for each declared
+    login, as [vmlab ssh-config](cmd_ssh_config) describes.
+  DOC
+
+  p <<DOC
+    The command refuses on a stopped machine and never starts one, like
+    `console` and `exec`. A lab with no running daemon, or a machine whose
+    state is anything but running, is refused with a message that says to
+    run `vmlab up <machine>` first. A daemon that predates an edit adding the
+    machine is refused with a pointer to `vmlab lab restart`.
+  DOC
+
+  p <<DOC
+    After the checks the process becomes `ssh <alias> [CMD...]`. From then
+    on signals, the terminal, the `~.` escape, and the exit code are the
+    client's. The `ProxyCommand` the alias carries is the hidden
+    `vmlab ssh-proxy`, which pipes the connection onto the facade and does
+    no lifecycle of its own. Agent forwarding is not served and fails
+    silently in the guest; `ssh -R` is refused by the facade.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab ssh dev01
+vmlab ssh dev-vscode-windows/dev01 -- hostname
+scp ./notes.md vmlab-dev-vscode-windows-dev01:notes.md
+SRC
+  }
+
+  p <<DOC
+    Exit status is the exit status of `ssh` once it has been started. Before
+    that, every refusal exits 1: a lab or machine that is not declared, a
+    managed block that could not be written or that `ssh -G` resolves
+    elsewhere, a lab that is not running, and a machine that is not running.
+  DOC
+}

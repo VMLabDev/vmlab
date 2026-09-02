@@ -1,0 +1,161 @@
+page guide_shares {
+  title = "Shared folders"
+  chapter_header "Shared folders" {
+    kicker       = "The guide · explanation"
+    reading_time = "7 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A `share` block on a VM maps a host directory to a guest path. Two
+    transports sit behind that one surface, virtiofs and SMB, and vmlab
+    picks between them, serves them, and mounts them in the guest once it
+    is ready. This chapter explains how each works, how the choice is made,
+    and what a share is not. The fields are in
+    [Lab file: vm and its children](ref_vm).
+  DOC
+
+  code wcl { source = <<'SRC'
+vm "dev01" {
+  template = "x86_64/ubuntu-24.04"
+  nic { segment = "lan" }
+  share { host = "./src"      guest = "/mnt/src" }
+  share { host = "~/datasets" guest = "D:\\data"  readonly = true }
+}
+SRC
+  }
+
+  h2 "Two transports"
+
+  p <<DOC
+    **virtiofs** is the fast path. vmlab runs one `virtiofsd` per share and
+    attaches it as a vhost-user-fs device, which the guest mounts natively
+    with `mount -t virtiofs`. No guest network is involved and no credential
+    exists. It needs a virtiofs client in the guest: Linux kernels from 5.4
+    have one, and a Windows guest needs the virtio-win driver and WinFsp
+    baked into its template. A [profile](guide_profiles) declares whether
+    its guests mount virtiofs with the `virtiofs` capability flag, and the
+    shipped `linux-modern` profile sets it.
+  DOC
+
+  p <<DOC
+    virtiofs used to be incompatible with online snapshots, because the
+    FUSE session state lived outside QEMU. That objection expired with
+    QEMU's device-state transfer: vmlab runs `virtiofsd` with migration
+    mode enabled, so its session state, open handles included, rides the
+    snapshot's migration stream. The cost is that a VM carrying a virtiofs
+    share has its RAM moved to a shared memory backend, and one daemon per
+    share.
+  DOC
+
+  p <<DOC
+    **SMB** is the universal fallback. The lab daemon serves each share at
+    the segment gateway as `\\\\<gateway>\\<share>`, so a Windows guest needs
+    nothing extra, a Linux guest needs only `cifs-utils`, and an
+    XP-era guest can be served too: `smb1 = true` on a share enables the
+    SMB1 dialect and the NTLMv1 authentication those guests require. It is
+    off unless asked for, and harmless on an isolated lab segment. SMB
+    carries no device state at all, so a restored VM's sessions are stale
+    TCP that the guest's SMB client re-establishes transparently.
+  DOC
+
+  h2 "How the transport is chosen"
+
+  p <<DOC
+    Each share carries `transport = "auto" | "virtiofs" | "smb"`, defaulting
+    to `auto`. The choice is made once, before the lab starts, as the **share
+    plan**: which shares ride virtiofs, which fall back to SMB, which
+    segments need a gateway rule to reach the SMB server, and which host
+    port it takes. Two host facts feed it, whether a `virtiofsd` binary
+    exists and whether a localhost port is free, and one guest fact, the
+    profile's capability flag.
+  DOC
+
+  list {
+    li "`auto` takes virtiofs only when the host can serve it *and* the guest can mount it. SMB is the fallback, never the preference."
+    li "`virtiofs` always rides virtiofs. A host with no `virtiofsd` errors when the machine starts rather than degrading silently."
+    li "`smb` always rides the bundled SMB server."
+  }
+
+  p <<DOC
+    Container volumes join the same plan. They have no per-guest question,
+    since the micro-VM's own guest always mounts virtiofs, so they ride
+    virtiofs whenever the host has a `virtiofsd` and SMB otherwise.
+  DOC
+
+  h2 "The bundled smbd"
+
+  p <<DOC
+    No mature embeddable SMB server exists in Rust, so vmlab runs Samba's
+    `smbd` as an unprivileged process. Three things make that work without
+    root. It listens on a localhost high port, which any user may bind, and
+    the switch proxies the segment gateway's port 445 onto it. Every Samba
+    state directory is relocated under the lab's `.vmlab/smb`. And each
+    share is served with `force user` as the invoking user, so `smbd` never
+    switches uid. Samba is a documented host package, and `smb1` shares
+    depend on the installed build retaining NT1 support, which vmlab checks.
+  DOC
+
+  p <<DOC
+    vmlab mints per-lab SMB credentials automatically, and a share is
+    mappable only with its owning VM's credential. That scopes shares to
+    the VM that declared them even on a shared segment. Authenticated NTLMv2
+    with SMB signing is the baseline, because current Windows hardening
+    rejects unauthenticated shares. None of this is visible to you: the
+    credentials are plumbed by vmlab.
+  DOC
+
+  h2 "Mounting in the guest"
+
+  p <<DOC
+    Once a VM is ready, the lab daemon runs the share plan's **mount steps**
+    through the agent. The steps are a value computed per guest OS before
+    anything runs, so what a Windows guest will be told to do can be read
+    without booting one.
+  DOC
+
+  list {
+    li "**Linux, virtiofs:** `mount -t virtiofs <tag> <guest_path>`."
+    li "**Linux, SMB:** `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential."
+    li "**Windows:** the credential is stored once per lab with `cmdkey`. A drive-letter target such as `S:` is mapped with `net use`. A folder-path target becomes a directory symbolic link to the UNC path with `mklink /D`, because a junction cannot target a UNC path."
+  }
+
+  p <<DOC
+    The agent's mounts run as the agent identity, SYSTEM on Windows, and a
+    drive letter is visible in every session while each logon authenticates
+    separately. So the agent also writes the lab's share credential into
+    every logon it mints, before spawning anything. Without that, a developer
+    attaching through the [SSH facade](guide_logins) would see the mapped
+    drive and be unable to open it.
+  DOC
+
+  callout "XP-era guests mount by screen" {
+    kind = :info
+    body = "The agent does not target XP or 2003-era guests, so automatic mounting does not apply there. A provision script maps the share instead, by typing `net use X: \\\\<gateway>\\<share> /user:… /persistent:yes` through the screen-driven API described in [Screens, input and vision](guide_vision)."
+  }
+
+  h2 "What a share is not"
+
+  callout "Share contents are outside every snapshot" {
+    kind = :warning
+    body = "A share's files are host state. A snapshot restore never rolls them back, on either transport, and a `destroy` never deletes them. If you want a directory rolled back with the VM, it must be on the VM's disk."
+  }
+
+  p <<DOC
+    A share also needs a segment to reach the gateway on when it rides SMB,
+    so a VM with an SMB share and no NIC is a validation error. A
+    port-isolated NIC can still reach the gateway, so shares work on isolated
+    ports by design.
+  DOC
+
+  p <<DOC
+    A share is a passthrough view of the host directory, and that is the
+    wrong tool for a watched source tree: file-change notification does not
+    cross virtiofs or SMB, on either guest family, and it fails silently. A
+    dev machine's source is therefore a **workspace**, a guest-local copy
+    kept in step by vmlab's syncer, which [Dev machines and the workspace
+    syncer](guide_dev) explains. Use a share for datasets, build caches and
+    artefacts, and a workspace for the code you edit.
+  DOC
+}

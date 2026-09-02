@@ -1,0 +1,196 @@
+page guide_templates {
+  title = "Templates and the store"
+  chapter_header "Templates and the store" {
+    kicker       = "The guide · explanation"
+    reading_time = "10 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    A **template** is a sealed, read-only disk image that VMs boot linked
+    clones of. It is vmlab's answer to the Vagrant box: build it once from
+    an installer ISO or an existing disk, store it under a name and version,
+    and clone it into as many labs as you like. This chapter explains what a
+    template holds, how the store is laid out, how a build runs, and the
+    two ways a template leaves the machine it was built on. The fields of a
+    `template` block are in [Lab file: template and source](ref_template),
+    and every verb in [vmlab template](cmd_template).
+  DOC
+
+  h2 "What a template is"
+
+  p <<DOC
+    A store entry is two files: `disk.qcow2`, the sealed image, and
+    `template.wcl`, its metadata. The metadata records the hardware the
+    template was built with (profile, CPUs, memory, disk size, firmware, TPM,
+    secure boot, display), where it came from, the version of `vmlab-agent`
+    baked into it, the wscript surface version its embedded scripts were
+    written against, an optional first-boot script, and the OCI repository it
+    publishes to. The hardware fields form the template layer of the
+    resolution chain described in [The lab file](guide_lab_file): a VM that
+    does not set `memory` inherits it from here.
+  DOC
+
+  p <<DOC
+    Templates are keyed by **arch, name and version**, and a reference is
+    written `<arch>/<name>[@<version>]`. The arch is mandatory and never
+    inferred from the host, because it selects which QEMU system emulator
+    boots the image. Omitting the version means the highest in the store.
+    `vmlab validate` rejects an archless reference.
+  DOC
+
+  h2 "The store"
+
+  p <<DOC
+    The store lives at `~/.local/share/vmlab/templates/`, laid out as
+    `<arch>/<name>/<version>/`. Reads are lock-free. Every mutation, whether
+    an install, a removal or an import, holds an exclusive lock on the store,
+    and content only ever enters it by an atomic rename of a fully staged
+    directory. A build or import that fails part way leaves nothing behind.
+  DOC
+
+  p <<DOC
+    Since the supervisor became the store's owner, every `vmlab template`
+    verb is a protocol client: the CLI reads its own surroundings, such as a
+    relative path or the git remote of the current directory, and sends them
+    to the supervisor, which is the only process that opens the store or
+    dials a registry. Two consequences follow. A build started in one
+    terminal can be listed and stopped from another with `vmlab template
+    stop`. And a build needs a supervisor, which the CLI starts for you.
+  DOC
+
+  p <<DOC
+    `vmlab template list` shows what is installed. `rm` removes one version
+    and refuses, without `--force`, when that disk still backs a linked clone
+    in some lab. `clean` prunes superseded builds per family, keeping the
+    newest by default, and is a dry run until you pass `--yes`.
+  DOC
+
+  h2 "Building a template"
+
+  p <<DOC
+    A template is declared in a `template` block, in its own WCL file or
+    beside a `lab`, and built with `vmlab template build`. The block names
+    the build's **source**, the **hardware** the build VM boots with, any
+    **media** to attach, and the **provision** scripts and playbooks that
+    drive the install.
+  DOC
+
+  code wcl {
+    filename    = "examples/templates/ubuntu-24.04/vmlab.wcl"
+    source_file = "../../examples/templates/ubuntu-24.04/vmlab.wcl"
+    dedent      = true
+  }
+
+  p "The source is exactly one of four forms:"
+
+  list {
+    li "`iso` — an installer ISO, by local path or by URL with a required `sha256`. A URL is downloaded into the artefact cache and verified before use."
+    li "`qcow2` — an existing disk image, by path or URL and hash, imported as the base."
+    li "`template` — another template in the store, named by `from`. A **layered build** starts from that template's disk and its recorded hardware, runs more provisioning, and seals a new template."
+    li "`scratch` — a blank disk of the declared `disk` size. The attached media and the provision script do everything."
+  }
+
+  p <<DOC
+    The build runs as a synthetic one-VM lab: a `scratch` VM whose primary
+    disk is pre-seeded from the source, on the hardware the block declares
+    over the source template's recorded hardware. It reuses the whole lab
+    runtime, so a build script has the same API a lab provision has. The
+    flow is: create the working qcow2, boot it, run the provision steps,
+    wait for the guest to shut down, verify the agent's handshake, then move
+    the disk and its metadata into the store under the new version. Build
+    output streams to your terminal as it happens.
+  DOC
+
+  h3 "The agent bootstrap ISO"
+
+  p <<DOC
+    vmlab attaches one extra ISO to every build VM, labelled `VMLAB`. It
+    carries the agent binaries and an install script per OS. The template's
+    own unattended-install hook, such as a cloud-init `runcmd`, a subiquity
+    late command, or an autounattend first-logon command, mounts that ISO and
+    runs the script. The guest installs the agent itself, so no host channel
+    is needed before the agent exists, and the build verifies the handshake
+    before sealing. Clones never see this ISO. Set `agent = false` on the
+    block to skip baking the agent, at the cost of a template that never
+    reports ready.
+  DOC
+
+  h3 "Versions"
+
+  p <<DOC
+    The block's `version` is a fixed prefix that identifies the upstream
+    release. vmlab appends a build counter, so building the Ubuntu example
+    above once produces `24.04.4.0` and again `24.04.4.1`. The counter
+    continues from the highest tag already published when the block names a
+    `registry`, and from the local store otherwise. Change the prefix and the
+    counter restarts at zero. Pass `--version` to pin a version instead; a
+    version already in the store is refused.
+  DOC
+
+  callout "A failed build leaves nothing in the store" {
+    kind = :note
+    body = "The build's working directory is removed on success and on failure, and the supervisor sweeps any build directory a killed process left behind the next time it starts. A supervisor restart fails every build in flight; there is no resumption."
+  }
+
+  h2 "Media built from folders"
+
+  p <<DOC
+    A `media` block turns a folder on disk into an ISO or a floppy image and
+    attaches it to the build VM, or to a lab VM. This is how unattend files,
+    driver bundles and payloads reach a guest that has no network. Built
+    images land in the lab's `.vmlab/media` and are content-addressed by a
+    digest over the folder's contents, the kind and the label, so an
+    unchanged folder never rebuilds.
+  DOC
+
+  p <<DOC
+    ISOs are built with `xorriso`, falling back to `genisoimage` and then
+    `mkisofs`, with Joliet and Rock Ridge extensions so both Windows unattend
+    media and Linux payloads read correctly. Floppies are 1.44 MB FAT12
+    images built with `mformat` and `mcopy` from mtools. A `disk` block with
+    `from` does the same for a larger FAT disk.
+  DOC
+
+  h2 "Linked clones and scratch VMs"
+
+  p <<DOC
+    `vmlab up` creates each VM's disk as a qcow2 overlay whose backing file
+    is the template's disk in the store. The template is never written to.
+    Clones live in `.vmlab/`, survive `down`, and are deleted by `destroy`,
+    after which the next `up` makes fresh ones. Clones grow as the guest
+    writes, which is why the supervisor watches free space on the
+    filesystems holding `.vmlab/` and the store and emits `host.disk_low`.
+  DOC
+
+  p <<DOC
+    `template = "scratch"` is a reserved name meaning no backing image. The
+    VM gets a freshly created blank qcow2 instead of a clone, and its
+    hardware chain collapses to VM block then profile. Validation therefore
+    requires an explicit `arch`, `profile` and `disk`. Boot media is yours to
+    supply, typically a `cdrom` or a `media` block. `scratch` never appears
+    in the store and cannot be pushed or pulled. It is for installer
+    development and OS builds, where starting with no OS is the point.
+  DOC
+
+  h2 "Moving a template between machines"
+
+  p <<DOC
+    Two paths carry a template off the host it was built on. Both preserve
+    the metadata, so a moved template inherits into VMs exactly as it did at
+    home.
+  DOC
+
+  list {
+    li "**Export and import.** `vmlab template export` writes one portable `.tar.zst` archive holding the disk and its metadata, and `import` installs it into another store. This is the offline path."
+    li "**Registries.** `vmlab template push` publishes a template to any OCI registry, and `pull` installs it from one. [Distributing templates over registries](guide_registries) explains how a template is laid out as an OCI artifact."
+  }
+
+  p <<DOC
+    A lab's `template =` may also name a registry reference directly, with
+    an explicit `arch` on the VM. `vmlab up` pulls it when it is absent from
+    the store and never re-pulls it implicitly. Updates are explicit, through
+    `vmlab pull` or `vmlab template pull`.
+  DOC
+}

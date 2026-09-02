@@ -5,12 +5,11 @@
 // dependency cycles, …) are enforced by `vmlab validate` in Rust.
 //
 // Per-field `@doc("…")` decorators are the single source for the generated
-// schema reference (the vmlab wskill reflects them with `type_table`); keep
-// them one-line and current.
+// schema reference (the manual's lab-file chapters restate them); keep them
+// one-line and current.
 //
 // This file is the single source of truth for the *shape* of `vmlab.wcl`
-// (ADR-0005). Everything that needs that shape — the designer's forms, the
-// console's pickers, the rendered reference — reads the Schema projection
+// (ADR-0005). Everything that needs that shape reads the Schema projection
 // (`src/config/projection.rs`), which reflects this file. Nothing restates it.
 
 // ── Projection metadata ──────────────────────────────────────────────────────
@@ -71,8 +70,8 @@ type RequiredGroup {
 @document
 type VmlabDoc {
   @children("lab")      labs: list<Lab>
-  // Field name avoids colliding with wdoc.Site's `templates` when the wskill
-  // docs merge this schema with wdoc's.
+  // Field name avoids colliding with wdoc.Site's `templates` when a wdoc
+  // document merges this schema with wdoc's.
   @children("template") template_defs: list<TemplateDef>
 }
 

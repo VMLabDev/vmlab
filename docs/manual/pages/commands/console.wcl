@@ -1,0 +1,68 @@
+page cmd_console {
+  title = "vmlab console"
+  chapter_header "vmlab console" {
+    kicker       = "Commands · reference"
+    reading_time = "4 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab console` attaches a VNC viewer to a VM's display. Every VM serves
+    VNC on a unix socket in the lab's runtime directory, and this command
+    either launches a viewer against that socket or bridges the socket to a
+    localhost TCP port and prints the address. It is the interactive
+    counterpart of the screen verbs described in
+    [Screens, input and vision](guide_vision).
+  DOC
+
+  code sh { source = "vmlab console [OPTIONS] <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`. A bare name is looked up in the lab of the current directory." |
+      | "`--tcp`" | "Forward the VNC display over TCP instead of launching a viewer." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The command requires the lab daemon to be running already and never
+    starts one: a stopped lab is refused with `lab \"<name>\" is not running`.
+    It then checks the VM's `vnc.sock` exists and refuses when it does not,
+    which is what a VM that has not been started looks like. Containers have
+    no display, so this verb is for VMs only.
+  DOC
+
+  p <<DOC
+    The viewer comes from the `viewer` command template in the
+    [host configuration](guide_host) when one is set. Otherwise the command
+    looks on `PATH` for `remote-viewer`, then `gvncviewer`, then `vncviewer`.
+    A configured viewer is handed the socket path directly. A detected
+    viewer needs TCP, so the command spawns a detached helper that holds a
+    unix-to-TCP bridge open, launches the viewer against it, and prints
+    `opened <lab>/<vm> in a viewer (closes with the window)`. The terminal is
+    free straight away, and the bridge ends when the viewer window closes.
+  DOC
+
+  p <<DOC
+    With `--tcp`, or when no viewer is found, the command binds a localhost
+    port itself, preferring a VNC display port from 5900 upward so a client
+    that takes `host:display` works, and prints
+    `VNC for <lab>/<vm> on 127.0.0.1:<port>`. It then holds the bridge until
+    Ctrl-C. This is the path to use under WSL 2, where the viewer lives on
+    the Windows side and connects to the forwarded port.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab console winsrv
+vmlab console --tcp mixed-lab/winsrv
+SRC
+  }
+
+  p <<DOC
+    Exit status is 0 on success. The command sends no request that can fail
+    after the liveness check, so every failure, including a lab that is not
+    running or a missing socket, exits 1.
+  DOC
+}

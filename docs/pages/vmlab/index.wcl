@@ -1,47 +1,42 @@
 // vmlab landing page. `start = true` makes it the page served at `/`.
 // Rendered through the stdlib `website` template: the alpha banner and the
-// footer are named `region`s (slotted by the template), everything else is
+// footer are named slot fills (placed by the template), everything else is
 // ordinary page content built from the landing components in
 // landing-parts.wcl. The same content degrades to the Markdown / PDF
 // backends — no parallel fallback copy needed.
+//
+// The manual is a separate document (docs/manual/main.wcl) built beside this
+// one into `./manual/`, so every link to it is a hand-written relative href
+// naming that mount point (or a page under it) rather than a wdoc page link.
 
 // Single injection point for the version badge (shown in the banner). CI can
 // patch just this line to stamp the release version.
 let vmlab_version = "0.1.0"
 
-// The wskill registry, discovered from the `include`s in main.wcl: every
-// member's book, plus the optional deck / training views (their entry
-// files exist only when a member ships that view).
-let wskill_books   = included_sites({ folder: "wskills", entry: "wdoc/book/main.wcl" })
-let wskill_decks   = included_sites({ folder: "wskills", entry: "wdoc/presentation/main.wcl", prefix: "decks" })
-let wskill_courses = included_sites({ folder: "wskills", entry: "wdoc/training/main.wcl", prefix: "training" })
+// Where the manual is mounted relative to the landing page, and its
+// Getting-started part (the first chapter of the manual's `toc`).
+let manual_href = "./manual/"
+let manual_start_href = "./manual/gs_install.html"
 
-// Card icon per wskill; new members fall back to a generic book.
-let wskill_icon = fn(n: utf8) -> utf8
-  if n == "vmlab" { "lucide.square-terminal" }
-  else { "lucide.book" }
-
-// One reference card per wskill book (data for `lp_cards`) — the manual link
-// only; the deck/course views are not advertised here.
-let ref_cards = map(wskill_books, fn(s: IncludeEntry) -> LpRefCard {
+// The reference cards (data for `lp_cards`): one per published manual.
+let ref_cards = [
   {
-    name: s.name,
-    summary: s.summary ?? "",
-    href: $"./${s.href}",
-    icon: wskill_icon(s.name),
-    links: "",
-  }
-})
+    name:    "vmlab",
+    summary: "The complete vmlab manual — a guide to labs, templates, networking and dev machines, hands-on tutorials, and the full reference for every block, verb and wscript API.",
+    href:    manual_href,
+    icon:    "lucide.square-terminal",
+    links:   "",
+  },
+]
 
-// Every published view as a footer link (books, then decks, then courses).
-let ref_links = flatten([
-  map(wskill_books,   fn(s: IncludeEntry) -> LpFootlink { { label: s.name, href: $"./${s.href}" } }),
-  map(wskill_decks,   fn(s: IncludeEntry) -> LpFootlink { { label: $"${s.name} deck", href: $"./${s.href}" } }),
-  map(wskill_courses, fn(s: IncludeEntry) -> LpFootlink { { label: $"${s.name} course", href: $"./${s.href}" } }),
-])
+// Every published view as a footer link.
+let ref_links = [
+  { label: "Manual",          href: manual_href },
+  { label: "Getting started", href: manual_start_href },
+]
 
 page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
-  region "banner" {
+  banner {
     callout $"Alpha software (v${vmlab_version}) — vmlab is under active development." {
       class = ["warning"]
       body  = "Expect frequent breaking changes to labs, templates, and the CLI."
@@ -52,8 +47,8 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
     badge    = "Declarative VM labs · QEMU/KVM"
     lede     = "vmlab turns a single `vmlab.wcl` into a running fleet of machines — VMs, containers, networks and provisioning, wired automatically. Boot, snapshot, and tear down complex topologies with one command."
     footnote = "Open source · MIT · Linux, or Windows 11 via WSL 2"
-    lp_cta "Get started"         { href = "#start"  primary = true }
-    lp_cta "Read the reference"  { href = "./wskills/vmlab/" }
+    lp_cta "Get started"      { href = "#start"  primary = true }
+    lp_cta "Read the manual"  { href = "./manual/" }
   }
 
   lp_showcase {
@@ -157,14 +152,14 @@ page index { sites = [:vmlab]  title = "Declarative VM labs"  start = true
     id      = start
     eyebrow = "Getting started"
     title   = "Install it and boot your first lab."
-    lede    = "Needs `/dev/kvm` (on WSL 2 enable nested virtualisation)."
+    lede    = "Needs `/dev/kvm` (on WSL 2 enable nested virtualisation). The manual's [Getting started](./manual/gs_install.html) part walks through each step."
 
     lp_step "Install the CLI"                { command = "curl -fsSL https://vmlab.io/install.sh | sh" }
     lp_step "Write a lab, then validate it"  { command = "vmlab validate" }
     lp_step "Boot it"                        { command = "vmlab up" }
   }
 
-  region "footer" {
+  footer {
     lp_footer {
       brand     = "vmlab"
       tagline   = "Orchestrate virtual machine labs from your terminal. Open source under the MIT license."

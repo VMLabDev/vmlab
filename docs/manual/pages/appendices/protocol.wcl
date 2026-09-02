@@ -1,0 +1,119 @@
+page ref_protocol {
+  title = "Wire protocol and error codes"
+  chapter_header "Wire protocol and error codes" {
+    kicker       = "Appendices · reference"
+    reading_time = "8 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    This chapter summarises the protocol the `vmlab` CLI speaks to the two
+    daemons, and the error codes every failure carries. It is what an
+    out-of-repo client needs to know. The full command list, with every
+    argument and the reason each command is reachable from where it is, is
+    generated from the source into `docs/protocol.md` in the repository; this
+    chapter does not repeat it. [How vmlab runs a lab](guide_architecture)
+    explains which daemon owns what.
+  DOC
+
+  h2 "Shape"
+  p <<DOC
+    Both daemons listen on unix sockets under the runtime directory, see
+    [Files and directories](ref_paths): the supervisor on `vmlabd.sock` and
+    each lab daemon on its lab's `control.sock`. A connection carries JSON
+    lines, each one object tagged by `type`. A request is `req`, with a
+    client-chosen `id`, a `cmd` string and an `args` object. The final
+    answer is `resp` for the same `id`, carrying either `ok` with the
+    result, or `err` with a prose message and a machine-readable `code`.
+    Commands that produce output as they run, such as `up` and
+    `machine.logs` with `follow`, send `stream` messages with a `chunk`
+    before the final `resp`, and a connection that has subscribed receives
+    `event` messages on the same line stream.
+  DOC
+  code json { source = <<'SRC'
+{"type":"req","id":1,"cmd":"machine.ip","args":{"machine":"dc01","nic":null}}
+{"type":"resp","id":1,"ok":"10.0.0.10"}
+{"type":"req","id":2,"cmd":"snapshot.restore","args":{"name":"nope","machine":"dc01","discard":false}}
+{"type":"resp","id":2,"err":"\"dc01\" has no snapshot \"nope\"","code":"not_found"}
+SRC
+  }
+  p <<DOC
+    The message may be reworded between releases; the code is the contract.
+    Inside the repository every surface builds requests through the typed
+    vocabulary in the source rather than spelling the strings, and the
+    generated reference is produced from that vocabulary, so the two cannot
+    drift.
+  DOC
+
+  h2 "Error codes"
+  p <<DOC
+    A failed command answers with one of seven codes. The CLI maps each to
+    its exit status, so a script can branch on `$?` without parsing output.
+    Every command chapter under [Commands](cmd_up) names the codes that
+    apply to it.
+  DOC
+  table {
+    rows:
+      | "Code" | "`vmlab` exit code" | "Meaning" |
+      | "`unknown_command`" | "2" | "The daemon does not know the command. Usually a version mismatch between CLI and daemon." |
+      | "`invalid_argument`" | "2" | "An argument is missing, malformed or out of range." |
+      | "`not_found`" | "4" | "The lab, machine, snapshot, template or path named does not exist." |
+      | "`conflict`" | "5" | "The request contradicts current state: a build already running, a halted workspace, a port already claimed." |
+      | "`unsupported`" | "6" | "This machine or host cannot do what was asked, such as a screen operation on a machine without a display." |
+      | "`failed`" | "1" | "The operation was attempted and failed: the emulator, the agent, a registry or the guest reported an error." |
+      | "`internal`" | "1" | "A fault in the daemon itself." |
+  }
+  p "A command that succeeds exits 0. A CLI-side failure before any request is sent, such as no `vmlab.wcl` in any parent directory, also exits non-zero with a message and no code."
+
+  h2 "The supervisor socket"
+  p <<DOC
+    The supervisor owns the lab registry, the template store, the registry
+    catalogue and global segments. Its commands fall into these groups.
+  DOC
+  table {
+    rows:
+      | "Group" | "Commands" | "Called by" |
+      | "Liveness" | "`ping`, `version`, `fastpath`, `status`, `shutdown`" | "CLI, and daemons for `ping` and `shutdown`" |
+      | "Lab daemons" | "`lab.ensure`, `lab.release`, `lab.restart`" | "CLI" |
+      | "Global segments" | "`global.attach`, `global.detach`, `global.list`" | "Lab daemons only" |
+      | "Template builds" | "`template.list`, `template.build`, `template.stop_build`" | "CLI" |
+      | "The store" | "`store.list`, `store.remove`, `store.prune`, `store.export`, `store.import`, `store.pull`, `store.push`, `store.stop_push`" | "CLI" |
+      | "Registries" | "`registry.search`, `registry.login`, `registry.namespaces`, `registry.namespace_add`, `registry.namespace_remove`" | "CLI" |
+  }
+
+  h2 "A lab daemon's socket"
+  p <<DOC
+    A lab daemon owns one lab: its machines, network, snapshots, playbooks
+    and workspaces. Its commands fall into these groups.
+  DOC
+  table {
+    rows:
+      | "Group" | "Commands" |
+      | "Lab" | "`ping`, `status`, `dns.table`, `up`, `pull`, `pull.cancel`, `run`, `down`, `destroy`, `shutdown`" |
+      | "Machine lifecycle" | "`machine.start`, `machine.stop`, `machine.restart`, `machine.destroy`, `machine.capabilities`, `machine.ip`, `machine.osinfo`, `machine.stats`, `machine.logs`, `machine.repair_agent`" |
+      | "Display and input" | "`machine.screenshot`, `machine.sendkeys`, `machine.mouse_move`, `machine.mouse_click`, `machine.mouse_drag`, `machine.ocr`, `machine.find_image`" |
+      | "Guest agent" | "`machine.exec`, `machine.tty_open`, `machine.tty_resize`, `machine.push_file`, `machine.pull_file`, `machine.tail`, `machine.eventlog`, `machine.clipboard_get`, `machine.clipboard_set`" |
+      | "SSH facade" | "`machine.ssh_open`" |
+      | "Playbooks" | "`playbook.list`, `playbook.check`, `playbook.apply`" |
+      | "Snapshots" | "`snapshot.take`, `snapshot.restore`, `snapshot.delete`, `snapshot.list`" |
+      | "Workspace" | "`workspace.flush`, `workspace.resolve`, `workspace.diff`" |
+  }
+  p <<DOC
+    Every lab-daemon command is called by the CLI. `machine.tty_open` and
+    `machine.ssh_open` answer with the path of a second unix socket the
+    caller connects to and pipes bytes over: a raw terminal for the first,
+    an SSH connection for the second, which is what `vmlab ssh-proxy` hands
+    to `ssh` as its `ProxyCommand`. See [Logins and the SSH facade](guide_logins).
+  DOC
+
+  h2 "Events on the wire"
+  p <<DOC
+    A subscriber receives each event as an object with `event` and `data`.
+    The supervisor forwards every event from every lab daemon it has adopted
+    unchanged, and adds its own: `lab.daemon_crashed`, `host.disk_low` for
+    the store's filesystem, `segment.peer.up` and `segment.peer.down`, and
+    the `template.op.*` family. The names and payloads are in
+    [Events](ref_events).
+  DOC
+}

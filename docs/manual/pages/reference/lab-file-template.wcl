@@ -1,0 +1,159 @@
+page ref_template {
+  title = "Lab file: template and source"
+  chapter_header "Lab file: template and source" {
+    kicker       = "Reference · reference"
+    reading_time = "9 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    This chapter is the field-by-field reference for the `template {}` block
+    and its required `source {}` child. A template block describes how to
+    build a sealed base image for the store; [Templates and the store](guide_templates)
+    explains the build flow and [vmlab template](cmd_template) the verbs that
+    run it. Template blocks live at the top level of a `vmlab.wcl`, beside a
+    `lab {}` or in a file of their own with no lab at all. `vmlab template
+    build` reads `./vmlab.wcl` unless `--file` names another.
+  DOC
+
+  h2 "template {}"
+  p <<DOC
+    One buildable template. The build creates a working disk from the
+    `source`, boots it with the hardware declared here, runs the provisions
+    and playbooks, shuts the VM down and seals the disk into the store under
+    `<arch>/<name>/<version>/`. The hardware fields are recorded in the
+    template's metadata and become the inheritance layer for every VM cloned
+    from it.
+  DOC
+  code wcl { source = <<'SRC'
+template "<name>" {
+  arch        = "x86_64"
+  version     = "24.04"
+  registry    = "ghcr.io/owner/ubuntu-24.04"
+  profile     = "linux-modern"
+  cpus        = 2
+  memory      = 4GiB
+  disk        = 20GiB
+  display     = "virtio-vga"
+  firmware    = "ovmf"
+  tpm         = false
+  secure_boot = false
+  nested      = false
+  gui         = false
+  qemu_args   = []
+  first_boot  = "scripts/first-boot.ws"
+  agent       = true
+  source "…"  { … }
+  media       { … }
+  provision "…" { … }
+  playbook "…"  { … }
+  nic         { … }
+  disk "…"    { … }
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "utf8 (label)" | "required" | "Template name, for example `linux-modern`; the inline block label." |
+      | "`arch`" | "utf8" | "required" | "Architecture. Selects the QEMU system emulator." |
+      | "`version`" | "utf8" | "required" | "Version string, non-empty. Name, arch and version together are unique." |
+      | "`registry`" | "utf8" | "none" | "Full OCI repository to publish to and to version-bump against." |
+      | "`profile`" | "utf8" | "none" | "Guest OS profile supplying hardware defaults for the build VM." |
+      | "`cpus`" | "i64" | "from profile" | "vCPU count for the build VM. Inherited by clones." |
+      | "`memory`" | "ByteSize" | "from profile" | "RAM for the build VM, for example `8GiB`. Inherited by clones." |
+      | "`disk`" | "ByteSize" | "from source" | "Working disk size for the build, for example `64GiB`. Required for a `scratch` source." |
+      | "`display`" | "utf8" | "from profile" | "QEMU display device string for the build VM." |
+      | "`firmware`" | "utf8" | "from profile" | "Firmware: `ovmf` or `seabios`." |
+      | "`tpm`" | "bool" | "from profile" | "Enable a TPM 2.0 device." |
+      | "`secure_boot`" | "bool" | "from profile" | "Enable secure boot; OVMF only." |
+      | "`nested`" | "bool" | "`false`" | "Enable nested virtualisation for the build VM." |
+      | "`gui`" | "bool" | "`false`" | "Watch the build VM in a VNC viewer." |
+      | "`qemu_args`" | "list<utf8>" | "none" | "Raw QEMU flags for the build VM. The escape hatch." |
+      | "`first_boot`" | "utf8" | "none" | "wscript run on the first instantiation of a clone, before it turns ready." |
+      | "`agent`" | "bool" | "`true`" | "Bake the vmlab-agent service into the image." |
+      | "`source {}`" | "child" | "required" | "What the build starts from. Exactly one of four forms." |
+      | "`media {}`" | "children" | "none" | "ISO or floppy images attached to the build." |
+      | "`provision {}`" | "children" | "none" | "Provision scripts that drive the build." |
+      | "`playbook {}`" | "children" | "none" | "config-weave playbooks applied to the build VM, interleaved with provisions in declaration order. Steps stream as structured build progress." |
+      | "`nic {}`" | "children" | "none" | "NICs for the build VM. Optional; the build VM may be air-gapped." |
+      | "`disk {}`" | "children" | "none" | "Additional disks attached during the build." |
+  }
+  p <<DOC
+    `media`, `provision`, `playbook`, `nic` and `disk` are the same blocks a
+    `vm` carries; see [vm and its children](ref_vm).
+  DOC
+  h3 "Versions and the registry"
+  p <<DOC
+    The declared `version` is a fixed prefix naming the upstream identity,
+    such as an OS release. Each build appends a counter: the stored version is
+    `<version>.<N>`, where N is one higher than the highest existing build
+    with that prefix, or 0 for the first. When `registry` is set the existing
+    builds are read from its tags, so the counter continues across machines;
+    otherwise the local store decides. Changing the prefix restarts the
+    counter at `.0`. `vmlab template build --version` pins an explicit
+    version instead. `registry` is also the repository `vmlab template push`
+    publishes to; see [Distributing templates over registries](guide_registries).
+  DOC
+  h3 "The first-boot script and the agent"
+  p <<DOC
+    `first_boot` is read at build time and baked into the template's
+    metadata, so a clone runs it on its first start without the lab needing
+    the file. It runs before the VM turns ready. With `agent = true` the
+    build waits for the guest-installed agent's handshake before sealing and
+    records the agent version in the metadata. With `agent = false`, or on a
+    profile with no agent channel, the check is skipped and the build log
+    says so.
+  DOC
+  h3 "Validation"
+  list {
+    li "`arch` is one of the known architectures: `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`, `s390x`, `ppc64`."
+    li "`version` is non-empty, and no other template in the file has the same arch, name and version."
+    li "`profile`, if set, names a known profile."
+    li "A `scratch` source requires `disk`."
+    li "`first_boot` and every `provision` script exist under the template's root and compile."
+    li "A `playbook` on a template whose `arch` is not `x86_64` is rejected."
+    li "Every `media` and `disk` source folder exists."
+  }
+  code wcl {
+    filename    = "examples/templates/ubuntu-24.04/vmlab.wcl"
+    source_file = "../../examples/templates/ubuntu-24.04/vmlab.wcl"
+  }
+
+  h2 "source {}"
+  p <<DOC
+    What the build starts from. The inline label is the kind, and the kind
+    decides which fields apply. Exactly one `source {}` per template; the
+    schema rejects a template without one.
+  DOC
+  code wcl { source = <<'SRC'
+source "iso"      { path = "./installer.iso" }
+source "iso"      { url = "https://…/installer.iso" sha256 = "…" }
+source "qcow2"    { path = "./base.qcow2" }
+source "template" { from = "x86_64/ubuntu-24.04@24.04.4" }
+source "scratch"  { }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`kind`" | "utf8 (label)" | "required" | "Source kind: `iso`, `qcow2`, `template` or `scratch`; the inline label." |
+      | "`path`" | "utf8" | "none" | "Local file path, for `iso` and `qcow2`. Mutually exclusive with `url`." |
+      | "`url`" | "utf8" | "none" | "Remote artefact URL, for `iso` and `qcow2`. Requires `sha256`." |
+      | "`sha256`" | "utf8" | "none" | "SHA-256 of the remote artefact. Required with `url`." |
+      | "`from`" | "utf8" | "none" | "Source template `<arch>/<name>[@<version>]`, for kind `template`: a layered build." |
+  }
+  p "The four kinds:"
+  list {
+    li "**`iso`**: an installer ISO. The build boots it with the attached media and lets the provision script drive the installer. A remote artefact is downloaded to the cache and verified against `sha256` before use."
+    li "**`qcow2`**: an existing disk image, imported as the base."
+    li "**`template`**: a layered build. An existing store template is the base, more provisioning runs, and the result seals as a new template. `from` must be a local store reference; a registry reference or `scratch` is rejected here."
+    li "**`scratch`**: a blank disk of the template's `disk` size. The attached installer media and provision script do everything."
+  }
+  p <<DOC
+    Validation requires exactly one of `path` and `url` for `iso` and
+    `qcow2`, `sha256` whenever `url` is set, a `path` file that exists, and a
+    `from` template that is in the store. An unknown kind is rejected.
+  DOC
+}

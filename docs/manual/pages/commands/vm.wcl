@@ -1,0 +1,335 @@
+page cmd_vm {
+  title = "vmlab vm"
+  chapter_header "vmlab vm" {
+    kicker       = "Commands · reference"
+    reading_time = "10 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab vm` controls one VM at a time: power, its IP address, and the
+    display-driven interaction described in
+    [Screens, input and vision](guide_vision), which the wscript
+    [Machine](ref_ws_machine) handle offers to scripts and this verb offers
+    to a shell.
+  DOC
+
+  code sh { source = "vmlab vm <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`start`" | "Start one VM." |
+      | "`ip`" | "Print a VM's IP address (defaults to the first NIC with a lease)." |
+      | "`stop`" | "Stop one VM (graceful ladder; `--force` to kill)." |
+      | "`restart`" | "Restart one VM." |
+      | "`destroy`" | "Destroy one VM: stop it and delete its clone (config retained)." |
+      | "`screenshot`" | "Capture a running VM's screen to a PNG file." |
+      | "`sendkeys`" | "Send a key chord (e.g. `ctrl-alt-delete`)." |
+      | "`mouse-move`" | "Move the mouse pointer to absolute screen coordinates." |
+      | "`click`" | "Click a mouse button, optionally first moving to x,y." |
+      | "`drag`" | "Press, drag from x1,y1 to x2,y2, and release the left button." |
+      | "`ocr`" | "OCR the screen (optionally a region)." |
+      | "`find-image`" | "Search the screen for a template image." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Every subcommand takes a VM reference of the form `[lab/]vm`. A bare
+    name is resolved against the lab in the current directory, and the lab
+    daemon is started if none is running. The qualified form addresses a lab
+    that is already running from any directory and never starts one; it fails
+    with `lab "<name>" is not running` otherwise. A malformed reference such as
+    `lab/` is refused before anything is contacted.
+  DOC
+
+  p <<DOC
+    The power subcommands and `ip` accept a container name too and behave the
+    same; [vmlab container](cmd_container) is the same request under the other
+    noun. The display subcommands need a framebuffer, which a container never
+    has, so on a container they fail with `unsupported`.
+  DOC
+
+  h2 "vmlab vm start"
+
+  code sh { source = "vmlab vm start <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Starts one VM without running the lab's `up` plan: no dependency waves,
+    no provision scripts, no playbooks. Any deferred download the VM needs
+    runs first with progress on the terminal, then the host binaries are
+    checked, then the VM boots. A VM whose clone does not exist yet gets one
+    created from its template, and its first-boot script runs before it
+    reports ready, exactly as under [vmlab up](cmd_up). A VM that is already
+    running is left alone. Nothing is printed on success.
+  DOC
+
+  h2 "vmlab vm ip"
+
+  code sh { source = "vmlab vm ip [OPTIONS] <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`--nic <NIC>`" | "Report this NIC's address instead of the first one." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Asks the guest agent for its interfaces, matches them to the VM's NICs
+    by MAC address and prints one IPv4 address followed by a newline. With
+    no `--nic` it is the first NIC that holds an address, in declaration
+    order. `--nic` takes a zero-based index into the VM's `nic {}` blocks
+    and reports that NIC's address, failing with `no IPv4 address reported by
+    agent` if that NIC has none. The VM must be running with its agent
+    answering; a VM still booting fails the same way.
+  DOC
+
+  h2 "vmlab vm stop"
+
+  code sh { source = "vmlab vm stop [OPTIONS] <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`--force`" | "Hard kill instead of the graceful ladder." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Stops one VM through the graceful ladder: a shutdown through the guest
+    agent, then an ACPI power-down, then a hard kill, each with a timeout. See
+    [vmlab down](cmd_down) for the rungs and their timeouts. `--force` kills
+    QEMU at once. Unlike `down`, this stops only the named VM; machines that
+    depend on it keep running. A VM that is already stopped is a no-op.
+    Nothing is printed on success.
+  DOC
+
+  h2 "vmlab vm restart"
+
+  code sh { source = "vmlab vm restart <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Stops the VM through the graceful ladder, waits up to 60 seconds for it
+    to settle as stopped, and boots it again. The clone is kept, so the guest
+    comes back with its disk state and no first-boot script. Port forwards
+    that target the VM are re-installed by the daemon when it gets a new
+    lease. A VM that does not settle in time fails with `<name> did not stop
+    for restart`.
+  DOC
+
+  h2 "vmlab vm destroy"
+
+  code sh { source = "vmlab vm destroy <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The per-machine form of [vmlab destroy](cmd_destroy). The VM's SSH
+    multiplexer is told to exit while its alias still resolves, the workspace
+    syncer for it is stopped, the VM is force-stopped and its clone, runtime
+    directory, [snapshots](guide_snapshots), workspace sync ledger and any
+    agent-repair divergence are deleted. The VM stays declared in the lab
+    file, so a later `vmlab up <vm>` re-creates it from the template and runs
+    its first-boot script again. The rest of the lab keeps running. Prints
+    `vm "<name>" destroyed`.
+  DOC
+
+  callout "Snapshots go with the clone" {
+    kind = :warning
+    body = "A VM's snapshots live inside its qcow2 clone. `vmlab vm destroy` deletes them along with the disk, and nothing restores them."
+  }
+
+  h2 "vmlab vm screenshot"
+
+  code sh { source = "vmlab vm screenshot <VM> <PATH>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`<PATH>`" | "Output PNG path." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Captures the VM's framebuffer to a PNG. A relative path is made absolute
+    against your current directory before it is sent, because the daemon
+    writes the file and has a working directory of its own. The path written
+    is printed on success. The VM must be running.
+  DOC
+
+  h2 "vmlab vm sendkeys"
+
+  code sh { source = "vmlab vm sendkeys <VM> <CHORD>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`<CHORD>`" | "The key chord, e.g. `ctrl-alt-delete`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Presses and releases one chord on the VM's virtual keyboard, in the same
+    spelling the wscript `send_keys` call accepts: key names joined with `-`.
+    To type a string rather than a chord use a script and the `type` call
+    described in [Screens, input and vision](guide_vision). Nothing is
+    printed on success.
+  DOC
+
+  h2 "vmlab vm mouse-move"
+
+  code sh { source = "vmlab vm mouse-move <VM> <X> <Y>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`<X>`, `<Y>`" | "Absolute screen coordinates, in pixels from the top-left corner." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p "Moves the pointer to an absolute position on the guest screen without clicking. Nothing is printed on success."
+
+  h2 "vmlab vm click"
+
+  code sh { source = "vmlab vm click [OPTIONS] <VM> [X] [Y]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`[X]`, `[Y]`" | "Move here before clicking. Omit both to click at the current position." |
+      | "`--button <BUTTON>`" | "Button to click: `left`, `right` or `middle`. Default `left`." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Clicks one button, moving the pointer first when coordinates are given.
+    Giving only one of `X` and `Y` is refused with `click coordinates need
+    both x and y` before anything is contacted. Nothing is printed on
+    success.
+  DOC
+
+  h2 "vmlab vm drag"
+
+  code sh { source = "vmlab vm drag <VM> <X1> <Y1> <X2> <Y2>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`<X1>`, `<Y1>`" | "Where the left button is pressed." |
+      | "`<X2>`, `<Y2>`" | "Where it is released." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p "Presses the left button at the first point, moves to the second and releases. Nothing is printed on success."
+
+  h2 "vmlab vm ocr"
+
+  code sh { source = "vmlab vm ocr [OPTIONS] <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`--region <X> <Y> <W> <H>`" | "Restrict to a region: x y w h." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Runs OCR over the current screen, or over the rectangle `--region`
+    names, and prints the recognised text followed by a newline. The four
+    region values are separate arguments; negative values are clamped to 0.
+    The recogniser and its limits are described in
+    [Screens, input and vision](guide_vision).
+  DOC
+
+  h2 "vmlab vm find-image"
+
+  code sh { source = "vmlab vm find-image [OPTIONS] <VM> <IMAGE>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`<IMAGE>`" | "Template image path (PNG/PPM)." |
+      | "`--threshold <THRESHOLD>`" | "Match threshold 0.0–1.0. Default 0.9." |
+      | "`--region <X> <Y> <W> <H>`" | "Restrict the search to a region: x y w h." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Searches the screen for the template image and prints the best match as
+    one line, `x=.. y=.. w=.. h=.. score=.. center=x,y`. The image path is
+    resolved on the host before the request is sent, so a missing file is
+    refused with `reference image <path>` and no daemon is contacted. When
+    nothing scores at or above the threshold the verb prints `no match` on
+    stderr and exits 1, which makes it usable as a condition in a shell loop.
+  DOC
+
+  h2 "Examples"
+
+  p "Restart a VM and wait for it to get an address:"
+  code sh { source = <<'SRC'
+vmlab vm restart client01
+until vmlab vm ip client01 2>/dev/null; do sleep 5; done
+SRC
+  }
+
+  p "Log in on a Windows console from the shell:"
+  code sh { source = <<'SRC'
+vmlab vm sendkeys client01 ctrl-alt-delete
+vmlab vm screenshot client01 /tmp/login.png
+vmlab vm ocr client01 --region 0 400 1024 200
+SRC
+  }
+
+  p "Wait for a button to appear, then click it:"
+  code sh { source = <<'SRC'
+until out=$(vmlab vm find-image client01 ./ok-button.png); do sleep 2; done
+center=${out##*center=}
+vmlab vm click client01 ${center%,*} ${center#*,}
+SRC
+  }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 on success. Exit 4 (`not_found`) means the lab declares
+    no VM by that name, for `stop`, `ip` and every display subcommand. Exit 6
+    (`unsupported`) means the machine has no display, which is every
+    container. `start`, `restart` and `destroy` exit 1 (`failed`) on an
+    unknown name and on any boot, stop or disk failure; the other
+    subcommands exit 1 on a VM that is not running, an agent that does not
+    answer, or a local problem such as an unreadable image or an unreachable
+    lab. `find-image` exits 1 on no match. Exit 5 (`conflict`) means the
+    supervisor tracks a lab with this name from another directory. A usage
+    error, including a bad `--button` value, exits 2.
+  DOC
+}

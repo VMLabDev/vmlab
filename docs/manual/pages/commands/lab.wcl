@@ -1,0 +1,193 @@
+page cmd_lab {
+  title = "vmlab lab"
+  chapter_header "vmlab lab" {
+    kicker       = "Commands · reference"
+    reading_time = "6 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab lab` manages running labs host-wide, by name rather than by the
+    current directory. The supervisor keeps a registry of every lab daemon
+    it started, and these verbs read it and act on the daemons behind it. See
+    [How vmlab runs a lab](guide_architecture) for the supervisor and the
+    per-lab daemons.
+  DOC
+
+  code sh { source = "vmlab lab <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`list`" | "List every tracked lab: name, state, and directory." |
+      | "`info`" | "Show detailed status (machines and segments) of a running lab." |
+      | "`stop`" | "Gracefully stop a running lab; clones retained." |
+      | "`restart`" | "Restart a lab's daemon so it re-reads `vmlab.wcl`." |
+      | "`destroy`" | "Stop a lab and delete its clones and local state." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The read-only subcommands never start the supervisor: with none running
+    the registry is empty and `list` says so. None of them starts a lab
+    daemon either; a lab that is not running is reported, not brought up.
+  DOC
+
+  h2 "vmlab lab list"
+
+  code sh { source = "vmlab lab list [OPTIONS]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`--json`" | "Emit a JSON array instead of a table." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Prints one row per registered lab with `NAME`, `STATE` and `DIRECTORY`.
+    The state is `running`, `stopping` or `failed`, the last meaning the
+    daemon exited without being asked to. With no supervisor or an empty
+    registry it prints `no running labs`. Under `--json` each entry carries
+    `name`, `root`, `pid` and `state`.
+  DOC
+
+  h2 "vmlab lab info"
+
+  code sh { source = "vmlab lab info [OPTIONS] <LAB>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<LAB>`" | "The lab's name." |
+      | "`-v`, `--verbose`" | "Add the raw power state, readiness, and each machine's kind-specific detail." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The host-wide form of [vmlab status](cmd_status). With the daemon
+    reachable it prints `directory: <root>` and then the same report `status`
+    prints, with the same `--verbose` detail. A lab that is registered but
+    whose daemon does not answer, for example one in the `failed` state,
+    prints one line from the registry, `lab "<name>" [<state>] (not reachable)
+    directory <root>`, and exits 0. A name the registry does not know fails
+    with `lab "<name>" is not running`.
+  DOC
+
+  h2 "vmlab lab stop"
+
+  code sh { source = "vmlab lab stop [OPTIONS] <LAB>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<LAB>`" | "The lab's name." |
+      | "`--force`" | "Hard kill instead of the graceful ladder." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Stops every machine in the named lab through the graceful ladder
+    [vmlab down](cmd_down) describes, or kills them under `--force`, and
+    keeps the clones. Prints `lab "<name>" is down (clones retained)`. A lab
+    with no reachable daemon prints `lab "<name>" is not running` and exits 0;
+    unlike `down` this form reaps no orphaned processes, since without the
+    registry entry it has no directory to release.
+  DOC
+
+  h2 "vmlab lab restart"
+
+  code sh { source = "vmlab lab restart [OPTIONS] <LAB>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<LAB>`" | "The lab's name." |
+      | "`--json`" | "Emit the raw JSON reply instead of a confirmation." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Replaces the lab's daemon so it re-reads `vmlab.wcl`. This is not
+    `down` followed by `up`: that stops every machine and re-runs
+    provisioning, whereas this replaces only the daemon. It is the way to
+    pick up an edit to the [lab file](guide_lab_file), and the way to recover
+    a daemon whose lab file no longer loads.
+  DOC
+
+  p <<DOC
+    The lab must already be stopped. A fresh daemon cannot re-adopt machines
+    the old one was running, and the old daemon's own shutdown stops them, so
+    a lab with machines still running is refused with `lab "<name>" still has
+    machines running — stop them first; a restarted daemon cannot re-adopt
+    them`. A daemon that cannot answer a status request at all is not a
+    veto, because a lab whose file no longer loads is exactly what this verb
+    exists to recover.
+  DOC
+
+  p <<DOC
+    Run inside the lab's own directory, the current directory is the root
+    the supervisor is asked to restart from; run elsewhere, the registry's
+    entry is used. The supervisor refuses a name already registered from a
+    different directory. On success the verb pings the new daemon and
+    prints `lab "<name>" daemon restarted at <socket>`; under `--json` it
+    prints the supervisor's reply, which carries the new `socket` path.
+  DOC
+
+  h2 "vmlab lab destroy"
+
+  code sh { source = "vmlab lab destroy <LAB>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<LAB>`" | "The lab's name." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The host-wide form of [vmlab destroy](cmd_destroy): withdraws the lab's
+    SSH aliases, asks the daemon to stop every machine and delete the clones,
+    volumes and lab-local state, and releases the lab at the supervisor so
+    its daemon is reaped. With no reachable daemon but a registry entry, it
+    removes the lab's `.vmlab/` directory itself. A name the registry does
+    not know fails with `lab "<name>" is not running`. Prints `lab "<name>"
+    destroyed`.
+  DOC
+
+  h2 "Examples"
+
+  p "See what is running on this host:"
+  code sh { source = "vmlab lab list" }
+
+  code sh { source = <<'SRC'
+NAME      STATE      DIRECTORY
+ad-lab    running    /home/wil/labs/ad-lab
+mixed-lab failed     /home/wil/labs/mixed-lab
+SRC
+  }
+
+  p "Pick up an edited lab file without re-provisioning:"
+  code sh { source = <<'SRC'
+vmlab lab stop ad-lab
+vmlab lab restart ad-lab
+vmlab up
+SRC
+  }
+
+  p "Free the host of a lab you started from another directory:"
+  code sh { source = "vmlab lab destroy peer-b" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 on success, including `list` with nothing running,
+    `stop` on a lab that is not running, and `info` on a registered lab
+    whose daemon does not answer. An unknown lab name, a lab with machines
+    still running at `restart`, a daemon that fails the request, or a
+    supervisor that does not come up exits 1 (`failed`). `restart` exits 5
+    (`conflict`) when the supervisor already tracks this name from another
+    directory. A usage error exits 2.
+  DOC
+}

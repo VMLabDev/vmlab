@@ -1,0 +1,265 @@
+page guide_networking {
+  title = "Networking"
+  chapter_header "Networking" {
+    kicker       = "The guide · explanation"
+    reading_time = "14 min read"
+    updated      = "2026-09-02"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    The lab daemon contains a complete userspace network stack: switching,
+    DHCP, DNS, NAT, port forwarding, and traffic filtering and redirection.
+    It needs no root, no tap devices, no bridges and no host network
+    configuration, which is what makes WSL 2 a first-class host. This chapter
+    explains the pieces and how they fit. The fields of a `segment` block and
+    its children are in [Lab file: lab and segment](ref_lab).
+  DOC
+
+  h2 "Segments and the switch"
+
+  p <<DOC
+    A **segment** is a virtual L2 switch. Every machine NIC on it attaches
+    as a port over a QEMU stream-socket netdev, which is a unix socket in the
+    runtime directory, and the daemon does MAC-learning frame forwarding
+    between the ports of one segment. Because the daemon sees every frame,
+    DHCP, DNS, routing, filtering and redirection are implemented as
+    participants on the switch rather than as external services.
+  DOC
+
+  p <<DOC
+    Segments are lab-scoped by default: `corp` in one lab and `corp` in
+    another are different wires. A machine reaches a segment only through a
+    `nic` block, and a machine with none is air-gapped. Any NIC may set
+    `isolated = true`, after which the switch drops frames between that port
+    and other guests, in the private-VLAN style. An isolated NIC still
+    reaches the segment's gateway services, its NAT, its forwards and its
+    shares, but never a neighbour.
+  DOC
+
+  p <<DOC
+    Throughput is a stated non-goal. The fabric proxies every flow in
+    process, so it will not approach tap or bridge speeds, and the eBPF fast
+    path at the end of this chapter is the optional remedy.
+  DOC
+
+  h2 "The connectivity ladder"
+
+  p "Connectivity is climbed by declaration, one rung at a time:"
+
+  list {
+    style = :numbered
+    li "**No `nic` block.** No network hardware at all. The agent still works, over virtio-serial."
+    li "**`nic { nat = true }`.** The NIC joins the lab's built-in NAT segment: DHCP, DNS and internet egress are on, and nothing needs declaring. It is one shared segment per lab, so machines using the shorthand can reach each other unless a NIC also sets `isolated = true`."
+    li "**A declared segment.** `nic { segment = \"corp\" }` on a segment you declared, with the subnet, DNS, NAT, routes and rules you choose. A declared segment is isolated from the internet unless it sets `nat = true`."
+  }
+
+  h2 "Addressing and DHCP"
+
+  p <<DOC
+    DHCP is on for every segment unless it sets `dhcp = false`. A segment
+    with no `subnet` is allocated a `/24` from a host-wide pool, `10.213.0.0/16`
+    by default and overridable with `subnet_pool` in the
+    [host configuration](guide_host). A declared subnet is honoured. The
+    daemon holds the subnet's first usable address as the gateway and serves
+    leases from there.
+  DOC
+
+  p <<DOC
+    A NIC with a static `ip` becomes a **DHCP reservation** keyed on the
+    NIC's MAC, which vmlab generates once and persists in `.vmlab/` unless
+    the block fixes a `mac`. The guest keeps plain DHCP configuration and
+    still lands on a deterministic address, and a static IP may sit outside
+    the dynamic pool. The lease carries the gateway, the DNS server, the
+    domain suffix and, when the segment declares `route` blocks, classless
+    static routes as DHCP option 121.
+  DOC
+
+  p <<DOC
+    Turn DHCP off for a segment where a lab machine should own addressing: a
+    domain controller, a pfSense VM, a dnsmasq experiment. A NIC may also
+    declare `gateway = true` to take over the segment's router role. It must
+    own the subnet's first usable address, and the daemon moves its own
+    DHCP, DNS and SMB services to another free address on the segment.
+  DOC
+
+  h2 "DNS"
+
+  p <<DOC
+    The daemon answers DNS on each segment's gateway address. Every guest NIC
+    auto-registers as `<machine>.<lab>.<suffix>`, with a short
+    `<machine>.<suffix>` alias where that is unambiguous within the segment.
+    The suffix defaults to `vmlab.internal`, chosen to avoid the `.local`
+    mDNS collision, and is overridable with `dns_suffix` in the host
+    configuration. Containers register the same way as VMs.
+  DOC
+
+  p <<DOC
+    Static entries are `record` blocks, per segment or lab-wide, with
+    wildcards allowed in the name. Queries nothing in the lab answers are
+    forwarded upstream, to the host's own resolver unless `dns_upstream`
+    names another, so a guest on a NAT segment gets working public DNS for
+    free. A segment's `dns` child hands out a different server over DHCP,
+    which an Active Directory lab needs so the DC owns resolution, or sets
+    `enabled = false` to suppress the DHCP option entirely. `vmlab dns`
+    prints the zones the lab's segments currently serve.
+  DOC
+
+  h2 "Internet egress"
+
+  p <<DOC
+    Egress is a userspace NAT attached as a port on the switch. Guest TCP
+    and UDP flows are terminated in the daemon and proxied over ordinary
+    host sockets, so no privilege is needed anywhere. ICMP echo is degraded
+    by design: unprivileged ICMP sockets are unavailable, so reachability is
+    probed with the system `ping` binary and a reply synthesised from the
+    result. A guest's `ping` tells you whether a host is reachable, and
+    nothing about round-trip time.
+  DOC
+
+  p <<DOC
+    Because the NAT terminates flows on the host, anything a guest addresses
+    off-segment reaches the host's own address space. That is how a guest
+    reaches a host-side service such as a package mirror or a licence server,
+    and it is the answer to the reverse tunnel the
+    [SSH facade](guide_logins) refuses.
+  DOC
+
+  h2 "Port forwards"
+
+  p <<DOC
+    A `forward` block on a segment, or a `port` block on a container, makes
+    the daemon listen on a host port and proxy TCP, UDP or both into the
+    segment. This is the host-to-guest path for RDP, SSH and web UIs. It
+    works identically under WSL 2, where Windows-side access rides WSL's own
+    localhost forwarding.
+  DOC
+
+  p <<DOC
+    Every forward a lab needs is worked out as one **forward plan** before
+    any is installed, with lease resolution as the only runtime input. A
+    forward whose machine has no lease yet is skipped with a reason rather
+    than dropped, and installed once the lease arrives. Two forwards claiming
+    one host port are settled in the plan: the first claimant keeps the port
+    and the rest are dropped, naming the winner, rather than all being
+    installed and the losers failing at bind time. Scripts can add forwards
+    at runtime with `Segment.forward`.
+  DOC
+
+  h2 "Guest routes and inter-segment routing"
+
+  p <<DOC
+    Multi-segment topologies are routed through a machine. Give a router VM
+    a NIC on each segment, and declare `route` blocks on the segments whose
+    guests should know about the other side. Each route is pushed to every
+    guest at lease time as DHCP option 121, so a firewall or router lab needs
+    no guest configuration.
+  DOC
+
+  p <<DOC
+    A segment's `routes_to` list names other segments the daemon itself
+    should forward L3 traffic to, always an explicit opt-in per pair.
+    Validation checks that every target is a declared segment. The daemon's
+    own forwarding engine behind that field is not yet wired, and the script
+    verbs `route_to` and `unroute_to` answer with an error saying so. Route
+    through a machine for now.
+  DOC
+
+  h2 "Filtering and redirection"
+
+  p <<DOC
+    Two enforcement layers are declared in the lab file and mutable at
+    runtime from wscript. Runtime mutation is a first-class lab scenario:
+    block the DC and watch the client fail over. There is no `vmlab net`
+    command; static rules belong in `vmlab.wcl` and dynamic ones in scripts.
+  DOC
+
+  p <<DOC
+    **DNS rules** are `sinkhole` blocks, per segment or lab-wide. A sinkhole
+    answers a name pattern with NXDOMAIN, or with `0.0.0.0` when its mode is
+    `zero`, and wildcards such as `*.telemetry.example.com` are supported.
+    A `record` overrides a name to an address of your choosing. Both are
+    only effective for guests using the segment's DNS.
+  DOC
+
+  p <<DOC
+    **L3 rules** run at the switch on every guest-originated IPv4 packet
+    addressed to the gateway. A `block` rule drops traffic to or from a
+    CIDR, optionally scoped by protocol and port, and answers with a TCP
+    reset or an ICMP unreachable so the guest fails fast instead of hanging.
+    A `redirect` rule is DNAT: traffic to one `ip[:port]` is rewritten to
+    another, and the daemon keeps the connection state to rewrite the return
+    path.
+  DOC
+
+  p <<DOC
+    Redirect rules are evaluated before block rules, so a packet matching
+    both is redirected, not dropped. Within a layer the most specific match
+    wins: an `ip:port` redirect beats a port-less one, and among blocks the
+    longest prefix wins, then a rule with a port, then a rule with a protocol.
+    Remaining ties go to declaration order. Removing a redirect stops new
+    rewrites at once, while established return-path entries linger until
+    they idle out.
+  DOC
+
+  p <<DOC
+    From a script, `Segment.block`, `block_port`, `redirect`, `dns_set` and
+    `dns_sinkhole` each return a rule id, and `unblock` and `dns_clear`
+    remove one. `rules` lists what is currently in force. The full API is in
+    [wscript API: Lab and Segment](ref_ws_lab).
+  DOC
+
+  h2 "Global segments and cross-host trunks"
+
+  p <<DOC
+    A segment declared `global = true` is owned by the supervisor rather
+    than the lab daemon. It is created on first attach, destroyed on last
+    detach, and shared by every lab on the host that declares the same name.
+    Each lab daemon attaches over a **trunk**, a frame-forwarding connection
+    on a unix socket, and the supervisor runs the shared segment's DHCP and
+    DNS so registrations span labs coherently. Machines in different labs on
+    a global segment resolve each other's names.
+  DOC
+
+  p <<DOC
+    The same trunk protocol over TCP is the whole cross-host story. A global
+    segment with a `connect { host = "peer:port" }` child is bridged to the
+    same-named segment on another host's supervisor, with the two
+    supervisors authenticating by the pre-shared key both set in `psk` in
+    their host configuration and listening on `trunk_port`. VMs stay local;
+    only the wire spans hosts. `connect` on a segment that is not global is a
+    validation error.
+  DOC
+
+  callout "Declare `connect` on one side" {
+    kind = :tip
+    body = "The supervisor keeps at most one trunk per remote host per segment, so both sides declaring `connect` to each other is safe on a plain network: the dialer stands down while an inbound trunk from that address is active. A NAT'd or multi-homed peer can defeat the address match, so on such topologies declare `connect` on one side only."
+  }
+
+  h2 "The eBPF fast path"
+
+  p <<DOC
+    The netdev attachment is designed so a faster backend can be substituted
+    per segment without changing lab semantics, and two opt-in kernel tiers
+    use that seam. **afxdp** attaches NICs as tap devices with a per-segment
+    XDP program that forwards known unicast between two non-isolated guest
+    ports in-kernel; everything else punts to the daemon and crosses the
+    userspace switch as before. **sockmap** keeps the stream sockets and
+    splices known guest-to-guest unicast between them in-kernel. It is
+    functionally validated but measured slower than the userspace fabric, so
+    `auto` never selects it. **userspace** is the fabric as described, and
+    always the fallback.
+  DOC
+
+  p <<DOC
+    Both kernel tiers need `CAP_BPF` and `CAP_NET_ADMIN`, and each daemon
+    proves a tier works on its host, loading the programs and pushing frames
+    through throwaway taps or sockets, before using it. An unprivileged or
+    WSL 2 daemon degrades to userspace silently. The gateway MAC and the
+    service and trunk ports never enter the kernel forwarding tables, so DHCP,
+    DNS, NAT, rules and forwards behave identically on every tier. Force a
+    tier with `fastpath` in the host configuration or the `VMLAB_FASTPATH`
+    environment variable, and see which tier the host selected and why the
+    others were unavailable with [vmlab fastpath](cmd_fastpath).
+  DOC
+}
