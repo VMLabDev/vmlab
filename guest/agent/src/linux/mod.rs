@@ -163,7 +163,9 @@ fn serial_port() -> Option<PathBuf> {
 /// Put a serial device in raw mode at 115200 8N1, no flow control — the
 /// line discipline would otherwise cook the frames.
 fn configure_serial(port: &File) -> std::io::Result<()> {
-    use nix::sys::termios::{BaudRate, ControlFlags, SetArg, cfmakeraw, cfsetspeed, tcgetattr, tcsetattr};
+    use nix::sys::termios::{
+        BaudRate, ControlFlags, SetArg, cfmakeraw, cfsetspeed, tcgetattr, tcsetattr,
+    };
     let mut t = tcgetattr(port)?;
     cfmakeraw(&mut t);
     cfsetspeed(&mut t, BaudRate::B115200)?;
@@ -185,7 +187,10 @@ pub fn open_port() -> (
     loop {
         let path = match serial_port() {
             Some(serial) => {
-                eprintln!("vmlab-agent: no virtio-serial; serving on {}", serial.display());
+                eprintln!(
+                    "vmlab-agent: no virtio-serial; serving on {}",
+                    serial.display()
+                );
                 serial
             }
             None => match find_virtio_port(PORT_NAME) {
