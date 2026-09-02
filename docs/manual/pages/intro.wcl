@@ -1,6 +1,7 @@
 // Front matter: what vmlab is, who it is for, and how this manual is laid out.
 page intro {
   title = "Introduction"
+  start = true
   chapter_header "Introduction" {
     kicker       = "Introduction · explanation"
     reading_time = "6 min read"
