@@ -127,6 +127,52 @@ fn find_virtio_port(name: &str) -> Option<PathBuf> {
     byname.exists().then_some(byname)
 }
 
+static PORT_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `--port <device>`: serve on this serial device instead of the virtio port.
+pub fn set_port_override(path: PathBuf) {
+    let _ = PORT_OVERRIDE.set(path);
+}
+
+/// Whether this VM has a virtio-serial controller at all (PCI vendor 1af4,
+/// device 1003 legacy or 1043 modern). Hardware, not timing: the profile
+/// decided it before boot, so its absence is a fact, not a race — and the
+/// signal that the agent channel is the 16550 on COM1 instead (PRD §7.4).
+fn has_virtio_serial_controller() -> bool {
+    let Ok(entries) = fs::read_dir("/sys/bus/pci/devices") else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let vendor = fs::read_to_string(e.path().join("vendor")).unwrap_or_default();
+        let device = fs::read_to_string(e.path().join("device")).unwrap_or_default();
+        vendor.trim() == "0x1af4" && matches!(device.trim(), "0x1003" | "0x1043")
+    })
+}
+
+/// The serial device the agent channel rides when there is no virtio-serial:
+/// an explicit `--port`, else COM1 when the machine has no virtio-serial
+/// controller but does have a UART.
+fn serial_port() -> Option<PathBuf> {
+    if let Some(p) = PORT_OVERRIDE.get() {
+        return Some(p.clone());
+    }
+    let com1 = PathBuf::from("/dev/ttyS0");
+    (!has_virtio_serial_controller() && com1.exists()).then_some(com1)
+}
+
+/// Put a serial device in raw mode at 115200 8N1, no flow control — the
+/// line discipline would otherwise cook the frames.
+fn configure_serial(port: &File) -> std::io::Result<()> {
+    use nix::sys::termios::{BaudRate, ControlFlags, SetArg, cfmakeraw, cfsetspeed, tcgetattr, tcsetattr};
+    let mut t = tcgetattr(port)?;
+    cfmakeraw(&mut t);
+    cfsetspeed(&mut t, BaudRate::B115200)?;
+    t.control_flags |= ControlFlags::CLOCAL | ControlFlags::CREAD;
+    t.control_flags &= !ControlFlags::CRTSCTS;
+    tcsetattr(port, SetArg::TCSANOW, &t)?;
+    Ok(())
+}
+
 /// Open the agent port read+write (virtio ports are exclusive-open; the two
 /// halves are fd clones). Retries until the device exists — the service may
 /// start before the virtio-console driver has bound. A busy port means
@@ -137,14 +183,31 @@ pub fn open_port() -> (
     impl std::io::Write + Send + 'static,
 ) {
     loop {
-        let Some(path) = find_virtio_port(PORT_NAME) else {
-            eprintln!("vmlab-agent: waiting for port {PORT_NAME}");
-            thread::sleep(Duration::from_secs(2));
-            continue;
+        let path = match serial_port() {
+            Some(serial) => {
+                eprintln!("vmlab-agent: no virtio-serial; serving on {}", serial.display());
+                serial
+            }
+            None => match find_virtio_port(PORT_NAME) {
+                Some(p) => p,
+                None => {
+                    eprintln!("vmlab-agent: waiting for port {PORT_NAME}");
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            },
         };
+        let is_serial = serial_port().is_some();
         match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(port) => match port.try_clone() {
-                Ok(w) => return (port, w),
+                Ok(w) => {
+                    if is_serial && let Err(e) = configure_serial(&port) {
+                        eprintln!("vmlab-agent: cannot configure {}: {e}", path.display());
+                        thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                    return (port, w);
+                }
                 Err(e) => {
                     eprintln!("vmlab-agent: port clone failed: {e}");
                     thread::sleep(Duration::from_secs(2));
@@ -1248,9 +1311,12 @@ pub fn disk_sample() -> Vec<DiskUsage> {
         let Ok(vfs) = nix::sys::statvfs::statvfs(mount) else {
             continue;
         };
-        // c_ulong == u64 on every target we build (all 64-bit).
-        let frsize: u64 = vfs.fragment_size();
-        let total = vfs.blocks() * frsize;
+        // c_ulong is 32 bits on the i686 build, so widen explicitly; on the
+        // 64-bit builds the conversion is the identity clippy would remove.
+        #[allow(clippy::useless_conversion)]
+        let frsize: u64 = vfs.fragment_size().into();
+        #[allow(clippy::useless_conversion)]
+        let total = u64::from(vfs.blocks()) * frsize;
         if total == 0 {
             continue;
         }

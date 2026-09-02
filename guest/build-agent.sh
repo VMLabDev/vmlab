@@ -13,6 +13,9 @@
 #   windows-x86_64  x86_64-pc-windows-gnu       (static CRT; needs mingw-w64,
 #                   skipped with a warning when x86_64-w64-mingw32-gcc is
 #                   absent)
+#   linux-x86       i686-unknown-linux-musl     (static; optional — a 32-bit
+#                   guest too old for virtio-serial serves on COM1 instead,
+#                   PRD §7.4; skipped with a warning when not installed)
 #
 # Usage: guest/build-agent.sh [target-key...]   (default: all of the above)
 
@@ -48,7 +51,8 @@ target_spec() {
     linux-aarch64) echo "aarch64-unknown-linux-musl|vmlab-agent|1" ;;
     linux-riscv64) echo "riscv64gc-unknown-linux-musl|vmlab-agent|0" ;;
     windows-x86_64) echo "x86_64-pc-windows-gnu|vmlab-agent.exe|0" ;;
-    *) die "unknown target key '$1' (known: linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64)" ;;
+    linux-x86) echo "i686-unknown-linux-musl|vmlab-agent|0" ;;
+    *) die "unknown target key '$1' (known: linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 linux-x86)" ;;
   esac
 }
 
@@ -104,7 +108,7 @@ main() {
   command -v rustup >/dev/null 2>&1 || die "missing host tool: rustup"
   mkdir -p "$DIST_DIR"
   local -a keys=("$@")
-  [[ ${#keys[@]} -gt 0 ]] || keys=(linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64)
+  [[ ${#keys[@]} -gt 0 ]] || keys=(linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 linux-x86)
   local key
   for key in "${keys[@]}"; do
     build_one "$key"

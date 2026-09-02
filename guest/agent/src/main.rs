@@ -70,8 +70,20 @@ fn main() {
         _ => {}
     }
     let mut console = false;
-    for a in &args {
+    let mut args_iter = args.iter();
+    while let Some(a) = args_iter.next() {
         match a.as_str() {
+            // Linux: serve on a serial device instead of the virtio port —
+            // a guest too old for virtio-serial on an `isa-serial` profile
+            // (PRD §7.4). Without it the port is auto-detected by hardware.
+            #[cfg(unix)]
+            "--port" => {
+                let Some(path) = args_iter.next() else {
+                    eprintln!("vmlab-agent: --port needs a device path");
+                    std::process::exit(2);
+                };
+                linux::set_port_override(std::path::PathBuf::from(path));
+            }
             "--daemonize" => {
                 #[cfg(unix)]
                 linux::daemonize();

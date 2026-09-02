@@ -13,6 +13,8 @@ set -e
 
 here="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 arch="$(uname -m)"
+# The ISO is laid out by template arch, where every 32-bit x86 is `x86`.
+case "$arch" in i?86) arch=x86 ;; esac
 bin="$here/linux/$arch/vmlab-agent"
 if [ ! -f "$bin" ]; then
     echo "vmlab bootstrap: no agent binary for $arch on the VMLAB ISO" >&2
