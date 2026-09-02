@@ -489,8 +489,10 @@ fn open_by_enumeration(want: &str) -> Option<Arc<PortHandle>> {
                 continue;
             }
             let path_u16: Vec<u16> = detail[4..]
-                .chunks_exact(2)
-                .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_ne_bytes(*c))
                 .take_while(|&c| c != 0)
                 .collect();
             let path = String::from_utf16_lossy(&path_u16);
