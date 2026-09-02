@@ -1,211 +1,80 @@
 ---
 name: vmlab
-description: "Reference and processes for vmlab. A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript. Use when working with vmlab or answering questions about it."
+description: "Complete vmlab reference — the lab file, wscript, the CLI, templates, networking, containers, dev machines. Read before writing or editing a `vmlab.wcl` or a `.ws` script, running any `vmlab` command, or answering a question about how vmlab behaves."
 allowed-tools:
   - Bash
   - Read
 disable-model-invocation: false
-metadata:
-  wskill_schema_version: 1.3.0
 ---
 
 # vmlab
 
 <overview>
+vmlab is a declarative QEMU/KVM VM-lab orchestrator. A lab — machines plus the
+virtual networks between them — is declared in WCL in a `vmlab.wcl` file and
+brought up with one command. Disk templates are built locally and distributed
+over OCI registries. OCI containers join a lab as micro-VM machines. Guest
+automation is written in wscript, which drives power, exec, files, keystrokes,
+screen matching and OCR. Any machine can be marked `@dev` and serves an editor
+over a host-terminated SSH facade. A supervisor daemon plus one daemon per lab
+run behind the CLI, which is the only front end.
 
-A declarative QEMU/KVM VM-lab orchestrator: labs and virtual networks declared in WCL, reusable disk templates built locally or distributed over OCI registries, and guest automation written in wscript.
-
-**Upstream version:** `1.4`. If the real upstream has moved past this, the skill may be stale — bump `topic.version` and re-verify (see the update workflow).
-
-vmlab orchestrates single-host VM labs: labs (VMs + virtual networks) are declared in WCL (`vmlab.wcl`), disk templates are built and stored locally or distributed via OCI registries, and automation is written in wscript scripts that drive guests (power, exec, keystrokes, screen matching, OCR).
-
-OCI containers join labs as micro-VM machines (`container {}`), config-weave playbooks converge guests declaratively (`playbook {}`), and the `vmlab-web` console (REST + WebSocket API, visual designer, guest web-page proxy) manages labs from the browser.
-
-A two-tier daemon (supervisor `vmlabd` + one daemon per lab) is auto-started by the CLI. This skill captures the full reference as data.
-
+`references/` holds the whole product reference. It is self-contained: the
+answer is in these files, so read the one that covers the question rather than
+recalling vmlab behaviour or reading vmlab's source.
 </overview>
 
-## Parameters
+## Which file answers it
 
-<variables>
-
-- `${CLAUDE_SKILL_DIR}`: path to this skill's directory (its `scripts/`, `assets/`, and `references/` live here).
-
-- `$ARGUMENTS`: The vmlab topic, CLI subcommand, WCL attribute, or wscript API method to look up. How to determine: Take it from the user's request. If empty, summarise the reference and ask what they need.
-
-</variables>
+| Question | File |
+|----------|------|
+| Installing, and the first lab, VM, template or provision end to end | `references/start-here.md` |
+| Daemons, processes, guest channels, on-disk paths, the wire protocol and its error codes | `references/architecture.md` |
+| The lab file's syntax and evaluation, and the `lab {}` block | `references/lab-file.md` |
+| The `vm {}` block and every child block: attributes, types, defaults | `references/vm.md` |
+| Containers as lab machines, the micro-VM model, the `container {}` block | `references/containers.md` |
+| Segments, DHCP, DNS, NAT, routing, traffic rules, the eBPF fast path | `references/networking.md` |
+| Templates, the store, builds, `source {}`, linked clones, scratch VMs, OCI distribution | `references/templates.md` |
+| The wscript language: types, control flow, matching, modules, stdlib | `references/wscript-language.md` |
+| wscript `Lab`, `Segment` and `Term` methods, and the shared types (`Match`, `ExecResult`, `Login`, `GuestStats`, `Event`) | `references/wscript-lab-api.md` |
+| wscript `Machine` methods — lifecycle, exec, files, input, vision, snapshots | `references/wscript-machine-api.md` |
+| Provisions, `on "event" {}` handlers, the event catalogue, playbooks | `references/automation.md` |
+| `@dev`, `dev attach`, `dev use`, and the workspace syncer | `references/dev-machines.md` |
+| `login {}`, minted guest logons, the SSH facade, sftp, `ssh-config` | `references/logins-and-ssh.md` |
+| Snapshots, screenshots, keyboard and mouse input, image matching, OCR | `references/snapshots-vision.md` |
+| Shared folders, `vmlab cp`, clipboard transfer (the `media {}` block is in `vm.md`) | `references/shares-media.md` |
+| The host config file, WSL 2, guest OS profiles | `references/host-profiles.md` |
+| Lab-level CLI verbs: `up`, `down`, `status`, `validate`, `destroy`, `pull`, `lab`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`, `script` | `references/cli-lab.md` |
+| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `console`, `cp`, `clipboard`, `snapshot`, `dev`, `ssh`, `ssh-config` | `references/cli-machine.md` |
+| `vmlab template` and its subcommands | `references/cli-template.md` |
+| A command that failed, or a message the user is asking about | `references/troubleshooting.md` |
+| What a vmlab term means | `references/glossary.md` |
+| A worked lab to copy from | `references/examples.md` |
 
 <boundaries>
-
 <always>
-
-- Run `vmlab validate` after editing `vmlab.wcl` and before `vmlab up`.
-- For multi-step guest automation, write a wscript script (`vmlab script x.ws`) instead of chaining many `vmlab exec` calls.
-- Cite the exact reference page when answering.
-
+- Read the reference file covering the surface before writing WCL or wscript, so
+  attribute names, defaults and signatures come from the file rather than memory.
+- Run `vmlab validate` after editing a `vmlab.wcl`, before `vmlab up`.
+- Write a wscript script (`vmlab script x.ws`) for guest automation of more than
+  one step, so the run is one program against the machine handle rather than a
+  chain of `vmlab exec` calls.
+- Name the reference file an answer came from, so the user can check it.
+- Confirm the target lab or template before acting when more than one
+  `vmlab.wcl` or store version is plausible.
 </always>
 
-<ask>
-
-- Which lab or template is meant when multiple `vmlab.wcl` files or store versions are plausible targets.
-
-</ask>
-
 <never>
-
-- Run `vmlab destroy` or `vmlab template rm` without explicit user say-so — both delete state (clones / store images).
-- Invent WCL attributes or wscript functions: everything that exists is in the reference; if it's not there, check `src/config/schema.wcl` or `src/scripting/mod.rs` before using it.
-
+- Run `vmlab destroy` or `vmlab template rm` without the user asking for it in
+  this session — both delete state (a lab's clones, a store image).
+- State that a WCL attribute, wscript method or CLI flag exists without finding
+  it in `references/`.
 </never>
-
 </boundaries>
 
-## Reference
-
-### Getting started
-
-_What vmlab is and your first lab._
-
-Getting started using VMLab: describe the lab in `vmlab.wcl`, bring it up with one command.
-
-- [Start here](references/concept_start_here.md)
-
-### How vmlab works
-
-_The moving parts: daemons, QEMU processes, guest channels, and where state lives on disk._
-
-The big picture first, then the daemon model and the on-disk layout — machine-wide state versus each lab's disposable `.vmlab/`.
-
-- [How vmlab fits together](references/concept_architecture.md)
-- [Daemon model](references/concept_daemon_model.md)
-- [Filesystem layout](references/fact_paths_table.md)
-- [vmlab.wcl](references/entity_vmlab_wcl.md)
-- [.vmlab/](references/entity_dot_vmlab.md)
-- [Template store](references/entity_template_store.md)
-
-### Labs & networking
-
-_Declare machines and the virtual networks that connect them._
-
-The `vmlab.wcl` topology surface: the lab, VM and container blocks, shared folders and media, then the network fabric — segments, DHCP/DNS, routing, NAT and traffic rules.
-
-- [lab {} block](references/entity_labs.md)
-- [vm {} block](references/entity_vms.md)
-- [container {} block](references/entity_container_block.md)
-- [nic {} block](references/entity_nic_block.md)
-- [share {} block](references/entity_shares.md)
-- [media {} block](references/entity_media.md)
-- [Networking model](references/concept_networking.md)
-- [segment {} block](references/entity_segment_block.md)
-- [segment {} sub-blocks](references/fact_segment_subblocks.md)
-
-### Templates & distribution
-
-_Build reusable disk images and move them between machines._
-
-Templates end to end: what they are, declaring and building them, how clones boot from them, scratch VMs, and pushing/pulling over OCI registries.
-
-- [Templates](references/concept_templates.md)
-- [template {} block](references/entity_template_block.md)
-- [source {} build source](references/entity_template_sources.md)
-- [Template build flow](references/concept_template_builds.md)
-- [Build a disk template](references/process_build_template.md)
-- [Linked clones](references/concept_linked_clones.md)
-- [Scratch VMs](references/concept_scratch_vms.md)
-- [OCI distribution](references/concept_oci.md)
-- [OCI artifact model](references/fact_oci_artifact.md)
-- [Distribute a template over an OCI registry](references/process_distribute_oci.md)
-
-### Lab containers
-
-_OCI containers as first-class lab machines, each in its own micro-VM._
-
-The container story (PRD §18): why micro-VMs, the `container {}` block, and containers on the one wscript machine handle.
-
-- [Lab containers](references/concept_lab_containers.md)
-- [container {} block](references/entity_container_block.md)
-- [Container handle](references/entity_container_api.md)
-
-### Automation
-
-_Drive guests: provision scripts, event handlers, playbooks, and the wscript language + API underneath._
-
-Start with the overview — which of the four automation surfaces fits which job — then the wscript language, the host API, and the provision/event/playbook machinery.
-
-- [Automating labs](references/concept_automation_overview.md)
-
-#### The wscript language
-
-_The statically typed scripting language: types, functions, matching, modules, stdlib._
-- [wscript: overview](references/concept_wscript_overview.md)
-- [wscript: types & values](references/concept_wscript_types.md)
-- [wscript: functions & control flow](references/concept_wscript_functions.md)
-- [wscript: pattern matching & errors](references/concept_wscript_matching.md)
-- [wscript: modules & prelude](references/concept_wscript_modules.md)
-- [wscript: List & Map methods](references/fact_wscript_collections.md)
-- [wscript: string methods](references/fact_wscript_strings.md)
-- [wscript: not in v1](references/fact_wscript_limits.md)
-
-#### The vmlab API
-
-_The Lab / Machine / Segment handles and their method groups, plus the result types._
-- [Lab](references/entity_lab_api.md)
-- [Machine](references/entity_vm_api.md)
-- [Machine: lifecycle & state methods](references/fact_vm_lifecycle.md)
-- [Machine: snapshot methods](references/fact_vm_snapshots.md)
-- [Machine: keyboard & mouse methods](references/fact_vm_input.md)
-- [Machine: screen, image matching & OCR methods](references/fact_vm_vision.md)
-- [Machine: guest agent methods (exec, files, terminal, stats)](references/fact_vm_agent.md)
-- [vmlab-agent](references/entity_vmlab_agent.md)
-- [Segment](references/entity_seg_api.md)
-- [Match](references/entity_match_type.md)
-- [ExecResult](references/entity_exec_result_type.md)
-
-#### Provisions, events & playbooks
-
-_The declared automation: provision scripts on `up`, lifecycle event handlers, and config-weave playbooks._
-- [Provisions & event handlers](references/concept_provisions.md)
-- [provision {} block](references/entity_provision_block.md)
-- [on "event" {} handler](references/entity_on_handler.md)
-- [Event](references/entity_event_type.md)
-- [Lifecycle events](references/fact_events.md)
-- [Playbooks (config-weave)](references/concept_playbooks.md)
-- [playbook {} block](references/entity_playbook_block.md)
-
-### Operations & hosting
-
-_Run vmlab anywhere: the everyday lifecycle, host config, profiles, WSL2, and the network fast path._
-
-Running labs day to day — the full lifecycle runbook — plus host-side concerns: the optional host config, guest OS profiles, running on WSL2, eBPF acceleration, and what `vmlab validate` checks.
-
-- [Bring a lab up and tear it down](references/process_golden_path.md)
-- [Host config](references/concept_host_config.md)
-- [Guest OS profiles](references/concept_profiles.md)
-- [Shipped guest OS profiles](references/fact_profiles_table.md)
-- [WSL2](references/concept_wsl2.md)
-- [Network fast path (eBPF)](references/concept_fastpath.md)
-- [What `vmlab validate` checks](references/fact_validate_checks.md)
-
-### Appendix: reference tables
-
-_The full vmlab.wcl schema and other lookup tables._
-
-Lookup material: the complete reflected `vmlab.wcl` schema (every block and attribute) and the key-chord names. The CLI reference and glossary follow as their own chapters.
-
-- [The vmlab.wcl schema](references/fact_schema_reference.md)
-- [Keyboard chord names](references/fact_key_chords.md)
-
-- [CLI reference](references/cli_ref.md) — every `vmlab` subcommand, its arguments and switches
-
-- [Glossary](references/glossary_ref.md) — terms and definitions
-
-- [Related skills](references/related_ref.md) — cross-references to other wskills
-
-## Views
-
-Beyond this skill, the wskill ships these views — build them with `just render` in the wskill folder:
-
-- **book** (`wdoc/book/main.wcl`)
-- **ai skill** (`wdoc/skill/main.wcl`)
-- **presentation** — vmlab in a nutshell — an overview deck. (`wdoc/presentation/main.wcl`)
-- **training** — Learn vmlab — a hands-on lesson series. (`wdoc/training/main.wcl`)
+<maintenance>
+These files are maintained by hand against vmlab's manual. Inside the vmlab
+source tree, `docs/manual/` is where a correction lands first, `docs/vmlab-prd.md`
+is the binding contract, `src/config/schema.wcl` is every lab-file attribute
+that exists, and `src/scripting/mod.rs` every wscript function.
+</maintenance>

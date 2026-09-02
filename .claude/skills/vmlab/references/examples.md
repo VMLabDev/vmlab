@@ -1,0 +1,223 @@
+# Example labs
+
+The `examples/` directory of the vmlab source tree holds ten labs and a set of template definitions. Each is a working `vmlab.wcl` with its scripts, and each exists to show one part of the product.
+
+Every example runs from its own directory. Most name a template you build first under `examples/templates`, and a few pull one from a registry on the first `vmlab up`. Guest credentials are the ones each template bakes in: `Administrator` / `vmlab123!` on Windows Server 2025, `vmlab` / `vmlab` on the Linux images.
+
+## ad-lab
+
+Directory: `examples/ad-lab`.
+
+A small Active Directory lab: a domain controller on a `corp` segment that hands out the DC as its DNS server and routes to a second subnet, a Windows 11 client that waits for the DC through `depends_on`, and an Ubuntu build box on its own NAT'd NIC pulled from a registry. It shows a static IP as a DHCP reservation, wave ordering, a provision, and two event handlers: a crash collector and a disk-low alert.
+
+Needs `x86_64/windows-server-2025` and a pinned `x86_64/windows-11` in the store; the repository ships a build for the first under `examples/templates` and none for the second. The Ubuntu box pulls itself on `up`, so its segment needs egress.
+
+```sh
+cd examples/ad-lab
+vmlab validate
+vmlab up
+vmlab status
+vmlab down
+```
+
+Illustrates lab-file.md, networking.md, wscript-language.md and automation.md.
+
+## alpine-arm64
+
+Directory: `examples/alpine-arm64`.
+
+One Alpine Linux guest on an aarch64 machine, on a NAT'd segment with a host forward to its SSH port. On an x86 host there is no KVM for aarch64, so the VM runs under TCG emulation and boots in minutes; the TCG warning (see troubleshooting.md) is expected here. The provision script waits for the agent and logs the guest's `uname -m`, which should print `aarch64`.
+
+Needs `aarch64/alpine-3.23` in the store. That template's definition lives in the separate `vmlab-templates` repository, not under `examples/templates`; build it there with `vmlab template build`, then confirm it with `vmlab template list`. The host needs `qemu-system-aarch64` and the aarch64 UEFI firmware.
+
+```sh
+cd examples/alpine-arm64
+vmlab up                          # TCG: give it a minute or two
+ssh vmlab@localhost -p 12222      # password: vmlab
+vmlab logs                        # the provision's uname -m line
+vmlab down
+```
+
+Illustrates start-here.md, networking.md and the architecture fields in vm.md.
+
+## alpine-registry
+
+Directory: `examples/alpine-registry`.
+
+A one-VM lab whose `template` is an OCI registry ref rather than a store ref. There is no build or pull step: the first `vmlab up` resolves the ref's tag, pulls that version into the store if it is absent, and boots. A cached version is reused without downloading again. With no tag the ref tracks the moving `latest`; `:latest-prerelease` tracks pre-releases and `:<version>` pins one.
+
+Needs network egress from the host for the pull; the segment declares `nat = true` so `apk` works inside the guest too. To make the next `up` pull again, remove the cached version with `vmlab template rm x86_64/alpine-3.23@<version> --force`.
+
+```sh
+cd examples/alpine-registry
+vmlab up                          # first run pulls the template, then boots
+vmlab status                      # TEMPLATE shows the registry ref
+ssh vmlab@localhost -p 12222      # password: vmlab
+vmlab down
+```
+
+Illustrates templates.md and `vmlab pull` (cli-lab.md).
+
+## dev-neovim-container
+
+Directory: `examples/dev-neovim-container`.
+
+The second of the two worked dev-machine examples. A lab container running `alpine:3.22` in idle mode is the lab's dev machine, with `./workspace` on the host landing at `/src` in the guest and syncing both ways. Neovim runs as a TUI over the SSH facade's own session channel, so there is no client/server split and no marketplace. The `login "dev"` block declares the account alone, with no password, because the agent in a container is root and root needs no credential to become an account. That is the container identity floor.
+
+Its point is the guarantee both dev examples exist to show: a provision can write into the dev login's home before that user has ever logged on. `scripts/editor-bits.ws` does it with `dev01.as_login("dev")`, a second handle onto the same machine whose every call lands as `dev`. Without that line the same files land root-owned and Neovim's first run fails. The README records the durability rule: what the provision places survives `down`/`up` and a restore, dies on `vmlab container destroy dev01`, and comes back on the next `up` because it is a declaration.
+
+Needs nothing built. The image is pulled on the first `up`, the segment has egress for the package install and the plugin clone, and the host needs the container guest asset (see containers.md).
+
+```sh
+cd examples/dev-neovim-container
+vmlab up
+vmlab status                      # dev01 ready, attachable
+vmlab dev attach                  # waits for attachable, prints the alias, opens a shell
+# in that shell:
+cd /src && nvim hello.lua
+./build.sh                        # writes /src/out.txt, which appears in ./workspace
+# or straight off the alias:
+ssh vmlab-dev-neovim-container-dev01 -t nvim /src
+```
+
+Illustrates dev-machines.md, logins-and-ssh.md, containers.md and `vmlab dev` (cli-machine.md).
+
+## dev-vscode-windows
+
+Directory: `examples/dev-vscode-windows`.
+
+The first of the two worked dev-machine examples, and the harder half. A Windows Server 2025 domain controller promotes itself to `PROBE`, and a second Windows VM joins the domain and becomes the lab's dev machine, with `./workspace` on the host at `C:\src` in the guest. Two `login {}` blocks give it a domain user as the default login and an administrator, so `vmlab dev attach`, the facade's shell, its `sftp` subsystem and `vmlab exec` all land on one minted domain logon. That is what lets the build script read `\\dc01\team` from the editor's terminal with no credential prompt.
+
+The `corp` segment declares no `nat`, so the guest has no route off the segment. VS Code Remote-SSH still attaches, because the client-side setting `remote.SSH.localServerDownload: always` makes the client push the server over `scp`. `vmlab dev attach` and `vmlab ssh-config --print` print that snippet with the alias filled in. As in its twin, the point is `scripts/editor-bits.ws` placing editor bits into the domain user's profile through `dev01.as_login("dev")` before that profile exists. The README also records two riders §19.8 left open, each with the run that would confirm it.
+
+Needs `x86_64/windows-server-2025` in the store, built from `examples/templates/windows-server-2025`. Two 4-vCPU, 8 GiB VMs boot, and the promotion and the join each reboot once, so the first `up` is long. Guest credentials are `PROBE\dev` / `vmlab123!` and `PROBE\Administrator` / `vmlab123!`.
+
+```sh
+(cd examples/templates/windows-server-2025 && ./fetch-deps.sh && vmlab template build)
+cd examples/dev-vscode-windows
+vmlab up                          # dc01 becomes PROBE; dev01 joins and is provisioned
+vmlab status                      # dev01 ready, attachable
+vmlab dev attach                  # prints the alias and the VS Code settings snippet
+code --remote ssh-remote+vmlab-dev-vscode-windows-dev01 C:\src
+```
+
+Illustrates dev-machines.md, logins-and-ssh.md, `vmlab ssh-config` and `vmlab dev` (cli-machine.md).
+
+## mixed-lab
+
+Directory: `examples/mixed-lab`.
+
+Windows Server 2025 and Ubuntu 24.04 on one NAT'd segment, plus an nginx lab container on the same segment. It exercises a static IP reservation, `depends_on` ordering across all three machines, an SMB share that appears on the Windows guest as `S:`, a segment forward to nginx on the Ubuntu box, a container `port {}` and healthcheck, a provision driving both guests, and a crash handler. With `gui = true` on the lab, `up` opens a viewer per guest.
+
+Needs both templates built from `examples/templates`. The README explains one thing about the share: the daemon maps `S:` as SYSTEM, so an interactive user opening it sees a credential error until they run the `vmlab-shares` script vmlab drops on the desktop, once per user.
+
+```sh
+(cd examples/templates/ubuntu-24.04 && vmlab template build)
+(cd examples/templates/windows-server-2025 && ./fetch-deps.sh && vmlab template build)
+cd examples/mixed-lab
+vmlab validate
+vmlab up                          # winsrv, then nix01, then the web container
+vmlab status
+curl http://localhost:18080       # nginx on nix01, through the forward
+curl http://localhost:18081       # nginx in the container
+vmlab down                        # clones retained; vmlab destroy deletes them
+```
+
+Illustrates start-here.md, networking.md, shares-media.md, containers.md and automation.md.
+
+## peer-a
+
+Directory: `examples/peer-a`.
+
+Side A of a cross-instance peering pair. Its `wan` segment is a global segment with a `connect {}` block naming the other side's trunk port, so the two supervisors bridge the segment over a PSK-authenticated TCP trunk and `a1` here shares one L2 segment with `b1` over there. Both sides may declare `connect` at each other; the trunk table converges the mutual dial to a single trunk.
+
+It pulls its Alpine template from a registry on `up`. Because the two sides address each other's `trunk_port`, they run under two supervisors: two hosts with the `connect` host changed to the other machine's address, or two users on one host, each with a different `trunk_port` and the same `psk` in their host configuration. Both supervisors run a DHCP server on the bridged segment, so leases can collide; the provision adds a deterministic secondary IP, `10.99.0.10` on this side, so the cross-trunk ping has a stable target.
+
+```sh
+cd examples/peer-a
+vmlab up
+vmlab exec a1 -- ping -c 3 10.99.0.20   # b1 on the other side
+vmlab down
+```
+
+Illustrates global segments and trunks in networking.md and the `trunk_port` and `psk` fields in host-profiles.md.
+
+## peer-b
+
+Directory: `examples/peer-b`.
+
+Side B of the same pair. It is the mirror of `peer-a`: the same global `wan` segment, a `connect` pointing back at side A's trunk port, and one Alpine VM whose provision takes `10.99.0.20` as its secondary IP. Run it under the second supervisor, with everything else as for side A.
+
+```sh
+cd examples/peer-b
+vmlab up
+vmlab exec b1 -- ping -c 3 10.99.0.10   # a1 on the other side
+vmlab down
+```
+
+Illustrates the same material as `peer-a`.
+
+## riscv64-ubuntu
+
+Directory: `examples/riscv64-ubuntu`.
+
+One Ubuntu 24.04 guest on a riscv64 machine, on a NAT'd segment with a host forward to SSH. Like `alpine-arm64` it runs under TCG on an x86 host and boots slowly by design. The provision logs `uname -m`, which should print `riscv64`.
+
+Needs `riscv64/ubuntu-24.04` in the store, built from the separate `vmlab-templates` repository, and on the host `qemu-system-riscv64` from QEMU 8.1 or later plus the riscv64 UEFI firmware, `qemu-efi-riscv64` on Debian and Ubuntu.
+
+```sh
+cd examples/riscv64-ubuntu
+vmlab up                          # TCG: give it a minute or two
+ssh vmlab@localhost -p 12322      # password: vmlab
+vmlab down
+```
+
+Illustrates networking.md and the architecture and firmware handling in host-profiles.md.
+
+## templates
+
+Directory: `examples/templates`.
+
+Not a lab but eight `template {}` definitions, one per directory, each building an `x86_64` template into the store with `vmlab template build` run from that directory. Seven are Linux cloud images with a `cloudinit/` folder attached as a `CIDATA` media volume: cloud-init creates the `vmlab` user, installs the guest agent from the auto-attached VMLAB ISO, and disables itself for later boots. The script waits for the agent, which is the proof the install landed, and vmlab seals the disk. Ubuntu 24.04 uses the live-server ISO with a subiquity autoinstall instead, answering the installer's confirmation prompt through OCR and keystrokes. Windows Server 2025 is fully unattended from the Evaluation Center ISO through `autounattend.xml`, after `fetch-deps.sh` stages the virtio drivers and guest MSIs.
+
+| Directory | Builds | Source |
+| --- | --- | --- |
+| `almalinux-10` | `x86_64/almalinux-10` | GenericCloud image, cloud-init. Needs an x86-64-v3 host CPU. |
+| `arch` | `x86_64/arch` | Dated cloud image, cloud-init. |
+| `fedora-44` | `x86_64/fedora-44` | Cloud Base image, cloud-init. |
+| `opensuse-leap-16.0` | `x86_64/opensuse-leap` | Minimal-VM cloud image, cloud-init. |
+| `opensuse-tumbleweed` | `x86_64/opensuse-tumbleweed` | Dated Cloud-Snapshot image, cloud-init. |
+| `ubuntu-24.04` | `x86_64/ubuntu-24.04` | Live-server ISO, subiquity autoinstall. |
+| `ubuntu-26.04` | `x86_64/ubuntu-26.04` | Cloud image, cloud-init. |
+| `windows-server-2025` | `x86_64/windows-server-2025` | Evaluation ISO, `autounattend.xml`; 30 to 45 minutes; 180-day licence. |
+
+```sh
+cd examples/templates/ubuntu-24.04
+vmlab validate
+vmlab template build
+vmlab template list               # x86_64/ubuntu-24.04@24.04.4
+```
+
+Each README says how to bump the version: update `version`, the image file name in `url` and `sha256` from the checksum file beside the image. The cloud images boot through SeaBIOS, which each file sets with `firmware = "seabios"` on the `linux-modern` profile.
+
+Illustrates templates.md, snapshots-vision.md and cli-template.md.
+
+## winsrv-desktop
+
+Directory: `examples/winsrv-desktop`.
+
+The smallest useful lab: one Windows Server 2025 VM on a NAT'd segment with its display surfaced on the host. Every VM runs headless and serves VNC on a Unix socket; `gui = true` makes `up` launch a viewer against that socket, and `vmlab console winsrv` attaches one at any time. Closing the viewer only disconnects, because the viewer is a separate process. On WSL 2, `vmlab console --tcp` bridges the socket to a localhost port for a Windows-side client.
+
+Needs `x86_64/windows-server-2025` built from `examples/templates`, and a viewer: the `viewer` field in host config, else `remote-viewer`, `gvncviewer` or `vncviewer` on `PATH`.
+
+```sh
+(cd examples/templates/windows-server-2025 && ./fetch-deps.sh && vmlab template build)
+cd examples/winsrv-desktop
+vmlab validate
+vmlab up                          # a viewer opens on the desktop
+vmlab status                      # winsrv ready at 10.80.0.10
+vmlab console winsrv              # reattach after closing the window
+vmlab down
+```
+
+Illustrates snapshots-vision.md, `vmlab console` (cli-machine.md) and host-profiles.md.
