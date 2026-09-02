@@ -19,7 +19,11 @@ type Profile {
   display: utf8?        // "qxl" | "virtio-gpu" | "std"
   cpus: i64?
   memory: std.ByteSize?  // 4GiB
-  agent_channel: bool?  // virtio-serial guest agent channel (default true)
+  // The guest agent's channel device (§7.4): "virtio-serial" (default, the
+  // vmlab.agent.0 port) | "isa-serial" (COM1, for guests with no virtio
+  // drivers — the legacy agent) | "none" (no agent possible; screen-driven).
+  agent_transport: utf8?
+  agent_channel: bool?  // superseded by agent_transport: true = virtio-serial, false = none
   input_transport: utf8?  // "qmp" (default) | "vnc" — scripted input path (§10.3)
   virtiofs: bool?       // guest mounts virtiofs natively (default false) — §7.5 share transport
   // Dev-machine defaults (§19.1). Guest-OS-shaped, which is why they are

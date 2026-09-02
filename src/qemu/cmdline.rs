@@ -9,7 +9,7 @@ use vmlab_agent_proto::PORT_NAME as AGENT_PORT_NAME;
 
 use super::resolve::ResolvedVm;
 use crate::config::model::{GpuMode, MacAddr};
-use crate::profiles::{DiskBus, FirmwareKind};
+use crate::profiles::{AgentTransport, DiskBus, FirmwareKind};
 
 /// Per-VM runtime paths and attachments supplied by the lab daemon.
 #[derive(Debug, Clone, Default)]
@@ -186,7 +186,20 @@ pub fn build_args(
     a.push("none".into());
 
     if let Some(log) = &paths.serial_log {
-        arg(&mut a, "serial", format!("file:{}", log.display()));
+        match vm.agent_transport {
+            // `-serial` claims ISA index 0 (COM1) before any `-device` is
+            // placed, so where the agent needs COM1 the log is placed
+            // explicitly on COM2 instead.
+            AgentTransport::IsaSerial => {
+                arg(
+                    &mut a,
+                    "chardev",
+                    format!("file,id=serlog,path={}", log.display()),
+                );
+                arg(&mut a, "device", "isa-serial,chardev=serlog,index=1".into());
+            }
+            _ => arg(&mut a, "serial", format!("file:{}", log.display())),
+        }
     }
 
     // UEFI firmware: CODE read-only pflash + per-VM writable VARS.
@@ -217,10 +230,13 @@ pub fn build_args(
     }
     // SeaBIOS is the QEMU default on x86 — nothing to add.
 
-    // Guest agent virtio-serial channel (§7.4): the vmlab-agent port
-    // (interactive terminals / exec / files / net-info / shutdown —
-    // guest/agent-proto). QEMU listens, the daemon connects.
-    if vm.agent_channel {
+    // Guest agent channel (§7.4): the vmlab-agent port (interactive
+    // terminals / exec / files / net-info / shutdown — guest/agent-proto).
+    // QEMU listens, the daemon connects — on the same socket whichever
+    // guest-facing device carries it: the virtio-serial port a modern guest
+    // drives, or a 16550 on COM1 for a guest with no virtio drivers, where
+    // the legacy agent speaks the same protocol.
+    if vm.agent_transport.has_channel() {
         arg(
             &mut a,
             "chardev",
@@ -229,12 +245,24 @@ pub fn build_args(
                 paths.agent_sock.display()
             ),
         );
-        arg(&mut a, "device", "virtio-serial-pci".into());
-        arg(
-            &mut a,
-            "device",
-            format!("virtserialport,chardev=vagent0,name={}", AGENT_PORT_NAME),
-        );
+    }
+    match vm.agent_transport {
+        AgentTransport::VirtioSerial => {
+            arg(&mut a, "device", "virtio-serial-pci".into());
+            arg(
+                &mut a,
+                "device",
+                format!("virtserialport,chardev=vagent0,name={}", AGENT_PORT_NAME),
+            );
+        }
+        AgentTransport::IsaSerial => {
+            arg(
+                &mut a,
+                "device",
+                "isa-serial,chardev=vagent0,index=0".into(),
+            );
+        }
+        AgentTransport::None => {}
     }
 
     // Primary + extra disks: explicit blockdev node names (disk0, disk1, …)
@@ -575,16 +603,63 @@ mod tests {
         assert!(!s.contains("tpm"));
     }
 
-    /// Vintage guests (`agent_channel = false`) get no virtio-serial bus at
-    /// all — no vmlab-agent port.
+    /// Guests with no agent transport at all get no agent socket, no
+    /// virtio-serial bus and no COM device — nothing for an agent to answer
+    /// over. The serial log keeps its `-serial` shorthand on COM1.
     #[test]
-    fn no_agent_channel_emits_no_virtio_serial() {
+    fn no_agent_transport_emits_no_agent_device() {
         let mut vm = resolved("windows-legacy", "x86_64");
-        vm.agent_channel = false;
-        let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
+        vm.agent_transport = AgentTransport::None;
+        let mut p = paths();
+        p.serial_log = Some("/logs/l/t/serial.log".into());
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("virtserialport"), "{s}");
         assert!(!s.contains("virtio-serial-pci"), "{s}");
         assert!(!s.contains("vmlab.agent.0"), "{s}");
+        assert!(!s.contains("vagent0"), "{s}");
+        assert!(!s.contains("isa-serial"), "{s}");
+        assert!(s.contains("-serial file:/logs/l/t/serial.log"), "{s}");
+    }
+
+    /// The legacy agent's channel (§7.4): the same host socket a modern
+    /// guest's virtio port lands on, carried by a 16550 on COM1 — and the
+    /// serial log moved to COM2 so the two never contend for index 0.
+    #[test]
+    fn isa_serial_transport_puts_the_agent_on_com1_and_the_log_on_com2() {
+        let vm = resolved("windows-xp", "x86_64");
+        assert_eq!(vm.agent_transport, AgentTransport::IsaSerial);
+        let mut p = paths();
+        p.serial_log = Some("/logs/l/t/serial.log".into());
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(
+            s.contains("socket,id=vagent0,path=/run/l/t/agent.sock,server=on,wait=off"),
+            "{s}"
+        );
+        assert!(s.contains("isa-serial,chardev=vagent0,index=0"), "{s}");
+        assert!(
+            s.contains("file,id=serlog,path=/logs/l/t/serial.log"),
+            "{s}"
+        );
+        assert!(s.contains("isa-serial,chardev=serlog,index=1"), "{s}");
+        assert!(!s.contains("-serial file:"), "{s}");
+        assert!(!s.contains("virtserialport"), "{s}");
+        assert!(!s.contains("virtio-serial-pci"), "{s}");
+    }
+
+    /// `windows-legacy` (Vista/7/2008) keeps its virtio-serial channel: that
+    /// era has virtio-win drivers, and its agent blocker is ConPTY, not the
+    /// transport (decision Q1).
+    #[test]
+    fn windows_legacy_keeps_the_virtio_serial_channel() {
+        let vm = resolved("windows-legacy", "x86_64");
+        let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
+        assert!(s.contains("-machine pc"));
+        assert!(s.contains("ide-hd,drive=disk0"));
+        assert!(
+            s.contains("virtserialport,chardev=vagent0,name=vmlab.agent.0"),
+            "{s}"
+        );
+        assert!(!s.contains("isa-serial"), "{s}");
     }
 
     #[test]

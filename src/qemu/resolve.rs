@@ -9,7 +9,9 @@
 //! firmware, TPM, display or disk bus to choose.
 
 use crate::config::model::{Container, Firmware, Gpu, TemplateRef, Vm};
-use crate::profiles::{DiskBus, FirmwareKind, InputTransport, Machine, Profile, ProfileSet};
+use crate::profiles::{
+    AgentTransport, DiskBus, FirmwareKind, InputTransport, Machine, Profile, ProfileSet,
+};
 use crate::template::TemplateMeta;
 
 /// Fully resolved hardware for one VM — input to the cmdline builder.
@@ -32,7 +34,8 @@ pub struct ResolvedVm {
     /// VGA/display device QEMU name (None = profile said nothing and the
     /// gpu block supplies the display device instead).
     pub display_device: Option<String>,
-    pub agent_channel: bool,
+    /// The agent channel's device (§7.4) — see [`AgentTransport`].
+    pub agent_transport: AgentTransport,
     /// How scripted input reaches the guest (QMP vs VNC).
     pub input_transport: InputTransport,
     /// The guest mounts virtiofs natively (profile capability) — with a
@@ -164,7 +167,7 @@ pub fn vm_arch(lab_vm: &Vm) -> Option<String> {
 /// (§5.3), except that the agent channel is vmlab's own, not the guest's.
 pub fn default_profile() -> Profile {
     Profile {
-        agent_channel: true,
+        agent_transport: AgentTransport::VirtioSerial,
         ..Profile::default()
     }
 }
@@ -322,7 +325,7 @@ pub fn resolve_vm(
             .clone()
             .unwrap_or_else(|| "virtio-net-pci".to_string()),
         display_device,
-        agent_channel: profile.agent_channel,
+        agent_transport: profile.agent_transport,
         input_transport: profile.input_transport,
         virtiofs: profile.virtiofs,
         nested: lab_vm.nested,

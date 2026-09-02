@@ -50,7 +50,7 @@ profile "windows-server" {
 }
 
 profile "windows-legacy" {
-  description = "XP/7/2008-era guests with no virtio drivers: i440fx, SeaBIOS, IDE disk, e1000 NIC, std VGA"
+  description = "Vista/7/2008-era guests with no virtio storage/net drivers at install time: i440fx, SeaBIOS, IDE disk, e1000 NIC, std VGA; virtio-serial agent channel (virtio-win covers this era)"
   machine     = "pc"
   firmware    = "seabios"
   secure_boot = false
@@ -60,6 +60,21 @@ profile "windows-legacy" {
   display     = "std"
   cpus        = 2
   memory      = 2GiB
+  workspace_guest = "C:\\src"
+}
+
+profile "windows-xp" {
+  description = "NT4 through XP/2003: i440fx, SeaBIOS, IDE disk, e1000 NIC, std VGA; no virtio drivers at all, so the agent channel is a 16550 on COM1 (the legacy agent)"
+  machine     = "pc"
+  firmware    = "seabios"
+  secure_boot = false
+  tpm         = false
+  disk_bus    = "ide"
+  nic_model   = "e1000"
+  display     = "std"
+  cpus        = 2
+  memory      = 2GiB
+  agent_transport = "isa-serial"
   workspace_guest = "C:\\src"
 }
 
@@ -74,6 +89,7 @@ profile "windows-9x" {
   display     = "cirrus-vga"
   cpus        = 1
   memory      = 256MiB
+  agent_transport = "isa-serial"
   // Real-mode DOS/9x TUIs (fdisk, setup) drop QMP send-key events between menu
   // redraws; drive their keyboard over VNC instead, which lands reliably.
   input_transport = "vnc"

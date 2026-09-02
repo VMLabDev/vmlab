@@ -78,7 +78,7 @@ impl MountPlan {
 /// and for which XP-versus-modern is irrelevant.
 pub fn guest_os_hint(profile: Option<&str>) -> OsHint {
     match profile {
-        Some("windows-legacy") => OsHint::WindowsXp,
+        Some("windows-legacy" | "windows-xp") => OsHint::WindowsXp,
         Some(p) if p.starts_with("windows") => OsHint::Windows,
         _ => OsHint::Linux,
     }
@@ -226,6 +226,7 @@ mod tests {
         assert_eq!(guest_os_hint(Some("windows-server")), OsHint::Windows);
         assert_eq!(guest_os_hint(Some("windows-desktop")), OsHint::Windows);
         assert_eq!(guest_os_hint(Some("windows-legacy")), OsHint::WindowsXp);
+        assert_eq!(guest_os_hint(Some("windows-xp")), OsHint::WindowsXp);
         assert_eq!(guest_os_hint(Some("linux-modern")), OsHint::Linux);
         assert_eq!(guest_os_hint(None), OsHint::Linux);
     }

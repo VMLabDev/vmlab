@@ -331,7 +331,7 @@ impl VmInstance {
         if self.power_state().await != PowerState::Running {
             return Err(super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into());
         }
-        if !self.template().resolved.agent_channel {
+        if !self.template().resolved.agent_transport.has_channel() {
             return Err(super::machine::AgentUnavailable::NoChannel(self.cfg.name.clone()).into());
         }
         self.agent
@@ -343,7 +343,7 @@ impl VmInstance {
     /// the cached handle.
     async fn agent_probe(&self) -> bool {
         if self.power_state().await != PowerState::Running
-            || !self.template().resolved.agent_channel
+            || !self.template().resolved.agent_transport.has_channel()
         {
             return false;
         }
@@ -725,7 +725,7 @@ impl VmInstance {
             let agent = self.agent.cached().await;
             let agent = match agent {
                 Some(a) => Some(a),
-                None if self.template().resolved.agent_channel => {
+                None if self.template().resolved.agent_transport.has_channel() => {
                     super::vm_agent::AgentHandle::connect(
                         &self.dirs.agent_sock(),
                         Duration::from_secs(2),
@@ -985,7 +985,7 @@ impl super::machine::Machine for VmInstance {
             return false;
         }
         let parts = self.template();
-        let agentless = !parts.resolved.agent_channel
+        let agentless = !parts.resolved.agent_transport.has_channel()
             || (parts.backing.is_some() && parts.agent_version.is_none());
         agentless && self.power_state().await == PowerState::Running
     }
@@ -1106,7 +1106,7 @@ impl super::machine::Machine for VmInstance {
     }
 
     fn has_agent_channel(&self) -> bool {
-        self.template().resolved.agent_channel
+        self.template().resolved.agent_transport.has_channel()
     }
 
     async fn clear_agent_failure(&self) {

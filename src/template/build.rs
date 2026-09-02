@@ -768,7 +768,7 @@ fn wants_agent(
 ) -> bool {
     let channel = profiles
         .get(hw.profile_or_default())
-        .map(|p| p.agent_channel)
+        .map(|p| p.agent_transport.has_channel())
         .unwrap_or(true);
     def.agent && channel
 }
@@ -1886,7 +1886,7 @@ mod tests {
             dir.path().join("vintage.wcl"),
             "import <vmlab-profile.wcl>\n\n\
              profile \"vintage\" {\n  description = \"no virtio-serial\"\n  \
-             agent_channel = false\n}\n",
+             agent_transport = \"none\"\n}\n",
         )
         .unwrap();
         let profiles = crate::profiles::ProfileSet::load(dir.path()).unwrap();

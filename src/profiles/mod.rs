@@ -48,6 +48,29 @@ pub enum InputTransport {
     Vnc,
 }
 
+/// The device the vmlab guest agent's channel rides (PRD §7.4). One host
+/// socket, one wire protocol; only the guest-facing device differs.
+/// `VirtioSerial` is the `vmlab.agent.0` port a modern guest drives.
+/// `IsaSerial` is a 16550 UART on COM1 for guests with no virtio drivers
+/// (NT4 through XP/2003, Windows 9x, DOS, pre-virtio Linux) — the legacy
+/// agent speaks the same protocol over it. `None` is a guest nothing can
+/// run an agent on: never ready by handshake, screen-driven only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentTransport {
+    #[default]
+    VirtioSerial,
+    IsaSerial,
+    None,
+}
+
+impl AgentTransport {
+    /// Whether the guest has an agent channel at all — the question every
+    /// consumer short of the QEMU builder actually asks.
+    pub fn has_channel(self) -> bool {
+        !matches!(self, AgentTransport::None)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareKind {
     Ovmf,
@@ -72,7 +95,9 @@ pub struct Profile {
     pub display: Option<String>,
     pub cpus: Option<u32>,
     pub memory: Option<u64>,
-    pub agent_channel: bool,
+    /// The agent channel's device (§7.4). `agent_channel = false` in an
+    /// older profile file still reads as [`AgentTransport::None`].
+    pub agent_transport: AgentTransport,
     pub input_transport: InputTransport,
     /// The guest OS mounts virtiofs natively (`mount -t virtiofs` on Linux,
     /// the virtio-win driver + WinFsp on Windows) — makes it a candidate
@@ -220,7 +245,28 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
         display: r.string("display").unspan(),
         cpus: r.int_at_least("cpus", 1).unspan(),
         memory: r.size("memory").unspan(),
-        agent_channel: r.bool("agent_channel").unspan().unwrap_or(true),
+        agent_transport: {
+            // `agent_channel` is the bool this key replaced; still accepted
+            // so a user profile written against it keeps loading.
+            let alias = r.bool("agent_channel").unspan().map(|on| {
+                if on {
+                    AgentTransport::VirtioSerial
+                } else {
+                    AgentTransport::None
+                }
+            });
+            r.keyword(
+                "agent_transport",
+                &[
+                    ("virtio-serial", AgentTransport::VirtioSerial),
+                    ("isa-serial", AgentTransport::IsaSerial),
+                    ("none", AgentTransport::None),
+                ],
+            )
+            .unspan()
+            .or(alias)
+            .unwrap_or_default()
+        },
         input_transport: r
             .keyword(
                 "input_transport",
@@ -250,6 +296,8 @@ mod tests {
             "windows-10",
             "windows-server",
             "windows-legacy",
+            "windows-xp",
+            "windows-9x",
             "linux-modern",
             "linux-generic",
             "custom",
@@ -272,11 +320,47 @@ mod tests {
         assert_eq!(legacy.firmware, Some(FirmwareKind::Seabios));
         assert_eq!(legacy.disk_bus, Some(DiskBus::Ide));
         assert_eq!(legacy.nic_model.as_deref(), Some("e1000"));
+        // Vista/7-era guests drive virtio-serial; NT4 through XP/2003 and
+        // the 9x/DOS profile get the legacy agent's COM1.
+        assert_eq!(legacy.agent_transport, AgentTransport::VirtioSerial);
+        assert_eq!(
+            set.get("windows-xp").unwrap().agent_transport,
+            AgentTransport::IsaSerial
+        );
+        assert_eq!(
+            set.get("windows-9x").unwrap().agent_transport,
+            AgentTransport::IsaSerial
+        );
 
         let custom = set.get("custom").unwrap();
         assert!(custom.machine.is_none());
         assert!(custom.firmware.is_none());
-        assert!(custom.agent_channel);
+        assert_eq!(custom.agent_transport, AgentTransport::VirtioSerial);
+    }
+
+    /// `agent_channel` is the bool `agent_transport` replaced: a user
+    /// profile still written against it loads, and the keyword wins when
+    /// both are present.
+    #[test]
+    fn agent_channel_bool_reads_as_a_transport() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("t.wcl"),
+            "import <vmlab-profile.wcl>\n\
+             profile \"off\" { agent_channel = false }\n\
+             profile \"on\" { agent_channel = true }\n\
+             profile \"serial\" { agent_transport = \"isa-serial\" }\n\
+             profile \"both\" { agent_channel = false agent_transport = \"isa-serial\" }\n",
+        )
+        .unwrap();
+        let set = ProfileSet::load(tmp.path()).unwrap();
+        let of = |n: &str| set.get(n).unwrap().agent_transport;
+        assert_eq!(of("off"), AgentTransport::None);
+        assert_eq!(of("on"), AgentTransport::VirtioSerial);
+        assert_eq!(of("serial"), AgentTransport::IsaSerial);
+        assert_eq!(of("both"), AgentTransport::IsaSerial);
+        assert!(!AgentTransport::None.has_channel());
+        assert!(AgentTransport::IsaSerial.has_channel());
     }
 
     #[test]
