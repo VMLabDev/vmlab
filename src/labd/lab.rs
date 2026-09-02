@@ -67,6 +67,14 @@ pub struct LabRuntime {
     /// provision generalizes/shuts the guest down (Windows sysprep). Std
     /// lock: set once before `up`, cloned out, never held across await.
     pub pre_provision: std::sync::RwLock<Option<PreProvisionHook>>,
+    /// Whether a provision step waits for its machine to report ready first.
+    /// A template build turns this off: its provisions ARE the installer, so
+    /// the agent whose handshake readiness means only exists once they have
+    /// run — waiting first is a deadlock the machine cannot break. The build
+    /// verifies the agent itself either way (`template::build`): blocking
+    /// through `pre_provision` for a source that boots an installed OS,
+    /// concurrently for one that installs from an ISO.
+    pub provisions_wait_ready: std::sync::atomic::AtomicBool,
     /// Host config loaded once at build (config-weave binary dir, …).
     pub host_cfg: crate::config::host::HostConfig,
     /// In-flight config-weave runs, one per machine (`up` and on-demand
@@ -465,6 +473,7 @@ impl LabRuntime {
             pulls: std::sync::Mutex::new(PullLedger::new(pending)),
             pull_lock: Mutex::new(()),
             pre_provision: std::sync::RwLock::new(None),
+            provisions_wait_ready: std::sync::atomic::AtomicBool::new(true),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
@@ -510,6 +519,7 @@ impl LabRuntime {
             pulls: std::sync::Mutex::new(PullLedger::new(BTreeMap::new())),
             pull_lock: Mutex::new(()),
             pre_provision: std::sync::RwLock::new(None),
+            provisions_wait_ready: std::sync::atomic::AtomicBool::new(true),
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
@@ -1452,8 +1462,14 @@ impl LabRuntime {
             let machine = self.machine(m)?;
             // The machine's own budget, never a literal: a VM may still be
             // running a first-boot provision, a container's entrypoint starts
-            // fast and its healthcheck governs the rest.
-            machine.wait_ready(machine.ready_timeout()).await?;
+            // fast and its healthcheck governs the rest. A build waives the
+            // wait entirely — see `provisions_wait_ready`.
+            if self
+                .provisions_wait_ready
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                machine.wait_ready(machine.ready_timeout()).await?;
+            }
             match &step.kind {
                 plan::StepKind::Provision(p) => {
                     let script = self.root.join(&p.script);
@@ -2387,6 +2403,15 @@ mod tests {
             })
         }
 
+        /// A double that starts but never reports ready — the guest of an
+        /// installer-driven build, which cannot answer a handshake until the
+        /// provision that installs the OS has run.
+        fn never_ready(name: &str, kind: MachineKind, shared: &Shared) -> Arc<Self> {
+            let mut m = Arc::into_inner(Self::new(name, kind, shared)).expect("sole owner");
+            m.settle = Duration::from_secs(86_400);
+            Arc::new(m)
+        }
+
         /// The same double, with a guest agent answering for it.
         fn with_agent(
             name: &str,
@@ -2821,6 +2846,38 @@ lab "t" {
             );
             assert_eq!(db.starts.load(Ordering::SeqCst), 1);
             assert_eq!(web.starts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// A build's provisions ARE the installer, so the build waives the
+    /// readiness gate in front of them (`provisions_wait_ready`): the agent
+    /// whose handshake readiness means only exists once they have run. With
+    /// the gate left on, the same lab waits out the machine's whole budget
+    /// and fails — which is what every ISO-installed template used to do.
+    #[tokio::test(start_paused = true)]
+    async fn a_build_does_not_gate_its_provisions_on_readiness() {
+        let src = r#"import <vmlab.wcl>
+lab "t" { container "build" { image = "x:1" provision "install.ws" { } } }"#;
+
+        for waived in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("install.ws"), "fn main(lab: Lab) { }\n")
+                .expect("provision script");
+            let sh = shared(dir.path());
+            // Never reports ready — an installer's guest, before the install.
+            let build = FakeMachine::never_ready("build", MachineKind::Vm, &sh);
+            let lab = lab_of(dir.path(), src, vec![build.clone()]);
+            if waived {
+                lab.provisions_wait_ready
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            let result = lab.up(&[], quiet()).await;
+            if waived {
+                result.expect("the provision runs against a guest that is not ready");
+            } else {
+                let err = result.expect_err("the gate holds a never-ready machine");
+                assert!(format!("{err:#}").contains("not ready"), "{err:#}");
+            }
         }
     }
 

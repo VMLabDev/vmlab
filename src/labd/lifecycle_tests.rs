@@ -767,6 +767,76 @@ async fn a_healthcheck_gates_readiness() {
     ctr.stop(true).await.expect("stop");
 }
 
+/// A clone of a template that baked no agent is ready once it is running.
+/// Nothing in that guest can ever answer a handshake, so holding it unready
+/// only spends the caller's whole budget waiting for a signal that cannot
+/// come — how an agent-less template used to fail its own build.
+#[tokio::test]
+async fn an_agentless_clone_is_ready_once_it_is_running() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            agent: false,
+            ..Script::healthy()
+        },
+    );
+    let parts = vm.template();
+    vm.set_template(TemplateParts {
+        resolved: parts.resolved.clone(),
+        backing: Some(dirs.root.join("template.qcow2")),
+        disk_size: parts.disk_size,
+        first_boot: parts.first_boot.clone(),
+        agent_version: None,
+    });
+
+    let m: Arc<dyn Machine> = vm.clone();
+    assert!(!m.is_ready().await, "not ready before it is running");
+
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    m.wait_ready(SETTLE)
+        .await
+        .expect("an agent-less clone is ready once running");
+
+    vm.stop(true).await.expect("stop");
+}
+
+/// The same clone with an agent baked in keeps the handshake as its gate: a
+/// guest that *can* answer must, or readiness would mean nothing.
+#[tokio::test]
+async fn a_clone_with_an_agent_still_waits_for_the_handshake() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            agent: false,
+            ..Script::healthy()
+        },
+    );
+    let parts = vm.template();
+    vm.set_template(TemplateParts {
+        resolved: parts.resolved.clone(),
+        backing: Some(dirs.root.join("template.qcow2")),
+        disk_size: parts.disk_size,
+        first_boot: parts.first_boot.clone(),
+        agent_version: parts.agent_version.clone(), // an agent IS baked in
+    });
+
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let err = m
+        .wait_ready(Duration::from_millis(300))
+        .await
+        .expect_err("no agent answered, so it is not ready");
+    assert!(format!("{err:#}").contains("not ready"), "{err:#}");
+
+    vm.stop(true).await.expect("stop");
+}
+
 /// Readiness gives up at the timeout it was handed — which is the machine's
 /// own [`Machine::ready_timeout`], because a container's entrypoint starts
 /// fast while a VM may be running a first-boot provision through a Windows

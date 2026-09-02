@@ -304,6 +304,13 @@ async fn run_build(
     //   Installers that power off from a live environment (subiquity) never
     //   hand one over — those builds get a verification boot below.
     let vm = runtime.vm(build_vm)?;
+    // A build's provisions are the installer, and the agent readiness means
+    // only exists once they have run — so a build never gates a provision
+    // step on readiness. The verification below is what holds the agent
+    // contract instead, and it is the one thing that must not be skipped.
+    runtime
+        .provisions_wait_ready
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let agent_version: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
     let verify_concurrent = matches!(

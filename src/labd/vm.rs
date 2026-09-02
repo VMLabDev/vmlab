@@ -964,7 +964,22 @@ impl super::machine::Machine for VmInstance {
     }
 
     async fn is_ready(&self) -> bool {
-        self.ready_flag().await
+        if self.ready_flag().await {
+            return true;
+        }
+        // A guest that can never answer a handshake — no agent channel at all,
+        // or a clone of a template that baked no agent — is as ready as it is
+        // going to get once it is running. Reporting otherwise would make
+        // every caller wait out its whole budget for a signal nothing can
+        // send. A pending first-boot provision still defers readiness: that
+        // one runs before the clone is usable, whatever the agent situation.
+        if self.first_boot_pending() {
+            return false;
+        }
+        let parts = self.template();
+        let agentless = !parts.resolved.agent_channel
+            || (parts.backing.is_some() && parts.agent_version.is_none());
+        agentless && self.power_state().await == PowerState::Running
     }
 
     async fn stop(&self, force: bool) -> Result<()> {

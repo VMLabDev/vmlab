@@ -12,6 +12,7 @@
 #   --version <X>   install version X (e.g. 0.2.0-alpha); or set VMLAB_VERSION
 #   --pre           install the newest pre-release
 #   --bin-dir <dir> install into <dir> (default: $VMLAB_INSTALL_DIR or ~/.local/bin)
+#   --skip-checks   do not report missing runtime tools after installing
 #   --help          show this help
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
@@ -26,11 +27,12 @@ SOURCE_BUILD="cargo install --git https://github.com/VMLabDev/vmlab --locked"
 VERSION="${VMLAB_VERSION:-}"
 BIN_DIR="${VMLAB_INSTALL_DIR:-$HOME/.local/bin}"
 PRE=0
+SKIP_CHECKS=0
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -42,6 +44,7 @@ while [ $# -gt 0 ]; do
     --pre) PRE=1; shift ;;
     --bin-dir) [ $# -ge 2 ] || err "--bin-dir needs an argument"; BIN_DIR="$2"; shift 2 ;;
     --bin-dir=*) BIN_DIR="${1#--bin-dir=}"; shift ;;
+    --skip-checks) SKIP_CHECKS=1; shift ;;
     -h|--help) usage 0 ;;
     -*) err "unknown option: $1 (try --help)" ;;
     *) [ -z "$VERSION" ] || err "unexpected argument: $1"; VERSION="$1"; shift ;;
@@ -117,3 +120,97 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) printf '\n%s is not on your PATH. Add it, e.g.:\n  export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR" ;;
 esac
+
+# ── Runtime tools ───────────────────────────────────────────────────────────
+# vmlab bundles none of these: it looks each one up on PATH the first time it
+# needs it, so a host missing one fails at the first `up`, container start or
+# template build instead of here. Report what is absent now, while the person
+# who can install it is still watching. Missing tools are a warning, never an
+# error — most of them matter only to the features that use them.
+[ "$SKIP_CHECKS" -eq 1 ] && exit 0
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Package name per manager, for the one-line install hint below.
+pkg_for() {
+  case "$1" in
+    qemu-system-x86_64) apt=qemu-system-x86; dnf=qemu-system-x86;   pac=qemu-system-x86 ;;
+    qemu-img)           apt=qemu-utils;      dnf=qemu-img;          pac=qemu-img ;;
+    xorriso)            apt=xorriso;         dnf=xorriso;           pac=libisoburn ;;
+    mcopy)              apt=mtools;          dnf=mtools;            pac=mtools ;;
+    mkfs.vfat)          apt=dosfstools;      dnf=dosfstools;        pac=dosfstools ;;
+    swtpm)              apt=swtpm;           dnf=swtpm;             pac=swtpm ;;
+    smbd)               apt=samba;           dnf=samba;             pac=samba ;;
+    tesseract)          apt=tesseract-ocr;   dnf=tesseract;         pac=tesseract ;;
+    sqfstar)            apt=squashfs-tools;  dnf=squashfs-tools;    pac=squashfs-tools ;;
+    virtiofsd)          apt=virtiofsd;       dnf=virtiofsd;         pac=virtiofsd ;;
+    remote-viewer)      apt=virt-viewer;     dnf=virt-viewer;       pac=virt-viewer ;;
+    *)                  apt="$1";            dnf="$1";              pac="$1" ;;
+  esac
+}
+
+missing=''   # newline-separated "<cmd>\t<what it is for>"
+want() {     # want <cmd> <purpose> [alternative-cmd...]
+  cmd=$1; purpose=$2; shift 2
+  have "$cmd" && return 0
+  for alt in "$@"; do have "$alt" && return 0; done
+  missing="${missing}${cmd}	${purpose}
+"
+}
+
+# Running a guest at all.
+want qemu-system-x86_64 "run x86_64 guests (install qemu-system-arm / -misc for other arches)"
+want qemu-img           "clone disks, snapshot, and build templates"
+# Per feature. Each is only needed by the labs that use it.
+want xorriso            "build ISO media and the bootstrap ISO every template build attaches" genisoimage mkisofs
+want mcopy              "build floppy media (mtools)" mformat
+want mkfs.vfat          "format floppy images"
+want swtpm              "guests with tpm = true — Windows 11 and Server 2025 require one"
+want smbd               "shared folders on guests without virtiofs"
+want tesseract          "vmlab vm ocr and wait_for_text in scripts"
+want sqfstar            "lab containers: flattening a pulled OCI image"
+want virtiofsd          "shared folders over virtiofs (smbd is the fallback)"
+want remote-viewer      "vmlab console and gui = true" gvncviewer vncviewer
+
+if [ -n "$missing" ]; then
+  printf '\nMissing runtime tools — vmlab will fail at the first thing that needs one:\n\n'
+  printf '%s' "$missing" | while IFS='	' read -r cmd purpose; do
+    printf '  %-18s %s\n' "$cmd" "$purpose"
+  done
+
+  # One command that installs the lot, for the manager this host has.
+  pkgs=''
+  for cmd in $(printf '%s' "$missing" | cut -f1); do
+    pkg_for "$cmd"
+    if   have apt-get; then pkgs="$pkgs $apt"
+    elif have dnf;     then pkgs="$pkgs $dnf"
+    elif have pacman;  then pkgs="$pkgs $pac"
+    fi
+  done
+  if have apt-get;   then printf '\n  sudo apt-get install -y%s\n' "$pkgs"
+  elif have dnf;     then printf '\n  sudo dnf install -y%s\n' "$pkgs"
+  elif have pacman;  then printf '\n  sudo pacman -S --needed%s\n' "$pkgs"
+  else printf '\nInstall them with your package manager. See https://vmlab.io for the full list.\n'
+  fi
+fi
+
+if [ ! -e /dev/kvm ]; then
+  printf '\n/dev/kvm is missing: guests will run under emulation, which is very slow.\n'
+  printf 'Enable virtualisation in the BIOS, or load kvm_intel / kvm_amd.\n'
+elif [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+  printf '\n/dev/kvm exists but this user cannot use it. Add yourself to the kvm group:\n'
+  printf '  sudo usermod -aG kvm "$USER"    # then log out and back in\n'
+fi
+
+# The guest assets are not in the release: the binary ships alone. A pulled
+# template already carries its agent, so this only bites a container start or
+# a template build — the two things that need an asset from the host.
+asset_dir=''
+for d in "${VMLAB_GUEST_ASSET_DIR:-}" /usr/share/vmlab/guest "$HOME/.local/share/vmlab/guest"; do
+  [ -n "$d" ] && [ -d "$d" ] && { asset_dir=$d; break; }
+done
+if [ -z "$asset_dir" ]; then
+  printf '\nNo guest assets found. VMs cloned from a published template need none,\n'
+  printf 'but a lab container and a template build both do. Build them from source:\n'
+  printf '  git clone https://github.com/VMLabDev/vmlab && cd vmlab && just guest-install\n'
+fi
