@@ -20,6 +20,32 @@ use super::bootstrap::StagedGuestIso;
 use crate::agent_asset::AgentOs;
 use crate::labd::machine::Machine;
 
+/// Whether the answering agent is a legacy-tier one.
+///
+/// Judged by what those agents assert, not by what the Rust one was assumed
+/// to. The C and HolyC agents compile their build stamp in as their version
+/// (`agent-legacy=<rev>`, `agent-templeos=<rev>`). The Rust agent reports its
+/// crate version — "0.1.0" — and never carried an `agent=` prefix, so a test
+/// for one called every Rust agent legacy. Nothing noticed until a guest old
+/// enough to need this tier finally answered on Windows: a Windows 7 build
+/// sealed a full agent as `windows-nt`, exec-only (2026-09-03).
+fn is_legacy_agent(agent_version: &str) -> bool {
+    agent_version.starts_with("agent-legacy=") || agent_version.starts_with("agent-templeos=")
+}
+
+/// Which staged flavour answered, from the handshake's OS and that judgement.
+fn agent_flavour(os: &str, legacy: bool) -> AgentOs {
+    match (os, legacy) {
+        ("windows", false) => AgentOs::Windows,
+        // The NT and 9x builds both say "windows"; their stamps are one
+        // build's, so either staged flavour names it.
+        ("windows", true) => AgentOs::WindowsNt,
+        ("dos", _) => AgentOs::Dos,
+        ("templeos", _) => AgentOs::TempleOs,
+        _ => AgentOs::Linux,
+    }
+}
+
 /// Wait for the agent handshake; returns the staged asset's version stamp
 /// (by the handshake's OS flavour), or `None` when verification was skipped
 /// (reason already logged). `wait` is how long to keep probing: a
@@ -68,18 +94,8 @@ pub async fn verify(
     };
 
     let info = handle.info();
-    // The Rust agent stamps `agent=<rev>`; every legacy-tier agent stamps
-    // its own name (`agent-legacy=`, `agent-templeos=`).
-    let legacy = !info.agent_version.starts_with("agent=");
-    let os = match (info.os.as_str(), legacy) {
-        ("windows", false) => AgentOs::Windows,
-        // The NT and 9x builds both say "windows"; their stamps are one
-        // build's, so either staged flavour names it.
-        ("windows", true) => AgentOs::WindowsNt,
-        ("dos", _) => AgentOs::Dos,
-        ("templeos", _) => AgentOs::TempleOs,
-        _ => AgentOs::Linux,
-    };
+    let legacy = is_legacy_agent(&info.agent_version);
+    let os = agent_flavour(&info.os, legacy);
     // The staged stamp identifies what the ISO carried; the handshake's own
     // version is the fallback if the flavour somehow wasn't staged — and is
     // the answer for the legacy agent, whose stamp *is* its version string.
@@ -97,4 +113,44 @@ pub async fn verify(
         version
     ));
     Ok(Some(version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Rust agent answers with its crate version, and must not be mistaken
+    /// for the exec-only tier — the mistake that sealed a Windows 7 template
+    /// as `windows-nt` with a full agent inside it.
+    #[test]
+    fn the_rust_agent_is_not_a_legacy_agent() {
+        assert!(!is_legacy_agent("0.1.0"));
+        assert_eq!(
+            agent_flavour("windows", is_legacy_agent("0.1.0")),
+            AgentOs::Windows
+        );
+        assert_eq!(
+            agent_flavour("linux", is_legacy_agent("0.1.0")),
+            AgentOs::Linux
+        );
+    }
+
+    /// Each legacy agent names itself in its stamp, which is the whole signal.
+    #[test]
+    fn the_legacy_agents_name_themselves() {
+        assert!(is_legacy_agent("agent-legacy=1a2b3c4"));
+        assert!(is_legacy_agent("agent-templeos=1a2b3c4"));
+        assert_eq!(
+            agent_flavour("windows", is_legacy_agent("agent-legacy=1a2b3c4")),
+            AgentOs::WindowsNt
+        );
+        assert_eq!(
+            agent_flavour("dos", is_legacy_agent("agent-legacy=1a2b3c4")),
+            AgentOs::Dos
+        );
+        assert_eq!(
+            agent_flavour("templeos", is_legacy_agent("agent-templeos=1a2b3c4")),
+            AgentOs::TempleOs
+        );
+    }
 }
