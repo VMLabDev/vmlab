@@ -107,6 +107,33 @@ pub fn emulator_binary(arch: &str) -> String {
     format!("qemu-system-{}", qemu_arch(arch))
 }
 
+/// Which IDE/AHCI bus and unit the n-th disk-or-CD-ROM takes.
+///
+/// Every attachment is addressed, never auto-placed. QEMU places an
+/// unaddressed `ide-hd` on the secondary master (ide.1 unit 0) — the middle of
+/// the four legacy slots — and its CD-ROM auto-placement does not advance past
+/// the first bus, so the two together collide as soon as a guest carries a disk
+/// and more than one ISO. That is every legacy Windows build: install media,
+/// vmlab's bootstrap ISO, and (once the answer file grows drivers) an unattend
+/// ISO too, which is exactly the four slots a legacy `pc` has.
+///
+/// q35's AHCI ports hold one unit each, so there the slot IS the bus.
+fn ide_slot(slot: usize, machine: &MachineKind) -> (usize, usize) {
+    match machine {
+        MachineKind::Q35 => (slot, 0),
+        // Two units to a bus, primary first: (0,0) (0,1) (1,0) (1,1).
+        _ => (slot / 2, slot % 2),
+    }
+}
+
+/// The machine shape the argv is being built for, as far as device addressing
+/// cares: AHCI ports on q35, IDE buses on `pc`, neither on `virt`.
+enum MachineKind {
+    Q35,
+    LegacyPc,
+    Virt,
+}
+
 /// Build the full argv (excluding argv[0], which is `emulator_binary`).
 pub fn build_args(
     lab: &str,
@@ -273,6 +300,13 @@ pub fn build_args(
     // lowest bootindex (install media boots first), disks the next, and leave
     // the answer-file floppy unindexed (never a boot candidate).
     let seabios = vm.firmware != Some(FirmwareKind::Ovmf);
+    let machine_kind = if vm.machine.starts_with("virt") {
+        MachineKind::Virt
+    } else if vm.machine.starts_with("q35") {
+        MachineKind::Q35
+    } else {
+        MachineKind::LegacyPc
+    };
     let mut disk_index = 0usize;
     let mut add_disk = |a: &mut Vec<String>, path: &Path, bus: DiskBus| {
         let node = format!("disk{disk_index}");
@@ -289,7 +323,17 @@ pub fn build_args(
         };
         match bus {
             DiskBus::Virtio => a.push(format!("virtio-blk-pci,drive={node}{boot}")),
-            DiskBus::Ide | DiskBus::Sata => a.push(format!("ide-hd,drive={node}{boot}")),
+            // Addressed, never auto-placed: QEMU puts an unaddressed ide-hd on
+            // the secondary master (ide.1 unit 0), in the middle of the four
+            // slots, so every CD-ROM placed after it collides with something
+            // nothing asked for. Disks take the slots from the front; the
+            // CD-ROMs below carry on from where they stop.
+            DiskBus::Ide | DiskBus::Sata => {
+                let (bus_idx, unit) = ide_slot(disk_index, &machine_kind);
+                a.push(format!(
+                    "ide-hd,drive={node},bus=ide.{bus_idx},unit={unit}{boot}"
+                ))
+            }
         }
         disk_index += 1;
     };
@@ -311,7 +355,6 @@ pub fn build_args(
         DiskBus::Virtio => 0,
         DiskBus::Ide | DiskBus::Sata => disk_index,
     };
-    let ahci = vm.machine.starts_with("q35");
     for (i, iso) in paths.cdroms.iter().enumerate() {
         a.push("-blockdev".into());
         a.push(format!(
@@ -326,35 +369,8 @@ pub fn build_args(
         };
         if virt {
             a.push(format!("virtio-blk-pci,drive=cd{i}{boot}"));
-        } else if ahci {
-            a.push(format!(
-                "ide-cd,drive=cd{i},bus=ide.{}{boot}",
-                sata_disks + i
-            ));
         } else {
-            // Legacy `pc`: two units per IDE bus, but QEMU's auto-placement
-            // does not advance past the first bus, so a second CD-ROM asks for
-            // a unit the first already holds and QEMU refuses the whole
-            // command line with "IDE unit 1 is in use". A legacy Windows build
-            // carries exactly two — the install ISO and vmlab's bootstrap ISO
-            // — so address both explicitly.
-            //
-            // Three usable slots, not four: with no `-nodefaults`, QEMU puts
-            // its own empty CD-ROM on the secondary master (ide.1 unit 0), so
-            // that one is spoken for however few devices we attach. The IDE
-            // disks auto-place from the front of the same list.
-            const LEGACY_IDE_SLOTS: [(usize, usize); 3] = [(0, 0), (0, 1), (1, 1)];
-            let slot = sata_disks + i;
-            let (bus, unit) = *LEGACY_IDE_SLOTS.get(slot).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{}: {} IDE disk(s) and {} CD-ROM(s) need more slots than a legacy IDE \
-                     bus has — QEMU's own CD-ROM holds ide.1 unit 0. Use a q35 profile, or \
-                     fewer attachments.",
-                    vm.name,
-                    sata_disks,
-                    paths.cdroms.len()
-                )
-            })?;
+            let (bus, unit) = ide_slot(sata_disks + i, &machine_kind);
             a.push(format!(
                 "ide-cd,drive=cd{i},bus=ide.{bus},unit={unit}{boot}"
             ));
@@ -814,28 +830,37 @@ mod tests {
         assert!(s.contains("ide-cd,drive=cd1,bus=ide.1"), "{s}");
     }
 
-    /// The same on a legacy `pc` machine, where the IDE disk holds a unit and
-    /// the two CD-ROMs must take the ones after it. QEMU's auto-placement does
-    /// not advance past the first bus, so it refuses the second CD with "IDE
-    /// unit 1 is in use" — which failed every legacy Windows build, each of
-    /// which carries an install ISO and vmlab's bootstrap ISO.
+    /// A legacy `pc` guest fills its four IDE slots in order: the disk, then
+    /// every CD-ROM. Nothing is auto-placed — QEMU drops an unaddressed
+    /// `ide-hd` on the secondary master, mid-list, and its CD auto-placement
+    /// will not advance past the first bus, so the pair collide with "IDE unit
+    /// N is in use" and refuse the whole command line.
     #[test]
-    fn legacy_pc_cdroms_take_the_units_after_the_ide_disk() {
+    fn legacy_pc_fills_its_four_ide_slots_in_order() {
         let vm = resolved("windows-legacy", "x86_64");
         assert!(!vm.machine.starts_with("q35"), "profile must be legacy pc");
         let mut p = paths();
+        // The Option 3 shape: install media, unattend+drivers, bootstrap ISO.
         p.cdroms = vec![
             "/isos/installer.iso".into(),
+            "/lab/.vmlab/media/unattend.iso".into(),
             "/lab/.vmlab/media/vmlab.iso".into(),
         ];
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        // disk0 holds ide.0 unit 0 and QEMU's own default CD-ROM holds
-        // ide.1 unit 0, so ours take the two slots either side of it.
+        assert!(s.contains("ide-hd,drive=disk0,bus=ide.0,unit=0"), "{s}");
         assert!(s.contains("ide-cd,drive=cd0,bus=ide.0,unit=1"), "{s}");
-        assert!(s.contains("ide-cd,drive=cd1,bus=ide.1,unit=1"), "{s}");
-        assert!(
-            !s.contains("bus=ide.1,unit=0"),
-            "ide.1 unit 0 is QEMU's own default CD-ROM: {s}"
-        );
+        assert!(s.contains("ide-cd,drive=cd1,bus=ide.1,unit=0"), "{s}");
+        assert!(s.contains("ide-cd,drive=cd2,bus=ide.1,unit=1"), "{s}");
+    }
+
+    /// The disk is addressed on q35 too, where a slot is a whole AHCI port.
+    #[test]
+    fn q35_addresses_the_disk_and_cdroms_by_port() {
+        let vm = resolved("windows-server", "x86_64");
+        let mut p = paths();
+        p.cdroms = vec!["/isos/installer.iso".into()];
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        // windows-server is virtio-disk, so the CD-ROM starts at port 0.
+        assert!(s.contains("ide-cd,drive=cd0,bus=ide.0,unit=0"), "{s}");
     }
 }
