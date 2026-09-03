@@ -9,9 +9,7 @@ use std::os::windows::io::FromRawHandle;
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
-use windows_sys::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
-};
+use windows_sys::Win32::System::Console::{COORD, HPCON};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
@@ -31,7 +29,58 @@ use crate::spawn::{Spawned, TerminalSpec, command_line};
 /// to the SYSTEM warning.
 const DEFAULT_SHELL: &str = "powershell.exe -NoLogo";
 
+/// ConPTY, resolved at run time rather than imported.
+///
+/// A static import is a load-time dependency: a binary that names
+/// `CreatePseudoConsole` will not start at all on a Windows without it, and
+/// the API arrived in Windows 10 1809. That floor would be the *agent's*
+/// floor — no exec, no file transfer, no metrics on Server 2012 R2 or
+/// Windows 7 — for the sake of one feature. Resolved through
+/// `GetProcAddress`, the agent runs everywhere and only terminals are
+/// missing where the API is.
+mod api {
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{COORD, HPCON};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    pub struct ConPty {
+        pub create: unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32,
+        pub resize: unsafe extern "system" fn(HPCON, COORD) -> i32,
+        pub close: unsafe extern "system" fn(HPCON),
+    }
+
+    /// `Some` on Windows 10 1809 and later, `None` on everything older.
+    pub fn conpty() -> Option<&'static ConPty> {
+        static API: OnceLock<Option<ConPty>> = OnceLock::new();
+        API.get_or_init(|| {
+            // SAFETY: kernel32 is loaded in every process; a null return is
+            // handled, and each symbol is checked before it is transmuted.
+            unsafe {
+                let k32 = GetModuleHandleW(super::wide("kernel32.dll").as_ptr());
+                if k32.is_null() {
+                    return None;
+                }
+                let create = GetProcAddress(k32, c"CreatePseudoConsole".as_ptr() as *const u8)?;
+                let resize = GetProcAddress(k32, c"ResizePseudoConsole".as_ptr() as *const u8)?;
+                let close = GetProcAddress(k32, c"ClosePseudoConsole".as_ptr() as *const u8)?;
+                Some(ConPty {
+                    create: std::mem::transmute(create),
+                    resize: std::mem::transmute(resize),
+                    close: std::mem::transmute(close),
+                })
+            }
+        })
+        .as_ref()
+    }
+}
+
+/// What a guest too old for ConPTY says when a terminal is opened on it.
+pub const NO_CONPTY: &str = "this guest has no ConPTY (Windows 10 1809 / Server 2019 and later),      so interactive terminals are unavailable; exec, file transfer and the rest of the agent work";
+
 /// The pseudoconsole handle, shared with the resize hook.
+
 struct Pty(HPCON);
 // SAFETY: ResizePseudoConsole/ClosePseudoConsole are callable from any
 // thread; we serialize destruction via Arc.
@@ -62,9 +111,10 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
         X: cols.max(2) as i16,
         Y: rows.max(2) as i16,
     };
+    let conpty = api::conpty().ok_or_else(|| std::io::Error::other(NO_CONPTY))?;
     let mut hpc: HPCON = 0;
     // SAFETY: fresh pipe handles; ConPTY duplicates what it needs.
-    let hr = unsafe { CreatePseudoConsole(size, in_read.0, out_write.0, 0, &mut hpc) };
+    let hr = unsafe { (conpty.create)(size, in_read.0, out_write.0, 0, &mut hpc) };
     if hr != S_OK || hpc == 0 {
         return Err(std::io::Error::other(format!(
             "CreatePseudoConsole failed: 0x{hr:08x}"
@@ -79,7 +129,7 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
         Ok(v) => v,
         Err(e) => {
             // SAFETY: hpc came from CreatePseudoConsole above.
-            unsafe { ClosePseudoConsole(pty.0) };
+            unsafe { (conpty.close)(pty.0) };
             return Err(e);
         }
     };
@@ -101,7 +151,7 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
                 Y: rows.max(2) as i16,
             };
             // SAFETY: live HPCON until the session's reaper closes it.
-            unsafe { ResizePseudoConsole(resize_pty.0, size) };
+            unsafe { (conpty.resize)(resize_pty.0, size) };
         })),
         kill: Box::new(move || {
             // SAFETY: live process handle held by the Arc.
@@ -118,7 +168,7 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
             // Closing the pseudoconsole tears down conhost and closes the
             // output pipe, ending the caller's output pump.
             // SAFETY: single close of the HPCON we created.
-            unsafe { ClosePseudoConsole(pty.0) };
+            unsafe { (conpty.close)(pty.0) };
             code
         }),
     })

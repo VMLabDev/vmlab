@@ -24,6 +24,11 @@
 
 set -euo pipefail
 
+# The win7 targets need a nightly with rust-src; reuse the channel the
+# ebpf workspace already pins so a checkout needs one nightly, not two.
+NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$(dirname "${BASH_SOURCE[0]}")/../ebpf/rust-toolchain.toml" 2>/dev/null || true)"
+NIGHTLY="${NIGHTLY:-nightly}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST_DIR="$SCRIPT_DIR/dist/agent"
 
@@ -53,8 +58,8 @@ target_spec() {
     linux-x86_64) echo "x86_64-unknown-linux-musl|vmlab-agent|1" ;;
     linux-aarch64) echo "aarch64-unknown-linux-musl|vmlab-agent|1" ;;
     linux-riscv64) echo "riscv64gc-unknown-linux-musl|vmlab-agent|0" ;;
-    windows-x86_64) echo "x86_64-pc-windows-gnu|vmlab-agent.exe|0" ;;
-    windows-x86) echo "i686-pc-windows-gnu|vmlab-agent.exe|0" ;;
+    windows-x86_64) echo "x86_64-win7-windows-gnu|vmlab-agent.exe|0" ;;
+    windows-x86) echo "i686-win7-windows-gnu|vmlab-agent.exe|0" ;;
     linux-x86) echo "i686-unknown-linux-musl|vmlab-agent|0" ;;
     *) die "unknown target key '$1' (known: linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 windows-x86 linux-x86)" ;;
   esac
@@ -65,7 +70,26 @@ build_one() {
   spec="$(target_spec "$key")"
   IFS='|' read -r target binary required <<<"$spec"
 
-  if ! rustup target list --installed | grep -qx "$target"; then
+  # The *-win7-windows-gnu targets are tier 3: rustup ships no std for them, so
+  # they are built from source with a nightly that has rust-src. They exist for
+  # one reason — a std built for the Windows 7 API floor calls RtlGenRandom
+  # instead of ProcessPrng, which is Windows 10 1809 and later. A binary that
+  # names ProcessPrng does not load *at all* on anything older, agent and every
+  # feature with it.
+  local -a build_std=()
+  local toolchain=""
+  if [[ "$target" == *-win7-windows-* ]]; then
+    if ! rustup toolchain list | grep -q "^$NIGHTLY"; then
+      log "skipping $key: $NIGHTLY not installed (rustup toolchain install $NIGHTLY --component rust-src)"
+      return 0
+    fi
+    if ! rustup component list --toolchain "$NIGHTLY" 2>/dev/null | grep -q "^rust-src (installed)"; then
+      log "skipping $key: rust-src missing (rustup component add rust-src --toolchain $NIGHTLY)"
+      return 0
+    fi
+    toolchain="+$NIGHTLY"
+    build_std=(-Z build-std=std,panic_abort)
+  elif ! rustup target list --installed | grep -qx "$target"; then
     if [[ "$required" == "1" ]]; then
       die "rust target $target not installed — run: rustup target add $target"
     fi
@@ -96,15 +120,15 @@ build_one() {
       )
       ;;
     windows-x86_64)
-      env_args+=("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static")
+      env_args+=("CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static")
       ;;
     windows-x86)
-      env_args+=("CARGO_TARGET_I686_PC_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static")
+      env_args+=("CARGO_TARGET_I686_WIN7_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static")
       ;;
   esac
 
   log "building vmlab-agent for $key ($target)"
-  env "${env_args[@]}" cargo build --release --target "$target" \
+  env "${env_args[@]}" cargo $toolchain build --release --target "$target" "${build_std[@]}" \
     --manifest-path "$SCRIPT_DIR/agent/Cargo.toml" \
     || die "cargo build for $target failed"
 
