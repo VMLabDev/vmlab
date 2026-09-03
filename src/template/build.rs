@@ -648,9 +648,18 @@ async fn resolve_artefact(src: &ArtefactSource, root: &Path, log: &OutputSink) -
     super::artefact::resolve(src, move |m| log(format!("{m}\n"))).await
 }
 
-/// The synthetic lab a build runs in, named after the template it builds.
+/// The synthetic lab a build runs in, named after the template it builds —
+/// architecture included, like the working directory beside it.
+///
+/// A short name is not unique: `windows-vista` is one template built for
+/// `x86_64` and another for `x86`, which is the whole point of a store ref
+/// carrying an arch. Two such builds running at once took the same lab name
+/// and therefore the same runtime directory, so they shared one set of QMP,
+/// agent and VNC sockets — the second QEMU to start rebinds them and the
+/// first build loses its control channel and hangs out its budget. Their
+/// disks were always separate; only this name collided (2026-09-03).
 fn build_lab_name(def: &TemplateDef) -> String {
-    format!("build-{}", def.name)
+    format!("build-{}-{}", def.arch, def.name)
 }
 
 /// Effective build hardware: what a build boots on and seals, the template
@@ -1103,10 +1112,29 @@ fn synth_lab(
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildBoot, EffectiveHardware, SealedImage, seal_meta, sweep_workdirs_in, synth_lab, wcl_str,
+        BuildBoot, EffectiveHardware, SealedImage, build_lab_name, seal_meta, sweep_workdirs_in,
+        synth_lab, wcl_str,
     };
     use crate::template::meta::TemplateMeta;
     use std::path::Path;
+
+    /// Two builds of one short name — the same template for two
+    /// architectures — must not share a lab, because the lab name is what
+    /// picks the runtime directory holding the QMP, agent and VNC sockets.
+    /// When they collided the second QEMU rebound them and the first build
+    /// sat there until its budget ran out.
+    #[test]
+    fn a_build_lab_is_named_per_architecture() {
+        let x64 = def(r#"import <vmlab.wcl>
+               template "windows-vista" { arch = "x86_64" version = "1" profile = "windows-legacy"
+                 disk = 40GiB source "iso" { path = "/i.iso" } }"#);
+        let x86 = def(r#"import <vmlab.wcl>
+               template "windows-vista" { arch = "x86" version = "1" profile = "windows-legacy"
+                 disk = 40GiB source "iso" { path = "/i.iso" } }"#);
+        assert_eq!(build_lab_name(&x64), "build-x86_64-windows-vista");
+        assert_eq!(build_lab_name(&x86), "build-x86-windows-vista");
+        assert_ne!(build_lab_name(&x64), build_lab_name(&x86));
+    }
 
     /// A supervisor that was killed mid-build leaves its working disk behind
     /// — the guard that would have removed it is a `Drop`. The next one to
