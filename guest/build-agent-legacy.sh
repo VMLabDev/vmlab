@@ -25,6 +25,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$SCRIPT_DIR/agent-legacy/src"
 DIST_DIR="$SCRIPT_DIR/dist/agent"
+MSVCRT_PREFIX="${VMLAB_MSVCRT_PREFIX:-$HOME/.local/share/vmlab/toolchains/mingw-msvcrt}"
 WATCOM="${WATCOM:-$HOME/.local/opt/open-watcom-v2}"
 
 die() {
@@ -98,8 +99,21 @@ build_one() {
       fi
       local out="$DIST_DIR/$key"
       mkdir -p "$out"
+      # Against the msvcrt CRT when one is built, because the distro mingw is
+      # UCRT-only and a UCRT import will not load on the very guests this
+      # binary exists for — NT4 through 2003 shipped long before it. The
+      # binary builds either way; without the prefix it silently inherits a
+      # Windows 10 floor, which for the legacy tier is no use at all.
+      local msvcrt_lib="$MSVCRT_PREFIX/i686-w64-mingw32/lib"
+      local -a crt_args=()
+      if [[ -f "$msvcrt_lib/libmsvcrt.a" && -f "$msvcrt_lib/crt2.o" ]]; then
+        crt_args=("-B$msvcrt_lib" "-L$msvcrt_lib")
+      else
+        log "$key: no msvcrt CRT — this binary will need the UCRT (Windows 10+);" \
+            "build one with guest/build-mingw-msvcrt.sh"
+      fi
       i686-w64-mingw32-gcc -std=c99 -Wall -Wextra -Werror -Wno-cast-function-type -Os -s \
-        -static -DAGENT_VERSION="\"$stamp\"" \
+        "${crt_args[@]}" -static -DAGENT_VERSION="\"$stamp\"" \
         -o "$out/vmlab-agent-legacy.exe" "${srcs[@]}" "$SRC_DIR/plat_win32.c" \
         -ladvapi32 -luser32 \
         || die "mingw build failed for $key"

@@ -179,6 +179,26 @@ SRC
     when absent. The riscv64 target is best-effort and skipped the same way.
   DOC
 
+  p <<DOC
+    The Windows agents are built twice over for age. They target
+    `*-win7-windows-gnu` rather than `*-pc-windows-gnu`, because the standard
+    library's usual RNG entry point (`ProcessPrng`) arrived in Windows 10 1809
+    and an import the loader cannot resolve stops the process starting at all.
+    Those targets are tier 3, so the build needs a nightly toolchain with
+    `rust-src`; it reuses the channel `ebpf/rust-toolchain.toml` pins.
+  DOC
+
+  p <<DOC
+    They also link against a **msvcrt** C runtime built by
+    `guest/build-mingw-msvcrt.sh`, a one-time five-minute build into
+    `~/.local/share/vmlab/toolchains/mingw-msvcrt`. Distribution mingw-w64
+    packages are UCRT-only, and the UCRT ships with Windows 10: a binary that
+    imports it will not load on Vista, 7, 8, 8.1, Server 2008, 2008 R2, 2012
+    or 2012 R2, which is most of the guests the 32-bit agent exists for.
+    `msvcrt.dll` has been present since NT4. Without the prefix the agents
+    still build and the script says what it cost you.
+  DOC
+
   p "You do not need the assets for every workflow."
 
   list {

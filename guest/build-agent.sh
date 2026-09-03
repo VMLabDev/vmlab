@@ -28,6 +28,7 @@ set -euo pipefail
 # ebpf workspace already pins so a checkout needs one nightly, not two.
 NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$(dirname "${BASH_SOURCE[0]}")/../ebpf/rust-toolchain.toml" 2>/dev/null || true)"
 NIGHTLY="${NIGHTLY:-nightly}"
+MSVCRT_PREFIX="${VMLAB_MSVCRT_PREFIX:-$HOME/.local/share/vmlab/toolchains/mingw-msvcrt}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST_DIR="$SCRIPT_DIR/dist/agent"
@@ -63,6 +64,21 @@ target_spec() {
     linux-x86) echo "i686-unknown-linux-musl|vmlab-agent|0" ;;
     *) die "unknown target key '$1' (known: linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 windows-x86 linux-x86)" ;;
   esac
+}
+
+# Link a Windows target against the msvcrt CRT from build-mingw-msvcrt.sh, if
+# it is there. The distro toolchains are UCRT-only, and a UCRT import is a
+# load-time dependency on Windows 10 — the agent will not start at all on
+# Vista through Server 2012 R2 without this. Absent the prefix the build still
+# succeeds; the binary just carries that floor, which the caller is warned of.
+msvcrt_link_args() {
+  local host="$1" lib="$MSVCRT_PREFIX/$1/lib"
+  if [[ -f "$lib/libmsvcrt.a" && -f "$lib/crt2.o" ]]; then
+    echo "-Clink-arg=-B$lib -Clink-arg=-L$lib"
+  else
+    log "no msvcrt CRT for $host — the binary will need the UCRT (Windows 10+);" \
+        "build one with guest/build-mingw-msvcrt.sh"
+  fi
 }
 
 build_one() {
@@ -120,10 +136,10 @@ build_one() {
       )
       ;;
     windows-x86_64)
-      env_args+=("CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static")
+      env_args+=("CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static $(msvcrt_link_args x86_64-w64-mingw32)")
       ;;
     windows-x86)
-      env_args+=("CARGO_TARGET_I686_WIN7_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static")
+      env_args+=("CARGO_TARGET_I686_WIN7_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static $(msvcrt_link_args i686-w64-mingw32)")
       ;;
   esac
 
