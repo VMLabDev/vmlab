@@ -53,8 +53,14 @@ impl TemplateOps {
         let mut ops = self.inner.lock_recover();
         if let Some(op) = ops.get(&key) {
             return Err(CommandError::conflict(format!(
-                "{} already running for `{arch}/{template}`",
-                op.kind
+                "{} already running for `{arch}/{template}`{} — stop it with \
+                 `vmlab template stop {template}`",
+                op.kind,
+                if lab.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in lab `{lab}`")
+                },
             )));
         }
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -115,8 +121,30 @@ impl TemplateOps {
         kind: &str,
     ) -> Result<(), CommandError> {
         let ops = self.inner.lock_recover();
+        // The lab is where the operation is *filed*, not what identifies it:
+        // a build claims the lab of the directory it was started from, and a
+        // stop asks with the lab of the directory the user is standing in.
+        // Those differ routinely — `just <t>-build` cd's into the template's
+        // own directory, while the operator stops it from the repository root
+        // — and the mismatch made `template stop` answer "no build running"
+        // about the very build `template build` was refusing as already
+        // running. Unstoppable except by restarting the supervisor.
+        //
+        // So fall back to the pair that does identify the work. Only when
+        // exactly one operation matches: two labs building the same template
+        // is the case the lab is there to tell apart, and guessing between
+        // them would cancel work nobody asked about.
         let op = ops
             .get(&(lab.to_string(), arch.to_string(), template.to_string()))
+            .or_else(|| {
+                let mut hits = ops
+                    .iter()
+                    .filter(|((_, a, t), _)| a == arch && t == template);
+                match (hits.next(), hits.next()) {
+                    (Some((_, op)), None) => Some(op),
+                    _ => None,
+                }
+            })
             .ok_or_else(|| {
                 CommandError::not_found(format!("no {kind} running for `{arch}/{template}`"))
             })?;
@@ -392,6 +420,34 @@ pub(super) fn op_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build is filed under the lab it was started from, and a stop asks
+    /// with the lab the operator is standing in. Those differ routinely — the
+    /// justfile cd's into each template's own directory — and when the lookup
+    /// insisted on an exact match, `template stop` reported "no build running"
+    /// about the build `template build` was refusing as already running.
+    #[test]
+    fn a_build_can_be_stopped_from_another_lab() {
+        let ops = TemplateOps::default();
+        let _guard = ops
+            .try_begin("built-here", "x86_64", "base", "build")
+            .unwrap();
+        ops.cancel("standing-there", "x86_64", "base", "build")
+            .expect("the arch/template pair identifies the work");
+    }
+
+    /// Except when two labs are building the same template: that is precisely
+    /// what the lab distinguishes, and cancelling a guess would stop work
+    /// nobody asked about.
+    #[test]
+    fn an_ambiguous_stop_is_refused() {
+        let ops = TemplateOps::default();
+        let _a = ops.try_begin("lab-a", "x86_64", "base", "build").unwrap();
+        let _b = ops.try_begin("lab-b", "x86_64", "base", "build").unwrap();
+        assert!(ops.cancel("lab-c", "x86_64", "base", "build").is_err());
+        ops.cancel("lab-a", "x86_64", "base", "build")
+            .expect("an exact lab still resolves");
+    }
 
     #[test]
     fn second_op_on_same_template_rejected() {
