@@ -448,6 +448,24 @@ impl Handler<LabRequest> for LabdHandler {
             }
             LabRequest::Destroy {} => {
                 lab.destroy().await?;
+                // And then go away. This daemon parsed vmlab.wcl once, at
+                // startup, and holds the result for its whole life — so a
+                // daemon that outlives the lab it was built from serves the
+                // old config to whatever comes next. `up` after `destroy`
+                // reuses a live daemon, so an edited lab file was silently
+                // ignored: a changed `cdrom` kept attaching the ISO the lab
+                // was first created with, through destroy and re-up alike.
+                //
+                // Nothing is left to serve once the clones and lab-local
+                // state are gone, so exiting is both correct and the
+                // simplest way to guarantee the next `up` re-reads the file.
+                let tasks = self.tasks.clone();
+                let lab = lab.clone();
+                tokio::spawn(async move {
+                    teardown(&lab, &tasks).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    std::process::exit(0);
+                });
                 Ok(json!(true))
             }
             // ---- machines (PRD §7, §18) ---------------------------------
