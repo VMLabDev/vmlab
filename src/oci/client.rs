@@ -839,22 +839,38 @@ impl Transport for HttpTransport {
     }
 
     async fn put_blob(&self, repository: &str, digest: &str, data: Vec<u8>) -> Result<()> {
-        let location = self.start_upload(repository).await?;
-        let scope = self.scope(repository, true);
-        let sep = if location.contains('?') { '&' } else { '?' };
-        let url = format!("{location}{sep}digest={digest}");
-        let resp = self
-            .send_with_auth(&scope, || {
-                self.client
-                    .put(&url)
-                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                    .body(data.clone())
-            })
-            .await?;
-        if !resp.status().is_success() {
-            bail!("PUT blob {digest} returned {}", resp.status());
+        // An upload session outlives its usefulness: a chunk blob is up to
+        // `oci_chunk_size` (512 MiB by default), and GHCR drops the session
+        // under a PUT that takes minutes, answering 404 to a location it
+        // handed out itself. Every large template failed that way on
+        // 2026-09-05 while the small ones went straight up. A dropped session
+        // is not a refusal, so start a new one and send the blob again.
+        let mut last = String::new();
+        for attempt in 1..=BLOB_PUT_ATTEMPTS {
+            let location = self.start_upload(repository).await?;
+            let scope = self.scope(repository, true);
+            let sep = if location.contains('?') { '&' } else { '?' };
+            let url = format!("{location}{sep}digest={digest}");
+            let resp = self
+                .send_with_auth(&scope, || {
+                    self.client
+                        .put(&url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                        .body(data.clone())
+                })
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(());
+            }
+            last = status.to_string();
+            if !session_lost(status) {
+                break;
+            }
+            tracing::debug!(%digest, %status, attempt, "upload session lost; restarting it");
+            backoff(attempt).await;
         }
-        Ok(())
+        bail!("PUT blob {digest} returned {last}");
     }
 
     async fn put_blob_file(&self, repository: &str, digest: &str, path: &Path) -> Result<()> {
@@ -1048,6 +1064,18 @@ impl HttpTransport {
 
 fn is_transient(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// How many times a blob PUT restarts its upload session before giving up.
+const BLOB_PUT_ATTEMPTS: u32 = 3;
+
+/// Whether a failed blob PUT means the upload session went away rather than
+/// the registry refusing the blob: 404 on a location the registry itself
+/// handed out. Anything else (401 after the auth retry, 413, 400) is a
+/// refusal that a new session cannot change, and 5xx is already retried
+/// against the same session by `send_with_auth`.
+fn session_lost(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND
 }
 
 async fn backoff(attempt: u32) {
@@ -1594,5 +1622,71 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A registry that loses the first upload session it hands out, the way
+    /// GHCR loses one under a slow PUT: 404 on a location it issued itself.
+    /// The push has to start a new session rather than report the blob
+    /// refused (every large template failed that way on 2026-09-05).
+    #[tokio::test]
+    async fn a_lost_upload_session_is_started_again() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sessions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = sessions.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let reply = if head.starts_with("POST") {
+                            let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            format!(
+                                "HTTP/1.1 202 Accepted\r\nLocation: /upload/{n}\r\nContent-Length: 0\r\n\r\n"
+                            )
+                        } else if head.starts_with("PUT /upload/1") {
+                            // The session the registry itself handed out is gone.
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+                        } else {
+                            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_string()
+                        };
+                        if sock.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let transport = HttpTransport::new(addr.to_string(), Credential::Anonymous).unwrap();
+        let data = b"blob bytes".to_vec();
+        transport
+            .put_blob("acme/ubuntu", &digest_of(&data), data)
+            .await
+            .expect("a lost session is not a refusal");
+        assert_eq!(
+            sessions.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second attempt must open its own upload session"
+        );
+    }
+
+    /// A refusal the registry means is reported, not retried into silence.
+    #[tokio::test]
+    async fn a_refused_blob_is_not_retried() {
+        assert!(session_lost(reqwest::StatusCode::NOT_FOUND));
+        assert!(!session_lost(reqwest::StatusCode::PAYLOAD_TOO_LARGE));
+        assert!(!session_lost(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!session_lost(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
     }
 }
