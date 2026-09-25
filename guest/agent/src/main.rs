@@ -70,6 +70,9 @@ fn main() {
     }
     let mut console = false;
     let mut args_iter = args.iter();
+    // Not a `for`: the Unix `--port` arm takes its value from the same
+    // iterator, which a `for` loop would be holding.
+    #[allow(clippy::while_let_on_iterator)]
     while let Some(a) = args_iter.next() {
         match a.as_str() {
             // Linux: serve on a serial device instead of the virtio port —

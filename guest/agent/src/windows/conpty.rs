@@ -45,10 +45,16 @@ mod api {
     use windows_sys::Win32::System::Console::{COORD, HPCON};
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
+    /// What `GetProcAddress` hands back, before it is given its real type.
+    type Proc = unsafe extern "system" fn() -> isize;
+    type CreateFn = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
+    type ResizeFn = unsafe extern "system" fn(HPCON, COORD) -> i32;
+    type CloseFn = unsafe extern "system" fn(HPCON);
+
     pub struct ConPty {
-        pub create: unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32,
-        pub resize: unsafe extern "system" fn(HPCON, COORD) -> i32,
-        pub close: unsafe extern "system" fn(HPCON),
+        pub create: CreateFn,
+        pub resize: ResizeFn,
+        pub close: CloseFn,
     }
 
     /// `Some` on Windows 10 1809 and later, `None` on everything older.
@@ -66,9 +72,9 @@ mod api {
                 let resize = GetProcAddress(k32, c"ResizePseudoConsole".as_ptr() as *const u8)?;
                 let close = GetProcAddress(k32, c"ClosePseudoConsole".as_ptr() as *const u8)?;
                 Some(ConPty {
-                    create: std::mem::transmute(create),
-                    resize: std::mem::transmute(resize),
-                    close: std::mem::transmute(close),
+                    create: std::mem::transmute::<Proc, CreateFn>(create),
+                    resize: std::mem::transmute::<Proc, ResizeFn>(resize),
+                    close: std::mem::transmute::<Proc, CloseFn>(close),
                 })
             }
         })
@@ -80,7 +86,6 @@ mod api {
 pub const NO_CONPTY: &str = "this guest has no ConPTY (Windows 10 1809 / Server 2019 and later),      so interactive terminals are unavailable; exec, file transfer and the rest of the agent work";
 
 /// The pseudoconsole handle, shared with the resize hook.
-
 struct Pty(HPCON);
 // SAFETY: ResizePseudoConsole/ClosePseudoConsole are callable from any
 // thread; we serialize destruction via Arc.
