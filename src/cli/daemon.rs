@@ -30,10 +30,15 @@ pub fn abs_path(path: &Path) -> Result<PathBuf> {
 /// user, auto-started by the CLI).
 pub async fn ensure_supervisor() -> Result<SupClient> {
     let sock = crate::paths::supervisor_socket();
-    if let Ok(client) = SupClient::connect(&sock).await
-        && client.send(SupRequest::Ping {}).await.is_ok()
-    {
-        return Ok(client);
+    if let Ok(client) = SupClient::connect(&sock).await {
+        if client.send(SupRequest::Ping {}).await.is_ok() {
+            return Ok(client);
+        }
+        // Something holds the socket and will not serve: a supervisor on its
+        // way out. A new one cannot bind until it has gone.
+        if !wait_supervisor_gone(&sock).await {
+            bail!("the running supervisor is still shutting down — try again shortly");
+        }
     }
 
     spawn_supervisor()?;
@@ -50,6 +55,23 @@ pub async fn ensure_supervisor() -> Result<SupClient> {
         "supervisor did not come up — check {}",
         crate::paths::state_dir().join("vmlabd.log").display()
     )
+}
+
+/// How long a supervisor gets to finish its teardown: every lab it holds is
+/// released, then its background tasks get five seconds to stop.
+const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait until nothing is listening on the supervisor socket, or give up after
+/// [`SHUTDOWN_WAIT`]. True when it has gone.
+async fn wait_supervisor_gone(sock: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + SHUTDOWN_WAIT;
+    while std::time::Instant::now() < deadline {
+        if SupClient::connect(sock).await.is_err() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
 }
 
 fn spawn_supervisor() -> Result<()> {
@@ -159,7 +181,16 @@ pub fn cmd_daemon(cmd: DaemonCmd) -> Result<()> {
                 match SupClient::connect(&sock).await {
                     Ok(client) => {
                         let _ = client.send(SupRequest::Shutdown {}).await;
-                        println!("vmlabd stopped");
+                        // The reply comes before the teardown, so "stopped"
+                        // waits for the process to be gone.
+                        if wait_supervisor_gone(&sock).await {
+                            println!("vmlabd stopped");
+                        } else {
+                            bail!(
+                                "vmlabd is still shutting down after {}s",
+                                SHUTDOWN_WAIT.as_secs()
+                            );
+                        }
                     }
                     Err(_) => println!("vmlabd is not running"),
                 }

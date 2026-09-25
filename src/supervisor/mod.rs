@@ -31,6 +31,11 @@ pub struct Supervisor {
     ensure_locks: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// In-flight template builds/pushes (web Templates page, PRD §6).
     template_ops: templates::TemplateOps,
+    /// Set once `shutdown` is accepted. From then on every request is
+    /// refused: a lab daemon spawned during teardown would outlive this
+    /// process, carrying its environment, and be adopted by the next
+    /// supervisor as if it were current.
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 /// Entry point for `vmlab __supervisord`.
@@ -62,6 +67,7 @@ async fn run_async() -> Result<()> {
         ),
         ensure_locks: Mutex::new(std::collections::HashMap::new()),
         template_ops: templates::TemplateOps::default(),
+        shutting_down: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Long-lived background tasks register here so the `shutdown` command
@@ -458,6 +464,12 @@ struct SupervisorHandler {
 impl Handler<SupRequest> for SupervisorHandler {
     async fn handle(&self, req: SupRequest, _stream: &Streamer) -> Result<Value, CommandError> {
         let sup = &self.sup;
+        if sup.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return match req {
+                SupRequest::Shutdown {} => Ok(json!(true)),
+                _ => Err(CommandError::conflict("vmlabd is shutting down")),
+            };
+        }
         match req {
             SupRequest::Ping {} => Ok(json!("pong")),
             SupRequest::Version {} => Ok(json!(env!("CARGO_PKG_VERSION"))),
@@ -563,6 +575,8 @@ impl Handler<SupRequest> for SupervisorHandler {
             SupRequest::RegistryNamespaceRemove { namespace } => store::namespace_remove(namespace),
             SupRequest::Shutdown {} => {
                 tracing::info!("supervisor shutdown requested");
+                sup.shutting_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let sup = sup.clone();
                 let tasks = self.tasks.clone();
                 // Spawned so this command's response reaches the caller before
