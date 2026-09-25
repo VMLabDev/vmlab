@@ -70,7 +70,7 @@ cross-reference by name.
 | `nic` | `vm`, `container`, `template` | A network interface on a segment. A machine with no `nic` blocks has no network hardware at all. |
 | `share` | `vm` | A host directory mounted in the guest. See shares-media.md. |
 | `disk`, `media`, `gpu` | `vm` (and `template` for disks and media) | Extra disks, ISO and floppy images built from folders, and GPU acceleration. |
-| `login` | `vm`, `container` | A labelled identity a surface attaches as. See logins-and-ssh.md. |
+| `login` | `vm`, `container` | A labelled identity `exec`, `shell` and the syncer run as. See logins.md. |
 | `provision`, `playbook` | `vm`, `container`, `template` | Configuration steps run once the machine is ready, in declaration order. See automation.md. |
 | `template` | the document, beside `lab` | A buildable template definition. See templates.md. |
 
@@ -126,10 +126,9 @@ required child blocks. The schema declares these with decorators on each field.
   without a `password`, `elevated` on a Linux-family profile, and more than one
   `login` with `default = true` on a machine.
 
-Validation deliberately does not check: `@dev` on a machine whose agent cannot
-serve an attach is not a validation error. The agent's features are only known
-once it is running, so that failure is reported by `vmlab up` as a warning and
-by an attach as a refusal (see dev-machines.md).
+Validation deliberately does not check which features a machine's agent serves.
+Those are only known once the agent is running and answers its handshake (see
+dev-machines.md).
 
 ## How a value resolves
 
@@ -158,40 +157,38 @@ precedence for both machine kinds, and no other surface reimplements it.
 
 A decorator is written on a machine block and states something *about* the
 machine rather than configuring something inside it. vmlab ships one: `@dev`,
-which marks a VM or container as a dev machine that vmlab publishes as an SSH
-endpoint and syncs a workspace onto. Every argument is optional. A bare `@dev`
+which marks a VM or container as a dev machine: a machine vmlab syncs a
+workspace onto. Every argument is optional. A bare `@dev`
 is a complete dev machine, and unset arguments resolve `@dev` then profile then
 vmlab's own floor.
 
 `default = true` names the lab's default dev machine, which is the same for
-everyone who opens the file. Which dev machine is *yours* is not a property of
-the file; see dev-machines.md for where it is recorded instead. The decorator's
+everyone who opens the file. A `dev sync` verb acts on a different machine when
+given one as an argument or through `VMLAB_DEV_MACHINE` (see dev-machines.md). The decorator's
 arguments are listed with the machine blocks in vm.md.
 
 ```wcl
-# examples/dev-neovim-container/vmlab.wcl
+# examples/dev-container/vmlab.wcl
 @dev(default = true, workspace = "./workspace")
 container "dev01" {
   image   = "alpine:3.22"
   profile = "container"
-  // Neovim wants more than the profile's floor, and a container names its
-  // own size when the profile's is not the right one.
+  // A dev machine builds things, and a container names its own size when
+  // the profile's floor is not the right one.
   cpus    = 2
   memory  = 1GiB
-  // `:idle` keeps the micro-VM up for attaching without running the
-  // image's entrypoint — a dev container has no service to be.
+  // `:idle` keeps the micro-VM up without running the image's entrypoint
+  // — a dev container has no service to be.
   mode    = :idle
   nic { segment = "lan" }
 
   // The container identity floor (§19.2): the agent is root and root needs
   // no credential to become an account, so a Linux `login {}` may declare
-  // the account alone. Its Windows twin cannot — every credential-free
-  // route there is the one Windows OpenSSH's S4U logon already
-  // disqualified, and `elevated` is a validation error on this side.
+  // the account alone. `elevated` is a validation error on this side.
   login "dev" { user = "dev" default = true }
 
   provision "scripts/dev-user.ws" { }
-  provision "scripts/editor-bits.ws" { }
+  provision "scripts/home-bits.ws" { }
 }
 ```
 

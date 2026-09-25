@@ -125,9 +125,9 @@ SRC
     The agent's mounts run as the agent identity, SYSTEM on Windows, and a
     drive letter is visible in every session while each logon authenticates
     separately. So the agent also writes the lab's share credential into
-    every logon it mints, before spawning anything. Without that, a developer
-    attaching through the [SSH facade](guide_logins) would see the mapped
-    drive and be unable to open it.
+    every logon it mints, before spawning anything. Without that, a
+    [login](guide_logins) running `vmlab shell` would see the mapped drive
+    and be unable to open it.
   DOC
 
   callout "XP-era guests mount by screen" {

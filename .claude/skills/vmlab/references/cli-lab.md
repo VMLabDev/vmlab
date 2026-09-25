@@ -28,9 +28,7 @@ vmlab up [VMS]...
 
 A full validation of the lab file runs before any side effect. A lab that does
 not validate is never started, and the issues are printed with the offending
-text underlined in the source. A lab that loads also refreshes the managed block
-in `~/.ssh/config` (see logins-and-ssh.md), so its machines appear in an editor's
-host picker after the first command run in the directory.
+text underlined in the source.
 
 It then connects to the supervisor, starting it if none is running, and asks it
 for the lab daemon. The lab daemon owns everything that follows and outlives this
@@ -55,9 +53,8 @@ Inside the daemon, `up` works through a plan computed before anything is touched
    inspection.
 6. Between waves the daemon runs every provision script and playbook whose machine
    has started, in declaration order, waiting for each machine's readiness first.
-7. Port forwards are installed, a warning is printed for any machine whose agent
-   cannot serve an attach (see logins-and-ssh.md), and the workspace syncer starts
-   for every dev machine that declares a workspace (see dev-machines.md).
+7. Port forwards are installed, and the workspace syncer starts for every dev
+   machine that declares a workspace (see dev-machines.md).
 
 Output from provision scripts streams to the terminal as it happens. On success
 the last line is `lab "<name>" is up`. A VM declared with `gui = true` (or a lab
@@ -208,7 +205,7 @@ way:
 
 `IP` is the first NIC with a lease, as reported by the guest agent, or `-` before
 the guest is ready. With `--verbose` a second line under each machine carries
-`state=`, `ready=`, `cached=` and `attachable=`, plus `diverged=yes` on a machine
+`state=`, `ready=` and `cached=`, plus `diverged=yes` on a machine
 whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md). A VM
 then adds `arch`, `cpus`, `memory` and `agent` (the sealed agent version); a
 container adds `health`, `exit` and `digest`.
@@ -216,8 +213,7 @@ container adds `health`, `exit` and `digest`.
 #### Dev machines
 
 Labs with `@dev` machines get a second table: `DEV`, `DEFAULT` (whether it is the
-lab's default dev machine), `ATTACH` (whether its agent can serve an attach at all),
-`WORKSPACE` (the host directory) and `GUEST WORKSPACE`. A halted workspace syncer
+lab's default dev machine), `WORKSPACE` (the host directory) and `GUEST WORKSPACE`. A halted workspace syncer
 prints its halt sentence under the machine's row, followed by
 `vmlab dev sync status <machine>` as the place to read more (see dev-machines.md).
 
@@ -296,14 +292,8 @@ On success the verb prints one line,
 every issue as a report with the offending text underlined in the source, and prints
 nothing else.
 
-One thing does happen on success: the lab is registered in the managed block of
-`~/.ssh/config`, because every command that loads a lab does that (see
-logins-and-ssh.md). The lab file itself is not written, which is what "no side
-effects" refers to. A failure to write the block is a warning, not an error.
-
-Nothing here probes a running machine. The attachability of a dev machine is checked
-at `up` and at attach, deliberately not at `validate`, because it depends on a live
-agent handshake (see logins-and-ssh.md).
+Nothing here writes a file or probes a running machine. Whether an agent serves a
+feature depends on a live handshake, so `validate` never checks it.
 
 ### Examples
 
@@ -337,22 +327,18 @@ vmlab destroy
 
 ### What it does
 
-1. It withdraws every SSH alias the lab publishes, while the stanzas in the managed
-   `~/.ssh/config` block still resolve, so any `ssh` multiplexer holding a connection
-   is told to exit (see logins-and-ssh.md).
-2. With a lab daemon running, it asks the daemon to destroy the lab. The daemon stops
+1. With a lab daemon running, it asks the daemon to destroy the lab. The daemon stops
    every workspace syncer, force-stops every machine, waits up to 30 seconds for each
    to settle, then removes `.vmlab/` and each machine's runtime directory.
-3. With no daemon running, it removes `.vmlab/` itself if the directory exists.
-4. It asks the supervisor to release the lab, which reaps the lab daemon.
+2. With no daemon running, it removes `.vmlab/` itself if the directory exists.
+3. It asks the supervisor to release the lab, which reaps the lab daemon.
 
 The last line printed is `lab "<name>" destroyed`.
 
 Everything a machine had that was not in its template goes: snapshots live inside the
 clones, so they go with them (see snapshots-vision.md), and a machine marked diverged
 by `vmlab machine repair-agent` comes back on its template's sealed agent. The
-`vmlab dev use` selection recorded in `.vmlab/` is forgotten too, and so is the
-workspace sync ledger.
+workspace sync ledger recorded in `.vmlab/` is forgotten too.
 
 Warning — the workspace survives, the guest tree does not: a dev machine's source
 lives in the host workspace directory, which `destroy` never touches. The guest copy
@@ -552,10 +538,10 @@ vmlab lab destroy <LAB>
 | `<LAB>` | The lab's name. |
 | `-h`, `--help` | Print help. |
 
-The host-wide form of `vmlab destroy`: withdraws the lab's SSH aliases, asks the daemon
-to stop every machine and delete the clones, volumes and lab-local state, and releases
-the lab at the supervisor so its daemon is reaped. With no reachable daemon but a
-registry entry, it removes the lab's `.vmlab/` directory itself. A name the registry does
+The host-wide form of `vmlab destroy`: asks the daemon to stop every machine and
+delete the clones, volumes and lab-local state, and releases the lab at the supervisor
+so its daemon is reaped. With no reachable daemon but a registry entry, it removes the
+lab's `.vmlab/` directory itself. A name the registry does
 not know fails with `lab "<name>" is not running`. Prints `lab "<name>" destroyed`.
 
 ### Examples

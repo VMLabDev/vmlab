@@ -960,7 +960,7 @@ SRC
     exactly as written, `None` where none was declared, so a provision
     creates the account the lab declares rather than a copy of it. It never
     fails; a machine with no logins returns an empty list. See
-    [Logins and the SSH facade](guide_logins).
+    [Logins](guide_logins).
   DOC
   code wscript { source = <<'SRC'
 fn main(lab: Lab) {
@@ -990,13 +990,13 @@ SRC
     user has ever logged on. The pointer position is shared with the
     original handle. It fails, loudly, when nothing matches the selector;
     that is what stops a provision from silently writing into the system
-    profile. See [Logins and the SSH facade](guide_logins).
+    profile. See [Logins](guide_logins).
   DOC
   code wscript { source = <<'SRC'
 fn main(lab: Lab) {
     let Ok(dc) = lab.vm("dc01") else { return }
     let Ok(dev) = dc.as_login("dev") else { return }
-    let c = dev.copy_to("settings.json", "%APPDATA%\\Code\\User\\settings.json")
+    let c = dev.copy_to("gitconfig", "C:\\Users\\dev\\.gitconfig")
 }
 SRC
   }

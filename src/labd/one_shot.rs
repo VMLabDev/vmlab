@@ -1,15 +1,10 @@
 //! A unix socket that serves exactly one connection and then goes away.
 //!
-//! Two things in the lab daemon hand a caller a socket path instead of a
-//! stream: an interactive terminal (`machine.tty_open`) and the SSH facade
-//! (`machine.ssh_open`, PRD §19.3). Both have the same lifetime — bind,
-//! accept once, serve, unlink — because both exist for exactly one process
-//! that was just told where to connect. Nothing may outlive that process,
-//! and an open nobody ever connects to must not leave a socket behind
-//! either.
-//!
-//! It lives here rather than beside either caller so the grace period has
-//! one definition: the two would otherwise have to agree by comment.
+//! The lab daemon hands an interactive terminal (`machine.tty_open`) to its
+//! caller as a socket path instead of a stream. Its lifetime is bind, accept
+//! once, serve, unlink, because it exists for exactly one process that was
+//! just told where to connect. Nothing may outlive that process, and an open
+//! nobody ever connects to must not leave a socket behind either.
 
 use std::path::PathBuf;
 use std::time::Duration;

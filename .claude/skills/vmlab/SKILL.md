@@ -15,9 +15,9 @@ virtual networks between them — is declared in WCL in a `vmlab.wcl` file and
 brought up with one command. Disk templates are built locally and distributed
 over OCI registries. OCI containers join a lab as micro-VM machines. Guest
 automation is written in wscript, which drives power, exec, files, keystrokes,
-screen matching and OCR. Any machine can be marked `@dev` and serves an editor
-over a host-terminated SSH facade. A supervisor daemon plus one daemon per lab
-run behind the CLI, which is the only front end.
+screen matching and OCR. Any machine can be marked `@dev`, which gives it a
+workspace synced both ways with a host directory. A supervisor daemon plus one
+daemon per lab run behind the CLI, which is the only front end.
 
 `references/` holds the whole product reference. It is self-contained: the
 answer is in these files, so read the one that covers the question rather than
@@ -39,13 +39,13 @@ recalling vmlab behaviour or reading vmlab's source.
 | wscript `Lab`, `Segment` and `Term` methods, and the shared types (`Match`, `ExecResult`, `Login`, `GuestStats`, `Event`) | `references/wscript-lab-api.md` |
 | wscript `Machine` methods — lifecycle, exec, files, input, vision, snapshots | `references/wscript-machine-api.md` |
 | Provisions, `on "event" {}` handlers, the event catalogue, playbooks | `references/automation.md` |
-| `@dev`, `dev attach`, `dev use`, and the workspace syncer | `references/dev-machines.md` |
-| `login {}`, minted guest logons, the SSH facade, sftp, `ssh-config` | `references/logins-and-ssh.md` |
+| `@dev`, the workspace syncer, and `vmlab dev sync` | `references/dev-machines.md` |
+| `login {}`, who runs as whom, minted Windows logons, Linux sessions, `as_login` | `references/logins.md` |
 | Snapshots, screenshots, keyboard and mouse input, image matching, OCR | `references/snapshots-vision.md` |
 | Shared folders, `vmlab cp`, clipboard transfer (the `media {}` block is in `vm.md`) | `references/shares-media.md` |
 | The host config file, WSL 2, guest OS profiles | `references/host-profiles.md` |
 | Lab-level CLI verbs: `up`, `down`, `status`, `validate`, `destroy`, `pull`, `lab`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`, `script` | `references/cli-lab.md` |
-| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `console`, `cp`, `clipboard`, `snapshot`, `dev`, `ssh`, `ssh-config` | `references/cli-machine.md` |
+| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `console`, `cp`, `clipboard`, `snapshot`, `dev` | `references/cli-machine.md` |
 | `vmlab template` and its subcommands | `references/cli-template.md` |
 | A command that failed, or a message the user is asking about | `references/troubleshooting.md` |
 | What a vmlab term means | `references/glossary.md` |

@@ -136,9 +136,9 @@ page guide_containers {
     container's lifecycle is that process's: when it exits, cinit reports
     the exit and powers the micro-VM off. `mode = :idle` boots the micro-VM,
     mounts everything and starts the agent, but never runs the entrypoint.
-    The container then stays up for `exec`, `shell` and an SSH attach until
-    you stop it. That is what a [dev container](guide_dev) wants, since it
-    has no service to be, and the neovim example in this manual declares it.
+    The container then stays up for `exec` and `shell` until you stop it.
+    That is what a [dev container](guide_dev) wants, since it has no service
+    to be, and the `dev-container` example in this manual declares it.
   DOC
 
   h2 "Readiness and health"
@@ -191,7 +191,7 @@ page guide_containers {
     else the image's `USER`, else root. This is devcontainers' `remoteUser`
     idea, and it costs nothing because Linux needs no credential to become
     that user. A `login` block on a container may therefore declare the
-    account alone, with no password. [Logins and the SSH facade](guide_logins)
+    account alone, with no password. [Logins](guide_logins)
     covers the rest of the identity ladder.
   DOC
 

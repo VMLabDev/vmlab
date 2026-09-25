@@ -1,0 +1,52 @@
+// Worked example (PRD §19.8): **a dev machine on a Linux container micro-VM.**
+//
+// A dev machine is a machine with a synced workspace. This one shows three
+// things: the container identity floor for a `login {}`, provisioning into
+// that login's home with `as_login` before the account has ever logged on,
+// and the workspace syncer carrying edits both ways.
+//
+// No template to build — a container is pulled like a docker image and run
+// inside a micro-VM, so it is a lab machine in every respect: same segments,
+// DNS, snapshots, agent channel and workspace syncer as a VM.
+//
+//   vmlab up
+//   vmlab shell dev01         # lands as the default login, `dev`, in /src
+//   vmlab dev sync status
+//
+// The workspace is ./workspace on the host, landing at /src in the guest.
+
+import <vmlab.wcl>
+
+lab "dev-container" {
+
+  // This segment *has* egress, and the example needs it once: the package
+  // install in scripts/dev-user.ws.
+  segment "lan" {
+    subnet = "10.62.0.0/24"
+    nat    = true
+  }
+
+  // ANCHOR: dev01
+  @dev(default = true, workspace = "./workspace")
+  container "dev01" {
+    image   = "alpine:3.22"
+    profile = "container"
+    // A dev machine builds things, and a container names its own size when
+    // the profile's floor is not the right one.
+    cpus    = 2
+    memory  = 1GiB
+    // `:idle` keeps the micro-VM up without running the image's entrypoint
+    // — a dev container has no service to be.
+    mode    = :idle
+    nic { segment = "lan" }
+
+    // The container identity floor (§19.2): the agent is root and root needs
+    // no credential to become an account, so a Linux `login {}` may declare
+    // the account alone. `elevated` is a validation error on this side.
+    login "dev" { user = "dev" default = true }
+
+    provision "scripts/dev-user.ws" { }
+    provision "scripts/home-bits.ws" { }
+  }
+  // ANCHOR_END: dev01
+}

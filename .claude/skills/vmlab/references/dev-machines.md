@@ -1,11 +1,12 @@
 # Dev machines and the workspace syncer
 
 Any lab machine — VM or container, Windows or Linux — can be the lab's development
-environment. Mark it `@dev` and vmlab publishes it as an SSH endpoint an editor
-attaches *into*: language server, build, debugger and terminal all run guest-side,
-against real guest paths, the real toolchain and, where the lab has one, the real
-domain identity. The target is parity with what devcontainers give a Linux
-developer, for a Windows application on a real domain.
+environment. **A dev machine is a machine with a synced workspace**: mark it `@dev`,
+name a host directory, and vmlab keeps a guest-local working copy of it in step both
+ways. Build, test, debugger and toolchain run guest-side, against real guest paths,
+the real toolchain and, where the lab has one, the real domain identity, while the
+source stays canonical on the host. You reach the machine with `vmlab shell` and
+`vmlab exec` (see cli-machine.md), as its declared login (see logins.md).
 
 ## The `@dev` declaration
 
@@ -13,7 +14,7 @@ developer, for a Windows application on a real domain.
 states something *about* the machine rather than configuring something inside it;
 nothing it carries is a setting the guest sees. Any number of machines may carry it
 and zero is normal. Its arguments are all optional, and a bare `@dev` is a
-complete, attachable dev machine.
+complete dev machine.
 
 ```wcl
 # vmlab.wcl
@@ -36,7 +37,7 @@ container "buildbox" {
 | Argument | Meaning |
 | --- | --- |
 | `default` | Make this the lab's default dev machine. At most one per lab. The only `@dev` machine in a lab is the default implicitly, even if it wrote `default = false`; with several and none marked, there is no default. |
-| `workspace` | Host directory to sync into the guest, relative to the lab root. Without it the machine is still attachable and has no workspace. |
+| `workspace` | Host directory to sync into the guest, relative to the lab root. Without it the machine is still `@dev` and has no workspace. |
 | `workspace_guest` | Guest path the workspace lands at. Resolved `@dev` argument, then the profile's `workspace_guest`, then the floor `/src`. |
 
 Unset arguments resolve **`@dev` argument, then profile, then floor**. The default
@@ -49,42 +50,25 @@ already means something in vmlab and a block reorder would silently move it.
 
 Three things were kept off the decorator on purpose:
 
-- Editor hints: the SSH endpoint is the whole contract and vmlab learns no editor.
-- Ports: a dev machine's ports are ordinary `port {}` and `forward {}` declarations,
-  and `ssh -L` over the facade is the ad-hoc path.
+- Editor hints: vmlab learns no editor.
+- Ports: a dev machine's ports are ordinary `port {}` and `forward {}` declarations.
 - Toolchain and package lists: that is `provision {}` and `playbook {}`. A
   distributable template is vmlab's answer to devcontainer features, installed once
   at build time and pulled by every developer (see templates.md).
 
-## `attachable` and the failure ladder
+## What the guest needs
 
-The guest needs two things: the agent and the toolchain. There is no sshd to install
-and the workspace path is created by the syncer. The agent advertises three feature
-strings in its handshake: `tunnel` serves the facade's `direct-tcpip`, `fileops`
-serves host-side SFTP and every transfer, and `watch` serves the workspace syncer.
+The guest needs two things: the agent and the toolchain. The workspace path is
+created by the syncer. The syncer rides two agent features, which the agent
+advertises in its handshake: `watch` serves the guest-side change feed and
+`fileops` every transfer. The syncer checks `watch && fileops` for itself, and
+`vmlab machine capabilities` lists the features an agent negotiated.
 
-**`attachable` means exactly `tunnel` and `fileops` are both present**: this agent
-can serve an attach, never that your attach will succeed, because identity is
-declared separately. It does not widen to cover `watch`; the syncer checks
-`watch && fileops` for itself. A template built with `agent = false` reports `false`
-through the same path as one whose agent is merely old. `vmlab machine capabilities`
-reports it and `vmlab status` carries it.
-
-A machine whose agent predates these features fails where it costs least and says
-most:
-
-- **`validate` says nothing.** It has no side effects, and the only static signal is
-  the template's free-form `agent_version` string. Comparing that would be inference.
-- **`up` warns.** The handshake is part of readiness, so by then the features are
-  honestly probed. The warning says a shell still works and names both remedies.
-- **Attach fails hard.** `vmlab dev attach` refuses, naming what the agent does not
-  serve and both remedies: rebuild the template to bake in the shipped agent, or
-  push it into the running machine with `vmlab machine repair-agent`. The facade
-  itself degrades per channel, so an old agent still serves a shell while `sftp` and
-  `direct-tcpip` refuse by name.
-
-Rebuild is policy; repair is a tool. The agent enters an image once, at build, and
-`repair-agent` pushes the host's shipped agent over the agent's own channel and
+An agent that predates these features is fixed one of two ways: rebuild the template
+to bake in the shipped agent, or push it into the running machine with
+`vmlab machine repair-agent`. Rebuild is policy; repair is a tool, for iterating on
+the agent without rebuilding a template. The agent enters an image once, at build,
+and `repair-agent` pushes the host's shipped agent over the agent's own channel and
 marks the machine **diverged**, because the template's sealed `agent_version` no
 longer describes it. Nothing does this by itself. It is meaningless on a container,
 whose agent lives in the initramfs vmlab ships and tracks the installed vmlab; the
@@ -95,87 +79,24 @@ symlink-capable, on Windows through `SeCreateSymbolicLinkPrivilege` or Developer
 Mode, and a full Linux VM's kernel must be recent enough that `inotify` survives an
 overlayfs copy-up.
 
-## The managed SSH config block
+## Which machine a `dev` verb acts on
 
-vmlab's whole host-side footprint is one marker-fenced block inside your own
-`~/.ssh/config`, between `# BEGIN vmlab managed block` and
-`# END vmlab managed block`. A separate file behind an `Include` was rejected on
-evidence: JetBrains Toolbox's importer does not follow `Include`, and a private file
-reached with `-F` would keep `vmlab ssh` working while every editor saw nothing.
-Sharing one path means a broken block breaks `vmlab ssh` too, at a terminal that can
-explain it. The `ssh_config` key in the host configuration (see host-profiles.md)
-relocates the file vmlab writes into; it is a location knob with one code path
-behind it, and the `ssh -G` check below still runs.
-
-Stanzas cover **declared** machines, not running ones, because an empty picker at
-the moment you want it helps nobody. Any command that successfully loads a lab
-renders the block and writes it only on a real difference, so working inside a lab
-directory is enough to register it; a failed write warns, except at `vmlab ssh` and
-`vmlab dev attach` where the alias is load-bearing and the command fails with the
-reason.
-
-The alias is `vmlab-<lab>-<machine>`, plus `vmlab-<lab>-<machine>-<label>` for each
-non-default login, so "attach as admin" is a pick in an editor's host list. Each
-stanza sets:
-
-- a `ProxyCommand` running `vmlab ssh-proxy <lab>/<machine>`,
-- `User <label>` on a labelled alias,
-- vmlab's own `UserKnownHostsFile` with `StrictHostKeyChecking accept-new`,
-- `ControlMaster auto` with a `ControlPath` of `$XDG_RUNTIME_DIR/vmlab/ssh/%C` and
-  `ControlPersist 10m`. `%C` is OpenSSH's own bounded token, which keeps the socket
-  path inside the unix socket limit on any home directory.
-
-No `HostName` is set: the proxy is the connection.
-
-The writer's discipline is the feature, because its failure mode is eating someone's
-SSH config: an advisory lock across the read-modify-write, a temp file in the same
-directory fsynced and renamed onto the *resolved* path so a dotfiles symlink stays a
-symlink, an absent file created `0600`, deterministic ordering by lab, machine and
-label so a tracked config diffs only when something changed, and a refusal naming
-file and line on markers it cannot read. Each lab's section carries the lab's
-canonical root in a comment, and a root that no longer holds a `vmlab.wcl` has its
-section dropped on the next write. Every write re-hoists vmlab's region to the top,
-because OpenSSH takes the first value for each keyword and an earlier `Host *` would
-silently win, then runs `ssh -G <alias>` and errors naming the keyword that beat it
-if the resolved `proxycommand` is not vmlab's.
-
-`vmlab ssh-config` refreshes the block by hand and `--print <machine>` emits one
-stanza plus the editor settings snippet for a client that will not read the file.
-
-## `dev attach`, `dev use` and which machine is mine
-
-`vmlab dev attach [machine]` is cold-to-editing in one command: it ups the machine,
-waits until it is attachable with the wait visible, prints the alias and the editor
-settings snippet and the offline-guest notes, and then `exec`s the system `ssh` so
-it becomes a shell on the machine. It launches no editor and knows none; you open
-your own editor and pick the alias out of its host list. Because it becomes a shell,
-the syncer is not tied to it: the syncer is owned by the lab daemon and keeps
-running when the shell closes. `vmlab ssh` by contrast refuses on a stopped machine,
-and `ssh-proxy` never does lifecycle at all.
-
-A committed `vmlab.wcl` cannot say which dev machine is *yours*, so that is
-host-side state. `vmlab dev use <machine>` records it in the lab's own gitignored
-`.vmlab/` directory, in a file named `dev-machine`, which makes it per-developer by
-construction; `vmlab destroy` clears `.vmlab/` and forgets it.
-
-When a `dev` verb needs a machine and none was named it climbs a fixed ladder and
-never guesses:
+When a `dev sync` verb needs a machine and none was named it climbs a fixed ladder
+and never guesses:
 
 1. an explicit argument,
 2. the `VMLAB_DEV_MACHINE` environment variable,
-3. the `vmlab dev use` selection,
-4. the lab's default dev machine (`@dev(default = true)`, or the lone `@dev`),
-5. otherwise an error listing the candidates.
+3. the lab's default dev machine (`@dev(default = true)`, or the lone `@dev`),
+4. otherwise an error listing the candidates.
 
 Every rung that names a machine is checked rather than trusted: a rung naming
 something that is not a dev machine in this lab is an error at that rung, never a
 silent fall-through, so an environment variable left over from another lab cannot
-land you somewhere nothing said out loud. The output says which rung answered.
+land you somewhere nothing said out loud.
 
-There is no `dev list` or `dev status`; `vmlab status` shows dev-ness and
-`attachable` for every machine. There is no `rebuild` verb either:
-`vmlab vm destroy <m>` then `vmlab up <m>` is re-clone plus re-provision, and the
-workspace survives it.
+There is no `dev list` or `dev status`; `vmlab status` shows dev-ness for every
+machine. There is no `rebuild` verb either: `vmlab vm destroy <m>` then
+`vmlab up <m>` is re-clone plus re-provision, and the workspace survives it.
 
 ## The workspace
 
@@ -196,7 +117,8 @@ The syncer is a task in the lab daemon, started by `up` **after provisioning**
 rather than at machine-ready, and it runs as the machine's default login: the one
 exception to vmlab's own machinery keeping the agent identity, because it produces
 the developer's files, and the account it writes as does not exist until
-provisioning creates it. Ownership always matches whoever will attach. One pass
+provisioning creates it. Ownership always matches the login `vmlab shell` and
+`vmlab exec` run as. One pass
 walks the host, learns what the guest holds, reconciles, applies and saves the
 ledger. The seed is simply the first pass.
 
@@ -416,42 +338,26 @@ machine. Every surface that takes or restores one says the same sentence.
 > guest from. A snapshot holds the guest's copy at that moment and nothing more; do
 > not rely on one to keep uncommitted work.
 
-## Editors and the offline guest
+## What lives outside the workspace
 
-vmlab publishes SSH and nothing else, so any SSH-capable client attaches, but for a
-Windows dev machine the set that works is narrower: plain `ssh`, `scp`, `sftp` and
-VS Code Remote-SSH work on both guest families; JetBrains Toolbox, JetBrains Gateway
-and Zed serve a Linux dev machine only.
+Tools, dotfiles and anything else under the guest home live outside the workspace,
+so they survive reboot, `down`/`up` and restore to a later snapshot, and die on
+`destroy` plus `up`. Bake what the lab needs every developer to have; hand-install
+what you personally want today, and expect to redo it after a rebuild.
 
-The guest can stay offline. The settings snippet `dev attach` and
-`ssh-config --print` print sets VS Code's `remote.SSH.localServerDownload` to
-`always`, so the client downloads its server and pushes it over `scp`, and
-`remote.SSH.remotePlatform` to `windows` for a Windows alias.
+The worked example, `examples/dev-container`, places a dotfile into the dev login's
+home from a `provision {}` using `as_login`, before that user has ever logged on
+(see examples.md and logins.md).
 
-Extensions and plugins live in the guest home, outside the workspace, so they
-survive reboot, `down`/`up` and restore to a later snapshot, and die on `destroy`
-plus `up`. Bake what the lab needs every developer to have; hand-install what you
-personally want today, and expect to redo it after a rebuild.
+## Walkthrough: cold to a synced workspace
 
-The two worked examples, `examples/dev-vscode-windows` and
-`examples/dev-neovim-container`, place editor bits into the dev login's home from a
-`provision {}` using `as_login`, before that user has ever logged on (see
-examples.md).
-
-## Walkthrough: cold to editing
-
-A trimmed version of the `dev-neovim-container` example — the parts every dev
-machine has.
+A trimmed version of the `dev-container` example — the parts every dev machine has.
 
 ### Before you start
 
 - vmlab is installed with the micro-VM guest asset in place, so containers boot (see
   start-here.md).
 - Internet access from the host, to pull `alpine:3.22`.
-- An `ssh` client on the host. vmlab does not ship one; it writes a block into
-  `~/.ssh/config` and hands over to yours.
-- Optionally, an editor with remote SSH support, such as VS Code with Remote-SSH or
-  any editor that opens files over `ssh`.
 
 ### Write the lab file
 
@@ -459,7 +365,7 @@ In a new directory, create the lab file and the workspace directory it names.
 
 ```sh
 mkdir -p workspace scripts
-printf 'print("hello from the workspace")\n' > workspace/hello.lua
+printf 'hello from the workspace\n' > workspace/hello.txt
 ```
 
 ```wcl
@@ -496,10 +402,10 @@ lab "first-dev" {
   a lab has more than one.
 - `mode = :idle` keeps the micro-VM up without running the image's entrypoint. A dev
   container has no service to be.
-- `login "dev" { user = "dev" default = true }` declares the account every surface
-  attaches as: `ssh`, `vmlab exec`, `vmlab shell` and the syncer itself. On a Linux
-  machine the agent is root and needs no credential to become an account, so no
-  password is declared. A Windows login needs one.
+- `login "dev" { user = "dev" default = true }` declares the account `vmlab exec`,
+  `vmlab shell` and the syncer itself run as. On a Linux machine the agent is root
+  and needs no credential to become an account, so no password is declared. A
+  Windows login needs one.
 - The provision creates that account. vmlab declares logins but does not create
   accounts; the lab's own provisioning does.
 
@@ -543,87 +449,43 @@ every `up`.
 vmlab validate
 ```
 
-`vmlab validate` reports one container. It also writes the managed block into
-`~/.ssh/config`: any command that loads a lab file does.
+`vmlab validate` reports one container.
 
-### Attach in one command
+### Bring it up and open a shell
 
 ```sh
-vmlab dev attach
+vmlab up
+vmlab shell dev01
 ```
 
-`dev attach` brings the machine up if it is down, runs the provision, waits until
-the machine is **attachable**, prints the SSH alias and an editor settings snippet,
-and then becomes a shell on the machine as the `dev` login. With no argument it
-picks the machine from the fixed ladder.
-
-A container is always attachable because its agent is the one vmlab ships. On a VM
-built from an old template, `vmlab machine capabilities dev01` shows what is missing
-and `vmlab machine repair-agent` pushes the current agent in.
+`up` boots the container, runs the provision, and then starts the syncer, whose
+first pass seeds `/src` from `./workspace`. `vmlab shell` opens a terminal over the
+agent's channel, with no guest network involved, as the machine's default login.
 
 In the shell that opens:
 
 ```sh
 id -un
 ls /src
-cat /src/hello.lua
+cat /src/hello.txt
 ```
 
-`id -un` prints `dev`. `/src` holds `hello.lua`, placed there by the syncer's first
-pass. Leave the shell with `exit`. The machine keeps running and the syncer keeps
-running: it belongs to the lab daemon, not to the shell. `vmlab status` shows
-`dev01` ready and attachable; `dev attach` printed the alias `vmlab-first-dev-dev01`.
-
-### Reach it with plain ssh
-
-The stanza's `ProxyCommand` is a hidden vmlab verb, so the system `ssh` connects
-through the facade with no guest network and no sshd in the guest. Anything that
-reads `~/.ssh/config` can use it.
-
-```sh
-ssh vmlab-first-dev-dev01 id -un
-vmlab ssh dev01 -- uname -a
-```
-
-`vmlab ssh` is not a second SSH client. It refreshes the managed block and then
-hands over to the system `ssh` against the alias. Unlike `dev attach` it refuses if
-the machine is down and never starts one, the way `exec` and `console` behave.
-Copying files works the same way, because the facade answers `sftp` on the host.
-
-```sh
-scp workspace/hello.lua vmlab-first-dev-dev01:/tmp/hello.lua
-```
-
-To see the stanza and the editor snippet again, for a client that will not read the
-config file:
-
-```sh
-vmlab ssh-config --print dev01
-```
-
-### Open your editor
-
-`dev attach` launches no editor and knows none. Open yours and pick
-`vmlab-first-dev-dev01` out of its SSH host list, then open `/src`. The snippet
-`dev attach` printed sets `remote.SSH.localServerDownload` to `always` for VS Code,
-so a segment without egress does not block the server install. For a terminal
-editor, run it over the alias directly.
-
-```sh
-ssh vmlab-first-dev-dev01 -t vi /src/hello.lua
-```
+`id -un` prints `dev`. `/src` holds `hello.txt`, placed there by the syncer's first
+pass. Leave the shell with `exit` or `Ctrl-]`. The machine and the syncer keep
+running: the syncer belongs to the lab daemon, not to the shell.
 
 ### Edit on either side
 
 ```sh
-printf 'print("edited on the host")\n' > workspace/hello.lua
-vmlab ssh dev01 -- cat /src/hello.lua
-vmlab ssh dev01 -- sh -c 'echo built > /src/out.txt'
+printf 'edited on the host\n' > workspace/hello.txt
+vmlab exec dev01 -- cat /src/hello.txt
+vmlab exec dev01 -- sh -c 'echo built > /src/out.txt'
 cat workspace/out.txt
 ```
 
-The host edit reaches `/src/hello.lua`, and the file written in the guest appears in
-`./workspace/`.
+The host edit reaches `/src/hello.txt`, and the file written in the guest appears in
+`./workspace/`, owned on the guest side by `dev` because `exec` runs as the default
+login.
 
 ### Read what the syncer is doing
 
@@ -640,7 +502,7 @@ the syncer seeds it again from the host.
 
 ```sh
 vmlab container destroy dev01
-vmlab dev attach
+vmlab up
 ```
 
 Everything the provision declared is back, and `/src` holds the host directory's
@@ -655,7 +517,4 @@ vmlab down
 vmlab destroy
 ```
 
-`destroy` also forgets a `vmlab dev use` selection, which lives in the lab's
-gitignored `.vmlab/`. The `./workspace` directory on the host is untouched, and the
-alias leaves `~/.ssh/config` the next time a command loads a lab and finds this
-directory no longer has a `vmlab.wcl`.
+The `./workspace` directory on the host is untouched.

@@ -94,17 +94,15 @@ SRC
       | "Machine lifecycle" | "`machine.start`, `machine.stop`, `machine.restart`, `machine.destroy`, `machine.capabilities`, `machine.ip`, `machine.osinfo`, `machine.stats`, `machine.logs`, `machine.repair_agent`" |
       | "Display and input" | "`machine.screenshot`, `machine.sendkeys`, `machine.mouse_move`, `machine.mouse_click`, `machine.mouse_drag`, `machine.ocr`, `machine.find_image`" |
       | "Guest agent" | "`machine.exec`, `machine.tty_open`, `machine.tty_resize`, `machine.push_file`, `machine.pull_file`, `machine.tail`, `machine.eventlog`, `machine.clipboard_get`, `machine.clipboard_set`" |
-      | "SSH facade" | "`machine.ssh_open`" |
       | "Playbooks" | "`playbook.list`, `playbook.check`, `playbook.apply`" |
       | "Snapshots" | "`snapshot.take`, `snapshot.restore`, `snapshot.delete`, `snapshot.list`" |
       | "Workspace" | "`workspace.flush`, `workspace.resolve`, `workspace.diff`" |
   }
   p <<DOC
-    Every lab-daemon command is called by the CLI. `machine.tty_open` and
-    `machine.ssh_open` answer with the path of a second unix socket the
-    caller connects to and pipes bytes over: a raw terminal for the first,
-    an SSH connection for the second, which is what `vmlab ssh-proxy` hands
-    to `ssh` as its `ProxyCommand`. See [Logins and the SSH facade](guide_logins).
+    Every lab-daemon command is called by the CLI. `machine.tty_open`
+    answers with the path of a second unix socket the caller connects to and
+    pipes a raw terminal over, which is what [vmlab shell](cmd_shell)
+    does.
   DOC
 
   h2 "Events on the wire"

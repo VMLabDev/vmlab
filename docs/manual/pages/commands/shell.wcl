@@ -9,8 +9,7 @@ page cmd_shell {
 
   p <<DOC
     `vmlab shell` attaches an interactive shell inside a machine over the
-    vmlab agent's virtio-serial channel. No guest network is involved and no
-    guest sshd exists. Every attach opens a fresh terminal session, so
+    vmlab agent's virtio-serial channel. No guest network is involved. Every attach opens a fresh terminal session, so
     several shells on one machine are independent. `vmlab container shell`
     is the same verb under the container noun.
   DOC
@@ -40,14 +39,8 @@ page cmd_shell {
     Ctrl-] detaches and leaves the guest shell to end on its own. Exiting the
     guest shell ends the session and returns to the prompt. The identity is
     the machine's default `login {}` when it declares one and the agent's
-    own identity otherwise, following [Logins and the SSH facade](guide_logins);
+    own identity otherwise, following [Logins](guide_logins);
     `--user` and `--password` behave as they do for [vmlab exec](cmd_exec).
-  DOC
-
-  p <<DOC
-    For a dev machine, [vmlab ssh](cmd_ssh) and [vmlab dev attach](cmd_dev)
-    give the same shell over the SSH facade, which is what an editor uses.
-    This verb needs no SSH client and no managed config block.
   DOC
 
   code sh { source = <<'SRC'

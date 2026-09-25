@@ -358,8 +358,8 @@ vmlab container shell web
 ```
 
 With no `login {}` block on the machine, `exec` and `shell` run as the agent's
-own identity, which is root in a container. Declaring the account a surface
-attaches as is in logins-and-ssh.md.
+own identity, which is root in a container. Declaring the account they run as
+instead is in logins.md.
 
 ### Down
 
@@ -477,9 +477,9 @@ pulled.
 ### Open a shell
 
 `vmlab shell` attaches an interactive terminal inside the guest over the
-agent's virtio-serial channel. No SSH and no guest network are involved, so it
-works even on a VM with no NIC. This VM declares no `login {}`, so the shell
-runs as the agent's identity, which is root on Linux.
+agent's virtio-serial channel. No guest network is involved, so it works even
+on a VM with no NIC. This VM declares no `login {}`, so the shell runs as the
+agent's identity, which is root on Linux.
 
 ```sh
 vmlab shell alp
@@ -1035,4 +1035,4 @@ handler, which reacts to an event such as `vm.crashed` (automation.md).
 Note: provisions run as the agent identity. With no `login {}` on the machine,
 `exec` and `copy_to` run as root or SYSTEM. To write into a user's home as that
 user, declare a login and take a second handle with `as_login`
-(logins-and-ssh.md, dev-machines.md).
+(logins.md, dev-machines.md).

@@ -4,7 +4,6 @@
 - **Date**: 2026-08-07
 - **Supersedes**: nothing
 - **Related**: [ADR-0001](0001-hypervisor-seam-substitutes-the-host.md),
-  [ADR-0012](0012-vmlab-terminates-ssh-on-the-host.md),
   [ADR-0013](0013-the-host-opens-channels-the-guest-answers.md)
 
 ## Context
@@ -58,12 +57,6 @@ Concretely:
 - Tests assert through the wire — `AgentMsg` frames off a capture port — not
   through the seam. The seam's call log is asserted only for the one claim
   nothing else can express: which identity a channel resolved to.
-
-**What the seam deliberately does not cover.** A tunnel (§19.5) creates a
-socket, not a process or a file. It dials from the agent's own network context
-whatever identity a channel resolved to, and a container micro-VM shares the
-guest's network stack, so there is nothing for an identity to change. It stays
-portable in `tunnel.rs` with no platform hook and no spawner.
 
 ## Consequences
 

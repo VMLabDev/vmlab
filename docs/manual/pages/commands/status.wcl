@@ -55,7 +55,7 @@ page cmd_status {
   p <<DOC
     `IP` is the first NIC with a lease, as reported by the guest agent, or
     `-` before the guest is ready. With `--verbose` a second line under each
-    machine carries `state=`, `ready=`, `cached=` and `attachable=`, plus
+    machine carries `state=`, `ready=` and `cached=`, plus
     `diverged=yes` on a machine whose agent was replaced by
     [vmlab machine repair-agent](cmd_machine). A VM then adds `arch`, `cpus`,
     `memory` and `agent` (the sealed agent version); a container adds
@@ -66,8 +66,7 @@ page cmd_status {
 
   p <<DOC
     Labs with `@dev` machines get a second table: `DEV`, `DEFAULT` (whether it
-    is the lab's default dev machine), `ATTACH` (whether its agent can serve an
-    attach at all), `WORKSPACE` (the host directory) and `GUEST WORKSPACE`.
+    is the lab's default dev machine), `WORKSPACE` (the host directory) and `GUEST WORKSPACE`.
     A halted workspace syncer prints its halt sentence under the machine's
     row, followed by `vmlab dev sync status <machine>` as the place to read
     more. See [Dev machines and the workspace syncer](guide_dev) and

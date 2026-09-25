@@ -33,7 +33,7 @@ page intro {
     li "A **container** is an OCI image run inside its own micro-VM, so it sits on the same segments and has the same snapshots and agent channel as a VM. See [Lab containers](guide_containers)."
     li "**Provision scripts** and **playbooks** configure a guest after it boots. Provisions are wscript, an imperative language with a typed guest API. Playbooks are config-weave plays with a drift check. See [Guest automation with wscript](guide_scripting) and [Playbooks](guide_playbooks)."
     li "**Snapshots**, both online and offline, are taken per machine or lab-wide. See [Snapshots](guide_snapshots)."
-    li "A **dev machine** is any VM or container marked `@dev`. vmlab publishes it as an SSH endpoint your editor attaches into and keeps a workspace on it in step with a directory on the host. See [Dev machines and the workspace syncer](guide_dev)."
+    li "A **dev machine** is any VM or container marked `@dev`. vmlab keeps a workspace on it in step with a directory on the host, so you edit with your own tools and build in the guest. See [Dev machines and the workspace syncer](guide_dev)."
   }
 
   p <<DOC
@@ -48,10 +48,10 @@ page intro {
   DOC
 
   p <<DOC
-    The **SSH facade** is how editors reach a machine. vmlab terminates SSH on
-    the host and serves each channel through the agent, so no guest runs an
-    sshd and no guest network is involved. Which account you land on is a
-    `login {}` the lab file declares. See [Logins and the SSH facade](guide_logins).
+    A **login** is the account a person lands as inside a guest, through
+    `vmlab exec`, `vmlab shell` or a script. It is a `login {}` the lab file
+    declares, and the agent mints it with no guest network involved. See
+    [Logins](guide_logins).
   DOC
 
   h2 "Who this manual is for"
@@ -61,7 +61,7 @@ page intro {
     whole environment written down in a file you can commit, share and rebuild.
     Typical readers are engineers standing up a Windows domain to test against,
     a cluster of Linux hosts to rehearse a deployment on, a disposable
-    development box an editor attaches into, or a security lab that must stay
+    development box that builds your checkout, or a security lab that must stay
     off the network.
   DOC
 
@@ -78,7 +78,7 @@ page intro {
 
   list {
     style = :numbered
-    li "**[Getting started](gs_install)** is a sequence of tutorials. You install vmlab, bring up a lab with one container, run a VM from a registry template, build a template from an ISO, write a provision script, and attach an editor to a dev machine. Each tutorial ends with a working lab on your host."
+    li "**[Getting started](gs_install)** is a sequence of tutorials. You install vmlab, bring up a lab with one container, run a VM from a registry template, build a template from an ISO, and write a provision script. Each tutorial ends with a working lab on your host."
     li "**[The guide](guide_architecture)** explains how vmlab works and why: the two daemons, the lab file, templates, networking, containers, shared folders, snapshots, scripting, vision, playbooks, logins, dev machines, profiles, host configuration and events."
     li "**[Reference](ref_lab)** defines every block and field of the lab file, the host configuration file, the guest OS profiles, every function of the wscript API, the events, the files vmlab writes, and the wire protocol with its error codes."
     li "**[Commands](cmd_up)** documents each `vmlab` verb with its synopsis, options and exit status, one chapter per top-level verb."

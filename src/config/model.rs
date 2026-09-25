@@ -112,7 +112,7 @@ impl<'a> MachineCfg<'a> {
 }
 
 /// A machine's `@dev` decorator, as written (§19.1). Every argument is
-/// optional; a bare `@dev` is a complete, attachable dev machine, and the
+/// optional; a bare `@dev` is a complete dev machine, and the
 /// unset arguments resolve `@dev` > profile > floor in [`crate::dev`].
 #[derive(Debug, Clone)]
 pub struct DevDecl {
@@ -581,17 +581,16 @@ impl std::fmt::Display for ImageRef {
 /// A labelled identity declared on a machine (PRD §19.2): the account a
 /// surface attaches *as*, its secret, and whether the session is elevated.
 ///
-/// Declared on the machine and not on the attach, because the SSH facade is a
-/// general capability — an unmarked machine needs an identity too. The secret
+/// Declared on the machine and not on `@dev`, because `exec`, `shell` and
+/// `cp` reach every machine — an unmarked machine needs an identity too. The secret
 /// is plaintext by decision, not by omission: the account exists because the
 /// lab's own provisioning created it, so the string already sits in the
 /// provision script beside it (§19.2, §1.2).
 #[derive(Debug, Clone)]
 pub struct Login {
-    /// What an SSH username selects this identity by. Carrying the *label*
-    /// rather than the account is what keeps `DOMAIN\user` out of an SSH
-    /// username, and what lets one account be declared twice at different
-    /// elevation.
+    /// What `--user` and `as_login` select this identity by. Carrying the
+    /// *label* rather than the account is what lets one account be declared
+    /// twice at different elevation.
     pub label: String,
     /// The guest account, e.g. `PROBE\dev` or `dev`.
     pub user: String,

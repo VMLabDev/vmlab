@@ -211,13 +211,11 @@ type SinkholeRule {
 // Written on a machine in a `vmlab.wcl`, unlike the projection metadata above.
 
 // Designates this machine as a development environment (PRD §19.1): vmlab
-// publishes it as an SSH endpoint an editor attaches *into*, and syncs a
-// workspace onto it. A decorator rather than a child block because it states
+// syncs a workspace onto it. A decorator rather than a child block because it states
 // something *about* the machine — nothing it carries is a setting the guest
 // ever sees.
 //
-// Every argument is optional and a bare `@dev` is a complete, attachable dev
-// machine; unset arguments resolve `@dev` > profile > vmlab floor, in
+// Every argument is optional and a bare `@dev` is a complete dev machine; unset arguments resolve `@dev` > profile > vmlab floor, in
 // `src/dev.rs`. Any number of machines may carry it and zero is normal.
 @decorator("dev")
 @applies_to(on = [:block], kinds = ["vm", "container"])
@@ -284,11 +282,11 @@ type Vm {
   @children("playbook")  playbooks: list<Playbook>
 }
 
-// A labelled identity on a machine — the account a surface attaches *as*
-// (PRD §19.2). Declared on the machine rather than on the attach, because the
-// SSH facade is a general capability and an unmarked machine needs an identity
-// too. Repeatable: one account may be declared twice at different elevation,
-// and the SSH username selects between them by label.
+// A labelled identity on a machine — the account a surface runs *as*
+// (PRD §19.2). Declared on the machine, because every machine needs an
+// identity, not only a dev machine. Repeatable: one account may be declared
+// twice at different elevation, and `--user` or `as_login` selects between
+// them by label.
 //
 // The secret is written in the lab file plainly. The account exists because
 // the lab's own provisioning created it, so the same string is already in the
@@ -296,7 +294,7 @@ type Vm {
 // store, a login verb and a wscript credential API (§19.2, §1.2).
 @block("login")
 type Login {
-  @doc("Identity label — what an SSH username selects it by, e.g. `dev`; unique per machine; the inline block label")
+  @doc("Identity label — what `--user` and `as_login` select it by, e.g. `dev`; unique per machine; the inline block label")
   @inline(0) label: utf8
   @doc("Guest account to log on as, e.g. `PROBE\\dev` (required)")
   user: utf8

@@ -1,0 +1,12 @@
+# Placed into dev's home as ~/.profile by scripts/home-bits.ws, as `dev`,
+# before that account has ever logged on (PRD §19.8). It lives in the guest
+# home rather than in the workspace, so it survives reboot, `down`/`up` and a
+# restore to a snapshot taken after it landed, and a per-machine `destroy`
+# re-creates it from this file rather than losing it.
+
+export EDITOR=vi
+PS1='\u@dev01:\w\$ '
+
+# The workspace is at /src and syncs both ways with ./workspace on the host.
+cd /src 2>/dev/null || true
+echo "vmlab dev machine: workspace at /src"

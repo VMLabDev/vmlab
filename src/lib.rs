@@ -1,7 +1,6 @@
 //! vmlab as a library: the CLI binary (`src/main.rs`) builds on these modules.
 
 pub mod agent_asset;
-pub mod attach;
 pub mod cli;
 pub mod config;
 pub mod dev;
@@ -25,9 +24,6 @@ pub use qemu::kvm_available;
 mod qmp;
 mod scripting;
 mod smb;
-/// The managed `~/.ssh/config` block (§19.7): host-side, client-generated,
-/// and the one artefact vmlab writes outside its own directories.
-pub mod ssh_config;
 mod supervisor;
 mod sync;
 pub mod template;

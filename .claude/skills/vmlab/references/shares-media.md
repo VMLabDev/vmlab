@@ -94,8 +94,9 @@ what a Windows guest will be told to do can be read without booting one.
 The agent's mounts run as the agent identity, SYSTEM on Windows, and a drive
 letter is visible in every session while each logon authenticates separately. So
 the agent also writes the lab's share credential into every logon it mints,
-before spawning anything. Without that, a developer attaching through the SSH
-facade (logins-and-ssh.md) would see the mapped drive and be unable to open it.
+before spawning anything. Without that, a `vmlab shell` or `vmlab exec` session
+under a declared login (logins.md) would see the mapped drive and be unable to
+open it.
 
 **XP-era guests mount by screen.** The agent does not target XP or 2003-era
 guests, so automatic mounting does not apply there. A provision script maps the
@@ -157,9 +158,9 @@ existing directory the guest file's name is kept under it. It prints
 
 **Transfers run as the agent identity.** `cp` runs as SYSTEM or root even on a
 machine that declares a `login {}`, unlike `exec` and `shell`. A pushed file is
-owned by the agent identity, not by the login you would attach as. To write into
-a login's home as that login, use `scp` over the SSH alias, or the `as_login`
-handle in a provision script (logins-and-ssh.md).
+owned by the agent identity, not by the login `exec` and `shell` run as. To write
+into a login's home as that login, use the `as_login` handle in a provision script
+(logins.md).
 
 ```sh
 vmlab cp ./tools/ dc01:C:/tools

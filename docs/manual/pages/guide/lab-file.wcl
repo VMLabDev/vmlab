@@ -56,7 +56,7 @@ page guide_lab_file {
       | "`nic`" | "`vm`, `container`, `template`" | "A network interface on a segment. A machine with no `nic` blocks has no network hardware at all." |
       | "`share`" | "`vm`" | "A host directory mounted in the guest. See [Shared folders](guide_shares)." |
       | "`disk`, `media`, `gpu`" | "`vm` (and `template` for disks and media)" | "Extra disks, ISO and floppy images built from folders, and GPU acceleration." |
-      | "`login`" | "`vm`, `container`" | "A labelled identity a surface attaches as. See [Logins and the SSH facade](guide_logins)." |
+      | "`login`" | "`vm`, `container`" | "A labelled identity a person's commands run as. See [Logins](guide_logins)." |
       | "`provision`, `playbook`" | "`vm`, `container`, `template`" | "Configuration steps run once the machine is ready, in declaration order. See [Guest automation with wscript](guide_scripting) and [Playbooks](guide_playbooks)." |
       | "`template`" | "the document, beside `lab`" | "A buildable template definition. See [Templates and the store](guide_templates)." |
   }
@@ -116,7 +116,7 @@ page guide_lab_file {
 
   callout "What validation deliberately does not check" {
     kind = :note
-    body = "`@dev` on a machine whose agent cannot serve an attach is not a validation error. The agent's features are only known once it is running, so that failure is reported by `vmlab up` as a warning and by an attach as a refusal, as [Dev machines and the workspace syncer](guide_dev) explains."
+    body = "`@dev(workspace = …)` on a machine whose agent cannot serve the workspace syncer is not a validation error. The agent's features are only known once it is running, so that failure is reported when the syncer starts, as [Dev machines and the workspace syncer](guide_dev) explains."
   }
 
   h2 "How a value resolves"
@@ -153,15 +153,15 @@ page guide_lab_file {
   p <<DOC
     A decorator is written on a machine block and states something *about*
     the machine rather than configuring something inside it. vmlab ships one:
-    `@dev`, which marks a VM or container as a dev machine that vmlab
-    publishes as an SSH endpoint and syncs a workspace onto. Every argument is
+    `@dev`, which marks a VM or container as a dev machine: a machine with a
+    workspace vmlab keeps in step with a host directory. Every argument is
     optional. A bare `@dev` is a complete dev machine, and unset arguments
     resolve `@dev` then profile then vmlab's own floor.
   DOC
 
   code wcl {
-    filename    = "examples/dev-neovim-container/vmlab.wcl"
-    source_file = "../../examples/dev-neovim-container/vmlab.wcl"
+    filename    = "examples/dev-container/vmlab.wcl"
+    source_file = "../../examples/dev-container/vmlab.wcl"
     anchor      = "dev01"
     dedent      = true
   }

@@ -44,10 +44,9 @@ vmlab targets QEMU/KVM exclusively, driven directly over QMP — no libvirt. Hos
 | **Handler** | A wscript function bound to a daemon event (lifecycle, error, disk-space) for a lab or VM. |
 | **Guest OS profile** | A named bundle of hardware defaults (firmware, machine type, devices) applied to a VM or template. |
 | **Ready** | A VM is *ready* when its vmlab guest agent answers its handshake. A lab is *up* when all VMs are ready and all provision scripts have completed. |
-| **Dev machine** | A machine marked `@dev`, published as an SSH endpoint an editor attaches *into* (§19). VM or container, Windows or Linux — one contract for both. |
+| **Dev machine** | A machine marked `@dev`: a machine with a synced workspace (§19). VM or container, Windows or Linux — one contract for both. |
 | **Workspace** | A dev machine's source tree: a guest-local working copy of a canonical host directory, kept in step by vmlab's syncer (§19.6). Not a `share {}`. |
-| **Login** | A labelled identity declared on a machine — an account, its secret, and whether it is elevated. What a surface attaches *as* (§19.2). |
-| **SSH facade** | The SSH server vmlab terminates on the host, servicing channels through the guest agent. No sshd runs in any guest (§19.3). |
+| **Login** | A labelled identity declared on a machine — an account, its secret, and whether it is elevated. What a surface runs *as* (§19.2). |
 
 ---
 
@@ -185,9 +184,6 @@ decorator and schema validation structurally cannot see:
 - `elevated` on a **Linux-family** profile (§19.2).
 - More than one `login` with `default = true` on a machine, naming both (§19.2).
 
-`@dev` on a machine whose agent cannot serve an attach is deliberately **not** a
-validation error; §19.4 says where it fails instead and why.
-
 ### 5.2 VM hardware surface
 
 Each VM block can express:
@@ -304,10 +300,10 @@ Snapshots use **qcow2-internal snapshots wherever the mechanism supports the cas
 
 The vmlab guest agent (`vmlab-agent`, one multiplexed virtio-serial channel — `vmlab.agent.0`) is the channel for: readiness detection, interactive terminals, streaming command execution with captured stdout/stderr/exit code, digest-verified file transfer in both directions, log tailing, metrics, clipboard, structured OS info, per-NIC IP address reporting, and graceful shutdown/reboot. Template builds stage the agent binaries plus an install script on an auto-attached **VMLAB bootstrap ISO**; the template's unattended-install hook (cloud-init runcmd, installer late-commands, autounattend first-logon) runs the script, and the build verifies the agent's handshake before sealing. A VM without an agent still works for screen-driven automation but never reports **ready** — provision scripts targeting it must rely on screen/time waits.
 
-**The legacy tier.** A profile names the agent channel's device with `agent_transport`: `"virtio-serial"` (the default, above), `"isa-serial"`, or `"none"` (no agent is possible; the guest is screen-driven and never reports ready). With `isa-serial` the same host socket is wired to a 16550 UART on COM1, the serial console log moves to COM2, and the guest runs **`vmlab-agent-legacy`** (`guest/agent-legacy`): the same wire protocol, in C89 because Rust has no supported target for NT4 through XP/2003, Windows 9x/ME or DOS. It advertises one feature, `exec`, and refuses every other open by name on the channel that asked, so the §19.4 ladder degrades truthfully — readiness, `vmlab exec`, `os_info` and the stop ladder work; a terminal, `vmlab cp`, `dev attach` and `repair-agent` say what is missing. A `logon` on an exec is refused: nothing in that tier mints one. Two limits are deliberate: QEMU times UART transmit to the baud rate (about 11 KB/s at 115200), which is why no file transfer is offered; and DOS runs one program at a time, so on DOS the agent is the foreground program, output arrives after the command exits, stdin is acknowledged and discarded, and the agent answers nothing else while a command runs. The bootstrap ISO carries the three legacy builds (`legacy/nt`, `legacy/9x`, `legacy/dos`, 8.3-safe because DOS reads no Joliet) with an install script each; `install.cmd` defers to the NT one on a 4.x/5.x kernel. A Linux guest too old for virtio-serial needs no C agent: `vmlab-agent` takes COM1 itself when the VM has no virtio-serial controller, with its full feature set at serial speed. **TempleOS** joins the tier in its own language (`guest/agent-templeos`): HolyC, compiled by the guest, one task polling the same UART. A command there *is* HolyC source, which `ExePrint` compiles and runs. It cannot ride the bootstrap ISO, because TempleOS reads no ISO 9660 and has no network, so the one way in is the screen: `vmlab::templeos_agent_script()` returns the source as statements to type, and the provision that types them registers the agent in `~/MakeHome.HC` for every later boot. **⚠ Implementation note:** the transport, the handshake and the feature ladder are verified live; **capturing a command's output is not finished**. TempleOS has no output redirection hook — printing goes into the task's own document — so output must be read back from that document, which works in a task that has a window and yields nothing in the agent's spawned task. Until it does, a TempleOS guest answers `ready` and returns empty output, so the shipped template keeps `agent = false`.
+**The legacy tier.** A profile names the agent channel's device with `agent_transport`: `"virtio-serial"` (the default, above), `"isa-serial"`, or `"none"` (no agent is possible; the guest is screen-driven and never reports ready). With `isa-serial` the same host socket is wired to a 16550 UART on COM1, the serial console log moves to COM2, and the guest runs **`vmlab-agent-legacy`** (`guest/agent-legacy`): the same wire protocol, in C89 because Rust has no supported target for NT4 through XP/2003, Windows 9x/ME or DOS. It advertises one feature, `exec`, and refuses every other open by name on the channel that asked, so every surface degrades truthfully — readiness, `vmlab exec`, `os_info` and the stop ladder work; a terminal, `vmlab cp` and `repair-agent` say what is missing. A `logon` on an exec is refused: nothing in that tier mints one. Two limits are deliberate: QEMU times UART transmit to the baud rate (about 11 KB/s at 115200), which is why no file transfer is offered; and DOS runs one program at a time, so on DOS the agent is the foreground program, output arrives after the command exits, stdin is acknowledged and discarded, and the agent answers nothing else while a command runs. The bootstrap ISO carries the three legacy builds (`legacy/nt`, `legacy/9x`, `legacy/dos`, 8.3-safe because DOS reads no Joliet) with an install script each; `install.cmd` defers to the NT one on a 4.x/5.x kernel. A Linux guest too old for virtio-serial needs no C agent: `vmlab-agent` takes COM1 itself when the VM has no virtio-serial controller, with its full feature set at serial speed. **TempleOS** joins the tier in its own language (`guest/agent-templeos`): HolyC, compiled by the guest, one task polling the same UART. A command there *is* HolyC source, which `ExePrint` compiles and runs. It cannot ride the bootstrap ISO, because TempleOS reads no ISO 9660 and has no network, so the one way in is the screen: `vmlab::templeos_agent_script()` returns the source as statements to type, and the provision that types them registers the agent in `~/MakeHome.HC` for every later boot. **⚠ Implementation note:** the transport, the handshake and the feature ladder are verified live; **capturing a command's output is not finished**. TempleOS has no output redirection hook — printing goes into the task's own document — so output must be read back from that document, which works in a task that has a window and yields nothing in the agent's spawned task. Until it does, a TempleOS guest answers `ready` and returns empty output, so the shipped template keeps `agent = false`.
 
-§19 adds three capabilities to the agent, advertised as feature strings —
-`tunnel`, `fileops` and `watch` (§19.4) — and **retires the whole-file,
+§19 adds two capabilities to the agent, advertised as feature strings —
+`fileops` and `watch` (§19.4) — and **retires the whole-file,
 path-addressed transfer** above onto `fileops`, keeping its guest-computed
 digest verification (§19.5). The protocol version is unchanged.
 
@@ -340,9 +336,9 @@ Share contents are outside snapshot scope on both transports (§7.3).
 **Correction required by §19.2.** The agent's mounts run as the agent identity
 and land in the global DOS-device namespace, so every session *sees* the drive
 letters while each logon authenticates separately; today's fix is an
-`HKLM\…\Run` hook, which a facade-minted logon never fires because it is not a
-desktop session. **The agent must write the lab's share credential into each
-logon it mints**, before spawning anything — otherwise an attached developer
+`HKLM\…\Run` hook, which a logon the agent mints never fires because it is not
+a desktop session. **The agent must write the lab's share credential into each
+logon it mints**, before spawning anything — otherwise a developer in a shell
 finds the mapped drive visible and unopenable, reporting a wrong password. Only
 SMB is affected.
 
@@ -615,7 +611,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab up [vm...]` | Create/start lab (or subset), run provision scripts |
 | `vmlab down [vm...]` | Graceful stop; clones retained |
 | `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
-| `vmlab status [-v]` | Machine status, IPs and segments, plus `dev` and `attachable` (§19.4); `-v` adds raw state and per-kind detail |
+| `vmlab status [-v]` | Machine status, IPs and segments, plus `dev` (§19.1); `-v` adds raw state and per-kind detail |
 | `vmlab validate` | Full §5.1 validation, no side effects |
 | `vmlab vm start / stop / restart <vm>` | Per-VM power control |
 | `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide (§7.3) |
@@ -625,13 +621,9 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab osinfo <vm>` | Guest OS identification as JSON |
 | `vmlab script <script.ws>` | Ad-hoc script against the current lab |
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
-| `vmlab ssh <machine> [-- cmd]` | Attach over the SSH facade — refreshes the managed block, then `exec`s the system `ssh` (§19.7) |
-| `vmlab ssh-config [--print <m>]` | Refresh the managed `~/.ssh/config` block; `--print` emits a stanza plus the editor settings snippet (§19.7) |
-| `vmlab dev attach [machine]` | Up, wait for `attachable`, become a shell on the dev machine (§19.7) |
-| `vmlab dev use <machine>` | Record which dev machine is *mine*, in the lab's `.vmlab/` (§19.7) |
 | `vmlab dev sync status / flush / diff / resolve` | Workspace syncer state and conflict resolution (§19.6) |
-| `vmlab machine capabilities / stats` | Per-machine probed capabilities, including `attachable` (§19.4) |
-| `vmlab machine repair-agent <machine>` | Push the shipped agent into a running machine and mark it diverged; never automatic (§19.4) |
+| `vmlab machine capabilities / stats` | Per-machine probed capabilities, including agent features (§19.4) |
+| `vmlab machine repair-agent <machine>` | Push the shipped agent into a running machine, to iterate on the agent without rebuilding a template, and mark it diverged; never automatic (§19.4) |
 | `vmlab template build / list / rm / export / import` | Template store |
 | `vmlab template push / pull / login` | OCI registry distribution (§6.4) |
 | `vmlab daemon start / stop / status` | Supervisor control (normally automatic); status lists lab daemons |
@@ -782,12 +774,13 @@ if micro-VM start latency ever matters).
 ## 19. Dev machines
 
 Any lab machine — VM or container, Windows or Linux — may be designated the
-lab's **development environment** with a `@dev` decorator. vmlab publishes it as
-an **SSH endpoint** that any SSH-capable editor attaches *into*: the language
-server, the build, the debugger and the terminal all run guest-side, against
-real guest paths, the real toolchain and — where the lab has one — the real
-domain identity. Host-edit/guest-execute was considered and rejected; the editor
-goes in.
+lab's **development environment** with a `@dev` decorator. A dev machine is a
+machine with a **synced workspace**: a guest-local copy of a canonical host
+source tree, kept in step both ways by vmlab's syncer (§19.6). The build, the
+tests and the terminal run guest-side, against real guest paths, the real
+toolchain and — where the lab has one — the real domain identity. The developer
+reaches the machine with `vmlab shell` and `vmlab exec`, as a declared login
+(§19.2).
 
 The bar is **parity, not novelty**: what devcontainers give a Linux developer,
 for a Windows application on a real domain. Nothing else serves that case, which
@@ -795,9 +788,10 @@ is why it is the case that has to work.
 
 Two things are specified here and only one of them is dev-specific:
 
-- **The SSH facade** (§19.3) is a *general* capability of every machine.
-  `vmlab ssh mem01` works on a machine carrying no `@dev` at all. It lives in
-  §19 rather than a section of its own because §19 is why it exists.
+- **Identity** (§19.2) and the agent capabilities behind it (§19.4, §19.5) are
+  *general*. `vmlab shell --user admin mem01` works on a machine carrying no
+  `@dev` at all. They live in §19 rather than a section of their own because §19
+  is why they exist.
 - **The dev machine** is the workspace (§19.6) and the verbs that are
   meaningless without one (§19.7).
 
@@ -852,8 +846,9 @@ carrying `default = true`, or — where none does — the only machine carrying
 concept. "First in file order wins" was rejected: declaration order already
 means something in vmlab (§5.1), and overloading it would let a block reorder
 silently move the default. Note that `default = true` is the **lab file's**
-choice, so it is the same for everyone who clones the repo; which dev machine is
-*mine* is host-side state (§19.7).
+choice, so it is the same for everyone who clones the repo; a developer who wants
+another dev machine names it on the command line or in `VMLAB_DEV_MACHINE`
+(§19.7).
 
 **Arguments are admitted by a three-part rule**, not by a list. An argument
 earns a slot on `@dev` only if it is all three of: **per-machine** (it differs
@@ -863,26 +858,21 @@ and not host-side state. The rule, not the current list, is the contract.
 
 Ruled out by it, each for a stated reason rather than taste:
 
-- **Editor hints** (`editor = "vscode"`). The SSH endpoint is the whole
-  contract, and vmlab deliberately does not repeat devcontainers' coupling to
-  one editor. The editor settings snippet §19.8 describes is something vmlab
-  *hands* the developer, never something the lab file declares.
 - **Ports.** Container `port {}` and §9.8 forwarding already express them. A dev
   machine's ports are ordinary ports, and they are **declared, not discovered** —
-  vmlab does not watch a guest for listening sockets. `ssh -L` over the facade's
-  `direct-tcpip` is the ad-hoc path.
+  vmlab does not watch a guest for listening sockets. A runtime forward (§9.8)
+  is the ad-hoc path.
 - **Toolchain and package lists.** That is `provision {}` / `playbook {}`
   (§19.4). `@dev` never grows a list duplicating config-weave.
 - **Ignore rules and dotfiles.** Developer-owned; they live in the repo tree
-  (§19.6) and in the developer's own tooling (§19.8).
-- **Identity.** It outgrew the decorator: the facade is general, so
-  `vmlab ssh mem01` needs an answer on an unmarked machine too. Identity is
-  declared machine-level (§19.2).
+  (§19.6) and in the developer's own tooling.
+- **Identity.** It outgrew the decorator: `exec`, `shell` and `vmlab cp` reach
+  every machine, so `vmlab shell mem01` needs an answer on an unmarked machine
+  too. Identity is declared machine-level (§19.2).
 
 That leaves `default`, `workspace` and `workspace_guest`.
 
-**Every argument is optional, and a bare `@dev` is a complete, attachable dev
-machine.** Unset arguments resolve **`@dev` argument > profile > vmlab floor**,
+**Every argument is optional, and a bare `@dev` is a complete dev machine.** Unset arguments resolve **`@dev` argument > profile > vmlab floor**,
 with a hard error where nothing supplies a value and no floor is sensible — the
 call §18 already made for container `cpus`/`memory`. Defaults are
 profile-sourced because they are guest-OS-shaped (a workspace path is `C:\src`
@@ -906,28 +896,25 @@ declared applicability (`@applies_to(on = [:block], kinds = ["vm",
 "container"])`). What WCL cannot see is the cross-block case, so §5.1 gains one
 rule for `@dev`: **more than one `@dev(default = true)` in a lab is an error,
 naming both machines** — the same class as the existing duplicate-static-IP
-rule. `@dev` on a machine whose agent cannot serve an attach is *not* a
-validation error; see §19.4 for why, and where it fails instead.
+rule.
 
 > **✔ Prerequisite, met.** Validated instance decorators were WCL work that
 > landed after the `wcl_lang` revision vmlab pinned. The pin now carries them,
 > and the schema projection reflects decorator declarations alongside block
 > fields, so `@dev` is ordinary schema work.
 
-### 19.2 Identity — who you are when you attach
+### 19.2 Identity — who you are on the machine
 
 **The machine declares who you are, and vmlab logs you on as them.** Identity is
-a property of the machine, not of the attach, and is declared with a repeatable
+a property of the machine, not of the command, and is declared with a repeatable
 `login "<label>" { user, password?, elevated?, default? }` block on `vm` and
 `container`. A child block rather than flat fields because the account and its
 secret are meaningless split, and because `elevated` needs somewhere to land.
 
-**The SSH username is the selector, and it carries the *label*.**
-`ssh vmlab-probe-dev01` attaches as `dev`; `-l admin` as `admin`. The raw
-account name is accepted as an alias for its label, but the label wins. Three
-things follow: one account may be declared twice at different elevation;
-`DOMAIN\user` never has to survive an SSH username or `ControlPath`'s `%r`; and
-the generated stanza's `User` line is a label vmlab chose.
+**A surface selects a login by its *label*.** `vmlab shell dev01` runs as the
+default login, `dev`; `--user admin` as `admin`. The raw account name is
+accepted as an alias for its label, but the label wins, so one account may be
+declared twice at different elevation.
 
 **The secret goes in the lab file, plainly.** The account exists because the
 lab's own provisioning created it, so the same string is already sitting in
@@ -939,16 +926,16 @@ dependency** (WCL has no environment or file interpolation, so "declare it but
 do not commit it" was never available). Consistent with §1.2 — vmlab is not a
 security boundary.
 
-**Precedence: CLI flag → wscript → `login {}` → agent identity.** `vmlab ssh
-dev01 -l admin`; `--user`/`--password` on `ssh`/`exec`/`shell` for an account
-the lab file never declared; wscript can both *read* the declared login (so a
+**Precedence: CLI flag → wscript → `login {}` → agent identity.** `vmlab shell
+--user admin dev01`; `--user`/`--password` on `exec`/`shell` for an account the
+lab file never declared; wscript can both *read* the declared login (so a
 provision script creates exactly the account declared, rather than the password
 existing in two places that drift) and override it. A second ad-hoc identity is
 a flag, not a schema addition.
 
 **Everything a person invokes defaults to the declared login; everything vmlab
-does on its own behalf keeps the agent identity.** Person-invoked: `vmlab ssh`
-and the facade, `exec`, `shell`, `push`/`pull`. vmlab's own: `provision {}`/`playbook {}` steps, share mounting,
+does on its own behalf keeps the agent identity.** Person-invoked: `exec`,
+`shell`, `vmlab cp`, `push`/`pull`. vmlab's own: `provision {}`/`playbook {}` steps, share mounting,
 readiness, metrics, tail, shutdown. The dividing argument is the bootstrap and
 it is decisive rather than stylistic — `PROBE\dev` does not exist until
 provisioning creates it, so a lab whose provisioning ran as the declared login
@@ -965,20 +952,21 @@ principal the user is not. Two consequences: the syncer **starts after
 provisioning**, not at machine-ready, and it shares the developer's cached
 logon, so a file created by sync and one created in the shell are
 indistinguishable. With no `login {}` declared the floor applies and the tree is
-SYSTEM/root-owned — still correct, because the attached session is SYSTEM/root
-too. **Ownership always matches whoever will attach.**
+SYSTEM/root-owned — still correct, because a shell on that machine is
+SYSTEM/root too. **Ownership always matches whoever works in the tree.**
 
 **The floor needs no new spelling.** `--user SYSTEM` on Windows and `--user
-root` on Linux *are* the agent's identity, so the facade treats them as "spawn
+root` on Linux *are* the agent's identity, so the agent treats them as "spawn
 directly, no logon". Stated plainly because it is a real break: on a machine
 that declares a `login {}`, `vmlab exec` and `vmlab push` **stop being
 SYSTEM/root**, and pushing into `C:\Windows\System32` starts failing where it
 used to work. Only machines that opted in are affected, and it is what makes "I
 am the dev user on this box" true in every verb rather than in one.
 
-**Elevation is declared, defaults to `true`, and is Windows-only.** An editor
-invokes `ssh <alias>` and nothing else, so elevation must be selectable through
-something SSH carries — hence a field on a *labelled* block rather than a flag.
+**Elevation is declared, defaults to `true`, and is Windows-only.** Elevation
+belongs to the identity rather than to one command, so it is a field on a
+*labelled* block rather than a flag: selecting the label selects the
+elevation.
 It defaults true because the parity bar is devcontainers and a devcontainer
 gives you root; `elevated = false` serves the real but rarer "test as a standard
 user" case, and §19.6 names the two ways it degrades the workspace. Without the
@@ -996,15 +984,14 @@ DC plus a domain-joined member), not inferred:
    LocalSystem and mints a real logon, which carries a **real initial TGT**
    (`initial pre_authent`) and genuine network credentials — unlike the
    `KERB_S4U_LOGON` identity-without-credentials a key-authenticated Windows
-   sshd produces, which is the finding that moved the SSH server to the host
-   (§19.3). `BATCH` and `SERVICE` are refused outright (1385) and `INTERACTIVE`
+   sshd produces. `BATCH` and `SERVICE` are refused outright (1385) and `INTERACTIVE`
    is refused **on a domain controller**, where "log on locally" is not granted
    to ordinary users — so choosing `INTERACTIVE` would quietly make "the DC is
    my dev machine" impossible. `NETWORK_CLEARTEXT` works on both machine kinds,
    trips no policy on either, and still yields the full TGT.
 2. **`LoadUserProfileW` before `CreateProcessAsUserW`.** It *creates* the profile
    on demand for a never-logged-on domain user. Skip it and `USERPROFILE` is
-   `C:\Users\Default` — shared, wrong, and silent, with every editor that writes
+   `C:\Users\Default` — shared, wrong, and silent, with every tool that writes
    under `$HOME` scribbling into it.
 3. **`AdjustTokenPrivileges`.** SYSTEM holds `SeAssignPrimaryToken` and
    `SeIncreaseQuota` **present but disabled**; `CreateProcessAsUserW` fails
@@ -1030,18 +1017,17 @@ needs no credential to become that user.
 **The cached logon** is keyed on **(account, secret, machine)** — not on the
 label, so two labels naming one account share a session, and a changed password
 mints a fresh logon rather than failing against a stale token. It lives while
-any channel uses it plus a bounded idle grace aligned with the alias's
-`ControlPersist`, is **recycled at idle once older than its Kerberos ticket
+any channel uses it plus a bounded idle grace, is **recycled at idle once older than its Kerberos ticket
 lifetime** (a dev box left up over a weekend would otherwise wake holding a
 logon whose TGT expired days ago, surfacing as "the share stopped working" with
 no visible cause), and **never survives the machine stopping**.
 `LoadUserProfileW` pairs with it — loaded when minted, unloaded when dropped, or
 the user's registry hive stays mounted for the machine's life. One measured
-logon costs ~97 ms, so attach latency is a non-issue.
+logon costs ~97 ms, so logon latency is a non-issue.
 
-This makes **"the SFTP logon is the same logon" true by construction rather than
-by discipline**: the facade's file operations resolve the same (account, secret)
-as the shell, so they land on the same cached logon, the same `LogonId` and the
+This makes **"the file transfer's logon is the shell's logon" true by
+construction rather than by discipline**: `vmlab cp` and wscript push/pull
+resolve the same (account, secret) as the shell, so they land on the same cached logon, the same `LogonId` and the
 same view of mapped drives. Verified — three processes from one cached token,
 one `LogonId`, one ticket cache.
 
@@ -1049,10 +1035,10 @@ one `LogonId`, one ticket cache.
 anything is spawned. This is a **correction to §7.5**, not an addition: the
 agent's own mounts run as SYSTEM and land in the global DOS-device namespace, so
 every session *sees* the drive letters while each logon authenticates
-separately. The existing fix is a `Run`-key hook, and a facade logon never fires
-one — a `Run` key needs a desktop session, and `NETWORK_CLEARTEXT` +
-`CreateProcessAsUserW` is not that. Without the injection an attached developer
-lands in exactly the documented failure: `Z:` is visible and opening it says the
+separately. The existing fix is a `Run`-key hook, and a minted logon never
+fires one — a `Run` key needs a desktop session, and `NETWORK_CLEARTEXT` +
+`CreateProcessAsUserW` is not that. Without the injection a developer in a
+shell lands in exactly the documented failure: `Z:` is visible and opening it says the
 password is wrong. Only SMB is affected; virtiofs mounts through a service-owned
 global device with no credential, and Linux mounts are global in a shared
 namespace.
@@ -1082,161 +1068,11 @@ A lone `login {}` is the default implicitly, matching `@dev`'s shape.
 
 ### 19.3 The SSH facade
 
-**vmlab terminates SSH on the host. The guest runs no sshd at all.**
-
-```
-editor ──ssh──► vmlab SSH facade (in labd)
-                    │ maps SSH channels to agent channels
-                    ▼
-            vmlab.agent.0 ──► vmlab-agent (LocalSystem / root)
-                    │ LogonUser + CreateProcessAsUserW
-                    ▼
-            the developer's process, with real network credentials
-
-guest: no sshd, no host keys, no authorized_keys, no NIC required
-```
-
-A tunnel to a guest `sshd` sidesteps *none* of the Windows OpenSSH findings —
-sshd would still do the authenticating, so the profile-path trap, the
-`administrators_authorized_keys` redirect, the `cmd.exe` default shell, the
-cloned host key and, fatally, the missing network credentials all survive a
-change of transport. So the SSH server moved to the host, where the agent's
-LocalSystem context can mint the one thing that carries network credentials
-(§19.2). **This is the load-bearing decision of the whole section; everything
-else follows from it** (ADR-0012).
-
-**Transport is the agent channel.** No NIC, no DHCP lease, no NAT priming, no
-host port — identical for VMs and container micro-VMs, and a machine
-deliberately cut off from every segment can still be attached to. Guest
-networking was rejected: a §9.8 forward rides the machine's first NIC's segment
-and is skipped until a lease exists, and it fixes none of the above regardless.
-
-**The endpoint is a stdio `ProxyCommand` and nothing else.** The proxy process
-*is* the client's server connection: one per `ssh`/`scp` invocation, speaking
-SSH over stdin/stdout. **Nothing listens on the host and no port is leased.**
-The SSH implementation lives in `labd`, beside the agent client, the cached
-logon and the feature probe; the proxy is a byte pipe over **one lab command
-that returns a unix socket path**, so a proxy invocation costs a `connect(2)`
-plus a copy loop. Precedent is in tree — `machine.terminal` already re-exposes
-an agent session as a raw-byte unix socket, and the console's VNC bridge does
-the same. Rejected: the proxy itself terminating SSH and driving channels over
-the lab protocol, which would re-export agent-proto through ADR-0007's typed
-vocabulary and make every one of the several `ssh`/`scp` processes a client
-spawns pay for it.
-
-**Auth is `none`, and vmlab owns the host key.** There is no network path to the
-facade, so the trust boundary is already "can you exec the proxy against this
-lab socket". Nothing to generate, store, rotate or leak. A per-machine host key
-lives in vmlab's own state directory with vmlab's own `known_hosts`, so the
-developer's `~/.ssh/known_hosts` is never touched and a rebuilt machine never
-triggers a host-key warning. Observed against a real client: OpenSSH's opening
-`none` probe is **unconditional** — it is how the client enumerates methods — so
-`PreferredAuthentications`, `BatchMode`, `NumberOfPasswordPrompts=0` and
-`PasswordAuthentication=no` all still authenticate. `none` cannot be talked out
-of.
-
-**What the facade answers:**
-
-| Request | Serviced by | Because |
-|---|---|---|
-| `pty-req`, `shell` | `OpenTerminal` | plain `ssh`, an IDE's terminal |
-| `exec` | `OpenExec` | VS Code's PowerShell bootstrap |
-| `window-change` | `Resize` | |
-| `subsystem sftp` | host-side SFTP over `fileops` | `scp`, the editor server push |
-| `env` | applied over the logon's environment, minus a deny-list | most distros ship `SendEnv LANG LC_*` |
-| `direct-tcpip` | `OpenTunnel` | VS Code rides its whole protocol over `ssh -T -D` |
-| `exit-status` | always sent, from the agent's exit code | `ssh`/`scp` exit codes depend on it |
-
-`env`'s deny-list is load-bearing rather than defensive: `HOME`, `USERPROFILE`,
-`USERNAME`, `LOGNAME` and `SSH_AUTH_SOCK` are dropped, because a client-sent
-`USERPROFILE` would silently undo the `LoadUserProfileW` that gave a
-never-logged-on domain user a profile at all. Dropped, not an error — the
-request is best-effort by design. `exit-signal` is **never sent**, because the
-agent reports `128 + signal` rather than a signal name; `ssh devbox 'kill -9
-$$'` therefore reports status 137, which is the honest translation of what the
-agent knows. At the connection level, `keepalive@openssh.com` gets
-`SSH_MSG_REQUEST_FAILURE` — which *is* the correct answer, and is what makes
-`ServerAliveInterval` work — `no-more-sessions@openssh.com` is accepted and
-ignored, `hostkeys-00@openssh.com` is never advertised (one key per machine,
-nothing to rotate), and many `session` channels per connection are expected,
-since `ControlMaster` exists to put them there.
-
-**`direct-tcpip` is mandatory, not a convenience.** VS Code runs `ssh -T -D
-<port>` and rides its entire protocol over that SOCKS forward, so refusing
-`direct-tcpip` would not degrade the editor, it would break it. That promotion
-rests on VS Code's **observed** channel; JetBrains Toolbox was seen asking for
-`-D` with the same shape, which corroborates it but is not a second observation.
-`-T` was observed on both, making "no `pty-req` ever reaches the control
-connection" a property of remote-dev clients generally.
-
-**What it refuses, and the invariant that decides it:**
-
-> **The facade only ever answers a channel open; it never initiates one.** Every
-> stream is client-initiated: `session` and `direct-tcpip`, nothing else.
-
-This is not stylistic. It is agent-proto's own asymmetry — the host opens
-channels and the guest answers, and there is no guest-initiated channel open in
-the protocol (ADR-0013). `forwarded-tcpip`, `auth-agent@openssh.com` and `x11`
-are channel types the facade never opens, which is precisely why
-`tcpip-forward`/`cancel-tcpip-forward` (`ssh -R`),
-`auth-agent-req@openssh.com` and `x11-req` are refused. Each would need a
-guest-side listener with its own lifetime and bind policy against a
-`ControlPersist` mux that outlives its client. §19 states the rule and names the
-refusals as its consequences rather than enumerating requests a future reader
-must keep extending. Everything else — `subsystem <other>`, `signal`, `break`,
-`xon-xoff` — is refused because nothing in the client set sends it.
-
-**How a refusal reads.** Only a channel **open** failure can carry vmlab's own
-words (`SSH_MSG_CHANNEL_OPEN_FAILURE` has a description string). A channel
-*request* refusal is `SSH_MSG_CHANNEL_FAILURE` and a global request refusal is
-`SSH_MSG_REQUEST_FAILURE`, neither of which carries text — so §19 says plainly
-that those refusals are **narrated by the client, not by vmlab**, rather than
-promising a friendly message the protocol cannot carry. Observed at default
-`LogLevel`: `-R` warns, `-X` warns, and **agent forwarding is refused in total
-silence** — `SSH_AUTH_SOCK` is simply empty in the guest, so a developer
-forwarding a key gets no signal and a later, unrelated-looking auth failure.
-That is the one refusal worth spending vmlab's own words on, in the banner below
-or in a line from `vmlab dev attach`.
-
-Three further behaviours:
-
-- **An unrecognised login label gets a `USERAUTH_BANNER` naming the machine's
-  declared logins**, then an auth failure. The username is a selector over
-  declared identities (§19.2), so an unrecognised selector is not an identity and
-  auth is the right layer; the banner is the one place before it where free text
-  is displayed. `none` is unchanged for a recognised label — the banner path is a
-  refusal, not an authentication.
-- **The facade degrades per channel.** An agent missing `fileops` still serves a
-  shell (`terminal` and `exec` are baseline) while `subsystem sftp` refuses **by
-  name**, telling the developer to rebuild the template or run the agent repair
-  verb; `direct-tcpip` refuses the same way for a missing `tunnel`. §19.4's
-  *hard at attach* belongs to `vmlab dev attach`, which owns a terminal — not to
-  a proxy whose stderr an editor swallows.
-- **Refused channels reach the lab event log**, which is otherwise the one place
-  a refusal is not visible only in one developer's terminal.
-
-**`ControlMaster` goes in the generated alias** (§19.7), backed by the per-user
-cached logon: clients spawn several `ssh`/`scp` processes per session and each
-would otherwise cost a handshake *and* a domain logon. Multiplexing through the
-facade was observed working under a real client — two connection attempts, one
-proxy invocation, one facade connection, two session channels.
-
-**Throughput forks nothing.** Measured over `vmlab.agent.0` into a Windows
-guest: 80 MiB/s sustained on a 1 GiB push, 141–185 MiB/s in bursts, and `exec`
-round trips going 45–91 ms → 59–111 ms while ~1 GiB is in flight on the same
-port — a latency bump, no starvation, no stalls. The frame and window constants
-stay as they are and the mux needs no fairness fix.
-
-**One coupling that is a requirement, not an implementation detail: the facade
-must never grant SSH window it cannot back with agent credit.** There are two
-stacked flow-control layers, and the naive implementation ACKs the client
-generously and buffers the difference *inside `labd`* — which, against the
-tens-of-megabytes editor-server push, is an unbounded buffer in the lab daemon.
+Removed.
 
 ### 19.4 What the guest must already have
 
-**Two things, and only two: the agent, and the toolchain.** There is no sshd to
-install, and the workspace path is created by the syncer rather than
+**Two things, and only two: the agent, and the toolchain.** The workspace path is created by the syncer rather than
 pre-installed. The image is otherwise a stock template.
 
 **The toolchain is the lab author's `provision {}` / `playbook {}`, and the
@@ -1262,18 +1098,17 @@ Windows), and a full Linux VM's own kernel must be recent enough that `inotify`
 survives an overlayfs copy-up — container micro-VMs are covered by the kernel
 vmlab itself pins, so this can only bite on a VM.
 
-**The agent gains three capabilities, advertised as feature strings in its
+**The agent gains two capabilities, advertised as feature strings in its
 handshake:**
 
 | Feature | Serves |
 |---|---|
-| `tunnel` | the facade's `direct-tcpip` |
-| `fileops` | the offset-addressed file vocabulary backing host-side SFTP |
+| `fileops` | the offset-addressed file vocabulary backing `vmlab cp`, wscript push/pull and the workspace syncer |
 | `watch` | the recursive guest tree watch backing the workspace syncer |
 
-`tunnel` and `fileops` are named separately rather than as one coarse `ssh`
-because they have independent consumers — `vmlab cp` has no interest in
-tunnels. `watch` lives in **the agent**, not a second guest binary:
+`fileops` and `watch` are named separately rather than as one coarse `dev`
+because they have independent consumers — `vmlab cp` has no interest in a tree
+watch. `watch` lives in **the agent**, not a second guest binary:
 a separate daemon would be a second thing to bake into every template, a second
 install path, a second skew axis and a second thing the repair verb must know
 about, for code that has to sit on the same channel anyway. **User-logon spawning
@@ -1298,60 +1133,31 @@ host's shipped agent binary into a running machine on demand and marks that
 machine `diverged`**. It never fires by itself: an automatic refresh at `up`
 would make the template's sealed `agent_version` a lie and stop *same template →
 same machine* holding. It exists because a 15–45 minute Windows rebuild to pick
-up an agent change is otherwise the inner loop of building §19 itself. It sits
+up an agent change is otherwise the inner loop of developing the agent itself. It sits
 under `vmlab machine`, beside `capabilities` and `stats` (§12).
 
 None of that applies to a container. **A container micro-VM's agent lives in the
 initramfs guest asset**, not in any image, so it tracks the host's installed
-vmlab and cannot go stale; the repair verb is meaningless there, and refreshing
-means reinstalling the guest asset. `attachable` therefore reduces to "is the
-host's vmlab current" for a container and stays a genuine per-machine probe only
-for VMs.
+vmlab and cannot go stale; the repair verb is meaningless there and says so,
+and refreshing means reinstalling the guest asset.
 
-**Where it fails: silent at `validate`, warn at `up`, hard at attach.**
-
-- **`validate` says nothing.** It is a config check with no side effects, and the
-  only statically available signal is the template's sealed `agent_version` — a
-  free-form string. Comparing it is *inference*, which the capability doctrine
-  rejects, and it would be `validate`'s first guest-content check.
-- **`up` warns.** The handshake is part of readiness, so by then the features are
-  honestly probed. Free, correctly sourced, early.
-- **Attach fails hard**, naming both the rebuild and the repair verb. The facade
-  is a general capability, so a machine that cannot be attached to is still a
-  perfectly good machine; failing `up` over it is disproportionate.
-
-**`vmlab machine capabilities` gains `attachable`**, meaning exactly **`tunnel`
-and `fileops` are both present** — *this agent can serve an attach*, never *your
-attach will succeed*. The narrow definition is load-bearing: identity is
-declared separately and a flag promising success would become a lie. This is a
-computed projection over probed facts (ADR-0004), not an inference from machine
-kind. It deliberately does **not** widen to cover `watch`: workspace sync checks
-`watch && fileops`, a different consumer with a different answer. A template
-built with the agent disabled can neither be attached to nor host a workspace,
-by construction, and surfaces through the same flag and the same error.
+**The workspace checks `watch && fileops`** over the features the handshake
+probed — a projection over probed facts (ADR-0004), never an inference from
+machine kind or from the template's sealed `agent_version`, which is a
+free-form string. A template built with the agent disabled cannot host a
+workspace, by construction.
 
 ### 19.5 What the agent gains on the wire
 
-Three vocabularies, deliberately unalike — which is the check that none was
-cargo-culted from another. `tunnel` is a byte stream, `fileops` an out-of-order
-RPC session, `watch` a single-request-at-a-time set swap.
-
-**`tunnel`.** `OpenTunnel { id, host, port }`; the agent dials TCP inside the
-guest; then bytes both ways. **Resolution is guest-side** — the host string
-passes through verbatim, which is what makes a domain name in a SOCKS request
-work. **No destination policy**: any address the guest can reach, not
-loopback-only, since `-D` dials whatever the developer's tooling asks for and
-vmlab is not a security boundary. A connect failure maps to
-`SSH_OPEN_CONNECT_FAILED`, **not** `ADMINISTRATIVELY_PROHIBITED` — a SOCKS
-client must distinguish "nothing is listening" from "vmlab refused you", and the
-prohibited code is spent on things vmlab genuinely refuses. Only the facade ever
-opens one; general host→guest TCP remains the Forward plan's job (§9.8).
+Two vocabularies, deliberately unalike — which is the check that neither was
+cargo-culted from the other. `fileops` is an out-of-order RPC session, `watch` a
+single-request-at-a-time set swap.
 
 **`fileops` is one channel that is an RPC session**, not a set of control
 messages. Control frames are JSON and explicitly not flow-controlled, so a
-40 MB editor-server push would arrive base64-inflated and sit in front of every
-keystroke and metrics sample with nothing to throttle it; a channel per read is
-worse, since OpenSSH's SFTP client keeps ~64 requests of 32 KiB in flight.
+40 MB push would arrive base64-inflated and sit in front of every keystroke and
+metrics sample with nothing to throttle it; a channel per read is worse, since a
+pipelined transfer keeps dozens of requests in flight.
 Instead `OpenFileOps` carries length-prefixed records inside the channel's own
 credit window — JSON for metadata, raw bytes appended for a read or write
 payload — which keeps agent-proto's "JSON for control, raw for bulk" split at
@@ -1359,19 +1165,18 @@ the record level and scopes handles to the channel so they die with it. Three
 properties §19 fixes:
 
 1. **Handle-based and offset-addressed** — `open → handle`, read/write at
-   offset, `close`. A path-addressed vocabulary cannot express an SFTP client
-   that opens once and writes 400 times, and cannot hold `O_APPEND` or
+   offset, `close`. A path-addressed vocabulary cannot express a writer that
+   opens once and writes 400 times, and cannot hold `O_APPEND` or
    `fsetstat` semantics at all.
 2. **Pipelined: many requests outstanding per channel, replies matched by
    request id and free to complete out of order.** This is the throughput
-   decision. Serialised against the measured 59–111 ms round trip, the facade
+   decision. Serialised against the measured 59–111 ms round trip, a transfer
    would deliver under 1 MB/s where the raw channel does 80.
-3. **SFTP-shaped by intent, in vmlab's spelling** — the facade *transcodes*
-   rather than adapts, covering what `scp` and the editors issue
-   (`open/close/read/write/stat/lstat/fstat/setstat/opendir/readdir/mkdir/rmdir/remove/rename/realpath`).
-   Otherwise a tidier abstraction gets invented and discovers at implementation
-   time that it cannot express `realpath` on a Windows drive letter. Two
-   concrete instances of why transcoding rather than adapting is right:
+3. **A full filesystem vocabulary, in vmlab's spelling** —
+   `open/close/read/write/stat/lstat/fstat/setstat/opendir/readdir/mkdir/rmdir/remove/rename/realpath`.
+   A tidier abstraction discovers at implementation time that it cannot
+   express `realpath` on a Windows drive letter. Two concrete instances of why
+   the vocabulary carries platform detail rather than hiding it:
    **`mkdir` carries a case-sensitivity flag** (§19.6 needs it, and NTFS only
    accepts it while the directory is empty, so it cannot be a later `setstat`),
    and **symlink creation carries the link kind**, because Windows requires
@@ -1436,10 +1241,8 @@ secret crossing repeatedly is a non-cost — it is a pipe on the same host, and
 the secret is in the lab file in plaintext already.
 
 It is carried by `OpenTerminal`, `OpenExec`, `OpenFileOps` and `OpenTail` —
-§19.2's "everything a person invokes" — and **three opens never carry it**, each
-for a stated reason so none reads as an oversight: `OpenTunnel` (a TCP connect
-has no user context on either OS, and the field would imply a per-user network
-view that does not exist), `OpenEventLog` (the Windows event log is
+§19.2's "everything a person invokes" — and **two opens never carry it**, each
+for a stated reason so neither reads as an oversight: `OpenEventLog` (the Windows event log is
 machine-scoped and its ACLs assume an administrator, so an ordinary login would
 get a silently empty Security channel — a stated agent-identity read beats a
 quiet empty one), and `OpenWatch` (a watcher *observes*; it produces none of the
@@ -1449,10 +1252,9 @@ the reciprocal that creates).
 One message is added in the guest→host direction and it is deliberately **not** a
 channel open, so ADR-0013's invariant is untouched: **an agent→host `Eof`**.
 The protocol has a host→guest EOF but no reverse one — the guest can only end a
-stream by exiting or closing — and a TCP tunnel needs per-direction half-close,
-or a peer that shuts down its write side tears the channel down and the absence
-surfaces a year later as a hung tool nobody can reproduce. It incidentally gives
-`exec` stdout a clean EOF.
+stream by exiting or closing. It gives `exec` a clean EOF once both output pipes
+are drained, so a consumer that wants only the output need not wait for
+`Exited` to learn it is complete.
 
 ### 19.6 The workspace
 
@@ -1698,9 +1500,9 @@ adopts them as agreed.
 halted paths, in the built-in ignore floor so it never syncs. From inside the
 guest a halt is otherwise *nothing happening* — the file simply stops updating —
 which is the silent-divergence failure this section keeps ruling out, on the one
-side no control path can reach. An SSH banner was rejected as the primary signal
-because it fires only on a *new* attach, useless to everyone already working when
-the halt happened; it survives as a secondary. The marker file's `git status`
+side no control path can reach. A banner at session start was rejected as the
+signal because it fires only on a *new* shell, useless to everyone already
+working when the halt happened. The marker file's `git status`
 noise is a feature: it is the developer noticing.
 
 #### Timing, deletions, durability
@@ -1862,322 +1664,121 @@ synced. `.gitattributes` is the documented escape for genuine CRLF needs. **The
 syncer translates nothing** — bytes cross verbatim and git does all normalisation
 on both sides, from settings that now agree.
 
-### 19.7 The verb surface and the host-side footprint
+### 19.7 The verb surface
 
-**The facade is general, so its verbs are top-level; `vmlab dev` holds only what
-is meaningless for a machine that is not `@dev`.** That rule — *a verb earns the
-`dev` noun only if it is meaningless for an unmarked machine* — decides the
-whole surface, and it matches how §12's table already sorts: the reach-into-a-
-guest verbs are top level while `vmlab machine` carries only capabilities and
-stats.
-
-**Top level, any machine:**
-
-| Verb | Behaviour |
-|---|---|
-| `vmlab ssh <machine> [-- cmd]` | Refreshes the managed SSH block, then **`exec`s the system `ssh`** against the alias. Not a second SSH client: one implementation of the client side, and it is the one editors already use. Takes a bare name in a lab directory or `<lab>/<machine>` from anywhere. |
-| `vmlab ssh-proxy <lab>/<machine>` | **Hidden** — not in `--help`, not in §12. The `ProxyCommand` target, never typed by a human. |
-| `vmlab ssh-config [--print <machine>]` | Refreshes the managed block. `--print` emits the stanza plus the editor settings snippet (§19.8) for a client that will not read the file. |
+**`vmlab dev` holds only what is meaningless for a machine that is not `@dev`.**
+That rule — *a verb earns the `dev` noun only if it is meaningless for an
+unmarked machine* — decides the whole surface, and it matches how §12's table
+already sorts: the reach-into-a-guest verbs (`exec`, `shell`, `cp`) are top
+level and work on any machine, while `vmlab machine` carries only capabilities,
+stats and agent repair.
 
 **Under `vmlab dev`:**
 
 | Verb | Why it earns the noun |
 |---|---|
-| `vmlab dev attach [machine]` | Cold-to-editing in one command: ups, waits for `attachable`, becomes a shell. |
-| `vmlab dev use <machine>` | Records which dev machine is *mine* — host-side, because `vmlab.wcl` is committed and structurally cannot say it. |
 | `vmlab dev sync status \| flush \| diff \| resolve` | The workspace exists only for a dev machine. `status` carries the halted-path list, volume warnings, overflow/rescan symptoms and loudly-skipped special files; `resolve` takes per-path `--host`/`--guest` or `--all`; `diff` pulls the guest copy host-side; `flush` is nearly free, since bracketing snapshot capture and restore already requires the machinery. |
 
 **Two verbs deliberately not added.** There is **no `dev list` or `dev status`**:
 lab status is a typed projection (ADR-0004) and a dev machine is a machine, so
-the projection **widens** to carry `dev` and `attachable` and `vmlab status`
-shows them, rather than standing up a second status verb reporting on a subset of
-machines. And there is **no `rebuild` verb** in either spelling: `vmlab vm
-destroy <m>` (or `vmlab container destroy`) followed by `vmlab up <m>` already
-*is* re-clone plus re-provision, and §19.6 means the workspace survives it. An
-alias's only job would be to hide which of three operations it performed, and
-that hiding is actively dangerous — a domain member rotates its computer-account
-password roughly monthly, so a `rebuild` that quietly chose snapshot-revert would
-hand back a machine that boots and cannot authenticate. **§19 states the
-equivalence — *`Rebuild Container` is `destroy` + `up`, and your workspace
-survives it* — and adds no verb.**
+the projection **widens** to carry `dev` and `vmlab status` shows it, rather
+than standing up a second status verb reporting on a subset of machines. And
+there is **no `rebuild` verb** in either spelling: `vmlab vm destroy <m>` (or
+`vmlab container destroy`) followed by `vmlab up <m>` already *is* re-clone plus
+re-provision, and §19.6 means the workspace survives it. A `rebuild` verb's only job
+would be to hide which of three operations it performed, and that hiding is
+actively dangerous — a domain member rotates its computer-account password
+roughly monthly, so a `rebuild` that quietly chose snapshot-revert would hand
+back a machine that boots and cannot authenticate. **§19 states the equivalence
+— *`Rebuild Container` is `destroy` + `up`, and your workspace survives it* —
+and adds no verb.**
 
-**`vmlab dev attach` launches no editor and knows none.** It ups the machine,
-waits, and **becomes a shell on it**, printing the alias and the editor snippet
-alongside; the developer opens their own editor and picks the alias out of the
-picker, which the managed block guarantees is there. A host-config `editor`
-command template mirroring the existing `viewer` key was real prior art and was
-rejected on coupling: vmlab learning an editor is exactly what §19.1 rejected
-editor hints for. **Consequence, because `attach` becomes a shell: the workspace
-syncer must not be tied to that process's lifetime.** Closing the shell cannot
-stop sync while the editor is still attached — the syncer is lab-daemon-owned and
-`attach` starts nothing it owns.
+**The workspace syncer is tied to no shell's lifetime.** It is lab-daemon-owned
+and starts after provisioning (§19.2); no `vmlab shell` or `vmlab exec` starts
+it, so closing one stops nothing.
 
-**Lifecycle differs by caller, and one of the three is forced rather than
-chosen.** `vmlab ssh-proxy` **never** does lifecycle: it is spawned by the editor
-with no TTY, its stderr may never be shown, and clients spawn several
-concurrently — so "boot and wait" becomes a silent multi-minute hang that races
-itself, and the client's own connect timeout kills it long before a
-domain-joined Windows guest finishes booting. It fails immediately with a
-diagnostic that survives being printed into an editor log. `vmlab ssh`
-**refuses** if the machine is down and reports why, matching `console` and `exec`,
-which do not secretly start machines either. `vmlab dev attach` **ups and
-waits**, because cold-to-editing is its entire reason to exist and progress goes
-to a terminal it owns.
+**Which machine a `dev sync` verb acts on**, resolved when none was named: an
+explicit argument → `VMLAB_DEV_MACHINE` → the lab's default dev machine
+(`@dev(default = true)`, else a lone `@dev` machine) → otherwise **error,
+listing the candidates**. Never guess. Every rung is checked rather than
+trusted: a rung naming a machine this lab does not offer is an error at that
+rung, never a fall through to the next. `VMLAB_DEV_MACHINE` is the
+per-developer rung, which a committed `vmlab.wcl` structurally cannot express.
 
-**The host-side footprint is one artefact: a marker-fenced block vmlab owns
-inside `~/.ssh/config` itself.** A vmlab-owned file plus an `Include` was the
-obvious shape and it fails on evidence: **JetBrains Toolbox's config importer
-does not follow `Include`** (proven against a four-stanza control — `Include`d
-hosts never appear in the picker, with or without a `ProxyCommand`, even with the
-`Include` at the very top), while VS Code resolves `Include` in its own parser
-and `vmlab ssh` never needed it either. So the `Include`'s entire value was
-serving third-party clients, and the one client that needs it cannot read it. The
-tempting half-measure — keep a private file and reach it with `-F` — is rejected
-*because* it works: vmlab's own commands would keep succeeding while every editor
-saw nothing. **Sharing one path means a broken or displaced block breaks `vmlab
-ssh` too**, deliberately, so the developer meets the failure at a terminal that
-can explain it. It also leaves the developer's own `Host *` settings applying to
-vmlab connections, which `-F` would silently discard.
+**What this costs the wire (ADR-0007): two new lab commands**, the syncer's
+`status` and `flush`. Dev-ness in `vmlab status` is a projection widening, not a
+command. **Sync-conflict resolution is CLI-only**, because ADR-0013 leaves no
+guest→host control path to offer it from.
 
-The block is **deterministically ordered** (lab → machine → login label), so a
-dotfiles-tracked config shows a diff only when something really changed; it
-**prunes itself by lab root**, since each lab's stanzas carry that lab's
-canonical root in a machine-readable comment and a root that no longer holds a
-`vmlab.wcl` has its stanzas dropped — the block *is* the record, and no
-bookkeeping file exists; and it **refuses to write on mangled markers** (one of a
-pair, duplicated pairs, `END` before `BEGIN`) with an error naming file and line,
-because vmlab does not attempt repair on a file it does not own.
+### 19.8 Provisioning into the dev login's home
 
-**Stanzas cover *declared* machines, not running ones.** An alias means "this
-machine exists in this lab", not "it is attachable right now" — liveness is
-`vmlab status`'s job and the refusal path above. Listing only running machines
-would empty the editor's picker at exactly the moment you want it. The block
-therefore **accumulates**, written from the `vmlab.wcl` the CLI already has in
-hand: **any command that successfully loads a lab** renders the block and
-compares it to disk, writing only on a real difference, so working inside a lab
-directory is enough to register it. A failed write **warns**, except at
-`vmlab ssh` and `vmlab dev attach` where the alias is load-bearing and the
-command **fails hard with the reason** — the same ladder §19.4 sets for agent
-capability. Mechanics that follow, each a way to lose someone's file: an advisory
-`flock` across read-modify-write; a temp file in the same directory, fsynced and
-renamed onto the **resolved** path, so a stow/chezmoi symlink keeps its symlink;
-an absent file created `0600` under a `0700` `~/.ssh`.
+**Per-user content lives in a home directory, and a domain user's home does not
+exist at build time.** Tools, plugins and settings that belong to the developer
+rather than to the machine land under a per-user home. A template is
+lab-independent, so a *domain* user's profile cannot exist when it is built; it
+is created on first logon by `LoadUserProfileW` (§19.2).
 
-**Placement stops being a parsing problem.** OpenSSH takes the first value it
-obtains for each keyword, so an earlier `Host *` setting `ProxyCommand` or
-`ControlPath` silently wins. Every write therefore **re-hoists vmlab's own region
-to the top** — relocating its own region and never moving a line the developer
-wrote — and then runs **`ssh -G <alias>`** and checks the resolved `proxycommand`
-is vmlab's, erroring loudly and naming the keyword and pattern that beat it if it
-is not. That is OpenSSH's own resolver, the one every client shells out to, and
-it catches displacement, an overriding `Host *`, a stale hand-paste and a
-redirected block alike with one mechanism and no ssh_config grammar in vmlab. The
-escape is **a host-config path override naming the file vmlab manages its block
-in** — a *location* knob with one code path behind it, not an on/off with two;
-the `ssh -G` check still runs against it, so a redirected block warns honestly
-rather than pretending to work. It doubles as the seam that makes the writer
-testable without a real home directory, which matters for a component whose
-failure mode is "ate someone's ssh config".
-
-**Alias shape is `vmlab-<lab>-<machine>`**, with `vmlab-<lab>-<machine>-<label>`
-for each non-default login (§19.2) — so "attach as admin" is a pick in the
-editor's host list rather than something you have to know to type, and it is the
-only way elevation is reachable from an editor that invokes `ssh <alias>` and
-nothing else. It is typeable, tab-completable, and the prefix namespaces the
-block against the user's own aliases. `<lab>/<machine>` is **disqualified as an
-alias** because it lands in `ControlPath` via `%n` and a slash turns the mux
-socket path into a nonexistent subdirectory; it survives as the *argument* form,
-which is what `ssh-proxy` takes. Host-global uniqueness is ADR-0011's.
-
-**`ControlPath` is `$XDG_RUNTIME_DIR/vmlab/ssh/%C`.** The real budget is **90
-bytes, not 108**: `muxserver_listen` binds a temporary `"<path>.<16 random
-chars>"` *before* the `sun_path` length check, so 108 − 1 − 17 = 90 usable bytes.
-`%C` is OpenSSH's own token — 40 hex characters, **bounded by construction** —
-and under the runtime directory that is ~66 of the 90 on any home directory and
-any uid. Two things come free: the mux socket moves out of the config directory
-into the runtime directory where every other vmlab control socket already lives,
-and vmlab invents no naming scheme it would then have to keep stable. The stanza
-sets no `HostName`, so `%C` varies per alias. Stating a length limit and refusing
-at generation was rejected as the wrong direction of coupling — a lab would be
-valid on one machine and invalid on another because of how long the developer's
-home directory is — leaving the durable rule:
-
-> **Anything vmlab puts in a Unix socket path is bounded by construction, never
-> by a name it does not control.**
-
-**Host keys and withdrawal.** The guest holds no host key at all, so a template
-clone cannot carry a stale one and a snapshot restore cannot roll one back. What
-remains: the key is per (lab, machine) and **survives `destroy`**, so destroying
-and recreating `dev01` presents the same key and the `known_hosts` entry never
-needs rewriting. A recreated machine inheriting a name's identity costs nothing,
-since the real trust boundary is reaching the lab socket. `destroy` withdraws the
-master with **`ssh -O exit <alias>` before removing the stanza** — the tool's own
-way to kill a multiplexer, and it needs the stanza to still resolve — then
-removes the stanza and the host key stays.
-
-**Which machine is mine**, resolved when a `dev` verb needs a machine and none was
-named: an explicit argument → `VMLAB_DEV_MACHINE` → the `vmlab dev use`
-selection → `@dev(default = true)` → a lone `@dev` machine → otherwise **error,
-listing the candidates**. Never guess. The selection is stored in the lab's own
-**`.vmlab/`**, which §4 already says should be gitignored — that makes it
-per-developer by construction, which is exactly what a committed `vmlab.wcl`
-cannot express, and it needs no key at all since it lives inside the lab it
-describes. `destroy` clears `.vmlab/` and therefore forgets the selection;
-re-setting it is one command.
-
-**What this costs the wire (ADR-0007): three new lab commands.** `vmlab ssh`,
-`ssh-config`, `dev use` and `dev attach` add nothing — they generate client-side
-or compose existing commands. `vmlab ssh-proxy` is **one** new command, the
-proxy's channel to the machine's agent (§19.3), and the syncer's `status`/`flush`
-are **two**. Dev-ness in `vmlab status` is a projection widening, not a command.
-
-**No other surface joins the SSH path.** The facade's whole point is a stdio
-pipe for a *local* editor, so no vmlab surface beyond `ssh-proxy` offers an SSH
-affordance of its own. (The browser console this paragraph once excused was
-removed before release; the reasoning stands without it.) **Sync-conflict
-resolution is CLI-only.** So `ssh-proxy` is a deliberate one-way command
-carrying a genuine reason rather than a gap. Note also that
-today's `vmlab shell` runs as the agent identity, so `vmlab ssh` is not a
-duplicate path — it is a **different identity to the same guest**.
-
-### 19.8 Editors, extensions, and the offline guest
-
-**The client set, stated as a matrix rather than implied.** vmlab publishes SSH
-and nothing else, so any SSH-capable client attaches — but for a *Windows* dev
-machine the set that actually works is narrower than it looks:
-
-| Client | Linux dev machine | Windows dev machine |
-|---|---|---|
-| plain `ssh` / `scp` / `sftp` | yes | yes |
-| VS Code Remote-SSH | yes | yes |
-| JetBrains Toolbox App | yes | **no** — its deploy bootstrap is `/bin/sh -c …`, a POSIX shell reading a script off stdin (observed) |
-| JetBrains Gateway | yes | no — Linux backends only, documented |
-| Zed | yes | no — no Windows remote server |
-
-So **JetBrains remote dev serves a Linux dev machine**, and the Windows dev
-machine is served by VS Code Remote-SSH and plain `ssh`. §19 says that plainly
-rather than implying Rider covers Windows.
-
-**The guest can stay offline.** VS Code's `"remote.SSH.localServerDownload":
-"always"` makes the *client* download the 12 MB server and push it over `scp`,
-observed end to end through the facade. It is a **client-side** setting, so a dev
-machine cannot make itself offline-capable unilaterally — which is why
-`vmlab ssh-config --print` hands the developer a settings snippet beside the
-stanza, carrying that setting and `remote.SSH.remotePlatform: windows` (the
-documented workaround for a Windows host-detection bug). Pre-staging the server
-into a template works mechanically but is keyed to the *client's* build commit,
-so it dies on every editor update; the push route is version-agnostic by
-construction.
-
-**Extensions are toolchain, and toolchain is a declaration. vmlab builds
-nothing.** Worked through for two structurally opposite editors — VS Code
-(client/server split, marketplace fetch) and Neovim (a TUI over the facade's own
-`session` channel, plugins that are `git clone`s) — they converge on one finding
-that dissolves the question: **the blocker is never the editor, it is that
-everything editor-shaped lives in a per-user home directory.** A template is
-lab-independent, so a *domain* user's profile cannot exist at build time; it is
-created on first logon by `LoadUserProfileW` (§19.2).
-
-**The durable home is the *declaration*.** Extensions and plugins live in the
-guest home, outside the workspace, so they survive reboot, `down`/`up`, and
-restore to a snapshot taken after install; they die on a per-machine `destroy` + `up`
-and on restore to a snapshot from before install. Both declared placements
-re-apply across a rebuild — a template build because the clone is re-made from
-it, a lab `provision {}` because a fresh clone boots first-boot again. Only
-hand-install does not:
+**The durable home is the *declaration*.** Content in the guest home sits
+outside the workspace, so it survives reboot, `down`/`up`, and restore to a
+snapshot taken after it was placed; it dies on a per-machine `destroy` + `up` and
+on restore to a snapshot from before. Both declared placements re-apply across a
+rebuild — a template build because the clone is re-made from it, a lab
+`provision {}` because a fresh clone boots first-boot again. Only hand-install
+does not:
 
 > **Bake what the lab needs every developer to have; hand-install what you
 > personally want today, and expect to redo it after a rebuild.**
 
-That closes devcontainers' `customizations.vscode.extensions` gap without §19.1's
-rejected editor hints. A **per-machine durable home overlay** was rejected: it
-reintroduces exactly the surviving guest-side state §19.6 retired the workspace
-disk to eliminate, and for *less* reason, since unlike source, editor bits have a
-canonical durable home already.
+A **per-machine durable home overlay** was rejected: it reintroduces exactly the
+surviving guest-side state §19.6 retired the workspace disk to eliminate, and
+for *less* reason, since unlike source, declared content has a canonical durable
+home already.
 
 **One guarantee §19 states, because nobody would infer it:**
 
 > A `provision {}` step can address the dev login's home directory **before that
 > user has ever logged on.**
 
-§19.2's precedence makes it true — a provision script passes `user:` to `exec`,
-vmlab mints that logon, `LoadUserProfileW` creates the profile, and the write
-lands in the real dev user's home. It is written down because §19.2's headline is
-"everything vmlab does on its own behalf keeps the agent identity", which makes
-"provision runs as SYSTEM, full stop" the natural implementation — and then the
-Windows domain example silently fails. There is nothing to check statically, so
-it adds no §5.1 rule.
+§19.2's precedence makes it true — a provision script takes a handle carrying
+the login with `m.as_login(label)` (or `m.as_account(user, password)`), vmlab
+mints that logon, `LoadUserProfileW` creates the profile, and every call on the
+handle — exec, file push, terminal — lands in the real dev user's home. It is
+written down because §19.2's headline is "everything vmlab does on its own
+behalf keeps the agent identity", which makes "provision runs as SYSTEM, full
+stop" the natural implementation — and then the Windows domain case silently
+fails. There is nothing to check statically, so it adds no §5.1 rule.
 
 **`provision {}`, never `playbook {}`.** A playbook runs config-weave in-guest
 with no user parameter and has no rung on the precedence ladder. That is not a
 total block, which is what makes it dangerous: the agent identity *can* write
 into a profile directory that already exists, but cannot create one or set
 ownership — so a playbook half-works on an existing profile and fails on a fresh
-domain user, which is the first-run case. The rule generalises past editors:
+domain user, which is the first-run case. The rule generalises:
 
 > **Anything that must land as the developer rather than as the machine belongs
 > in `provision {}`.**
 
 Which is the same rule §19.2 drew when it carved out the workspace syncer.
 Giving `playbook {}` a `login` field was rejected as surface added on
-speculation — neither worked example needs it, and it is an ordinary later
-feature request rather than a §19 decision.
+speculation — nothing in §19 needs it, and it is an ordinary later feature
+request rather than a §19 decision.
 
 **Personal config is the developer's and needs no decision.** A `dotfiles`
 argument is already dead by §19.1's third clause, and devcontainers itself puts
-dotfiles in a *client* setting rather than in `devcontainer.json`. The facade
-already answers it with nothing built:
-
-```
-scp -r ~/.config/nvim vmlab-probe-dev01:.config/nvim
-```
-
-§19 prints that line, because a developer who does not know SFTP is available
-over the alias will assume the offline guest has cut them off.
-
-**Reaching a host-side service from an offline guest** — a package mirror, a
-proxy, a licence server — is the other thing that looks like a dead end and is
-not. `ssh -R` is refused (§19.3), but the answer needs no reverse tunnel: give
-the dev machine a NIC on a segment with egress, and the NAT engine terminates
-guest flows in-process and proxies them over ordinary host sockets, so anything
-addressed to the gateway but off-segment reaches the host's own address. §19 says
-so for the same reason it prints the `scp` line.
-
-**Two worked examples, split by machine kind** so *one contract, every machine
-kind* is shown rather than asserted: **VS Code on a Windows domain member** —
-client/server, `%USERPROFILE%`, a minted domain logon, the case §19 exists for —
-and **Neovim on a Linux container micro-VM** — no server, `~/.local/share/nvim`,
-the container identity floor. Both use the *proven* placement (a lab
-`provision {}` addressing the dev login's home), with baking into
-`C:\Users\Default` named as the option for shipping a template to a team. The
-bytes arrive by `media {}` (§6.3, whose stated primary use is already payload
-delivery to guests with no network) or from the repo.
+dotfiles in a *client* setting rather than in `devcontainer.json`. `vmlab cp`
+already carries it as the developer's login, with nothing built.
 
 The line that keeps all of this from sliding into a feature:
 
 > **vmlab moves bytes it is told to move and never interprets them.** `media {}`
-> does not know a VSIX from a driver bundle; `provision {}` does not know
-> `code --install-extension` from `winget install`.
+> does not know a plugin bundle from a driver bundle; `provision {}` does not
+> know one installer command from another.
 
 ### 19.9 Non-goals
 
-- **A guest-initiated channel open, and with it `ssh -R`.** ADR-0013's invariant
-  refuses it. The stated need is already met by NAT egress (§19.8), and no named
-  client wants one: VS Code's real forwarding is dynamic and local, and every SSH
-  and gateway jar in JetBrains Toolbox has zero reverse-forwarding strings. True
-  `-R` would be a separate agent-proto effort — one message mirroring the host's
-  open, plus guest-side listener lifetime — and the invariant is what keeps that
-  a visible amendment rather than a drift.
-- **Remote or multi-host development.** Attaching from another machine over the
-  network is §1.2's single-host non-goal.
 - **Being a security boundary** between the developer and the guest (§1.2).
-- **Shipping or bundling editor servers or licensed components.** vmlab publishes
-  SSH; the editor brings its own backend.
-- **vmlab placing extensions itself.** It would require learning an editor's
-  on-disk layout, which is the attach contract's stated non-goal.
 - **Consuming `devcontainer.json`.** Deriving a lab from an existing devcontainer
   definition is a separate effort in the other direction.
-- **An editor plugin presenting sync state.** §19.6 leaves it somewhere to attach
+- **An editor plugin presenting sync state.** §19.6 leaves it somewhere to read
   — the marker file and `dev sync status` — and building it is a separate effort.
-- **A `rebuild` verb and a host-config `editor` launcher**, both for the reasons
-  in §19.7.
+- **A `rebuild` verb**, for the reasons in §19.7.

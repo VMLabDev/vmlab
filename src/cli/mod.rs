@@ -182,44 +182,10 @@ pub enum Command {
         #[command(flatten)]
         run_as: As,
     },
-    /// Attach over the SSH facade: refresh the managed `~/.ssh/config` block,
-    /// then hand over to the system `ssh` (PRD §19.7)
-    ///
-    /// Not a second SSH client — one implementation of the client side, and
-    /// it is the one editors already use. Refuses on a stopped machine and
-    /// never starts one, like `console` and `exec`.
-    Ssh {
-        /// [lab/]machine — a bare name inside a lab directory, or the
-        /// qualified form from anywhere
-        machine: String,
-        /// Command and arguments to run instead of a shell (after --)
-        #[arg(last = true)]
-        cmd: Vec<String>,
-    },
-    /// Refresh the managed `~/.ssh/config` block for the lab in this
-    /// directory (PRD §19.7)
-    SshConfig {
-        /// Print one machine's stanza and the editor settings snippet, for a
-        /// client that will not read the file
-        #[arg(long, value_name = "MACHINE")]
-        print: Option<String>,
-    },
-    /// Dev machines: attach to one, and record which one is yours (PRD §19.7)
-    ///
-    /// Only what is meaningless for a machine that is not `@dev` lives here —
-    /// the SSH facade is a general capability, so its verbs are top level.
+    /// Dev machines: the workspace syncer and its halts (PRD §19.6, §19.7)
     Dev {
         #[command(subcommand)]
         cmd: DevCmd,
-    },
-    /// The `ProxyCommand` target: pipe stdin/stdout onto a machine's SSH
-    /// facade (PRD §19.3). Hidden — spawned by `ssh`, never typed.
-    #[command(hide = true)]
-    SshProxy {
-        /// [lab/]machine — the lab-qualified form is what the generated
-        /// `ssh_config` block passes, since an editor spawns this from
-        /// wherever it happens to be.
-        machine: String,
     },
     /// Copy files between host and guest (either side may be <vm>:<path>;
     /// parent directories are created)
@@ -228,7 +194,7 @@ pub enum Command {
     /// declares a `login {}`, unlike `exec` and `shell`: transfers move onto
     /// the agent's file vocabulary before they can carry a login (PRD
     /// §19.5). Until then a pushed file is owned by SYSTEM/root, not by the
-    /// login you would attach as.
+    /// machine's login.
     Cp {
         /// Source: a host path, or <vm>:<path> to pull from the guest
         src: String,
@@ -298,23 +264,6 @@ pub enum Command {
 /// The dev-machine verbs (PRD §19.7).
 #[derive(Subcommand)]
 pub enum DevCmd {
-    /// Up the dev machine, wait until it is attachable, and become a shell
-    /// on it — cold to editing in one command
-    ///
-    /// It prints the SSH alias and the editor settings snippet, and launches
-    /// no editor: pick the alias out of your own client's host list. The
-    /// workspace syncer belongs to the lab daemon, so leaving the shell does
-    /// not stop it.
-    Attach {
-        /// Which dev machine (default: $VMLAB_DEV_MACHINE, then the
-        /// `vmlab dev use` selection, then the lab's default `@dev` machine)
-        machine: Option<String>,
-    },
-    /// Record which dev machine is yours, in the lab's gitignored `.vmlab/`
-    ///
-    /// Per-developer by construction: `vmlab.wcl` is committed, so it cannot
-    /// say it. `vmlab destroy` forgets the selection.
-    Use { machine: String },
     /// The workspace syncer: what it is doing, and what to do about a halt
     /// (PRD §19.6)
     Sync {
@@ -330,15 +279,14 @@ pub enum DevCmd {
 /// host opens channels and the guest answers, so there is no guest→host control
 /// path at all: a `vmlab` inside the dev machine could not call back even if one
 /// were shipped. That is why these are typed in the lab directory rather than
-/// in the shell `dev attach` drops you into — and why the console shows a halt
-/// but offers no button.
+/// in a shell on the dev machine.
 #[derive(Subcommand)]
 pub enum DevSyncCmd {
     /// What the syncer last decided: halted paths, warnings, and what it
     /// skipped by name
     Status {
-        /// Which dev machine (default: $VMLAB_DEV_MACHINE, then the
-        /// `vmlab dev use` selection, then the lab's default `@dev` machine)
+        /// Which dev machine (default: $VMLAB_DEV_MACHINE, then the lab's
+        /// default `@dev` machine)
         machine: Option<String>,
     },
     /// Run a sync pass now and wait for it, rather than for the next edit
@@ -761,12 +709,7 @@ pub fn run() -> ExitCode {
             cmd,
         } => lab::cmd_exec(&vm, timeout, cmd, run_as),
         Command::Shell { vm, run_as } => lab::cmd_shell(&vm, run_as),
-        Command::Ssh { machine, cmd } => lab::cmd_ssh(&machine, cmd),
-        Command::SshConfig { print } => lab::cmd_ssh_config(print.as_deref()),
-        Command::SshProxy { machine } => lab::cmd_ssh_proxy(&machine),
         Command::Dev { cmd } => match cmd {
-            DevCmd::Attach { machine } => dev::cmd_dev_attach(machine),
-            DevCmd::Use { machine } => dev::cmd_dev_use(&machine),
             DevCmd::Sync { cmd } => match cmd {
                 DevSyncCmd::Status { machine } => dev::cmd_dev_sync_status(machine),
                 DevSyncCmd::Flush { machine } => dev::cmd_dev_sync_flush(machine),

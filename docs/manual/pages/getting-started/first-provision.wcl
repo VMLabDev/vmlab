@@ -188,7 +188,7 @@ SRC
 
   callout "Provisions run as the agent identity" {
     kind = :note
-    body = "With no `login {}` on the machine, `exec` and `copy_to` run as root or SYSTEM. To write into a user's home as that user, declare a login and take a second handle with `as_login`. [Attach an editor to a dev machine](gs_dev_attach) uses it, and [Logins and the SSH facade](guide_logins) explains the rules."
+    body = "With no `login {}` on the machine, `exec` and `copy_to` run as root or SYSTEM. To write into a user's home as that user, declare a login and take a second handle with `as_login`. The `dev-container` example uses it (see [Example labs](apx_examples)), and [Logins](guide_logins) explains the rules."
   }
 
   h2 "Next steps"

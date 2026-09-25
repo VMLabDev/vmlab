@@ -65,7 +65,8 @@ page guide_architecture {
     lab name cannot run at once on one host. When you `up` the second, the
     supervisor answers with a `conflict` error that names the other root and
     the two remedies: stop that lab, or rename this one. This rule is what
-    makes the [SSH aliases](guide_logins) `vmlab-<lab>-<machine>` unambiguous.
+    makes a qualified machine reference such as `<lab>/<machine>`
+    unambiguous.
   DOC
 
   h2 "The wire protocol"
@@ -99,10 +100,10 @@ page guide_architecture {
     rows:
       | "Path" | "What is there" |
       | "`<lab>/vmlab.wcl`" | "The lab definition. The CLI finds it by walking up from the current directory, the way git finds a repository." |
-      | "`<lab>/.vmlab/`" | "Lab-local working data: linked-clone disks, snapshot data, built ISO and floppy images, TPM state, persisted lab state, the workspace sync ledger and the `dev use` selection. Safe to delete when the lab is down. Gitignore it." |
+      | "`<lab>/.vmlab/`" | "Lab-local working data: linked-clone disks, snapshot data, built ISO and floppy images, TPM state, persisted lab state and the workspace sync ledger. Safe to delete when the lab is down. Gitignore it." |
       | "`~/.local/share/vmlab/templates/`" | "The template store, laid out as `<arch>/<name>/<version>/`." |
       | "`~/.local/share/vmlab/oci/`" | "The digest-addressed cache of pulled container images." |
-      | "`~/.local/state/vmlab/`" | "Daemon state, per-lab and per-machine logs as JSON lines, event history, SSH host keys." |
+      | "`~/.local/state/vmlab/`" | "Daemon state, per-lab and per-machine logs as JSON lines, event history." |
       | "`~/.config/vmlab/`" | "The [host configuration](guide_host) file and user profile overrides." |
       | "`$XDG_RUNTIME_DIR/vmlab/`" | "`vmlabd.sock`, and `labs/<lab>/` holding each lab daemon's `control.sock` and its per-machine QMP, agent, NIC and VNC sockets." |
   }
@@ -167,7 +168,7 @@ page guide_architecture {
 
   callout "The host opens channels; the guest answers" {
     kind = :note
-    body = "Every channel to a guest is opened from the host side and answered by the agent. Nothing in a guest can open a connection back to vmlab. This one rule is why the SSH facade refuses `ssh -R`, why a halted workspace can only be resolved from the host, and why a guest with no network is still fully driveable."
+    body = "Every channel to a guest is opened from the host side and answered by the agent. Nothing in a guest can open a connection back to vmlab. This one rule is why a halted workspace can only be resolved from the host, and why a guest with no network is still fully driveable."
   }
 
   h2 "What happens on `vmlab up`"

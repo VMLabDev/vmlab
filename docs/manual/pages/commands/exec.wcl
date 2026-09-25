@@ -39,7 +39,7 @@ page cmd_exec {
 
   p <<DOC
     Which account the command runs as follows the ladder in
-    [Logins and the SSH facade](guide_logins). On a machine that declares a
+    [Logins](guide_logins). On a machine that declares a
     `login {}`, the command runs as that login rather than as the agent, so
     writing into a system directory starts failing where it used to work.
     `--user SYSTEM` or `--user root` is the old behaviour, spelled out.

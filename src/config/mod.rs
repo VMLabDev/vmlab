@@ -436,8 +436,9 @@ lab "l" {
         assert!(default_login(&vms[2].logins).is_none());
     }
 
-    /// The label is the SSH username selector (§19.2), so it is required —
-    /// an unlabelled `login {}` is not a nameless identity, it is a mistake.
+    /// The label is what `--user` and `as_login` select a login by (§19.2),
+    /// so it is required — an unlabelled `login {}` is not a nameless
+    /// identity, it is a mistake.
     #[test]
     fn a_login_needs_a_label_and_a_user() {
         let src = r#"import <vmlab.wcl>
@@ -726,47 +727,29 @@ template "base" {
         assert!(checked >= 6, "expected example labs, found {checked}");
     }
 
-    /// The §19.8 worked examples carry the declarations they exist to
-    /// demonstrate: a `@dev` machine with a workspace and a `login {}`, on
-    /// **both** machine kinds — one contract, every machine kind, shown
-    /// rather than asserted.
+    /// The §19.8 worked example carries the declarations it exists to
+    /// demonstrate: a `@dev` machine with a workspace and a `login {}` its
+    /// provisioning writes into.
     #[test]
-    fn the_worked_examples_declare_a_dev_machine_of_each_kind() {
-        let load = |name: &str| {
-            let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples"))
-                .join(name);
-            let src = std::fs::read_to_string(dir.join(crate::paths::LAB_FILE)).unwrap();
-            load_lab_source(&src, "vmlab.wcl", &dir).unwrap().lab
-        };
+    fn the_worked_example_declares_a_dev_machine() {
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples"))
+            .join("dev-container");
+        let src = std::fs::read_to_string(dir.join(crate::paths::LAB_FILE)).unwrap();
+        let lab = load_lab_source(&src, "vmlab.wcl", &dir).unwrap().lab;
 
-        for (example, machine, is_vm) in [
-            ("dev-vscode-windows", "dev01", true),
-            ("dev-neovim-container", "dev01", false),
-        ] {
-            let lab = load(example);
-            let m = lab.machine(machine).unwrap_or_else(|| {
-                panic!("{example} declares no machine `{machine}`");
-            });
-            let dev = m
-                .dev()
-                .unwrap_or_else(|| panic!("{example}/{machine} carries no @dev"));
-            assert!(
-                dev.workspace.is_some(),
-                "{example}: a worked example without a workspace demonstrates half of §19"
-            );
-            // The identity the editor bits land as — without it the provision
-            // runs as the machine and §19.8's guarantee is untested.
-            assert!(
-                m.logins().iter().any(|l| l.label == "dev"),
-                "{example}/{machine} declares no `dev` login"
-            );
-            // And the two are different machine kinds, which is the whole
-            // reason there are two examples.
-            assert_eq!(
-                matches!(m, crate::config::model::MachineCfg::Vm(_)),
-                is_vm,
-                "{example}: the pair must be split by machine kind"
-            );
-        }
+        let m = lab
+            .machine("dev01")
+            .expect("dev-container declares no machine `dev01`");
+        let dev = m.dev().expect("dev-container/dev01 carries no @dev");
+        assert!(
+            dev.workspace.is_some(),
+            "a worked example without a workspace demonstrates half of §19"
+        );
+        // The identity the provisioning lands as — without it the provision
+        // runs as the machine and §19.8's guarantee is untested.
+        assert!(
+            m.logins().iter().any(|l| l.label == "dev"),
+            "dev-container/dev01 declares no `dev` login"
+        );
     }
 }

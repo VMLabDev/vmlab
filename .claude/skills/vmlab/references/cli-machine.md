@@ -1,8 +1,8 @@
 # vmlab CLI: machine-level verbs
 
-Per-machine commands: `vm`, `machine`, `container`, `exec`, `shell`, `console`, `cp`, `clipboard`, `snapshot`, `dev`, `ssh`, `ssh-config`. Lab-level verbs (`up`, `down`, `destroy`, `status`, `validate`, `lab`) are in cli-lab.md.
+Per-machine commands: `vm`, `machine`, `container`, `exec`, `shell`, `console`, `cp`, `clipboard`, `snapshot`, `dev`. Lab-level verbs (`up`, `down`, `destroy`, `status`, `validate`, `lab`) are in cli-lab.md.
 
-Machine references take the form `[lab/]name`. A bare name resolves against the lab in the current directory and starts the lab daemon if none is running. The qualified form addresses a lab already running, from any directory, and never starts one; it fails with `lab "<name>" is not running` otherwise. A malformed reference such as `lab/` is refused before anything is contacted. Exceptions are noted per verb (`console`, `ssh`, `dev sync` never start a daemon).
+Machine references take the form `[lab/]name`. A bare name resolves against the lab in the current directory and starts the lab daemon if none is running. The qualified form addresses a lab already running, from any directory, and never starts one; it fails with `lab "<name>" is not running` otherwise. A malformed reference such as `lab/` is refused before anything is contacted. Exceptions are noted per verb (`console` and `dev sync` never start a daemon).
 
 ## vmlab vm
 
@@ -95,7 +95,7 @@ vmlab vm destroy <VM>
 | `<VM>` | The VM, as `[lab/]name`. |
 | `-h`, `--help` | Print help. |
 
-The per-machine form of `vmlab destroy`. The VM's SSH multiplexer is told to exit while its alias still resolves, the workspace syncer for it is stopped, the VM is force-stopped and its clone, runtime directory, snapshots, workspace sync ledger and any agent-repair divergence are deleted. The VM stays declared in the lab file, so a later `vmlab up <vm>` re-creates it from the template and runs its first-boot script again. The rest of the lab keeps running. Prints `vm "<name>" destroyed`.
+The per-machine form of `vmlab destroy`. The workspace syncer for it is stopped, the VM is force-stopped and its clone, runtime directory, snapshots, workspace sync ledger and any agent-repair divergence are deleted. The VM stays declared in the lab file, so a later `vmlab up <vm>` re-creates it from the template and runs its first-boot script again. The rest of the lab keeps running. Prints `vm "<name>" destroyed`.
 
 Warning — snapshots go with the clone: a VM's snapshots live inside its qcow2 clone. `vmlab vm destroy` deletes them along with the disk, and nothing restores them.
 
@@ -268,10 +268,9 @@ Reports what this machine can serve, probed live rather than inferred from its k
 | `console log` | `yes` when a console log is readable from the host, as `vmlab container logs` reads it. |
 | `reboot` | `yes` when the guest can reboot in place and come back. |
 | `healthcheck` | `yes` when the machine declares a healthcheck, so its status carries a verdict. |
-| `attachable` | `yes` when the agent negotiated both `tunnel` and `fileops`, the two features an attach over the SSH facade needs. |
 | `agent` | The features the agent negotiated at handshake, comma-separated, or `-` when no agent is answering. |
 
-Agent features come from a live handshake, so a machine that is up but not yet answering reports `-`, which reads differently from a feature list that lacks something. The possible features are `terminal`, `exec`, `fileops`, `tail`, `metrics`, `clipboard`, `eventlog`, `tunnel` and `watch`. `attachable` says whether this agent can serve an attach at all, never whether your attach will succeed: identity is declared separately. The failure ladder built on this flag is in logins-and-ssh.md.
+Agent features come from a live handshake, so a machine that is up but not yet answering reports `-`, which reads differently from a feature list that lacks something. The possible features are `terminal`, `exec`, `fileops`, `tail`, `metrics`, `clipboard`, `eventlog` and `watch`. The workspace syncer needs `watch` and `fileops` (dev-machines.md).
 
 ### vmlab machine stats
 
@@ -303,7 +302,7 @@ vmlab machine repair-agent [OPTIONS] <MACHINE>
 
 Pushes the agent binary this `vmlab` ships into a running machine over the machine's own agent channel, restarts the agent, and records the machine as **diverged**. The agent normally enters a machine once, when its template is built, and the template's sealed `agent_version` describes every clone of it. After a repair that is no longer true for this clone, so `vmlab status` shows `diverged=yes` under `-v` until the disks are destroyed. Nothing runs this by itself; it is a tool, not a policy. Rebuilding the template is the other remedy and the one that keeps "same template, same machine" true.
 
-The report says what landed and what the machine now is: `pushed <version> to <path> on "<machine>"`, then `agent <version> answering, attachable yes|no`, then `"<machine>" is now diverged from its template — vmlab vm destroy + vmlab up puts it back on the sealed agent`. The JSON form carries `machine`, `pushed`, `installed_at`, `agent_version`, `features` and `attachable`.
+The report says what landed and what the machine now is: `pushed <version> to <path> on "<machine>"`, then `agent <version> answering`, then `"<machine>" is now diverged from its template — vmlab vm destroy + vmlab up puts it back on the sealed agent`. The JSON form carries `machine`, `pushed`, `installed_at`, `agent_version` and `features`.
 
 The machine must be running with its agent answering, and that agent must serve `fileops`, because the binary rides the agent's own file vocabulary. An agent too old to serve it cannot be replaced this way at all; the verb refuses and names the rebuild as the only remedy.
 
@@ -311,7 +310,7 @@ Meaningless on a container: a lab container's agent lives in the initramfs guest
 
 ### Examples
 
-Check why an editor cannot attach to a dev machine:
+Check which features a machine's agent serves:
 
 ```sh
 vmlab machine capabilities dev01
@@ -323,7 +322,6 @@ display      yes
 console log  yes
 reboot       yes
 healthcheck  no
-attachable   no
 agent        terminal, exec, tail, metrics, clipboard
 ```
 
@@ -333,7 +331,7 @@ Watch memory on a build box:
 watch -n 2 vmlab machine stats buildbox
 ```
 
-Bring a stale agent up to date without rebuilding the template:
+Push the current agent into a running machine while iterating on it, without rebuilding the template:
 
 ```sh
 vmlab machine repair-agent dev01
@@ -433,7 +431,7 @@ vmlab container exec [OPTIONS] <CONTAINER> [-- <CMD>...]
 
 Runs one command inside the container through the guest agent, the container spelling of `vmlab exec`. The command's stdout and stderr are mirrored to this process's stdout and stderr once it finishes, and its exit code becomes this verb's exit code. Without a command the verb refuses with `nothing to execute — usage: vmlab container exec <container> -- <cmd> [args...]`.
 
-Who the command runs as follows the login ladder in logins-and-ssh.md: `--user` first, then the container's default `login {}`, then the agent identity, `root`. A container has no PAM, so a declared login is entered by `setuid`, the container identity floor. A login that cannot be resolved fails naming both the account and the machine.
+Who the command runs as follows the login ladder in logins.md: `--user` first, then the container's default `login {}`, then the agent identity, `root`. A container has no PAM, so a declared login is entered by `setuid`, the container identity floor. A login that cannot be resolved fails naming both the account and the machine.
 
 ### vmlab container logs
 
@@ -476,7 +474,7 @@ vmlab container shell [OPTIONS] <CONTAINER>
 | `--password <PASSWORD>` | Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`. |
 | `-h`, `--help` | Print help. |
 
-Opens an interactive terminal inside the container over the agent's virtio-serial channel, so it works with no guest network. Every attach opens a fresh session at your terminal's current size, and resizes follow the local window. The local terminal goes raw; `Ctrl-]` detaches, as in `telnet`. The banner `connected to "<name>" — escape character is ^]` is printed on connect. Identity is resolved the same way as for `exec`. The same shell is reachable through `ssh` once the lab's managed block is in place.
+Opens an interactive terminal inside the container over the agent's virtio-serial channel, so it works with no guest network. Every attach opens a fresh session at your terminal's current size, and resizes follow the local window. The local terminal goes raw; `Ctrl-]` detaches, as in `telnet`. The banner `connected to "<name>" — escape character is ^]` is printed on connect. Identity is resolved the same way as for `exec`.
 
 ### Examples
 
@@ -492,10 +490,10 @@ Watch the entrypoint start up:
 vmlab container logs -f -n 20 web
 ```
 
-Open a shell as the dev login on the neovim example's container:
+Open a shell as the dev login on the dev-container example's container:
 
 ```sh
-vmlab container shell dev-neovim-container/dev01 --user dev
+vmlab container shell dev-container/dev01 --user dev
 ```
 
 ### Exit status
@@ -521,7 +519,7 @@ vmlab exec [OPTIONS] <VM> [-- <CMD>...]
 
 The first word after `--` is the program and the rest are its arguments; nothing is passed through a shell, so quote and glob on the host side or invoke a shell explicitly. The command is refused locally when nothing follows `--`. Standard output goes to the terminal's standard output and standard error to its standard error, so the two can be redirected separately.
 
-Which account the command runs as follows the login ladder in logins-and-ssh.md. On a machine that declares a `login {}`, the command runs as that login rather than as the agent, so writing into a system directory starts failing where it used to work. `--user SYSTEM` or `--user root` is the old behaviour, spelled out. `--user` also accepts an account the lab file never declared when `--password` is given. A logon that cannot be minted fails naming the account and the machine.
+Which account the command runs as follows the login ladder in logins.md. On a machine that declares a `login {}`, the command runs as that login rather than as the agent, so writing into a system directory starts failing where it used to work. `--user SYSTEM` or `--user root` is the old behaviour, spelled out. `--user` also accepts an account the lab file never declared when `--password` is given. A logon that cannot be minted fails naming the account and the machine.
 
 When the command has not exited by `--timeout`, the daemon stops waiting and reports the timeout as a failure. A guest exit code other than zero becomes this command's exit status, so a script can test the guest command's result directly.
 
@@ -535,7 +533,7 @@ Exit status is 0 when the guest command exits 0, and the guest's own exit code o
 
 ## vmlab shell
 
-Attaches an interactive shell inside a machine over the vmlab agent's virtio-serial channel. No guest network is involved and no guest sshd exists. Every attach opens a fresh terminal session, so several shells on one machine are independent. `vmlab container shell` is the same verb under the container noun.
+Attaches an interactive shell inside a machine over the vmlab agent's virtio-serial channel. No guest network is involved. Every attach opens a fresh terminal session, so several shells on one machine are independent. `vmlab container shell` is the same verb under the container noun.
 
 ```sh
 vmlab shell [OPTIONS] <VM>
@@ -550,9 +548,7 @@ vmlab shell [OPTIONS] <VM>
 
 The command reads the terminal's size, asks the lab daemon to open an agent terminal at that size under the chosen login, and connects the terminal to the unix socket the daemon exposes for the session. It prints `connected to "<machine>" — escape character is ^]` and then hands the terminal over: keystrokes go to the guest, and a resize on the host is forwarded to the session. The shell is a PTY on Linux and a ConPTY on Windows.
 
-Ctrl-] detaches and leaves the guest shell to end on its own. Exiting the guest shell ends the session and returns to the prompt. The identity is the machine's default `login {}` when it declares one and the agent's own identity otherwise (logins-and-ssh.md); `--user` and `--password` behave as they do for `vmlab exec`.
-
-For a dev machine, `vmlab ssh` and `vmlab dev attach` give the same shell over the SSH facade, which is what an editor uses. This verb needs no SSH client and no managed config block.
+Ctrl-] detaches and leaves the guest shell to end on its own. Exiting the guest shell ends the session and returns to the prompt. The identity is the machine's default `login {}` when it declares one and the agent's own identity otherwise (logins.md); `--user` and `--password` behave as they do for `vmlab exec`.
 
 ```sh
 vmlab shell nix01
@@ -608,7 +604,7 @@ A push sends one file, or walks a directory and sends every file under it to the
 
 A pull copies one guest file to the host path. When the host destination is an existing directory the guest file's name is kept under it. It prints `pulled <bytes> bytes to <path>`.
 
-Note — transfers run as the agent identity: `cp` still runs as SYSTEM or root even on a machine that declares a `login {}`, unlike `exec` and `shell`. A pushed file is owned by the agent identity, not by the login you would attach as. To write into a login's home as that login, use `scp` over the SSH alias, or the `as_login` handle in a provision script (logins-and-ssh.md).
+Note — transfers run as the agent identity: `cp` still runs as SYSTEM or root even on a machine that declares a `login {}`, unlike `exec` and `shell`. A pushed file is owned by the agent identity, not by the login `exec` and `shell` run as. To write into a login's home as that login, use the `as_login` handle in a provision script (logins.md).
 
 ```sh
 vmlab cp ./tools/ dc01:C:/tools
@@ -801,7 +797,7 @@ vmlab snapshot restore --vm dev01 --discard-guest-changes before-refactor
 
 ## vmlab dev
 
-Holds the verbs that mean nothing for a machine that is not `@dev`: attaching to a dev machine from cold, recording which dev machine is yours, and reading or resolving the workspace syncer (dev-machines.md). The SSH facade is a general capability, so `vmlab ssh` and `vmlab ssh-config` stay top level.
+Holds the verbs that mean nothing for a machine that is not `@dev`: reading and resolving the workspace syncer (dev-machines.md).
 
 ```sh
 vmlab dev <COMMAND>
@@ -809,60 +805,12 @@ vmlab dev <COMMAND>
 
 | Subcommand | Meaning |
 | --- | --- |
-| `attach` | Up the dev machine, wait until it is attachable, and become a shell on it. |
-| `use` | Record which dev machine is yours, in the lab's gitignored `.vmlab/`. |
 | `sync` | The workspace syncer: what it is doing, and what to do about a halt. |
 | `-h`, `--help` | Print help. |
 
-Every verb here that takes an optional machine resolves it through one ladder: the argument, then `VMLAB_DEV_MACHINE`, then the `dev use` selection, then the lab's default `@dev` machine. A rung that names a machine which is not a dev machine in this lab is an error that says which rung and lists the candidates. When no rung names one and no machine is the default, the error lists the dev machines and the three ways to pick one. A lab with no `@dev` machine at all says so.
+Every verb here that takes an optional machine resolves it through one ladder: the argument, then `VMLAB_DEV_MACHINE`, then the lab's default `@dev` machine. A rung that names a machine which is not a dev machine in this lab is an error that says which rung and lists the candidates. When no rung names one and no machine is the default, the error lists the dev machines and the ways to pick one. A lab with no `@dev` machine at all says so.
 
-Exit status is 0 on success. The selection ladder, the lab file, and the managed SSH block are checked locally and fail with 1. Requests the verbs send carry the wire protocol's error codes: `not_found` (4) when the daemon does not know the machine, and `failed` (1) for everything the syncer refuses, since the workspace verbs answer every refusal as `failed` with the reason in the message.
-
-### vmlab dev attach
-
-```sh
-vmlab dev attach [MACHINE]
-```
-
-| Option | Meaning |
-| --- | --- |
-| `[MACHINE]` | Which dev machine. Default: `VMLAB_DEV_MACHINE`, then the `vmlab dev use` selection, then the lab's default `@dev` machine. |
-| `-h`, `--help` | Print help. |
-
-`attach` is cold to editing in one command. It validates the lab file, resolves the machine, refreshes the managed SSH block and checks this machine's alias with `ssh -G`, all before anything boots, so an attach that could not work fails before a machine is started. It prints which machine it is attaching to and which rung chose it, so a surprise can be interrupted before the wrong guest boots.
-
-It then ups this machine alone, not the lab, streaming `up`'s output, and waits until the machine is `attachable` as `vmlab machine capabilities` reports it. The wait is visible: each distinct stage is printed once, such as waiting for the machine to run, to become ready, or for its agent to answer. A running, ready machine whose agent answers without the `tunnel` and `fileops` features is refused with both remedies, rebuilding the template or `vmlab machine repair-agent`. The wait gives up after 300 seconds past `up` and says what it was still waiting for.
-
-On `attachable` it prints the SSH alias and every labelled alias beside it, a reminder that vmlab launches no editor, a note that agent forwarding refuses silently, a note that the workspace syncer belongs to the lab daemon and survives the shell when the machine declares a workspace, and the same editor snippet and offline notes as `ssh-config --print`. Then the process becomes `ssh <alias>`. Nothing of vmlab survives to own anything the editor still needs.
-
-```sh
-cd examples/dev-vscode-windows
-vmlab dev attach
-vmlab dev attach dev01
-```
-
-Exit status is `ssh`'s once the shell has started. Before that, the ladder, validation, and the block check exit 1; the `up` and the capability probe carry `failed` (1) and `not_found` (4); a refused or timed-out wait exits 1.
-
-### vmlab dev use
-
-```sh
-vmlab dev use <MACHINE>
-```
-
-| Option | Meaning |
-| --- | --- |
-| `<MACHINE>` | The dev machine to record. |
-| `-h`, `--help` | Print help. |
-
-`use` records which dev machine is yours in the lab's own gitignored `.vmlab/` directory, in the file `dev-machine`. The lab file is committed and shared, so it cannot say this; the selection is per-developer by construction. The verb validates the lab first, because a selection against a lab that does not validate is a promise vmlab cannot keep, then checks the name through the same ladder `attach` uses, so what `use` accepts and what `attach <machine>` accepts are one answer. It needs no daemon and starts nothing.
-
-It prints the lab, the machine, and the file the selection went in, and reminds you that `vmlab destroy` forgets it with everything else in `.vmlab/`, and that running `use` again changes it.
-
-```sh
-vmlab dev use buildbox
-```
-
-Exit status is 0 on success and 1 for a lab that does not validate or a name that is not a dev machine.
+Exit status is 0 on success. The selection ladder and the lab file are checked locally and fail with 1. Requests the verbs send carry the wire protocol's error codes: `not_found` (4) when the daemon does not know the machine, and `failed` (1) for everything the syncer refuses, since the workspace verbs answer every refusal as `failed` with the reason in the message.
 
 ### vmlab dev sync
 
@@ -878,9 +826,9 @@ vmlab dev sync <COMMAND>
 | `resolve` | Pick which side wins at a halted path, and carry it out. |
 | `-h`, `--help` | Print help. |
 
-Resolution is host-side, necessarily. The host opens channels and the guest answers, so there is no guest-to-host control path: a `vmlab` inside the dev machine could not call back. These verbs are typed in the lab directory, not in the shell `attach` drops you into. The guest's only signal of a halt is the marker file `.vmlab-sync-halt` at its workspace root, which lists the halted paths.
+Resolution is host-side, necessarily. The host opens channels and the guest answers, so there is no guest-to-host control path: a `vmlab` inside the dev machine could not call back. These verbs are typed in the lab directory on the host, not in a shell inside the guest. The guest's only signal of a halt is the marker file `.vmlab-sync-halt` at its workspace root, which lists the halted paths.
 
-All four verbs talk to a lab daemon that is already running and never start one: a syncer exists only while its machine is up, so starting a daemon would boot a lab in order to answer no. A lab that is not running is refused with a pointer to `vmlab up` and `vmlab dev attach`. A machine that is up but declares no `@dev(workspace = …)`, or is not up, is refused with `has no workspace syncer running`.
+All four verbs talk to a lab daemon that is already running and never start one: a syncer exists only while its machine is up, so starting a daemon would boot a lab in order to answer no. A lab that is not running is refused with a pointer to `vmlab up`. A machine that is up but declares no `@dev(workspace = …)`, or is not up, is refused with `has no workspace syncer running`.
 
 ### vmlab dev sync status
 
@@ -890,10 +838,10 @@ vmlab dev sync status [MACHINE]
 
 | Option | Meaning |
 | --- | --- |
-| `[MACHINE]` | Which dev machine. Default: `VMLAB_DEV_MACHINE`, then the `vmlab dev use` selection, then the lab's default `@dev` machine. |
+| `[MACHINE]` | Which dev machine. Default: `VMLAB_DEV_MACHINE`, then the lab's default `@dev` machine. |
 | `-h`, `--help` | Print help. |
 
-`status` reads the syncer's report off the lab status projection, the same value the console shows, and prints it in the order it matters. First the halt, whole, when there is one: the headline names the machine and how many paths conflict, or the bulk-delete guard that tripped, then each halted path with its reason, a count of any not listed, and the routes out. Without a halt the first line says the workspace is in step with its pass count, or is a number of paths behind the canonical copy, or has not completed a pass yet.
+`status` reads the syncer's report off the lab status projection, the same value `vmlab status` reads, and prints it in the order it matters. First the halt, whole, when there is one: the headline names the machine and how many paths conflict, or the bulk-delete guard that tripped, then each halted path with its reason, a count of any not listed, and the routes out. Without a halt the first line says the workspace is in step with its pass count, or is a number of paths behind the canonical copy, or has not completed a pass yet.
 
 Then everything the syncer declined to do or is waiting on, each by name: a `waiting` line while both directions wait on a stat-walk, a `re-seeding` line while the bracket after a snapshot restore runs, a `volume` warning naming a subtree that carried an unusual amount of work, a `trouble` line when the last pass could not finish, the count of watch discontinuities answered with a full walk, `.git` paths deferred while a lock is held, paths not yet carried across that a snapshot capture would refuse on, and paths not synced by name with their reasons, such as a socket or a file over the size guard.
 
@@ -942,7 +890,7 @@ vmlab dev sync diff [OPTIONS] [PATHS]...
 | `--machine <MACHINE>` | Which dev machine, through the same ladder as `status`. |
 | `-h`, `--help` | Print help. |
 
-`diff` brings the guest's copy of each path to the host and shows it beside the host's. The host copy is a directory on this workstation; only the guest's is behind the seam, which is why the verb exists rather than attaching and looking. With no path and no halt it is refused, because there is nothing to name.
+`diff` brings the guest's copy of each path to the host and shows it beside the host's. The host copy is a directory on this workstation; only the guest's is behind the seam, which is why the verb exists rather than opening a shell and looking. With no path and no halt it is refused, because there is nothing to name.
 
 The output opens with the host root and the guest root, then one section per path. Two identical copies say so, and that the next pass adopts them with no verb. A path one side lacks says which. Two readable text copies print as a unified diff, `-` for host lines and `+` for guest lines, up to 2000 lines a side; past that, or for a binary or a file the guest would not send whole, each side prints its size and digest prefix and why it was not shown.
 
@@ -978,60 +926,3 @@ vmlab dev sync resolve --all --host
 ```
 
 Exit status is 0 on success, 1 when no side or no path is given, and `failed` (1) when the workspace is not halted or the pass does not complete.
-
-## vmlab ssh
-
-Attaches to a machine over the SSH facade the lab daemon terminates on the host (logins-and-ssh.md). It refreshes the managed block in `~/.ssh/config`, checks the machine is running, and then replaces itself with the system `ssh` against the machine's alias. It is not a second SSH client: the `ssh` in play is the one your editor uses, with your own `Host *` settings, so a failure here reproduces as `ssh <alias>`.
-
-```sh
-vmlab ssh <MACHINE> [-- <CMD>...]
-```
-
-| Option | Meaning |
-| --- | --- |
-| `<MACHINE>` | `[lab/]machine`: a bare name inside a lab directory, or the qualified form from anywhere. |
-| `[CMD]...` | Command and arguments to run instead of a shell, after `--`. |
-| `-h`, `--help` | Print help. |
-
-A bare name is looked up in the lab of the current directory. The qualified `lab/machine` form is resolved through the supervisor's lab registry, so it works from any directory but only for a lab whose daemon is running. The lab file must declare the machine.
-
-The refresh of the managed block fails hard here, where every other verb only warns, because the alias is the command. After writing, the command runs `ssh -G` on this machine's alias and refuses when something earlier in the config, an `Include`, or a system file resolves a different `ProxyCommand`; the refusal names the file and line that won. The alias is `vmlab-<lab>-<machine>`, with `-<label>` appended for each declared login.
-
-The command refuses on a stopped machine and never starts one, like `console` and `exec`. A lab with no running daemon, or a machine whose state is anything but running, is refused with a message that says to run `vmlab up <machine>` first. A daemon that predates an edit adding the machine is refused with a pointer to `vmlab lab restart`.
-
-After the checks the process becomes `ssh <alias> [CMD...]`. From then on signals, the terminal, the `~.` escape, and the exit code are the client's. The `ProxyCommand` the alias carries is the hidden `vmlab ssh-proxy`, which pipes the connection onto the facade and does no lifecycle of its own. Agent forwarding is not served and fails silently in the guest; `ssh -R` is refused by the facade.
-
-```sh
-vmlab ssh dev01
-vmlab ssh dev-vscode-windows/dev01 -- hostname
-scp ./notes.md vmlab-dev-vscode-windows-dev01:notes.md
-```
-
-Exit status is the exit status of `ssh` once it has been started. Before that, every refusal exits 1: a lab or machine that is not declared, a managed block that could not be written or that `ssh -G` resolves elsewhere, a lab that is not running, and a machine that is not running.
-
-## vmlab ssh-config
-
-Refreshes the managed block vmlab keeps in `~/.ssh/config` for the lab of the current directory, and with `--print` emits one machine's stanzas together with the editor settings snippet. The block is vmlab's whole host-side SSH footprint: one `Host` stanza per declared machine and per declared login, each with a `ProxyCommand` onto the SSH facade (logins-and-ssh.md).
-
-```sh
-vmlab ssh-config [OPTIONS]
-```
-
-| Option | Meaning |
-| --- | --- |
-| `--print <MACHINE>` | Print one machine's stanza and the editor settings snippet, for a client that will not read the file. |
-| `-h`, `--help` | Print help. |
-
-Any command that loads a lab refreshes the block on the way past and only warns when that fails. This verb exists for the two moments the ambient refresh cannot serve: when you want to know the block is current, and when your client will not read `~/.ssh/config` at all. Its own failure is an error, because the write is what was asked for.
-
-The block is generated from the lab file, not from running machines, so every declared machine has an alias whether or not it is up. Aliases are `vmlab-<lab>-<machine>` for the machine's default identity and `vmlab-<lab>-<machine>-<label>` for each `login {}` label, so attaching as another account is a pick in an editor's host list. A login whose label is not one `ssh_config` word gets no alias, and the command says so on standard error with the `ssh -l` form to use instead. The write takes a lock, renames a temporary file onto the resolved path, and checks the first alias with `ssh -G`. Where the block lives is a field in the host configuration (host-profiles.md).
-
-Without `--print` the command prints the config path, whether the block was updated or was already current, and how many aliases the lab contributes. With `--print` it prints the machine's stanzas as they appear in the block, then the VS Code `settings.json` snippet, which sets `remote.SSH.localServerDownload` to `always` and, for a Windows guest, `remote.SSH.remotePlatform` per alias, and then two notes: personal config copies over the alias with `scp`, and a host-side service is reached by giving the machine a NIC on a segment with egress rather than by `ssh -R`, which the facade refuses. `vmlab dev attach` prints the same handover.
-
-```sh
-$ vmlab ssh-config
-/home/wil/.ssh/config — block already current (4 aliases for lab "dev-vscode-windows")
-$ vmlab ssh-config --print dev01
-```
-
-Exit status is 0 on success. The command sends no daemon request, so every failure exits 1: no lab in the current directory, a lab file that does not load, a block that cannot be written, an `ssh -G` check that resolves another `ProxyCommand`, or a `--print` machine the lab does not declare.

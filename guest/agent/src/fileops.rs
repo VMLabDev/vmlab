@@ -5,8 +5,8 @@
 //! a slow request — a digest over a gigabyte, a read off a cold disk — never
 //! stands in front of the ones behind it. Replies carry the request's own id
 //! and go out in whatever order they finish, which is what the pipelining is
-//! for: against the round trip the SSH facade pays, serialising would cost it
-//! two orders of magnitude of throughput.
+//! for: against a round trip per request, serialising would cost two orders
+//! of magnitude of throughput.
 //!
 //! **Handles are scoped to the channel and die with it.** They live in this
 //! session's table; a host `close` (or a dropped connection) drops the table
@@ -715,8 +715,8 @@ fn symlink(target: &str, link: &str, kind: LinkKind) -> std::io::Result<()> {
 
 /// Canonicalise where the path exists, and fall back to what the client can
 /// still use where it does not — a client asks `realpath` about files it is
-/// about to create, and an error there would break the very first thing an
-/// SFTP session does.
+/// about to create, and an error there would break the transfer before it
+/// began.
 fn realpath(path: &str) -> String {
     if let Ok(real) = std::fs::canonicalize(path) {
         let real = real.to_string_lossy().into_owned();

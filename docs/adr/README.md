@@ -19,7 +19,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0009](0009-build-hardware-resolves-block-over-source-template.md) | Build hardware resolves block over source template, and the profile stays live | Accepted |
 | [0010](0010-the-supervisor-owns-the-template-store.md) | The supervisor owns the template store, and every surface asks it | Accepted |
 | [0011](0011-a-lab-name-is-its-host-global-runtime-identity.md) | A lab name is its host-global runtime identity | Accepted |
-| [0012](0012-vmlab-terminates-ssh-on-the-host.md) | vmlab terminates SSH on the host | Accepted |
+| [0012](0012-vmlab-terminates-ssh-on-the-host.md) | vmlab terminates SSH on the host | Superseded |
 | [0013](0013-the-host-opens-channels-the-guest-answers.md) | The host opens channels, the guest answers | Accepted |
 | [0014](0014-the-workspace-is-a-guest-local-copy-of-a-canonical-host-tree.md) | The workspace is a guest-local copy of a canonical host tree | Accepted |
 | [0015](0015-one-guest-side-spawner-seam-carries-identity.md) | One guest-side Spawner seam, and identity is its parameter | Accepted |

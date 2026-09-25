@@ -16,8 +16,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use vmlab_agent_proto::{
-    AgentMsg, ErrorCause, Frame, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD, NetInterface,
-    OsInfo, PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame,
+    AgentMsg, Frame, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD, NetInterface, OsInfo,
+    PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame,
 };
 
 use crate::spawn::{ProcessSpec, Spawner, TerminalSpec};
@@ -153,17 +153,6 @@ impl Mux {
         self.send_ctrl(&AgentMsg::Error {
             id,
             msg: msg.into(),
-            cause: None,
-        });
-    }
-
-    /// Fail a channel with a reason the host branches on, not just reports —
-    /// today only a tunnel's connect failure (see [`ErrorCause`]).
-    pub fn send_error_cause(&self, id: Option<u32>, msg: impl Into<String>, cause: ErrorCause) {
-        self.send_ctrl(&AgentMsg::Error {
-            id,
-            msg: msg.into(),
-            cause: Some(cause),
         });
     }
 
@@ -360,10 +349,6 @@ impl Mux {
                 ProcessSpec { argv, env, cwd },
             ),
             HostMsg::Eof { id } => self.route_input(id, Input::Eof),
-            // No spawner and no platform hook: a tunnel creates a socket,
-            // not a process or a file, and the dial is portable — a
-            // container micro-VM shares the guest's network stack anyway.
-            HostMsg::OpenTunnel { id, host, port } => crate::tunnel::open(self, id, host, port),
             // A file session takes the resolver rather than one resolved
             // path: every request in it names its own (§19.5).
             HostMsg::OpenFileOps { id, logon } => crate::fileops::open(

@@ -190,8 +190,8 @@ SRC
   p <<DOC
     With no `login {}` block on the machine, `exec` and `shell` run as the
     agent's own identity, which is root in a container.
-    [Logins and the SSH facade](guide_logins) explains how to declare the
-    account a surface attaches as.
+    [Logins](guide_logins) explains how to declare the
+    account a person's commands run as.
   DOC
 
   h2 "Take it down"

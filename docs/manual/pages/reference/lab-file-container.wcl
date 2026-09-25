@@ -66,7 +66,7 @@ SRC
       | "`volume {}`" | "children" | "none" | "Host binds and named volumes mounted into the container." |
       | "`port {}`" | "children" | "none" | "Host-to-container port forwards; sugar for a segment `forward` to this container." |
       | "`healthcheck {}`" | "child" | "none" | "Health probe gating readiness. Without one the container is ready once its process starts." |
-      | "`login {}`" | "children" | "none" | "Identities a surface attaches to this container as. Without one it falls to the user cinit resolves." |
+      | "`login {}`" | "children" | "none" | "Identities a person's commands run as on this container. Without one it falls to the user cinit resolves." |
       | "`provision {}`" | "children" | "none" | "wscript scripts run on `vmlab up` once this container is ready, interleaved with its playbooks in declaration order." |
       | "`playbook {}`" | "children" | "none" | "config-weave playbooks applied on `vmlab up`, interleaved with its provisions in declaration order." |
   }
@@ -94,10 +94,10 @@ SRC
     anchor      = "container-web"
     dedent      = true
   }
-  p "A dev container uses `:idle` mode, since it has no service to be, and a `login` for the account an editor attaches as."
+  p "A dev container uses `:idle` mode, since it has no service to be, and a `login` for the account `vmlab shell` lands as."
   code wcl {
-    filename    = "examples/dev-neovim-container/vmlab.wcl"
-    source_file = "../../examples/dev-neovim-container/vmlab.wcl"
+    filename    = "examples/dev-container/vmlab.wcl"
+    source_file = "../../examples/dev-container/vmlab.wcl"
     anchor      = "dev01"
     dedent      = true
   }

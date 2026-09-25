@@ -67,7 +67,7 @@ at call time by naming the capability: `screenshot` on a machine with no display
 fails with "machine `api` has no display", never with "no such method" and never
 with a claim about its kind. Its methods fall into six groups: lifecycle and
 state, snapshots, input and screen (see snapshots-vision.md), the guest agent,
-and identity (see logins-and-ssh.md). `poweroff` is a clean QMP quit that flushes
+and identity (see logins.md). `poweroff` is a clean QMP quit that flushes
 block caches first, unlike `stop_force`, which kills QEMU; for a guest with no
 ACPI it is the only way to seal a consistent disk. Snapshot calls go through the
 lab runtime so the records, events and pin-guarding stay in one place; see
@@ -158,10 +158,10 @@ A **template build script** gets the same API scoped to the single build VM. See
 templates.md.
 
 Relative local paths in a script resolve against the script's own directory, not
-the lab root: a `copy_to("scripts/editor-bits.ps1", …)` from
-`scripts/editor-bits.ws` reads `scripts/scripts/editor-bits.ps1`. This is what
-lets a provision ship reference images and payload files beside itself, and it
-holds for template builds, which run from a separate working directory.
+the lab root: a `copy_to("scripts/setup.ps1", …)` from `scripts/join.ws` reads
+`scripts/scripts/setup.ps1`. This is what lets a provision ship reference images
+and payload files beside itself, and it holds for template builds, which run
+from a separate working directory.
 
 ## The interface file and the LSP
 

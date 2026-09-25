@@ -13,10 +13,6 @@ name therefore do not merely overwrite registry metadata: a command from the
 second root can reach the first root's lab daemon, and orphan reaping for one
 can kill processes belonging to the other.
 
-The `vmlab dev` SSH facade in #56 exposes the same identity requirement at a
-user-facing surface. Its host-global `vmlab-<lab>-<machine>` aliases are
-well-defined only if one lab name identifies at most one running lab per host.
-
 ## Decision
 
 **A lab's declared name is its host-global runtime identity. Its root is not
@@ -29,15 +25,14 @@ decision is made before `lab.restart` releases anything. The decision itself
 is a pure registry operation; filesystem canonicalisation happens before it.
 
 Re-keying the registry, runtime paths, sockets and process markers by root was
-rejected. A path-derived SSH alias would also make aliases unstable when a
-collision appeared.
+rejected.
 
 ## Consequences
 
 **Gained**
 
-- Name-keyed sockets, runtime paths, process markers and SSH aliases describe
-  one lab without another disambiguator.
+- Name-keyed sockets, runtime paths and process markers describe one lab
+  without another disambiguator.
 - A colliding directory cannot operate on, replace or reap the registered lab.
 - The caller receives a structured conflict naming the other root and both
   available remedies: stop that lab, or rename this one.

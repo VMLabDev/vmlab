@@ -43,10 +43,10 @@ lab, with no owning machine.
 A **template build script** gets the same API scoped to the single build VM.
 
 Relative local paths in a script resolve against the script's own directory,
-not the lab root: a `copy_to("scripts/editor-bits.ps1", …)` from
-`scripts/editor-bits.ws` reads `scripts/scripts/editor-bits.ps1`. This is what
-lets a provision ship reference images and payload files beside itself, and it
-holds for template builds, which run from a separate working directory.
+not the lab root: a `copy_to("scripts/setup.ps1", …)` from `scripts/join.ws`
+reads `scripts/scripts/setup.ps1`. This is what lets a provision ship reference
+images and payload files beside itself, and it holds for template builds, which
+run from a separate working directory.
 
 ### Re-running and idempotence
 
@@ -99,8 +99,7 @@ rejects an `on {}` that names anything else:
 | `playbook.applied`, `playbook.failed` | A play converged, or a run ended non-zero or failed to run. |
 | `host.disk_low` | The free-space watchdog crossed its threshold. |
 
-Other events reach the stream and the history but cannot be bound: the SSH
-facade's `ssh.refused` for every channel or request it refuses, the workspace
+Other events reach the stream and the history but cannot be bound: the workspace
 syncer's `workspace.halted`, `workspace.synced`, `workspace.rescan`,
 `workspace.deferred`, `workspace.skipped`, `workspace.refused`,
 `workspace.volume` and their siblings, the per-step `playbook.op.*` progress,
@@ -243,9 +242,7 @@ status and `exit_code` the container's.
 | `container.stopped` | `container`, `reason`, `exit_code` | The container exited for any reason. |
 | `container.unhealthy` | `container` | The container's healthcheck reported not healthy. |
 | `container.destroyed` | `container` | `vmlab container destroy` removed everything the container materialised. |
-| `machine.not_attachable` | `vm`, `machine`, `reason` | During `up`, a machine whose agent answered lacks a feature the SSH facade needs. See logins-and-ssh.md. |
 | `machine.agent_repaired` | `vm`, `machine`, `agent_version` | `vmlab machine repair-agent` pushed the host's agent; the machine is now diverged from its template. |
-| `ssh.refused` | `vm`, `machine`, `request`, `reason` | The SSH facade refused an authentication, channel or request. `request` is the SSH name, `reason` vmlab's words. |
 | `share.unmountable` | `vm`, `reason` | The mount plan holds a share this guest cannot mount. See shares-media.md. |
 
 ### Snapshots
@@ -467,7 +464,7 @@ streamed as build progress.
 
 Both run as the machine's agent identity, SYSTEM on Windows and root on Linux. A
 playbook has no user parameter and no rung on the identity ladder
-(logins-and-ssh.md), which is a real limit: the agent identity can write into a
+(logins.md), which is a real limit: the agent identity can write into a
 profile directory that already exists but cannot create one or set its
 ownership, so a play that writes into a user's home half-works on an existing
 profile and fails on a fresh domain user. Anything that must land as a

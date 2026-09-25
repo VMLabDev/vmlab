@@ -17,7 +17,6 @@ import "./pages/getting-started/first-lab.wcl"
 import "./pages/getting-started/first-vm.wcl"
 import "./pages/getting-started/first-template.wcl"
 import "./pages/getting-started/first-provision.wcl"
-import "./pages/getting-started/dev-attach.wcl"
 
 // Part II — The guide.
 import "./pages/guide/architecture.wcl"
@@ -70,8 +69,6 @@ import "./pages/commands/console.wcl"
 import "./pages/commands/script.wcl"
 import "./pages/commands/exec.wcl"
 import "./pages/commands/shell.wcl"
-import "./pages/commands/ssh.wcl"
-import "./pages/commands/ssh-config.wcl"
 import "./pages/commands/dev.wcl"
 import "./pages/commands/cp.wcl"
 import "./pages/commands/tail.wcl"
@@ -116,7 +113,6 @@ site manual {
       chapter "Your first VM"                        { page = gs_first_vm }
       chapter "Build a template from an ISO"         { page = gs_first_template }
       chapter "Automate a guest with a script"       { page = gs_first_provision }
-      chapter "Attach an editor to a dev machine"    { page = gs_dev_attach }
     }
 
     chapter "The guide" {
@@ -131,7 +127,7 @@ site manual {
       chapter "Guest automation with wscript"        { page = guide_scripting }
       chapter "Screens, input and vision"            { page = guide_vision }
       chapter "Playbooks"                            { page = guide_playbooks }
-      chapter "Logins and the SSH facade"            { page = guide_logins }
+      chapter "Logins"                                { page = guide_logins }
       chapter "Dev machines and the workspace syncer" { page = guide_dev }
       chapter "Guest OS profiles"                    { page = guide_profiles }
       chapter "Host configuration and WSL 2"         { page = guide_host }
@@ -170,8 +166,6 @@ site manual {
       chapter "vmlab script"     { page = cmd_script }
       chapter "vmlab exec"       { page = cmd_exec }
       chapter "vmlab shell"      { page = cmd_shell }
-      chapter "vmlab ssh"        { page = cmd_ssh }
-      chapter "vmlab ssh-config" { page = cmd_ssh_config }
       chapter "vmlab dev"        { page = cmd_dev }
       chapter "vmlab cp"         { page = cmd_cp }
       chapter "vmlab tail"       { page = cmd_tail }

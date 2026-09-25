@@ -3,9 +3,9 @@
 //!
 //! **One channel that *is* an RPC session**, not a set of control messages.
 //! Control frames are JSON and explicitly not flow-controlled, so a 40 MB
-//! editor-server push would arrive base64-inflated and sit in front of every
-//! keystroke and metrics sample; a channel per read is worse, since an SFTP
-//! client keeps ~64 requests of 32 KiB in flight. So the records live inside
+//! push would arrive base64-inflated and sit in front of every keystroke and
+//! metrics sample; a channel per read is worse, since a pipelined transfer
+//! keeps dozens of requests in flight. So the records live inside
 //! the channel's own credit window instead:
 //!
 //! ```text
@@ -25,12 +25,10 @@
 //!    with it.
 //! 2. **Pipelined**: many requests outstanding at once, replies matched by
 //!    [`Request::id`] and free to complete out of order. This is the
-//!    throughput decision — serialised against the measured 59–111 ms round
-//!    trip the SSH facade would deliver under 1 MB/s where the raw channel
-//!    does 80.
-//! 3. **SFTP-shaped by intent, in vmlab's spelling**, because the facade
-//!    *transcodes* rather than adapts. Two places where the spelling differs
-//!    deliberately: [`Op::Mkdir`] carries a case-sensitivity flag (NTFS
+//!    throughput decision — serialised, a round trip per request would cap a
+//!    transfer far below what the raw channel carries.
+//! 3. **In vmlab's spelling**, with two places where it goes beyond a plain
+//!    file protocol deliberately: [`Op::Mkdir`] carries a case-sensitivity flag (NTFS
 //!    accepts it only while the directory is empty, so it can never be a
 //!    later `setstat`), and [`Op::Symlink`] carries the link kind, because
 //!    Windows requires file-vs-directory at creation and a dangling link does
@@ -52,7 +50,7 @@ pub const MAX_META: usize = 8 * 1024 * 1024;
 
 /// Largest raw payload one record may carry, and so the largest
 /// [`Op::Read`] a client may ask for or [`Op::Write`] it may send. Sized well
-/// above the 32 KiB an SFTP client uses, and inside the initial credit window
+/// above a typical 32 KiB transfer chunk, and inside the initial credit window
 /// so a single record never deadlocks against it.
 pub const MAX_DATA: usize = 128 * 1024;
 
@@ -70,8 +68,8 @@ pub struct Request {
     pub op: Op,
 }
 
-/// What a [`Request`] asks for. The set is what `scp` and the editors issue,
-/// in vmlab's spelling.
+/// What a [`Request`] asks for: what `vmlab cp`, wscript push/pull and the
+/// workspace syncer issue, in vmlab's spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
@@ -115,8 +113,8 @@ pub enum Op {
     ReadDir { handle: u64 },
     /// Create a directory, answering [`Reply::Ok`].
     ///
-    /// `case_sensitive` is the flag plain SFTP has no concept of, and the
-    /// reason it rides the creation rather than a later
+    /// `case_sensitive` is the flag a plain file protocol has no concept of,
+    /// and the reason it rides the creation rather than a later
     /// [`Setstat`](Op::Setstat): NTFS accepts the per-directory case
     /// sensitivity flag only while the directory is still empty. Elsewhere
     /// (and on a filesystem that is already case-sensitive) it is satisfied
@@ -135,7 +133,7 @@ pub enum Op {
     /// Rename, answering [`Reply::Ok`]. Overwrites an existing `to` where the
     /// guest OS allows it.
     Rename { from: String, to: String },
-    /// Canonicalise `path`, answering [`Reply::Name`]. The one the facade
+    /// Canonicalise `path`, answering [`Reply::Name`]. The one a host
     /// could not have invented for itself: it has to work on a Windows drive
     /// letter.
     Realpath { path: String },
@@ -295,8 +293,7 @@ pub enum Reply {
     },
 }
 
-/// Why an operation failed, in the vocabulary the SSH facade transcodes into
-/// SFTP status codes. `Failure` is the catch-all; `msg` always carries the
+/// Why an operation failed. `Failure` is the catch-all; `msg` always carries the
 /// detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -600,7 +597,7 @@ mod tests {
         );
     }
 
-    /// §19.5's two spellings plain SFTP has no room for: the case-sensitivity
+    /// §19.5's two spellings a plain file protocol has no room for: the case-sensitivity
     /// flag rides the `mkdir` (NTFS takes it only while the directory is
     /// empty, so it can never be a later `setstat`) and the link kind rides
     /// the symlink (Windows picks the object at creation).
@@ -689,9 +686,9 @@ mod tests {
     }
 
     /// Every OS error a filesystem op can produce reaches the client as
-    /// something it can branch on, so the facade never has to parse `msg`.
+    /// something it can branch on, so it never has to parse `msg`.
     #[test]
-    fn os_errors_map_onto_codes_the_facade_can_transcode() {
+    fn os_errors_map_onto_codes_a_client_can_branch_on() {
         use std::io::{Error, ErrorKind};
         for (kind, want) in [
             (ErrorKind::NotFound, ErrorCode::NoSuchFile),

@@ -30,10 +30,7 @@ page cmd_up {
   p <<DOC
     The verb runs a full [validation](cmd_validate) of the lab file before it
     has any side effect. A lab that does not validate is never started, and the
-    issues are printed with the offending text underlined in the source. A lab
-    that loads also refreshes the managed block in `~/.ssh/config`
-    ([vmlab ssh-config](cmd_ssh_config)), so its machines appear in an editor's
-    host picker after the first command you run in the directory.
+    issues are printed with the offending text underlined in the source.
   DOC
 
   p <<DOC
@@ -54,7 +51,7 @@ page cmd_up {
     li "The bundled SMB server starts when the lab declares [shared folders](guide_shares), so shares are reachable during provisioning."
     li "Each wave boots in parallel. A machine carrying a first-boot script runs it before it counts as ready. If one machine in a wave fails, the rest of the wave is aborted and the verb fails; the machine that failed is left running for inspection."
     li "Between waves the daemon runs every provision script and playbook whose machine has started, in declaration order, waiting for each machine's readiness first."
-    li "Port forwards are installed, a warning is printed for any machine whose agent cannot serve an attach (see [Logins and the SSH facade](guide_logins)), and the workspace syncer starts for every dev machine that declares a workspace (see [Dev machines and the workspace syncer](guide_dev))."
+    li "Port forwards are installed, and the workspace syncer starts for every dev machine that declares a workspace (see [Dev machines and the workspace syncer](guide_dev))."
   }
 
   p <<DOC

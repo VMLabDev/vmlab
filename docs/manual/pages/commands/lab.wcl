@@ -147,8 +147,7 @@ page cmd_lab {
   }
 
   p <<DOC
-    The host-wide form of [vmlab destroy](cmd_destroy): withdraws the lab's
-    SSH aliases, asks the daemon to stop every machine and delete the clones,
+    The host-wide form of [vmlab destroy](cmd_destroy): asks the daemon to stop every machine and delete the clones,
     volumes and lab-local state, and releases the lab at the supervisor so
     its daemon is reaped. With no reachable daemon but a registry entry, it
     removes the lab's `.vmlab/` directory itself. A name the registry does

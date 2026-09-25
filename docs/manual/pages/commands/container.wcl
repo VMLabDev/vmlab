@@ -143,7 +143,7 @@ page cmd_container {
 
   p <<DOC
     Who the command runs as follows the ladder in
-    [Logins and the SSH facade](guide_logins): `--user` first, then the
+    [Logins](guide_logins): `--user` first, then the
     container's default `login {}`, then the agent identity, `root`. A
     container has no PAM, so a declared login is entered by `setuid`, the
     container identity floor. A login that cannot be resolved fails naming
@@ -207,9 +207,7 @@ page cmd_container {
     opens a fresh session at your terminal's current size, and resizes follow
     the local window. The local terminal goes raw; `Ctrl-]` detaches, as in
     `telnet`. The banner `connected to "<name>" — escape character is ^]` is
-    printed on connect. Identity is resolved the same way as for `exec`. The
-    same shell is reachable through `ssh` once the lab's managed block is in
-    place; see [vmlab ssh](cmd_ssh).
+    printed on connect. Identity is resolved the same way as for `exec`.
   DOC
 
   h2 "Examples"
@@ -220,8 +218,8 @@ page cmd_container {
   p "Watch the entrypoint start up:"
   code sh { source = "vmlab container logs -f -n 20 web" }
 
-  p "Open a shell as the dev login on the neovim example's container:"
-  code sh { source = "vmlab container shell dev-neovim-container/dev01 --user dev" }
+  p "Open a shell as the dev login on the dev-container example's container:"
+  code sh { source = "vmlab container shell dev-container/dev01 --user dev" }
 
   h2 "Exit status"
 

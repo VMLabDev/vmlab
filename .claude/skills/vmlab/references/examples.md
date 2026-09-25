@@ -1,6 +1,6 @@
 # Example labs
 
-The `examples/` directory of the vmlab source tree holds ten labs and a set of template definitions. Each is a working `vmlab.wcl` with its scripts, and each exists to show one part of the product.
+The `examples/` directory of the vmlab source tree holds nine labs and a set of template definitions. Each is a working `vmlab.wcl` with its scripts, and each exists to show one part of the product.
 
 Every example runs from its own directory. Most name a template you build first under `examples/templates`, and a few pull one from a registry on the first `vmlab up`. Guest credentials are the ones each template bakes in: `Administrator` / `vmlab123!` on Windows Server 2025, `vmlab` / `vmlab` on the Linux images.
 
@@ -58,50 +58,28 @@ vmlab down
 
 Illustrates templates.md and `vmlab pull` (cli-lab.md).
 
-## dev-neovim-container
+## dev-container
 
-Directory: `examples/dev-neovim-container`.
+Directory: `examples/dev-container`.
 
-The second of the two worked dev-machine examples. A lab container running `alpine:3.22` in idle mode is the lab's dev machine, with `./workspace` on the host landing at `/src` in the guest and syncing both ways. Neovim runs as a TUI over the SSH facade's own session channel, so there is no client/server split and no marketplace. The `login "dev"` block declares the account alone, with no password, because the agent in a container is root and root needs no credential to become an account. That is the container identity floor.
+The worked dev-machine example. A lab container running `alpine:3.22` in idle mode is the lab's dev machine, with `./workspace` on the host landing at `/src` in the guest and syncing both ways. The `login "dev"` block declares the account alone, with no password, because the agent in a container is root and root needs no credential to become an account. That is the container identity floor.
 
-Its point is the guarantee both dev examples exist to show: a provision can write into the dev login's home before that user has ever logged on. `scripts/editor-bits.ws` does it with `dev01.as_login("dev")`, a second handle onto the same machine whose every call lands as `dev`. Without that line the same files land root-owned and Neovim's first run fails. The README records the durability rule: what the provision places survives `down`/`up` and a restore, dies on `vmlab container destroy dev01`, and comes back on the next `up` because it is a declaration.
+Its point is that a provision can write into the dev login's home before that user has ever logged on. `scripts/home-bits.ws` places `~/.profile` with `dev01.as_login("dev")`, a second handle onto the same machine whose every call lands as `dev`. Without that line the file lands root-owned. The README records the durability rule: what the provision places survives `down`/`up` and a restore, dies on `vmlab container destroy dev01`, and comes back on the next `up` because it is a declaration.
 
-Needs nothing built. The image is pulled on the first `up`, the segment has egress for the package install and the plugin clone, and the host needs the container guest asset (see containers.md).
+Needs nothing built. The image is pulled on the first `up`, the segment has egress for the package install, and the host needs the container guest asset (see containers.md).
 
 ```sh
-cd examples/dev-neovim-container
+cd examples/dev-container
 vmlab up
-vmlab status                      # dev01 ready, attachable
-vmlab dev attach                  # waits for attachable, prints the alias, opens a shell
+vmlab status                      # dev01 ready
+vmlab shell dev01                 # a shell as dev, in /src
 # in that shell:
-cd /src && nvim hello.lua
 ./build.sh                        # writes /src/out.txt, which appears in ./workspace
-# or straight off the alias:
-ssh vmlab-dev-neovim-container-dev01 -t nvim /src
+# back on the host:
+vmlab dev sync status
 ```
 
-Illustrates dev-machines.md, logins-and-ssh.md, containers.md and `vmlab dev` (cli-machine.md).
-
-## dev-vscode-windows
-
-Directory: `examples/dev-vscode-windows`.
-
-The first of the two worked dev-machine examples, and the harder half. A Windows Server 2025 domain controller promotes itself to `PROBE`, and a second Windows VM joins the domain and becomes the lab's dev machine, with `./workspace` on the host at `C:\src` in the guest. Two `login {}` blocks give it a domain user as the default login and an administrator, so `vmlab dev attach`, the facade's shell, its `sftp` subsystem and `vmlab exec` all land on one minted domain logon. That is what lets the build script read `\\dc01\team` from the editor's terminal with no credential prompt.
-
-The `corp` segment declares no `nat`, so the guest has no route off the segment. VS Code Remote-SSH still attaches, because the client-side setting `remote.SSH.localServerDownload: always` makes the client push the server over `scp`. `vmlab dev attach` and `vmlab ssh-config --print` print that snippet with the alias filled in. As in its twin, the point is `scripts/editor-bits.ws` placing editor bits into the domain user's profile through `dev01.as_login("dev")` before that profile exists. The README also records two riders §19.8 left open, each with the run that would confirm it.
-
-Needs `x86_64/windows-server-2025` in the store, built from `examples/templates/windows-server-2025`. Two 4-vCPU, 8 GiB VMs boot, and the promotion and the join each reboot once, so the first `up` is long. Guest credentials are `PROBE\dev` / `vmlab123!` and `PROBE\Administrator` / `vmlab123!`.
-
-```sh
-(cd examples/templates/windows-server-2025 && ./fetch-deps.sh && vmlab template build)
-cd examples/dev-vscode-windows
-vmlab up                          # dc01 becomes PROBE; dev01 joins and is provisioned
-vmlab status                      # dev01 ready, attachable
-vmlab dev attach                  # prints the alias and the VS Code settings snippet
-code --remote ssh-remote+vmlab-dev-vscode-windows-dev01 C:\src
-```
-
-Illustrates dev-machines.md, logins-and-ssh.md, `vmlab ssh-config` and `vmlab dev` (cli-machine.md).
+Illustrates dev-machines.md, logins.md, containers.md and `vmlab dev` (cli-machine.md).
 
 ## mixed-lab
 

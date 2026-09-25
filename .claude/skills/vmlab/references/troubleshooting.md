@@ -73,23 +73,15 @@ Usual causes, in order of likelihood: the template was built without the agent, 
 
 If the guest is up and the agent is absent, rebuild the template so the bake installs the agent this vmlab ships, or push one into the running machine with `vmlab machine repair-agent`. A container's agent comes from the host's guest asset, so on a container the message ends with `there is nothing to rebuild or repair — an agent that is not answering here is a machine to restart, or a guest asset to reinstall (§19.4)`.
 
-## The machine is not attachable
+## `vmlab machine repair-agent` refused
 
-```
-warning: "{machine}"'s agent serves no `fileops` — a shell still works, but nothing can attach to it until you rebuild the template to bake in the agent this vmlab ships, or push that agent into the running machine with `vmlab machine repair-agent {machine}` (§19.4)
-```
-
-Attachable means the agent serves both `tunnel` and `fileops`. `vmlab up` prints this warning for a dev machine whose agent is missing one or both; `vmlab dev attach` refuses with the same words; and the SSH facade degrades one channel at a time, so a shell over `vmlab ssh` still works while `sftp` and `direct-tcpip` refuse by name. `vmlab validate` says nothing about it, deliberately, because it needs a running agent to know.
-
-The message names both remedies. Rebuilding the template is the durable one. `vmlab machine repair-agent <machine>` pushes the host's shipped agent into the running machine over its own channel and marks the machine *diverged* in `vmlab status`, so you remember the clone no longer matches its template. It refuses on three conditions:
+A machine whose agent is older than the host's lacks features the host expects; `vmlab machine capabilities <machine>` lists the ones it negotiated. Rebuilding the template is the durable remedy. `vmlab machine repair-agent <machine>` pushes the host's shipped agent into the running machine over its own channel and marks the machine *diverged* in `vmlab status`, so you remember the clone no longer matches its template. It refuses on three conditions:
 
 | Refusal | Meaning |
 | --- | --- |
 | `"{machine}" must be running with its agent answering before a new one can be pushed into it over that channel` | There is no channel to push over. Start the machine, or fix the readiness problem first. |
 | ``"{machine}"'s agent serves no `fileops`, so it cannot be handed a binary over its own channel — this one can only be replaced by rebuilding the template (§19.4)`` | The old agent cannot receive a file. Rebuild the template. |
 | `this machine's agent lives in the initramfs guest asset this host installed, not in anything it boots — it already tracks the vmlab you are running and cannot go stale, so there is nothing to push into it. Refreshing it means reinstalling the guest asset (§19.4)` | The machine is a container. Reinstall the guest asset instead. |
-
-If `vmlab dev attach` times out while waiting, it prints `"{machine}" is still not attachable after {n}s — {what it was waiting for}` and points at `vmlab status` and `vmlab machine capabilities`. The machine is left running.
 
 ## The workspace has stopped syncing
 
@@ -134,21 +126,6 @@ Every forward in the lab is planned before `up` installs any. When two claim the
 | `no lease — is it running and ready?` | The target has a NIC but no DHCP lease yet. The forward installs once the machine is up; `vmlab status` shows the lease. |
 
 A host port held by an unrelated process is not detected by the plan. That forward fails at install time, which `up` treats as best effort and reports in the lab log. Change the `host_port` or free the port.
-
-## The SSH facade refused a channel
-
-The SSH facade is terminated on the host and opens every channel into the guest itself, so what it refuses follows from what the agent protocol has. The client sees a bare channel or request failure; the reason is on the lab event log, and the sftp channel writes its reason to stderr as `vmlab: sftp: {reason}`.
-
-| Client action | Recorded reason | What to do instead |
-| --- | --- | --- |
-| `ssh -R` (a remote forward) | ``serving a reverse forward of {address}:{port} would need vmlab to open a `forwarded-tcpip` channel into the guest, and the agent protocol has no guest-initiated channel (ADR-0013)`` | Give the machine a NIC on a segment with `nat = true`; the NAT engine proxies guest flows over host sockets, so a host-side service is reachable by address. |
-| `ssh -A`, `ssh -X`, a Unix-socket reverse forward | The same shape of message, naming `auth-agent`, `x11` or the socket path. | None of these have a guest-initiated channel. |
-| `ssh -D`, `ssh -W`, `ssh -L` to a port nothing listens on | Not a refusal: the open answers `SSH_OPEN_CONNECT_FAILED`. | Start the guest service. A refusal by vmlab is always `ADMINISTRATIVELY_PROHIBITED`, so the two are distinguishable. |
-| `ssh -D`, `sftp`, `scp` against a stale agent | ``{channel}: "{machine}"'s agent serves no `tunnel`/`fileops` — rebuild the template …`` | The attachable remedies above. A shell still works on the same connection. |
-| Any subsystem other than `sftp` | ``{name}` is not served by this facade`` | Only `sftp` is answered. |
-| A user name that is not a declared login | ``vmlab: `{user}` is not a login on this machine.`` followed by the logins the machine declares and the floor identity. | Attach as a `login {}` label from the lab file, or as the floor identity the banner names. |
-
-Authentication is `none` over a label selector: the SSH user name selects a `login {}` block, and it is not a credential. The managed block in `~/.ssh/config` written by `vmlab ssh-config` sets this up per alias.
 
 ## Nested virtualisation is off on WSL 2
 

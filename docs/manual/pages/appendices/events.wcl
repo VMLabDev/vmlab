@@ -67,9 +67,7 @@ SRC
       | "`container.stopped`" | "`container`, `reason`, `exit_code`" | "The container exited for any reason." |
       | "`container.unhealthy`" | "`container`" | "The container's healthcheck reported not healthy." |
       | "`container.destroyed`" | "`container`" | "`vmlab container destroy` removed everything the container materialised." |
-      | "`machine.not_attachable`" | "`vm`, `machine`, `reason`" | "During `up`, a machine whose agent answered lacks a feature the SSH facade needs. See [Logins and the SSH facade](guide_logins)." |
       | "`machine.agent_repaired`" | "`vm`, `machine`, `agent_version`" | "`vmlab machine repair-agent` pushed the host's agent; the machine is now diverged from its template." |
-      | "`ssh.refused`" | "`vm`, `machine`, `request`, `reason`" | "The SSH facade refused an authentication, channel or request. `request` is the SSH name, `reason` vmlab's words." |
       | "`share.unmountable`" | "`vm`, `reason`" | "The mount plan holds a share this guest cannot mount. See [Shared folders](guide_shares)." |
 
   }

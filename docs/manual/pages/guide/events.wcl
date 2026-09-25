@@ -43,9 +43,8 @@ DOC
   }
 
   p <<'DOC'
-Other events reach the stream and the history but cannot be bound: the SSH
-facade's `ssh.refused` for every channel or request it refuses, the workspace
-syncer's `workspace.halted`, `workspace.synced`, `workspace.rescan`,
+Other events reach the stream and the history but cannot be bound: the
+workspace syncer's `workspace.halted`, `workspace.synced`, `workspace.rescan`,
 `workspace.deferred`, `workspace.skipped`, `workspace.refused`,
 `workspace.volume` and their siblings, the per-step `playbook.op.*` progress,
 and `smb.started` and `smb.failed` from the shared-folder service. They exist

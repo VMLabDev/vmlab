@@ -800,7 +800,7 @@ struct Login {
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `label` | string | none | The name an SSH username or `--user` selects this identity by. |
+| `label` | string | none | The name `--user` and `as_login` select this identity by. |
 | `user` | string | none | The guest account, for example `PROBE\dev`. |
 | `password` | Option[string] | `None` | The declared secret exactly as written, or `None` where the author declared none. Never an empty string. |
 | `elevated` | bool | true on Windows, false on Linux | Whether sessions as this login run elevated. Resolved: an undeclared value takes the guest family's default. Elevation is Windows-only, so a Linux login that never declared it reports false. |
@@ -809,7 +809,7 @@ struct Login {
 `password` is `None` rather than empty so that a script never passes an empty
 secret to an account-creation command by accident. `elevated` and `default` cross
 resolved rather than as written, so a script asking "is this the default" gets
-the answer vmlab acts on. See logins-and-ssh.md and the `login {}` block in
+the answer vmlab acts on. See logins.md and the `login {}` block in
 vm.md.
 
 ## GuestStats

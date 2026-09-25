@@ -568,8 +568,6 @@ U0 VaHandleCtrl()
     VaSendError(id,"templeos agent: no terminal (features: exec)");
   } else if (!StrCmp(name,"open_fileops")) {
     VaSendError(id,"templeos agent: no fileops (features: exec)");
-  } else if (!StrCmp(name,"open_tunnel")) {
-    VaSendError(id,"templeos agent: no tunnel (features: exec)");
   } else if (!StrCmp(name,"open_tail")) {
     VaSendError(id,"templeos agent: no tail (features: exec)");
   } else if (!StrCmp(name,"open_watch")) {

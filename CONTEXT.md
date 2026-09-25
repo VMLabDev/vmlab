@@ -54,9 +54,8 @@ requiring explicit `arch`, `profile` and `disk`.
 
 **Dev machine**:
 A lab machine designated as a development environment with a `@dev` decorator
-on its block, which vmlab publishes as an SSH endpoint an editor attaches
-*into*. VM or container, Windows or Linux — one contract for every machine
-kind. The decorator states something *about* the machine rather than
+on its block: a machine with a synced **workspace**. VM or container, Windows
+or Linux — one contract for every machine kind. The decorator states something *about* the machine rather than
 configuring something *inside* it: nothing it carries is a setting the guest
 sees. A lab may have any number, or none.
 _Avoid_: devbox, workspace (a workspace is the source tree on one), devcontainer
@@ -64,19 +63,11 @@ _Avoid_: devbox, workspace (a workspace is the source tree on one), devcontainer
 **Default dev machine**:
 The dev machine carrying `@dev(default = true)`, or the only one carrying
 `@dev`. A property of the **lab file**, so it is the same for everyone who
-opens it — not per-developer. Which dev machine is *mine* is host-side state
-and deliberately not expressible in `vmlab.wcl`.
-
-**Dev selection**:
-Which dev machine is *mine* — one developer's answer, recorded by `vmlab dev
-use` in the lab's own gitignored `.vmlab/`, and forgotten with it by `destroy`.
-Per-developer by construction, which is exactly what the committed lab file
-cannot express, and keyless because it lives inside the lab it describes. It
-is one rung of a fixed ladder — argument, `VMLAB_DEV_MACHINE`, selection,
-**default dev machine** — every rung of which is checked rather than trusted:
-a rung naming a machine this lab does not offer is an error at that rung, never
-a fall through to the next. See PRD §19.7.
-_Avoid_: current dev machine, active machine, context (nothing is switched)
+opens it — not per-developer. It is the last rung of the fixed ladder a `vmlab
+dev sync` verb picks its machine by — argument, `VMLAB_DEV_MACHINE`, default
+dev machine, else an error listing the candidates. A rung naming a machine
+this lab does not offer is an error at that rung, never a fall through to the
+next. See PRD §19.7.
 
 **Workspace**:
 A dev machine's source tree: a guest-local working copy on the machine's own
@@ -134,20 +125,10 @@ Something one machine can do that another might not — a display, a clipboard,
 a Windows event log. Probed and reported, never inferred from whether the
 machine is a VM or a container.
 
-**Attachable**:
-A machine whose agent serves both `tunnel` and `fileops` — *this agent can
-serve an attach*, never *your attach will succeed*, since identity is declared
-separately. A **capability** computed over probed features, reported by
-`vmlab machine capabilities` and carried in **lab status**; deliberately not
-widened to `watch`, which is the **workspace syncer**'s different question.
-Where it is false, `validate` says nothing, `up` warns, and an attach fails —
-naming the rebuild and the **agent repair** verb.
-_Avoid_: attachable-ready, sshable, dev-ready
-
 **Agent repair**:
 Pushing the host's shipped agent binary into a running machine over the
-agent's own channel, replacing what its artefact baked. A tool, never a
-policy: it fires only when someone types it, because an automatic refresh
+agent's own channel, replacing what its artefact baked — the way to iterate on
+the agent without rebuilding a template. A tool, never a policy: it fires only when someone types it, because an automatic refresh
 would make a template's sealed `agent_version` a lie, and it makes the machine
 a **diverged machine**. Meaningless for a machine whose agent came with the
 host rather than with what it boots — a container micro-VM's — which is
@@ -241,8 +222,8 @@ re-runs and automatic reboots.
 vmlab's first-party in-guest agent, reached over a virtio-serial port with no
 guest network involved. Powers readiness, exec, **file operations**
 (`fileops`: handle-based, offset-addressed, pipelined — every transfer runs
-over it), terminals, tail, metrics, clipboard and **tunnels**, in both VMs
-and containers.
+over it), terminals, tail, metrics, clipboard and the workspace watch, in
+both VMs and containers.
 _Avoid_: QGA, qemu-guest-agent (removed), guest tools
 
 **Event handler**:
@@ -320,54 +301,13 @@ done, errored, cancelled — as a value the CLI reads.
 The port-forward rules a lab's machines require, resolved to leases and
 gateways before any is installed.
 
-**SSH facade**:
-The SSH protocol vmlab terminates on the host, reached as a stdio
-`ProxyCommand` so nothing listens and no port is leased. Presents an SSH
-interface with no sshd in the guest: `session` channels are serviced by
-vmlab-agent, SFTP is terminated host-side over a **fileops session**, and
-`direct-tcpip` rides an SSH-scoped tunnel stream. It only ever *answers* a
-channel open, never initiates one (ADR-0013), which is why `-R`, agent
-forwarding and X11 are refused. See PRD §19.3 and ADR-0012. It degrades **per
-channel**: a machine whose agent cannot serve an attach still serves a shell,
-and only what needs the missing feature is refused, by name (§19.4).
-_Avoid_: sshd, SSH server (implies guest-side), gateway, proxy
-
-**Managed block**:
-The marker-fenced region vmlab owns inside the developer's own
-`~/.ssh/config` — its whole host-side footprint, and the only file it writes
-outside its own directories. Deterministically ordered, refreshed by any
-command that loads a lab, written only on a real difference, pruned by lab
-root, and re-hoisted to the top of the file on every write so OpenSSH's
-first-value-wins rule keeps it in effect. There is no vmlab-owned config file
-and no `Include`: a client that cannot follow one is the reason. See PRD
-§19.7.
-_Avoid_: ssh config file (that is the developer's), include file, snippet
-
-**Alias**:
-One `Host` entry in the managed block: `vmlab-<lab>-<machine>`, plus
-`vmlab-<lab>-<machine>-<label>` for each non-default **login**. Covers
-*declared* machines, not running ones — it means "this machine exists in this
-lab", never "it is attachable right now". `<lab>/<machine>` is the argument
-form `vmlab ssh` and `ssh-proxy` take, and is disqualified as an alias because
-the slash would land in the mux socket path.
-_Avoid_: host entry, hostname (the stanza sets no `HostName`)
-
-**Host key**:
-The SSH identity the facade presents, minted per (lab, machine) into vmlab's
-own state directory beside a `known_hosts` vmlab also owns. It survives
-`destroy`, so a recreated machine presents the identity its entry already
-records, and the developer's `~/.ssh/known_hosts` is never touched. No guest
-holds one, so a template clone cannot carry a stale key and a snapshot restore
-cannot roll one back.
-_Avoid_: server key, machine key (that is not what it identifies)
-
 **Login**:
 A labelled identity declared on a machine with a repeatable `login {}` block —
-an account, its secret, and whether it is elevated. What a surface attaches
-*as*, selected by label; the SSH username carries the label, never the raw
-account. Declared on the machine rather than on the attach, because the SSH
-facade is a general capability: an unmarked machine needs an identity too. A
-machine may declare any number, or none — with none, everything falls to the
+an account, its secret, and whether it is elevated. What a surface runs *as*,
+selected by label — `--user`, `as_login`, or the **default login** — never by
+the raw account. Declared on the machine rather than on `@dev`, because `exec`,
+`shell` and `vmlab cp` reach every machine: an unmarked machine needs an
+identity too. A machine may declare any number, or none — with none, everything falls to the
 **agent identity**.
 _Avoid_: user (that is a person, or the guest's OS account), credential (that
 is the secret alone), account (the guest owns those; vmlab owns the login)
@@ -390,19 +330,18 @@ here at all.
 _Avoid_: run-as, impersonation, sudo (none of the three is a mode switch)
 
 **Declared placement**:
-Editor bits — extensions, plugins, per-user settings — put into a guest home by
-a template build or a lab `provision {}`, as opposed to hand-installed by a
-developer after attaching. Both declared placements re-apply across a
+Per-user content — tools, plugins, settings — put into a guest home by a
+template build or a lab `provision {}`, as opposed to hand-installed by a
+developer from a shell. Both declared placements re-apply across a
 per-machine `destroy` + `up` because a fresh clone is re-made and boots
 first-boot again; a hand-install does not. Hence: bake what the lab needs every
 developer to have, hand-install what you personally want today, and expect to
 redo it after a rebuild. A per-machine durable home overlay was rejected — it
 would reintroduce exactly the surviving guest-side state the **workspace**
-retired a disk to eliminate, and editor bits already have a canonical durable
-home. See PRD §19.8.
+retired a disk to eliminate, and declared content already has a canonical
+durable home. See PRD §19.8.
 _Avoid_: provisioning extensions (vmlab moves the bytes and never interprets
-them), editor hints, dotfiles (those are the developer's, and copy over the
-**alias**)
+them), dotfiles (those are the developer's)
 
 **Agent identity**:
 What the guest agent itself runs as — SYSTEM on Windows, root on Linux. The
@@ -427,7 +366,7 @@ is minted and unloaded when it is dropped. On Linux the **login session** is
 each `su`'s, so what is shared is the resolution — the account, the machinery,
 the runtime directory. Dies with the machine, and is recycled at idle once
 older than its Kerberos ticket lifetime.
-_Avoid_: session (ambiguous with an SSH session or a terminal)
+_Avoid_: session (ambiguous with a login session or a terminal)
 
 **Login session**:
 What a **login** gets on a Linux guest: the environment, supplementary groups,
@@ -441,21 +380,10 @@ _Avoid_: setuid (that is the fallback, not the concept), impersonation
 **Fileops session**:
 One agent channel serving file requests as an RPC session: handle-based,
 offset-addressed, pipelined with out-of-order replies, records framed inside the
-channel's own credit window. Opened per SFTP session by the SSH facade and per
-transfer by `vmlab cp` and the workspace syncer; handles are scoped to the
-channel and die with it.
-_Avoid_: file channel (it carries requests, not one file's bytes), SFTP channel
-(SFTP is terminated host-side and never reaches the guest)
-
-**Tunnel**:
-One agent channel carrying a TCP connection the agent dialled *inside* the
-guest. The destination string crosses verbatim and the guest resolves it, and
-no destination policy applies — any address the guest can reach. Opened only by
-the SSH facade, for `direct-tcpip`. A dial that fails is a **connect failure**,
-reported apart from a refusal so a SOCKS client can tell "nothing is listening"
-from "vmlab refused you".
-_Avoid_: port forward (that is the Forward plan's host→guest lease), socket,
-proxy
+channel's own credit window. Opened per transfer by `vmlab cp`, wscript
+push/pull and the workspace syncer; handles are scoped to the channel and die
+with it.
+_Avoid_: file channel (it carries requests, not one file's bytes)
 
 **Diverged machine**:
 A running machine whose guest content no longer matches the template it was

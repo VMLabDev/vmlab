@@ -124,7 +124,7 @@ groups: lifecycle and state (`start`, `stop`, `stop_force`, `restart`,
 [Screens, input and vision](guide_vision)), the guest agent (`exec`,
 `exec_timeout`, `copy_to`, `copy_from`, `terminal`, `stats`), and identity
 (`logins`, `as_login`, `as_account`, covered in
-[Logins and the SSH facade](guide_logins)).
+[Logins](guide_logins)).
 DOC
 
   p <<'DOC'
@@ -193,8 +193,8 @@ DOC
 
   p <<'DOC'
 Relative local paths in a script resolve against the script's own directory,
-not the lab root: a `copy_to("scripts/editor-bits.ps1", …)` from
-`scripts/editor-bits.ws` reads `scripts/scripts/editor-bits.ps1`. This is what
+not the lab root: a `copy_to("scripts/setup.ps1", …)` from
+`scripts/setup.ws` reads `scripts/scripts/setup.ps1`. This is what
 lets a provision ship reference images and payload files beside itself, and it
 holds for template builds, which run from a separate working directory.
 DOC

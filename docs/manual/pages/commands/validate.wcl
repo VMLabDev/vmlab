@@ -46,18 +46,10 @@ page cmd_validate {
   DOC
 
   p <<DOC
-    One thing does happen on success: the lab is registered in the managed
-    block of `~/.ssh/config`, because every command that loads a lab does
-    that (see [vmlab ssh-config](cmd_ssh_config)). The lab file itself is not
-    written, which is what "no side effects" refers to. A failure to write the
-    block is a warning, not an error.
-  DOC
-
-  p <<DOC
-    Nothing here probes a running machine. In particular the attachability
-    of a dev machine (see [Logins and the SSH facade](guide_logins)) is
-    checked at `up` and at attach, deliberately not at `validate`, because it
-    depends on a live agent handshake.
+    Nothing here probes a running machine. In particular whether a
+    [dev machine](guide_dev)'s agent can serve the workspace syncer is
+    checked when the syncer starts, deliberately not at `validate`, because
+    it depends on a live agent handshake.
   DOC
 
   h2 "Examples"

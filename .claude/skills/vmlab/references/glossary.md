@@ -4,12 +4,10 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 
 | Term | Meaning |
 | --- | --- |
-| agent | `vmlab-agent`, the process vmlab runs inside every guest, listening on the `vmlab.agent.0` virtio-serial port. It carries exec, terminals, file transfer, tunnels, the workspace watch, metrics and the clipboard. It is baked into a template at build time and shipped with the host for containers. See architecture.md. |
-| attachable | A machine whose agent serves both `tunnel` and `fileops`, and so can carry an editor session over the SSH facade. Reported by `vmlab machine capabilities` and `vmlab status`; a warning at `up`, a refusal at attach. See dev-machines.md. |
-| dev machine | A machine carrying the `@dev` decorator: vmlab publishes it as an SSH endpoint an editor attaches into and syncs a workspace onto it. A lab may mark one of them `default = true`. See dev-machines.md. |
+| agent | `vmlab-agent`, the process vmlab runs inside every guest, listening on the `vmlab.agent.0` virtio-serial port. It carries exec, terminals, file transfer, the workspace watch, metrics and the clipboard. It is baked into a template at build time and shipped with the host for containers. See architecture.md. |
+| dev machine | A machine with a synced workspace: one carrying the `@dev` decorator, onto which vmlab syncs a host directory both ways. A lab may mark one of them `default = true`. See dev-machines.md. |
 | event | A named occurrence in a lab, such as `vm.crashed` or `host.disk_low`, carried on the lab's event stream and written to the event log. See automation.md. |
 | fabric | The userspace network vmlab runs every segment on: frame codecs, an L2 switch, DHCP, DNS, a gateway and a NAT engine, all in the lab daemon's process. No tap, bridge or macvlan. See networking.md. |
-| facade | The SSH server vmlab terminates on the host for each machine. No guest runs an sshd; the facade answers shells, `sftp` and local forwards over the agent's channels, and refuses what the agent protocol cannot carry. See logins-and-ssh.md. |
 | fast path | An optional kernel-assisted tier of the fabric (`afxdp` or `sockmap`) probed at daemon start and used when it works. `vmlab fastpath` says which tier is active. See networking.md. |
 | forward | A `forward {}` on a segment, or a `port {}` on a container, that maps a host TCP port onto a guest port. Planned as a whole before any is installed. See networking.md. |
 | global segment | A segment with `global = true`, owned by the supervisor rather than one lab, so machines from several labs share it; it can also peer with another host over a trunk. See networking.md. |
@@ -18,11 +16,11 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | host config | `vmlab-host.wcl`, the per-user file that sets host-wide values: the store location, the viewer command, the fast path mode, the trunk port and PSK. See host-profiles.md. |
 | lab | One `lab "<name>" {}` in a `vmlab.wcl`: a set of machines and segments brought up and torn down together. Its name is its host-global identity. See lab-file.md. |
 | lab container | A `container {}` in a lab: an OCI image pulled like a docker image and run inside a micro-VM, so it is a lab machine in every respect. See containers.md. |
-| lab daemon | The per-lab process the supervisor spawns on `up`: lifecycle, snapshots, the fabric for the lab's segments, events, shares, the syncer and the SSH facade. Logs to `.vmlab/lab.log`. See architecture.md. |
+| lab daemon | The per-lab process the supervisor spawns on `up`: lifecycle, snapshots, the fabric for the lab's segments, events, shares and the syncer. Logs to `.vmlab/lab.log`. See architecture.md. |
 | ledger | The host-side record of what the two sides of a workspace last agreed on, per path. Guest changes are drained into it; the note that a re-seed is owed and the halt a restore refuses on both ride it. See dev-machines.md. |
 | linked clone | A VM's disk: a qcow2 whose backing file is the template image in the store. Created on `up` under `.vmlab/`, kept by `down`, deleted by `destroy`. See templates.md. |
-| login | A `login {}` block on a machine: a declared guest account a surface attaches as. The SSH user name selects one by label; `vmlab exec --user` does the same. See logins-and-ssh.md. |
-| logon | The Windows session vmlab mints for a login: a token from `LogonUser` and a loaded profile, cached per (account, secret, machine). The Linux equivalent is a real session through `su -l` or `setuid`. See logins-and-ssh.md. |
+| login | A `login {}` block on a machine: a declared guest account that `exec`, `shell` and the syncer run as. `--user` and `as_login` select one by label. See logins.md. |
+| logon | The Windows session vmlab mints for a login: a token from `LogonUser` and a loaded profile, cached per (account, secret, machine). The Linux equivalent is a real session through `su -l` or `setuid`. See logins.md. |
 | machine | A VM or a lab container. Every verb that takes a machine name accepts either kind. See architecture.md. |
 | marker file | `.vmlab-sync-halt`, the file the syncer writes at the guest's workspace root when the workspace halts, and removes when the halt clears. It is the only signal the guest side receives. See dev-machines.md. |
 | media | A `media {}` block: a host folder packed into an ISO or floppy image and attached to a machine, cached by content. See vm.md. |

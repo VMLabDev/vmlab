@@ -57,9 +57,6 @@ fn render_capabilities(caps: &Value) -> String {
         ("console log", flag("console_log")),
         ("reboot", flag("reboot")),
         ("healthcheck", flag("healthcheck")),
-        // What this agent can serve, never what your attach will do: the
-        // identity it runs as is declared separately (§19.4).
-        ("attachable", flag("attachable")),
         ("agent", agent.as_str()),
     ] {
         let _ = writeln!(out, "{label:<12} {value}");
@@ -178,12 +175,7 @@ fn render_repair(report: &Value) -> String {
         text("installed_at"),
         text("machine"),
     );
-    let _ = writeln!(
-        out,
-        "agent  {} answering, attachable {}",
-        text("agent_version"),
-        yes_no(report["attachable"].as_bool().unwrap_or(false)),
-    );
+    let _ = writeln!(out, "agent  {} answering", text("agent_version"),);
     // The consequence, not a footnote: this machine no longer matches what it
     // was built from, and a rebuild is what puts that back.
     let _ = writeln!(
@@ -264,7 +256,6 @@ mod tests {
             console_log: false,
             reboot: true,
             healthcheck: false,
-            attachable: false,
             agent: vec!["terminal".into(), "exec".into(), "metrics".into()],
         };
         let out = render_capabilities(&serde_json::to_value(caps).unwrap());
@@ -279,37 +270,6 @@ mod tests {
         );
     }
 
-    /// `attachable` is reported beside the probed flags and reads as one:
-    /// a developer asking "can I attach to this?" gets a yes or a no without
-    /// reading the feature list and applying §19.4's rule themselves.
-    #[test]
-    fn capabilities_report_attachable_as_a_flag_of_its_own() {
-        let stale = Capabilities {
-            kind: MachineKind::Vm,
-            display: false,
-            console_log: false,
-            reboot: true,
-            healthcheck: false,
-            attachable: false,
-            agent: vec!["terminal".into(), "exec".into()],
-        };
-        let out = render_capabilities(&serde_json::to_value(&stale).unwrap());
-        assert!(out.contains("attachable   no"), "got:\n{out}");
-
-        let current = Capabilities {
-            attachable: true,
-            agent: vec![
-                "terminal".into(),
-                "exec".into(),
-                "fileops".into(),
-                "tunnel".into(),
-            ],
-            ..stale
-        };
-        let out = render_capabilities(&serde_json::to_value(current).unwrap());
-        assert!(out.contains("attachable   yes"), "got:\n{out}");
-    }
-
     /// No agent answering is a live fact, not a missing field: it reads as a
     /// dash, so "probed and got nothing" cannot be mistaken for "not probed".
     #[test]
@@ -320,7 +280,6 @@ mod tests {
             console_log: true,
             reboot: false,
             healthcheck: true,
-            attachable: false,
             agent: Vec::new(),
         };
         let out = render_capabilities(&serde_json::to_value(caps).unwrap());
@@ -340,8 +299,7 @@ mod tests {
                 pushed: "agent=abc123".into(),
                 installed_at: r"C:\ProgramData\vmlab\vmlab-agent.exe".into(),
                 agent_version: "0.2.0".into(),
-                features: vec!["terminal".into(), "fileops".into(), "tunnel".into()],
-                attachable: true,
+                features: vec!["terminal".into(), "fileops".into()],
             })
             .unwrap(),
         );
@@ -351,7 +309,6 @@ mod tests {
             "got:\n{out}"
         );
         assert!(out.contains("agent  0.2.0 answering"), "got:\n{out}");
-        assert!(out.contains("attachable yes"), "got:\n{out}");
         assert!(out.contains("diverged from its template"), "got:\n{out}");
         assert!(out.contains("vmlab up"), "the way back is named: {out}");
     }

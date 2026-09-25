@@ -34,12 +34,6 @@ pub struct HostConfig {
     /// Directory holding config-weave guest binaries; `None` = env var /
     /// XDG default (see `labd::playbook::resolve_bin_dir`).
     pub config_weave_bin_dir: Option<std::path::PathBuf>,
-    /// The file vmlab writes its managed SSH block into; `None` =
-    /// `~/.ssh/config` (§19.7). A **location** knob with one code path behind
-    /// it, never an on/off with two: the `ssh -G` check still runs, so a
-    /// block redirected somewhere OpenSSH does not read warns honestly rather
-    /// than pretending to work.
-    pub ssh_config: Option<std::path::PathBuf>,
     /// The workspace syncer's per-file size guard (PRD §19.6). Host config
     /// rather than a `@dev` argument: the cap is about this developer's link
     /// to this guest, not about the lab everyone shares — and the refusal
@@ -60,7 +54,6 @@ impl Default for HostConfig {
             oci_chunk_size: crate::oci::chunking::DEFAULT_CHUNK_SIZE,
             fastpath: crate::net::fastpath::FastpathMode::Auto,
             config_weave_bin_dir: None,
-            ssh_config: None,
             workspace_max_file: DEFAULT_WORKSPACE_MAX_FILE,
         }
     }
@@ -121,7 +114,6 @@ impl HostConfig {
                 cfg.fastpath = v;
             }
             cfg.config_weave_bin_dir = r.path("config_weave_bin_dir").unspan();
-            cfg.ssh_config = r.path("ssh_config").unspan();
             if let Some(v) = r.size("oci_chunk_size").unspan() {
                 cfg.oci_chunk_size = v;
             }

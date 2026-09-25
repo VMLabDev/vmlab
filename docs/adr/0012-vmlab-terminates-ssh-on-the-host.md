@@ -1,11 +1,17 @@
 # ADR-0012: vmlab terminates SSH on the host
 
-- **Status**: Accepted
+- **Status**: Superseded
 - **Date**: 2026-08-05
 - **Related**: [ADR-0002](0002-machine-is-the-only-route-to-a-machine.md),
   [ADR-0007](0007-the-wire-protocol-carries-a-typed-vocabulary.md),
   [ADR-0013](0013-the-host-opens-channels-the-guest-answers.md),
   [ADR-0011](0011-a-lab-name-is-its-host-global-runtime-identity.md)
+
+> **Superseded.** The SSH facade this record describes was removed before the
+> first release, together with every editor-attach surface built on it. A dev
+> machine is now a machine with a synced workspace (PRD §19), reached with
+> `vmlab shell` and `vmlab exec`. The record stays for the reasoning; nothing in
+> vmlab implements it.
 
 ## Context
 

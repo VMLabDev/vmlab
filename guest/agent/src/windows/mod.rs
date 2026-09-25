@@ -98,7 +98,6 @@ impl crate::mux::Platform for WindowsPlatform {
             features::WATCH.to_string(),
             features::EVENTLOG.to_string(),
             features::CLIPBOARD.to_string(),
-            features::TUNNEL.to_string(),
         ]
     }
 

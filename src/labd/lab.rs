@@ -1337,8 +1337,6 @@ impl LabRuntime {
 
         self.install_forwards(&targets).await;
 
-        self.warn_unattachable(&targets, &output).await;
-
         // After provisioning, and only now: the syncer writes as the
         // machine's default login, which the provisioning is what creates
         // (§19.6). The task belongs to this daemon, so the `vmlab` process
@@ -1347,41 +1345,6 @@ impl LabRuntime {
 
         self.events.emit("lab.up", json!({"vms": targets}));
         Ok(())
-    }
-
-    /// §19.4's middle rung: `up` warns about a machine whose agent cannot
-    /// serve an attach, and never fails over it.
-    ///
-    /// Here rather than at `validate` because the handshake is part of
-    /// readiness, so by now the features are *probed* rather than inferred
-    /// from a sealed version string; and a warning rather than an error
-    /// because the SSH facade is a general capability — a machine nothing can
-    /// attach to is still a perfectly good machine, and its shell still works.
-    ///
-    /// Only machines whose agent actually answered are considered. A machine
-    /// still booting, or one whose guest profile has no agent channel at all,
-    /// has told us nothing about its features, and guessing from silence is
-    /// the inference this ladder exists to avoid.
-    ///
-    /// **Every machine, not only the `@dev` ones.** Scoping it to dev machines
-    /// was the quieter reading and is wrong: the SSH facade is a *general*
-    /// capability of every machine (§19.3), so "nothing can attach to this"
-    /// is news about any of them. It also self-clears — the warning exists for
-    /// a machine whose agent answered and is old, which stops the moment its
-    /// template is rebuilt.
-    async fn warn_unattachable(&self, targets: &[String], output: &crate::scripting::OutputSink) {
-        for name in targets {
-            let Ok(m) = self.machine(name) else { continue };
-            let Ok(agent) = m.agent().await else { continue };
-            let Some(warning) = crate::attach::warning(name, &agent.info().features) else {
-                continue;
-            };
-            output(format!("{warning}\n"));
-            self.events.emit(
-                "machine.not_attachable",
-                json!({"vm": name, "machine": name, "reason": warning}),
-            );
-        }
     }
 
     /// Wire up every forward `scope` requires — segment `forward {}` blocks
@@ -2412,18 +2375,6 @@ mod tests {
             Arc::new(m)
         }
 
-        /// The same double, with a guest agent answering for it.
-        fn with_agent(
-            name: &str,
-            kind: MachineKind,
-            shared: &Shared,
-            agent: super::super::vm_agent::AgentHandle,
-        ) -> Arc<Self> {
-            let mut me = Arc::into_inner(Self::new(name, kind, shared)).expect("sole owner");
-            me.agent = Some(agent);
-            Arc::new(me)
-        }
-
         async fn note(&self, what: &str) {
             let n = self.seq.fetch_add(1, Ordering::SeqCst);
             self.log
@@ -2586,77 +2537,6 @@ mod tests {
 
     fn quiet() -> crate::scripting::OutputSink {
         Arc::new(|_| {})
-    }
-
-    /// An output sink that keeps what was printed, for the tests that are
-    /// about what `up` *said*.
-    fn recording() -> (
-        crate::scripting::OutputSink,
-        Arc<std::sync::Mutex<Vec<String>>>,
-    ) {
-        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        (
-            Arc::new(move |line: String| sink.lock().expect("sink lock").push(line)),
-            lines,
-        )
-    }
-
-    /// A guest agent that answers a handshake advertising `features`, and a
-    /// ping, and nothing else — which is every question §19.4 asks of one.
-    async fn mock_agent(sock: PathBuf, features: &[&str]) -> super::super::vm_agent::AgentHandle {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use vmlab_agent_proto::{
-            AgentMsg, Frame, FrameDecoder, FrameKind, HostMsg, PROTO_VERSION, encode_ctrl,
-        };
-
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind the mock agent");
-        let features: Vec<String> = features.iter().map(|f| f.to_string()).collect();
-        tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut dec = FrameDecoder::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => dec.push(&buf[..n]),
-                }
-                while let Some(Frame { kind, payload, .. }) = dec.next_frame() {
-                    if kind != FrameKind::Ctrl {
-                        continue;
-                    }
-                    let Ok(msg) = serde_json::from_slice::<HostMsg>(&payload) else {
-                        continue;
-                    };
-                    let reply = match msg {
-                        HostMsg::Hello { token, .. } => AgentMsg::Hello {
-                            proto_version: PROTO_VERSION,
-                            agent_version: "mock".into(),
-                            os: "linux".into(),
-                            features: features.clone(),
-                            token,
-                        },
-                        HostMsg::Ping => AgentMsg::Pong,
-                        // A guest on no segment still answers the question,
-                        // and answering it is what keeps a caller that asks
-                        // (the forward plan does) from waiting out its
-                        // timeout.
-                        HostMsg::NetInfo => AgentMsg::NetInfo {
-                            interfaces: Vec::new(),
-                        },
-                        _ => continue,
-                    };
-                    if stream.write_all(&encode_ctrl(&reply)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        });
-        super::super::vm_agent::AgentHandle::connect(&sock, Duration::from_secs(5))
-            .await
-            .expect("connect the mock agent")
     }
 
     #[tokio::test]
@@ -2902,67 +2782,6 @@ lab "t" { container "leaf" { image = "x:1" } }"#,
             start.elapsed() < Duration::from_secs(1),
             "up waited on a machine nothing depends on"
         );
-    }
-
-    /// §19.4's middle rung. `up` warns about a machine whose agent cannot
-    /// serve an attach — by then the features are probed rather than inferred
-    /// — and **brings the lab up anyway**: the facade is a general capability,
-    /// so a machine nothing can attach to is still a perfectly good machine.
-    ///
-    /// The lab holds one of each on purpose: the machine that can serve an
-    /// attach must draw no warning at all, or the warning would be noise the
-    /// developer learns to skip.
-    #[tokio::test]
-    async fn up_warns_about_a_machine_that_cannot_serve_an_attach() {
-        let dir = tempfile::tempdir().unwrap();
-        let sh = shared(dir.path());
-        let stale = FakeMachine::with_agent(
-            "stale",
-            MachineKind::Vm,
-            &sh,
-            mock_agent(dir.path().join("stale.sock"), &["terminal", "exec"]).await,
-        );
-        let current = FakeMachine::with_agent(
-            "dev01",
-            MachineKind::Vm,
-            &sh,
-            mock_agent(
-                dir.path().join("dev01.sock"),
-                &["terminal", "exec", "tunnel", "fileops"],
-            )
-            .await,
-        );
-        let lab = lab_of(
-            dir.path(),
-            r#"import <vmlab.wcl>
-lab "t" {
-  container "stale" { image = "a:1" }
-  container "dev01" { image = "b:1" }
-}"#,
-            vec![stale.clone(), current.clone()],
-        );
-
-        let (sink, printed) = recording();
-        lab.up(&[], sink)
-            .await
-            .expect("a stale agent must not fail `up`");
-
-        let said = printed.lock().unwrap().join("");
-        let warned: Vec<&str> = said.lines().filter(|l| l.starts_with("warning:")).collect();
-        assert_eq!(warned.len(), 1, "one warning, for one machine: {said:?}");
-        assert!(warned[0].contains("\"stale\""), "{said:?}");
-        assert!(
-            warned[0].contains("serves no `tunnel` and `fileops`"),
-            "{said:?}"
-        );
-        assert!(warned[0].contains("repair-agent stale"), "{said:?}");
-        assert!(
-            !said.contains("dev01"),
-            "the attachable machine drew a warning: {said:?}"
-        );
-        // And it really did come up.
-        assert_eq!(stale.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(current.starts.load(Ordering::SeqCst), 1);
     }
 
     /// `down` runs the waves leaves-first: a dependency outlives the machines

@@ -12,8 +12,8 @@ source to `guest/dist/agent/templeos/`).
 **Unfinished.** Verified live on the sealed `templeos` template: the agent
 compiles in the guest, installs, registers itself for every boot, answers the
 handshake over COM1, reports `exec` as its only feature, and the host's ladder
-degrades correctly (`vmlab machine capabilities` shows `agent exec` and
-`attachable no`; `vmlab shell` and `vmlab cp` refuse by name).
+degrades correctly (`vmlab machine capabilities` shows `agent exec`;
+`vmlab shell` and `vmlab cp` refuse by name).
 
 **Capturing a command's output does not work yet.** TempleOS has no
 redirection hook — no assignable `put_s`, no `user_put_s` that fires, and
@@ -34,7 +34,7 @@ including a compile error, is caught and reported as exit code 1 with the OS's
 own message in the output. `os_info`, `net_info` (empty; TempleOS has no
 network by design) and `shutdown` are answered — power-off is a write to the
 PIIX4 sleep register, reboot is `Reboot` — and every other open is refused by
-name, so `vmlab shell`, `vmlab cp` and `dev attach` say what is missing.
+name, so `vmlab shell` and `vmlab cp` say what is missing.
 
 ```
 vmlab exec temple -- '"hello %d\n",42;'

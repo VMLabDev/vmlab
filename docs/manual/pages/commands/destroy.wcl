@@ -30,7 +30,6 @@ page cmd_destroy {
 
   list {
     style = :numbered
-    li "It withdraws every SSH alias the lab publishes, while the stanzas in the managed `~/.ssh/config` block still resolve, so any `ssh` multiplexer holding a connection is told to exit. See [vmlab ssh-config](cmd_ssh_config)."
     li "With a lab daemon running, it asks the daemon to destroy the lab. The daemon stops every workspace syncer, force-stops every machine, waits up to 30 seconds for each to settle, then removes `.vmlab/` and each machine's runtime directory."
     li "With no daemon running, it removes `.vmlab/` itself if the directory exists."
     li "It asks the supervisor to release the lab, which reaps the lab daemon."
@@ -42,8 +41,8 @@ page cmd_destroy {
     Everything a machine had that was not in its template goes: [snapshots](guide_snapshots)
     live inside the clones, so they go with them, and a machine marked
     diverged by [vmlab machine repair-agent](cmd_machine) comes back on its
-    template's sealed agent. The `vmlab dev use` selection recorded in
-    `.vmlab/` is forgotten too, and so is the workspace sync ledger.
+    template's sealed agent. The workspace sync ledger in `.vmlab/` goes
+    too.
   DOC
 
   callout "The workspace survives, the guest tree does not" {

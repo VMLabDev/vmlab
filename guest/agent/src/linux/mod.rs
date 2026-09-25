@@ -346,7 +346,6 @@ impl crate::mux::Platform for LinuxPlatform {
             features::FILEOPS.to_string(),
             features::TAIL.to_string(),
             features::METRICS.to_string(),
-            features::TUNNEL.to_string(),
             features::WATCH.to_string(),
         ];
         if self.clipboard.is_some() {
@@ -533,9 +532,8 @@ impl LinuxSpawner {
     /// Everything the forked shell child needs, decided before the fork.
     ///
     /// `overrides` are applied *over* the environment the route already
-    /// brings, never instead of it: the SSH facade's `env` requests arrive
-    /// this way (§19.3), and everything vmlab opens on its own behalf sends
-    /// none.
+    /// brings, never instead of it: a terminal open's `env` arrives this
+    /// way, and everything vmlab opens on its own behalf sends none.
     fn shell_plan(
         &self,
         route: &Route,
@@ -2023,9 +2021,9 @@ mod tests {
         assert!(plan.env.contains(&("TERM".into(), "xterm-256color".into())));
     }
 
-    /// The SSH facade's `env` requests are applied *over* whatever the
-    /// route already brings, and never instead of it (§19.3): the account's
-    /// own `HOME` survives a client that sent `LANG`.
+    /// A terminal's `env` is applied *over* whatever the route already
+    /// brings, and never instead of it: the account's own `HOME` survives a
+    /// client that sent `LANG`.
     #[test]
     fn a_terminals_overrides_are_applied_over_the_routes_own_environment() {
         let spawner = vm_spawner();
@@ -2042,9 +2040,9 @@ mod tests {
     }
 
     /// `su -l` resets the environment as part of being a login, so overrides
-    /// ride the script it runs. With none, an attach stays a plain
+    /// ride the script it runs. With none, a shell stays a plain
     /// interactive `su -l` — the login shell is not replaced by a script
-    /// just because the facade exists.
+    /// just because overrides are possible.
     #[test]
     fn the_pam_route_re_applies_overrides_inside_the_login() {
         let spawner = vm_spawner();

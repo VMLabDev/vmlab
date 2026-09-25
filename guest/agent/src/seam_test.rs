@@ -315,11 +315,7 @@ fn terminal_spawn_failure_reports_the_seam_error() {
         },
     );
     match cap.ctrl() {
-        AgentMsg::Error {
-            id: Some(1),
-            msg,
-            cause: None,
-        } => {
+        AgentMsg::Error { id: Some(1), msg } => {
             assert_eq!(msg, "terminal: no shell found in this guest");
         }
         other => panic!("expected error, got {other:?}"),
@@ -375,11 +371,7 @@ fn exec_spawn_failure_names_the_binary() {
         },
     );
     match cap.ctrl() {
-        AgentMsg::Error {
-            id: Some(5),
-            msg,
-            cause: None,
-        } => assert!(msg.contains("/no/such/binary"), "{msg}"),
+        AgentMsg::Error { id: Some(5), msg } => assert!(msg.contains("/no/such/binary"), "{msg}"),
         other => panic!("expected error, got {other:?}"),
     }
 }
@@ -400,11 +392,7 @@ fn exec_empty_argv_never_reaches_the_seam() {
         },
     );
     match cap.ctrl() {
-        AgentMsg::Error {
-            id: Some(5),
-            msg,
-            cause: None,
-        } => assert_eq!(msg, "exec: empty argv"),
+        AgentMsg::Error { id: Some(5), msg } => assert_eq!(msg, "exec: empty argv"),
         other => panic!("expected error, got {other:?}"),
     }
     assert!(p.spawner.calls().is_empty());
@@ -432,11 +420,9 @@ fn a_file_session_that_cannot_mint_its_logon_fails_the_open() {
         },
     );
     match cap.ctrl() {
-        AgentMsg::Error {
-            id: Some(7),
-            msg,
-            cause: None,
-        } => assert_eq!(msg, "fileops: no such account: PROBE\\ghost"),
+        AgentMsg::Error { id: Some(7), msg } => {
+            assert_eq!(msg, "fileops: no such account: PROBE\\ghost")
+        }
         other => panic!("expected error, got {other:?}"),
     }
 }

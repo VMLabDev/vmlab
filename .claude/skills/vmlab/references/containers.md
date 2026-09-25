@@ -180,7 +180,7 @@ The default mode, `:workload`, runs the image's process, and the container's
 lifecycle is that process's: when it exits, cinit reports the exit and powers
 the micro-VM off. `mode = :idle` boots the micro-VM, mounts everything and
 starts the agent, but never runs the entrypoint. The container then stays up for
-`exec`, `shell` and an SSH attach until you stop it. That is what a dev
+`exec` and `shell` until you stop it. That is what a dev
 container wants, since it has no service to be.
 
 ## Readiness and health
@@ -219,7 +219,7 @@ no `login`, that account is the container floor: the user cinit resolved for the
 workload, which is the declared `user`, else the image's `USER`, else root. This
 is devcontainers' `remoteUser` idea, and it costs nothing because Linux needs no
 credential to become that user. A `login` block on a container may therefore
-declare the account alone, with no password. See logins-and-ssh.md for the rest
+declare the account alone, with no password. See logins.md for the rest
 of the identity ladder.
 
 ## container {}
@@ -269,7 +269,7 @@ container "<name>" {
 | `volume {}` | children | none | Host binds and named volumes mounted into the container. |
 | `port {}` | children | none | Host-to-container port forwards; sugar for a segment `forward` to this container. |
 | `healthcheck {}` | child | none | Health probe gating readiness. Without one the container is ready once its process starts. |
-| `login {}` | children | none | Identities a surface attaches to this container as. Without one it falls to the user cinit resolves. |
+| `login {}` | children | none | Identities `exec`, `shell` and the workspace syncer run as on this container. Without one they fall to the user cinit resolves. |
 | `provision {}` | children | none | wscript scripts run on `vmlab up` once this container is ready, interleaved with its playbooks in declaration order. |
 | `playbook {}` | children | none | config-weave playbooks applied on `vmlab up`, interleaved with its provisions in declaration order. |
 
@@ -314,32 +314,30 @@ container "web" {
 ```
 
 A dev container uses `:idle` mode, since it has no service to be, and a `login`
-for the account an editor attaches as.
+for the account `shell`, `exec` and the workspace syncer run as.
 
 ```wcl
-# examples/dev-neovim-container/vmlab.wcl
+# examples/dev-container/vmlab.wcl
 @dev(default = true, workspace = "./workspace")
 container "dev01" {
   image   = "alpine:3.22"
   profile = "container"
-  // Neovim wants more than the profile's floor, and a container names its
-  // own size when the profile's is not the right one.
+  // A dev machine builds things, and a container names its own size when
+  // the profile's floor is not the right one.
   cpus    = 2
   memory  = 1GiB
-  // `:idle` keeps the micro-VM up for attaching without running the
-  // image's entrypoint — a dev container has no service to be.
+  // `:idle` keeps the micro-VM up without running the image's entrypoint
+  // — a dev container has no service to be.
   mode    = :idle
   nic { segment = "lan" }
 
   // The container identity floor (§19.2): the agent is root and root needs
   // no credential to become an account, so a Linux `login {}` may declare
-  // the account alone. Its Windows twin cannot — every credential-free
-  // route there is the one Windows OpenSSH's S4U logon already
-  // disqualified, and `elevated` is a validation error on this side.
+  // the account alone. `elevated` is a validation error on this side.
   login "dev" { user = "dev" default = true }
 
   provision "scripts/dev-user.ws" { }
-  provision "scripts/editor-bits.ws" { }
+  provision "scripts/home-bits.ws" { }
 }
 ```
 

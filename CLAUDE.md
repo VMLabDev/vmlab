@@ -57,8 +57,8 @@ halt a restore refuses on, both ride the **ledger**, because a restore does not
 need a running machine. Restore's refusal has the one escape flag in §19.6
 (`--discard-guest-changes`); capture's has none. Every surface that takes or
 restores one says **snapshots are not a workspace backup**. The `@dev`
-declaration (#80) and all
-three agent vocabularies (§19.5) are built: `tunnel` (#85), `watch` (#86) and
+declaration (#80) and both
+agent vocabularies (§19.5) are built: `watch` (#86) and
 `fileops` (#84) — the handle-based, offset-addressed, pipelined file RPC
 session that **replaced** the whole-file push/pull pair outright, carrying
 `vmlab cp`, wscript push/pull and tree pushes. So is
@@ -67,49 +67,20 @@ mints** (#82) — the wire's per-open `logon`,
 `LogonUser`/`LoadUserProfileW`/linked-token minting, the (account, secret,
 machine) cache and `exec`/`shell`'s `--user`/`--password` — and the **Linux
 session** (#83): `su -l` where the guest has PAM, `setuid` where it does not,
-plus the container floor. **The SSH facade serves a shell** (#87,
-§19.3/ADR-0012): `machine.ssh_open` + `vmlab ssh-proxy`, `none` auth over a
-label selector, and the `session` vocabulary onto agent terminals and execs.
-**`direct-tcpip` rides the agent tunnel** (#89), so `ssh -D`/`-W` reach a
-guest port with no guest network involved and a failed dial answers
-`SSH_OPEN_CONNECT_FAILED` rather than the prohibited code. **`subsystem sftp`
-is answered host-side** (#88, `ssh/sftp.rs`): version 3, transcoded
-packet-for-request onto `fileops` under the connection's own logon, so `scp`
-and an editor's file explorer land on the same cached logon as the shell.
-**`attachable` and the failure ladder** (#90, §19.4): `tunnel && fileops`,
-reported by `vmlab machine capabilities` and carried in the status projection;
-silent at `validate`, a warning at `up`, hard at attach, and the facade
-degrading per channel — a stale agent still serves a shell, while the two
-channels that need what it lacks refuse by name. With it, `vmlab machine
-repair-agent`, which pushes the host's shipped agent into a running machine and
-marks it **diverged**; never automatic, and meaningless on a container, which
-it says. **The managed `~/.ssh/config` block** (#91, §19.7) carries the aliases
-every client picks out of, with `vmlab ssh` and `vmlab ssh-config` over it.
-**`vmlab dev attach` and `dev use`** (#92, §19.7) close the cold-to-editing
-path: attach ups one machine, waits for `attachable` with the wait visible,
-prints the alias and the editor snippet, and `exec`s `ssh` — launching no
-editor and owning nothing the editor will still need; `dev use` records which
-dev machine is *mine* in the lab's gitignored `.vmlab/`, which `destroy`
-forgets with everything else there. With them the selection ladder (argument →
-`VMLAB_DEV_MACHINE` → `dev use` → the default `@dev`, else an error listing
-the candidates) and `ssh-proxy`'s refusal to do any lifecycle at all. **The two
-worked examples run end to end** (#98, §19.8), demonstrating the parity claim
-rather than asserting it — `examples/dev-vscode-windows` (a Windows domain
-member, VS Code Remote-SSH, a minted domain logon, an offline segment) and
-`examples/dev-neovim-container` (a Linux container micro-VM, a TUI over the
-facade's own session channel, the container identity floor), split by machine
-kind so *one contract, every machine kind* is shown. Both place editor bits
-into the dev login's home **before that user has ever logged on**, through the
-**wscript rung** of §19.2's ladder that carries them — `m.as_login(label)` /
-`m.as_account(user, password)`, a second handle onto the same machine whose
-every call (exec, `copy_to`, terminal) lands under that identity — and through
-`provision {}`, never `playbook {}`, which has no rung on the ladder at all.
-Both READMEs record the durability rule (bake / hand-install / redo after a
-rebuild) and the two riders §19.8 left open, each with the run that would
-confirm it named. `dev attach` and `ssh-config --print` print the two things an
-offline guest looks like it has taken away and has not: personal config copies
-over the alias with `scp`, and a host-side service is reached by a NIC on a
-segment with egress rather than by the `ssh -R` §19.3 refuses.
+plus the container floor. `vmlab machine repair-agent` pushes the host's shipped
+agent into a running machine and marks it **diverged**; never automatic, and
+meaningless on a container, which it says. **The worked example runs end to
+end** (§19.8): `examples/dev-container`, a Linux container micro-VM with a
+synced workspace and a `login "dev"` whose home is provisioned **before that
+user has ever logged on**, through the **wscript rung** of §19.2's ladder —
+`m.as_login(label)` / `m.as_account(user, password)`, a second handle onto the
+same machine whose every call (exec, `copy_to`, terminal) lands under that
+identity — and through `provision {}`, never `playbook {}`, which has no rung
+on the ladder at all. **The SSH editor-attach surface was removed before the
+first release**: the host-side SSH facade (ADR-0012, superseded), `vmlab ssh`,
+`ssh-config` and `ssh-proxy`, the managed `~/.ssh/config` block, `dev attach`
+and `dev use`, `attachable`, and the agent's `tunnel` vocabulary. A dev
+machine is reached with `vmlab shell` and `vmlab exec`.
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the
 profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
 `guest/agent-legacy` serving `exec` only over COM1, the bootstrap ISO's
@@ -124,23 +95,9 @@ Module map under `src/`:
 - `dev/` — dev machines (§19.1): who carries `@dev`, which one is the lab's
   default, and the `@dev` > profile > floor resolution of its arguments —
   deliberately separate from the hardware resolver ADR-0008 owns. `select.rs`
-  answers the other question, the one a committed `vmlab.wcl` cannot (§19.7):
-  which dev machine is *mine* — the fixed ladder, and the selection recorded
-  in the lab's own `.vmlab/`.
-- `attach.rs` — `attachable` (§19.4) and the words every rung of its failure
-  ladder says: the one derivation over probed agent features, the refusal that
-  names both remedies, and the warning `up` prints. Nothing here is called by
-  `validate`, deliberately.
-- `ssh_config/` — the managed `~/.ssh/config` block (§19.7): vmlab's whole
-  host-side footprint, generated client-side from the lab file the CLI has in
-  hand. `block.rs` is the text (markers, per-lab sections, stanzas) and
-  `mod.rs` the writer — `flock`, atomic rename onto the *resolved* path, a
-  re-hoist and an `ssh -G` check. Every path it touches is a field on
-  `Managed`, which is both the host config's location override and the seam
-  the tests run against a temporary home. It also holds the two things every
-  attaching surface prints (§19.8): the editor settings snippet, and the
-  offline-guest notes — `scp` over the alias, and NAT egress rather than the
-  refused `ssh -R`.
+  is the fixed ladder a `vmlab dev` verb picks its machine by (§19.7):
+  argument, `VMLAB_DEV_MACHINE`, the default `@dev`, else an error listing
+  the candidates.
 - `profiles/` — guest OS profiles (WCL data, user-overridable).
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
   firmware lookup, process management; `container.rs` builds the micro-VM
@@ -172,10 +129,10 @@ Module map under `src/`:
   in-guest agent on the `vmlab.agent.0` virtio-serial port: interactive
   terminals (PTY/ConPTY), streaming exec, tail, metrics, clipboard, the
   handle-based file RPC session every transfer runs over (`fileops.rs`,
-  §19.5), guest-side TCP tunnels (`tunnel.rs`, §19.5) and the recursive
-  tree `watch` backing the workspace syncer (`watch/`, §19.5) — only a
-  tunnel's payload touches the guest network. `spawn.rs` is the one seam
-  every guest process is created through, and that a file session borrows
+  §19.5) and the recursive tree `watch` backing the workspace syncer
+  (`watch/`, §19.5) — none of it touches the guest network. `spawn.rs` is
+  the one seam every guest process is created through, and that a file
+  session borrows
   its identity from (ADR-0015); each platform half mints §19.2's declared
   logins behind it:
   `windows/logon.rs` a token and a loaded profile, `linux/login.rs` a real
@@ -200,8 +157,6 @@ Module map under `src/`:
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;
   `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18);
-  `ssh/` is the SSH facade vmlab terminates on the host (§19.3, ADR-0012) —
-  no guest runs an sshd, and its refusals follow ADR-0013's invariant;
   `agent_repair.rs` is `machine.repair_agent` (§19.4), the plan for replacing
   a guest's agent binary over its own channel and the divergence it records;
   `workspace/` is the workspace syncer (§19.6, ADR-0014) — the layered
@@ -234,9 +189,9 @@ Module map under `src/`:
   plan (virtiofs + SMB, per guest OS) the lab runtime only executes.
 - `oci/` — OCI registry push/pull (chunked, multi-arch).
 - `cli/` — the `vmlab` verb surface; `dev.rs` is `vmlab dev` (§19.7), which
-  holds only what is meaningless for a machine that is not `@dev` — `attach`,
-  `use`, and the `sync` verbs a halt is resolved through (§19.6), which live
-  here because ADR-0013 leaves no guest→host control path to offer them from.
+  holds only what is meaningless for a machine that is not `@dev` — the
+  `sync` verbs a halt is resolved through (§19.6), which live here because
+  ADR-0013 leaves no guest→host control path to offer them from.
 
 The user manual is a wdoc book at `docs/manual/` (`just manual-build`,
 `just manual-serve`; audited with `/technical-book audit`, whose surface

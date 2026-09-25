@@ -1027,7 +1027,7 @@ lone login is the default, and an undeclared `elevated` is true on Windows and
 false on Linux. The password crosses exactly as written, `None` where none was
 declared, so a provision creates the account the lab declares rather than a copy
 of it. It never fails; a machine with no logins returns an empty list. See
-logins-and-ssh.md.
+logins.md.
 
 ```wscript
 fn main(lab: Lab) {
@@ -1059,7 +1059,7 @@ Every method on the returned handle, `exec`, `copy_to`, `copy_from`,
 writes into the dev login's home before that user has ever logged on. The
 pointer position is shared with the original handle. It fails, loudly, when
 nothing matches the selector; that is what stops a provision from silently
-writing into the system profile. See logins-and-ssh.md.
+writing into the system profile. See logins.md.
 
 ```wscript
 fn main(lab: Lab) {

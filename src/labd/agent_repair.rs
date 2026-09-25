@@ -181,10 +181,8 @@ pub struct RepairReport {
     /// after-state, read from a fresh handshake rather than assumed from what
     /// was pushed.
     pub agent_version: String,
-    /// Everything it advertised, which is the evidence `attachable` is read
-    /// from rather than a second opinion about it.
+    /// Everything it advertised.
     pub features: Vec<String>,
-    pub attachable: bool,
 }
 
 /// Push the host's shipped agent into `m` and wait for it to come back.
@@ -282,7 +280,6 @@ pub async fn repair(m: &Arc<dyn Machine>) -> Result<RepairReport> {
         pushed: asset.version,
         installed_at: plan.install,
         agent_version: info.agent_version,
-        attachable: crate::attach::attachable(&info.features),
         features: info.features,
     })
 }

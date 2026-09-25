@@ -77,7 +77,7 @@ DOC
 guests have no virtio drivers, so the agent channel is a 16550 on COM1 and
 the guest runs the legacy agent, a small C program that speaks the same
 protocol and serves `exec` only. `vmlab exec`, readiness and the stop ladder
-work on such a guest; a terminal, `vmlab cp` and `vmlab dev attach` refuse by
+work on such a guest; a terminal and `vmlab cp` refuse by
 name. On DOS the agent is the foreground program, and a command's output
 arrives after it exits. The bootstrap ISO carries the legacy builds with an
 install script each, so a template's own install hook, or a provision typing

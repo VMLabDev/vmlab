@@ -7,15 +7,15 @@
 //!
 //! 1. **`LOGON32_LOGON_NETWORK_CLEARTEXT`.** It yields a *real* initial TGT
 //!    and genuine network credentials, unlike the identity-without-
-//!    credentials a key-authenticated Windows sshd produces — the finding
-//!    that moved the SSH server to the host (§19.3). `BATCH` and `SERVICE`
+//!    credentials of an S4U logon, which is what a key-authenticated Windows
+//!    sshd produces. `BATCH` and `SERVICE`
 //!    are refused outright (1385), and `INTERACTIVE` is refused **on a
 //!    domain controller**, where "log on locally" is not granted to ordinary
 //!    users: choosing it would quietly make "the DC is my dev machine"
 //!    impossible.
 //! 2. **[`LoadUserProfileW`] before spawning.** It *creates* the profile on
 //!    demand for a never-logged-on domain user. Skip it and `USERPROFILE` is
-//!    `C:\Users\Default` — shared, wrong, and silent, with every editor that
+//!    `C:\Users\Default` — shared, wrong, and silent, with every program that
 //!    writes under `$HOME` scribbling into it.
 //! 3. **[`AdjustTokenPrivileges`].** SYSTEM holds `SeAssignPrimaryToken` and
 //!    `SeIncreaseQuota` **present but disabled**; `CreateProcessAsUserW`
@@ -410,7 +410,7 @@ const RUN_VALUE: &str = "vmlab-shares";
 /// **A correction to §7.5, not an addition.** The agent's own mounts run as
 /// SYSTEM and land in the global DOS-device namespace, so every session
 /// *sees* the drive letters while each logon authenticates separately. The
-/// existing fix is an `HKLM\…\Run` hook — and a facade logon never fires
+/// existing fix is an `HKLM\…\Run` hook — and a minted logon never fires
 /// one, because a `Run` key needs a desktop session and
 /// `NETWORK_CLEARTEXT` + `CreateProcessAsUserW` is not that. Without this an
 /// attached developer lands in exactly the documented failure: `Z:` is

@@ -77,7 +77,7 @@ SRC
       | "`disk {}`" | "children" | "none" | "Additional disks beyond the primary disk." |
       | "`share {}`" | "children" | "none" | "Shared folders over virtiofs or SMB. SMB shares require at least one NIC." |
       | "`media {}`" | "children" | "none" | "ISO or floppy images built from a folder." |
-      | "`login {}`" | "children" | "none" | "Identities a surface attaches to this VM as. Without one every verb keeps the agent identity." |
+      | "`login {}`" | "children" | "none" | "Identities a person's commands run as on this VM. Without one every verb keeps the agent identity." |
       | "`provision {}`" | "children" | "none" | "wscript scripts run on `vmlab up` once this VM is ready, interleaved with its playbooks in declaration order." |
       | "`playbook {}`" | "children" | "none" | "config-weave playbooks applied on `vmlab up`, interleaved with its provisions in declaration order." |
   }
@@ -111,9 +111,8 @@ SRC
   h3 "The @dev decorator"
   p <<DOC
     `@dev` is written on the line before a `vm` or `container` block and marks
-    it as a [dev machine](guide_dev): vmlab publishes it as an SSH endpoint an
-    editor attaches into and, when a workspace is named, syncs that directory
-    onto it. It is a decorator rather than a child block because it states
+    it as a [dev machine](guide_dev): when a workspace is named, vmlab syncs
+    that directory onto it and keeps the two copies in step. It is a decorator rather than a child block because it states
     something about the machine; nothing it carries is a setting the guest
     sees. A bare `@dev` is complete. Any number of machines may carry it, and
     zero is normal.
@@ -127,7 +126,7 @@ SRC
     rows:
       | "Argument" | "Type" | "Default" | "Meaning" |
       | "`default`" | "bool" | "`false`" | "Make this the lab's default dev machine. At most one per lab. The only `@dev` machine in a lab is the default implicitly." |
-      | "`workspace`" | "utf8" | "none" | "Host directory whose contents sync into the workspace, relative to the lab root. Without it the machine is attachable but has no workspace." |
+      | "`workspace`" | "utf8" | "none" | "Host directory whose contents sync into the workspace, relative to the lab root. Without it the machine carries `@dev` but has nothing to sync." |
       | "`workspace_guest`" | "utf8" | "profile, else `/src`" | "Guest path the workspace lands at. Inherited from the profile (`C:\\src` on Windows profiles, `/src` on Linux ones) if omitted." |
   }
   p <<DOC
@@ -138,20 +137,21 @@ SRC
     not a `vm` or `container`. Validation adds one rule: two machines with
     `default = true` is an error naming both. With more than one `@dev`
     machine and none declaring `default = true`, the lab has no default; the
-    selection ladder in [vmlab dev](cmd_dev) then needs an argument.
+    selection ladder in [vmlab dev](cmd_dev) then needs an argument. The
+    `dev-container` example carries it on a container:
   DOC
   code wcl {
-    filename    = "examples/dev-vscode-windows/vmlab.wcl"
-    source_file = "../../examples/dev-vscode-windows/vmlab.wcl"
+    filename    = "examples/dev-container/vmlab.wcl"
+    source_file = "../../examples/dev-container/vmlab.wcl"
     anchor      = "dev01"
     dedent      = true
   }
 
   h2 "login {}"
   p <<DOC
-    A labelled identity on a machine: the guest account a surface attaches
-    as. See [Logins and the SSH facade](guide_logins). Repeatable, so one
-    account may be declared twice at different elevation, and an SSH username
+    A labelled identity on a machine: the guest account `exec`, `shell` and
+    a script's `as_login` run as. See [Logins](guide_logins). Repeatable, so
+    one account may be declared twice at different elevation, and `--user`
     selects between labels.
   DOC
   code wcl { source = <<'SRC'
@@ -166,7 +166,7 @@ SRC
   table {
     rows:
       | "Field" | "Type" | "Default" | "Meaning" |
-      | "`label`" | "utf8 (label)" | "required" | "Identity label, what an SSH username selects it by, for example `dev`. Unique per machine; the inline block label." |
+      | "`label`" | "utf8 (label)" | "required" | "Identity label, what `--user` and `as_login` select it by, for example `dev`. Unique per machine; the inline block label." |
       | "`user`" | "utf8" | "required" | "Guest account to log on as, for example `PROBE\\dev`." |
       | "`password`" | "utf8" | "none" | "The account's password, written plainly. Required on a Windows-family profile." |
       | "`elevated`" | "bool" | "`true`" | "Run the session elevated. Windows only; declaring it on a Linux-family profile is an error." |

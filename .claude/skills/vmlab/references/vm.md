@@ -70,7 +70,7 @@ vm "<name>" {
 | `disk {}` | children | none | Additional disks beyond the primary disk. |
 | `share {}` | children | none | Shared folders over virtiofs or SMB. SMB shares require at least one NIC. |
 | `media {}` | children | none | ISO or floppy images built from a folder. |
-| `login {}` | children | none | Identities a surface attaches to this VM as. Without one every verb keeps the agent identity. |
+| `login {}` | children | none | Identities `exec`, `shell` and the workspace syncer run as on this VM. Without one every verb keeps the agent identity. |
 | `provision {}` | children | none | wscript scripts run on `vmlab up` once this VM is ready, interleaved with its playbooks in declaration order. |
 | `playbook {}` | children | none | config-weave playbooks applied on `vmlab up`, interleaved with its provisions in declaration order. |
 
@@ -135,9 +135,8 @@ vm "winsrv" {
 ### The `@dev` decorator
 
 `@dev` is written on the line before a `vm` or `container` block and marks it as
-a dev machine (see dev-machines.md): vmlab publishes it as an SSH endpoint an
-editor attaches into and, when a workspace is named, syncs that directory onto
-it. It is a decorator rather than a child block because it states something
+a dev machine (see dev-machines.md): when a workspace is named, vmlab syncs
+that host directory onto it both ways. It is a decorator rather than a child block because it states something
 about the machine; nothing it carries is a setting the guest sees. A bare `@dev`
 is complete. Any number of machines may carry it, and zero is normal.
 
@@ -149,7 +148,7 @@ vm "dev01" { … }
 | Argument | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `default` | bool | `false` | Make this the lab's default dev machine. At most one per lab. The only `@dev` machine in a lab is the default implicitly. |
-| `workspace` | utf8 | none | Host directory whose contents sync into the workspace, relative to the lab root. Without it the machine is attachable but has no workspace. |
+| `workspace` | utf8 | none | Host directory whose contents sync into the workspace, relative to the lab root. Without it the machine is still `@dev` but has no workspace. |
 | `workspace_guest` | utf8 | profile, else `/src` | Guest path the workspace lands at. Inherited from the profile (`C:\src` on Windows profiles, `/src` on Linux ones) if omitted. |
 
 Unset arguments resolve in the order `@dev` argument, then the machine's
@@ -162,7 +161,7 @@ is an error naming both. With more than one `@dev` machine and none declaring
 needs an argument (see dev-machines.md).
 
 ```wcl
-# examples/dev-vscode-windows/vmlab.wcl
+# vmlab.wcl
 @dev(default = true, workspace = "./workspace")
 vm "dev01" {
   template   = "x86_64/windows-server-2025"
@@ -171,28 +170,25 @@ vm "dev01" {
   depends_on = ["dc01"]
   nic { segment = "corp" }
 
-  // Who a surface attaches as (§19.2). The default login is the domain
-  // user, so `vmlab dev attach`, the SSH facade's shell, its sftp
-  // subsystem and `vmlab exec` all land on **one** minted logon — which is
-  // what makes `dir \\dc01\team` work from the editor's terminal.
-  //
-  // The secret is written plainly because the account exists only because
-  // scripts/domain.ws created it, with the same string, six lines away.
+  // The default login is the domain user, so `vmlab exec`, `vmlab shell`
+  // and the workspace syncer all land on one minted logon, which is what
+  // makes `dir \\dc01\team` work from a shell in the guest.
   login "dev"   { user = "PROBE\\dev"           password = "vmlab123!" default = true }
   login "admin" { user = "PROBE\\Administrator" password = "vmlab123!" }
 
-  // Declaration order is run order. Join first, then place the editor bits
-  // into the domain user's home — which at that moment does not exist yet.
+  // Declaration order is run order. Join first, then place files into the
+  // domain user's home, which at that moment does not exist yet.
   provision "scripts/join-domain.ws" { }
-  provision "scripts/editor-bits.ws" { }
+  provision "scripts/home-bits.ws" { }
 }
 ```
 
 ## login {}
 
-A labelled identity on a machine: the guest account a surface attaches as (see
-logins-and-ssh.md). Repeatable, so one account may be declared twice at
-different elevation, and an SSH username selects between labels.
+A labelled identity on a machine: the guest account `exec`, `shell` and the
+workspace syncer run as (see logins.md). Repeatable, so one account may be
+declared twice at different elevation, and `--user` or `as_login` selects
+between labels.
 
 ```wcl
 login "<label>" {
@@ -205,7 +201,7 @@ login "<label>" {
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `label` | utf8 (label) | required | Identity label, what an SSH username selects it by, for example `dev`. Unique per machine; the inline block label. |
+| `label` | utf8 (label) | required | Identity label, what `--user` and `as_login` select it by, for example `dev`. Unique per machine; the inline block label. |
 | `user` | utf8 | required | Guest account to log on as, for example `PROBE\dev`. |
 | `password` | utf8 | none | The account's password, written plainly. Required on a Windows-family profile. |
 | `elevated` | bool | `true` | Run the session elevated. Windows only; declaring it on a Linux-family profile is an error. |

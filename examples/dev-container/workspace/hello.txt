@@ -1,0 +1,7 @@
+Edit this file on either side and watch the change arrive on the other.
+
+  host:   ./workspace/hello.txt
+  guest:  /src/hello.txt
+
+The workspace syncs both ways (PRD §19.6); everything else in this lab is a
+declaration.

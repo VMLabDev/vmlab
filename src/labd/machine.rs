@@ -65,10 +65,9 @@ pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(300);
 /// inferred. Drives `machine.capabilities`, which is how a surface decides
 /// whether to offer a console, a clipboard or a log view.
 ///
-/// `Deserialize` because a client reads it back: `vmlab dev attach` waits on
-/// the probed feature list, and reading it as the producer's own type is what
-/// stops a field renamed here from silently becoming an empty answer there
-/// (ADR-0004's lesson).
+/// `Deserialize` because a client reads it back, and reading it as the
+/// producer's own type is what stops a field renamed here from silently
+/// becoming an empty answer there (ADR-0004's lesson).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
     pub kind: MachineKind,
@@ -82,16 +81,10 @@ pub struct Capabilities {
     /// verdict rather than only "is it ready".
     pub healthcheck: bool,
     /// Agent features negotiated at handshake (`terminal`, `exec`, `fileops`,
-    /// `tail`, `metrics`, `clipboard`, `eventlog`, `tunnel`, `watch`). Empty
+    /// `tail`, `metrics`, `clipboard`, `eventlog`, `watch`). Empty
     /// when no agent is answering — which is a live fact, not a property of
     /// the kind.
     pub agent: Vec<String>,
-    /// This agent can serve an attach (§19.4): exactly `tunnel` and `fileops`,
-    /// both present. Never a promise that *your* attach will succeed —
-    /// identity is declared separately (§19.2) — and computed over the probed
-    /// features above rather than inferred from the kind
-    /// ([`crate::attach::attachable`]).
-    pub attachable: bool,
 }
 
 /// Where a machine's vmlab-agent came from — and so whether pushing the
@@ -195,19 +188,6 @@ pub trait Machine: Send + Sync + 'static {
     fn logins(&self) -> &[model::Login];
     /// Host socket re-exposing one agent terminal session as a raw byte pipe.
     fn term_session_sock(&self, id: u32) -> PathBuf;
-
-    /// Host socket carrying one SSH facade connection (§19.3), tagged
-    /// because there is one per proxy invocation rather than one per
-    /// machine.
-    ///
-    /// A default, where [`term_session_sock`](Machine::term_session_sock) is
-    /// answered per machine: the run directory is the right place for every
-    /// machine kind, and the tag is bounded by construction — §19.7's rule
-    /// that nothing vmlab puts in a unix socket path is bounded by a name it
-    /// does not control.
-    fn ssh_session_sock(&self, tag: u32) -> PathBuf {
-        self.run_dir().join(format!("ssh-{tag:08x}.sock"))
-    }
 
     /// Whether the host running this machine can serve a share over virtiofs
     /// ([`Hypervisor::virtiofsd_available`](super::hypervisor::Hypervisor::virtiofsd_available)).
@@ -581,25 +561,19 @@ impl dyn Machine {
     /// Agent features come from a live handshake, so a machine that is up but
     /// not yet answering reports an empty list rather than a guess.
     pub async fn capabilities(self: &Arc<Self>) -> Capabilities {
-        let agent = self.agent_features().await;
         Capabilities {
             kind: self.kind(),
             display: self.clone().display().is_some(),
             console_log: self.console_log(1).is_some(),
             reboot: self.can_reboot(),
             healthcheck: self.has_healthcheck(),
-            attachable: crate::attach::attachable(&agent),
-            agent,
+            agent: self.agent_features().await,
         }
     }
 
     /// What this machine's agent advertised at handshake, or nothing at all
     /// when none is answering — which is a live fact about the machine, not a
     /// property of its kind.
-    ///
-    /// One probe behind both `attachable` answers ([`Capabilities`] and
-    /// [`MachineStatus`]), so the two can never disagree about the same
-    /// machine.
     pub async fn agent_features(self: &Arc<Self>) -> Vec<String> {
         match self.agent().await {
             Ok(handle) => handle.info().features,
@@ -647,7 +621,6 @@ impl dyn Machine {
             // default dev machine depends on what the rest of the lab
             // declares, so `LabRuntime::status` fills this in (§19.1).
             dev: None,
-            attachable: crate::attach::attachable(&self.agent_features().await),
             // Lab-level too: divergence is recorded in the lab's persisted
             // state, which the machine does not hold (§19.4).
             agent_diverged: false,

@@ -3,8 +3,8 @@
 //! One measured `LogonUser` costs ~97 ms, so a cache is what keeps attach
 //! latency a non-issue — but its real job is sameness: three channels that
 //! resolve the same account share one token, one `LogonId` and one ticket
-//! cache, which is what makes *"the SFTP logon is the same logon"* true by
-//! construction rather than by discipline.
+//! cache, which is what makes *"the file session's logon is the shell's
+//! logon"* true by construction rather than by discipline.
 //!
 //! The policy is here, portable and testable with no guest; what a logon
 //! *is* stays with the platform that mints it (`windows/logon.rs`), and the
@@ -21,9 +21,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How long an unused logon survives before the sweeper drops it. Aligned
-/// with the `ControlPersist` the generated SSH alias sets (§19.3): a
-/// developer whose editor reconnects inside the window keeps the same
+/// How long an unused logon survives before the sweeper drops it: a
+/// developer who opens another channel inside the window keeps the same
 /// session, and one who walks away stops holding a hive mounted.
 pub const IDLE_GRACE: Duration = Duration::from_secs(10 * 60);
 
@@ -213,7 +212,7 @@ mod tests {
 
     /// §19.2: the key is (account, secret, machine) and *not* the label, so
     /// two labels naming one account share a session — which is what makes
-    /// the SFTP logon and the shell's logon the same logon.
+    /// the file session's logon and the shell's logon the same logon.
     #[test]
     fn two_channels_naming_one_account_share_one_logon() {
         let cache = LogonCache::new();

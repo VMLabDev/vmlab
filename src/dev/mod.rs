@@ -47,8 +47,7 @@ pub struct ResolvedDev {
     /// This is the lab's default dev machine.
     pub default: bool,
     /// Host directory whose contents sync into the workspace, relative to the
-    /// lab root (§19.6). `None` = this dev machine has no workspace; it is
-    /// still attachable.
+    /// lab root (§19.6). `None` = this dev machine has no workspace.
     pub workspace: Option<PathBuf>,
     /// Guest path the workspace lands at — `@dev` > profile > floor.
     pub workspace_guest: String,
@@ -97,7 +96,7 @@ pub fn machines<'a>(
     // implicitly, whether or not it says so. That includes one that wrote
     // `default = false` — "where none carries `default = true`, the only
     // machine carrying `@dev`" is the whole rule, and the alternative is a
-    // lab with exactly one dev machine and no default to attach to.
+    // lab with exactly one dev machine and no default to sync.
     if out.len() == 1 {
         out[0].default = true;
     }

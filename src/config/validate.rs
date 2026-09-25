@@ -774,7 +774,7 @@ impl TemplateLayer {
 /// neither is a claim vmlab can make about `custom`, whose whole contract is
 /// that nothing is assumed (§5.3), or about a VM whose profile is only
 /// knowable once its registry template is pulled. Those machines are left to
-/// fail loudly at attach time (§19.2) rather than rejected here on a guess.
+/// fail loudly at logon time (§19.2) rather than rejected here on a guess.
 ///
 /// Not the same question as [`crate::labd::guest_os::guest_os_of`] (which
 /// picks a config-weave binary) or [`crate::smb::guest_os_hint`] (which picks
@@ -802,7 +802,7 @@ fn login_family(profile: Option<&str>) -> LoginFamily {
 /// machine's resolved profile, or another `login` block beside it. The two
 /// family rules and the one-default rule are §5.1's; the label-uniqueness
 /// rule is the same "unique per machine" guard every other labelled child
-/// block carries, and here it is what keeps the SSH selector addressable.
+/// block carries, and here it is what keeps every login addressable.
 fn check_logins(
     kind: &str,
     machine: &str,
@@ -815,7 +815,7 @@ fn check_logins(
     for login in logins {
         // A Windows agent runs as LocalSystem and mints the logon with
         // `LogonUser`, so there is no credential-free route to the account —
-        // every one of them is the S4U logon §19.3 already disqualified.
+        // every one of them is an S4U logon, which carries no network credentials.
         if family == LoginFamily::Windows && login.password.is_none() {
             issues.push(Issue::at(
                 login.span,
@@ -839,14 +839,14 @@ fn check_logins(
                 ),
             ));
         }
-        // The label is the SSH username selector (§19.2), so two of them on
-        // one machine is an identity that cannot be addressed.
+        // The label is what `--user` and `as_login` select by (§19.2), so two
+        // of them on one machine is an identity that cannot be addressed.
         if !labels.insert(&login.label) {
             issues.push(Issue::at(
                 login.span,
                 format!(
-                    "{kind} \"{machine}\": duplicate login \"{}\" — the label is what an SSH \
-                     username selects an identity by (PRD §19.2)",
+                    "{kind} \"{machine}\": duplicate login \"{}\" — the label is what `--user` \
+                     and `as_login` select a login by (PRD §19.2)",
                     login.label
                 ),
             ));
@@ -1599,14 +1599,13 @@ lab "l" {
         assert_eq!(issue.span.map(|s| s.offset()), Some(second));
     }
 
-    /// §19.4's bottom rung: **`validate` says nothing about agent
-    /// capability.** It is a config check with no side effects, and the only
-    /// statically available signal is the template's sealed `agent_version` —
-    /// a free-form string, so comparing it is *inference*, which the
-    /// capability doctrine rejects, and it would be `validate`'s first
-    /// guest-content check. A dev machine on a template that records an
-    /// ancient agent, or none at all, validates clean; the failure lands at
-    /// `up` (a warning) and at attach (hard).
+    /// **`validate` says nothing about agent capability.** It is a config
+    /// check with no side effects, and the only statically available signal
+    /// is the template's sealed `agent_version` — a free-form string, so
+    /// comparing it is *inference*, which the capability doctrine rejects,
+    /// and it would be `validate`'s first guest-content check. A dev machine on a template that records an
+    /// ancient agent, or none at all, validates clean; what the agent can do
+    /// is probed once it runs.
     #[test]
     fn validate_says_nothing_about_agent_capability() {
         let src = r#"import <vmlab.wcl>
@@ -1898,8 +1897,8 @@ lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern"
         );
     }
 
-    /// The label is what an SSH username selects an identity by, so two of
-    /// them on one machine name an identity nothing can address.
+    /// The label is what `--user` and `as_login` select a login by, so two
+    /// of them on one machine name an identity nothing can address.
     #[test]
     fn login_labels_are_unique_per_machine() {
         assert_err(
@@ -1913,7 +1912,7 @@ lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern"
 
     /// Both family rules are claims about a *known* family. A profile that
     /// names none — `custom`, or a registry template whose profile is not
-    /// knowable until it is pulled — is left to fail loudly at attach time
+    /// knowable until it is pulled — is left to fail loudly at logon time
     /// (§19.2) rather than rejected here on a guess.
     #[test]
     fn an_unclassifiable_profile_triggers_neither_family_rule() {

@@ -46,8 +46,8 @@ its process markers are all keyed by the lab's declared name, not by the
 directory it lives in. Two directories that declare the same lab name cannot
 run at once on one host. On `up` of the second, the supervisor answers with a
 `conflict` error naming the other root and the two remedies: stop that lab, or
-rename this one. This rule is what makes the SSH aliases
-`vmlab-<lab>-<machine>` unambiguous (see logins-and-ssh.md).
+rename this one. This rule is what makes a `[lab/]name` machine reference
+unambiguous from any directory.
 
 ## What a machine is
 
@@ -84,9 +84,9 @@ wait on the screen or on time.
 
 **The host opens channels; the guest answers.** Every channel to a guest is
 opened from the host side and answered by the agent. Nothing in a guest can
-open a connection back to vmlab. This one rule is why the SSH facade refuses
-`ssh -R`, why a halted workspace can only be resolved from the host, and why a
-guest with no network is still fully driveable.
+open a connection back to vmlab. This one rule is why a halted workspace can
+only be resolved from the host, why the halt reaches the guest only as a marker
+file, and why a guest with no network is still fully driveable.
 
 ## What happens on `vmlab up`
 
@@ -112,10 +112,10 @@ corresponding environment variable.
 | Path | What is there |
 | --- | --- |
 | `<lab>/vmlab.wcl` | The lab definition. The CLI finds it by walking up from the current directory, the way git finds a repository. |
-| `<lab>/.vmlab/` | Lab-local working data: linked-clone disks, snapshot data, built ISO and floppy images, TPM state, persisted lab state, the workspace sync ledger and the `dev use` selection. Safe to delete when the lab is down. Gitignore it. |
+| `<lab>/.vmlab/` | Lab-local working data: linked-clone disks, snapshot data, built ISO and floppy images, TPM state, persisted lab state, the workspace sync ledger. Safe to delete when the lab is down. Gitignore it. |
 | `~/.local/share/vmlab/templates/` | The template store, laid out as `<arch>/<name>/<version>/`. |
 | `~/.local/share/vmlab/oci/` | The digest-addressed cache of pulled container images. |
-| `~/.local/state/vmlab/` | Daemon state, per-lab and per-machine logs as JSON lines, event history, SSH host keys. |
+| `~/.local/state/vmlab/` | Daemon state, per-lab and per-machine logs as JSON lines, event history. |
 | `~/.config/vmlab/` | The host configuration file and user profile overrides (see host-profiles.md). |
 | `$XDG_RUNTIME_DIR/vmlab/` | `vmlabd.sock`, and `labs/<lab>/` holding each lab daemon's `control.sock` and its per-machine QMP, agent, NIC and VNC sockets. |
 
@@ -134,7 +134,7 @@ labs never collide. The lab file stays where it is.
 | Root | Default | Override | Holds |
 | --- | --- | --- | --- |
 | Data | `~/.local/share/vmlab` | `XDG_DATA_HOME` | The template store, the container-image cache, guest assets, build caches. |
-| State | `~/.local/state/vmlab` | `XDG_STATE_HOME` | Daemon logs, per-lab logs and event history, the lab registry, SSH host keys. |
+| State | `~/.local/state/vmlab` | `XDG_STATE_HOME` | Daemon logs, per-lab logs and event history, the lab registry. |
 | Config | `~/.config/vmlab` | `XDG_CONFIG_HOME` | The host configuration file, registry namespaces, profile overrides. |
 | Runtime | `$XDG_RUNTIME_DIR/vmlab` | `XDG_RUNTIME_DIR` | Every control socket. Falls back to `/tmp/vmlab-<uid>` when the variable is unset, as on some WSL setups. |
 
@@ -171,8 +171,6 @@ deployments.
 | `labs/<lab>/lab.log` | Provision and script output. |
 | `labs/<lab>/vms/<vm>/` | `serial.log`, `qemu.log` and `swtpm.log` for one VM. |
 | `labs/<lab>/containers/<name>/console.log` | The micro-VM kernel log with the container's stdout and stderr. |
-| `ssh/known_hosts` | The `known_hosts` the managed SSH block points clients at. |
-| `ssh/<lab>/<machine>` | The SSH facade's host key for one machine. See logins-and-ssh.md. |
 
 `events.jsonl` and `lab.log` roll over at 16 MiB, keeping one previous
 generation as `<name>.1`. `vmlab logs` reads these files directly; there is no
@@ -186,7 +184,6 @@ daemon call for logs.
 | `registries.json` | The searchable OCI namespaces `vmlab template registry` manages. See cli-template.md. |
 | `profiles/` | User overrides of the shipped guest OS profiles. See host-profiles.md. |
 | `~/.docker/config.json` | Registry credentials, read and written Docker-style so an existing login works. `DOCKER_CONFIG` names a different directory. Credential helpers named there are invoked. |
-| `~/.ssh/config` | The managed block `vmlab ssh-config` writes between its markers. The host config's `ssh_config` field moves it. |
 
 ### Runtime sockets
 
@@ -197,7 +194,6 @@ daemon call for logs.
 | `labs/<lab>/vms/<vm>/` | `qmp.sock`, `agent.sock`, `vnc.sock`, `tpm.sock`, one `nic<i>.sock` per NIC, one `vfs<i>.sock` per virtiofs share, and a `term-<id>.sock` per open terminal. |
 | `labs/<lab>/containers/<name>/` | `qmp.sock`, `ctl.sock`, `agent.sock`, `nic<i>.sock`, `vfs<i>.sock` and `term-<id>.sock`. |
 | `global/<segment>.sock` | The trunk socket a lab daemon bridges to for a global segment. See networking.md. |
-| `ssh/` | The `ControlPath` multiplexer sockets the managed SSH block names, and `config.lock`, the lock its writer takes. |
 
 ## The lab directory
 
@@ -215,7 +211,6 @@ should be in the lab's `.gitignore`.
 | `smb/` | The bundled smbd's configuration and state. See shares-media.md. |
 | `workspace/<machine>.json` | The workspace syncer's ledger for one dev machine. See dev-machines.md. |
 | `screenshots/` | Where `Machine.screenshot` writes when given no path. |
-| `dev-machine` | The selection `vmlab dev use` records. |
 
 `VMLAB_WORK_DIR` relocates the whole directory: with it set, the lab's working
 data lives at `$VMLAB_WORK_DIR/<lab-dir-name>-<hash>/`, where the hash is
@@ -236,7 +231,7 @@ keeps disk clones off a slow filesystem such as a bind mount.
 | `VMLAB_FASTPATH` | Overrides the host config's `fastpath`: `auto`, `off`, `sockmap` or `afxdp`. A malformed value is ignored with a warning. See host-profiles.md. |
 | `VMLAB_DEV_MACHINE` | Which dev machine `vmlab dev` verbs mean, second on the selection ladder after an explicit argument. See dev-machines.md. |
 | `DOCKER_CONFIG` | The directory holding `config.json` with registry credentials. |
-| `PATH` | Searched for the emulator, `qemu-img`, `swtpm`, `virtiofsd` and `ssh`. |
+| `PATH` | Searched for the emulator, `qemu-img`, `swtpm` and `virtiofsd`. |
 
 ## The wire protocol
 
@@ -311,15 +306,12 @@ workspaces. Every lab-daemon command is called by the CLI.
 | Machine lifecycle | `machine.start`, `machine.stop`, `machine.restart`, `machine.destroy`, `machine.capabilities`, `machine.ip`, `machine.osinfo`, `machine.stats`, `machine.logs`, `machine.repair_agent` |
 | Display and input | `machine.screenshot`, `machine.sendkeys`, `machine.mouse_move`, `machine.mouse_click`, `machine.mouse_drag`, `machine.ocr`, `machine.find_image` |
 | Guest agent | `machine.exec`, `machine.tty_open`, `machine.tty_resize`, `machine.push_file`, `machine.pull_file`, `machine.tail`, `machine.eventlog`, `machine.clipboard_get`, `machine.clipboard_set` |
-| SSH facade | `machine.ssh_open` |
 | Playbooks | `playbook.list`, `playbook.check`, `playbook.apply` |
 | Snapshots | `snapshot.take`, `snapshot.restore`, `snapshot.delete`, `snapshot.list` |
 | Workspace | `workspace.flush`, `workspace.resolve`, `workspace.diff` |
 
-`machine.tty_open` and `machine.ssh_open` answer with the path of a second unix
-socket the caller connects to and pipes bytes over: a raw terminal for the
-first, an SSH connection for the second, which is what `vmlab ssh-proxy` hands
-to `ssh` as its `ProxyCommand`. See logins-and-ssh.md.
+`machine.tty_open` answers with the path of a second unix socket the caller
+connects to and pipes a raw terminal over.
 
 ### Events on the wire
 

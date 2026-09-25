@@ -9,10 +9,9 @@ the same client, so readiness, `vmlab exec`, the graceful stop ladder and
 `os_info` work unchanged.
 
 It advertises one feature, `exec`. Every other open (terminal, fileops,
-tunnel, tail, watch, eventlog) is refused by name on the channel that asked,
-which is what the host's feature ladder (§19.4) needs to degrade truthfully:
-`vmlab shell`, `vmlab cp` and `dev attach` say what is missing rather than
-hang. A `logon` on an exec is refused too — nothing here mints one; every
+tail, watch, eventlog) is refused by name on the channel that asked, which is
+what the host's feature ladder (§19.4) needs to degrade truthfully:
+`vmlab shell` and `vmlab cp` say what is missing rather than hang. A `logon` on an exec is refused too — nothing here mints one; every
 command runs as the agent's own identity (§19.2's floor).
 
 ## Why C

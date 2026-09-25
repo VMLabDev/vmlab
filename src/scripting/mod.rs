@@ -210,7 +210,7 @@ impl From<vision::Match> for ScriptMatch {
 #[derive(Script, Clone)]
 #[script(name = "Login")]
 pub struct ScriptLogin {
-    /// What an SSH username selects this identity by.
+    /// What `--user` and `as_login` select this identity by.
     pub label: String,
     /// The guest account, e.g. `PROBE\dev`.
     pub user: String,
@@ -304,8 +304,8 @@ impl MachineHandle {
     /// the choice was a second method per arity (`exec_as`, `exec_as_timeout`,
     /// and then one per file verb) or one handle carrying the identity. The
     /// handle wins on the thing §19.8 actually asks for: an identity said once
-    /// covers `copy_to` and `terminal` too, and the editor bits a provision
-    /// places are files at least as often as they are commands. The rung, its
+    /// covers `copy_to` and `terminal` too, and what a provision places in a
+    /// login's home is files at least as often as they are commands. The rung, its
     /// resolution and its precedence are unchanged — only where the pair is
     /// written moves.
     fn as_identity(&self, selector: &str, password: Option<&str>) -> Result<MachineHandle, String> {
@@ -1308,22 +1308,22 @@ fn main(lab: Lab) {
         let src = r#"
 use vmlab
 
-fn place_editor_bits(lab: Lab, m: Machine) {
+fn place_home_bits(lab: Lab, m: Machine) {
     let Ok(dev) = m.as_login("dev") else {
         lab.log("no `dev` login declared")
         return
     }
     // The write lands in the real dev user's home, whether or not that
     // profile existed a moment ago (PRD §19.8).
-    let r = dev.exec("cmd", ["/c", "mkdir", "%USERPROFILE%\\.vscode\\extensions"])
-    let c = dev.copy_to("settings.json", "%APPDATA%\\Code\\User\\settings.json")
+    let r = dev.exec("cmd", ["/c", "mkdir", "C:\\Users\\dev\\.config"])
+    let c = dev.copy_to("gitconfig", "C:\\Users\\dev\\.gitconfig")
     let Ok(t) = dev.terminal() else { return }
     let done = t.close()
 }
 
 fn main(lab: Lab) {
     let Ok(dc) = lab.vm("dc01") else { return }
-    place_editor_bits(lab, dc)
+    place_home_bits(lab, dc)
     // An account the lab file never declared needs its secret with it, the
     // same pair `vmlab exec --user/--password` takes.
     let Ok(audit) = dc.as_account("PROBE\\audit", "s3cret") else { return }

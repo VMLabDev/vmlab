@@ -90,8 +90,8 @@ whether a host is reachable, and nothing about round-trip time.
 
 Because the NAT terminates flows on the host, anything a guest addresses
 off-segment reaches the host's own address space. That is how a guest reaches a
-host-side service such as a package mirror or a licence server, and it is the
-answer to the reverse tunnel the SSH facade refuses (logins-and-ssh.md).
+host-side service such as a package mirror or a licence server, with no
+listener inside the guest and no route of the guest's own.
 
 ## Port forwards
 

@@ -79,15 +79,6 @@ pub fn runtime_dir() -> PathBuf {
     }
 }
 
-/// `$XDG_RUNTIME_DIR/vmlab/ssh` — the SSH multiplexer sockets the managed
-/// block's `ControlPath` names (PRD §19.7), and the advisory lock its writer
-/// serialises on. Under the runtime directory because that is where every
-/// other vmlab control socket already lives, and because `%C` plus this
-/// prefix is the whole of a path bounded by construction.
-pub fn ssh_runtime_dir() -> PathBuf {
-    runtime_dir().join("ssh")
-}
-
 /// Supervisor control socket.
 pub fn supervisor_socket() -> PathBuf {
     runtime_dir().join("vmlabd.sock")

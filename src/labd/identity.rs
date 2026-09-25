@@ -6,8 +6,7 @@
 //! identity.
 //!
 //! The host resolves label → triple and the guest only ever sees the triple
-//! (§19.5), so no vmlab label crosses the wire and `DOMAIN\user` never has
-//! to survive an SSH username. Everything vmlab does on its own behalf —
+//! (§19.5), so no vmlab label crosses the wire. Everything vmlab does on its own behalf —
 //! provisioning, share mounting, readiness, metrics, shutdown — never calls
 //! this and keeps the agent identity.
 
@@ -108,8 +107,8 @@ fn as_logon(machine: &str, login: &Login, guest_os: GuestOs) -> Result<Logon> {
         // free. So a Linux `login {}` may declare the account alone.
         (None, GuestOs::Linux) => String::new(),
         // §5.1 rejects this at validation on a Windows-family profile: the
-        // agent is SYSTEM and every credential-free route is the one Windows
-        // OpenSSH's S4U logon already disqualified. Reaching it anyway is a
+        // agent is SYSTEM and every credential-free route is an S4U logon,
+        // which carries no network credentials. Reaching it anyway is a
         // refusal, not a passwordless logon.
         (None, GuestOs::Windows) => bail!(
             "login `{}` on machine `{machine}` declares no password, and account `{}` \
@@ -281,7 +280,7 @@ mod tests {
     }
 
     /// A password on the flag overrides the declared secret, so a rotated
-    /// password does not need the lab file edited to attach once.
+    /// password does not need the lab file edited to log on once.
     #[test]
     fn a_password_flag_overrides_the_declared_secret() {
         let got = resolve(

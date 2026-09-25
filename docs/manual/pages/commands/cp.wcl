@@ -50,7 +50,7 @@ page cmd_cp {
 
   callout "Transfers run as the agent identity" {
     kind = :note
-    body = "`cp` still runs as SYSTEM or root even on a machine that declares a `login {}`, unlike `exec` and `shell`. A pushed file is owned by the agent identity, not by the login you would attach as. To write into a login's home as that login, use `scp` over the SSH alias, or the `as_login` handle in a provision script (see [Logins and the SSH facade](guide_logins))."
+    body = "`cp` still runs as SYSTEM or root even on a machine that declares a `login {}`, unlike `exec` and `shell`. A pushed file is owned by the agent identity, not by the login `shell` would land you as. To write into a login's home as that login, use the `as_login` handle in a provision script (see [Logins](guide_logins))."
   }
 
   code sh { source = <<'SRC'

@@ -32,7 +32,7 @@ SCHEMAS = [
     ROOT / "src" / "profiles" / "profile_schema.wcl",
 ]
 
-HIDDEN_VERBS = {"help", "wscripti", "__supervisord", "__labd", "__vncbridge", "ssh-proxy"}
+HIDDEN_VERBS = {"help", "wscripti", "__supervisord", "__labd", "__vncbridge"}
 
 
 def emit(path: str, kind: str) -> None:

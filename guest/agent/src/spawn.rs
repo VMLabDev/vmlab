@@ -63,9 +63,9 @@ pub struct TerminalSpec {
     pub rows: u16,
     /// Applied *over* the environment the identity already brings, never
     /// replacing it: a shell that lost the loaded profile's `USERPROFILE`
-    /// would write the developer's files into the wrong home (§19.2). The
-    /// SSH facade's `env` requests arrive here; everything vmlab opens on
-    /// its own behalf sends none.
+    /// would write the developer's files into the wrong home (§19.2). A
+    /// person's `env` arrives here; everything vmlab opens on its own behalf
+    /// sends none.
     pub env: Vec<(String, String)>,
 }
 

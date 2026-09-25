@@ -59,7 +59,6 @@ page cmd_machine {
       | "`console log`" | "`yes` when a console log is readable from the host, as `vmlab container logs` reads it." |
       | "`reboot`" | "`yes` when the guest can reboot in place and come back." |
       | "`healthcheck`" | "`yes` when the machine declares a healthcheck, so its status carries a verdict." |
-      | "`attachable`" | "`yes` when the agent negotiated both `tunnel` and `fileops`, the two features an attach over the SSH facade needs." |
       | "`agent`" | "The features the agent negotiated at handshake, comma-separated, or `-` when no agent is answering." |
   }
 
@@ -67,11 +66,8 @@ page cmd_machine {
     Agent features come from a live handshake, so a machine that is up but
     not yet answering reports `-`, which reads differently from a feature
     list that lacks something. The possible features are `terminal`, `exec`,
-    `fileops`, `tail`, `metrics`, `clipboard`, `eventlog`, `tunnel` and
-    `watch`. `attachable` says whether this agent can serve an attach at all,
-    never whether your attach will succeed: identity is declared separately.
-    See [Logins and the SSH facade](guide_logins) for the failure ladder built
-    on this flag.
+    `fileops`, `tail`, `metrics`, `clipboard`, `eventlog` and `watch`. A
+    [dev machine](guide_dev)'s workspace syncer needs `fileops` and `watch`.
   DOC
 
   h2 "vmlab machine stats"
@@ -121,19 +117,19 @@ page cmd_machine {
     its [template](guide_templates) is built, and the template's sealed
     `agent_version` describes every clone of it. After a repair that is no
     longer true for this clone, so [vmlab status](cmd_status) shows
-    `diverged=yes` under `-v` until the disks are destroyed. Nothing runs
-    this by itself; it is a tool, not a policy. Rebuilding the template is
-    the other remedy and the one that keeps "same template, same machine"
-    true.
+    `diverged=yes` under `-v` until the disks are destroyed. It is how you
+    try a new agent build, or bring a stale one up to date, without
+    rebuilding the template. Nothing runs this by itself; it is a tool, not a
+    policy. Rebuilding the template is the route that keeps "same template,
+    same machine" true.
   DOC
 
   p <<DOC
     The report says what landed and what the machine now is: `pushed <version>
-    to <path> on "<machine>"`, then `agent <version> answering, attachable
-    yes|no`, then `"<machine>" is now diverged from its template — vmlab vm
+    to <path> on "<machine>"`, then `agent <version> answering`, then `"<machine>" is now diverged from its template — vmlab vm
     destroy + vmlab up puts it back on the sealed agent`. The JSON form
-    carries `machine`, `pushed`, `installed_at`, `agent_version`, `features`
-    and `attachable`.
+    carries `machine`, `pushed`, `installed_at`, `agent_version` and
+    `features`.
   DOC
 
   p <<DOC
@@ -150,7 +146,7 @@ page cmd_machine {
 
   h2 "Examples"
 
-  p "Check why an editor cannot attach to a dev machine:"
+  p "Check which features a machine's agent serves:"
   code sh { source = "vmlab machine capabilities dev01" }
 
   code sh { source = <<'SRC'
@@ -159,7 +155,6 @@ display      yes
 console log  yes
 reboot       yes
 healthcheck  no
-attachable   no
 agent        terminal, exec, tail, metrics, clipboard
 SRC
   }

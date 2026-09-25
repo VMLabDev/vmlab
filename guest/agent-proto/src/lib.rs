@@ -1,8 +1,7 @@
 //! The wire contract between the vmlab host and `vmlab-agent`, the in-guest
 //! agent that serves interactive terminals, streaming exec, file operations,
-//! tailing, metrics, clipboard and TCP tunnels over **one** virtio-serial
-//! port (`vmlab.agent.0`) — the agent's own traffic never touches the guest
-//! network, though a tunnel's payload does by definition.
+//! tailing, metrics and clipboard over **one** virtio-serial port
+//! (`vmlab.agent.0`) — the agent's traffic never touches the guest network.
 //!
 //! The stream is a sequence of length-prefixed frames multiplexing many
 //! channels over the single port:
@@ -69,8 +68,6 @@ pub mod features {
     pub const CLIPBOARD: &str = "clipboard";
     /// Windows event-log tailing.
     pub const EVENTLOG: &str = "eventlog";
-    /// Guest-side TCP tunnels ([`HostMsg::OpenTunnel`], PRD §19.5).
-    pub const TUNNEL: &str = "tunnel";
     /// The recursive guest tree watch backing the workspace syncer
     /// (§19.4, [`crate::watch`]).
     pub const WATCH: &str = "watch";
@@ -348,8 +345,7 @@ pub enum HostMsg {
     ///
     /// `logon` is who the shell runs as; absent is the agent identity
     /// (§19.2's floor). `env` is applied *over* whatever environment that
-    /// identity brings — an SSH client's `env` requests reach a shell this
-    /// way (§19.3), and everything vmlab opens on its own behalf sends none.
+    /// identity brings; everything vmlab opens on its own behalf sends none.
     OpenTerminal {
         id: u32,
         cols: u16,
@@ -380,35 +376,10 @@ pub enum HostMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         logon: Option<Logon>,
     },
-    /// No more host->guest bytes on this channel (exec stdin EOF; a tunnel's
-    /// host side shutting down its write half — see [`AgentMsg::Eof`] for the
-    /// other direction).
+    /// No more host->guest bytes on this channel (exec stdin EOF — see
+    /// [`AgentMsg::Eof`] for the other direction).
     Eof {
         id: u32,
-    },
-    /// Dial `host:port` over TCP **from inside the guest** on channel `id`;
-    /// the channel then carries the connection's bytes both ways under the
-    /// usual credit window.
-    ///
-    /// `host` passes through verbatim and the guest resolves it, which is
-    /// what makes a domain name in a SOCKS request work. There is no
-    /// destination policy — any address the guest can reach, not
-    /// loopback-only — because a dynamic forward dials whatever the
-    /// developer's tooling asks for and vmlab is not a security boundary
-    /// (PRD §1.2, §19.5).
-    ///
-    /// A dial that does not succeed fails the channel with
-    /// [`ErrorCause::ConnectFailed`], which the caller must tell apart from
-    /// vmlab refusing the open. Only the SSH facade opens a tunnel; general
-    /// host->guest TCP is the Forward plan's job (§9.8).
-    ///
-    /// It carries no [`Logon`]: a TCP connect has no user context on either
-    /// OS, and the field would imply a per-user network view that does not
-    /// exist.
-    OpenTunnel {
-        id: u32,
-        host: String,
-        port: u16,
     },
     /// Open a file **RPC session** on channel `id`: the channel then carries
     /// length-prefixed [`fileops`] records — JSON metadata with raw bytes
@@ -531,10 +502,8 @@ pub enum AgentMsg {
     },
     /// No more guest->host bytes on this channel, and the channel stays
     /// open: the mirror of [`HostMsg::Eof`], and the one message §19 adds in
-    /// this direction. A tunnel needs it for per-direction half-close —
-    /// without it a peer that shuts down its write side can only be reported
-    /// by tearing the whole channel down — and it gives `exec` stdout a
-    /// clean end as well.
+    /// this direction. It gives `exec` stdout a clean end without tearing the
+    /// channel down.
     ///
     /// It is a message, not a channel open, so the guest still never
     /// initiates a stream (ADR-0013).
@@ -571,31 +540,12 @@ pub enum AgentMsg {
         bytes: u64,
     },
     /// A channel failed (`id` set) or the agent hit a channel-less error.
-    /// `cause` is set only where a caller has to branch on the reason; `msg`
-    /// always carries the human-readable detail.
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u32>,
         msg: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cause: Option<ErrorCause>,
     },
     Pong,
-}
-
-/// Machine-readable reasons an [`AgentMsg::Error`] can carry. Absent means
-/// an ordinary failure that `msg` describes and nothing branches on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCause {
-    /// An [`HostMsg::OpenTunnel`] dial did not succeed: nothing listening,
-    /// the name did not resolve, the route is dead.
-    ///
-    /// A SOCKS client has to tell *nothing is listening* from *vmlab refused
-    /// you*, so the SSH facade answers this with `SSH_OPEN_CONNECT_FAILED`
-    /// and keeps `ADMINISTRATIVELY_PROHIBITED` for what vmlab genuinely
-    /// refuses (PRD §19.5).
-    ConnectFailed,
 }
 
 /// One mounted filesystem in [`AgentMsg::Metrics`].
@@ -819,11 +769,6 @@ mod tests {
                 }),
             },
             HostMsg::Eof { id: 3 },
-            HostMsg::OpenTunnel {
-                id: 10,
-                host: "registry.internal".into(),
-                port: 5000,
-            },
             HostMsg::OpenFileOps { id: 4, logon: None },
             HostMsg::OpenFileOps {
                 id: 5,
@@ -918,17 +863,10 @@ mod tests {
             AgentMsg::Error {
                 id: Some(9),
                 msg: "no such file".into(),
-                cause: None,
             },
             AgentMsg::Error {
                 id: None,
                 msg: "bad frame".into(),
-                cause: None,
-            },
-            AgentMsg::Error {
-                id: Some(10),
-                msg: "tunnel db:5432: connection refused".into(),
-                cause: Some(ErrorCause::ConnectFailed),
             },
             AgentMsg::Pong,
         ] {
@@ -936,26 +874,18 @@ mod tests {
         }
     }
 
-    /// A connect failure has to be distinguishable on the wire from every
-    /// other refusal, and an agent that omits `cause` (an older build) still
-    /// parses.
+    /// An error from an older agent may still carry the `cause` field the
+    /// removed tunnel vocabulary used; it parses, and the field is dropped.
     #[test]
-    fn error_cause_is_optional_and_distinguishes_a_connect_failure() {
+    fn an_older_agents_error_cause_still_parses() {
         assert_eq!(
-            serde_json::to_string(&AgentMsg::Error {
+            serde_json::from_str::<AgentMsg>(
+                r#"{"event":"error","id":4,"msg":"nope","cause":"connect_failed"}"#
+            )
+            .unwrap(),
+            AgentMsg::Error {
                 id: Some(4),
                 msg: "nope".into(),
-                cause: Some(ErrorCause::ConnectFailed),
-            })
-            .unwrap(),
-            r#"{"event":"error","id":4,"msg":"nope","cause":"connect_failed"}"#
-        );
-        assert_eq!(
-            serde_json::from_str::<AgentMsg>(r#"{"event":"error","msg":"nope"}"#).unwrap(),
-            AgentMsg::Error {
-                id: None,
-                msg: "nope".into(),
-                cause: None,
             }
         );
     }
@@ -992,12 +922,12 @@ mod tests {
         );
     }
 
-    /// §19.5: three opens never carry a `logon`, each for a stated reason —
-    /// a watcher observes rather than produces, a TCP connect has no user
-    /// context, and the event log is machine-scoped. The check is that the
+    /// §19.5: two opens never carry a `logon`, each for a stated reason —
+    /// a watcher observes rather than produces, and the event log is
+    /// machine-scoped. The check is that the
     /// field cannot be set on them at all, which is what the wire shows.
     #[test]
-    fn three_opens_carry_no_logon() {
+    fn two_opens_carry_no_logon() {
         for (msg, wire) in [
             (
                 HostMsg::OpenWatch {
@@ -1006,14 +936,6 @@ mod tests {
                     prune: vec![],
                 },
                 r#"{"cmd":"open_watch","id":8,"path":"/home/dev/work","prune":[]}"#,
-            ),
-            (
-                HostMsg::OpenTunnel {
-                    id: 9,
-                    host: "db".into(),
-                    port: 5432,
-                },
-                r#"{"cmd":"open_tunnel","id":9,"host":"db","port":5432}"#,
             ),
             (
                 HostMsg::OpenEventLog {

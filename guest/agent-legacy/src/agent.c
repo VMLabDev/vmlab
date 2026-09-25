@@ -6,7 +6,7 @@
  * It speaks guest/agent-proto version 2 and advertises one feature, `exec`.
  * Everything else the wire can ask for is answered by name with an error,
  * which is what lets the host's feature ladder (PRD §19.4) degrade rather
- * than guess: a terminal, a file session or a tunnel refuses; readiness,
+ * than guess: a terminal or a file session refuses; readiness,
  * exec and the stop ladder work.
  */
 #include "agent.h"
@@ -452,8 +452,6 @@ static int handle_ctrl(const unsigned char *payload, unsigned long len)
         send_error((long)id, "legacy agent: no terminal (features: exec)");
     } else if (strcmp(cmd, "open_fileops") == 0) {
         send_error((long)id, "legacy agent: no fileops (features: exec)");
-    } else if (strcmp(cmd, "open_tunnel") == 0) {
-        send_error((long)id, "legacy agent: no tunnel (features: exec)");
     } else if (strcmp(cmd, "open_tail") == 0) {
         send_error((long)id, "legacy agent: no tail (features: exec)");
     } else if (strcmp(cmd, "open_watch") == 0) {

@@ -2,7 +2,7 @@
 //
 // This runs as the **agent identity** — root inside the micro-VM — and
 // should: installing packages and creating an account are done *to* the
-// machine. Its sibling, editor-bits.ws, is the other case, and getting the
+// machine. Its sibling, home-bits.ws, is the other case, and getting the
 // two the wrong way round is the mistake PRD §19.8 exists to head off.
 
 use vmlab
@@ -15,12 +15,12 @@ fn sh(m: Machine, script: string, timeout: int) -> Result[string, string] {
     Ok(r.stdout)
 }
 
-// The editor, and the two things a plugin clone needs. The segment's egress
-// is what makes this reachable; a lab that wants none of it bakes the same
-// packages into an image instead — the other half of the durability rule.
+// The toolchain. The segment's egress is what makes this reachable; a lab
+// that wants none of it bakes the same packages into an image instead — the
+// other half of the durability rule.
 fn install(lab: Lab, dev01: Machine) -> Result[unit, string] {
-    lab.log("installing neovim, git and a shell…")
-    sh(dev01, "apk add --no-cache neovim git ca-certificates shadow", 900)?
+    lab.log("installing the account tools…")
+    sh(dev01, "apk add --no-cache shadow", 900)?
     lab.log("toolchain installed")
     Ok(())
 }
@@ -45,7 +45,7 @@ fn create_accounts(lab: Lab, dev01: Machine) -> Result[unit, string] {
         }
 
         if login.default {
-            lab.log(login.label + " is the identity every surface attaches as")
+            lab.log(login.label + " is the identity `vmlab shell` and `vmlab exec` run as")
         }
     }
     Ok(())

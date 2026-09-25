@@ -62,7 +62,6 @@ host {
   fastpath             = "auto"
   oci_chunk_size       = 512MiB
   config_weave_bin_dir = "~/.local/share/config-weave/bin"
-  ssh_config           = "~/.ssh/config"
   workspace_max_file   = 256MiB
 }
 ```
@@ -79,7 +78,6 @@ host {
 | `fastpath` | utf8 | `auto` | Network fast path: `auto` probes, `off` forces userspace, `sockmap` and `afxdp` force a kernel tier. |
 | `oci_chunk_size` | ByteSize | `512MiB` | OCI layer chunk size for `vmlab template push` (see templates.md). |
 | `config_weave_bin_dir` | utf8 | `~/.local/share/config-weave/bin` | Directory holding the config-weave guest binaries playbooks push (see automation.md). |
-| `ssh_config` | utf8 | `~/.ssh/config` | File vmlab writes its managed SSH block into (see logins-and-ssh.md). |
 | `workspace_max_file` | ByteSize | `256MiB` | Workspace syncer per-file size guard. A larger file is refused by name (see dev-machines.md). |
 
 Parser rules, all violations reported in one pass:
@@ -92,13 +90,9 @@ Parser rules, all violations reported in one pass:
 - `oci_chunk_size` and `workspace_max_file` are non-negative sizes.
 - A field the schema does not name is rejected with its position.
 
-Two fields are location knobs with one code path behind them rather than switches:
-
-- `ssh_config` moves the managed SSH block. The block is written to the named file
-  and the `ssh -G` check still runs against it, so a block redirected somewhere
-  OpenSSH does not read warns honestly rather than pretending to work.
-- `config_weave_bin_dir` is the first rung of a three-rung lookup, ahead of the
-  `VMLAB_CONFIG_WEAVE_DIR` environment variable and the XDG default.
+`config_weave_bin_dir` is a location knob rather than a switch: it is the first
+rung of a three-rung lookup, ahead of the `VMLAB_CONFIG_WEAVE_DIR` environment
+variable and the XDG default.
 
 `workspace_max_file` is host config rather than a `@dev` argument because the cap
 is about this developer's link to the guest, not the lab everyone shares; the
@@ -134,8 +128,8 @@ vmlab follows the XDG layout and honours each variable that overrides it.
 | `~/.local/share/vmlab/` | The template store under `templates/` and the container image cache under `oci/`. |
 | `~/.local/share/config-weave/bin/` | Where config-weave's own install puts its guest binaries. |
 | `~/.local/state/vmlab/` | Daemon state, per-lab logs and event history. |
-| `$XDG_RUNTIME_DIR/vmlab/` | Control sockets: the supervisor's, each lab's, and per-VM QMP, agent and VNC sockets, plus the SSH multiplexer sockets under `ssh/`. |
-| `<lab>/.vmlab/` | The lab's own working data: disk clones, built media, TPM state, persisted state, sync ledgers and the `dev use` selection. Gitignore it. |
+| `$XDG_RUNTIME_DIR/vmlab/` | Control sockets: the supervisor's, each lab's, and per-VM QMP, agent and VNC sockets. |
+| `<lab>/.vmlab/` | The lab's own working data: disk clones, built media, TPM state, persisted state and sync ledgers. Gitignore it. |
 
 The runtime directory is a full-privilege interface, since a client that can connect
 to a lab socket runs scripts in the lab and reads and writes guest files. vmlab
@@ -155,7 +149,6 @@ grant KVM needs is `/dev/kvm`. Four things are specific to WSL 2.
   inside the distribution. Without it every VM runs under TCG.
 - **`XDG_RUNTIME_DIR` may be missing.** Some WSL setups do not set it; vmlab falls
   back to `/tmp/vmlab-<uid>`, created private and refused if owned by anyone else.
-  The SSH `ControlPath` lives under the same directory.
 - **The viewer lives on the Windows side.** Run `vmlab console --tcp` to get a
   localhost address and point a Windows VNC client at it; WSL's localhost forwarding
   carries it across. Host access to guest services works the same way, through port

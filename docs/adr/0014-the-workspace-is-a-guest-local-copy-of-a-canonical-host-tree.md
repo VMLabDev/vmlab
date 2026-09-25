@@ -3,13 +3,12 @@
 - **Status**: Accepted
 - **Date**: 2026-08-05
 - **Related**: [ADR-0003](0003-decisions-are-values-computed-before-execution.md),
-  [ADR-0012](0012-vmlab-terminates-ssh-on-the-host.md),
   [ADR-0013](0013-the-host-opens-channels-the-guest-answers.md)
 
 ## Context
 
-PRD §19 has the editor attach *into* the guest, so the language server, the
-build and the test watcher all run guest-side against the source tree. vmlab
+PRD §19 puts the developer's work *inside* the guest, so the language server,
+the build and the test watcher all run guest-side against the source tree. vmlab
 already has a share mechanism (§7.5) that looks exactly right for putting a host
 directory there.
 

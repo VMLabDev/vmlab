@@ -147,9 +147,8 @@ page cmd_vm {
   }
 
   p <<DOC
-    The per-machine form of [vmlab destroy](cmd_destroy). The VM's SSH
-    multiplexer is told to exit while its alias still resolves, the workspace
-    syncer for it is stopped, the VM is force-stopped and its clone, runtime
+    The per-machine form of [vmlab destroy](cmd_destroy). The workspace
+    syncer for the VM is stopped, the VM is force-stopped and its clone, runtime
     directory, [snapshots](guide_snapshots), workspace sync ledger and any
     agent-repair divergence are deleted. The VM stays declared in the lab
     file, so a later `vmlab up <vm>` re-creates it from the template and runs
