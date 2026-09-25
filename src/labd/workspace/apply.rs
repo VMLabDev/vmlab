@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use super::guest::GuestFs;
 use super::ignore::TEMP_PREFIX;
 use super::ledger::{Agreed, Kind, Ledger, Side};
-use super::plan::{Action, Direction, Plan};
+use super::plan::{Action, Direction, Plan, State};
 use super::scan::{join_guest, mtime_ns};
 use crate::labd::vm_agent::{ErrorCode, FileOpsError, LinkKind};
 
@@ -145,6 +145,7 @@ pub async fn apply(
     ledger: &mut Ledger,
 ) -> Applied {
     let mut done = Applied::default();
+    let mut expected = plan.expected.clone();
 
     // The workspace root is already there, made with the flag by
     // [`prepare_root`](super::windows::prepare_root) before the plan this is
@@ -154,6 +155,37 @@ pub async fn apply(
     // Adoptions are not applies: both sides already hold the same content, so
     // the agreement is all there is to record.
     for (path, agreed) in &plan.adopt {
+        let checked = async {
+            for (direction, side) in [
+                (Direction::ToHost, agreed.host),
+                (Direction::ToGuest, agreed.guest),
+            ] {
+                verify_copy(
+                    guest,
+                    target,
+                    path,
+                    direction,
+                    Some(&State {
+                        kind: agreed.kind,
+                        size: side.size,
+                        mtime_ns: side.mtime_ns,
+                        digest: Some(agreed.digest.clone()),
+                        target: None,
+                        oversize: false,
+                    }),
+                )
+                .await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = checked {
+            done.failures.push(Failure {
+                path: path.clone(),
+                why: format!("{e:#}"),
+            });
+            continue;
+        }
         ledger.entries.insert(path.clone(), agreed.clone());
         done.adopted += 1;
     }
@@ -164,14 +196,36 @@ pub async fn apply(
     for action in &plan.actions {
         let path = action.path();
         let direction = action.direction();
+        let Some(before) = expected.get(path) else {
+            done.failures.push(Failure {
+                path: path.into(),
+                why: "the action has no destination precondition".into(),
+            });
+            continue;
+        };
+        if let Err(e) = verify_copy(guest, target, path, direction, before.as_ref()).await {
+            done.failures.push(Failure {
+                path: path.into(),
+                why: format!("{e:#}"),
+            });
+            continue;
+        }
         let landed = match direction {
             Direction::ToGuest => {
-                into_guest(guest, target, action, &mut done.case_insensitive_dirs).await
+                into_guest(
+                    guest,
+                    target,
+                    action,
+                    before.as_ref(),
+                    &mut done.case_insensitive_dirs,
+                )
+                .await
             }
-            Direction::ToHost => onto_host(guest, target, action).await,
+            Direction::ToHost => onto_host(guest, target, action, before.as_ref()).await,
         };
         match landed {
             Ok(Landed::Removed) => {
+                expected.insert(path.into(), None);
                 ledger.entries.remove(path);
                 done.counts(direction).removed += 1;
             }
@@ -191,7 +245,7 @@ pub async fn apply(
                 // side reports for its own copy is what the ledger records
                 // for that side, because a side's record is only ever
                 // compared against itself.
-                match receiving_side(guest, target, path, direction, kind).await {
+                match verified_receiving_side(guest, target, path, direction, kind, &digest).await {
                     Ok(other) => {
                         let (host, guest_side) = if direction.source_is_host() {
                             (side, other)
@@ -212,10 +266,13 @@ pub async fn apply(
                     // Placed but unverifiable: leaving the agreement out is
                     // the safe direction — the next pass hashes both sides
                     // and adopts them if they match.
-                    Err(e) => done.failures.push(Failure {
-                        path: path.to_string(),
-                        why: format!("{e:#}"),
-                    }),
+                    Err(e) => {
+                        ledger.entries.remove(path);
+                        done.failures.push(Failure {
+                            path: path.to_string(),
+                            why: format!("{e:#}"),
+                        });
+                    }
                 }
             }
             // A symlink the *guest* would not create is the one failure with
@@ -300,6 +357,7 @@ async fn into_guest(
     guest: &dyn GuestFs,
     target: &Target,
     action: &Action,
+    expected: Option<&State>,
     degraded: &mut Vec<Failure>,
 ) -> anyhow::Result<Landed> {
     let path = action.path();
@@ -329,7 +387,7 @@ async fn into_guest(
                 })
         }
         Action::PutFile { side, digest, .. } => {
-            place_in_guest(guest, target, path, &guest_path, Placing::File)
+            place_in_guest(guest, target, action, &guest_path, Placing::File, expected)
                 .await
                 .map(|()| Landed::Placed {
                     kind: Kind::File,
@@ -346,9 +404,10 @@ async fn into_guest(
         } => place_in_guest(
             guest,
             target,
-            path,
+            action,
             &guest_path,
             Placing::Symlink(link_target, *dir_link),
+            expected,
         )
         .await
         .map(|()| Landed::Placed {
@@ -365,6 +424,7 @@ async fn onto_host(
     guest: &dyn GuestFs,
     target: &Target,
     action: &Action,
+    expected: Option<&State>,
 ) -> anyhow::Result<Landed> {
     let path = action.path();
     let host_path = target.host_root.join(path);
@@ -400,7 +460,11 @@ async fn onto_host(
         Action::PutFile { side, digest, .. } => place_on_host(&host_path, |temp| {
             let temp = temp.to_path_buf();
             let remote = join_guest(&target.guest_root, path);
-            async move { guest.pull(&remote, &temp).await }
+            async move {
+                guest.pull(&remote, &temp).await?;
+                verify_host_contents(&temp, Kind::File, digest)?;
+                verify_copy(guest, target, path, Direction::ToHost, expected).await
+            }
         })
         .await
         .map(|()| Landed::Placed {
@@ -422,7 +486,8 @@ async fn onto_host(
                 // translates nothing.
                 std::os::unix::fs::symlink(link_target, &temp).map_err(|e| {
                     anyhow::Error::new(e).context(format!("linking {}", temp.display()))
-                })
+                })?;
+                verify_copy(guest, target, path, Direction::ToHost, expected).await
             }
         })
         .await
@@ -469,6 +534,133 @@ async fn receiving_side(
     }
 }
 
+/// Revalidation narrows the external-writer race; it is not a filesystem
+/// compare-and-swap. The syncer serializes its own scan/apply passes separately.
+async fn verify_copy(
+    guest: &dyn GuestFs,
+    target: &Target,
+    path: &str,
+    direction: Direction,
+    expected: Option<&State>,
+) -> anyhow::Result<()> {
+    let current = match direction {
+        Direction::ToGuest => guest
+            .lstat(&join_guest(&target.guest_root, path))
+            .await?
+            .map(|a| (Kind::of(a.kind), Side::new(a.size, a.mtime_ns))),
+        Direction::ToHost => match std::fs::symlink_metadata(target.host_root.join(path)) {
+            Ok(m) => {
+                let kind = if m.is_symlink() {
+                    Some(Kind::Symlink)
+                } else if m.is_dir() {
+                    Some(Kind::Dir)
+                } else if m.is_file() {
+                    Some(Kind::File)
+                } else {
+                    None
+                };
+                let size = kind
+                    .map(|k| host_size(&m, &target.host_root.join(path), k))
+                    .unwrap_or(m.len());
+                Some((kind, Side::new(size, mtime_ns(&m))))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        },
+    };
+    let Some(expected) = expected else {
+        anyhow::ensure!(
+            current.is_none(),
+            "{path}: destination appeared after scanning; rescan required"
+        );
+        return Ok(());
+    };
+    let Some((kind, side)) = current else {
+        anyhow::bail!("{path}: destination disappeared after scanning; rescan required");
+    };
+    anyhow::ensure!(
+        kind == Some(expected.kind),
+        "{path}: destination kind changed; rescan required"
+    );
+    if expected.kind == Kind::Dir {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        side == expected.side(),
+        "{path}: destination changed after scanning; rescan required"
+    );
+    let digest = expected
+        .digest
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{path}: destination has no verified digest"))?;
+    match direction {
+        Direction::ToHost => {
+            verify_host_contents(&target.host_root.join(path), expected.kind, digest)?
+        }
+        Direction::ToGuest => {
+            let remote = join_guest(&target.guest_root, path);
+            let actual = if expected.kind == Kind::Symlink {
+                super::scan::digest_of_target(&guest.readlink(&remote).await?)
+            } else {
+                guest.digest(&remote).await?
+            };
+            anyhow::ensure!(
+                actual == digest,
+                "{path}: destination contents changed; rescan required"
+            );
+        }
+    }
+    anyhow::ensure!(
+        receiving_side(guest, target, path, direction, expected.kind).await? == side,
+        "{path}: destination changed while verifying; rescan required"
+    );
+    Ok(())
+}
+
+fn verify_host_contents(path: &std::path::Path, kind: Kind, digest: &str) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let actual = if kind == Kind::Symlink {
+        super::scan::digest_of_target(&std::fs::read_link(path)?.to_string_lossy())
+    } else {
+        let mut hash = Sha256::new();
+        crate::hashing::feed(std::fs::File::open(path)?, &mut hash)?;
+        hex::encode(hash.finalize())
+    };
+    anyhow::ensure!(
+        actual == digest,
+        "{}: contents changed since planning; rescan required",
+        path.display()
+    );
+    Ok(())
+}
+
+async fn verified_receiving_side(
+    guest: &dyn GuestFs,
+    target: &Target,
+    path: &str,
+    direction: Direction,
+    kind: Kind,
+    digest: &str,
+) -> anyhow::Result<Side> {
+    let side = receiving_side(guest, target, path, direction, kind).await?;
+    verify_copy(
+        guest,
+        target,
+        path,
+        direction,
+        Some(&State {
+            kind,
+            size: side.size,
+            mtime_ns: side.mtime_ns,
+            digest: Some(digest.into()),
+            target: None,
+            oversize: false,
+        }),
+    )
+    .await?;
+    Ok(side)
+}
+
 /// What the host scan will report as this path's size next pass — the link
 /// *target's* length for a symlink, because a link's target string is its
 /// content and the two records have to be the same shape.
@@ -495,10 +687,12 @@ enum Placing<'a> {
 async fn place_in_guest(
     guest: &dyn GuestFs,
     target: &Target,
-    rel: &str,
+    action: &Action,
     guest_path: &str,
     what: Placing<'_>,
+    expected: Option<&State>,
 ) -> anyhow::Result<()> {
+    let rel = action.path();
     let temp = temp_beside(guest_path);
     // A temp left by an earlier attempt is not an obstacle: the name is
     // derived from the path, so the previous pass's leftovers are this pass's
@@ -517,6 +711,20 @@ async fn place_in_guest(
         }
     };
     if let Err(e) = written {
+        let _ = guest.remove(&temp).await;
+        return Err(e);
+    }
+    let checked = async {
+        if let Action::PutFile { digest, .. } = action {
+            anyhow::ensure!(
+                guest.digest(&temp).await? == *digest,
+                "{rel}: source changed during transfer; rescan required"
+            );
+        }
+        verify_copy(guest, target, rel, Direction::ToGuest, expected).await
+    }
+    .await;
+    if let Err(e) = checked {
         let _ = guest.remove(&temp).await;
         return Err(e);
     }
@@ -539,12 +747,19 @@ where
     F: FnOnce(&std::path::Path) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    let temp = host_temp(host_path);
-    let _ = std::fs::remove_file(&temp);
     if let Some(parent) = host_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::Error::new(e).context(format!("creating {}", parent.display())))?;
     }
+    let dir = host_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let reservation = tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempfile_in(dir)?;
+    let temp = reservation.into_temp_path();
+    // Reserve a unique name before handing it to file or symlink creation.
+    std::fs::remove_file(&temp)?;
     if let Err(e) = write(&temp).await {
         let _ = std::fs::remove_file(&temp);
         return Err(e);
@@ -565,22 +780,6 @@ fn temp_beside(guest_path: &str) -> String {
     match guest_path.rfind(['/', '\\']) {
         Some(cut) => format!("{}{TEMP_PREFIX}{tag}", &guest_path[..cut + 1]),
         None => format!("{TEMP_PREFIX}{tag}"),
-    }
-}
-
-/// The same, for a host path: same directory, same derived name, same reason.
-///
-/// Built from the path's own bytes and joined onto its real parent rather than
-/// re-parsed out of a string, because a host filename need not be UTF-8 and a
-/// lossy one would name a temp in a directory that is not the target's.
-fn host_temp(host_path: &std::path::Path) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    use std::os::unix::ffi::OsStrExt;
-    let tag = hex::encode(&Sha256::digest(host_path.as_os_str().as_bytes())[..8]);
-    let name = format!("{TEMP_PREFIX}{tag}");
-    match host_path.parent() {
-        Some(dir) => dir.join(name),
-        None => PathBuf::from(name),
     }
 }
 
@@ -716,6 +915,136 @@ mod tests {
 
     fn ledger_for(root: &Path) -> Ledger {
         Ledger::new(root, "/src")
+    }
+
+    #[tokio::test]
+    async fn destination_edits_during_transfer_survive_in_both_directions() {
+        for to_host in [true, false] {
+            let dir = workspace(&[("a.txt", "original")]);
+            let guest = FakeGuest::new();
+            let mut ledger = ledger_for(dir.path());
+            pass(dir.path(), &guest, &mut ledger).await;
+            if to_host {
+                guest.file("/src/a.txt", "guest edit", 20);
+                guest.edit_host_on_pull(dir.path().join("a.txt"), "host edit");
+            } else {
+                std::fs::write(dir.path().join("a.txt"), "host edit").unwrap();
+                guest.edit_guest_on_push("/src/a.txt", "guest edit");
+            }
+            let done = pass(dir.path(), &guest, &mut ledger).await;
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "host edit"
+            );
+            assert_eq!(guest.text("/src/a.txt").as_deref(), Some("guest edit"));
+            assert_eq!(done.failures.len(), 1, "{done:?}");
+            let next = pass(dir.path(), &guest, &mut ledger).await;
+            assert_eq!(next.to_guest.placed + next.to_host.placed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_rename_edits_are_not_recorded_under_the_transferred_digest() {
+        let dir = workspace(&[("a.txt", "host contents")]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        guest.edit_after_rename("/src/a.txt", "concurrent guest contents");
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+        assert!(!ledger.entries.contains_key("a.txt"));
+        assert_eq!(done.failures.len(), 1, "{done:?}");
+        assert_eq!(
+            guest.text("/src/a.txt").as_deref(),
+            Some("concurrent guest contents")
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_deletions_refuse_new_destination_edits() {
+        for to_host in [true, false] {
+            let dir = workspace(&[("a.txt", "original")]);
+            let guest = FakeGuest::new();
+            let mut ledger = ledger_for(dir.path());
+            pass(dir.path(), &guest, &mut ledger).await;
+            if to_host {
+                guest.unlink("/src/a.txt");
+            } else {
+                std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+            }
+            let (host, _) = host_scan(dir.path(), &ledger, CAP).unwrap();
+            let paths = BTreeSet::from(["a.txt".to_string()]);
+            let probe = super::super::scan::probe_guest(&guest, "/src", &paths, &ledger, CAP).await;
+            let plan = reconcile(&Inputs {
+                host: &host.tree,
+                guest: &probe.tree,
+                ledger: &ledger,
+                undecided: &BTreeSet::new(),
+                guest_owned: &BTreeSet::new(),
+                resolved: &BTreeMap::new(),
+                max_file_bytes: CAP,
+                case_folding: false,
+            });
+            assert!(matches!(plan.actions.as_slice(), [Action::Remove { .. }]));
+            if to_host {
+                std::fs::write(dir.path().join("a.txt"), "new host edit").unwrap();
+            } else {
+                guest.file("/src/a.txt", "new guest edit", 40);
+            }
+            let applied = apply(&guest, &target(dir.path()), &plan, &mut ledger).await;
+            assert_eq!(applied.failures.len(), 1);
+            if to_host {
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                    "new host edit"
+                );
+            } else {
+                assert_eq!(guest.text("/src/a.txt").as_deref(), Some("new guest edit"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_host_transfers_commit_their_own_complete_file() {
+        use std::io::Write;
+        let dir = workspace(&[]);
+        let path = dir.path().join("a.txt");
+        let (first_ready, first_wait) = tokio::sync::oneshot::channel();
+        let (second_ready, second_wait) = tokio::sync::oneshot::channel();
+        let (first_done, done_wait) = tokio::sync::oneshot::channel();
+        let first = async {
+            let result = place_on_host(&path, |temp| {
+                let temp = temp.to_path_buf();
+                async move {
+                    std::fs::write(temp, "first complete")?;
+                    first_ready.send(()).unwrap();
+                    second_wait.await.unwrap();
+                    Ok(())
+                }
+            })
+            .await;
+            let observed = std::fs::read_to_string(&path).unwrap();
+            first_done.send(()).unwrap();
+            (result, observed)
+        };
+        let second = async {
+            first_wait.await.unwrap();
+            place_on_host(&path, |temp| {
+                let temp = temp.to_path_buf();
+                async move {
+                    let mut file = std::fs::File::create(temp)?;
+                    file.write_all(b"second")?;
+                    second_ready.send(()).unwrap();
+                    done_wait.await.unwrap();
+                    file.write_all(b" complete")?;
+                    Ok(())
+                }
+            })
+            .await
+        };
+        let ((first, observed), second) = tokio::join!(first, second);
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(observed, "first complete");
+        assert!(second.is_ok(), "{second:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "second complete");
     }
 
     /// The acceptance case: a declared workspace appears in the guest, whole.

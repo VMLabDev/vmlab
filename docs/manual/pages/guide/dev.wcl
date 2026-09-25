@@ -60,7 +60,10 @@ Unset arguments resolve **`@dev` argument, then profile, then floor**. The
 default is profile-sourced because it is guest-OS-shaped: the shipped Windows
 profiles say `C:\src` and the Linux ones `/src`. A profile with no dev keys
 still hosts a dev machine; a missing key means the floor applies, never that
-the profile cannot be a dev target. This resolver is deliberately separate
+the profile cannot be a dev target. The guest path does not have to exist:
+when the default login cannot create it, as with `/src` under a root-owned
+`/` on Linux, vmlab creates it as the agent identity and gives it to that
+login before the first sync. This resolver is deliberately separate
 from the hardware resolver. "First in file order wins" was rejected for the
 default because declaration order already means something in vmlab and a
 block reorder would silently move it.

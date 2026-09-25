@@ -414,6 +414,8 @@ pub struct Plan {
     /// Ordered: removals deepest-first, then creations parents-first, so a
     /// path replaced by another kind is cleared before it is remade.
     pub actions: Vec<Action>,
+    /// Destination snapshots, checked again before each destructive action.
+    pub expected: BTreeMap<String, Option<State>>,
     /// Matching content adopted as agreed for free — no transfer, ledger
     /// written. This is what keeps a wiped `.vmlab/` from re-pushing a tree
     /// the guest already holds.
@@ -437,6 +439,26 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn capture_expected(&mut self, inputs: &Inputs<'_>) {
+        for action in &self.actions {
+            let path = action.path();
+            let tree = if action.direction().source_is_host() {
+                inputs.guest
+            } else {
+                inputs.host
+            };
+            let mut state = tree.get(path).cloned();
+            if let Some(state) = &mut state
+                && state.digest.is_none()
+                && !state.oversize
+                && let Some(agreed) = inputs.ledger.entries.get(path)
+            {
+                state.digest = Some(agreed.digest.clone());
+            }
+            self.expected.insert(path.to_string(), state);
+        }
+    }
+
     /// Nothing here changes the ledger.
     pub fn nothing_to_record(&self) -> bool {
         self.actions.is_empty()
@@ -704,6 +726,7 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
     plan.actions = removals;
     plan.actions.extend(creations);
     plan.volume = volume(&plan.actions);
+    plan.capture_expected(inputs);
     plan
 }
 

@@ -97,7 +97,9 @@ impl GuestFs for FileOps {
     }
 
     async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
-        FileOps::pull_to(self, remote, local).await.map(|_| ())
+        FileOps::pull_to(self, remote, local).await?;
+        let mode = FileOps::lstat(self, remote).await?.and_then(|a| a.mode);
+        set_host_mode(local, mode)
     }
 
     async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
@@ -114,7 +116,9 @@ impl GuestFs for FileOps {
     }
 
     async fn push(&self, local: &Path, remote: &str) -> Result<()> {
-        FileOps::push(self, local, remote, None).await.map(|_| ())
+        FileOps::push(self, local, remote, Some(host_mode(local)?))
+            .await
+            .map(|_| ())
     }
 
     async fn symlink(&self, target: &str, link: &str, kind: LinkKind) -> Result<()> {
@@ -132,6 +136,29 @@ impl GuestFs for FileOps {
     async fn rmdir(&self, path: &str) -> Result<()> {
         FileOps::rmdir(self, path).await
     }
+}
+
+/// The permission bits a file carries across the seam: read, write and
+/// execute for owner, group and other. Setuid, setgid and sticky never travel.
+const CARRIED_MODE: u32 = 0o777;
+
+/// The permission bits of a host file, as they are carried to the guest. A
+/// Windows agent ignores them (§19.5).
+fn host_mode(local: &Path) -> Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(local)
+        .map_err(|e| anyhow::Error::new(e).context(format!("reading {}", local.display())))?;
+    Ok(meta.permissions().mode() & CARRIED_MODE)
+}
+
+/// Give a pulled host file the guest's permission bits. `None` is a Windows
+/// agent, which reports none, and leaves the host's default in place.
+fn set_host_mode(local: &Path, mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(mode) = mode else { return Ok(()) };
+    std::fs::set_permissions(local, std::fs::Permissions::from_mode(mode & CARRIED_MODE)).map_err(
+        |e| anyhow::Error::new(e).context(format!("setting the mode of {}", local.display())),
+    )
 }
 
 /// The directory a guest path sits in, in whichever separator it came with.
@@ -231,6 +258,9 @@ pub mod fake {
         fail_push: Vec<String>,
         /// Paths whose pull fails, the same thing in the other direction.
         fail_pull: Vec<String>,
+        edit_host_on_pull: Option<(std::path::PathBuf, String)>,
+        edit_guest_on_push: Option<(String, String)>,
+        edit_after_rename: Option<(String, String)>,
         /// Paths the guest refuses to be read at all.
         unreadable: Vec<String>,
         /// This guest's filesystem folds case, like a default NTFS volume:
@@ -364,6 +394,20 @@ pub mod fake {
                 .expect("fake guest")
                 .fail_pull
                 .push(path.to_string());
+        }
+
+        pub fn edit_host_on_pull(&self, path: std::path::PathBuf, body: &str) {
+            self.inner.lock().expect("fake guest").edit_host_on_pull = Some((path, body.into()));
+        }
+
+        pub fn edit_guest_on_push(&self, path: &str, body: &str) {
+            self.inner.lock().expect("fake guest").edit_guest_on_push =
+                Some((path.into(), body.into()));
+        }
+
+        pub fn edit_after_rename(&self, path: &str, body: &str) {
+            self.inner.lock().expect("fake guest").edit_after_rename =
+                Some((path.into(), body.into()));
         }
 
         /// Reading `path` fails — the root-owned artefact a login cannot open.
@@ -647,6 +691,9 @@ pub mod fake {
 
         async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
             let mut guest = self.inner.lock().expect("fake guest");
+            if let Some((path, body)) = guest.edit_host_on_pull.take() {
+                std::fs::write(path, body)?;
+            }
             if guest.unreadable.iter().any(|p| p == remote) {
                 bail!("permission denied: {remote}");
             }
@@ -701,6 +748,11 @@ pub mod fake {
         async fn push(&self, local: &Path, remote: &str) -> Result<()> {
             let bytes = std::fs::read(local)?;
             let mut guest = self.inner.lock().expect("fake guest");
+            if let Some((path, body)) = guest.edit_guest_on_push.take() {
+                guest
+                    .nodes
+                    .insert(path, (Node::File(body.into_bytes()), 19));
+            }
             guest.writes.push(remote.to_string());
             // What the real session does when the guest has no directory to
             // put it in: make the parents. The workspace root itself arrives
@@ -753,6 +805,11 @@ pub mod fake {
             };
             let to = resolve(&guest, to);
             guest.nodes.insert(to, node);
+            if let Some((path, body)) = guest.edit_after_rename.take() {
+                guest
+                    .nodes
+                    .insert(path, (Node::File(body.into_bytes()), 29));
+            }
             Ok(())
         }
 
@@ -779,5 +836,40 @@ pub mod fake {
             guest.case_sensitive.remove(&path);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// An executable script keeps its execute bit across the seam in both
+    /// directions, and the special bits never travel.
+    #[test]
+    fn permission_bits_travel_and_special_bits_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("build.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(host_mode(&script).unwrap(), 0o755);
+
+        set_host_mode(&script, Some(0o4750)).unwrap();
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750, "setuid stayed behind");
+    }
+
+    /// A Windows agent reports no mode, and the host file keeps its own.
+    #[test]
+    fn no_guest_mode_leaves_the_host_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "a").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        set_host_mode(&file, None).unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 }

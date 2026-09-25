@@ -137,6 +137,42 @@ impl crate::labd::workspace::syncer::GuestSessions for WorkspaceSessions {
         let agent = self.machine.agent().await?;
         Ok(Box::new(agent.open_watch(root.to_string(), prune).await?))
     }
+
+    /// On a Linux-family guest the default root (`/src`) sits under a
+    /// root-owned `/`, so the agent identity makes it and hands it to the
+    /// login. A Windows login can create `C:\src` itself, and a machine with
+    /// no login writes as the agent identity anyway.
+    async fn claim_root(&self, root: &str) -> Result<()> {
+        if self.machine.guest_os() == crate::labd::guest_os::GuestOs::Windows {
+            return Ok(());
+        }
+        let Some(logon) = self.logon()? else {
+            return Ok(());
+        };
+        let agent = self.machine.agent().await?;
+        let argv = [
+            "/bin/sh",
+            "-c",
+            r#"mkdir -p -- "$1" && chown -- "$2:" "$1""#,
+            "sh",
+            root,
+            &logon.user,
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let out = agent
+            .exec(argv, Vec::new(), None, None, Duration::from_secs(60), None)
+            .await?;
+        if out.exit_code != 0 {
+            anyhow::bail!(
+                "creating {root} for {}: exited {}: {}",
+                logon.user,
+                out.exit_code,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]

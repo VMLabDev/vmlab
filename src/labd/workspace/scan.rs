@@ -319,18 +319,21 @@ pub async fn guest_locks(
 /// A root that exists and cannot be *read* is a failure for the same reason:
 /// "I could not look" and "nothing is there" produce opposite actions, and
 /// only one of them is recoverable.
+/// `had_agreement` comes from the durable ledger, independently of the scan
+/// cache, which a watcher discontinuity may have invalidated.
 pub async fn guest_walk(
     files: &dyn GuestFs,
     guest_root: &str,
     ignores: &Ignores,
     ledger: &Ledger,
+    had_agreement: bool,
     max_file_bytes: u64,
 ) -> Result<GuestProbe> {
     let mut probe = GuestProbe::default();
     match files.lstat(guest_root).await {
         Ok(Some(_)) => {}
         // Nothing there yet: the seed is about to make it.
-        Ok(None) if ledger.entries.is_empty() => return Ok(probe),
+        Ok(None) if !had_agreement => return Ok(probe),
         Ok(None) => {
             return Err(anyhow::anyhow!(
                 "the workspace directory {guest_root} is gone from the guest: every path this \
@@ -710,7 +713,7 @@ mod tests {
         guest.dir("/src/node_modules/pkg");
         guest.file("/src/node_modules/pkg/index.js", "guest-native", 7);
 
-        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), NO_CAP)
+        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), false, NO_CAP)
             .await
             .unwrap();
         let paths: Vec<&String> = walk.tree.keys().collect();
@@ -729,7 +732,7 @@ mod tests {
         let dir = workspace(&[]);
         let (_, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
         let guest = super::super::guest::fake::FakeGuest::new();
-        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), NO_CAP)
+        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), false, NO_CAP)
             .await
             .unwrap();
         assert!(walk.tree.is_empty());
@@ -752,7 +755,7 @@ mod tests {
         guest.file("/src/app.rs", "y", 1);
         guest.unreadable("/src/root-only");
 
-        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), NO_CAP)
+        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), false, NO_CAP)
             .await
             .unwrap();
         assert!(walk.tree.contains_key("app.rs"));
@@ -778,7 +781,7 @@ mod tests {
         guest.file("/src/big.vhdx", "0123456789", 1);
         guest.file("/src/small.rs", "x", 1);
 
-        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), 4)
+        let walk = guest_walk(&guest, "/src", &ignores, &empty_ledger(), false, 4)
             .await
             .unwrap();
         assert!(walk.tree["big.vhdx"].oversize);

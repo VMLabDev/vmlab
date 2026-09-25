@@ -147,6 +147,7 @@ pub fn reseed(inputs: &Inputs<'_>) -> Plan {
     // **No volume warning.** A re-seed carrying a whole repository is the
     // expected shape of this operation, not a burst worth suggesting an ignore
     // rule for, and a warning that fires every time says nothing.
+    plan.capture_expected(inputs);
     plan
 }
 
@@ -186,14 +187,29 @@ pub struct Reconverged {
     pub collisions: Vec<Collision>,
     /// Paths neither side could be read for.
     pub skipped: Vec<Skip>,
-    /// Paths that did not land. Not agreed, so the next ordinary pass carries
-    /// them the usual way.
+    /// Paths that did not land and must retry under the host-only policy.
     pub failures: Vec<Failure>,
 }
 
 impl Reconverged {
+    /// Every in-scope path converged without a refusal or an unreadable path.
+    pub fn complete(&self) -> bool {
+        self.oversize.is_empty()
+            && self.collisions.is_empty()
+            && self.skipped.is_empty()
+            && self.failures.is_empty()
+    }
+
     /// The one line the event feed and `dev sync status` both carry.
     pub fn headline(&self, machine: &str) -> String {
+        if !self.complete() {
+            return format!(
+                "\"{machine}\"'s workspace re-convergence is incomplete after a snapshot restore: \
+                 {} placed, {} removed, {} already matched. The host-only re-seed remains owed \
+                 until failed, skipped, colliding, and oversize paths converge.",
+                self.placed, self.removed, self.adopted,
+            );
+        }
         format!(
             "\"{machine}\"'s workspace re-converged from the canonical copy after a snapshot \
              restore: {} placed, {} removed, {} already matched. Nothing flowed guest→host, so \
@@ -218,7 +234,9 @@ pub async fn reconverge(
     case_folding: bool,
     ledger: &mut Ledger,
 ) -> Result<Reconverged> {
-    let fresh = Ledger::new(&workspace.host_root, &workspace.guest_root);
+    ledger.reseed_owed = true;
+    let mut fresh = Ledger::new(&workspace.host_root, &workspace.guest_root);
+    fresh.reseed_owed = true;
 
     let root = workspace.host_root.clone();
     let cap = workspace.max_file_bytes;
@@ -232,7 +250,7 @@ pub async fn reconverge(
     // ledger every file is a suspect, so the guest reports a digest for
     // everything it holds — which is the whole difference between a reconcile
     // that undoes a rewind and one that preserves it.
-    let mut probe = guest_walk(guest, &workspace.guest_root, &ignores, &fresh, cap)
+    let mut probe = guest_walk(guest, &workspace.guest_root, &ignores, &fresh, false, cap)
         .await
         .with_context(|| format!("walking the guest tree at {}", workspace.guest_root))?;
     // Filtering stays host-side and happens on receipt, exactly as in an
@@ -289,7 +307,7 @@ pub async fn reconverge(
     ledger.ignore_digest = ignores.digest();
     ledger.prune = ignores.prune_list(&scan.pruned);
 
-    Ok(Reconverged {
+    let done = Reconverged {
         placed: applied.to_guest.placed,
         removed: applied.to_guest.removed,
         adopted: applied.adopted,
@@ -301,7 +319,11 @@ pub async fn reconverge(
             .into_iter()
             .chain(applied.symlinks_refused)
             .collect(),
-    })
+    };
+    // Persist partial progress without authorizing ordinary reconciliation.
+    // A retry or daemon restart must still discard restored guest state.
+    ledger.reseed_owed = !done.complete();
+    Ok(done)
 }
 
 #[cfg(test)]
@@ -314,6 +336,156 @@ mod tests {
     use std::sync::Arc;
 
     const NO_CAP: u64 = u64::MAX;
+
+    struct FailRemovalOnce {
+        guest: FakeGuest,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl GuestFs for FailRemovalOnce {
+        async fn lstat(&self, path: &str) -> Result<Option<crate::labd::vm_agent::Attrs>> {
+            self.guest.lstat(path).await
+        }
+        async fn readdir(&self, path: &str) -> Result<Vec<crate::labd::vm_agent::DirEntry>> {
+            self.guest.readdir(path).await
+        }
+        async fn readlink(&self, path: &str) -> Result<String> {
+            self.guest.readlink(path).await
+        }
+        async fn digest(&self, path: &str) -> Result<String> {
+            self.guest.digest(path).await
+        }
+        async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
+            self.guest.pull(remote, local).await
+        }
+        async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
+            self.guest.mkdir(path, case_sensitive).await
+        }
+        async fn mkdir_root(&self, path: &str, case_sensitive: bool) -> Result<()> {
+            self.guest.mkdir_root(path, case_sensitive).await
+        }
+        async fn push(&self, local: &Path, remote: &str) -> Result<()> {
+            self.guest.push(local, remote).await
+        }
+        async fn symlink(
+            &self,
+            target: &str,
+            link: &str,
+            kind: crate::labd::vm_agent::LinkKind,
+        ) -> Result<()> {
+            self.guest.symlink(target, link, kind).await
+        }
+        async fn rename(&self, from: &str, to: &str) -> Result<()> {
+            self.guest.rename(from, to).await
+        }
+        async fn remove(&self, path: &str) -> Result<()> {
+            if path == "/src/old.rs" && self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("injected sharing violation");
+            }
+            self.guest.remove(path).await
+        }
+        async fn rmdir(&self, path: &str) -> Result<()> {
+            self.guest.rmdir(path).await
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_reseed_removal_keeps_a_durable_barrier_until_retry_succeeds() {
+        let host = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let guest = FailRemovalOnce {
+            guest: FakeGuest::new(),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        };
+        guest.guest.dir("/src");
+        guest.guest.file("/src/old.rs", "restored content", 10);
+        let workspace = Workspace {
+            machine: "dev01".into(),
+            host_root: host.path().to_path_buf(),
+            guest_root: "/src".into(),
+            ledger_path: state.path().join("ledger.json"),
+            max_file_bytes: NO_CAP,
+            preconditions: Preconditions::default(),
+        };
+        let mut ledger = Ledger::new(host.path(), "/src");
+        ledger.reseed_owed = true;
+        let first = reconverge(&guest, &workspace, false, false, &mut ledger)
+            .await
+            .unwrap();
+        assert_eq!(first.failures.len(), 1);
+        assert!(!first.complete());
+        assert!(first.headline("dev01").contains("incomplete"));
+        assert!(guest.guest.get("/src/old.rs").is_some());
+        assert!(
+            ledger.reseed_owed,
+            "failed removal must retain the reseed barrier"
+        );
+        ledger.save(&workspace.ledger_path).unwrap();
+        let mut restarted = Ledger::load(&workspace.ledger_path, host.path(), "/src");
+        assert!(restarted.reseed_owed);
+        let second = reconverge(&guest, &workspace, false, false, &mut restarted)
+            .await
+            .unwrap();
+        assert!(second.failures.is_empty());
+        assert!(second.complete());
+        assert!(!restarted.reseed_owed);
+        assert!(guest.guest.get("/src/old.rs").is_none());
+        assert!(!host.path().join("old.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn reseed_refusals_keep_the_durable_barrier() {
+        for refusal in ["skipped", "collision", "oversize"] {
+            let host = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let guest = FakeGuest::new();
+            guest.dir("/src");
+            std::fs::write(host.path().join("file.rs"), "host truth").unwrap();
+            guest.file("/src/file.rs", "restored content", 10);
+            match refusal {
+                "skipped" => guest.unreadable("/src/file.rs"),
+                "collision" => {
+                    std::fs::write(host.path().join("FILE.rs"), "other host file").unwrap();
+                }
+                "oversize" => {}
+                _ => unreachable!(),
+            }
+            let workspace = Workspace {
+                machine: "dev01".into(),
+                host_root: host.path().to_path_buf(),
+                guest_root: "/src".into(),
+                ledger_path: state.path().join("ledger.json"),
+                max_file_bytes: if refusal == "oversize" { 1 } else { NO_CAP },
+                preconditions: Preconditions::default(),
+            };
+            let mut ledger = Ledger::new(host.path(), "/src");
+            ledger.reseed_owed = true;
+            let done = reconverge(
+                &guest,
+                &workspace,
+                false,
+                refusal == "collision",
+                &mut ledger,
+            )
+            .await
+            .unwrap();
+            match refusal {
+                "skipped" => assert!(!done.skipped.is_empty()),
+                "collision" => assert!(!done.collisions.is_empty()),
+                "oversize" => assert!(!done.oversize.is_empty()),
+                _ => unreachable!(),
+            }
+            assert!(ledger.reseed_owed, "{refusal} released the reseed barrier");
+            assert!(!done.complete());
+            ledger.save(&workspace.ledger_path).unwrap();
+            assert!(Ledger::load(&workspace.ledger_path, host.path(), "/src").reseed_owed);
+            assert_eq!(
+                std::fs::read_to_string(host.path().join("file.rs")).unwrap(),
+                "host truth"
+            );
+        }
+    }
 
     fn digest(body: &str) -> String {
         use sha2::{Digest, Sha256};

@@ -1308,7 +1308,10 @@ traded away. **Snapshots are not a workspace backup**, and §19 says so plainly.
 
 The **host path is required** — the one fact only the lab author knows. The
 **guest path is optional**, defaulting from the profile (`C:\src` on Windows,
-`/src` on Linux). **At most one workspace per machine**; additional repos are
+`/src` on Linux). It need not exist: the syncer makes it before the watch
+opens, and where the default login cannot (`/src` under a root-owned `/`), the
+agent identity creates it and hands it to that login — the one write outside
+the login, and only of the root itself. **At most one workspace per machine**; additional repos are
 ordinary guest-local clones, unsynced. The argument must **not** be spelled bare
 `guest`, and a `workspace {}` child block was rejected for the same reason: that
 is `share {}`'s shape, a share is virtiofs/SMB passthrough where a workspace is a
