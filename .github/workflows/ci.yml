@@ -61,11 +61,8 @@ jobs:
             guest/agent-proto
             guest/agent
       - run: just ci::guest-check
-      - name: Cross-check agent targets
-        run: |
-          cargo clippy --target x86_64-pc-windows-gnu \
-            --manifest-path guest/agent/Cargo.toml -- -D warnings
-          ./guest/build-agent.sh linux-x86_64 linux-aarch64 linux-riscv64
+      - run: just ci::guest-windows-check
+      - run: just ci::guest-cross-build
 
   # The committed BPF fast-path objects (src/net/fastpath/bpf/) must match
   # the ebpf/ sources: rebuild with the pinned toolchain and byte-diff.
@@ -181,7 +178,9 @@ jobs:
   # QEMU/KVM, so Linux is the only target). It is uploaded for the release job.
   build:
     name: Build vmlab (${{ matrix.target }})
-    needs: [version, check]
+    # The whole merge bar, not only the host job: a release is never cut from
+    # a commit any part of `ci::check` rejected.
+    needs: [version, check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:

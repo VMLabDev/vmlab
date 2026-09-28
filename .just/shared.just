@@ -14,6 +14,10 @@ require-rustup:
 	@command -v rustup > /dev/null 2>&1 || (echo 'rustup is required: ebpf/rust-toolchain.toml pins the nightly the BPF objects build with' && exit 1)
 
 [private]
+require-rust-target target: require-rustup
+	@rustup target list --installed | grep -qx '{{target}}' || (echo 'the {{target}} rustup target is required: rustup target add {{target}}' && exit 1)
+
+[private]
 require-bpf-linker:
 	@command -v bpf-linker > /dev/null 2>&1 || (echo 'bpf-linker is required: run "just ebpf-tools" once to build it against the pinned nightly' && exit 1)
 

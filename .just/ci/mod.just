@@ -9,11 +9,15 @@
 # guarded by the require-* helpers in ../shared.just, so a missing tool reports
 # as a missing tool rather than as a confusing build failure.
 #
+# The agent's Windows code is inside the bar: `guest-windows-check` lints it for
+# x86_64-pc-windows-gnu, which needs that one rustup target and no linker.
+#
 # Deliberately outside the bar: the privileged fast-path tests
 # (`just fastpath-test` — sudo, CAP_BPF, an XDP-capable kernel), the guest asset
-# build (`just guest-build` — pulls an Alpine rootfs), and ci.yml's cross-target
-# agent check, which needs four rustup targets a developer has no other reason
-# to install. None of the three runs unattended on an ordinary machine.
+# build (`just guest-build` — pulls an Alpine rootfs), and `guest-cross-build`,
+# which needs the musl targets and cross linkers a developer has no other
+# reason to install. ci.yml runs `guest-cross-build`; none of the three runs
+# unattended on an ordinary machine.
 
 # Recipes run from the project root, not from .just/ci.
 set working-directory := '../..'
@@ -26,7 +30,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: lint fmt-check test guest-check ebpf-verify
+check: lint fmt-check test guest-check guest-windows-check ebpf-verify
 
 # Run clippy with warnings as errors
 [group('ci')]
@@ -53,6 +57,16 @@ guest-crate-check crate: require-cargo
 # Check every guest-side crate (standalone workspaces the host build never sweeps in)
 [group('ci')]
 guest-check: (guest-crate-check 'cinit-proto') (guest-crate-check 'cinit') (guest-crate-check 'agent-proto') (guest-crate-check 'agent')
+
+# Lint the agent's Windows code (type-checks without a Windows linker)
+[group('ci')]
+guest-windows-check: require-cargo (require-rust-target 'x86_64-pc-windows-gnu')
+	cargo clippy --target x86_64-pc-windows-gnu --manifest-path guest/agent/Cargo.toml -- -D warnings
+
+# Cross-build the Linux agent binaries (musl targets; CI only)
+[group('ci')]
+guest-cross-build: require-cargo
+	./guest/build-agent.sh linux-x86_64 linux-aarch64 linux-riscv64
 
 # Verify the committed BPF objects match the ebpf/ sources
 [group('ci')]
