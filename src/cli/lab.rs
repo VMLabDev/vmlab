@@ -597,9 +597,33 @@ fn root_for(labs: &[Value], name: &str) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// The state `lab list` shows for one registry entry.
+///
+/// The registry knows only about the daemon, and a daemon stays up after
+/// `lab stop` with nothing running under it — so a running daemon whose
+/// machines are all stopped is listed `stopped`, as `lab info` would show
+/// it. An unreachable daemon keeps the registry's word.
+fn listed_state<'a>(registry: &'a str, status: Option<&LabStatus>) -> &'a str {
+    match status {
+        Some(status) if registry == "running" && status.all_stopped() => "stopped",
+        _ => registry,
+    }
+}
+
 fn cmd_lab_list(json: bool) -> Result<()> {
     rt()?.block_on(async {
-        let labs = registry_labs().await?;
+        let mut labs = registry_labs().await?;
+        for lab in &mut labs {
+            let registry = lab["state"].as_str().unwrap_or("?").to_string();
+            let status = match lab["name"].as_str() {
+                Some(name) if registry == "running" => match daemon::try_lab_daemon(name).await {
+                    Some(client) => lab_status(&client).await.ok(),
+                    None => None,
+                },
+                _ => None,
+            };
+            lab["state"] = Value::from(listed_state(&registry, status.as_ref()));
+        }
         if json {
             return super::print_json(&Value::Array(labs));
         }
@@ -1720,8 +1744,8 @@ pub fn cmd_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        LabRequest, PowerOp, Region, format_log_line, pulling_machines, region_value, render_dns,
-        render_status, root_for,
+        LabRequest, PowerOp, Region, format_log_line, listed_state, pulling_machines, region_value,
+        render_dns, render_status, root_for,
     };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
@@ -1741,6 +1765,19 @@ mod tests {
             ip: Some("10.0.0.5".into()),
             ..crate::status::fixtures::machine(name, state, ready, detail)
         }
+    }
+
+    /// A daemon left up by `lab stop` is listed by what runs under it.
+    #[test]
+    fn lab_list_says_stopped_when_no_machine_runs() {
+        let m = |state| crate::status::fixtures::machine("vm01", state, false, vm());
+        let stopped = lab(vec![m(PowerState::Stopped)]);
+        let booting = lab(vec![m(PowerState::Stopped), m(PowerState::Running)]);
+        assert_eq!(listed_state("running", Some(&stopped)), "stopped");
+        assert_eq!(listed_state("running", Some(&booting)), "running");
+        // Unreachable: the registry's word stands.
+        assert_eq!(listed_state("running", None), "running");
+        assert_eq!(listed_state("failed", Some(&stopped)), "failed");
     }
 
     /// The table renders straight off a projection value — no lab, no daemon.

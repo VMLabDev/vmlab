@@ -80,10 +80,12 @@ def run(h):
                          what="arm01's QEMU to exit")
             info = h.vmlab("lab", "info", LAB).out
             assert "stopped" in info, info
+            # The list agrees with info: the daemon is up, nothing runs.
+            assert listed(h).get(LAB) == "stopped", h.vmlab("lab", "list").out
             assert (lab / ".vmlab" / "vms" / "arm01").exists(), "clones were not retained"
             return True
 
-        h.check("lab.stop", stop, "QEMU exited, lab info shows arm01 stopped, clone retained")
+        h.check("lab.stop", stop, "QEMU exited, lab info and lab list show it stopped, clone retained")
 
         def restart():
             before = [p for p in pids(f"__labd --lab {LAB}") if alive(p)]
