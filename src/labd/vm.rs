@@ -29,9 +29,26 @@ pub const VM_READY_TIMEOUT: Duration = Duration::from_secs(600);
 /// then fail on `still Stopping after 10s`.
 const STOP_SETTLE: Duration = Duration::from_secs(120);
 
-/// What to tell a user whose guest has no answering vmlab-agent.
-const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the template likely predates \
-     agent support) — rebuild it with `vmlab template build`";
+/// What to tell a user whose guest has no answering vmlab-agent. A failed
+/// handshake alone cannot say why, so the advice leans on what is known:
+/// whether the agent has answered since this start, and whether the template
+/// recorded baking one in. A guest that is still booting is the common case
+/// (`vmlab up` returns before readiness) and must not read as a broken
+/// template.
+fn no_agent_hint(answered_before: bool, baked: Option<&str>) -> String {
+    match (answered_before, baked) {
+        (true, _) => "the guest's vmlab-agent answered earlier but does not now — the guest may \
+             be rebooting or shutting down; retry once it is back"
+            .to_string(),
+        (false, Some(version)) => format!(
+            "the guest's vmlab-agent ({version}) has not answered yet — the guest is likely \
+             still booting; retry once `vmlab status` shows it ready"
+        ),
+        (false, None) => "the guest has no running vmlab-agent (its template records no agent: \
+             it predates agent support) — rebuild it with `vmlab template build`"
+            .to_string(),
+    }
+}
 
 /// A machine's power state. Declared with the status projection, which is what
 /// puts it on the wire (ADR-0004), and re-exported here because this is where
@@ -334,8 +351,12 @@ impl VmInstance {
         if !self.template().resolved.agent_transport.has_channel() {
             return Err(super::machine::AgentUnavailable::NoChannel(self.cfg.name.clone()).into());
         }
+        let hint = no_agent_hint(
+            self.agent_up_flag().await,
+            self.template().agent_version.as_deref(),
+        );
         self.agent
-            .connect(&self.cfg.name, &self.dirs.agent_sock(), NO_AGENT_HINT)
+            .connect(&self.cfg.name, &self.dirs.agent_sock(), &hint)
             .await
     }
 
@@ -1337,4 +1358,24 @@ async fn run_tool(bin: &str, args: &[String]) -> Result<()> {
         bail!("{bin} failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::no_agent_hint;
+
+    #[test]
+    fn a_booting_guest_is_not_told_its_template_lacks_an_agent() {
+        let booting = no_agent_hint(false, Some("agent=12858e1"));
+        assert!(booting.contains("still booting"), "{booting}");
+        assert!(!booting.contains("predates"), "{booting}");
+
+        let gone = no_agent_hint(true, Some("agent=12858e1"));
+        assert!(gone.contains("answered earlier"), "{gone}");
+        assert!(!gone.contains("predates"), "{gone}");
+
+        let none = no_agent_hint(false, None);
+        assert!(none.contains("predates agent support"), "{none}");
+        assert!(none.contains("vmlab template build"), "{none}");
+    }
 }

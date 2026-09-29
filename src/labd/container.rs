@@ -33,9 +33,21 @@ use crate::qmp::QmpClient;
 /// whatever the container writes.
 const SCRATCH_SIZE: u64 = 2 << 30;
 
-/// What to tell a user whose container has no answering vmlab-agent.
-const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the guest boot asset predates \
-     it) — rebuild with guest/build-asset.sh and reinstall";
+/// What to tell a user whose container has no answering vmlab-agent. Every
+/// boot asset vmlab ships runs one, so a micro-VM that has not answered yet
+/// is far more likely still booting than built without it.
+fn no_agent_hint(answered_before: bool) -> String {
+    if answered_before {
+        "the container's vmlab-agent answered earlier but does not now — the micro-VM may be \
+         restarting or shutting down; retry once it is back"
+            .to_string()
+    } else {
+        "the container's vmlab-agent has not answered yet — the micro-VM is likely still \
+         booting; retry once `vmlab status` shows it ready (if it never answers, the guest boot \
+         asset may predate the agent: rebuild with guest/build-asset.sh and reinstall)"
+            .to_string()
+    }
+}
 
 pub struct ContainerDirs {
     /// `.vmlab/containers/<name>` — scratch qcow2, cfg/ (container.json).
@@ -481,8 +493,9 @@ impl ContainerInstance {
         if self.power_state().await != PowerState::Running {
             return Err(super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into());
         }
+        let hint = no_agent_hint(self.agent_up_flag().await);
         self.agent
-            .connect(&self.cfg.name, &self.dirs.agent_sock(), NO_AGENT_HINT)
+            .connect(&self.cfg.name, &self.dirs.agent_sock(), &hint)
             .await
     }
 
@@ -1410,6 +1423,14 @@ mod tests {
     use super::*;
     use crate::config::model::{EnvVar, Healthcheck, ImageRef, Volume};
     use crate::oci::image::model::RuntimeDefaults;
+
+    #[test]
+    fn a_booting_container_is_told_it_is_booting() {
+        let booting = no_agent_hint(false);
+        assert!(booting.starts_with("the container's vmlab-agent has not answered yet"));
+        assert!(booting.contains("still booting"), "{booting}");
+        assert!(no_agent_hint(true).contains("answered earlier"));
+    }
 
     fn container(name: &str) -> model::Container {
         model::Container {
