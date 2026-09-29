@@ -742,15 +742,31 @@ impl Handler<LabRequest> for LabdHandler {
                     })).collect::<Vec<_>>(),
                 }))
             }
+            // Clipboard exists only where the agent reaches a display server;
+            // without it both verbs refuse by name rather than claiming a copy
+            // or waiting out a reply that will never come.
             LabRequest::MachineClipboardGet { machine } => {
-                let text = agent_of(lab, &machine)
-                    .await?
+                let agent = agent_of(lab, &machine).await?;
+                if !agent.has_feature(vmlab_agent_proto::features::CLIPBOARD) {
+                    return Err(CommandError::unsupported(format!(
+                        "{machine}: {}",
+                        vm_agent::NO_CLIPBOARD
+                    )));
+                }
+                let text = agent
                     .get_clipboard(std::time::Duration::from_secs(10))
                     .await?;
                 Ok(json!(text))
             }
             LabRequest::MachineClipboardSet { machine, text } => {
-                agent_of(lab, &machine).await?.set_clipboard(text).await?;
+                let agent = agent_of(lab, &machine).await?;
+                if !agent.has_feature(vmlab_agent_proto::features::CLIPBOARD) {
+                    return Err(CommandError::unsupported(format!(
+                        "{machine}: {}",
+                        vm_agent::NO_CLIPBOARD
+                    )));
+                }
+                agent.set_clipboard(text).await?;
                 Ok(json!(true))
             }
 

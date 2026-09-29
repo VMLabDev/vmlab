@@ -700,11 +700,21 @@ impl AgentHandle {
         Ok(())
     }
 
+    /// Set the guest's clipboard. Refused, rather than sent into a void, on
+    /// an agent that does not advertise [`features::CLIPBOARD`]: such an
+    /// agent drops the request and a caller would report a copy that never
+    /// happened.
+    ///
+    /// [`features::CLIPBOARD`]: vmlab_agent_proto::features::CLIPBOARD
     pub async fn set_clipboard(&self, text: String) -> Result<()> {
+        self.require_clipboard()?;
         self.send_msg(&HostMsg::SetClipboard { text }).await
     }
 
+    /// Read the guest's clipboard; refused on an agent without the feature,
+    /// which would never answer.
     pub async fn get_clipboard(&self, timeout: Duration) -> Result<String> {
+        self.require_clipboard()?;
         let mut rx = self.inner.clipboard.subscribe();
         rx.mark_unchanged();
         self.send_msg(&HostMsg::GetClipboard).await?;
@@ -715,7 +725,20 @@ impl AgentHandle {
         let (_, text) = rx.borrow().clone();
         Ok(text)
     }
+
+    fn require_clipboard(&self) -> Result<()> {
+        if !self.has_feature(vmlab_agent_proto::features::CLIPBOARD) {
+            bail!(NO_CLIPBOARD);
+        }
+        Ok(())
+    }
 }
+
+/// Why a clipboard request is refused: the agent advertises `clipboard` only
+/// where its own environment reaches a display server, which a headless guest
+/// never has.
+pub const NO_CLIPBOARD: &str = "the guest agent has no clipboard (it offers one only where it \
+     can reach a display server; a headless guest has none)";
 
 /// One open channel, held by its consumer. Dropping it closes the channel
 /// on the agent side (best-effort).
@@ -2933,6 +2956,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("repair-agent"), "{err}");
+    }
+
+    /// An agent that does not advertise `clipboard` drops both requests, so
+    /// neither may be sent: a set would report a copy that never happened and
+    /// a get would wait out its whole timeout.
+    #[tokio::test]
+    async fn clipboard_on_an_agent_without_the_feature_is_refused() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let set = agent.set_clipboard("hi".into()).await.unwrap_err();
+        assert!(set.to_string().contains("no clipboard"), "{set}");
+        let started = std::time::Instant::now();
+        let get = agent
+            .get_clipboard(Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(get.to_string().contains("no clipboard"), "{get}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// Guest paths come in both spellings, and a Windows drive root is a
