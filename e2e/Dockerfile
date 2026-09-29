@@ -16,6 +16,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/guest/agent/target \
     --mount=type=cache,target=/src/guest/cinit/target \
     set -eux; \
+    # The target caches are shared by every checkout's image build, and cargo
+    # judges freshness by mtime: stamp this checkout's sources as newest so a
+    # build never ships another checkout's binary.
+    find src guest -type f -exec touch {} +; \
     cargo build --release --locked --bin vmlab; \
     install -D target/release/vmlab /out/vmlab; \
     ./guest/build-asset.sh x86_64; \
