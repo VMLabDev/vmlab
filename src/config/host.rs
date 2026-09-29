@@ -123,6 +123,42 @@ impl HostConfig {
         }
         Ok(finish(name, source, issues, Some(cfg))?)
     }
+
+    /// Where a segment's DNS forwards what it cannot answer (PRD §9.5):
+    /// `dns_upstream` when set, else the host's own resolver. `None` leaves
+    /// unmatched names NXDOMAIN.
+    pub fn upstream_resolver(&self) -> Option<std::net::SocketAddr> {
+        self.dns_upstream
+            .as_deref()
+            .and_then(parse_upstream)
+            .or_else(host_resolver)
+    }
+}
+
+fn parse_upstream(s: &str) -> Option<std::net::SocketAddr> {
+    if let Ok(sa) = s.parse() {
+        return Some(sa);
+    }
+    s.parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| std::net::SocketAddr::new(ip, 53))
+}
+
+/// The host's own resolver, read from /etc/resolv.conf (PRD §9.5: upstream
+/// defaults to the host's resolver).
+fn host_resolver() -> Option<std::net::SocketAddr> {
+    let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("nameserver")
+            && let Ok(ip) = rest.trim().parse::<std::net::IpAddr>()
+        {
+            // A loopback systemd-resolved stub still works — it's the
+            // host's resolver, reachable from the daemon's host sockets.
+            return Some(std::net::SocketAddr::new(ip, 53));
+        }
+    }
+    None
 }
 
 /// Percentage of free space on the filesystem holding `path`.

@@ -16,6 +16,7 @@ use crate::net::dns::DnsZone;
 use crate::net::fastpath::{self, FastpathTier, NicAttachment, SegmentXdp};
 use crate::net::gateway::{Gateway, GatewayConfig, gateway_mac};
 use crate::net::switch::{PortClass, Switch};
+use crate::proto::vocab::GlobalMember;
 
 /// Name of the built-in per-lab NAT segment (`nic { nat = true }`, §9.7).
 pub const NAT_SEGMENT: &str = "nat";
@@ -43,6 +44,9 @@ pub struct SegmentNet {
     pub global: bool,
     /// Cross-host peer (`connect { host }`), forwarded to the supervisor.
     pub peer: Option<String>,
+    /// This lab's NICs on a global segment, for the supervisor's DNS; filled
+    /// by [`LabNetwork::wire_gateways`] once MACs are settled.
+    pub global_members: Vec<GlobalMember>,
     /// Gateway service (ARP/ICMP/DHCP/DNS + uplink seam), wired by
     /// [`LabNetwork::wire_gateways`].
     pub gateway: Option<crate::net::gateway::GatewayHandle>,
@@ -174,6 +178,7 @@ impl LabNetwork {
                     dhcp: seg.dhcp,
                     global: seg.global,
                     peer: seg.connect.as_ref().map(|c| c.host.clone()),
+                    global_members: Vec::new(),
                     gateway: None,
                     services: None,
                     listeners: Vec::new(),
@@ -205,6 +210,7 @@ impl LabNetwork {
                     dhcp: true,
                     global: false,
                     peer: None,
+                    global_members: Vec::new(),
                     gateway: None,
                     services: None,
                     listeners: Vec::new(),
@@ -224,7 +230,7 @@ impl LabNetwork {
     /// §9.2): ask the supervisor to attach (creating the shared segment on
     /// first use), then connect this segment's local switch to the returned
     /// trunk socket. The supervisor runs the shared DHCP/DNS.
-    pub async fn attach_globals(&mut self) -> anyhow::Result<()> {
+    pub async fn attach_globals(&mut self, lab: &str) -> anyhow::Result<()> {
         let supervisor_sock = crate::paths::supervisor_socket();
         for seg in self.segments.values_mut() {
             if !seg.global {
@@ -238,6 +244,8 @@ impl LabNetwork {
                     name: seg.name.clone(),
                     subnet: seg.config.as_ref().and_then(|c| c.subnet),
                     peer: seg.peer.clone(),
+                    lab: Some(lab.to_string()),
+                    members: seg.global_members.clone(),
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("global.attach: {e}"))?;
@@ -259,7 +267,7 @@ impl LabNetwork {
     }
 
     /// Detach this lab's global segments from the supervisor (on shutdown).
-    pub async fn detach_globals(&self) {
+    pub async fn detach_globals(&self, lab: &str) {
         let names: Vec<String> = self
             .segments
             .values()
@@ -274,7 +282,10 @@ impl LabNetwork {
         {
             for name in names {
                 let _ = client
-                    .send(crate::proto::SupRequest::GlobalDetach { name })
+                    .send(crate::proto::SupRequest::GlobalDetach {
+                        name,
+                        lab: Some(lab.to_string()),
+                    })
                     .await;
             }
         }
@@ -290,16 +301,15 @@ impl LabNetwork {
         macs_by_vm: &HashMap<String, Vec<MacAddr>>,
         host: &crate::config::host::HostConfig,
     ) {
-        let upstream = host
-            .dns_upstream
-            .as_deref()
-            .and_then(parse_upstream)
-            .or_else(host_resolver);
+        let upstream = host.upstream_resolver();
 
         for seg in self.segments.values_mut() {
             if seg.global {
                 // Global segments are gatewayed by the supervisor; the lab
-                // daemon only bridges its local switch over a trunk.
+                // daemon only bridges its local switch over a trunk, and
+                // tells the supervisor which of its NICs sit there so the
+                // shared DNS can name them (§9.2).
+                seg.global_members = global_members(lab, &seg.name, macs_by_vm);
                 continue;
             }
             let gw_mac = gateway_mac(&lab.name, &seg.name);
@@ -417,6 +427,29 @@ impl LabNetwork {
     }
 }
 
+/// The NICs `lab` puts on the global segment `segment`, by persisted MAC.
+fn global_members(
+    lab: &Lab,
+    segment: &str,
+    macs_by_vm: &HashMap<String, Vec<MacAddr>>,
+) -> Vec<GlobalMember> {
+    let mut members = Vec::new();
+    for (mname, nics) in machine_nics(lab) {
+        for (i, nic) in nics.iter().enumerate() {
+            if nic_segment_name(nic) == segment
+                && let Some(mac) = macs_by_vm.get(mname).and_then(|m| m.get(i))
+            {
+                members.push(GlobalMember {
+                    machine: mname.to_string(),
+                    mac: *mac,
+                    ip: nic.ip,
+                });
+            }
+        }
+    }
+    members
+}
+
 /// Keep `<vm>.<lab>.<suffix>` (and the short `<vm>` alias) registered for
 /// every DHCP lease, matching leases back to VMs via their persisted MACs.
 fn spawn_lease_dns_sync(
@@ -452,32 +485,6 @@ fn spawn_lease_dns_sync(
             }
         }
     });
-}
-
-fn parse_upstream(s: &str) -> Option<std::net::SocketAddr> {
-    if let Ok(sa) = s.parse() {
-        return Some(sa);
-    }
-    s.parse::<std::net::IpAddr>()
-        .ok()
-        .map(|ip| std::net::SocketAddr::new(ip, 53))
-}
-
-/// The host's own resolver, read from /etc/resolv.conf (PRD §9.5: upstream
-/// defaults to the host's resolver).
-fn host_resolver() -> Option<std::net::SocketAddr> {
-    let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("nameserver")
-            && let Ok(ip) = rest.trim().parse::<std::net::IpAddr>()
-        {
-            // A loopback systemd-resolved stub still works — it's the
-            // host's resolver, reachable from the daemon's host sockets.
-            return Some(std::net::SocketAddr::new(ip, 53));
-        }
-    }
-    None
 }
 
 /// Segment a NIC attaches to: its declared segment, or the built-in NAT

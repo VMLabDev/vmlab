@@ -34,8 +34,8 @@ the code is the contract.
 | `lab.ensure` | `name: String`, `root: std::path::PathBuf` | `cli` | Spawn (or find) a lab's daemon; answers with its socket path. |
 | `lab.release` | `name: String` | `cli` | Stop a lab's daemon, after `down` or `destroy`. |
 | `lab.restart` | `name: String`, `root: std::path::PathBuf` | `cli` | Restart a lab's daemon so it re-reads its config; answers with the new socket path. |
-| `global.attach` | `name: String`, `subnet: Option<Ipv4Net>`, `peer: Option<String>` | `daemon` | Join a global segment (PRD §9.2), creating it on first use; answers with the trunk socket to bridge to. |
-| `global.detach` | `name: String` | `daemon` | Leave a global segment. |
+| `global.attach` | `name: String`, `subnet: Option<Ipv4Net>`, `peer: Option<String>`, `lab: Option<String>`, `members: Vec<GlobalMember>` | `daemon` | Join a global segment (PRD §9.2), creating it on first use; answers with the trunk socket to bridge to. |
+| `global.detach` | `name: String`, `lab: Option<String>` | `daemon` | Leave a global segment. |
 | `global.list` | — | `daemon` | Every global segment this host knows. |
 | `template.list` | `lab: String`, `root: std::path::PathBuf`, `file: Option<std::path::PathBuf>` | `cli` | The templates a file declares, with their store and build state. |
 | `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>` | `cli` | Start building one declared template. |

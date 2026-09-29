@@ -27,12 +27,14 @@ use ipnet::Ipv4Net;
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use crate::config::model::MacAddr;
 use crate::net::dhcp::DhcpConfig;
 use crate::net::dns::DnsZone;
 use crate::net::framing::{read_frame, write_frame};
 use crate::net::gateway::{Gateway, GatewayConfig, GatewayHandle, gateway_mac};
 use crate::net::switch::{ChannelPort, PortClass, Switch};
 use crate::proto::Event;
+use crate::proto::vocab::GlobalMember;
 
 /// Global segments use a distinct pool from per-lab segments to avoid
 /// collisions when both appear on one host.
@@ -227,10 +229,63 @@ impl TrunkTable {
     }
 }
 
+/// Who is on a global segment, lab by lab, and which names the segment's
+/// DNS zone currently holds on their behalf (PRD §9.2, §9.5).
+#[derive(Default)]
+struct Directory {
+    members: HashMap<String, Vec<GlobalMember>>,
+    /// Bare names (before the zone suffix) this directory registered.
+    registered: std::collections::BTreeSet<String>,
+}
+
+impl Directory {
+    /// Every name the attached labs' machines answer to, from their leases
+    /// (or a declared static address before one exists): `<vm>.<lab>`
+    /// always, and the short `<vm>` alias only where no other lab on the
+    /// segment has a machine of that name (§9.5).
+    fn names(&self, leases: &HashMap<MacAddr, Ipv4Addr>) -> HashMap<String, Ipv4Addr> {
+        let mut labs_by_machine: HashMap<&str, std::collections::BTreeSet<&str>> = HashMap::new();
+        for (lab, members) in &self.members {
+            for m in members {
+                labs_by_machine.entry(&m.machine).or_default().insert(lab);
+            }
+        }
+        let mut names = HashMap::new();
+        for (lab, members) in &self.members {
+            for m in members {
+                let Some(ip) = leases.get(&m.mac).copied().or(m.ip) else {
+                    continue;
+                };
+                names.insert(format!("{}.{lab}", m.machine), ip);
+                if labs_by_machine[m.machine.as_str()].len() == 1 {
+                    names.insert(m.machine.clone(), ip);
+                }
+            }
+        }
+        names
+    }
+
+    /// Bring `zone` in line with [`names`](Self::names): register what is
+    /// new or moved, unregister what left.
+    fn sync(&mut self, zone: &std::sync::Mutex<DnsZone>, leases: &[(MacAddr, Ipv4Addr)]) {
+        let names = self.names(&leases.iter().copied().collect());
+        let Ok(mut zone) = zone.lock() else { return };
+        for gone in self.registered.iter().filter(|n| !names.contains_key(*n)) {
+            zone.unregister(gone);
+        }
+        for (name, ip) in &names {
+            zone.register(name, *ip);
+        }
+        self.registered = names.into_keys().collect();
+    }
+}
+
 struct GlobalSeg {
     switch: Arc<Switch>,
-    #[allow(dead_code)]
     gateway: GatewayHandle,
+    directory: Arc<std::sync::Mutex<Directory>>,
+    /// Keeps the zone following the leases.
+    dns_sync: tokio::task::JoinHandle<()>,
     subnet: Ipv4Net,
     refcount: usize,
     sock: PathBuf,
@@ -241,10 +296,58 @@ struct GlobalSeg {
     trunks: Arc<TrunkTable>,
 }
 
+impl GlobalSeg {
+    /// Put a lab's machines into the segment's DNS.
+    fn join(&self, lab: Option<(String, Vec<GlobalMember>)>) {
+        let Some((lab, members)) = lab else { return };
+        let mut dir = self.directory.lock().expect("global directory");
+        dir.members.insert(lab, members);
+        self.sync_dns(&mut dir);
+    }
+
+    /// Take a lab's machines back out of the segment's DNS.
+    fn leave(&self, lab: Option<&str>) {
+        let Some(lab) = lab else { return };
+        let mut dir = self.directory.lock().expect("global directory");
+        if dir.members.remove(lab).is_some() {
+            self.sync_dns(&mut dir);
+        }
+    }
+
+    fn sync_dns(&self, dir: &mut Directory) {
+        if let (Some(zone), Some(leases)) = (self.gateway.dns_zone(), self.gateway.leases_probe()())
+        {
+            dir.sync(&zone, &leases);
+        }
+    }
+}
+
+/// Keep the segment's DNS following its DHCP leases, as a lab segment's
+/// lease sync does (PRD §9.5 auto-registration).
+fn spawn_dns_sync(
+    gateway: &GatewayHandle,
+    directory: Arc<std::sync::Mutex<Directory>>,
+) -> tokio::task::JoinHandle<()> {
+    let zone = gateway.dns_zone().expect("global segments serve DNS");
+    let leases = gateway.leases_probe();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let Some(leases) = leases() else { break };
+            directory
+                .lock()
+                .expect("global directory")
+                .sync(&zone, &leases);
+        }
+    })
+}
+
 pub struct GlobalSegments {
     segs: Mutex<HashMap<String, GlobalSeg>>,
     next_index: Mutex<u32>,
     dns_suffix: String,
+    /// Where the segments' DNS forwards names no attached lab answers to.
+    upstream_dns: Option<SocketAddr>,
     psk: Option<String>,
     events: tokio::sync::broadcast::Sender<Event>,
     /// Where segment trunk unix sockets live (tests inject a tempdir so two
@@ -254,14 +357,14 @@ pub struct GlobalSegments {
 
 impl GlobalSegments {
     pub fn new(
-        dns_suffix: String,
-        psk: Option<String>,
+        host: &crate::config::host::HostConfig,
         events: tokio::sync::broadcast::Sender<Event>,
     ) -> Arc<Self> {
         Self::new_at(
             crate::paths::runtime_dir().join("global"),
-            dns_suffix,
-            psk,
+            host.dns_suffix.clone(),
+            host.upstream_resolver(),
+            host.psk.clone(),
             events,
         )
     }
@@ -269,6 +372,7 @@ impl GlobalSegments {
     fn new_at(
         sock_dir: PathBuf,
         dns_suffix: String,
+        upstream_dns: Option<SocketAddr>,
         psk: Option<String>,
         events: tokio::sync::broadcast::Sender<Event>,
     ) -> Arc<Self> {
@@ -276,6 +380,7 @@ impl GlobalSegments {
             segs: Mutex::new(HashMap::new()),
             next_index: Mutex::new(0),
             dns_suffix,
+            upstream_dns,
             psk,
             events,
             sock_dir,
@@ -299,15 +404,21 @@ impl GlobalSegments {
 
     /// Attach to (creating if needed) the global segment `name`. Returns the
     /// unix socket the caller's lab daemon connects its trunk to.
+    ///
+    /// `lab` is the attaching lab and the NICs it puts on the segment; their
+    /// names join the segment's DNS until that lab detaches. An inbound
+    /// cross-host trunk attaches with none.
     pub async fn attach(
         self: &Arc<Self>,
         name: &str,
         subnet: Option<Ipv4Net>,
         peer: Option<String>,
+        lab: Option<(String, Vec<GlobalMember>)>,
     ) -> Result<PathBuf> {
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
             seg.refcount += 1;
+            seg.join(lab);
             // A later lab may be the one declaring `connect` — start the
             // dialer on an already-existing segment too.
             if let Some(peer) = peer
@@ -343,9 +454,11 @@ impl GlobalSegments {
                 gw_mac,
                 dhcp: Some(dhcp),
                 dns: Some(zone),
-                upstream_dns: None,
+                upstream_dns: self.upstream_dns,
             },
         );
+        let directory: Arc<std::sync::Mutex<Directory>> = Arc::default();
+        let dns_sync = spawn_dns_sync(&gateway, directory.clone());
 
         std::fs::create_dir_all(&self.sock_dir)?;
         let sock = self.sock_dir.join(format!("{name}.sock"));
@@ -366,19 +479,20 @@ impl GlobalSegments {
             ));
         }
 
-        segs.insert(
-            name.to_string(),
-            GlobalSeg {
-                switch,
-                gateway,
-                subnet,
-                refcount: 1,
-                sock: sock.clone(),
-                listener,
-                dialer,
-                trunks,
-            },
-        );
+        let seg = GlobalSeg {
+            switch,
+            gateway,
+            directory,
+            dns_sync,
+            subnet,
+            refcount: 1,
+            sock: sock.clone(),
+            listener,
+            dialer,
+            trunks,
+        };
+        seg.join(lab);
+        segs.insert(name.to_string(), seg);
         tracing::info!("global segment \"{name}\" created on {subnet}");
         Ok(sock)
     }
@@ -389,15 +503,18 @@ impl GlobalSegments {
             .ok_or_else(|| anyhow::anyhow!("cross-host segment needs a `psk` in host config"))
     }
 
-    /// Detach; destroys the segment when the last lab leaves.
-    pub async fn detach(self: &Arc<Self>, name: &str) {
+    /// Detach; destroys the segment when the last lab leaves. `lab`'s names
+    /// leave the segment's DNS with it.
+    pub async fn detach(self: &Arc<Self>, name: &str, lab: Option<&str>) {
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
+            seg.leave(lab);
             seg.refcount = seg.refcount.saturating_sub(1);
             if seg.refcount == 0
                 && let Some(seg) = segs.remove(name)
             {
                 seg.listener.abort();
+                seg.dns_sync.abort();
                 if let Some(d) = seg.dialer {
                     d.abort();
                 }
@@ -450,7 +567,7 @@ impl GlobalSegments {
     ) -> Result<bool> {
         let remote = stream.peer_addr().context("peer_addr")?;
         // The inbound trunk counts as a segment reference until it dies.
-        let _ = self.attach(name, None, None).await?;
+        let _ = self.attach(name, None, None, None).await?;
         let (switch, trunks) = {
             let segs = self.segs.lock().await;
             let seg = segs.get(name).expect("just attached");
@@ -460,7 +577,7 @@ impl GlobalSegments {
         let bridge = bridge_tcp_to_switch(switch, stream);
         if !trunks.try_reserve_accept(remote, bridge.abort_handle()) {
             bridge.abort();
-            self.detach(name).await;
+            self.detach(name, None).await;
             return Ok(false);
         }
         // Waiter: on bridge death clear the slot (emitting peer.down) and
@@ -470,7 +587,7 @@ impl GlobalSegments {
         tokio::spawn(async move {
             let _ = bridge.await;
             trunks.clear(remote.ip());
-            me.detach(&name).await;
+            me.detach(&name, None).await;
         });
         Ok(true)
     }
@@ -712,6 +829,7 @@ mod tests {
         let globals = GlobalSegments::new_at(
             dir.path().join("global"),
             "test.internal".into(),
+            None,
             Some(psk.into()),
             tx,
         );
@@ -778,7 +896,12 @@ mod tests {
         // A dials B; B's listener creates its side of the segment on accept.
         let a_sock = a
             .globals
-            .attach("wan", None, Some(format!("127.0.0.1:{}", b.addr.port())))
+            .attach(
+                "wan",
+                None,
+                Some(format!("127.0.0.1:{}", b.addr.port())),
+                None,
+            )
             .await
             .unwrap();
         let up_a = wait_event(&mut a.events, "segment.peer.up").await;
@@ -822,7 +945,7 @@ mod tests {
 
         // Kill B's side entirely: A must emit down and then redial into the
         // fresh accept, coming back up without duplicate ports.
-        b.globals.detach("wan").await;
+        b.globals.detach("wan", None).await;
         wait_event(&mut a.events, "segment.peer.down").await;
         wait_event(&mut a.events, "segment.peer.up").await;
         wait_connected(&a.globals, "wan", true).await;
@@ -838,12 +961,22 @@ mod tests {
         // UI's remote-vmlab node writes on both canvases.
         let a_sock = a
             .globals
-            .attach("wan", None, Some(format!("127.0.0.1:{}", b.addr.port())))
+            .attach(
+                "wan",
+                None,
+                Some(format!("127.0.0.1:{}", b.addr.port())),
+                None,
+            )
             .await
             .unwrap();
         let _ = b
             .globals
-            .attach("wan", None, Some(format!("127.0.0.1:{}", a.addr.port())))
+            .attach(
+                "wan",
+                None,
+                Some(format!("127.0.0.1:{}", a.addr.port())),
+                None,
+            )
             .await
             .unwrap();
         wait_event(&mut a.events, "segment.peer.up").await;
@@ -887,7 +1020,12 @@ mod tests {
         let b = instance("wrong").await;
         let _ = a
             .globals
-            .attach("wan", None, Some(format!("127.0.0.1:{}", b.addr.port())))
+            .attach(
+                "wan",
+                None,
+                Some(format!("127.0.0.1:{}", b.addr.port())),
+                None,
+            )
             .await
             .unwrap();
         // The dial must never come up; give it a few retry rounds.
@@ -898,5 +1036,146 @@ mod tests {
         assert!(up.is_err(), "trunk came up despite a PSK mismatch");
         let list = b.globals.list().await;
         assert!(list.is_empty(), "rejected peer still created the segment");
+    }
+
+    // ---- the shared segment's DNS (PRD §9.2, §9.5) ---------------------------
+
+    fn member(machine: &str, last: u8, ip: Option<[u8; 4]>) -> GlobalMember {
+        GlobalMember {
+            machine: machine.into(),
+            mac: MacAddr([0x02, 0, 0, 0, 0, last]),
+            ip: ip.map(Ipv4Addr::from),
+        }
+    }
+
+    async fn lookup(g: &Arc<GlobalSegments>, seg: &str, name: &str) -> crate::net::dns::DnsAnswer {
+        let segs = g.segs.lock().await;
+        let zone = segs[seg].gateway.dns_zone().expect("zone");
+        zone.lock().expect("zone lock").lookup(name)
+    }
+
+    /// Every lab on a global segment is named there — `<vm>.<lab>` always,
+    /// the short `<vm>` only while no other lab has a machine of that name —
+    /// and a lab's names leave with it.
+    #[tokio::test]
+    async fn a_global_segment_names_every_attached_labs_machines() {
+        use crate::net::dns::DnsAnswer;
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _events) = tokio::sync::broadcast::channel(8);
+        let g = GlobalSegments::new_at(dir.path().into(), "test.internal".into(), None, None, tx);
+        let subnet = Some("10.82.9.0/24".parse().unwrap());
+        g.attach(
+            "wan",
+            subnet,
+            None,
+            Some((
+                "lab-a".into(),
+                vec![
+                    member("ga", 1, Some([10, 82, 9, 10])),
+                    member("web", 2, Some([10, 82, 9, 11])),
+                ],
+            )),
+        )
+        .await
+        .unwrap();
+        g.attach(
+            "wan",
+            subnet,
+            None,
+            Some((
+                "lab-b".into(),
+                vec![
+                    member("gb", 3, Some([10, 82, 9, 20])),
+                    member("web", 4, Some([10, 82, 9, 21])),
+                ],
+            )),
+        )
+        .await
+        .unwrap();
+
+        let a = |ip: [u8; 4]| DnsAnswer::A(Ipv4Addr::from(ip));
+        assert_eq!(
+            lookup(&g, "wan", "gb.lab-b.test.internal").await,
+            a([10, 82, 9, 20])
+        );
+        assert_eq!(
+            lookup(&g, "wan", "gb.test.internal").await,
+            a([10, 82, 9, 20])
+        );
+        assert_eq!(
+            lookup(&g, "wan", "ga.test.internal").await,
+            a([10, 82, 9, 10])
+        );
+        assert_eq!(
+            lookup(&g, "wan", "web.lab-a.test.internal").await,
+            a([10, 82, 9, 11])
+        );
+        assert_eq!(
+            lookup(&g, "wan", "web.lab-b.test.internal").await,
+            a([10, 82, 9, 21])
+        );
+        assert_eq!(
+            lookup(&g, "wan", "web.test.internal").await,
+            DnsAnswer::Nxdomain,
+            "two labs have a \"web\": the short name is ambiguous"
+        );
+
+        g.detach("wan", Some("lab-b")).await;
+        assert_eq!(
+            lookup(&g, "wan", "gb.lab-b.test.internal").await,
+            DnsAnswer::Nxdomain
+        );
+        assert_eq!(
+            lookup(&g, "wan", "gb.test.internal").await,
+            DnsAnswer::Nxdomain
+        );
+        assert_eq!(
+            lookup(&g, "wan", "web.test.internal").await,
+            a([10, 82, 9, 11]),
+            "unambiguous again once lab-b left"
+        );
+    }
+
+    /// A lease wins over a declared address, and a machine with neither is
+    /// not named at all.
+    #[test]
+    fn a_lease_names_a_machine() {
+        let mut dir = Directory::default();
+        dir.members.insert(
+            "lab".into(),
+            vec![
+                member("dyn", 1, None),
+                member("idle", 2, None),
+                member("st", 3, Some([10, 0, 0, 3])),
+            ],
+        );
+        let leases = HashMap::from([
+            (MacAddr([0x02, 0, 0, 0, 0, 1]), Ipv4Addr::new(10, 0, 0, 50)),
+            (MacAddr([0x02, 0, 0, 0, 0, 3]), Ipv4Addr::new(10, 0, 0, 51)),
+        ]);
+        let names = dir.names(&leases);
+        assert_eq!(names["dyn.lab"], Ipv4Addr::new(10, 0, 0, 50));
+        assert_eq!(names["dyn"], Ipv4Addr::new(10, 0, 0, 50));
+        assert_eq!(names["st.lab"], Ipv4Addr::new(10, 0, 0, 51));
+        assert!(!names.contains_key("idle.lab"));
+    }
+
+    /// Names no attached lab answers to go upstream, as on a lab segment.
+    #[tokio::test]
+    async fn a_global_segment_forwards_what_it_cannot_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _events) = tokio::sync::broadcast::channel(8);
+        let g = GlobalSegments::new_at(
+            dir.path().into(),
+            "test.internal".into(),
+            Some("192.0.2.53:53".parse().unwrap()),
+            None,
+            tx,
+        );
+        g.attach("wan", None, None, None).await.unwrap();
+        assert_eq!(
+            lookup(&g, "wan", "example.com").await,
+            crate::net::dns::DnsAnswer::Forward
+        );
     }
 }

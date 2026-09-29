@@ -60,11 +60,7 @@ async fn run_async() -> Result<()> {
     let supervisor = Arc::new(Supervisor {
         registry: Mutex::new(Registry::load()),
         events: events_tx.clone(),
-        globals: GlobalSegments::new(
-            host_cfg.dns_suffix.clone(),
-            host_cfg.psk.clone(),
-            events_tx.clone(),
-        ),
+        globals: GlobalSegments::new(&host_cfg, events_tx.clone()),
         ensure_locks: Mutex::new(std::collections::HashMap::new()),
         template_ops: templates::TemplateOps::default(),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -496,12 +492,19 @@ impl Handler<SupRequest> for SupervisorHandler {
                 Ok(json!({"socket": sock}))
             }
             // Global segments (PRD §9.2): attach returns the trunk socket.
-            SupRequest::GlobalAttach { name, subnet, peer } => {
-                let sock = sup.globals.attach(&name, subnet, peer).await?;
+            SupRequest::GlobalAttach {
+                name,
+                subnet,
+                peer,
+                lab,
+                members,
+            } => {
+                let joining = lab.map(|lab| (lab, members));
+                let sock = sup.globals.attach(&name, subnet, peer, joining).await?;
                 Ok(json!({"socket": sock}))
             }
-            SupRequest::GlobalDetach { name } => {
-                sup.globals.detach(&name).await;
+            SupRequest::GlobalDetach { name, lab } => {
+                sup.globals.detach(&name, lab.as_deref()).await;
                 Ok(json!(true))
             }
             SupRequest::GlobalList {} => Ok(json!(sup.globals.list().await)),

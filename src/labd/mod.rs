@@ -107,7 +107,13 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     // Bridge any global segments to the supervisor (PRD §9.2). Best-effort:
     // a failure here is logged but doesn't abort the daemon (lab-local
     // segments still work).
-    if let Err(e) = runtime.network.lock().await.attach_globals().await {
+    if let Err(e) = runtime
+        .network
+        .lock()
+        .await
+        .attach_globals(&runtime.config.lab.name)
+        .await
+    {
         tracing::warn!("attaching global segments: {e:#}");
     }
 
@@ -199,7 +205,11 @@ async fn teardown(lab: &Arc<LabRuntime>, tasks: &crate::lifecycle::TaskGroup) {
     if let Some(mut smb) = lab.smb.lock().await.take() {
         smb.stop();
     }
-    lab.network.lock().await.detach_globals().await;
+    lab.network
+        .lock()
+        .await
+        .detach_globals(&lab.config.lab.name)
+        .await;
     tasks.shutdown(std::time::Duration::from_secs(5)).await;
 }
 

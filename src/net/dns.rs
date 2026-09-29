@@ -170,9 +170,8 @@ impl DnsZone {
     }
 
     /// Remove an auto-registered record. Returns whether it existed.
-    /// ([`Self::register`]'s inverse; nothing unregisters today — records
-    /// die with the zone — but the pair keeps the API symmetric.)
-    #[allow(dead_code)]
+    /// ([`Self::register`]'s inverse: a global segment's zone outlives the
+    /// labs that register into it, and drops their names as they detach.)
     pub fn unregister(&mut self, name: &str) -> bool {
         let fqdn = self.fqdn(name);
         self.records.remove(&fqdn).is_some()

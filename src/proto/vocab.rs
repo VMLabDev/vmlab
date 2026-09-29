@@ -322,6 +322,34 @@ impl<'de> Deserialize<'de> for Region {
     }
 }
 
+/// One NIC a lab puts on a global segment (PRD §9.2): what the supervisor's
+/// DNS registers it as, and the hardware address its lease will sit behind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalMember {
+    pub machine: String,
+    #[serde(with = "mac_str")]
+    pub mac: crate::config::model::MacAddr,
+    /// A declared static address, registered before any lease exists.
+    #[serde(default)]
+    pub ip: Option<std::net::Ipv4Addr>,
+}
+
+/// A MAC address on the wire as `aa:bb:cc:dd:ee:ff`.
+mod mac_str {
+    use super::*;
+    use crate::config::model::MacAddr;
+
+    pub fn serialize<S: serde::Serializer>(v: &MacAddr, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<MacAddr, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// `Option<Ipv4Net>` on the wire as an optional CIDR string (`ipnet` is built
 /// without its serde feature).
 mod opt_subnet {
@@ -859,6 +887,10 @@ vocabulary! {
             name: String,
             #[serde(default, with = "opt_subnet")] subnet: Option<Ipv4Net>,
             #[serde(default)] peer: Option<String>,
+            /// The attaching lab, whose machines' names the segment's DNS
+            /// serves until it detaches.
+            #[serde(default)] lab: Option<String>,
+            #[serde(default)] members: Vec<GlobalMember>,
         },
         /// Leave a global segment.
         #[one_way(
@@ -868,6 +900,7 @@ vocabulary! {
         )]
         GlobalDetach = "global.detach" {
             name: String,
+            #[serde(default)] lab: Option<String>,
         },
         /// Every global segment this host knows.
         #[one_way(
