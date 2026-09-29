@@ -428,7 +428,7 @@ Multiple labs run simultaneously. VM names are scoped per lab; the CLI addresses
 
 - Subnets auto-allocate as /24s carved from a host-wide pool — default **10.213.0.0/16**, overridable in host-level daemon config — when not declared. Declared subnets are honoured.
 - The daemon serves leases at the segment gateway. VM NICs with a static `ip` become **DHCP reservations** keyed on the NIC's persisted MAC — guests keep plain DHCP config and still land on deterministic addresses. Static IPs may sit outside the dynamic pool.
-- DHCP options served: gateway, DNS server (the daemon by default — overridable per segment to e.g. a DC, or suppressible), domain suffix, and **classless static routes (option 121)** from the segment's `routes {}` declarations.
+- DHCP options served: gateway, DNS server (the daemon by default — overridable per segment to e.g. a DC, or suppressible), domain suffix, and **classless static routes (option 121)** from the segment's `routes {}` declarations and its daemon-routed peers (§9.6), with the default route alongside them (a client given option 121 ignores option 3).
 - Per-segment opt-out: `dhcp = false` for segments where a lab VM (DC, pfSense, dnsmasq experiment) should own addressing.
 
 ### 9.5 DNS
@@ -446,7 +446,13 @@ Multiple labs run simultaneously. VM names are scoped per lab; the CLI addresses
 Two distinct mechanisms, both in v1:
 
 1. **Guest routes via DHCP option 121** — segment-declared `routes {}` are pushed to every guest at lease time. The mechanism for multi-segment topologies routed through a **VM** (firewall/router labs).
-2. **Daemon inter-segment routing** — the daemon itself forwards L3 between two segments. **Explicit opt-in per segment pair, never default**; segments are isolated unless connected by declaration or by a router VM. Declared in WCL and toggleable at runtime from scripts.
+2. **Daemon inter-segment routing** — the daemon itself forwards L3 between two segments. **Explicit opt-in per segment pair, never default**; segments are isolated unless connected by declaration or by a router VM. Declared in WCL (`segment { routes_to = [...] }`) and toggleable at runtime from scripts (`seg.route_to()` / `seg.unroute_to()`, §10.2).
+   - **Bidirectional.** A pair is unordered: `routes_to = ["b"]` on `a` connects `a` and `b` both ways, and declaring it on either side or both is the same thing.
+   - **Guests learn it by DHCP.** Each segment of a pair pushes the other's subnet via its own gateway in option 121, beside the default route. A runtime change reaches leases granted after it; renewals are not forced. Guests with addresses configured inside the guest (not DHCP reservations) add the route themselves.
+   - **No NAT.** Routed traffic keeps its source addresses; NAT (§9.7) is for internet egress only.
+   - **L3 rules apply** (§9.9): `block`/`redirect` rules are enforced on routed traffic at the switch ingress of the segment it is leaving; the segment it enters un-DNATs replies to its own redirects.
+   - **Lab-local only.** `routes_to` naming a `global` segment, or declared on one, is refused at validate by name, as is a segment naming itself.
+   - Routing runs in the daemon's userspace fabric: a packet for a connected peer arrives at the gateway MAC (which every fast-path tier punts to userspace), leaves the peer's gateway toward the ARP-resolved destination with its TTL decremented, and is never fragmented — an oversized packet with DF set is answered with ICMP fragmentation-needed.
 
 ### 9.7 NAT / internet egress
 
@@ -509,7 +515,8 @@ embedded in older templates continue to compile; new scripts document and use
 seg.block(cidr, opts)    seg.unblock(rule_id)
 seg.redirect(from, to, opts)
 seg.dns_set(name, ip)    seg.dns_sinkhole(pattern)   seg.dns_clear(...)
-seg.route_to(other_segment)          # opt-in inter-segment routing, reversible
+seg.route_to(other_segment)          # opt-in inter-segment routing, both ways (§9.6)
+seg.unroute_to(other_segment)        # take the pair apart again
 seg.forward(host_port, vm, guest_port) -> rule_id
 seg.rules() -> [Rule]
 ```

@@ -138,7 +138,7 @@ SRC
       | "`dhcp`" | "bool" | "`true`" | "Enable DHCP on this segment." |
       | "`nat`" | "bool" | "`false`" | "Enable NAT internet egress for this segment." |
       | "`mtu`" | "i64" | "9000 or 1500" | "Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` segment, else 1500, including on a `global` segment." |
-      | "`routes_to`" | "list<utf8>" | "none" | "Names of other segments the daemon routes to. Inter-segment routing is opt-in per segment." |
+      | "`routes_to`" | "list<utf8>" | "none" | "Lab-local segments the daemon routes to and from. Opt-in per pair, never a default; a pair runs both ways whichever side declares it. Routed traffic keeps its source address, the leaving segment's rules apply, and each side offers the other's subnet in DHCP option 121." |
       | "`dns {}`" | "child" | "none" | "DNS service override: hand out another server, or opt out." |
       | "`connect {}`" | "child" | "none" | "Cross-host segment peer over TCP, authenticated by the PSK from host config." |
       | "`route {}`" | "children" | "none" | "Guest routes pushed via DHCP option 121." |
@@ -159,7 +159,8 @@ SRC
     li "The name is a DNS label and no other segment in the lab has it."
     li "`subnet` is a well-formed CIDR, and no two declared subnets overlap."
     li "`mtu` is between 576 and 65535."
-    li "Every name in `routes_to` is a segment declared in this lab."
+    li "Every name in `routes_to` is a segment declared in this lab, other than the segment itself."
+    li "Neither side of `routes_to` is a `global` segment: daemon routing is lab-local."
     li "A `connect {}` child requires `global = true`; on a lab-local segment it would be ignored, so it is refused."
     li "A segment with a machine gateway (a `nic` with `gateway = true`) cannot also set `nat = true`, and cannot be `global`."
   }

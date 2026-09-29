@@ -5,6 +5,8 @@
 //!   stream-socket netdevs.
 //! - [`switch`]: the per-segment MAC-learning L2 switch with port isolation
 //!   and the ingress-hook seam for L3 rules.
+//! - [`router`]: daemon inter-segment routing between connected pairs of a
+//!   lab's own segments (§9.6).
 //! - [`fastpath`]: opt-in kernel acceleration tiers (eBPF sockmap/XDP) with
 //!   empirical probing and silent fallback to the userspace switch.
 
@@ -15,5 +17,6 @@ pub mod frame;
 pub mod framing;
 pub mod gateway;
 pub mod nat;
+pub mod router;
 pub mod rules;
 pub mod switch;

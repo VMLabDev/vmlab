@@ -10,14 +10,18 @@
 //! - hands every other IPv4 frame addressed to the gateway MAC (guests
 //!   routing off-segment traffic through their default gateway) to a
 //!   pluggable uplink handler — the NAT / inter-segment routing engine,
-//!   wired in later via [`GatewayHandle::set_uplink`].
+//!   wired in later via [`GatewayHandle::set_uplink`],
+//! - and is the segment's L3 interface the other way ([`L3Port`]): a packet
+//!   routed *onto* the segment leaves from the gateway MAC to a next hop it
+//!   resolves with ARP, learning its neighbours from the ARP it overhears.
 
 use crate::sync::LockRecover;
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -28,12 +32,20 @@ use crate::net::dhcp::{DHCP_SERVER_PORT, DhcpConfig, DhcpServer};
 use crate::net::dns::{DNS_PORT, DnsAction, DnsServer, DnsZone, forward_upstream};
 use crate::net::frame::{
     ArpOp, ArpView, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthView, IPPROTO_ICMP, IPPROTO_UDP, Ipv4View,
-    UdpView, arp_reply_build, eth_build, icmp_echo_reply_for,
+    UdpView, arp_reply_build, arp_request_build, eth_build, icmp_echo_reply_for,
 };
 use crate::net::switch::{ChannelPort, PortClass, Switch};
 
 /// How long the gateway waits for an upstream DNS resolver.
 const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a packet routed onto the segment waits for its next hop to
+/// answer ARP before it is dropped, and how often the question is repeated.
+const ARP_PENDING: Duration = Duration::from_secs(3);
+const ARP_RETRY: Duration = Duration::from_secs(1);
+/// Bounds on what waits for ARP: packets per next hop, and next hops.
+const ARP_PENDING_PACKETS: usize = 16;
+const ARP_PENDING_HOSTS: usize = 256;
 
 /// Uplink handler: receives every frame the gateway routes off-segment.
 ///
@@ -90,6 +102,7 @@ pub struct GatewayHandle {
     dhcp: Option<Arc<Mutex<DhcpServer>>>,
     dns: Option<Arc<Mutex<DnsZone>>>,
     uplink: SharedUplink,
+    neighbours: Arc<Mutex<Neighbours>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -117,6 +130,23 @@ impl GatewayHandle {
     /// `None` when DNS is disabled.
     pub fn dns_zone(&self) -> Option<Arc<Mutex<DnsZone>>> {
         self.dns.clone()
+    }
+
+    /// The DHCP server, for the option-121 routes inter-segment routing
+    /// adds and takes away at runtime (§9.6); `None` when DHCP is disabled.
+    pub fn dhcp_server(&self) -> Option<Arc<Mutex<DhcpServer>>> {
+        self.dhcp.clone()
+    }
+
+    /// The segment's L3 interface: what a packet routed onto this segment
+    /// is sent through (§9.6).
+    pub fn l3_port(&self) -> L3Port {
+        L3Port {
+            gw_ip: self.gw_ip,
+            gw_mac: self.gw_mac,
+            tx: self.tx.clone(),
+            neighbours: self.neighbours.clone(),
+        }
     }
 
     /// Detached lease accessor for background tasks (lease→DNS sync): the
@@ -154,6 +184,100 @@ impl Drop for GatewayHandle {
     }
 }
 
+/// The gateway as the segment's L3 interface (§9.6): sends an IPv4 packet
+/// to a host on the segment from the gateway MAC, resolving the host's MAC
+/// with ARP. Inter-segment routing emits through it.
+#[derive(Clone)]
+pub struct L3Port {
+    gw_ip: Ipv4Addr,
+    gw_mac: MacAddr,
+    tx: mpsc::Sender<Bytes>,
+    neighbours: Arc<Mutex<Neighbours>>,
+}
+
+impl L3Port {
+    /// Send `packet` to `next_hop` on this segment. A next hop whose MAC is
+    /// not yet known is asked for with ARP and the packet waits (briefly,
+    /// boundedly) for the answer the gateway task will release it on.
+    pub async fn send_ip(&self, next_hop: Ipv4Addr, packet: Vec<u8>) {
+        let (frame, ask) = {
+            let mut n = self.neighbours.lock_recover();
+            match n.table.get(&next_hop) {
+                Some(mac) => (
+                    Some(eth_build(*mac, self.gw_mac, ETHERTYPE_IPV4, &packet)),
+                    false,
+                ),
+                None => (None, n.hold(next_hop, packet, Instant::now())),
+            }
+        };
+        if let Some(frame) = frame {
+            let _ = self.tx.send(Bytes::from(frame)).await;
+        }
+        if ask {
+            let req = arp_request_build(self.gw_mac, self.gw_ip, next_hop);
+            let _ = self.tx.send(Bytes::from(req)).await;
+        }
+    }
+
+    /// Send `packet` straight to `mac`, no resolution: an answer to the host
+    /// whose frame is being answered.
+    pub async fn send_to(&self, mac: MacAddr, packet: &[u8]) {
+        let frame = eth_build(mac, self.gw_mac, ETHERTYPE_IPV4, packet);
+        let _ = self.tx.send(Bytes::from(frame)).await;
+    }
+}
+
+/// What the gateway knows of its segment's hosts, and the routed packets
+/// waiting for one of them to answer ARP.
+#[derive(Default)]
+struct Neighbours {
+    table: HashMap<Ipv4Addr, MacAddr>,
+    pending: HashMap<Ipv4Addr, Pending>,
+}
+
+struct Pending {
+    since: Instant,
+    asked: Instant,
+    packets: Vec<Vec<u8>>,
+}
+
+impl Neighbours {
+    /// Record `ip` at `mac`, returning whatever was waiting for it.
+    fn learn(&mut self, ip: Ipv4Addr, mac: MacAddr) -> Vec<Vec<u8>> {
+        self.table.insert(ip, mac);
+        self.pending
+            .remove(&ip)
+            .map(|p| p.packets)
+            .unwrap_or_default()
+    }
+
+    /// Hold `packet` for `ip` until it is resolved. Returns whether to ask
+    /// for `ip` now: first time, or the last question went unanswered.
+    fn hold(&mut self, ip: Ipv4Addr, packet: Vec<u8>, now: Instant) -> bool {
+        self.pending
+            .retain(|_, p| now.duration_since(p.since) < ARP_PENDING);
+        if !self.pending.contains_key(&ip) && self.pending.len() >= ARP_PENDING_HOSTS {
+            return false;
+        }
+        let p = self.pending.entry(ip).or_insert(Pending {
+            since: now,
+            asked: now,
+            packets: Vec::new(),
+        });
+        if p.packets.len() < ARP_PENDING_PACKETS {
+            p.packets.push(packet);
+        }
+        if p.packets.len() == 1 {
+            return true;
+        }
+        if now.duration_since(p.asked) >= ARP_RETRY {
+            p.asked = now;
+            return true;
+        }
+        false
+    }
+}
+
 /// The gateway service constructor (see module docs).
 pub struct Gateway;
 
@@ -184,6 +308,7 @@ impl Gateway {
             Arc::new(Mutex::new(z))
         });
         let uplink: SharedUplink = Arc::new(Mutex::new(None));
+        let neighbours = Arc::new(Mutex::new(Neighbours::default()));
 
         let task = GatewayTask {
             gw_ip,
@@ -193,6 +318,7 @@ impl Gateway {
             dhcp: dhcp.clone(),
             dns: dns_zone.clone().map(DnsServer::shared),
             uplink: Arc::clone(&uplink),
+            neighbours: Arc::clone(&neighbours),
         };
         debug!(segment = %task.segment, port = %id, ip = %gw_ip, mac = %gw_mac, "gateway spawned");
         let join = tokio::spawn(task.run(rx));
@@ -204,6 +330,7 @@ impl Gateway {
             dhcp,
             dns: dns_zone,
             uplink,
+            neighbours,
             task: join,
         }
     }
@@ -217,6 +344,7 @@ struct GatewayTask {
     dhcp: Option<Arc<Mutex<DhcpServer>>>,
     dns: Option<DnsServer>,
     uplink: SharedUplink,
+    neighbours: Arc<Mutex<Neighbours>>,
 }
 
 impl GatewayTask {
@@ -242,6 +370,14 @@ impl GatewayTask {
         let Some(arp) = ArpView::parse(payload) else {
             return;
         };
+        // Every ARP on the segment teaches the gateway a neighbour: the
+        // requests guests broadcast for anyone, and the replies to its own.
+        if !arp.spa().is_unspecified() {
+            let released = self.neighbours.lock_recover().learn(arp.spa(), arp.sha());
+            for packet in released {
+                self.send(eth_build(arp.sha(), self.gw_mac, ETHERTYPE_IPV4, &packet));
+            }
+        }
         if arp.op() == ArpOp::Request && arp.tpa() == self.gw_ip {
             self.send(arp_reply_build(
                 self.gw_mac,

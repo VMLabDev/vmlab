@@ -75,15 +75,40 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 ));
             }
         }
+        // Daemon inter-segment routing is lab-local (§9.6): a global segment
+        // has no daemon gateway in this lab to route through.
+        if seg.global && !seg.routes_to.is_empty() {
+            issues.push(Issue::at(
+                seg.span,
+                format!(
+                    "segment \"{}\" is global and declares routes_to — daemon inter-segment \
+                     routing is lab-local (PRD §9.6)",
+                    seg.name
+                ),
+            ));
+        }
         for target in &seg.routes_to {
-            if !lab.segments.iter().any(|s| &s.name == target) {
-                issues.push(Issue::at(
+            match lab.segments.iter().find(|s| &s.name == target) {
+                None => issues.push(Issue::at(
                     seg.span,
                     format!(
                         "segment \"{}\" routes_to undeclared segment \"{target}\"",
                         seg.name
                     ),
-                ));
+                )),
+                Some(t) if t.name == seg.name => issues.push(Issue::at(
+                    seg.span,
+                    format!("segment \"{}\" routes_to itself", seg.name),
+                )),
+                Some(t) if t.global => issues.push(Issue::at(
+                    seg.span,
+                    format!(
+                        "segment \"{}\" routes_to global segment \"{target}\" — daemon \
+                         inter-segment routing is lab-local (PRD §9.6)",
+                        seg.name
+                    ),
+                )),
+                Some(_) => {}
             }
         }
         for fwd in &seg.forwards {
@@ -2229,6 +2254,52 @@ lab "l" {
             r#"import <vmlab.wcl>
 lab "l" {
   segment "s" { global = true connect { host = "otherhost:13947" } }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    /// Daemon inter-segment routing is lab-local (§9.6): a global segment is
+    /// refused on either side of `routes_to`, by name, as is a segment
+    /// routing to itself.
+    #[test]
+    fn routes_to_is_lab_local() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "a" { routes_to = ["shared"] }
+  segment "shared" { global = true }
+}"#,
+            "segment \"a\" routes_to global segment \"shared\"",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "a" { }
+  segment "shared" { global = true routes_to = ["a"] }
+}"#,
+            "segment \"shared\" is global and declares routes_to",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "a" { routes_to = ["a"] }
+}"#,
+            "segment \"a\" routes_to itself",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "a" { routes_to = ["nowhere"] }
+}"#,
+            "routes_to undeclared segment \"nowhere\"",
+        );
+        // Two lab-local segments, declared on one side or both: clean.
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "a" { routes_to = ["b"] }
+  segment "b" { routes_to = ["a"] }
 }"#,
         );
         assert!(es.is_empty(), "expected clean validation, got: {es:#?}");

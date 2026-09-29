@@ -9,6 +9,11 @@ fn probe(vm: Machine, url: string) -> Result[string, string] {
     Ok(r.stdout.trim())
 }
 
+fn ping(m: Machine, ip: string) -> Result[string, string] {
+    let r = m.exec("/bin/sh", ["-c", "ping -c 2 -W 2 " + ip + " >/dev/null 2>&1 && echo PING-OK || echo PING-FAIL"])?
+    Ok(r.stdout.trim())
+}
+
 fn run(lab: Lab) -> Result[unit, string] {
     let vm = lab.vm("vm01")?
     let lan = lab.segment("lan")?
@@ -36,10 +41,19 @@ fn run(lab: Lab) -> Result[unit, string] {
     let fid = lan.forward(18687, "vm01", 8686)?
     lab.log("e2e-forward-id " + fmt("{}", fid))
 
-    // route_to: not wired from scripts in this release; report the answer.
+    // route_to / unroute_to: the container on "back" reaches vm01 on "lan"
+    // only while the pair is connected, and a pair is one thing -- it is
+    // taken apart from the other side.
+    let web = lab.container("web")?
+    let back = lab.segment("back")?
+    lab.log("e2e-route-before " + ping(web, "10.86.0.10")?)
+    lan.route_to("back")?
+    lab.log("e2e-route-during " + ping(web, "10.86.0.10")?)
+    back.unroute_to("lan")?
+    lab.log("e2e-route-after " + ping(web, "10.86.0.10")?)
     match lan.route_to("lan") {
-        Ok(_) => lab.log("e2e-route-to ok"),
-        Err(e) => lab.log("e2e-route-to err " + e),
+        Ok(_) => lab.log("e2e-route-self ok"),
+        Err(e) => lab.log("e2e-route-self err " + e),
     }
     Ok(())
 }

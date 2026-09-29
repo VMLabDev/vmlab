@@ -15,6 +15,7 @@ use crate::net::dhcp::DhcpConfig;
 use crate::net::dns::DnsZone;
 use crate::net::fastpath::{self, FastpathTier, NicAttachment, SegmentXdp};
 use crate::net::gateway::{Gateway, GatewayConfig, gateway_mac};
+use crate::net::router::{Leg, Router};
 use crate::net::switch::{PortClass, Switch};
 use crate::proto::vocab::GlobalMember;
 
@@ -135,6 +136,9 @@ impl SegmentNet {
 
 pub struct LabNetwork {
     pub segments: HashMap<String, SegmentNet>,
+    /// Daemon inter-segment routing (§9.6): every lab-local segment's
+    /// gateway, and the pairs connected by `routes_to` or a script.
+    pub router: Arc<Router>,
 }
 
 impl LabNetwork {
@@ -219,7 +223,10 @@ impl LabNetwork {
             );
         }
 
-        Ok(LabNetwork { segments })
+        Ok(LabNetwork {
+            segments,
+            router: Router::new(),
+        })
     }
 
     pub fn segment_mut(&mut self, name: &str) -> Option<&mut SegmentNet> {
@@ -302,6 +309,7 @@ impl LabNetwork {
         host: &crate::config::host::HostConfig,
     ) {
         let upstream = host.upstream_resolver();
+        let router = self.router.clone();
 
         for seg in self.segments.values_mut() {
             if seg.global {
@@ -415,16 +423,79 @@ impl LabNetwork {
 
             // NAT + L3 rule services on the same switch (§9.6–§9.9). Declared
             // routes' block/redirect/forward rules are pre-installed.
-            let services =
-                super::netservices::SegmentServices::install(&seg.switch, &handle, seg.nat, mtu);
+            let services = super::netservices::SegmentServices::install(
+                &seg.switch,
+                &handle,
+                seg.nat,
+                mtu,
+                (&router, &seg.name),
+            );
             if let Some(cfg) = &seg.config {
                 super::netservices::preinstall_rules(&services, cfg, lab);
             }
 
+            // The segment as the router sees it; connected below, once
+            // every segment is registered.
+            router.register(Leg {
+                name: seg.name.clone(),
+                subnet: seg.subnet,
+                gw_ip: seg.service_ip,
+                mtu,
+                port: handle.l3_port(),
+                rules: services.rules.clone(),
+                dhcp: handle.dhcp_server(),
+                declared_routes: seg
+                    .config
+                    .iter()
+                    .flat_map(|c| c.routes.iter().map(|r| (r.dest, r.via)))
+                    .collect(),
+            });
+
             seg.gateway = Some(handle);
             seg.services = Some(services);
         }
+
+        // Declared pairs (§9.6). Validation has refused a global segment on
+        // either side and an undeclared name, so every pair connects.
+        for (a, b) in declared_route_pairs(lab) {
+            if let Err(error) = router.connect(a, b) {
+                tracing::warn!("routes_to: {error}");
+            }
+        }
     }
+
+    /// Connect (`enable`) or disconnect `a` and `b` at runtime — a script's
+    /// `seg.route_to()` / `seg.unroute_to()` (§9.6). Guests learn of the
+    /// change with their next lease.
+    pub fn set_route(&self, a: &str, b: &str, enable: bool) -> Result<(), String> {
+        for name in [a, b] {
+            match self.segments.get(name) {
+                None => return Err(format!("no segment named \"{name}\" in this lab")),
+                Some(seg) if seg.global => {
+                    return Err(format!(
+                        "segment \"{name}\" is global — daemon inter-segment routing is \
+                         lab-local (PRD §9.6)"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if enable {
+            self.router.connect(a, b)
+        } else {
+            self.router.disconnect(a, b)
+        }
+    }
+}
+
+/// Every `routes_to` pair the lab declares, as (declaring segment, target).
+/// Declaring a pair on both sides lists it twice; connecting is idempotent.
+fn declared_route_pairs(lab: &Lab) -> impl Iterator<Item = (&str, &str)> {
+    lab.segments.iter().flat_map(|seg| {
+        seg.routes_to
+            .iter()
+            .map(move |target| (seg.name.as_str(), target.as_str()))
+    })
 }
 
 /// The NICs `lab` puts on the global segment `segment`, by persisted MAC.
@@ -594,6 +665,49 @@ lab "l" {
         let net = LabNetwork::build(&l).unwrap();
         assert_eq!(net.segments["a"].subnet.to_string(), "10.213.0.0/24");
         assert_ne!(net.segments["b"].subnet.to_string(), "10.213.0.0/24");
+    }
+
+    /// `routes_to` on one side connects the pair both ways (§9.6), and a
+    /// script can connect and disconnect a pair — never a global segment.
+    #[tokio::test]
+    async fn routes_to_connects_the_pair_and_scripts_toggle_it() {
+        let l = lab(r#"import <vmlab.wcl>
+lab "l" {
+  segment "a" { subnet = "10.60.0.0/24" routes_to = ["b"] }
+  segment "b" { subnet = "10.60.1.0/24" }
+  segment "c" { subnet = "10.60.2.0/24" }
+  segment "g" { subnet = "10.60.9.0/24" global = true }
+  vm "x" { template = "x86_64/t" nic { segment = "a" } }
+}"#);
+        let mut net = LabNetwork::build(&l).unwrap();
+        net.wire_gateways(
+            &l,
+            &HashMap::new(),
+            &crate::config::host::HostConfig::default(),
+        );
+
+        assert!(net.router.connected("b", "a"));
+        assert!(!net.router.connected("a", "c"));
+        let a: Ipv4Net = "10.60.0.0/24".parse().unwrap();
+        let b: Ipv4Net = "10.60.1.0/24".parse().unwrap();
+        assert_eq!(
+            net.router.dhcp_routes("a"),
+            vec![(b, "10.60.0.1".parse().unwrap())]
+        );
+        assert_eq!(
+            net.router.dhcp_routes("b"),
+            vec![(a, "10.60.1.1".parse().unwrap())]
+        );
+
+        net.set_route("c", "b", true).unwrap();
+        assert!(net.router.connected("b", "c"));
+        net.set_route("b", "c", false).unwrap();
+        assert!(!net.router.connected("c", "b"));
+
+        let e = net.set_route("a", "g", true).unwrap_err();
+        assert!(e.contains("\"g\" is global"), "{e}");
+        let e = net.set_route("a", "nope", true).unwrap_err();
+        assert!(e.contains("\"nope\""), "{e}");
     }
 
     #[test]
