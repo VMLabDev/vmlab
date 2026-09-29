@@ -427,7 +427,13 @@ fn machine_detail(m: &MachineStatus) -> String {
                 vm.memory
                     .map_or("-".into(), crate::template::meta::format_size),
             );
-            field("agent", or_dash(vm.agent_version.as_deref()).to_string());
+            // The stamp names its own component (`agent=<rev>`,
+            // `agent-legacy=<rev>`); the field already says `agent=`.
+            let agent = vm
+                .agent_version
+                .as_deref()
+                .map(|v| v.strip_prefix("agent=").unwrap_or(v));
+            field("agent", or_dash(agent).to_string());
         }
         MachineDetail::Container(c) => {
             field(
@@ -1864,6 +1870,27 @@ mod tests {
             out.contains("state=stopping ready=no cached=yes health=- exit=-"),
             "got:\n{out}"
         );
+    }
+
+    /// The agent stamp already names its component, so it is shown once
+    /// rather than as `agent=agent=…`.
+    #[test]
+    fn verbose_shows_the_agent_stamp_without_doubling_its_prefix() {
+        let MachineDetail::Vm(mut detail) = vm() else {
+            unreachable!()
+        };
+        detail.agent_version = Some("agent=12858e1".into());
+        let out = render_status(
+            &lab(vec![addressed(
+                "dc01",
+                PowerState::Running,
+                true,
+                MachineDetail::Vm(detail),
+            )]),
+            true,
+        );
+        assert!(out.contains(" agent=12858e1"), "got:\n{out}");
+        assert!(!out.contains("agent=agent="), "got:\n{out}");
     }
 
     /// A machine a repair verb changed in place says so wherever its state is

@@ -1261,11 +1261,15 @@ impl super::machine::Machine for VmInstance {
     }
 
     async fn status_detail(&self) -> super::machine::MachineDetail {
+        // Hardware as resolved (VM > template > profile, ADR-0008), not as
+        // declared: a VM that leaves its arch or size to its template still
+        // has one.
+        let resolved = &self.template().resolved;
         super::machine::MachineDetail::Vm(crate::status::VmStatus {
             template: self.cfg.template.to_string(),
-            arch: self.cfg.arch.clone(),
-            cpus: self.cfg.cpus,
-            memory: self.cfg.memory,
+            arch: Some(resolved.arch.clone()),
+            cpus: Some(resolved.cpus),
+            memory: Some(resolved.memory),
             // The template carries a baked-in vmlab-agent (terminal support);
             // null on vintage guests and pre-agent templates.
             agent_version: self.template().agent_version.clone(),
