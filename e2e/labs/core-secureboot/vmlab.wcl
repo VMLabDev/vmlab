@@ -1,0 +1,13 @@
+// Secure boot, enforced: the firmware gets Microsoft's keys enrolled, and
+// the Alpine image's bootloader is not signed by them, so it must be refused.
+// The core lab boots the same template without secure boot.
+import <vmlab.wcl>
+
+lab "e2e-core-secureboot" {
+  vm "sb" {
+    template    = "x86_64/e2e-alpine"
+    cpus        = 1
+    memory      = 512MiB
+    secure_boot = true
+  }
+}

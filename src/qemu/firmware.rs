@@ -21,32 +21,19 @@ pub struct UefiFirmware {
 
 /// The well-known CODE/VARS locations for one arch, most specific first.
 /// Data, not lookup: [`lookup_under`] is what touches the filesystem.
-fn candidates(
-    arch: &str,
-    secure_boot: bool,
-) -> Result<(&'static [&'static str], &'static [&'static str])> {
+fn candidates(arch: &str) -> Result<(&'static [&'static str], &'static [&'static str])> {
     Ok(match arch {
-        // OVMF for x86_64. `secure_boot` selects the secboot build (which
-        // requires the matching 4m VARS).
+        // OVMF for x86_64. Secure boot has its own pairs: see
+        // [`SECURE_BOOT_X86_64`].
         "x86_64" => (
-            if secure_boot {
-                &[
-                    "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
-                    "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
-                    "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
-                    "/usr/share/OVMF/OVMF_CODE.secboot.fd",
-                    "/usr/share/edk2-ovmf/OVMF_CODE.secboot.fd",
-                ][..]
-            } else {
-                &[
-                    "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
-                    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-                    "/usr/share/OVMF/OVMF_CODE_4M.fd",
-                    "/usr/share/OVMF/OVMF_CODE.fd",
-                    "/usr/share/edk2-ovmf/OVMF_CODE.fd",
-                    "/usr/share/qemu/ovmf-x86_64-code.bin",
-                ][..]
-            },
+            &[
+                "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+                "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+                "/usr/share/OVMF/OVMF_CODE_4M.fd",
+                "/usr/share/OVMF/OVMF_CODE.fd",
+                "/usr/share/edk2-ovmf/OVMF_CODE.fd",
+                "/usr/share/qemu/ovmf-x86_64-code.bin",
+            ][..],
             &[
                 "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
                 "/usr/share/edk2/ovmf/OVMF_VARS.fd",
@@ -90,8 +77,36 @@ fn candidates(
     })
 }
 
+/// The x86_64 secure-boot builds, each with the VARS template that has keys
+/// enrolled for it — Microsoft's, which Windows and shim-signed Linux boot
+/// under. A blank VARS leaves the firmware in setup mode, where it verifies
+/// nothing, so the pair is searched as a pair: CODE and VARS sizes must
+/// match, and a secboot CODE without its enrolled VARS is no answer.
+const SECURE_BOOT_X86_64: &[(&str, &str)] = &[
+    // Debian, Ubuntu (`ovmf`).
+    (
+        "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+        "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+    ),
+    (
+        "/usr/share/OVMF/OVMF_CODE.secboot.fd",
+        "/usr/share/OVMF/OVMF_VARS.ms.fd",
+    ),
+    // Fedora, RHEL (`edk2-ovmf`).
+    (
+        "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
+        "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd",
+    ),
+];
+
+/// Secure-boot CODE builds shipped without an enrolled VARS beside them —
+/// Arch's `edk2-ovmf` is one. Named in the error so a host carrying one is
+/// told what is missing rather than that it has no firmware.
+const SECURE_BOOT_X86_64_CODE_ONLY: &[&str] = &["/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd"];
+
 /// The UEFI CODE/VARS pair for a QEMU arch (`x86_64`, `aarch64`, `riscv64`).
-/// `secure_boot` only changes the x86_64 CODE image.
+/// `secure_boot` selects an x86_64 secboot build with keys enrolled; other
+/// arches have no secure-boot variant.
 pub fn lookup(arch: &str, secure_boot: bool) -> Result<UefiFirmware> {
     lookup_under(Path::new("/"), arch, secure_boot)
 }
@@ -101,12 +116,13 @@ pub fn lookup(arch: &str, secure_boot: bool) -> Result<UefiFirmware> {
 /// under a temp dir, which is what makes candidate ordering and the
 /// secure-boot variant testable on a host with no edk2 at all.
 fn lookup_under(root: &Path, arch: &str, secure_boot: bool) -> Result<UefiFirmware> {
-    let (code_candidates, vars_candidates) = candidates(arch, secure_boot)?;
+    let at = |c: &str| root.join(c.trim_start_matches('/'));
+    if secure_boot && arch == "x86_64" {
+        return secure_boot_x86_64(&at);
+    }
+    let (code_candidates, vars_candidates) = candidates(arch)?;
     let first_existing = |candidates: &[&str]| -> Option<PathBuf> {
-        candidates
-            .iter()
-            .map(|c| root.join(c.trim_start_matches('/')))
-            .find(|p| p.is_file())
+        candidates.iter().map(|c| at(c)).find(|p| p.is_file())
     };
     let code = first_existing(code_candidates).ok_or_else(|| {
         anyhow!(
@@ -124,6 +140,47 @@ fn lookup_under(root: &Path, arch: &str, secure_boot: bool) -> Result<UefiFirmwa
         code,
         vars_template,
     })
+}
+
+/// The first [`SECURE_BOOT_X86_64`] pair present in full. A host with a
+/// secboot CODE but no enrolled VARS to go with it is refused by name:
+/// booting it would look like secure boot and enforce nothing.
+fn secure_boot_x86_64(at: &dyn Fn(&str) -> PathBuf) -> Result<UefiFirmware> {
+    if let Some((code, vars)) = SECURE_BOOT_X86_64
+        .iter()
+        .map(|(c, v)| (at(c), at(v)))
+        .find(|(c, v)| c.is_file() && v.is_file())
+    {
+        return Ok(UefiFirmware {
+            code,
+            vars_template: vars,
+        });
+    }
+    let enrolled: Vec<&str> = SECURE_BOOT_X86_64.iter().map(|(_, v)| *v).collect();
+    let found_code = SECURE_BOOT_X86_64
+        .iter()
+        .map(|(c, _)| *c)
+        .chain(SECURE_BOOT_X86_64_CODE_ONLY.iter().copied())
+        .find(|c| at(c).is_file());
+    match found_code {
+        Some(code) => Err(anyhow!(
+            "x86_64 secure boot needs a UEFI VARS template with keys enrolled, and this host has \
+             only {code} without one — a blank VARS boots in setup mode and enforces nothing. \
+             Install an OVMF build that ships enrolled VARS; tried: {}",
+            enrolled.join(", ")
+        )),
+        None => {
+            let codes: Vec<&str> = SECURE_BOOT_X86_64
+                .iter()
+                .map(|(c, _)| *c)
+                .chain(SECURE_BOOT_X86_64_CODE_ONLY.iter().copied())
+                .collect();
+            Err(anyhow!(
+                "x86_64 secure-boot UEFI firmware not found; tried: {}",
+                codes.join(", ")
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -162,24 +219,67 @@ mod tests {
         );
     }
 
-    /// Secure boot picks the secboot CODE build; the VARS list is shared.
+    /// Secure boot picks the secboot CODE build and the VARS template with
+    /// keys enrolled beside it — never the blank one plain boot uses.
     #[test]
-    fn secure_boot_picks_the_secboot_build() {
+    fn secure_boot_picks_the_secboot_build_with_enrolled_vars() {
         let root = distro(&[
             "/usr/share/OVMF/OVMF_CODE_4M.fd",
             "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
             "/usr/share/OVMF/OVMF_VARS_4M.fd",
+            "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
         ]);
         let plain = lookup_under(root.path(), "x86_64", false).unwrap();
         assert!(
             !plain.code.to_string_lossy().contains("secboot"),
             "{plain:?}"
         );
+        assert!(plain.vars_template.ends_with("OVMF/OVMF_VARS_4M.fd"));
 
         let sb = lookup_under(root.path(), "x86_64", true).unwrap();
-        assert!(sb.code.to_string_lossy().contains("secboot"), "{sb:?}");
-        // Both variants share one VARS template.
-        assert_eq!(plain.vars_template, sb.vars_template);
+        assert!(sb.code.ends_with("OVMF/OVMF_CODE_4M.secboot.fd"), "{sb:?}");
+        assert!(
+            sb.vars_template.ends_with("OVMF/OVMF_VARS_4M.ms.fd"),
+            "{sb:?}"
+        );
+    }
+
+    /// CODE and VARS come as a pair: Fedora's 2 MiB secboot build takes
+    /// Fedora's enrolled VARS, not Debian's 4 MiB one found first.
+    #[test]
+    fn secure_boot_pairs_code_with_its_own_vars() {
+        let root = distro(&[
+            "/usr/share/OVMF/OVMF_VARS_4M.ms.fd",
+            "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
+            "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd",
+        ]);
+        let sb = lookup_under(root.path(), "x86_64", true).unwrap();
+        assert!(
+            sb.code.ends_with("edk2/ovmf/OVMF_CODE.secboot.fd"),
+            "{sb:?}"
+        );
+        assert!(
+            sb.vars_template.ends_with("edk2/ovmf/OVMF_VARS.secboot.fd"),
+            "{sb:?}"
+        );
+    }
+
+    /// A secboot build with only a blank VARS — Arch's layout — is refused
+    /// by name rather than booted in setup mode, where it would enforce
+    /// nothing.
+    #[test]
+    fn secure_boot_without_enrolled_vars_is_an_error() {
+        let root = distro(&[
+            "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+            "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
+            "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+        ]);
+        let msg = lookup_under(root.path(), "x86_64", true)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("keys enrolled"), "{msg}");
+        assert!(msg.contains("OVMF_CODE.secboot.4m.fd"), "{msg}");
+        assert!(msg.contains("/usr/share/OVMF/OVMF_VARS_4M.ms.fd"), "{msg}");
     }
 
     /// A host with the plain build but no secboot one fails rather than

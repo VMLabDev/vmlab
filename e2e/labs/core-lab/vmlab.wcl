@@ -24,14 +24,14 @@ lab "e2e-core" {
     media { kind = "iso" from = "./media-iso/" label = "E2EMEDIA" }
   }
 
-  // Started only once vm01 is ready.
+  // Started only once vm01 is ready. Secure boot has a lab of its own
+  // (`core-secureboot`): enforced, it refuses this unsigned image.
   vm "vm02" {
-    template    = "x86_64/e2e-alpine"
-    cpus        = 1
-    memory      = 512MiB
-    secure_boot = true
-    floppy      = "./fd.img"
-    depends_on  = ["vm01"]
+    template   = "x86_64/e2e-alpine"
+    cpus       = 1
+    memory     = 512MiB
+    floppy     = "./fd.img"
+    depends_on = ["vm01"]
     nic { segment = "lan" }
   }
 

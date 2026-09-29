@@ -200,7 +200,7 @@ Each VM block can express:
   - `vulkan` — paravirtualised Vulkan via virtio-gpu Venus. Newer and less settled than virgl; offered with the same guest-support caveats.
 
   The paravirtualised modes must coexist with vmlab's headless VNC model — host-side rendering with the framebuffer scraped for VNC/screenshots (QEMU's egl-headless-style display path). **⚠ Implementation note:** exact device/display flag combinations for virgl/Venus alongside VNC, and their behaviour on WSL2's GPU stack, change across QEMU versions and must be verified at implementation time rather than taken from this document. Screenshot/image-matching APIs (§10.3) must keep working in all GPU modes.
-- `display`, `firmware`, `tpm`, `secure_boot` — normally supplied by the profile, overridable per VM
+- `display`, `firmware`, `tpm`, `secure_boot` — normally supplied by the profile, overridable per VM. `secure_boot = true` is enforced: the VM's UEFI variable store starts from a template with Microsoft's keys enrolled, and a host with no such template refuses the VM rather than boot one in setup mode, where nothing is verified.
 - `qemu_args = [...]` — **escape hatch**: raw arguments appended verbatim to the QEMU command line, last so they win
 
 Values not set on the VM inherit from the template's recorded hardware; values not set there come from the profile; the profile's defaults are the floor. Precedence: **VM block > template > profile** (no template layer for `scratch` VMs, §6.5).
