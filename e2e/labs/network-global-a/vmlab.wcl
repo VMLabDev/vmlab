@@ -1,10 +1,13 @@
 // One of two labs sharing the supervisor-owned global segment "e2e-shared".
+// Both declare the same `mtu`; "ga" declares a static address, which the
+// supervisor's DHCP serves as a reservation.
 import <vmlab.wcl>
 
 lab "e2e-network-global-a" {
   segment "e2e-shared" {
     subnet = "10.82.9.0/24"
     global = true
+    mtu    = 1400
   }
 
   vm "ga" {
@@ -12,6 +15,6 @@ lab "e2e-network-global-a" {
     arch     = "x86_64"
     cpus     = 1
     memory   = 512MiB
-    nic { segment = "e2e-shared" }
+    nic { segment = "e2e-shared" ip = "10.82.9.50" }
   }
 }

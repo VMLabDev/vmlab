@@ -340,16 +340,37 @@ def routes(h, lab, ip):
     )
 
 
+def dhcp_offer(h, lab, machine: str) -> str:
+    """What the segment's DHCP hands `machine` right now, asked afresh with a
+    one-shot busybox udhcpc whose script only prints: `ip=... mtu=...`. Reads
+    the option-26 MTU off the wire, which the NIC's own MTU cannot show —
+    virtio's `host_mtu` sets that too."""
+    script = "printf '#!/bin/sh\\n[ \"$1\" = bound ] && echo \"ip=$ip mtu=$mtu\"\\n' > /tmp/lease.sh; " \
+             "chmod +x /tmp/lease.sh; udhcpc -i eth0 -f -q -n -t 3 -T 2 -s /tmp/lease.sh 2>/dev/null"
+    out = gsh(h, lab, machine, script).out
+    m = re.search(r"ip=\S* mtu=\S*", out)
+    return m.group(0) if m else out.strip()[-200:]
+
+
 def global_segment(h):
-    """Two labs on one supervisor declaring the same global segment."""
+    """Two labs on one supervisor declaring the same global segment, with an
+    `mtu` and one static address its (supervisor-owned) DHCP serves."""
     with h.lab("network-global-a") as a, h.lab("network-global-b") as b:
-        h.vmlab("up", cwd=a, timeout=600)
-        h.vmlab("up", cwd=b, timeout=600)
+        up_a = h.vmlab("up", cwd=a, timeout=600)
+        up_b = h.vmlab("up", cwd=b, timeout=600)
         h.wait_ready(a, "ga")
         h.wait_ready(b, "gb")
         ga, gb = ipv4(h, a, "ga"), ipv4(h, b, "gb")
         shared = ipaddress.ip_network("10.82.9.0/24")
         leased = bool(ga and gb) and ga != gb and all(ipaddress.ip_address(x) in shared for x in (ga, gb))
+        # PRD §9.2/§9.4: ga's declared address is a reservation, and both
+        # labs' `mtu = 1400` reaches the guests as DHCP option 26.
+        offer_a, offer_b = dhcp_offer(h, a, "ga"), dhcp_offer(h, b, "gb")
+        mtu_a = gexec(h, a, "ga", "cat", "/sys/class/net/eth0/mtu").out.strip()
+        mtu_b = gexec(h, b, "gb", "cat", "/sys/class/net/eth0/mtu").out.strip()
+        warned = [l for l in (up_a.text + up_b.text).splitlines() if "global segment" in l]
+        static = ga == "10.82.9.50" and offer_a == "ip=10.82.9.50 mtu=1400"
+        mtu = offer_b == f"ip={gb} mtu=1400" and mtu_a == mtu_b == "1400"
         ab, _ = pings(h, a, "ga", gb)
         ba, _ = pings(h, b, "gb", ga)
         # PRD §9.2: the supervisor runs the shared segment's DNS so names
@@ -360,8 +381,11 @@ def global_segment(h):
         named = gb and gb in (name, full)
         h.ok(
             "net.global",
-            reach and named,
+            reach and named and static and mtu and not warned,
             f"ga={ga} gb={gb} (one supervisor DHCP), ping a->b {ab}, b->a {ba}; "
-            f"gb.vmlab.internal -> {name}, gb.e2e-network-global-b.vmlab.internal -> {full}"
+            f"gb.vmlab.internal -> {name}, gb.e2e-network-global-b.vmlab.internal -> {full}; "
+            f"DHCP to ga: {offer_a!r}, to gb: {offer_b!r} (want ga's static 10.82.9.50 and mtu=1400); "
+            f"eth0 mtu ga={mtu_a} gb={mtu_b}"
+            + (f"; up warned: {warned}" if warned else "")
             + ("" if named else " — the global segment's DNS zone has no registrations (PRD §9.2 promises cross-lab names)"),
         )

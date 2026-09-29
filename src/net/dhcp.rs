@@ -180,6 +180,19 @@ impl DhcpServer {
         }
     }
 
+    /// Change the served configuration in place, keeping the lease table:
+    /// a supervisor-owned global segment learns its reservations and MTU as
+    /// labs attach and detach, long after the server started (PRD §9.2).
+    pub fn reconfigure(&mut self, f: impl FnOnce(&mut DhcpConfig)) {
+        f(&mut self.config);
+    }
+
+    /// The configuration being served.
+    #[cfg(test)]
+    pub fn config(&self) -> &DhcpConfig {
+        &self.config
+    }
+
     /// Current (unexpired) leases, sorted by address, for status display.
     pub fn leases(&self) -> Vec<(MacAddr, Ipv4Addr)> {
         let now = Instant::now();
@@ -673,6 +686,29 @@ mod tests {
         let mut s = DhcpServer::new(cfg);
         let r = parse_reply(&s.handle(&discover(mac(1))).unwrap());
         assert_eq!(r.opts[&OPT_MTU], 9000u16.to_be_bytes().to_vec());
+    }
+
+    /// A global segment learns its reservations and MTU after its server
+    /// started (PRD §9.2): the next exchange serves them, leases kept.
+    #[test]
+    fn reconfigure_serves_a_new_reservation_and_mtu() {
+        let mut s = DhcpServer::new(config());
+        let before = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        assert_eq!(before.yiaddr, Ipv4Addr::new(10, 213, 1, 2));
+        assert!(!before.opts.contains_key(&OPT_MTU));
+        let other = parse_reply(&s.handle(&discover(mac(2))).unwrap()).yiaddr;
+
+        let reserved = Ipv4Addr::new(10, 213, 1, 77);
+        s.reconfigure(|c| {
+            c.reservations.insert(mac(1), reserved);
+            c.mtu = 1400;
+        });
+        let after = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        assert_eq!(after.yiaddr, reserved);
+        assert_eq!(after.opts[&OPT_MTU], 1400u16.to_be_bytes().to_vec());
+        let ack = parse_reply(&s.handle(&request(mac(1), reserved)).unwrap());
+        assert_eq!(ack.opts[&OPT_MSG_TYPE], vec![DHCP_ACK]);
+        assert_eq!(s.lease_of(mac(2)), Some(other), "other leases survive");
     }
 
     #[test]

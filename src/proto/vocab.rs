@@ -891,6 +891,10 @@ vocabulary! {
             /// serves until it detaches.
             #[serde(default)] lab: Option<String>,
             #[serde(default)] members: Vec<GlobalMember>,
+            /// The MTU the attaching lab's NICs use on the segment. The
+            /// first lab to attach with one sets what the segment's DHCP
+            /// serves; a later lab that differs is told so.
+            #[serde(default)] mtu: Option<u16>,
         },
         /// Leave a global segment.
         #[one_way(

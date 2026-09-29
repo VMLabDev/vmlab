@@ -1,10 +1,12 @@
 // One of two labs sharing the supervisor-owned global segment "e2e-shared".
+// Both declare the same `mtu`.
 import <vmlab.wcl>
 
 lab "e2e-network-global-b" {
   segment "e2e-shared" {
     subnet = "10.82.9.0/24"
     global = true
+    mtu    = 1400
   }
 
   vm "gb" {

@@ -569,10 +569,11 @@ impl Handler<SupRequest> for SupervisorHandler {
                 peer,
                 lab,
                 members,
+                mtu,
             } => {
-                let joining = lab.map(|lab| (lab, members));
-                let sock = sup.globals.attach(&name, subnet, peer, joining).await?;
-                Ok(json!({"socket": sock}))
+                let joining = lab.map(|lab| global::Joining { lab, members, mtu });
+                let (sock, warnings) = sup.globals.attach(&name, subnet, peer, joining).await?;
+                Ok(json!({"socket": sock, "warnings": warnings}))
             }
             SupRequest::GlobalDetach { name, lab } => {
                 sup.globals.detach(&name, lab.as_deref()).await;
