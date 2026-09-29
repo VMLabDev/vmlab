@@ -46,6 +46,8 @@ def run(h):
             got = get(h, lab, "vm01")
             st = state(h, lab, "vm01")
             assert "created" in c.out and "restored" in r.out, c.text + r.text
+            # No workspace on this machine, so no workspace-backup warning.
+            assert "workspace backup" not in c.out + r.out, c.text + r.text
             assert got == "before" and st == "state=running", f"marker={got!r} {st}"
             return True
 

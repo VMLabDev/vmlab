@@ -38,7 +38,7 @@ page cmd_snapshot {
 
   callout "Snapshots are not a workspace backup" {
     kind = :warning
-    body = "A dev machine's source lives on the host, which is what survives `destroy` and what a restore re-converges the guest from. Both `create` and `restore` print this sentence in their help, and their refusals are built on it."
+    body = "A dev machine's source lives on the host, which is what survives `destroy` and what a restore re-converges the guest from. Both `create` and `restore` print this sentence in their help and after a success that touched a dev machine with a workspace, and their refusals are built on it."
   }
 
   h2 "vmlab snapshot create"
@@ -60,7 +60,8 @@ page cmd_snapshot {
     best effort, not coordinated. Each snapshot is recorded in the lab's
     state with whether it was online and when it was taken, and for a
     container with the image digest it was taken against. Prints `snapshot
-    "<name>" created`.
+    "<name>" created`, followed by the workspace-backup warning when a
+    snapshotted machine has a workspace.
   DOC
 
   p <<DOC
@@ -98,7 +99,8 @@ page cmd_snapshot {
     image digest it was taken against, and restoring it against a different
     pinned image is refused, naming both digests, with the remedies of
     destroying the machine or restoring the original pin. Prints `snapshot
-    "<name>" restored`.
+    "<name>" restored`, followed by the workspace-backup warning when a
+    restored machine has a workspace.
   DOC
 
   p <<DOC

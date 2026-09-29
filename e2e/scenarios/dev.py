@@ -139,10 +139,11 @@ def run(h):
         # -- snapshot bracket, part one: clean capture, restore re-seeds -------
         def capture_and_reseed():
             cap = h.vmlab("snapshot", "create", "clean", "--vm", M, cwd=lab)
-            assert "created" in cap.out, cap.out
+            assert "created" in cap.out and "not a workspace backup" in cap.out, cap.out
             gx(h, lab, "echo after-snapshot > /src/after.txt; echo scratch > /tmp/outside-workspace")
             h.wait_until(lambda: (lab / "ws1" / "after.txt").exists(), timeout=30, what="after.txt on the host")
-            h.vmlab("snapshot", "restore", "clean", "--vm", M, cwd=lab)
+            res = h.vmlab("snapshot", "restore", "clean", "--vm", M, cwd=lab)
+            assert "not a workspace backup" in res.out, res.out
             # Rewound: the guest-only scratch file outside the workspace is gone,
             # while the re-seed carries after.txt back from the host.
             gone = gx(h, lab, "test -e /tmp/outside-workspace", check=False).code != 0
@@ -155,7 +156,7 @@ def run(h):
             return True
 
         h.check("dev.snapshot-bracket", capture_and_reseed,
-                "clean capture; a restore rewound the guest and re-seeded after.txt from the host")
+                "clean capture; a restore rewound the guest and re-seeded after.txt from the host; both said snapshots are not a workspace backup")
 
         # Unsynced guest work, the slow way: a guest file still being written
         # sits inside its debounce window, so the pre-flight flush cannot carry it.
