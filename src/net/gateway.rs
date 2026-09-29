@@ -126,6 +126,22 @@ impl GatewayHandle {
         move || dhcp.as_ref().map(|d| d.lock_recover().leases())
     }
 
+    /// Change the DHCP service's configuration in place (see
+    /// [`DhcpServer::reconfigure`]); a no-op when DHCP is disabled.
+    pub fn reconfigure_dhcp(&self, f: impl FnOnce(&mut DhcpConfig)) {
+        if let Some(d) = &self.dhcp {
+            d.lock_recover().reconfigure(f);
+        }
+    }
+
+    /// The DHCP configuration being served; `None` when DHCP is disabled.
+    #[cfg(test)]
+    pub fn dhcp_config(&self) -> Option<DhcpConfig> {
+        self.dhcp
+            .as_ref()
+            .map(|d| d.lock_recover().config().clone())
+    }
+
     /// Install (or replace) the uplink handler that receives off-segment
     /// frames — the NAT / inter-segment routing seam.
     pub fn set_uplink(&self, handler: UplinkFn) {

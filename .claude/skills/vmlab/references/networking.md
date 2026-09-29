@@ -166,6 +166,16 @@ supervisor runs the shared segment's DHCP and DNS so registrations span labs
 coherently. Machines in different labs on a global segment resolve each other's
 names.
 
+The shared DHCP honours what each lab declares, as a lab segment's does. A
+machine's static `ip` on a global segment is a reservation for its NIC's MAC
+while its lab stays attached. The reservation is refused, and that NIC gets a
+dynamic lease, when the address is not a host address of the segment's subnet,
+is the gateway's, is another lab's reservation, or is leased to another
+machine; `vmlab up` prints a `warning:` line naming both machines. The
+segment's `mtu` is served as DHCP option 26. The first lab to attach sets it
+for the segment's life; a lab whose `mtu` differs still joins, and its `up`
+warns. Declare the same `mtu` in every lab that shares a global segment.
+
 The same trunk protocol over TCP is the whole cross-host story. A global
 segment with a `connect { host = "peer:port" }` child is bridged to the
 same-named segment on another host's supervisor, with the two supervisors
@@ -247,7 +257,7 @@ segment "<name>" {
 | `global` | bool | `false` | Owned by the supervisor and shared across labs. |
 | `dhcp` | bool | `true` | Enable DHCP on this segment. |
 | `nat` | bool | `false` | Enable NAT internet egress for this segment. |
-| `mtu` | i64 | 9000 or 1500 | Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` segment, else 1500, including on a `global` segment. |
+| `mtu` | i64 | 9000 or 1500 | Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` segment, else 1500, including on a `global` segment, where the first lab to attach sets it for every lab sharing the segment. |
 | `routes_to` | list<utf8> | none | Names of other segments the daemon routes to. Inter-segment routing is opt-in per segment. |
 | `dns {}` | child | none | DNS service override: hand out another server, or opt out. |
 | `connect {}` | child | none | Cross-host segment peer over TCP, authenticated by the PSK from host config. |

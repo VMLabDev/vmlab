@@ -229,16 +229,128 @@ impl TrunkTable {
     }
 }
 
-/// Who is on a global segment, lab by lab, and which names the segment's
-/// DNS zone currently holds on their behalf (PRD §9.2, §9.5).
+/// A lab joining a global segment (PRD §9.2): its name, the NICs it puts
+/// there, and the MTU those NICs were started with.
+pub struct Joining {
+    pub lab: String,
+    pub members: Vec<GlobalMember>,
+    /// The attaching lab's MTU for the segment — its declared `mtu`, else
+    /// 1500. `None` from a caller with no opinion.
+    pub mtu: Option<u16>,
+}
+
+/// Who is on a global segment, lab by lab, which names the segment's DNS
+/// zone currently holds on their behalf, and what its DHCP serves them
+/// (PRD §9.2, §9.4, §9.5).
 #[derive(Default)]
 struct Directory {
+    /// Each lab's members, a refused static address already stripped.
     members: HashMap<String, Vec<GlobalMember>>,
     /// Bare names (before the zone suffix) this directory registered.
     registered: std::collections::BTreeSet<String>,
+    /// The MTU the segment serves (DHCP option 26) and the lab that set it:
+    /// the first lab to attach with one. It stays for the segment's life —
+    /// guests already running took it.
+    mtu: Option<(u16, String)>,
 }
 
 impl Directory {
+    /// Admit `joining` onto the segment `name` (subnet `subnet`, gateway
+    /// `gateway`), replacing whatever that lab had there before. A declared
+    /// static address becomes a DHCP reservation unless it cannot be one —
+    /// not a host address of the subnet, the gateway's, another lab's
+    /// reservation, or held by another machine's lease — in which case that
+    /// NIC gets a dynamic lease and the refusal is returned as a warning. So
+    /// is an MTU that differs from the one the segment already serves: the
+    /// first lab to attach sets it. Nothing here refuses the attach itself;
+    /// the lab still joins the segment.
+    fn admit(
+        &mut self,
+        name: &str,
+        subnet: Ipv4Net,
+        gateway: Ipv4Addr,
+        joining: Joining,
+        leases: &[(MacAddr, Ipv4Addr)],
+    ) -> Vec<String> {
+        let Joining {
+            lab,
+            mut members,
+            mtu,
+        } = joining;
+        self.members.remove(&lab);
+        let mut warnings = Vec::new();
+        let others: Vec<(String, &GlobalMember)> = self
+            .members
+            .iter()
+            .flat_map(|(l, ms)| ms.iter().map(move |m| (format!("{}.{l}", m.machine), m)))
+            .collect();
+        for m in &mut members {
+            let Some(ip) = m.ip else { continue };
+            let usable = subnet.contains(&ip)
+                && ip != subnet.network()
+                && ip != subnet.broadcast()
+                && ip != gateway;
+            let reserved = others
+                .iter()
+                .find(|(_, o)| o.ip == Some(ip) && o.mac != m.mac);
+            let leased = leases.iter().find(|(mac, l)| *l == ip && *mac != m.mac);
+            let why = if !usable {
+                Some(format!(
+                    "it is not a host address on the segment's subnet {subnet} other than the gateway {gateway}"
+                ))
+            } else if let Some((who, _)) = reserved {
+                Some(format!("{who} already has it"))
+            } else if let Some((mac, _)) = leased {
+                let who = others
+                    .iter()
+                    .find(|(_, o)| o.mac == *mac)
+                    .map_or_else(|| format!("the machine with MAC {mac}"), |(w, _)| w.clone());
+                Some(format!("{who} holds it on a lease"))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                warnings.push(format!(
+                    "global segment \"{name}\": {}.{lab} declares ip {ip}, but {why}; it gets a \
+                     dynamic lease instead",
+                    m.machine
+                ));
+                m.ip = None;
+            }
+        }
+        if let Some(mtu) = mtu {
+            match &self.mtu {
+                None => self.mtu = Some((mtu, lab.clone())),
+                Some((served, by)) if *served != mtu => warnings.push(format!(
+                    "global segment \"{name}\" serves mtu {served}, set by lab \"{by}\" which \
+                     attached first, but this lab's NICs use {mtu}; declare the same `mtu` in \
+                     every lab that shares the segment"
+                )),
+                Some(_) => {}
+            }
+        }
+        self.members.insert(lab, members);
+        warnings
+    }
+
+    /// Every admitted static address, by MAC: the segment's DHCP
+    /// reservations (§9.4).
+    fn reservations(&self) -> HashMap<MacAddr, Ipv4Addr> {
+        self.members
+            .values()
+            .flatten()
+            .filter_map(|m| Some((m.mac, m.ip?)))
+            .collect()
+    }
+
+    /// The MTU the segment's DHCP serves: the first attaching lab's, else
+    /// the classic 1500.
+    fn mtu(&self) -> u16 {
+        self.mtu
+            .as_ref()
+            .map_or(crate::labd::network::STANDARD_MTU, |(m, _)| *m)
+    }
+
     /// Every name the attached labs' machines answer to, from their leases
     /// (or a declared static address before one exists): `<vm>.<lab>`
     /// always, and the short `<vm>` alias only where no other lab on the
@@ -297,21 +409,38 @@ struct GlobalSeg {
 }
 
 impl GlobalSeg {
-    /// Put a lab's machines into the segment's DNS.
-    fn join(&self, lab: Option<(String, Vec<GlobalMember>)>) {
-        let Some((lab, members)) = lab else { return };
+    /// Put a lab's machines into the segment's DNS and their static
+    /// addresses and MTU into its DHCP. Returns what [`Directory::admit`]
+    /// refused, for the lab to say.
+    fn join(&self, name: &str, lab: Option<Joining>) -> Vec<String> {
+        let Some(joining) = lab else {
+            return Vec::new();
+        };
+        let leases = self.gateway.leases_probe()().unwrap_or_default();
+        let gw = self.gateway.gw_ip();
         let mut dir = self.directory.lock().expect("global directory");
-        dir.members.insert(lab, members);
+        let warnings = dir.admit(name, self.subnet, gw, joining, &leases);
+        self.sync_dhcp(&dir);
         self.sync_dns(&mut dir);
+        warnings
     }
 
-    /// Take a lab's machines back out of the segment's DNS.
+    /// Take a lab's machines back out of the segment's DNS and DHCP.
     fn leave(&self, lab: Option<&str>) {
         let Some(lab) = lab else { return };
         let mut dir = self.directory.lock().expect("global directory");
         if dir.members.remove(lab).is_some() {
+            self.sync_dhcp(&dir);
             self.sync_dns(&mut dir);
         }
+    }
+
+    fn sync_dhcp(&self, dir: &Directory) {
+        let (reservations, mtu) = (dir.reservations(), dir.mtu());
+        self.gateway.reconfigure_dhcp(|c| {
+            c.reservations = reservations;
+            c.mtu = mtu;
+        });
     }
 
     fn sync_dns(&self, dir: &mut Directory) {
@@ -403,22 +532,24 @@ impl GlobalSegments {
     }
 
     /// Attach to (creating if needed) the global segment `name`. Returns the
-    /// unix socket the caller's lab daemon connects its trunk to.
+    /// unix socket the caller's lab daemon connects its trunk to, and the
+    /// warnings that lab should show (see [`Directory::admit`]).
     ///
     /// `lab` is the attaching lab and the NICs it puts on the segment; their
-    /// names join the segment's DNS until that lab detaches. An inbound
-    /// cross-host trunk attaches with none.
+    /// names join the segment's DNS, and their static addresses its DHCP
+    /// reservations, until that lab detaches. An inbound cross-host trunk
+    /// attaches with none.
     pub async fn attach(
         self: &Arc<Self>,
         name: &str,
         subnet: Option<Ipv4Net>,
         peer: Option<String>,
-        lab: Option<(String, Vec<GlobalMember>)>,
-    ) -> Result<PathBuf> {
+        lab: Option<Joining>,
+    ) -> Result<(PathBuf, Vec<String>)> {
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
             seg.refcount += 1;
-            seg.join(lab);
+            let warnings = seg.join(name, lab);
             // A later lab may be the one declaring `connect` — start the
             // dialer on an already-existing segment too.
             if let Some(peer) = peer
@@ -432,7 +563,7 @@ impl GlobalSegments {
                     seg.trunks.clone(),
                 ));
             }
-            return Ok(seg.sock.clone());
+            return Ok((seg.sock.clone(), warnings));
         }
 
         let subnet = self.alloc_subnet(subnet).await?;
@@ -491,10 +622,10 @@ impl GlobalSegments {
             dialer,
             trunks,
         };
-        seg.join(lab);
+        let warnings = seg.join(name, lab);
         segs.insert(name.to_string(), seg);
         tracing::info!("global segment \"{name}\" created on {subnet}");
-        Ok(sock)
+        Ok((sock, warnings))
     }
 
     fn require_psk(&self) -> Result<String> {
@@ -537,6 +668,7 @@ impl GlobalSegments {
                     "name": n,
                     "subnet": s.subnet.to_string(),
                     "refcount": s.refcount,
+                    "mtu": s.directory.lock().expect("global directory").mtu(),
                     "peer_connected": s.trunks.connected(),
                     "peers": s.trunks.peers_json(),
                 })
@@ -923,7 +1055,7 @@ mod tests {
                 .sock
                 .clone()
         };
-        let mut a_client = trunk_client(&a_sock).await;
+        let mut a_client = trunk_client(&a_sock.0).await;
         let mut b_client = trunk_client(&b_sock).await;
         let f = bcast(b"hello-b");
         write_frame(&mut a_client, &f).await.unwrap();
@@ -997,7 +1129,7 @@ mod tests {
             let segs = b.globals.segs.lock().await;
             segs.get("wan").unwrap().sock.clone()
         };
-        let mut a_client = trunk_client(&a_sock).await;
+        let mut a_client = trunk_client(&a_sock.0).await;
         let mut b_client = trunk_client(&b_sock).await;
         let f = bcast(b"once");
         write_frame(&mut a_client, &f).await.unwrap();
@@ -1068,13 +1200,14 @@ mod tests {
             "wan",
             subnet,
             None,
-            Some((
-                "lab-a".into(),
-                vec![
+            Some(Joining {
+                lab: "lab-a".into(),
+                mtu: None,
+                members: vec![
                     member("ga", 1, Some([10, 82, 9, 10])),
                     member("web", 2, Some([10, 82, 9, 11])),
                 ],
-            )),
+            }),
         )
         .await
         .unwrap();
@@ -1082,13 +1215,14 @@ mod tests {
             "wan",
             subnet,
             None,
-            Some((
-                "lab-b".into(),
-                vec![
+            Some(Joining {
+                lab: "lab-b".into(),
+                mtu: None,
+                members: vec![
                     member("gb", 3, Some([10, 82, 9, 20])),
                     member("web", 4, Some([10, 82, 9, 21])),
                 ],
-            )),
+            }),
         )
         .await
         .unwrap();
@@ -1158,6 +1292,182 @@ mod tests {
         assert_eq!(names["dyn"], Ipv4Addr::new(10, 0, 0, 50));
         assert_eq!(names["st.lab"], Ipv4Addr::new(10, 0, 0, 51));
         assert!(!names.contains_key("idle.lab"));
+    }
+
+    fn joining(lab: &str, mtu: Option<u16>, members: Vec<GlobalMember>) -> Joining {
+        Joining {
+            lab: lab.into(),
+            members,
+            mtu,
+        }
+    }
+
+    /// Every attached lab's static addresses are the segment's DHCP
+    /// reservations while it stays, and the first lab's MTU is what the
+    /// segment serves (PRD §9.2, §9.4).
+    #[tokio::test]
+    async fn a_global_segment_serves_static_addresses_and_the_first_labs_mtu() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _events) = tokio::sync::broadcast::channel(8);
+        let g = GlobalSegments::new_at(dir.path().into(), "test.internal".into(), None, None, tx);
+        let subnet = Some("10.82.9.0/24".parse().unwrap());
+        let (_, warnings) = g
+            .attach(
+                "wan",
+                subnet,
+                None,
+                Some(joining(
+                    "lab-a",
+                    Some(1400),
+                    vec![
+                        member("ga", 1, Some([10, 82, 9, 50])),
+                        member("dyn", 2, None),
+                    ],
+                )),
+            )
+            .await
+            .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (_, warnings) = g
+            .attach(
+                "wan",
+                subnet,
+                None,
+                Some(joining(
+                    "lab-b",
+                    Some(1400),
+                    vec![member("gb", 3, Some([10, 82, 9, 60]))],
+                )),
+            )
+            .await
+            .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let config = |g: Arc<GlobalSegments>| async move {
+            let segs = g.segs.lock().await;
+            segs["wan"]
+                .gateway
+                .dhcp_config()
+                .expect("global segments serve DHCP")
+        };
+        let c = config(g.clone()).await;
+        assert_eq!(c.mtu, 1400);
+        assert_eq!(
+            c.reservations,
+            HashMap::from([
+                (MacAddr([0x02, 0, 0, 0, 0, 1]), Ipv4Addr::new(10, 82, 9, 50)),
+                (MacAddr([0x02, 0, 0, 0, 0, 3]), Ipv4Addr::new(10, 82, 9, 60)),
+            ])
+        );
+        assert_eq!(g.list().await[0]["mtu"], 1400);
+
+        g.detach("wan", Some("lab-b")).await;
+        let c = config(g.clone()).await;
+        assert_eq!(
+            c.reservations,
+            HashMap::from([(MacAddr([0x02, 0, 0, 0, 0, 1]), Ipv4Addr::new(10, 82, 9, 50))]),
+            "lab-b's reservation leaves with it"
+        );
+        assert_eq!(c.mtu, 1400, "the MTU stays for the segment's life");
+    }
+
+    /// A static address that cannot be reserved is refused by name, and that
+    /// NIC falls back to a lease; the lab still joins. A lab re-attaching is
+    /// not in conflict with itself.
+    #[test]
+    fn a_conflicting_static_address_is_refused_with_a_warning() {
+        let subnet: Ipv4Net = "10.82.9.0/24".parse().unwrap();
+        let gw = Ipv4Addr::new(10, 82, 9, 1);
+        let mut dir = Directory::default();
+        let a = || joining("lab-a", None, vec![member("ga", 1, Some([10, 82, 9, 50]))]);
+        assert!(dir.admit("wan", subnet, gw, a(), &[]).is_empty());
+        assert!(
+            dir.admit("wan", subnet, gw, a(), &[]).is_empty(),
+            "re-attach"
+        );
+
+        let leases = [
+            (MacAddr([0x02, 0, 0, 0, 0, 1]), Ipv4Addr::new(10, 82, 9, 50)),
+            (MacAddr([0x02, 0, 0, 0, 0, 9]), Ipv4Addr::new(10, 82, 9, 70)),
+        ];
+        let warnings = dir.admit(
+            "wan",
+            subnet,
+            gw,
+            joining(
+                "lab-b",
+                None,
+                vec![
+                    member("taken", 2, Some([10, 82, 9, 50])),
+                    member("gw", 3, Some([10, 82, 9, 1])),
+                    member("outside", 4, Some([10, 99, 0, 5])),
+                    member("leased", 5, Some([10, 82, 9, 70])),
+                    member("fine", 6, Some([10, 82, 9, 80])),
+                ],
+            ),
+            &leases,
+        );
+        assert_eq!(warnings.len(), 4, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("taken.lab-b declares ip 10.82.9.50, but ga.lab-a already has it"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("gw.lab-b") && warnings[1].contains("not a host address"),
+            "{}",
+            warnings[1]
+        );
+        assert!(
+            warnings[2].contains("outside.lab-b") && warnings[2].contains("10.82.9.0/24"),
+            "{}",
+            warnings[2]
+        );
+        assert!(
+            warnings[3].contains("leased.lab-b")
+                && warnings[3].contains("02:00:00:00:00:09 holds it on a lease"),
+            "{}",
+            warnings[3]
+        );
+        assert!(warnings.iter().all(|w| w.contains("dynamic lease instead")));
+        assert_eq!(
+            dir.reservations(),
+            HashMap::from([
+                (MacAddr([0x02, 0, 0, 0, 0, 1]), Ipv4Addr::new(10, 82, 9, 50)),
+                (MacAddr([0x02, 0, 0, 0, 0, 6]), Ipv4Addr::new(10, 82, 9, 80)),
+            ])
+        );
+    }
+
+    /// The first lab to attach with an MTU sets the segment's; a later lab
+    /// that differs is told, and changes nothing.
+    #[test]
+    fn a_differing_mtu_is_warned_about_and_the_first_wins() {
+        let subnet: Ipv4Net = "10.82.9.0/24".parse().unwrap();
+        let gw = Ipv4Addr::new(10, 82, 9, 1);
+        let mut dir = Directory::default();
+        assert_eq!(dir.mtu(), 1500);
+        assert!(
+            dir.admit("wan", subnet, gw, joining("trunk", None, vec![]), &[])
+                .is_empty()
+        );
+        assert!(
+            dir.admit("wan", subnet, gw, joining("lab-a", Some(9000), vec![]), &[])
+                .is_empty()
+        );
+        assert!(
+            dir.admit("wan", subnet, gw, joining("lab-b", Some(9000), vec![]), &[])
+                .is_empty()
+        );
+        let warnings = dir.admit("wan", subnet, gw, joining("lab-c", Some(1500), vec![]), &[]);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("serves mtu 9000, set by lab \"lab-a\"")
+                && warnings[0].contains("this lab's NICs use 1500"),
+            "{}",
+            warnings[0]
+        );
+        assert_eq!(dir.mtu(), 9000);
     }
 
     /// Names no attached lab answers to go upstream, as on a lab segment.

@@ -1310,6 +1310,11 @@ impl LabRuntime {
         for skip in &plan.skipped {
             output(format!("{}: {}\n", skip.what, skip.why));
         }
+        // A global segment's DHCP is the supervisor's, and it may have had
+        // to refuse a static address or an MTU this lab declared (§9.2).
+        for warning in self.network.lock().await.global_warnings() {
+            output(format!("warning: {warning}\n"));
+        }
         let targets: Vec<String> = plan.machines().cloned().collect();
 
         // Deferred template/image downloads happen here — before the binary

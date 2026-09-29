@@ -47,6 +47,10 @@ pub struct SegmentNet {
     /// This lab's NICs on a global segment, for the supervisor's DNS; filled
     /// by [`LabNetwork::wire_gateways`] once MACs are settled.
     pub global_members: Vec<GlobalMember>,
+    /// What the supervisor said it could not honour when this lab attached
+    /// to a global segment — a static address or an MTU (§9.2). `up` says
+    /// them again, since the attach happens before anyone is watching.
+    pub global_warnings: Vec<String>,
     /// Gateway service (ARP/ICMP/DHCP/DNS + uplink seam), wired by
     /// [`LabNetwork::wire_gateways`].
     pub gateway: Option<crate::net::gateway::GatewayHandle>,
@@ -179,6 +183,7 @@ impl LabNetwork {
                     global: seg.global,
                     peer: seg.connect.as_ref().map(|c| c.host.clone()),
                     global_members: Vec::new(),
+                    global_warnings: Vec::new(),
                     gateway: None,
                     services: None,
                     listeners: Vec::new(),
@@ -211,6 +216,7 @@ impl LabNetwork {
                     global: false,
                     peer: None,
                     global_members: Vec::new(),
+                    global_warnings: Vec::new(),
                     gateway: None,
                     services: None,
                     listeners: Vec::new(),
@@ -246,6 +252,7 @@ impl LabNetwork {
                     peer: seg.peer.clone(),
                     lab: Some(lab.to_string()),
                     members: seg.global_members.clone(),
+                    mtu: Some(seg.effective_mtu()),
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("global.attach: {e}"))?;
@@ -254,6 +261,15 @@ impl LabNetwork {
                     .as_str()
                     .context("malformed global.attach response")?,
             );
+            seg.global_warnings = resp["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|w| w.as_str().map(str::to_string))
+                .collect();
+            for w in &seg.global_warnings {
+                tracing::warn!("{w}");
+            }
             let stream = tokio::net::UnixStream::connect(&trunk_sock)
                 .await
                 .with_context(|| format!("connecting global trunk {}", trunk_sock.display()))?;
@@ -264,6 +280,14 @@ impl LabNetwork {
             tracing::info!("bridged global segment \"{}\" to supervisor", seg.name);
         }
         Ok(())
+    }
+
+    /// Everything the supervisor refused this lab's global segments.
+    pub fn global_warnings(&self) -> Vec<String> {
+        self.segments
+            .values()
+            .flat_map(|s| s.global_warnings.iter().cloned())
+            .collect()
     }
 
     /// Detach this lab's global segments from the supervisor (on shutdown).
