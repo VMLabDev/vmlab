@@ -928,7 +928,8 @@ impl LabRuntime {
         self.events.emit("smb.started", json!({"port": port}));
 
         // DNAT gateway:445 → 127.0.0.1:smbd on each sharing segment, so a
-        // guest mounting \\<gateway>\<share> reaches the local smbd via NAT.
+        // guest mounting \\<gateway>\<share> reaches the local smbd. A
+        // segment without `nat` gets no egress, but still gets this.
         {
             let net = self.network.lock().await;
             for seg_name in &smb.gateway_segments {
@@ -949,6 +950,8 @@ impl LabRuntime {
                         proto: None,
                         span: (0, 0),
                     });
+                    drop(rs);
+                    services.expose_host_service(labsmb.listen_port());
                 }
             }
         }

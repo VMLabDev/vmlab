@@ -149,7 +149,9 @@ SRC
     A share also needs a segment to reach the gateway on when it rides SMB,
     so a VM with an SMB share and no NIC is a validation error. A
     port-isolated NIC can still reach the gateway, so shares work on isolated
-    ports by design.
+    ports by design. The segment needs no `nat` either: gateway:445 reaches
+    the lab's SMB server on a segment without egress, which gains that and
+    nothing else.
   DOC
 
   p <<DOC

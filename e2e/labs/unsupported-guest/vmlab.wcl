@@ -1,11 +1,11 @@
 // One Linux guest, used to show how vmlab answers Windows- and legacy-only
 // features on a machine that is neither: an SMB1 share, and `eventlog`.
+// The segment has no `nat`: a share must mount without egress.
 import <vmlab.wcl>
 
 lab "e2e-unsupported-guest" {
   segment "lan" {
     subnet = "10.89.1.0/24"
-    nat    = true
   }
 
   vm "lin01" {

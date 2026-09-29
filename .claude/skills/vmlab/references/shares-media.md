@@ -117,7 +117,8 @@ VM's disk.
 
 A share needs a segment to reach the gateway on when it rides SMB, so a VM with
 an SMB share and no NIC is a validation error. A port-isolated NIC can still
-reach the gateway, so shares work on isolated ports by design.
+reach the gateway, so shares work on isolated ports by design. The segment
+needs no `nat`: gateway:445 reaches the lab's `smbd` without egress.
 
 A share is a passthrough view of the host directory, and that is the wrong tool
 for a watched source tree: file-change notification does not cross virtiofs or

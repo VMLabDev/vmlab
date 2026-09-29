@@ -363,6 +363,7 @@ The PRD permits shipping 2 first and replacing with 1 later — including a hybr
 - Share *contents* are host state, outside snapshot scope — restore never rolls back files. The docs must say this loudly.
 - A VM's shares are reachable only via a segment its NIC sits on; a VM with no NICs cannot have shares (validation error) — consistent with air-gapped-by-default.
 - Port-isolated NICs (§9.1) can still reach the gateway, so shares work on isolated ports by design.
+- The segment needs no `nat`: gateway:445 reaches the lab's `smbd` on a segment without egress, which gains that and nothing else.
 
 ---
 
