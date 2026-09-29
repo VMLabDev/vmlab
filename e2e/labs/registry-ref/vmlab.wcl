@@ -1,0 +1,13 @@
+// A VM whose template is named by registry reference: `vmlab pull` fetches
+// it into the store, and `up` boots it.
+import <vmlab.wcl>
+
+lab "e2e-registry-ref" {
+  segment "lan" { subnet = "10.70.0.0/24" }
+
+  vm "vm01" {
+    template = "localhost:5000/e2e/e2e-alpine:1.0.0"
+    arch     = "x86_64"
+    nic { segment = "lan" }
+  }
+}

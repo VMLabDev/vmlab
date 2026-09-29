@@ -1,0 +1,21 @@
+// Snapshots: one VM and one idle container, snapshotted online, offline and
+// lab-wide.
+import <vmlab.wcl>
+
+lab "e2e-snapshots" {
+  segment "lan" { subnet = "10.85.0.0/24" }
+
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" }
+  }
+
+  container "c01" {
+    image   = "alpine:3.22"
+    profile = "container"
+    mode    = :idle
+    nic { segment = "lan" }
+  }
+}

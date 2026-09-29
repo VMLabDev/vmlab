@@ -1,0 +1,28 @@
+// Two container dev machines with no default between them: dev01 carries the
+// workspace the sync features run against, dev02 exists so the selection
+// ladder has a choice to refuse to make.
+import <vmlab.wcl>
+
+lab "e2e-dev" {
+  @dev(workspace = "./ws1")
+  container "dev01" {
+    image   = "alpine:3.22"
+    profile = "container"
+    cpus    = 1
+    memory  = 512MiB
+    mode    = :idle
+    login "dev" { user = "dev" default = true }
+    provision "scripts/dev-user.ws" { }
+  }
+
+  @dev(workspace = "./ws2")
+  container "dev02" {
+    image   = "alpine:3.22"
+    profile = "container"
+    cpus    = 1
+    memory  = 512MiB
+    mode    = :idle
+    login "dev" { user = "dev" default = true }
+    provision "scripts/dev-user.ws" { }
+  }
+}

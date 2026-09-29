@@ -211,6 +211,9 @@ throughout the code and commit messages.
   (groups, doc comments, `[private]`, noun-verb naming, the norm-14 gate).
 - Standard Rust toolchain: `cargo build`, `cargo test`, `cargo clippy`,
   `cargo fmt`.
+- `just e2e::run` is the end-to-end suite: every feature in
+  `e2e/features.py`, driven through the CLI inside a privileged container
+  with /dev/kvm (`e2e/README.md`). It sits outside the merge bar.
 
 ## Agent skills
 

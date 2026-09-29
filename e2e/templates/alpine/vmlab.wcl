@@ -1,0 +1,23 @@
+// The end-to-end test's one template: Alpine's NoCloud cloud image with the
+// vmlab agent and nothing else. No package installs and no updates, so the
+// build is a boot, an agent install and a seal.
+
+import <vmlab.wcl>
+
+template "e2e-alpine" {
+  arch    = "x86_64"
+  version = "1.0"
+  profile = "linux-modern"
+  cpus    = 1
+  memory  = 1GiB
+  disk    = 4GiB
+
+  source "qcow2" {
+    url    = "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
+    sha256 = "4c32a9fa451e9c2e23ae04ee2c31dddeab05e0d2a72820e0f584816299b146ef"
+  }
+
+  media { kind = "iso" from = "./cloudinit/" label = "CIDATA" }
+
+  provision "scripts/install.ws" { }
+}

@@ -1,0 +1,11 @@
+// A lab `vmlab validate` must refuse: vm01 depends on a machine that does not
+// exist, and declares zero CPUs.
+import <vmlab.wcl>
+
+lab "e2e-core-bad" {
+  vm "vm01" {
+    template   = "x86_64/e2e-alpine"
+    cpus       = 0
+    depends_on = ["ghost"]
+  }
+}

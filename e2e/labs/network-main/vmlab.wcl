@@ -1,0 +1,74 @@
+// The network scenario's main lab. `@HOST@` is replaced by the container's
+// own address before `up`: the NAT terminates guest flows on host sockets, so
+// that address is a host-side service a guest reaches through the NAT, and the
+// `block`/`redirect` rules are aimed at it.
+import <vmlab.wcl>
+
+lab "e2e-network" {
+  record   { name = "lab-wide.e2e.test" ip = "10.82.0.201" }
+  sinkhole { pattern = "zero.e2e.test" mode = "zero" }
+
+  segment "lan" {
+    subnet = "10.82.0.0/24"
+    nat    = true
+
+    record   { name = "db.e2e.test" ip = "10.82.0.200" }
+    record   { name = "*.wild.e2e.test" ip = "10.82.0.202" }
+    sinkhole { pattern = "*.blocked.e2e.test" }
+
+    forward  { host_port = 18280 to = "vm01:8080" }
+
+    block    { cidr = "@HOST@/32" proto = "tcp" port = 9002 }
+    redirect { from = "192.0.2.10:80" to = "@HOST@:9001" proto = "tcp" }
+  }
+
+  // No NAT, a small MTU, and a route to "lan" through the router VM.
+  segment "back" {
+    subnet    = "10.82.1.0/24"
+    mtu       = 1400
+    routes_to = ["lan"]
+    route { dest = "10.82.0.0/24" via = "10.82.1.254" }
+  }
+
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" }
+  }
+
+  vm "vm02" {
+    template = "x86_64/e2e-alpine"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 512MiB
+    nic {
+      segment  = "lan"
+      isolated = true
+    }
+  }
+
+  vm "router" {
+    template = "x86_64/e2e-alpine"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 512MiB
+    nic {
+      segment = "lan"
+      ip      = "10.82.0.254"
+    }
+    nic {
+      segment = "back"
+      ip      = "10.82.1.254"
+    }
+  }
+
+  vm "vm03" {
+    template = "x86_64/e2e-alpine"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "back" }
+  }
+}

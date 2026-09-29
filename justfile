@@ -3,6 +3,9 @@ import '.just/shared.just'
 # The merge bar: everything a change must pass before it can merge (`just ci::check`)
 mod ci '.just/ci'
 
+# End-to-end suite in a KVM container (every feature, see e2e/features.py)
+mod e2e '.just/e2e'
+
 [default, private]
 main:
 	@just --list

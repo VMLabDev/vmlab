@@ -1,0 +1,18 @@
+// Side b of the cross-supervisor trunk: "e2e-wan" is global, and side a's
+// segment dials side b's trunk_port. Each side runs under its own XDG dirs.
+import <vmlab.wcl>
+
+lab "e2e-peers-b" {
+  segment "e2e-wan" {
+    subnet = "10.83.0.0/24"
+    global = true
+  }
+
+  vm "pb" {
+    template = "x86_64/e2e-alpine"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "e2e-wan" }
+  }
+}

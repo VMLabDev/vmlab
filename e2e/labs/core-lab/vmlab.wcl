@@ -1,0 +1,57 @@
+// The core scenario's lab: lifecycle, hardware and attached media.
+//
+// `cd.iso` and `fd.img` are built by the scenario from `cd/` before the lab
+// is validated, so no binary image is checked in. `@LABROOT@` is replaced
+// with the lab's absolute path: a relative `disk { from }` is resolved
+// against the daemon's working directory rather than the lab root (the
+// `core-diskfrom` lab records that), so this lab names it absolutely.
+import <vmlab.wcl>
+
+lab "e2e-core" {
+  segment "lan" { subnet = "10.80.0.0/24" }
+
+  // Hardware as declared: two vCPUs, a TPM, explicit OVMF, nested, extra
+  // disks, a CD-ROM, a folder-built ISO and a raw QEMU passthrough.
+  vm "vm01" {
+    template  = "x86_64/e2e-alpine"
+    cpus      = 2
+    memory    = 768MiB
+    firmware  = "ovmf"
+    tpm       = true
+    nested    = true
+    cdrom     = "./cd.iso"
+    qemu_args = ["-smbios", "type=1,serial=E2E-QEMU-ARGS"]
+    nic { segment = "lan" ip = "10.80.0.10" }
+    disk "data" { size = 1GiB }
+    disk "payload" { from = "@LABROOT@/payload/" }
+    media { kind = "iso" from = "./media-iso/" label = "E2EMEDIA" }
+  }
+
+  // Started only once vm01 is ready.
+  vm "vm02" {
+    template    = "x86_64/e2e-alpine"
+    cpus        = 1
+    memory      = 512MiB
+    secure_boot = true
+    floppy      = "./fd.img"
+    depends_on  = ["vm01"]
+    nic { segment = "lan" }
+  }
+
+  vm "vm03" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    media { kind = "floppy" from = "./media-floppy/" label = "E2EFLOP" }
+  }
+
+  // No template layer: a blank disk under SeaBIOS, nothing to boot.
+  vm "blank" {
+    template = "scratch"
+    arch     = "x86_64"
+    profile  = "linux-generic"
+    disk     = 1GiB
+    cpus     = 1
+    memory   = 256MiB
+  }
+}

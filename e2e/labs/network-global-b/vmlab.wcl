@@ -1,0 +1,17 @@
+// One of two labs sharing the supervisor-owned global segment "e2e-shared".
+import <vmlab.wcl>
+
+lab "e2e-network-global-b" {
+  segment "e2e-shared" {
+    subnet = "10.82.9.0/24"
+    global = true
+  }
+
+  vm "gb" {
+    template = "x86_64/e2e-alpine"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "e2e-shared" }
+  }
+}

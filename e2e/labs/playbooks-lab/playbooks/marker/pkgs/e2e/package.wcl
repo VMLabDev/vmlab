@@ -1,0 +1,20 @@
+package "e2e" {
+  description = "The one resource the e2e playbook needs"
+
+  resource "file_present" {
+    description = "Ensure a file exists with the given content"
+    script = "resources/file_present.ws"
+    concurrency = "parallel"
+
+    param "path" {
+      description = "Absolute path of the file"
+      type = "string"
+      required = true
+    }
+    param "content" {
+      description = "Desired file content"
+      type = "string"
+      default = ""
+    }
+  }
+}

@@ -1,0 +1,2 @@
+instance-id: vmlab-e2e-alpine
+local-hostname: e2e

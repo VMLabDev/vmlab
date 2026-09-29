@@ -1,0 +1,21 @@
+// The guest scenario's lab: one VM for the agent verbs, the declared logins
+// and the screen. `dev` is the default login and `ops` a second label; the
+// provision creates both accounts, plus `temp`, which the lab never declares
+// and `exec --user temp --password …` names.
+import <vmlab.wcl>
+
+lab "e2e-guest" {
+  segment "lan" { subnet = "10.81.0.0/24" }
+
+  vm "g01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" }
+
+    login "dev" { user = "dev" default = true }
+    login "ops" { user = "ops" }
+
+    provision "scripts/accounts.ws" { }
+  }
+}

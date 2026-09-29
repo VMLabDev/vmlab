@@ -1,0 +1,40 @@
+// One VM and one idle container: every wscript surface, the four bindable
+// events a lab sees in a normal life, and every log stream `vmlab logs` reads.
+import <vmlab.wcl>
+
+lab "e2e-scripting" {
+  // NAT so the host can be reached through the gateway, which is where the
+  // segment's L3 rules and script-added forwards live.
+  segment "lan" {
+    subnet = "10.86.0.0/24"
+    nat    = true
+  }
+
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" }
+
+    // QEMU is silent on a healthy boot; a trace line per QMP command gives
+    // the qemu stream something to show.
+    qemu_args = ["-trace", "monitor_qmp_cmd_in_band"]
+
+    // `setup.ws` creates the account; a lone login is the default.
+    login "dev" { user = "dev" }
+
+    provision "scripts/setup.ws" { }
+  }
+
+  container "web" {
+    image   = "alpine:3.22"
+    profile = "container"
+    mode    = :idle
+    nic { segment = "lan" }
+  }
+
+  on "lab.up"           { run = "scripts/handler.ws" }
+  on "vm.ready"         { run = "scripts/handler.ws" }
+  on "vm.stopped"       { run = "scripts/handler.ws" }
+  on "snapshot.created" { run = "scripts/handler.ws" }
+}

@@ -1,0 +1,19 @@
+// One VM with one config-weave playbook, applied on `up` and then driven by
+// hand with `vmlab playbook check` and `apply`.
+import <vmlab.wcl>
+
+lab "e2e-playbooks" {
+  segment "lan" { subnet = "10.87.0.0/24" }
+
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" }
+
+    playbook "playbooks/marker" {
+      play = "marker"
+      var "marker_content" { value = "converged-by-vmlab" }
+    }
+  }
+}

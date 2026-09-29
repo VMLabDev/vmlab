@@ -1,0 +1,16 @@
+#cloud-config
+# The agent and nothing else: no packages, no updates.
+hostname: e2e
+runcmd:
+  - |
+    set -e
+    mkdir -p /media/vmlab
+    if ! mount -o ro LABEL=VMLAB /media/vmlab; then
+      for d in /dev/sr0 /dev/sr1 /dev/sr2 /dev/vdb /dev/vdc /dev/vdd; do
+        mount -o ro "$d" /media/vmlab 2>/dev/null || continue
+        [ -e /media/vmlab/install.sh ] && break
+        umount /media/vmlab
+      done
+    fi
+    /media/vmlab/install.sh
+    umount /media/vmlab

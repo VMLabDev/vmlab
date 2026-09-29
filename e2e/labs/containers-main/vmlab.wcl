@@ -1,0 +1,52 @@
+// Containers and shares: a workload container with env, both volume kinds, a
+// published port and a healthcheck; an idle container; and a VM carrying one
+// share per transport plus a read-only one.
+import <vmlab.wcl>
+
+lab "e2e-containers" {
+  segment "lan" {
+    subnet = "10.84.0.0/24"
+    nat    = true
+  }
+
+  container "web" {
+    image      = "alpine:3.22"
+    profile    = "container"
+    entrypoint = ["/bin/sh", "-c"]
+    // Alpine's busybox has no httpd; `nc -lk -e` serves one canned reply,
+    // after draining the request so the close is not a reset.
+    command    = ["echo E2E_VAR=$E2E_VAR; mkdir -p /srv; echo hello-$E2E_VAR > /srv/body; echo '#!/bin/sh' > /srv/serve; echo 'while read -r l; do [ -z \"$(echo \"$l\" | tr -d \"\\r\")\" ] && break; done; printf \"HTTP/1.0 200 OK\\r\\n\\r\\n\"; cat /srv/body' >> /srv/serve; chmod +x /srv/serve; echo written-by-web > /hostvol/from-container.txt; echo boot >> /named/boots; exec nc -lk -p 8080 -e /srv/serve"]
+    nic { segment = "lan" }
+    env { name = "E2E_VAR" value = "e2e-value-42" }
+    volume { host = "./hostvol" target = "/hostvol" }
+    volume { name = "e2e-named" target = "/named" }
+    port { host = 18480 container = 8080 }
+    healthcheck {
+      command      = ["/bin/sh", "-c", "test ! -e /tmp/unhealthy"]
+      interval     = 2s
+      timeout      = 2s
+      retries      = 2
+      start_period = 1s
+    }
+  }
+
+  container "idle" {
+    image   = "alpine:3.22"
+    profile = "container"
+    mode    = :idle
+    nic { segment = "lan" }
+  }
+
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 768MiB
+    nic { segment = "lan" }
+    share { host = "./share-vfs" guest = "/mnt/vfs" transport = "virtiofs" }
+    // An SMB share onto a directory the image already has, then one whose
+    // mount point the mount steps must create, as the virtiofs ones do.
+    share { host = "./share-smb-srv" guest = "/srv" transport = "smb" }
+    share { host = "./share-smb" guest = "/mnt/smb" transport = "smb" }
+    share { host = "./share-ro"  guest = "/mnt/ro"  transport = "virtiofs" readonly = true }
+  }
+}

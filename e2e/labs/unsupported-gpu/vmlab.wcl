@@ -1,0 +1,12 @@
+// The e2e Alpine guest with `gpu { mode = "virgl" }`: QEMU's virtio-gpu-gl
+// device renders on a host render node through the egl-headless display.
+import <vmlab.wcl>
+
+lab "e2e-unsupported-gpu" {
+  vm "gpu01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    gpu { mode = "virgl" }
+  }
+}

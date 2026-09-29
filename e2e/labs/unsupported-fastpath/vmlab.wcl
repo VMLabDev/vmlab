@@ -1,0 +1,22 @@
+// Two VMs on one segment. On the afxdp tier each NIC is a host tap with the
+// segment's XDP program attached, and known guest-to-guest unicast is
+// forwarded in-kernel rather than through the userspace switch.
+import <vmlab.wcl>
+
+lab "e2e-unsupported-fastpath" {
+  segment "lan" { subnet = "10.89.0.0/24" }
+
+  vm "fp01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" ip = "10.89.0.11" }
+  }
+
+  vm "fp02" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" ip = "10.89.0.12" }
+  }
+}

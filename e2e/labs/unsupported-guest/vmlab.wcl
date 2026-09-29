@@ -1,0 +1,26 @@
+// One Linux guest, used to show how vmlab answers Windows- and legacy-only
+// features on a machine that is neither: an SMB1 share, and `eventlog`.
+import <vmlab.wcl>
+
+lab "e2e-unsupported-guest" {
+  segment "lan" {
+    subnet = "10.89.1.0/24"
+    nat    = true
+  }
+
+  vm "lin01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    gui      = true
+    nic { segment = "lan" }
+    share {
+      host      = "./shared"
+      guest     = "/mnt/legacy"
+      name      = "legacy"
+      transport = "smb"
+      smb1      = true
+      readonly  = true
+    }
+  }
+}

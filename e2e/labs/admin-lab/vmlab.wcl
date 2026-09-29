@@ -1,0 +1,16 @@
+// One aarch64 VM with no template: a blank disk under TCG emulation on an
+// x86_64 host. Nothing boots from the disk, but the firmware draws a screen,
+// which is all `vm screenshot` needs — and the lab gives the `vmlab lab`
+// verbs something running to list, stop, restart and destroy.
+import <vmlab.wcl>
+
+lab "e2e-admin" {
+  vm "arm01" {
+    template = "scratch"
+    arch     = "aarch64"
+    profile  = "linux-modern"
+    cpus     = 1
+    memory   = 512MiB
+    disk     = 1GiB
+  }
+}

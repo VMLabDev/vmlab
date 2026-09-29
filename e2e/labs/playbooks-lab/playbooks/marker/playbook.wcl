@@ -1,0 +1,24 @@
+// One step: a file with the content the lab's `var` hands in. `check` finds
+// drift when the file is missing or differs; `apply` writes it.
+playbook "e2e marker" {
+  description = "The vmlab end-to-end suite's playbook"
+  version = "1.0.0"
+
+  vars {
+    marker_path = "/etc/e2e-weave.txt"
+    marker_content = "unset"
+  }
+
+  play "marker" {
+    description = "Write the marker file"
+
+    step "marker" {
+      description = "Ensure the marker file holds the declared content"
+      resource = "e2e.file_present"
+      properties {
+        path = marker_path
+        content = marker_content
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+# Build context for e2e/Dockerfile: the source tree, never build output.
+**/target
+guest/dist
+docs/_site
+.scratch
+.vmlab
+**/.vmlab

@@ -15,3 +15,6 @@ examples/**/.vmlab/
 # config-weave's package-repo clones, written beside a playbook whenever
 # `pkg search|add` runs.
 .repo-cache/
+
+# e2e suite output (logs, results.json).
+/e2e/results
