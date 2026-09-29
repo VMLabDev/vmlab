@@ -2186,6 +2186,14 @@ mod tests {
                                         send_data(channel, chunk.to_vec()).await;
                                     }
                                 }
+                            } else if payload == b"exit\r" {
+                                // The shell exits, as `exit` at a prompt does.
+                                terminals.retain(|&id| id != channel);
+                                send(AgentMsg::Exited {
+                                    id: channel,
+                                    code: 0,
+                                })
+                                .await;
                             } else {
                                 // Echo terminal.
                                 send_data(channel, payload).await;
@@ -3015,6 +3023,29 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// The guest shell exiting ends the bridge: the client reads end of
+    /// stream, which is what returns `vmlab shell` to its prompt.
+    #[tokio::test]
+    async fn a_guest_shell_exiting_hangs_up_the_exposed_socket() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let session = agent
+            .open_terminal(80, 24, None, vec![], None)
+            .await
+            .unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let sock = work.path().join("term-1.sock");
+        expose_terminal_socket(session, sock.clone()).await.unwrap();
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        client.write_all(b"exit\r").await.unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+            .await
+            .expect("the bridge stayed open after the shell exited")
+            .unwrap();
     }
 
     /// The whole watch contract from the host's side: one nudge, a drain
