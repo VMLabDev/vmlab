@@ -97,9 +97,24 @@ def run(h):
         h.ok("lab.restart", refused_ok and h.check("lab.restart", restart),
              f"refused while running ({refused.text.strip()[:90]!r}); after stop a new lab daemon answers")
 
+        # `destroy` returns only once the lab daemon and everything it owns
+        # have gone, so an `up` straight after it starts clean.
+        def destroy_then_up():
+            h.vmlab("destroy", cwd=lab, timeout=300)
+            left = [p for p in pids(f"__labd --lab {LAB} ") if alive(p)]
+            assert not left, f"destroy returned with the lab daemon still running: {left}"
+            assert LAB not in listed(h), h.vmlab("lab", "list").out
+            h.vmlab("up", cwd=lab, timeout=300)
+            assert listed(h).get(LAB) == "running", h.vmlab("lab", "list").out
+            return True
+
+        h.check("lab.destroy", destroy_then_up,
+                "destroy returned with the lab daemon gone and the lab unlisted; an immediate up succeeded")
+
         def destroy_named():
             h.vmlab("lab", "destroy", LAB, cwd=WORK, timeout=300)
-            h.wait_until(lambda: LAB not in listed(h), timeout=60, what="e2e-admin to leave lab list")
+            # Checked at once, not polled: the release waits for the daemon.
+            assert LAB not in listed(h), h.vmlab("lab", "list").out
             assert not (lab / ".vmlab").exists(), "the lab's .vmlab survived"
             return True
 

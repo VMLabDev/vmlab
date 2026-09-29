@@ -144,20 +144,8 @@ class Harness:
     # -- labs ----------------------------------------------------------------
 
     def destroy(self, lab: pathlib.Path) -> None:
-        """`vmlab destroy`, then wait for the lab's daemon to exit: destroy
-        returns before it has, and an `up` of the same lab in that window
-        fails (see the e2e report's findings)."""
+        """`vmlab destroy`, which returns only once the lab's daemon is gone."""
         self.run(["vmlab", "destroy"], cwd=lab, check=False, timeout=300)
-        m = re.search(r'^\s*lab\s+"([^"]+)"', (lab / "vmlab.wcl").read_text(), re.M)
-        if not m:
-            return
-        pattern = f"__labd --lab {m.group(1)} "
-        self.wait_until(
-            lambda: subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode != 0,
-            timeout=60,
-            interval=0.5,
-            what=f"lab daemon for {m.group(1)} to exit",
-        )
 
     @contextlib.contextmanager
     def lab(self, name: str):
