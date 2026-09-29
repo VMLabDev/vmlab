@@ -107,10 +107,11 @@ pub fn mount_plan(
 fn virtiofs_plan(os_hint: OsHint, mounts: &[VirtiofsMount]) -> MountPlan {
     let mut steps = Vec::new();
     let mut unsupported = Vec::new();
-    let step = |command: &str, args: Vec<String>| MountStep {
+    let step = |command: &str, args: Vec<String>, share: Option<&str>| MountStep {
         os_hint,
         command: command.to_string(),
         args,
+        share: share.map(str::to_string),
     };
     match os_hint {
         // XP-era guests have no vmlab agent to run commands through and no
@@ -151,6 +152,7 @@ fn virtiofs_plan(os_hint: OsHint, mounts: &[VirtiofsMount]) -> MountPlan {
                             data.into(),
                             "/f".into(),
                         ],
+                        None,
                     ));
                 }
             }
@@ -166,12 +168,17 @@ fn virtiofs_plan(os_hint: OsHint, mounts: &[VirtiofsMount]) -> MountPlan {
                         m.tag.clone(),
                         m.guest.clone(),
                     ],
+                    Some(&m.tag),
                 ));
             }
         }
         OsHint::Linux => {
             for m in mounts {
-                steps.push(step("mkdir", vec!["-p".into(), m.guest.clone()]));
+                steps.push(step(
+                    "mkdir",
+                    vec!["-p".into(), m.guest.clone()],
+                    Some(&m.tag),
+                ));
                 let mut args = vec![
                     "-t".into(),
                     "virtiofs".into(),
@@ -182,7 +189,7 @@ fn virtiofs_plan(os_hint: OsHint, mounts: &[VirtiofsMount]) -> MountPlan {
                     args.push("-o".into());
                     args.push("ro".into());
                 }
-                steps.push(step("mount", args));
+                steps.push(step("mount", args, Some(&m.tag)));
             }
         }
     }
@@ -334,6 +341,7 @@ mod tests {
             os_hint: OsHint::Linux,
             command: "mount".into(),
             args: vec!["-t".into(), "cifs".into(), "//10.0.0.1/data".into()],
+            share: Some("data".into()),
         }];
         let plan = mount_plan(OsHint::Linux, &mounts()[..1], smb);
         let lines: Vec<String> = plan.steps.iter().map(argv).collect();

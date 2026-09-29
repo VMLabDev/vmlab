@@ -1178,7 +1178,14 @@ impl super::machine::Machine for VmInstance {
             tracing::warn!("{vm_name}: no agent, cannot auto-mount shares");
             return;
         };
+        // A share whose step gave up is not retried again by its next step:
+        // a mount after a failed `mkdir` only fails the same way, five
+        // minutes later, and holds every share behind it up for as long.
+        let mut given_up: Vec<&str> = Vec::new();
         for step in &plan.steps {
+            if step.share.as_deref().is_some_and(|s| given_up.contains(&s)) {
+                continue;
+            }
             let mut argv = vec![step.command.clone()];
             argv.extend(step.args.iter().cloned());
             let mut last: Option<String> = None;
@@ -1230,6 +1237,21 @@ impl super::machine::Machine for VmInstance {
             }
             if let Some(err) = last {
                 tracing::warn!("{vm_name}: mount step `{}` failed: {err}", step.command);
+                // A share that never appears is the author's to see, on the
+                // feed, not only in the daemon's log.
+                let reason = format!(
+                    "`{}` still failing after {} attempts: {}",
+                    step.command,
+                    plan.retry.attempts,
+                    err.trim()
+                );
+                lab.events().emit(
+                    "share.unmountable",
+                    serde_json::json!({"vm": vm_name, "share": step.share, "reason": reason}),
+                );
+                if let Some(share) = step.share.as_deref() {
+                    given_up.push(share);
+                }
             }
         }
     }

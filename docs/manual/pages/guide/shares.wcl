@@ -112,12 +112,15 @@ SRC
     Once a VM is ready, the lab daemon runs the share plan's **mount steps**
     through the agent. The steps are a value computed per guest OS before
     anything runs, so what a Windows guest will be told to do can be read
-    without booting one.
+    without booting one. Each step is retried for five minutes, because a
+    freshly booted Windows guest cannot run `net use` for its first few. A
+    step still failing after that emits `share.unmountable` naming the share
+    and the last error, and that share's remaining steps are skipped.
   DOC
 
   list {
-    li "**Linux, virtiofs:** `mount -t virtiofs <tag> <guest_path>`."
-    li "**Linux, SMB:** `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential."
+    li "**Linux, virtiofs:** `mkdir -p <guest_path>`, then `mount -t virtiofs <tag> <guest_path>`."
+    li "**Linux, SMB:** `mkdir -p <guest_path>`, then `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential."
     li "**Windows:** the credential is stored once per lab with `cmdkey`. A drive-letter target such as `S:` is mapped with `net use`. A folder-path target becomes a directory symbolic link to the UNC path with `mklink /D`, because a junction cannot target a UNC path."
   }
 

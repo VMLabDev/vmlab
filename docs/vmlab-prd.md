@@ -346,6 +346,7 @@ SMB is affected.
 
 - **Linux (virtiofs):** `mount -t virtiofs <tag> <guest_path>` — no credential, no network dependency.
 - **Linux (SMB):** `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential.
+- On Linux the guest path is created (`mkdir -p`) before either mount. A mount that still fails once its retries run out is reported as a `share.unmountable` event naming the share and the error.
 - **Windows:** mapped via the SMB client with the generated credential. A drive-letter `guest` target maps directly; a folder-path target is realised as a directory symbolic link to the UNC path. Windows supports UNC targets with `mklink /D`; `mklink /J` junctions cannot target UNC paths.
 
 **Server implementation.** No mature embeddable SMB *server* library exists in the Rust ecosystem (clients only, verified at time of writing), so this is the largest single engineering component the feature implies. Two permitted strategies behind the identical WCL/user surface:

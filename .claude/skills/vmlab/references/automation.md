@@ -243,7 +243,7 @@ status and `exit_code` the container's.
 | `container.unhealthy` | `container` | The container's healthcheck reported not healthy. |
 | `container.destroyed` | `container` | `vmlab container destroy` removed everything the container materialised. |
 | `machine.agent_repaired` | `vm`, `machine`, `agent_version` | `vmlab machine repair-agent` pushed the host's agent; the machine is now diverged from its template. |
-| `share.unmountable` | `vm`, `reason` | The mount plan holds a share this guest cannot mount. See shares-media.md. |
+| `share.unmountable` | `vm`, `share`, `reason` | The mount plan holds a share this guest cannot mount, or a mount step still failed when its retries ran out (`share` is set then). See shares-media.md. |
 
 ### Snapshots
 
