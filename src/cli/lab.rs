@@ -1641,13 +1641,15 @@ pub fn cmd_logs(
         Some(t) => match split_vm_ref(t)? {
             (Some(lab), vm) => (lab, Some(vm)),
             (None, maybe_vm) => {
-                // Bare name: it's a VM in the cwd lab if that lab defines
-                // it, otherwise a lab name.
+                // Bare name: it's a machine (VM or container) in the cwd lab
+                // if that lab declares it, otherwise a lab name.
                 match current_lab() {
                     Ok((lab_name, root)) => {
                         let file = crate::config::load_lab_root(&root)
                             .map_err(|e| anyhow!("{:?}", miette::Report::new(e)))?;
-                        if file.lab.vms.iter().any(|v| v.name == maybe_vm) {
+                        if file.lab.vms.iter().any(|v| v.name == maybe_vm)
+                            || file.lab.containers.iter().any(|c| c.name == maybe_vm)
+                        {
                             (lab_name, Some(maybe_vm))
                         } else {
                             (maybe_vm, None)
@@ -1659,15 +1661,14 @@ pub fn cmd_logs(
         },
     };
 
-    let base = crate::paths::state_dir().join("labs").join(&lab);
-    let paths: Vec<std::path::PathBuf> = match &vm {
-        Some(vm) => {
-            let d = base.join("vms").join(vm);
-            vec![d.join("qemu.log"), d.join("serial.log")]
-        }
-        None => vec![base.join("events.jsonl")],
+    let base = crate::logs::lab_dir(&lab);
+    let existing: Vec<std::path::PathBuf> = match &vm {
+        Some(vm) => crate::logs::machine_files(&base, vm),
+        None => Some(base.join("events.jsonl"))
+            .filter(|p| p.exists())
+            .into_iter()
+            .collect(),
     };
-    let existing: Vec<_> = paths.into_iter().filter(|p| p.exists()).collect();
     if existing.is_empty() {
         bail!(
             "no logs found for {}{}",

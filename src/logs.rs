@@ -202,6 +202,22 @@ fn enumerate_in(base: &Path) -> Vec<LogFile> {
     files
 }
 
+/// The files `vmlab logs <machine>` shows for one machine, in the order it
+/// prints them: a VM's `qemu.log` then `serial.log`, or a container's
+/// `console.log`. Only files that exist are returned; a name with no logs
+/// under either directory yields none.
+pub fn machine_files(base: &Path, machine: &str) -> Vec<PathBuf> {
+    let vm = base.join("vms").join(machine);
+    [
+        vm.join("qemu.log"),
+        vm.join("serial.log"),
+        base.join("containers").join(machine).join("console.log"),
+    ]
+    .into_iter()
+    .filter(|p| p.is_file())
+    .collect()
+}
+
 /// Flatten an event into a one-line `event key=value …` summary (no color, no
 /// timestamp — callers add those). Shared with the CLI's pretty printer.
 pub fn format_event(ev: &Event) -> String {
@@ -316,6 +332,30 @@ mod tests {
         assert!(e.text.starts_with("vm.started"));
         assert!(e.text.contains("vm=web01"));
         assert!(e.text.contains("pid=1234"));
+    }
+
+    #[test]
+    fn machine_files_cover_vms_and_containers() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("vms/web01")).unwrap();
+        std::fs::write(base.join("vms/web01/serial.log"), "boot\n").unwrap();
+        std::fs::write(base.join("vms/web01/qemu.log"), "").unwrap();
+        std::fs::create_dir_all(base.join("containers/cache")).unwrap();
+        std::fs::write(base.join("containers/cache/console.log"), "up\n").unwrap();
+
+        assert_eq!(
+            machine_files(base, "web01"),
+            vec![
+                base.join("vms/web01/qemu.log"),
+                base.join("vms/web01/serial.log")
+            ]
+        );
+        assert_eq!(
+            machine_files(base, "cache"),
+            vec![base.join("containers/cache/console.log")]
+        );
+        assert!(machine_files(base, "missing").is_empty());
     }
 
     #[test]
