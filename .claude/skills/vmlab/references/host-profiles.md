@@ -166,8 +166,10 @@ architecture. Two cases hit it on purpose: a foreign-architecture guest such as 
 aarch64 or riscv64 template on an x86_64 host, which can only ever be emulated, and a
 host with no `/dev/kvm`. Give an emulated guest a couple of minutes to boot.
 
-Nested virtualisation inside a guest is separate: `nested = true` on a VM passes the
-host CPU through, which is what exposes VMX or SVM to the guest.
+Nested virtualisation inside a guest is separate: a KVM guest on x86 sees VMX or SVM
+only when its VM sets `nested = true`, and only when the host's own `kvm_intel` or
+`kvm_amd` module has nested virtualisation on. `vmlab up` warns with the fix when it
+is off.
 
 If every VM is slow and `vmlab logs` shows the TCG fallback warning for x86_64
 guests, the host lacks KVM: on WSL 2 enable nested virtualisation in `.wslconfig`,

@@ -1312,6 +1312,22 @@ impl LabRuntime {
         }
         let targets: Vec<String> = plan.machines().cloned().collect();
 
+        // `nested = true` asks for VMX/SVM the host may not have to give
+        // (§5.2): the machine still boots, so this is said, not refused.
+        let nested: Vec<&str> = self
+            .config
+            .lab
+            .vms
+            .iter()
+            .filter(|vm| vm.nested && targets.contains(&vm.name))
+            .map(|vm| vm.name.as_str())
+            .collect();
+        if !nested.is_empty()
+            && let Some(problem) = crate::qemu::host_nested_problem()
+        {
+            output(format!("warning: {}: {problem}\n", nested.join(", ")));
+        }
+
         // Deferred template/image downloads happen here — before the binary
         // preflight (pulled meta can change the resolved firmware/TPM needs)
         // and before any clone or boot work, streaming progress to both the

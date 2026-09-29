@@ -103,6 +103,52 @@ pub fn kvm_available() -> bool {
         .is_ok()
 }
 
+/// Why a `nested = true` guest will not see VMX/SVM on this host, with the
+/// fix — or None when there is nothing to say. The loaded x86 KVM module's
+/// `nested` parameter is the whole question: off, `-cpu host` has no VMX/SVM
+/// to pass through however the VM is declared (§5.2). No module loaded means
+/// no x86 KVM at all, which the TCG fallback warning already covers.
+pub fn host_nested_problem() -> Option<String> {
+    host_nested_problem_in(Path::new("/sys/module"))
+}
+
+fn host_nested_problem_in(sys_module: &Path) -> Option<String> {
+    for (module, feature) in [("kvm_intel", "VMX"), ("kvm_amd", "SVM")] {
+        let param = sys_module.join(module).join("parameters/nested");
+        let Ok(value) = std::fs::read_to_string(&param) else {
+            continue;
+        };
+        let value = value.trim();
+        // `Y`/`N` from kvm_intel, `1`/`0` from kvm_amd.
+        if matches!(value, "Y" | "y" | "1") {
+            return None;
+        }
+        return Some(format!(
+            "nested = true, but the host's {module} has nested virtualisation off \
+             ({} = {value}), so the guest sees no {feature} — enable it with \
+             `echo \"options {module} nested=1\" | sudo tee /etc/modprobe.d/kvm-nested.conf` \
+             and reload the module with no VM running \
+             (`sudo modprobe -r {module} && sudo modprobe {module}`)",
+            param.display(),
+        ));
+    }
+    None
+}
+
+/// The `-cpu` model under KVM. `host` passes the host CPU through, VMX/SVM
+/// included, so an x86 guest that did not ask for `nested = true` has both
+/// masked: the switch decides what the guest sees, not whatever the host
+/// happens to allow (§5.2). Masking the other vendor's flag too is harmless,
+/// and spares the builder asking which vendor the host is. Other arches pass
+/// the host CPU through unchanged.
+fn kvm_cpu_model(vm: &ResolvedVm) -> String {
+    if vm.nested || qemu_arch(&vm.arch) != "x86_64" {
+        "host".into()
+    } else {
+        "host,vmx=off,svm=off".into()
+    }
+}
+
 pub fn emulator_binary(arch: &str) -> String {
     format!("qemu-system-{}", qemu_arch(arch))
 }
@@ -172,8 +218,7 @@ pub fn build_args(
     match accel {
         Accel::Kvm => {
             arg(&mut a, "accel", "kvm".into());
-            // `host` exposes everything incl. VMX/SVM for nested (§5.2).
-            arg(&mut a, "cpu", "host".into());
+            arg(&mut a, "cpu", kvm_cpu_model(vm));
         }
         Accel::Tcg => {
             arg(&mut a, "accel", "tcg".into());
@@ -689,6 +734,82 @@ mod tests {
         assert!(!s.contains("addr.type=unix"), "{s}");
         // The virtio device line is backend-agnostic (host_mtu still works).
         assert!(s.contains("netdev=net0,mac=52:54:00:00:00:01,host_mtu=9000"));
+    }
+
+    /// `nested` is a real switch under KVM on x86: without it the guest
+    /// sees neither VMX nor SVM, with it the host CPU passes through whole.
+    #[test]
+    fn nested_decides_whether_kvm_guests_see_vmx_svm() {
+        let mut vm = resolved("linux-modern", "x86_64");
+        assert!(!vm.nested);
+        let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
+        let cpu = args.iter().position(|a| a == "-cpu").unwrap();
+        assert_eq!(args[cpu + 1], "host,vmx=off,svm=off");
+
+        vm.nested = true;
+        let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
+        let cpu = args.iter().position(|a| a == "-cpu").unwrap();
+        assert_eq!(args[cpu + 1], "host");
+
+        // TCG keeps `max` either way.
+        for nested in [false, true] {
+            vm.nested = nested;
+            let s = joined(&build_args("l", &vm, &paths(), Accel::Tcg).unwrap());
+            assert!(s.contains("-cpu max "), "{s}");
+        }
+    }
+
+    /// The flag comes from the vm block through the resolver.
+    #[test]
+    fn nested_resolves_from_the_vm_block() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let v = super::super::resolve::testing::vm(
+            "vm \"t\" { template = \"scratch\" arch = \"x86_64\" profile = \"linux-modern\" disk = 1GiB nested = true }",
+        );
+        let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
+        let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
+        assert!(s.contains("-cpu host "), "{s}");
+    }
+
+    /// Non-x86 KVM has no VMX/SVM to mask.
+    #[test]
+    fn nested_masking_is_x86_only() {
+        let vm = resolved("linux-modern", "aarch64");
+        let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
+        let cpu = args.iter().position(|a| a == "-cpu").unwrap();
+        assert_eq!(args[cpu + 1], "host");
+    }
+
+    #[test]
+    fn host_nested_off_is_named_with_its_fix() {
+        let sys = tempfile::tempdir().unwrap();
+        assert_eq!(
+            host_nested_problem_in(sys.path()),
+            None,
+            "no module: nothing to say"
+        );
+
+        let params = sys.path().join("kvm_amd/parameters");
+        std::fs::create_dir_all(&params).unwrap();
+        std::fs::write(params.join("nested"), "1\n").unwrap();
+        assert_eq!(host_nested_problem_in(sys.path()), None);
+
+        std::fs::write(params.join("nested"), "0\n").unwrap();
+        let msg = host_nested_problem_in(sys.path()).unwrap();
+        assert!(
+            msg.contains("kvm_amd") && msg.contains("= 0") && msg.contains("SVM"),
+            "{msg}"
+        );
+        assert!(msg.contains("options kvm_amd nested=1"), "{msg}");
+
+        let sys = tempfile::tempdir().unwrap();
+        let params = sys.path().join("kvm_intel/parameters");
+        std::fs::create_dir_all(&params).unwrap();
+        std::fs::write(params.join("nested"), "N\n").unwrap();
+        let msg = host_nested_problem_in(sys.path()).unwrap();
+        assert!(msg.contains("kvm_intel") && msg.contains("VMX"), "{msg}");
+        std::fs::write(params.join("nested"), "Y\n").unwrap();
+        assert_eq!(host_nested_problem_in(sys.path()), None);
     }
 
     #[test]

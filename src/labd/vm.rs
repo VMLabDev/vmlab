@@ -609,6 +609,10 @@ impl VmInstance {
                     self.cfg.name,
                     t.resolved.arch
                 );
+            } else if t.resolved.nested
+                && let Some(problem) = qemu::host_nested_problem()
+            {
+                tracing::warn!("{}: {problem}", self.cfg.name);
             }
             // virtiofsd daemons must be listening before QEMU spawns (its
             // vhost-user chardevs connect at startup).

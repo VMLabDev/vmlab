@@ -250,7 +250,7 @@ type Vm {
   floppy: utf8?
   @doc("VM names to wait for before this one (no cycles)")
   depends_on: list<utf8>?
-  @doc("Enable nested virtualisation (host CPU passthrough)")
+  @doc("Expose hardware virtualisation (VMX/SVM) to the guest; masked without it")
   nested: bool?
   @doc("Open a VNC viewer on `up`; the VM always runs headless")
   gui: bool?

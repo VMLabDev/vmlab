@@ -25,7 +25,8 @@ lab "e2e-core" {
   }
 
   // Started only once vm01 is ready. Secure boot has a lab of its own
-  // (`core-secureboot`): enforced, it refuses this unsigned image.
+  // (`core-secureboot`): enforced, it refuses this unsigned image. No
+  // `nested`, so its guest sees no VMX/SVM where vm01's does.
   vm "vm02" {
     template   = "x86_64/e2e-alpine"
     cpus       = 1

@@ -58,7 +58,7 @@ vm "<name>" {
 | `cdrom` | utf8 | none | Path to an ISO to attach as a CD-ROM, relative to the lab root. |
 | `floppy` | utf8 | none | Path to a floppy image to attach, relative to the lab root. |
 | `depends_on` | list<utf8> | none | VM or container names to wait for before this one starts. No cycles. |
-| `nested` | bool | `false` | Enable nested virtualisation, which passes the host CPU through. |
+| `nested` | bool | `false` | Expose hardware virtualisation (VMX/SVM) to the guest. Without it, an x86 guest under KVM has both masked. `up` warns when the host's KVM module has nested virtualisation off. No effect under TCG or on other architectures. |
 | `gui` | bool | lab `gui` | Open a VNC viewer on `up`. The VM always runs headless. |
 | `display` | utf8 | inherited | QEMU display device string. Inherited from template, then profile. |
 | `firmware` | utf8 | inherited | Firmware: `ovmf` or `seabios`. Inherited from template, then profile. |

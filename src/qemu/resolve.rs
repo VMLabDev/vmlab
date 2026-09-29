@@ -42,11 +42,11 @@ pub struct ResolvedVm {
     /// host virtiofsd, `transport = "auto"` shares attach as vhost-user-fs
     /// devices instead of SMB (§7.5).
     pub virtiofs: bool,
-    /// The `nested` flag from config. No cmdline consumer: `-cpu host`
-    /// already exposes VMX/SVM (see cmdline.rs §5.2), so nested virt needs
-    /// no extra QEMU argument; carried for a future non-host CPU model — which
-    /// is why it is resolved but never read.
-    #[allow(dead_code)]
+    /// The `nested` flag from the vm block (§5.2). Under KVM on x86 it
+    /// decides whether the guest's CPU carries VMX/SVM: `-cpu host` exposes
+    /// them, so without it the builder masks both. A VM-only setting — a
+    /// template's `nested` reaches its build VM, never the VMs made from it
+    /// (ADR-0009), and profiles do not carry it.
     pub nested: bool,
     pub gpu: Option<Gpu>,
     pub qemu_args: Vec<String>,

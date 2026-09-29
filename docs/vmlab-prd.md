@@ -193,7 +193,7 @@ Each VM block can express:
 - CD-ROM and floppy attachments (paths or `media {}` blocks built from folders)
 - `share {}` blocks — host↔guest shared folders (§7.5): host path, guest mount path, optional `readonly = true`
 - Multiple `nic {}` blocks — segment, optional static IP, optional fixed MAC (generated and persisted otherwise), optional `isolated = true` for port isolation (§9.1). **A VM with no `nic {}` blocks gets no network hardware at all** — air-gapped is the default, connectivity is always explicit. `nic { nat = true }` is the shorthand for internet-only access (§9.7).
-- `nested = true` — enables nested virtualisation (host CPU passthrough + the relevant accelerator flags)
+- `nested = true` — enables nested virtualisation: the guest CPU carries VMX/SVM. Under KVM on x86 a VM without it has both masked (`-cpu host,vmx=off,svm=off`), so the switch — not the host — decides what the guest sees; with it the host CPU passes through whole. `up` warns, naming the fix, when the host's `kvm_intel`/`kvm_amd` module has its own `nested` parameter off. TCG and non-x86 guests are unaffected
 - `gpu {}` — GPU acceleration, with a `mode` selecting between:
   - `passthrough` — full VFIO passthrough by host PCI address. Exclusive: the device leaves the host for the VM's lifetime.
   - `virgl` — paravirtualised OpenGL (virtio-gpu-gl + virglrenderer): the guest's GL is rendered on the host GPU, which stays shared — multiple VMs can accelerate at once. Requires guest virtio-gpu drivers (mature on Linux; Windows guest 3D support for virtio-gpu is limited and should be documented honestly rather than promised).

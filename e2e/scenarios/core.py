@@ -43,6 +43,12 @@ def qemu_argv_of(lab: str, vm: str) -> list[str]:
     return []
 
 
+def cpu_model(argv: list[str]) -> str:
+    """The `-cpu` value in a QEMU argv."""
+    i = argv.index("-cpu") if "-cpu" in argv else -1
+    return argv[i + 1] if 0 <= i < len(argv) - 1 else "?"
+
+
 def process_running(needle: str) -> bool:
     for p in pathlib.Path("/proc").iterdir():
         if not p.name.isdigit():
@@ -291,7 +297,16 @@ def _run(h):
             "(the Alpine virt kernel ships no tpm_tis driver, so no /dev/tpm0)",
         )
         h.ok("vm.hw.qemu_args", p.get("serial") == "E2E-QEMU-ARGS", f"guest DMI product_serial={p.get('serial')!r}")
-        h.ok("vm.hw.nested", int(p.get("virt", "0") or 0) > 0, f"guest /proc/cpuinfo vmx|svm on {p.get('virt')} cpu(s)")
+        # vm01 declares `nested = true`, vm02 does not: the switch decides
+        # what the guest CPU carries, whatever the host allows.
+        virt2 = sh(h, lab, "vm02", "grep -cwE 'vmx|svm' /proc/cpuinfo; true", check=False).out.strip()
+        cpu1, cpu2 = cpu_model(argv1), cpu_model(qemu_argv("vm02"))
+        h.ok(
+            "vm.hw.nested",
+            int(p.get("virt", "0") or 0) > 0 and virt2 == "0",
+            f"nested vm01 (-cpu {cpu1}): vmx|svm on {p.get('virt')} cpu(s); "
+            f"vm02 without it (-cpu {cpu2}): on {virt2 or '?'}",
+        )
 
         # SeaBIOS on the scratch VM (profile linux-generic): its screen says so.
         blank_screen = h.wait_until(
