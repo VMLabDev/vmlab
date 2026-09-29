@@ -131,14 +131,16 @@ page guide_networking {
     the daemon listen on a host port and proxy TCP, UDP or both into the
     segment. This is the host-to-guest path for RDP, SSH and web UIs. It
     works identically under WSL 2, where Windows-side access rides WSL's own
-    localhost forwarding.
+    localhost forwarding. A forward rides the segment's NAT engine, so the
+    segment it lands on needs `nat = true`.
   DOC
 
   p <<DOC
     Every forward a lab needs is worked out as one **forward plan** before
     any is installed, with lease resolution as the only runtime input. A
     forward whose machine has no lease yet is skipped with a reason rather
-    than dropped, and installed once the lease arrives. Two forwards claiming
+    than dropped, and installed once the machine is ready and holds its
+    lease. Two forwards claiming
     one host port are settled in the plan: the first claimant keeps the port
     and the rest are dropped, naming the winner, rather than all being
     installed and the losers failing at bind time. Scripts can add forwards

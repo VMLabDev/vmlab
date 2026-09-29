@@ -99,12 +99,13 @@ A `forward` block on a segment, or a `port` block on a container
 (containers.md), makes the daemon listen on a host port and proxy TCP, UDP or
 both into the segment. This is the host-to-guest path for RDP, SSH and web UIs.
 It works identically under WSL 2, where Windows-side access rides WSL's own
-localhost forwarding.
+localhost forwarding. A forward rides the segment's NAT engine, so the segment
+it lands on needs `nat = true`.
 
 Every forward a lab needs is worked out as one **forward plan** before any is
 installed, with lease resolution as the only runtime input. A forward whose
 machine has no lease yet is skipped with a reason rather than dropped, and
-installed once the lease arrives. Two forwards claiming one host port are
+installed once the machine is ready and holds its lease. Two forwards claiming one host port are
 settled in the plan: the first claimant keeps the port and the rest are
 dropped, naming the winner, rather than all being installed and the losers
 failing at bind time. Scripts can add forwards at runtime with
@@ -246,7 +247,7 @@ segment "<name>" {
 | `global` | bool | `false` | Owned by the supervisor and shared across labs. |
 | `dhcp` | bool | `true` | Enable DHCP on this segment. |
 | `nat` | bool | `false` | Enable NAT internet egress for this segment. |
-| `mtu` | i64 | 9000 or 1500 | Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` or `global` segment, else 1500. |
+| `mtu` | i64 | 9000 or 1500 | Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` segment, else 1500, including on a `global` segment. |
 | `routes_to` | list<utf8> | none | Names of other segments the daemon routes to. Inter-segment routing is opt-in per segment. |
 | `dns {}` | child | none | DNS service override: hand out another server, or opt out. |
 | `connect {}` | child | none | Cross-host segment peer over TCP, authenticated by the PSK from host config. |
@@ -386,6 +387,11 @@ Validation requires `to` to have the form `name:port` with a numeric port, the
 name to be a VM or container in this lab, and `host_port` to be unused by every
 other `forward` and every container `port {}` in the lab, since both compile
 into the same forward machinery.
+
+A forward rides the segment's NAT engine, so the segment needs `nat = true`.
+Validation does not check this: on a segment without NAT the forward is not
+installed, and a `forward.skipped` event says `port forwarding requires
+NAT/egress on the segment`.
 
 ```wcl
 # examples/mixed-lab/vmlab.wcl

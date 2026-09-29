@@ -107,7 +107,7 @@ type Segment {
   @default(true) dhcp: bool?
   @doc("Enable NAT/internet egress for this segment (default false)")
   @default(false) nat: bool?
-  @doc("Link MTU (576–65535); default jumbo (9000) on nat/global, else 1500")
+  @doc("Link MTU (576–65535); default jumbo (9000) on nat, else 1500")
   @range(576, 65535) mtu: i64?
   @doc("Names of other segments to route to — daemon inter-segment routing opt-in")
   routes_to: list<utf8>?

@@ -137,7 +137,7 @@ SRC
       | "`global`" | "bool" | "`false`" | "Owned by the supervisor and shared across labs." |
       | "`dhcp`" | "bool" | "`true`" | "Enable DHCP on this segment." |
       | "`nat`" | "bool" | "`false`" | "Enable NAT internet egress for this segment." |
-      | "`mtu`" | "i64" | "9000 or 1500" | "Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` or `global` segment, else 1500." |
+      | "`mtu`" | "i64" | "9000 or 1500" | "Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` segment, else 1500, including on a `global` segment." |
       | "`routes_to`" | "list<utf8>" | "none" | "Names of other segments the daemon routes to. Inter-segment routing is opt-in per segment." |
       | "`dns {}`" | "child" | "none" | "DNS service override: hand out another server, or opt out." |
       | "`connect {}`" | "child" | "none" | "Cross-host segment peer over TCP, authenticated by the PSK from host config." |
@@ -287,6 +287,12 @@ SRC
     the name to be a VM or container in this lab, and `host_port` to be unused
     by every other `forward` and every container `port {}` in the lab, since
     both compile into the same forward machinery.
+  DOC
+  p <<DOC
+    A forward rides the segment's NAT engine, so the segment needs
+    `nat = true`. Validation does not check this: on a segment without NAT
+    the forward is not installed, and a `forward.skipped` event says
+    `port forwarding requires NAT/egress on the segment`.
   DOC
   code wcl {
     filename    = "examples/mixed-lab/vmlab.wcl"
