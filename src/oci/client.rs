@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -462,6 +462,34 @@ impl Registry {
         // (no chunk download yet).
         let (manifest, meta) = self.resolve_manifest_meta(arch).await?;
 
+        // The same version already in the store: the same artefact is used
+        // as it stands, and only a different one is refused. The store name
+        // comes from the template's metadata, not the repository path, so a
+        // template pushed from this store and referenced back by registry
+        // lands here rather than in an offline cache hit.
+        if !overwrite
+            && let Some(local) = dest_store.installed(&meta.arch, &meta.name, &meta.version)?
+        {
+            let whole = manifest
+                .whole_digest()
+                .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
+                .to_string();
+            let local_meta = local.meta.clone();
+            let same = tokio::task::spawn_blocking(move || same_disk(&local, &whole))
+                .await
+                .map_err(|e| anyhow!("template digest task: {e}"))??;
+            ensure!(
+                same,
+                "template {}/{}@{} is already in the store with a different disk than {} \
+                 — remove it first, or pull with overwrite to replace it",
+                meta.arch,
+                meta.name,
+                meta.version,
+                self.reference.canonical()
+            );
+            return Ok(local_meta);
+        }
+
         // 4. Download chunks in order to a temp dir.
         let chunks_dir = work_dir.join("chunks");
         std::fs::create_dir_all(&chunks_dir)
@@ -542,6 +570,21 @@ impl Registry {
         );
         Ok(meta)
     }
+}
+
+/// Whether a stored template's disk is the image a manifest's whole-image
+/// digest names. The digest recorded at install answers without reading the
+/// disk; an entry that never recorded one is hashed.
+fn same_disk(local: &crate::template::store::ResolvedTemplate, whole: &str) -> Result<bool> {
+    let want = whole
+        .strip_prefix("sha256:")
+        .unwrap_or(whole)
+        .to_ascii_lowercase();
+    let have = match &local.meta.sha256 {
+        Some(d) => d.strip_prefix("sha256:").unwrap_or(d).to_ascii_lowercase(),
+        None => crate::template::store::sha256_file(&local.disk_path)?,
+    };
+    Ok(have == want)
 }
 
 /// Offline-only resolution of a `registry` template reference: `Some` when
@@ -1320,6 +1363,73 @@ mod tests {
         // disk reassembled identically
         let resolved = store.resolve("x86_64", "alpine", Some("3.20")).unwrap();
         assert_eq!(std::fs::read(&resolved.disk_path).unwrap(), disk);
+    }
+
+    /// Pulling a version the store already holds uses the stored copy when it
+    /// is the same image, without downloading, and refuses only when the two
+    /// disks differ.
+    #[tokio::test]
+    async fn pull_of_a_version_already_in_the_store() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let disk: Vec<u8> = (0..(3u32 * 1024 * 1024)).map(|i| (i % 241) as u8).collect();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.sha256 = Some(hex::encode(Sha256::digest(&disk)));
+        make_template(&tdir, &m, &disk);
+        // Pushed under a repository whose last component is not the
+        // template's name, as a lab's `template = "localhost:5000/x/y:3.20"`.
+        let reference = "localhost:5000/e2e/other-name:3.20";
+        registry_with_fake(reference, fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let staged = store_root.join("stage");
+        make_template(&staged, &m, &disk);
+        store.install(&staged, &m, false).unwrap();
+
+        let mut downloads = 0;
+        let pulled = registry_with_fake(reference, fake.clone())
+            .pull_with_progress(
+                Some("x86_64"),
+                &store,
+                &store_root.join(".oci-pull"),
+                false,
+                &mut |_| downloads += 1,
+            )
+            .await
+            .expect("the same image is used as it stands");
+        assert_eq!(
+            (pulled.name.as_str(), pulled.version.as_str()),
+            ("alpine", "3.20")
+        );
+        assert_eq!(downloads, 0, "nothing downloaded for an image already held");
+
+        // A different disk under the same name and version is refused.
+        store
+            .remove("x86_64", "alpine", "3.20", true, &|_| None)
+            .unwrap();
+        let mut other = m.clone();
+        other.sha256 = Some("00".repeat(32));
+        make_template(&staged, &other, b"not the pushed disk");
+        store.install(&staged, &other, false).unwrap();
+        let err = registry_with_fake(reference, fake.clone())
+            .pull(Some("x86_64"), &store, &store_root.join(".oci-pull"), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different disk"), "{err}");
     }
 
     #[tokio::test]

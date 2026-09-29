@@ -122,13 +122,16 @@ def run(h):
     rm_all(h, "e2e-alpine")
     h.check(
         "template.registry.pull",
-        lambda: h.vmlab("template", "pull", f"{REGISTRY}:1.0.0", "--arch", "x86_64", timeout=900) and has(h, "e2e-alpine"),
+        lambda: h.vmlab("template", "pull", f"{REGISTRY}:1.0.0", "--arch", "x86_64", timeout=900) and has(h, "e2e-alpine")
+        # Again, with the same image already in the store: used, not refused.
+        and h.vmlab("template", "pull", f"{REGISTRY}:1.0.0", "--arch", "x86_64", timeout=900),
     )
     h.vmlab("template", "registry", "remove", "localhost:5000/e2e", check=False)
 
     # A lab that names the registry copy: `pull`, then `up`.
+    # The store still holds the version just pulled: the same image is used
+    # as it stands rather than refused as already present.
     with h.lab("registry-ref") as lab:
-        rm_all(h, "e2e-alpine")
         h.check("lab.pull", lambda: h.vmlab("pull", cwd=lab, timeout=900) and has(h, "e2e-alpine"))
         h.check(
             "template.registry.lab-ref",

@@ -131,6 +131,32 @@ impl TemplateStore {
         })
     }
 
+    /// `<arch>/<name>@<version>` exactly as named — no pin resolution —
+    /// when the store holds it.
+    pub fn installed(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<ResolvedTemplate>> {
+        let dir = self.version_dir(arch, name, version);
+        let meta_path = dir.join(META_FILE);
+        if !meta_path.is_file() {
+            return Ok(None);
+        }
+        let meta = TemplateMeta::read_from(&meta_path)?;
+        let disk_path = dir.join(DISK_FILE);
+        ensure!(
+            disk_path.is_file(),
+            "template {arch}/{name}@{version} is corrupt: missing {DISK_FILE}"
+        );
+        Ok(Some(ResolvedTemplate {
+            disk_path,
+            dir,
+            meta,
+        }))
+    }
+
     /// Version directory names present for `<arch>/<name>` (those with
     /// metadata), unsorted.
     pub(crate) fn versions_of(&self, arch: &str, name: &str) -> Result<Vec<String>> {
