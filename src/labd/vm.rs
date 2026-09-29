@@ -1018,6 +1018,7 @@ impl super::machine::Machine for VmInstance {
         let events_exit = events.clone();
         let vm_name = self.cfg.name.clone();
         let vm_name2 = self.cfg.name.clone();
+        let ready_lab = Arc::clone(&lab);
         self.boot(
             move |reason, status| {
                 let payload =
@@ -1032,6 +1033,11 @@ impl super::machine::Machine for VmInstance {
             },
             move || {
                 events.emit("vm.ready", serde_json::json!({"vm": vm_name2}));
+                // Forwards target the VM's lease; install them once it is
+                // ready, as a container does.
+                let lab = Arc::clone(&ready_lab);
+                let n = vm_name2.clone();
+                tokio::spawn(async move { lab.machine_ready(&n).await });
             },
         )
         .await
@@ -1066,7 +1072,12 @@ impl super::machine::Machine for VmInstance {
             },
             move || events_ready.emit("vm.ready", serde_json::json!({"vm": n2})),
         )
-        .await
+        .await?;
+        if online {
+            // Re-point forwards / re-prime the NAT MAC at the restored lease.
+            lab.machine_ready(&self.cfg.name).await;
+        }
+        Ok(())
     }
 
     /// A VM may be running a template first-boot provision through a Windows

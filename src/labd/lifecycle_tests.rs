@@ -120,6 +120,21 @@ async fn collect_events(
 
 struct TestLab {
     events: Arc<EventLog>,
+    /// Every `machine_ready` the lab was told of, in order.
+    readied: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl TestLab {
+    fn new(events: Arc<EventLog>) -> Self {
+        Self {
+            events,
+            readied: Arc::default(),
+        }
+    }
+
+    fn readied(&self) -> Vec<String> {
+        self.readied.lock().expect("readied").clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -147,7 +162,12 @@ impl LabServices for TestLab {
         })
     }
 
-    async fn machine_ready(&self, _machine: &str) {}
+    async fn machine_ready(&self, machine: &str) {
+        self.readied
+            .lock()
+            .expect("readied")
+            .push(machine.to_string());
+    }
 
     async fn smb_mount_plan(
         &self,
@@ -378,6 +398,34 @@ async fn a_vm_starts_and_becomes_ready_without_a_hypervisor() {
     assert_eq!(m.state().await, PowerState::Running);
     m.wait_ready(SETTLE).await.expect("ready");
     assert_eq!(observed.ready_count(), 1, "on_ready fires exactly once");
+
+    vm.stop(true).await.expect("stop");
+}
+
+/// Readiness is when the lab installs whatever is keyed on the machine's
+/// lease — a segment `forward {}` aimed at it above all (PRD §9.8). The VM
+/// must tell the lab exactly as a container does, or its forwards stay
+/// skipped from `up` until the next one.
+#[tokio::test]
+async fn a_vm_that_becomes_ready_tells_the_lab() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events));
+
+    vm.clone()
+        .start(lab.clone() as Arc<dyn LabServices>)
+        .await
+        .expect("start");
+    vm.wait_ready(SETTLE).await.expect("ready");
+    tokio::time::timeout(SETTLE, async {
+        while lab.readied().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the lab was never told the VM is ready");
+    assert_eq!(lab.readied(), ["dc01"]);
 
     vm.stop(true).await.expect("stop");
 }
@@ -886,7 +934,7 @@ async fn a_crashed_container_stays_stopped_until_explicitly_started() {
         },
     );
     let (events, mut rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
-    let lab: Arc<dyn LabServices> = Arc::new(TestLab { events });
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
 
     ctr.clone().start(lab.clone()).await.expect("start");
 

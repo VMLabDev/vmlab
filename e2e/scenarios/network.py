@@ -11,6 +11,8 @@ import socket
 import subprocess
 import tempfile
 
+from harness import ScenarioFailed
+
 HOST_MARKER = "e2e-host-marker"
 GUEST_MARKER = "e2e-guest-marker"
 FORWARD_PORT = 18280
@@ -257,23 +259,15 @@ def forward(h, lab):
         h.ok("net.forward", False, f"guest web server did not start: {started.text.strip()[-200:]}")
         return
     url = f"http://127.0.0.1:{FORWARD_PORT}/g"
-    first = GUEST_MARKER in curl(h, url)
-    if first:
+    # The forward is skipped at `up` (no lease yet) and installed when the
+    # VM becomes ready, with no second `up`.
+    try:
+        h.wait_until(lambda: GUEST_MARKER in curl(h, url), timeout=30, what=f"host :{FORWARD_PORT}")
         h.ok("net.forward", True, f"host :{FORWARD_PORT} answered from vm01:8080")
-        return
-    # vmlab bug: a VM with no lease at `up` time has its forward skipped and
-    # never installed once the lease arrives (machine_ready is only called for
-    # containers). A second `up` installs it; confirm the path otherwise works.
-    h.vmlab("up", cwd=lab, timeout=300, check=False)
-    second = GUEST_MARKER in curl(h, url)
-    events = h.vmlab("logs", "-o", "jsonl", "-n", "200", cwd=lab, check=False).out
-    skipped = "forward.skipped" in events
-    h.ok(
-        "net.forward",
-        False,
-        f"host :{FORWARD_PORT} refused after the VM became ready (forward.skipped logged at up: {skipped}); "
-        f"a second `vmlab up` installed it: {second}. The deferred forward is never installed on lease arrival for VMs",
-    )
+    except ScenarioFailed:
+        events = h.vmlab("logs", "-o", "jsonl", "-n", "200", cwd=lab, check=False).out
+        skips = [l for l in events.splitlines() if "forward.skipped" in l]
+        h.ok("net.forward", False, f"host :{FORWARD_PORT} refused after the VM became ready; skips: {skips[-3:]}")
 
 
 def routes(h, lab, ip):

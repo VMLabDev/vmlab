@@ -1383,6 +1383,19 @@ impl LabRuntime {
         Ok(())
     }
 
+    /// Whether any forward — a segment `forward {}` or a container
+    /// `port {}` — targets `machine`.
+    fn has_forwards(&self, machine: &str) -> bool {
+        let plan = forward_plan::plan(
+            &forward_plan::ForwardInputs {
+                lab: &self.config.lab,
+                observed: &forward_plan::Observed::default(),
+            },
+            &[machine.to_string()],
+        );
+        !plan.skipped.is_empty()
+    }
+
     /// Wire up every forward `scope` requires — segment `forward {}` blocks
     /// aimed at those machines and their container `port {}` blocks alike
     /// (PRD §9.8, §18). An empty `scope` means the whole lab.
@@ -1565,6 +1578,7 @@ impl LabRuntime {
             &format!("{}.ready", m.event_subject()),
             json!({ m.event_subject(): name }),
         );
+        super::machine::LabServices::machine_ready(self.as_ref(), name).await;
         output(format!("first-boot: {name} ready\n"));
         Ok(())
     }
@@ -2158,6 +2172,10 @@ impl LabRuntime {
 /// removing what the machine was using.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a machine that just became ready is given to take a DHCP lease
+/// before its forwards are planned without one (and skipped, said so).
+const LEASE_WAIT: Duration = Duration::from_secs(60);
+
 /// Wait for one machine to come to rest before deleting its disks.
 ///
 /// Best-effort, and deliberately: a machine that will not settle must not
@@ -2208,9 +2226,23 @@ impl crate::labd::machine::LabServices for LabRuntime {
     }
 
     async fn machine_ready(&self, machine: &str) {
-        self.arc()
-            .install_forwards(std::slice::from_ref(&machine.to_string()))
-            .await;
+        let scope = [machine.to_string()];
+        // Readiness is the agent's handshake, which a guest can give before
+        // its DHCP client has a lease. A machine with forwards waits a while
+        // for one rather than having every forward skipped for want of it.
+        if self.has_forwards(machine) {
+            let deadline = tokio::time::Instant::now() + LEASE_WAIT;
+            while !self
+                .forward_observations(&scope)
+                .await
+                .leases
+                .contains_key(machine)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        self.arc().install_forwards(&scope).await;
     }
 
     async fn smb_mount_plan(
