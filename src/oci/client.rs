@@ -533,9 +533,9 @@ impl Registry {
         }
 
         // 5 + 6. Decompress the chunks into the disk image, verify the
-        // whole-image digest, and install into the store (staging must be on
-        // the same FS as the store; the caller passes a work_dir under the
-        // store root). Record the disk digest if absent.
+        // whole-image digest, and install into the store (a work_dir under
+        // the store root keeps the install a plain rename; one elsewhere
+        // costs a copy). Record the disk digest if absent.
         //
         // All of this is multi-GB CPU and disk work — a Windows template is
         // tens of GB — so it runs on a blocking thread. Inline, it stalled the
