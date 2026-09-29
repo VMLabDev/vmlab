@@ -292,7 +292,7 @@ SRC
     rows:
       | "Option" | "Meaning" |
       | "`<ARCHIVE>`" | "An archive written by `template export`." |
-      | "`--overwrite`" | "Overwrite the version if the store already has it." |
+      | "`--overwrite`" | "Replace the version if the store already has it with a different disk." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -358,14 +358,16 @@ SRC
     `pull` downloads a published template into the store and prints
     `pulled <arch>/<name>@<version> into the store`. A reference without a
     tag pulls `latest`. A multi-architecture index with no `--arch` is
-    refused, because the store keys templates by architecture. `vmlab up` and
+    refused, because the store keys templates by architecture. A version the
+    store already holds is used as it stands when its disk is the published
+    image, and refused without `--overwrite` when it differs. `vmlab up` and
     `vmlab pull` pull a machine's template on demand, so this verb is for
     fetching ahead of time or for a template no lab file names yet.
   DOC
 
   code sh { source = "vmlab template pull ghcr.io/vmlabdev/alpine:0.3.1 --arch x86_64" }
 
-  p "Exit status is 0 on success and `failed` (1) when the registry refuses, the architecture is missing, or the version already exists without `--overwrite`."
+  p "Exit status is 0 on success and `failed` (1) when the registry refuses, the architecture is missing, or the version already exists with a different disk and no `--overwrite`."
 
   h2 "vmlab template login"
 

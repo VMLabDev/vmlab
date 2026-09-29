@@ -317,13 +317,15 @@ vmlab template pull [OPTIONS] <TARGET>
 | --- | --- |
 | `<TARGET>` | Registry reference, for example `ghcr.io/owner/name:version`. |
 | `--arch <ARCH>` | Architecture to pull. Required when the reference is a multi-architecture index. |
-| `--overwrite` | Overwrite the version if the store already has it. |
+| `--overwrite` | Replace the version if the store already has it with a different disk. |
 | `-h`, `--help` | Print help. |
 
 `pull` downloads a published template into the store and prints `pulled
 <arch>/<name>@<version> into the store`. A reference without a tag pulls
 `latest`. A multi-architecture index with no `--arch` is refused, because the
-store keys templates by architecture. `vmlab up` and `vmlab pull` pull a
+store keys templates by architecture. A version the store already holds is used
+as it stands when its disk is the published image, and refused without
+`--overwrite` when it differs. `vmlab up` and `vmlab pull` pull a
 machine's template on demand, so this verb is for fetching ahead of time or for
 a template no lab file names yet.
 
@@ -332,7 +334,8 @@ vmlab template pull ghcr.io/vmlabdev/alpine:0.3.1 --arch x86_64
 ```
 
 Exit status is 0 on success and `failed` (1) when the registry refuses, the
-architecture is missing, or the version already exists without `--overwrite`.
+architecture is missing, or the version already exists with a different disk
+and no `--overwrite`.
 
 ## vmlab template login
 

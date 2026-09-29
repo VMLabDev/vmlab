@@ -131,6 +131,32 @@ impl TemplateStore {
         })
     }
 
+    /// `<arch>/<name>@<version>` exactly as named — no pin resolution —
+    /// when the store holds it.
+    pub fn installed(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<ResolvedTemplate>> {
+        let dir = self.version_dir(arch, name, version);
+        let meta_path = dir.join(META_FILE);
+        if !meta_path.is_file() {
+            return Ok(None);
+        }
+        let meta = TemplateMeta::read_from(&meta_path)?;
+        let disk_path = dir.join(DISK_FILE);
+        ensure!(
+            disk_path.is_file(),
+            "template {arch}/{name}@{version} is corrupt: missing {DISK_FILE}"
+        );
+        Ok(Some(ResolvedTemplate {
+            disk_path,
+            dir,
+            meta,
+        }))
+    }
+
     /// Version directory names present for `<arch>/<name>` (those with
     /// metadata), unsorted.
     pub(crate) fn versions_of(&self, arch: &str, name: &str) -> Result<Vec<String>> {
@@ -150,9 +176,10 @@ impl TemplateStore {
     /// Atomically install a staged directory containing `disk.qcow2`.
     /// Writes `template.wcl` from `meta` into the staging dir, then
     /// renames it to `<arch>/<name>/<version>/` in one step — a failure
-    /// anywhere leaves the store untouched (PRD §6.1). The staging dir
-    /// must live on the same filesystem as the store root. Refuses to
-    /// replace an existing version unless `overwrite` is set.
+    /// anywhere leaves the store untouched (PRD §6.1). A staging dir on
+    /// another filesystem is first copied into one inside the store, so the
+    /// final step is still a rename. Refuses to replace an existing version
+    /// unless `overwrite` is set.
     pub fn install(&self, staging_dir: &Path, meta: &TemplateMeta, overwrite: bool) -> Result<()> {
         let _lock = self.lock()?;
         self.install_locked(staging_dir, meta, overwrite)
@@ -181,14 +208,37 @@ impl TemplateStore {
         let parent = dest.parent().expect("version dir always has a parent");
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
-        fs::rename(staging, &dest).with_context(|| {
-            format!(
-                "cannot move staged template into {} (staging must be on the same \
-                 filesystem as the store)",
-                dest.display()
-            )
-        })?;
-        Ok(())
+        self.move_in(staging, &dest, &|from, to| fs::rename(from, to))
+    }
+
+    /// Rename `staging` to `dest`. When `staging` is on another filesystem
+    /// — a data dir whose cache and store are separate mounts — it is copied
+    /// into a staging dir inside the store and renamed from there, so the
+    /// version still appears in one step; the original is removed after.
+    /// `rename` is [`fs::rename`] outside tests.
+    fn move_in(
+        &self,
+        staging: &Path,
+        dest: &Path,
+        rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let moving = || format!("cannot move staged template into {}", dest.display());
+        match rename(staging, dest) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                let local = StagingDir::create(&self.root)?;
+                copy_tree(staging, local.path()).with_context(|| {
+                    format!(
+                        "cannot copy staged template {} into the store",
+                        staging.display()
+                    )
+                })?;
+                rename(local.path(), dest).with_context(moving)?;
+                let _ = fs::remove_dir_all(staging);
+                Ok(())
+            }
+            Err(e) => Err(e).with_context(moving),
+        }
     }
 
     /// Remove `<arch>/<name>@<version>`. `in_use` reports why the
@@ -439,6 +489,21 @@ fn subdirs(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Staging directory inside the store root, removed on drop unless the
 /// install rename already consumed it.
+/// Copy the directory tree at `from` into the existing directory `to`.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            fs::create_dir(&target)?;
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 struct StagingDir {
     path: PathBuf,
 }
@@ -676,6 +741,44 @@ mod tests {
                 .resolve("x86_64", "windows-11", Some("26100.9999"))
                 .is_err()
         );
+    }
+
+    /// A staging dir on another filesystem than the store (EXDEV on rename)
+    /// is copied into the store and renamed from there, and the original
+    /// is removed.
+    #[test]
+    fn install_from_another_filesystem_copies_into_the_store() {
+        let (_tmp, store) = new_store();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let staging = elsewhere.path().join("staging");
+        fs::create_dir_all(staging.join("extra")).unwrap();
+        fs::write(staging.join(DISK_FILE), b"disk").unwrap();
+        fs::write(staging.join("extra").join("note"), b"n").unwrap();
+        let m = meta("x86_64", "t", "1");
+        m.write_to(&staging.join(META_FILE)).unwrap();
+        let dest = store.version_dir("x86_64", "t", "1");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+        let root = store.root().to_path_buf();
+        let cross_device = |from: &Path, to: &Path| {
+            if from.starts_with(&root) {
+                fs::rename(from, to)
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+            }
+        };
+        store.move_in(&staging, &dest, &cross_device).unwrap();
+
+        let r = store.resolve("x86_64", "t", Some("1")).unwrap();
+        assert_eq!(fs::read(&r.disk_path).unwrap(), b"disk");
+        assert_eq!(fs::read(r.dir.join("extra").join("note")).unwrap(), b"n");
+        assert!(!staging.exists(), "the original staging dir is removed");
+        let leftovers: Vec<_> = fs::read_dir(store.root())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(STAGING_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "no staging dir left in the store");
     }
 
     #[test]

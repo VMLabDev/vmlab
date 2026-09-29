@@ -25,7 +25,11 @@ OWNED = [
 def qemu_argv(vm: str) -> list[str]:
     """The running QEMU's argv for `vm` of this lab, read from /proc (QEMU is
     a child of the lab daemon in this same container)."""
-    want = f"vmlab:{LAB}/{vm}"
+    return qemu_argv_of(LAB, vm)
+
+
+def qemu_argv_of(lab: str, vm: str) -> list[str]:
+    want = f"vmlab:{lab}/{vm}"
     for p in pathlib.Path("/proc").iterdir():
         if not p.name.isdigit():
             continue
@@ -106,12 +110,10 @@ def kv(text: str) -> dict[str, str]:
 
 def build_images(h, lab: pathlib.Path) -> None:
     """`cd.iso` and `fd.img` for the `cdrom`/`floppy` attachments, built from
-    `cd/` so no binary image is checked in; and the absolute `disk from`."""
+    `cd/` so no binary image is checked in."""
     h.run(["xorriso", "-as", "mkisofs", "-V", "E2ECDROM", "-o", str(lab / "cd.iso"), str(lab / "cd")])
     h.run(["mkfs.fat", "-C", "-n", "E2EFD", str(lab / "fd.img"), "1440"])
     h.run(["mcopy", "-i", str(lab / "fd.img"), str(lab / "cd" / "cdrom.txt"), "::/FD.TXT"])
-    wcl = lab / "vmlab.wcl"
-    wcl.write_text(wcl.read_text().replace("@LABROOT@", str(lab)))
 
 
 PROBE_VM01 = r"""
@@ -144,8 +146,6 @@ echo label=$(blkid -s LABEL -o value /dev/fd0)
 echo files=$(ls /mnt/f | tr '\n' ' ')
 echo fd=$(cat /mnt/f/FD.TXT 2>/dev/null)
 echo mfloppy=$(cat /mnt/f/MFLOPPY.TXT 2>/dev/null)
-echo sb=$(od -An -tu1 /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | awk '{print $NF}')
-echo setup=$(od -An -tu1 /sys/firmware/efi/efivars/SetupMode-* 2>/dev/null | awk '{print $NF}')
 true
 """
 
@@ -162,6 +162,40 @@ def run(h):
                 h.ok(f, False, "not reached: the scenario stopped before this step")
 
 
+def secure_boot(h):
+    """`secure_boot = true` enforces: QEMU runs the secboot build with secure
+    pflash, the VM's VARS carry enrolled keys (PK, KEK, db), and the firmware
+    refuses the Alpine image's unsigned bootloader — which boots in the core
+    lab without secure boot. Enforced, it never reaches a guest to ask."""
+    with h.lab("core-secureboot") as lab:
+        up = h.vmlab("up", cwd=lab, timeout=300, check=False)
+        serial = pathlib.Path.home() / ".local/state/vmlab/labs/e2e-core-secureboot/vms/sb/serial.log"
+        refused = ""
+        try:
+            refused = h.wait_until(
+                lambda: next(
+                    (l.strip() for l in (serial.read_text(errors="replace") if serial.exists() else "").splitlines()
+                     if "failed to load" in l and "Access Denied" in l),
+                    None,
+                ),
+                timeout=120, interval=2, what="the firmware to refuse the unsigned bootloader",
+            )
+        except ScenarioFailed:
+            pass
+        argv = qemu_argv_of("e2e-core-secureboot", "sb")
+        code = next((a for a in argv if "OVMF_CODE" in a), "")
+        vars_file = lab / ".vmlab" / "vms" / "sb" / "OVMF_VARS.fd"
+        blob = vars_file.read_bytes() if vars_file.exists() else b""
+        keys = [k for k in ("PK", "KEK", "db") if (k + "\0").encode("utf-16-le") in blob]
+        h.ok(
+            "vm.hw.secure_boot",
+            up.code == 0 and "secboot" in code and "driver=cfi.pflash01,property=secure,value=on" in argv
+            and keys == ["PK", "KEK", "db"] and bool(refused),
+            f"qemu runs {code.rsplit('/', 1)[-1]} with secure pflash; the VM's VARS enrol {keys}; "
+            f"serial: {refused or 'no refusal seen'!r}",
+        )
+
+
 def _run(h):
     # A lab validate must refuse, naming what is wrong.
     bad = h.vmlab("validate", cwd=E2E / "labs" / "core-bad", check=False)
@@ -171,11 +205,7 @@ def _run(h):
         f"exit {bad.code}: " + next((l.strip(" ×") for l in bad.text.splitlines() if "at least" in l), bad.text.strip()[-120:]),
     )
 
-    # `disk "x" { from = "./rel/" }` as the docs write it: a relative folder.
-    with h.lab("core-diskfrom") as dlab:
-        rel = h.vmlab("up", cwd=dlab, check=False, timeout=300)
-        rel_ok = rel.code == 0
-        rel_detail = "relative `from` boots" if rel_ok else f"relative `from` fails: {rel.text.strip()[-120:]}"
+    secure_boot(h)
 
     with h.lab("core-lab") as lab:
         build_images(h, lab)
@@ -244,12 +274,11 @@ def _run(h):
             2 * 1024 * 1024 in sizes.values(),
             f"guest block devices (512-byte sectors): {sizes}; data = 1GiB = 2097152",
         )
-        abs_ok = p.get("payload") == "disk-from payload e2e"
         h.ok(
             "vm.hw.disk-from",
-            abs_ok and rel_ok,
-            f"{rel_detail}; with an absolute `from` the FAT disk {p.get('payload_dev')} carries payload.txt={abs_ok}"
-            + ("" if rel_ok else " — vmlab bug: src/labd/vm.rs fat_disk_from_folder gets the unjoined relative path"),
+            p.get("payload") == "disk-from payload e2e",
+            f"relative `from = \"./payload/\"`: the FAT disk {p.get('payload_dev')} carries "
+            f"payload.txt={p.get('payload')!r}",
         )
         h.ok("vm.hw.cdrom", p.get("cdrom") == "cdrom attachment e2e", f"E2ECDROM mounted: cdrom.txt={p.get('cdrom')!r}")
         h.ok("vm.media.iso", p.get("media_iso") == "media iso e2e", f"E2EMEDIA mounted: {p.get('media_iso')!r}")
@@ -286,17 +315,8 @@ def _run(h):
             f"running with a blank {vsize}-byte disk and no backing template; SeaBIOS: 'No bootable device'",
         )
 
-        # vm02: secure boot and the `floppy` attachment.
+        # vm02: the `floppy` attachment.
         f2 = kv(sh(h, lab, "vm02", PROBE_FLOPPY).out)
-        argv2 = qemu_argv("vm02")
-        code2 = next((a for a in argv2 if "OVMF_CODE" in a), "")
-        h.ok(
-            "vm.hw.secure_boot",
-            "secboot" in code2 and "driver=cfi.pflash01,property=secure,value=on" in argv2
-            and f2.get("sb") in ("0", "1"),
-            f"qemu runs {code2.rsplit('/', 1)[-1]} with secure pflash; guest efivars SecureBoot={f2.get('sb')} "
-            f"SetupMode={f2.get('setup')} (the VARS template has no keys enrolled, so the guest boots in setup mode)",
-        )
         h.ok("vm.hw.floppy", f2.get("fd") == "cdrom attachment e2e", f"/dev/fd0 label={f2.get('label')} FD.TXT={f2.get('fd')!r}")
 
         # vm03: a floppy built from a folder.

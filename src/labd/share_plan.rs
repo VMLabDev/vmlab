@@ -86,7 +86,8 @@ pub struct SmbPlan {
     pub host_ports: Vec<u16>,
     pub exports: Vec<SmbExport>,
     /// Segments needing `gateway:445 → 127.0.0.1:<the port smbd took>`, so a
-    /// guest mounting `\\<gateway>\<share>` reaches the local smbd through NAT.
+    /// guest mounting `\\<gateway>\<share>` reaches the local smbd — with or
+    /// without `nat` on the segment.
     pub gateway_segments: Vec<String>,
     /// Containers whose volumes mount over CIFS, with the gateway their
     /// cinit mounts from.

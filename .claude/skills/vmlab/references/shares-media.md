@@ -81,11 +81,15 @@ are plumbed by vmlab and are not user-visible.
 
 Once a VM is ready, the lab daemon runs the share plan's **mount steps** through
 the agent. The steps are a value computed per guest OS before anything runs, so
-what a Windows guest will be told to do can be read without booting one.
+what a Windows guest will be told to do can be read without booting one. Each
+step is retried for five minutes; a step still failing then emits
+`share.unmountable` naming the share and the last error, and that share's
+remaining steps are skipped.
 
-- **Linux, virtiofs:** `mount -t virtiofs <tag> <guest_path>`.
-- **Linux, SMB:** `mount -t cifs //<gateway>/<share> <guest_path>` with the
-  generated credential.
+- **Linux, virtiofs:** `mkdir -p <guest_path>`, then
+  `mount -t virtiofs <tag> <guest_path>`.
+- **Linux, SMB:** `mkdir -p <guest_path>`, then
+  `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential.
 - **Windows:** the credential is stored once per lab with `cmdkey`. A drive-letter
   target such as `S:` is mapped with `net use`. A folder-path target becomes a
   directory symbolic link to the UNC path with `mklink /D`, because a junction
@@ -113,7 +117,8 @@ VM's disk.
 
 A share needs a segment to reach the gateway on when it rides SMB, so a VM with
 an SMB share and no NIC is a validation error. A port-isolated NIC can still
-reach the gateway, so shares work on isolated ports by design.
+reach the gateway, so shares work on isolated ports by design. The segment
+needs no `nat`: gateway:445 reaches the lab's `smbd` without egress.
 
 A share is a passthrough view of the host directory, and that is the wrong tool
 for a watched source tree: file-change notification does not cross virtiofs or

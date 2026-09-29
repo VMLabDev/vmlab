@@ -58,6 +58,9 @@ pub struct MountStep {
     pub os_hint: OsHint,
     pub command: String,
     pub args: Vec<String>,
+    /// The share this step mounts — what a step that never succeeds is
+    /// reported against. `None` for a step serving every share at once.
+    pub share: Option<String>,
 }
 
 /// Per-VM SMB plan for a lab: the credential, the share definitions, and the
@@ -208,6 +211,14 @@ impl LabSmb {
         for (share, _host, guest, readonly, smb1) in &plan.shares {
             match os_hint {
                 OsHint::Linux => {
+                    // `mount` needs the target to exist, and a guest path is
+                    // usually one nobody created.
+                    steps.push(MountStep {
+                        os_hint,
+                        command: "mkdir".into(),
+                        args: vec!["-p".into(), guest.clone()],
+                        share: Some(share.clone()),
+                    });
                     let (cmd, args) = linux_mount_cmd(
                         gw,
                         share,
@@ -221,6 +232,7 @@ impl LabSmb {
                         os_hint,
                         command: cmd,
                         args,
+                        share: Some(share.clone()),
                     });
                 }
                 OsHint::Windows => {
@@ -231,6 +243,7 @@ impl LabSmb {
                             os_hint,
                             command: cmd,
                             args,
+                            share: Some(share.clone()),
                         });
                     }
                 }
@@ -242,6 +255,7 @@ impl LabSmb {
                         os_hint,
                         command: s,
                         args: Vec::new(),
+                        share: Some(share.clone()),
                     });
                 }
             }
@@ -268,6 +282,7 @@ impl LabSmb {
                     os_hint,
                     command: cmd,
                     args,
+                    share: None,
                 });
                 // And authenticate future logons automatically.
                 let (cmd, args) =
@@ -276,6 +291,7 @@ impl LabSmb {
                     os_hint,
                     command: cmd,
                     args,
+                    share: None,
                 });
             }
         }
@@ -346,9 +362,14 @@ mod tests {
     fn linux_mount_plan() {
         let lab = sample();
         let steps = lab.mount_plan("web", OsHint::Linux);
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].command, "mount");
-        let joined = steps[0].args.join(" ");
+        assert_eq!(steps.len(), 2);
+        // The mount point is created first: `mount` cannot, and a guest path
+        // is usually one nobody made.
+        assert_eq!(steps[0].command, "mkdir");
+        assert_eq!(steps[0].args, ["-p", "/mnt/src"]);
+        assert_eq!(steps[1].command, "mount");
+        assert!(steps.iter().all(|s| s.share.as_deref() == Some("src")));
+        let joined = steps[1].args.join(" ");
         assert!(joined.contains("//10.0.0.1/src"));
         assert!(joined.contains("vers=3.0"));
         assert!(joined.contains(&format!("username={}", config::current_unix_user())));

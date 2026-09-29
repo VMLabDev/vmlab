@@ -397,8 +397,9 @@ the metadata records, so a template built for a known home needs no argument.
 The push is performed by the supervisor, streams progress to your terminal, and
 can be stopped from another terminal with `vmlab template stop`.
 
-`vmlab template pull <registry/owner/name:version>` installs into the store and
-refuses to replace a version already there unless you pass `--overwrite`. A lab
+`vmlab template pull <registry/owner/name:version>` installs into the store. A
+version already there is used as it stands when its disk is the published image,
+and refused unless you pass `--overwrite` when it differs. A lab
 file can skip the explicit pull: a `vm` whose `template` is a registry reference,
 with an `arch` beside it, is pulled by the supervisor before the lab daemon
 starts, with progress events you can watch, and never re-pulled once present.

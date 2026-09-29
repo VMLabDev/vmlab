@@ -200,7 +200,7 @@ Each VM block can express:
   - `vulkan` — paravirtualised Vulkan via virtio-gpu Venus. Newer and less settled than virgl; offered with the same guest-support caveats.
 
   The paravirtualised modes must coexist with vmlab's headless VNC model — host-side rendering with the framebuffer scraped for VNC/screenshots (QEMU's egl-headless-style display path). **⚠ Implementation note:** exact device/display flag combinations for virgl/Venus alongside VNC, and their behaviour on WSL2's GPU stack, change across QEMU versions and must be verified at implementation time rather than taken from this document. Screenshot/image-matching APIs (§10.3) must keep working in all GPU modes.
-- `display`, `firmware`, `tpm`, `secure_boot` — normally supplied by the profile, overridable per VM
+- `display`, `firmware`, `tpm`, `secure_boot` — normally supplied by the profile, overridable per VM. `secure_boot = true` is enforced: the VM's UEFI variable store starts from a template with Microsoft's keys enrolled, and a host with no such template refuses the VM rather than boot one in setup mode, where nothing is verified.
 - `qemu_args = [...]` — **escape hatch**: raw arguments appended verbatim to the QEMU command line, last so they win
 
 Values not set on the VM inherit from the template's recorded hardware; values not set there come from the profile; the profile's defaults are the floor. Precedence: **VM block > template > profile** (no template layer for `scratch` VMs, §6.5).
@@ -346,6 +346,7 @@ SMB is affected.
 
 - **Linux (virtiofs):** `mount -t virtiofs <tag> <guest_path>` — no credential, no network dependency.
 - **Linux (SMB):** `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential.
+- On Linux the guest path is created (`mkdir -p`) before either mount. A mount that still fails once its retries run out is reported as a `share.unmountable` event naming the share and the error.
 - **Windows:** mapped via the SMB client with the generated credential. A drive-letter `guest` target maps directly; a folder-path target is realised as a directory symbolic link to the UNC path. Windows supports UNC targets with `mklink /D`; `mklink /J` junctions cannot target UNC paths.
 
 **Server implementation.** No mature embeddable SMB *server* library exists in the Rust ecosystem (clients only, verified at time of writing), so this is the largest single engineering component the feature implies. Two permitted strategies behind the identical WCL/user surface:
@@ -362,6 +363,7 @@ The PRD permits shipping 2 first and replacing with 1 later — including a hybr
 - Share *contents* are host state, outside snapshot scope — restore never rolls back files. The docs must say this loudly.
 - A VM's shares are reachable only via a segment its NIC sits on; a VM with no NICs cannot have shares (validation error) — consistent with air-gapped-by-default.
 - Port-isolated NICs (§9.1) can still reach the gateway, so shares work on isolated ports by design.
+- The segment needs no `nat`: gateway:445 reaches the lab's `smbd` on a segment without egress, which gains that and nothing else.
 
 ---
 

@@ -183,10 +183,6 @@ def guest(h):
 
         # share.smb1: the SMB1 dialect, mounted by vmlab with vers=1.0.
         def smb1():
-            # vmlab's Linux SMB mount plan has no `mkdir` for the mount point
-            # (its virtiofs plan does); it retries for five minutes, so making
-            # the directory lets the next retry land.
-            h.vmlab("exec", "lin01", "--user", "root", "--", "mkdir", "-p", "/mnt/legacy", cwd=lab)
             h.wait_until(
                 lambda: "served over smb1" in h.vmlab("exec", "lin01", "--", "cat", "/mnt/legacy/hello.txt",
                                                       cwd=lab, check=False).out,
@@ -199,8 +195,8 @@ def guest(h):
 
         h.check("share.smb1", smb1,
                 "vmlab mounted the smb1 share in a Linux guest with vers=1.0 (smbd min protocol NT1) and it read "
-                "the host file; needed a manual mkdir of the mount point (vmlab bug) and nat=true on the segment "
-                "(gateway:445 unreachable without it); an XP-era client itself was not exercised")
+                "the host file, vmlab creating the mount point itself, on a segment without nat; an XP-era "
+                "client itself was not exercised")
 
         ev = h.vmlab("eventlog", "lin01", cwd=lab, check=False, timeout=30)
         caps = h.vmlab("machine", "capabilities", "lin01", cwd=lab, check=False).out
