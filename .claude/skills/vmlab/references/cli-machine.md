@@ -870,7 +870,7 @@ vmlab dev sync flush [MACHINE]
 | `[MACHINE]` | Which dev machine, through the same ladder as `status`. |
 | `-h`, `--help` | Print help. |
 
-`flush` asks the syncer to run a pass now, waits for that pass to complete, and prints the same report `status` prints, so the effect of the flush is visible. It is the pass a snapshot capture runs first, and the way to make a host edit land before the debounce would. A halted workspace stays halted: a flush carries nothing across a halt. The wait gives up after 120 seconds and says to check `vmlab status` for whether the machine is still answering.
+`flush` asks the syncer to run a pass now, waits for that pass to complete, and prints the same report `status` prints, so the effect of the flush is visible. It is the pass a snapshot capture runs first. The pass carries every write made on either side before the flush and left alone since, waiting out the 250 ms quiet period for a path still inside it. A file still being written stays pending and is listed as not yet carried. A halted workspace stays halted: a flush carries nothing across a halt. The wait gives up after 120 seconds and says to check `vmlab status` for whether the machine is still answering.
 
 ```sh
 vmlab dev sync flush dev01

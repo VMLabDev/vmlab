@@ -122,9 +122,10 @@ def run(h):
         h.check("dev.sync.modes", modes, "host 0755 run.sh runs in the guest; guest chmod +x build.sh runs on the host")
 
         def status_flush():
-            (lab / "ws1" / "flushed.txt").write_text("flush me\n")
+            # No wait before the flush: a completed flush carries every write
+            # made before it, the host one here still inside its debounce.
             gx(h, lab, "echo from-guest > /src/flushed-g.txt")
-            time.sleep(1)  # past the 250ms per-path debounce
+            (lab / "ws1" / "flushed.txt").write_text("flush me\n")
             f = h.vmlab("dev", "sync", "flush", M, cwd=lab)
             assert "is in step" in f.out, f.out
             assert "flush me" in guest_cat(h, lab, "flushed.txt")

@@ -88,6 +88,8 @@ pub struct HostWatch {
     inotify: Arc<Inotify>,
     registry: Arc<std::sync::Mutex<Registry>>,
     stop: Arc<AtomicBool>,
+    /// Held across the pump's read and its sends — see [`HostWatch::settle`].
+    reading: Arc<std::sync::Mutex<()>>,
     pub events: mpsc::UnboundedReceiver<HostEvent>,
 }
 
@@ -103,22 +105,50 @@ impl HostWatch {
         let (tx, events) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let registry = Arc::new(std::sync::Mutex::new(Registry::default()));
+        let reading = Arc::new(std::sync::Mutex::new(()));
         // A blocking read loop on its own thread: `inotify` has no async
         // surface worth the wrapper, and the tree walk that answers a rescan
         // is blocking anyway.
         {
-            let (inotify, stop, registry) = (inotify.clone(), stop.clone(), registry.clone());
+            let (inotify, stop, registry, reading) = (
+                inotify.clone(),
+                stop.clone(),
+                registry.clone(),
+                reading.clone(),
+            );
             std::thread::Builder::new()
                 .name("vmlab-workspace-watch".into())
-                .spawn(move || pump(inotify, stop, registry, tx))
+                .spawn(move || pump(inotify, stop, registry, reading, tx))
                 .context("starting the workspace watcher thread")?;
         }
         Ok(HostWatch {
             inotify,
             registry,
             stop,
+            reading,
             events,
         })
+    }
+
+    /// Everything the kernel has queued for this watch up to now, whether the
+    /// pump thread has read it yet or not.
+    ///
+    /// The kernel queues an event inside the write that causes it, so a save
+    /// that returned before this call is in the answer. That is what lets
+    /// `dev sync flush` promise every write made before it was issued: the
+    /// channel alone cannot, because the pump may still be between its poll
+    /// and its send.
+    pub fn settle(&mut self) -> Vec<HostEvent> {
+        let _reading = self.reading.lock_recover();
+        let mut out = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            out.push(event);
+        }
+        // Non-blocking: an empty queue is `EAGAIN`, which is the answer.
+        if let Ok(events) = self.inotify.read_events() {
+            out.extend(decode(events, &self.registry));
+        }
+        out
     }
 
     /// Bring the registered set in line with `dirs` — the directories the
@@ -178,10 +208,15 @@ impl Drop for HostWatch {
 
 /// Read events until the watch is dropped, turning each into a path relative
 /// to the workspace root.
+///
+/// A read and the sends it produces happen under `reading`, so whoever holds
+/// that lock knows every event the kernel handed this thread is already in
+/// the channel — which is what [`HostWatch::settle`] relies on.
 fn pump(
     inotify: Arc<Inotify>,
     stop: Arc<AtomicBool>,
     registry: Arc<std::sync::Mutex<Registry>>,
+    reading: Arc<std::sync::Mutex<()>>,
     tx: mpsc::UnboundedSender<HostEvent>,
 ) {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -199,47 +234,56 @@ fn pump(
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => return,
         }
+        let _reading = reading.lock_recover();
         let events = match inotify.read_events() {
             Ok(events) => events,
             Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => return,
         };
-        for event in events {
-            use nix::sys::inotify::AddWatchFlags as F;
-            // The queue overflowed: the kernel drops events whole-tree, so
-            // nothing partial can be recovered from what did arrive.
-            if event.mask.contains(F::IN_Q_OVERFLOW) {
-                if tx.send(HostEvent::Rescan).is_err() {
-                    return;
-                }
-                continue;
-            }
-            // A directory appearing is coverage this watch does not have yet;
-            // the syncer answers a rescan by walking and re-registering, which
-            // is the only thing that can place a watch inside it.
-            if event.mask.contains(F::IN_ISDIR) && tx.send(HostEvent::Rescan).is_err() {
-                return;
-            }
-            let dir = registry.lock_recover().by_wd.get(&event.wd).cloned();
-            let Some(dir) = dir else {
-                // A descriptor the registry no longer holds: the watch set
-                // moved under this event. Coverage is in doubt, so say so
-                // rather than dropping it.
-                if tx.send(HostEvent::Rescan).is_err() {
-                    return;
-                }
-                continue;
-            };
-            let rel = match event.name.as_ref().and_then(|n| n.to_str()) {
-                Some(name) => join_rel(&dir, name),
-                // An event about the watched directory itself.
-                None => dir,
-            };
-            if tx.send(HostEvent::Touched(rel)).is_err() {
+        for event in decode(events, &registry) {
+            if tx.send(event).is_err() {
                 return;
             }
         }
     }
+}
+
+/// Turn what the kernel read into what the syncer acts on.
+fn decode(
+    events: Vec<nix::sys::inotify::InotifyEvent>,
+    registry: &std::sync::Mutex<Registry>,
+) -> Vec<HostEvent> {
+    use nix::sys::inotify::AddWatchFlags as F;
+    let mut out = Vec::new();
+    for event in events {
+        // The queue overflowed: the kernel drops events whole-tree, so
+        // nothing partial can be recovered from what did arrive.
+        if event.mask.contains(F::IN_Q_OVERFLOW) {
+            out.push(HostEvent::Rescan);
+            continue;
+        }
+        // A directory appearing is coverage this watch does not have yet;
+        // the syncer answers a rescan by walking and re-registering, which
+        // is the only thing that can place a watch inside it.
+        if event.mask.contains(F::IN_ISDIR) {
+            out.push(HostEvent::Rescan);
+        }
+        let dir = registry.lock_recover().by_wd.get(&event.wd).cloned();
+        let Some(dir) = dir else {
+            // A descriptor the registry no longer holds: the watch set
+            // moved under this event. Coverage is in doubt, so say so
+            // rather than dropping it.
+            out.push(HostEvent::Rescan);
+            continue;
+        };
+        let rel = match event.name.as_ref().and_then(|n| n.to_str()) {
+            Some(name) => join_rel(&dir, name),
+            // An event about the watched directory itself.
+            None => dir,
+        };
+        out.push(HostEvent::Touched(rel));
+    }
+    out
 }
 
 /// Paths that have been touched and are not yet still enough to read.
@@ -294,7 +338,7 @@ impl Debounce {
             .min()
     }
 
-    #[cfg(test)]
+    /// Whether nothing is in its quiet period.
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
