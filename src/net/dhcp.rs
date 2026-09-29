@@ -8,7 +8,8 @@
 //! Served options: subnet mask (1), router (3), DNS (6, omitted when
 //! unconfigured), domain (15), lease time (51), message type (53), server
 //! identifier (54), and RFC 3442 classless static routes (121) when the
-//! segment declares `routes {}`.
+//! segment declares `routes {}` — with the default route through the router
+//! appended, since a client given option 121 ignores option 3.
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -369,10 +370,17 @@ impl DhcpServer {
                 opt(&mut b, OPT_MTU, &cfg.mtu.to_be_bytes());
             }
             if !cfg.routes.is_empty() {
+                // RFC 3442: a client that receives option 121 ignores option
+                // 3, so the default route rides here too unless a route
+                // already claims it.
+                let mut routes = cfg.routes.clone();
+                if !routes.iter().any(|(net, _)| net.prefix_len() == 0) {
+                    routes.push((Ipv4Net::default(), cfg.router));
+                }
                 opt(
                     &mut b,
                     OPT_CLASSLESS_ROUTES,
-                    &encode_classless_routes(&cfg.routes),
+                    &encode_classless_routes(&routes),
                 );
             }
         }
@@ -829,6 +837,23 @@ mod tests {
         let mut s = DhcpServer::new(cfg);
         let r = parse_reply(&s.handle(&discover(mac(1))).unwrap());
         assert_eq!(r.opts[&OPT_CLASSLESS_ROUTES], expected);
+    }
+
+    /// RFC 3442: a client that receives option 121 ignores option 3, so the
+    /// default route has to ride option 121 too or the guest loses it.
+    #[test]
+    fn option_121_carries_the_default_route() {
+        let mut cfg = config();
+        cfg.router = Ipv4Addr::new(10, 213, 1, 5);
+        cfg.routes = vec![(net("10.0.0.0/8"), Ipv4Addr::new(10, 213, 1, 254))];
+        let mut s = DhcpServer::new(cfg);
+        let r = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        let expected: Vec<u8> = vec![
+            8, 10, 10, 213, 1, 254, // 10/8 via .254
+            0, 10, 213, 1, 5, // default via the router
+        ];
+        assert_eq!(r.opts[&OPT_CLASSLESS_ROUTES], expected);
+        assert_eq!(r.opts[&OPT_ROUTER], vec![10, 213, 1, 5]);
     }
 
     #[test]

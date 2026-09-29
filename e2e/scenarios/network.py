@@ -274,6 +274,9 @@ def routes(h, lab, ip):
     # "back" pushes 10.82.0.0/24 via the router as DHCP option 121.
     table = gexec(h, lab, "vm03", "ip", "route").out
     pushed = "10.82.0.0/24 via 10.82.1.254" in table
+    # RFC 3442: with option 121 present the guest ignores option 3, so the
+    # default route has to ride option 121 as well.
+    default = "default via 10.82.1.1" in table
     # Forward on the router, give vm01 the return route, and cross segments.
     gexec(h, lab, "router", "sysctl", "-w", "net.ipv4.ip_forward=1")
     gexec(h, lab, "vm01", "ip", "route", "add", "10.82.1.0/24", "via", "10.82.0.254")
@@ -281,10 +284,11 @@ def routes(h, lab, ip):
     hop = "ttl=63" in out
     h.ok(
         "net.routes",
-        pushed and crossed and hop,
-        f"option-121 route in vm03: {pushed}; vm03 -> vm01 through the router: {crossed} (ttl=63: {hop}). "
+        pushed and default and crossed and hop,
+        f"option-121 route in vm03: {pushed}; default route kept: {default}; "
+        f"vm03 -> vm01 through the router: {crossed} (ttl=63: {hop}). "
         "`routes_to` validates, but the daemon's own inter-segment forwarding is documented as not yet wired"
-        + ("; note vm03 has no default route — option 121 present, so the guest ignores option 3" if "default" not in table else ""),
+        + ("" if default else f"; vm03 routes: {table.strip()!r}"),
     )
 
 
