@@ -271,25 +271,72 @@ def forward(h, lab):
         h.ok("net.forward", False, f"host :{FORWARD_PORT} refused after the VM became ready; skips: {skips[-3:]}")
 
 
+PEER_SERVER = """
+import http.server, threading
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = self.client_address[0].encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+for port in (8081, 8082):
+    threading.Thread(target=http.server.ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever).start()
+"""
+
+
 def routes(h, lab, ip):
-    # "back" pushes 10.82.0.0/24 via the router as DHCP option 121.
-    table = gexec(h, lab, "vm03", "ip", "route").out
-    pushed = "10.82.0.0/24 via 10.82.1.254" in table
-    # RFC 3442: with option 121 present the guest ignores option 3, so the
-    # default route has to ride option 121 as well.
-    default = "default via 10.82.1.1" in table
-    # Forward on the router, give vm01 the return route, and cross segments.
-    gexec(h, lab, "router", "sysctl", "-w", "net.ipv4.ip_forward=1")
-    gexec(h, lab, "vm01", "ip", "route", "add", "10.82.1.0/24", "via", "10.82.0.254")
-    crossed, out = pings(h, lab, "vm03", ip["vm01"])
+    # Option 121: "back" declares routes_to = ["lan"], so each side offers
+    # the other's subnet via its own gateway -- both ways from the one
+    # declaration -- beside back's declared route {}. RFC 3442: with option
+    # 121 present the guest ignores option 3, so the default rides it too.
+    back = gexec(h, lab, "vm03", "ip", "route").out
+    lan = gexec(h, lab, "vm01", "ip", "route").out
+    pushed = {
+        "back: lan via back's gateway": "10.82.0.0/24 via 10.82.1.1" in back,
+        "lan: back via lan's gateway": "10.82.1.0/24 via 10.82.0.1" in lan,
+        "back: declared route {}": "10.99.0.0/16 via 10.82.1.254" in back,
+        "back: default": "default via 10.82.1.1" in back,
+    }
+
+    # vm01 answers on 8081 and 8082 with the address it saw the client at:
+    # the daemon routes without NAT, so that is vm03's own.
+    gsh(
+        h,
+        lab,
+        "vm01",
+        f"cat > /tmp/peer.py <<'EOF'\n{PEER_SERVER}\nEOF\n"
+        "setsid nohup python3 /tmp/peer.py >/dev/null 2>&1 </dev/null &",
+    )
+    up = gsh(h, lab, "vm01", "for i in $(seq 1 20); do wget -q -O - http://127.0.0.1:8082/ && exit 0; sleep 0.5; done; exit 1")
+    seen = wget(h, lab, "vm03", f"http://{ip['vm01']}:8081/")
+    kept = seen.code == 0 and seen.out.strip() == ip["vm03"]
+    # back's block rule holds on the way out of back, and for 8082 only.
+    blocked = wget(h, lab, "vm03", f"http://{ip['vm01']}:8082/")
+    refused = up.code == 0 and blocked.code != 0 and "refused" in blocked.text.lower()
+    # The other direction needs no declaration on lan; one hop, so ttl=63.
+    crossed, out = pings(h, lab, "vm01", ip["vm03"])
     hop = "ttl=63" in out
+
+    # "island" is routed to nothing. The router VM's NIC there shows the
+    # segment is alive; neither of the other two reaches it.
+    island = gsh(h, lab, "router", "dhcpcd -1 -4 eth2 >/dev/null 2>&1; ip -4 -o addr show dev eth2").out
+    alive = "10.82.2.254/" in island
+    from_back, _ = pings(h, lab, "vm03", "10.82.2.254")
+    from_lan, _ = pings(h, lab, "vm01", "10.82.2.254")
+
+    missing = [k for k, v in pushed.items() if not v]
     h.ok(
         "net.routes",
-        pushed and default and crossed and hop,
-        f"option-121 route in vm03: {pushed}; default route kept: {default}; "
-        f"vm03 -> vm01 through the router: {crossed} (ttl=63: {hop}). "
-        "`routes_to` validates, but the daemon's own inter-segment forwarding is documented as not yet wired"
-        + ("" if default else f"; vm03 routes: {table.strip()!r}"),
+        not missing and kept and refused and crossed and hop and alive and not from_back and not from_lan,
+        f"option 121 {'complete' if not missing else f'lacks {missing}'}; "
+        f"vm01:8081 saw vm03 ({ip['vm03']}) as {seen.out.strip() or seen.text.strip()[-120:]!r}; "
+        f"vm03 -> vm01:8082 refused by back's block: {refused}; "
+        f"vm01 -> vm03: {crossed} (ttl=63: {hop}); "
+        f"island {'up' if alive else 'has no lease'}, unreached from back/lan: {not from_back}/{not from_lan}"
+        + ("" if not missing else f"; vm03 routes: {back.strip()!r}; vm01 routes: {lan.strip()!r}"),
     )
 
 

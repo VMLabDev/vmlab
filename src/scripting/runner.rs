@@ -321,9 +321,13 @@ impl SegmentHandle {
         })
     }
 
-    pub(crate) fn route_to(&self, _other: &str, _enable: bool) -> Result<(), String> {
-        // Daemon inter-segment routing: explicit opt-in per pair (§9.6).
-        Err("inter-segment routing is not yet available from scripts".into())
+    /// Connect (`enable`) or disconnect this segment and `other` for daemon
+    /// inter-segment routing (§9.6): both ways, lab-local segments only.
+    pub(crate) fn route_to(&self, other: &str, enable: bool) -> Result<(), String> {
+        self.rt.block_on(async {
+            let net = self.runtime.network.lock().await;
+            net.set_route(&self.segment, other, enable)
+        })
     }
 
     pub(crate) fn rules_json(&self) -> Result<String, String> {

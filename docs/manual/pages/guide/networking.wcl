@@ -150,21 +150,43 @@ page guide_networking {
   h2 "Guest routes and inter-segment routing"
 
   p <<DOC
-    Multi-segment topologies are routed through a machine. Give a router VM
-    a NIC on each segment, and declare `route` blocks on the segments whose
-    guests should know about the other side. Each route is pushed to every
-    guest at lease time as DHCP option 121, so a firewall or router lab needs
-    no guest configuration.
+    Segments are isolated from each other unless something connects them,
+    and two mechanisms do. One is a router VM with a NIC on each segment:
+    declare `route` blocks on the segments whose guests should know about
+    the other side, and each route is pushed to every guest at lease time as
+    DHCP option 121, so a firewall or router lab needs no guest
+    configuration.
   DOC
 
   p <<DOC
-    A segment's `routes_to` list names other segments the daemon itself
-    should forward L3 traffic to, always an explicit opt-in per pair.
-    Validation checks that every target is a declared segment. The daemon's
-    own forwarding engine behind that field is not yet wired, and the script
-    verbs `route_to` and `unroute_to` answer with an error saying so. Route
-    through a machine for now.
+    The other is the daemon itself. A segment's `routes_to` list names
+    segments the daemon forwards L3 traffic to and from, always an explicit
+    opt-in per pair and never a default. A pair runs both ways:
+    `routes_to = ["dmz"]` on `lan` connects `lan` and `dmz` in both
+    directions, and declaring it on `dmz` as well changes nothing. Scripts
+    connect and disconnect a pair at runtime with `route_to` and
+    `unroute_to`.
   DOC
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+segment "lan" {
+  nat       = true
+  routes_to = ["dmz"]
+}
+segment "dmz" {
+  block { cidr = "10.213.0.0/24" proto = "tcp" port = 22 }
+}
+SRC
+  }
+
+  list {
+    li "**No NAT.** Routed traffic keeps its source address, so a server on one side sees the client's real address. NAT is for internet egress only."
+    li "**Rules apply where a packet leaves.** The `block` and `redirect` rules of the segment a packet is leaving apply to it. In the example, `dmz` guests cannot reach port 22 on `lan`, and everything else crosses. A `redirect` may point into the other segment; its replies are rewritten on the way back."
+    li "**Guests learn the route by DHCP.** Each segment of a pair offers the other's subnet through its own gateway in option 121, beside the default route and any `route` blocks. A pair a script connects reaches leases granted after the call. A guest that already holds a lease still gets there through its default route when that is the daemon's gateway."
+    li "**Static addresses route themselves.** A guest whose address is configured inside the guest, rather than by a DHCP reservation, needs its own route to the other subnet through its segment's gateway."
+    li "**Lab-local only.** A `global` segment cannot name, or be named in, `routes_to`. Validation refuses it by name, as it refuses a segment naming itself."
+    li "**No fragmentation.** A packet larger than the other segment's MTU with DF set is answered with ICMP fragmentation-needed carrying that MTU. Without DF it is dropped."
+  }
 
   h2 "Filtering and redirection"
 

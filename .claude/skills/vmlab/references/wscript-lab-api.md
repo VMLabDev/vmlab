@@ -482,8 +482,8 @@ fn main(lab: Lab) {
 
 ## Segment.route_to
 
-Opt this segment into routing to another. Not available from scripts in this
-release.
+Connect this segment and another for the daemon to route between, in both
+directions.
 
 ```wscript
 fn route_to(self, other: string) -> Result[unit, string]
@@ -491,11 +491,15 @@ fn route_to(self, other: string) -> Result[unit, string]
 
 | Parameter | Type | Meaning |
 | --- | --- | --- |
-| `other` | string | The segment to route to. |
+| `other` | string | The segment to route to and from. |
 
-The method compiles and always fails with "inter-segment routing is not yet
-available from scripts". Declare routing in the lab file instead; see
-networking.md.
+The runtime form of `routes_to`: the pair is the same thing whichever side
+connects it, and connecting a connected pair is not an error. Routing takes
+effect at once. Each side offers the other's subnet in DHCP option 121 to
+leases granted after the call; a guest holding a lease reaches the other side
+through its default route when that is the daemon's gateway. Fails, naming the
+segment, when `other` is not a segment of this lab, is `global` or either side
+is, or is this segment. See networking.md.
 
 ```wscript
 fn main(lab: Lab) {
@@ -509,7 +513,8 @@ fn main(lab: Lab) {
 
 ## Segment.unroute_to
 
-Reverse `Segment.route_to`. Not available from scripts in this release.
+Disconnect this segment and another: the daemon stops routing between them,
+both ways.
 
 ```wscript
 fn unroute_to(self, other: string) -> Result[unit, string]
@@ -517,9 +522,12 @@ fn unroute_to(self, other: string) -> Result[unit, string]
 
 | Parameter | Type | Meaning |
 | --- | --- | --- |
-| `other` | string | The segment to stop routing to. |
+| `other` | string | The segment to stop routing to and from. |
 
-Always fails with the same message as `Segment.route_to`.
+Takes apart a pair connected by either side, including one declared with
+`routes_to`. A pair not connected is not an error. Fails as `Segment.route_to`
+does for a segment that is unknown, global or this one. Leases granted after
+the call no longer carry the route.
 
 ```wscript
 fn main(lab: Lab) {

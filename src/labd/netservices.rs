@@ -1,8 +1,12 @@
 //! Wire the NAT engine and L3 rule engine into a segment's switch and
 //! gateway (PRD §9.6–§9.9). Phase 3 of network assembly, after gateways.
 //!
-//! - **NAT**: the gateway's uplink hands off-segment frames to the engine;
-//!   the engine's output is injected back through the gateway port.
+//! - **Routing**: the gateway's uplink offers every off-segment frame to the
+//!   lab's inter-segment router first (§9.6); a frame for a connected peer
+//!   never reaches NAT.
+//! - **NAT**: the gateway's uplink hands the remaining off-segment frames to
+//!   the engine; the engine's output is injected back through the gateway
+//!   port.
 //! - **Rules**: a switch ingress hook evaluates guest→world IPv4 packets
 //!   (those addressed to the gateway MAC) — `block` drops with a synthesised
 //!   RST/ICMP reply back to the guest, `redirect` DNATs in place.
@@ -16,6 +20,7 @@ use crate::config::model::MacAddr;
 use crate::net::frame::{ETHERTYPE_IPV4, EthView, IPPROTO_TCP, Ipv4View, TcpView, eth_build};
 use crate::net::gateway::GatewayHandle;
 use crate::net::nat::{NatConfig, NatEngine};
+use crate::net::router::Router;
 use crate::net::rules::{RuleSet, Verdict};
 use crate::net::switch::{HookAction, PortClass, Switch};
 
@@ -37,12 +42,14 @@ pub struct SegmentServices {
 
 impl SegmentServices {
     /// Install NAT (when the segment has egress) and the L3 rule hook on the
-    /// switch. `gateway` is this segment's gateway handle.
+    /// switch. `gateway` is this segment's gateway handle; `router` routes
+    /// what it can of the gateway's off-segment frames, as `segment`'s.
     pub fn install(
         switch: &Arc<Switch>,
         gateway: &GatewayHandle,
         nat_enabled: bool,
         mtu: u16,
+        router: (&Arc<Router>, &str),
     ) -> Arc<SegmentServices> {
         let rules = Arc::new(Mutex::new(RuleSet::new()));
         let gw_mac = gateway.gw_mac();
@@ -90,7 +97,7 @@ impl SegmentServices {
         // uplink admits those and nothing else.
         let host_services = Arc::new(Mutex::new(Vec::new()));
         let admit = (!nat_enabled).then(|| host_services.clone());
-        let engine = spawn_nat(switch, gateway, gw_mac, mtu, rules.clone(), admit);
+        let engine = spawn_nat(switch, gateway, gw_mac, mtu, rules.clone(), admit, router);
         let nat = nat_enabled.then_some(engine);
 
         Arc::new(SegmentServices {
@@ -110,6 +117,9 @@ impl SegmentServices {
 /// `admit` is `None` for a segment with egress. Otherwise only frames to a
 /// host loopback TCP port it lists reach the engine; the rest are dropped,
 /// as they were before a segment without egress had an engine at all.
+///
+/// Every frame is offered to `router` first: one for a connected peer
+/// segment is routed there and never reaches the engine (§9.6).
 fn spawn_nat(
     _switch: &Arc<Switch>,
     gateway: &GatewayHandle,
@@ -117,6 +127,7 @@ fn spawn_nat(
     mtu: u16,
     rules: Arc<Mutex<RuleSet>>,
     admit: Option<Arc<Mutex<Vec<u16>>>>,
+    (router, segment): (&Arc<Router>, &str),
 ) -> Arc<NatEngine> {
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Bytes>(1024);
     let mut cfg = NatConfig::new(gateway.gw_ip(), gw_mac);
@@ -156,12 +167,20 @@ fn spawn_nat(
     // The gateway awaits every off-segment frame in arrival order. This is
     // essential for vTCP: spawning one task per frame reorders bulk streams.
     let engine_uplink = engine.clone();
+    let router = router.clone();
+    let segment: Arc<str> = segment.into();
     gateway.set_uplink(Arc::new(move |frame: Bytes| {
         let e = engine_uplink.clone();
-        let admitted = admit
-            .as_ref()
-            .is_none_or(|ports| is_host_service(&frame, &ports.lock_recover()));
+        let router = router.clone();
+        let segment = segment.clone();
+        let admit = admit.clone();
         Box::pin(async move {
+            let Some(frame) = router.route(&segment, frame).await else {
+                return;
+            };
+            let admitted = admit
+                .as_ref()
+                .is_none_or(|ports| is_host_service(&frame, &ports.lock_recover()));
             if admitted {
                 e.handle_frame(frame).await;
             }
@@ -306,7 +325,7 @@ mod tests {
                 upstream_dns: None,
             },
         );
-        let services = SegmentServices::install(&sw, &gw, nat, 1500);
+        let services = SegmentServices::install(&sw, &gw, nat, 1500, (&Router::new(), "seg"));
         let guest = sw.add_channel_port(PortClass::Guest { isolated: false });
         (services, gw, guest)
     }

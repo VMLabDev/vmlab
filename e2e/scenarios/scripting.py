@@ -131,7 +131,7 @@ def run(h):
 
         h.check("script.vision-api", vision, "screenshot wrote a PNG; wait_for_text and ocr read the probe text")
 
-        # -- segment API: dns_set, block/unblock, forward, route_to.
+        # -- segment API: dns_set, block/unblock, forward, route_to/unroute_to.
         def segment():
             ip = host_ip()
             srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Hello)
@@ -163,11 +163,18 @@ def run(h):
                 fw = str(e)
             if "e2e-forwarded" not in fw:
                 problems.append(f"forward 127.0.0.1:{FWD_PORT} answered {fw!r}")
-            route = line(t, "e2e-route-to")
-            # route_to is documented as not yet available from scripts: the
-            # observable contract is its error, by name.
-            if "not yet available" not in route:
-                problems.append(f"route_to answered {route!r}")
+            # route_to connects "lan" and "back" for the daemon to route
+            # between; unroute_to, from the other side, takes them apart.
+            before, during, after = (line(t, f"e2e-route-{k}") for k in ("before", "during", "after"))
+            if "PING-FAIL" not in before:
+                problems.append(f"web reached vm01 before route_to: {before!r}")
+            if "PING-OK" not in during:
+                problems.append(f"route_to did not connect back to lan: {during!r}")
+            if "PING-FAIL" not in after:
+                problems.append(f"unroute_to did not disconnect them: {after!r}")
+            itself = line(t, "e2e-route-self")
+            if "cannot route to itself" not in itself:
+                problems.append(f"route_to itself answered {itself!r}")
             assert not problems, "; ".join(problems)
             return True
 
@@ -175,7 +182,8 @@ def run(h):
             "script.segment-api",
             segment,
             "dns_set resolved then cleared; block/unblock toggled the guest's reach to a host listener; "
-            "forward served a guest port on the host; route_to gave its documented not-yet-available error",
+            "forward served a guest port on the host; route_to/unroute_to connected and disconnected two "
+            "segments (a container on one pinged vm01 on the other only in between)",
         )
 
         # -- logs -f, started before the next events so it must pick them up.

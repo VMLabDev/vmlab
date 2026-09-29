@@ -193,6 +193,18 @@ impl DhcpServer {
         v
     }
 
+    /// Replace the option-121 routes offered from now on. A lease already
+    /// held keeps the routes it was given until its client renews.
+    pub fn set_routes(&mut self, routes: Vec<(Ipv4Net, Ipv4Addr)>) {
+        self.config.routes = routes;
+    }
+
+    /// The option-121 routes currently offered.
+    #[cfg(test)]
+    pub fn routes(&self) -> &[(Ipv4Net, Ipv4Addr)] {
+        &self.config.routes
+    }
+
     /// The valid lease held by `mac`, if any.
     pub fn lease_of(&self, mac: MacAddr) -> Option<Ipv4Addr> {
         let now = Instant::now();

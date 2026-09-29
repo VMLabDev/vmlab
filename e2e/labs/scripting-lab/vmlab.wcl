@@ -10,11 +10,19 @@ lab "e2e-scripting" {
     nat    = true
   }
 
+  // Routed to "lan" only while `segment.ws` says so (`route_to`).
+  segment "back" {
+    subnet = "10.86.1.0/24"
+  }
+
   vm "vm01" {
     template = "x86_64/e2e-alpine"
     cpus     = 1
     memory   = 512MiB
-    nic { segment = "lan" }
+    nic {
+      segment = "lan"
+      ip      = "10.86.0.10"
+    }
 
     // QEMU is silent on a healthy boot; a trace line per QMP command gives
     // the qemu stream something to show.
@@ -30,7 +38,10 @@ lab "e2e-scripting" {
     image   = "alpine:3.22"
     profile = "container"
     mode    = :idle
-    nic { segment = "lan" }
+    nic {
+      segment = "back"
+      ip      = "10.86.1.10"
+    }
   }
 
   on "lab.up"           { run = "scripts/handler.ws" }

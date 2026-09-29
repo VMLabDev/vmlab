@@ -79,9 +79,8 @@ signatures in wscript-machine-api.md.
 `block_port`, `unblock` and `redirect` edit its L3 rules, `forward` adds a host
 port forward to a machine's leased address, and `rules()` returns the current
 rule set as JSON. Each rule-adding call returns a rule id the removing call takes
-back. `route_to` and `unroute_to` exist in the interface but currently return an
-error saying inter-segment routing is not yet available from scripts. See
-networking.md for what these rules do.
+back. `route_to` and `unroute_to` connect and disconnect the segment and another
+for the daemon to route between, in both directions. See networking.md for what these rules do.
 
 ## Result handling and pattern matching
 
@@ -204,9 +203,6 @@ the reboot when it is already set; see examples.md.
 
 ## Not in the language
 
-- Inter-segment routing from scripts: `Segment.route_to` and
-  `Segment.unroute_to` compile and always fail with "inter-segment routing is not
-  yet available from scripts". Declare routing in the lab file.
 - Sinkhole modes other than NXDOMAIN: the script surface always sinks with
   NXDOMAIN; the other modes are available in the lab file only.
 - Protocol-specific redirects: the script surface leaves the protocol unset, so a

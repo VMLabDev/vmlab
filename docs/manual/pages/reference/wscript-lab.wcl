@@ -460,17 +460,22 @@ SRC
   }
 
   h2 "Segment.route_to"
-  p "Opt this segment into routing to another. Not available from scripts in this release."
+  p "Connect this segment and another for the daemon to route between, in both directions."
   code wscript { source = "fn route_to(self, other: string) -> Result[unit, string]" }
   table {
     rows:
       | "Parameter" | "Type" | "Meaning" |
-      | "`other`" | "string" | "The segment to route to." |
+      | "`other`" | "string" | "The segment to route to and from." |
   }
   p <<DOC
-    The method compiles and always fails with "inter-segment routing is not
-    yet available from scripts". Declare routing in the lab file instead; see
-    [networking](guide_networking).
+    The runtime form of `routes_to`: the pair is the same thing whichever
+    side connects it, and connecting a connected pair is not an error.
+    Routing takes effect at once. Each side offers the other's subnet in
+    DHCP option 121 to leases granted after the call; a guest holding a
+    lease reaches the other side through its default route when that is
+    the daemon's gateway. Fails, naming the segment, when `other` is not a
+    segment of this lab, is `global` or either side is, or is this segment.
+    See [networking](guide_networking).
   DOC
   code wscript { source = <<'SRC'
 fn main(lab: Lab) {
@@ -484,15 +489,18 @@ SRC
   }
 
   h2 "Segment.unroute_to"
-  p "Reverse `Segment.route_to`. Not available from scripts in this release."
+  p "Disconnect this segment and another: the daemon stops routing between them, both ways."
   code wscript { source = "fn unroute_to(self, other: string) -> Result[unit, string]" }
   table {
     rows:
       | "Parameter" | "Type" | "Meaning" |
-      | "`other`" | "string" | "The segment to stop routing to." |
+      | "`other`" | "string" | "The segment to stop routing to and from." |
   }
   p <<DOC
-    Always fails with the same message as `Segment.route_to`.
+    Takes apart a pair connected by either side, including one declared
+    with `routes_to`. A pair not connected is not an error. Fails as
+    `Segment.route_to` does for a segment that is unknown, global or this
+    one. Leases granted after the call no longer carry the route.
   DOC
   code wscript { source = <<'SRC'
 fn main(lab: Lab) {

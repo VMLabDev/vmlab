@@ -22,12 +22,20 @@ lab "e2e-network" {
     redirect { from = "192.0.2.10:80" to = "@HOST@:9001" proto = "tcp" }
   }
 
-  // No NAT, a small MTU, and a route to "lan" through the router VM.
+  // No NAT, a small MTU, and the daemon routing to "lan" (declared on this
+  // side only; it runs both ways). Its block rule stops one port on the way
+  // out, and the declared route rides option 121 beside the daemon's.
   segment "back" {
     subnet    = "10.82.1.0/24"
     mtu       = 1400
     routes_to = ["lan"]
-    route { dest = "10.82.0.0/24" via = "10.82.1.254" }
+    route { dest = "10.99.0.0/16" via = "10.82.1.254" }
+    block { cidr = "10.82.0.0/24" proto = "tcp" port = 8082 }
+  }
+
+  // Routed to nothing: unreachable from both of the others.
+  segment "island" {
+    subnet = "10.82.2.0/24"
   }
 
   vm "vm01" {
@@ -61,6 +69,10 @@ lab "e2e-network" {
     nic {
       segment = "back"
       ip      = "10.82.1.254"
+    }
+    nic {
+      segment = "island"
+      ip      = "10.82.2.254"
     }
   }
 

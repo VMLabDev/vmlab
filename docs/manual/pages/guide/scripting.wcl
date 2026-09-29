@@ -144,9 +144,8 @@ DOC
 `block_port`, `unblock` and `redirect` edit its L3 rules, `forward` adds a
 host port forward to a machine's leased address, and `rules()` returns the
 current rule set as JSON. Each rule-adding call returns a rule id the removing
-call takes back. `route_to` and `unroute_to` exist in the interface but
-currently return an error saying inter-segment routing is not yet available
-from scripts. See [Networking](guide_networking) for what these rules do.
+call takes back. `route_to` and `unroute_to` connect and disconnect the
+segment and another for the daemon to route between, in both directions. See [Networking](guide_networking) for what these rules do.
 DOC
 
   h2 "Where a script runs from"

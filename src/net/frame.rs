@@ -215,9 +215,8 @@ fn arp_build(op: u16, sha: MacAddr, spa: Ipv4Addr, tha: MacAddr, tpa: Ipv4Addr) 
 }
 
 /// Build a complete ethernet frame carrying an ARP request (who-has `tpa`),
-/// broadcast at L2. The fabric never sends requests (MACs are learned
-/// passively); tests use this to synthesise guest ARP traffic.
-#[cfg(test)]
+/// broadcast at L2. The fabric asks only for the next hop of a packet it
+/// routes onto a segment (§9.6); tests also synthesise guest ARP with it.
 pub fn arp_request_build(sha: MacAddr, spa: Ipv4Addr, tpa: Ipv4Addr) -> Vec<u8> {
     let arp = arp_build(1, sha, spa, MacAddr([0; 6]), tpa);
     eth_build(MAC_BROADCAST, sha, ETHERTYPE_ARP, &arp)

@@ -113,16 +113,49 @@ failing at bind time. Scripts can add forwards at runtime with
 
 ## Guest routes and inter-segment routing
 
-Multi-segment topologies are routed through a machine. Give a router VM a NIC
-on each segment, and declare `route` blocks on the segments whose guests should
-know about the other side. Each route is pushed to every guest at lease time as
-DHCP option 121, so a firewall or router lab needs no guest configuration.
+Segments are isolated from each other unless something connects them, and two
+mechanisms do. One is a router VM with a NIC on each segment: declare `route`
+blocks on the segments whose guests should know about the other side, and each
+route is pushed to every guest at lease time as DHCP option 121, so a firewall
+or router lab needs no guest configuration.
 
-A segment's `routes_to` list names other segments the daemon itself should
-forward L3 traffic to, always an explicit opt-in per pair. Validation checks
-that every target is a declared segment. The daemon's own forwarding engine
-behind that field is not yet wired, and the script verbs `route_to` and
-`unroute_to` answer with an error saying so. Route through a machine for now.
+The other is the daemon itself. A segment's `routes_to` list names segments the
+daemon forwards L3 traffic to and from, always an explicit opt-in per pair and
+never a default. A pair runs both ways: `routes_to = ["dmz"]` on `lan` connects
+`lan` and `dmz` in both directions, and declaring it on `dmz` as well changes
+nothing. Scripts connect and disconnect a pair at runtime with `route_to` and
+`unroute_to`.
+
+```wcl
+segment "lan" {
+  nat       = true
+  routes_to = ["dmz"]
+}
+segment "dmz" {
+  block { cidr = "10.213.0.0/24" proto = "tcp" port = 22 }
+}
+```
+
+- **No NAT.** Routed traffic keeps its source address, so a server on one side
+  sees the client's real address. NAT is for internet egress only.
+- **Rules apply where a packet leaves.** The `block` and `redirect` rules of
+  the segment a packet is leaving apply to it. In the example, `dmz` guests
+  cannot reach port 22 on `lan`, and everything else crosses. A `redirect` may
+  point into the other segment; its replies are rewritten on the way back.
+- **Guests learn the route by DHCP.** Each segment of a pair offers the other's
+  subnet through its own gateway in option 121, beside the default route and
+  any `route` blocks. A pair a script connects reaches leases granted after the
+  call. A guest that already holds a lease still gets there through its default
+  route when that is the daemon's gateway.
+- **Static addresses route themselves.** A guest whose address is configured
+  inside the guest, rather than by a DHCP reservation, needs its own route to
+  the other subnet through its segment's gateway.
+- **Lab-local only.** A `global` segment cannot name, or be named in,
+  `routes_to`. Validation refuses it by name, as it refuses a segment naming
+  itself.
+- **No fragmentation.** A packet larger than the other segment's MTU with DF
+  set is answered with ICMP fragmentation-needed carrying that MTU. Without DF
+  it is dropped.
 
 ## Filtering and redirection
 
@@ -248,7 +281,7 @@ segment "<name>" {
 | `dhcp` | bool | `true` | Enable DHCP on this segment. |
 | `nat` | bool | `false` | Enable NAT internet egress for this segment. |
 | `mtu` | i64 | 9000 or 1500 | Link MTU, 576 to 65535. Default is jumbo (9000) on a `nat` segment, else 1500, including on a `global` segment. |
-| `routes_to` | list<utf8> | none | Names of other segments the daemon routes to. Inter-segment routing is opt-in per segment. |
+| `routes_to` | list<utf8> | none | Lab-local segments the daemon routes to and from. Opt-in per pair, never a default; a pair runs both ways whichever side declares it. Routed traffic keeps its source address, the leaving segment's rules apply, and each side offers the other's subnet in DHCP option 121. |
 | `dns {}` | child | none | DNS service override: hand out another server, or opt out. |
 | `connect {}` | child | none | Cross-host segment peer over TCP, authenticated by the PSK from host config. |
 | `route {}` | children | none | Guest routes pushed via DHCP option 121. |
@@ -268,7 +301,10 @@ Validation enforces these rules:
 - The name is a DNS label and no other segment in the lab has it.
 - `subnet` is a well-formed CIDR, and no two declared subnets overlap.
 - `mtu` is between 576 and 65535.
-- Every name in `routes_to` is a segment declared in this lab.
+- Every name in `routes_to` is a segment declared in this lab, other than the
+  segment itself.
+- Neither side of `routes_to` is a `global` segment: daemon routing is
+  lab-local.
 - A `connect {}` child requires `global = true`; on a lab-local segment it
   would be ignored, so it is refused.
 - A segment with a machine gateway (a `nic` with `gateway = true`) cannot also
