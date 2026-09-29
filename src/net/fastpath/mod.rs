@@ -207,22 +207,24 @@ fn select(mode: FastpathMode) -> FastpathStatus {
     let tier = match mode {
         FastpathMode::Off => FastpathTier::Userspace,
         FastpathMode::Auto => {
-            if probe(FastpathTier::AfXdp, &mut reasons) {
+            let tier = if probe(FastpathTier::AfXdp, &mut reasons) {
                 FastpathTier::AfXdp
             } else {
-                // The sockmap tier works but measured ~8x SLOWER than the
-                // userspace fabric (every af_unix redirect rides the psock
-                // backlog workqueue, ~30µs/frame), so auto never picks it —
-                // it stays available for explicit evaluation.
-                reasons.push((
-                    FastpathTier::Sockmap.as_str(),
-                    "not used in auto mode: af_unix kernel splicing measures slower than \
-                     the userspace fabric (psock backlog workqueue); force with \
-                     `fastpath = \"sockmap\"` to evaluate it"
-                        .into(),
-                ));
                 FastpathTier::Userspace
-            }
+            };
+            // The sockmap tier works but measured ~8x SLOWER than the
+            // userspace fabric (every af_unix redirect rides the psock
+            // backlog workqueue, ~30µs/frame), so auto never picks it — it
+            // stays available for explicit evaluation. Said whichever tier
+            // won: auto skipped it either way.
+            reasons.push((
+                FastpathTier::Sockmap.as_str(),
+                "not used in auto mode: af_unix kernel splicing measures slower than \
+                 the userspace fabric (psock backlog workqueue); force with \
+                 `fastpath = \"sockmap\"` to evaluate it"
+                    .into(),
+            ));
+            tier
         }
         FastpathMode::Sockmap => {
             if probe(FastpathTier::Sockmap, &mut reasons) {
@@ -312,7 +314,7 @@ mod tests {
         let status = select(FastpathMode::Auto);
         let skipped: Vec<&str> = status.reasons.iter().map(|(t, _)| *t).collect();
         match status.tier {
-            FastpathTier::AfXdp => assert!(skipped.is_empty()),
+            FastpathTier::AfXdp => assert_eq!(skipped, vec!["sockmap"]),
             // Sockmap measured slower than the userspace fabric; auto must
             // never select it (explicit `fastpath = "sockmap"` only).
             FastpathTier::Sockmap => panic!("auto selected the demoted sockmap tier"),
