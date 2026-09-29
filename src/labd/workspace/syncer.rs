@@ -91,7 +91,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use super::apply::{Target, apply};
 use super::guest::{GuestFs, GuestWatch};
 use super::halt::{self, Halt};
-use super::ignore::TEMP_PREFIX;
+use super::ignore::{TEMP_PREFIX, is_syncer_own};
 use super::ledger::{Kind, Ledger};
 use super::locks;
 use super::plan::{Inputs, Oversize, Volume, Winner, reconcile};
@@ -1192,7 +1192,9 @@ async fn run(
                     WatchReport::Batch(entries) => {
                         draining = draining.saturating_sub(1);
                         let now = Instant::now();
-                        for entry in entries {
+                        // vmlab's own writes — the marker above all, written
+                        // *because* of a halt — are never the guest's work.
+                        for entry in entries.into_iter().filter(|e| !is_syncer_own(&e.path)) {
                             guest_debounce.touch(entry.path, now);
                         }
                     }
@@ -1314,7 +1316,7 @@ async fn settle_guest(
                 Some(WatchReport::Batch(entries)) => {
                     *draining -= 1;
                     let now = Instant::now();
-                    for entry in entries {
+                    for entry in entries.into_iter().filter(|e| !is_syncer_own(&e.path)) {
                         debounce.touch(entry.path, now);
                     }
                 }
@@ -1610,8 +1612,16 @@ async fn pass(
 
     // A walk can discover edits without a named event. Keep their digest
     // invalidations until the path is decided, including across a halt.
+    // What the rules make guest-owned is dropped from the guest's set: it is
+    // never decided, so carrying it would keep it owed — and listed as
+    // unsynced — forever.
     let mut rehash_host = pending.host_dirty.clone();
-    let mut rehash_guest = pending.guest_dirty.clone();
+    let mut rehash_guest: BTreeSet<String> = pending
+        .guest_dirty
+        .iter()
+        .filter(|path| !ignores.verdict(path, false).is_guest_owned())
+        .cloned()
+        .collect();
     for (tree, skips, rehash) in [
         (&scan.tree, &scan.skipped, &mut rehash_host),
         (&probe.tree, &probe.skipped, &mut rehash_guest),
@@ -3630,6 +3640,40 @@ mod tests {
         assert_eq!(
             guest.text("/src/main.rs").as_deref(),
             Some("the host's version")
+        );
+        syncers.stop("dev01").await;
+    }
+
+    /// The marker, and the temp it is renamed from, are the syncer's own
+    /// writes: the guest's watch reports them like any other, and a halted
+    /// workspace must not then list them as work the guest owes.
+    #[tokio::test]
+    async fn the_halt_marker_is_never_listed_as_unsynced_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
+        diverge(dir.path(), &guest, &sessions);
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
+        let marker = format!("/src/{}", halt::MARKER);
+        assert!(guest.text(&marker).is_some(), "no marker was written");
+        sessions.watcher.mark(&format!("{TEMP_PREFIX}halt"));
+        sessions.watcher.mark(halt::MARKER);
+
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        let report = syncer.pass_now().await.expect("no pass");
+        assert!(report.halt.is_some(), "the halt cleared by itself");
+        assert!(
+            report
+                .unsynced
+                .iter()
+                .all(|p| !p.starts_with(".vmlab-sync")),
+            "{:?}",
+            report.unsynced
+        );
+        assert!(
+            report.unsynced.contains(&"main.rs".to_string()),
+            "{:?}",
+            report.unsynced
         );
         syncers.stop("dev01").await;
     }

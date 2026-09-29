@@ -60,6 +60,20 @@ pub const TEMP_PREFIX: &str = ".vmlab-sync.";
 /// halt.
 const FLOOR: &[&str] = &[".vmlab-sync*", ".git/**/*.lock"];
 
+/// Whether `rel` is one of the syncer's own files — an apply's temp or the
+/// halt marker, both under the floor's `.vmlab-sync*` glob.
+///
+/// For deciding about a path before any repo rule has been read: what the
+/// guest's watch reports is filtered through this on receipt, so the syncer's
+/// own writes into the guest never become work the guest is said to owe.
+/// `.git`'s lock files are in the floor too but are *not* this: the watch
+/// reporting one is how a held lock defers the mutable set.
+pub fn is_syncer_own(rel: &str) -> bool {
+    rel.rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(".vmlab-sync"))
+}
+
 /// What the rules say about one path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -546,6 +560,21 @@ mod tests {
         let set = ignores(dir.path(), &[(".gitignore", "build/\n")]);
         assert_eq!(set.verdict("build", true), Verdict::GuestOwned);
         assert_eq!(set.verdict("build", false), Verdict::Synced);
+    }
+
+    #[test]
+    fn the_syncer_own_files_are_known_without_any_repo_rule() {
+        for own in [
+            ".vmlab-sync-halt",
+            ".vmlab-sync.halt",
+            "src/.vmlab-sync.a1b2",
+        ] {
+            assert!(is_syncer_own(own), "{own}");
+            assert!(Ignores::new().verdict(own, false).is_guest_owned(), "{own}");
+        }
+        // A git lock is floor, but the watch reporting it is the point.
+        assert!(!is_syncer_own(".git/index.lock"));
+        assert!(!is_syncer_own("src/main.rs"));
     }
 
     /// The floor is vmlab's own and no repo rule reaches it: an apply's temp
