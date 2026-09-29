@@ -709,13 +709,15 @@ impl ContainerInstance {
             )?;
             // The machine answers control shortly after spawn (-S leaves
             // CPUs paused); the hypervisor returns once it does.
+            let qemu_log = self.dirs.logs.join("qemu.log");
+            let log_from = crate::qemu::process::log_offset(&qemu_log);
             let super::hypervisor::Running { proc, control } = self
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
                     binary: qemu::emulator_binary(&self.resolved.arch),
                     args,
-                    log: self.dirs.logs.join("qemu.log"),
+                    log: qemu_log.clone(),
                     qmp_sock: self.dirs.qmp_sock(),
                     fds: Vec::new(),
                     channels: super::hypervisor::GuestChannels {
@@ -730,7 +732,7 @@ impl ContainerInstance {
 
             // QEMU creates the ctl socket at startup; retry briefly in
             // case we won the race.
-            let ctl = connect_ctl_retry(&self.dirs.ctl_sock(), &proc).await?;
+            let ctl = connect_ctl_retry(&self.dirs.ctl_sock(), &proc, &qemu_log, log_from).await?;
             *self.ctl.lock().await = Some(ctl.clone());
             // cinit blocks its boot on the spec. Send one now (the guest
             // port is usually already open); the ctl watcher re-answers
@@ -1402,13 +1404,20 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
     Ok(())
 }
 
-async fn connect_ctl_retry(sock: &Path, proc: &Arc<dyn Process>) -> Result<CtlHandle> {
+async fn connect_ctl_retry(
+    sock: &Path,
+    proc: &Arc<dyn Process>,
+    log: &Path,
+    log_from: u64,
+) -> Result<CtlHandle> {
     for _ in 0..100 {
         if !proc.is_running() {
-            bail!(
-                "QEMU exited during startup: {}",
-                proc.exit_status().unwrap_or_default()
-            );
+            return Err(crate::qemu::process::exited_during_startup(
+                "QEMU",
+                &proc.exit_status().unwrap_or_default(),
+                log,
+                log_from,
+            ));
         }
         match CtlHandle::connect(sock).await {
             Ok(c) => return Ok(c),
