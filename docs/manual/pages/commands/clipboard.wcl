@@ -29,7 +29,9 @@ page cmd_clipboard {
     lab daemon is started if none is running. The qualified form addresses a
     lab that is already running from any directory and never starts one. The
     machine must be running with an agent that advertises the `clipboard`
-    feature; see [vmlab machine capabilities](cmd_machine).
+    feature; see [vmlab machine capabilities](cmd_machine). The agent
+    advertises it only where it can reach a display server, so on a headless
+    guest both subcommands refuse with `the guest agent has no clipboard`.
   DOC
 
   h2 "vmlab clipboard get"
@@ -88,9 +90,10 @@ page cmd_clipboard {
 
   p <<DOC
     Exit status is 0 when the clipboard was read or written. Exit 4
-    (`not_found`) means the lab declares no machine by that name. A machine
-    that is not running, an agent that is not answering or lacks the
-    `clipboard` feature, and a request that times out all exit 1 (`failed`).
+    (`not_found`) means the lab declares no machine by that name. Exit 6
+    (`unsupported`) means the agent lacks the `clipboard` feature. A machine
+    that is not running, an agent that is not answering, and a request that
+    times out all exit 1 (`failed`).
     A qualified reference to a lab that is not running exits 1. A usage
     error exits 2.
   DOC

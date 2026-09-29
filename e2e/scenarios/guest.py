@@ -297,14 +297,15 @@ def _run(h):
             h.ok("agent.clipboard", s.code == 0 and g.out == "e2e-clip-42", f"round trip -> {g.out!r}")
         else:
             # A headless Linux agent has no display server to hold a clipboard
-            # and never advertises it; the verbs must then refuse (exit 1).
+            # and never advertises it, so both verbs must refuse by name
+            # (`unsupported`, exit 6). The real round trip needs a guest with a
+            # display server the agent can reach; this template has none.
             s = h.vmlab("clipboard", "set", VM, "e2e-clip-42", cwd=lab, check=False)
             g = h.vmlab("clipboard", "get", VM, cwd=lab, check=False, timeout=60)
-            h.ok("agent.clipboard", s.code == 1 and g.code == 1,
-                 f"agent lacks `clipboard`: set exit {s.code} ({s.text.strip()[:60]!r}), "
-                 f"get exit {g.code} ({g.text.strip()[:60]!r})"
-                 + (" — vmlab bug: set reports success with no clipboard feature (src/labd/mod.rs "
-                    "MachineClipboardSet has no feature gate)" if s.code == 0 else ""))
+            refused = all(r.code == 6 and "no clipboard" in r.text for r in (s, g))
+            h.ok("agent.clipboard", refused,
+                 f"agent lacks `clipboard`, both verbs refuse by name: set exit {s.code} "
+                 f"({s.text.strip()[:80]!r}), get exit {g.code} ({g.text.strip()[:80]!r})")
 
         # -- shell ----------------------------------------------------------------
         text, _ = pty_session(h, ["vmlab", "shell", VM], [(4, b"echo SHELL_$((6*7)) $(id -un)\r"), (3, b"\x1d")], lab, timeout=15)

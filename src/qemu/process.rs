@@ -156,6 +156,58 @@ impl Proc {
     }
 }
 
+/// How many of its last lines a process that died during startup is quoted
+/// by. QEMU says why in one or two; the rest is margin for a warning or two
+/// printed ahead of the fatal line.
+pub const STARTUP_TAIL_LINES: usize = 8;
+
+/// The length of `log` now: where the next run's output will start, since
+/// every run appends to the same file.
+pub fn log_offset(log: &Path) -> u64 {
+    std::fs::metadata(log).map(|m| m.len()).unwrap_or(0)
+}
+
+/// The error for a process that exited before it answered: its exit status,
+/// plus the last lines it wrote to `log` past `from`. The status alone
+/// (`exit status: 1`) never says why, and the reason otherwise only lives in
+/// `vmlab logs`.
+pub fn exited_during_startup(what: &str, status: &str, log: &Path, from: u64) -> anyhow::Error {
+    let tail = log_tail_since(log, from, STARTUP_TAIL_LINES);
+    if tail.is_empty() {
+        return anyhow::anyhow!("{what} exited during startup: {status}");
+    }
+    anyhow::anyhow!(
+        "{what} exited during startup: {status}\n{}",
+        tail.iter()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+/// The last `max` non-blank lines written to `log` past byte `from` — one
+/// run's output, when the file is appended to across runs. Reads at most the
+/// final 64 KiB; an unreadable log yields nothing.
+pub fn log_tail_since(log: &Path, from: u64, max: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 64 * 1024;
+    let Ok(mut file) = std::fs::File::open(log) else {
+        return Vec::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = from.max(len.saturating_sub(WINDOW)).min(len);
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(max)..]
+        .iter()
+        .map(|l| l.to_string())
+        .collect()
+}
+
 /// Is `bin` on PATH? Used by the lab daemon's pre-`up` binary check so a
 /// missing package is one clear error instead of a spawn failure mid-boot.
 pub fn binary_on_path(bin: &str) -> bool {
@@ -264,6 +316,45 @@ pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only this run's output is quoted: the log is appended to across runs,
+    /// and an earlier run's failure must not be passed off as this one's.
+    #[test]
+    fn a_startup_failure_quotes_only_this_runs_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("qemu.log");
+        std::fs::write(&log, "qemu: an older run's complaint\n").unwrap();
+        let from = log_offset(&log);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            b"\nqemu-system-x86_64: -drive file=/x.qcow2: Could not open '/x.qcow2'\n",
+        )
+        .unwrap();
+
+        let err = exited_during_startup("QEMU", "exit status: 1", &log, from).to_string();
+        assert!(
+            err.starts_with("QEMU exited during startup: exit status: 1\n"),
+            "{err}"
+        );
+        assert!(err.contains("Could not open '/x.qcow2'"), "{err}");
+        assert!(!err.contains("older run"), "{err}");
+
+        // Nothing written this run: the status alone.
+        let quiet = exited_during_startup("QEMU", "signal: 6", &log, log_offset(&log));
+        assert_eq!(quiet.to_string(), "QEMU exited during startup: signal: 6");
+    }
+
+    #[test]
+    fn the_tail_keeps_the_last_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("qemu.log");
+        let body: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&log, body).unwrap();
+        let tail = log_tail_since(&log, 0, 3);
+        assert_eq!(tail, vec!["line 17", "line 18", "line 19"]);
+        assert!(log_tail_since(&tmp.path().join("missing.log"), 0, 3).is_empty());
+    }
 
     #[tokio::test]
     async fn spawn_watch_exit() {

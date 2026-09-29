@@ -427,7 +427,13 @@ fn machine_detail(m: &MachineStatus) -> String {
                 vm.memory
                     .map_or("-".into(), crate::template::meta::format_size),
             );
-            field("agent", or_dash(vm.agent_version.as_deref()).to_string());
+            // The stamp names its own component (`agent=<rev>`,
+            // `agent-legacy=<rev>`); the field already says `agent=`.
+            let agent = vm
+                .agent_version
+                .as_deref()
+                .map(|v| v.strip_prefix("agent=").unwrap_or(v));
+            field("agent", or_dash(agent).to_string());
         }
         MachineDetail::Container(c) => {
             field(
@@ -1641,13 +1647,15 @@ pub fn cmd_logs(
         Some(t) => match split_vm_ref(t)? {
             (Some(lab), vm) => (lab, Some(vm)),
             (None, maybe_vm) => {
-                // Bare name: it's a VM in the cwd lab if that lab defines
-                // it, otherwise a lab name.
+                // Bare name: it's a machine (VM or container) in the cwd lab
+                // if that lab declares it, otherwise a lab name.
                 match current_lab() {
                     Ok((lab_name, root)) => {
                         let file = crate::config::load_lab_root(&root)
                             .map_err(|e| anyhow!("{:?}", miette::Report::new(e)))?;
-                        if file.lab.vms.iter().any(|v| v.name == maybe_vm) {
+                        if file.lab.vms.iter().any(|v| v.name == maybe_vm)
+                            || file.lab.containers.iter().any(|c| c.name == maybe_vm)
+                        {
                             (lab_name, Some(maybe_vm))
                         } else {
                             (maybe_vm, None)
@@ -1659,15 +1667,14 @@ pub fn cmd_logs(
         },
     };
 
-    let base = crate::paths::state_dir().join("labs").join(&lab);
-    let paths: Vec<std::path::PathBuf> = match &vm {
-        Some(vm) => {
-            let d = base.join("vms").join(vm);
-            vec![d.join("qemu.log"), d.join("serial.log")]
-        }
-        None => vec![base.join("events.jsonl")],
+    let base = crate::logs::lab_dir(&lab);
+    let existing: Vec<std::path::PathBuf> = match &vm {
+        Some(vm) => crate::logs::machine_files(&base, vm),
+        None => Some(base.join("events.jsonl"))
+            .filter(|p| p.exists())
+            .into_iter()
+            .collect(),
     };
-    let existing: Vec<_> = paths.into_iter().filter(|p| p.exists()).collect();
     if existing.is_empty() {
         bail!(
             "no logs found for {}{}",
@@ -1863,6 +1870,27 @@ mod tests {
             out.contains("state=stopping ready=no cached=yes health=- exit=-"),
             "got:\n{out}"
         );
+    }
+
+    /// The agent stamp already names its component, so it is shown once
+    /// rather than as `agent=agent=…`.
+    #[test]
+    fn verbose_shows_the_agent_stamp_without_doubling_its_prefix() {
+        let MachineDetail::Vm(mut detail) = vm() else {
+            unreachable!()
+        };
+        detail.agent_version = Some("agent=12858e1".into());
+        let out = render_status(
+            &lab(vec![addressed(
+                "dc01",
+                PowerState::Running,
+                true,
+                MachineDetail::Vm(detail),
+            )]),
+            true,
+        );
+        assert!(out.contains(" agent=12858e1"), "got:\n{out}");
+        assert!(!out.contains("agent=agent="), "got:\n{out}");
     }
 
     /// A machine a repair verb changed in place says so wherever its state is

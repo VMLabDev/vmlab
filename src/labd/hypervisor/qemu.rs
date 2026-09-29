@@ -71,9 +71,10 @@ impl Hypervisor for Qemu {
     }
 
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running> {
+        let log_from = crate::qemu::process::log_offset(&spec.log);
         let proc = Proc::spawn_with_fds(&spec.label, &spec.binary, &spec.args, &spec.log, spec.fds)
             .await?;
-        let qmp = connect_qmp_retry(&spec.qmp_sock, &proc).await?;
+        let qmp = connect_qmp_retry(&spec.qmp_sock, &proc, &spec.log, log_from).await?;
         // QEMU binds the guest channels itself, from the argv — this adapter
         // has nothing to stand up, only to say where they landed. It is the
         // first thing anyone wants when a terminal will not attach.
@@ -176,14 +177,22 @@ impl Control for QemuControl {
 }
 
 /// Wait for the emulator's QMP socket to accept a connection, failing fast if
-/// the process dies during startup.
-async fn connect_qmp_retry(sock: &Path, proc: &Arc<Proc>) -> Result<QmpClient> {
+/// the process dies during startup — quoting what it wrote to `log` past
+/// `log_from`, which is where QEMU says why.
+async fn connect_qmp_retry(
+    sock: &Path,
+    proc: &Arc<Proc>,
+    log: &Path,
+    log_from: u64,
+) -> Result<QmpClient> {
     for _ in 0..100 {
         if !proc.is_running() {
-            bail!(
-                "QEMU exited during startup: {}",
-                proc.exit_status().unwrap_or_default()
-            );
+            return Err(crate::qemu::process::exited_during_startup(
+                "QEMU",
+                &proc.exit_status().unwrap_or_default(),
+                log,
+                log_from,
+            ));
         }
         match QmpClient::connect(sock).await {
             Ok(c) => return Ok(c),
@@ -203,23 +212,29 @@ mod tests {
     #[tokio::test]
     async fn an_emulator_that_exits_during_startup_is_reported() {
         let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("qemu.log");
+        let log_from = crate::qemu::process::log_offset(&log);
         let proc = Proc::spawn(
             "qemu:test",
             "/bin/sh",
-            &["-c".to_string(), "exit 1".to_string()],
-            &dir.path().join("qemu.log"),
+            &[
+                "-c".to_string(),
+                "echo 'qemu-system-x86_64: Could not access KVM kernel module' >&2; exit 1"
+                    .to_string(),
+            ],
+            &log,
         )
         .await
         .unwrap();
         // Give it a moment to actually exit.
         let _ = proc.wait_exit(Duration::from_secs(5)).await;
-        let err = connect_qmp_retry(&dir.path().join("nope.sock"), &proc)
+        let err = connect_qmp_retry(&dir.path().join("nope.sock"), &proc, &log, log_from)
             .await
             .err()
             .expect("must fail");
-        assert!(
-            format!("{err:#}").contains("exited during startup"),
-            "{err:#}"
-        );
+        let err = format!("{err:#}");
+        assert!(err.contains("exited during startup"), "{err}");
+        // The reason QEMU gave, not only its exit status.
+        assert!(err.contains("Could not access KVM kernel module"), "{err}");
     }
 }

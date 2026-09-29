@@ -628,7 +628,7 @@ vmlab clipboard <COMMAND>
 | `set` | Set the guest clipboard from TEXT, or from stdin when TEXT is omitted. |
 | `-h`, `--help` | Print help. |
 
-The machine must be running with an agent that advertises the `clipboard` feature; see `vmlab machine capabilities`.
+The machine must be running with an agent that advertises the `clipboard` feature; see `vmlab machine capabilities`. The agent advertises it only where it can reach a display server, so on a headless guest both subcommands refuse with `the guest agent has no clipboard` and exit 6 (`unsupported`).
 
 ### vmlab clipboard get
 

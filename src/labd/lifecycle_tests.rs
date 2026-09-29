@@ -381,6 +381,40 @@ async fn stopping_a_stopped_container_is_a_no_op() {
     stops_idempotently(ctr).await;
 }
 
+/// A VM reports the hardware it resolved to (VM > template > profile), not
+/// what it declared: one that leaves its arch or size to its template must
+/// not show a dash for each.
+#[tokio::test]
+async fn a_vms_status_reports_its_resolved_hardware() {
+    let dirs = Dirs::new();
+    // Declares no cpus or memory; the arch is then taken from the template,
+    // which is what a registry template's metadata does.
+    let (vm, _hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB }"#,
+        Script::healthy(),
+    );
+    let parts = vm.template();
+    let mut resolved = parts.resolved.clone();
+    resolved.arch = "aarch64".into();
+    vm.set_template(TemplateParts {
+        resolved,
+        backing: parts.backing.clone(),
+        disk_size: parts.disk_size,
+        first_boot: None,
+        agent_version: parts.agent_version.clone(),
+    });
+
+    let m: Arc<dyn Machine> = vm.clone();
+    let crate::status::MachineDetail::Vm(detail) = m.status_detail().await else {
+        panic!("a VM reports VM detail");
+    };
+    let resolved = &vm.template().resolved;
+    assert_eq!(detail.arch.as_deref(), Some("aarch64"));
+    assert_eq!(detail.cpus, Some(resolved.cpus));
+    assert_eq!(detail.memory, Some(resolved.memory));
+}
+
 // ---- the VM start ladder ----------------------------------------------------
 
 /// The whole point of the seam: a VM's start ladder runs to completion with

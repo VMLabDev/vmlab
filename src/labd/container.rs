@@ -33,9 +33,21 @@ use crate::qmp::QmpClient;
 /// whatever the container writes.
 const SCRATCH_SIZE: u64 = 2 << 30;
 
-/// What to tell a user whose container has no answering vmlab-agent.
-const NO_AGENT_HINT: &str = "the guest has no running vmlab-agent (the guest boot asset predates \
-     it) — rebuild with guest/build-asset.sh and reinstall";
+/// What to tell a user whose container has no answering vmlab-agent. Every
+/// boot asset vmlab ships runs one, so a micro-VM that has not answered yet
+/// is far more likely still booting than built without it.
+fn no_agent_hint(answered_before: bool) -> String {
+    if answered_before {
+        "the container's vmlab-agent answered earlier but does not now — the micro-VM may be \
+         restarting or shutting down; retry once it is back"
+            .to_string()
+    } else {
+        "the container's vmlab-agent has not answered yet — the micro-VM is likely still \
+         booting; retry once `vmlab status` shows it ready (if it never answers, the guest boot \
+         asset may predate the agent: rebuild with guest/build-asset.sh and reinstall)"
+            .to_string()
+    }
+}
 
 pub struct ContainerDirs {
     /// `.vmlab/containers/<name>` — scratch qcow2, cfg/ (container.json).
@@ -481,8 +493,9 @@ impl ContainerInstance {
         if self.power_state().await != PowerState::Running {
             return Err(super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into());
         }
+        let hint = no_agent_hint(self.agent_up_flag().await);
         self.agent
-            .connect(&self.cfg.name, &self.dirs.agent_sock(), NO_AGENT_HINT)
+            .connect(&self.cfg.name, &self.dirs.agent_sock(), &hint)
             .await
     }
 
@@ -696,13 +709,15 @@ impl ContainerInstance {
             )?;
             // The machine answers control shortly after spawn (-S leaves
             // CPUs paused); the hypervisor returns once it does.
+            let qemu_log = self.dirs.logs.join("qemu.log");
+            let log_from = crate::qemu::process::log_offset(&qemu_log);
             let super::hypervisor::Running { proc, control } = self
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
                     binary: qemu::emulator_binary(&self.resolved.arch),
                     args,
-                    log: self.dirs.logs.join("qemu.log"),
+                    log: qemu_log.clone(),
                     qmp_sock: self.dirs.qmp_sock(),
                     fds: Vec::new(),
                     channels: super::hypervisor::GuestChannels {
@@ -717,7 +732,7 @@ impl ContainerInstance {
 
             // QEMU creates the ctl socket at startup; retry briefly in
             // case we won the race.
-            let ctl = connect_ctl_retry(&self.dirs.ctl_sock(), &proc).await?;
+            let ctl = connect_ctl_retry(&self.dirs.ctl_sock(), &proc, &qemu_log, log_from).await?;
             *self.ctl.lock().await = Some(ctl.clone());
             // cinit blocks its boot on the spec. Send one now (the guest
             // port is usually already open); the ctl watcher re-answers
@@ -1389,13 +1404,20 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
     Ok(())
 }
 
-async fn connect_ctl_retry(sock: &Path, proc: &Arc<dyn Process>) -> Result<CtlHandle> {
+async fn connect_ctl_retry(
+    sock: &Path,
+    proc: &Arc<dyn Process>,
+    log: &Path,
+    log_from: u64,
+) -> Result<CtlHandle> {
     for _ in 0..100 {
         if !proc.is_running() {
-            bail!(
-                "QEMU exited during startup: {}",
-                proc.exit_status().unwrap_or_default()
-            );
+            return Err(crate::qemu::process::exited_during_startup(
+                "QEMU",
+                &proc.exit_status().unwrap_or_default(),
+                log,
+                log_from,
+            ));
         }
         match CtlHandle::connect(sock).await {
             Ok(c) => return Ok(c),
@@ -1410,6 +1432,14 @@ mod tests {
     use super::*;
     use crate::config::model::{EnvVar, Healthcheck, ImageRef, Volume};
     use crate::oci::image::model::RuntimeDefaults;
+
+    #[test]
+    fn a_booting_container_is_told_it_is_booting() {
+        let booting = no_agent_hint(false);
+        assert!(booting.starts_with("the container's vmlab-agent has not answered yet"));
+        assert!(booting.contains("still booting"), "{booting}");
+        assert!(no_agent_hint(true).contains("answered earlier"));
+    }
 
     fn container(name: &str) -> model::Container {
         model::Container {

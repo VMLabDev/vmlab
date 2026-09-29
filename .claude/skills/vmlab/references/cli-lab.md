@@ -594,23 +594,24 @@ vmlab logs [OPTIONS] [TARGET]
 
 | Option | Meaning |
 | --- | --- |
-| `[TARGET]` | `[lab/][vm]`. Default: the lab of the current directory. |
+| `[TARGET]` | `[lab/][machine]`. Default: the lab of the current directory. |
 | `-f`, `--follow` | Keep following. |
 | `-n`, `--lines <LINES>` | Lines of history to show. Default: 100. |
 | `-o`, `--output <OUTPUT>` | Output format: `pretty`, human-readable and colorized on a terminal, or `jsonl`, one raw event per line. Default: `pretty`. |
 | `-h`, `--help` | Print help. |
 
 With no target the command shows the current lab's `events.jsonl`. A `lab/vm` target
-shows that VM's `qemu.log` and `serial.log`. A bare name is a VM when the current
-directory's lab declares it and a lab name otherwise, so `vmlab logs ad-lab` works from
+shows that VM's `qemu.log` and `serial.log`, and a `lab/container` target that
+container's `console.log`. A bare name is a machine when the current directory's lab
+declares it and a lab name otherwise, so `vmlab logs ad-lab` works from
 anywhere. When no matching log file exists the command refuses with `no logs found`.
 
 Each file is read from its end, so a serial log of tens of megabytes costs only the last
 `--lines`. When more than one file matches, each section is introduced with a
 `==> path <==` header. Event lines in `pretty` form show the local time, the event name,
-and the flattened data; QEMU and serial lines are printed as they are in both formats.
-With `--follow` the command polls the first matching file every half second and prints
-new lines until Ctrl-C.
+and the flattened data; QEMU, serial and console lines are printed as they are in both
+formats. With `--follow` the command polls the first matching file every half second and
+prints new lines until Ctrl-C.
 
 ```sh
 vmlab logs -f
