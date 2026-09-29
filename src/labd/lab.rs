@@ -217,6 +217,23 @@ impl std::fmt::Display for PullCancelled {
 
 impl std::error::Error for PullCancelled {}
 
+/// A VM's declaration as its machine runs it: the lab file's folder paths
+/// resolved against the lab root. The daemon's working directory is not the
+/// lab's, so a relative `disk { from }` left alone names a folder nobody
+/// meant — validation and template builds already read it from the root.
+fn rooted_vm_config(
+    vm_cfg: &crate::config::model::Vm,
+    root: &std::path::Path,
+) -> crate::config::model::Vm {
+    let mut cfg = vm_cfg.clone();
+    for d in &mut cfg.extra_disks {
+        if let Some(from) = &d.from {
+            d.from = Some(root.join(from));
+        }
+    }
+    cfg
+}
+
 impl LabRuntime {
     pub async fn build(
         config: LabFile,
@@ -351,7 +368,7 @@ impl LabRuntime {
                 .collect();
             let vm = VmInstance::new(
                 &name,
-                vm_cfg.clone(),
+                rooted_vm_config(vm_cfg, &root),
                 dirs,
                 macs,
                 nic_mtus,
@@ -2886,6 +2903,40 @@ lab "t" {
             crate::labd::vm::VM_READY_TIMEOUT,
             Duration::from_secs(600),
             "a VM waits 600s"
+        );
+    }
+
+    /// A relative `disk { from }` names a folder under the lab root, not the
+    /// daemon's working directory; an absolute one is left as written.
+    #[test]
+    fn disk_from_folders_resolve_against_the_lab_root() {
+        let root = std::path::Path::new("/labs/demo");
+        let lab = crate::config::load_lab_source(
+            r#"import <vmlab.wcl>
+            lab "l" {
+                vm "v" {
+                    template = "scratch"
+                    arch = "x86_64"
+                    disk = 1GiB
+                    disk "rel" { from = "./payload/" }
+                    disk "abs" { from = "/srv/payload" }
+                    disk "blank" { size = 1GiB }
+                }
+            }"#,
+            "<test>",
+            root,
+        )
+        .expect("parse")
+        .lab;
+        let cfg = rooted_vm_config(&lab.vms[0], root);
+        let from: Vec<_> = cfg.extra_disks.iter().map(|d| d.from.clone()).collect();
+        assert_eq!(
+            from,
+            [
+                Some(PathBuf::from("/labs/demo/payload/")),
+                Some(PathBuf::from("/srv/payload")),
+                None,
+            ]
         );
     }
 

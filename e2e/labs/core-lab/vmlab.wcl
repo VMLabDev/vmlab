@@ -1,10 +1,7 @@
 // The core scenario's lab: lifecycle, hardware and attached media.
 //
 // `cd.iso` and `fd.img` are built by the scenario from `cd/` before the lab
-// is validated, so no binary image is checked in. `@LABROOT@` is replaced
-// with the lab's absolute path: a relative `disk { from }` is resolved
-// against the daemon's working directory rather than the lab root (the
-// `core-diskfrom` lab records that), so this lab names it absolutely.
+// is validated, so no binary image is checked in.
 import <vmlab.wcl>
 
 lab "e2e-core" {
@@ -23,7 +20,7 @@ lab "e2e-core" {
     qemu_args = ["-smbios", "type=1,serial=E2E-QEMU-ARGS"]
     nic { segment = "lan" ip = "10.80.0.10" }
     disk "data" { size = 1GiB }
-    disk "payload" { from = "@LABROOT@/payload/" }
+    disk "payload" { from = "./payload/" }
     media { kind = "iso" from = "./media-iso/" label = "E2EMEDIA" }
   }
 

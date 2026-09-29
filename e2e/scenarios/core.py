@@ -106,12 +106,10 @@ def kv(text: str) -> dict[str, str]:
 
 def build_images(h, lab: pathlib.Path) -> None:
     """`cd.iso` and `fd.img` for the `cdrom`/`floppy` attachments, built from
-    `cd/` so no binary image is checked in; and the absolute `disk from`."""
+    `cd/` so no binary image is checked in."""
     h.run(["xorriso", "-as", "mkisofs", "-V", "E2ECDROM", "-o", str(lab / "cd.iso"), str(lab / "cd")])
     h.run(["mkfs.fat", "-C", "-n", "E2EFD", str(lab / "fd.img"), "1440"])
     h.run(["mcopy", "-i", str(lab / "fd.img"), str(lab / "cd" / "cdrom.txt"), "::/FD.TXT"])
-    wcl = lab / "vmlab.wcl"
-    wcl.write_text(wcl.read_text().replace("@LABROOT@", str(lab)))
 
 
 PROBE_VM01 = r"""
@@ -170,12 +168,6 @@ def _run(h):
         bad.code != 0 and "cpus" in bad.text and "at least 1" in bad.text,
         f"exit {bad.code}: " + next((l.strip(" ×") for l in bad.text.splitlines() if "at least" in l), bad.text.strip()[-120:]),
     )
-
-    # `disk "x" { from = "./rel/" }` as the docs write it: a relative folder.
-    with h.lab("core-diskfrom") as dlab:
-        rel = h.vmlab("up", cwd=dlab, check=False, timeout=300)
-        rel_ok = rel.code == 0
-        rel_detail = "relative `from` boots" if rel_ok else f"relative `from` fails: {rel.text.strip()[-120:]}"
 
     with h.lab("core-lab") as lab:
         build_images(h, lab)
@@ -244,12 +236,11 @@ def _run(h):
             2 * 1024 * 1024 in sizes.values(),
             f"guest block devices (512-byte sectors): {sizes}; data = 1GiB = 2097152",
         )
-        abs_ok = p.get("payload") == "disk-from payload e2e"
         h.ok(
             "vm.hw.disk-from",
-            abs_ok and rel_ok,
-            f"{rel_detail}; with an absolute `from` the FAT disk {p.get('payload_dev')} carries payload.txt={abs_ok}"
-            + ("" if rel_ok else " — vmlab bug: src/labd/vm.rs fat_disk_from_folder gets the unjoined relative path"),
+            p.get("payload") == "disk-from payload e2e",
+            f"relative `from = \"./payload/\"`: the FAT disk {p.get('payload_dev')} carries "
+            f"payload.txt={p.get('payload')!r}",
         )
         h.ok("vm.hw.cdrom", p.get("cdrom") == "cdrom attachment e2e", f"E2ECDROM mounted: cdrom.txt={p.get('cdrom')!r}")
         h.ok("vm.media.iso", p.get("media_iso") == "media iso e2e", f"E2EMEDIA mounted: {p.get('media_iso')!r}")
