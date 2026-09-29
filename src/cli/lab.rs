@@ -603,9 +603,33 @@ fn root_for(labs: &[Value], name: &str) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// The state `lab list` shows for one registry entry.
+///
+/// The registry knows only about the daemon, and a daemon stays up after
+/// `lab stop` with nothing running under it — so a running daemon whose
+/// machines are all stopped is listed `stopped`, as `lab info` would show
+/// it. An unreachable daemon keeps the registry's word.
+fn listed_state<'a>(registry: &'a str, status: Option<&LabStatus>) -> &'a str {
+    match status {
+        Some(status) if registry == "running" && status.all_stopped() => "stopped",
+        _ => registry,
+    }
+}
+
 fn cmd_lab_list(json: bool) -> Result<()> {
     rt()?.block_on(async {
-        let labs = registry_labs().await?;
+        let mut labs = registry_labs().await?;
+        for lab in &mut labs {
+            let registry = lab["state"].as_str().unwrap_or("?").to_string();
+            let status = match lab["name"].as_str() {
+                Some(name) if registry == "running" => match daemon::try_lab_daemon(name).await {
+                    Some(client) => lab_status(&client).await.ok(),
+                    None => None,
+                },
+                _ => None,
+            };
+            lab["state"] = Value::from(listed_state(&registry, status.as_ref()));
+        }
         if json {
             return super::print_json(&Value::Array(labs));
         }
@@ -1509,6 +1533,30 @@ pub fn cmd_run(script: &str) -> Result<()> {
     })
 }
 
+/// §19.6's sentence, for a snapshot verb that succeeded — `None` unless a
+/// machine it touched has a workspace. The refusals already carry it; a
+/// success is where a developer is left believing the snapshot holds their
+/// source, so it says it there too, and only where there is source to hold.
+fn backup_notice(status: &LabStatus, machine: Option<&str>) -> Option<&'static str> {
+    status
+        .machines
+        .iter()
+        .filter(|m| machine.is_none_or(|name| m.name == name))
+        .any(|m| m.dev.as_ref().is_some_and(|dev| dev.workspace.is_some()))
+        .then_some(crate::labd::workspace::bracket::NOT_A_BACKUP)
+}
+
+/// Print [`backup_notice`] after a snapshot verb, if it applies. Best-effort:
+/// the verb has already succeeded, and a status that cannot be read is not a
+/// reason to say it failed.
+async fn say_backup_notice(client: &LabClient, machine: Option<&str>) {
+    if let Ok(status) = lab_status(client).await
+        && let Some(notice) = backup_notice(&status, machine)
+    {
+        println!("{notice}");
+    }
+}
+
 pub fn cmd_snapshot(vm_ref: Option<String>, name: String) -> Result<()> {
     rt()?.block_on(async {
         let (lab, vm) = match &vm_ref {
@@ -1522,11 +1570,12 @@ pub fn cmd_snapshot(vm_ref: Option<String>, name: String) -> Result<()> {
         client
             .send(LabRequest::SnapshotTake {
                 name: name.clone(),
-                machine: vm,
+                machine: vm.clone(),
             })
             .await
             .map_err(remote)?;
         println!("snapshot \"{name}\" created");
+        say_backup_notice(&client, vm.as_deref()).await;
         Ok(())
     })
 }
@@ -1547,12 +1596,13 @@ pub fn cmd_restore(vm_ref: Option<String>, name: String, discard: bool) -> Resul
         client
             .send(LabRequest::SnapshotRestore {
                 name: name.clone(),
-                machine: vm,
+                machine: vm.clone(),
                 discard,
             })
             .await
             .map_err(remote)?;
         println!("snapshot \"{name}\" restored");
+        say_backup_notice(&client, vm.as_deref()).await;
         Ok(())
     })
 }
@@ -1727,8 +1777,8 @@ pub fn cmd_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        LabRequest, PowerOp, Region, format_log_line, pulling_machines, region_value, render_dns,
-        render_status, root_for,
+        LabRequest, PowerOp, Region, backup_notice, format_log_line, listed_state,
+        pulling_machines, region_value, render_dns, render_status, root_for,
     };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
@@ -1748,6 +1798,37 @@ mod tests {
             ip: Some("10.0.0.5".into()),
             ..crate::status::fixtures::machine(name, state, ready, detail)
         }
+    }
+
+    /// The success line names §19.6's sentence only where a touched machine
+    /// has a workspace.
+    #[test]
+    fn a_snapshot_success_says_it_is_no_backup_only_over_a_workspace() {
+        use crate::status::fixtures::{dev, machine};
+        let plain = machine("web", PowerState::Running, true, vm());
+        let status = lab(vec![
+            dev(machine("dev01", PowerState::Running, true, vm()), true),
+            plain,
+        ]);
+        let notice = crate::labd::workspace::bracket::NOT_A_BACKUP;
+        assert_eq!(backup_notice(&status, Some("dev01")), Some(notice));
+        assert_eq!(backup_notice(&status, None), Some(notice));
+        assert_eq!(backup_notice(&status, Some("web")), None);
+        let no_dev = lab(vec![machine("web", PowerState::Running, true, vm())]);
+        assert_eq!(backup_notice(&no_dev, None), None);
+    }
+
+    /// A daemon left up by `lab stop` is listed by what runs under it.
+    #[test]
+    fn lab_list_says_stopped_when_no_machine_runs() {
+        let m = |state| crate::status::fixtures::machine("vm01", state, false, vm());
+        let stopped = lab(vec![m(PowerState::Stopped)]);
+        let booting = lab(vec![m(PowerState::Stopped), m(PowerState::Running)]);
+        assert_eq!(listed_state("running", Some(&stopped)), "stopped");
+        assert_eq!(listed_state("running", Some(&booting)), "running");
+        // Unreachable: the registry's word stands.
+        assert_eq!(listed_state("running", None), "running");
+        assert_eq!(listed_state("failed", Some(&stopped)), "failed");
     }
 
     /// The table renders straight off a projection value — no lab, no daemon.

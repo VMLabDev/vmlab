@@ -357,13 +357,8 @@ def _run(h):
         )
 
         de = h.vmlab("destroy", cwd=lab, check=False, timeout=300)
-        # The supervisor reaps the lab daemon after the reply; give it a moment.
-        try:
-            after = h.wait_until(
-                lambda: (lambda o: o if "not running" in o else None)(h.vmlab("status", cwd=lab, check=False).out),
-                timeout=30, interval=1, what="the destroyed lab's daemon to go")
-        except ScenarioFailed as e:
-            after = str(e)
+        # Checked at once: destroy returns only once the lab daemon is gone.
+        after = h.vmlab("status", cwd=lab, check=False).out
         h.ok(
             "lab.destroy",
             de.code == 0 and f'lab "{LAB}" destroyed' in de.out and not (lab / ".vmlab").exists()

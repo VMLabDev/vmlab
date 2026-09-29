@@ -122,9 +122,10 @@ def run(h):
         h.check("dev.sync.modes", modes, "host 0755 run.sh runs in the guest; guest chmod +x build.sh runs on the host")
 
         def status_flush():
-            (lab / "ws1" / "flushed.txt").write_text("flush me\n")
+            # No wait before the flush: a completed flush carries every write
+            # made before it, the host one here still inside its debounce.
             gx(h, lab, "echo from-guest > /src/flushed-g.txt")
-            time.sleep(1)  # past the 250ms per-path debounce
+            (lab / "ws1" / "flushed.txt").write_text("flush me\n")
             f = h.vmlab("dev", "sync", "flush", M, cwd=lab)
             assert "is in step" in f.out, f.out
             assert "flush me" in guest_cat(h, lab, "flushed.txt")
@@ -138,10 +139,11 @@ def run(h):
         # -- snapshot bracket, part one: clean capture, restore re-seeds -------
         def capture_and_reseed():
             cap = h.vmlab("snapshot", "create", "clean", "--vm", M, cwd=lab)
-            assert "created" in cap.out, cap.out
+            assert "created" in cap.out and "not a workspace backup" in cap.out, cap.out
             gx(h, lab, "echo after-snapshot > /src/after.txt; echo scratch > /tmp/outside-workspace")
             h.wait_until(lambda: (lab / "ws1" / "after.txt").exists(), timeout=30, what="after.txt on the host")
-            h.vmlab("snapshot", "restore", "clean", "--vm", M, cwd=lab)
+            res = h.vmlab("snapshot", "restore", "clean", "--vm", M, cwd=lab)
+            assert "not a workspace backup" in res.out, res.out
             # Rewound: the guest-only scratch file outside the workspace is gone,
             # while the re-seed carries after.txt back from the host.
             gone = gx(h, lab, "test -e /tmp/outside-workspace", check=False).code != 0
@@ -154,7 +156,7 @@ def run(h):
             return True
 
         h.check("dev.snapshot-bracket", capture_and_reseed,
-                "clean capture; a restore rewound the guest and re-seeded after.txt from the host")
+                "clean capture; a restore rewound the guest and re-seeded after.txt from the host; both said snapshots are not a workspace backup")
 
         # Unsynced guest work, the slow way: a guest file still being written
         # sits inside its debounce window, so the pre-flight flush cannot carry it.

@@ -112,6 +112,15 @@ impl Registry {
     pub fn remove(&mut self, name: &str) {
         self.labs.retain(|l| l.name != name);
     }
+
+    /// Remove `name`'s entry only if it still describes the daemon `pid`.
+    ///
+    /// What a daemon's exit is allowed to clear: by the time an exit is
+    /// noticed the name may already belong to that daemon's successor, and
+    /// removing the successor's entry would orphan a running lab.
+    pub fn remove_daemon(&mut self, name: &str, pid: u32) {
+        self.labs.retain(|l| l.name != name || l.pid != pid);
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +166,24 @@ mod tests {
         registry
             .check_name("mylab", std::path::Path::new("/labs/mylab"))
             .unwrap();
+    }
+
+    #[test]
+    fn a_daemon_exit_clears_only_its_own_entry() {
+        let entry = |pid| LabEntry {
+            name: "mylab".into(),
+            root: PathBuf::from("/labs/mylab"),
+            pid,
+            state: LabState::Running,
+        };
+        let mut registry = Registry {
+            labs: vec![entry(84)],
+        };
+        // The old daemon (42) exiting after its successor (84) registered.
+        registry.remove_daemon("mylab", 42);
+        assert_eq!(registry.get("mylab").unwrap().pid, 84);
+        registry.remove_daemon("mylab", 84);
+        assert!(registry.get("mylab").is_none());
     }
 
     #[test]

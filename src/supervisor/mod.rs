@@ -38,6 +38,24 @@ pub struct Supervisor {
     shutting_down: std::sync::atomic::AtomicBool,
 }
 
+/// How long a release waits for a lab daemon's teardown before killing it
+/// and everything it owns. Teardown stops any machine still running, which is
+/// a guest shutdown per machine.
+const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether `pid` is a live process, as opposed to gone or a zombie nobody has
+/// reaped yet — an exited daemon this supervisor did not spawn can linger as
+/// one where PID 1 does not reap.
+fn process_running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next().map(|s| s != "Z"))
+        })
+        .unwrap_or(false)
+}
+
 /// Entry point for `vmlab __supervisord`.
 pub fn run() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -231,6 +249,23 @@ impl Supervisor {
         root: PathBuf,
     ) -> Result<PathBuf, CommandError> {
         let sock = crate::paths::lab_socket(name);
+        // A daemon still stopping holds the lab's disks, sockets and smbd
+        // port; a successor started beside it dies at `vm.starting`. Wait
+        // for the release under way rather than racing it.
+        let stopping = {
+            let reg = self.registry.lock().await;
+            reg.get(name)
+                .filter(|e| e.state == LabState::Stopping)
+                .map(|e| e.pid)
+        };
+        if let Some(pid) = stopping
+            && !self.wait_daemon_gone(name, pid, RELEASE_DEADLINE).await
+        {
+            return Err(CommandError::conflict(format!(
+                "lab daemon for {name} is still stopping; try again once `vmlab lab list` no \
+                 longer shows it"
+            )));
+        }
         {
             let reg = self.registry.lock().await;
             reg.check_name(name, &root)?;
@@ -297,13 +332,16 @@ impl Supervisor {
             let exited_cleanly = status.as_ref().is_ok_and(|s| s.success());
             let expected = exited_cleanly || {
                 let reg = sup.registry.lock().await;
+                // Only this daemon's own entry says whether its exit was
+                // asked for: the name may already belong to a successor.
                 reg.get(&lab_name)
+                    .filter(|e| e.pid == pid)
                     .map(|e| e.state == LabState::Stopping)
                     .unwrap_or(true)
             };
             if expected {
                 let mut reg = sup.registry.lock().await;
-                reg.remove(&lab_name);
+                reg.remove_daemon(&lab_name, pid);
                 reg.save();
             } else {
                 tracing::warn!("lab daemon {lab_name} exited unexpectedly: {status:?}");
@@ -371,13 +409,14 @@ impl Supervisor {
         let sock = crate::paths::lab_socket(name);
         // Captured before the entry can be removed — the orphan reaper needs it
         // to recognise this lab's smbd.
-        let root;
+        let (root, pid);
         {
             let mut reg = self.registry.lock().await;
             let Some(entry) = reg.get(name) else {
                 return Ok(());
             };
             root = entry.root.clone();
+            pid = entry.pid;
             reg.set_state(name, LabState::Stopping);
             reg.save();
         }
@@ -387,6 +426,24 @@ impl Supervisor {
         // stuck in Stopping forever.
         if let Ok(client) = LabClient::connect(&sock).await {
             let _ = client.send(LabRequest::Shutdown {}).await;
+            // The release is not done until the daemon is: `Shutdown` answers
+            // before its teardown runs, and a daemon still tearing down holds
+            // the clone disks, the QMP socket and the smbd port that the
+            // next `up` of this lab needs.
+            if !self.wait_daemon_gone(name, pid, RELEASE_DEADLINE).await {
+                tracing::warn!(
+                    "lab daemon for {name} did not stop within {}s; killing it",
+                    RELEASE_DEADLINE.as_secs()
+                );
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                crate::qemu::process::kill_lab_orphans(name, Some(&root));
+                let mut reg = self.registry.lock().await;
+                reg.remove_daemon(name, pid);
+                reg.save();
+            }
         } else {
             // The daemon is gone and can't have stopped anything it owned. Reap
             // the QEMU processes AND the helpers it orphaned (swtpm, virtiofsd,
@@ -401,6 +458,34 @@ impl Supervisor {
             reg.save();
         }
         Ok(())
+    }
+
+    /// Wait until the daemon `pid` no longer runs `name`, up to `deadline`.
+    /// Returns whether it went.
+    ///
+    /// Gone means its entry is gone — the reaper's doing for a daemon this
+    /// supervisor spawned — or the process is. A daemon adopted from an
+    /// earlier supervisor has no reaper, so its exit is noticed here and its
+    /// entry dropped here.
+    async fn wait_daemon_gone(&self, name: &str, pid: u32, deadline: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + deadline;
+        loop {
+            {
+                let mut reg = self.registry.lock().await;
+                if reg.get(name).is_none_or(|e| e.pid != pid) {
+                    return true;
+                }
+                if !process_running(pid) {
+                    reg.remove_daemon(name, pid);
+                    reg.save();
+                    return true;
+                }
+            }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Restart a lab daemon so it re-reads `vmlab.wcl` from disk (the web UI's
@@ -425,24 +510,10 @@ impl Supervisor {
             registry.get(name).is_some()
         };
         if registered {
+            // Returns once the old daemon is gone, so `ensure_lab` cannot
+            // see it still alive (state Running + socket up) and hand back
+            // the stale socket.
             self.release_lab(name).await?;
-            // Wait for the old daemon to fully exit before re-spawning. On a
-            // clean shutdown the reaper removes the registry entry; a daemon
-            // that was already dead was removed by `release_lab` directly.
-            // Without this, `ensure_lab` could see the still-alive old daemon
-            // (state Running + socket up) and hand back the stale socket.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                if self.registry.lock().await.get(name).is_none() {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(CommandError::failed(format!(
-                        "lab daemon for {name} did not stop in time"
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
         }
         self.ensure_lab_locked(name, root).await
     }
@@ -592,5 +663,26 @@ impl Handler<SupRequest> for SupervisorHandler {
                 Ok(json!(true))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_running;
+
+    #[test]
+    fn an_exited_child_is_not_running_before_it_is_reaped() {
+        assert!(process_running(std::process::id()));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        // Exited but not yet waited on: a zombie, which a release must treat
+        // as gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!process_running(pid));
+        child.wait().unwrap();
+        assert!(!process_running(pid));
     }
 }

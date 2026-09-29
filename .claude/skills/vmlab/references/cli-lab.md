@@ -456,8 +456,9 @@ vmlab lab list [OPTIONS]
 | `-h`, `--help` | Print help. |
 
 Prints one row per registered lab with `NAME`, `STATE` and `DIRECTORY`. The state is
-`running`, `stopping` or `failed`, the last meaning the daemon exited without being
-asked to. With no supervisor or an empty registry it prints `no running labs`. Under
+`running`, `stopped`, `stopping` or `failed`. `stopped` means the daemon is up with no
+machine running, as after `vmlab lab stop`. `failed` means the daemon exited without
+being asked to. With no supervisor or an empty registry it prints `no running labs`. Under
 `--json` each entry carries `name`, `root`, `pid` and `state`.
 
 ### vmlab lab info

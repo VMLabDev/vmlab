@@ -91,7 +91,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use super::apply::{Target, apply};
 use super::guest::{GuestFs, GuestWatch};
 use super::halt::{self, Halt};
-use super::ignore::TEMP_PREFIX;
+use super::ignore::{TEMP_PREFIX, is_syncer_own};
 use super::ledger::{Kind, Ledger};
 use super::locks;
 use super::plan::{Inputs, Oversize, Volume, Winner, reconcile};
@@ -157,6 +157,10 @@ const VERB_TIMEOUT: Duration = Duration::from_secs(120);
 /// as long as the developer happened not to type. Short, because a git lock is
 /// held for milliseconds and the cost of looking is one `lstat`.
 const LOCK_RETRY: Duration = Duration::from_secs(1);
+
+/// How long a verb waits for the guest to answer the drain its pass settles
+/// on — see [`settle_guest`].
+const SETTLE: Duration = Duration::from_secs(5);
 
 /// How many halted paths and named skips the projection carries.
 ///
@@ -793,6 +797,9 @@ async fn run(
     // skip.
     let mut prune = ledger.prune.clone();
     let mut guest_watch: Option<Box<dyn GuestWatch>> = None;
+    // Drains asked of the open watch and not yet answered, so a verb's settle
+    // knows which answer is its own.
+    let mut draining = 0u32;
     // A fresh run is a watch discontinuity by definition: nothing has been
     // drained yet, and the guest may have moved under a ledger that predates
     // this process.
@@ -930,6 +937,7 @@ async fn run(
             match opened {
                 Ok(watch) => {
                     guest_watch = Some(watch);
+                    draining = 0;
                     // Every (re)open is a discontinuity: what happened while
                     // there was no watch is exactly what the walk is for. The
                     // one exception is the open that follows a re-seed, where
@@ -960,6 +968,50 @@ async fn run(
             // waits for the *next* one — the pass under way was computed
             // without its resolution in hand.
             let serving = syncer.requested.load(Ordering::SeqCst);
+            // A verb is waiting on this pass, and `flush` promises every write
+            // made before it was issued. A save still between the kernel and
+            // the watcher, or still inside its quiet period, would otherwise
+            // be left out of the pass and the verb would answer "in step" over
+            // it. So everything already noticed is collected on both sides,
+            // the quiet period is **waited out rather than skipped**, and both
+            // sides are asked again: a path written before the verb and left
+            // alone since is carried, and a path still being written stays in
+            // flight — which is what a snapshot capture must refuse on, and
+            // what the debounce exists to keep from being read torn.
+            if serving > *syncer.served.borrow() {
+                for round in 0..2 {
+                    if round == 1 {
+                        if host_debounce.is_empty() && guest_debounce.is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(QUIET).await;
+                    }
+                    let now = Instant::now();
+                    for event in host_watch.settle() {
+                        match event {
+                            HostEvent::Touched(path) => host_debounce.touch(path, now),
+                            HostEvent::Rescan => rescan = true,
+                        }
+                    }
+                    if let Some(watch) = guest_watch.as_deref_mut()
+                        && let Err(e) =
+                            settle_guest(watch, &mut draining, &mut guest_debounce, &mut rescan)
+                                .await
+                    {
+                        drop_watch(
+                            &mut guest_watch,
+                            &mut rescan,
+                            &events,
+                            &workspace,
+                            &syncer,
+                            e,
+                        );
+                    }
+                }
+                let now = Instant::now();
+                host_dirty.extend(host_debounce.settled(now));
+                owed.extend(guest_debounce.settled(now));
+            }
             let drained = std::mem::take(&mut owed);
             let resolutions = syncer.take_resolutions();
             match pass(
@@ -1114,6 +1166,7 @@ async fn run(
                     // makes an idle workspace feel immediate; under load the
                     // set batches itself and this fires once.
                     WatchReport::Dirty => {
+                        draining += 1;
                         if let Some(watch) = &guest_watch
                             && let Err(e) = watch.drain().await
                         {
@@ -1137,8 +1190,11 @@ async fn run(
                     // The pass re-reads both, and that is where the named
                     // skip comes from.
                     WatchReport::Batch(entries) => {
+                        draining = draining.saturating_sub(1);
                         let now = Instant::now();
-                        for entry in entries {
+                        // vmlab's own writes — the marker above all, written
+                        // *because* of a halt — are never the guest's work.
+                        for entry in entries.into_iter().filter(|e| !is_syncer_own(&e.path)) {
                             guest_debounce.touch(entry.path, now);
                         }
                     }
@@ -1147,6 +1203,7 @@ async fn run(
                     // would let a compile stop the dev machine — but it does
                     // block both directions until the walk completes.
                     WatchReport::Rescan => {
+                        draining = draining.saturating_sub(1);
                         let why = "the guest's watch lost coverage, so the guest tree is walked \
                                    again; both directions wait for the walk rather than \
                                    propagating over changes the host cannot see yet";
@@ -1231,6 +1288,51 @@ fn drop_watch(
         rescan: Some(said),
         ..syncer.report()
     });
+}
+
+/// Ask the guest for its dirty set and wait for that answer, so a verb's pass
+/// sees every guest-side write the agent had noticed when the verb arrived.
+///
+/// Every drain already on the wire is answered first, in order, and a nudge
+/// that arrives meanwhile is answered with a drain of its own rather than
+/// swallowed — the agent sends one per window, and a lost one would leave
+/// its set undrained. Bounded: a guest slow to answer costs the verb the
+/// writes it has not reported yet, never the verb itself.
+async fn settle_guest(
+    watch: &mut dyn GuestWatch,
+    draining: &mut u32,
+    debounce: &mut Debounce,
+    rescan: &mut bool,
+) -> Result<()> {
+    watch.drain().await?;
+    *draining += 1;
+    let answered = async {
+        while *draining > 0 {
+            match watch.recv().await {
+                Some(WatchReport::Dirty) => {
+                    watch.drain().await?;
+                    *draining += 1;
+                }
+                Some(WatchReport::Batch(entries)) => {
+                    *draining -= 1;
+                    let now = Instant::now();
+                    for entry in entries.into_iter().filter(|e| !is_syncer_own(&e.path)) {
+                        debounce.touch(entry.path, now);
+                    }
+                }
+                Some(WatchReport::Rescan) => {
+                    *draining -= 1;
+                    *rescan = true;
+                }
+                Some(WatchReport::Error(msg)) => anyhow::bail!(msg),
+                None => anyhow::bail!("the guest's watch channel closed"),
+            }
+        }
+        Ok(())
+    };
+    tokio::time::timeout(SETTLE, answered)
+        .await
+        .unwrap_or(Ok(()))
 }
 
 /// The next thing the guest's watch says, or nothing at all while there is no
@@ -1510,8 +1612,16 @@ async fn pass(
 
     // A walk can discover edits without a named event. Keep their digest
     // invalidations until the path is decided, including across a halt.
+    // What the rules make guest-owned is dropped from the guest's set: it is
+    // never decided, so carrying it would keep it owed — and listed as
+    // unsynced — forever.
     let mut rehash_host = pending.host_dirty.clone();
-    let mut rehash_guest = pending.guest_dirty.clone();
+    let mut rehash_guest: BTreeSet<String> = pending
+        .guest_dirty
+        .iter()
+        .filter(|path| !ignores.verdict(path, false).is_guest_owned())
+        .cloned()
+        .collect();
     for (tree, skips, rehash) in [
         (&scan.tree, &scan.skipped, &mut rehash_host),
         (&probe.tree, &probe.skipped, &mut rehash_guest),
@@ -2650,6 +2760,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_carries_writes_made_just_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "seed").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        // Written and flushed at once: the path is still inside its quiet
+        // period when the flush's pass is computed.
+        for round in 0..5 {
+            let text = format!("edit {round}");
+            std::fs::write(dir.path().join("f.txt"), &text).unwrap();
+            let report = syncer.pass_now().await.unwrap();
+            assert_eq!(
+                guest.text("/src/f.txt").as_deref(),
+                Some(text.as_str()),
+                "flush answered before carrying a write made before it"
+            );
+            assert!(report.unsynced.is_empty(), "{:?}", report.unsynced);
+
+            // The guest half: noticed by the agent, not yet drained.
+            guest.file(&format!("/src/g{round}.txt"), &text, 42 + round);
+            sessions.watcher.mark(&format!("g{round}.txt"));
+            let report = syncer.pass_now().await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(format!("g{round}.txt"))).ok(),
+                Some(text.clone()),
+                "flush answered before carrying a guest write made before it"
+            );
+            assert!(report.unsynced.is_empty(), "{:?}", report.unsynced);
+        }
+        syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
+    async fn flush_leaves_a_guest_path_still_being_written_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "seed").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        let writer = {
+            let (guest, watcher) = (guest.clone(), sessions.watcher.clone());
+            tokio::spawn(async move {
+                for i in 0..40 {
+                    guest.file("/src/busy.txt", &i.to_string(), 100 + i);
+                    watcher.mark("busy.txt");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let report = syncer.pass_now().await.unwrap();
+        assert!(
+            report.unsynced.contains(&"busy.txt".to_string()),
+            "a path still moving must not be read by a flush: {:?}",
+            report.unsynced
+        );
+        writer.abort();
+        syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
     async fn watcher_events_detect_edits_with_unchanged_size_and_mtime() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
@@ -3466,6 +3640,40 @@ mod tests {
         assert_eq!(
             guest.text("/src/main.rs").as_deref(),
             Some("the host's version")
+        );
+        syncers.stop("dev01").await;
+    }
+
+    /// The marker, and the temp it is renamed from, are the syncer's own
+    /// writes: the guest's watch reports them like any other, and a halted
+    /// workspace must not then list them as work the guest owes.
+    #[tokio::test]
+    async fn the_halt_marker_is_never_listed_as_unsynced_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
+        diverge(dir.path(), &guest, &sessions);
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
+        let marker = format!("/src/{}", halt::MARKER);
+        assert!(guest.text(&marker).is_some(), "no marker was written");
+        sessions.watcher.mark(&format!("{TEMP_PREFIX}halt"));
+        sessions.watcher.mark(halt::MARKER);
+
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        let report = syncer.pass_now().await.expect("no pass");
+        assert!(report.halt.is_some(), "the halt cleared by itself");
+        assert!(
+            report
+                .unsynced
+                .iter()
+                .all(|p| !p.starts_with(".vmlab-sync")),
+            "{:?}",
+            report.unsynced
+        );
+        assert!(
+            report.unsynced.contains(&"main.rs".to_string()),
+            "{:?}",
+            report.unsynced
         );
         syncers.stop("dev01").await;
     }

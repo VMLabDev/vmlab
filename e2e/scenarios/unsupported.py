@@ -84,8 +84,6 @@ def fastpath(h):
             ok = h.check("net.fastpath.kernel", sockmap, "sockmap") and ok
         finally:
             h.vmlab("destroy", cwd=lab, timeout=300, check=False)
-            h.wait_until(lambda: subprocess.run(["pgrep", "-f", "__labd"], capture_output=True).returncode != 0,
-                         timeout=60, what="the lab daemon to exit")
             h.vmlab("daemon", "stop", check=False)
             h.vmlab("daemon", "start")
         if ok:

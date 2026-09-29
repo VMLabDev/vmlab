@@ -701,7 +701,7 @@ vmlab snapshot <COMMAND>
 
 A bare name, or no machine at all, is resolved against the lab in the current directory, and the lab daemon is started if none is running.
 
-Warning — snapshots are not a workspace backup: a dev machine's source lives on the host, which is what survives `destroy` and what a restore re-converges the guest from. Both `create` and `restore` print this sentence in their help, and their refusals are built on it.
+Warning — snapshots are not a workspace backup: a dev machine's source lives on the host, which is what survives `destroy` and what a restore re-converges the guest from. Both `create` and `restore` print this sentence in their help and after a success that touched a dev machine with a workspace, and their refusals are built on it.
 
 ### vmlab snapshot create
 
@@ -715,7 +715,7 @@ vmlab snapshot create [OPTIONS] <NAME>
 | `--vm <VM>` | Machine (`[lab/]name`); omitted = every VM and container in the lab. |
 | `-h`, `--help` | Print help. |
 
-Takes a snapshot named `NAME` of one machine, or, with no `--vm`, of every VM and container in the lab under the one name. A lab-wide snapshot is taken machine by machine; consistency across machines is best effort, not coordinated. Each snapshot is recorded in the lab's state with whether it was online and when it was taken, and for a container with the image digest it was taken against. Prints `snapshot "<name>" created`.
+Takes a snapshot named `NAME` of one machine, or, with no `--vm`, of every VM and container in the lab under the one name. A lab-wide snapshot is taken machine by machine; consistency across machines is best effort, not coordinated. Each snapshot is recorded in the lab's state with whether it was online and when it was taken, and for a container with the image digest it was taken against. Prints `snapshot "<name>" created`, followed by the workspace-backup warning when a snapshotted machine has a workspace.
 
 For a dev machine with a workspace, capture is bracketed by the workspace syncer (dev-machines.md). A sync pass is flushed first, so the snapshot is coherent with the canonical copy. If the guest holds work the host has never seen, because the syncer is halted, has not completed a pass, or could not finish the flush, the capture **refuses**, naming the machine and the outstanding paths. There is no escape flag: a snapshot of a tree that exists nowhere else is not a thing to take against a warning. `vmlab dev sync flush` waits for a pending pass; a halt has to be resolved first with `vmlab dev sync resolve`. Every other machine passes straight through.
 
@@ -732,7 +732,7 @@ vmlab snapshot restore [OPTIONS] <NAME>
 | `--discard-guest-changes` | Restore a machine whose workspace is halted, throwing the guest copy of every conflicting path away. |
 | `-h`, `--help` | Print help. |
 
-Rolls one machine, or every machine in the lab, back to the snapshot `NAME`. A machine with no snapshot by that name fails with `"<machine>" has no snapshot "<name>"`; in the lab-wide form the first such machine stops the whole restore. An online snapshot resumes running; an offline one leaves the machine stopped. A container's snapshot is pinned to the image digest it was taken against, and restoring it against a different pinned image is refused, naming both digests, with the remedies of destroying the machine or restoring the original pin. Prints `snapshot "<name>" restored`.
+Rolls one machine, or every machine in the lab, back to the snapshot `NAME`. A machine with no snapshot by that name fails with `"<machine>" has no snapshot "<name>"`; in the lab-wide form the first such machine stops the whole restore. An online snapshot resumes running; an offline one leaves the machine stopped. A container's snapshot is pinned to the image digest it was taken against, and restoring it against a different pinned image is refused, naming both digests, with the remedies of destroying the machine or restoring the original pin. Prints `snapshot "<name>" restored`, followed by the workspace-backup warning when a restored machine has a workspace.
 
 For a dev machine with a workspace, restore is bracketed too. A restore rewinds the guest by hundreds of files at once, which a bidirectional syncer cannot tell from the developer having edited them and would carry onto the canonical copy. So the syncer is taken off the workspace before the rewind, a note that a **re-seed** is owed is written to the sync ledger, and after the rewind the syncer goes back on and runs the re-seed: a host-only reconcile that carries the canonical tree back into the guest and emits no guest-to-host action at all, completing before the watch reopens. The note rides the ledger, so a daemon that dies mid-restore still owes it, and a restore that fails after the note is written still runs it, with the reason on the event feed.
 
@@ -870,7 +870,7 @@ vmlab dev sync flush [MACHINE]
 | `[MACHINE]` | Which dev machine, through the same ladder as `status`. |
 | `-h`, `--help` | Print help. |
 
-`flush` asks the syncer to run a pass now, waits for that pass to complete, and prints the same report `status` prints, so the effect of the flush is visible. It is the pass a snapshot capture runs first, and the way to make a host edit land before the debounce would. A halted workspace stays halted: a flush carries nothing across a halt. The wait gives up after 120 seconds and says to check `vmlab status` for whether the machine is still answering.
+`flush` asks the syncer to run a pass now, waits for that pass to complete, and prints the same report `status` prints, so the effect of the flush is visible. It is the pass a snapshot capture runs first. The pass carries every write made on either side before the flush and left alone since, waiting out the 250 ms quiet period for a path still inside it. A file still being written stays pending and is listed as not yet carried. A halted workspace stays halted: a flush carries nothing across a halt. The wait gives up after 120 seconds and says to check `vmlab status` for whether the machine is still answering.
 
 ```sh
 vmlab dev sync flush dev01

@@ -102,9 +102,10 @@ def fastpath(h):
     m = re.match(r"network fast path: (afxdp|sockmap|userspace) \(mode (\w+)\)", first)
     reasons = [l.strip() for l in r.out.splitlines()[1:] if "unavailable" in l]
     ok = r.code == 0 and m is not None
-    # Every tier not selected must say why it was skipped.
-    if ok and m.group(1) == "userspace":
-        ok = len(reasons) >= 2
+    # Under auto, every kernel tier not selected must say why it was skipped.
+    if ok and m.group(2) == "auto":
+        skipped = {t for t in ("afxdp", "sockmap") if t != m.group(1)}
+        ok = skipped <= {l.split()[0] for l in reasons}
     h.ok("net.fastpath", ok, f"{first}; {' | '.join(reasons)[:200]}" if ok else r.text.strip()[-300:])
 
 
