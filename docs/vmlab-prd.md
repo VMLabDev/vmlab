@@ -1155,7 +1155,13 @@ direction is replaced. An agent whose handshake predates the stamp is judged by
 the host's record — the asset last pushed into the machine, else the
 template's sealed `agent_version`. The machine is marked `diverged` exactly as
 a repair marks it, `machine.agent_updated` is emitted, and `up` prints
-`agent: updated "<vm>" (<old> → <new>)`. A refresh **never fails `up`**: a
+`agent: updated "<vm>" (<old> → <new>)`. **`up` never starts waiting on a
+machine just to refresh it**: the refresh runs inline only for a VM `up`
+already waits on — one with a first-boot, a provision or playbook, or a
+dependent. Any other VM (and every `vm start`) is refreshed in the background
+when it next reports ready, with the event, the daemon log and the diverged
+mark as its only report; a guest that never answers is never waited for. A
+refresh **never fails `up`**: a
 failure is a `warning:` naming the machine and the reason, the event carries
 the error, and the binary was staged beside the running one, so the old agent
 is left in place. It is skipped silently where it cannot apply — a container

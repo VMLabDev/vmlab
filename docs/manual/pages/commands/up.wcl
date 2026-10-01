@@ -50,7 +50,7 @@ page cmd_up {
     li "The host's QEMU, firmware and helper binaries are checked for every target machine."
     li "The bundled SMB server starts when the lab declares [shared folders](guide_shares), so shares are reachable during provisioning."
     li "Each wave boots in parallel. A machine carrying a first-boot script runs it before it counts as ready. If one machine in a wave fails, the rest of the wave is aborted and the verb fails; the machine that failed is left running for inspection."
-    li "Once a VM's agent answers, and after its first-boot script, `up` refreshes the agent if it is out of date (see below). This happens before any provision script for that VM runs."
+    li "For a VM that `up` waits on anyway, because it has a first-boot script, a provision or playbook, or a dependent, `up` refreshes the agent if it is out of date once it answers: after the first-boot script and before any provision (see below)."
     li "Between waves the daemon runs every provision script and playbook whose machine has started, in declaration order, waiting for each machine's readiness first."
     li "Port forwards are installed, and the workspace syncer starts for every dev machine that declares a workspace (see [Dev machines and the workspace syncer](guide_dev))."
   }
@@ -85,11 +85,18 @@ page cmd_up {
     The VM is then **diverged**: its template's sealed `agent_version` no
     longer describes it, and [vmlab status](cmd_status) `-v` shows
     `diverged=yes` until its disks are destroyed. The refresh also emits
-    `machine.agent_updated` (see the [event list](ref_events)). `vmlab vm
-    start` refreshes the same way. The refresh runs after the first-boot
-    script, because that script belongs to the template and was written for
-    the agent the template sealed, and before every provision script, so
-    provisions see the current agent.
+    `machine.agent_updated` (see the [event list](ref_events)). The refresh
+    runs after the first-boot script, because that script belongs to the
+    template and was written for the agent the template sealed, and before
+    every provision script, so provisions see the current agent.
+  DOC
+  p <<DOC
+    `up` never starts waiting on a VM just to refresh its agent. A VM with no
+    first-boot script, no provision or playbook and nothing depending on it is
+    refreshed in the background when it reports ready, after `up` has
+    returned. Its line goes to the lab daemon's log instead of your terminal;
+    the event and `diverged=yes` report it as usual. `vmlab vm start` always
+    refreshes this way. A guest that never answers is never waited for.
   DOC
   p <<DOC
     A refresh never fails `up`. If it fails, `up` prints a `warning:` line

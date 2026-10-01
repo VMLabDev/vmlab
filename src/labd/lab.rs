@@ -80,6 +80,12 @@ pub struct LabRuntime {
     /// verifies the agent itself, and the artefact it seals must carry the
     /// agent the build staged, not one pushed over it mid-build.
     pub agent_updates: std::sync::atomic::AtomicBool,
+    /// Machines whose agent refresh waits for their next ready, because
+    /// nothing in the `up` (or `vm start`) that booted them waits on their
+    /// agent (§19.4). Claimed — removed — by whichever comes first, the
+    /// ready callback or the starter seeing the machine already ready, so
+    /// a refresh runs at most once per start.
+    deferred_refresh: std::sync::Mutex<HashSet<String>>,
     /// Host config loaded once at build (config-weave binary dir, …).
     pub host_cfg: crate::config::host::HostConfig,
     /// In-flight config-weave runs, one per machine (`up` and on-demand
@@ -533,6 +539,7 @@ impl LabRuntime {
             pre_provision: std::sync::RwLock::new(None),
             provisions_wait_ready: std::sync::atomic::AtomicBool::new(true),
             agent_updates: std::sync::atomic::AtomicBool::new(true),
+            deferred_refresh: std::sync::Mutex::new(HashSet::new()),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
@@ -583,6 +590,7 @@ impl LabRuntime {
             // which a test must not depend on. The tests of the refresh turn
             // it on and supply their own asset.
             agent_updates: std::sync::atomic::AtomicBool::new(false),
+            deferred_refresh: std::sync::Mutex::new(HashSet::new()),
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
@@ -1236,6 +1244,45 @@ impl LabRuntime {
             .await
     }
 
+    /// Start `m` with its agent refresh deferred to its ready, so the caller
+    /// waits on nothing it did not wait on before (§19.4). A machine that
+    /// never becomes ready — a guest that cannot answer — is never refreshed
+    /// and never waited for.
+    pub async fn start_with_deferred_refresh(self: &Arc<Self>, m: &Arc<dyn Machine>) -> Result<()> {
+        let name = m.name().to_string();
+        self.deferred_refresh.lock_recover().insert(name.clone());
+        self.start_machine(&name).await?;
+        // Already running and ready, so no ready callback is coming.
+        if m.is_ready().await {
+            self.claim_deferred_refresh(&name);
+        }
+        Ok(())
+    }
+
+    /// Run a deferred refresh for `machine` in the background, if one is
+    /// still owed. Nobody is reading an `up`'s output by now, so what it says
+    /// goes to the daemon log; the event and the diverged mark are the same
+    /// as an inline refresh's.
+    fn claim_deferred_refresh(&self, machine: &str) {
+        if !self.deferred_refresh.lock_recover().remove(machine) {
+            return;
+        }
+        let me = self.arc();
+        let Ok(m) = me.machine(machine) else {
+            return;
+        };
+        let name = machine.to_string();
+        tokio::spawn(async move {
+            let log: crate::scripting::OutputSink = {
+                let name = name.clone();
+                Arc::new(move |line: String| {
+                    tracing::info!(machine = %name, "{}", line.trim_end());
+                })
+            };
+            me.refresh_agent(&m, &log).await;
+        });
+    }
+
     /// [`refresh_agent`](Self::refresh_agent) with the asset lookup supplied,
     /// which is the seam the tests run through.
     pub(super) async fn refresh_agent_with(
@@ -1502,9 +1549,22 @@ impl LabRuntime {
                 let me = self.clone();
                 let n = name.clone();
                 let out = output.clone();
+                // Whether `up` waits on this machine's agent anyway: a
+                // first-boot runs on it, a provision or playbook is scoped to
+                // it, or a later wave depends on it. Only those get the agent
+                // refresh inline (§19.4); `up` must not start waiting on a
+                // machine nothing waits for — one whose guest can never answer
+                // would hold it for the whole ready timeout.
+                let waited = me.machine(&n)?.pending_first_boot().is_some()
+                    || steps.iter().any(|s| s.machine == n)
+                    || me.has_dependents(&n);
                 wave_tasks.spawn(async move {
-                    me.start_machine(&n).await?;
                     let m = me.machine(&n)?;
+                    if waited {
+                        me.start_machine(&n).await?;
+                    } else {
+                        me.start_with_deferred_refresh(&m).await?;
+                    }
                     // Detached, so provisions can rely on the shares (§7.5)
                     // without the wave blocking on the mount retry window. A
                     // machine whose guest mounts for itself does nothing here.
@@ -1517,7 +1577,9 @@ impl LabRuntime {
                     // first-boot script is the template's and runs under the
                     // agent the template sealed; every provision after it
                     // sees the current one. Never fails the wave.
-                    me.refresh_agent(&m, &out).await;
+                    if waited {
+                        me.refresh_agent(&m, &out).await;
+                    }
                     // See `LabRuntime::pre_provision`.
                     let hook = me.pre_provision.read().expect("pre_provision lock").clone();
                     if let Some(hook) = hook {
@@ -2413,6 +2475,9 @@ impl crate::labd::machine::LabServices for LabRuntime {
     }
 
     async fn machine_ready(&self, machine: &str) {
+        // An agent refresh `up` deferred because nothing waited on this
+        // machine (§19.4). Backgrounded: forwards below must not wait on it.
+        self.claim_deferred_refresh(machine);
         let scope = [machine.to_string()];
         // Readiness is the agent's handshake, which a guest can give before
         // its DHCP client has a lease. A machine with forwards waits a while
@@ -2980,6 +3045,42 @@ lab "t" {
         lab.up(&[], sink.clone())
             .await
             .expect("up never fails on a refresh");
+    }
+
+    /// `up` does not start waiting on a machine nothing waits for just to
+    /// refresh its agent (§19.4): a guest that can never answer — an unsigned
+    /// bootloader under secure boot — would otherwise hold `up` for the whole
+    /// ready timeout. Its refresh is owed to its ready instead, and the ready
+    /// callback claims it.
+    #[tokio::test]
+    async fn a_machine_nothing_waits_on_is_refreshed_at_its_ready_not_by_blocking_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "silent" { template = "x86_64/t" }
+}"#,
+            vec![FakeMachine::never_ready("silent", MachineKind::Vm, &sh)],
+        );
+        lab.agent_updates
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        tokio::time::timeout(Duration::from_secs(10), lab.up(&[], quiet()))
+            .await
+            .expect("up returns without waiting on the agent")
+            .expect("up");
+        assert!(
+            lab.deferred_refresh.lock_recover().contains("silent"),
+            "the refresh is owed to the machine's ready"
+        );
+
+        super::super::machine::LabServices::machine_ready(lab.as_ref(), "silent").await;
+        assert!(
+            !lab.deferred_refresh.lock_recover().contains("silent"),
+            "the ready claims it, once"
+        );
     }
 
     /// The `vm` block's `agent_update` beats the `lab` block's, and the floor

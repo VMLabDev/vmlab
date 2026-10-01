@@ -51,9 +51,9 @@ Inside the daemon, `up` works through a plan computed before anything is touched
    before it counts as ready. If one machine in a wave fails, the rest of the wave
    is aborted and the verb fails; the machine that failed is left running for
    inspection.
-   Once a VM's agent answers, and after its first-boot script, `up` refreshes the
-   agent if it is out of date (see "Agent refresh" below), before any provision
-   for that VM runs.
+   For a VM `up` waits on anyway (first-boot, a provision or playbook, or a
+   dependent), `up` refreshes the agent if it is out of date once it answers,
+   after first-boot and before any provision (see "Agent refresh" below).
 6. Between waves the daemon runs every provision script and playbook whose machine
    has started, in declaration order, waiting for each machine's readiness first.
 7. Port forwards are installed, and the workspace syncer starts for every dev
@@ -81,7 +81,10 @@ it pushes the shipped agent the way `vmlab machine repair-agent` does, marks the
 **diverged** (`diverged=yes` in `status -v`), emits `machine.agent_updated`, and
 prints `agent: updated "<vm>" (<old> → <new>)`. It runs after the first-boot script
 (the template's, written for the agent it sealed) and before every provision.
-`vmlab vm start` does the same. A failed refresh never fails `up`: it prints
+`up` never starts waiting on a VM just to refresh it: a VM with no first-boot, no
+provision or playbook and no dependent (and every `vmlab vm start`) is refreshed in
+the background when it reports ready, its line going to the lab daemon's log; the
+event and `diverged=yes` still report it. A failed refresh never fails `up`: it prints
 `warning: agent: could not update "<vm>" …` with the reason and the old agent stays
 in place. Containers, the legacy agent tier, and VMs whose template sealed no agent
 are skipped silently. `agent_update = false` on a `vm` (or on the `lab`, for every
