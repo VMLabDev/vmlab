@@ -78,6 +78,8 @@ struct VmPlan {
 pub struct LabSmb {
     listen_port: u16,
     smb_dir: PathBuf,
+    /// Where smbd's sockets go ([`crate::paths::smb_runtime_dir`]).
+    run_dir: PathBuf,
     vms: HashMap<String, VmPlan>,
     server: Option<SmbServer>,
 }
@@ -126,6 +128,7 @@ impl LabSmb {
         }
         LabSmb {
             listen_port,
+            run_dir: crate::paths::smb_runtime_dir(&smb_dir),
             smb_dir,
             vms: plans,
             server: None,
@@ -170,6 +173,7 @@ impl LabSmb {
         SmbConfig {
             listen_port: self.listen_port,
             lab_dir: self.smb_dir.clone(),
+            run_dir: self.run_dir.clone(),
             shares,
             any_smb1,
         }
@@ -352,6 +356,10 @@ mod tests {
         assert!(cfg.any_smb1); // xp share is smb1
         assert_eq!(cfg.shares.len(), 2);
         assert_eq!(cfg.lab_dir, PathBuf::from("/lab/.vmlab/smb"));
+        assert_eq!(
+            cfg.run_dir,
+            crate::paths::smb_runtime_dir(Path::new("/lab/.vmlab/smb"))
+        );
         // each share scoped to the lab's authenticated account
         let data = cfg.shares.iter().find(|s| s.name == "data").unwrap();
         assert_eq!(data.allowed_user, config::current_unix_user());

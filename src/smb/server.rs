@@ -8,8 +8,10 @@
 //! 1. **High port.** `smbd` listens on a port > 1024 (`smb ports =`), which any
 //!    user may bind. The switch proxies the segment gateway's 445 onto it.
 //! 2. **Relocated state.** Every Samba private/state/cache/lock/pid directory
-//!    is moved under the lab's `.vmlab/smb` directory (see [`super::config`]),
-//!    all of which the invoking user owns.
+//!    is moved somewhere the invoking user owns (see [`super::config`]): the
+//!    persistent ones under the lab's `.vmlab/smb`, the ones smbd binds unix
+//!    sockets in under a short per-lab directory in vmlab's runtime dir, so a
+//!    lab in a deep directory cannot push a socket path past `sun_path`.
 //! 3. **`force user`.** Each share accesses the host tree as the invoking unix
 //!    user, so `smbd` never needs to switch to another uid.
 //!
@@ -55,8 +57,14 @@ pub enum SmbError {
     CreateUser { user: String, detail: String },
     #[error("spawning smbd failed: {0}")]
     Spawn(std::io::Error),
-    #[error("smbd exited immediately (code {code:?}); check log {log}")]
-    DiedOnStart { code: Option<i32>, log: PathBuf },
+    #[error("smbd exited immediately (code {code:?}): {reason}; check log {log}")]
+    DiedOnStart {
+        code: Option<i32>,
+        /// smbd's own last words — its log normally holds nothing, because
+        /// the startup failures it hits are logged below `log level = 1`.
+        reason: String,
+        log: PathBuf,
+    },
 }
 
 type Result<T> = std::result::Result<T, SmbError>;
@@ -85,11 +93,15 @@ impl SmbServer {
             path: config.lab_dir.clone(),
             source,
         })?;
-        let ncalrpc = config.lab_dir.join("ncalrpc");
-        std::fs::create_dir_all(&ncalrpc).map_err(|source| SmbError::StateDir {
-            path: ncalrpc,
-            source,
-        })?;
+        // The socket directories: private (they sit in the runtime dir, beside
+        // vmlab's own control sockets) and bounded in length.
+        let ncalrpc = config.ncalrpc_dir();
+        crate::paths::ensure_private_dir(&config.run_dir)
+            .and_then(|()| crate::paths::ensure_private_dir(&ncalrpc))
+            .map_err(|e| SmbError::StateDir {
+                path: ncalrpc.clone(),
+                source: std::io::Error::other(format!("{e:#}")),
+            })?;
         clear_stale_pidfile(&config);
 
         // 2. Write smb.conf.
@@ -148,8 +160,13 @@ impl SmbServer {
         // Give smbd a beat; if it immediately died (e.g. port in use), report.
         std::thread::sleep(std::time::Duration::from_millis(300));
         if let Ok(Some(status)) = child.try_wait() {
+            let reason = diagnose_start_failure(&config)
+                .or_else(|| last_log_line(&log))
+                .unwrap_or_else(|| "smbd gave no reason".to_string());
+            remove_run_dir(&config);
             return Err(SmbError::DiedOnStart {
                 code: status.code(),
+                reason,
                 log,
             });
         }
@@ -164,13 +181,15 @@ impl SmbServer {
         self.config.listen_port
     }
 
-    /// Kill the `smbd` child and reap it.
+    /// Kill the `smbd` child and reap it, then remove its socket directory
+    /// from the runtime dir — nothing in it outlives the process.
     pub fn stop(&mut self) {
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
         }
         clear_stale_pidfile(&self.config);
+        remove_run_dir(&self.config);
     }
 }
 
@@ -201,6 +220,75 @@ fn clear_stale_pidfile(config: &SmbConfig) {
     {
         tracing::debug!(path = %path.display(), %error, "failed to remove stale smbd pidfile");
     }
+}
+
+/// Remove the lab's smbd socket directory ([`SmbConfig::run_dir`]) unless its
+/// pidfile still names a live process — another smbd for the same lab, which
+/// is left alone exactly as [`clear_stale_pidfile`] leaves its pidfile.
+fn remove_run_dir(config: &SmbConfig) {
+    if config.pid_path().exists() {
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(&config.run_dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(path = %config.run_dir.display(), %error, "failed to remove smbd run dir");
+    }
+}
+
+/// Why smbd died at start. Its startup failures (`messaging_dgm_ref failed:
+/// File name too long`, a port already bound) are logged at debug level 2,
+/// below the `log level = 1` the server runs at, so they never reach its log
+/// and stderr is silent. Re-run it once with that level on stdout and keep
+/// its last word. Bounded: a re-run that does come up is killed.
+fn diagnose_start_failure(config: &SmbConfig) -> Option<String> {
+    let mut child = Command::new("smbd")
+        .arg("-F")
+        .arg("--no-process-group")
+        .arg("-s")
+        .arg(config.conf_path())
+        .arg("-l")
+        .arg(&config.lab_dir)
+        .arg("--debug-stdout")
+        .arg("-d")
+        .arg("2")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().ok()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    last_reason(&text)
+}
+
+/// The last line of smbd output that says something: not blank, not a debug
+/// header (`[2026/10/01 11:05:00,  2] file.c:12(fn)`) and not the start-up
+/// banner every run prints.
+fn last_reason(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .rfind(|l| {
+            !l.is_empty()
+                && !l.starts_with('[')
+                && !l.starts_with("smbd version")
+                && !l.starts_with("Copyright")
+                && !l.starts_with("uid=")
+        })
+        .map(str::to_string)
+}
+
+fn last_log_line(log: &std::path::Path) -> Option<String> {
+    last_reason(&std::fs::read_to_string(log).ok()?)
 }
 
 /// Create a passdb account with `pdbedit`, piping the password twice on stdin.
@@ -300,6 +388,7 @@ mod tests {
     fn test_config(dir: PathBuf) -> SmbConfig {
         SmbConfig {
             listen_port: 14450,
+            run_dir: dir.join("run"),
             lab_dir: dir,
             any_smb1: false,
             shares: vec![],
@@ -313,8 +402,8 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ));
-        std::fs::create_dir_all(&tmp).unwrap();
         let config = test_config(tmp.clone());
+        std::fs::create_dir_all(&config.run_dir).unwrap();
 
         std::fs::write(config.pid_path(), "2147483647\n").unwrap();
         clear_stale_pidfile(&config);
@@ -337,9 +426,12 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let child = Command::new("sleep").arg("60").spawn().unwrap();
         let pid = child.id() as i32;
+        let config = test_config(tmp.clone());
+        std::fs::create_dir_all(config.ncalrpc_dir()).unwrap();
+        let run_dir = config.run_dir.clone();
         let mut server = SmbServer {
             child: Some(child),
-            config: test_config(tmp.clone()),
+            config,
         };
 
         server.stop();
@@ -347,6 +439,8 @@ mod tests {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
             Err(nix::errno::Errno::ESRCH)
         );
+        // The socket directory goes with the process.
+        assert!(!run_dir.exists());
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -358,8 +452,11 @@ mod tests {
             return;
         }
 
+        // A lab deep enough that the old layout (sockets under `.vmlab/smb`)
+        // put `msg.sock/<pid>` past sun_path's 108 bytes and smbd died at start.
         let tmp = std::env::temp_dir().join(format!("vmlab-smb-test-{}", std::process::id()));
-        let smb_dir = tmp.join(".vmlab/smb");
+        let smb_dir = tmp.join("d".repeat(120)).join(".vmlab/smb");
+        assert!(smb_dir.as_os_str().len() > 120);
         let share_dir = tmp.join("share");
         std::fs::create_dir_all(&share_dir).unwrap();
         std::fs::write(share_dir.join("hello.txt"), b"hi").unwrap();
@@ -367,71 +464,123 @@ mod tests {
         // The unprivileged passdb requires a real Unix account; use ours.
         let user = super::super::config::current_unix_user();
         let pass = "TestPass123abc";
-        let port = free_high_port();
 
-        let config = SmbConfig {
-            listen_port: port,
-            lab_dir: smb_dir.clone(),
-            any_smb1: false,
-            shares: vec![ShareDef {
-                name: "testshare".to_string(),
-                host_path: share_dir.clone(),
-                readonly: true,
-                smb1: false,
-                allowed_user: user.to_string(),
-            }],
-        };
+        // Twice: the second start finds the passdb (kept with the lab) from
+        // the first but a fresh runtime directory, as after any `down`/`up`.
+        for round in 0..2 {
+            let port = free_high_port();
+            let config = SmbConfig {
+                listen_port: port,
+                run_dir: crate::paths::smb_runtime_dir(&smb_dir),
+                lab_dir: smb_dir.clone(),
+                any_smb1: false,
+                shares: vec![ShareDef {
+                    name: "testshare".to_string(),
+                    host_path: share_dir.clone(),
+                    readonly: true,
+                    smb1: false,
+                    allowed_user: user.to_string(),
+                }],
+            };
 
-        let mut creds = HashMap::new();
-        creds.insert(user.to_string(), pass.to_string());
+            let mut creds = HashMap::new();
+            creds.insert(user.to_string(), pass.to_string());
 
-        let server = match SmbServer::spawn(config, creds) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("SKIP: could not spawn smbd: {e}");
+            let server = match SmbServer::spawn(config, creds) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    // The lab-path defect this layout fixes is never a skip.
+                    assert!(!e.to_string().contains("too long"), "{e}");
+                    eprintln!("SKIP: could not spawn smbd: {e}");
+                    return;
+                }
+            };
+
+            // Wait until the port accepts connections (smbd init can be slow).
+            let mut connected = false;
+            for _ in 0..50 {
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    connected = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(connected, "round {round}: smbd never opened port {port}");
+
+            if which("smbclient").is_none() {
+                eprintln!("SKIP smbclient ls assertion: smbclient not found (smbd spawn OK)");
+                drop(server);
                 let _ = std::fs::remove_dir_all(&tmp);
                 return;
             }
-        };
 
-        // Wait until the port accepts connections (smbd init can be slow).
-        let mut connected = false;
-        for _ in 0..50 {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                connected = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(connected, "smbd never opened port {port}");
+            let out = Command::new("smbclient")
+                .arg("//127.0.0.1/testshare")
+                .arg("-p")
+                .arg(port.to_string())
+                .arg("-U")
+                .arg(format!("{user}%{pass}"))
+                .arg("-c")
+                .arg("ls")
+                .output()
+                .expect("run smbclient");
 
-        if which("smbclient").is_none() {
-            eprintln!("SKIP smbclient ls assertion: smbclient not found (smbd spawn OK)");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let run_dir = server.config.run_dir.clone();
             drop(server);
-            let _ = std::fs::remove_dir_all(&tmp);
+            assert!(!run_dir.exists(), "{} outlived smbd", run_dir.display());
+            if !stdout.contains("hello.txt") {
+                let _ = std::fs::remove_dir_all(&tmp);
+                panic!(
+                    "round {round}: smbclient ls did not list hello.txt.\n\
+                     stdout:\n{stdout}\nstderr:\n{stderr}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn start_failure_carries_smbds_own_reason() {
+        if which("smbd").is_none() {
+            eprintln!("SKIP: smbd not found");
             return;
         }
-
-        let out = Command::new("smbclient")
-            .arg("//127.0.0.1/testshare")
-            .arg("-p")
-            .arg(port.to_string())
-            .arg("-U")
-            .arg(format!("{user}%{pass}"))
-            .arg("-c")
-            .arg("ls")
-            .output()
-            .expect("run smbclient");
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        drop(server);
+        // Force the original defect: a socket directory too deep for
+        // sun_path. smbd says why only at debug level 2, which the spawn's
+        // diagnostic re-run recovers.
+        let tmp = std::env::temp_dir().join(format!(
+            "vmlab-smb-fail-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut config = test_config(tmp.join("smb"));
+        config.listen_port = free_high_port();
+        config.run_dir = tmp.join("r".repeat(120));
+        let err = SmbServer::spawn(config.clone(), HashMap::new()).unwrap_err();
         let _ = std::fs::remove_dir_all(&tmp);
+        match err {
+            SmbError::DiedOnStart { reason, .. } => {
+                assert!(reason.contains("File name too long"), "{reason}");
+            }
+            other => panic!("expected DiedOnStart, got {other}"),
+        }
+    }
 
-        assert!(
-            stdout.contains("hello.txt"),
-            "smbclient ls did not list hello.txt.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    #[test]
+    fn last_reason_skips_banner_and_debug_headers() {
+        let out = "smbd version 4.24.6 started.\n\
+                   Copyright Andrew Tridgell and the Samba Team 1992-2026\n\
+                   [2026/10/01 11:05:00,  2] ../../source3/smbd/server.c:1(main)\n\
+                   uid=1000 gid=1000 euid=1000 egid=1000\n\
+                   messaging_dgm_ref failed: File name too long\n\n";
+        assert_eq!(
+            last_reason(out).as_deref(),
+            Some("messaging_dgm_ref failed: File name too long")
         );
+        assert_eq!(last_reason("smbd version 4.24.6 started.\n"), None);
     }
 
     fn which(bin: &str) -> Option<PathBuf> {

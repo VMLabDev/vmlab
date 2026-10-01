@@ -87,6 +87,7 @@ page ref_paths {
       | "`labs/<lab>/control.sock`" | "One lab daemon's control socket." |
       | "`labs/<lab>/vms/<vm>/`" | "`qmp.sock`, `agent.sock`, `vnc.sock`, `tpm.sock`, one `nic<i>.sock` per NIC, one `vfs<i>.sock` per virtiofs share, and a `term-<id>.sock` per open terminal." |
       | "`labs/<lab>/containers/<name>/`" | "`qmp.sock`, `ctl.sock`, `agent.sock`, `nic<i>.sock`, `vfs<i>.sock` and `term-<id>.sock`." |
+      | "`smb/<hash>/`" | "One lab's bundled smbd: its private, lock and pid directories, where it binds `msg.sock/<pid>` and `ncalrpc/`. Named by a hash of the lab's path so a socket path stays short however deep the lab sits, and removed when the smbd stops." |
       | "`global/<segment>.sock`" | "The trunk socket a lab daemon bridges to for a global segment. See [Networking](guide_networking)." |
   }
 
@@ -104,7 +105,7 @@ page ref_paths {
       | "`containers/<name>/`" | "`scratch.qcow2`, the writable overlay, and `container.json`." |
       | "`media/`" | "ISO and floppy images built from `media {}` folders, content-addressed. See [Lab file: vm and its children](ref_vm)." |
       | "`volumes/`" | "Named container volumes." |
-      | "`smb/`" | "The bundled smbd's configuration and state. See [Shared folders](guide_shares)." |
+      | "`smb/`" | "The bundled smbd's configuration, passdb, log and persistent state; its sockets live under the runtime root's `smb/<hash>/`. See [Shared folders](guide_shares)." |
       | "`workspace/<machine>.json`" | "The workspace syncer's ledger for one dev machine. See [Dev machines and the workspace syncer](guide_dev)." |
       | "`screenshots/`" | "Where `Machine.screenshot` writes when given no path." |
   }

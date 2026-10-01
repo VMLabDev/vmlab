@@ -91,7 +91,10 @@ SRC
     `smbd` as an unprivileged process. Three things make that work without
     root. It listens on a localhost high port, which any user may bind, and
     the switch proxies the segment gateway's port 445 onto it. Every Samba
-    state directory is relocated under the lab's `.vmlab/smb`. And each
+    state directory is relocated: persistent state under the lab's
+    `.vmlab/smb`, and the directories smbd binds unix sockets in under a
+    short per-lab directory in vmlab's runtime root, so a lab in a deep
+    directory cannot push a socket path past its 108-byte limit. And each
     share is served with `force user` as the invoking user, so `smbd` never
     switches uid. Samba is a documented host package, and `smb1` shares
     depend on the installed build retaining NT1 support, which vmlab checks.
