@@ -31,7 +31,7 @@ NIGHTLY="${NIGHTLY:-nightly}"
 MSVCRT_PREFIX="${VMLAB_MSVCRT_PREFIX:-$HOME/.local/share/vmlab/toolchains/mingw-msvcrt}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DIST_DIR="$SCRIPT_DIR/dist/agent"
+DIST_DIR="${VMLAB_AGENT_DIST_DIR:-$SCRIPT_DIR/dist/agent}"
 
 die() {
   echo "build-agent: error: $*" >&2
@@ -43,6 +43,11 @@ log() {
 }
 
 version_stamp() {
+  # An explicit stamp wins: the e2e image builds a deliberately stale agent.
+  if [[ -n "${VMLAB_AGENT_STAMP:-}" ]]; then
+    echo "$VMLAB_AGENT_STAMP"
+    return
+  fi
   local rev="unknown"
   if git -C "$SCRIPT_DIR" rev-parse --short HEAD >/dev/null 2>&1; then
     rev="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD)"

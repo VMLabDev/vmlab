@@ -24,6 +24,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     install -D target/release/vmlab /out/vmlab; \
     ./guest/build-asset.sh x86_64; \
     ./guest/build-agent.sh linux-x86_64; \
+    VMLAB_AGENT_STAMP=agent=e2e-stale VMLAB_AGENT_DIST_DIR=/out/stale-agent \
+      ./guest/build-agent.sh linux-x86_64; \
     mkdir -p /out/guest; \
     cp -r guest/dist/x86_64 guest/dist/agent /out/guest/
 
@@ -42,6 +44,8 @@ RUN apt-get update \
 COPY --from=registry /bin/registry /usr/local/bin/registry
 COPY --from=build /out/vmlab /usr/local/bin/vmlab
 COPY --from=build /out/guest /usr/share/vmlab/guest
+# A second Linux agent with a different stamp, for the agent-refresh check.
+COPY --from=build /out/stale-agent /usr/share/vmlab/e2e/stale-agent
 COPY e2e /e2e
 ENV XDG_RUNTIME_DIR=/run/user/0 \
     PYTHONUNBUFFERED=1

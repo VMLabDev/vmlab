@@ -398,27 +398,31 @@ def _run(h):
              f"{line.strip()}: server said {banner!r}; bridge ended on Ctrl-C")
 
         # -- update: `up` refreshes a stale agent (it replaces the agent too) -----
-        # The host judges the guest's agent against the stamp in the shipped
-        # asset's VERSION, so a different stamp there makes the guest's agent
-        # stale without building a second agent. Put back whatever happens.
-        version = pathlib.Path("/usr/share/vmlab/guest/agent/linux-x86_64/VERSION")
-        original = version.read_text()
-        stale_to = "agent=e2e-refresh"
-        try:
-            version.write_text(stale_to + "\n")
-            h.vmlab("down", VM, cwd=lab, timeout=180)
-            upd = h.vmlab("up", cwd=lab, timeout=600, check=False)
-        finally:
-            version.write_text(original)
+        # The image carries a second agent stamped `agent=e2e-stale`. Put it in
+        # the guest and restart the service, so the guest really runs a stale
+        # agent; `up` must then push the shipped one, and the agent answering
+        # afterwards must carry the shipped stamp, not just answer.
+        stale_bin = "/usr/share/vmlab/e2e/stale-agent/linux-x86_64/vmlab-agent"
+        shipped = pathlib.Path("/usr/share/vmlab/guest/agent/linux-x86_64/VERSION").read_text().strip()
+        h.vmlab("cp", stale_bin, f"{VM}:/usr/local/lib/vmlab/vmlab-agent.stale", cwd=lab)
+        h.vmlab("exec", VM, "--user", "root", "--", "/bin/sh", "-c",
+                "chmod 755 /usr/local/lib/vmlab/vmlab-agent.stale && "
+                "mv -f /usr/local/lib/vmlab/vmlab-agent.stale /usr/local/lib/vmlab/vmlab-agent",
+                cwd=lab)
+        # The next boot starts the stale agent; this `up` must replace it.
+        h.vmlab("down", VM, cwd=lab, timeout=180)
+        upd = h.vmlab("up", cwd=lab, timeout=600, check=False)
         h.wait_ready(lab, VM)
         line = h.machine_line(lab, VM)
         after = h.vmlab("exec", VM, "--", "id", "-un", cwd=lab, check=False)
         said = [ln.strip() for ln in upd.text.splitlines() if ln.strip().startswith(("agent:", "warning: agent:"))]
         h.ok("agent.update",
-             upd.code == 0 and any(s.startswith(f'agent: updated "{VM}"') and s.endswith(f"→ {stale_to})") for s in said)
+             upd.code == 0
+             and any(s.startswith(f'agent: updated "{VM}" (agent=e2e-stale') and s.endswith(f"→ {shipped})") for s in said)
              and "diverged=yes" in line and after.out.strip() == "dev",
-             f"up exit {upd.code}: {' | '.join(said) or 'no agent line'}; status -v: diverged=yes "
-             f"{'present' if 'diverged=yes' in line else 'absent'}; exec after update -> {after.out.strip()!r}")
+             f"guest ran the stale agent; up exit {upd.code}: {' | '.join(said) or 'no agent line'}; "
+             f"status -v: diverged=yes {'present' if 'diverged=yes' in line else 'absent'}; "
+             f"exec after update -> {after.out.strip()!r}")
 
         # -- repair (last: it replaces the agent under everything above) ----------
         rp = h.vmlab("machine", "repair-agent", VM, cwd=lab, check=False, timeout=180)
