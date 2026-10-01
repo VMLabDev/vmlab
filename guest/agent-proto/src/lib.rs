@@ -66,6 +66,18 @@ pub mod features {
     pub const TAIL: &str = "tail";
     pub const METRICS: &str = "metrics";
     pub const CLIPBOARD: &str = "clipboard";
+    /// The agent answers **every** clipboard request: `set_clipboard` with
+    /// [`AgentMsg::ClipboardSet`] once the text is on the guest clipboard,
+    /// `get_clipboard` with [`AgentMsg::Clipboard`], and either with
+    /// [`AgentMsg::ClipboardFailed`] naming why it could not — a Windows
+    /// guest nobody is logged on to has no clipboard to reach, though it
+    /// still advertises [`CLIPBOARD`] because a logon can arrive at any time.
+    ///
+    /// An agent without it sets silently and reports a failure as a
+    /// channel-less [`AgentMsg::Error`] the host cannot attribute, so a host
+    /// can only fire and forget a set and wait out a get. Being a feature
+    /// rather than a version bump is what lets `PROTO_VERSION` stay put.
+    pub const CLIPBOARD_REPLY: &str = "clipboard_reply";
     /// Windows event-log tailing.
     pub const EVENTLOG: &str = "eventlog";
     /// The recursive guest tree watch backing the workspace syncer
@@ -439,11 +451,14 @@ pub enum HostMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filter: Option<String>,
     },
-    /// Set the guest clipboard.
+    /// Set the guest clipboard. An agent advertising
+    /// [`features::CLIPBOARD_REPLY`] answers [`AgentMsg::ClipboardSet`] or
+    /// [`AgentMsg::ClipboardFailed`]; an older one answers nothing on success.
     SetClipboard {
         text: String,
     },
-    /// Ask for the guest clipboard; the agent replies [`AgentMsg::Clipboard`].
+    /// Ask for the guest clipboard; the agent replies [`AgentMsg::Clipboard`]
+    /// (or, with [`features::CLIPBOARD_REPLY`], [`AgentMsg::ClipboardFailed`]).
     GetClipboard,
     /// Start periodic [`AgentMsg::Metrics`].
     SubscribeMetrics {
@@ -521,6 +536,15 @@ pub enum AgentMsg {
     /// guest-side clipboard change).
     Clipboard {
         text: String,
+    },
+    /// The text of a [`HostMsg::SetClipboard`] is on the guest clipboard
+    /// (only from an agent advertising [`features::CLIPBOARD_REPLY`]).
+    ClipboardSet,
+    /// A clipboard request could not be served, and why — e.g. nobody is
+    /// logged on to a Windows guest's desktop (only from an agent
+    /// advertising [`features::CLIPBOARD_REPLY`]).
+    ClipboardFailed {
+        msg: String,
     },
     /// Reply to [`HostMsg::NetInfo`].
     NetInfo {
@@ -838,6 +862,10 @@ mod tests {
             AgentMsg::Clipboard {
                 text: "clip".into(),
             },
+            AgentMsg::ClipboardSet,
+            AgentMsg::ClipboardFailed {
+                msg: "no one is logged on".into(),
+            },
             AgentMsg::NetInfo {
                 interfaces: vec![NetInterface {
                     name: "eth0".into(),
@@ -908,6 +936,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AgentMsg::Opened { id: 3 }).unwrap(),
             r#"{"event":"opened","id":3}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentMsg::ClipboardSet).unwrap(),
+            r#"{"event":"clipboard_set"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentMsg::ClipboardFailed { msg: "x".into() }).unwrap(),
+            r#"{"event":"clipboard_failed","msg":"x"}"#
         );
         assert_eq!(
             serde_json::to_string(&HostMsg::Shutdown {

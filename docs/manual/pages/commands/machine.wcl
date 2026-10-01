@@ -66,8 +66,11 @@ page cmd_machine {
     Agent features come from a live handshake, so a machine that is up but
     not yet answering reports `-`, which reads differently from a feature
     list that lacks something. The possible features are `terminal`, `exec`,
-    `fileops`, `tail`, `metrics`, `clipboard`, `eventlog` and `watch`. A
-    [dev machine](guide_dev)'s workspace syncer needs `fileops` and `watch`.
+    `fileops`, `tail`, `metrics`, `clipboard`, `clipboard_reply`, `eventlog`
+    and `watch`. `clipboard_reply` means the agent answers every clipboard
+    request, so [vmlab clipboard](cmd_clipboard) can confirm a copy and
+    report a refusal at once. A [dev machine](guide_dev)'s workspace syncer
+    needs `fileops` and `watch`.
   DOC
 
   h2 "vmlab machine stats"

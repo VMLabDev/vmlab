@@ -34,6 +34,21 @@ page cmd_clipboard {
     guest both subcommands refuse with `the guest agent has no clipboard`.
   DOC
 
+  p <<DOC
+    A Windows agent always advertises `clipboard`, because someone can log
+    on at any time. The Windows clipboard belongs to an interactive session,
+    so on a guest at the lock screen with nobody logged on both subcommands
+    refuse at once:
+  DOC
+
+  code text { source = "winsrv: no one is logged on to the desktop; the Windows clipboard belongs to an interactive session (it works once a user logs on)" }
+
+  p <<DOC
+    Log on at the console ([vmlab console](cmd_console)) and run the command
+    again. A locked session still counts as logged on, so the clipboard keeps
+    working after the screen locks.
+  DOC
+
   h2 "vmlab clipboard get"
 
   code sh { source = "vmlab clipboard get [OPTIONS] <MACHINE>" }
@@ -75,6 +90,13 @@ page cmd_clipboard {
     clipboard`; with `--json` it prints the daemon's reply, which is `true`.
   DOC
 
+  p <<DOC
+    The confirmation is printed only after the agent reports that the text
+    is on the guest clipboard; the agent is given 10 seconds to report. An
+    agent that predates the `clipboard_reply` feature sends no such report,
+    so against one the confirmation means only that the request was sent.
+  DOC
+
   h2 "Examples"
 
   p "Move a password from one guest to another without typing it:"
@@ -92,8 +114,9 @@ page cmd_clipboard {
     Exit status is 0 when the clipboard was read or written. Exit 4
     (`not_found`) means the lab declares no machine by that name. Exit 6
     (`unsupported`) means the agent lacks the `clipboard` feature. A machine
-    that is not running, an agent that is not answering, and a request that
-    times out all exit 1 (`failed`).
+    that is not running, an agent that is not answering, a guest the agent
+    cannot reach the clipboard of (nobody logged on to a Windows desktop),
+    and a request that times out all exit 1 (`failed`).
     A qualified reference to a lab that is not running exits 1. A usage
     error exits 2.
   DOC

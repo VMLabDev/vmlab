@@ -28,9 +28,7 @@ use nix::unistd::{ForkResult, Pid, chdir, chroot, execve, fork, setsid};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 
-use vmlab_agent_proto::{
-    AgentMsg, DiskUsage, NetInterface, OsInfo, PORT_NAME, ShutdownMode, features,
-};
+use vmlab_agent_proto::{DiskUsage, NetInterface, OsInfo, PORT_NAME, ShutdownMode, features};
 
 use crate::logon::Held;
 use crate::mux::Mux;
@@ -350,6 +348,7 @@ impl crate::mux::Platform for LinuxPlatform {
         ];
         if self.clipboard.is_some() {
             f.push(features::CLIPBOARD.to_string());
+            f.push(features::CLIPBOARD_REPLY.to_string());
         }
         f
     }
@@ -373,24 +372,23 @@ impl crate::mux::Platform for LinuxPlatform {
     }
 
     fn set_clipboard(&self, mux: &Mux, text: String) {
-        match &self.clipboard {
-            Some(tool) => {
-                if let Err(e) = tool.set(&text) {
-                    mux.send_error(None, format!("clipboard: {e}"));
-                }
-            }
-            None => mux.send_error(None, "clipboard: no display session reachable"),
-        }
+        let outcome = match &self.clipboard {
+            Some(tool) => tool
+                .set(&text)
+                .map_err(|e| format!("the clipboard tool failed: {e}")),
+            None => Err(NO_DISPLAY.to_string()),
+        };
+        crate::clipboard::answer_set(mux, outcome);
     }
 
     fn get_clipboard(&self, mux: &Mux) {
-        match &self.clipboard {
-            Some(tool) => match tool.get() {
-                Ok(text) => mux.send_ctrl(&AgentMsg::Clipboard { text }),
-                Err(e) => mux.send_error(None, format!("clipboard: {e}")),
-            },
-            None => mux.send_error(None, "clipboard: no display session reachable"),
-        }
+        let outcome = match &self.clipboard {
+            Some(tool) => tool
+                .get()
+                .map_err(|e| format!("the clipboard tool failed: {e}")),
+            None => Err(NO_DISPLAY.to_string()),
+        };
+        crate::clipboard::answer_get(mux, outcome);
     }
 
     fn net_info(&self) -> Result<Vec<NetInterface>, String> {
@@ -1335,6 +1333,10 @@ pub fn disk_sample() -> Vec<DiskUsage> {
 
 // ---- clipboard (best-effort; headless guests never advertise it) ----------
 
+/// The answer a guest without a reachable display gives — it never advertises
+/// the feature, so only a host that asked anyway hears it.
+const NO_DISPLAY: &str = "no display session is reachable from the agent";
+
 struct ClipboardTool {
     get: Vec<String>,
     set: Vec<String>,
@@ -1388,7 +1390,13 @@ impl ClipboardTool {
             stdin.write_all(text.as_bytes())?;
         }
         drop(child.stdin.take());
-        child.wait()?;
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "{} exited {status}",
+                self.set[0]
+            )));
+        }
         Ok(())
     }
 }

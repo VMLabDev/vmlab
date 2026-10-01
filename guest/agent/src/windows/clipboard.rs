@@ -6,17 +6,23 @@
 //! `CreateProcessAsUserW`) and talks to it over a named pipe:
 //!
 //! - helper → service: `{"clip": "<text>"}` on every clipboard change
-//!   (AddClipboardFormatListener) and in reply to a `get`.
+//!   (AddClipboardFormatListener) and in reply to a `get`; `{"set_ok": true}`
+//!   or `{"failed": "<why>"}` in reply to a request.
 //! - service → helper: `{"set": "<text>"}` / `{"get": true}`.
 //!
+//! The lines themselves, and the host replies they become, are
+//! `crate::clipboard::helper`.
+//!
 //! With no user logged on there is no helper, and clipboard calls answer
-//! with an explanatory error.
+//! [`AgentMsg::ClipboardFailed`] naming why (`crate::clipboard`). A request
+//! that finds no helper tries to start one on the spot rather than waiting for
+//! the spawner's next round, so the first copy after a logon works.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -29,12 +35,14 @@ use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
-use vmlab_agent_proto::AgentMsg;
-
 use super::port::wide;
+use crate::clipboard::{self as reply, NO_DESKTOP_LOGON, helper};
 use crate::mux::Mux;
 
 const PIPE_PATH: &str = "\\\\.\\pipe\\vmlab-agent-clipboard";
+
+/// How long a request waits for a helper it just started to connect.
+const HELPER_CONNECT: Duration = Duration::from_secs(5);
 
 /// The service side: latest connected helper's pipe (write half).
 struct State {
@@ -60,29 +68,74 @@ pub fn start(mux: &Mux) {
     thread::spawn(helper_spawner);
 }
 
+/// Hand a set to the helper. Its `set_ok`/`failed` comes back through the
+/// pipe server; a refusal before it ever reaches one is answered here. Off
+/// the control thread, because starting a helper can take seconds.
 pub fn set(mux: &Mux, text: String) {
-    let line = serde_json::json!({ "set": text }).to_string();
-    if !send_to_helper(&line) {
-        mux.send_error(None, "clipboard: no interactive user session");
-    }
+    let mux = mux.clone();
+    thread::spawn(move || {
+        if let Err(e) = ensure_helper().and_then(|()| send_to_helper(&helper::set_request(&text))) {
+            reply::answer_set(&mux, Err(e));
+        }
+    });
 }
 
+/// Ask the helper for the clipboard; its `clip`/`failed` comes back through
+/// the pipe server.
 pub fn get(mux: &Mux) {
-    if !send_to_helper(&serde_json::json!({ "get": true }).to_string()) {
-        mux.send_error(None, "clipboard: no interactive user session");
-    }
-    // The helper's `clip` reply flows back through the pipe server below.
+    let mux = mux.clone();
+    thread::spawn(move || {
+        if let Err(e) = ensure_helper().and_then(|()| send_to_helper(&helper::get_request())) {
+            reply::answer_get(&mux, Err(e));
+        }
+    });
 }
 
-fn send_to_helper(line: &str) -> bool {
+fn helper_connected() -> bool {
+    state().helper.lock().unwrap().is_some()
+}
+
+/// A connected helper, or why there cannot be one: start one into the
+/// console session if none is connected, and give it a moment to dial in.
+fn ensure_helper() -> Result<(), String> {
+    if helper_connected() {
+        return Ok(());
+    }
+    spawn_helper()?;
+    let deadline = Instant::now() + HELPER_CONNECT;
+    while Instant::now() < deadline {
+        if helper_connected() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!(
+        "a user is logged on, but the clipboard helper did not start in their session \
+         within {}s",
+        HELPER_CONNECT.as_secs()
+    ))
+}
+
+fn send_to_helper(line: &str) -> Result<(), String> {
     let mut guard = state().helper.lock().unwrap();
     if let Some(pipe) = guard.as_mut()
-        && writeln!(pipe, "{line}").and_then(|()| pipe.flush()).is_ok()
+        && send_line(pipe, line).is_ok()
     {
-        return true;
+        return Ok(());
     }
     *guard = None;
-    false
+    Err(
+        "the clipboard helper in the desktop session went away (the user may have \
+         logged off)"
+            .to_string(),
+    )
+}
+
+/// One whole line in one write, so the helper's change reports and its
+/// replies — written from two threads — never interleave mid-line.
+fn send_line(pipe: &mut File, line: &str) -> std::io::Result<()> {
+    pipe.write_all(format!("{line}\n").as_bytes())?;
+    pipe.flush()
 }
 
 /// Serve one helper at a time on the named pipe; forward its clipboard
@@ -133,13 +186,10 @@ fn pipe_server() {
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => break, // helper gone (logoff)
                 Ok(_) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim())
-                        && let Some(text) = v["clip"].as_str()
+                    if let Some(msg) = helper::reply_msg(&line)
                         && let Some(mux) = state().mux.lock().unwrap().clone()
                     {
-                        mux.send_ctrl(&AgentMsg::Clipboard {
-                            text: text.to_string(),
-                        });
+                        mux.send_ctrl(&msg);
                     }
                 }
             }
@@ -152,30 +202,36 @@ fn pipe_server() {
 /// logged on.
 fn helper_spawner() {
     loop {
-        if state().helper.lock().unwrap().is_none() {
-            spawn_helper();
+        if !helper_connected() {
+            // Nobody logged on is the normal idle state, not a fault; the
+            // reason is for a request to report, not for this loop.
+            let _ = spawn_helper();
         }
         thread::sleep(Duration::from_secs(15));
     }
 }
 
-fn spawn_helper() {
+/// Start a helper into the active console session, or say why there is no
+/// one there to start it for.
+fn spawn_helper() -> Result<(), String> {
     // SAFETY: token query + CreateProcessAsUserW with our own exe path.
     unsafe {
         let session = WTSGetActiveConsoleSessionId();
         if session == 0xFFFF_FFFF {
-            return; // no console session (nobody logged on)
+            // No console session at all (mid-switch); same answer for the user.
+            return Err(NO_DESKTOP_LOGON.to_string());
         }
         let mut token: HANDLE = std::ptr::null_mut();
         if WTSQueryUserToken(session, &mut token) == 0 {
-            return;
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(reply::token_failure(code));
         }
         let exe = std::env::current_exe().unwrap_or_default();
         let mut cmd = wide(&format!("\"{}\" --clipboard-helper", exe.display()));
         let mut si: STARTUPINFOW = std::mem::zeroed();
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-        if CreateProcessAsUserW(
+        let started = CreateProcessAsUserW(
             token,
             std::ptr::null(),
             cmd.as_mut_ptr(),
@@ -189,12 +245,17 @@ fn spawn_helper() {
             std::ptr::null(),
             &si,
             &mut pi,
-        ) != 0
-        {
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        }
+        ) != 0;
+        let err = std::io::Error::last_os_error();
         CloseHandle(token);
+        if !started {
+            return Err(format!(
+                "cannot start the clipboard helper in the desktop session ({err})"
+            ));
+        }
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        Ok(())
     }
 }
 
@@ -243,16 +304,18 @@ pub fn helper_main() {
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => std::process::exit(0), // service gone
             Ok(_) => {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-                    continue;
+                let reply = match helper::parse_request(&line) {
+                    Some(helper::Request::Set(text)) => match clip::set_text(&text) {
+                        Ok(()) => helper::set_ok(),
+                        Err(e) => helper::failed(&e),
+                    },
+                    Some(helper::Request::Get) => match clip::get_text() {
+                        Ok(text) => helper::clip(&text),
+                        Err(e) => helper::failed(&e),
+                    },
+                    None => continue,
                 };
-                if let Some(text) = v["set"].as_str() {
-                    clip::set_text(text);
-                } else if v["get"].as_bool() == Some(true) {
-                    let text = clip::get_text().unwrap_or_default();
-                    let _ = writeln!(write_half, "{}", serde_json::json!({ "clip": text }));
-                    let _ = write_half.flush();
-                }
+                let _ = send_line(&mut write_half, &reply);
             }
         }
     }
@@ -287,10 +350,9 @@ fn clipboard_watch(pipe: &mut File) {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, hwnd, 0, 0) > 0 {
             if msg.message == WM_CLIPBOARDUPDATE
-                && let Some(text) = clip::get_text()
+                && let Ok(text) = clip::get_text()
             {
-                let _ = writeln!(pipe, "{}", serde_json::json!({ "clip": text }));
-                let _ = pipe.flush();
+                let _ = send_line(pipe, &helper::clip(&text));
             }
             DispatchMessageW(&msg);
         }
@@ -310,35 +372,41 @@ mod clip {
 
     const CF_UNICODETEXT: u32 = 13;
 
-    pub fn get_text() -> Option<String> {
+    /// Whoever holds the clipboard open blocks everyone else; say so.
+    fn busy() -> String {
+        format!(
+            "the clipboard is held open by another program ({})",
+            std::io::Error::last_os_error()
+        )
+    }
+
+    /// The clipboard's text; empty when it holds none (empty, or only
+    /// non-text formats).
+    pub fn get_text() -> Result<String, String> {
         // SAFETY: standard open/get/lock/unlock/close sequence.
         unsafe {
             if OpenClipboard(std::ptr::null_mut()) == 0 {
-                return None;
+                return Err(busy());
             }
             let handle = GetClipboardData(CF_UNICODETEXT);
-            let text = if handle.is_null() {
-                None
-            } else {
+            let mut text = String::new();
+            if !handle.is_null() {
                 let ptr = GlobalLock(handle as HGLOBAL) as *const u16;
-                if ptr.is_null() {
-                    None
-                } else {
+                if !ptr.is_null() {
                     let mut len = 0usize;
                     while *ptr.add(len) != 0 {
                         len += 1;
                     }
-                    let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+                    text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
                     GlobalUnlock(handle as HGLOBAL);
-                    Some(s)
                 }
-            };
+            }
             CloseClipboard();
-            text
+            Ok(text)
         }
     }
 
-    pub fn set_text(text: &str) {
+    pub fn set_text(text: &str) -> Result<(), String> {
         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: movable global alloc handed to the clipboard on success
         // (the system owns it afterwards); freed on any failure path.
@@ -346,24 +414,32 @@ mod clip {
             let bytes = wide.len() * 2;
             let mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
             if mem.is_null() {
-                return;
+                return Err(format!("cannot allocate {bytes} bytes for the clipboard"));
             }
             let ptr = GlobalLock(mem) as *mut u16;
             if ptr.is_null() {
                 GlobalFree(mem);
-                return;
+                return Err("cannot lock the clipboard buffer".into());
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
             GlobalUnlock(mem);
             if OpenClipboard(std::ptr::null_mut()) == 0 {
+                let e = busy();
                 GlobalFree(mem);
-                return;
+                return Err(e);
             }
             EmptyClipboard();
-            if SetClipboardData(CF_UNICODETEXT, mem as _).is_null() {
+            let placed = !SetClipboardData(CF_UNICODETEXT, mem as _).is_null();
+            let err = std::io::Error::last_os_error();
+            if !placed {
                 GlobalFree(mem);
             }
             CloseClipboard();
+            if placed {
+                Ok(())
+            } else {
+                Err(format!("SetClipboardData failed ({err})"))
+            }
         }
     }
 }

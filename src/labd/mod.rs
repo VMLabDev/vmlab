@@ -291,6 +291,14 @@ fn on_machine<T>(machine: &str, r: Result<T, CommandError>) -> Result<T, Command
     r.map_err(|e| e.prefixed(machine))
 }
 
+/// A clipboard request that failed, under the machine's name: the agent's
+/// own refusal ([`vm_agent::ClipboardRefused`] — nobody is logged on to a
+/// Windows guest's desktop) knows why but not where, so the host says which
+/// machine it was.
+fn clipboard_error(machine: &str, e: anyhow::Error) -> CommandError {
+    CommandError::from(e).prefixed(machine)
+}
+
 /// The agent channel of the addressed machine.
 async fn agent_of(
     lab: &Arc<LabRuntime>,
@@ -754,7 +762,10 @@ impl Handler<LabRequest> for LabdHandler {
             }
             // Clipboard exists only where the agent reaches a display server;
             // without it both verbs refuse by name rather than claiming a copy
-            // or waiting out a reply that will never come.
+            // or waiting out a reply that will never come. An agent that has
+            // one but cannot reach it right now — a Windows guest nobody is
+            // logged on to — says why, and that is refused under the machine's
+            // name the same way.
             LabRequest::MachineClipboardGet { machine } => {
                 let agent = agent_of(lab, &machine).await?;
                 if !agent.has_feature(vmlab_agent_proto::features::CLIPBOARD) {
@@ -765,7 +776,8 @@ impl Handler<LabRequest> for LabdHandler {
                 }
                 let text = agent
                     .get_clipboard(std::time::Duration::from_secs(10))
-                    .await?;
+                    .await
+                    .map_err(|e| clipboard_error(&machine, e))?;
                 Ok(json!(text))
             }
             LabRequest::MachineClipboardSet { machine, text } => {
@@ -776,7 +788,10 @@ impl Handler<LabRequest> for LabdHandler {
                         vm_agent::NO_CLIPBOARD
                     )));
                 }
-                agent.set_clipboard(text).await?;
+                agent
+                    .set_clipboard(text, std::time::Duration::from_secs(10))
+                    .await
+                    .map_err(|e| clipboard_error(&machine, e))?;
                 Ok(json!(true))
             }
 

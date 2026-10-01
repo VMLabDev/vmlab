@@ -262,9 +262,11 @@ impl Platform for TestPlatform {
     fn open_eventlog(&self, mux: &Mux, id: u32, _: Option<String>) {
         mux.send_error(Some(id), "unsupported");
     }
-    fn set_clipboard(&self, _: &Mux, _: String) {}
+    fn set_clipboard(&self, mux: &Mux, _: String) {
+        crate::clipboard::answer_set(mux, Err("unsupported".into()));
+    }
     fn get_clipboard(&self, mux: &Mux) {
-        mux.send_error(None, "unsupported");
+        crate::clipboard::answer_get(mux, Err("unsupported".into()));
     }
     fn net_info(&self) -> Result<Vec<NetInterface>, String> {
         Ok(vec![NetInterface {

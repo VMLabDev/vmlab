@@ -270,7 +270,7 @@ Reports what this machine can serve, probed live rather than inferred from its k
 | `healthcheck` | `yes` when the machine declares a healthcheck, so its status carries a verdict. |
 | `agent` | The features the agent negotiated at handshake, comma-separated, or `-` when no agent is answering. |
 
-Agent features come from a live handshake, so a machine that is up but not yet answering reports `-`, which reads differently from a feature list that lacks something. The possible features are `terminal`, `exec`, `fileops`, `tail`, `metrics`, `clipboard`, `eventlog` and `watch`. The workspace syncer needs `watch` and `fileops` (dev-machines.md).
+Agent features come from a live handshake, so a machine that is up but not yet answering reports `-`, which reads differently from a feature list that lacks something. The possible features are `terminal`, `exec`, `fileops`, `tail`, `metrics`, `clipboard`, `clipboard_reply`, `eventlog` and `watch`. `clipboard_reply` means the agent answers every clipboard request, so `vmlab clipboard` can confirm a copy and report a refusal at once. The workspace syncer needs `watch` and `fileops` (dev-machines.md).
 
 ### vmlab machine stats
 
@@ -630,6 +630,8 @@ vmlab clipboard <COMMAND>
 
 The machine must be running with an agent that advertises the `clipboard` feature; see `vmlab machine capabilities`. The agent advertises it only where it can reach a display server, so on a headless guest both subcommands refuse with `the guest agent has no clipboard` and exit 6 (`unsupported`).
 
+A Windows agent always advertises `clipboard`, but the Windows clipboard belongs to an interactive session. On a guest at the lock screen with nobody logged on, both subcommands refuse at once with `<machine>: no one is logged on to the desktop; the Windows clipboard belongs to an interactive session (it works once a user logs on)` and exit 1 (`failed`). Log on at the console (`vmlab console`) and retry. Clipboard access does not need anyone at the desktop on Linux, where it depends only on the agent reaching a display server.
+
 ### vmlab clipboard get
 
 ```sh
@@ -657,7 +659,7 @@ vmlab clipboard set [OPTIONS] <MACHINE> [TEXT]
 | `--json` | Emit the raw JSON reply instead of a confirmation. |
 | `-h`, `--help` | Print help. |
 
-With a `TEXT` argument that text becomes the guest's clipboard. Without one, stdin is read to end of file and passed through verbatim, trailing newline included, so `vmlab clipboard get a | vmlab clipboard set b` round-trips exactly. Use `echo -n` when you do not want the newline `echo` adds. On success the verb prints `copied N bytes to "<machine>" clipboard`; with `--json` it prints the daemon's reply, which is `true`.
+With a `TEXT` argument that text becomes the guest's clipboard. Without one, stdin is read to end of file and passed through verbatim, trailing newline included, so `vmlab clipboard get a | vmlab clipboard set b` round-trips exactly. Use `echo -n` when you do not want the newline `echo` adds. On success the verb prints `copied N bytes to "<machine>" clipboard`; with `--json` it prints the daemon's reply, which is `true`. The confirmation is printed only after the agent reports that the text is on the guest clipboard. An agent that predates the `clipboard_reply` feature sends no such report, so against one the confirmation means only that the request was sent.
 
 ### Examples
 
@@ -681,7 +683,7 @@ token=$(vmlab clipboard get buildbox)
 
 ### Exit status
 
-0 when the clipboard was read or written. Exit 4 (`not_found`) means the lab declares no machine by that name. A machine that is not running, an agent that is not answering or lacks the `clipboard` feature, and a request that times out all exit 1 (`failed`). A qualified reference to a lab that is not running exits 1. A usage error exits 2.
+0 when the clipboard was read or written. Exit 4 (`not_found`) means the lab declares no machine by that name. Exit 6 (`unsupported`) means the agent lacks the `clipboard` feature. A machine that is not running, an agent that is not answering, a guest the agent cannot reach the clipboard of (nobody logged on to a Windows desktop), and a request that times out all exit 1 (`failed`). A qualified reference to a lab that is not running exits 1. A usage error exits 2.
 
 ## vmlab snapshot
 

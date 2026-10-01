@@ -164,6 +164,12 @@ struct Inner {
     metrics: watch::Sender<Option<MetricsSnapshot>>,
     /// Incremented per clipboard report, with the text.
     clipboard: watch::Sender<(u64, String)>,
+    /// Incremented per `clipboard_set` / `clipboard_failed` — the answers an
+    /// agent advertising `clipboard_reply` gives besides the text itself.
+    clipboard_answer: watch::Sender<(u64, ClipboardAnswer)>,
+    /// One clipboard request in flight at a time: the answers carry no
+    /// request id, so two overlapping requests could take each other's.
+    clipboard_op: Mutex<()>,
     /// Incremented per net_info reply, with the interfaces.
     net_info: watch::Sender<(u64, Vec<NetInterface>)>,
     /// Incremented per os_info reply, with the info.
@@ -247,6 +253,8 @@ impl AgentHandle {
             pong: watch::Sender::new(0),
             metrics: watch::Sender::new(None),
             clipboard: watch::Sender::new((0, String::new())),
+            clipboard_answer: watch::Sender::new((0, ClipboardAnswer::Set)),
+            clipboard_op: Mutex::new(()),
             net_info: watch::Sender::new((0, Vec::new())),
             os_info: watch::Sender::new((0, None)),
             shutting_down: watch::Sender::new(0),
@@ -705,25 +713,70 @@ impl AgentHandle {
     /// agent drops the request and a caller would report a copy that never
     /// happened.
     ///
+    /// An agent advertising [`features::CLIPBOARD_REPLY`] confirms the set or
+    /// says why it could not — a Windows guest nobody is logged on to — and
+    /// this waits up to `timeout` for that answer, so success is never
+    /// reported before the guest has the text. An older agent answers nothing
+    /// on success, so against one the set is fire-and-forget, as it always
+    /// was.
+    ///
     /// [`features::CLIPBOARD`]: vmlab_agent_proto::features::CLIPBOARD
-    pub async fn set_clipboard(&self, text: String) -> Result<()> {
+    /// [`features::CLIPBOARD_REPLY`]: vmlab_agent_proto::features::CLIPBOARD_REPLY
+    pub async fn set_clipboard(&self, text: String, timeout: Duration) -> Result<()> {
         self.require_clipboard()?;
-        self.send_msg(&HostMsg::SetClipboard { text }).await
+        let _op = self.inner.clipboard_op.lock().await;
+        if !self.has_feature(features::CLIPBOARD_REPLY) {
+            return self.send_msg(&HostMsg::SetClipboard { text }).await;
+        }
+        let mut answers = self.inner.clipboard_answer.subscribe();
+        answers.mark_unchanged();
+        self.send_msg(&HostMsg::SetClipboard { text }).await?;
+        tokio::time::timeout(timeout, answers.changed())
+            .await
+            .map_err(|_| anyhow!("the agent did not confirm the clipboard within {timeout:?}"))?
+            .map_err(|_| anyhow!("agent channel closed"))?;
+        let (_, answer) = answers.borrow().clone();
+        match answer {
+            ClipboardAnswer::Set => Ok(()),
+            ClipboardAnswer::Failed(msg) => Err(anyhow::Error::new(ClipboardRefused(msg))),
+        }
     }
 
     /// Read the guest's clipboard; refused on an agent without the feature,
-    /// which would never answer.
+    /// which would never answer. An agent advertising
+    /// [`features::CLIPBOARD_REPLY`] that cannot read it says why at once,
+    /// rather than leaving the caller to wait out `timeout`.
+    ///
+    /// [`features::CLIPBOARD_REPLY`]: vmlab_agent_proto::features::CLIPBOARD_REPLY
     pub async fn get_clipboard(&self, timeout: Duration) -> Result<String> {
         self.require_clipboard()?;
-        let mut rx = self.inner.clipboard.subscribe();
-        rx.mark_unchanged();
+        let _op = self.inner.clipboard_op.lock().await;
+        let mut texts = self.inner.clipboard.subscribe();
+        texts.mark_unchanged();
+        let mut answers = self.inner.clipboard_answer.subscribe();
+        answers.mark_unchanged();
         self.send_msg(&HostMsg::GetClipboard).await?;
-        tokio::time::timeout(timeout, rx.changed())
+        let wait = async {
+            loop {
+                tokio::select! {
+                    changed = texts.changed() => {
+                        changed.map_err(|_| anyhow!("agent channel closed"))?;
+                        let (_, text) = texts.borrow().clone();
+                        return Ok(text);
+                    }
+                    changed = answers.changed() => {
+                        changed.map_err(|_| anyhow!("agent channel closed"))?;
+                        // A stray `clipboard_set` is not this request's.
+                        if let (_, ClipboardAnswer::Failed(msg)) = answers.borrow().clone() {
+                            return Err(anyhow::Error::new(ClipboardRefused(msg)));
+                        }
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait)
             .await
             .map_err(|_| anyhow!("agent sent no clipboard within {timeout:?}"))?
-            .map_err(|_| anyhow!("agent channel closed"))?;
-        let (_, text) = rx.borrow().clone();
-        Ok(text)
     }
 
     fn require_clipboard(&self) -> Result<()> {
@@ -733,6 +786,20 @@ impl AgentHandle {
         Ok(())
     }
 }
+
+/// An agent's answer to a clipboard request other than the text itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClipboardAnswer {
+    Set,
+    Failed(String),
+}
+
+/// The guest agent's own reason a clipboard request could not be served —
+/// e.g. nobody is logged on to a Windows guest's desktop. A refusal the user
+/// acts on, not a fault in vmlab.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct ClipboardRefused(pub String);
 
 /// Why a clipboard request is refused: the agent advertises `clipboard` only
 /// where its own environment reaches a display server, which a headless guest
@@ -1761,6 +1828,16 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             let seq = inner.clipboard.borrow().0 + 1;
             let _ = inner.clipboard.send((seq, text));
         }
+        AgentMsg::ClipboardSet => {
+            let seq = inner.clipboard_answer.borrow().0 + 1;
+            let _ = inner.clipboard_answer.send((seq, ClipboardAnswer::Set));
+        }
+        AgentMsg::ClipboardFailed { msg } => {
+            let seq = inner.clipboard_answer.borrow().0 + 1;
+            let _ = inner
+                .clipboard_answer
+                .send((seq, ClipboardAnswer::Failed(msg)));
+        }
         AgentMsg::NetInfo { interfaces } => {
             let seq = inner.net_info.borrow().0 + 1;
             let _ = inner.net_info.send((seq, interfaces));
@@ -2007,6 +2084,11 @@ mod tests {
             // Watch channels: the root the host named, its record decoder,
             // and how many drains it has asked for.
             let mut watches: HashMap<u32, (String, RecordDecoder, usize)> = HashMap::new();
+            // The guest clipboard, and whether anyone is logged on to the
+            // desktop it belongs to (`mock:no-desktop` says nobody is).
+            let mut clip = String::new();
+            let desktop = !advertised.iter().any(|f| f == "mock:no-desktop");
+            let replies = advertised.iter().any(|f| f == features::CLIPBOARD_REPLY);
             let mut pulled = b"pulled-file-content".repeat(1000);
             pulled.truncate(10_000);
             let fs = MockFs::default();
@@ -2158,6 +2240,48 @@ mod tests {
                                 HostMsg::Shutdown { mode } => {
                                     send(AgentMsg::ShuttingDown { mode }).await;
                                 }
+                                // What the agent does: with `clipboard_reply`
+                                // every request is answered; without it a set
+                                // is silent and a failure is a channel-less
+                                // error the host cannot attribute.
+                                HostMsg::SetClipboard { text } => match (desktop, replies) {
+                                    (true, true) => {
+                                        clip = text;
+                                        send(AgentMsg::ClipboardSet).await;
+                                    }
+                                    (true, false) => clip = text,
+                                    (false, true) => {
+                                        send(AgentMsg::ClipboardFailed {
+                                            msg: MOCK_NO_DESKTOP.into(),
+                                        })
+                                        .await
+                                    }
+                                    (false, false) => {
+                                        send(AgentMsg::Error {
+                                            id: None,
+                                            msg: MOCK_NO_DESKTOP.into(),
+                                        })
+                                        .await
+                                    }
+                                },
+                                HostMsg::GetClipboard => match (desktop, replies) {
+                                    (true, _) => {
+                                        send(AgentMsg::Clipboard { text: clip.clone() }).await
+                                    }
+                                    (false, true) => {
+                                        send(AgentMsg::ClipboardFailed {
+                                            msg: MOCK_NO_DESKTOP.into(),
+                                        })
+                                        .await
+                                    }
+                                    (false, false) => {
+                                        send(AgentMsg::Error {
+                                            id: None,
+                                            msg: MOCK_NO_DESKTOP.into(),
+                                        })
+                                        .await
+                                    }
+                                },
                                 _ => {}
                             }
                         }
@@ -2958,6 +3082,80 @@ mod tests {
         assert!(err.to_string().contains("repair-agent"), "{err}");
     }
 
+    const MOCK_NO_DESKTOP: &str = "no one is logged on to the desktop";
+
+    fn clipboard_features(extra: &[&str]) -> Vec<String> {
+        ["terminal", features::CLIPBOARD]
+            .iter()
+            .chain(extra)
+            .map(|f| f.to_string())
+            .collect()
+    }
+
+    /// An agent that answers clipboard requests confirms a set before it is
+    /// reported, and the text it holds is what a get reads back.
+    #[tokio::test]
+    async fn a_confirmed_set_reads_back() {
+        let (_dir, path) =
+            mock_agent_with(true, clipboard_features(&[features::CLIPBOARD_REPLY])).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        agent
+            .set_clipboard("hello".into(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let text = agent.get_clipboard(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(text, "hello");
+    }
+
+    /// F22: a Windows guest at the lock screen with nobody logged on. Both
+    /// verbs are refused at once with the agent's reason — never a reported
+    /// copy, never a get that waits out its timeout — and the refusal is a
+    /// [`ClipboardRefused`] the lab daemon can name the machine in.
+    #[tokio::test]
+    async fn nobody_logged_on_is_refused_at_once_by_reason() {
+        let (_dir, path) = mock_agent_with(
+            true,
+            clipboard_features(&[features::CLIPBOARD_REPLY, "mock:no-desktop"]),
+        )
+        .await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let started = std::time::Instant::now();
+        let set = agent
+            .set_clipboard("x".into(), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            set.downcast_ref::<ClipboardRefused>(),
+            Some(&ClipboardRefused(MOCK_NO_DESKTOP.into()))
+        );
+        let get = agent
+            .get_clipboard(Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            get.downcast_ref::<ClipboardRefused>(),
+            Some(&ClipboardRefused(MOCK_NO_DESKTOP.into()))
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// An agent that predates `clipboard_reply` answers nothing on a set, so
+    /// the set stays fire-and-forget rather than waiting for a confirmation
+    /// that will never come — today's behaviour, kept.
+    #[tokio::test]
+    async fn an_older_agents_set_is_not_waited_on() {
+        let (_dir, path) = mock_agent_with(true, clipboard_features(&[])).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let started = std::time::Instant::now();
+        agent
+            .set_clipboard("old".into(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let text = agent.get_clipboard(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(text, "old");
+    }
+
     /// An agent that does not advertise `clipboard` drops both requests, so
     /// neither may be sent: a set would report a copy that never happened and
     /// a get would wait out its whole timeout.
@@ -2965,7 +3163,10 @@ mod tests {
     async fn clipboard_on_an_agent_without_the_feature_is_refused() {
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
-        let set = agent.set_clipboard("hi".into()).await.unwrap_err();
+        let set = agent
+            .set_clipboard("hi".into(), Duration::from_secs(10))
+            .await
+            .unwrap_err();
         assert!(set.to_string().contains("no clipboard"), "{set}");
         let started = std::time::Instant::now();
         let get = agent

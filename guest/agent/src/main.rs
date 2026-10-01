@@ -9,6 +9,7 @@
 //! Runs as a service (systemd on Linux, SCM on Windows — installed by the
 //! template build) or in the foreground for debugging.
 
+mod clipboard;
 mod exec;
 mod fileops;
 // The logon cache is portable policy, and both adapters resolve through it:

@@ -88,7 +88,8 @@ impl crate::mux::Platform for WindowsPlatform {
     fn features(&self) -> Vec<String> {
         // Clipboard is advertised unconditionally: whether it works depends
         // on a user being logged on *right now*, which can change during the
-        // agent's life — calls answer with a clear error when nobody is.
+        // agent's life — so every call is answered (`clipboard_reply`), and
+        // with nobody logged on the answer names that as the reason.
         vec![
             features::TERMINAL.to_string(),
             features::EXEC.to_string(),
@@ -98,6 +99,7 @@ impl crate::mux::Platform for WindowsPlatform {
             features::WATCH.to_string(),
             features::EVENTLOG.to_string(),
             features::CLIPBOARD.to_string(),
+            features::CLIPBOARD_REPLY.to_string(),
         ]
     }
 
