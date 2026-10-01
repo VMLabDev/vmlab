@@ -121,16 +121,18 @@ page cmd_machine {
     `agent_version` describes every clone of it. After a repair that is no
     longer true for this clone, so [vmlab status](cmd_status) shows
     `diverged=yes` under `-v` until the disks are destroyed. It is how you
-    try a new agent build, or bring a stale one up to date, without
-    rebuilding the template. Nothing runs this by itself; it is a tool, not a
-    policy. Rebuilding the template is the route that keeps "same template,
-    same machine" true.
+    try a new agent build on a machine that is already running, without
+    rebuilding the template. [vmlab up](cmd_up) and `vmlab vm start` run the
+    same push by themselves when a VM's agent stamp differs from the shipped
+    one, unless the lab file sets `agent_update = false`. Rebuilding the
+    template is the route that keeps "same template, same machine" true.
   DOC
 
   p <<DOC
     The report says what landed and what the machine now is: `pushed <version>
     to <path> on "<machine>"`, then `agent <version> answering`, then `"<machine>" is now diverged from its template — vmlab vm
-    destroy + vmlab up puts it back on the sealed agent`. The JSON form
+    destroy + vmlab up with agent_update = false puts it back on the sealed
+    agent`. The JSON form
     carries `machine`, `pushed`, `installed_at`, `agent_version` and
     `features`.
   DOC

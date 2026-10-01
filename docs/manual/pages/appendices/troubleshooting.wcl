@@ -164,9 +164,17 @@ MSG
     because it needs a running agent to know.
   DOC
   p <<DOC
-    There are two remedies. Rebuilding the template is the durable one.
-    `vmlab machine repair-agent <machine>` pushes the host's shipped agent
-    into the running machine over its own channel and marks the machine
+    `vmlab up` normally fixes this by itself: when a VM's agent stamp
+    differs from the agent this vmlab ships, it pushes the shipped agent
+    before any provision runs and prints `agent: updated "<vm>" (<old> →
+    <new>)`. If it printed `warning: agent: could not update "<vm>"` instead,
+    the reason follows on that line, and the old agent is still in place. A
+    lab file with `agent_update = false` turns the refresh off.
+  DOC
+  p <<DOC
+    Otherwise there are two remedies. Rebuilding the template is the durable
+    one. `vmlab machine repair-agent <machine>` pushes the host's shipped
+    agent into the running machine over its own channel and marks the machine
     *diverged* in `vmlab status`, so you remember the clone no longer matches
     its template. It refuses on three conditions, each in its own words.
   DOC

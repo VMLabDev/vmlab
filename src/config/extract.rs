@@ -76,6 +76,7 @@ fn extract_lab(b: &Block, issues: &mut IssueList) -> Option<Lab> {
         name: String::new(),
         span: r.span(),
         gui: r.bool("gui").unspan(),
+        agent_update: r.bool("agent_update").unspan(),
         segments: Vec::new(),
         vms: Vec::new(),
         containers: Vec::new(),
@@ -505,6 +506,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let depends_on = r.string_list("depends_on");
     let nested = r.bool("nested").unspan().unwrap_or(false);
     let gui = r.bool("gui").unspan();
+    let agent_update = r.bool("agent_update").unspan();
     let display = r.string("display").unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -572,6 +574,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         depends_on,
         nested,
         gui,
+        agent_update,
         display,
         firmware,
         tpm,

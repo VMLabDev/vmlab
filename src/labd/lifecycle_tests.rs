@@ -1122,3 +1122,82 @@ async fn repairing_a_containers_agent_is_meaningless_and_says_so() {
 
     ctr.stop(true).await.expect("stop");
 }
+
+/// **`up` refreshes a stale agent, and a refresh that fails never fails
+/// `up`** (§19.4). Driven against a VM whose agent answers: its handshake is
+/// not a stamp (`0.0.0-fake`), so what it is falls back to the stamp its
+/// template sealed (`0.1.0`).
+///
+/// A shipped asset carrying that stamp is current, and nothing is said. One
+/// carrying another is pushed — and the fake agent refuses the file session,
+/// so the push fails the way a real refusal does: a `warning:` naming the
+/// machine and both stamps, `machine.agent_updated` with the error, the old
+/// agent still answering, and the machine not marked diverged.
+#[tokio::test]
+async fn a_stale_agent_is_refreshed_and_a_failed_refresh_only_warns() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let config = crate::config::load_lab_source(
+        &format!("import <vmlab.wcl>\nlab \"t\" {{\n{LINUX_VM}\n}}\n"),
+        "<test>",
+        &dirs.root,
+    )
+    .expect("lab source");
+    let lab = super::lab::LabRuntime::with_machines(config, vec![vm.clone()]).expect("runtime");
+    lab.agent_updates.store(true, Ordering::Relaxed);
+    let mut events = lab.events.subscribe();
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+
+    let binary = dirs.root.join("vmlab-agent");
+    std::fs::write(&binary, b"a newer agent").expect("asset");
+    let shipped = |version: &'static str| {
+        let path = binary.clone();
+        move |_: &dyn Machine| {
+            Ok(crate::agent_asset::AgentAsset {
+                path: path.clone(),
+                version: version.to_string(),
+            })
+        }
+    };
+    let said = Arc::new(std::sync::Mutex::new(String::new()));
+    let sink: crate::scripting::OutputSink = {
+        let said = said.clone();
+        Arc::new(move |s: String| said.lock().expect("said").push_str(&s))
+    };
+
+    lab.refresh_agent_with(&m, &sink, shipped("0.1.0")).await;
+    assert_eq!(*said.lock().unwrap(), "", "a current agent is left alone");
+
+    lab.refresh_agent_with(&m, &sink, shipped("agent=new"))
+        .await;
+    let out = said.lock().unwrap().clone();
+    assert!(
+        out.contains("warning: agent: could not update \"dc01\" (0.1.0 → agent=new)"),
+        "{out}"
+    );
+    let event = collect_events(&mut events, &["machine.agent_updated"], 1)
+        .await
+        .remove(0);
+    assert_eq!(event.data["machine"], "dc01");
+    assert_eq!(event.data["ok"], false);
+    assert!(
+        event.data["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("file session")),
+        "{}",
+        event.data
+    );
+    assert!(
+        m.agent_answering().await,
+        "the old agent is still answering"
+    );
+    let status = lab.status().await;
+    assert!(
+        !status.machines.iter().any(|s| s.agent_diverged),
+        "nothing was replaced, so nothing diverged"
+    );
+
+    vm.stop(true).await.expect("stop");
+}

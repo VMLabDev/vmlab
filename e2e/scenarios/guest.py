@@ -3,6 +3,7 @@ template matching, keyboard, mouse and the VNC console bridge."""
 
 import json
 import os
+import pathlib
 import pty
 import re
 import select
@@ -19,7 +20,7 @@ VM = "g01"
 OWNED = [
     "agent.exec", "agent.exec.timeout", "agent.shell", "agent.cp.push", "agent.cp.pull",
     "agent.tail", "agent.osinfo", "agent.stats", "agent.capabilities", "agent.clipboard",
-    "agent.repair", "login.default", "login.user", "login.password", "vision.screenshot",
+    "agent.update", "agent.repair", "login.default", "login.user", "login.password", "vision.screenshot",
     "vision.ocr", "vision.find-image", "vision.sendkeys", "vision.mouse", "console.tcp",
 ]
 
@@ -395,6 +396,29 @@ def _run(h):
         stop(con, h)
         h.ok("console.tcp", banner.startswith(b"RFB ") and con.returncode is not None,
              f"{line.strip()}: server said {banner!r}; bridge ended on Ctrl-C")
+
+        # -- update: `up` refreshes a stale agent (it replaces the agent too) -----
+        # The host judges the guest's agent against the stamp in the shipped
+        # asset's VERSION, so a different stamp there makes the guest's agent
+        # stale without building a second agent. Put back whatever happens.
+        version = pathlib.Path("/usr/share/vmlab/guest/agent/linux-x86_64/VERSION")
+        original = version.read_text()
+        stale_to = "agent=e2e-refresh"
+        try:
+            version.write_text(stale_to + "\n")
+            h.vmlab("down", VM, cwd=lab, timeout=180)
+            upd = h.vmlab("up", cwd=lab, timeout=600, check=False)
+        finally:
+            version.write_text(original)
+        h.wait_ready(lab, VM)
+        line = h.machine_line(lab, VM)
+        after = h.vmlab("exec", VM, "--", "id", "-un", cwd=lab, check=False)
+        said = [ln.strip() for ln in upd.text.splitlines() if ln.strip().startswith(("agent:", "warning: agent:"))]
+        h.ok("agent.update",
+             upd.code == 0 and any(s.startswith(f'agent: updated "{VM}"') and s.endswith(f"→ {stale_to})") for s in said)
+             and "diverged=yes" in line and after.out.strip() == "dev",
+             f"up exit {upd.code}: {' | '.join(said) or 'no agent line'}; status -v: diverged=yes "
+             f"{'present' if 'diverged=yes' in line else 'absent'}; exec after update -> {after.out.strip()!r}")
 
         # -- repair (last: it replaces the agent under everything above) ----------
         rp = h.vmlab("machine", "repair-agent", VM, cwd=lab, check=False, timeout=180)

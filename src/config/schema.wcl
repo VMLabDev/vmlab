@@ -81,6 +81,8 @@ type Lab {
   @inline(0) name: utf8
   @doc("Default for all VMs: open a VNC viewer on `up`; VM `gui` overrides")
   gui: bool?
+  @doc("Default for all VMs: refresh an out-of-date guest agent on `up` (default true); VM `agent_update` overrides")
+  agent_update: bool?
   @doc("Virtual L2 network segments in this lab")
   @children("segment")   segments: list<Segment>
   @doc("The VMs in this lab")
@@ -254,6 +256,8 @@ type Vm {
   nested: bool?
   @doc("Open a VNC viewer on `up`; the VM always runs headless")
   gui: bool?
+  @doc("Refresh the guest agent on `up` when its stamp differs from the host's (marks the VM diverged); inherits the lab's, default true")
+  agent_update: bool?
   @doc("QEMU display string; inherited from template→profile if omitted")
   display: utf8?
   @doc("Firmware: `ovmf` | `seabios`; inherited from template→profile")

@@ -41,8 +41,9 @@ page cmd_destroy {
     Everything a machine had that was not in its template goes: [snapshots](guide_snapshots)
     live inside the clones, so they go with them, and a machine marked
     diverged by [vmlab machine repair-agent](cmd_machine) comes back on its
-    template's sealed agent. The workspace sync ledger in `.vmlab/` goes
-    too.
+    template's sealed agent, unless the next [vmlab up](cmd_up) refreshes it
+    again; `agent_update = false` stops that. The workspace sync ledger in
+    `.vmlab/` goes too.
   DOC
 
   callout "The workspace survives, the guest tree does not" {

@@ -51,6 +51,9 @@ Inside the daemon, `up` works through a plan computed before anything is touched
    before it counts as ready. If one machine in a wave fails, the rest of the wave
    is aborted and the verb fails; the machine that failed is left running for
    inspection.
+   For a VM `up` waits on anyway (first-boot, a provision or playbook, or a
+   dependent), `up` refreshes the agent if it is out of date once it answers,
+   after first-boot and before any provision (see "Agent refresh" below).
 6. Between waves the daemon runs every provision script and playbook whose machine
    has started, in declaration order, waiting for each machine's readiness first.
 7. Port forwards are installed, and the workspace syncer starts for every dev
@@ -69,6 +72,23 @@ script.
 Note: a first-boot provision that errors, or that takes longer than 30 minutes,
 fails `up` but does not stop the machine, so a console or shell can be opened to
 inspect it.
+
+### Agent refresh
+
+When a VM's agent first answers, `up` compares its version stamp (`agent=<rev>`)
+with the stamp of the agent this vmlab ships. If they differ, in either direction,
+it pushes the shipped agent the way `vmlab machine repair-agent` does, marks the VM
+**diverged** (`diverged=yes` in `status -v`), emits `machine.agent_updated`, and
+prints `agent: updated "<vm>" (<old> → <new>)`. It runs after the first-boot script
+(the template's, written for the agent it sealed) and before every provision.
+`up` never starts waiting on a VM just to refresh it: a VM with no first-boot, no
+provision or playbook and no dependent (and every `vmlab vm start`) is refreshed in
+the background when it reports ready, its line going to the lab daemon's log; the
+event and `diverged=yes` still report it. A failed refresh never fails `up`: it prints
+`warning: agent: could not update "<vm>" …` with the reason and the old agent stays
+in place. Containers, the legacy agent tier, and VMs whose template sealed no agent
+are skipped silently. `agent_update = false` on a `vm` (or on the `lab`, for every
+VM; the `vm` wins) keeps the template's agent.
 
 ### Examples
 
@@ -206,7 +226,8 @@ way:
 `IP` is the first NIC with a lease, as reported by the guest agent, or `-` before
 the guest is ready. With `--verbose` a second line under each machine carries
 `state=`, `ready=` and `cached=`, plus `diverged=yes` on a machine
-whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md). A VM
+whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md) or by
+`up`'s agent refresh. A VM
 then adds `arch`, `cpus`, `memory` and `agent` (the sealed agent version); a
 container adds `health`, `exit` and `digest`.
 
@@ -337,7 +358,8 @@ The last line printed is `lab "<name>" destroyed`.
 
 Everything a machine had that was not in its template goes: snapshots live inside the
 clones, so they go with them (see snapshots-vision.md), and a machine marked diverged
-by `vmlab machine repair-agent` comes back on its template's sealed agent. The
+by `vmlab machine repair-agent` comes back on its template's sealed agent, unless
+the next `up` refreshes it again (`agent_update = false` stops that). The
 workspace sync ledger recorded in `.vmlab/` is forgotten too.
 
 Warning — the workspace survives, the guest tree does not: a dev machine's source

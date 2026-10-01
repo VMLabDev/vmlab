@@ -104,6 +104,16 @@ struct MuxInner {
     sessions: Mutex<HashMap<u32, Session>>,
 }
 
+/// What the handshake says this agent is: the build stamp
+/// `guest/build-agent.sh` compiles in (`agent=<rev>`, the same string it
+/// writes to the asset's `VERSION`), so the host can tell whether the agent
+/// in a guest is the one it would push (§19.4). A plain `cargo build` has no
+/// stamp and answers with the crate version.
+const AGENT_VERSION: &str = match option_env!("VMLAB_AGENT_STAMP") {
+    Some(stamp) => stamp,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// How many encoded frames may queue for the port writer before senders
 /// block. Sized to absorb bursts, not to buffer a detached host forever.
 const OUT_QUEUE: usize = 256;
@@ -306,7 +316,7 @@ impl Mux {
                 }
                 self.send_ctrl(&AgentMsg::Hello {
                     proto_version: PROTO_VERSION,
-                    agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                    agent_version: AGENT_VERSION.to_string(),
                     os: platform.os().to_string(),
                     features: platform.features(),
                     token,

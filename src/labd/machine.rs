@@ -350,6 +350,22 @@ pub trait Machine: Send + Sync + 'static {
         AgentOrigin::Image
     }
 
+    /// The agent stamp this machine's artefact sealed at build (§6.1) —
+    /// `None` where it sealed none: a scratch machine, a template built with
+    /// `agent = false`, or one whose agent is not sealed into anything it
+    /// boots. What `up`'s agent refresh (§19.4) falls back on for an agent
+    /// whose handshake carries no stamp.
+    fn sealed_agent_version(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether this machine's agent rides the legacy tier's ISA serial
+    /// channel (§7.4) — the C or HolyC agent, which nothing can replace over
+    /// its own channel.
+    fn agent_on_legacy_tier(&self) -> bool {
+        false
+    }
+
     /// Whether the agent answers a ping *right now* — unlike the sticky
     /// [`is_agent_up`](Machine::is_agent_up) this goes false mid-reboot.
     async fn agent_answering(&self) -> bool;

@@ -64,13 +64,14 @@ advertises in its handshake: `watch` serves the guest-side change feed and
 `fileops` every transfer. The syncer checks `watch && fileops` for itself, and
 `vmlab machine capabilities` lists the features an agent negotiated.
 
-An agent that predates these features is fixed one of two ways: rebuild the template
-to bake in the shipped agent, or push it into the running machine with
-`vmlab machine repair-agent`. Rebuild is policy; repair is a tool, for iterating on
-the agent without rebuilding a template. The agent enters an image once, at build,
-and `repair-agent` pushes the host's shipped agent over the agent's own channel and
-marks the machine **diverged**, because the template's sealed `agent_version` no
-longer describes it. Nothing does this by itself. It is meaningless on a container,
+An agent that predates these features is normally refreshed by `vmlab up` itself:
+when a VM's agent stamp differs from the agent this vmlab ships, `up` pushes the
+shipped agent over the agent's own channel before any provision runs and marks the
+machine **diverged**, because the template's sealed `agent_version` no longer
+describes it. `vmlab machine repair-agent` is the same push on demand, for a machine
+already running. Rebuilding the template is the route that keeps the machine
+matching its template, and `agent_update = false` keeps `up` away from the agent.
+The push needs an agent that serves `fileops`. It is meaningless on a container,
 whose agent lives in the initramfs vmlab ships and tracks the installed vmlab; the
 verb says so.
 

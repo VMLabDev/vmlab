@@ -75,6 +75,17 @@ pub struct LabRuntime {
     /// through `pre_provision` for a source that boots an installed OS,
     /// concurrently for one that installs from an ISO.
     pub provisions_wait_ready: std::sync::atomic::AtomicBool,
+    /// Whether `up` and `vm start` may refresh a machine's out-of-date guest
+    /// agent (§19.4). A template build turns this off: it installs and
+    /// verifies the agent itself, and the artefact it seals must carry the
+    /// agent the build staged, not one pushed over it mid-build.
+    pub agent_updates: std::sync::atomic::AtomicBool,
+    /// Machines whose agent refresh waits for their next ready, because
+    /// nothing in the `up` (or `vm start`) that booted them waits on their
+    /// agent (§19.4). Claimed — removed — by whichever comes first, the
+    /// ready callback or the starter seeing the machine already ready, so
+    /// a refresh runs at most once per start.
+    deferred_refresh: std::sync::Mutex<HashSet<String>>,
     /// Host config loaded once at build (config-weave binary dir, …).
     pub host_cfg: crate::config::host::HostConfig,
     /// In-flight config-weave runs, one per machine (`up` and on-demand
@@ -527,6 +538,8 @@ impl LabRuntime {
             pull_lock: Mutex::new(()),
             pre_provision: std::sync::RwLock::new(None),
             provisions_wait_ready: std::sync::atomic::AtomicBool::new(true),
+            agent_updates: std::sync::atomic::AtomicBool::new(true),
+            deferred_refresh: std::sync::Mutex::new(HashSet::new()),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
@@ -573,6 +586,11 @@ impl LabRuntime {
             pull_lock: Mutex::new(()),
             pre_provision: std::sync::RwLock::new(None),
             provisions_wait_ready: std::sync::atomic::AtomicBool::new(true),
+            // Off: the real asset lookup reads this host's installed agent,
+            // which a test must not depend on. The tests of the refresh turn
+            // it on and supply their own asset.
+            agent_updates: std::sync::atomic::AtomicBool::new(false),
+            deferred_refresh: std::sync::Mutex::new(HashSet::new()),
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
@@ -1189,16 +1207,186 @@ impl LabRuntime {
     /// what is inside the clone, and every surface reporting that machine's
     /// state says so until its disks are destroyed.
     pub async fn record_agent_repair(&self, machine: &str, agent_version: &str) -> Result<()> {
-        {
-            let mut state = self.state.lock().await;
-            state.machine_mut(machine).repaired_agent = Some(agent_version.to_string());
-            state.save(&self.lab_local)?;
-        }
+        self.mark_diverged(machine, agent_version).await?;
         self.events.emit(
             "machine.agent_repaired",
             json!({"vm": machine, "machine": machine, "agent_version": agent_version}),
         );
         Ok(())
+    }
+
+    /// The one record both a repair and `up`'s refresh leave: `machine` now
+    /// runs `agent_version`, pushed by this host, and is diverged until its
+    /// disks are destroyed.
+    async fn mark_diverged(&self, machine: &str, agent_version: &str) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.machine_mut(machine).repaired_agent = Some(agent_version.to_string());
+        state.save(&self.lab_local)
+    }
+
+    /// `up`'s agent refresh (§19.4): once `m`'s agent has answered and before
+    /// any provision runs, push the host's shipped agent where the stamps
+    /// differ, and mark the machine diverged exactly as the repair verb does.
+    ///
+    /// **Never fails the caller.** A machine that is not eligible — opted
+    /// out, a host-shipped agent, the legacy tier, nothing sealed — is passed
+    /// over silently, as is one with no asset to push; a refresh that fails
+    /// says `warning:` with the machine and the reason, emits
+    /// `machine.agent_updated` carrying the error, and `up` goes on. The push
+    /// stages the binary beside the installed one, so a failure before the
+    /// swap leaves the old agent installed and running.
+    pub async fn refresh_agent(
+        self: &Arc<Self>,
+        m: &Arc<dyn Machine>,
+        output: &crate::scripting::OutputSink,
+    ) {
+        self.refresh_agent_with(m, output, super::agent_repair::shipped_asset)
+            .await
+    }
+
+    /// Start `m` with its agent refresh deferred to its ready, so the caller
+    /// waits on nothing it did not wait on before (§19.4). A machine that
+    /// never becomes ready — a guest that cannot answer — is never refreshed
+    /// and never waited for.
+    pub async fn start_with_deferred_refresh(self: &Arc<Self>, m: &Arc<dyn Machine>) -> Result<()> {
+        let name = m.name().to_string();
+        self.deferred_refresh.lock_recover().insert(name.clone());
+        self.start_machine(&name).await?;
+        // Already running and ready, so no ready callback is coming.
+        if m.is_ready().await {
+            self.claim_deferred_refresh(&name);
+        }
+        Ok(())
+    }
+
+    /// Run a deferred refresh for `machine` in the background, if one is
+    /// still owed. Nobody is reading an `up`'s output by now, so what it says
+    /// goes to the daemon log; the event and the diverged mark are the same
+    /// as an inline refresh's.
+    fn claim_deferred_refresh(&self, machine: &str) {
+        if !self.deferred_refresh.lock_recover().remove(machine) {
+            return;
+        }
+        let me = self.arc();
+        let Ok(m) = me.machine(machine) else {
+            return;
+        };
+        let name = machine.to_string();
+        tokio::spawn(async move {
+            let log: crate::scripting::OutputSink = {
+                let name = name.clone();
+                Arc::new(move |line: String| {
+                    tracing::info!(machine = %name, "{}", line.trim_end());
+                })
+            };
+            me.refresh_agent(&m, &log).await;
+        });
+    }
+
+    /// [`refresh_agent`](Self::refresh_agent) with the asset lookup supplied,
+    /// which is the seam the tests run through.
+    pub(super) async fn refresh_agent_with(
+        self: &Arc<Self>,
+        m: &Arc<dyn Machine>,
+        output: &crate::scripting::OutputSink,
+        shipped: impl Fn(&dyn Machine) -> Result<crate::agent_asset::AgentAsset>,
+    ) {
+        use super::agent_repair::{Refresh, decide, eligible, push};
+        if !self
+            .agent_updates
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let name = m.name().to_string();
+        if let Err(why) = eligible(m.as_ref(), self.config.lab.agent_update_for(&name)) {
+            tracing::debug!(machine = %name, ?why, "agent refresh: not eligible");
+            return;
+        }
+        let asset = match shipped(m.as_ref()) {
+            Ok(asset) => asset,
+            Err(e) => {
+                tracing::debug!(machine = %name, error = %format!("{e:#}"), "agent refresh: no asset to push");
+                return;
+            }
+        };
+        let handshake = match async {
+            m.wait_agent_up(m.ready_timeout()).await?;
+            m.wait_agent(Duration::from_secs(60)).await
+        }
+        .await
+        {
+            Ok(agent) => agent.info().agent_version.clone(),
+            Err(e) => {
+                self.agent_update_failed(&name, None, &asset.version, &e, output);
+                return;
+            }
+        };
+        let recorded = self
+            .state
+            .lock()
+            .await
+            .machines
+            .get(&name)
+            .and_then(|s| s.repaired_agent.clone());
+        let sealed = m.sealed_agent_version();
+        let (from, to) = match decide(
+            &handshake,
+            recorded.as_deref(),
+            sealed.as_deref(),
+            &asset.version,
+        ) {
+            Refresh::Current => {
+                tracing::debug!(machine = %name, stamp = %asset.version, "agent refresh: current");
+                return;
+            }
+            Refresh::Skip(why) => {
+                tracing::debug!(machine = %name, %why, "agent refresh: skipped");
+                return;
+            }
+            Refresh::Update { from, to } => (from, to),
+        };
+        let pushed = match push(m, &asset).await {
+            Ok(report) => report.pushed,
+            Err(e) => {
+                self.agent_update_failed(&name, Some(&from), &to, &e, output);
+                return;
+            }
+        };
+        if let Err(e) = self.mark_diverged(&name, &pushed).await {
+            // The new agent is running; only the record of it failed.
+            output(format!(
+                "warning: agent: \"{name}\" runs {pushed} now, but recording it as diverged failed: {e:#}\n"
+            ));
+        }
+        self.events.emit(
+            "machine.agent_updated",
+            json!({"vm": name, "machine": name, "from": from, "to": pushed, "ok": true}),
+        );
+        output(format!("agent: updated \"{name}\" ({from} → {pushed})\n"));
+    }
+
+    /// The failed refresh: said, evented, and survived.
+    fn agent_update_failed(
+        &self,
+        name: &str,
+        from: Option<&str>,
+        to: &str,
+        e: &anyhow::Error,
+        output: &crate::scripting::OutputSink,
+    ) {
+        let what = match from {
+            Some(from) => format!("({from} → {to})"),
+            None => format!("(to {to})"),
+        };
+        output(format!(
+            "warning: agent: could not update \"{name}\" {what}: {e:#}; set agent_update = false \
+             on the vm to stop trying\n"
+        ));
+        self.events.emit(
+            "machine.agent_updated",
+            json!({"vm": name, "machine": name, "from": from, "to": to, "ok": false, "error": format!("{e:#}")}),
+        );
     }
 
     /// Stop a machine, wait for the exit monitor to settle, and boot it again.
@@ -1361,9 +1549,22 @@ impl LabRuntime {
                 let me = self.clone();
                 let n = name.clone();
                 let out = output.clone();
+                // Whether `up` waits on this machine's agent anyway: a
+                // first-boot runs on it, a provision or playbook is scoped to
+                // it, or a later wave depends on it. Only those get the agent
+                // refresh inline (§19.4); `up` must not start waiting on a
+                // machine nothing waits for — one whose guest can never answer
+                // would hold it for the whole ready timeout.
+                let waited = me.machine(&n)?.pending_first_boot().is_some()
+                    || steps.iter().any(|s| s.machine == n)
+                    || me.has_dependents(&n);
                 wave_tasks.spawn(async move {
-                    me.start_machine(&n).await?;
                     let m = me.machine(&n)?;
+                    if waited {
+                        me.start_machine(&n).await?;
+                    } else {
+                        me.start_with_deferred_refresh(&m).await?;
+                    }
                     // Detached, so provisions can rely on the shares (§7.5)
                     // without the wave blocking on the mount retry window. A
                     // machine whose guest mounts for itself does nothing here.
@@ -1372,6 +1573,13 @@ impl LabRuntime {
                     // no-op for machines carrying no first-boot script, so
                     // leaf timing is unchanged.
                     me.run_first_boot(&m, &out).await?;
+                    // After first-boot, before any provision (§19.4): the
+                    // first-boot script is the template's and runs under the
+                    // agent the template sealed; every provision after it
+                    // sees the current one. Never fails the wave.
+                    if waited {
+                        me.refresh_agent(&m, &out).await;
+                    }
                     // See `LabRuntime::pre_provision`.
                     let hook = me.pre_provision.read().expect("pre_provision lock").clone();
                     if let Some(hook) = hook {
@@ -2267,6 +2475,9 @@ impl crate::labd::machine::LabServices for LabRuntime {
     }
 
     async fn machine_ready(&self, machine: &str) {
+        // An agent refresh `up` deferred because nothing waited on this
+        // machine (§19.4). Backgrounded: forwards below must not wait on it.
+        self.claim_deferred_refresh(machine);
         let scope = [machine.to_string()];
         // Readiness is the agent's handshake, which a guest can give before
         // its DHCP client has a lease. A machine with forwards waits a while
@@ -2601,6 +2812,17 @@ mod tests {
             Ok(())
         }
 
+        /// A VM double seals an agent, as a template built with one does; a
+        /// container double's agent ships with the host, as a real one's.
+        fn sealed_agent_version(&self) -> Option<String> {
+            (self.kind == MachineKind::Vm).then(|| "agent=sealed".to_string())
+        }
+        fn agent_origin(&self) -> crate::labd::machine::AgentOrigin {
+            match self.kind {
+                MachineKind::Vm => crate::labd::machine::AgentOrigin::Image,
+                MachineKind::Container => crate::labd::machine::AgentOrigin::HostAsset,
+            }
+        }
         async fn agent(&self) -> Result<super::super::vm_agent::AgentHandle> {
             self.agent
                 .clone()
@@ -2744,6 +2966,147 @@ lab "t" {
             ["dev01"],
             "exactly one machine is the lab's default"
         );
+    }
+
+    /// Who `up`'s agent refresh asks at all (§19.4), through the real `up`:
+    /// a VM double seals an agent but has none answering, so a refresh that
+    /// is attempted ends in a warning — and one that is not says nothing.
+    /// `agent_update` on the `vm` beats the `lab`'s, a container is never
+    /// asked, and `up` succeeds either way.
+    #[tokio::test]
+    async fn up_refreshes_the_agents_the_lab_file_lets_it_and_never_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let src = r#"import <vmlab.wcl>
+lab "t" {
+  agent_update = false
+  vm "inherits" { template = "x86_64/t" }
+  vm "insists" { template = "x86_64/t" agent_update = true }
+  container "web" { image = "web:1" }
+}"#;
+        let lab = lab_of(
+            dir.path(),
+            src,
+            vec![
+                FakeMachine::new("inherits", MachineKind::Vm, &sh),
+                FakeMachine::new("insists", MachineKind::Vm, &sh),
+                FakeMachine::new("web", MachineKind::Container, &sh),
+            ],
+        );
+        lab.agent_updates
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let said = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink: crate::scripting::OutputSink = {
+            let said = said.clone();
+            Arc::new(move |s: String| said.lock().unwrap().push_str(&s))
+        };
+        let asset = dir.path().join("vmlab-agent");
+        std::fs::write(&asset, b"agent").unwrap();
+        let shipped = move |_: &dyn Machine| {
+            Ok(crate::agent_asset::AgentAsset {
+                path: asset.clone(),
+                version: "agent=shipped".into(),
+            })
+        };
+
+        for m in lab.machines().collect::<Vec<_>>() {
+            Arc::clone(&m).start(lab.services()).await.unwrap();
+            lab.refresh_agent_with(&m, &sink, &shipped).await;
+        }
+        let out = said.lock().unwrap().clone();
+        assert!(
+            out.contains("warning: agent: could not update \"insists\""),
+            "the vm's own `agent_update = true` beats the lab's: {out}"
+        );
+        assert!(!out.contains("\"inherits\""), "the lab's opt-out: {out}");
+        assert!(
+            !out.contains("\"web\""),
+            "a container is never asked: {out}"
+        );
+
+        // A template build turns the refresh off for everything.
+        said.lock().unwrap().clear();
+        lab.agent_updates
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let insists = lab.machine("insists").unwrap();
+        lab.refresh_agent_with(&insists, &sink, &shipped).await;
+        assert_eq!(*said.lock().unwrap(), "");
+
+        // No asset for the guest's os/arch is passed over silently.
+        lab.agent_updates
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        lab.refresh_agent_with(&insists, &sink, |_: &dyn Machine| {
+            Err(anyhow!("no agent asset"))
+        })
+        .await;
+        assert_eq!(*said.lock().unwrap(), "");
+
+        // And the real `up` survives the failed refresh.
+        lab.up(&[], sink.clone())
+            .await
+            .expect("up never fails on a refresh");
+    }
+
+    /// `up` does not start waiting on a machine nothing waits for just to
+    /// refresh its agent (§19.4): a guest that can never answer — an unsigned
+    /// bootloader under secure boot — would otherwise hold `up` for the whole
+    /// ready timeout. Its refresh is owed to its ready instead, and the ready
+    /// callback claims it.
+    #[tokio::test]
+    async fn a_machine_nothing_waits_on_is_refreshed_at_its_ready_not_by_blocking_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "silent" { template = "x86_64/t" }
+}"#,
+            vec![FakeMachine::never_ready("silent", MachineKind::Vm, &sh)],
+        );
+        lab.agent_updates
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        tokio::time::timeout(Duration::from_secs(10), lab.up(&[], quiet()))
+            .await
+            .expect("up returns without waiting on the agent")
+            .expect("up");
+        assert!(
+            lab.deferred_refresh.lock_recover().contains("silent"),
+            "the refresh is owed to the machine's ready"
+        );
+
+        super::super::machine::LabServices::machine_ready(lab.as_ref(), "silent").await;
+        assert!(
+            !lab.deferred_refresh.lock_recover().contains("silent"),
+            "the ready claims it, once"
+        );
+    }
+
+    /// The `vm` block's `agent_update` beats the `lab` block's, and the floor
+    /// is on.
+    #[test]
+    fn agent_update_resolves_vm_then_lab_then_on() {
+        let cfg = |src: &str| {
+            crate::config::load_lab_source(src, "<test>", std::path::Path::new("/tmp"))
+                .expect("lab source")
+                .lab
+        };
+        let lab = cfg(r#"import <vmlab.wcl>
+lab "t" {
+  vm "a" { template = "x86_64/t" }
+  vm "b" { template = "x86_64/t" agent_update = false }
+}"#);
+        assert!(lab.agent_update_for("a"));
+        assert!(!lab.agent_update_for("b"));
+        let lab = cfg(r#"import <vmlab.wcl>
+lab "t" {
+  agent_update = false
+  vm "a" { template = "x86_64/t" }
+  vm "b" { template = "x86_64/t" agent_update = true }
+}"#);
+        assert!(!lab.agent_update_for("a"));
+        assert!(lab.agent_update_for("b"));
     }
 
     /// A machine the repair verb changed in place is reported diverged

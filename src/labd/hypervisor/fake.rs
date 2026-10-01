@@ -527,6 +527,12 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
                     interfaces: Vec::new(),
                 },
                 HostMsg::Shutdown { mode } => AgentMsg::ShuttingDown { mode },
+                // Advertised so a caller gets as far as asking, refused so
+                // the asking fails the way a real agent's refusal does.
+                HostMsg::OpenFileOps { id, .. } => AgentMsg::Error {
+                    id: Some(id),
+                    msg: "the fake agent serves no file session".into(),
+                },
                 _ => continue,
             };
             let shutting_down = matches!(reply, AgentMsg::ShuttingDown { .. });

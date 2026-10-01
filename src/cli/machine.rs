@@ -181,7 +181,7 @@ fn render_repair(report: &Value) -> String {
     let _ = writeln!(
         out,
         "\"{}\" is now diverged from its template — `vmlab vm destroy` + `vmlab up` \
-         puts it back on the sealed agent",
+         with `agent_update = false` puts it back on the sealed agent",
         text("machine"),
     );
     out

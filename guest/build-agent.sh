@@ -143,6 +143,13 @@ build_one() {
       ;;
   esac
 
+  # One stamp for both halves: compiled into the binary's handshake and
+  # written to VERSION beside it, so the host can tell whether the agent in a
+  # guest is the one it would push (PRD §19.4).
+  local stamp
+  stamp="$(version_stamp)"
+  env_args+=("VMLAB_AGENT_STAMP=$stamp")
+
   log "building vmlab-agent for $key ($target)"
   env "${env_args[@]}" cargo $toolchain build --release --target "$target" "${build_std[@]}" \
     --manifest-path "$SCRIPT_DIR/agent/Cargo.toml" \
@@ -151,7 +158,7 @@ build_one() {
   local out="$DIST_DIR/$key"
   mkdir -p "$out"
   install -m 0755 "$SCRIPT_DIR/agent/target/$target/release/$binary" "$out/$binary"
-  version_stamp >"$out/VERSION"
+  echo "$stamp" >"$out/VERSION"
   log "$key: $(du -h "$out/$binary" | cut -f1) → $out/$binary"
 }
 

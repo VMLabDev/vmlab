@@ -1,12 +1,22 @@
 //! `vmlab machine repair-agent` — push the host's shipped agent into a
-//! running machine, and mark that machine **diverged** (PRD §19.4).
+//! running machine, and mark that machine **diverged** (PRD §19.4) — and the
+//! refresh `vmlab up` performs with the same push when a machine's agent is
+//! out of date.
 //!
-//! **Rebuild is policy; repair is a tool.** The agent enters an image exactly
-//! once, at build (§6.1, §7.4), so a stale agent is a rebuild — and this verb
-//! never fires by itself, because an automatic refresh at `up` would make the
-//! template's sealed `agent_version` a lie and stop *same template → same
-//! machine* holding. It exists because a 15–45 minute Windows rebuild to pick
-//! up an agent change is otherwise the inner loop of building §19 itself.
+//! **Rebuild is the clean answer; repair is a tool; `up` refreshes.** The
+//! agent enters an image exactly once, at build (§6.1, §7.4), so the only way
+//! to get a machine whose agent matches its template's sealed
+//! `agent_version` again is a rebuild. Short of that, `up` (and `vm start`)
+//! compare the agent's version stamp with the stamp of the asset this host
+//! would push and, where they differ, push it — once the agent first answers
+//! and before any provision runs, so provisions see the current agent. A
+//! machine that has been refreshed is diverged exactly as a repaired one is:
+//! the template's sealed `agent_version` no longer describes it, and every
+//! surface reporting the machine says so. `agent_update = false` on the `vm`
+//! or `lab` block keeps `up` from touching the agent at all, which restores
+//! *same template → same machine*. The verb stays for the moment `up` does
+//! not cover: a machine already running, or an agent the developer wants
+//! pushed now.
 //!
 //! **What it can and cannot recover.** The binary rides the agent's own
 //! channel, so the agent already there has to be able to receive it: an agent
@@ -31,7 +41,7 @@ use serde::Serialize;
 
 use super::guest_os::GuestOs;
 use super::machine::{AgentOrigin, Machine};
-use crate::agent_asset::{AgentOs, ensure_agent_asset};
+use crate::agent_asset::{AgentAsset, AgentOs, ensure_agent_asset};
 
 /// How long the new agent has to answer its handshake after the swap. A
 /// service restart is seconds on both guest families; this is the budget for
@@ -185,6 +195,17 @@ pub struct RepairReport {
     pub features: Vec<String>,
 }
 
+/// The agent asset this host would push into `m` — the one both the repair
+/// verb and `up`'s refresh push, so the two can never disagree about what
+/// "current" means.
+pub fn shipped_asset(m: &dyn Machine) -> Result<AgentAsset> {
+    let os = match m.guest_os() {
+        GuestOs::Windows => AgentOs::Windows,
+        GuestOs::Linux => AgentOs::Linux,
+    };
+    ensure_agent_asset(os, &m.arch())
+}
+
 /// Push the host's shipped agent into `m` and wait for it to come back.
 ///
 /// Marking the machine diverged is the *caller's* half, because the record
@@ -195,12 +216,16 @@ pub async fn repair(m: &Arc<dyn Machine>) -> Result<RepairReport> {
     if let Some(why) = meaningless_for(m.agent_origin()) {
         bail!("\"{name}\": {why}");
     }
+    let asset = shipped_asset(m.as_ref())?;
+    push(m, &asset).await
+}
 
-    let os = match m.guest_os() {
-        GuestOs::Windows => AgentOs::Windows,
-        GuestOs::Linux => AgentOs::Linux,
-    };
-    let asset = ensure_agent_asset(os, &m.arch())?;
+/// The push both callers share — the repair verb and `up`'s refresh: hand
+/// `asset` to `m`'s agent over its own channel, stage it beside the installed
+/// binary, swap, restart the service and wait for the new agent's handshake.
+/// A failure before the swap leaves the old agent installed and running.
+pub async fn push(m: &Arc<dyn Machine>, asset: &AgentAsset) -> Result<RepairReport> {
+    let name = m.name().to_string();
     let plan = plan(m.guest_os());
 
     let agent = m.agent().await.with_context(|| {
@@ -277,11 +302,130 @@ pub async fn repair(m: &Arc<dyn Machine>) -> Result<RepairReport> {
     let info = agent.info();
     Ok(RepairReport {
         machine: name,
-        pushed: asset.version,
+        pushed: asset.version.clone(),
         installed_at: plan.install,
         agent_version: info.agent_version,
         features: info.features,
     })
+}
+
+// ---- `up`'s refresh (§19.4) --------------------------------------------------
+
+/// The prefix the Rust agent's build stamp carries (`agent=<rev>`), in the
+/// asset's `VERSION` file and — for an agent built by `guest/build-agent.sh`
+/// since the stamp was compiled in — in its handshake. An agent from before
+/// that answers with its crate version instead, which is not a stamp.
+pub const STAMP_PREFIX: &str = "agent=";
+
+/// Why `up` leaves a machine's agent alone without asking it anything. Each is
+/// silent: none of them is something the developer has to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotEligible {
+    /// `agent_update = false` on the `vm` block, or on the `lab` block with
+    /// the `vm` saying nothing.
+    OptedOut,
+    /// The agent ships with the host (a container's initramfs guest asset), so
+    /// it is current by construction.
+    HostAsset,
+    /// The legacy tier — the C agent or the HolyC one, over ISA serial
+    /// (§7.4). Nothing can replace it over its own channel.
+    LegacyTier,
+    /// The machine's artefact sealed no agent: a scratch VM, a template built
+    /// with `agent = false`, or one predating agent support. There is no agent
+    /// to refresh, and waiting for one would hold `up` for nothing.
+    NoSealedAgent,
+}
+
+/// Whether `up` should look at `m`'s agent at all — decided from what the lab
+/// file and the machine already say, before anything waits on the guest.
+pub fn eligible(m: &dyn Machine, opted_in: bool) -> Result<(), NotEligible> {
+    eligible_from(
+        opted_in,
+        m.agent_origin(),
+        m.agent_on_legacy_tier(),
+        m.sealed_agent_version().as_deref(),
+    )
+}
+
+/// [`eligible`] over plain facts, so every rung is a test.
+pub fn eligible_from(
+    opted_in: bool,
+    origin: AgentOrigin,
+    legacy_transport: bool,
+    sealed: Option<&str>,
+) -> Result<(), NotEligible> {
+    if !opted_in {
+        return Err(NotEligible::OptedOut);
+    }
+    if origin == AgentOrigin::HostAsset {
+        return Err(NotEligible::HostAsset);
+    }
+    let Some(sealed) = sealed else {
+        return Err(NotEligible::NoSealedAgent);
+    };
+    if legacy_transport || crate::template::agent_install::is_legacy_agent(sealed) {
+        return Err(NotEligible::LegacyTier);
+    }
+    Ok(())
+}
+
+/// What `up` does about one eligible machine's agent once it has answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refresh {
+    /// The agent's stamp is the shipped asset's.
+    Current,
+    /// Cannot be judged; said at debug level only.
+    Skip(String),
+    /// Push the shipped asset. `from` is what the agent is, `to` what it will
+    /// be.
+    Update { from: String, to: String },
+}
+
+/// The stamp the running agent carries.
+///
+/// Its own handshake where that is a stamp. An agent that predates the stamp
+/// being compiled in answers with its crate version, so what it is falls back
+/// to the host's record: the asset last pushed into this machine, else the
+/// stamp its template sealed.
+pub fn installed_stamp<'a>(
+    handshake: &'a str,
+    recorded: Option<&'a str>,
+    sealed: Option<&'a str>,
+) -> Option<&'a str> {
+    if handshake.starts_with(STAMP_PREFIX) {
+        Some(handshake)
+    } else {
+        recorded.or(sealed)
+    }
+}
+
+/// The decision, as a value (ADR-0003). **The host is the source of truth**: a
+/// stamp that differs in either direction is replaced, because "newer" is not
+/// something two git revisions say about themselves.
+pub fn decide(
+    handshake: &str,
+    recorded: Option<&str>,
+    sealed: Option<&str>,
+    shipped: &str,
+) -> Refresh {
+    // The fallback `VERSION`-less assets read as — nothing to compare with.
+    if shipped == "unknown" || shipped.is_empty() {
+        return Refresh::Skip("the shipped agent asset carries no VERSION stamp".into());
+    }
+    // This exact asset was already pushed into this machine. An agent that
+    // still answers with another stamp is one whose asset's `VERSION` does not
+    // describe the binary beside it; pushing it again would change nothing
+    // and would repeat on every `up`.
+    if recorded == Some(shipped) {
+        return Refresh::Current;
+    }
+    match installed_stamp(handshake, recorded, sealed) {
+        Some(installed) if installed == shipped => Refresh::Current,
+        installed => Refresh::Update {
+            from: installed.unwrap_or(handshake).to_string(),
+            to: shipped.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -369,5 +513,122 @@ mod tests {
         assert!(why.contains("cannot go stale"), "{why}");
         assert!(!why.contains("rebuild the template"), "{why}");
         assert_eq!(meaningless_for(AgentOrigin::Image), None);
+    }
+
+    // ---- `up`'s refresh --------------------------------------------------------
+
+    /// A stamp equal to the shipped asset's is left alone; a different one —
+    /// in either direction — is replaced, the host being the source of truth.
+    #[test]
+    fn a_matching_stamp_is_current_and_a_different_one_is_updated() {
+        assert_eq!(
+            decide(
+                "agent=2284722",
+                None,
+                Some("agent=57fa802"),
+                "agent=2284722"
+            ),
+            Refresh::Current
+        );
+        assert_eq!(
+            decide(
+                "agent=57fa802",
+                None,
+                Some("agent=57fa802"),
+                "agent=2284722"
+            ),
+            Refresh::Update {
+                from: "agent=57fa802".into(),
+                to: "agent=2284722".into()
+            }
+        );
+        // "Older" on the host is still the host's answer.
+        assert_eq!(
+            decide("agent=2284722", None, None, "agent=57fa802"),
+            Refresh::Update {
+                from: "agent=2284722".into(),
+                to: "agent=57fa802".into()
+            }
+        );
+    }
+
+    /// An agent from before the stamp was compiled in answers with its crate
+    /// version, so what it is comes from the host's record: the last push,
+    /// else the template's seal.
+    #[test]
+    fn an_agent_that_reports_no_stamp_is_judged_by_the_hosts_record() {
+        assert_eq!(
+            decide("0.1.0", None, Some("agent=abc"), "agent=abc"),
+            Refresh::Current
+        );
+        assert_eq!(
+            decide("0.1.0", None, Some("agent=abc"), "agent=def"),
+            Refresh::Update {
+                from: "agent=abc".into(),
+                to: "agent=def".into()
+            }
+        );
+        assert_eq!(
+            decide("0.1.0", Some("agent=def"), Some("agent=abc"), "agent=def"),
+            Refresh::Current
+        );
+    }
+
+    /// The asset already pushed into this machine is not pushed again, even
+    /// where the agent still answers with some other stamp — that would repeat
+    /// on every `up` and change nothing.
+    #[test]
+    fn the_asset_already_pushed_is_not_pushed_again() {
+        assert_eq!(
+            decide(
+                "agent=old",
+                Some("agent=new"),
+                Some("agent=old"),
+                "agent=new"
+            ),
+            Refresh::Current
+        );
+    }
+
+    /// An asset with no `VERSION` file reads as "unknown", which no stamp can
+    /// be compared with.
+    #[test]
+    fn an_unstamped_asset_is_skipped() {
+        assert!(matches!(
+            decide("agent=abc", None, None, "unknown"),
+            Refresh::Skip(_)
+        ));
+    }
+
+    /// Opt-out, a host-shipped agent, the legacy tier and a machine sealing no
+    /// agent each keep `up` away from the guest entirely.
+    #[test]
+    fn who_up_never_asks() {
+        let image = AgentOrigin::Image;
+        assert_eq!(eligible_from(true, image, false, Some("agent=a")), Ok(()));
+        assert_eq!(
+            eligible_from(false, image, false, Some("agent=a")),
+            Err(NotEligible::OptedOut)
+        );
+        assert_eq!(
+            eligible_from(true, AgentOrigin::HostAsset, false, Some("agent=a")),
+            Err(NotEligible::HostAsset)
+        );
+        assert_eq!(
+            eligible_from(true, image, true, Some("agent=a")),
+            Err(NotEligible::LegacyTier)
+        );
+        assert_eq!(
+            eligible_from(true, image, false, Some("agent-legacy=a")),
+            Err(NotEligible::LegacyTier)
+        );
+        assert_eq!(
+            eligible_from(true, image, false, Some("agent-templeos=a")),
+            Err(NotEligible::LegacyTier)
+        );
+        assert_eq!(
+            eligible_from(true, image, false, None),
+            Err(NotEligible::NoSealedAgent)
+        );
     }
 }

@@ -24,12 +24,12 @@ use crate::labd::machine::Machine;
 ///
 /// Judged by what those agents assert, not by what the Rust one was assumed
 /// to. The C and HolyC agents compile their build stamp in as their version
-/// (`agent-legacy=<rev>`, `agent-templeos=<rev>`). The Rust agent reports its
-/// crate version — "0.1.0" — and never carried an `agent=` prefix, so a test
-/// for one called every Rust agent legacy. Nothing noticed until a guest old
+/// (`agent-legacy=<rev>`, `agent-templeos=<rev>`). The Rust agent reports
+/// `agent=<rev>` when `guest/build-agent.sh` built it and its crate version —
+/// "0.1.0" — otherwise; an `agent=` test once called every Rust agent legacy. Nothing noticed until a guest old
 /// enough to need this tier finally answered on Windows: a Windows 7 build
 /// sealed a full agent as `windows-nt`, exec-only (2026-09-03).
-fn is_legacy_agent(agent_version: &str) -> bool {
+pub(crate) fn is_legacy_agent(agent_version: &str) -> bool {
     agent_version.starts_with("agent-legacy=") || agent_version.starts_with("agent-templeos=")
 }
 

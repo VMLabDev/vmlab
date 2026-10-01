@@ -1145,6 +1145,14 @@ impl super::machine::Machine for VmInstance {
         self.template().resolved.agent_transport.has_channel()
     }
 
+    fn sealed_agent_version(&self) -> Option<String> {
+        self.template().agent_version.clone()
+    }
+
+    fn agent_on_legacy_tier(&self) -> bool {
+        self.template().resolved.agent_transport == crate::profiles::AgentTransport::IsaSerial
+    }
+
     async fn clear_agent_failure(&self) {
         self.agent.clear_failure().await;
     }

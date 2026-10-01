@@ -311,6 +311,11 @@ async fn run_build(
     runtime
         .provisions_wait_ready
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    // The build installs and verifies the agent it seals; `up` refreshing a
+    // base template's agent over it mid-build would seal the wrong one.
+    runtime
+        .agent_updates
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let agent_version: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
     let verify_concurrent = matches!(

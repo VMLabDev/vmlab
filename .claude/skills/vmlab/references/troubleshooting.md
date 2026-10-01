@@ -76,7 +76,7 @@ If the guest is up and the agent is absent, rebuild the template so the bake ins
 
 ## `vmlab machine repair-agent` refused
 
-A machine whose agent is older than the host's lacks features the host expects; `vmlab machine capabilities <machine>` lists the ones it negotiated. Rebuilding the template is the durable remedy. `vmlab machine repair-agent <machine>` pushes the host's shipped agent into the running machine over its own channel and marks the machine *diverged* in `vmlab status`, so you remember the clone no longer matches its template. It refuses on three conditions:
+A machine whose agent is older than the host's lacks features the host expects; `vmlab machine capabilities <machine>` lists the ones it negotiated. `vmlab up` and `vmlab vm start` normally refresh it by themselves when the VM's agent stamp differs from the shipped agent's, printing `agent: updated "<vm>" (<old> → <new>)`, or `warning: agent: could not update "<vm>" …` with the reason, leaving the old agent in place and carrying on; `agent_update = false` on the `vm` or `lab` block turns that off. Rebuilding the template is the durable remedy. `vmlab machine repair-agent <machine>` pushes the host's shipped agent into the running machine over its own channel and marks the machine *diverged* in `vmlab status`, so you remember the clone no longer matches its template. It refuses on three conditions:
 
 | Refusal | Meaning |
 | --- | --- |
