@@ -316,6 +316,7 @@ async fn start_vm(vm: &Arc<VmInstance>, cbs: Callbacks) -> anyhow::Result<()> {
         move || {
             readies.fetch_add(1, Ordering::SeqCst);
         },
+        std::future::ready(()),
     )
     .await
 }
@@ -602,6 +603,7 @@ async fn nothing_is_still_up_when_the_exit_callback_fires() {
             let _ = tx.send(snapshot);
         },
         || {},
+        std::future::ready(()),
     )
     .await
     .expect("start");
@@ -1200,4 +1202,135 @@ async fn a_stale_agent_is_refreshed_and_a_failed_refresh_only_warns() {
     );
 
     vm.stop(true).await.expect("stop");
+}
+
+// ---- readiness and the deferred agent refresh (§19.4) -------------------------
+
+/// A lab runtime over one fake-hypervisor VM, with agent refreshes on and the
+/// shipped asset supplied by the test. `vm_decl` is the lab file's `vm` block,
+/// which is where `agent_update` is read from.
+fn refreshing_lab(
+    dirs: &Dirs,
+    vm: &Arc<VmInstance>,
+    vm_decl: &str,
+    shipped: super::lab::ShippedAgent,
+) -> Arc<super::lab::LabRuntime> {
+    let config = crate::config::load_lab_source(
+        &format!("import <vmlab.wcl>\nlab \"t\" {{\n{vm_decl}\n}}\n"),
+        "<test>",
+        &dirs.root,
+    )
+    .expect("lab source");
+    let lab = super::lab::LabRuntime::with_machines(config, vec![vm.clone()]).expect("runtime");
+    lab.agent_updates.store(true, Ordering::Relaxed);
+    *lab.shipped_agent.write().expect("shipped_agent") = shipped;
+    lab
+}
+
+/// **A machine owed an agent refresh is not ready until the refresh has
+/// run** (§19.4). The refresh restarts the agent, so a machine reported ready
+/// first hands whoever was waiting on it a channel about to close — which is
+/// what `vmlab exec` met live, as "agent channel closed during exec".
+///
+/// The refresh here is held at its first step until the test lets it go, and
+/// then fails (the fake agent refuses the file session): readiness waits for
+/// it, and a failed refresh still ends with the machine ready on its old
+/// agent, `vm.ready` arriving only after the refresh said how it went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_owed_a_refresh_is_not_ready_until_the_refresh_has_run() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let binary = dirs.root.join("vmlab-agent");
+    std::fs::write(&binary, b"a newer agent").expect("asset");
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let lab = refreshing_lab(
+        &dirs,
+        &vm,
+        LINUX_VM,
+        Arc::new(move |_: &dyn Machine| {
+            // Off the reactor: a worker blocked here would strand whatever
+            // it had queued, the fake agent's own answers among them.
+            let _ = tokio::task::block_in_place(|| held.lock().expect("held").recv());
+            Ok(crate::agent_asset::AgentAsset {
+                path: binary.clone(),
+                version: "agent=new".into(),
+            })
+        }),
+    );
+    let mut events = lab.events.subscribe();
+    let m: Arc<dyn Machine> = vm.clone();
+
+    lab.start_with_deferred_refresh(&m).await.expect("start");
+    m.wait_agent_up(SETTLE).await.expect("the agent answered");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !m.is_ready().await,
+        "the agent answered, but the refresh it is owed has not run"
+    );
+
+    release.send(()).expect("release the refresh");
+    m.wait_ready(SETTLE)
+        .await
+        .expect("a failed refresh still ends with the machine ready");
+    let seen = collect_events(&mut events, &["machine.agent_updated", "vm.ready"], 2).await;
+    assert_eq!(seen[0].event, "machine.agent_updated", "{seen:?}");
+    assert_eq!(seen[0].data["ok"], false);
+    assert_eq!(
+        seen[1].event, "vm.ready",
+        "ready only once the refresh said"
+    );
+    assert!(m.agent_answering().await, "on its old agent");
+
+    vm.stop(true).await.expect("stop");
+}
+
+/// The other half: a machine with **no** refresh owed is not delayed by one.
+/// An agent already current is held only for the handshake that shows it; a
+/// machine opted out with `agent_update = false` is never even asked about
+/// its asset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_owed_no_refresh_is_ready_at_its_handshake() {
+    // Current: the shipped stamp is the one the template sealed.
+    let dirs = Dirs::new();
+    let (vm1, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let binary = dirs.root.join("vmlab-agent");
+    let lab = refreshing_lab(
+        &dirs,
+        &vm1,
+        LINUX_VM,
+        Arc::new(move |_: &dyn Machine| {
+            Ok(crate::agent_asset::AgentAsset {
+                path: binary.clone(),
+                version: "0.1.0".into(),
+            })
+        }),
+    );
+    let mut events = lab.events.subscribe();
+    let m: Arc<dyn Machine> = vm1.clone();
+    lab.start_with_deferred_refresh(&m).await.expect("start");
+    m.wait_ready(SETTLE).await.expect("ready");
+    collect_events(&mut events, &["vm.ready"], 1).await;
+    vm1.stop(true).await.expect("stop");
+
+    // Opted out: the asset lookup is never reached.
+    let dirs = Dirs::new();
+    let opted_out = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB agent_update = false }"#;
+    let (vm2, _hv) = vm(&dirs, opted_out, Script::healthy());
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lab = refreshing_lab(&dirs, &vm2, opted_out, {
+        let asked = asked.clone();
+        Arc::new(move |_: &dyn Machine| {
+            asked.store(true, Ordering::SeqCst);
+            anyhow::bail!("never asked")
+        })
+    });
+    let m: Arc<dyn Machine> = vm2.clone();
+    lab.start_with_deferred_refresh(&m).await.expect("start");
+    m.wait_ready(SETTLE).await.expect("ready");
+    assert!(
+        !asked.load(Ordering::SeqCst),
+        "an opted-out machine owes no refresh"
+    );
+    vm2.stop(true).await.expect("stop");
 }

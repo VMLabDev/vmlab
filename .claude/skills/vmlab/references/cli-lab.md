@@ -83,8 +83,12 @@ prints `agent: updated "<vm>" (<old> → <new>)`. It runs after the first-boot s
 (the template's, written for the agent it sealed) and before every provision.
 `up` never starts waiting on a VM just to refresh it: a VM with no first-boot, no
 provision or playbook and no dependent (and every `vmlab vm start`) is refreshed in
-the background when it reports ready, its line going to the lab daemon's log; the
-event and `diverged=yes` still report it. A failed refresh never fails `up`: it prints
+the background when its agent first answers, its line going to the lab daemon's log;
+the event and `diverged=yes` still report it. Such a VM is **not ready until the
+refresh has finished** (succeeded or failed): `status` shows it `booting`, and
+`wait_ready`, dependents, `vm.ready` and port forwards wait for it — capped at five
+minutes. A VM whose agent is current is held only for the comparison; one that
+cannot be refreshed is not held. A failed refresh never fails `up`: it prints
 `warning: agent: could not update "<vm>" …` with the reason and the old agent stays
 in place. Containers, the legacy agent tier, and VMs whose template sealed no agent
 are skipped silently. `agent_update = false` on a `vm` (or on the `lab`, for every
@@ -216,7 +220,7 @@ way:
 | Label | Meaning |
 | --- | --- |
 | `starting` | The process is being launched, or a container is up but its entrypoint has not signalled ready. |
-| `booting` | A VM is running but its guest agent has not answered yet. |
+| `booting` | A VM is running but not ready yet: its guest agent has not answered, or a first-boot script or agent refresh is still running. |
 | `running` | Running and ready. |
 | `unhealthy` | A container is ready but its declared healthcheck is failing. |
 | `stopping` | The stop ladder is in progress. |

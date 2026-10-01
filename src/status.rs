@@ -93,7 +93,9 @@ pub enum Severity {
 pub enum LabelState {
     /// Running, ready, and not failing a healthcheck.
     Running,
-    /// A VM whose guest is up but whose agent has not answered yet.
+    /// A VM whose guest is up but that is not ready yet: its agent has not
+    /// answered, or a first-boot script or a deferred agent refresh (§19.4)
+    /// is still running.
     Booting,
     /// Mid-start, or a container whose entrypoint has not signalled ready —
     /// which is genuinely not "booting".

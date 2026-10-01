@@ -441,8 +441,9 @@ impl Handler<LabRequest> for LabdHandler {
                     .await?;
                 lab.preflight_binaries(std::slice::from_ref(&machine))?;
                 // `vm start` refreshes a stale agent as `up` does (§19.4),
-                // in the background once the machine is ready, so the verb
-                // still returns as soon as the machine has started. Not under
+                // in the background at its handshake — holding its readiness
+                // until the refresh is done — so the verb still returns as
+                // soon as the machine has started. Not under
                 // a pending first-boot, which only `up` runs and which the
                 // refresh must follow — the next `up` does it.
                 let m = machine_of(lab, &machine)?;

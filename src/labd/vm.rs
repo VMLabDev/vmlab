@@ -549,6 +549,11 @@ impl VmInstance {
     /// Spawn QEMU paused, connect QMP, then release the CPUs. The caller has
     /// already wired the NIC listener sockets on the segment switches.
     /// `on_exit` runs when the QEMU process ends (reason classified).
+    /// `before_ready` is awaited between the agent's handshake and `ready`
+    /// flipping (with `on_ready` firing): whatever the lab owes this boot
+    /// before anyone may use it — a deferred agent refresh (§19.4) — runs
+    /// there, so readiness means the agent a caller reaches is the one that
+    /// stays.
     ///
     /// The callback-level entry point [`Machine::start`](super::machine::Machine::start)
     /// wraps: it turns these callbacks into the lab's lifecycle events and
@@ -562,6 +567,7 @@ impl VmInstance {
         self: &Arc<Self>,
         on_exit: impl Fn(StopReason, String) + Send + Sync + 'static,
         on_ready: impl Fn() + Send + Sync + 'static,
+        before_ready: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         {
             let mut st = self.state.write().await;
@@ -685,6 +691,14 @@ impl VmInstance {
         // first-boot provision, agent-up is also full readiness, so set both
         // and fire on_ready. Otherwise leave `ready` for the orchestration
         // layer to flip once the first-boot provision completes.
+        //
+        // Between the two, `before_ready` runs whatever the lab owes this boot
+        // first — the agent refresh a deferred `up` or `vm start` left to the
+        // handshake (§19.4). It restarts the agent, so a machine reported
+        // ready before it finished would hand callers a channel about to
+        // close. The lab owes nothing for most machines and returns at once;
+        // where it does, it returns success or failure, bounded, so the
+        // machine always ends ready.
         let me = self.clone();
         tokio::spawn(async move {
             let defer_ready = me.first_boot_pending();
@@ -695,6 +709,12 @@ impl VmInstance {
                 if me.agent_probe().await {
                     *me.agent_up.write().await = true;
                     if !defer_ready {
+                        before_ready.await;
+                        // Stopped while the lab was busy: the exit monitor
+                        // has already cleared readiness, and must win.
+                        if me.power_state().await != PowerState::Running {
+                            return;
+                        }
                         *me.ready.write().await = true;
                         on_ready();
                     }
@@ -834,7 +854,7 @@ impl VmInstance {
         if was_online {
             // Ensure a running QEMU to load into.
             if self.power_state().await == PowerState::Stopped {
-                self.boot(on_exit, on_ready).await?;
+                self.boot(on_exit, on_ready, std::future::ready(())).await?;
             }
             let qmp = self.qmp().await?;
             qmp.stop().await?;
@@ -1044,6 +1064,8 @@ impl super::machine::Machine for VmInstance {
         let vm_name = self.cfg.name.clone();
         let vm_name2 = self.cfg.name.clone();
         let ready_lab = Arc::clone(&lab);
+        let gate_lab = Arc::clone(&lab);
+        let gate_name = self.cfg.name.clone();
         self.boot(
             move |reason, status| {
                 let payload =
@@ -1064,6 +1086,7 @@ impl super::machine::Machine for VmInstance {
                 let n = vm_name2.clone();
                 tokio::spawn(async move { lab.machine_ready(&n).await });
             },
+            async move { gate_lab.before_ready(&gate_name).await },
         )
         .await
     }

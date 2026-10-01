@@ -44,7 +44,7 @@ page cmd_status {
     rows:
       | "Label" | "Meaning" |
       | "`starting`" | "The process is being launched, or a container is up but its entrypoint has not signalled ready." |
-      | "`booting`" | "A VM is running but its guest agent has not answered yet." |
+      | "`booting`" | "A VM is running but not ready yet: its guest agent has not answered, or a first-boot script or agent refresh is still running." |
       | "`running`" | "Running and ready." |
       | "`unhealthy`" | "A container is ready but its declared healthcheck is failing." |
       | "`stopping`" | "The stop ladder is in progress." |

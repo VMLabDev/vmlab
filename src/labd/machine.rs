@@ -143,6 +143,17 @@ pub trait LabServices: Send + Sync + 'static {
         tap_ok: bool,
     ) -> Result<NicAttachment>;
 
+    /// This machine's agent has answered and it is about to be reported
+    /// ready: finish whatever a caller must not race before that happens.
+    /// Today that is the agent refresh `up` or `vm start` deferred to this
+    /// handshake (§19.4), which restarts the agent a caller would otherwise
+    /// already be using.
+    ///
+    /// Returns when readiness may be reported, success or not, and is bounded:
+    /// a machine is never held unready forever on the lab's account. The
+    /// default owes nothing.
+    async fn before_ready(&self, _machine: &str) {}
+
     /// This machine reached readiness — (re-)install anything keyed on its
     /// network lease, which moves across restarts.
     async fn machine_ready(&self, machine: &str);

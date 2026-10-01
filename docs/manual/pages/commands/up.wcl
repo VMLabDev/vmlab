@@ -93,10 +93,21 @@ page cmd_up {
   p <<DOC
     `up` never starts waiting on a VM just to refresh its agent. A VM with no
     first-boot script, no provision or playbook and nothing depending on it is
-    refreshed in the background when it reports ready, after `up` has
+    refreshed in the background when its agent first answers, after `up` has
     returned. Its line goes to the lab daemon's log instead of your terminal;
     the event and `diverged=yes` report it as usual. `vmlab vm start` always
     refreshes this way. A guest that never answers is never waited for.
+  DOC
+  p <<DOC
+    Such a VM is not reported ready until its refresh has finished, whether
+    it succeeded or failed, because the refresh restarts the agent. Until
+    then `vmlab status` shows it `booting`, and anything that waits for
+    readiness, such as a script's `wait_ready` or a dependent machine, keeps
+    waiting. `vm.ready` arrives, and port forwards are installed, once the
+    refresh is done. A VM whose agent is already current is held only for
+    the comparison. A VM that cannot be refreshed is not held at all. The
+    hold is capped at five minutes, after which the VM is reported ready and
+    the refresh finishes in the background.
   DOC
   p <<DOC
     A refresh never fails `up`. If it fails, `up` prints a `warning:` line
