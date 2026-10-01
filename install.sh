@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh — install the `vmlab` CLI from a GitHub release.
+# install.sh — install the `vmlab` CLI and its guest assets from a GitHub release.
 #
 #   curl -fsSL https://vmlab.io/install.sh | sh                       # latest stable
 #   curl -fsSL https://vmlab.io/install.sh | sh -s -- --pre           # latest pre-release
@@ -9,11 +9,25 @@
 # targets stable, which does not exist yet.
 #
 # Options / environment:
-#   --version <X>   install version X (e.g. 0.2.0-alpha); or set VMLAB_VERSION
-#   --pre           install the newest pre-release
-#   --bin-dir <dir> install into <dir> (default: $VMLAB_INSTALL_DIR or ~/.local/bin)
-#   --skip-checks   do not report missing runtime tools after installing
-#   --help          show this help
+#   --version <X>     install version X (e.g. 0.2.0-alpha); or set VMLAB_VERSION
+#   --pre             install the newest pre-release
+#   --bin-dir <dir>   install into <dir> (default: $VMLAB_INSTALL_DIR or ~/.local/bin)
+#   --guest-dir <dir> install the guest assets into <dir> (default: $VMLAB_GUEST_DIR,
+#                     else ~/.local/share/vmlab/guest — where vmlab looks for them)
+#   --no-guest        install the binary only, not the guest assets
+#   --skip-checks     do not report missing runtime tools after installing
+#   --help            show this help
+#
+#   VMLAB_RELEASE_BASE_URL  where releases are downloaded from, as
+#                     <base>/v<version>/<asset> (default:
+#                     https://github.com/VMLabDev/vmlab/releases/download);
+#                     point it at a local server to test the installer
+#
+# The guest assets — the container micro-VM kernel/initramfs and every in-guest
+# agent build — come from the same release as the binary
+# (vmlab-guest-<version>.tar.gz, checked against its .sha256) and replace
+# whatever an older install left in the guest directory. A release without
+# them, or a failed download, costs only the guest assets: the binary stays.
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
 # Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
@@ -26,13 +40,18 @@ SOURCE_BUILD="cargo install --git https://github.com/VMLabDev/vmlab --locked"
 
 VERSION="${VMLAB_VERSION:-}"
 BIN_DIR="${VMLAB_INSTALL_DIR:-$HOME/.local/bin}"
+GUEST_DIR="${VMLAB_GUEST_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/vmlab/guest}"
+BASE_URL="${VMLAB_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
 PRE=0
 SKIP_CHECKS=0
+NO_GUEST=0
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
+warn() { printf '\nwarning: %s\n' "$1" >&2; }
 
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  # The header comment, up to the first blank line.
+  sed -n '2,/^$/p' "$0" | sed -n 's/^# \{0,1\}//p'
   exit "${1:-0}"
 }
 
@@ -44,6 +63,9 @@ while [ $# -gt 0 ]; do
     --pre) PRE=1; shift ;;
     --bin-dir) [ $# -ge 2 ] || err "--bin-dir needs an argument"; BIN_DIR="$2"; shift 2 ;;
     --bin-dir=*) BIN_DIR="${1#--bin-dir=}"; shift ;;
+    --guest-dir) [ $# -ge 2 ] || err "--guest-dir needs an argument"; GUEST_DIR="$2"; shift 2 ;;
+    --guest-dir=*) GUEST_DIR="${1#--guest-dir=}"; shift ;;
+    --no-guest) NO_GUEST=1; shift ;;
     --skip-checks) SKIP_CHECKS=1; shift ;;
     -h|--help) usage 0 ;;
     -*) err "unknown option: $1 (try --help)" ;;
@@ -98,7 +120,8 @@ fi
 
 ver="${tag#v}"
 asset="vmlab-${ver}-${suffix}"
-url="https://github.com/$REPO/releases/download/$tag/$asset"
+BASE_URL="${BASE_URL%/}"
+url="$BASE_URL/$tag/$asset"
 
 # ── Download + install ──────────────────────────────────────────────────────
 printf 'Installing vmlab %s to %s\n' "$ver" "$BIN_DIR"
@@ -120,6 +143,93 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) printf '\n%s is not on your PATH. Add it, e.g.:\n  export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR" ;;
 esac
+
+# ── Guest assets ────────────────────────────────────────────────────────────
+# The container micro-VM kernel/initramfs and every in-guest agent build, as
+# one tarball from the same release: a lab container and a template build
+# both need them from the host (a VM cloned from a published template does
+# not). Nothing here can fail the install — the binary is already in place —
+# so every failure is a warning naming the source-build fallback.
+guest_fallback() {
+  warn "$1
+The vmlab binary is installed; the guest assets are not. A VM cloned from a
+published template needs none, but a lab container and a template build both
+do. Build them from source instead:
+  git clone https://github.com/$REPO && cd vmlab && just guest-install"
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    return 1
+  fi
+}
+
+install_guest() {
+  gname="vmlab-guest-${ver}.tar.gz"
+  gurl="$BASE_URL/$tag/$gname"
+  printf '\nInstalling guest assets to %s\n' "$GUEST_DIR"
+
+  # Staged beside the target, so the swap below is a rename on one filesystem.
+  gparent="$(dirname "$GUEST_DIR")"
+  mkdir -p "$gparent" || { guest_fallback "cannot create $gparent"; return 0; }
+  gtmp="$(mktemp -d "$gparent/.vmlab-guest.XXXXXX")" \
+    || { guest_fallback "cannot create a staging directory in $gparent"; return 0; }
+  trap 'rm -rf "$gtmp"' EXIT INT TERM
+
+  if ! download_file "$gurl" "$gtmp/$gname" || ! download_file "$gurl.sha256" "$gtmp/$gname.sha256"; then
+    guest_fallback "could not download $gurl (or its .sha256) — releases before the guest bundle do not carry one."
+    return 0
+  fi
+
+  want="$(sed -n '1s/^\([0-9a-fA-F]\{64\}\).*/\1/p' "$gtmp/$gname.sha256")"
+  got="$(sha256_of "$gtmp/$gname")" || {
+    guest_fallback "need sha256sum or shasum to verify $gname; refusing to install it unverified."
+    return 0
+  }
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    guest_fallback "checksum mismatch for $gname (expected ${want:-nothing}, got $got); refusing to install it."
+    return 0
+  fi
+
+  mkdir "$gtmp/new"
+  if ! tar -xzf "$gtmp/$gname" -C "$gtmp/new" || [ ! -d "$gtmp/new/agent" ]; then
+    guest_fallback "$gname did not unpack into a guest directory."
+    return 0
+  fi
+
+  # Swap: the old directory moves aside whole (nothing from an older version
+  # survives in the new one), the new one renames into its place, and the old
+  # one is removed. Put the old one back if the second rename fails.
+  if [ -e "$GUEST_DIR" ] || [ -L "$GUEST_DIR" ]; then
+    mv "$GUEST_DIR" "$gtmp/old" || { guest_fallback "cannot move the old $GUEST_DIR aside."; return 0; }
+  fi
+  if ! mv "$gtmp/new" "$GUEST_DIR"; then
+    [ -e "$gtmp/old" ] && mv "$gtmp/old" "$GUEST_DIR"
+    guest_fallback "cannot move the new guest assets into $GUEST_DIR."
+    return 0
+  fi
+  rm -rf "$gtmp"
+  trap - EXIT INT TERM
+
+  printf 'Installed guest assets: %s\n' "$(ls "$GUEST_DIR" | tr '\n' ' ')"
+
+  # vmlab searches $VMLAB_GUEST_ASSET_DIR, then /usr/share/vmlab/guest, then
+  # the per-user directory — say so when this install is not the one it finds.
+  default_dir="${XDG_DATA_HOME:-$HOME/.local/share}/vmlab/guest"
+  if [ -n "${VMLAB_GUEST_ASSET_DIR:-}" ] && [ "$VMLAB_GUEST_ASSET_DIR" != "$GUEST_DIR" ]; then
+    printf 'Note: VMLAB_GUEST_ASSET_DIR=%s is set and takes precedence over %s.\n' "$VMLAB_GUEST_ASSET_DIR" "$GUEST_DIR"
+  elif [ "$GUEST_DIR" != "$default_dir" ] && [ "$GUEST_DIR" != /usr/share/vmlab/guest ]; then
+    printf 'Note: vmlab does not look in %s by itself; set VMLAB_GUEST_ASSET_DIR=%s\n' "$GUEST_DIR" "$GUEST_DIR"
+  elif [ "$GUEST_DIR" = "$default_dir" ] && [ -d /usr/share/vmlab/guest ]; then
+    printf 'Note: /usr/share/vmlab/guest exists and takes precedence over %s.\n' "$GUEST_DIR"
+  fi
+}
+
+[ "$NO_GUEST" -eq 1 ] || install_guest
 
 # ── Runtime tools ───────────────────────────────────────────────────────────
 # vmlab bundles none of these: it looks each one up on PATH the first time it
@@ -200,17 +310,4 @@ if [ ! -e /dev/kvm ]; then
 elif [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
   printf '\n/dev/kvm exists but this user cannot use it. Add yourself to the kvm group:\n'
   printf '  sudo usermod -aG kvm "$USER"    # then log out and back in\n'
-fi
-
-# The guest assets are not in the release: the binary ships alone. A pulled
-# template already carries its agent, so this only bites a container start or
-# a template build — the two things that need an asset from the host.
-asset_dir=''
-for d in "${VMLAB_GUEST_ASSET_DIR:-}" /usr/share/vmlab/guest "$HOME/.local/share/vmlab/guest"; do
-  [ -n "$d" ] && [ -d "$d" ] && { asset_dir=$d; break; }
-done
-if [ -z "$asset_dir" ]; then
-  printf '\nNo guest assets found. VMs cloned from a published template need none,\n'
-  printf 'but a lab container and a template build both do. Build them from source:\n'
-  printf '  git clone https://github.com/VMLabDev/vmlab && cd vmlab && just guest-install\n'
 fi
