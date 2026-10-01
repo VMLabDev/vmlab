@@ -57,7 +57,8 @@ page cmd_status {
     `-` before the guest is ready. With `--verbose` a second line under each
     machine carries `state=`, `ready=` and `cached=`, plus
     `diverged=yes` on a machine whose agent was replaced by
-    [vmlab machine repair-agent](cmd_machine). A VM then adds `arch`, `cpus`,
+    [vmlab machine repair-agent](cmd_machine) or by the agent refresh in
+    [vmlab up](cmd_up). A VM then adds `arch`, `cpus`,
     `memory` and `agent` (the sealed agent version); a container adds
     `health`, `exit` and `digest`.
   DOC

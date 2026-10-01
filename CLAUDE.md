@@ -68,8 +68,9 @@ mints** (#82) — the wire's per-open `logon`,
 machine) cache and `exec`/`shell`'s `--user`/`--password` — and the **Linux
 session** (#83): `su -l` where the guest has PAM, `setuid` where it does not,
 plus the container floor. `vmlab machine repair-agent` pushes the host's shipped
-agent into a running machine and marks it **diverged**; never automatic, and
-meaningless on a container, which it says. **The worked example runs end to
+agent into a running machine and marks it **diverged**; `up` and `vm start` run
+the same push on a stale agent by default (`agent_update = false` opts out),
+and it is meaningless on a container, which it says. **The worked example runs end to
 end** (§19.8): `examples/dev-container`, a Linux container micro-VM with a
 synced workspace and a `login "dev"` whose home is provisioned **before that
 user has ever logged on**, through the **wscript rung** of §19.2's ladder —

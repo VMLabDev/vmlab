@@ -632,7 +632,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
 | `vmlab dev sync status / flush / diff / resolve` | Workspace syncer state and conflict resolution (§19.6) |
 | `vmlab machine capabilities / stats` | Per-machine probed capabilities, including agent features (§19.4) |
-| `vmlab machine repair-agent <machine>` | Push the shipped agent into a running machine, to iterate on the agent without rebuilding a template, and mark it diverged; never automatic (§19.4) |
+| `vmlab machine repair-agent <machine>` | Push the shipped agent into a running machine, to iterate on the agent without rebuilding a template, and mark it diverged; `up` runs the same push on a stale agent by default (§19.4) |
 | `vmlab template build / list / rm / export / import` | Template store |
 | `vmlab template push / pull / login` | OCI registry distribution (§6.4) |
 | `vmlab daemon start / stop / status` | Supervisor control (normally automatic); status lists lab daemons |
@@ -1135,15 +1135,37 @@ v2 is baseline for readiness, IP discovery and the shutdown ladder, so a v3
 requirement would take `exec`, `terminal` and *ready* with it. Feature-string
 degradation is the precedent already in tree.
 
-**Rebuild is policy; repair is a tool — and this paragraph is a *VM*
-statement.** The agent enters an image exactly once, at build (§6.1, §7.4), so a
-stale agent is a rebuild. Alongside that, a **machine-scoped verb pushes the
-host's shipped agent binary into a running machine on demand and marks that
-machine `diverged`**. It never fires by itself: an automatic refresh at `up`
-would make the template's sealed `agent_version` a lie and stop *same template →
-same machine* holding. It exists because a 15–45 minute Windows rebuild to pick
-up an agent change is otherwise the inner loop of developing the agent itself. It sits
-under `vmlab machine`, beside `capabilities` and `stats` (§12).
+**Repair is a tool; `up` refreshes a stale agent — and this paragraph is a
+*VM* statement.** The agent enters an image exactly once, at build (§6.1,
+§7.4), and a rebuild remains the only route that leaves a machine matching its
+template. Alongside that, a **machine-scoped verb pushes the host's shipped
+agent binary into a running machine on demand and marks that machine
+`diverged`**. It exists because a 15–45 minute Windows rebuild to pick up an
+agent change is otherwise the inner loop of developing the agent itself. It
+sits under `vmlab machine`, beside `capabilities` and `stats` (§12).
+
+**`vmlab up` (and `vm start`) runs the same push by default.** Once a VM's
+agent first answers — after a first-boot provision, which is the template's
+and runs under the agent the template sealed, and before any `provision {}`,
+so provisions see the current agent — `up` compares the agent's version stamp
+(`agent=<rev>`, compiled into the handshake by `guest/build-agent.sh` and
+written to the asset's `VERSION`) with the stamp of the asset the repair verb
+would push. **The host is the source of truth**: a different stamp in either
+direction is replaced. An agent whose handshake predates the stamp is judged by
+the host's record — the asset last pushed into the machine, else the
+template's sealed `agent_version`. The machine is marked `diverged` exactly as
+a repair marks it, `machine.agent_updated` is emitted, and `up` prints
+`agent: updated "<vm>" (<old> → <new>)`. A refresh **never fails `up`**: a
+failure is a `warning:` naming the machine and the reason, the event carries
+the error, and the binary was staged beside the running one, so the old agent
+is left in place. It is skipped silently where it cannot apply — a container
+(below), the legacy tier (§7.4), a machine whose artefact sealed no agent, or
+no shipped asset for the guest's OS and arch — and is off inside a template
+build, which seals the agent it staged. This trades *same template → same
+machine* for a current agent by default; **`agent_update = false`** on the
+`vm` block, or on the `lab` block for every VM (the `vm` wins), restores the
+old behaviour, under which the template's sealed `agent_version` stays the
+truth about the clone.
 
 None of that applies to a container. **A container micro-VM's agent lives in the
 initramfs guest asset**, not in any image, so it tracks the host's installed

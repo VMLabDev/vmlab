@@ -30,6 +30,7 @@ vm "<name>" {
   depends_on  = ["dc01"]
   nested      = false
   gui         = false
+  agent_update = true
   display     = "virtio-vga"
   firmware    = "ovmf"
   tpm         = false
@@ -60,6 +61,7 @@ vm "<name>" {
 | `depends_on` | list<utf8> | none | VM or container names to wait for before this one starts. No cycles. |
 | `nested` | bool | `false` | Expose hardware virtualisation (VMX/SVM) to the guest. Without it, an x86 guest under KVM has both masked. `up` warns when the host's KVM module has nested virtualisation off. No effect under TCG or on other architectures. |
 | `gui` | bool | lab `gui` | Open a VNC viewer on `up`. The VM always runs headless. |
+| `agent_update` | bool | lab `agent_update`, else `true` | Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. Ignored on the legacy agent tier. |
 | `display` | utf8 | inherited | QEMU display device string. Inherited from template, then profile. |
 | `firmware` | utf8 | inherited | Firmware: `ovmf` or `seabios`. Inherited from template, then profile. |
 | `tpm` | bool | inherited | Enable a TPM 2.0 device. Inherited from template, then profile. |

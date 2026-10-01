@@ -50,6 +50,7 @@ page cmd_up {
     li "The host's QEMU, firmware and helper binaries are checked for every target machine."
     li "The bundled SMB server starts when the lab declares [shared folders](guide_shares), so shares are reachable during provisioning."
     li "Each wave boots in parallel. A machine carrying a first-boot script runs it before it counts as ready. If one machine in a wave fails, the rest of the wave is aborted and the verb fails; the machine that failed is left running for inspection."
+    li "Once a VM's agent answers, and after its first-boot script, `up` refreshes the agent if it is out of date (see below). This happens before any provision script for that VM runs."
     li "Between waves the daemon runs every provision script and playbook whose machine has started, in declaration order, waiting for each machine's readiness first."
     li "Port forwards are installed, and the workspace syncer starts for every dev machine that declares a workspace (see [Dev machines and the workspace syncer](guide_dev))."
   }
@@ -67,6 +68,43 @@ page cmd_up {
     it alone. Clones persist across [vmlab down](cmd_down) and are only removed
     by [vmlab destroy](cmd_destroy), so a second `up` after a `down` boots the
     same disks and skips the first-boot script.
+  DOC
+
+  h2 "Agent refresh"
+
+  p <<DOC
+    A VM's guest agent comes from its [template](guide_templates), so a
+    template built by an older vmlab carries an older agent. When a VM's agent
+    first answers, `up` compares the agent's version stamp (`agent=<rev>`)
+    with the stamp of the agent this vmlab ships. If they differ, in either
+    direction, `up` pushes the shipped agent into the VM the way
+    [vmlab machine repair-agent](cmd_machine) does, and prints one line:
+  DOC
+  code text { source = "agent: updated \"winsrv\" (agent=57fa802 → agent=2284722)" }
+  p <<DOC
+    The VM is then **diverged**: its template's sealed `agent_version` no
+    longer describes it, and [vmlab status](cmd_status) `-v` shows
+    `diverged=yes` until its disks are destroyed. The refresh also emits
+    `machine.agent_updated` (see the [event list](ref_events)). `vmlab vm
+    start` refreshes the same way. The refresh runs after the first-boot
+    script, because that script belongs to the template and was written for
+    the agent the template sealed, and before every provision script, so
+    provisions see the current agent.
+  DOC
+  p <<DOC
+    A refresh never fails `up`. If it fails, `up` prints a `warning:` line
+    that names the VM and the reason, emits `machine.agent_updated` with the
+    error, and continues. The new binary is staged beside the installed one,
+    so a push that fails leaves the old agent running. Containers are never
+    refreshed, because their agent ships with this vmlab. Guests on the legacy
+    agent tier are never refreshed either, because nothing can replace that
+    agent over its own channel. A VM whose template sealed no agent is
+    skipped too.
+  DOC
+  p <<DOC
+    Set `agent_update = false` on a `vm` block to keep the agent its template
+    sealed. Set it on the `lab` block to do the same for every VM; a VM's own
+    setting wins. See [vm and its children](ref_vm).
   DOC
 
   callout "A failed first-boot leaves the machine running" {

@@ -199,7 +199,8 @@ part of every guest hostname and is unique on the host.
 
 ```wcl
 lab "<name>" {
-  gui = false
+  gui          = false
+  agent_update = true
   segment "…" { … }
   vm "…" { … }
   container "…" { … }
@@ -213,6 +214,7 @@ lab "<name>" {
 | --- | --- | --- | --- |
 | `name` | utf8 (label) | required | Lab name, a DNS label of at most 63 characters; the inline block label. |
 | `gui` | bool | unset | Default for all VMs: open a VNC viewer on `up`. A VM's own `gui` overrides it. |
+| `agent_update` | bool | `true` | Default for all VMs: refresh an out-of-date guest agent on `up` and mark the VM diverged. A VM's own `agent_update` overrides it. |
 | `segment {}` | children | none | Virtual L2 network segments in this lab. |
 | `vm {}` | children | none | The VMs in this lab. |
 | `container {}` | children | none | OCI containers in this lab, each run in a micro-VM. |

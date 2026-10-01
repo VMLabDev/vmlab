@@ -128,12 +128,14 @@ machine is a VM or a container.
 **Agent repair**:
 Pushing the host's shipped agent binary into a running machine over the
 agent's own channel, replacing what its artefact baked — the way to iterate on
-the agent without rebuilding a template. A tool, never a policy: it fires only when someone types it, because an automatic refresh
-would make a template's sealed `agent_version` a lie, and it makes the machine
-a **diverged machine**. Meaningless for a machine whose agent came with the
-host rather than with what it boots — a container micro-VM's — which is
-reported rather than implied.
-_Avoid_: update, upgrade, hot-patch, self-update
+the agent without rebuilding a template. The verb is the on-demand form;
+**agent refresh** is the same push run by `vmlab up` and `vm start`, by
+default, when a VM's agent stamp differs from the shipped asset's (opt out
+with `agent_update = false`). Either makes the machine a **diverged machine**.
+Meaningless for a machine whose agent came with the host rather than with what
+it boots — a container micro-VM's — which is reported rather than implied, and
+impossible on the legacy tier, which `up` skips silently.
+_Avoid_: upgrade, hot-patch, self-update
 
 **Display**:
 A machine's framebuffer, together with the keyboard, pointer, OCR and
@@ -387,12 +389,14 @@ _Avoid_: file channel (it carries requests, not one file's bytes)
 
 **Diverged machine**:
 A running machine whose guest content no longer matches the template it was
-cloned from, because a vmlab verb deliberately changed it in place — today, only
-the **agent repair** verb. Divergence is always user-initiated and always
-reported; vmlab never diverges a machine on its own, because the template's
+cloned from, because vmlab deliberately changed it in place — today, only by
+**agent repair**: the verb, or the refresh `up` performs on a stale agent.
+Divergence is always reported, and the refresh is the one case vmlab starts
+without being asked, which `agent_update = false` turns off; the template's
 sealed metadata is otherwise the truth about what a clone contains. Recorded in
 the lab's own state and forgotten with the disks it lived on, so `destroy` +
-`up` is what puts a machine back on its sealed agent.
+`up` with `agent_update = false` is what puts a machine back on its sealed
+agent.
 _Avoid_: dirty, modified, patched, drifted (drift implies unnoticed)
 
 **Workspace syncer**:

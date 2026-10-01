@@ -93,13 +93,15 @@ capabilities` reports what the agent serves.
 DOC
 
   p <<'DOC'
-An old agent has two remedies: rebuild the template to bake in the shipped
-agent, or push it into the running machine with `vmlab machine repair-agent`.
-Rebuild is policy; repair is a tool. The agent enters an image once, at build,
-and `repair-agent` pushes the host's shipped agent over the agent's own
-channel and marks the machine **diverged**, because the template's sealed
-`agent_version` no longer describes it. Nothing does this by itself. It is
-meaningless on a container, whose agent lives in the initramfs vmlab ships
+An old agent is refreshed by `vmlab up` itself: when a VM's agent stamp
+differs from the agent this vmlab ships, `up` pushes the shipped agent over
+the agent's own channel before any provision runs, and marks the machine
+**diverged**, because the template's sealed `agent_version` no longer
+describes it. `vmlab machine repair-agent` does the same push on demand, for a
+machine already running. Rebuilding the template is the route that leaves the
+machine matching its template, and `agent_update = false` keeps `up` from
+touching the agent. The push needs an agent that serves `fileops`; an older
+one can only be rebuilt. It is meaningless on a container, whose agent lives in the initramfs vmlab ships
 and tracks the installed vmlab; the verb says so. Two further preconditions
 of a dev-capable image: the guest must be symlink-capable, on Windows through
 `SeCreateSymbolicLinkPrivilege` or Developer Mode, and a full Linux VM's kernel
