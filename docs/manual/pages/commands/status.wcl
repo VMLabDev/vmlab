@@ -59,7 +59,9 @@ page cmd_status {
     `diverged=yes` on a machine whose agent was replaced by
     [vmlab machine repair-agent](cmd_machine) or by the agent refresh in
     [vmlab up](cmd_up). A VM then adds `arch`, `cpus`,
-    `memory` and `agent` (the sealed agent version); a container adds
+    `memory` and `agent`: the version of the agent running in the guest, as
+    its last handshake reported it, or the version the template sealed
+    before an agent has answered or while the VM is stopped. A container adds
     `health`, `exit` and `digest`.
   DOC
 

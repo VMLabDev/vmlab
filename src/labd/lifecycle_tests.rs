@@ -1334,3 +1334,36 @@ async fn a_machine_owed_no_refresh_is_ready_at_its_handshake() {
     );
     vm2.stop(true).await.expect("stop");
 }
+
+/// **A VM's status names the agent actually running** (§19.4). After a
+/// refresh or a repair that is not the stamp its template sealed, and
+/// reporting the sealed one would say the push never happened. The template's
+/// stamp stands in only until an agent has answered, and again once the
+/// machine has stopped.
+#[tokio::test]
+async fn a_vms_status_names_the_agent_that_answered_not_the_sealed_one() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let m: Arc<dyn Machine> = vm.clone();
+    let agent = |detail: crate::status::MachineDetail| match detail {
+        crate::status::MachineDetail::Vm(vm) => vm.agent_version,
+        _ => panic!("a VM reports VM detail"),
+    };
+    assert_eq!(
+        agent(m.status_detail().await).as_deref(),
+        Some("0.1.0"),
+        "nothing has answered, so the sealed stamp"
+    );
+
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    m.wait_ready(SETTLE).await.expect("ready");
+    assert_eq!(
+        agent(m.status_detail().await).as_deref(),
+        Some("0.0.0-fake"),
+        "the handshake's own version"
+    );
+
+    vm.stop(true).await.expect("stop");
+    assert_eq!(agent(m.status_detail().await).as_deref(), Some("0.1.0"));
+}

@@ -220,8 +220,16 @@ pub struct VmStatus {
     pub cpus: Option<u32>,
     /// Bytes.
     pub memory: Option<u64>,
-    /// The vmlab-agent stamp baked into the template; `None` on vintage guests
-    /// and pre-agent templates, which have no interactive terminal.
+    /// The vmlab-agent stamp of the agent running in the guest: what its last
+    /// handshake since this start reported, which after an agent refresh or
+    /// repair (§19.4) is not the stamp the template sealed. Before an agent
+    /// has answered — and while the machine is stopped — the template's
+    /// sealed stamp instead. `None` on vintage guests and pre-agent templates,
+    /// which have no interactive terminal.
+    ///
+    /// One field, not two: the sealed stamp belongs to the template (its
+    /// metadata carries it), and a machine running an agent other than that
+    /// one is marked by `agent_diverged`.
     pub agent_version: Option<String>,
 }
 

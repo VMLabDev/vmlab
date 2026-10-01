@@ -48,6 +48,7 @@ use super::guest_os::GuestOs;
 use super::state::MachineState;
 use super::vm::PowerState;
 use super::vm_agent::AgentHandle;
+use crate::sync::LockRecover;
 
 /// The status vocabulary this seam reports in. Declared with the projection
 /// (ADR-0004) because it is what reaches the CLI, the REST surface and the
@@ -782,6 +783,9 @@ impl AgentUnavailable {
 pub(super) struct AgentSlot {
     handle: tokio::sync::Mutex<Option<AgentHandle>>,
     failed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// The version the last successful handshake reported, kept apart from
+    /// `handle` so a status read never waits behind a connect in progress.
+    answered: std::sync::Mutex<Option<String>>,
 }
 
 impl AgentSlot {
@@ -815,6 +819,7 @@ impl AgentSlot {
         match AgentHandle::connect(sock, Duration::from_secs(5)).await {
             Ok(handle) => {
                 *self.failed_at.lock().await = None;
+                self.note_answered(&handle);
                 *agent = Some(handle.clone());
                 Ok(handle)
             }
@@ -845,11 +850,24 @@ impl AgentSlot {
         match AgentHandle::connect(sock, Duration::from_secs(2)).await {
             Ok(handle) => {
                 *self.failed_at.lock().await = None;
+                self.note_answered(&handle);
                 *agent = Some(handle);
                 true
             }
             Err(_) => false,
         }
+    }
+
+    fn note_answered(&self, handle: &AgentHandle) {
+        *self.answered.lock_recover() = Some(handle.info().agent_version);
+    }
+
+    /// The version the agent reported at the last handshake since this
+    /// machine started — the agent actually running, which after a refresh or
+    /// a repair is not the one its template sealed (§19.4). `None` until an
+    /// agent has answered. Never waits.
+    pub fn answered_version(&self) -> Option<String> {
+        self.answered.lock_recover().clone()
     }
 
     /// The cached handle without connecting — what the stop ladder uses once
@@ -873,6 +891,7 @@ impl AgentSlot {
             handle.shutdown().await;
         }
         *self.failed_at.lock().await = None;
+        *self.answered.lock_recover() = None;
     }
 }
 

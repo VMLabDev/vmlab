@@ -1338,9 +1338,14 @@ impl super::machine::Machine for VmInstance {
             arch: Some(resolved.arch.clone()),
             cpus: Some(resolved.cpus),
             memory: Some(resolved.memory),
-            // The template carries a baked-in vmlab-agent (terminal support);
-            // null on vintage guests and pre-agent templates.
-            agent_version: self.template().agent_version.clone(),
+            // The agent actually running where one has answered — after a
+            // refresh or a repair that is not the stamp the template sealed
+            // (§19.4) — else the sealed stamp; null on vintage guests and
+            // pre-agent templates.
+            agent_version: self
+                .agent
+                .answered_version()
+                .or_else(|| self.template().agent_version.clone()),
         })
     }
 }

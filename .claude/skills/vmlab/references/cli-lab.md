@@ -232,7 +232,8 @@ the guest is ready. With `--verbose` a second line under each machine carries
 `state=`, `ready=` and `cached=`, plus `diverged=yes` on a machine
 whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md) or by
 `up`'s agent refresh. A VM
-then adds `arch`, `cpus`, `memory` and `agent` (the sealed agent version); a
+then adds `arch`, `cpus`, `memory` and `agent` (the running agent's handshake
+stamp, or the template's sealed one before an agent answers or while stopped); a
 container adds `health`, `exit` and `digest`.
 
 #### Dev machines

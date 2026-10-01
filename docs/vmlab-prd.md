@@ -1184,6 +1184,14 @@ machine* for a current agent by default; **`agent_update = false`** on the
 old behaviour, under which the template's sealed `agent_version` stays the
 truth about the clone.
 
+**Status reports the agent that is running, not the one that was sealed.** A
+VM's status projection carries one `agent_version`: the stamp its agent's last
+handshake since this start reported, falling back to the template's sealed
+stamp only before an agent has answered or while the machine is stopped. A
+refreshed or repaired machine therefore reads as the agent it now runs, and
+`agent_diverged` (`diverged=yes` in `status -v`) is what says that differs from
+its template.
+
 None of that applies to a container. **A container micro-VM's agent lives in the
 initramfs guest asset**, not in any image, so it tracks the host's installed
 vmlab and cannot go stale; the repair verb is meaningless there and says so,
