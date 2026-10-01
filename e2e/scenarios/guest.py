@@ -404,10 +404,11 @@ def _run(h):
         # afterwards must carry the shipped stamp, not just answer.
         stale_bin = "/usr/share/vmlab/e2e/stale-agent/linux-x86_64/vmlab-agent"
         shipped = pathlib.Path("/usr/share/vmlab/guest/agent/linux-x86_64/VERSION").read_text().strip()
-        h.vmlab("cp", stale_bin, f"{VM}:/usr/local/lib/vmlab/vmlab-agent.stale", cwd=lab)
+        # `cp` writes as the default login, so stage in /tmp and let root move it.
+        h.vmlab("cp", stale_bin, f"{VM}:/tmp/vmlab-agent.stale", cwd=lab)
         h.vmlab("exec", VM, "--user", "root", "--", "/bin/sh", "-c",
-                "chmod 755 /usr/local/lib/vmlab/vmlab-agent.stale && "
-                "mv -f /usr/local/lib/vmlab/vmlab-agent.stale /usr/local/lib/vmlab/vmlab-agent",
+                "chmod 755 /tmp/vmlab-agent.stale && "
+                "mv -f /tmp/vmlab-agent.stale /usr/local/lib/vmlab/vmlab-agent",
                 cwd=lab)
         # The next boot starts the stale agent; this `up` must replace it.
         h.vmlab("down", VM, cwd=lab, timeout=180)
