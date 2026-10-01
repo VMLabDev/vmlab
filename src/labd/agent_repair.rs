@@ -136,17 +136,26 @@ pub fn plan(guest_os: GuestOs) -> RepairPlan {
                     "/c".into(),
                     format!("move /y {install} {previous} && move /y {staging} {install}"),
                 ],
-                // Detached through `start /b`, so the agent's own exec is not
-                // the process being stopped. `ping` is the sleep that works
-                // without a console, and the service is asked to start twice
-                // because a stop that has not finished refuses the first.
+                // Launched through WMI, so the restart runs outside the
+                // agent's process tree and holds none of the exec's handles. A
+                // `start /b` child inherits the exec's stdout: the exec then
+                // waits on it, the service stop waits on the exec, and the
+                // timeout kills the restart before `sc start` — the old agent
+                // keeps running from its renamed image. `[wmiclass]` works from
+                // PowerShell 2.0 on, where `Invoke-CimMethod` does not exist
+                // and `wmic` is gone from Server 2025. `ping` is the sleep that
+                // works without a console, and the service is asked to start
+                // twice because a stop that has not finished refuses the first.
                 restart: vec![
-                    "cmd.exe".into(),
-                    "/c".into(),
-                    "start \"\" /b cmd.exe /c \"ping -n 3 127.0.0.1 >nul \
-                     & sc stop vmlab-agent & ping -n 4 127.0.0.1 >nul \
-                     & sc start vmlab-agent & ping -n 3 127.0.0.1 >nul \
-                     & sc start vmlab-agent\""
+                    "powershell.exe".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    "$r = ([wmiclass]'Win32_Process').Create('cmd.exe /c \
+                     ping -n 3 127.0.0.1 >nul & sc stop vmlab-agent \
+                     & ping -n 4 127.0.0.1 >nul & sc start vmlab-agent \
+                     & ping -n 3 127.0.0.1 >nul & sc start vmlab-agent'); \
+                     exit $r.ReturnValue"
                         .into(),
                 ],
                 // The rename leaves it on disk under its own name, which is
@@ -300,6 +309,17 @@ pub async fn push(m: &Arc<dyn Machine>, asset: &AgentAsset) -> Result<RepairRepo
     m.clear_agent_failure().await;
 
     let info = agent.info();
+    // An agent that answers is not proof the new one does: a restart that
+    // never happened leaves the old agent running from its renamed image, and
+    // it answers the reconnect as readily. The pushed binary carries its stamp
+    // in its handshake, so anything else answering is the old one.
+    if let Some(stale) = still_running_the_old_agent(&asset.version, &info.agent_version) {
+        bail!(
+            "\"{name}\": the pushed agent is installed at {} but the agent answering is still \
+             {stale} — the service did not restart onto it; `vmlab vm restart {name}` loads it",
+            plan.install
+        );
+    }
     Ok(RepairReport {
         machine: name,
         pushed: asset.version.clone(),
@@ -307,6 +327,13 @@ pub async fn push(m: &Arc<dyn Machine>, asset: &AgentAsset) -> Result<RepairRepo
         agent_version: info.agent_version,
         features: info.features,
     })
+}
+
+/// The version the agent answering a reconnect reports, when it is not the
+/// agent that was pushed. Only a stamped asset can be checked: an asset with
+/// no `agent=` stamp carries nothing its handshake can be compared with.
+fn still_running_the_old_agent<'a>(pushed: &str, answering: &'a str) -> Option<&'a str> {
+    (pushed.starts_with(STAMP_PREFIX) && answering != pushed).then_some(answering)
 }
 
 // ---- `up`'s refresh (§19.4) --------------------------------------------------
@@ -489,6 +516,22 @@ mod tests {
     /// The half that kills the channel is separated from the half that can be
     /// observed, and it is detached inside the guest — so a repair reports
     /// what happened instead of dying with the service it restarted.
+    /// A reconnect answered by anything but the pushed stamp is the old agent
+    /// still running; an unstamped asset has nothing to compare.
+    #[test]
+    fn a_reconnect_by_the_old_agent_is_not_a_repair() {
+        assert_eq!(still_running_the_old_agent("agent=new", "agent=new"), None);
+        assert_eq!(
+            still_running_the_old_agent("agent=new", "agent=old"),
+            Some("agent=old")
+        );
+        assert_eq!(
+            still_running_the_old_agent("agent=new", "0.1.0"),
+            Some("0.1.0")
+        );
+        assert_eq!(still_running_the_old_agent("unknown", "agent=old"), None);
+    }
+
     #[test]
     fn the_restart_is_detached_and_separate_from_the_swap() {
         let linux = plan(GuestOs::Linux);
@@ -498,7 +541,14 @@ mod tests {
         assert!(!linux.swap.last().unwrap().contains("systemctl"));
 
         let windows = plan(GuestOs::Windows);
-        assert!(windows.restart.last().unwrap().starts_with("start \"\" /b"));
+        assert_eq!(windows.restart[0], "powershell.exe");
+        assert!(
+            windows
+                .restart
+                .last()
+                .unwrap()
+                .contains("[wmiclass]'Win32_Process'")
+        );
         assert!(windows.restart.last().unwrap().contains("sc start"));
         assert!(!windows.swap.last().unwrap().contains("sc stop"));
     }
