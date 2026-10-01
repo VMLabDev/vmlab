@@ -33,6 +33,9 @@ pub struct Lab {
     pub span: Span,
     /// Default for all VMs: open a VNC viewer on `up` (§11).
     pub gui: Option<bool>,
+    /// Default for all VMs: refresh an out-of-date guest agent on `up`
+    /// (§19.4). `None` = the floor, which is on.
+    pub agent_update: Option<bool>,
     pub segments: Vec<Segment>,
     pub vms: Vec<Vm>,
     pub containers: Vec<Container>,
@@ -145,6 +148,18 @@ impl Lab {
     /// answers here is not also a machine of the other kind.
     pub fn machine(&self, name: &str) -> Option<MachineCfg<'_>> {
         self.machines().find(|m| m.name() == name)
+    }
+
+    /// Whether `up` may refresh `machine`'s guest agent (§19.4): the `vm`
+    /// block's `agent_update`, else the `lab` block's, else on. A container
+    /// declares none — its agent ships with the host and is never refreshed
+    /// whatever this says.
+    pub fn agent_update_for(&self, machine: &str) -> bool {
+        let own = match self.machine(machine) {
+            Some(MachineCfg::Vm(vm)) => vm.agent_update,
+            _ => None,
+        };
+        own.or(self.agent_update).unwrap_or(true)
     }
 }
 
@@ -320,6 +335,9 @@ pub struct Vm {
     pub nested: bool,
     /// Open a VNC viewer on `up` (§11); None = inherit the lab default.
     pub gui: Option<bool>,
+    /// Refresh an out-of-date guest agent on `up` (§19.4); None = inherit
+    /// the lab default.
+    pub agent_update: Option<bool>,
     pub display: Option<String>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,

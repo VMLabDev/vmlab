@@ -441,6 +441,13 @@ impl Handler<LabRequest> for LabdHandler {
                     .await?;
                 lab.preflight_binaries(std::slice::from_ref(&machine))?;
                 lab.start_machine(&machine).await?;
+                // `vm start` refreshes a stale agent as `up` does (§19.4) —
+                // except under a pending first-boot, which only `up` runs
+                // and which the refresh must follow, so the next `up` does it.
+                let m = machine_of(lab, &machine)?;
+                if m.pending_first_boot().is_none() {
+                    lab.refresh_agent(&m, &output).await;
+                }
                 Ok(json!(true))
             }
             LabRequest::MachineStop { machine, force } => {
@@ -612,10 +619,11 @@ impl Handler<LabRequest> for LabdHandler {
                 vm_agent::expose_terminal_socket(session, path.clone()).await?;
                 Ok(json!({"session": id, "path": path}))
             }
-            // Rebuild is policy, repair is a tool (§19.4). It is a command
-            // and never a reflex: nothing else in the daemon calls this, and
-            // a machine it succeeds on is diverged from what it was built
-            // from until its disks are destroyed.
+            // Repair is a tool (§19.4): the push on demand, for a machine
+            // already running. `up`'s refresh pushes through the same
+            // `agent_repair::push`, and a machine either succeeds on is
+            // diverged from what it was built from until its disks are
+            // destroyed.
             LabRequest::MachineRepairAgent { machine } => {
                 let m = machine_of(lab, &machine)?;
                 let report = agent_repair::repair(&m)

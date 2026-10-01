@@ -48,6 +48,12 @@ impl EventLog {
         let _ = self.tx.send(ev);
     }
 
+    /// Every event emitted from now on — what a test asserts on.
+    #[cfg(test)]
+    pub(super) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
+        self.tx.subscribe()
+    }
+
     #[cfg(test)]
     pub(super) fn recording(
         lab: &str,
