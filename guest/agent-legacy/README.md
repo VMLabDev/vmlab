@@ -24,10 +24,13 @@ source tree so a single core builds for every target:
 | `windows-nt-x86` | NT4, 2000, XP, 2003   | mingw-w64 i686, static CRT        | `vmlab-agent-legacy.exe`  |
 | `windows-9x-x86` | 95, 98, ME            | OpenWatcom v2, `win95` system     | `vmlab-agent-legacy.exe`  |
 | `dos-i386`       | MS-DOS, FreeDOS       | OpenWatcom v2, DOS/32A bound in   | `VMLABAGT.EXE`            |
-| `linux-x86`      | conformance; old Linux| host `cc`                         | `vmlab-agent-legacy`      |
+| `linux-x86`      | old 32-bit Linux      | host `cc -m32 -static`            | `vmlab-agent-legacy`      |
 
 `../build-agent-legacy.sh` builds them into `guest/dist/agent/<key>/` with
-a `VERSION` stamp, skipping targets whose toolchain is absent. OpenWatcom is
+a `VERSION` stamp (`VERSION-legacy` for `linux-x86`, whose directory the
+Rust agent's 32-bit build shares), skipping targets whose toolchain is absent
+unless `VMLAB_REQUIRE_ALL_TARGETS=1`. The conformance tests compile their own
+host binary rather than using this one. OpenWatcom is
 found through `$WATCOM`, else `~/.local/opt/open-watcom-v2` (unpack the
 project's `ow-snapshot.tar.xz` there).
 

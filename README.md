@@ -21,8 +21,11 @@ requirements; it is the source of truth for design and scope.
 curl -fsSL https://vmlab.io/install.sh | sh -s -- --pre   # vmlab is pre-release only for now
 ```
 
-This drops `vmlab` into `~/.local/bin`. Or build from source (see
-[Building](#building)).
+This drops `vmlab` into `~/.local/bin` and the guest assets — the container
+micro-VM kernel/initramfs and every in-guest agent build, from the same
+release, checksum-verified — into `~/.local/share/vmlab/guest`. `--no-guest`
+skips the guest assets and `--guest-dir <dir>` puts them elsewhere; `--help`
+lists the rest. Or build from source (see [Building](#building)).
 
 ## Architecture
 
@@ -190,6 +193,12 @@ just test      # cargo test
 just ci::check # the merge bar: everything a change must pass before it can merge
 just ci        # list the gate's parts — run one on its own with `just ci::lint`
 ```
+
+A source build has no guest assets: `just guest-install` builds what the host
+has toolchains for and copies it into `~/.local/share/vmlab/guest`, and
+`just guest-package` is the strict release build that fails on any missing
+target (`scripts/guest-toolchains.sh` installs every toolchain it needs on
+Ubuntu 24.04).
 
 `just ci::check` is self-sufficient from a clean checkout and reports a missing
 tool as a missing tool. It covers clippy, `cargo fmt --check`, the test suite,

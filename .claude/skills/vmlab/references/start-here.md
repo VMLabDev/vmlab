@@ -125,10 +125,24 @@ Inside that tree the micro-VM asset lives at `<arch>/vmlinuz`,
 `<arch>/initramfs.img` and `<arch>/VERSION`, and the agent at
 `agent/<os>-<arch>/vmlab-agent` or `vmlab-agent.exe` with its own `VERSION`.
 
-The release installer ships the CLI binary only. It does not place guest
-assets, so on a fresh host there are none. Build them from a source checkout
-with one recipe, which runs both build scripts and copies the result into
-`~/.local/share/vmlab/guest/`.
+The release installer places them. Every release carries
+`vmlab-guest-<version>.tar.gz` — the micro-VM asset for x86_64 and aarch64,
+the Rust agent for Linux x86_64/aarch64/riscv64/x86 and Windows x86_64/x86,
+and the legacy agents (Windows NT, Windows 9x, DOS, old 32-bit Linux,
+TempleOS) — and `install.sh` downloads it from the same release as the binary,
+verifies it against its `.sha256`, and swaps it into
+`~/.local/share/vmlab/guest/` whole, so nothing from an older version
+survives. `--no-guest` skips it; `--guest-dir <dir>` (or `VMLAB_GUEST_DIR`)
+puts it elsewhere, which then needs `VMLAB_GUEST_ASSET_DIR` pointing at it. A
+failed download or checksum mismatch keeps the binary and warns.
+
+Build them from source when working on vmlab, running a source-built binary,
+or after `--no-guest`: one recipe runs the three build scripts and copies the
+result into `~/.local/share/vmlab/guest/`, skipping with a warning any target
+whose toolchain is missing. `just guest-package` is the strict release build
+(every target or fail; `VMLAB_REQUIRE_ALL_TARGETS=1` makes any build script
+strict), and `scripts/guest-toolchains.sh` installs its toolchains on Ubuntu
+24.04.
 
 ```sh
 git clone https://github.com/VMLabDev/vmlab

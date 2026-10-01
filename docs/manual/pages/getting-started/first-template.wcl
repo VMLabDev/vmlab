@@ -29,7 +29,7 @@ page gs_first_template {
 
   list {
     li "vmlab is installed with the runtime tools. `xorriso` and `mtools` are needed here, because the build packs two ISOs: the cloud-init folder and vmlab's own bootstrap ISO."
-    li "The agent binary for Linux x86_64 is installed under `~/.local/share/vmlab/guest/agent/linux-x86_64/`. The build stages it on the bootstrap ISO and refuses to start without it. [Install](gs_install) explains how to build the guest assets."
+    li "The agent binary for Linux x86_64 is installed under `~/.local/share/vmlab/guest/agent/linux-x86_64/`. The build stages it on the bootstrap ISO and refuses to start without it. The installer places it; [Install](gs_install) explains how to build the guest assets from source instead."
     li "`/dev/kvm` is available. The install takes several minutes under KVM and far longer under emulation."
     li "About 3 GB of free disk for the ISO download and 20 GB for the build disk. The sealed template is much smaller than the working disk."
     li "A checkout of the vmlab source, for the example directory: `git clone https://github.com/VMLabDev/vmlab`."

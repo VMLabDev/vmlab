@@ -4,13 +4,13 @@ page gs_install {
   chapter_header "Install" {
     kicker       = "Getting started · tutorial"
     reading_time = "7 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-01"
     version      = "vmlab 0.9"
   }
 
   p <<DOC
-    This tutorial puts the `vmlab` binary on your host, installs the tools it
-    drives, and explains where the guest-side assets come from. At the end
+    This tutorial puts the `vmlab` binary and its guest-side assets on your
+    host, installs the tools it drives, and explains what those assets are. At the end
     `vmlab --version` prints a version and your host is ready for
     [Your first lab](gs_first_lab).
   DOC
@@ -28,7 +28,9 @@ page gs_install {
 
   p <<DOC
     The installer downloads a prebuilt Linux x86_64 binary from the GitHub
-    release and places it in `~/.local/bin`. vmlab publishes pre-releases only,
+    release and places it in `~/.local/bin`. From the same release it then
+    installs the guest assets into `~/.local/share/vmlab/guest/`, which the
+    section on guest assets below describes. vmlab publishes pre-releases only,
     so pass `--pre`. Without it the installer looks for a stable release, finds
     none, and stops with a message telling you to add the flag.
   DOC
@@ -41,6 +43,14 @@ page gs_install {
     install somewhere other than `~/.local/bin`, pass `--bin-dir <dir>` or set
     `VMLAB_INSTALL_DIR`. If the target directory is not on your `PATH`, the
     installer prints the `export` line to add.
+  DOC
+
+  p <<DOC
+    `--no-guest` installs the binary alone. `--guest-dir <dir>`, or
+    `VMLAB_GUEST_DIR`, puts the guest assets somewhere other than
+    `~/.local/share/vmlab/guest/`; vmlab does not search an arbitrary
+    directory, so the installer then prints the `VMLAB_GUEST_ASSET_DIR`
+    setting that points vmlab at it.
   DOC
 
   h3 "Build from source instead"
@@ -57,7 +67,8 @@ page gs_install {
   p <<DOC
     From a checkout, `just build` runs `cargo build` and `just install` runs
     `cargo install --path . --locked`, which places the binary in
-    `~/.cargo/bin`.
+    `~/.cargo/bin`. A source build installs no guest assets; the section on guest
+    assets below says how to build them.
   DOC
 
   p "Confirm the binary runs."
@@ -153,10 +164,32 @@ SRC
   DOC
 
   p <<DOC
-    The release installer ships the CLI binary only. It does not place guest
-    assets, so on a fresh host there are none. You build them from a source
-    checkout with one recipe, which runs both build scripts and copies the
-    result into `~/.local/share/vmlab/guest/`.
+    The installer places them for you. Every release carries
+    `vmlab-guest-<version>.tar.gz`, built by CI with every target: the
+    micro-VM asset for x86_64 and aarch64, the Rust agent for Linux x86_64,
+    aarch64, riscv64 and x86 and for Windows x86_64 and x86, and the legacy
+    agents for Windows NT, Windows 9x, DOS, old 32-bit Linux and TempleOS.
+    The installer downloads it from the same release as the binary, checks it
+    against the `.sha256` published beside it, unpacks it next to the target
+    directory and renames it into place. The previous contents move aside
+    whole and are deleted, so nothing from an older version survives an
+    upgrade.
+  DOC
+
+  p <<DOC
+    A failed download, a checksum mismatch, or a release published before the
+    bundle existed costs only the guest assets. The installer keeps the binary,
+    prints a warning, and names the source build below as the fallback.
+  DOC
+
+  h3 "Build the guest assets from source"
+
+  p <<DOC
+    Build them yourself when you work on vmlab, run a binary built from
+    source, or installed with `--no-guest`. One recipe runs the three build
+    scripts and copies the result into `~/.local/share/vmlab/guest/`. It
+    skips, with a warning, every target whose toolchain is missing, so a
+    developer host builds what it can.
   DOC
 
   code sh { source = <<'SRC'
@@ -177,6 +210,20 @@ SRC
     and x86. The Windows targets need `x86_64-w64-mingw32-gcc` and
     `i686-w64-mingw32-gcc` from mingw-w64 and are skipped with a warning
     when absent. The riscv64 target is best-effort and skipped the same way.
+    `guest/build-agent-legacy.sh` builds the legacy agents: the Windows NT
+    build with mingw-w64, the Windows 9x and DOS builds with OpenWatcom v2
+    (found through `$WATCOM`, else `~/.local/opt/open-watcom-v2`), and the
+    old-Linux build with the host `cc` at `-m32 -static`, which needs
+    `gcc-multilib` on an x86_64 host.
+  DOC
+
+  p <<DOC
+    `just guest-package` is the release build. It builds every target and
+    packs the bundle into `target/guest-package/`, and it is strict: a target
+    whose toolchain is missing fails it instead of being skipped. Setting
+    `VMLAB_REQUIRE_ALL_TARGETS=1` makes any of the three build scripts strict
+    the same way. `scripts/guest-toolchains.sh` installs every toolchain the
+    strict build needs on Ubuntu 24.04, and is what CI runs.
   DOC
 
   p <<DOC
@@ -209,7 +256,7 @@ SRC
 
   callout "Guest assets are in place" {
     kind = :success
-    body = "`ls ~/.local/share/vmlab/guest/` lists `x86_64` and `agent`. `cat ~/.local/share/vmlab/guest/x86_64/VERSION` prints a version stamp."
+    body = "`ls ~/.local/share/vmlab/guest/` lists `aarch64`, `agent` and `x86_64`. `cat ~/.local/share/vmlab/guest/x86_64/VERSION` prints a version stamp."
   }
 
   h2 "On WSL 2"
