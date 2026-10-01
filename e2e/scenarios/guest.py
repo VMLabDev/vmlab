@@ -397,10 +397,10 @@ def _run(h):
         h.ok("console.tcp", banner.startswith(b"RFB ") and con.returncode is not None,
              f"{line.strip()}: server said {banner!r}; bridge ended on Ctrl-C")
 
-        # -- update: `up` refreshes a stale agent (it replaces the agent too) -----
+        # -- update: `vm start` refreshes a stale agent (it replaces it too) -----
         # The image carries a second agent stamped `agent=e2e-stale`. Put it in
         # the guest and restart the service, so the guest really runs a stale
-        # agent; `up` must then push the shipped one, and the agent answering
+        # agent; `vm start` must then push the shipped one, and the agent answering
         # afterwards must carry the shipped stamp, not just answer.
         stale_bin = "/usr/share/vmlab/e2e/stale-agent/linux-x86_64/vmlab-agent"
         shipped = pathlib.Path("/usr/share/vmlab/guest/agent/linux-x86_64/VERSION").read_text().strip()
@@ -410,20 +410,58 @@ def _run(h):
                 "chmod 755 /tmp/vmlab-agent.stale && "
                 "mv -f /tmp/vmlab-agent.stale /usr/local/lib/vmlab/vmlab-agent",
                 cwd=lab)
-        # The next boot starts the stale agent; this `up` must replace it.
+        # Boot onto it first with `vm restart`, which refreshes nothing, so
+        # `status -v` is seen naming the agent that answered rather than the
+        # template's sealed stamp: `e2e-stale` is nobody's sealed stamp. (An
+        # in-guest service restart would not show it: the host keeps its
+        # connection, which the new agent answers pings on, and so never
+        # handshakes again.)
+        h.vmlab("vm", "restart", VM, cwd=lab, timeout=180, check=False)
+        seen_stale = "-"
+        try:
+            h.wait_ready(lab, VM, timeout=180)
+            found = re.search(r"\bagent=(\S+)", h.machine_line(lab, VM))
+            seen_stale = found.group(1) if found else "-"
+        except ScenarioFailed as e:
+            h.log.write(f"g01 did not come back from `vm restart`: {e}\n")
+        # The next boot starts the stale agent, and `vm start` must replace it.
+        # `vm start` rather than `up`: g01 carries a provision, so `up` would
+        # refresh it inline, while `vm start` defers the refresh to the
+        # handshake — the background path, where the machine must not be
+        # reported ready until the refresh has run (§19.4). An exec issued the
+        # moment `status` says ready must land on the agent that stays, not on
+        # one about to restart under it.
         h.vmlab("down", VM, cwd=lab, timeout=180)
-        upd = h.vmlab("up", cwd=lab, timeout=600, check=False)
+        upd = h.vmlab("vm", "start", VM, cwd=lab, timeout=600, check=False)
         h.wait_ready(lab, VM)
-        line = h.machine_line(lab, VM)
         after = h.vmlab("exec", VM, "--", "id", "-un", cwd=lab, check=False)
-        said = [ln.strip() for ln in upd.text.splitlines() if ln.strip().startswith(("agent:", "warning: agent:"))]
+        line = h.machine_line(lab, VM)
+        stamp = re.search(r"\bagent=(\S+)", line)
+        running = stamp.group(1) if stamp else "-"
+        # The refresh's report is the event (its words go to the daemon log),
+        # and it must precede the machine's ready: that order is the hold.
+        events = []
+        for raw in h.vmlab("logs", "-o", "jsonl", "-n", "500", cwd=lab, check=False).out.splitlines():
+            try:
+                events.append(json.loads(raw))
+            except ValueError:
+                pass
+        mine = [(i, e) for i, e in enumerate(events) if (e.get("data") or {}).get("vm") == VM]
+        updated = [(i, e["data"]) for i, e in mine if e.get("event") == "machine.agent_updated"]
+        readies = [i for i, e in mine if e.get("event") == "vm.ready"]
+        last = updated[-1] if updated else (None, {})
+        took = (last[1].get("ok") is True and str(last[1].get("from", "")).startswith("agent=e2e-stale")
+                and last[1].get("to") == shipped)
+        held = last[0] is not None and readies and readies[-1] > last[0]
         h.ok("agent.update",
-             upd.code == 0
-             and any(s.startswith(f'agent: updated "{VM}" (agent=e2e-stale') and s.endswith(f"→ {shipped})") for s in said)
-             and "diverged=yes" in line and after.out.strip() == "dev",
-             f"guest ran the stale agent; up exit {upd.code}: {' | '.join(said) or 'no agent line'}; "
-             f"status -v: diverged=yes {'present' if 'diverged=yes' in line else 'absent'}; "
-             f"exec after update -> {after.out.strip()!r}")
+             seen_stale == "e2e-stale" and upd.code == 0 and took and held
+             and running == shipped.removeprefix("agent=")
+             and "diverged=yes" in line and after.code == 0 and after.out.strip() == "dev",
+             f"status -v while the stale agent ran: agent={seen_stale}; vm start exit {upd.code}; machine.agent_updated "
+             f"{json.dumps(last[1]) if last[0] is not None else 'absent'}; vm.ready after it: {bool(held)}; "
+             f"status -v: agent={running} (shipped {shipped}), diverged=yes "
+             f"{'present' if 'diverged=yes' in line else 'absent'}; "
+             f"exec the moment it was ready -> exit {after.code} {after.out.strip() or after.text.strip()[-80:]!r}")
 
         # -- repair (last: it replaces the agent under everything above) ----------
         rp = h.vmlab("machine", "repair-agent", VM, cwd=lab, check=False, timeout=180)
