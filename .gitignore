@@ -18,3 +18,6 @@ examples/**/.vmlab/
 
 # e2e suite output (logs, results.json).
 /e2e/results
+
+# Python bytecode from the e2e harness.
+__pycache__/

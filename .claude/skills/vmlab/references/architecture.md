@@ -14,6 +14,9 @@ vmlab is a two-tier daemon system with a thin client in front of it. The
   global segments that span labs (see networking.md), serialises every write to
   the template store (see templates.md), runs host-level watchdogs such as
   `host.disk_low`, and aggregates the event stream of every lab on the host.
+  It runs in a session of its own, so closing the terminal that started it
+  does not stop it or the labs it runs; `vmlab daemon stop` returns only once
+  it has exited.
 - **The lab daemon.** One per running lab, spawned by the supervisor on
   `vmlab up` and reaped on `down` or `destroy`. It owns everything lab-scoped:
   the QEMU processes, their QMP and agent channels, the lab's segments with

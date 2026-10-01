@@ -12,9 +12,16 @@ vm "dev01" {
   template = "x86_64/ubuntu-24.04"
   nic { segment = "lan" }
   share { host = "./src"      guest = "/mnt/src" }
-  share { host = "~/datasets" guest = "D:\\data"  readonly = true }
+  share { host = "~/datasets" guest = "/mnt/data" readonly = true }
 }
 ```
+
+On a Windows guest, `guest` is either a drive letter (`guest = "S:"`, mapped
+with `net use`) or a folder on an existing drive (`guest = "C:\\data"`, a
+symbolic link to the share). Pick a free letter: on vmlab's Windows VMs `D:` is
+usually the optical drive, so `guest = "D:\\data"` fails with "The device is not
+ready". smbd keeps its sockets under vmlab's runtime directory, not the lab's
+`.vmlab/smb/`, so a lab in a deeply nested directory still serves shares.
 
 ### Two transports
 
