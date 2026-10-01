@@ -215,11 +215,66 @@ jobs:
           path: vmlab-${{ needs.version.outputs.version }}-${{ matrix.suffix }}
           retention-days: 1
 
+  # ── Guest assets ──────────────────────────────────────────────────────────
+  # Every guest asset the binary looks up on the host — the container micro-VM
+  # kernel/initramfs for x86_64 and aarch64, every Rust agent target, every
+  # legacy agent target — as one tarball install.sh deploys beside the binary.
+  # `just guest-package` is strict: a target whose toolchain is missing fails
+  # the job rather than shipping a partial set. scripts/guest-toolchains.sh is
+  # the one list of what that takes; this job only caches the two slow stages.
+  guest-assets:
+    name: Build guest assets
+    needs: [version, check, guest-crates, ebpf-verify]
+    if: needs.version.outputs.do_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@just
+      - name: Install host packages
+        run: ./scripts/guest-toolchains.sh apt
+      - name: Install Rust toolchains
+        run: ./scripts/guest-toolchains.sh rust
+      # The msvcrt CRT is a ~5 minute build from source; key it on the script
+      # that builds it and the mingw-w64 the runner's apt just installed.
+      - name: Resolve mingw-w64 version
+        id: mingw
+        run: echo "version=$(dpkg-query -W -f='${Version}' mingw-w64-common)" >> "$GITHUB_OUTPUT"
+      # Both caches sit at the default locations the build scripts look in.
+      - uses: actions/cache@v5
+        with:
+          path: ~/.local/share/vmlab/toolchains/mingw-msvcrt
+          key: mingw-msvcrt-${{ runner.os }}-${{ steps.mingw.outputs.version }}-${{ hashFiles('guest/build-mingw-msvcrt.sh', 'scripts/guest-toolchains.sh') }}
+      - name: Build msvcrt CRT
+        run: ./scripts/guest-toolchains.sh msvcrt
+      # OpenWatcom is a pinned 150 MB snapshot; the pin lives in the script.
+      - uses: actions/cache@v5
+        with:
+          path: ~/.local/opt/open-watcom-v2
+          key: open-watcom-${{ runner.os }}-${{ hashFiles('scripts/guest-toolchains.sh') }}
+      - name: Install OpenWatcom
+        run: ./scripts/guest-toolchains.sh watcom
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: guest-assets
+          workspaces: |
+            guest/cinit
+            guest/agent
+      - name: Build and package
+        run: just guest-package "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: guest-assets
+          path: |
+            target/guest-package/vmlab-guest-${{ needs.version.outputs.version }}.tar.gz
+            target/guest-package/vmlab-guest-${{ needs.version.outputs.version }}.tar.gz.sha256
+          retention-days: 1
+
   # ── Release ───────────────────────────────────────────────────────────────
-  # Tag the commit and cut a GitHub (pre-)release with the binary attached.
+  # Tag the commit and cut a GitHub (pre-)release with the binary and the
+  # guest-asset bundle (and its checksum) attached.
   release:
     name: Create GitHub release
-    needs: [version, build]
+    needs: [version, build, guest-assets]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -232,6 +287,10 @@ jobs:
         with:
           path: dist
           pattern: bin-*
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          name: guest-assets
       - name: Tag
         run: |
           V="${{ needs.version.outputs.version }}"
