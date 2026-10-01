@@ -21,6 +21,11 @@
 #                   PRD §7.4; skipped with a warning when not installed)
 #
 # Usage: guest/build-agent.sh [target-key...]   (default: all of the above)
+#
+# VMLAB_REQUIRE_ALL_TARGETS=1 turns every "skipped with a warning" above into
+# an error, and so a Windows build that would fall back to the UCRT for want
+# of the msvcrt CRT: a release (`just guest-package`) ships the whole set or
+# nothing. Unset, a missing toolchain only costs its target.
 
 set -euo pipefail
 
@@ -40,6 +45,15 @@ die() {
 
 log() {
   echo "build-agent: $*" >&2
+}
+
+STRICT="${VMLAB_REQUIRE_ALL_TARGETS:-0}"
+
+# A target whose toolchain is absent: a warning by default, fatal in strict
+# mode. Callers `return 0` after it, which strict mode never reaches.
+skip() {
+  [[ "$STRICT" == "1" ]] && die "$* — VMLAB_REQUIRE_ALL_TARGETS=1 allows no skipped target"
+  log "skipping $*"
 }
 
 version_stamp() {
@@ -81,6 +95,8 @@ msvcrt_link_args() {
   if [[ -f "$lib/libmsvcrt.a" && -f "$lib/crt2.o" ]]; then
     echo "-Clink-arg=-B$lib -Clink-arg=-L$lib"
   else
+    [[ "$STRICT" == "1" ]] && die "no msvcrt CRT for $host under $MSVCRT_PREFIX —" \
+      "build one with guest/build-mingw-msvcrt.sh (VMLAB_REQUIRE_ALL_TARGETS=1)"
     log "no msvcrt CRT for $host — the binary will need the UCRT (Windows 10+);" \
         "build one with guest/build-mingw-msvcrt.sh"
   fi
@@ -101,11 +117,11 @@ build_one() {
   local toolchain=""
   if [[ "$target" == *-win7-windows-* ]]; then
     if ! rustup toolchain list | grep -q "^$NIGHTLY"; then
-      log "skipping $key: $NIGHTLY not installed (rustup toolchain install $NIGHTLY --component rust-src)"
+      skip "$key: $NIGHTLY not installed (rustup toolchain install $NIGHTLY --component rust-src)"
       return 0
     fi
     if ! rustup component list --toolchain "$NIGHTLY" 2>/dev/null | grep -q "^rust-src (installed)"; then
-      log "skipping $key: rust-src missing (rustup component add rust-src --toolchain $NIGHTLY)"
+      skip "$key: rust-src missing (rustup component add rust-src --toolchain $NIGHTLY)"
       return 0
     fi
     toolchain="+$NIGHTLY"
@@ -114,7 +130,7 @@ build_one() {
     if [[ "$required" == "1" ]]; then
       die "rust target $target not installed — run: rustup target add $target"
     fi
-    log "skipping $key: rust target $target not installed (rustup target add $target)"
+    skip "$key: rust target $target not installed (rustup target add $target)"
     return 0
   fi
   local mingw_cc=""
@@ -123,7 +139,7 @@ build_one() {
     windows-x86) mingw_cc="i686-w64-mingw32-gcc" ;;
   esac
   if [[ -n "$mingw_cc" ]] && ! command -v "$mingw_cc" >/dev/null 2>&1; then
-    log "skipping $key: $mingw_cc not found (install mingw-w64)"
+    skip "$key: $mingw_cc not found (install mingw-w64)"
     return 0
   fi
 

@@ -60,6 +60,11 @@ guest-install: guest-build agent-build agent-legacy-build
 	mkdir -p ~/.local/share/vmlab/guest
 	cp -r guest/dist/* ~/.local/share/vmlab/guest/
 
+# Build every guest target and pack the release bundle (version defaults to Cargo.toml's; a missing toolchain fails it)
+[group('build')]
+guest-package version='':
+	./guest/package.sh {{version}}
+
 # The eBPF fast-path programs (ebpf/ workspace) need the nightly pinned in
 # ebpf/rust-toolchain.toml plus bpf-linker built against that same toolchain
 # (its LLVM proxy dlopens the toolchain's libLLVM — a mismatched install

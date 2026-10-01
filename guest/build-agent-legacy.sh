@@ -11,7 +11,12 @@
 #                    skipped with a warning when OpenWatcom is absent
 #   dos-i386         DOS (32-bit, DOS/32A extender bound in) — OpenWatcom v2;
 #                    skipped with a warning when OpenWatcom is absent
-#   linux-x86        the POSIX build, host cc; also the conformance binary
+#   linux-x86        the POSIX build for old 32-bit Linux guests: host cc with
+#                    `-m32 -static` (gcc-multilib on an x86_64 host); skipped
+#                    with a warning when the compiler cannot target i386. Its
+#                    stamp is VERSION-legacy, because the directory is shared
+#                    with the Rust agent's linux-x86 build and its VERSION.
+#                    (The conformance tests compile their own host binary.)
 #   templeos         guest/agent-templeos/VmlabAgt.HC, stamped — HolyC source is
 #                    the artefact; TempleOS compiles it itself
 #
@@ -19,6 +24,10 @@
 # (the unpacked ow-snapshot.tar.xz from the project's GitHub releases).
 #
 # Usage: guest/build-agent-legacy.sh [target-key...]   (default: all)
+#
+# VMLAB_REQUIRE_ALL_TARGETS=1 turns every "skipped with a warning" above into
+# an error, and so the NT build's fallback to the UCRT for want of the msvcrt
+# CRT: a release (`just guest-package`) ships the whole set or nothing.
 
 set -euo pipefail
 
@@ -35,6 +44,15 @@ die() {
 
 log() {
   echo "build-agent-legacy: $*" >&2
+}
+
+STRICT="${VMLAB_REQUIRE_ALL_TARGETS:-0}"
+
+# A target whose toolchain is absent: a warning by default, fatal in strict
+# mode. Callers `return 0` after it, which strict mode never reaches.
+skip() {
+  [[ "$STRICT" == "1" ]] && die "$* — VMLAB_REQUIRE_ALL_TARGETS=1 allows no skipped target"
+  log "skipping $*"
 }
 
 version_stamp() {
@@ -94,7 +112,7 @@ build_one() {
   case "$key" in
     windows-nt-x86)
       if ! command -v i686-w64-mingw32-gcc >/dev/null 2>&1; then
-        log "skipping $key: i686-w64-mingw32-gcc not found (install mingw-w64)"
+        skip "$key: i686-w64-mingw32-gcc not found (install mingw-w64)"
         return 0
       fi
       local out="$DIST_DIR/$key"
@@ -109,6 +127,8 @@ build_one() {
       if [[ -f "$msvcrt_lib/libmsvcrt.a" && -f "$msvcrt_lib/crt2.o" ]]; then
         crt_args=("-B$msvcrt_lib" "-L$msvcrt_lib")
       else
+        [[ "$STRICT" == "1" ]] && die "$key: no msvcrt CRT under $MSVCRT_PREFIX —" \
+          "build one with guest/build-mingw-msvcrt.sh (VMLAB_REQUIRE_ALL_TARGETS=1)"
         log "$key: no msvcrt CRT — this binary will need the UCRT (Windows 10+);" \
             "build one with guest/build-mingw-msvcrt.sh"
       fi
@@ -122,14 +142,14 @@ build_one() {
       ;;
     windows-9x-x86)
       if ! have_watcom; then
-        log "skipping $key: OpenWatcom not found at $WATCOM (set WATCOM)"
+        skip "$key: OpenWatcom not found at $WATCOM (set WATCOM)"
         return 0
       fi
       watcom_build "$key" nt win95 vmlab-agent-legacy.exe plat_win32.c "$stamp"
       ;;
     dos-i386)
       if ! have_watcom; then
-        log "skipping $key: OpenWatcom not found at $WATCOM (set WATCOM)"
+        skip "$key: OpenWatcom not found at $WATCOM (set WATCOM)"
         return 0
       fi
       # 8.3, and the name the DOS install notes refer to.
@@ -137,12 +157,25 @@ build_one() {
       ;;
     linux-x86)
       command -v cc >/dev/null 2>&1 || die "missing host tool: cc"
+      # A guest too old for virtio-serial is old enough that its libc is
+      # anyone's guess: link statically, for i386, whatever the host is.
+      local probe
+      probe="$(mktemp -d)"
+      if ! printf 'int main(void){return 0;}\n' >"$probe/p.c" ||
+        ! cc -m32 -static -o "$probe/p" "$probe/p.c" >/dev/null 2>&1; then
+        rm -rf "$probe"
+        skip "$key: cc cannot link -m32 -static (install gcc-multilib)"
+        return 0
+      fi
+      rm -rf "$probe"
       local out="$DIST_DIR/$key"
       mkdir -p "$out"
-      cc -std=c99 -Wall -Wextra -Werror -Os -s -DAGENT_VERSION="\"$stamp\"" \
+      cc -m32 -static -std=c99 -Wall -Wextra -Werror -Os -s -DAGENT_VERSION="\"$stamp\"" \
         -o "$out/vmlab-agent-legacy" "${srcs[@]}" "$SRC_DIR/plat_posix.c" \
         || die "cc build failed for $key"
-      echo "$stamp" >"$out/VERSION"
+      # Not VERSION: that is the Rust agent's stamp for this directory, which
+      # the host compares against a running agent (PRD §19.4).
+      echo "$stamp" >"$out/VERSION-legacy"
       log "$key: $(du -h "$out/vmlab-agent-legacy" | cut -f1) → $out/vmlab-agent-legacy"
       ;;
     templeos)
