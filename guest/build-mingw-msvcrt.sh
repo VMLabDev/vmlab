@@ -24,6 +24,9 @@ set -euo pipefail
 VERSION="${1:-14.0.0}"
 PREFIX="${VMLAB_MSVCRT_PREFIX:-$HOME/.local/share/vmlab/toolchains/mingw-msvcrt}"
 URL="https://downloads.sourceforge.net/project/mingw-w64/mingw-w64/mingw-w64-release/mingw-w64-v${VERSION}.tar.bz2"
+# SourceForge's download edge is often unavailable; the project's GitHub
+# mirror tags every release with the same tree under one top-level directory.
+MIRROR_URL="https://github.com/mingw-w64/mingw-w64/archive/refs/tags/v${VERSION}.tar.gz"
 
 log() { echo "build-mingw-msvcrt: $*" >&2; }
 die() { echo "build-mingw-msvcrt: error: $*" >&2; exit 1; }
@@ -32,9 +35,13 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 log "fetching mingw-w64 $VERSION"
-curl -fSL --retry 3 -o "$work/src.tar.bz2" "$URL" || die "download failed: $URL"
+if ! curl -fsSL --retry 3 -o "$work/src.tar" "$URL"; then
+    log "$URL failed; trying the GitHub mirror"
+    curl -fsSL --retry 3 -o "$work/src.tar" "$MIRROR_URL" \
+        || die "download failed: $URL and $MIRROR_URL"
+fi
 mkdir -p "$work/src"
-tar xf "$work/src.tar.bz2" -C "$work/src" --strip-components=1
+tar xf "$work/src.tar" -C "$work/src" --strip-components=1
 
 built=0
 for host in i686-w64-mingw32 x86_64-w64-mingw32; do
