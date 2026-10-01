@@ -24,7 +24,7 @@ page guide_architecture {
   DOC
 
   list {
-    li "**The supervisor, `vmlabd`.** One per user, started automatically by the CLI the first time it is needed. It keeps the registry of running labs, owns the [global segments](guide_networking) that span labs, serialises every write to the [template store](guide_templates), runs host-level watchdogs such as `host.disk_low`, and aggregates the [event stream](guide_events) of every lab on the host."
+    li "**The supervisor, `vmlabd`.** One per user, started automatically by the CLI the first time it is needed, in a session of its own: closing the terminal that started it takes neither it nor any lab down. It keeps the registry of running labs, owns the [global segments](guide_networking) that span labs, serialises every write to the [template store](guide_templates), runs host-level watchdogs such as `host.disk_low`, and aggregates the [event stream](guide_events) of every lab on the host."
     li "**The lab daemon.** One per running lab, spawned by the supervisor on `vmlab up` and reaped on `down` or `destroy`. It owns everything lab-scoped: the QEMU processes, their QMP and agent channels, the lab's segments with their DHCP, DNS, NAT and rules, clones, snapshots, lab state, the wscript runtime, and the workspace syncer of any [dev machine](guide_dev)."
     li "**The CLI.** It connects to the supervisor for discovery and host-scoped verbs, then talks directly to the lab daemon's socket for anything lab-scoped. Nothing proxies the hot path."
   }

@@ -75,7 +75,6 @@ async fn wait_supervisor_gone(sock: &std::path::Path) -> bool {
 }
 
 fn spawn_supervisor() -> Result<()> {
-    use std::os::unix::process::CommandExt;
     // The supervisor + lab daemons live in the `vmlab` binary; resolve that
     // rather than assuming the current executable is it.
     let exe = crate::paths::vmlab_exe()?;
@@ -87,16 +86,29 @@ fn spawn_supervisor() -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let log_err = log.try_clone()?;
-    // New process group so the daemon survives the CLI's terminal.
-    std::process::Command::new(exe)
-        .arg("__supervisord")
-        .stdin(std::process::Stdio::null())
-        .stdout(log)
-        .stderr(log_err)
-        .process_group(0)
+    supervisor_command(&exe, log, log_err)
         .spawn()
         .context("spawning vmlabd")?;
     Ok(())
+}
+
+/// The supervisor's spawn, minus the binary's own location.
+///
+/// Deliberately *not* `process_group(0)`: the supervisor's first act is
+/// [`crate::supervisor::start_session`], and `setsid` refuses a process-group
+/// leader. Its own session is what lets it — and the lab daemons it spawns,
+/// which inherit that session — outlive the terminal the CLI ran in.
+fn supervisor_command(
+    exe: &Path,
+    log: std::fs::File,
+    log_err: std::fs::File,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__supervisord")
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    cmd
 }
 
 /// Connect to a lab's daemon, starting the supervisor and lab daemon as
@@ -240,4 +252,66 @@ pub fn cmd_daemon(cmd: DaemonCmd) -> Result<()> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HELPER_ENV: &str = "VMLAB_TEST_SESSION_HELPER";
+
+    /// Stand-in for `vmlab __supervisord`: what the supervisor does first,
+    /// then the session it ended up in. Only meaningful when spawned by
+    /// [`supervisor_leaves_the_spawning_terminals_session`].
+    #[test]
+    #[ignore = "helper process for supervisor_leaves_the_spawning_terminals_session"]
+    fn session_helper() {
+        if std::env::var_os(HELPER_ENV).is_none() {
+            return;
+        }
+        crate::supervisor::start_session();
+        let sid = nix::unistd::getsid(None).unwrap();
+        println!("SID={sid} PID={}", std::process::id());
+    }
+
+    /// Field 6 of `/proc/<pid>/stat`: the process's session id.
+    fn proc_sid(pid: u32) -> i32 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        // `comm` (field 2) may hold spaces; everything after its `)` splits.
+        let rest = &stat[stat.rfind(')').unwrap() + 2..];
+        rest.split(' ').nth(3).unwrap().parse().unwrap()
+    }
+
+    /// F23: the supervisor shared the launching terminal's session, so
+    /// closing that terminal took every lab down. Spawned exactly as the CLI
+    /// spawns it, it must end up leading a session of its own.
+    #[test]
+    fn supervisor_leaves_the_spawning_terminals_session() {
+        let ours = proc_sid(std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::fs::File::create(dir.path().join("log")).unwrap();
+        let log_err = log.try_clone().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = supervisor_command(&exe, log, log_err);
+        cmd.args([
+            "--exact",
+            "cli::daemon::tests::session_helper",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HELPER_ENV, "1");
+        let status = cmd.status().unwrap();
+        assert!(status.success());
+        let out = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        let line = out
+            .lines()
+            .find_map(|l| l.find("SID=").map(|i| &l[i..]))
+            .unwrap_or_else(|| panic!("helper printed no session:\n{out}"));
+        let (sid, pid) = line.split_once(' ').unwrap();
+        let sid: i32 = sid.trim_start_matches("SID=").parse().unwrap();
+        let pid: i32 = pid.trim_start_matches("PID=").parse().unwrap();
+        assert_ne!(sid, ours, "the supervisor stayed in the spawner's session");
+        assert_eq!(sid, pid, "the supervisor leads its own session");
+    }
 }

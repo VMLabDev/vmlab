@@ -58,8 +58,28 @@ fn process_running(pid: u32) -> bool {
 
 /// Entry point for `vmlab __supervisord`.
 pub fn run() -> Result<()> {
+    start_session();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async())
+}
+
+/// Leave the session of whoever started us, before anything else runs.
+///
+/// The CLI auto-starts the supervisor from a terminal, and a process in that
+/// terminal's session is sent `SIGHUP` when it closes — a multiplexer pane, an
+/// SSH connection, a window. The lab daemons are the supervisor's children and
+/// share its session, so they and every machine they own went with it. A new
+/// session has no controlling terminal to lose.
+///
+/// Done here rather than in the spawning CLI's `pre_exec` because the crate
+/// denies `unsafe_code`; `setsid` is the first thing the process does, and the
+/// CLI spawns it outside any new process group because `setsid` refuses a
+/// process-group leader. A supervisor started by hand as a group leader (a
+/// shell job) stays where it was: that is what its user asked for.
+pub fn start_session() {
+    if let Err(e) = nix::unistd::setsid() {
+        tracing::debug!("supervisor stays in its session: setsid: {e}");
+    }
 }
 
 async fn run_async() -> Result<()> {

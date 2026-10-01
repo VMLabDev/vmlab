@@ -148,11 +148,12 @@ class Harness:
         self.run(["vmlab", "destroy"], cwd=lab, check=False, timeout=300)
 
     @contextlib.contextmanager
-    def lab(self, name: str):
-        """A fresh copy of `labs/<name>` under the work directory, destroyed
-        afterwards unless the run keeps its labs."""
+    def lab(self, name: str, under: str = ""):
+        """A fresh copy of `labs/<name>` under the work directory (inside
+        `under`, when given), destroyed afterwards unless the run keeps its
+        labs."""
         src = E2E / "labs" / name
-        dst = WORK / name
+        dst = WORK / under / name
         if dst.exists():
             self.destroy(dst)
             shutil.rmtree(dst)

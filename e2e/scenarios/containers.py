@@ -8,6 +8,11 @@ import time
 from harness import ScenarioFailed
 
 LAB = "containers-main"
+# The lab sits this deep so its `.vmlab/smb` is past 120 characters: smbd binds
+# unix sockets (108-byte paths) in some of its directories, and a lab at a deep
+# path once killed every SMB share at start (`messaging_dgm_ref failed: File
+# name too long`). share.smb passing here is that regression's check.
+DEEP = "a-lab-directory-deep-enough-to-overflow-a-unix-socket-path-" + "x" * 50
 
 
 def sh(h, lab, machine, script, check=True, container=False, timeout=120):
@@ -38,7 +43,8 @@ def http_get(h, port: int) -> str:
 
 
 def run(h):
-    with h.lab(LAB) as lab:
+    with h.lab(LAB, under=DEEP) as lab:
+        assert len(str(lab / ".vmlab" / "smb")) > 120, lab
         h.vmlab("up", cwd=lab, timeout=900)
         h.wait_ready(lab, "web", "idle", "vm01")
 
@@ -175,7 +181,8 @@ def share_checks(h, lab, mounts: str):
 
     ok_srv, d_srv = probe("/srv", "share-smb-srv", "from-host-smb-srv", "cifs")
     ok_mnt, d_mnt = probe("/mnt/smb", "share-smb", "from-host-smb", "cifs")
-    h.ok("share.smb", ok_srv and ok_mnt, f"{d_srv}; {d_mnt}")
+    h.ok("share.smb", ok_srv and ok_mnt,
+         f"lab path {len(str(lab))} chars; {d_srv}; {d_mnt}")
 
     line = next((l for l in mounts.splitlines() if " /mnt/ro " in l), "")
     read = sh(h, lab, "vm01", "cat /mnt/ro/host.txt", check=False).out.strip()

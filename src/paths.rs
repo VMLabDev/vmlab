@@ -95,6 +95,25 @@ pub fn lab_socket(lab: &str) -> PathBuf {
     lab_runtime_dir(lab).join("control.sock")
 }
 
+/// Where one lab's `smbd` keeps the directories it binds unix sockets in —
+/// `private dir` (`msg.sock/<pid>`) and `ncalrpc dir` (`np/<pipe>`) — with
+/// its volatile lock and pid directories.
+///
+/// A unix socket path is capped at 108 bytes (`sun_path`), so these cannot
+/// live under the lab's own `.vmlab/smb`: a lab in a deep directory left smbd
+/// dying at start with `messaging_dgm_ref failed: File name too long`. Keyed
+/// by a short hash of the lab's SMB state directory rather than by any name
+/// the user chose, so the length is fixed by construction:
+/// `<runtime>/smb/<12 hex>`.
+pub fn smb_runtime_dir(smb_state_dir: &Path) -> PathBuf {
+    smb_runtime_dir_in(&runtime_dir(), smb_state_dir)
+}
+
+/// [`smb_runtime_dir`] against an explicit runtime base, for tests.
+pub fn smb_runtime_dir_in(runtime: &Path, smb_state_dir: &Path) -> PathBuf {
+    runtime.join("smb").join(short_hash(smb_state_dir))
+}
+
 /// Walk up from `start` looking for `vmlab.wcl` (like git locates its repo).
 /// Returns the directory containing the lab file.
 pub fn find_lab_root(start: &Path) -> Result<PathBuf> {
@@ -245,6 +264,25 @@ pub fn vmlab_exe() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smb_runtime_dir_is_bounded_whatever_the_lab_path() {
+        // A lab root of 200 characters still yields socket directories far
+        // inside sun_path's 108 bytes: nothing of the lab path survives.
+        let deep = PathBuf::from(format!("/{}/.vmlab/smb", "d".repeat(200)));
+        let base = Path::new("/run/user/1000/vmlab");
+        let run = smb_runtime_dir_in(base, &deep);
+        // The longest socket smbd binds there: msg.sock/<pid>, pid_max 2^22.
+        let msg = run.join("msg.sock").join("4194304");
+        assert!(msg.as_os_str().len() < 64, "{}", msg.display());
+        let ncalrpc = run.join("ncalrpc").join("np").join("lsa_ds");
+        assert!(ncalrpc.as_os_str().len() < 64, "{}", ncalrpc.display());
+        // The same length for every lab; distinct labs, distinct directories.
+        let other = smb_runtime_dir_in(base, Path::new("/l/.vmlab/smb"));
+        assert_eq!(run.as_os_str().len(), other.as_os_str().len());
+        assert_ne!(run, other);
+        assert_eq!(run, smb_runtime_dir_in(base, &deep));
+    }
 
     #[test]
     fn find_lab_root_walks_up() {

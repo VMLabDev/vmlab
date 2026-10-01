@@ -6,8 +6,10 @@
 //! backend drives a stock Samba `smbd`:
 //!
 //! - runs **unprivileged** (no root): a localhost high port (>1024), every
-//!   Samba state/lock/cache directory relocated under the lab's `.vmlab/smb`
-//!   tree, and `force user = <invoking unix user>` so the daemon's `smbd`
+//!   Samba state/lock/cache directory relocated off the system paths — the
+//!   persistent ones under the lab's `.vmlab/smb`, the ones smbd binds unix
+//!   sockets in under vmlab's runtime directory (see [`SmbConfig::run_dir`]) —
+//!   and `force user = <invoking unix user>` so the daemon's `smbd`
 //!   reads host files with the daemon's own identity rather than needing to
 //!   switch uid;
 //! - the switch then proxies the segment gateway's port 445 to this high port
@@ -129,9 +131,15 @@ pub struct ShareDef {
 pub struct SmbConfig {
     /// Localhost high port `smbd` listens on (`smb ports =`).
     pub listen_port: u16,
-    /// The lab's `.vmlab/smb` directory; holds the conf, passdb, and every
-    /// Samba state/lock/cache/pid directory so `smbd` needs no root.
+    /// The lab's `.vmlab/smb` directory; holds the conf, passdb, log and the
+    /// state/cache directories so `smbd` needs no root.
     pub lab_dir: PathBuf,
+    /// The directories `smbd` binds unix sockets in — `private dir`
+    /// (`msg.sock/<pid>`), `ncalrpc dir` (`np/<pipe>`) — with the volatile
+    /// lock and pid directories, under vmlab's runtime directory
+    /// ([`crate::paths::smb_runtime_dir`]). A socket path is capped at 108
+    /// bytes, so these must not grow with the lab's own path.
+    pub run_dir: PathBuf,
     pub shares: Vec<ShareDef>,
     /// True if any share opted into smb1 — toggles the global protocol floor,
     /// signing, and NTLM auth relaxation for the whole instance (a single
@@ -150,13 +158,18 @@ impl SmbConfig {
         self.lab_dir.join("smbd.log")
     }
     pub fn pid_path(&self) -> PathBuf {
-        self.lab_dir.join("smbd.pid")
+        self.run_dir.join("smbd.pid")
+    }
+    pub fn ncalrpc_dir(&self) -> PathBuf {
+        self.run_dir.join("ncalrpc")
     }
 
     /// Render the `smb.conf`. Every directive is annotated below; the key
-    /// theme is "run as a normal user, keep all state under `lab_dir`".
+    /// theme is "run as a normal user, keep all state under `lab_dir`" — and
+    /// every socket under the short `run_dir`.
     pub fn render_conf(&self) -> String {
         let dir = self.lab_dir.display();
+        let run = self.run_dir.display();
 
         // Unix account the running daemon process belongs to. `force user`
         // makes smbd access the exported tree as this account, so the
@@ -180,13 +193,20 @@ impl SmbConfig {
         // Bind to loopback only — the only reachable path is the switch proxy.
         out.push_str("    bind interfaces only = yes\n");
         out.push_str("    interfaces = 127.0.0.1\n");
-        // --- Unprivileged state relocation (everything under lab_dir) -------
-        out.push_str(&format!("    private dir = {dir}\n"));
+        // --- Unprivileged state relocation --------------------------------
+        // Persistent state beside the lab. Sockets — msg.sock/<pid> in the
+        // private dir, np/<pipe> under ncalrpc — and the volatile lock and
+        // pid directories under the bounded run_dir. The passdb is named
+        // explicitly below, so it stays with the lab despite private dir.
+        out.push_str(&format!("    private dir = {run}\n"));
         out.push_str(&format!("    state directory = {dir}\n"));
         out.push_str(&format!("    cache directory = {dir}\n"));
-        out.push_str(&format!("    lock directory = {dir}\n"));
-        out.push_str(&format!("    pid directory = {dir}\n"));
-        out.push_str(&format!("    ncalrpc dir = {dir}/ncalrpc\n"));
+        out.push_str(&format!("    lock directory = {run}\n"));
+        out.push_str(&format!("    pid directory = {run}\n"));
+        out.push_str(&format!(
+            "    ncalrpc dir = {}\n",
+            self.ncalrpc_dir().display()
+        ));
         out.push_str(&format!(
             "    passdb backend = tdbsam:{}\n",
             self.passdb_path().display()
@@ -291,6 +311,7 @@ mod tests {
         SmbConfig {
             listen_port: 14450,
             lab_dir: PathBuf::from("/labroot/.vmlab/smb"),
+            run_dir: PathBuf::from("/run/vmlab/smb/0123456789ab"),
             any_smb1: smb1,
             shares: vec![
                 ShareDef {
@@ -315,11 +336,12 @@ mod tests {
     fn conf_has_unprivileged_dirs() {
         let conf = cfg(false).render_conf();
         for dir_key in [
-            "private dir = /labroot/.vmlab/smb",
+            "private dir = /run/vmlab/smb/0123456789ab\n",
             "state directory = /labroot/.vmlab/smb",
             "cache directory = /labroot/.vmlab/smb",
-            "lock directory = /labroot/.vmlab/smb",
-            "pid directory = /labroot/.vmlab/smb",
+            "lock directory = /run/vmlab/smb/0123456789ab\n",
+            "pid directory = /run/vmlab/smb/0123456789ab\n",
+            "ncalrpc dir = /run/vmlab/smb/0123456789ab/ncalrpc\n",
             "passdb backend = tdbsam:/labroot/.vmlab/smb/passdb.tdb",
         ] {
             assert!(conf.contains(dir_key), "missing `{dir_key}` in:\n{conf}");
