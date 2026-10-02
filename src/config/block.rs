@@ -95,6 +95,9 @@ fn describe(v: &Value) -> &'static str {
         Value::Record { .. } => "a record",
         Value::DataPath { .. } => "a reference",
         Value::PendingUnit { .. } => "a unit literal without a type",
+        // `Value` is non-exhaustive: a kind wcl adds later still gets a
+        // sentence rather than failing the build.
+        _ => "a value",
     }
 }
 
