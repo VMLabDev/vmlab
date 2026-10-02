@@ -62,7 +62,7 @@ sha2 = "0.11"
 hex = "0.4"
 rand = "0.10"
 base64 = "0.23"
-zstd = "0.13"
+zstd = "0.14"
 flate2 = "1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
