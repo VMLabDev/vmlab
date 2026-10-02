@@ -34,7 +34,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | The `vm {}` block and every child block: attributes, types, defaults | `references/vm.md` |
 | Containers as lab machines, the micro-VM model, the `container {}` block | `references/containers.md` |
 | Segments, DHCP, DNS, NAT, routing, traffic rules, the eBPF fast path | `references/networking.md` |
-| Templates, the store, builds, `source {}`, linked clones, scratch VMs, OCI distribution | `references/templates.md` |
+| Templates, the store, builds, `source {}`, linked clones, scratch VMs, OCI distribution, and the published templates anyone can pull (`ghcr.io/vmlabdev/vmlab-templates`, Windows included) | `references/templates.md` |
 | The wscript language: types, control flow, matching, modules, stdlib | `references/wscript-language.md` |
 | wscript `Lab`, `Segment` and `Term` methods, and the shared types (`Match`, `ExecResult`, `Login`, `GuestStats`, `Event`) | `references/wscript-lab-api.md` |
 | wscript `Machine` methods — lifecycle, exec, files, input, vision, snapshots | `references/wscript-machine-api.md` |

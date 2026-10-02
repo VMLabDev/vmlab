@@ -70,8 +70,10 @@ page guide_templates {
   h2 "Building a template"
 
   p <<DOC
-    A template is declared in a `template` block, in its own WCL file or
-    beside a `lab`, and built with `vmlab template build`. The block names
+    Before building, check whether the template is already
+    [published](guide_registries): pulling one takes minutes, building it can
+    take much longer. A template is declared in a `template` block, in its own
+    WCL file or beside a `lab`, and built with `vmlab template build`. The block names
     the build's **source**, the **hardware** the build VM boots with, any
     **media** to attach, and the **provision** scripts and playbooks that
     drive the install.

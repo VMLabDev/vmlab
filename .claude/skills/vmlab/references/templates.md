@@ -437,3 +437,81 @@ container images. The namespaces it searches are host-level settings managed wit
 `vmlab template registry add | list | remove`. They are search roots, not
 secrets: credentials stay in the Docker config and are looked up by registry
 host.
+
+## Published templates
+
+vmlab's own templates are published under `ghcr.io/vmlabdev/vmlab-templates`,
+the namespace `vmlab template search` looks in by default for VM templates. The
+packages are public: anyone can pull them anonymously, with no `template login`.
+
+**Pull before you build.** A pull takes minutes; building the same template
+from its installer can take 30 to 45 minutes for Windows. Build from
+`examples/templates` (or the separate `vmlab-templates` repository) only to
+change a template, or for an arch or version that is not published.
+
+Two ways to use one:
+
+- **Name it in the lab file.** `template` takes the registry reference and
+  `arch` is required, because one tag can carry several architectures. `vmlab
+  up` (or `vmlab pull`) fetches it into the store the first time:
+
+  ```wcl
+  vm "winsrv" {
+    template = "ghcr.io/vmlabdev/vmlab-templates/windows-server-2025"
+    arch     = "x86_64"
+  }
+  ```
+
+  With no tag it tracks `latest`; `:latest-prerelease` and `:<version>` work as
+  described under Addressing.
+- **Pull it into the store, then use the store reference.** The store entry is
+  named after the template itself, so a lab that already says
+  `template = "x86_64/windows-server-2025"` works unchanged after:
+
+  ```sh
+  vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-server-2025 --arch x86_64
+  ```
+
+  A pull of a version already in the store reuses the stored copy when its disk
+  is the same image, and refuses when it differs.
+
+**`vmlab template search` is the authority** on which templates exist: run it
+rather than trusting a list. Two caveats. It searches with whatever credentials
+you have stored, so it can show entries an anonymous user cannot pull (at the
+time of writing it also lists `freebsd-15`, which is private). And its ARCH
+column is the architectures of the highest version only, so a template whose
+architectures were published under different versions looks narrower than it
+is: `debian-13` and `ubuntu-24.04` show one or two arches but carry three. The
+table below lists every published architecture.
+
+What anyone can pull, checked anonymously on 2026-10-02:
+
+| Template | Arches | Newest version |
+| --- | --- | --- |
+| `almalinux-10` | x86_64 | 10.2.1 |
+| `alpine-3.23` | aarch64, x86_64 | 3.23.8 |
+| `arch` | x86_64 | 20260901.0 |
+| `debian-13` | aarch64, riscv64, x86_64 | aarch64 13.20260617, riscv64 13.20260617.1, x86_64 13.20260617 |
+| `fedora-42` | riscv64 | 42.20250911.1 |
+| `fedora-44` | aarch64, x86_64 | 44.1.9 |
+| `freedos-1.3` | x86 | 1.3 |
+| `home-assistant` | aarch64 | 17.3.1 |
+| `kali` | x86_64 | 2026.1.1 |
+| `nixos-25.11` | x86_64 | 25.11.1 |
+| `opensuse-leap` | x86_64 | 16.0 |
+| `opensuse-tumbleweed` | x86_64 | 20260613 |
+| `parrot` | x86_64 | 7.2.1 |
+| `rocky-9` | x86_64 | 9.8.1 |
+| `templeos` | x86_64 | 5.03.1 |
+| `ubuntu-24.04` | aarch64, riscv64, x86_64 | aarch64 24.04.20260520, riscv64 24.04.20260520, x86_64 24.04.20260519 |
+| `ubuntu-26.04` | x86_64 | 26.04.1 |
+| `windows-10` | x86_64 | 19045.2006.5 |
+| `windows-11` | x86_64 | 26100.1742.3 |
+| `windows-server-2019` | x86_64 | 17763.737.5 |
+| `windows-server-2022` | x86_64 | 20348.169.5 |
+| `windows-server-2025` | x86_64 | 26100.1742.6 |
+
+The Windows images are evaluation editions with their 180-day licences. Their
+first boot replays Windows specialize before the VM reports ready; with the
+template already pulled, `up` of Windows Server 2025 took about a minute and a
+half on KVM.

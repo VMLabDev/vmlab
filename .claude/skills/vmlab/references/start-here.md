@@ -455,6 +455,12 @@ tracks pre-releases and `:<version>` pins one. A registry reference always
 needs `arch`, because one tag can carry several architectures and vmlab never
 assumes the host's.
 
+The same namespace publishes more than Alpine: Ubuntu, Debian, Fedora, Rocky,
+AlmaLinux, openSUSE, Arch, Kali, NixOS and Windows 10, 11 and Server
+2019/2022/2025, among others. `vmlab template search` lists them, and
+"Published templates" in templates.md has the table and when to pull instead of
+build.
+
 `nic { nat = true }` is shorthand for attaching the VM to the lab's built-in
 NAT segment, so no segment declaration is needed. The guest gets a DHCP lease
 and internet egress. `memory = 1GiB` overrides the size the template recorded;

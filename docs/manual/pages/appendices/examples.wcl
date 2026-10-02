@@ -20,10 +20,10 @@ page apx_examples {
     written against.
   DOC
   p <<DOC
-    Every example runs from its own directory. Most name a
-    [template](guide_templates) that you build first under
-    `examples/templates`, and a few pull one from a
-    [registry](guide_registries) on the first `vmlab up`. Guest credentials
+    Every example runs from its own directory. Each names
+    [templates](guide_templates) that are published on a public
+    [registry](guide_registries): pull them as each example shows, or build
+    them yourself under `examples/templates`. Guest credentials
     are the ones each template bakes in: `Administrator` / `vmlab123!` on
     Windows Server 2025, `vmlab` / `vmlab` on the Linux images.
   DOC
@@ -40,11 +40,13 @@ page apx_examples {
   DOC
   p <<DOC
     It needs `x86_64/windows-server-2025` and a pinned `x86_64/windows-11`
-    in the [store](guide_templates); the repository ships a build for the
-    first under `examples/templates` and none for the second. The Ubuntu box
+    in the [store](guide_templates). Both are published, so pull them;
+    `examples/templates` has a build for the first only. The Ubuntu box
     pulls itself on `up`, so its segment needs egress.
   DOC
   code sh { source = <<'SH'
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-server-2025 --arch x86_64
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-11 --arch x86_64
 cd examples/ad-lab
 vmlab validate
 vmlab up
@@ -68,13 +70,13 @@ SH
     guest's `uname -m`, which should print `aarch64`.
   DOC
   p <<DOC
-    It needs `aarch64/alpine-3.23` in the store. That template's definition
-    lives in the separate `vmlab-templates` repository, not under
-    `examples/templates`; build it there with `vmlab template build`, then
-    confirm it with `vmlab template list`. The host needs
-    `qemu-system-aarch64` and the aarch64 UEFI firmware.
+    It needs `aarch64/alpine-3.23` in the store. It is published, so pull
+    it; its definition lives in the separate `vmlab-templates` repository if
+    you need to build it. The host needs `qemu-system-aarch64` and the
+    aarch64 UEFI firmware.
   DOC
   code sh { source = <<'SH'
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/alpine-3.23 --arch aarch64
 cd examples/alpine-arm64
 vmlab up                          # TCG: give it a minute or two
 ssh vmlab@localhost -p 12222      # password: vmlab
@@ -171,15 +173,17 @@ SH
     a [viewer](guide_vision) per guest.
   DOC
   p <<DOC
-    It needs both templates built from `examples/templates`. The README
+    It needs `x86_64/windows-server-2025` and `x86_64/ubuntu-24.04` in the
+    store. Both are published, so pull them; building them from
+    `examples/templates` is the fallback. The README
     explains one thing about the share worth knowing: the daemon maps `S:`
     as SYSTEM, so an interactive user opening it sees a credential error
     until they run the `vmlab-shares` script vmlab drops on the desktop,
     once per user.
   DOC
   code sh { source = <<'SH'
-(cd examples/templates/ubuntu-24.04 && vmlab template build)
-(cd examples/templates/windows-server-2025 && ./fetch-deps.sh && vmlab template build)
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-server-2025 --arch x86_64
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04 --arch x86_64
 cd examples/mixed-lab
 vmlab validate
 vmlab up                          # winsrv, then nix01, then the web container
@@ -256,12 +260,13 @@ SH
     should print `riscv64`.
   DOC
   p <<DOC
-    It needs `riscv64/ubuntu-24.04` in the store, built from the separate
-    `vmlab-templates` repository, and on the host `qemu-system-riscv64`
+    It needs `riscv64/ubuntu-24.04` in the store, which is published (pull
+    it as below), and on the host `qemu-system-riscv64`
     from QEMU 8.1 or later plus the riscv64 UEFI firmware, `qemu-efi-riscv64`
     on Debian and Ubuntu.
   DOC
   code sh { source = <<'SH'
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04 --arch riscv64
 cd examples/riscv64-ubuntu
 vmlab up                          # TCG: give it a minute or two
 ssh vmlab@localhost -p 12322      # password: vmlab
@@ -278,7 +283,8 @@ SH
   p <<DOC
     Not a lab but eight `template {}` definitions, one per directory, each
     building an `x86_64` template into the store with `vmlab template build`
-    run from that directory. Seven are Linux cloud images with a
+    run from that directory. Every one is also published prebuilt, so build
+    from here to change a template, not to get one. Seven are Linux cloud images with a
     `cloudinit/` folder attached as a `CIDATA` [media](ref_vm) volume: cloud-init
     creates the `vmlab` user, installs the guest agent from the auto-attached
     VMLAB ISO, and disables itself for later boots. The script waits for the
@@ -335,12 +341,12 @@ SH
     bridges the socket to a localhost port for a Windows-side client.
   DOC
   p <<DOC
-    It needs `x86_64/windows-server-2025` built from `examples/templates`,
-    and a viewer: the `viewer` field in host config, else `remote-viewer`,
+    It needs `x86_64/windows-server-2025` in the store, which is published
+    (pull it as below, or build it from `examples/templates`), and a viewer: the `viewer` field in host config, else `remote-viewer`,
     `gvncviewer` or `vncviewer` on `PATH`.
   DOC
   code sh { source = <<'SH'
-(cd examples/templates/windows-server-2025 && ./fetch-deps.sh && vmlab template build)
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-server-2025 --arch x86_64
 cd examples/winsrv-desktop
 vmlab validate
 vmlab up                          # a viewer opens on the desktop

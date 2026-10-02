@@ -10,9 +10,11 @@ Directory: `examples/ad-lab`.
 
 A small Active Directory lab: a domain controller on a `corp` segment that hands out the DC as its DNS server and routes to a second subnet, a Windows 11 client that waits for the DC through `depends_on`, and an Ubuntu build box on its own NAT'd NIC pulled from a registry. It shows a static IP as a DHCP reservation, wave ordering, a provision, and two event handlers: a crash collector and a disk-low alert.
 
-Needs `x86_64/windows-server-2025` and a pinned `x86_64/windows-11` in the store; the repository ships a build for the first under `examples/templates` and none for the second. The Ubuntu box pulls itself on `up`, so its segment needs egress.
+Needs `x86_64/windows-server-2025` and a pinned `x86_64/windows-11` in the store. Both are published (see "Published templates" in templates.md), so pull them rather than build; `examples/templates` has a build for the first only. The Ubuntu box pulls itself on `up`, so its segment needs egress.
 
 ```sh
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-server-2025 --arch x86_64
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-11 --arch x86_64
 cd examples/ad-lab
 vmlab validate
 vmlab up
@@ -28,9 +30,10 @@ Directory: `examples/alpine-arm64`.
 
 One Alpine Linux guest on an aarch64 machine, on a NAT'd segment with a host forward to its SSH port. On an x86 host there is no KVM for aarch64, so the VM runs under TCG emulation and boots in minutes; the TCG warning (see troubleshooting.md) is expected here. The provision script waits for the agent and logs the guest's `uname -m`, which should print `aarch64`.
 
-Needs `aarch64/alpine-3.23` in the store. That template's definition lives in the separate `vmlab-templates` repository, not under `examples/templates`; build it there with `vmlab template build`, then confirm it with `vmlab template list`. The host needs `qemu-system-aarch64` and the aarch64 UEFI firmware.
+Needs `aarch64/alpine-3.23` in the store. It is published, so pull it; its definition lives in the separate `vmlab-templates` repository if you need to build it instead. The host needs `qemu-system-aarch64` and the aarch64 UEFI firmware.
 
 ```sh
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/alpine-3.23 --arch aarch64
 cd examples/alpine-arm64
 vmlab up                          # TCG: give it a minute or two
 ssh vmlab@localhost -p 12222      # password: vmlab
@@ -87,11 +90,11 @@ Directory: `examples/mixed-lab`.
 
 Windows Server 2025 and Ubuntu 24.04 on one NAT'd segment, plus an nginx lab container on the same segment. It exercises a static IP reservation, `depends_on` ordering across all three machines, an SMB share that appears on the Windows guest as `S:`, a segment forward to nginx on the Ubuntu box, a container `port {}` and healthcheck, a provision driving both guests, and a crash handler. With `gui = true` on the lab, `up` opens a viewer per guest.
 
-Needs both templates built from `examples/templates`. The README explains one thing about the share: the daemon maps `S:` as SYSTEM, so an interactive user opening it sees a credential error until they run the `vmlab-shares` script vmlab drops on the desktop, once per user.
+Needs `x86_64/windows-server-2025` and `x86_64/ubuntu-24.04` in the store. Both are published, so pull them; building them from `examples/templates` is the fallback. The README explains one thing about the share: the daemon maps `S:` as SYSTEM, so an interactive user opening it sees a credential error until they run the `vmlab-shares` script vmlab drops on the desktop, once per user.
 
 ```sh
-(cd examples/templates/ubuntu-24.04 && vmlab template build)
-(cd examples/templates/windows-server-2025 && ./fetch-deps.sh && vmlab template build)
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-server-2025 --arch x86_64
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04 --arch x86_64
 cd examples/mixed-lab
 vmlab validate
 vmlab up                          # winsrv, then nix01, then the web container
@@ -141,9 +144,10 @@ Directory: `examples/riscv64-ubuntu`.
 
 One Ubuntu 24.04 guest on a riscv64 machine, on a NAT'd segment with a host forward to SSH. Like `alpine-arm64` it runs under TCG on an x86 host and boots slowly by design. The provision logs `uname -m`, which should print `riscv64`.
 
-Needs `riscv64/ubuntu-24.04` in the store, built from the separate `vmlab-templates` repository, and on the host `qemu-system-riscv64` from QEMU 8.1 or later plus the riscv64 UEFI firmware, `qemu-efi-riscv64` on Debian and Ubuntu.
+Needs `riscv64/ubuntu-24.04` in the store, which is published (pull it as below; the separate `vmlab-templates` repository has its build), and on the host `qemu-system-riscv64` from QEMU 8.1 or later plus the riscv64 UEFI firmware, `qemu-efi-riscv64` on Debian and Ubuntu.
 
 ```sh
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04 --arch riscv64
 cd examples/riscv64-ubuntu
 vmlab up                          # TCG: give it a minute or two
 ssh vmlab@localhost -p 12322      # password: vmlab
@@ -169,6 +173,8 @@ Not a lab but eight `template {}` definitions, one per directory, each building 
 | `ubuntu-26.04` | `x86_64/ubuntu-26.04` | Cloud image, cloud-init. |
 | `windows-server-2025` | `x86_64/windows-server-2025` | Evaluation ISO, `autounattend.xml`; 30 to 45 minutes; 180-day licence. |
 
+Every one of these is also published prebuilt (see "Published templates" in templates.md); build from here to change one, not to get one.
+
 ```sh
 cd examples/templates/ubuntu-24.04
 vmlab validate
@@ -186,10 +192,10 @@ Directory: `examples/winsrv-desktop`.
 
 The smallest useful lab: one Windows Server 2025 VM on a NAT'd segment with its display surfaced on the host. Every VM runs headless and serves VNC on a Unix socket; `gui = true` makes `up` launch a viewer against that socket, and `vmlab console winsrv` attaches one at any time. Closing the viewer only disconnects, because the viewer is a separate process. On WSL 2, `vmlab console --tcp` bridges the socket to a localhost port for a Windows-side client.
 
-Needs `x86_64/windows-server-2025` built from `examples/templates`, and a viewer: the `viewer` field in host config, else `remote-viewer`, `gvncviewer` or `vncviewer` on `PATH`.
+Needs `x86_64/windows-server-2025` in the store, which is published (pull it as below, or build it from `examples/templates`), and a viewer: the `viewer` field in host config, else `remote-viewer`, `gvncviewer` or `vncviewer` on `PATH`.
 
 ```sh
-(cd examples/templates/windows-server-2025 && ./fetch-deps.sh && vmlab template build)
+vmlab template pull ghcr.io/vmlabdev/vmlab-templates/windows-server-2025 --arch x86_64
 cd examples/winsrv-desktop
 vmlab validate
 vmlab up                          # a viewer opens on the desktop
