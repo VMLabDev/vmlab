@@ -88,6 +88,25 @@ pub trait Control: Send + Sync + 'static {
     /// shutdown or a crash depending on this answer.
     fn guest_shutdown(&self) -> bool;
 
+    /// Whether the guest is asleep — suspended to RAM (ACPI S3), the emulator
+    /// alive with its vCPUs stopped — as a channel that changes on every
+    /// transition. QEMU's q35 machine advertises S3, and a Windows client
+    /// edition takes it after an idle timeout.
+    ///
+    /// `None` from an adapter whose guests cannot sleep. Subscribed before
+    /// [`resume`](Control::resume) like the shutdown watch, so a guest that
+    /// sleeps the moment it runs is not missed.
+    fn sleep_watch(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        None
+    }
+
+    /// Wake a sleeping guest (`system_wakeup`). Success means the request was
+    /// delivered; the guest is awake once [`sleep_watch`](Control::sleep_watch)
+    /// says so.
+    async fn wakeup(&self) -> Result<()> {
+        anyhow::bail!("this machine cannot sleep, so there is nothing to wake")
+    }
+
     /// The live QMP client, when this machine is real QEMU.
     ///
     /// `None` under an in-memory adapter: snapshot save/load, the framebuffer
@@ -187,6 +206,22 @@ pub trait Hypervisor: Send + Sync + 'static {
     fn guest_asset(&self, arch: &str) -> Result<GuestAsset>;
 }
 
+/// What one QMP event says about whether the guest is asleep: `Some(true)`
+/// as it suspends, `Some(false)` for anything that means its vCPUs run again,
+/// `None` for an event that says nothing either way.
+///
+/// `WAKEUP` is the ordinary way out of S3. A reset or a `cont` also leaves
+/// the guest running whatever state it was in, and QEMU emits no `WAKEUP` for
+/// either, so they count as waking too — a watch that missed them would
+/// report a running guest asleep for the rest of its life.
+pub fn sleep_transition(event: &str) -> Option<bool> {
+    match event {
+        "SUSPEND" => Some(true),
+        "WAKEUP" | "RESET" | "RESUME" => Some(false),
+        _ => None,
+    }
+}
+
 /// Why a machine left the Running state (PRD §8.1).
 ///
 /// Above the seam because it is a judgement about meaning, not a host
@@ -218,6 +253,22 @@ pub fn classify_exit(
 mod tests {
     use super::*;
     use crate::labd::vm::StopReason;
+
+    /// The sleep watch is only as good as this table: a missed way out of S3
+    /// leaves a running guest reported `suspended` for good, and a missed way
+    /// in is the bug the watch exists to fix — a sleeping guest read as hung.
+    #[test]
+    fn sleep_transitions() {
+        assert_eq!(sleep_transition("SUSPEND"), Some(true));
+        assert_eq!(sleep_transition("WAKEUP"), Some(false));
+        // Neither emits WAKEUP, and both leave the vCPUs running.
+        assert_eq!(sleep_transition("RESET"), Some(false));
+        assert_eq!(sleep_transition("RESUME"), Some(false));
+        // Suspend-to-disk powers the guest off; the exit monitor owns that.
+        assert_eq!(sleep_transition("SUSPEND_DISK"), None);
+        assert_eq!(sleep_transition("SHUTDOWN"), None);
+        assert_eq!(sleep_transition("STOP"), None);
+    }
 
     /// Why a machine stopped is a judgement, and the three answers mean very
     /// different things to someone watching `vmlab status`. A guest that

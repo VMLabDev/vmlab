@@ -674,13 +674,10 @@ pub fn lab_module() -> Module {
         .method("poweroff", |h: &MachineHandle| -> Result<(), String> {
             h.block(h.machine.poweroff()).map_err(estr)
         })
+        // The power state's own wire spelling — `suspended` included, for a
+        // guest that went to sleep — so a script reads what `status` shows.
         .method("state", |h: &MachineHandle| -> String {
-            match h.block(h.machine.state()) {
-                PowerState::Stopped => "stopped".into(),
-                PowerState::Starting => "starting".into(),
-                PowerState::Running => "running".into(),
-                PowerState::Stopping => "stopping".into(),
-            }
+            h.block(h.machine.state()).to_string()
         })
         // Readiness. Inside the machine's own first-boot provision the ready
         // flag is deferred until that script returns, so these mean "does the

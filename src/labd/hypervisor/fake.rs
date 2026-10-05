@@ -63,6 +63,10 @@ pub struct Run {
     /// accepts it); nothing happens, which is what forces a stop ladder onto
     /// its next rung.
     pub ignores_powerdown: bool,
+    /// The guest suspends itself to RAM this long after coming up — the
+    /// idle-timeout sleep a Windows client edition takes. It stays asleep
+    /// until something wakes it.
+    pub sleeps_after: Option<Duration>,
 }
 
 impl Run {
@@ -91,6 +95,14 @@ impl Run {
                 status: "exit status: 0".into(),
                 guest_initiated: true,
             }),
+            ..Self::default()
+        }
+    }
+
+    /// Comes up, then the guest goes to sleep (ACPI S3) after `after`.
+    pub fn guest_sleeps(after: Duration) -> Self {
+        Self {
+            sleeps_after: Some(after),
             ..Self::default()
         }
     }
@@ -241,6 +253,16 @@ impl Hypervisor for FakeHypervisor {
             });
         }
 
+        if let Some(after) = run.sleeps_after {
+            let machine = machine.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                if machine.is_running() {
+                    machine.asleep.send_replace(true);
+                }
+            });
+        }
+
         Ok(Running {
             control: Arc::new(FakeControl {
                 machine: machine.clone(),
@@ -272,6 +294,9 @@ pub(crate) struct FakeProc {
     name: String,
     exited: watch::Sender<Option<String>>,
     guest_shutdown: AtomicBool,
+    /// The guest is suspended to RAM; what the control channel's sleep watch
+    /// reports.
+    asleep: watch::Sender<bool>,
 }
 
 impl FakeProc {
@@ -280,6 +305,7 @@ impl FakeProc {
             name,
             exited: watch::Sender::new(None),
             guest_shutdown: AtomicBool::new(false),
+            asleep: watch::Sender::new(false),
         }
     }
 
@@ -371,6 +397,17 @@ impl Control for FakeControl {
 
     fn guest_shutdown(&self) -> bool {
         self.machine.guest_shutdown.load(Ordering::SeqCst)
+    }
+
+    fn sleep_watch(&self) -> Option<watch::Receiver<bool>> {
+        Some(self.machine.asleep.subscribe())
+    }
+
+    async fn wakeup(&self) -> Result<()> {
+        // QEMU refuses `system_wakeup` on a guest that is not asleep; the
+        // callers above the seam only ask while the watch says it is.
+        self.machine.asleep.send_replace(false);
+        Ok(())
     }
 }
 

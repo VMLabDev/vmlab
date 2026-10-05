@@ -126,29 +126,45 @@ impl Process for HostProcess {
 struct QemuControl {
     qmp: QmpClient,
     guest_shutdown: Arc<AtomicBool>,
+    /// Whether the guest is suspended to RAM, from `SUSPEND`/`WAKEUP` (see
+    /// [`super::sleep_transition`]).
+    asleep: tokio::sync::watch::Sender<bool>,
 }
 
 impl QemuControl {
     /// Subscribing here rather than above the seam matters: the caller has
-    /// not been handed the client yet, so no SHUTDOWN event can be missed
-    /// between connect and subscribe.
+    /// not been handed the client yet, so no SHUTDOWN or SUSPEND event can be
+    /// missed between connect and subscribe.
     fn new(qmp: QmpClient) -> Self {
         let guest_shutdown = Arc::new(AtomicBool::new(false));
         let flag = guest_shutdown.clone();
+        let asleep = tokio::sync::watch::Sender::new(false);
+        let sleep = asleep.clone();
         let mut events = qmp.subscribe_events();
         tokio::spawn(async move {
-            while let Ok(ev) = events.recv().await {
+            loop {
+                let ev = match events.recv().await {
+                    Ok(ev) => ev,
+                    // A burst of events overran the channel: carry on, since
+                    // the next sleep transition still lands.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 if ev.event == "SHUTDOWN" {
                     let initiator = ev.data.get("reason").and_then(|r| r.as_str());
                     if initiator == Some("guest-shutdown") || initiator == Some("guest-reset") {
                         flag.store(true, Ordering::SeqCst);
                     }
                 }
+                if let Some(now) = super::sleep_transition(&ev.event) {
+                    sleep.send_if_modified(|was| std::mem::replace(was, now) != now);
+                }
             }
         });
         Self {
             qmp,
             guest_shutdown,
+            asleep,
         }
     }
 }
@@ -169,6 +185,14 @@ impl Control for QemuControl {
 
     fn guest_shutdown(&self) -> bool {
         self.guest_shutdown.load(Ordering::SeqCst)
+    }
+
+    fn sleep_watch(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        Some(self.asleep.subscribe())
+    }
+
+    async fn wakeup(&self) -> Result<()> {
+        Ok(self.qmp.system_wakeup().await?)
     }
 
     fn qmp(&self) -> Option<QmpClient> {

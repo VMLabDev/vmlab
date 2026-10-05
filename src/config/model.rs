@@ -338,6 +338,11 @@ pub struct Vm {
     /// Refresh an out-of-date guest agent on `up` (§19.4); None = inherit
     /// the lab default.
     pub agent_update: Option<bool>,
+    /// Wake the guest the moment it suspends to RAM (ACPI S3). Runtime
+    /// policy the lab daemon applies, not hardware: the guest still sees S3
+    /// advertised, so it is declared on the VM alone and never resolved
+    /// through template or profile (ADR-0008 resolves hardware).
+    pub prevent_sleep: bool,
     pub display: Option<String>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
@@ -754,6 +759,8 @@ pub const EVENT_NAMES: &[&str] = &[
     "vm.ready",
     "vm.stopped",
     "vm.crashed",
+    "vm.suspended",
+    "vm.woken",
     "container.starting",
     "container.ready",
     "container.stopped",

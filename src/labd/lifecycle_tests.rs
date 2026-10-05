@@ -317,6 +317,7 @@ async fn start_vm(vm: &Arc<VmInstance>, cbs: Callbacks) -> anyhow::Result<()> {
             readies.fetch_add(1, Ordering::SeqCst);
         },
         std::future::ready(()),
+        |_| {},
     )
     .await
 }
@@ -604,6 +605,7 @@ async fn nothing_is_still_up_when_the_exit_callback_fires() {
         },
         || {},
         std::future::ready(()),
+        |_| {},
     )
     .await
     .expect("start");
@@ -635,6 +637,148 @@ async fn nothing_is_still_up_when_the_exit_callback_fires() {
         !vm.is_agent_up().await,
         "a stale agent handle must never be handed out after an exit"
     );
+}
+
+// ---- a guest that sleeps (ACPI S3) ------------------------------------------
+
+/// The VM block the sleep tests boot: the plain Linux VM, keeping itself
+/// awake or not.
+fn sleepy_vm(prevent_sleep: bool) -> String {
+    format!(
+        r#"vm "dc01" {{ template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB prevent_sleep = {prevent_sleep} }}"#
+    )
+}
+
+/// A guest that suspends to RAM leaves QEMU alive and nothing answering. It
+/// is reported as `suspended` — not stopped, not running — with an event to
+/// say so; anything that needs its agent is refused by name, with the way
+/// out; and a start wakes it rather than booting a second emulator.
+#[tokio::test]
+async fn a_guest_that_sleeps_is_suspended_until_a_start_wakes_it() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        &sleepy_vm(false),
+        Script {
+            runs: vec![Run::guest_sleeps(Duration::from_millis(300))],
+            ..Script::healthy()
+        },
+    );
+    let (events, mut rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = vm.clone();
+
+    m.clone().start(lab.clone()).await.expect("start");
+    m.wait_ready(SETTLE).await.expect("ready");
+    m.wait_state(PowerState::Suspended, SETTLE)
+        .await
+        .expect("the guest went to sleep");
+
+    let slept = collect_events(&mut rx, &["vm.suspended"], 1).await;
+    assert_eq!(slept[0].data["vm"], "dc01");
+    assert_eq!(slept[0].data["prevent_sleep"], false);
+
+    let status = m.status().await;
+    assert_eq!(status.state, PowerState::Suspended);
+    assert_eq!(status.label.text, "suspended");
+
+    // Refused at once, by name, with the remedy — not a handshake timeout.
+    let err = m
+        .agent()
+        .await
+        .err()
+        .expect("a sleeping guest has no agent");
+    let coded = crate::proto::CommandError::from(err);
+    assert_eq!(coded.code, crate::proto::ErrorCode::Conflict);
+    assert!(coded.message.contains("suspended"), "{}", coded.message);
+    assert!(
+        coded.message.contains("vmlab vm start dc01"),
+        "{}",
+        coded.message
+    );
+    assert!(coded.message.contains("prevent_sleep"), "{}", coded.message);
+    // And never retried: waiting does not wake a guest.
+    let started = tokio::time::Instant::now();
+    assert!(m.wait_agent(Duration::from_secs(60)).await.is_err());
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // A start wakes it — the same emulator, so nothing reports a stop.
+    m.clone().start(lab.clone()).await.expect("wake");
+    assert_eq!(m.state().await, PowerState::Running);
+    let woke = collect_events(&mut rx, &["vm.woken", "vm.stopped", "vm.starting"], 1).await;
+    assert_eq!(woke[0].event, "vm.woken");
+    assert_eq!(woke[0].data["cause"], "start");
+    m.agent()
+        .await
+        .expect("the agent answers once the guest is awake");
+
+    vm.stop(true).await.expect("stop");
+}
+
+/// `prevent_sleep` wakes the guest the moment it suspends, and says so: the
+/// machine is back to running on its own and the event log records that the
+/// guest tried to sleep and was woken.
+#[tokio::test]
+async fn prevent_sleep_wakes_the_guest_and_records_it() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        &sleepy_vm(true),
+        Script {
+            runs: vec![Run::guest_sleeps(Duration::from_millis(300))],
+            ..Script::healthy()
+        },
+    );
+    let (events, mut rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = vm.clone();
+
+    m.clone().start(lab).await.expect("start");
+    let seen = collect_events(&mut rx, &["vm.suspended", "vm.woken"], 2).await;
+    assert_eq!(seen[0].event, "vm.suspended");
+    assert_eq!(seen[0].data["prevent_sleep"], true);
+    assert_eq!(seen[1].event, "vm.woken");
+    assert_eq!(seen[1].data["cause"], "prevent_sleep");
+    assert!(
+        seen[1].data["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tried to sleep")),
+        "{:?}",
+        seen[1].data
+    );
+    m.wait_state(PowerState::Running, SETTLE)
+        .await
+        .expect("awake again");
+    m.agent().await.expect("the agent answers");
+
+    vm.stop(true).await.expect("stop");
+}
+
+/// A graceful stop of a sleeping guest wakes it first, so the agent rung can
+/// ask it to shut down: it ends cleanly rather than at the kill.
+#[tokio::test]
+async fn a_graceful_stop_wakes_a_sleeping_guest_first() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        &sleepy_vm(false),
+        Script {
+            runs: vec![Run::guest_sleeps(Duration::from_millis(300))],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    vm.wait_agent_up(SETTLE).await.expect("agent up");
+    vm.wait_state(PowerState::Suspended, SETTLE)
+        .await
+        .expect("asleep");
+
+    vm.stop(false).await.expect("graceful stop");
+
+    let exit = observed.exit().await;
+    assert_eq!(exit.reason, StopReason::Requested);
+    assert_eq!(exit.status, "exit status: 0", "shut down, not killed");
 }
 
 // ---- the VM stop ladder -----------------------------------------------------

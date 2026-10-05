@@ -31,6 +31,11 @@ pub enum PowerState {
     Starting,
     Running,
     Stopping,
+    /// The guest put itself to sleep (ACPI S3): the emulator is alive and
+    /// holding the guest's memory, its vCPUs are stopped, and nothing in the
+    /// guest — the agent included — answers until it is woken. VMs only; a
+    /// container micro-VM never sleeps.
+    Suspended,
 }
 
 impl fmt::Display for PowerState {
@@ -40,6 +45,7 @@ impl fmt::Display for PowerState {
             Self::Starting => "starting",
             Self::Running => "running",
             Self::Stopping => "stopping",
+            Self::Suspended => "suspended",
         })
     }
 }
@@ -113,13 +119,18 @@ pub enum LabelState {
     Exited { code: i32 },
     /// Stopped cleanly.
     Stopped,
+    /// The guest went to sleep (ACPI S3). Not stopped — QEMU is alive and the
+    /// guest resumes exactly where it was — and not running either, since
+    /// nothing in it answers: `vmlab vm start` wakes it, and `prevent_sleep`
+    /// keeps it from staying asleep at all.
+    Suspended,
 }
 
 impl LabelState {
     fn severity(&self) -> Severity {
         match self {
             Self::Running => Severity::Success,
-            Self::Booting | Self::Starting | Self::Stopping => Severity::Warning,
+            Self::Booting | Self::Starting | Self::Stopping | Self::Suspended => Severity::Warning,
             Self::Unhealthy | Self::Exited { .. } => Severity::Danger,
             Self::Stopped => Severity::Neutral,
         }
@@ -136,6 +147,7 @@ impl fmt::Display for LabelState {
             Self::Stopping => f.write_str("stopping"),
             Self::Exited { code } => write!(f, "exited ({code})"),
             Self::Stopped => f.write_str("stopped"),
+            Self::Suspended => f.write_str("suspended"),
         }
     }
 }
@@ -174,6 +186,9 @@ impl MachineLabel {
                 _ => LabelState::Running,
             },
             PowerState::Stopping => LabelState::Stopping,
+            // Before readiness and health: a sleeping guest answers neither,
+            // and whatever they last said is not what it is doing now.
+            PowerState::Suspended => LabelState::Suspended,
             PowerState::Stopped => match detail.exit_code() {
                 Some(code) if code != 0 => LabelState::Exited { code },
                 _ => LabelState::Stopped,
@@ -796,6 +811,25 @@ mod tests {
             MachineLabel::derive(PowerState::Stopping, false, &vm()).severity,
             Severity::Warning
         );
+    }
+
+    /// A sleeping guest is neither stopped nor running: QEMU is alive and
+    /// nothing in the guest answers. Reading it as either is the bug this
+    /// state exists for — a sleeping Windows guest read as a hung build — so
+    /// it wins over a readiness flag that was set before the guest slept.
+    #[test]
+    fn a_sleeping_guest_is_suspended() {
+        assert_eq!(label(PowerState::Suspended, true, &vm()), "suspended");
+        assert_eq!(label(PowerState::Suspended, false, &vm()), "suspended");
+        let l = MachineLabel::derive(PowerState::Suspended, true, &vm());
+        assert_eq!(l.state, LabelState::Suspended);
+        assert_eq!(l.severity, Severity::Warning);
+        // On the wire the raw state and the label both say so.
+        assert_eq!(
+            serde_json::to_value(PowerState::Suspended).unwrap(),
+            serde_json::json!("suspended")
+        );
+        assert_eq!(serde_json::to_value(&l).unwrap()["state"], "suspended");
     }
 
     /// The rendered text and the badge tone travel with the state, so a surface

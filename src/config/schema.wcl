@@ -258,6 +258,8 @@ type Vm {
   gui: bool?
   @doc("Refresh the guest agent on `up` when its stamp differs from the host's (marks the VM diverged); inherits the lab's, default true")
   agent_update: bool?
+  @doc("Keep the guest awake: wake it with `system_wakeup` the moment it suspends to RAM (ACPI S3) (default false)")
+  prevent_sleep: bool?
   @doc("QEMU display string; inherited from template→profile if omitted")
   display: utf8?
   @doc("Firmware: `ovmf` | `seabios`; inherited from template→profile")

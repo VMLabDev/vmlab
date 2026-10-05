@@ -326,7 +326,11 @@ async fn pump_session(
                 Some(_) => {}
             },
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                if m.state().await != vm::PowerState::Running {
+                // A guest asleep is still up: its session resumes on wake.
+                if !matches!(
+                    m.state().await,
+                    vm::PowerState::Running | vm::PowerState::Suspended
+                ) {
                     break;
                 }
             }
@@ -447,6 +451,13 @@ impl Handler<LabRequest> for LabdHandler {
                 // a pending first-boot, which only `up` runs and which the
                 // refresh must follow — the next `up` does it.
                 let m = machine_of(lab, &machine)?;
+                // Starting a sleeping machine wakes it, and nothing else: it
+                // never stopped, so no handshake is coming to defer a
+                // refresh to, and a refresh is not what was asked for.
+                if m.state().await == vm::PowerState::Suspended {
+                    lab.start_machine(&machine).await?;
+                    return Ok(json!(true));
+                }
                 if m.pending_first_boot().is_none() {
                     lab.start_with_deferred_refresh(&m).await?;
                 } else {

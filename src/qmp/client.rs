@@ -200,6 +200,12 @@ impl QmpClient {
         self.execute("system_powerdown", None).await.map(|_| ())
     }
 
+    /// Wake a guest suspended to RAM (ACPI S3) — `system_wakeup`. QEMU emits
+    /// `WAKEUP` once the guest is running again.
+    pub async fn system_wakeup(&self) -> Result<(), QmpError> {
+        self.execute("system_wakeup", None).await.map(|_| ())
+    }
+
     /// Terminate the QEMU process (`quit`).
     pub async fn quit(&self) -> Result<(), QmpError> {
         self.execute("quit", None).await.map(|_| ())

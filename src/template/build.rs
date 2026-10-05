@@ -995,6 +995,10 @@ fn synth_lab(
     if def.nested {
         writeln!(s, "    nested   = true").unwrap();
     }
+    // A build is unattended, so nobody is there to wake a guest that idles
+    // into S3 — a Windows client edition does, mid-install — and a sleeping
+    // build VM looks exactly like a hung one. Every render keeps it awake.
+    writeln!(s, "    prevent_sleep = true").unwrap();
     if !def.qemu_args.is_empty() {
         let args: Vec<String> = def.qemu_args.iter().map(wcl_str).collect();
         writeln!(s, "    qemu_args = [{}]", args.join(", ")).unwrap();
@@ -1351,6 +1355,26 @@ mod tests {
         let wcl = render(&d);
         crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
             .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+    }
+
+    /// A build is unattended, so its VM keeps itself awake — a guest that
+    /// idles into S3 mid-install stalls the build exactly like a hang. Every
+    /// render, the verification boot included, declares it.
+    #[test]
+    fn the_build_vm_never_sleeps() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        for boot in [install(None), BuildBoot::Bare] {
+            let wcl = synth_lab(&d, &hw(&d), "build-t", "build", Path::new("/root"), boot).unwrap();
+            let lab = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+                .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"))
+                .lab;
+            assert!(lab.vms[0].prevent_sleep, "{wcl}");
+        }
     }
 
     /// The VMLAB bootstrap ISO folder rides in as extra media; the

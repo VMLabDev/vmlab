@@ -14,6 +14,7 @@ use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, VmPaths};
 use crate::qmp::QmpClient;
 use crate::smb::VirtiofsMount;
+use crate::sync::LockRecover;
 
 use super::hypervisor::{Control, Hypervisor, Process};
 
@@ -28,6 +29,11 @@ pub const VM_READY_TIMEOUT: Duration = Duration::from_secs(600);
 /// host and not on a busy one, where a template build would seal its image and
 /// then fail on `still Stopping after 10s`.
 const STOP_SETTLE: Duration = Duration::from_secs(120);
+
+/// How long a wake waits for the guest to report itself running again after
+/// `system_wakeup`. QEMU resumes the vCPUs at once; what takes the time is
+/// the event arriving, so this is generous rather than tight.
+const WAKE_SETTLE: Duration = Duration::from_secs(10);
 
 /// What to tell a user whose guest has no answering vmlab-agent. A failed
 /// handshake alone cannot say why, so the advice leans on what is known:
@@ -54,6 +60,74 @@ fn no_agent_hint(answered_before: bool, baked: Option<&str>) -> String {
 /// puts it on the wire (ADR-0004), and re-exported here because this is where
 /// the daemon's callers reach for it.
 pub use crate::status::PowerState;
+
+/// Who woke a sleeping guest — carried on `vm.woken`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeCause {
+    /// The VM declares `prevent_sleep`, so the lab daemon woke it the moment
+    /// it suspended.
+    PreventSleep,
+    /// `vmlab vm start` on the suspended machine.
+    Start,
+    /// A stop: the ladder's agent and ACPI rungs need a guest that runs.
+    Stop,
+    /// A snapshot restore, which loads into a running machine.
+    Restore,
+    /// Nothing vmlab asked for: the guest's own wake source (an RTC alarm,
+    /// a keypress in a viewer), or a reset.
+    Guest,
+}
+
+impl WakeCause {
+    /// The sentence `vm.woken` carries, so the event log reads without a
+    /// lookup table.
+    fn message(self) -> &'static str {
+        match self {
+            Self::PreventSleep => "the guest tried to sleep and was woken (prevent_sleep)",
+            Self::Start => "woken by a start",
+            Self::Stop => "woken so it could be stopped",
+            Self::Restore => "woken for a snapshot restore",
+            Self::Guest => "the guest woke up",
+        }
+    }
+}
+
+/// A sleep transition, as [`VmInstance::boot`]'s `on_sleep` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepChange {
+    /// The guest suspended to RAM; `prevent_sleep` says whether a wake is
+    /// already on its way.
+    Suspended { prevent_sleep: bool },
+    /// The guest runs again.
+    Woken(WakeCause),
+}
+
+/// The event log's rendering of a VM's sleep transitions: `vm.suspended` as
+/// the guest sleeps, `vm.woken` with who woke it. One function, so a start
+/// and a restore cannot word the same transition differently.
+pub(super) fn sleep_events(
+    events: std::sync::Arc<super::events::EventLog>,
+    vm: String,
+) -> impl Fn(SleepChange) + Send + Sync + 'static {
+    move |change| match change {
+        SleepChange::Suspended { prevent_sleep } => {
+            events.emit(
+                "vm.suspended",
+                serde_json::json!({"vm": vm, "prevent_sleep": prevent_sleep}),
+            );
+        }
+        SleepChange::Woken(cause) => {
+            if cause == WakeCause::PreventSleep {
+                tracing::info!("{vm}: {}", cause.message());
+            }
+            events.emit(
+                "vm.woken",
+                serde_json::json!({"vm": vm, "cause": cause, "message": cause.message()}),
+            );
+        }
+    }
+}
 
 /// Why a VM left the Running state — carried on `vm.stopped` (PRD §8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -179,6 +253,10 @@ pub struct VmInstance {
     /// provision (if any) has completed. Gates dependents and provisions.
     ready: RwLock<bool>,
     stop_requested: RwLock<bool>,
+    /// Who asked for the wake in flight, read by the sleep watch when the
+    /// guest reports itself running again. `None` there means the guest woke
+    /// by itself. Std lock: never held across an await.
+    wake_cause: std::sync::Mutex<Option<WakeCause>>,
     qemu: Mutex<Option<Arc<dyn Process>>>,
     swtpm: Mutex<Option<Arc<dyn Process>>>,
     /// Per-share virtiofsd daemons of the current run (§7.5). Killed on
@@ -226,6 +304,7 @@ impl VmInstance {
             agent_up: RwLock::new(false),
             ready: RwLock::new(false),
             stop_requested: RwLock::new(false),
+            wake_cause: std::sync::Mutex::new(None),
             qemu: Mutex::new(None),
             swtpm: Mutex::new(None),
             virtiofsd: Mutex::new(Vec::new()),
@@ -345,8 +424,28 @@ impl VmInstance {
     /// guests don't pay the timeout on every exec that would prefer the
     /// agent transport.
     async fn agent_handle(&self) -> Result<super::vm_agent::AgentHandle> {
-        if self.power_state().await != PowerState::Running {
-            return Err(super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into());
+        match self.power_state().await {
+            PowerState::Running => {}
+            // A guest that keeps itself awake is only asleep for the moment
+            // the wake takes, and a caller racing that moment deserves the
+            // agent, not an error.
+            PowerState::Suspended
+                if self.cfg.prevent_sleep
+                    && super::machine::Machine::wait_state(
+                        self,
+                        PowerState::Running,
+                        WAKE_SETTLE,
+                    )
+                    .await
+                    .is_ok() => {}
+            PowerState::Suspended => {
+                return Err(super::machine::suspended_error(&self.cfg.name));
+            }
+            _ => {
+                return Err(
+                    super::machine::AgentUnavailable::NotRunning(self.cfg.name.clone()).into(),
+                );
+            }
         }
         if !self.template().resolved.agent_transport.has_channel() {
             return Err(super::machine::AgentUnavailable::NoChannel(self.cfg.name.clone()).into());
@@ -579,6 +678,7 @@ impl VmInstance {
         on_exit: impl Fn(StopReason, String) + Send + Sync + 'static,
         on_ready: impl Fn() + Send + Sync + 'static,
         before_ready: impl std::future::Future<Output = ()> + Send + 'static,
+        on_sleep: impl Fn(SleepChange) + Send + Sync + 'static,
     ) -> Result<()> {
         {
             let mut st = self.state.write().await;
@@ -679,6 +779,16 @@ impl VmInstance {
         };
 
         *self.state.write().await = PowerState::Running;
+        *self.wake_cause.lock_recover() = None;
+
+        // Sleep watch: the guest suspending to RAM leaves QEMU alive and the
+        // guest unreachable, which is neither Running nor Stopped — so it gets
+        // its own state, and a VM that declares `prevent_sleep` is woken on
+        // the spot. Only Running and Suspended trade places here: a guest
+        // that sleeps while the stop ladder has it stays Stopping.
+        if let Some(asleep) = control.sleep_watch() {
+            tokio::spawn(Arc::clone(self).watch_sleep(asleep, on_sleep));
+        }
 
         // Exit monitor: classify why QEMU ended (PRD §8.1 stop reasons).
         let me = self.clone();
@@ -716,8 +826,15 @@ impl VmInstance {
         tokio::spawn(async move {
             let defer_ready = me.first_boot_pending();
             loop {
-                if me.power_state().await != PowerState::Running {
-                    return;
+                match me.power_state().await {
+                    PowerState::Running => {}
+                    // Asleep before it ever answered: keep waiting, since
+                    // the machine is still up and will answer once woken.
+                    PowerState::Suspended => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    _ => return,
                 }
                 if me.agent_probe().await {
                     *me.agent_up.write().await = true;
@@ -725,7 +842,10 @@ impl VmInstance {
                         before_ready.await;
                         // Stopped while the lab was busy: the exit monitor
                         // has already cleared readiness, and must win.
-                        if me.power_state().await != PowerState::Running {
+                        if !matches!(
+                            me.power_state().await,
+                            PowerState::Running | PowerState::Suspended
+                        ) {
                             return;
                         }
                         *me.ready.write().await = true;
@@ -738,6 +858,88 @@ impl VmInstance {
         });
 
         Ok(())
+    }
+
+    /// Follow the guest's sleep transitions for the life of this run (see
+    /// [`Control::sleep_watch`]). Ends when the run's control channel goes,
+    /// which is what closes the watch.
+    ///
+    /// Holds no handle on the control channel itself: a wake goes through
+    /// the one the machine holds, which teardown clears — holding a clone
+    /// here would keep the watch's sender, and so this task, alive forever.
+    async fn watch_sleep(
+        self: Arc<Self>,
+        mut asleep: tokio::sync::watch::Receiver<bool>,
+        on_sleep: impl Fn(SleepChange) + Send + Sync + 'static,
+    ) {
+        // A guest that slept between the resume and the subscribe.
+        let mut now = *asleep.borrow_and_update();
+        loop {
+            if now {
+                {
+                    let mut st = self.state.write().await;
+                    if *st == PowerState::Running {
+                        *st = PowerState::Suspended;
+                        drop(st);
+                        let prevent_sleep = self.cfg.prevent_sleep;
+                        on_sleep(SleepChange::Suspended { prevent_sleep });
+                        if prevent_sleep {
+                            *self.wake_cause.lock_recover() = Some(WakeCause::PreventSleep);
+                            let control = self.control.lock().await.clone();
+                            if let Some(control) = control
+                                && let Err(e) = control.wakeup().await
+                            {
+                                tracing::warn!(
+                                    "{}: the guest went to sleep and could not be woken \
+                                     (prevent_sleep): {e:#}",
+                                    self.cfg.name
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                let cause = self
+                    .wake_cause
+                    .lock_recover()
+                    .take()
+                    .unwrap_or(WakeCause::Guest);
+                let mut st = self.state.write().await;
+                if *st == PowerState::Suspended {
+                    *st = PowerState::Running;
+                    drop(st);
+                    on_sleep(SleepChange::Woken(cause));
+                }
+            }
+            if asleep.changed().await.is_err() {
+                return;
+            }
+            now = *asleep.borrow_and_update();
+        }
+    }
+
+    /// Wake a sleeping guest and wait until it reports itself running.
+    /// `cause` is what `vm.woken` will say. A no-op on a guest that is not
+    /// asleep — including one a wake already in flight got to first.
+    async fn wake(&self, cause: WakeCause) -> Result<()> {
+        if self.power_state().await != PowerState::Suspended {
+            return Ok(());
+        }
+        let control = self
+            .control
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))?;
+        *self.wake_cause.lock_recover() = Some(cause);
+        if let Err(e) = control.wakeup().await
+            && self.power_state().await == PowerState::Suspended
+        {
+            return Err(e.context(format!("waking {}", self.cfg.name)));
+        }
+        super::machine::Machine::wait_state(self, PowerState::Running, WAKE_SETTLE)
+            .await
+            .with_context(|| format!("{} did not wake from suspend", self.cfg.name))
     }
 
     async fn teardown(&self) {
@@ -767,6 +969,11 @@ impl VmInstance {
         let Some(proc) = proc else {
             return Ok(()); // already stopped
         };
+        // A sleeping guest answers neither the agent nor ACPI, so a graceful
+        // stop wakes it first. Failing to is not fatal: the kill still works.
+        if !force && let Err(e) = self.wake(WakeCause::Stop).await {
+            tracing::warn!("{e:#}");
+        }
         *self.stop_requested.write().await = true;
         *self.state.write().await = PowerState::Stopping;
 
@@ -850,6 +1057,8 @@ impl VmInstance {
                 }
                 Ok(false)
             }
+            // Capturing must not change the guest, and waking it would.
+            PowerState::Suspended => Err(super::machine::suspended_error(&self.cfg.name)),
             other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
         }
     }
@@ -863,12 +1072,17 @@ impl VmInstance {
         was_online: bool,
         on_exit: impl Fn(StopReason, String) + Send + Sync + 'static,
         on_ready: impl Fn() + Send + Sync + 'static,
+        on_sleep: impl Fn(SleepChange) + Send + Sync + 'static,
     ) -> Result<()> {
         if was_online {
             // Ensure a running QEMU to load into.
             if self.power_state().await == PowerState::Stopped {
-                self.boot(on_exit, on_ready, std::future::ready(())).await?;
+                self.boot(on_exit, on_ready, std::future::ready(()), on_sleep)
+                    .await?;
             }
+            // QEMU loads a snapshot into a running machine; one that is
+            // asleep is woken first, and the snapshot decides what it runs.
+            self.wake(WakeCause::Restore).await?;
             let qmp = self.qmp().await?;
             qmp.stop().await?;
             let nodes = disk_nodes(self.all_disk_paths().len());
@@ -900,7 +1114,9 @@ impl VmInstance {
 
     async fn drop_snapshot(&self, name: &str) -> Result<()> {
         match self.power_state().await {
-            PowerState::Running => {
+            // Asleep is still a live QEMU holding the disks open, so the
+            // offline path's qemu-img must not touch them.
+            PowerState::Running | PowerState::Suspended => {
                 let qmp = self.qmp().await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
@@ -1060,8 +1276,12 @@ impl super::machine::Machine for VmInstance {
     /// available, since a VM's argv can carry pre-opened descriptors — then
     /// spawn QEMU with event-emitting callbacks.
     async fn start(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) -> Result<()> {
-        if self.power_state().await != PowerState::Stopped {
-            return Ok(());
+        match self.power_state().await {
+            PowerState::Stopped => {}
+            // Starting a sleeping machine means waking it: QEMU is already
+            // running it, and a second one would fight it for the disks.
+            PowerState::Suspended => return self.wake(WakeCause::Start).await,
+            _ => return Ok(()),
         }
         // Safety net for paths that don't pull explicitly (restore, wscript):
         // a no-op unless this VM's template download is still pending.
@@ -1100,6 +1320,7 @@ impl super::machine::Machine for VmInstance {
                 tokio::spawn(async move { lab.machine_ready(&n).await });
             },
             async move { gate_lab.before_ready(&gate_name).await },
+            sleep_events(lab.events().clone(), self.cfg.name.clone()),
         )
         .await
     }
@@ -1132,6 +1353,7 @@ impl super::machine::Machine for VmInstance {
                 );
             },
             move || events_ready.emit("vm.ready", serde_json::json!({"vm": n2})),
+            sleep_events(lab.events().clone(), self.cfg.name.clone()),
         )
         .await?;
         if online {

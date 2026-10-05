@@ -735,6 +735,23 @@ async fn wait_until(
     }
 }
 
+/// What an operation that needs the guest says when the guest is asleep
+/// (ACPI S3): the state by name, how to wake it, and how to stop it sleeping.
+///
+/// A [`Conflict`](crate::proto::ErrorCode::Conflict) — the machine exists and
+/// its state forbids the request — carried as a `CommandError` so a plain `?`
+/// in a handler keeps the code. Deliberately not an [`AgentUnavailable`]:
+/// waiting does not wake a sleeping guest, so nothing should retry it, and
+/// [`Machine::wait_agent`] treats what it cannot classify as permanent.
+pub fn suspended_error(machine: &str) -> anyhow::Error {
+    crate::proto::CommandError::conflict(format!(
+        "{machine} is suspended: the guest went to sleep (ACPI S3) and nothing in it answers \
+         until it is woken — wake it with `vmlab vm start {machine}`, or set \
+         `prevent_sleep = true` on the VM to keep it awake"
+    ))
+    .into()
+}
+
 /// Why a machine's agent channel could not be reached.
 ///
 /// The distinction that matters to a caller is whether waiting could change

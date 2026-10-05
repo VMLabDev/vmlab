@@ -474,6 +474,32 @@ lab "l" {
         );
     }
 
+    /// `prevent_sleep` is the VM's own runtime policy: off unless declared,
+    /// and read from the VM block alone.
+    #[test]
+    fn prevent_sleep_is_a_vm_option_off_by_default() {
+        let src = "import <vmlab.wcl>\nlab \"x\" {\n  vm \"a\" { template = \"x86_64/t\" prevent_sleep = true }\n  vm \"b\" { template = \"x86_64/t\" }\n}\n";
+        let lf = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap();
+        assert!(lf.lab.vms[0].prevent_sleep);
+        assert!(!lf.lab.vms[1].prevent_sleep);
+    }
+
+    /// A container micro-VM never sleeps — vmlab's own init is its whole
+    /// userland — so `prevent_sleep` on one is refused exactly as `gui` and
+    /// `nested` are: the schema does not know the field there.
+    #[test]
+    fn rejects_prevent_sleep_on_a_container() {
+        let src = "import <vmlab.wcl>\nlab \"x\" {\n  container \"web\" { image = \"nginx\" prevent_sleep = true }\n}\n";
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        assert!(
+            err.issues
+                .iter()
+                .any(|i| i.message.contains("prevent_sleep")),
+            "expected prevent_sleep to be refused on a container, got: {:?}",
+            err.issues
+        );
+    }
+
     #[test]
     fn rejects_the_removed_container_restart_field_at_its_source_line() {
         let src = "import <vmlab.wcl>\nlab \"x\" {\n  container \"web\" { image = \"nginx\" restart = \"always\" }\n}\n";
