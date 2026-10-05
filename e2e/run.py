@@ -25,6 +25,7 @@ from harness import RESULTS, Harness, ScenarioFailed  # noqa: E402
 SCENARIOS = [
     "template",
     "core",
+    "sleep",
     "guest",
     "network",
     "containers",

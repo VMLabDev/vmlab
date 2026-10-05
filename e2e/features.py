@@ -43,6 +43,8 @@ FEATURES: dict[str, str] = {
     "vm.restart": "`vmlab vm restart`",
     "vm.destroy": "`vmlab vm destroy`",
     "vm.ip": "`vmlab vm ip` and `--nic`",
+    "vm.sleep": "a guest that suspends to RAM reports `suspended`, agent verbs refuse by name, `vm start` wakes it",
+    "vm.prevent_sleep": "`prevent_sleep = true` wakes the guest the moment it suspends, recorded as `vm.woken`",
     "vm.hw.cpus-memory": "declared cpus and memory reach the guest",
     "vm.hw.disk": "an extra `disk` block with a size",
     "vm.hw.disk-from": "a `disk` built from a folder (FAT)",

@@ -1,0 +1,18 @@
+// The sleep scenario's lab: two copies of the e2e guest on q35 + OVMF, which
+// advertises ACPI S3. One is left to sleep; the other keeps itself awake.
+import <vmlab.wcl>
+
+lab "e2e-sleep" {
+  vm "sleepy" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+  }
+
+  vm "awake" {
+    template      = "x86_64/e2e-alpine"
+    cpus          = 1
+    memory        = 512MiB
+    prevent_sleep = true
+  }
+}
