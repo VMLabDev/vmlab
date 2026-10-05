@@ -660,13 +660,15 @@ pub async fn ensure_registry_template(
     if let Ok(r) = store.resolve(arch, &store_name, Some(&real)) {
         return Ok(r);
     }
-    let work = crate::paths::template_store_dir().join(".oci-pull");
-    std::fs::create_dir_all(&work)?;
+    // Its own staging directory, on the store's filesystem: two labs pulling
+    // at once must not share (and then delete) one.
+    let work = crate::template::oci_bridge::fresh_work_dir(
+        &crate::paths::template_store_dir().join(".oci-pull"),
+    )?;
     let meta = registry
-        .pull_with_progress(Some(arch), store, &work, false, progress)
+        .pull_with_progress(Some(arch), store, work.path(), false, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
-    let _ = std::fs::remove_dir_all(&work);
     store.resolve(&meta.arch, &meta.name, Some(&meta.version))
 }
 

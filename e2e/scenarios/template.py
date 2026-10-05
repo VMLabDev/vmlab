@@ -108,7 +108,17 @@ def run(h):
 
     # Registry round trip against localhost:5000.
     h.check("template.registry.login", lambda: h.vmlab("template", "login", "localhost:5000", "-u", "e2e", "-p", "e2e"))
-    h.check("template.registry.push", lambda: h.vmlab("template", "push", REF, REGISTRY, "--source", "https://example.invalid/e2e", timeout=900))
+    # Two pushes at once: each must stage its own chunks, or they upload each
+    # other's bytes and the registry refuses both.
+    def push_two_at_once():
+        other = h.background(["vmlab", "template", "push", "x86_64/e2e-layered", "localhost:5000/e2e/e2e-layered",
+                              "--source", "https://example.invalid/e2e"])
+        h.vmlab("template", "push", REF, REGISTRY, "--source", "https://example.invalid/e2e", timeout=900)
+        assert other.wait(timeout=900) == 0, "the concurrent push of e2e-layered failed"
+        for repo in ("e2e/e2e-alpine", "e2e/e2e-layered"):
+            tags = h.run(["curl", "-sf", f"http://127.0.0.1:5000/v2/{repo}/tags/list"]).out
+            assert "latest" in tags, f"{repo} has no latest tag: {tags}"
+    h.check("template.registry.push", push_two_at_once, "two templates pushed concurrently")
     h.check(
         "template.registry.config",
         lambda: h.vmlab("template", "registry", "add", "localhost:5000/e2e")
