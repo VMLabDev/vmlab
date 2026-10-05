@@ -215,6 +215,10 @@ throughout the code and commit messages.
 - `just e2e::run` is the end-to-end suite: every feature in
   `e2e/features.py`, driven through the CLI inside a privileged container
   with /dev/kvm (`e2e/README.md`). It sits outside the merge bar.
+- `just buildbox::dist` builds every release artefact (binary, strict guest
+  bundle, BPF objects) into `target/dist/` inside the `vmlab-build` container
+  (`build/Dockerfile`, toolchains from `scripts/guest-toolchains.sh`), as the
+  host uid; `buildbox::shell` runs `just ci::check` there (`build/README.md`).
 
 ## Agent skills
 

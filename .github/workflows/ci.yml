@@ -68,7 +68,7 @@ jobs:
   # the ebpf/ sources: rebuild with the pinned toolchain and byte-diff.
   # bpf-linker's LLVM proxy dlopens the pinned toolchain's libLLVM, so the
   # objects are deterministic given the rust-toolchain.toml pin + the
-  # bpf-linker version pinned in the justfile.
+  # bpf-linker version pinned in scripts/guest-toolchains.sh (`just ebpf-tools`).
   ebpf-verify:
     name: ebpf objects match source
     runs-on: ubuntu-latest

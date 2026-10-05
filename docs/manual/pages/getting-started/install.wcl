@@ -4,7 +4,7 @@ page gs_install {
   chapter_header "Install" {
     kicker       = "Getting started · tutorial"
     reading_time = "7 min read"
-    updated      = "2026-10-01"
+    updated      = "2026-10-05"
     version      = "vmlab 0.9"
   }
 
@@ -69,6 +69,32 @@ page gs_install {
     `cargo install --path . --locked`, which places the binary in
     `~/.cargo/bin`. A source build installs no guest assets; the section on guest
     assets below says how to build them.
+  DOC
+
+  p <<DOC
+    To build everything a release ships without installing a single
+    toolchain on your host, use the build container. It needs Docker and
+    nothing else. The image holds every toolchain on Ubuntu 24.04, the
+    distribution CI builds on. Your checkout is mounted into it and the
+    build runs as your user, so nothing in the checkout ends up owned by
+    root.
+  DOC
+
+  code sh { source = <<'SRC'
+just buildbox::dist
+ls target/dist/
+SRC
+  }
+
+  p <<DOC
+    `target/dist/` then holds the release binary
+    `vmlab-<version>-linux-x86_64`, the guest bundle
+    `vmlab-guest-<version>.tar.gz` with its `.sha256`, and the BPF objects
+    rebuilt under `bpf/`. The first run builds the image and every target
+    from cold. Later runs are incremental, because cargo's caches and target
+    directories persist in Docker volumes. `just buildbox::shell` opens a
+    shell in the same container, where `just ci::check` runs.
+    `build/README.md` describes the setup.
   DOC
 
   p "Confirm the binary runs."

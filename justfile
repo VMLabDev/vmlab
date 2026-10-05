@@ -6,6 +6,9 @@ mod ci '.just/ci'
 # End-to-end suite in a KVM container (every feature, see e2e/features.py)
 mod e2e '.just/e2e'
 
+# Release artefacts built in the vmlab-build container (binary, guest bundle, BPF objects)
+mod buildbox '.just/buildbox'
+
 [default, private]
 main:
 	@just --list
@@ -72,9 +75,8 @@ guest-package version='':
 
 # Install the pinned bpf-linker for the ebpf toolchain (one-time setup)
 [group('build')]
-ebpf-tools:
-	cd ebpf && rustup run "$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)" \
-		cargo install bpf-linker --version 0.10.3 --locked --force
+ebpf-tools: require-rustup
+	./scripts/guest-toolchains.sh ebpf
 
 # `ebpf-build` is imported from .just/shared.just (the gate needs it, and a
 # module cannot depend on a root recipe); `ebpf-verify` is now `ci::ebpf-verify`.

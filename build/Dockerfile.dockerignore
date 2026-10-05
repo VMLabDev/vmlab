@@ -1,0 +1,7 @@
+# Build context for build/Dockerfile (BuildKit reads this file in place of the
+# root .dockerignore when -f build/Dockerfile is given): only the files the
+# toolchain stages read, so no source edit invalidates a toolchain layer.
+*
+!scripts/guest-toolchains.sh
+!ebpf/rust-toolchain.toml
+!guest/build-mingw-msvcrt.sh

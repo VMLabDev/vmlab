@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Install every toolchain `just guest-package` needs on a stock Ubuntu 24.04
-# (what GitHub's ubuntu-latest is), so the strict build skips nothing.
+# (what GitHub's ubuntu-latest is), so the strict build skips nothing — and,
+# as the opt-in `ebpf` stage, the bpf-linker the BPF objects build with.
 #
 # The release workflow's guest-assets job runs this, and so does the
-# from-scratch check in a bare `ubuntu:24.04` container — one definition of
-# what the bundle needs, not a YAML copy that drifts from it.
+# from-scratch check in a bare `ubuntu:24.04` container, and build/Dockerfile
+# (one stage per image layer) — one definition of what the bundle needs, not a
+# YAML copy that drifts from it.
 #
 # Usage: scripts/guest-toolchains.sh [stage...]
 #   apt     host packages: cc + gcc-multilib (linux-x86 legacy, i686 musl
@@ -17,8 +19,12 @@
 #           $VMLAB_MSVCRT_PREFIX already holds it (a CI cache hit)
 #   watcom  OpenWatcom v2, the pinned snapshot below, unpacked into $WATCOM
 #           (default ~/.local/opt/open-watcom-v2); skipped when present
-#   just    the `just` runner, into ~/.local/bin, when not already on PATH
-# No stage given: all five, in that order.
+#   just    the `just` runner, into $VMLAB_BIN_DIR (default ~/.local/bin),
+#           when not already on PATH
+#   ebpf    bpf-linker, built against the nightly ebpf/rust-toolchain.toml
+#           pins (`just ebpf-tools`) — not a bundle toolchain, so not in the
+#           default set; CI's ebpf-verify job and build/Dockerfile run it
+# No stage given: the first five, in that order.
 #
 # Runs as root or as a user with passwordless sudo (apt only).
 
@@ -31,6 +37,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OW_TAG="2026-09-01-Build"
 OW_SHA256="bac354f3c75ffa49ff8d70a44e475de7e7c1823fff04b80c14787bd0792c9bdf"
 OW_URL="https://github.com/open-watcom/open-watcom-v2/releases/download/$OW_TAG/ow-snapshot.tar.xz"
+
+# bpf-linker links against the pinned nightly's libLLVM through its proxy, so
+# the objects are reproducible given this version and the channel pin.
+BPF_LINKER_VERSION="0.10.3"
 
 WATCOM="${WATCOM:-$HOME/.local/opt/open-watcom-v2}"
 MSVCRT_PREFIX="${VMLAB_MSVCRT_PREFIX:-$HOME/.local/share/vmlab/toolchains/mingw-msvcrt}"
@@ -51,6 +61,15 @@ stage_apt() {
     gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 binutils-mingw-w64 mingw-w64-common
 }
 
+# The nightly ebpf/rust-toolchain.toml pins: the BPF objects build with it,
+# and the win7 agent targets reuse it for build-std.
+pinned_nightly() {
+  local nightly
+  nightly="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$ROOT/ebpf/rust-toolchain.toml")"
+  [[ -n "$nightly" ]] || die "no channel in ebpf/rust-toolchain.toml"
+  echo "$nightly"
+}
+
 stage_rust() {
   if ! command -v rustup >/dev/null 2>&1; then
     log "rust: installing rustup"
@@ -65,10 +84,21 @@ stage_rust() {
     x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
     riscv64gc-unknown-linux-musl i686-unknown-linux-musl
   local nightly
-  nightly="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$ROOT/ebpf/rust-toolchain.toml")"
-  [[ -n "$nightly" ]] || die "no channel in ebpf/rust-toolchain.toml"
+  nightly="$(pinned_nightly)"
   log "rust: $nightly + rust-src (win7 targets)"
   rustup toolchain install "$nightly" --profile minimal --component rust-src
+}
+
+stage_ebpf() {
+  command -v rustup >/dev/null 2>&1 || die "ebpf: rustup is not installed (run the rust stage)"
+  local nightly
+  nightly="$(pinned_nightly)"
+  log "ebpf: $nightly + rust-src, bpf-linker $BPF_LINKER_VERSION against it"
+  rustup toolchain install "$nightly" --profile minimal --component rust-src
+  # --force: rebuild even when a bpf-linker is present, since one built
+  # against another toolchain would dlopen the wrong libLLVM.
+  (cd "$ROOT/ebpf" && rustup run "$nightly" \
+    cargo install bpf-linker --version "$BPF_LINKER_VERSION" --locked --force)
 }
 
 # The installed mingw-w64 headers' upstream version (Debian: 11.0.1-3build1
@@ -118,10 +148,11 @@ stage_just() {
     log "just: $(just --version) already on PATH"
     return
   fi
-  log "just: installing into ~/.local/bin"
-  mkdir -p "$HOME/.local/bin"
+  local bin="${VMLAB_BIN_DIR:-$HOME/.local/bin}"
+  log "just: installing into $bin"
+  mkdir -p "$bin"
   curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh |
-    bash -s -- --to "$HOME/.local/bin"
+    bash -s -- --to "$bin"
 }
 
 main() {
@@ -130,8 +161,8 @@ main() {
   local s
   for s in "${stages[@]}"; do
     case "$s" in
-      apt | rust | msvcrt | watcom | just) "stage_$s" ;;
-      *) die "unknown stage '$s' (known: apt rust msvcrt watcom just)" ;;
+      apt | rust | msvcrt | watcom | just | ebpf) "stage_$s" ;;
+      *) die "unknown stage '$s' (known: apt rust msvcrt watcom just ebpf)" ;;
     esac
   done
 }
