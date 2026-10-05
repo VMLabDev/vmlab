@@ -240,14 +240,14 @@ jobs:
         id: mingw
         run: echo "version=$(dpkg-query -W -f='${Version}' mingw-w64-common)" >> "$GITHUB_OUTPUT"
       # Both caches sit at the default locations the build scripts look in.
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.local/share/vmlab/toolchains/mingw-msvcrt
           key: mingw-msvcrt-${{ runner.os }}-${{ steps.mingw.outputs.version }}-${{ hashFiles('guest/build-mingw-msvcrt.sh', 'scripts/guest-toolchains.sh') }}
       - name: Build msvcrt CRT
         run: ./scripts/guest-toolchains.sh msvcrt
       # OpenWatcom is a pinned 150 MB snapshot; the pin lives in the script.
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ~/.local/opt/open-watcom-v2
           key: open-watcom-${{ runner.os }}-${{ hashFiles('scripts/guest-toolchains.sh') }}
