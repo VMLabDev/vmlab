@@ -23,20 +23,27 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --bin vmlab; \
     install -D target/release/vmlab /out/vmlab; \
     ./guest/build-asset.sh x86_64; \
+    # vmlab's own UEFI firmware for the aarch64 admin VM too: the runtime
+    # image carries no OVMF/AAVMF package, so every UEFI boot proves the
+    # bundled set is all a host needs.
+    ./guest/fetch-firmware.sh aarch64; \
     ./guest/build-agent.sh linux-x86_64; \
     VMLAB_AGENT_STAMP=agent=e2e-stale VMLAB_AGENT_DIST_DIR=/out/stale-agent \
       ./guest/build-agent.sh linux-x86_64; \
     mkdir -p /out/guest; \
-    cp -r guest/dist/x86_64 guest/dist/agent /out/guest/
+    cp -r --sparse=always guest/dist/x86_64 guest/dist/agent guest/dist/firmware /out/guest/
 
 FROM registry:2 AS registry
 
 FROM debian:trixie-slim
+# No `ovmf` or `qemu-efi-aarch64`: vmlab boots the UEFI firmware it ships
+# under /usr/share/vmlab/guest/firmware, and the suite proves it needs nothing
+# else.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       qemu-system-x86 qemu-system-arm qemu-system-modules-opengl \
       libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri libgbm1 libopengl0 \
-      qemu-efi-aarch64 qemu-utils ovmf \
+      qemu-utils \
       swtpm swtpm-tools virtiofsd \
       samba xorriso mtools dosfstools squashfs-tools tesseract-ocr \
       python3 util-linux procps iproute2 curl ca-certificates \

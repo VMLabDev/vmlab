@@ -49,6 +49,9 @@ def run(h):
             argv = argv_of(qemu[0])
             assert argv[0].endswith("qemu-system-aarch64"), argv[0]
             assert "tcg" in argv[argv.index("-accel") + 1], argv
+            # vmlab's own AAVMF: the image carries no qemu-efi-aarch64.
+            assert any(a.startswith("if=pflash") and "/usr/share/vmlab/guest/firmware/aarch64/AAVMF_CODE.fd" in a
+                       for a in argv), [a for a in argv if "pflash" in a]
             # The firmware is aarch64 code running under emulation: it has to
             # get as far as drawing its shell before the screen means anything.
             h.wait_until(lambda: "UEFI" in h.vmlab("logs", "arm01", "-n", "200", cwd=lab, check=False).out,
@@ -61,7 +64,7 @@ def run(h):
             return True
 
         h.check("arch.emulated", emulated,
-                "qemu-system-aarch64 -accel tcg; AAVMF reached its UEFI shell on serial; vm screenshot wrote a PNG")
+                "qemu-system-aarch64 -accel tcg; the bundled AAVMF reached its UEFI shell on serial; vm screenshot wrote a PNG")
 
         # -- lab verbs -------------------------------------------------------
         h.check("lab.list",

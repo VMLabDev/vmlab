@@ -28,6 +28,10 @@ def qemu_argv(vm: str) -> list[str]:
     return qemu_argv_of(LAB, vm)
 
 
+# Where the image installs vmlab's own UEFI firmware (e2e/Dockerfile).
+BUNDLED_FIRMWARE = "/usr/share/vmlab/guest/firmware"
+
+
 def qemu_argv_of(lab: str, vm: str) -> list[str]:
     want = f"vmlab:{lab}/{vm}"
     for p in pathlib.Path("/proc").iterdir():
@@ -193,12 +197,18 @@ def secure_boot(h):
         vars_file = lab / ".vmlab" / "vms" / "sb" / "OVMF_VARS.fd"
         blob = vars_file.read_bytes() if vars_file.exists() else b""
         keys = [k for k in ("PK", "KEK", "db") if (k + "\0").encode("utf-16-le") in blob]
+        # vmlab's own firmware, not the host's: the image carries no OVMF
+        # package, and the VM's VARS started as the bundled enrolled template.
+        bundled = code.startswith(f"if=pflash,format=raw,readonly=on,file={BUNDLED_FIRMWARE}/x86_64/")
+        template = pathlib.Path(BUNDLED_FIRMWARE, "x86_64", "OVMF_VARS_4M.ms.fd")
+        same_size = template.exists() and len(blob) == template.stat().st_size
         h.ok(
             "vm.hw.secure_boot",
-            up.code == 0 and "secboot" in code and "driver=cfi.pflash01,property=secure,value=on" in argv
+            up.code == 0 and "secboot" in code and bundled and same_size
+            and "driver=cfi.pflash01,property=secure,value=on" in argv
             and keys == ["PK", "KEK", "db"] and bool(refused),
-            f"qemu runs {code.rsplit('/', 1)[-1]} with secure pflash; the VM's VARS enrol {keys}; "
-            f"serial: {refused or 'no refusal seen'!r}",
+            f"qemu runs the bundled {code.rsplit('=', 1)[-1]} with secure pflash; the VM's VARS enrol "
+            f"{keys}; serial: {refused or 'no refusal seen'!r}",
         )
 
 
@@ -316,9 +326,10 @@ def _run(h):
         code1 = next((a for a in argv1 if "OVMF_CODE" in a), "")
         h.ok(
             "vm.hw.firmware",
-            p.get("efi") == "yes" and "OVMF_CODE" in code1 and "SeaBIOS" in blank_screen
+            p.get("efi") == "yes" and f"file={BUNDLED_FIRMWARE}/x86_64/OVMF_CODE" in code1
+            and "SeaBIOS" in blank_screen
             and not any("OVMF" in a for a in qemu_argv("blank")),
-            f"vm01 (firmware=ovmf) has /sys/firmware/efi and pflash {code1.rsplit('/', 1)[-1]}; "
+            f"vm01 (firmware=ovmf) has /sys/firmware/efi and the bundled pflash {code1.rsplit('=', 1)[-1]}; "
             "blank (seabios) shows the SeaBIOS banner",
         )
         disk = lab / ".vmlab" / "vms" / "blank" / "disk0.qcow2"
