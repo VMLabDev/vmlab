@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import pathlib
 import subprocess
 import sys
@@ -107,7 +108,20 @@ def main() -> int:
         for fid in list(FEATURES):
             if f'"{fid}"' not in named:
                 FEATURES.pop(fid)
-    return h.report()
+    code = h.report()
+    give_back_results()
+    return code
+
+
+def give_back_results() -> None:
+    """The container runs as root; hand the results to whoever owns the
+    mounted results directory, so a run leaves nothing root-owned behind."""
+    owner = RESULTS.stat()
+    for path in [RESULTS, *RESULTS.rglob("*")]:
+        try:
+            os.chown(path, owner.st_uid, owner.st_gid)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
