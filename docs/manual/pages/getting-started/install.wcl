@@ -109,18 +109,20 @@ SRC
   h2 "Install the runtime tools"
 
   p <<DOC
-    vmlab does not bundle QEMU. It finds the emulators, firmware and helper
-    tools on your `PATH` and in the standard firmware directories. The package
-    list below is the one vmlab's own test suite installs on Ubuntu. It covers
-    every guest architecture and every feature described in this manual.
+    vmlab does not bundle QEMU. It finds the emulators and helper tools on
+    your `PATH`. UEFI firmware is the exception: the guest assets carry
+    vmlab's own OVMF and AAVMF, secure boot included, so the distribution's
+    firmware packages are optional on x86_64 and aarch64. The package list
+    below covers every guest architecture and every feature described in this
+    manual.
   DOC
 
   code sh { source = <<'SRC'
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   qemu-system-x86 qemu-system-arm qemu-system-misc qemu-utils \
-  ovmf seabios swtpm \
-  qemu-efi-aarch64 qemu-efi-riscv64 \
+  seabios swtpm \
+  qemu-efi-riscv64 \
   tesseract-ocr passt \
   xorriso mtools dosfstools samba
 SRC
@@ -131,7 +133,9 @@ SRC
       | "Package" | "Provides" | "Needed for" |
       | "`qemu-system-x86`, `qemu-system-arm`, `qemu-system-misc`" | "`qemu-system-x86_64`, `qemu-system-aarch64`, `qemu-system-riscv64`" | "Running guests. Install only the architectures you use." |
       | "`qemu-utils`" | "`qemu-img`" | "Every disk operation: clones, snapshots, template builds" |
-      | "`ovmf`, `seabios`, `qemu-efi-aarch64`, `qemu-efi-riscv64`" | "UEFI and BIOS firmware per architecture" | "Booting any guest; `firmware = \"ovmf\"` is the default on modern profiles" |
+      | "`seabios`" | "BIOS firmware" | "Booting `firmware = \"seabios\"` guests; usually pulled in by QEMU itself" |
+      | "`qemu-efi-riscv64`" | "UEFI firmware for riscv64" | "riscv64 guests; vmlab bundles no riscv64 firmware" |
+      | "`ovmf`, `qemu-efi-aarch64`" | "The distribution's UEFI firmware" | "Optional. vmlab boots its bundled firmware first and falls back to these only when the guest assets are missing" |
       | "`swtpm`" | "A software TPM 2.0" | "Guests with `tpm = true`, which Windows 11 and Server 2025 require" |
       | "`passt`" | "Userspace networking helper" | "The network fabric" |
       | "`xorriso`, `mtools`, `dosfstools`" | "ISO and floppy builders" | "`media {}` blocks and the bootstrap ISO every template build attaches" |

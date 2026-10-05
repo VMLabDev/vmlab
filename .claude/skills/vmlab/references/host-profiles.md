@@ -63,6 +63,7 @@ host {
   oci_chunk_size       = 512MiB
   config_weave_bin_dir = "~/.local/share/config-weave/bin"
   workspace_max_file   = 256MiB
+  firmware_dir         = "/opt/vmlab-firmware"
 }
 ```
 
@@ -79,6 +80,7 @@ host {
 | `oci_chunk_size` | ByteSize | `512MiB` | OCI layer chunk size for `vmlab template push` (see templates.md). |
 | `config_weave_bin_dir` | utf8 | `~/.local/share/config-weave/bin` | Directory holding the config-weave guest binaries playbooks push (see automation.md). |
 | `workspace_max_file` | ByteSize | `256MiB` | Workspace syncer per-file size guard. A larger file is refused by name (see dev-machines.md). |
+| `firmware_dir` | utf8 | none | UEFI firmware override, `<dir>/<arch>/` with the bundled set's file names; searched before vmlab's bundled firmware and the host's (see "UEFI firmware" below). |
 
 Parser rules, all violations reported in one pass:
 
@@ -97,6 +99,37 @@ variable and the XDG default.
 `workspace_max_file` is host config rather than a `@dev` argument because the cap
 is about this developer's link to the guest, not the lab everyone shares; the
 refusal message names the field.
+
+### UEFI firmware
+
+vmlab ships its own UEFI firmware in the guest assets, under
+`<guest asset dir>/firmware/<arch>/` — Debian's edk2 builds, pinned by version
+and sha256 (`firmware/VERSION` names the packages):
+
+| Arch | Plain UEFI | Secure boot |
+| --- | --- | --- |
+| x86_64 | `OVMF_CODE_4M.fd` + `OVMF_VARS_4M.fd` | `OVMF_CODE_4M.secboot.fd` + `OVMF_VARS_4M.ms.fd` (Microsoft + Debian keys enrolled) |
+| aarch64 | `AAVMF_CODE.fd` + `AAVMF_VARS.fd` | `AAVMF_CODE.secboot.fd` + `AAVMF_VARS.ms.fd` (keys enrolled) |
+
+A host needs no `ovmf` / `qemu-efi-aarch64` package. Lookup order, for plain UEFI
+and secure boot alike:
+
+1. `firmware_dir` from the host config, `<dir>/<arch>/`. Authoritative for an
+   arch it has a directory for: a missing pair is an error, not a fall-through.
+2. The bundled set, under `$VMLAB_GUEST_ASSET_DIR`, `/usr/share/vmlab/guest`,
+   `~/.local/share/vmlab/guest`, in that order.
+3. The host's distro firmware at its well-known paths (riscv64 always lands
+   here — nothing is bundled for it).
+
+- A secure-boot CODE is only ever paired with its enrolled VARS; a blank store
+  boots in setup mode and enforces nothing, so vmlab refuses instead.
+- Each VM copies its VARS template once, at first start, to
+  `.vmlab/vms/<vm>/OVMF_VARS.fd`, and keeps it. A VM whose store was created
+  under a firmware of another flash layout (a host's 2 MiB OVMF) keeps booting
+  a build of that layout.
+- Templates record `firmware` and `secure_boot`, never a firmware path.
+- To see which firmware a running VM booted, read the `-drive if=pflash`
+  arguments of its QEMU process.
 
 Fast path note: `auto` never selects `sockmap`; it was measured slower than the
 userspace fabric and exists for explicit evaluation. Both kernel tiers need

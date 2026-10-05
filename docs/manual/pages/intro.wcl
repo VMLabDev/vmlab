@@ -101,7 +101,7 @@ page intro {
     rows:
       | "Tool" | "What vmlab uses it for" |
       | "`qemu-system-<arch>`, `qemu-img`" | "Running guests and managing qcow2 disks" |
-      | "OVMF, AAVMF, SeaBIOS" | "Guest firmware, per architecture" |
+      | "SeaBIOS" | "BIOS guest firmware; UEFI firmware (OVMF, AAVMF) ships with vmlab" |
       | "`swtpm`" | "A TPM 2.0 device for guests that want one" |
       | "`passt`" | "Part of the userspace network fabric" |
       | "`xorriso`, `mtools`, `mkfs.vfat`" | "Building ISO and floppy images from folders" |

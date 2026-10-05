@@ -11,7 +11,7 @@ page guide_host {
 Almost everything vmlab needs is in the lab file. What is left is per-host:
 where it may allocate subnets from, which VNC viewer to launch, how big a
 chunk to push to a registry, where the config-weave binaries are, how large a
-file the workspace syncer carries. Those live in one optional host configuration
+file the workspace syncer carries, which UEFI firmware a VM boots. Those live in one optional host configuration
 file. This chapter explains that file, the directories vmlab uses, what changes
 when the host is WSL 2, and how vmlab picks between KVM and TCG. Every field is
 in [Host configuration file](ref_host) and every path in
@@ -59,6 +59,7 @@ SRC
       | "`oci_chunk_size`" | "The layer chunk size a template push uses. See [Distributing templates over registries](guide_registries)." | "`512MiB`" |
       | "`config_weave_bin_dir`" | "The directory holding the config-weave guest binaries. See [Playbooks](guide_playbooks)." | "`~/.local/share/config-weave/bin`" |
       | "`workspace_max_file`" | "The workspace syncer's per-file size guard; a larger file is refused by name." | "`256MiB`" |
+      | "`firmware_dir`" | "A UEFI firmware override, laid out `<dir>/<arch>/`. See the UEFI firmware section below." | "vmlab's bundled firmware" |
   }
 
   p <<'DOC'
@@ -84,6 +85,47 @@ no viewer at all, or with `--tcp`, `vmlab console` bridges the socket to a
 localhost port and prints the address for you to point any VNC client at.
 Closing a viewer only disconnects; the VM keeps running, always headless
 behind VNC. See [vmlab console](cmd_console).
+DOC
+
+  h2 "UEFI firmware"
+
+  p <<'DOC'
+vmlab ships its own UEFI firmware. The guest assets carry Debian's edk2
+builds, pinned by version and sha256, under `firmware/<arch>/`:
+DOC
+
+  table {
+    rows:
+      | "Arch" | "Plain UEFI" | "Secure boot" |
+      | "x86_64" | "`OVMF_CODE_4M.fd` with `OVMF_VARS_4M.fd`" | "`OVMF_CODE_4M.secboot.fd` with `OVMF_VARS_4M.ms.fd`, Microsoft's and Debian's keys enrolled" |
+      | "aarch64" | "`AAVMF_CODE.fd` with `AAVMF_VARS.fd`" | "`AAVMF_CODE.secboot.fd` with `AAVMF_VARS.ms.fd`, keys enrolled" |
+  }
+
+  p <<'DOC'
+So a host needs no `ovmf` or `qemu-efi-aarch64` package, and every host boots
+the same firmware, which is what lets a Windows 11 template built on one host
+boot under secure boot on another. `firmware/VERSION` names the Debian
+packages the set came from. For each UEFI VM, vmlab looks in three places, in
+order, for plain UEFI and secure boot alike:
+DOC
+
+  list {
+    style = :numbered
+    li "`firmware_dir` from the host config, as `<dir>/<arch>/` with the file names above. A directory there is authoritative for that architecture; a missing pair is an error."
+    li "The bundled set, under each guest asset directory in turn: `$VMLAB_GUEST_ASSET_DIR`, `/usr/share/vmlab/guest`, `~/.local/share/vmlab/guest`."
+    li "The host's distribution firmware at its well-known paths. riscv64 always lands here, since vmlab bundles no riscv64 firmware."
+  }
+
+  p <<'DOC'
+A secure-boot build is only ever taken with the variable store that has keys
+enrolled for it: a blank store boots in setup mode, where nothing is verified,
+so vmlab refuses rather than boot one. Each VM copies its store from the
+template once, at its first start, into `.vmlab/vms/<vm>/OVMF_VARS.fd`, and
+keeps it, enrolled keys and boot entries included. A VM created under a
+firmware of a different flash layout, such as a host's old 2 MiB OVMF, keeps
+booting a build of that layout. Templates record `firmware` and
+`secure_boot`, never a firmware path, so nothing about the building host
+travels with them.
 DOC
 
   h2 "Directories"

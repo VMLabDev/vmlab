@@ -29,13 +29,15 @@ Install the packages and run `vmlab up` again. Three more dependencies are not i
 
 | Message | Cause | Fix |
 | --- | --- | --- |
-| `{arch} UEFI firmware not found; tried: {paths}` | No OVMF or AAVMF image under any of the directories vmlab searches. | Install the `edk2-ovmf` (or `qemu-efi-aarch64`, `qemu-efi-riscv64`) package for the guest architecture. |
-| `{arch} UEFI VARS template not found; tried: {paths}` | The firmware code was found but its variable-store template was not. | Install the same firmware package; the two ship together. |
-| `x86_64 secure boot needs a UEFI VARS template with keys enrolled …` | `secure_boot = true`, and the host has a secure-boot OVMF build but no variable store with Microsoft's keys enrolled beside it (Arch's `edk2-ovmf`). A blank store boots in setup mode and enforces nothing, so vmlab refuses it. | Install an OVMF that ships enrolled VARS: Debian and Ubuntu's `ovmf` (`OVMF_VARS_4M.ms.fd`) or Fedora's `edk2-ovmf` (`OVMF_VARS.secboot.fd`). |
+| `{arch} UEFI firmware not found; tried: {paths}; vmlab's own firmware was not found either …` | The guest assets carrying vmlab's bundled OVMF/AAVMF are missing from every guest asset directory, and the host has no distro firmware to fall back to. riscv64 has no bundled firmware. | Reinstall the guest assets (`install.sh`, or `just guest-install`), or point `firmware_dir` in the host config at a copy. riscv64: install `qemu-efi-riscv64`. |
+| `{arch} UEFI VARS template not found; tried: {paths}` | Host fallback only: distro firmware code found, its variable-store template not. | Reinstall the guest assets, or install the same firmware package. |
+| `{arch} secure boot needs a UEFI VARS template with keys enrolled …` | `secure_boot = true`, the bundled firmware is missing, and the host has a secure-boot build but no enrolled variable store beside it (Arch's `edk2-ovmf`). A blank store boots in setup mode and enforces nothing, so vmlab refuses it. | Reinstall the guest assets: they carry enrolled `OVMF_VARS_4M.ms.fd` (x86_64) and `AAVMF_VARS.ms.fd` (aarch64). |
+| `firmware_dir {dir} is the {arch} firmware this host config chose, and it lacks …` | The host config's `firmware_dir` has a directory for this arch, making it the only place that arch is looked up, and the needed pair is not in it. | Add the named file, or remove the arch's directory to fall back to vmlab's own firmware. |
+| `this VM's UEFI VARS store is {n} bytes and the firmware vmlab would boot ({code}) takes {m} …` | The VM was created under a firmware of another flash layout and no build of that layout is installed any more. | Delete `.vmlab/vms/<vm>/OVMF_VARS.fd` for a fresh store (losing UEFI boot entries), or reinstall the firmware it was created with. |
 | `no virtiofsd binary found (set VMLAB_VIRTIOFSD or install one)` | A share on a Linux guest uses virtiofs and no `virtiofsd` is on `PATH`. | Install `virtiofsd`, or point `VMLAB_VIRTIOFSD` at one. |
 | `cannot spawn sqfstar` | A container image is being flattened and `squashfs-tools` is not installed. | Install `squashfs-tools`. |
 
-A `secure_boot = true` machine whose firmware lookup fails is refused earlier, at hardware resolution, with `vm "{machine}": secure_boot = true (from {source}) but no firmware …`. The fix is the same package. Secure boot is enforced: a guest whose bootloader Microsoft's keys do not sign is refused by the firmware (`Access Denied` on its console).
+A `secure_boot = true` machine whose firmware lookup fails is refused earlier, at hardware resolution, with `vm "{machine}": secure_boot = true (from {source}) but no firmware …`. Secure boot is enforced: a guest whose bootloader Microsoft's keys do not sign is refused by the firmware (`Access Denied` on its console).
 
 ## No guest asset for a container micro-VM
 

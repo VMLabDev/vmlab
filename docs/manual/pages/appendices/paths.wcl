@@ -44,7 +44,7 @@ page ref_paths {
       | "`templates/.lock`" | "The advisory lock every store mutation holds." |
       | "`templates/.oci-pull/`" | "Staging for a registry pull in progress." |
       | "`oci/`" | "The digest-addressed container-image cache: `blobs/sha256/`, `images/sha256/<manifest>/` with `manifest.json`, `config.json` and `rootfs.sqfs`, and `refs/<host>/<repo>/<tag>` recording the last digest a tag resolved to. See [Lab containers](guide_containers)." |
-      | "`guest/<arch>/`" | "The container micro-VM kernel and initramfs, and `guest/agent/<os>-<arch>/` the guest agent binaries, when installed here rather than under `/usr/share/vmlab/guest`." |
+      | "`guest/<arch>/`" | "The container micro-VM kernel and initramfs, `guest/agent/<os>-<arch>/` the guest agent binaries, and `guest/firmware/<arch>/` the UEFI firmware vmlab boots its VMs with, when installed here rather than under `/usr/share/vmlab/guest`." |
       | "`cache/artefacts/`" | "Content-addressed downloads a template build's `source {}` fetched." |
       | "`cache/builds/`" | "Working directories of template builds." |
       | "`cache/oci-push/`" | "Working directory of a registry push." |
@@ -125,7 +125,7 @@ page ref_paths {
       | "`XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`" | "Move the four roots above." |
       | "`HOME`" | "The base of every default root." |
       | "`VMLAB_WORK_DIR`" | "Relocates every lab's `.vmlab/` under one base, as described above." |
-      | "`VMLAB_GUEST_ASSET_DIR`" | "Searched first for the micro-VM kernel and initramfs (`<arch>/`) and the agent binaries (`agent/<os>-<arch>/`), before `/usr/share/vmlab/guest` and the data root's `guest/`." |
+      | "`VMLAB_GUEST_ASSET_DIR`" | "Searched first for the micro-VM kernel and initramfs (`<arch>/`), the agent binaries (`agent/<os>-<arch>/`) and the bundled UEFI firmware (`firmware/<arch>/`), before `/usr/share/vmlab/guest` and the data root's `guest/`." |
       | "`VMLAB_CONFIG_WEAVE_DIR`" | "Where the playbook engine's guest binaries are, instead of `~/.local/share/config-weave/bin`." |
       | "`VMLAB_VIRTIOFSD`" | "The `virtiofsd` binary to use, before searching `PATH`." |
       | "`VMLAB_FASTPATH`" | "Overrides the host config's `fastpath`: `auto`, `off`, `sockmap` or `afxdp`. A malformed value is ignored with a warning. See [Host configuration and WSL 2](guide_host)." |
