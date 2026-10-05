@@ -39,6 +39,10 @@ pub struct HostConfig {
     /// to this guest, not about the lab everyone shares — and the refusal
     /// message names it, because "raise the cap" has to point somewhere.
     pub workspace_max_file: u64,
+    /// UEFI firmware override (PRD §5.2): `<dir>/<arch>/`, laid out like the
+    /// bundled `firmware/` set. `None` = vmlab's bundled firmware, then the
+    /// host's (see `qemu::firmware`).
+    pub firmware_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for HostConfig {
@@ -55,6 +59,7 @@ impl Default for HostConfig {
             fastpath: crate::net::fastpath::FastpathMode::Auto,
             config_weave_bin_dir: None,
             workspace_max_file: DEFAULT_WORKSPACE_MAX_FILE,
+            firmware_dir: None,
         }
     }
 }
@@ -114,6 +119,7 @@ impl HostConfig {
                 cfg.fastpath = v;
             }
             cfg.config_weave_bin_dir = r.path("config_weave_bin_dir").unspan();
+            cfg.firmware_dir = r.path("firmware_dir").unspan();
             if let Some(v) = r.size("oci_chunk_size").unspan() {
                 cfg.oci_chunk_size = v;
             }
@@ -214,6 +220,7 @@ mod tests {
         assert_eq!(cfg.disk_low_percent, 10);
         assert_eq!(cfg.oci_chunk_size, 512 << 20);
         assert_eq!(cfg.workspace_max_file, DEFAULT_WORKSPACE_MAX_FILE);
+        assert_eq!(cfg.firmware_dir, None);
     }
 
     #[test]
@@ -229,6 +236,7 @@ host {
   oci_chunk_size   = 128MiB
   fastpath         = "sockmap"
   workspace_max_file = 2GiB
+  firmware_dir     = "/opt/edk2"
 }
 "#,
             "<test>",
@@ -242,6 +250,7 @@ host {
         assert_eq!(cfg.oci_chunk_size, 128 << 20);
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
         assert_eq!(cfg.workspace_max_file, 2 << 30);
+        assert_eq!(cfg.firmware_dir.as_deref(), Some(Path::new("/opt/edk2")));
     }
 
     /// The diagnostics a host-config author now gets — same wording as a

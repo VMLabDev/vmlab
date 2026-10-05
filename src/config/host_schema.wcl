@@ -31,4 +31,6 @@ type HostConfig {
   config_weave_bin_dir: utf8?
   @doc("Workspace syncer per-file size guard; a larger file is refused by name; default `256MiB`")
   workspace_max_file: std.ByteSize?
+  @doc("UEFI firmware override, laid out `<dir>/<arch>/` like the bundled set; default: vmlab's bundled firmware, then the host's")
+  firmware_dir: utf8?
 }

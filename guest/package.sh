@@ -10,6 +10,8 @@
 #   x86_64/{vmlinuz,initramfs.img,VERSION}      container micro-VM asset
 #   aarch64/{vmlinuz,initramfs.img,VERSION}
 #   agent/<key>/<binary> + VERSION              every agent target
+#   firmware/<arch>/*.fd + VERSION, firmware/VERSION
+#                                               the UEFI firmware vmlab ships
 #
 # Strict by default (VMLAB_REQUIRE_ALL_TARGETS=1): a target whose toolchain is
 # missing fails the package instead of being left out. guest/dist is wiped
@@ -50,6 +52,13 @@ EXPECTED=(
   agent/dos-i386/VMLABAGT.EXE agent/dos-i386/VERSION
   agent/linux-x86/vmlab-agent-legacy agent/linux-x86/VERSION-legacy
   agent/templeos/VmlabAgt.HC agent/templeos/VERSION
+  firmware/VERSION
+  firmware/x86_64/OVMF_CODE_4M.fd firmware/x86_64/OVMF_VARS_4M.fd
+  firmware/x86_64/OVMF_CODE_4M.secboot.fd firmware/x86_64/OVMF_VARS_4M.ms.fd
+  firmware/x86_64/VERSION
+  firmware/aarch64/AAVMF_CODE.fd firmware/aarch64/AAVMF_VARS.fd
+  firmware/aarch64/AAVMF_CODE.secboot.fd firmware/aarch64/AAVMF_VARS.ms.fd
+  firmware/aarch64/VERSION
 )
 
 main() {
@@ -74,9 +83,11 @@ main() {
   mkdir -p "$out"
   local name="vmlab-guest-$version.tar.gz"
   # Reproducible-ish: fixed order, owner and mode bits; no host user leaks in.
-  tar -C "$DIST_DIR" --sort=name --owner=0 --group=0 --numeric-owner \
+  # --sparse: the AAVMF images are 64 MiB of mostly zeros, and an extract
+  # keeps the holes.
+  tar -C "$DIST_DIR" --sort=name --owner=0 --group=0 --numeric-owner --sparse \
     --mtime="@${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)}" \
-    -cf - x86_64 aarch64 agent | gzip -9n >"$out/$name"
+    -cf - x86_64 aarch64 agent firmware | gzip -9n >"$out/$name"
   (cd "$out" && sha256sum "$name" >"$name.sha256")
   log "$(du -h "$out/$name" | cut -f1) → $out/$name"
   log "$(cat "$out/$name.sha256")"

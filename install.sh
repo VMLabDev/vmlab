@@ -23,8 +23,9 @@
 #                     https://github.com/VMLabDev/vmlab/releases/download);
 #                     point it at a local server to test the installer
 #
-# The guest assets — the container micro-VM kernel/initramfs and every in-guest
-# agent build — come from the same release as the binary
+# The guest assets — the container micro-VM kernel/initramfs, every in-guest
+# agent build and the UEFI firmware vmlab boots its VMs with (OVMF/AAVMF,
+# secure boot included) — come from the same release as the binary
 # (vmlab-guest-<version>.tar.gz, checked against its .sha256) and replace
 # whatever an older install left in the guest directory. A release without
 # them, or a failed download, costs only the guest assets: the binary stays.
@@ -145,16 +146,17 @@ case ":$PATH:" in
 esac
 
 # ── Guest assets ────────────────────────────────────────────────────────────
-# The container micro-VM kernel/initramfs and every in-guest agent build, as
-# one tarball from the same release: a lab container and a template build
-# both need them from the host (a VM cloned from a published template does
-# not). Nothing here can fail the install — the binary is already in place —
-# so every failure is a warning naming the source-build fallback.
+# The container micro-VM kernel/initramfs, every in-guest agent build and the
+# bundled UEFI firmware, as one tarball from the same release: a lab container
+# and a template build both need them from the host, and a UEFI VM boots the
+# bundled firmware before the host's own OVMF. Nothing here can fail the
+# install — the binary is already in place — so every failure is a warning
+# naming the source-build fallback.
 guest_fallback() {
   warn "$1
 The vmlab binary is installed; the guest assets are not. A VM cloned from a
-published template needs none, but a lab container and a template build both
-do. Build them from source instead:
+published template needs none (a UEFI one falls back to the host's OVMF), but
+a lab container and a template build both do. Build them from source instead:
   git clone https://github.com/$REPO && cd vmlab && just guest-install"
 }
 

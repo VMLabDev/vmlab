@@ -17,6 +17,11 @@
 # v3.22 main/community repos. apk files are plain tar.gz — unpacked without
 # root; the cpio owner flag maps everything to root:root.
 #
+# The same run fetches the UEFI firmware vmlab ships for each arch into
+# guest/dist/firmware/<arch>/ (guest/fetch-firmware.sh — Debian's edk2
+# builds, pinned the same way), so everything that installs the guest asset
+# installs the firmware with it.
+#
 # Usage: guest/build-asset.sh [arch...]      (default: x86_64 aarch64)
 
 set -euo pipefail
@@ -332,6 +337,7 @@ main() {
     log "building guest asset for $arch"
     build_arch "$arch"
   done
+  "$SCRIPT_DIR/fetch-firmware.sh" "${arches[@]}"
   log "done"
 }
 

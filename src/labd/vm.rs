@@ -420,16 +420,27 @@ impl VmInstance {
         v
     }
 
-    /// The host's UEFI CODE/VARS pair for this VM, or `None` under SeaBIOS.
-    /// Firmware discovery probes the host filesystem, so it happens here —
-    /// where the runtime paths are assembled — rather than inside the argv
-    /// builder, which is a pure function of what it is handed (ADR-0008).
+    /// The UEFI CODE/VARS pair for this VM, or `None` under SeaBIOS: the
+    /// host config's `firmware_dir`, else vmlab's bundled firmware, else the
+    /// host's (PRD §5.2). A VM whose VARS copy already exists keeps a CODE
+    /// build of that store's layout. Firmware discovery probes the host
+    /// filesystem, so it happens here — where the runtime paths are
+    /// assembled — rather than inside the argv builder, which is a pure
+    /// function of what it is handed (ADR-0008).
     fn uefi_firmware(&self, t: &TemplateParts) -> Result<Option<qemu::firmware::UefiFirmware>> {
         if t.resolved.firmware != Some(crate::profiles::FirmwareKind::Ovmf) {
             return Ok(None);
         }
         let arch = qemu::qemu_arch(&t.resolved.arch);
-        Ok(Some(qemu::firmware::lookup(arch, t.resolved.secure_boot)?))
+        let firmware_dir = crate::config::host::HostConfig::load_default()?.firmware_dir;
+        let sources = qemu::firmware::Sources::installed(firmware_dir);
+        let fw = match std::fs::metadata(self.dirs.ovmf_vars()) {
+            Ok(m) => sources.lookup_for_vars(arch, t.resolved.secure_boot, m.len()),
+            Err(_) => sources.lookup(arch, t.resolved.secure_boot),
+        };
+        Ok(Some(fw.with_context(|| {
+            format!("{}: UEFI firmware", self.cfg.name)
+        })?))
     }
 
     fn build_paths(
@@ -586,7 +597,9 @@ impl VmInstance {
             std::fs::create_dir_all(&self.dirs.logs)?;
             self.ensure_disks().await?;
 
-            // Per-VM writable OVMF VARS from the firmware template.
+            // Per-VM writable OVMF VARS from the firmware template — copied
+            // once, at the VM's first start; an existing copy is never
+            // replaced, so a VM keeps its enrolled keys and boot entries.
             let firmware = self.uefi_firmware(&t)?;
             if let Some(fw) = &firmware
                 && !self.dirs.ovmf_vars().exists()

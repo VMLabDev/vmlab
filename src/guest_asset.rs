@@ -38,8 +38,10 @@ pub fn ensure_guest_asset(arch: &str) -> Result<GuestAsset> {
     find_in(&candidate_dirs(), arch)
 }
 
-/// The base directories searched, in priority order.
-fn candidate_dirs() -> Vec<PathBuf> {
+/// The base directories searched, in priority order — shared with the
+/// bundled UEFI firmware lookup ([`crate::qemu::firmware`]), which lives
+/// beside the boot asset in the same install.
+pub(crate) fn candidate_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(dir) = env::var_os("VMLAB_GUEST_ASSET_DIR").filter(|d| !d.is_empty()) {
         dirs.push(PathBuf::from(dir));
