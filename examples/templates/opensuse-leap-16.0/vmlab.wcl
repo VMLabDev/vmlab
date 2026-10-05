@@ -22,8 +22,8 @@ template "opensuse-leap" {
   disk     = 20GiB
 
   source "qcow2" {
-    url    = "https://download.opensuse.org/distribution/leap/16.0/appliances/Leap-16.0-Minimal-VM.x86_64-Cloud-Build18.3.qcow2"
-    sha256 = "81c9a61e9097c1e87bc27ca9f1e83f050145ffd7267d38a96b5e1852dd26731b"
+    url    = "https://download.opensuse.org/distribution/leap/16.0/appliances/Leap-16.0-Minimal-VM.x86_64-Cloud-Build18.72.qcow2"
+    sha256 = "8267490632e380890cfea663b5dba5cd828161af3e8cf562a73d6eb04898c4a1"
   }
 
   media { kind = "iso" from = "./cloudinit/" label = "CIDATA" }

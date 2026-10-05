@@ -7,7 +7,7 @@ the rolling-release counterpart to Leap (the current/bleeding-edge option).
 ```sh
 vmlab validate
 vmlab template build
-vmlab template list      # → x86_64/opensuse-tumbleweed@20260613
+vmlab template list      # → x86_64/opensuse-tumbleweed@20261003
 ```
 
 What happens (`scripts/install.ws` narrates it in the build log):

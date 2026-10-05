@@ -112,6 +112,10 @@ Module map under `src/`:
 - `guest_asset.rs` + `guest/` — the container micro-VM kernel/initramfs:
   `vmlab-cinit` (guest PID 1), `cinit-proto` (host↔init contract, shared
   crate), `build-asset.sh` (pinned Alpine, rootless build).
+- `guest/fetch-firmware.sh` — the UEFI firmware vmlab ships (§5.2): Debian's
+  OVMF/AAVMF, plain and secure-boot with keys enrolled, pinned by version and
+  sha256 into `guest/dist/firmware/<arch>/`. `qemu/firmware.rs` prefers the
+  host config's `firmware_dir`, then these, then the host distro's.
 - `guest/agent-legacy` + `guest/build-agent-legacy.sh` — `vmlab-agent-legacy`,
   the C89 agent for guests with no virtio-serial (§7.4's legacy tier: NT4
   through XP/2003, Windows 9x/ME, DOS), speaking the same protocol over a

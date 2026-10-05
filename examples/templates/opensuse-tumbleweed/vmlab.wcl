@@ -16,7 +16,7 @@ import <vmlab.wcl>
 
 template "opensuse-tumbleweed" {
   arch     = "x86_64"
-  version  = "20260613"
+  version  = "20261003"
   profile  = "linux-modern"
   firmware = "seabios"
   cpus     = 2
@@ -24,8 +24,8 @@ template "opensuse-tumbleweed" {
   disk     = 20GiB
 
   source "qcow2" {
-    url    = "https://download.opensuse.org/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.x86_64-1.0.0-Cloud-Snapshot20260613.qcow2"
-    sha256 = "b32bb52168817e1bb245a25159a3550a3c8fadfc3ca5328ba25e458db69ec2ab"
+    url    = "https://download.opensuse.org/tumbleweed/appliances/openSUSE-Tumbleweed-Minimal-VM.x86_64-1.0.0-Cloud-Snapshot20261003.qcow2"
+    sha256 = "b824c088f811a41f29b3d9e3b98aea0e0c3b2e85456ac9088cfaa0b7523ff0d8"
   }
 
   media { kind = "iso" from = "./cloudinit/" label = "CIDATA" }
