@@ -37,6 +37,7 @@ vm "<name>" {
   nested      = false
   gui         = false
   agent_update = true
+  prevent_sleep = false
   display     = "virtio-vga"
   firmware    = "ovmf"
   tpm         = false
@@ -69,6 +70,7 @@ SRC
       | "`nested`" | "bool" | "`false`" | "Expose hardware virtualisation (VMX/SVM) to the guest. Without it, an x86 guest under KVM has both masked. `up` warns when the host's KVM module has nested virtualisation off. No effect under TCG or on other architectures." |
       | "`gui`" | "bool" | "lab `gui`" | "Open a VNC viewer on `up`. The VM always runs headless." |
       | "`agent_update`" | "bool" | "lab `agent_update`, else `true`" | "Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. See [vmlab up](cmd_up)." |
+      | "`prevent_sleep`" | "bool" | "`false`" | "Keep the guest awake: the moment it suspends to RAM (ACPI S3), the lab daemon wakes it with QMP `system_wakeup` and records `vm.woken` with `cause = prevent_sleep`. Declared here only, never inherited: it is the daemon's policy, not hardware. The template build VM always has it on. Not accepted on a `container {}`. See [vmlab status](cmd_status)." |
       | "`display`" | "utf8" | "inherited" | "QEMU display device string. Inherited from template, then profile." |
       | "`firmware`" | "utf8" | "inherited" | "Firmware: `ovmf` or `seabios`. Inherited from template, then profile." |
       | "`tpm`" | "bool" | "inherited" | "Enable a TPM 2.0 device. Inherited from template, then profile." |

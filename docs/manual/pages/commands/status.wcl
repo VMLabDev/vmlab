@@ -48,6 +48,7 @@ page cmd_status {
       | "`running`" | "Running and ready." |
       | "`unhealthy`" | "A container is ready but its declared healthcheck is failing." |
       | "`stopping`" | "The stop ladder is in progress." |
+      | "`suspended`" | "A VM's guest put itself to sleep (ACPI S3). QEMU is alive and holds its memory, but nothing in the guest answers, so agent commands are refused with `conflict`. [vmlab vm start](cmd_vm) wakes it; `prevent_sleep = true` on the VM keeps it from staying asleep." |
       | "`stopped`" | "Powered off." |
       | "`exited (N)`" | "A container's entrypoint exited with a non-zero code." |
   }

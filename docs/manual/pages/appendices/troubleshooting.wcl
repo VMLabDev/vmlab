@@ -156,6 +156,26 @@ MSG
     machine to restart, or a guest asset to reinstall (§19.4)`.
   DOC
 
+  h2 "The machine is suspended"
+  code text { source = <<'MSG'
+{machine} is suspended: the guest went to sleep (ACPI S3) and nothing in it answers until it is woken
+MSG
+  }
+  p <<DOC
+    QEMU's q35 machine advertises ACPI S3, and a guest that takes it, as a
+    Windows client edition does after an idle timeout, leaves QEMU running
+    with its vCPUs stopped. `vmlab status` shows the VM `suspended`, the
+    event log has `vm.suspended`, and `exec`, `shell`, `cp` and every other
+    agent command fail at once with this message and exit code 5
+    (`conflict`) rather than waiting out a handshake.
+  DOC
+  p <<DOC
+    `vmlab vm start <machine>` wakes it where it left off. To stop it
+    sleeping at all, set `prevent_sleep = true` on the `vm` block, or turn
+    the guest's own sleep timer off. Template builds already run with
+    `prevent_sleep` on.
+  DOC
+
   h2 "The machine's agent is out of date"
   code text { source = <<'MSG'
 the guest agent has no `watch` support — rebuild the template to update it

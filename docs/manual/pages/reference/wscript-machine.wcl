@@ -177,7 +177,8 @@ SRC
   p "The machine's power state."
   code wscript { source = "fn state(self) -> string" }
   p <<DOC
-    Returns `stopped`, `starting`, `running` or `stopping`. It never fails.
+    Returns `stopped`, `starting`, `running`, `stopping` or `suspended` (a
+    VM whose guest went to sleep; `start()` wakes it). It never fails.
     Running says nothing about readiness; see `Machine.is_ready`.
   DOC
   code wscript { source = <<'SRC'

@@ -60,6 +60,8 @@ SRC
       | "`vm.ready`" | "`vm`" | "The agent handshake completed (after any agent refresh `up` or `vm start` deferred to it), or an online snapshot finished loading, or the first-boot provision completed and was sealed. For a container in that last case the key is `container`." |
       | "`vm.crashed`" | "`vm`, `reason`, `status`" | "The emulator exited without being asked. Always followed by `vm.stopped`." |
       | "`vm.stopped`" | "`vm`, `reason`, `status`" | "The emulator exited for any reason." |
+      | "`vm.suspended`" | "`vm`, `prevent_sleep`" | "The guest suspended itself to RAM (ACPI S3); the VM now reports `suspended`. `prevent_sleep = true` means a wake is already on its way." |
+      | "`vm.woken`" | "`vm`, `cause`, `message`" | "A suspended guest runs again. `cause` is `prevent_sleep` (the daemon woke it the moment it slept), `start` (`vmlab vm start`), `stop` (a graceful stop woke it first), `restore` (an online snapshot restore), or `guest` (its own wake source, or a reset)." |
       | "`vm.destroyed`" | "`vm`" | "`vmlab vm destroy` removed the VM's clones, run directory and workspace ledger." |
       | "`container.starting`" | "`container`" | "The container's start began, after the image pull." |
       | "`container.ready`" | "`container`" | "The micro-VM reported ready; port forwards are installed next." |

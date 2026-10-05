@@ -69,7 +69,10 @@ page cmd_vm {
     checked, then the VM boots. A VM whose clone does not exist yet gets one
     created from its template, and its first-boot script runs before it
     reports ready, exactly as under [vmlab up](cmd_up). A VM that is already
-    running is left alone. Nothing is printed on success.
+    running is left alone. A `suspended` VM, one whose guest put itself to
+    sleep, is woken with QMP `system_wakeup` instead: no second QEMU, no
+    agent refresh, and the verb returns once the guest runs again, emitting
+    `vm.woken` with `cause = start`. Nothing is printed on success.
   DOC
 
   h2 "vmlab vm ip"

@@ -286,6 +286,14 @@ Because nothing is inherited or fetched, validation requires three things a norm
 
 `start`, graceful `stop` (guest-agent shutdown, falling back to ACPI, falling back to hard kill after a timeout), `force stop`, `restart`. Bring-up order respects `depends_on`: VMs with satisfied dependencies start in parallel; a dependency is satisfied when the VM is **ready** (agent responding) and any provision steps scoped to it have completed.
 
+**A guest can put itself to sleep.** QEMU's q35 machine advertises ACPI S3, and a Windows client edition takes it after an idle timeout: QEMU stays alive holding the guest's memory, the vCPUs stop, and nothing in the guest — the agent included — answers. The lab daemon follows QMP's `SUSPEND` and `WAKEUP` and reports such a VM as **`suspended`**, a power state of its own beside `stopped`, `starting`, `running` and `stopping`, in `vmlab status`, the status projection and wscript's `state()`; `vm.suspended` and `vm.woken` (carrying who woke it) go on the event log. It is never read as stopped. While a VM is suspended:
+
+- `vmlab vm start` **wakes** it (QMP `system_wakeup`) rather than booting a second QEMU, and returns once it runs again;
+- anything that needs the agent (`exec`, `shell`, `cp`, …) fails at once with a `conflict` error that names the state, the wake, and `prevent_sleep` — never a handshake timeout;
+- a graceful stop and an online snapshot restore wake it first; an online snapshot capture refuses, since waking would change what it captures.
+
+**`prevent_sleep = true`** on a VM keeps it awake: the daemon issues `system_wakeup` the moment the guest suspends, and `vm.woken` records that the guest tried to sleep and was woken. It is runtime policy the daemon applies, not hardware — the guest still sees S3 advertised — so it is declared on the `vm` block alone, default false, and never resolved through template or profile (§5.3's chain resolves hardware). The template build VM (§6.1) always runs with it on: a build is unattended, and a sleeping build VM is indistinguishable from a hung one. A container micro-VM never sleeps (vmlab's own init is its whole userland), so a `container {}` block does not take the field.
+
 ### 7.3 Snapshots
 
 Both **online** and **offline** snapshots are required:
@@ -374,7 +382,7 @@ The PRD permits shipping 2 first and replacing with 1 later — including a hybr
 
 The daemon emits structured events, minimally:
 
-- **Lifecycle:** `vm.starting`, `vm.ready`, `vm.stopped` (with reason: requested / guest-initiated / crashed), `vm.crashed`, `lab.up`, `lab.down`, `snapshot.created`, `snapshot.restored`, `template.built`
+- **Lifecycle:** `vm.starting`, `vm.ready`, `vm.stopped` (with reason: requested / guest-initiated / crashed), `vm.crashed`, `vm.suspended` and `vm.woken` (the guest slept and woke, §7.2; `vm.woken` carries a `cause`: `prevent_sleep`, `start`, `stop`, `restore` or `guest`), `lab.up`, `lab.down`, `snapshot.created`, `snapshot.restored`, `template.built`
 - **Errors:** QMP failures, QEMU process death, agent timeouts, network fabric errors, `lab.daemon_crashed` (emitted by the supervisor) — any unrecoverable error is an event before it is a failure.
 - **Resource watchdog:** `host.disk_low` (configurable threshold on the filesystems holding `.vmlab/` and the template store — linked clones grow), plus headroom checks before snapshot operations.
 
@@ -623,7 +631,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
 | `vmlab status [-v]` | Machine status, IPs and segments, plus `dev` (§19.1); `-v` adds raw state and per-kind detail |
 | `vmlab validate` | Full §5.1 validation, no side effects |
-| `vmlab vm start / stop / restart <vm>` | Per-VM power control |
+| `vmlab vm start / stop / restart <vm>` | Per-VM power control; `start` wakes a `suspended` VM (§7.2) |
 | `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide (§7.3) |
 | `vmlab console <vm>` | Attach viewer |
 | `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |

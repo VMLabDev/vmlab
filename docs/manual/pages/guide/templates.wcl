@@ -120,6 +120,13 @@ page guide_templates {
   DOC
 
   p <<DOC
+    The build VM always runs with `prevent_sleep` on. A build is unattended,
+    and a guest that idles into ACPI S3 mid-install, as a Windows client
+    edition does, would stall it exactly like a hang; instead the lab daemon
+    wakes it the moment it sleeps.
+  DOC
+
+  p <<DOC
     For an x86 guest the ISO also carries the legacy agent (see
     [Guest OS profiles](guide_profiles), `agent_transport = "isa-serial"`)
     under `legacy/nt`, `legacy/9x` and `legacy/dos`, every name 8.3 because
