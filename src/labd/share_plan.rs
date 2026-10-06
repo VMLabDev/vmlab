@@ -13,7 +13,7 @@
 //! whether a virtiofsd exists, and whether a localhost port is free — arrive
 //! as a bool and as a [`PortProbe`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
@@ -100,6 +100,9 @@ pub struct SharePlan {
     pub virtiofs: Vec<VirtiofsShare>,
     pub smb: Option<SmbPlan>,
     pub skipped: Vec<Skip>,
+    /// Shares the plan serves but the author should know about: today, a
+    /// share riding virtiofs into a Windows guest ([`windows_virtiofs_warning`]).
+    pub warnings: Vec<String>,
 }
 
 /// One share and the transport carrying it.
@@ -184,6 +187,10 @@ pub struct ShareInputs<'a> {
     /// Per VM: does its resolved profile say the guest mounts virtiofs
     /// natively? A VM absent from the map is assumed not to.
     pub guest_virtiofs: &'a BTreeMap<String, bool>,
+    /// VMs whose guest mounts virtiofs through virtio-win's VioFS driver and
+    /// WinFsp — the modern-Windows profiles, [`crate::smb::guest_os_hint`]'s
+    /// `Windows`. A share placed on virtiofs for one of these is warned about.
+    pub windows_guests: &'a BTreeSet<String>,
     /// Each segment's service address — where a guest reaches the lab's
     /// gateway services. A segment absent from the map has no gateway.
     pub gateways: &'a BTreeMap<String, Ipv4Addr>,
@@ -199,6 +206,7 @@ struct Building {
     gateway_segments: Vec<String>,
     volume_gateways: Vec<(String, Ipv4Addr)>,
     skipped: Vec<Skip>,
+    warnings: Vec<String>,
 }
 
 impl Building {
@@ -264,14 +272,20 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
         for (i, share) in vm.shares.iter().enumerate() {
             let host = resolve_share_host(inputs.root, inputs.home, &share.host);
             match transport_of(share.transport, inputs.host_virtiofsd, guest_ok) {
-                Transport::Virtiofs => b.virtiofs.push(VirtiofsShare {
-                    machine: vm.name.clone(),
-                    index: i,
-                    name: share.name.clone(),
-                    host,
-                    guest: share.guest.clone(),
-                    readonly: share.readonly,
-                }),
+                Transport::Virtiofs => {
+                    if inputs.windows_guests.contains(&vm.name) {
+                        b.warnings
+                            .push(windows_virtiofs_warning(&vm.name, &share.name));
+                    }
+                    b.virtiofs.push(VirtiofsShare {
+                        machine: vm.name.clone(),
+                        index: i,
+                        name: share.name.clone(),
+                        host,
+                        guest: share.guest.clone(),
+                        readonly: share.readonly,
+                    })
+                }
                 Transport::Smb => {
                     let mut share = share.clone();
                     share.host = host;
@@ -359,7 +373,32 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
         virtiofs: b.virtiofs,
         smb,
         skipped: b.skipped,
+        warnings: b.warnings,
     })
+}
+
+/// What a share riding virtiofs into a Windows guest is warned with.
+///
+/// The shipped Windows profiles leave the `virtiofs` capability off, so
+/// `auto` puts their shares on SMB and only an explicit
+/// `transport = "virtiofs"` (or a profile override turning the flag on)
+/// lands here. It is served as declared, because small files work, but large
+/// reads may not: virtio-win 0.1.302's VioFS driver locks a read's buffer
+/// from whatever process context drains its queue, so under concurrent reads
+/// a paging read fails before it reaches virtiofsd and Windows reports
+/// "Error performing inpage operation". No virtiofsd flag or device setting
+/// avoids it, and `robocopy /J` reports success for a copy it cannot read
+/// back (#137; virtio-win/kvm-guest-drivers-windows #1659, unmerged fix
+/// #1633). 0.1.285, which predates that read path, copies correctly. vmlab
+/// cannot see which driver a template carries, so it warns on every one.
+pub fn windows_virtiofs_warning(machine: &str, share: &str) -> String {
+    format!(
+        "vm \"{machine}\": share \"{share}\" rides virtiofs into a Windows guest; virtio-win \
+         0.1.302's VioFS driver fails large reads there at random (\"Error performing inpage \
+         operation\") and can leave a copy that reported success unreadable; use \
+         transport = \"smb\" (or \"auto\", which picks SMB on Windows) unless the template \
+         carries a VioFS without the fault, such as 0.1.285"
+    )
 }
 
 /// Which transport a container's volumes ride, all together.
@@ -498,6 +537,7 @@ mod tests {
     struct Host {
         virtiofsd: bool,
         guest_virtiofs: BTreeMap<String, bool>,
+        windows_guests: BTreeSet<String>,
         gateways: BTreeMap<String, Ipv4Addr>,
     }
 
@@ -508,6 +548,7 @@ mod tests {
             Host {
                 virtiofsd: true,
                 guest_virtiofs: guests.iter().map(|g| (g.to_string(), true)).collect(),
+                windows_guests: BTreeSet::new(),
                 gateways: BTreeMap::from([("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1))]),
             }
         }
@@ -517,6 +558,7 @@ mod tests {
             Host {
                 virtiofsd: false,
                 guest_virtiofs: BTreeMap::new(),
+                windows_guests: BTreeSet::new(),
                 gateways: BTreeMap::from([("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1))]),
             }
         }
@@ -530,6 +572,7 @@ mod tests {
                 home: Some(Path::new("/home/dev")),
                 host_virtiofsd: host.virtiofsd,
                 guest_virtiofs: &host.guest_virtiofs,
+                windows_guests: &host.windows_guests,
                 gateways: &host.gateways,
             },
             ports,
@@ -598,6 +641,7 @@ lab "l" {
             let host = Host {
                 virtiofsd: host_has,
                 guest_virtiofs: BTreeMap::from([("web".to_string(), guest_ok)]),
+                windows_guests: BTreeSet::new(),
                 gateways: BTreeMap::from([("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1))]),
             };
             let p = plan_on(&lab, &host, &AllFree).unwrap();
@@ -622,6 +666,45 @@ lab "l" {
             .find(|p| p.share == "vfs")
             .unwrap();
         assert_eq!(vfs.transport, Transport::Virtiofs);
+    }
+
+    /// A Windows guest's VioFS driver fails large reads (#137), so a share
+    /// that lands on virtiofs there is still served as declared but warned
+    /// about. Its `auto` share rides SMB, because the Windows profiles leave
+    /// the capability off, and a Linux guest on virtiofs is never warned.
+    #[test]
+    fn virtiofs_into_a_windows_guest_is_served_and_warned_about() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" }
+  vm "win" { template = "x86_64/t" nic { segment = "lan" }
+    share { host = "./a" guest = "C:\\a" name = "a" }
+    share { host = "./v" guest = "C:\\v" name = "v" transport = "virtiofs" }
+  }
+  vm "web" { template = "x86_64/t" nic { segment = "lan" }
+    share { host = "./w" guest = "/mnt/w" name = "w" transport = "virtiofs" }
+  }
+}"#,
+        );
+        let mut host = Host::with_virtiofsd(&["web"]);
+        host.guest_virtiofs.insert("win".into(), false);
+        host.windows_guests.insert("win".into());
+        let p = plan_on(&lab, &host, &AllFree).unwrap();
+        let by_name: BTreeMap<String, Transport> = p
+            .placements()
+            .into_iter()
+            .map(|pl| (pl.share, pl.transport))
+            .collect();
+        assert_eq!(by_name["a"], Transport::Smb, "auto on Windows is SMB");
+        assert_eq!(by_name["v"], Transport::Virtiofs, "explicit stays explicit");
+        assert_eq!(by_name["w"], Transport::Virtiofs);
+        assert_eq!(p.warnings, [windows_virtiofs_warning("win", "v")]);
+        assert!(
+            p.warnings[0].contains("transport = \"smb\""),
+            "{:#?}",
+            p.warnings
+        );
     }
 
     /// VM shares and container volumes are both accounted for, so neither
@@ -699,6 +782,7 @@ lab "l" {
         let host = Host {
             virtiofsd: false,
             guest_virtiofs: BTreeMap::new(),
+            windows_guests: BTreeSet::new(),
             gateways: BTreeMap::from([
                 ("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1)),
                 ("dmz".to_string(), Ipv4Addr::new(10, 0, 1, 1)),
@@ -724,6 +808,7 @@ lab "l" {
         let host = Host {
             virtiofsd: false,
             guest_virtiofs: BTreeMap::new(),
+            windows_guests: BTreeSet::new(),
             gateways: BTreeMap::new(), // the lab is not up
         };
         let p = plan_on(&lab, &host, &AllFree).unwrap();

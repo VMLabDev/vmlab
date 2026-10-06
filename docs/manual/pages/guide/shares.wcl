@@ -48,6 +48,19 @@ SRC
   DOC
 
   p <<DOC
+    Do not use virtiofs for large files on a Windows guest. virtio-win
+    0.1.302's VioFS driver fails large reads at random with `Error
+    performing inpage operation`, and `robocopy /J` can report success for
+    a copy that cannot be read back. The fault is in the guest driver, and
+    no `virtiofsd` setting avoids it. VioFS 0.1.285 does not have it. vmlab
+    cannot tell which driver a template carries, so the shipped Windows
+    profiles leave the `virtiofs` flag off and their `auto` shares ride SMB.
+    A share that rides virtiofs into a Windows guest anyway, through an
+    explicit `transport = "virtiofs"` or a profile that turns the flag on,
+    is still served, and `vmlab up` prints a warning naming it.
+  DOC
+
+  p <<DOC
     virtiofs used to be incompatible with online snapshots, because the
     FUSE session state lived outside QEMU. That objection expired with
     QEMU's device-state transfer: vmlab runs `virtiofsd` with migration

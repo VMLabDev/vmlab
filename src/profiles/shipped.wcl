@@ -3,6 +3,10 @@ import <vmlab-profile.wcl>
 // Shipped guest OS profiles (PRD §5.3). Known-good hardware defaults;
 // values not set on the VM or template inherit from these. Override or
 // extend by dropping `*.wcl` files into `~/.config/vmlab/profiles/`.
+//
+// No Windows profile sets `virtiofs`: virtio-win 0.1.302's VioFS driver fails
+// large reads at random, so `transport = "auto"` shares on Windows ride SMB
+// (§7.5).
 
 profile "windows-11" {
   description = "Windows 11: q35, OVMF with secure boot, swtpm 2.0, virtio devices"
