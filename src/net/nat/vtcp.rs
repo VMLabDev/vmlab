@@ -19,9 +19,15 @@
 //!
 //! Simplifications, all backed by the PRD's performance non-goal: go-back-N
 //! retransmission of the first unacked segment on a fixed 1 s RTO with at most
-//! 5 tries, no TIME_WAIT, no window scaling, no SACK, no zero-window probes (a
-//! flow stuck on a closed guest window falls to the 5-minute idle reset), RST
-//! on anything unexpected.
+//! 5 tries, no TIME_WAIT, no window scaling, no SACK, RST on anything
+//! unexpected.
+//!
+//! Host→guest data never runs past the right edge of the guest's advertised
+//! window, and a closed window is probed every RTO until it reopens. Sending a
+//! full MSS whenever any window remained overran it once per window on a slow
+//! reader: a Windows guest acked the excess while still advertising a full
+//! window, buffered a fast download until it ran out of memory, and the flow
+//! fell to one retransmit per RTO.
 //!
 //! Segments arriving ahead of `rcv_nxt` ARE buffered (up to one window per
 //! flow) and stitched in when the hole fills. Dropping them and dup-ACKing —
@@ -41,7 +47,7 @@ use anyhow::{Context as _, Result, anyhow};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tracing::{debug, trace};
 
 use crate::config::model::MacAddr;
@@ -444,6 +450,39 @@ impl Flow {
         self.snd_nxt.wrapping_sub(self.snd_una)
     }
 
+    /// How many new bytes may go to the guest now: never past the right edge
+    /// of its advertised window, at most one MSS, and nothing at all while
+    /// what is left is a sliver smaller than a segment the window could
+    /// otherwise take (sender-side silly-window avoidance, RFC 1122
+    /// 4.2.3.4). Sending a full MSS whenever *any* window remained overran
+    /// it on every slow-reader cycle; a receiver that discards the excess
+    /// stalls the flow for an RTO per window.
+    fn send_allowance(&self) -> usize {
+        let usable = self.peer_wnd.saturating_sub(self.in_flight()) as usize;
+        let segment = self.mss.min(self.peer_wnd as usize);
+        if usable == 0 || usable < segment {
+            0
+        } else {
+            usable.min(self.mss)
+        }
+    }
+
+    /// Probe a closed window: an ACK one byte behind `snd_nxt` lies outside
+    /// the guest's window, so it answers with an ACK carrying the current
+    /// one (RFC 9293 3.8.6.1). Without it a lost window update would leave
+    /// the flow silent until the idle reset.
+    async fn send_window_probe(&self) {
+        trace!(key = ?self.key, "nat: vtcp zero-window probe");
+        self.emit(
+            self.snd_nxt.wrapping_sub(1),
+            self.rcv_nxt,
+            TCP_ACK,
+            &[],
+            &[],
+        )
+        .await;
+    }
+
     /// Process an acknowledgement; drops fully-acked segments and rearms
     /// the RTO.
     fn on_ack(&mut self, seg: &Segment) {
@@ -771,10 +810,12 @@ impl Flow {
                 trace!(key = ?self.key, "nat: vtcp closed cleanly");
                 return;
             }
-            let can_read = !rd_done
-                && !self.our_fin_sent
-                && self.in_flight() < self.peer_wnd
-                && self.unacked.len() < 64;
+            let allowance = self.send_allowance();
+            let sending = !rd_done && !self.our_fin_sent;
+            let can_read = sending && allowance > 0 && self.unacked.len() < 64;
+            // Nothing in flight to retransmit and no room to send: only a
+            // probe will hear about the window reopening.
+            let window_closed = sending && allowance == 0 && self.unacked.is_empty();
             let rto_deadline = self.rto_at.unwrap_or_else(|| Instant::now() + RTO);
             let idle_deadline = self.last_activity + IDLE_TIMEOUT;
 
@@ -785,23 +826,18 @@ impl Flow {
                         return;
                     }
                 }
-                read = rd.read(&mut buf), if can_read => {
+                read = rd.read(&mut buf[..allowance]), if can_read => {
                     match read {
                         Ok(0) | Err(_) => {
                             rd_done = true;
                             self.our_fin_sent = true;
                             self.send_data(Vec::new(), true).await;
                         }
-                        Ok(n) => {
-                            let take = n.min(self.mss);
-                            self.send_data(buf[..take].to_vec(), false).await;
-                            if take < n {
-                                // Shouldn't happen (buf is mss-sized), but
-                                // never silently drop bytes.
-                                self.send_data(buf[take..n].to_vec(), false).await;
-                            }
-                        }
+                        Ok(n) => self.send_data(buf[..n].to_vec(), false).await,
                     }
+                }
+                _ = sleep(RTO), if window_closed => {
+                    self.send_window_probe().await;
                 }
                 _ = sleep_until(rto_deadline), if self.rto_at.is_some() => {
                     if !self.on_rto().await {

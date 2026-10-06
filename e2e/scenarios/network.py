@@ -14,6 +14,13 @@ import tempfile
 from harness import ScenarioFailed
 
 HOST_MARKER = "e2e-host-marker"
+# A long NAT download: 2 GiB read in four 512 MiB chunks with a 2 s stall
+# after each, so the guest's window closes and reopens mid-flow. A flow that
+# fell to one window per RTO (#136) would need hours, not seconds.
+BULK_BYTES = 2 << 30
+BULK_CHUNKS = 4
+BULK_PAUSE = 2
+BULK_FLOOR = 20e6  # bytes/s over the time spent moving data
 GUEST_MARKER = "e2e-guest-marker"
 FORWARD_PORT = 18280
 
@@ -32,6 +39,8 @@ def start_host_http(ports) -> tuple[list[subprocess.Popen], pathlib.Path]:
     """Plain HTTP servers in the container serving one marker file."""
     root = pathlib.Path(tempfile.mkdtemp(prefix="e2e-network-www-"))
     (root / "marker").write_text(HOST_MARKER + "\n")
+    with open(root / "bulk", "wb") as f:
+        f.truncate(BULK_BYTES)  # sparse: costs no disk
     procs = [
         subprocess.Popen(
             ["python3", "-m", "http.server", str(p), "--bind", "0.0.0.0", "--directory", str(root)],
@@ -219,6 +228,8 @@ def egress_and_rules(h, lab, host: str):
             f"guest fetched {host}:9001 through the NAT; the container has no internet, so the public fetch was not attempted",
         )
 
+    nat_bulk(h, lab, host)
+
     # block: tcp/9002 to the host is refused at the switch, 9001 is not, and
     # the server on 9002 itself answers the container.
     blocked = wget(h, lab, "vm01", f"http://{host}:9002/marker")
@@ -233,6 +244,34 @@ def egress_and_rules(h, lab, host: str):
     # host's 9001, and the reply comes back as from 192.0.2.10.
     red = wget(h, lab, "vm01", "http://192.0.2.10/marker")
     h.ok("net.l3.redirect", red.code == 0 and HOST_MARKER in red.out, f"192.0.2.10:80 answered: {red.text.strip()[-120:]}")
+
+
+def nat_bulk(h, lab, host: str):
+    """One long guest download through the NAT stays fast while the guest
+    reader stalls and its receive window closes and reopens."""
+    chunk_mib = BULK_BYTES // BULK_CHUNKS >> 20
+    script = (
+        "set -o pipefail; s=$(date +%s); "
+        f"wget -q -O - http://{host}:9001/bulk | {{ "
+        f"while dd bs=1048576 count={chunk_mib} iflag=fullblock of=/dev/null 2>/tmp/dd.err "
+        f"&& grep -q '^{chunk_mib}+0 records in' /tmp/dd.err; do sleep {BULK_PAUSE}; done; "
+        "cat >/dev/null; }; "
+        "echo rc=$? secs=$(( $(date +%s) - s ))"
+    )
+    r = h.vmlab("exec", "vm01", "--timeout", "280", "--", "/bin/sh", "-c", script, cwd=lab, check=False, timeout=310)
+    m = re.search(r"rc=(\d+) secs=(\d+)", r.out)
+    if not m:
+        h.ok("net.nat.bulk", False, f"no result: {r.text.strip()[-200:]}")
+        return
+    rc, secs = int(m.group(1)), int(m.group(2))
+    moving = max(secs - BULK_CHUNKS * BULK_PAUSE, 1)
+    rate = BULK_BYTES / moving
+    h.ok(
+        "net.nat.bulk",
+        rc == 0 and rate >= BULK_FLOOR,
+        f"{BULK_BYTES >> 20} MiB from {host}:9001 in {secs}s with {BULK_CHUNKS} reader stalls "
+        f"(wget/dd rc={rc}, ~{rate / 1e6:.0f} MB/s moving, floor {BULK_FLOOR / 1e6:.0f})",
+    )
 
 
 def isolation(h, lab, ip):

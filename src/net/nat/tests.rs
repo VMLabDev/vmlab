@@ -141,6 +141,22 @@ async fn guest_tcp(
     payload: &[u8],
     options: &[u8],
 ) {
+    guest_tcp_window(engine, sport, dst, seq, ack, flags, 65535, payload, options).await;
+}
+
+/// [`guest_tcp`] advertising `window` instead of a full 64 KiB.
+#[allow(clippy::too_many_arguments)]
+async fn guest_tcp_window(
+    engine: &Arc<NatEngine>,
+    sport: u16,
+    dst: (Ipv4Addr, u16),
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+    options: &[u8],
+) {
     let seg = frame::tcp_build(
         GUEST_IP,
         dst.0,
@@ -150,7 +166,7 @@ async fn guest_tcp(
             seq,
             ack,
             flags,
-            window: 65535,
+            window,
             options,
         },
         payload,
@@ -785,6 +801,129 @@ async fn retransmits_unacked_data_within_budget() {
     let end = first.seq.wrapping_add(first.payload.len() as u32);
     guest_tcp(&engine, 8081, gw, g_seq, end, TCP_ACK, b"", &[]).await;
     let _ = g_ack;
+}
+
+/// Complete an engine-originated handshake whose SYN-ACK advertises
+/// `window`; returns (gw endpoint, guest seq, first engine data seq).
+async fn guest_accept_active_window(
+    engine: &Arc<NatEngine>,
+    rx: &mut mpsc::Receiver<Bytes>,
+    guest_port: u16,
+    guest_isn: u32,
+    window: u16,
+) -> ((Ipv4Addr, u16), u32, u32) {
+    let syn = recv_tcp(rx).await;
+    assert_eq!(syn.flags & (TCP_SYN | TCP_ACK), TCP_SYN);
+    #[rustfmt::skip]
+    guest_tcp_window(
+        engine, guest_port, syn.src, guest_isn, syn.seq.wrapping_add(1),
+        TCP_SYN | TCP_ACK, window, b"", &[2, 4, 0x05, 0xB4],
+    )
+    .await;
+    let ack = recv_tcp(rx).await;
+    assert_eq!(ack.flags & (TCP_SYN | TCP_ACK), TCP_ACK);
+    (syn.src, guest_isn.wrapping_add(1), syn.seq.wrapping_add(1))
+}
+
+/// Every engine→guest segment until the engine has been quiet for `quiet`.
+async fn drain_tcp(rx: &mut mpsc::Receiver<Bytes>, quiet: Duration) -> Vec<GTcp> {
+    let mut out = Vec::new();
+    while let Ok(t) = timeout(quiet, recv_tcp(rx)).await {
+        out.push(t);
+    }
+    out
+}
+
+/// Issue #136. A guest window that is not a whole number of segments
+/// (65535 over a 1460-byte MSS) used to end every window with a full MSS
+/// past its right edge. Windows acked that excess without ever shrinking
+/// its window and buffered a fast download until it ran out of memory.
+/// The engine must stop at the edge, and send nothing into a sliver
+/// smaller than a segment.
+#[tokio::test]
+async fn vtcp_never_sends_past_the_guest_window() {
+    const WND: u16 = 4000; // two 1460-byte segments and a 1080-byte sliver
+    let (engine, mut rx) = engine();
+    engine.learn_mac(GUEST_IP, GUEST_MAC);
+
+    let open = engine.open_tcp_to_guest(GUEST_IP, 8082);
+    let guest = guest_accept_active_window(&engine, &mut rx, 8082, 5000, WND);
+    let (stream, (gw, g_seq, base)) = tokio::join!(open, guest);
+    let mut stream = stream.expect("active open succeeds");
+
+    const TOTAL: usize = 20_000;
+    stream.write_all(&[0x5A; TOTAL]).await.unwrap();
+    let mut acked = base;
+    let mut delivered = 0usize;
+    while delivered < TOTAL {
+        let burst = drain_tcp(&mut rx, Duration::from_millis(300)).await;
+        let mut end = acked;
+        for t in &burst {
+            assert!(
+                !t.payload.is_empty(),
+                "only data while the window is open: {t:?}"
+            );
+            assert_eq!(t.seq, end, "segments are contiguous");
+            end = t.seq.wrapping_add(t.payload.len() as u32);
+            let used = end.wrapping_sub(acked);
+            assert!(
+                used <= u32::from(WND),
+                "segment ends {used} bytes into a {WND}-byte window"
+            );
+        }
+        let sent = end.wrapping_sub(acked) as usize;
+        assert_eq!(
+            sent,
+            2920.min(TOTAL - delivered),
+            "two full segments per window, no runt"
+        );
+        delivered += sent;
+        acked = end;
+        guest_tcp_window(&engine, 8082, gw, g_seq, acked, TCP_ACK, WND, b"", &[]).await;
+    }
+}
+
+/// A guest that closes its window must be probed, or a lost window update
+/// leaves the flow silent until the idle reset. When it reopens, data
+/// resumes from where it stopped.
+#[tokio::test]
+async fn vtcp_probes_a_closed_guest_window() {
+    let (engine, mut rx) = engine();
+    engine.learn_mac(GUEST_IP, GUEST_MAC);
+
+    let open = engine.open_tcp_to_guest(GUEST_IP, 8083);
+    let guest = guest_accept_active_window(&engine, &mut rx, 8083, 6000, 0);
+    let (stream, (gw, g_seq, base)) = tokio::join!(open, guest);
+    let mut stream = stream.expect("active open succeeds");
+
+    stream
+        .write_all(b"held behind a closed window")
+        .await
+        .unwrap();
+    let probe = recv_tcp(&mut rx).await;
+    assert!(
+        probe.payload.is_empty(),
+        "nothing is sent into a zero window: {probe:?}"
+    );
+    assert_eq!(probe.flags, TCP_ACK);
+    assert_eq!(
+        probe.seq,
+        base.wrapping_sub(1),
+        "probe sits one byte behind the window"
+    );
+    let again = recv_tcp(&mut rx).await;
+    assert_eq!(again.seq, probe.seq, "unanswered, it is probed again");
+
+    // The answer to a probe reopens the window: data follows at once.
+    guest_tcp_window(&engine, 8083, gw, g_seq, base, TCP_ACK, 65535, b"", &[]).await;
+    let data = loop {
+        let t = recv_tcp(&mut rx).await;
+        if !t.payload.is_empty() {
+            break t;
+        }
+    };
+    assert_eq!(data.seq, base);
+    assert_eq!(data.payload, b"held behind a closed window");
 }
 
 // ---------------------------------------------------------------------------
