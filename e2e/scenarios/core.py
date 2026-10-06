@@ -13,8 +13,8 @@ LAB = "e2e-core"
 OWNED = [
     "lab.validate", "lab.validate.reject", "lab.up", "lab.up.partial", "lab.depends_on",
     "lab.status", "lab.down", "lab.up.reload", "lab.up.template-changed", "lab.destroy",
-    "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory", "vm.hw.disk", "vm.hw.disk-from",
-    "vm.hw.cdrom", "vm.hw.floppy", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
+    "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory",
+    "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.floppy", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
     "vm.hw.qemu_args", "vm.hw.nested", "vm.scratch", "vm.media.iso", "vm.media.floppy",
 ]
 
@@ -242,12 +242,24 @@ def reload_after_down(h, lab: pathlib.Path) -> None:
         busy.code != 0 and "vm01 is still running" in busy.text and "vmlab down" in busy.text
         and "type=1,serial=E2E-QEMU-ARGS-2" in qemu_argv("vm01")
     )
+
+    # `vm stop` leaves the daemon up with nothing running, still holding the
+    # file it loaded: `vm start` replaces it and boots the edit.
+    h.vmlab("vm", "stop", "vm01", cwd=lab, check=False, timeout=180)
+    sv = h.vmlab("vm", "start", "vm01", cwd=lab, timeout=600, check=False)
+    if sv.code == 0:
+        h.wait_ready(lab, "vm01")
+    replaced = (
+        sv.code == 0 and "restarting the lab daemon" in sv.text
+        and "type=1,serial=E2E-QEMU-ARGS-3" in qemu_argv("vm01")
+    )
     h.ok(
         "lab.up.reload",
-        applied and refused,
+        applied and refused and replaced,
         f"after down + edit: up exit {up.code}, guest serial {serial!r}; "
         f"edit over running vm01: exit {busy.code}, "
-        + next((l.strip() for l in busy.text.splitlines() if "still running" in l), busy.text.strip()[-200:]),
+        + next((l.strip() for l in busy.text.splitlines() if "still running" in l), busy.text.strip()[-200:])
+        + f"; vm stop + vm start: exit {sv.code}, replaced daemon and booted serial 3={replaced}",
     )
 
     # A clone cannot move to another template: `up` refuses before starting
@@ -451,12 +463,18 @@ def _run(h):
         )
 
         dn = h.vmlab("down", cwd=lab, check=False, timeout=300)
-        states = {m: state_of(h, lab, m) for m in ("vm01", "vm02", "vm03", "blank")}
+        # A full down stops every machine and has the supervisor reap the
+        # lab daemon, releasing the name (#142); checked at once, since the
+        # release waits for the daemon.
+        after_down = h.vmlab("status", cwd=lab, check=False).out
+        running = [m for m in ("vm01", "vm02", "vm03", "blank") if qemu_argv(m)]
         h.ok(
             "lab.down",
-            dn.code == 0 and set(states.values()) == {"stopped"} and not qemu_argv("vm01")
+            dn.code == 0 and not running and "not running" in after_down
+            and LAB not in h.vmlab("lab", "list").out
             and (lab / ".vmlab" / "vms" / "vm01").exists(),
-            f"states {states}, clones kept",
+            f"no QEMU left ({running or 'none running'}), daemon released "
+            f"({after_down.strip()!r}), clones kept",
         )
 
         reload_after_down(h, lab)

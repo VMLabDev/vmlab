@@ -153,7 +153,7 @@ fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFresh
 /// restart is everything on disk — clones, snapshots, `.vmlab/state.json`,
 /// the workspace ledgers — because a daemon's restart is not a `destroy`.
 async fn ensure_current_daemon(name: &str, root: &std::path::Path) -> Result<LabClient> {
-    let Some(client) = daemon::try_lab_daemon(name).await else {
+    let Some(client) = daemon::try_own_lab_daemon(name, root).await? else {
         // A daemon started now reads the file now.
         return daemon::ensure_lab_daemon(name, root).await;
     };
@@ -306,10 +306,17 @@ fn pulling_machines(status: &LabStatus, targets: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// `vmlab down [vms…]`.
+///
+/// A full `down` (no machine named) also has the supervisor reap the lab
+/// daemon, which releases the lab's name (ADR-0011): the next `up` — from
+/// this directory or another declaring the same name — starts a fresh daemon
+/// that reads the lab file as it is then (issue #142). A partial `down`
+/// leaves the daemon serving the machines still running.
 pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
     rt()?.block_on(async {
-        let (name, _root) = current_lab()?;
-        let Some(client) = daemon::try_lab_daemon(&name).await else {
+        let (name, root) = current_lab()?;
+        let Some(client) = daemon::try_own_lab_daemon(&name, &root).await? else {
             // No daemon — but a daemon that died without stopping its machines
             // leaves QEMU (and swtpm/virtiofsd/smbd) running with the guest
             // disks open, and `down` is exactly where a user asks for that to
@@ -322,6 +329,7 @@ pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
             println!("lab \"{name}\" is not running (any orphaned processes were reaped)");
             return Ok(());
         };
+        let full = vms.is_empty();
         client
             .send(LabRequest::Down {
                 machines: vms,
@@ -329,9 +337,26 @@ pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
             })
             .await
             .map_err(remote)?;
+        if full {
+            release(&name).await?;
+        }
         println!("lab \"{name}\" is down (clones retained)");
         Ok(())
     })
+}
+
+/// Have the supervisor reap a stopped lab's daemon and drop its registration
+/// (`lab.release`). Returns once the daemon has gone, so a following `up` —
+/// here or in another checkout of the same lab — cannot meet it.
+async fn release(name: &str) -> Result<()> {
+    daemon::ensure_supervisor()
+        .await?
+        .send(SupRequest::LabRelease {
+            name: name.to_string(),
+        })
+        .await
+        .map_err(remote)?;
+    Ok(())
 }
 
 pub fn cmd_destroy() -> Result<()> {
@@ -340,7 +365,7 @@ pub fn cmd_destroy() -> Result<()> {
         // Destroy needs a daemon (to stop VMs and delete state) even if one
         // isn't currently running — .vmlab may still hold clones.
         let lab_local = crate::paths::lab_local_dir(&root);
-        match daemon::try_lab_daemon(&name).await {
+        match daemon::try_own_lab_daemon(&name, &root).await? {
             Some(client) => {
                 client.send(LabRequest::Destroy {}).await.map_err(remote)?;
             }
@@ -361,10 +386,13 @@ pub fn cmd_destroy() -> Result<()> {
     })
 }
 
+/// `vmlab status`. A lab name registered from another directory is that
+/// directory's lab, not this one's, so it is the same conflict every other
+/// lab-scoped verb answers (ADR-0011, issue #148) rather than its status.
 pub fn cmd_status(verbose: bool) -> Result<()> {
     rt()?.block_on(async {
-        let (name, _root) = current_lab()?;
-        let Some(client) = daemon::try_lab_daemon(&name).await else {
+        let (name, root) = current_lab()?;
+        let Some(client) = daemon::try_own_lab_daemon(&name, &root).await? else {
             println!("lab \"{name}\": not running");
             return Ok(());
         };
@@ -680,7 +708,7 @@ pub enum LabCmd {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Gracefully stop a running lab; clones retained
+    /// Gracefully stop a running lab and release its name; clones retained
     Stop {
         lab: String,
         /// Hard kill instead of the graceful ladder
@@ -734,8 +762,9 @@ fn root_for(labs: &[Value], name: &str) -> Option<std::path::PathBuf> {
 
 /// The state `lab list` shows for one registry entry.
 ///
-/// The registry knows only about the daemon, and a daemon stays up after
-/// `lab stop` with nothing running under it — so a running daemon whose
+/// The registry knows only about the daemon, and a daemon stays up when its
+/// machines were stopped one by one (`vm stop`), or after an `up` that
+/// failed, with nothing running under it — so a running daemon whose
 /// machines are all stopped is listed `stopped`, as `lab info` would show
 /// it. An unreachable daemon keeps the registry's word.
 fn listed_state<'a>(registry: &'a str, status: Option<&LabStatus>) -> &'a str {
@@ -814,10 +843,24 @@ fn cmd_lab_info(name: &str, verbose: bool) -> Result<()> {
     })
 }
 
+/// `vmlab lab stop <lab>` — a full `down` by name, from anywhere: the
+/// machines stop, the clones stay, and the daemon is reaped so the name is
+/// released (#142). It is also how a lab registered from a directory that no
+/// longer exists gives its name back.
 fn cmd_lab_stop(name: &str, force: bool) -> Result<()> {
     rt()?.block_on(async {
         let Some(client) = daemon::try_lab_daemon(name).await else {
-            println!("lab \"{name}\" is not running");
+            // No daemon answering, but a registration (a crashed daemon's,
+            // say) still holds the name; releasing it reaps whatever that
+            // daemon left running.
+            if root_for(&registry_labs().await?, name).is_some() {
+                release(name).await?;
+                println!(
+                    "lab \"{name}\" is not running (released; any orphaned processes were reaped)"
+                );
+            } else {
+                println!("lab \"{name}\" is not running");
+            }
             return Ok(());
         };
         client
@@ -827,6 +870,7 @@ fn cmd_lab_stop(name: &str, force: bool) -> Result<()> {
             })
             .await
             .map_err(remote)?;
+        release(name).await?;
         println!("lab \"{name}\" is down (clones retained)");
         Ok(())
     })

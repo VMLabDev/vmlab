@@ -1,0 +1,17 @@
+// One lab name, two checkouts: the admin scenario copies this lab into two
+// directories, the way two git worktrees of one repository both declare
+// `lab "e2e-roots"`. A lab name is host-global (ADR-0011), so only one of
+// them can hold it at a time, and a full `down` must give it back. The VM
+// boots nothing — a blank disk under SeaBIOS — so it costs nothing to run.
+import <vmlab.wcl>
+
+lab "e2e-roots" {
+  vm "blank" {
+    template = "scratch"
+    arch     = "x86_64"
+    profile  = "linux-generic"
+    cpus     = 1
+    memory   = 256MiB
+    disk     = 1GiB
+  }
+}

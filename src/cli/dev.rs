@@ -45,10 +45,18 @@ fn sync_target(machine: Option<String>) -> Result<(String, String)> {
 /// Deliberately not `ensure`: a syncer exists only while its machine is up, so
 /// starting a daemon to be told "no syncer" would boot a lab in order to
 /// deliver a negative answer.
+///
+/// `lab` is always the cwd's lab here, so a name registered from another
+/// checkout is that checkout's conflict, not its syncer (ADR-0011).
 async fn running_lab(lab: &str) -> Result<LabClient> {
-    daemon::try_lab_daemon(lab).await.ok_or_else(|| {
-        anyhow!("lab \"{lab}\" is not running, so no workspace is syncing — `vmlab up` starts it")
-    })
+    let root = crate::paths::find_lab_root(&std::env::current_dir()?)?;
+    daemon::try_own_lab_daemon(lab, &root)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "lab \"{lab}\" is not running, so no workspace is syncing — `vmlab up` starts it"
+            )
+        })
 }
 
 /// `vmlab dev sync status` — what the syncer last decided (§19.6).

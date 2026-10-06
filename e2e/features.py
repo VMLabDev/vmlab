@@ -36,6 +36,8 @@ FEATURES: dict[str, str] = {
     "lab.list": "`vmlab lab list`",
     "lab.info": "`vmlab lab info`",
     "lab.stop": "`vmlab lab stop`",
+    "lab.down.release": "a full `vmlab down` releases the lab name, so another checkout declaring it can `up`",
+    "lab.status.conflict": "`vmlab status` (and `down`) in a checkout whose lab name is registered from another root exit 5 naming it",
     "lab.restart": "`vmlab lab restart` (and its refusal while running)",
     "lab.destroy.named": "`vmlab lab destroy <lab>`",
     "daemon.lifecycle": "`vmlab daemon start/status/stop`",

@@ -33,6 +33,26 @@ pub struct LabEntry {
     pub state: LabState,
 }
 
+impl LabEntry {
+    /// Whether this entry leaves `name` free for a lab at `requested_root`
+    /// (ADR-0011): the conflict when it is registered from anywhere else.
+    ///
+    /// The remedies it names each release the name: a full `vmlab down`
+    /// there, or `vmlab lab stop` by name from anywhere — which is also the
+    /// way out when that directory no longer exists — both stop the lab and
+    /// have the supervisor reap its daemon while keeping its clones.
+    pub fn claims(&self, name: &str, requested_root: &Path) -> Result<(), CommandError> {
+        if self.root == requested_root {
+            return Ok(());
+        }
+        Err(CommandError::conflict(format!(
+            "lab `{name}` is already registered from {root} — run `vmlab down` there \
+             (or `vmlab lab stop {name}` from anywhere) to release it, or rename this lab",
+            root = self.root.display()
+        )))
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Registry {
     labs: Vec<LabEntry>,
@@ -83,15 +103,10 @@ impl Registry {
     ///
     /// Both roots must be canonical before this pure decision is made.
     pub fn check_name(&self, name: &str, requested_root: &Path) -> Result<(), CommandError> {
-        if let Some(entry) = self.get(name)
-            && entry.root != requested_root
-        {
-            return Err(CommandError::conflict(format!(
-                "lab `{name}` is already registered from {} — stop the other lab there or rename this lab",
-                entry.root.display()
-            )));
+        match self.get(name) {
+            Some(entry) => entry.claims(name, requested_root),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub fn upsert(&mut self, entry: LabEntry) -> Result<(), CommandError> {
@@ -147,7 +162,8 @@ mod tests {
 
             assert_eq!(error.code, ErrorCode::Conflict);
             assert!(error.message.contains("/labs/first"));
-            assert!(error.message.contains("stop the other lab"));
+            assert!(error.message.contains("run `vmlab down` there"));
+            assert!(error.message.contains("vmlab lab stop mylab"));
             assert!(error.message.contains("rename this lab"));
         }
     }

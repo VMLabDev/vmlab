@@ -132,6 +132,39 @@ pub async fn ensure_lab_daemon(name: &str, root: &std::path::Path) -> Result<Lab
     Ok(LabClient::connect(&sock).await?)
 }
 
+/// Refuse when `name` is registered from a root other than `root` — the same
+/// conflict `lab.ensure` answers with (ADR-0011).
+///
+/// For the verbs that reach a cwd lab's daemon without going through
+/// `lab.ensure` (`status`, `down`, `destroy`): a lab daemon's socket is keyed
+/// by name, so without this a second checkout declaring the same name would
+/// read, stop or destroy the first one's lab as if it were its own. No
+/// supervisor running means nothing is registered, so nothing conflicts.
+pub async fn check_registration(name: &str, root: &Path) -> Result<()> {
+    let Ok(supervisor) = SupClient::connect(&crate::paths::supervisor_socket()).await else {
+        return Ok(());
+    };
+    let labs = supervisor
+        .send(SupRequest::Status {})
+        .await
+        .map_err(remote)?;
+    let labs: Vec<crate::supervisor::registry::LabEntry> = serde_json::from_value(labs)
+        .context("the supervisor reported a registry vmlab cannot read")?;
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    match labs.iter().find(|entry| entry.name == name) {
+        Some(entry) => entry.claims(name, &root).map_err(anyhow::Error::new),
+        None => Ok(()),
+    }
+}
+
+/// [`try_lab_daemon`] for the lab in the current directory: `None` when its
+/// daemon is not running, and the ADR-0011 conflict when the name is
+/// registered from another root (see [`check_registration`]).
+pub async fn try_own_lab_daemon(name: &str, root: &Path) -> Result<Option<LabClient>> {
+    check_registration(name, root).await?;
+    Ok(try_lab_daemon(name).await)
+}
+
 /// Connect to a lab daemon only if it is already running.
 pub async fn try_lab_daemon(name: &str) -> Option<LabClient> {
     let sock = crate::paths::lab_socket(name);

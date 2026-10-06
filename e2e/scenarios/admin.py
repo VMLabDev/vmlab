@@ -4,6 +4,7 @@ machine is an aarch64 VM under TCG, so it doubles as the thing to administer.
 """
 
 import pathlib
+import shutil
 import subprocess
 import time
 
@@ -36,6 +37,56 @@ def listed(h) -> dict[str, str]:
     """`vmlab lab list` as name → state."""
     rows = h.vmlab("lab", "list").out.splitlines()
     return {c[0]: c[1] for c in (r.split() for r in rows[1:]) if len(c) >= 2}
+
+
+ROOTS = "e2e-roots"
+
+
+def two_roots(h):
+    """Two checkouts declaring one lab name (ADR-0011): only one holds the
+    name, the other is refused by name everywhere — `status` included
+    (#148) — and a full `down` releases the name so the other can `up` with
+    the clones it was handed (#142)."""
+    with h.lab("admin-roots", under="a") as a, h.lab("admin-roots", under="b") as b:
+        h.vmlab("up", cwd=a, timeout=300)
+        qemu = f"vmlab:{ROOTS}/blank"
+
+        st = h.vmlab("status", cwd=b, check=False)
+        dn = h.vmlab("down", cwd=b, check=False, timeout=120)
+        still = bool([p for p in pids(qemu) if alive(p)])
+        h.ok(
+            "lab.status.conflict",
+            st.code == 5 and str(a) in st.text and "blank" not in st.out
+            and dn.code == 5 and still,
+            f"status in b: exit {st.code} {st.text.strip()[:160]!r}; "
+            f"down in b: exit {dn.code}, a's VM still running={still}",
+        )
+
+        def release():
+            h.vmlab("down", cwd=a, timeout=300)
+            # Checked at once: the release waits for the daemon to go.
+            assert not [p for p in pids(f"__labd --lab {ROOTS} ") if alive(p)], "a's daemon outlived `down`"
+            assert ROOTS not in listed(h), h.vmlab("lab", "list").out
+            # b takes over a's provisioned disks, as a moved worktree would.
+            shutil.rmtree(b / ".vmlab", ignore_errors=True)
+            (a / ".vmlab").rename(b / ".vmlab")
+            up = h.vmlab("up", cwd=b, timeout=300, check=False)
+            assert up.code == 0, up.text
+            rows = h.vmlab("lab", "list").out
+            assert listed(h).get(ROOTS) == "running" and str(b) in rows, rows
+            back = h.vmlab("status", cwd=a, check=False)
+            assert back.code == 5 and str(b) in back.text, back.text
+            # By name from anywhere, the other remedy the conflict names.
+            h.vmlab("lab", "stop", ROOTS, cwd=WORK, timeout=300)
+            assert ROOTS not in listed(h), h.vmlab("lab", "list").out
+            return True
+
+        h.check(
+            "lab.down.release",
+            release,
+            "down in a reaped the daemon and unlisted the lab; b came up on a's disks; "
+            "status in a was then refused naming b; lab stop by name released it",
+        )
 
 
 def run(h):
@@ -81,18 +132,21 @@ def run(h):
             h.vmlab("lab", "stop", LAB, timeout=300)
             h.wait_until(lambda: not [p for p in pids(QEMU_NAME) if alive(p)], timeout=60,
                          what="arm01's QEMU to exit")
-            info = h.vmlab("lab", "info", LAB).out
-            assert "stopped" in info, info
-            # The list agrees with info: the daemon is up, nothing runs.
-            assert listed(h).get(LAB) == "stopped", h.vmlab("lab", "list").out
+            # A full stop by name is a full `down`: the daemon is reaped and
+            # the name released (#142), checked at once since the release
+            # waits for the daemon.
+            assert not [p for p in pids(f"__labd --lab {LAB} ") if alive(p)], "the lab daemon outlived `lab stop`"
+            assert LAB not in listed(h), h.vmlab("lab", "list").out
             assert (lab / ".vmlab" / "vms" / "arm01").exists(), "clones were not retained"
             return True
 
-        h.check("lab.stop", stop, "QEMU exited, lab info and lab list show it stopped, clone retained")
+        h.check("lab.stop", stop, "QEMU exited, the lab daemon reaped and the lab unlisted, clone retained")
 
         def restart():
             before = [p for p in pids(f"__labd --lab {LAB}") if alive(p)]
-            r = h.vmlab("lab", "restart", LAB)
+            # From the lab's directory: the stop released the registration,
+            # so the directory is what says where the lab lives.
+            r = h.vmlab("lab", "restart", LAB, cwd=lab)
             assert "restarted" in r.out, r.out
             after = [p for p in pids(f"__labd --lab {LAB}") if alive(p)]
             assert after and set(after) != set(before), f"labd pids {before} -> {after}"
@@ -124,6 +178,8 @@ def run(h):
             return True
 
         h.check("lab.destroy.named", destroy_named, "destroyed by name from outside the lab: gone from list, .vmlab removed")
+
+    two_roots(h)
 
     # -- the supervisor ---------------------------------------------------------
     def daemon():

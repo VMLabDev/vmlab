@@ -21,7 +21,13 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
         let (lab_opt, vm) = split_vm_ref(vm_ref)?;
         let lab = match lab_opt {
             Some(l) => l,
-            None => current_lab()?.0,
+            None => {
+                // The cwd's lab: a name registered from another checkout is
+                // that checkout's display, not this one's (ADR-0011).
+                let (name, root) = current_lab()?;
+                daemon::check_registration(&name, &root).await?;
+                name
+            }
         };
         // Ensure the lab daemon is up so the socket exists.
         let _client = daemon::try_lab_daemon(&lab)
