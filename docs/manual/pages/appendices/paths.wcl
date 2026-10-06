@@ -115,7 +115,9 @@ page ref_paths {
     hash is twelve hex characters of the lab root's canonical path, so
     several labs can share one base without colliding. The lab file itself
     stays where it is. This keeps disk clones off a slow filesystem such as
-    a bind mount.
+    a bind mount. Because the hash is of the root, a lab whose directory
+    moves finds no working data at its new path; `vmlab lab move` carries it
+    across (see [vmlab lab](cmd_lab)).
   DOC
 
   h2 "Environment variables"

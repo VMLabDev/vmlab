@@ -400,8 +400,15 @@ MSG
     directory, which is also the way out when that directory no longer
     exists. Both stop the lab's machines, keep its clones and have the
     supervisor reap its daemon. Or change the `lab` name in one of the two
-    files. To carry the provisioned disks across, move `.vmlab/` to the new
-    directory after the release and before `vmlab up` there.
+    files.
+  DOC
+  p <<DOC
+    To carry the provisioned machines across instead of building them
+    again, run `vmlab lab move <name>` in the directory that should own the
+    lab. It refuses while a machine runs, releases the name itself, moves
+    the working data and registers the lab from there (see
+    [vmlab lab move](cmd_lab)). Pass `--from <dir>` when the name has
+    already been released.
   DOC
 
   h2 "The eBPF fast path is unavailable"

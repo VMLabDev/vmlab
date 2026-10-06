@@ -636,6 +636,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab up [vm...]` | Create/start lab (or subset), run provision scripts; always from the lab file as it is on disk now (§7.1) |
 | `vmlab down [vm...]` | Graceful stop; clones retained; a full `down` also reaps the lab daemon and releases the lab name |
 | `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
+| `vmlab lab move <lab> [--from <dir>]` | Run in the lab root that should own a stopped lab (its `vmlab.wcl` declaring the same name): refuses while any of the lab's machines or processes run, or when this root already holds machine data; warns naming each machine the two lab files declare differently; releases the name; moves the working data (`.vmlab/`, or the `VMLAB_WORK_DIR` directory keyed by the root), renaming on one filesystem and otherwise copying, verifying and only then deleting the source; drops `smb/smb.conf` and rebases each `@dev` sync ledger onto the new root; lists each share, volume or workspace folder missing under the new root; and registers the lab from there. `--from` names the old root once the name is released |
 | `vmlab status [-v]` | Machine status, IPs and segments, plus `dev` (§19.1); `-v` adds raw state and per-kind detail |
 | `vmlab validate` | Full §5.1 validation, no side effects |
 | `vmlab vm start / stop / restart <vm>` | Per-VM power control; `start` wakes a `suspended` VM (§7.2) |

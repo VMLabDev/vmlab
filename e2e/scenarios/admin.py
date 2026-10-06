@@ -46,7 +46,8 @@ def two_roots(h):
     """Two checkouts declaring one lab name (ADR-0011): only one holds the
     name, the other is refused by name everywhere — `status` included
     (#148) — and a full `down` releases the name so the other can `up` with
-    the clones it was handed (#142)."""
+    the clones it was handed (#142), or `vmlab lab move` hands them over
+    (#143)."""
     with h.lab("admin-roots", under="a") as a, h.lab("admin-roots", under="b") as b:
         h.vmlab("up", cwd=a, timeout=300)
         qemu = f"vmlab:{ROOTS}/blank"
@@ -86,6 +87,35 @@ def two_roots(h):
             release,
             "down in a reaped the daemon and unlisted the lab; b came up on a's disks; "
             "status in a was then refused naming b; lab stop by name released it",
+        )
+
+        def move():
+            # b holds the working data now and the name is released, so the
+            # move back to a has to be told where the lab lives (#143).
+            disk = b / ".vmlab" / "vms" / "blank" / "disk0.qcow2"
+            inode = disk.stat().st_ino
+            unknown = h.vmlab("lab", "move", ROOTS, cwd=a, check=False)
+            assert unknown.code == 1 and "--from" in unknown.text, unknown.text
+            mv = h.vmlab("lab", "move", ROOTS, "--from", str(b), cwd=a, check=False, timeout=120)
+            assert mv.code == 0 and f"now lives in {a}" in mv.out, mv.text
+            # One filesystem: the clone was renamed, not rebuilt or copied.
+            moved = a / ".vmlab" / "vms" / "blank" / "disk0.qcow2"
+            assert not (b / ".vmlab").exists() and moved.stat().st_ino == inode, mv.text
+            rows = h.vmlab("lab", "list").out
+            assert ROOTS in rows and str(a) in rows, rows
+            up = h.vmlab("up", cwd=a, timeout=300, check=False)
+            assert up.code == 0, up.text
+            busy = h.vmlab("lab", "move", ROOTS, cwd=b, check=False)
+            assert busy.code == 5 and "still has machines running" in busy.text, busy.text
+            assert [p for p in pids(f"vmlab:{ROOTS}/blank") if alive(p)], "the refused move stopped a's VM"
+            h.vmlab("down", cwd=a, timeout=300)
+            return True
+
+        h.check(
+            "lab.move",
+            move,
+            "lab move without --from on a released lab asked for it; with --from it renamed "
+            "b's clone into a and registered a; a came up on it; a move while it ran exited 5",
         )
 
 
