@@ -151,12 +151,16 @@ SRC
     dials the display's unix socket directly, and `gvncviewer` or `vncviewer`
     work over a local TCP bridge. Shared folders use `virtiofsd` when the host
     and guest both support it and fall back to the bundled `smbd` otherwise,
-    so installing both covers every guest.
+    so installing both covers every guest. Install `virtiofsd` 1.13.0 or
+    later for every feature: online snapshots of a VM with a virtiofs share
+    need 1.11.0, and read-only virtiofs shares need 1.13.0. Ubuntu 24.04
+    ships 1.10.0, and the install script says so when it finds one that old.
   DOC
 
   p <<DOC
     vmlab checks for a missing tool when it first needs it, not at install
-    time. `vmlab validate` does not probe the host. A missing emulator is
+    time. `vmlab validate` probes the host only for `virtiofsd`, when a share
+    demands virtiofs and the installed one cannot serve it. A missing emulator is
     reported by `vmlab up`, a missing `sqfstar` by the first container start,
     and a missing viewer by `vmlab console`.
   DOC

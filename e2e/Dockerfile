@@ -48,6 +48,15 @@ RUN apt-get update \
       samba xorriso mtools dosfstools squashfs-tools tesseract-ocr \
       python3 util-linux procps iproute2 curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+# Ubuntu 24.04's virtiofsd 1.10.0, which predates --migration-mode and
+# --readonly, for the old-virtiofsd snapshot check. Pinned by digest.
+RUN set -eux; \
+    deb=/tmp/virtiofsd.deb; \
+    curl -fsSL -o "$deb" http://archive.ubuntu.com/ubuntu/pool/universe/r/rust-virtiofsd/virtiofsd_1.10.0-1ubuntu0.1_amd64.deb; \
+    echo "8069325e87cd4485fdb4dd2dde0e54dc68345847c92a1f5d9e9916dadd549b07  $deb" | sha256sum -c -; \
+    dpkg-deb -x "$deb" /tmp/virtiofsd-old; \
+    install -D /tmp/virtiofsd-old/usr/libexec/virtiofsd /usr/local/lib/vmlab-e2e/virtiofsd-1.10.0; \
+    rm -rf "$deb" /tmp/virtiofsd-old
 COPY --from=registry /bin/registry /usr/local/bin/registry
 COPY --from=build /out/vmlab /usr/local/bin/vmlab
 COPY --from=build /out/guest /usr/share/vmlab/guest

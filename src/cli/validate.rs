@@ -56,6 +56,22 @@ impl ValidationContext for HostContext {
         let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         crate::scripting::check_script_source(&source)
     }
+
+    fn check_virtiofs_share(&self, share: &crate::config::model::Share) -> Result<(), String> {
+        use crate::qemu::virtiofsd::{Probe, probe};
+        match probe() {
+            Probe::Missing => Ok(()),
+            Probe::Found(v) if share.readonly => v
+                .readonly_refusal(&format!("share \"{}\"", share.name))
+                .map_or(Ok(()), Err),
+            Probe::Found(_) => Ok(()),
+            unusable => Err(format!(
+                "share \"{}\" demands transport = \"virtiofs\", but {}",
+                share.name,
+                unusable.unusable_reason().unwrap_or_default()
+            )),
+        }
+    }
 }
 
 /// A validation problem reduced for the web editor: a message and an optional

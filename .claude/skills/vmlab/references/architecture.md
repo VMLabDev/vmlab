@@ -230,7 +230,7 @@ keeps disk clones off a slow filesystem such as a bind mount.
 | `VMLAB_WORK_DIR` | Relocates every lab's `.vmlab/` under one base, as described above. |
 | `VMLAB_GUEST_ASSET_DIR` | Searched first for the micro-VM kernel and initramfs (`<arch>/`) and the agent binaries (`agent/<os>-<arch>/`), before `/usr/share/vmlab/guest` and the data root's `guest/`. |
 | `VMLAB_CONFIG_WEAVE_DIR` | Where the playbook engine's guest binaries are, instead of `~/.local/share/config-weave/bin`. |
-| `VMLAB_VIRTIOFSD` | The `virtiofsd` binary to use, before searching `PATH`. |
+| `VMLAB_VIRTIOFSD` | The `virtiofsd` binary to use, before searching `PATH` and the distribution helper directories (`/usr/lib`, `/usr/libexec`, `/usr/lib/qemu`). |
 | `VMLAB_FASTPATH` | Overrides the host config's `fastpath`: `auto`, `off`, `sockmap` or `afxdp`. A malformed value is ignored with a warning. See host-profiles.md. |
 | `VMLAB_DEV_MACHINE` | Which dev machine `vmlab dev` verbs mean, second on the selection ladder after an explicit argument. See dev-machines.md. |
 | `DOCKER_CONFIG` | The directory holding `config.json` with registry credentials. |

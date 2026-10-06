@@ -1,8 +1,14 @@
-"""Snapshots: a VM online and offline, the whole lab, list and delete, and a
-container."""
+"""Snapshots: a VM online and offline, the whole lab, list and delete, a
+container, and a VM whose virtiofs share rides a virtiofsd too old to carry
+its state through a snapshot."""
 
+from harness import WORK
 
 LAB = "snapshots-main"
+OLD_LAB = "snapshots-old-virtiofsd"
+# Ubuntu 24.04's virtiofsd, which has neither --migration-mode nor --readonly
+# (installed by e2e/Dockerfile).
+OLD_VIRTIOFSD = "/usr/local/lib/vmlab-e2e/virtiofsd-1.10.0"
 MARK = "/root/e2e-mark"
 
 
@@ -122,3 +128,61 @@ def run(h):
             return True
 
         h.check("snapshot.list-delete", list_delete, "on1 listed, deleted, then unrestorable")
+
+    old_virtiofsd(h)
+
+
+def old_virtiofsd(h):
+    """virtiofsd 1.10.0 serves the share without the migration flags, online
+    snapshots refuse naming 1.11.0, offline ones work, and a read-only
+    virtiofs share fails validation naming 1.13.0."""
+    old = {"VMLAB_VIRTIOFSD": OLD_VIRTIOFSD}
+    # labd inherits the supervisor's environment, so the override needs a
+    # supervisor of its own.
+    h.vmlab("daemon", "stop", check=False)
+    h.run(["vmlab", "daemon", "start"], env=old)
+    try:
+        with h.lab(OLD_LAB) as lab:
+            h.vmlab("up", cwd=lab, timeout=600, env=old)
+            h.wait_ready(lab, "vm01")
+
+            def share():
+                argv = h.run(["ps", "-eo", "args"]).out
+                daemons = [l for l in argv.splitlines() if l.startswith(OLD_VIRTIOFSD)]
+                assert daemons, f"no {OLD_VIRTIOFSD} running:\n{argv}"
+                assert all("--migration-mode" not in d for d in daemons), daemons
+                mounts = h.vmlab("exec", "vm01", "--", "cat", "/proc/mounts", cwd=lab).out
+                assert any(" /mnt/vfs virtiofs " in l for l in mounts.splitlines()), mounts
+                read = h.vmlab("exec", "vm01", "--", "cat", "/mnt/vfs/host.txt", cwd=lab).out.strip()
+                assert read == "from-host-vfs", read
+                return True
+
+            h.check("share.virtiofs.old-virtiofsd", share,
+                    "virtiofsd 1.10.0 ran with no --migration-mode and the guest read the host file over virtiofs")
+
+            def snapshots():
+                on = snap(h, lab, "create", "--vm", "vm01", "on1", check=False)
+                assert on.code != 0 and "virtiofsd 1.11.0 or later" in on.text, on.text
+                assert state(h, lab, "vm01") == "state=running", "a refused snapshot stopped the VM"
+                h.vmlab("vm", "stop", "vm01", cwd=lab, timeout=180)
+                h.wait_until(lambda: state(h, lab, "vm01") == "state=stopped", timeout=120, what="vm01 stopped")
+                off = snap(h, lab, "create", "--vm", "vm01", "off1")
+                assert "created" in off.out, off.text
+                ro = WORK / "old-virtiofsd-readonly"
+                ro.mkdir(exist_ok=True)
+                (ro / "share").mkdir(exist_ok=True)
+                (ro / "vmlab.wcl").write_text(
+                    'import <vmlab.wcl>\n\nlab "ro" {\n  vm "vm01" {\n    template = "x86_64/e2e-alpine"\n'
+                    '    share { host = "./share" guest = "/mnt/ro" transport = "virtiofs" readonly = true }\n'
+                    '  }\n}\n')
+                v = h.run(["vmlab", "validate"], cwd=ro, env=old, check=False)
+                assert v.code != 0 and "virtiofsd 1.13.0" in v.text, v.text
+                return True
+
+            h.check("snapshot.virtiofs.old-virtiofsd", snapshots,
+                    "online create refused naming virtiofsd 1.11.0 with the VM left running; offline create "
+                    "taken; a read-only virtiofs share failed validate naming 1.13.0")
+    finally:
+        # The next scenario's first command starts a supervisor with the
+        # default environment.
+        h.vmlab("daemon", "stop", check=False)

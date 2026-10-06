@@ -303,7 +303,7 @@ Both **online** and **offline** snapshots are required:
 
 Every snapshot records the VM's **power state at capture time**. Restore must do the right thing: restoring an online snapshot resumes the VM running exactly where it was; restoring an offline snapshot leaves the VM powered off. Snapshots are named, listable, and deletable per VM; a lab-wide snapshot verb captures all VMs (and containers, §18) in a lab under one name (consistency across VMs is best-effort, not coordinated — document this).
 
-Snapshots use **qcow2-internal snapshots wherever the mechanism supports the case**, keeping the on-disk footprint to the clone file itself; external snapshot files are permitted only where internal snapshots cannot deliver the behavioural contract above. Either way the mechanism must coexist with the linked-clone backing chain, and the contract — not the mechanism — is what binds. Shared folders (§7.5) stay snapshot-compatible on both transports: SMB carries no device state at all, and virtiofs shares transfer the virtiofsd session state through the snapshot's migration stream.
+Snapshots use **qcow2-internal snapshots wherever the mechanism supports the case**, keeping the on-disk footprint to the clone file itself; external snapshot files are permitted only where internal snapshots cannot deliver the behavioural contract above. Either way the mechanism must coexist with the linked-clone backing chain, and the contract — not the mechanism — is what binds. Shared folders (§7.5) stay snapshot-compatible on both transports: SMB carries no device state at all, and virtiofs shares transfer the virtiofsd session state through the snapshot's migration stream. On a host whose virtiofsd predates that transfer (§7.5), online capture and restore of a machine with virtiofs devices refuse, naming the virtiofsd release that has it; offline snapshots are unaffected.
 
 ### 7.4 Guest agent
 
@@ -330,7 +330,7 @@ vm "dev01" {
 
 **Mechanism: two transports behind one `share {}` surface.** Each share carries `transport = "auto" | "virtiofs" | "smb"` (default `auto`).
 
-**virtiofs** is the fast path: one `virtiofsd` per share, attached as a vhost-user-fs device, mounted natively by the guest (`mount -t virtiofs <tag>`). The original objection — virtio-fs carries FUSE session state outside QEMU, which historically made VMs unmigratable and blocked savevm-style online snapshots — expired with the QEMU ≥8.2 / virtiofsd ≥1.11.0 device-state transfer: vmlab runs virtiofsd with `--migration-mode=find-paths --migration-verify-handles`, so its session state (open handles included) rides the snapshot's migration stream. Validated: save under dirty FUSE state, online reload, and restore-much-later into a fresh QEMU + virtiofsd. Costs accepted: the VM's RAM moves to a shared `memory-backend-memfd` (pre-existing snapshots of that VM stop restoring — the RAM block is renamed), one daemon per share, and the guest needs a virtiofs client (profile capability flag `virtiofs`; Linux ≥5.4 kernels have it, Windows needs the virtio-win driver + WinFsp in the template).
+**virtiofs** is the fast path: one `virtiofsd` per share, attached as a vhost-user-fs device, mounted natively by the guest (`mount -t virtiofs <tag>`). The original objection — virtio-fs carries FUSE session state outside QEMU, which historically made VMs unmigratable and blocked savevm-style online snapshots — expired with the QEMU ≥8.2 / virtiofsd ≥1.11.0 device-state transfer: vmlab runs virtiofsd with `--migration-mode=find-paths --migration-verify-handles`, so its session state (open handles included) rides the snapshot's migration stream. Validated: save under dirty FUSE state, online reload, and restore-much-later into a fresh QEMU + virtiofsd. Distributions ship older virtiofsd releases (Ubuntu 24.04 has 1.10.0), so vmlab reads the binary's `--help` once per binary and passes only the flags it lists: without `--migration-mode` (before 1.11.0) the share still works and online snapshots of that machine refuse (§7.3); without `--readonly` (before 1.13.0) an `auto` read-only share falls back to SMB and an explicit `virtiofs` one fails validation. A binary lacking the basic flags (QEMU's retired C virtiofsd) fails validation for any explicit `virtiofs` share. Costs accepted: the VM's RAM moves to a shared `memory-backend-memfd` (pre-existing snapshots of that VM stop restoring — the RAM block is renamed), one daemon per share, and the guest needs a virtiofs client (profile capability flag `virtiofs`; Linux ≥5.4 kernels have it, Windows needs the virtio-win driver + WinFsp in the template).
 
 **SMB, served by the daemon at the segment gateway**, remains the universal fallback and the `auto` choice whenever host or guest lacks virtiofs support. Each SMB share is exposed as `\\<gateway>\<share>` on the VM's segment:
 
@@ -731,11 +731,12 @@ scratch qcow2 as the overlayfs writable layer. Config reaches the guest as a
 `ContainerSpec` pushed over the ctl channel (the virtio-serial port that also
 carries lifecycle events and stop/resync commands). Volumes attach as
 **vhost-user-fs devices** — one `virtiofsd` per volume, spawned by the lab
-daemon with `--migration-mode` so its FUSE session state rides the
-snapshot's migration stream — mounted natively by cinit (`mount -t
+daemon with `--migration-mode` where the binary has it (§7.5) so its FUSE
+session state rides the snapshot's migration stream — mounted natively by cinit (`mount -t
 virtiofs`) before the network is even up; a volume-carrying micro-VM's RAM
 switches to a shared `memory-backend-memfd` (a vhost-user requirement).
-Hosts without a `virtiofsd` binary fall back to the v1 transport: SMB
+Hosts without a `virtiofsd` binary, or whose `virtiofsd` lacks `--readonly`
+when a volume is read-only, fall back to the v1 transport: SMB
 shares served by the lab daemon at the segment gateway — the same
 bundled-`smbd` mechanism as §7.5 shared folders — mounted by cinit over
 CIFS once the network is up. No 9p device is ever attached (it would add a

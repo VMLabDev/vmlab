@@ -1,0 +1,13 @@
+import <vmlab.wcl>
+
+// One VM with a virtiofs share, run against Ubuntu 24.04's virtiofsd 1.10.0
+// (VMLAB_VIRTIOFSD, set by the scenario): the share works, online snapshots
+// are refused by name, offline ones are taken.
+lab "snapshots-old-virtiofsd" {
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    share { host = "./share-vfs" guest = "/mnt/vfs" transport = "virtiofs" }
+  }
+}

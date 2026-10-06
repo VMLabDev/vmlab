@@ -265,6 +265,11 @@ pub struct VmInstance {
     /// The shares this run attached over virtiofs, for the ready-time mount
     /// (see `LabRuntime::mount_shares`).
     virtiofs_mounts: Mutex<Vec<VirtiofsMount>>,
+    /// Why this run cannot be snapshotted online: its virtiofs devices are
+    /// served by a virtiofsd that cannot carry their state. Recorded as the
+    /// daemons start, because what they were started with is what a
+    /// snapshot meets. Std lock: never held across an await.
+    snapshot_refusal: std::sync::Mutex<Option<String>>,
     /// The running machine's control channel (see [`Control`]); `None` while
     /// stopped.
     control: Mutex<Option<Arc<dyn Control>>>,
@@ -309,6 +314,7 @@ impl VmInstance {
             swtpm: Mutex::new(None),
             virtiofsd: Mutex::new(Vec::new()),
             virtiofs_mounts: Mutex::new(Vec::new()),
+            snapshot_refusal: std::sync::Mutex::new(None),
             control: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
@@ -334,17 +340,34 @@ impl VmInstance {
     /// served by exactly one transport — under a substituted host as much as
     /// a real one.
     pub fn virtiofs_share_indices(&self) -> Vec<usize> {
-        use crate::labd::share_plan::{Transport, transport_of};
-        let host_has = self.hv.virtiofsd_available();
+        use crate::labd::share_plan::{HostVirtiofsd, Transport, transport_of};
+        let host = HostVirtiofsd::of(self.hv.virtiofsd().as_ref());
         let guest_ok = self.template().resolved.virtiofs;
         self.cfg
             .shares
             .iter()
             .enumerate()
             .filter_map(|(i, s)| {
-                (transport_of(s.transport, host_has, guest_ok) == Transport::Virtiofs).then_some(i)
+                (transport_of(s.transport, host, guest_ok, s.readonly) == Transport::Virtiofs)
+                    .then_some(i)
             })
             .collect()
+    }
+
+    /// Why an online snapshot of this VM cannot be taken or loaded right
+    /// now — `None` when it can. A live QEMU answers with the virtiofsd its
+    /// run started; a stopped one, which an online restore boots first, with
+    /// the virtiofsd it would start.
+    async fn online_snapshot_refusal(&self) -> Option<String> {
+        if self.power_state().await != PowerState::Stopped {
+            return self.snapshot_refusal.lock().expect("refusal lock").clone();
+        }
+        if self.virtiofs_share_indices().is_empty() {
+            return None;
+        }
+        self.hv
+            .virtiofsd()
+            .and_then(|v| v.snapshot_refusal(&self.cfg.name))
     }
 
     /// The shares the current run attached over virtiofs (empty when
@@ -573,21 +596,34 @@ impl VmInstance {
 
     /// Spawn one virtiofsd per virtiofs share (listening before QEMU
     /// starts) and return the (tag, socket) device list; also records the
-    /// ready-time mount plan. Explicit `transport = "virtiofs"` with no
-    /// host virtiofsd is a start error.
+    /// ready-time mount plan and whether the run can be snapshotted online.
+    /// Explicit `transport = "virtiofs"` with no host virtiofsd, or a
+    /// read-only one on a virtiofsd with no `--readonly`, is a start error.
     async fn start_virtiofsds(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut procs = Vec::new();
         let mut devices = Vec::new();
         let mut mounts = Vec::new();
-        for i in self.virtiofs_share_indices() {
+        let vfsd = self.hv.virtiofsd();
+        let indices = self.virtiofs_share_indices();
+        *self.snapshot_refusal.lock().expect("refusal lock") = match &vfsd {
+            Some(v) if !indices.is_empty() => v.snapshot_refusal(&self.cfg.name),
+            _ => None,
+        };
+        for i in indices {
             let share = &self.cfg.shares[i];
-            if !self.hv.virtiofsd_available() {
+            let Some(vfsd) = &vfsd else {
                 bail!(
-                    "{}: share \"{}\" demands transport = \"virtiofs\" but no virtiofsd was \
-                     found on this host (install one or set VMLAB_VIRTIOFSD)",
+                    "{}: share \"{}\" demands transport = \"virtiofs\" but no usable \
+                     virtiofsd was found on this host (install one or set VMLAB_VIRTIOFSD)",
                     self.cfg.name,
                     share.name
                 );
+            };
+            if share.readonly
+                && let Some(why) =
+                    vfsd.readonly_refusal(&format!("{}: share \"{}\"", self.cfg.name, share.name))
+            {
+                bail!("{why}");
             }
             let host = self
                 .share_hosts
@@ -954,6 +990,7 @@ impl VmInstance {
             }
         }
         self.virtiofs_mounts.lock().await.clear();
+        *self.snapshot_refusal.lock().expect("refusal lock") = None;
         // RAII: dropping tap attachments detaches their switch ports and
         // XDP state; with QEMU gone, the kernel then destroys the taps.
         self.nic_attachments.lock().await.clear();
@@ -1045,6 +1082,9 @@ impl VmInstance {
         validate_snapshot_name(name)?;
         match self.power_state().await {
             PowerState::Running => {
+                if let Some(why) = self.online_snapshot_refusal().await {
+                    bail!("{why}");
+                }
                 let qmp = self.qmp().await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
@@ -1159,8 +1199,8 @@ impl super::display::DisplayHost for VmInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for VmInstance {
-    fn virtiofsd_available(&self) -> bool {
-        self.hv.virtiofsd_available()
+    fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
+        self.hv.virtiofsd()
     }
 
     fn as_machine(&self) -> &dyn super::machine::Machine {
@@ -1334,6 +1374,11 @@ impl super::machine::Machine for VmInstance {
         snap: &str,
         online: bool,
     ) -> Result<()> {
+        // Refused before anything moves: a load the virtiofs devices cannot
+        // take fails after the disks have been rewound.
+        if online && let Some(why) = self.online_snapshot_refusal().await {
+            bail!("{why}");
+        }
         // Restoring into a running VM needs NIC listeners only if QEMU must be
         // booted; go through `start` for that so the wiring stays in one place.
         if online && self.power_state().await == PowerState::Stopped {

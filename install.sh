@@ -281,8 +281,38 @@ want swtpm              "guests with tpm = true — Windows 11 and Server 2025 r
 want smbd               "shared folders on guests without virtiofs"
 want tesseract          "vmlab vm ocr and wait_for_text in scripts"
 want sqfstar            "lab containers: flattening a pulled OCI image"
-want virtiofsd          "shared folders over virtiofs (smbd is the fallback)"
 want remote-viewer      "vmlab console and gui = true" gvncviewer vncviewer
+
+# virtiofsd ships as an internal helper off PATH on most distros, so look
+# where vmlab looks: $VMLAB_VIRTIOFSD, PATH, then the distro locations.
+virtiofsd_bin=''
+for c in "${VMLAB_VIRTIOFSD:-}" "$(command -v virtiofsd 2>/dev/null || true)" \
+         /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd; do
+  if [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ]; then virtiofsd_bin=$c; break; fi
+done
+virtiofsd_old=''
+if [ -z "$virtiofsd_bin" ]; then
+  missing="${missing}virtiofsd	shared folders over virtiofs (smbd is the fallback)
+"
+else
+  # Older releases still serve shares, without the flags two features need.
+  virtiofsd_help=$("$virtiofsd_bin" --help 2>&1 || true)
+  case "$virtiofsd_help" in
+    *--shared-dir*) ;;
+    *) virtiofsd_old="cannot serve shares at all (it has no --shared-dir)" ;;
+  esac
+  if [ -z "$virtiofsd_old" ]; then
+    case "$virtiofsd_help" in
+      *--migration-mode*) ;;
+      *) virtiofsd_old="no --migration-mode: VMs with virtiofs shares cannot be snapshotted online (needs 1.11.0)" ;;
+    esac
+    case "$virtiofsd_help" in
+      *--readonly*) ;;
+      *) virtiofsd_old="${virtiofsd_old:+$virtiofsd_old
+  }no --readonly: read-only shares cannot use virtiofs (needs 1.13.0)" ;;
+    esac
+  fi
+fi
 
 if [ -n "$missing" ]; then
   printf '\nMissing runtime tools — vmlab will fail at the first thing that needs one:\n\n'
@@ -304,6 +334,14 @@ if [ -n "$missing" ]; then
   elif have pacman;  then printf '\n  sudo pacman -S --needed%s\n' "$pkgs"
   else printf '\nInstall them with your package manager. See https://vmlab.io for the full list.\n'
   fi
+fi
+
+if [ -n "$virtiofsd_old" ]; then
+  virtiofsd_version=$("$virtiofsd_bin" --version 2>/dev/null | head -n 1)
+  printf '\n%s (%s) is too old for every vmlab feature:\n  %s\n' \
+    "${virtiofsd_version:-virtiofsd}" "$virtiofsd_bin" "$virtiofsd_old"
+  printf 'Install virtiofsd 1.13.0 or later (https://gitlab.com/virtio-fs/virtiofsd/-/releases)\n'
+  printf 'and point VMLAB_VIRTIOFSD at it if it is not the one above.\n'
 fi
 
 if [ ! -e /dev/kvm ]; then

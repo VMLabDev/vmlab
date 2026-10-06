@@ -124,7 +124,8 @@ pub fn mount_container_root(root_dev: &str, scratch_dev: &str) -> Result<()> {
 /// vhost-user-fs device the host attached for it (proto v4). Native FUSE
 /// over shared memory — no network, no credentials — so these mount before
 /// DHCP. Snapshot-safe: virtiofsd migrates its state through QEMU's
-/// migration stream (the host runs it with `--migration-mode`), which is
+/// migration stream (the host runs it with `--migration-mode` where its
+/// virtiofsd has the flag, and refuses online snapshots where not), which is
 /// exactly what an online snapshot stores.
 pub fn mount_virtiofs(tag: &str, target: &str, read_only: bool) -> Result<()> {
     let inside = format!("{ROOTFS}/{}", target.trim_start_matches('/'));
