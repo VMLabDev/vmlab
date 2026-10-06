@@ -22,7 +22,7 @@ page cmd_lab {
       | "Subcommand" | "Meaning" |
       | "`list`" | "List every tracked lab: name, state, and directory." |
       | "`info`" | "Show detailed status (machines and segments) of a running lab." |
-      | "`stop`" | "Gracefully stop a running lab; clones retained." |
+      | "`stop`" | "Gracefully stop a running lab and release its name; clones retained." |
       | "`restart`" | "Restart a lab's daemon so it re-reads `vmlab.wcl`." |
       | "`destroy`" | "Stop a lab and delete its clones and local state." |
       | "`-h`, `--help`" | "Print help." |
@@ -48,8 +48,9 @@ page cmd_lab {
   p <<DOC
     Prints one row per registered lab with `NAME`, `STATE` and `DIRECTORY`.
     The state is `running`, `stopped`, `stopping` or `failed`. `stopped`
-    means the daemon is up with no machine running, as after `vmlab lab
-    stop`. `failed` means the daemon exited without being asked to. With no
+    means the daemon is up with no machine running, as after `vmlab vm stop`
+    of every machine or an `up` that failed; a full `vmlab down` or
+    `vmlab lab stop` removes the lab from the list instead. `failed` means the daemon exited without being asked to. With no
     supervisor or an empty registry it prints `no running labs`. Under
     `--json` each entry carries `name`, `root`, `pid` and `state`.
   DOC
@@ -89,12 +90,22 @@ page cmd_lab {
   }
 
   p <<DOC
-    Stops every machine in the named lab through the graceful ladder
-    [vmlab down](cmd_down) describes, or kills them under `--force`, and
-    keeps the clones. Prints `lab "<name>" is down (clones retained)`. A lab
-    with no reachable daemon prints `lab "<name>" is not running` and exits 0;
-    unlike `down` this form reaps no orphaned processes, since without the
-    registry entry it has no directory to release.
+    A full [vmlab down](cmd_down) by name, from any directory. It stops
+    every machine in the named lab through the graceful ladder `down`
+    describes, or kills them under `--force`, keeps the clones, and has the
+    supervisor reap the lab daemon, which releases the lab's name. Prints
+    `lab "<name>" is down (clones retained)`. This is the way to give a name
+    back when the directory that registered it is gone or out of reach (see
+    [The lab name is already registered](apx_troubleshooting)).
+  DOC
+
+  p <<DOC
+    A lab whose daemon does not answer but which the supervisor still has
+    registered, for example one in the `failed` state, is released: the
+    supervisor reaps any QEMU, swtpm, virtiofsd or smbd process the daemon
+    left behind, and the verb prints `lab "<name>" is not running (released;
+    any orphaned processes were reaped)`. A name the registry does not know
+    prints `lab "<name>" is not running`. Both exit 0.
   DOC
 
   h2 "vmlab lab restart"
@@ -115,8 +126,11 @@ page cmd_lab {
     provisioning, whereas this replaces only the daemon. It picks up an edit
     to the [lab file](guide_lab_file) without starting anything, and it
     recovers a daemon whose lab file no longer loads. You do not need it
-    before [vmlab up](cmd_up): `up`, `pull` and `vm start`/`restart` make
-    the same replacement themselves when the file has changed.
+    before [vmlab up](cmd_up): a full `down` already reaps the daemon, and
+    `up`, `pull` and `vm start`/`restart` replace a daemon that outlived a
+    partial stop themselves when the file has changed. Run it from the lab's
+    directory when the lab is not registered (after a full `down` or
+    `lab stop`); by name elsewhere it needs the registration.
   DOC
 
   p <<DOC
@@ -170,13 +184,8 @@ mixed-lab failed     /home/wil/labs/mixed-lab
 SRC
   }
 
-  p "Pick up an edited lab file without re-provisioning:"
-  code sh { source = <<'SRC'
-vmlab lab stop ad-lab
-vmlab lab restart ad-lab
-vmlab up
-SRC
-  }
+  p "Give back the name of a lab registered from a directory you cannot reach, keeping its clones:"
+  code sh { source = "vmlab lab stop ad-lab" }
 
   p "Free the host of a lab you started from another directory:"
   code sh { source = "vmlab lab destroy peer-b" }

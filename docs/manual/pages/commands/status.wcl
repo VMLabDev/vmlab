@@ -27,7 +27,12 @@ page cmd_status {
 
   p <<DOC
     With no lab daemon running the verb prints `lab "<name>": not running`
-    and exits 0. Otherwise it prints up to four sections, each omitted when
+    and exits 0. A full [vmlab down](cmd_down) reaps the daemon, so a lab
+    that is down reports this. When the lab's name is registered from
+    another directory, the lab running under it is that directory's, not
+    this one's, and `status` refuses with the same `conflict` as `up`,
+    naming the other directory (see
+    [The lab name is already registered](apx_troubleshooting)). Otherwise it prints up to four sections, each omitted when
     empty.
   DOC
 
@@ -120,6 +125,7 @@ SRC
     Exit status is 0, including when the lab is not running. A lab directory
     that cannot be found, or a daemon whose status reply this binary cannot
     read (a version mismatch between CLI and daemon), exits 1 (`failed`). A
+    lab name registered from another directory exits 5 (`conflict`). A
     usage error exits 2.
   DOC
 }

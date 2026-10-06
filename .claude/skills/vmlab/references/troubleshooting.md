@@ -152,12 +152,14 @@ Related messages from the same code path are `spawning vmlabd`, when the binary 
 ## The lab name is already registered
 
 ```
-lab `{name}` is already registered from {root} — stop the other lab there or rename this lab
+lab `{name}` is already registered from {root} — run `vmlab down` there (or `vmlab lab stop {name}` from anywhere) to release it, or rename this lab
 ```
 
 A lab's declared name is its host-global runtime identity, not its directory (ADR-0011). The supervisor compares the requested lab root with the registered one before it hands out a socket or starts a daemon, and a different root is a `conflict` in every registry state, so the command exits 5. This is what two clones or worktrees of the same repository hit when both declare `lab "demo"`.
 
-Run `vmlab down` or `vmlab destroy` in the directory the message names, or change the `lab` name in one of the two files. A lab whose directory was deleted while it was registered is released with `vmlab lab restart` from its new location, which re-runs the same check.
+`status`, `down`, `destroy`, `console` and `dev sync` refuse the same way, so the second directory can neither read nor stop the first one's lab.
+
+Release the name with a full `vmlab down` (or `vmlab destroy`) in the directory the message names, or with `vmlab lab stop <name>` from any directory — also the way out when that directory no longer exists. Both stop the machines, keep the clones and reap the daemon. Or change the `lab` name in one of the two files. To carry the provisioned disks across, move `.vmlab/` after the release and before `vmlab up` in the new directory.
 
 ## The eBPF fast path is unavailable
 

@@ -128,7 +128,7 @@ DOC
 
   p <<'DOC'
 The supervisor is also the watchdog over lab daemons. It reaps a daemon on
-`destroy` (a `down` leaves it up, serving status), and if one dies unexpectedly it emits
+a full `down`, `vmlab lab stop` or `destroy`, and if one dies unexpectedly it emits
 `lab.daemon_crashed`, marks the lab failed, and does not restart it; see
 [How vmlab runs a lab](guide_architecture).
 DOC

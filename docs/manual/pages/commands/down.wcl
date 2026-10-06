@@ -61,19 +61,30 @@ page cmd_down {
 
   p <<DOC
     A full `down` (no machine names) also stops the bundled SMB server, so it
-    does not hold its port against the next `up`. A partial `down` keeps
-    shares served for the machines still running. The lab daemon itself stays
-    up; use [vmlab lab stop](cmd_lab) to stop a lab by name from another
+    does not hold its port against the next `up`, and then has the supervisor
+    reap the lab daemon. That releases the lab's name: `vmlab lab list` no
+    longer shows the lab, `vmlab status` says `not running`, and another
+    directory declaring the same `lab` name, such as a second git worktree,
+    can bring it up (see
+    [The lab name is already registered](apx_troubleshooting)). The clones,
+    snapshots and `.vmlab/` stay. The next [vmlab up](cmd_up) starts a fresh
+    daemon, so it reads `vmlab.wcl` as it is then, edits included.
+  DOC
+
+  p <<DOC
+    A partial `down` keeps the daemon and the shares served for the machines
+    still running. A daemon that outlives a partial `down` still holds the
+    lab file as it read it; the next `up` replaces it if the file has changed
+    and nothing is running (see
+    [Editing the lab file between runs](cmd_up)). Use
+    [vmlab lab stop](cmd_lab) to do a full `down` by name from another
     directory, or [vmlab destroy](cmd_destroy) to remove everything.
   DOC
 
   p <<DOC
-    The daemon that stays up still holds the lab file as it read it. That does
-    not leak into the next run: edit `vmlab.wcl` after a `down` and the next
-    [vmlab up](cmd_up) sees the edit, replaces the daemon and boots the
-    machines from the file as it is now. See
-    [Editing the lab file between runs](cmd_up) for what it keeps and what it
-    refuses.
+    A directory whose lab name is registered from another directory is
+    refused with the same `conflict` as `up` (exit 5), so it cannot stop the
+    other directory's machines.
   DOC
 
   h2 "Examples"
@@ -89,6 +100,7 @@ page cmd_down {
   p <<DOC
     Exit status is 0 when every machine in the plan stopped, and 0 when no lab
     daemon was running. A machine that fails to stop, or a lab directory that
-    cannot be found, exits 1 (`failed`). A usage error exits 2.
+    cannot be found, exits 1 (`failed`). A lab name registered from another
+    directory exits 5 (`conflict`). A usage error exits 2.
   DOC
 }

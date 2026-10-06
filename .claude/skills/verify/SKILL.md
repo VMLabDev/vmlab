@@ -34,9 +34,10 @@ reports fails the run.
 ## Gotchas
 
 - `just lab-up` defaults to `examples/mixed-lab`; pass `dir=` for another lab.
-- Stopping a machine keeps labd running (status still served, machines show
-  stopped), and so does `vmlab down`; only `destroy` reaps labd. A later `up`
-  replaces the daemon when `vmlab.wcl` has changed since it loaded it.
+- Stopping a machine (or a partial `down`) keeps labd running (status still
+  served, machines show stopped); a full `vmlab down`, `lab stop` or `destroy`
+  reaps it (status says not running). A later `up` replaces a surviving daemon
+  when `vmlab.wcl` has changed since it loaded it.
 - `vmlab up` returns once machines have started, not once they are ready. Poll
   `vmlab status -v` for `ready=yes` before `exec`/`cp`.
 - Run the binary under the name `vmlab`. Under any other name the CLI starts

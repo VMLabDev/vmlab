@@ -74,12 +74,14 @@ page cmd_up {
 
   p <<DOC
     `up` always runs the lab file as it is on disk now. The lab daemon reads
-    `vmlab.wcl` once, when it starts, and stays up after
-    [vmlab down](cmd_down) to keep serving status, so a daemon left from an
-    earlier run may hold an older version of the file. Before it starts
-    anything, `up` compares what the file declares now with what that daemon
-    loaded. If they differ and none of the lab's machines is running, `up`
-    replaces the daemon with one that reads the file and prints one line:
+    `vmlab.wcl` once, when it starts. A full [vmlab down](cmd_down) reaps it,
+    so `down`, an edit and `up` start a fresh daemon that reads the edit. A
+    daemon also outlives a partial `down`, a `vm stop` of every machine and an
+    `up` that failed, and such a daemon may hold an older version of the
+    file. Before it starts anything, `up` compares what the file declares now
+    with what a running daemon loaded. If they differ and none of the lab's
+    machines is running, `up` replaces the daemon with one that reads the
+    file and prints one line:
   DOC
   code text { source = "lab \"ad-lab\": vmlab.wcl changed — restarting the lab daemon to load it" }
   p <<DOC

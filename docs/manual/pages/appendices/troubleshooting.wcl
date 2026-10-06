@@ -371,7 +371,7 @@ MSG
   DOC
 
   h2 "The lab name is already registered"
-  code text { source = "lab `{name}` is already registered from {root} — stop the other lab there or rename this lab" }
+  code text { source = "lab `{name}` is already registered from {root} — run `vmlab down` there (or `vmlab lab stop {name}` from anywhere) to release it, or rename this lab" }
   p <<DOC
     A [lab](guide_lab_file)'s declared name is its host-global runtime
     identity, not its directory (ADR-0011). The supervisor compares the
@@ -381,10 +381,18 @@ MSG
     worktrees of the same repository hit when both declare `lab "demo"`.
   DOC
   p <<DOC
-    Run `vmlab down` or `vmlab destroy` in the directory the message names,
-    or change the `lab` name in one of the two files. A lab whose directory
-    was deleted while it was registered is released with `vmlab lab restart`
-    from its new location, which re-runs the same check.
+    `status`, `down`, `destroy`, `console` and `dev sync` refuse the same
+    way, so the second directory can neither read nor stop the first
+    directory's lab.
+  DOC
+  p <<DOC
+    Release the name with a full `vmlab down` (or `vmlab destroy`) in the
+    directory the message names, or with `vmlab lab stop <name>` from any
+    directory, which is also the way out when that directory no longer
+    exists. Both stop the lab's machines, keep its clones and have the
+    supervisor reap its daemon. Or change the `lab` name in one of the two
+    files. To carry the provisioned disks across, move `.vmlab/` to the new
+    directory after the release and before `vmlab up` there.
   DOC
 
   h2 "The eBPF fast path is unavailable"

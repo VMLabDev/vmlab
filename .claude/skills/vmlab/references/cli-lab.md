@@ -70,7 +70,8 @@ so a second `up` after a `down` boots the same disks and skips the first-boot
 script.
 
 `up` always runs the lab file as it is on disk now. The lab daemon reads
-`vmlab.wcl` once and stays up after `down`, so before starting anything `up`
+`vmlab.wcl` once. A full `down` reaps it, but it outlives a partial `down`, a
+`vm stop` of every machine and a failed `up`, so before starting anything `up`
 compares a digest of what the file declares (comments do not count) with the one
 the daemon loaded. Changed, with no machine running and no download in flight:
 `up` replaces the daemon and prints `lab "<name>": vmlab.wcl changed — restarting
@@ -181,9 +182,14 @@ ladder and kills immediately; the guest gets no chance to flush, so a qcow2 clon
 can lose unflushed writes.
 
 A full `down` (no machine names) also stops the bundled SMB server, so it does not
-hold its port against the next `up`. A partial `down` keeps shares served for the
-machines still running. The lab daemon itself stays up; use `vmlab lab stop` to
-stop a lab by name from another directory, or `vmlab destroy` to remove everything.
+hold its port against the next `up`, then has the supervisor reap the lab daemon.
+That releases the lab's name: `lab list` drops it, `status` says `not running`, and
+another directory declaring the same `lab` name (a second worktree) can `up` it.
+Clones, snapshots and `.vmlab/` stay; the next `up` starts a fresh daemon that reads
+`vmlab.wcl` as it is then. A partial `down` keeps the daemon and shares for the
+machines still running. `vmlab lab stop` is a full `down` by name from anywhere;
+`vmlab destroy` removes everything. A directory whose lab name is registered from
+another directory is refused with exit 5 (`conflict`), so it cannot stop that lab.
 
 ### Examples
 
@@ -222,7 +228,9 @@ vmlab status [OPTIONS]
 
 ### What it prints
 
-With no lab daemon running the verb prints `lab "<name>": not running` and exits 0.
+With no lab daemon running the verb prints `lab "<name>": not running` and exits 0
+(as after a full `down`). When the lab's name is registered from another directory,
+`status` refuses with the same exit-5 `conflict` as `up`, naming that directory.
 Otherwise it prints up to four sections, each omitted when empty.
 
 #### Machines
@@ -477,7 +485,7 @@ vmlab lab <COMMAND>
 | --- | --- |
 | `list` | List every tracked lab: name, state, and directory. |
 | `info` | Show detailed status (machines and segments) of a running lab. |
-| `stop` | Gracefully stop a running lab; clones retained. |
+| `stop` | Gracefully stop a running lab and release its name; clones retained. |
 | `restart` | Restart a lab's daemon so it re-reads `vmlab.wcl`. |
 | `destroy` | Stop a lab and delete its clones and local state. |
 | `-h`, `--help` | Print help. |
@@ -499,7 +507,8 @@ vmlab lab list [OPTIONS]
 
 Prints one row per registered lab with `NAME`, `STATE` and `DIRECTORY`. The state is
 `running`, `stopped`, `stopping` or `failed`. `stopped` means the daemon is up with no
-machine running, as after `vmlab lab stop`. `failed` means the daemon exited without
+machine running, as after `vm stop` of every machine or a failed `up` (a full `down`
+or `lab stop` unlists the lab). `failed` means the daemon exited without
 being asked to. With no supervisor or an empty registry it prints `no running labs`. Under
 `--json` each entry carries `name`, `root`, `pid` and `state`.
 
@@ -534,11 +543,13 @@ vmlab lab stop [OPTIONS] <LAB>
 | `--force` | Hard kill instead of the graceful ladder. |
 | `-h`, `--help` | Print help. |
 
-Stops every machine in the named lab through the graceful ladder `vmlab down`
-describes, or kills them under `--force`, and keeps the clones. Prints
-`lab "<name>" is down (clones retained)`. A lab with no reachable daemon prints
-`lab "<name>" is not running` and exits 0; unlike `down` this form reaps no orphaned
-processes, since without the registry entry it has no directory to release.
+A full `vmlab down` by name, from any directory: stops every machine through the
+graceful ladder (or kills them under `--force`), keeps the clones, and has the
+supervisor reap the daemon, releasing the lab's name. Prints `lab "<name>" is down
+(clones retained)`. The way to give a name back when the registering directory is
+gone. A registered lab whose daemon does not answer is released (orphans reaped):
+`lab "<name>" is not running (released; any orphaned processes were reaped)`. An
+unknown name prints `lab "<name>" is not running`. Both exit 0.
 
 ### vmlab lab restart
 
@@ -602,12 +613,11 @@ ad-lab    running    /home/wil/labs/ad-lab
 mixed-lab failed     /home/wil/labs/mixed-lab
 ```
 
-Pick up an edited lab file without re-provisioning:
+Give back the name of a lab registered from a directory you cannot reach, keeping its
+clones:
 
 ```sh
 vmlab lab stop ad-lab
-vmlab lab restart ad-lab
-vmlab up
 ```
 
 Free the host of a lab started from another directory:
