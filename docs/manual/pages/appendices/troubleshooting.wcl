@@ -282,6 +282,28 @@ MSG
     refusals ride the ledger, so they apply to a stopped machine too.
   DOC
 
+  h2 "Large reads fail on a Windows virtiofs share"
+  code text { source = <<'MSG'
+WARNING: vm "{machine}": share "{share}" rides virtiofs into a Windows guest; virtio-win 0.1.302's VioFS driver fails large reads there at random ("Error performing inpage operation") and can leave a copy that reported success unreadable; use transport = "smb" (or "auto", which picks SMB on Windows) unless the template carries a VioFS without the fault, such as 0.1.285
+MSG
+  }
+  p <<DOC
+    `vmlab up` prints this for every [share](guide_shares) that rides
+    virtiofs into a Windows guest. Listings and small files work, but
+    reading a file of a few hundred megabytes or more fails in the guest
+    with `Error performing inpage operation`. Some copy tools, `robocopy /J`
+    among them, report success while leaving a copy that cannot be read.
+    The fault is in virtio-win 0.1.302's VioFS driver, and no `virtiofsd`
+    setting avoids it.
+  DOC
+  p <<DOC
+    Set `transport = "smb"` on the share, or remove `transport` so that
+    `auto` picks SMB. An SMB share needs the VM to have a `nic {}`. A
+    template built with VioFS 0.1.285 reads large files correctly over
+    virtiofs. The warning still appears for it, because vmlab cannot see
+    the guest's driver version.
+  DOC
+
   h2 "A port forward was skipped"
   code text { source = <<'MSG'
 {machine}: {forward}: host port {port} is already claimed by {machine}: {forward}

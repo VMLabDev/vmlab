@@ -338,6 +338,22 @@ mod tests {
         assert_eq!(custom.agent_transport, AgentTransport::VirtioSerial);
     }
 
+    /// `transport = "auto"` puts a share on virtiofs only where the profile
+    /// claims the capability, so every shipped Windows profile leaving it
+    /// off is what keeps `auto` on SMB there: virtio-win's VioFS driver
+    /// fails large reads at random (#137). `linux-modern` keeps it on.
+    #[test]
+    fn no_shipped_windows_profile_claims_virtiofs() {
+        let set = ProfileSet::shipped().unwrap();
+        for name in set.names().filter(|n| n.starts_with("windows")) {
+            assert!(
+                !set.get(name).unwrap().virtiofs,
+                "{name} must not claim virtiofs"
+            );
+        }
+        assert!(set.get("linux-modern").unwrap().virtiofs);
+    }
+
     /// `agent_channel` is the bool `agent_transport` replaced: a user
     /// profile still written against it loads, and the keyword wins when
     /// both are present.

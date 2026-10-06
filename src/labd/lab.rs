@@ -1,7 +1,7 @@
 //! Lab runtime: owns the VM instances, network fabric, persisted state, and
 //! the lifecycle verbs (PRD §7). Lives inside the lab daemon.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -914,6 +914,10 @@ impl LabRuntime {
             tracing::warn!("{}: {}", skip.what, skip.why);
             output(format!("WARNING: {}: {}\n", skip.what, skip.why));
         }
+        for warning in &plan.warnings {
+            tracing::warn!("{warning}");
+            output(format!("WARNING: {warning}\n"));
+        }
         // "Why did my share not arrive over virtiofs?" is a support question,
         // and the plan is the only place that knows.
         for placed in plan.placements() {
@@ -1040,6 +1044,15 @@ impl LabRuntime {
             .iter()
             .map(|(name, vm)| (name.clone(), vm.template().resolved.virtiofs))
             .collect();
+        let windows_guests: BTreeSet<String> = self
+            .vms
+            .iter()
+            .filter(|(_, vm)| {
+                crate::smb::guest_os_hint(vm.template().resolved.profile.as_deref())
+                    == crate::smb::OsHint::Windows
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
         let home = std::env::var_os("HOME").map(PathBuf::from);
         share_plan::plan(
             &share_plan::ShareInputs {
@@ -1048,6 +1061,7 @@ impl LabRuntime {
                 home: home.as_deref(),
                 host_virtiofsd: share_plan::HostVirtiofsd::of(self.host_virtiofsd().as_ref()),
                 guest_virtiofs: &guest_virtiofs,
+                windows_guests: &windows_guests,
                 gateways: &gateways,
             },
             &share_plan::BindProbe,
