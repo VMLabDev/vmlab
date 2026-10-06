@@ -91,10 +91,9 @@ HolyC, compiled by the guest, and a command is HolyC source rather than a
 program name, as in `vmlab exec temple -- 'Dir;'`. TempleOS reads no ISO 9660
 and has no network, so the agent cannot ride the bootstrap ISO; a provision
 types it in with `vmlab::templeos_agent_script()`, which also registers it to
-start at every boot. It is **unfinished**: the guest answers the handshake and
-reports `exec`, but capturing a command's output is not working yet, so an
-exec returns empty. The shipped TempleOS template therefore still sets
-`agent = false`.
+start at every boot. The output is what the command printed, with the DolDoc
+markup reduced to the text the screen shows; a compile error or an uncaught
+exception exits 1 with the compiler's or the OS's report as the output.
 DOC
 
   h2 "Overriding with user profiles"

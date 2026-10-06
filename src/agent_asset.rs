@@ -215,6 +215,15 @@ mod tests {
         assert!(ts.ends_with("#include \"~/VmlabAgt\"\nVmlabAgentInstall;\n"));
     }
 
+    /// The agent is typed at a DolDoc shell, where a typed `$` opens a
+    /// command rather than landing as text, so the code it types has none.
+    #[test]
+    fn templeos_agent_types_no_dollar() {
+        let src = include_str!("../guest/agent-templeos/VmlabAgt.HC");
+        let ts = templeos_typescript(src);
+        assert!(!ts.contains('$'), "a `$` would be typed at the shell");
+    }
+
     fn write_asset(dir: &std::path::Path, key: &str, binary: &str, version: Option<&str>) {
         let d = dir.join("agent").join(key);
         fs::create_dir_all(&d).unwrap();

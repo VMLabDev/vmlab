@@ -127,9 +127,9 @@ Module map under `src/`:
 - `guest/agent-templeos` — `VmlabAgt.HC`, the same agent for TempleOS in
   HolyC (the guest compiles it). A command is HolyC source run through
   `ExePrint`; it reaches the guest by being typed at its shell
-  (`vmlab::templeos_agent_script`), TempleOS reading no ISO 9660.
-  **Unfinished**: handshake and ladder verified live, output capture is not
-  (it works in a task with a window, not in the agent's spawned task).
+  (`vmlab::templeos_agent_script`), TempleOS reading no ISO 9660. Output
+  is captured by a hook in the kernel's StdOut key-device chain that claims
+  what the agent's own task prints while a command runs.
 - `agent_asset.rs` + `guest/agent`, `guest/agent-proto` — `vmlab-agent`, the
   in-guest agent on the `vmlab.agent.0` virtio-serial port: interactive
   terminals (PTY/ConPTY), streaming exec, tail, metrics, clipboard, the

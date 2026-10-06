@@ -123,10 +123,10 @@ block. The scripts probe drives A, D, E and F for their source.
 TempleOS is the exception that proves the rule: it reads no ISO 9660 and has no
 network, so nothing can be carried in. Its agent is HolyC, and a provision types
 it at the shell with `vmlab::templeos_agent_script()` (wscript-lab-api.md), which
-also registers it in `~/MakeHome.HC` so it starts at every boot. A command on
-that guest is HolyC source, as in `vmlab exec temple -- 'Dir;'`. It is
-unfinished: the handshake and the feature ladder work, but output capture does
-not, so an exec returns empty and the shipped template keeps `agent = false`.
+also registers it in `~/MakeHome.HC.Z` so it starts at every boot. A command on
+that guest is HolyC source, as in `vmlab exec temple -- 'Dir;'`. The output is
+what the command printed, as plain text; a compile error or an uncaught
+exception exits 1 with the compiler's or the OS's report.
 
 ### Versions
 
