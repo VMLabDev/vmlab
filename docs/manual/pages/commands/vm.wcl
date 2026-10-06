@@ -75,6 +75,15 @@ page cmd_vm {
     `vm.woken` with `cause = start`. Nothing is printed on success.
   DOC
 
+  p <<DOC
+    The VM is built from the lab file as it is on disk now. If `vmlab.wcl`
+    has changed since the lab daemon loaded it, the verb replaces the daemon
+    first, as [vmlab up](cmd_up) does, and refuses when another machine in
+    the lab is still running. A VM whose clone was made from a different
+    template than the one the file now names refuses to boot; see
+    [Editing the lab file between runs](cmd_up).
+  DOC
+
   h2 "vmlab vm ip"
 
   code sh { source = "vmlab vm ip [OPTIONS] <VM>" }
@@ -136,6 +145,13 @@ page cmd_vm {
     that target the VM are re-installed by the daemon when it gets a new
     lease. A VM that does not settle in time fails with `<name> did not stop
     for restart`.
+  DOC
+
+  p <<DOC
+    Restart applies the lab file the same way `vm start` does. A running VM
+    is a machine a new daemon cannot take over, so restarting it after an
+    edit to `vmlab.wcl` refuses; run `vmlab down` and then `vmlab up` (or
+    `vm start`) to boot it with the edit.
   DOC
 
   h2 "vmlab vm destroy"

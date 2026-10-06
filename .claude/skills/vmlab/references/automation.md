@@ -172,7 +172,7 @@ full disk does not flood the stream. The lab daemon's copy is the one an
 `on "host.disk_low"` handler sees.
 
 The supervisor is also the watchdog over lab daemons. It reaps a daemon on
-`down` or `destroy`, and if one dies unexpectedly it emits `lab.daemon_crashed`,
+`destroy` (a `down` leaves it up, serving status), and if one dies unexpectedly it emits `lab.daemon_crashed`,
 marks the lab failed, and does not restart it.
 
 ### Logs

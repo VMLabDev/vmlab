@@ -70,6 +70,57 @@ page cmd_up {
     same disks and skips the first-boot script.
   DOC
 
+  h2 "Editing the lab file between runs"
+
+  p <<DOC
+    `up` always runs the lab file as it is on disk now. The lab daemon reads
+    `vmlab.wcl` once, when it starts, and stays up after
+    [vmlab down](cmd_down) to keep serving status, so a daemon left from an
+    earlier run may hold an older version of the file. Before it starts
+    anything, `up` compares what the file declares now with what that daemon
+    loaded. If they differ and none of the lab's machines is running, `up`
+    replaces the daemon with one that reads the file and prints one line:
+  DOC
+  code text { source = "lab \"ad-lab\": vmlab.wcl changed — restarting the lab daemon to load it" }
+  p <<DOC
+    Only what the file declares counts: an edit to a comment or to blank
+    lines does not replace the daemon. Replacing the daemon keeps everything
+    on disk: clones, snapshots, `.vmlab/state.json` (generated MACs and image
+    pins) and the workspace ledgers. It is the same replacement
+    [vmlab lab restart](cmd_lab) makes. [vmlab pull](cmd_pull),
+    `vmlab vm start`, `vmlab vm restart` and their [container](cmd_container)
+    spellings check the file the same way, because each builds a machine from
+    the daemon's configuration.
+  DOC
+  p <<DOC
+    A new daemon cannot take over a machine the old one is running, nor a
+    download the old one is doing. When the file has changed and any machine
+    in the lab is running, starting, stopping or suspended, `up` refuses,
+    names those machines, and changes nothing:
+  DOC
+  code text { source = "lab \"ad-lab\": vmlab.wcl has changed since the lab daemon loaded it, and dc01 is still running — the daemon cannot load the new file without stopping it. Run `vmlab down`, then this command again, to apply the edit (or undo the edit)" }
+  p <<DOC
+    A download still in flight refuses the same way and names the artefact;
+    wait for it to finish, or interrupt the `vmlab pull` that started it.
+  DOC
+  p <<DOC
+    Most edits simply take effect on the next boot of the machine. One kind
+    cannot: a VM's clone is an overlay on the template it was made from, so it
+    cannot move to a different `template`. vmlab records the template
+    reference a clone was made from in `.vmlab/vms/<vm>/clone-source`. When
+    the lab file names a different template while that clone still exists,
+    `up` refuses before downloading or starting anything and keeps the clone:
+  DOC
+  code text { source = "vm \"web\": its disk is a clone of \"x86_64/alpine-3.23\", but vmlab.wcl now declares \"x86_64/debian-13\" — a clone cannot move to another template. Run `vmlab vm destroy web` (or `vmlab destroy`) to discard the disk and recreate it from \"x86_64/debian-13\", or put the template line back" }
+  p <<DOC
+    The reference is compared as written. An unpinned `<arch>/<name>` keeps
+    its clone when a newer version of the same template is built, while
+    pinning a different `@<version>` counts as a different template. A
+    container's `image` line is different: changing it drops the image pin,
+    and the next `up` pulls the new image (see
+    [Containers](guide_containers)).
+  DOC
+
   h2 "Agent refresh"
 
   p <<DOC
@@ -151,8 +202,10 @@ SRC
   p <<DOC
     Exit status is 0 when every target machine started and every provision
     step completed. A lab file that fails validation, a lab directory that
-    cannot be found, a supervisor that does not come up, or a boot or provision
-    failure all exit 1, the `failed` code from the
+    cannot be found, a supervisor that does not come up, a boot or provision
+    failure, an edit that cannot be applied while machines are running, or a
+    VM whose template changed under its clone all exit 1, the `failed` code
+    from the
     [error table](ref_protocol). Exit 5 (`conflict`) means the supervisor
     already tracks a lab with this name from a different directory; stop that
     lab or rename this one. A usage error the argument parser rejects exits 2.

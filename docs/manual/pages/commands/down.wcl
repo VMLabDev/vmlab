@@ -67,6 +67,15 @@ page cmd_down {
     directory, or [vmlab destroy](cmd_destroy) to remove everything.
   DOC
 
+  p <<DOC
+    The daemon that stays up still holds the lab file as it read it. That does
+    not leak into the next run: edit `vmlab.wcl` after a `down` and the next
+    [vmlab up](cmd_up) sees the edit, replaces the daemon and boots the
+    machines from the file as it is now. See
+    [Editing the lab file between runs](cmd_up) for what it keeps and what it
+    refuses.
+  DOC
+
   h2 "Examples"
 
   p "Stop the whole lab, keeping clones:"

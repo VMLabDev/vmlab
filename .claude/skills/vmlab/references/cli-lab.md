@@ -69,6 +69,21 @@ alone. Clones persist across `vmlab down` and are only removed by `vmlab destroy
 so a second `up` after a `down` boots the same disks and skips the first-boot
 script.
 
+`up` always runs the lab file as it is on disk now. The lab daemon reads
+`vmlab.wcl` once and stays up after `down`, so before starting anything `up`
+compares a digest of what the file declares (comments do not count) with the one
+the daemon loaded. Changed, with no machine running and no download in flight:
+`up` replaces the daemon and prints `lab "<name>": vmlab.wcl changed — restarting
+the lab daemon to load it`. Clones, snapshots, `.vmlab/state.json` and workspace
+ledgers persist. Changed while a machine runs (or starts, stops, is suspended) or
+a download is in flight: `up` refuses, naming them; run `vmlab down` first.
+`pull`, `vm start`/`restart` and `container start`/`restart` follow the same
+rule. A VM whose clone was made from a different `template` than the file now
+names (recorded in `.vmlab/vms/<vm>/clone-source`, compared as written, so an
+unpinned reference survives newer builds) is refused before anything downloads
+or boots: `vmlab vm destroy <vm>` (or `vmlab destroy`) recreates it, or put the
+template line back. A container's edited `image` line just drops its pin.
+
 Note: a first-boot provision that errors, or that takes longer than 30 minutes,
 fails `up` but does not stop the machine, so a console or shell can be opened to
 inspect it.
@@ -539,8 +554,9 @@ vmlab lab restart [OPTIONS] <LAB>
 
 Replaces the lab's daemon so it re-reads `vmlab.wcl`. This is not `down` followed by
 `up`: that stops every machine and re-runs provisioning, whereas this replaces only the
-daemon. It is the way to pick up an edit to the lab file (see lab-file.md), and the way
-to recover a daemon whose lab file no longer loads.
+daemon. It picks up an edit to the lab file (see lab-file.md) without starting anything,
+and recovers a daemon whose lab file no longer loads. It is not needed before `up`, `pull`
+or `vm start`/`restart`, which make the same replacement when the file has changed.
 
 The lab must already be stopped. A fresh daemon cannot re-adopt machines the old one was
 running, and the old daemon's own shutdown stops them, so a lab with machines still

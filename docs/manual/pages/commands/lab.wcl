@@ -112,9 +112,11 @@ page cmd_lab {
   p <<DOC
     Replaces the lab's daemon so it re-reads `vmlab.wcl`. This is not
     `down` followed by `up`: that stops every machine and re-runs
-    provisioning, whereas this replaces only the daemon. It is the way to
-    pick up an edit to the [lab file](guide_lab_file), and the way to recover
-    a daemon whose lab file no longer loads.
+    provisioning, whereas this replaces only the daemon. It picks up an edit
+    to the [lab file](guide_lab_file) without starting anything, and it
+    recovers a daemon whose lab file no longer loads. You do not need it
+    before [vmlab up](cmd_up): `up`, `pull` and `vm start`/`restart` make
+    the same replacement themselves when the file has changed.
   DOC
 
   p <<DOC

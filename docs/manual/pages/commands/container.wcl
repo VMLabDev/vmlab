@@ -59,6 +59,13 @@ page cmd_container {
     success.
   DOC
 
+  p <<DOC
+    The container is built from the lab file as it is on disk now: if
+    `vmlab.wcl` has changed since the lab daemon loaded it, the daemon is
+    replaced first, and the verb refuses while another machine in the lab
+    still runs. See [Editing the lab file between runs](cmd_up).
+  DOC
+
   h2 "vmlab container stop"
 
   code sh { source = "vmlab container stop [OPTIONS] <CONTAINER>" }
@@ -96,6 +103,12 @@ page cmd_container {
     Stops the container gracefully, waits up to 60 seconds for it to settle,
     and boots it again. Its scratch overlay is kept, so files written since
     the last `destroy` survive. Nothing is printed on success.
+  DOC
+
+  p <<DOC
+    Like `vmlab vm restart`, it refuses after an edit to `vmlab.wcl`, since a
+    new daemon cannot take over a running container; `vmlab down` and
+    `vmlab up` apply the edit.
   DOC
 
   h2 "vmlab container destroy"

@@ -36,6 +36,13 @@ page cmd_pull {
   DOC
 
   p <<DOC
+    `pull` downloads what the lab file declares now. When `vmlab.wcl` has
+    changed since the lab daemon loaded it, the verb replaces the daemon
+    first, exactly as [vmlab up](cmd_up) does, so an edited `template` or
+    `image` line is what gets fetched.
+  DOC
+
+  p <<DOC
     Pressing Ctrl-C cancels the downloads rather than abandoning them. The
     daemon outlives this process, so an interrupt that simply walked away
     would leave transfers running with nobody watching. The cancel only
