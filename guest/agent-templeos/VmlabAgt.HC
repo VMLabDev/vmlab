@@ -3,9 +3,9 @@
 // `agent_transport = "isa-serial"` profile wires to the host socket.
 //
 // One feature, `exec`: a command is HolyC source, compiled and run by the
-// OS's own compiler. Output is captured by marking the task document's tail
-// before the run and reading back the entries the run appended — printing
-// goes into that document, and there is no redirection hook to borrow. An
+// OS's own compiler. Output is captured by a hook in the kernel's StdOut
+// chain that claims whatever the agent's task prints while a command runs,
+// with the DolDoc markup stripped to the text the screen would show. An
 // exception, including a compile error, becomes exit code 1 with the OS's
 // own report in the output. Everything else the wire can ask for is refused
 // by name, so the host's feature ladder degrades truthfully.
@@ -373,6 +373,102 @@ U0 VaSendOsInfo()
   VaEnd;
 }
 
+// ---- capture ---------------------------------------------------------
+//
+// Every Print goes through PutS, which offers the text to each StdOut hook
+// in the kernel's key-device chain in priority order until one claims it.
+// The agent adds one ahead of the DolDoc hook that writes into a task's
+// document: while a command runs, it takes whatever the agent's own task
+// prints and stops it there, and passes everything else on untouched. It
+// needs no window: the agent's spawned task has none, and reading back a
+// task's document yields nothing there.
+
+#define VA_KD_PRIO  0x20000000
+#define VA_DOLLAR   0x24
+
+CTask *va_task;    // the agent's task; output from any other passes through
+Bool va_capturing;
+U8 *va_cap;
+I64 va_caplen;
+
+U0 VaCapPut(U8 *s,I64 n)
+{
+  if (n>VA_MAX_PAY-1-va_caplen) n=VA_MAX_PAY-1-va_caplen;
+  if (n>0) {
+    MemCpy(va_cap+va_caplen,s,n);
+    va_caplen+=n;
+  }
+}
+
+Bool VaKdPutKey(I64 ch,I64 sc)
+{
+  U8 c;
+  no_warn sc;
+  if (!va_capturing || Fs!=va_task) return FALSE;
+  if (ch) { c=ch; VaCapPut(&c,1); }
+  return TRUE;
+}
+
+Bool VaKdPutS(U8 *st)
+{
+  if (!va_capturing || Fs!=va_task) return FALSE;
+  VaCapPut(st,StrLen(st));
+  return TRUE;
+}
+
+// Printed text carries DolDoc commands (`$FG,4$`, `$LK,"name",A="..."$`):
+// keep a command's tag, the text the screen shows, and drop the rest. The
+// tag is the first argument when that is quoted, else a `T="..."` one.
+// `$$` is a literal dollar. The dollar is written as its code, VA_DOLLAR:
+// the agent arrives typed at a DolDoc shell, where a typed dollar opens a
+// command.
+I64 VaDolTag(U8 *b,I64 i,I64 j,I64 o)
+{
+  I64 q,t,arg=0;
+  Bool quoted=FALSE;
+  for (q=i;q<j;q++) {
+    if (b[q]=='"') {
+      quoted=!quoted;
+    } else if (b[q]==',' && !quoted) {
+      arg++;
+      t=-1;
+      if (q+1<j && b[q+1]=='"' && arg==1)
+        t=q+2;
+      else if (q+3<j && b[q+1]=='T' && b[q+2]=='=' && b[q+3]=='"')
+        t=q+4;
+      if (t>=0) {
+        while (t<j && b[t]!='"') {
+          if (b[t]=='\\' && t+1<j) t++;
+          b[o++]=b[t++];
+        }
+        return o;
+      }
+    }
+  }
+  return o;
+}
+
+// Strip b[0..n) to plain text in place; returns the new length.
+I64 VaDolStrip(U8 *b,I64 n)
+{
+  I64 i=0,o=0,j;
+  while (i<n) {
+    if (b[i]!=VA_DOLLAR) {
+      b[o++]=b[i++];
+    } else if (i+1<n && b[i+1]==VA_DOLLAR) {
+      b[o++]=VA_DOLLAR;
+      i+=2;
+    } else {
+      j=i+1;
+      while (j<n && b[j]!=VA_DOLLAR) j++;
+      o=VaDolTag(b,i+1,j,o);
+      i=j+1;
+    }
+  }
+  b[o]=0;
+  return o;
+}
+
 // ---- exec ------------------------------------------------------------
 
 I64 va_credit;   // guest->host credit on the one live channel
@@ -415,42 +511,11 @@ U0 VaSendText(I64 chan,U8 *buf,I64 len)
   }
 }
 
-// Read back what a run appended to the task's document: entries are text
-// (their `tag`) and newlines, from the entry after `mark` to the end.
-I64 VaCapture(CDoc *d,CDocEntry *mark,U8 *out,I64 cap)
-{
-  CDocEntry *e;
-  I64 n=0,l;
-  out[0]=0;
-  if (!d) return 0;
-  // A document that has never been printed to has no tail, so the mark is
-  // NULL and everything in it is new.
-  if (mark) e=mark->next;
-  else e=d->head.next;
-  while (e && e!=&d->head && n<cap-1) {
-    if (e->type_u8==DOCT_NEW_LINE) {
-      out[n++]='\n';
-    } else if (e->type_u8==DOCT_TAB) {
-      out[n++]='\t';
-    } else if (e->tag) {
-      l=StrLen(e->tag);
-      if (n+l>=cap-1) l=cap-1-n;
-      MemCpy(out+n,e->tag,l);
-      n+=l;
-    }
-    e=e->next;
-  }
-  out[n]=0;
-  return n;
-}
-
 U0 VaExec(I64 id)
 {
   I64 argv_tok,t,i,n=0,l;
   U8 *src=MAlloc(VA_MAX_PAY);
   U8 *arg=MAlloc(VA_MAX_PAY);
-  U8 *out;
-  CDoc *cap,*old_put,*old_disp;
   I64 code=0,outlen;
 
   if (VaGet(0,"logon")>=0 && va_tok[VaGet(0,"logon")].type==JT_OBJ) {
@@ -483,14 +548,13 @@ U0 VaExec(I64 id)
   if (n && src[n-1]!=';' && src[n-1]!='}') { src[n++]=';'; src[n]=0; }
   VaSendSimple("opened",id);
 
-  // Run with a document of our own in place, then read it back. Printing
-  // follows the task's `display_doc`; `put_doc` is its double-buffer pair
-  // and both are swapped so neither route escapes to the guest's screen.
-  cap=DocNew;
-  old_put=Fs->put_doc;
-  old_disp=Fs->display_doc;
-  Fs->put_doc=cap;
-  Fs->display_doc=cap;
+  // Run with the StdOut hook claiming this task's output. A compile error
+  // is caught inside ExePrint, which prints the compiler's report and
+  // leaves the exception's kind behind; anything else that escapes is
+  // caught here and reported the same way.
+  va_caplen=0;
+  Fs->except_ch=0;
+  va_capturing=TRUE;
   try {
     ExePrint("%s",src);
   } catch {
@@ -498,16 +562,10 @@ U0 VaExec(I64 id)
     PutExcept;
     code=1;
   }
-  Fs->put_doc=old_put;
-  Fs->display_doc=old_disp;
-  out=MAlloc(VA_MAX_PAY);
-  outlen=VaCapture(cap,NULL,out,VA_MAX_PAY);
-  DocDel(cap);
-  // A compile error is reported by the compiler rather than thrown past
-  // ExePrint, so the captured text is the only signal there is.
-  if (StrFind("ERROR:",out)) code=1;
-  VaSendText(id,out,outlen);
-  Free(out);
+  va_capturing=FALSE;
+  if (Fs->except_ch=='Compiler') code=1;
+  outlen=VaDolStrip(va_cap,va_caplen);
+  VaSendText(id,va_cap,outlen);
   if (va_credit>=0) {
     VaSendSimple("eof",id);
     VaBegin("exited");
@@ -584,6 +642,9 @@ U0 VmlabAgentTask(U8 *data)
   no_warn data;
   va_pay=MAlloc(VA_MAX_PAY+1);
   va_out=MAlloc(VA_MAX_PAY);
+  va_cap=MAlloc(VA_MAX_PAY);
+  va_task=Fs;
+  KeyDevAdd(&VaKdPutKey,&VaKdPutS,VA_KD_PRIO);
   VaUartInit;
   while (TRUE) {
     VaReadFrame;
@@ -598,22 +659,23 @@ U0 VmlabAgentStart()
   Spawn(&VmlabAgentTask,NULL,"VmlabAgent");
 }
 
-// Register the agent to start at every boot — ~/MakeHome.HC is what
-// StartOS.HC includes last — and start it now. Idempotent: a rebuild that
-// already registered it changes nothing.
+// Register the agent to start at every boot — StartOS.HC ends with
+// `#include "~/MakeHome"`, which resolves to ~/MakeHome.HC.Z — and start it
+// now. Idempotent: a rebuild that already registered it changes nothing.
 U0 VmlabAgentInstall()
 {
   I64 sz;
-  U8 *old=FileRead("~/MakeHome.HC",&sz),*nw;
+  U8 *old=FileRead("~/MakeHome.HC.Z",&sz),*nw;
   if (!old) { old=StrNew(""); sz=0; }
   if (!StrFind("VmlabAgt",old)) {
     nw=MAlloc(sz+128);
     MemCpy(nw,old,sz);
     nw[sz]=0;
     CatPrint(nw,"\n#include \"~/VmlabAgt\"\nVmlabAgentStart;\n");
-    // The uncompressed name: `MakeHome.HC.Z` is compressed on disk, and
-    // plain text written under it would not read back.
-    FileWrite("~/MakeHome.HC",nw,StrLen(nw));
+    // The `.Z` name is what the include finds first; FileWrite compresses
+    // under it, as FileRead expands it. A plain ~/MakeHome.HC beside it
+    // would never be included.
+    FileWrite("~/MakeHome.HC.Z",nw,StrLen(nw));
     Free(nw);
   }
   Free(old);

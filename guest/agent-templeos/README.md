@@ -9,29 +9,23 @@ source to `guest/dist/agent/templeos/`).
 
 ## Status
 
-**Unfinished.** Verified live on the sealed `templeos` template: the agent
-compiles in the guest, installs, registers itself for every boot, answers the
-handshake over COM1, reports `exec` as its only feature, and the host's ladder
-degrades correctly (`vmlab machine capabilities` shows `agent exec`;
-`vmlab shell` and `vmlab cp` refuse by name).
-
-**Capturing a command's output does not work yet.** TempleOS has no
-redirection hook — no assignable `put_s`, no `user_put_s` that fires, and
-`Doc2PlainText` converts one entry rather than a document — so output has to
-be read back from the document a task prints into. That works in a task with a
-window (verified in the shell: swap both `Fs->put_doc` and `Fs->display_doc`
-to a `DocNew`, run, walk the entries), and yields nothing in the agent's own
-spawned task, which appears to have no such document. Until that is settled an
-exec returns exit 0 with empty output, so the shipped TempleOS template keeps
-`agent = false`.
+Verified live on a `templeos` clone: the agent compiles in the guest,
+installs, starts again after a reboot, answers the handshake over COM1,
+reports `exec` as its only feature, and returns a command's output. `vmlab
+exec temple -- 'Dir;'` prints the listing; a compile error exits 1 with the
+compiler's report. `vmlab shell` and `vmlab cp` refuse by name.
 
 ## What it does
 
 One feature, `exec`. A command is HolyC source: the argv joined by spaces,
-compiled and run by `ExePrint` with the task's output document swapped for a
-capture document, whose text becomes the channel's stdout. An exception,
-including a compile error, is caught and reported as exit code 1 with the OS's
-own message in the output. `os_info`, `net_info` (empty; TempleOS has no
+compiled and run by `ExePrint`, and what it prints becomes the channel's
+stdout. TempleOS offers no per-task redirection, so the agent adds a hook to
+the kernel's StdOut key-device chain (`KeyDevAdd`) ahead of the DolDoc one:
+while a command runs, the hook claims everything the agent's own task prints
+and lets every other task's output through. DolDoc markup in the captured
+text is reduced to the text the screen would show. An exception, including a
+compile error, is reported as exit code 1 with the OS's own message in the
+output. `os_info`, `net_info` (empty; TempleOS has no
 network by design) and `shutdown` are answered — power-off is a write to the
 PIIX4 sleep register, reboot is `Reboot` — and every other open is refused by
 name, so `vmlab shell` and `vmlab cp` say what is missing.
@@ -58,9 +52,13 @@ vm.type_text_paced(vmlab::templeos_agent_script(), 40)
 
 Roughly twelve thousand keystrokes; at 40 ms each, about eight minutes, once
 per template build. `VmlabAgentInstall` appends the include and the spawn to
-`~/MakeHome.HC`, which `StartOS.HC` includes last at every boot, and starts
+`~/MakeHome.HC.Z`, which `StartOS.HC` includes last at every boot, and starts
 the agent immediately, so the build verifies the handshake without a reboot.
 
 Input must be the QMP transport (the profile's default). Over VNC, TempleOS
 sees every shift a keystroke late, so shifted characters land on the wrong
 key.
+
+The code lines carry no `$`: typed at the DolDoc shell, a dollar opens a
+command instead of landing as text, so the source writes it as `0x24`. Comment
+lines are not typed and may use it. `agent_asset.rs` has a test for this.

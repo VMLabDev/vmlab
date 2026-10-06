@@ -939,7 +939,7 @@ TempleOS reads no ISO 9660 and has no network, so the bootstrap ISO cannot carry
 the agent in and the screen is the only way. This returns the HolyC source as
 `A("…")` statements that accumulate in a buffer, then the `FileWrite` to
 `~/VmlabAgt.HC`, the `#include`, and `VmlabAgentInstall` — which appends the
-include and the spawn to `~/MakeHome.HC`, so the agent starts at every boot, and
+include and the spawn to `~/MakeHome.HC.Z`, so the agent starts at every boot, and
 starts it now so a build verifies the handshake without a reboot. It fails when
 the agent asset is missing, naming the searched paths.
 
