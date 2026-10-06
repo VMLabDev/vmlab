@@ -40,6 +40,19 @@ snapshot's migration stream via QEMU's device-state transfer. The cost is that a
 VM carrying a virtiofs share has its RAM moved to a shared memory backend, and
 one daemon per share.
 
+vmlab reads the `virtiofsd` binary's `--help` once and passes only the flags it
+lists, so any Rust `virtiofsd` serves a share (Ubuntu 24.04 ships 1.10.0). Two
+features depend on the release:
+
+- Online snapshot capture and restore of a machine with virtiofs devices need
+  1.11.0 (`--migration-mode`). On an older one they refuse and name the
+  release. Offline snapshots still work.
+- A read-only share needs 1.13.0 (`--readonly`). On an older one an `auto`
+  read-only share rides SMB, and a `virtiofs` one fails `vmlab validate`.
+
+A binary without the basic flags (QEMU's retired C `virtiofsd`) fails
+`vmlab validate` for every `virtiofs` share.
+
 **SMB** is the universal fallback. The lab daemon serves each share at the
 segment gateway as `\\<gateway>\<share>`, so a Windows guest needs nothing extra
 and a Linux guest needs only `cifs-utils`. An XP-era guest can be served too:

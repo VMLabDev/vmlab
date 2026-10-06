@@ -265,6 +265,16 @@ fn container(
     decl: &str,
     script: Script,
 ) -> (Arc<ContainerInstance>, Arc<FakeHypervisor>) {
+    container_with_volumes(dirs, decl, script, Vec::new())
+}
+
+/// [`container`] with resolved volumes: (share name, host dir, read-only).
+fn container_with_volumes(
+    dirs: &Dirs,
+    decl: &str,
+    script: Script,
+    volumes: Vec<(String, PathBuf, bool)>,
+) -> (Arc<ContainerInstance>, Arc<FakeHypervisor>) {
     let cfg = testing::container(decl);
     let profiles = ProfileSet::shipped().expect("shipped profiles");
     let resolved = crate::qemu::resolve_container(&cfg, "x86_64", &profiles).expect("resolve");
@@ -299,7 +309,7 @@ fn container(
         Vec::new(),
         Vec::new(),
         Some(image),
-        Vec::new(),
+        volumes,
     );
     let hv = FakeHypervisor::new(script);
     ctr.set_hypervisor(hv.clone());
@@ -522,6 +532,116 @@ async fn a_virtiofsd_that_dies_fails_the_start() {
         hv.live_helpers().await.is_empty(),
         "a failed start leaves no daemons behind"
     );
+}
+
+/// A virtiofsd older than `--migration-mode` (Ubuntu 24.04 ships 1.10.0)
+/// still serves a share: the VM starts, and only an online snapshot — which
+/// would need the daemon's state — is refused, naming the release that has
+/// it. The same VM on a current virtiofsd gets past the check to QMP, which
+/// the fake does not answer.
+#[tokio::test]
+async fn an_old_virtiofsd_starts_the_vm_and_refuses_online_snapshots() {
+    const SHARED: &str = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB
+             share "data" { host = "./data" guest = "/mnt/data" transport = "virtiofs" } }"#;
+    for (old, refused) in [(true, true), (false, false)] {
+        let dirs = Dirs::new();
+        let (vm, _hv) = vm(
+            &dirs,
+            SHARED,
+            Script {
+                old_virtiofsd: old,
+                ..Script::healthy()
+            },
+        );
+        let (cbs, _observed) = callbacks();
+        start_vm(&vm, cbs)
+            .await
+            .expect("an old virtiofsd still starts");
+
+        let m: Arc<dyn Machine> = vm.clone();
+        let err = format!("{:#}", m.snapshot("s1").await.expect_err("no QMP"));
+        assert_eq!(
+            err.contains("virtiofsd 1.11.0 or later"),
+            refused,
+            "old={old}: {err}"
+        );
+        if refused {
+            assert!(
+                err.contains("virtiofsd 1.10.0"),
+                "names what it found: {err}"
+            );
+        }
+        vm.stop(true).await.expect("stop");
+    }
+}
+
+/// An online restore is refused before anything moves — a stopped VM is not
+/// booted only to have the load fail after its disks were rewound.
+#[tokio::test]
+async fn an_old_virtiofsd_refuses_an_online_restore_without_booting() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB
+             share "data" { host = "./data" guest = "/mnt/data" transport = "virtiofs" } }"#,
+        Script {
+            old_virtiofsd: true,
+            ..Script::healthy()
+        },
+    );
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = vm.clone();
+    let err = m.restore(lab, "s1", true).await.expect_err("refused");
+    assert!(format!("{err:#}").contains("virtiofsd 1.11.0"), "{err:#}");
+    assert_eq!(vm.state().await, PowerState::Stopped, "never booted");
+    assert!(hv.live_helpers().await.is_empty());
+}
+
+/// A read-only share on a virtiofsd with no `--readonly` fails the start
+/// naming the release that added it, instead of exporting it writable.
+#[tokio::test]
+async fn a_readonly_share_on_a_virtiofsd_without_readonly_fails_the_start() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB
+             share "data" { host = "./data" guest = "/mnt/data" transport = "virtiofs" readonly = true } }"#,
+        Script {
+            old_virtiofsd: true,
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    let err = format!("{:#}", start_vm(&vm, cbs).await.expect_err("refused"));
+    assert!(err.contains("--readonly"), "{err}");
+    assert!(err.contains("virtiofsd 1.13.0"), "{err}");
+    assert_eq!(vm.state().await, PowerState::Stopped);
+    assert!(hv.live_helpers().await.is_empty());
+}
+
+/// A container's virtiofs volumes are held to the same rule as a VM's shares.
+#[tokio::test]
+async fn an_old_virtiofsd_refuses_a_containers_online_snapshot() {
+    let dirs = Dirs::new();
+    let data = dirs.root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let (ctr, _hv) = container_with_volumes(
+        &dirs,
+        WORKLOAD,
+        Script {
+            old_virtiofsd: true,
+            ..Script::healthy()
+        },
+        vec![("data".into(), data, false)],
+    );
+    let (cbs, _observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("start");
+
+    let m: Arc<dyn Machine> = ctr.clone();
+    let err = m.snapshot("s1").await.expect_err("refused");
+    assert!(format!("{err:#}").contains("virtiofsd 1.11.0"), "{err:#}");
+    ctr.stop(true).await.expect("stop");
 }
 
 // ---- the VM exit monitor ----------------------------------------------------

@@ -108,6 +108,7 @@ FEATURES: dict[str, str] = {
     "share.smb": "`share` over SMB",
     "share.readonly": "`share { readonly = true }`",
     "share.smb1": "SMB1 shares for legacy guests",
+    "share.virtiofs.old-virtiofsd": "a virtiofs share on a virtiofsd without `--migration-mode` (Ubuntu 24.04's 1.10.0)",
     # -- containers --------------------------------------------------------
     "container.up": "an OCI container runs as a micro-VM",
     "container.idle": "`mode = :idle`",
@@ -125,6 +126,7 @@ FEATURES: dict[str, str] = {
     "snapshot.lab": "`vmlab snapshot create` for the whole lab",
     "snapshot.list-delete": "`vmlab snapshot list` and `delete`",
     "snapshot.container": "snapshots of a container",
+    "snapshot.virtiofs.old-virtiofsd": "online snapshots refused, offline ones taken, on a virtiofsd too old to migrate",
     # -- scripting and events ----------------------------------------------
     "script.run": "`vmlab script` runs a wscript against the lab",
     "script.provision": "`provision` scripts run on `up`",

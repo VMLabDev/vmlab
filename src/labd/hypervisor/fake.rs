@@ -128,6 +128,10 @@ pub struct Script {
     pub virtiofsd_fails: Option<String>,
     /// This host has no virtiofsd, so shares and volumes fall back to SMB.
     pub no_virtiofsd: bool,
+    /// This host's virtiofsd predates `--migration-mode` and `--readonly`
+    /// (Ubuntu 24.04's 1.10.0): it serves shares, but cannot carry their
+    /// state through a snapshot or export one read-only.
+    pub old_virtiofsd: bool,
     /// No guest boot asset is installed for this architecture.
     pub guest_asset_missing: bool,
     /// The guest runs a vmlab-agent that answers the handshake.
@@ -216,8 +220,14 @@ impl Hypervisor for FakeHypervisor {
         Ok(self.helper(format!("swtpm:{machine}")).await)
     }
 
-    fn virtiofsd_available(&self) -> bool {
-        !self.script.no_virtiofsd
+    fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
+        let current = !self.script.old_virtiofsd;
+        (!self.script.no_virtiofsd).then(|| crate::qemu::virtiofsd::Virtiofsd {
+            path: PathBuf::from("/fake/virtiofsd"),
+            version: Some(if current { "1.14.0" } else { "1.10.0" }.to_string()),
+            migration: current,
+            readonly: current,
+        })
     }
 
     async fn start_virtiofsd(

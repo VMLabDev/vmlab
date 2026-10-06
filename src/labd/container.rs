@@ -332,6 +332,10 @@ pub struct ContainerInstance {
     /// spawned) rather than CIFS mounts. Decided per start attempt;
     /// `spec_for_guest` tags the volumes accordingly.
     virtiofs_active: AtomicBool,
+    /// Why this run cannot be snapshotted online: its volumes are served by
+    /// a virtiofsd that cannot carry their state. Recorded as the daemons
+    /// start. Std lock: never held across an await.
+    snapshot_refusal: std::sync::Mutex<Option<String>>,
 
     state: RwLock<PowerState>,
     /// The bundled vmlab-agent answers its handshake.
@@ -388,6 +392,7 @@ impl ContainerInstance {
             smb: RwLock::new(None),
             virtiofsd: Mutex::new(Vec::new()),
             virtiofs_active: AtomicBool::new(false),
+            snapshot_refusal: std::sync::Mutex::new(None),
             state: RwLock::new(PowerState::Stopped),
             agent_up: RwLock::new(false),
             started: RwLock::new(false),
@@ -568,9 +573,35 @@ impl ContainerInstance {
         }
     }
 
+    /// Whether this container's volumes ride virtiofs on a host with `vfsd`
+    /// (none when it has no volumes).
+    fn volumes_on_virtiofs(&self, vfsd: Option<&crate::qemu::virtiofsd::Virtiofsd>) -> bool {
+        use crate::labd::share_plan::{HostVirtiofsd, Transport, container_volume_transport};
+        let any_readonly = self.volumes.iter().any(|(_, _, ro)| *ro);
+        !self.volumes.is_empty()
+            && container_volume_transport(HostVirtiofsd::of(vfsd), any_readonly)
+                == Transport::Virtiofs
+    }
+
+    /// Why an online snapshot of this container cannot be taken or loaded
+    /// right now — `None` when it can. A live micro-VM answers with the
+    /// virtiofsd its run started; a stopped one, which an online restore
+    /// boots first, with the virtiofsd it would start.
+    async fn online_snapshot_refusal(&self) -> Option<String> {
+        if self.power_state().await != PowerState::Stopped {
+            return self.snapshot_refusal.lock().expect("refusal lock").clone();
+        }
+        let vfsd = self.hv.virtiofsd()?;
+        if !self.volumes_on_virtiofs(Some(&vfsd)) {
+            return None;
+        }
+        vfsd.snapshot_refusal(&self.cfg.name)
+    }
+
     /// Spawn one virtiofsd per volume (listening before QEMU starts) and
     /// return the (tag, socket) list for the argv builder. With no
-    /// virtiofsd on the host the volumes fall back to CIFS — empty list,
+    /// virtiofsd on the host, or a read-only volume it cannot export, the
+    /// volumes fall back to CIFS — empty list,
     /// `virtiofs_active` false — and the lab's smbd serves them as before.
     ///
     /// The choice itself is
@@ -579,14 +610,21 @@ impl ContainerInstance {
     /// the share plan reads too — so what this attaches and what the plan
     /// says it attaches cannot disagree.
     async fn start_virtiofsds(&self) -> Result<Vec<(String, PathBuf)>> {
-        use crate::labd::share_plan::{Transport, container_volume_transport};
-        let on_virtiofs =
-            container_volume_transport(self.hv.virtiofsd_available()) == Transport::Virtiofs;
+        let vfsd = self.hv.virtiofsd();
+        let on_virtiofs = self.volumes_on_virtiofs(vfsd.as_ref());
+        *self.snapshot_refusal.lock().expect("refusal lock") = match &vfsd {
+            Some(v) if on_virtiofs => v.snapshot_refusal(&self.cfg.name),
+            _ => None,
+        };
         if self.volumes.is_empty() || !on_virtiofs {
             if !self.volumes.is_empty() {
                 tracing::warn!(
-                    "{}: no virtiofsd on this host — volumes fall back to CIFS",
-                    self.cfg.name
+                    "{}: {} — volumes fall back to CIFS",
+                    self.cfg.name,
+                    match &vfsd {
+                        None => "no virtiofsd on this host".to_string(),
+                        Some(v) => format!("{} cannot export a read-only volume", v.describe()),
+                    }
                 );
             }
             self.virtiofs_active.store(false, Ordering::SeqCst);
@@ -914,6 +952,7 @@ impl ContainerInstance {
                 proc.kill().await;
             }
         }
+        *self.snapshot_refusal.lock().expect("refusal lock") = None;
     }
 
     /// Graceful stop ladder (PRD §7.2 shape): ctl `stop` (in-guest signal +
@@ -1011,6 +1050,9 @@ impl ContainerInstance {
         super::vm::validate_snapshot_name(name)?;
         match self.power_state().await {
             PowerState::Running => {
+                if let Some(why) = self.online_snapshot_refusal().await {
+                    bail!("{why}");
+                }
                 let qmp = self.qmp().await?;
                 qmp.snapshot_save(name, "scratch", &["scratch"]).await?;
                 Ok(true)
@@ -1108,8 +1150,8 @@ impl ContainerInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for ContainerInstance {
-    fn virtiofsd_available(&self) -> bool {
-        self.hv.virtiofsd_available()
+    fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
+        self.hv.virtiofsd()
     }
 
     fn as_machine(&self) -> &dyn super::machine::Machine {
@@ -1273,6 +1315,11 @@ impl super::machine::Machine for ContainerInstance {
         // The image must be bound before anything else: a daemon restarted
         // after a cache wipe re-pends the pull.
         lab.ensure_pulled(&self.cfg.name).await?;
+        // Refused before anything moves: a load the virtiofs devices cannot
+        // take fails after the scratch disk has been rewound.
+        if online && let Some(why) = self.online_snapshot_refusal().await {
+            bail!("{why}");
+        }
         if online {
             // Ensure a running micro-VM to load into — the normal start path
             // wires NIC listeners and the event callbacks. Whatever the fresh

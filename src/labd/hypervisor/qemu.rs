@@ -50,8 +50,8 @@ impl Hypervisor for Qemu {
         )
     }
 
-    fn virtiofsd_available(&self) -> bool {
-        crate::qemu::virtiofsd::available()
+    fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
+        crate::qemu::virtiofsd::found()
     }
 
     async fn start_virtiofsd(

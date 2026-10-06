@@ -1015,11 +1015,10 @@ impl LabRuntime {
     /// against rather than probed again here — every machine in a lab runs on
     /// one host, so any of them answers for all. A lab with no machines has
     /// no shares either, so the fallback never decides anything.
-    fn host_virtiofsd(&self) -> bool {
+    fn host_virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
         self.machines()
             .next()
-            .map(|m| m.virtiofsd_available())
-            .unwrap_or_else(crate::qemu::virtiofsd::available)
+            .map_or_else(crate::qemu::virtiofsd::found, |m| m.virtiofsd())
     }
 
     /// Where every share in this lab goes, computed against the host as it is
@@ -1047,7 +1046,7 @@ impl LabRuntime {
                 lab: &self.config.lab,
                 root: &self.root,
                 home: home.as_deref(),
-                host_virtiofsd: self.host_virtiofsd(),
+                host_virtiofsd: share_plan::HostVirtiofsd::of(self.host_virtiofsd().as_ref()),
                 guest_virtiofs: &guest_virtiofs,
                 gateways: &gateways,
             },
@@ -2813,8 +2812,8 @@ mod tests {
             self.dir.join(format!("nic{i}.sock"))
         }
         /// A double has no host behind it, and no shares to place either.
-        fn virtiofsd_available(&self) -> bool {
-            false
+        fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
+            None
         }
         fn event_subject(&self) -> &'static str {
             match self.kind {

@@ -58,6 +58,26 @@ SRC
   DOC
 
   p <<DOC
+    Distributions ship older `virtiofsd` releases than vmlab's features
+    need. Ubuntu 24.04 ships 1.10.0, for example. vmlab reads the binary's
+    `--help` once and passes only the flags it lists, so any Rust
+    `virtiofsd` serves a share. Two features depend on the release:
+
+    - Online snapshots of a machine with virtiofs devices need 1.11.0 or
+      later, the first release with `--migration-mode`. On an older one,
+      `vmlab snapshot create` and the restore of an online snapshot refuse
+      and name the release. Offline snapshots still work.
+    - A read-only share needs 1.13.0 or later, the first release with
+      `--readonly`. On an older one, an `auto` read-only share rides SMB,
+      and a `virtiofs` read-only share fails `vmlab validate`.
+
+    A binary that lacks the basic flags, such as QEMU's retired C
+    `virtiofsd`, fails `vmlab validate` for every `virtiofs` share. The
+    install script reports an old `virtiofsd` too. Set `VMLAB_VIRTIOFSD` to
+    use a newer build than the distribution's.
+  DOC
+
+  p <<DOC
     **SMB** is the universal fallback. The lab daemon serves each share at
     the segment gateway as `\\\\<gateway>\\<share>`, so a Windows guest needs
     nothing extra, a Linux guest needs only `cifs-utils`, and an
@@ -75,21 +95,23 @@ SRC
     to `auto`. The choice is made once, before the lab starts, as the **share
     plan**: which shares ride virtiofs, which fall back to SMB, which
     segments need a gateway rule to reach the SMB server, and which host
-    port it takes. Two host facts feed it, whether a `virtiofsd` binary
-    exists and whether a localhost port is free, and one guest fact, the
+    port it takes. Two host facts feed it, what the host's `virtiofsd` can
+    serve and whether a localhost port is free, and one guest fact, the
     profile's capability flag.
   DOC
 
   list {
-    li "`auto` takes virtiofs only when the host can serve it *and* the guest can mount it. SMB is the fallback, never the preference."
-    li "`virtiofs` always rides virtiofs. A host with no `virtiofsd` errors when the machine starts rather than degrading silently."
+    li "`auto` takes virtiofs only when the host can serve it *and* the guest can mount it. SMB is the fallback, never the preference. A read-only share counts as servable only on a `virtiofsd` with `--readonly`."
+    li "`virtiofs` always rides virtiofs. A host with no `virtiofsd` errors when the machine starts rather than degrading silently, and a `virtiofsd` that cannot serve the share fails `vmlab validate`."
     li "`smb` always rides the bundled SMB server."
   }
 
   p <<DOC
     Container volumes join the same plan. They have no per-guest question,
     since the micro-VM's own guest always mounts virtiofs, so they ride
-    virtiofs whenever the host has a `virtiofsd` and SMB otherwise.
+    virtiofs whenever the host has a `virtiofsd` and SMB otherwise. A
+    container with a read-only volume rides SMB on a `virtiofsd` without
+    `--readonly`, because its volumes all take one transport.
   DOC
 
   h2 "The bundled smbd"

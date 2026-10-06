@@ -12,7 +12,8 @@
 //! channel full VMs carry; guest/agent-proto). Deliberately NO 9p device — it would add a
 //! migration blocker and break online snapshots. Volumes attach as
 //! vhost-user-fs devices instead (one virtiofsd per volume, spawned by
-//! labd with `--migration-mode` so its state rides the snapshot), which
+//! labd with `--migration-mode` where supported so its state rides the
+//! snapshot), which
 //! also forces the memory backend to shared memfd; CIFS mounts remain the
 //! no-virtiofsd fallback (PRD §18).
 

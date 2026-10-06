@@ -175,12 +175,14 @@ pub trait Hypervisor: Send + Sync + 'static {
         log: &Path,
     ) -> Result<Arc<dyn Process>>;
 
-    /// Whether this host can serve a share over virtiofs at all. A
-    /// capability probe rather than an operation, but the same kind of fact
-    /// as the rest of this trait: what the host running the machine can do.
-    /// Decides whether `transport = "auto"` shares and container volumes
-    /// attach as vhost-user-fs devices or fall back to SMB/CIFS.
-    fn virtiofsd_available(&self) -> bool;
+    /// The virtiofsd this host serves shares with, and what it accepts —
+    /// `None` when it has no usable one. A capability probe rather than an
+    /// operation, but the same kind of fact as the rest of this trait: what
+    /// the host running the machine can do. Decides whether
+    /// `transport = "auto"` shares and container volumes attach as
+    /// vhost-user-fs devices or fall back to SMB/CIFS, and whether a machine
+    /// with those devices can be snapshotted online.
+    fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd>;
 
     /// Start one virtiofsd exporting `shared_dir` on `socket`. These are
     /// vhost-user backends, so they must be listening before the emulator

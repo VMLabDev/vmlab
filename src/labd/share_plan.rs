@@ -10,8 +10,8 @@
 //! [`SharePlan::placements`], and a test asserts it.
 //!
 //! Nothing here does I/O. The two facts that are genuinely host state —
-//! whether a virtiofsd exists, and whether a localhost port is free — arrive
-//! as a bool and as a [`PortProbe`].
+//! what the host's virtiofsd can serve, and whether a localhost port is free
+//! — arrive as a [`HostVirtiofsd`] and as a [`PortProbe`].
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -40,6 +40,37 @@ pub struct BindProbe;
 impl PortProbe for BindProbe {
     fn is_free(&self, port: u16) -> bool {
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
+    }
+}
+
+/// What the host's virtiofsd can serve, as far as placing a share goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostVirtiofsd {
+    /// No usable virtiofsd.
+    Absent,
+    /// One with no `--readonly` (before virtiofsd 1.13.0): it exports
+    /// writable shares only.
+    WritableOnly,
+    /// One that exports both.
+    Full,
+}
+
+impl HostVirtiofsd {
+    pub fn of(v: Option<&crate::qemu::virtiofsd::Virtiofsd>) -> Self {
+        match v {
+            None => Self::Absent,
+            Some(v) if !v.readonly => Self::WritableOnly,
+            Some(_) => Self::Full,
+        }
+    }
+
+    /// Can it export a share with this `readonly`?
+    pub fn serves(self, readonly: bool) -> bool {
+        match self {
+            Self::Absent => false,
+            Self::WritableOnly => !readonly,
+            Self::Full => true,
+        }
     }
 }
 
@@ -179,8 +210,8 @@ pub struct ShareInputs<'a> {
     pub root: &'a Path,
     /// `$HOME`, for resolving `~`-prefixed ones. `None` = leave them alone.
     pub home: Option<&'a Path>,
-    /// Does this host have a virtiofsd at all?
-    pub host_virtiofsd: bool,
+    /// What this host's virtiofsd can serve.
+    pub host_virtiofsd: HostVirtiofsd,
     /// Per VM: does its resolved profile say the guest mounts virtiofs
     /// natively? A VM absent from the map is assumed not to.
     pub guest_virtiofs: &'a BTreeMap<String, bool>,
@@ -263,7 +294,12 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
         let mut smb_shares: Vec<Share> = Vec::new();
         for (i, share) in vm.shares.iter().enumerate() {
             let host = resolve_share_host(inputs.root, inputs.home, &share.host);
-            match transport_of(share.transport, inputs.host_virtiofsd, guest_ok) {
+            match transport_of(
+                share.transport,
+                inputs.host_virtiofsd,
+                guest_ok,
+                share.readonly,
+            ) {
                 Transport::Virtiofs => b.virtiofs.push(VirtiofsShare {
                     machine: vm.name.clone(),
                     index: i,
@@ -302,7 +338,8 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
             continue;
         }
         let hosts = resolve_volume_hosts(c, inputs.root);
-        if container_volume_transport(inputs.host_virtiofsd) == Transport::Virtiofs {
+        let any_readonly = hosts.iter().any(|(_, _, readonly)| *readonly);
+        if container_volume_transport(inputs.host_virtiofsd, any_readonly) == Transport::Virtiofs {
             for (i, ((name, host, readonly), vol)) in hosts.iter().zip(&c.volumes).enumerate() {
                 b.virtiofs.push(VirtiofsShare {
                     machine: c.name.clone(),
@@ -366,14 +403,16 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
 ///
 /// Containers declare no per-volume transport and the micro-VM's init mounts
 /// either, so there is no per-guest capability question: the whole set
-/// follows the host (PRD §18).
+/// follows the host (PRD §18). A virtiofsd that cannot export read-only
+/// sends the set to CIFS when any volume is read-only, rather than handing
+/// the guest a writable export it was promised would not be.
 ///
 /// A vhost-user-fs device cannot hotplug, so this is decided again at machine
 /// start rather than read off the plan. Both sites call *this*, which is what
 /// keeps the plan's placement and what the machine actually attaches from
 /// drifting apart — the same arrangement [`transport_of`] gives VM shares.
-pub fn container_volume_transport(host_virtiofsd: bool) -> Transport {
-    if host_virtiofsd {
+pub fn container_volume_transport(host_virtiofsd: HostVirtiofsd, any_readonly: bool) -> Transport {
+    if host_virtiofsd.serves(any_readonly) {
         Transport::Virtiofs
     } else {
         Transport::Smb
@@ -382,16 +421,22 @@ pub fn container_volume_transport(host_virtiofsd: bool) -> Transport {
 
 /// Which transport one declared VM share takes.
 ///
-/// An explicit `transport = "virtiofs"` always rides virtiofs — a host with
-/// no virtiofsd errors at machine start rather than silently degrading. `smb`
-/// always rides smbd. `auto` takes virtiofs only when the host can serve it
+/// An explicit `transport = "virtiofs"` always rides virtiofs — a host whose
+/// virtiofsd cannot serve it errors at machine start rather than silently
+/// degrading. `smb` always rides smbd. `auto` takes virtiofs only when the
+/// host can serve it (a read-only share needs a virtiofsd with `--readonly`)
 /// *and* the guest can mount it, so SMB is the fallback and never the
 /// preference.
-pub fn transport_of(declared: ShareTransport, host_virtiofsd: bool, guest_ok: bool) -> Transport {
+pub fn transport_of(
+    declared: ShareTransport,
+    host_virtiofsd: HostVirtiofsd,
+    guest_ok: bool,
+    readonly: bool,
+) -> Transport {
     match declared {
         ShareTransport::Smb => Transport::Smb,
         ShareTransport::Virtiofs => Transport::Virtiofs,
-        ShareTransport::Auto if host_virtiofsd && guest_ok => Transport::Virtiofs,
+        ShareTransport::Auto if host_virtiofsd.serves(readonly) && guest_ok => Transport::Virtiofs,
         ShareTransport::Auto => Transport::Smb,
     }
 }
@@ -496,7 +541,7 @@ mod tests {
     }
 
     struct Host {
-        virtiofsd: bool,
+        virtiofsd: HostVirtiofsd,
         guest_virtiofs: BTreeMap<String, bool>,
         gateways: BTreeMap<String, Ipv4Addr>,
     }
@@ -506,7 +551,7 @@ mod tests {
         /// able to mount virtiofs.
         fn with_virtiofsd(guests: &[&str]) -> Self {
             Host {
-                virtiofsd: true,
+                virtiofsd: HostVirtiofsd::Full,
                 guest_virtiofs: guests.iter().map(|g| (g.to_string(), true)).collect(),
                 gateways: BTreeMap::from([("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1))]),
             }
@@ -515,7 +560,7 @@ mod tests {
         /// The same host with no virtiofsd on it.
         fn bare() -> Self {
             Host {
-                virtiofsd: false,
+                virtiofsd: HostVirtiofsd::Absent,
                 guest_virtiofs: BTreeMap::new(),
                 gateways: BTreeMap::from([("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1))]),
             }
@@ -562,7 +607,7 @@ lab "l" {
             assert_eq!(
                 names,
                 ["auto", "cifs", "vfs"],
-                "every share placed once, virtiofsd={}",
+                "every share placed once, virtiofsd={:?}",
                 host.virtiofsd
             );
         }
@@ -589,10 +634,11 @@ lab "l" {
     fn auto_falls_back_to_smb_only_when_virtiofs_is_unavailable() {
         let lab = mixed();
         let cases = [
-            (true, true, Transport::Virtiofs),
-            (false, true, Transport::Smb), // no virtiofsd on the host
-            (true, false, Transport::Smb), // the guest cannot mount it
-            (false, false, Transport::Smb),
+            (HostVirtiofsd::Full, true, Transport::Virtiofs),
+            (HostVirtiofsd::WritableOnly, true, Transport::Virtiofs), // a writable share
+            (HostVirtiofsd::Absent, true, Transport::Smb),            // no virtiofsd on the host
+            (HostVirtiofsd::Full, false, Transport::Smb),             // the guest cannot mount it
+            (HostVirtiofsd::Absent, false, Transport::Smb),
         ];
         for (host_has, guest_ok, want) in cases {
             let host = Host {
@@ -606,7 +652,7 @@ lab "l" {
                 .into_iter()
                 .find(|p| p.share == "auto")
                 .unwrap();
-            assert_eq!(auto.transport, want, "host={host_has} guest={guest_ok}");
+            assert_eq!(auto.transport, want, "host={host_has:?} guest={guest_ok}");
         }
     }
 
@@ -622,6 +668,53 @@ lab "l" {
             .find(|p| p.share == "vfs")
             .unwrap();
         assert_eq!(vfs.transport, Transport::Virtiofs);
+    }
+
+    /// A virtiofsd with no `--readonly` (before 1.13.0) still serves an
+    /// `auto` read-only share — over SMB, which can honour it — while a
+    /// writable one stays on virtiofs, and an explicit `virtiofs` read-only
+    /// share stays put so its start names the missing flag.
+    #[test]
+    fn a_readonly_share_leaves_a_virtiofsd_that_cannot_export_one() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" }
+  vm "web" { template = "x86_64/t" nic { segment = "lan" }
+    share { host = "./rw"  guest = "/mnt/rw"  name = "rw" }
+    share { host = "./ro"  guest = "/mnt/ro"  name = "ro" readonly = true }
+    share { host = "./rov" guest = "/mnt/rov" name = "rov" readonly = true transport = "virtiofs" }
+  }
+}"#,
+        );
+        let mut host = Host::with_virtiofsd(&["web"]);
+        host.virtiofsd = HostVirtiofsd::WritableOnly;
+        let by_name: BTreeMap<String, Transport> = plan_on(&lab, &host, &AllFree)
+            .unwrap()
+            .placements()
+            .into_iter()
+            .map(|pl| (pl.share, pl.transport))
+            .collect();
+        assert_eq!(by_name["rw"], Transport::Virtiofs);
+        assert_eq!(by_name["ro"], Transport::Smb);
+        assert_eq!(by_name["rov"], Transport::Virtiofs);
+    }
+
+    /// A container's volumes move together, so one read-only volume takes
+    /// the set to CIFS on a virtiofsd with no `--readonly`.
+    #[test]
+    fn container_volumes_follow_the_readonly_support_of_the_host() {
+        use HostVirtiofsd::*;
+        assert_eq!(container_volume_transport(Full, true), Transport::Virtiofs);
+        assert_eq!(
+            container_volume_transport(WritableOnly, false),
+            Transport::Virtiofs
+        );
+        assert_eq!(
+            container_volume_transport(WritableOnly, true),
+            Transport::Smb
+        );
+        assert_eq!(container_volume_transport(Absent, false), Transport::Smb);
     }
 
     /// VM shares and container volumes are both accounted for, so neither
@@ -697,7 +790,7 @@ lab "l" {
 }"#,
         );
         let host = Host {
-            virtiofsd: false,
+            virtiofsd: HostVirtiofsd::Absent,
             guest_virtiofs: BTreeMap::new(),
             gateways: BTreeMap::from([
                 ("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1)),
@@ -722,7 +815,7 @@ lab "l" {
 }"#,
         );
         let host = Host {
-            virtiofsd: false,
+            virtiofsd: HostVirtiofsd::Absent,
             guest_virtiofs: BTreeMap::new(),
             gateways: BTreeMap::new(), // the lab is not up
         };

@@ -114,7 +114,8 @@ page guide_containers {
     `down` and per-container destroy, and only lab `destroy` removes them.
     Volumes attach as vhost-user-fs devices, one `virtiofsd` per volume,
     mounted natively by cinit before the network is even up. A host with no
-    `virtiofsd` binary falls back to SMB shares served by the lab daemon at
+    `virtiofsd` binary, or a read-only volume on a `virtiofsd` without
+    `--readonly`, falls back to SMB shares served by the lab daemon at
     the segment gateway, mounted over CIFS once the network is up, exactly
     as [Shared folders](guide_shares) describes for VMs. Ownership on
     volume files is mount-level, not per-file container uid and gid.

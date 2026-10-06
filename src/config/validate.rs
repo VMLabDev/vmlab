@@ -33,6 +33,14 @@ pub trait ValidationContext {
     fn check_container_hardware(&self, container: &Container) -> Result<(), String>;
     /// Compile-check a wscript script at an absolute path.
     fn check_script(&self, path: &Path) -> Result<(), String>;
+    /// Can the host's virtiofsd serve this `transport = "virtiofs"` share?
+    /// A virtiofsd vmlab cannot drive, or one with no `--readonly` for a
+    /// read-only share, would fail the machine's start; this says so first.
+    /// A host with no virtiofsd at all is left to that start. A permissive
+    /// context answers `Ok`.
+    fn check_virtiofs_share(&self, _share: &Share) -> Result<(), String> {
+        Ok(())
+    }
 
     fn template_exists(&self, arch: &str, name: &str, version: Option<&str>) -> bool {
         self.template_meta(arch, name, version).is_some()
@@ -250,6 +258,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         share.guest
                     ),
                 ));
+            }
+            if share.transport == ShareTransport::Virtiofs
+                && let Err(why) = ctx.check_virtiofs_share(share)
+            {
+                issues.push(Issue::at(share.span, why));
             }
         }
         // The family a VM's logins are judged against is the §5.2 resolved
@@ -1822,6 +1835,44 @@ lab "l" {
             !es.iter().any(|m| m.contains("no NICs")),
             "virtiofs share should not require a NIC, got: {es:#?}"
         );
+    }
+
+    /// An explicit virtiofs share the host's virtiofsd cannot serve is a
+    /// validation error, carrying the context's reason; `auto` and `smb`
+    /// shares are not asked about, since they have somewhere else to go.
+    #[test]
+    fn a_virtiofs_share_the_host_cannot_serve_fails_validation() {
+        struct OldVirtiofsd;
+        impl ValidationContext for OldVirtiofsd {
+            fn template_meta(&self, a: &str, n: &str, v: Option<&str>) -> Option<TemplateMeta> {
+                Permissive.template_meta(a, n, v)
+            }
+            fn profile(&self, name: &str) -> Option<Profile> {
+                Permissive.profile(name)
+            }
+            fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
+                Ok(())
+            }
+            fn check_script(&self, _: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn check_virtiofs_share(&self, share: &Share) -> Result<(), String> {
+                Err(format!("{} needs virtiofsd 1.13.0", share.name))
+            }
+        }
+        let f = lab(r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { }
+  vm "a" { template = "x86_64/t" nic { segment = "s" }
+    share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" }
+    share { host = "." guest = "/mnt/a" name = "a" }
+    share { host = "." guest = "/mnt/s" name = "s" transport = "smb" } }
+}"#);
+        let es: Vec<String> = validate(&f, &OldVirtiofsd)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        assert_eq!(es, ["v needs virtiofsd 1.13.0"], "{es:#?}");
     }
 
     /// §19.2's first rule: the Windows agent is LocalSystem and mints the
