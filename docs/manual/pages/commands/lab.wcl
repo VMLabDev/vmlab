@@ -3,7 +3,7 @@ page cmd_lab {
   chapter_header "vmlab lab" {
     kicker       = "Commands · reference"
     reading_time = "6 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-06"
     version      = "vmlab 0.9"
   }
 
@@ -25,6 +25,7 @@ page cmd_lab {
       | "`stop`" | "Gracefully stop a running lab and release its name; clones retained." |
       | "`restart`" | "Restart a lab's daemon so it re-reads `vmlab.wcl`." |
       | "`destroy`" | "Stop a lab and delete its clones and local state." |
+      | "`move`" | "Move a stopped lab's working data to the lab in this directory." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -172,6 +173,69 @@ page cmd_lab {
     destroyed`.
   DOC
 
+  h2 "vmlab lab move"
+
+  code sh { source = "vmlab lab move [OPTIONS] <LAB>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<LAB>`" | "The lab's name. The `vmlab.wcl` in this directory must declare it." |
+      | "`--from <DIR>`" | "The lab root to move from. Defaults to the directory the lab is registered from; required once the name is released, for example after a full `vmlab down` there." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Hands a stopped lab, with its provisioned machines, to another
+    directory that declares the same lab name, typically another git
+    worktree of the same repository. A lab name is unique per host, so the
+    worktrees share one lab, and this moves it to the one you work in now
+    without building its machines again. Run it in the directory that should
+    own the lab.
+  DOC
+
+  p <<DOC
+    It refuses, and changes nothing, when this directory's lab file declares
+    another name, when a machine of the lab is running (`vmlab down` there
+    first), or when this directory's working data already holds machine
+    data: a clone, a container's disk or a named volume (`vmlab destroy`
+    here first). Working data without any, such as SMB state left by an
+    earlier `up`, is replaced. When the two lab files declare a machine
+    differently, or one declares a machine the other does not, it warns
+    naming each one and continues: the next `up` runs this directory's file,
+    and refuses a clone whose template changed (see [vmlab up](cmd_up)).
+  DOC
+
+  p <<DOC
+    It then releases the name as `vmlab lab stop` does and refuses if any
+    process still holds the old working data. It moves `.vmlab/`, or the
+    `VMLAB_WORK_DIR` directory keyed by the old root, to the one keyed by
+    this root. On one filesystem that is a rename. Across filesystems it
+    copies the tree beside the destination, checks every file's content
+    against the source, renames the copy into place and only then deletes
+    the source, so a failed copy leaves the source whole. Clones, snapshots,
+    firmware variables, TPM state and named volumes move with it. It removes
+    `smb/smb.conf`, which the next `up` writes for the new root, and rebases
+    each `@dev` machine's sync ledger onto the new root, so the workspace
+    syncer reads what this checkout holds differently as host-side changes
+    rather than conflicts.
+  DOC
+
+  p <<DOC
+    Folders the lab points machines at do not move: shares, container bind
+    mounts and `@dev` workspaces belong to the checkout. The verb lists each
+    one that does not exist under this directory, such as a media folder git
+    ignores. Last, it registers the lab from this directory and prints
+    `lab "<name>" now lives in <dir> — run `vmlab validate`, then
+    `vmlab up``.
+  DOC
+
+  p <<DOC
+    There is no `--copy`. Both directories declare one lab name, and a name
+    is registered from one directory at a time, so a copy could not run
+    beside the original without renaming one of the labs.
+  DOC
+
   h2 "Examples"
 
   p "See what is running on this host:"
@@ -190,6 +254,14 @@ SRC
   p "Free the host of a lab you started from another directory:"
   code sh { source = "vmlab lab destroy peer-b" }
 
+  p "Take over the lab another worktree built, from the worktree you work in now:"
+  code sh { source = <<'SRC'
+cd ~/src/app-feature
+vmlab lab move app-lab --from ~/src/app-main
+vmlab up
+SRC
+  }
+
   h2 "Exit status"
 
   p <<DOC
@@ -199,6 +271,10 @@ SRC
     still running at `restart`, a daemon that fails the request, or a
     supervisor that does not come up exits 1 (`failed`). `restart` exits 5
     (`conflict`) when the supervisor already tracks this name from another
-    directory. A usage error exits 2.
+    directory. `move` exits 5 when a machine or process of the lab is
+    running, when this directory already holds machine data, or when the
+    lab is registered from a directory other than `--from`; it exits 2 when
+    a lab file declares another name, and 1 when the lab is not registered
+    and no `--from` is given. A usage error exits 2.
   DOC
 }

@@ -155,6 +155,16 @@ pub fn load_lab_root(root: &Path) -> Result<LabFile, ConfigErrors> {
 /// edit, comments included, while what the lab declares stays the same. The
 /// model holds no maps, so its rendering is deterministic across processes.
 pub fn digest(lab: &LabFile) -> String {
+    declaration_digest(lab)
+}
+
+/// [`digest`] of any part of the typed model — one machine, or the `lab`
+/// block without the root it was loaded from — with the same span blanking.
+///
+/// `vmlab lab move` compares two checkouts' declarations machine by machine
+/// with it: [`digest`] of a whole [`LabFile`] includes its root, so two
+/// checkouts of one lab file never agree on that.
+pub fn declaration_digest(value: &impl std::fmt::Debug) -> String {
     use sha2::{Digest, Sha256};
     use std::sync::OnceLock;
     static SPAN: OnceLock<regex::Regex> = OnceLock::new();
@@ -162,7 +172,7 @@ pub fn digest(lab: &LabFile) -> String {
         regex::Regex::new(r"\b(\w*span): (?:\(\d+, \d+\)|Some\(\(\d+, \d+\)\)|None)")
             .expect("valid span regex")
     });
-    let rendered = format!("{lab:?}");
+    let rendered = format!("{value:?}");
     let blanked = span.replace_all(&rendered, "$1: _");
     hex::encode(Sha256::digest(blanked.as_bytes()))
 }

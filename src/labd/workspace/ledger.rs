@@ -233,6 +233,35 @@ impl Ledger {
         }
     }
 
+    /// Carry a ledger to a lab that moved to another root (`vmlab lab move`):
+    /// a `host_root` under `from` becomes the same relative path under `to`.
+    ///
+    /// The guest tree it agreed with moved too — it is on the clone — so the
+    /// agreements still describe it. Left as it was, the next load would find
+    /// a ledger about another workspace and discard it, and every path the
+    /// new checkout holds differently would go down the conflict path instead
+    /// of being read as the host-side change it is. A `host_root` outside
+    /// `from`, or a ledger this version cannot read, is left alone: the load
+    /// already handles that safely. Returns whether it rewrote anything.
+    pub fn rebase(path: &Path, from: &Path, to: &Path) -> Result<bool> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let Ok(mut ledger) = serde_json::from_slice::<Ledger>(&bytes) else {
+            return Ok(false);
+        };
+        let Ok(rel) = Path::new(&ledger.host_root).strip_prefix(from) else {
+            return Ok(false);
+        };
+        if ledger.version != VERSION {
+            return Ok(false);
+        }
+        let moved = to.join(rel);
+        // The daemon compares against the canonical workspace path.
+        let moved = moved.canonicalize().unwrap_or(moved);
+        ledger.host_root = moved.display().to_string();
+        ledger.save(path)?;
+        Ok(true)
+    }
+
     /// Write the ledger where a crash cannot leave a torn one: same directory,
     /// temp then rename — the discipline every apply follows, for the same
     /// reason.
@@ -321,6 +350,30 @@ mod tests {
                 .entries
                 .is_empty()
         );
+    }
+
+    /// A moved lab keeps what its guest agreed to: the ledger follows the
+    /// workspace to the new root, flags and halts included.
+    #[test]
+    fn a_rebased_ledger_loads_under_the_new_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut want) = saved(dir.path());
+        want.halted = vec!["src/main.rs".into()];
+        want.save(&path).unwrap();
+
+        assert!(Ledger::rebase(&path, Path::new("/lab"), Path::new("/moved")).unwrap());
+        let got = Ledger::load(&path, Path::new("/moved/src"), "/src");
+        assert_eq!(got.entries, want.entries);
+        assert_eq!(got.halted, want.halted);
+    }
+
+    /// A workspace outside the old root is not the move's to reinterpret.
+    #[test]
+    fn a_ledger_outside_the_old_root_is_not_rebased() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, want) = saved(dir.path());
+        assert!(!Ledger::rebase(&path, Path::new("/elsewhere"), Path::new("/moved")).unwrap());
+        assert_eq!(Ledger::load(&path, Path::new("/lab/src"), "/src"), want);
     }
 
     #[test]

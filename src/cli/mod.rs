@@ -5,6 +5,7 @@ pub mod console;
 pub mod daemon;
 pub mod dev;
 pub mod lab;
+mod lab_move;
 pub mod machine;
 pub mod tty_attach;
 pub mod validate;

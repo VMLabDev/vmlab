@@ -348,7 +348,7 @@ pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
 /// Have the supervisor reap a stopped lab's daemon and drop its registration
 /// (`lab.release`). Returns once the daemon has gone, so a following `up` —
 /// here or in another checkout of the same lab — cannot meet it.
-async fn release(name: &str) -> Result<()> {
+pub(super) async fn release(name: &str) -> Result<()> {
     daemon::ensure_supervisor()
         .await?
         .send(SupRequest::LabRelease {
@@ -729,6 +729,20 @@ pub enum LabCmd {
     },
     /// Stop a lab and delete its clones and local state
     Destroy { lab: String },
+    /// Move a stopped lab's working data to the lab in this directory.
+    ///
+    /// Run from the checkout that should own the lab: its vmlab.wcl must
+    /// declare the same name. Releases the name, moves `.vmlab/` (clones,
+    /// snapshots, state), carries the paths stored in it over, and registers
+    /// the lab from here. Refuses while a machine runs, or when this
+    /// directory already holds machine data.
+    Move {
+        lab: String,
+        /// The root to move from, when the lab is not registered (after a
+        /// full `vmlab down`, say); defaults to where it is registered
+        #[arg(long, value_name = "DIR")]
+        from: Option<std::path::PathBuf>,
+    },
 }
 
 pub fn cmd_lab(cmd: LabCmd) -> Result<()> {
@@ -738,12 +752,13 @@ pub fn cmd_lab(cmd: LabCmd) -> Result<()> {
         LabCmd::Stop { lab, force } => cmd_lab_stop(&lab, force),
         LabCmd::Restart { lab, json } => cmd_lab_restart(&lab, json),
         LabCmd::Destroy { lab } => cmd_lab_destroy(&lab),
+        LabCmd::Move { lab, from } => super::lab_move::cmd_lab_move(&lab, from),
     }
 }
 
 /// Ask the supervisor for its lab registry. Returns an empty list when the
 /// supervisor isn't running — read-only queries don't auto-start it.
-async fn registry_labs() -> Result<Vec<Value>> {
+pub(super) async fn registry_labs() -> Result<Vec<Value>> {
     let sock = crate::paths::supervisor_socket();
     let Ok(client) = SupClient::connect(&sock).await else {
         return Ok(Vec::new());
@@ -753,7 +768,7 @@ async fn registry_labs() -> Result<Vec<Value>> {
 }
 
 /// Find a registry entry's root directory by lab name.
-fn root_for(labs: &[Value], name: &str) -> Option<std::path::PathBuf> {
+pub(super) fn root_for(labs: &[Value], name: &str) -> Option<std::path::PathBuf> {
     labs.iter()
         .find(|l| l["name"].as_str() == Some(name))
         .and_then(|l| l["root"].as_str())

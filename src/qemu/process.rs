@@ -282,12 +282,36 @@ fn cmdline_matches(cmdline: &[u8], markers: &[String]) -> bool {
 /// Pass the lab's `root` when known so the lab's `smbd` is covered too — an
 /// orphaned smbd holds its port against the next `up`.
 pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
-    let markers = lab_process_markers(lab, root);
+    let pids = matching_pids(&lab_process_markers(lab, root));
+    for pid in &pids {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(*pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    pids.len()
+}
+
+/// Every process still running for `lab` — QEMU and its helpers, found by
+/// the same markers [`kill_lab_orphans`] uses — or holding a path under its
+/// working data `lab_local` in its argv.
+///
+/// For `vmlab lab move`, which must not move a disk out from under a process
+/// that has it open, and has no daemon left to ask once the name is released.
+pub fn lab_processes(lab: &str, lab_local: &Path) -> Vec<i32> {
+    let mut markers = lab_process_markers(lab, None);
+    markers.push(format!("{}/", lab_local.display()));
+    matching_pids(&markers)
+}
+
+/// The pids, other than this process, whose `/proc/<pid>/cmdline` carries one
+/// of `markers`.
+fn matching_pids(markers: &[String]) -> Vec<i32> {
     let us = std::process::id();
-    let mut killed = 0;
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return 0;
+        return Vec::new();
     };
+    let mut pids = Vec::new();
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -302,15 +326,11 @@ pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
         let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
             continue;
         };
-        if cmdline_matches(&cmdline, &markers) {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            killed += 1;
+        if cmdline_matches(&cmdline, markers) {
+            pids.push(pid);
         }
     }
-    killed
+    pids
 }
 
 #[cfg(test)]
