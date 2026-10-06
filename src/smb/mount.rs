@@ -60,40 +60,60 @@ pub fn is_drive_letter(target: &str) -> bool {
     }
 }
 
+/// One Windows guest command, and the exit code (if any) that means retrying
+/// it cannot help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsMountCmd {
+    pub program: String,
+    pub args: Vec<String>,
+    /// The exit code with which this command refuses rather than fails.
+    pub refused_exit: Option<i32>,
+}
+
+/// The exit code the folder-link step refuses with: the folder path exists
+/// and is not a link vmlab made, so replacing it could destroy user data.
+pub const LINK_REFUSED_EXIT: i32 = 64;
+
 /// Build the Windows mount command(s) for a share.
 ///
 /// - **Drive-letter target** (`X:`): a single `net use X: \\<gw>\<share>
 ///   /user:<u> <p> /persistent:yes`. This maps directly (PRD §7.5).
 /// - **Folder-path target** (e.g. `C:\mnt\data`): realised as a directory
-///   symbolic link to the UNC path — `cmd /c mklink /D <folder>
-///   \\<gw>\<share>`. Windows permits UNC targets for `/D`; `/J` junctions
-///   cannot target UNC paths. We additionally prime credentials with a
-///   credential-only `net use \\<gw>\<share> /user:<u> <p>` so the symbolic
-///   link resolves authenticated.
+///   symbolic link to the UNC path. Windows permits UNC targets for `/D`;
+///   `/J` junctions cannot target UNC paths. We additionally prime
+///   credentials with a credential-only `net use \\<gw>\<share> /user:<u>
+///   <p>` so the symbolic link resolves authenticated. The link step is
+///   [`windows_link_script`], run every `up`: it keeps a link that already
+///   points at this gateway and replaces one that points at another.
 pub fn windows_mount_cmds(
     gateway: Ipv4Addr,
     share: &str,
     guest_path: &str,
     user: &str,
     pass: &str,
-) -> Vec<(String, Vec<String>)> {
+) -> Vec<WindowsMountCmd> {
     let unc = format!("\\\\{gateway}\\{share}");
+    let cmd = |program: &str, args: Vec<String>| WindowsMountCmd {
+        program: program.to_string(),
+        args,
+        refused_exit: None,
+    };
     if is_drive_letter(guest_path) {
         // Normalise `X:\` to `X:` for net use.
         let letter = &guest_path[..2];
         // A stale remembered mapping on the letter (e.g. from a previous
-        // lab run) blocks the fresh `net use` — clear it first. `exit /b 0`
-        // because "nothing to delete" exits 2 and must not count as a
-        // failed mount step.
-        let cleanup = (
-            "cmd".to_string(),
+        // lab run, possibly to another gateway) blocks the fresh `net use` —
+        // clear it first. `exit /b 0` because "nothing to delete" exits 2
+        // and must not count as a failed mount step.
+        let cleanup = cmd(
+            "cmd",
             vec![
                 "/c".to_string(),
                 format!("net use {letter} /delete /y & exit /b 0"),
             ],
         );
-        let map = (
-            "net".to_string(),
+        let map = cmd(
+            "net",
             vec![
                 "use".to_string(),
                 letter.to_string(),
@@ -106,28 +126,78 @@ pub fn windows_mount_cmds(
         vec![cleanup, map]
     } else {
         // Folder-path target: authenticate, then link the folder to the UNC.
-        let auth = (
-            "net".to_string(),
+        let auth = cmd(
+            "net",
             vec![
                 "use".to_string(),
-                unc.clone(),
+                unc,
                 format!("/user:{user}"),
                 pass.to_string(),
                 "/persistent:yes".to_string(),
             ],
         );
-        let link = (
-            "cmd".to_string(),
-            vec![
-                "/c".to_string(),
-                "mklink".to_string(),
-                "/D".to_string(),
-                guest_path.to_string(),
-                unc,
+        // Encoded, so no layer between here and PowerShell (the agent's
+        // command line, `cmd`, PowerShell's own parser) can re-read a
+        // backslash or a quote in the path.
+        use base64::Engine as _;
+        let script = windows_link_script(gateway, share, guest_path);
+        let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let link = WindowsMountCmd {
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-EncodedCommand".to_string(),
+                base64::engine::general_purpose::STANDARD.encode(utf16),
             ],
-        );
+            refused_exit: Some(LINK_REFUSED_EXIT),
+        };
         vec![auth, link]
     }
+}
+
+/// The PowerShell that makes `guest_path` a directory symbolic link to
+/// `\\<gateway>\<share>`, whatever the guest already has there.
+///
+/// - Nothing there: create the link.
+/// - A link to this gateway's share: leave it, and succeed.
+/// - A link to the same share on another gateway (a link vmlab made before
+///   the VM's segment moved to another subnet): remove the link, which
+///   leaves the share's files alone, and create it again.
+/// - Anything else: exit [`LINK_REFUSED_EXIT`] naming the path. A real
+///   directory there may hold the user's data, so it is never removed.
+///
+/// Windows reports a UNC link's target as `UNC\<host>\<share>`; it is
+/// compared as `\\<host>\<share>`, case-insensitively. Progress records are
+/// silenced because PowerShell writes them to a redirected stderr as CLIXML,
+/// which would bury the refusal message in the `share.unmountable` event.
+pub fn windows_link_script(gateway: Ipv4Addr, share: &str, guest_path: &str) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let path = quote(guest_path);
+    let target = quote(&format!("\\\\{gateway}\\{share}"));
+    let share = quote(share);
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$path = {path}
+$target = {target}
+$share = {share}
+$item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+if ($item) {{
+  $current = ''
+  if ($item.LinkType -eq 'SymbolicLink') {{ $current = [string]@($item.Target)[0] }}
+  if ($current -like 'UNC\*') {{ $current = '\' + $current.Substring(3) }}
+  if ($current -eq $target) {{ exit 0 }}
+  if ($current -notmatch ('^\\\\[^\\]+\\' + [regex]::Escape($share) + '\\?$')) {{
+    [Console]::Error.WriteLine("$path already exists and is not a link vmlab made to share $share, so vmlab will not replace it. Move it aside and run vmlab up again.")
+    exit {LINK_REFUSED_EXIT}
+  }}
+  $item.Delete()
+}}
+& cmd.exe /c mklink /D $path $target
+exit $LASTEXITCODE
+"#
+    )
 }
 
 /// Path of the connect script dropped on the shared desktop (visible to
@@ -267,17 +337,16 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         // First clears any stale remembered mapping — and must always
         // exit 0 (the daemon retries failing steps).
-        let (prog, args) = &cmds[0];
-        assert_eq!(prog, "cmd");
-        assert!(args[1].contains("net use X: /delete /y"));
-        assert!(args[1].contains("exit /b 0"));
+        assert_eq!(cmds[0].program, "cmd");
+        assert!(cmds[0].args[1].contains("net use X: /delete /y"));
+        assert!(cmds[0].args[1].contains("exit /b 0"));
         // Then maps the drive.
-        let (prog, args) = &cmds[1];
-        assert_eq!(prog, "net");
-        let joined = args.join(" ");
+        assert_eq!(cmds[1].program, "net");
+        let joined = cmds[1].args.join(" ");
         assert!(joined.starts_with("use X: \\\\10.0.0.1\\data"));
         assert!(joined.contains("/user:u"));
         assert!(joined.contains("/persistent:yes"));
+        assert!(cmds.iter().all(|c| c.refused_exit.is_none()));
     }
 
     #[test]
@@ -302,17 +371,95 @@ mod tests {
         assert!(joined.ends_with("/f"));
     }
 
+    /// The script a step carries, decoded the way PowerShell decodes
+    /// `-EncodedCommand`.
+    fn decoded(cmd: &WindowsMountCmd) -> String {
+        use base64::Engine as _;
+        assert_eq!(
+            cmd.args[..3],
+            ["-NoProfile", "-NonInteractive", "-EncodedCommand"]
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&cmd.args[3])
+            .unwrap();
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        String::from_utf16(&units).unwrap()
+    }
+
     #[test]
-    fn windows_folder_path_mklink() {
+    fn windows_folder_path_links_through_the_encoded_script() {
         let cmds = windows_mount_cmds(gw(), "data", "C:\\mnt\\data", "u", "p");
         assert_eq!(cmds.len(), 2);
         // first authenticates
-        assert_eq!(cmds[0].0, "net");
-        // second is the directory symbolic link
-        let (prog, args) = &cmds[1];
-        assert_eq!(prog, "cmd");
-        let joined = args.join(" ");
-        assert!(joined.contains("mklink /D C:\\mnt\\data \\\\10.0.0.1\\data"));
+        assert_eq!(cmds[0].program, "net");
+        assert!(
+            cmds[0]
+                .args
+                .join(" ")
+                .starts_with("use \\\\10.0.0.1\\data /user:u")
+        );
+        // second is the link step, which refuses with its own exit code
+        assert_eq!(cmds[1].program, "powershell");
+        assert_eq!(cmds[1].refused_exit, Some(LINK_REFUSED_EXIT));
+        assert_eq!(
+            decoded(&cmds[1]),
+            windows_link_script(gw(), "data", "C:\\mnt\\data")
+        );
+    }
+
+    /// Issue #141: the link step is run on every `up`, so it has to accept a
+    /// link already there — and replace one left pointing at the gateway of
+    /// a subnet the VM is no longer on.
+    #[test]
+    fn the_link_script_keeps_or_replaces_a_link_and_never_removes_a_folder() {
+        let script = windows_link_script(gw(), "c_repo", "C:\\repo");
+        assert!(script.contains("$path = 'C:\\repo'"), "{script}");
+        assert!(
+            script.contains("$target = '\\\\10.0.0.1\\c_repo'"),
+            "{script}"
+        );
+        // The link itself, never what it points at.
+        assert!(
+            script.contains("Get-Item -LiteralPath $path -Force"),
+            "{script}"
+        );
+        // Windows reports `UNC\host\share`; compared as `\\host\share`.
+        assert!(
+            script.contains(
+                "if ($current -like 'UNC\\*') { $current = '\\' + $current.Substring(3) }"
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains("if ($current -eq $target) { exit 0 }"),
+            "{script}"
+        );
+        // Only a link to this share on some gateway is vmlab's to replace;
+        // anything else at the path is refused, by name.
+        assert!(
+            script.contains(r"'^\\\\[^\\]+\\' + [regex]::Escape($share) + '\\?$'"),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!("exit {LINK_REFUSED_EXIT}")),
+            "{script}"
+        );
+        assert!(script.contains("is not a link vmlab made"), "{script}");
+        // Removing a directory symbolic link non-recursively removes the
+        // link and nothing it points at.
+        assert!(script.contains("$item.Delete()"), "{script}");
+        assert!(!script.contains("Recurse"), "{script}");
+        assert!(script.contains("mklink /D $path $target"), "{script}");
+    }
+
+    /// A quote in a path would end PowerShell's string early.
+    #[test]
+    fn the_link_script_quotes_the_path_for_powershell() {
+        let script = windows_link_script(gw(), "data", "C:\\Bob's files");
+        assert!(script.contains("$path = 'C:\\Bob''s files'"), "{script}");
     }
 
     #[test]

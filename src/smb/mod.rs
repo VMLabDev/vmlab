@@ -46,7 +46,7 @@ use crate::config::model::Share;
 pub enum OsHint {
     /// `mount -t cifs ...` run via the guest agent.
     Linux,
-    /// `net use` / `mklink` run via the guest agent.
+    /// `net use` / a PowerShell link step run via the guest agent.
     Windows,
     /// `net use` typed via the screen-automation surface (no agent on XP).
     WindowsXp,
@@ -61,6 +61,10 @@ pub struct MountStep {
     /// The share this step mounts — what a step that never succeeds is
     /// reported against. `None` for a step serving every share at once.
     pub share: Option<String>,
+    /// An exit code with which the step refuses rather than fails — the
+    /// guest is in a state another attempt will not change, so the executor
+    /// reports it at once instead of retrying.
+    pub refused_exit: Option<i32>,
 }
 
 /// Per-VM SMB plan for a lab: the credential, the share definitions, and the
@@ -222,6 +226,7 @@ impl LabSmb {
                         command: "mkdir".into(),
                         args: vec!["-p".into(), guest.clone()],
                         share: Some(share.clone()),
+                        refused_exit: None,
                     });
                     let (cmd, args) = linux_mount_cmd(
                         gw,
@@ -237,17 +242,19 @@ impl LabSmb {
                         command: cmd,
                         args,
                         share: Some(share.clone()),
+                        refused_exit: None,
                     });
                 }
                 OsHint::Windows => {
-                    for (cmd, args) in
+                    for cmd in
                         windows_mount_cmds(gw, share, guest, &creds.username, &creds.password)
                     {
                         steps.push(MountStep {
                             os_hint,
-                            command: cmd,
-                            args,
+                            command: cmd.program,
+                            args: cmd.args,
                             share: Some(share.clone()),
+                            refused_exit: cmd.refused_exit,
                         });
                     }
                 }
@@ -260,6 +267,7 @@ impl LabSmb {
                         command: s,
                         args: Vec::new(),
                         share: Some(share.clone()),
+                        refused_exit: None,
                     });
                 }
             }
@@ -289,6 +297,7 @@ impl LabSmb {
                     command: cmd,
                     args,
                     share: None,
+                    refused_exit: None,
                 });
             }
             // And authenticate future logons automatically — a folder-path
@@ -300,6 +309,7 @@ impl LabSmb {
                 command: cmd,
                 args,
                 share: None,
+                refused_exit: None,
             });
         }
         steps
@@ -417,9 +427,10 @@ mod tests {
         )];
         let lab = LabSmb::plan("l", Path::new("/lab/.vmlab"), 14451, &vms);
         let steps = lab.mount_plan("win", OsHint::Windows);
-        assert_eq!(steps.len(), 3, "{steps:#?}"); // net use auth + mklink + hook
-        assert_eq!(steps[1].command, "cmd");
-        assert!(steps[1].args.join(" ").contains("mklink /D C:\\mnt\\data"));
+        assert_eq!(steps.len(), 3, "{steps:#?}"); // net use auth + link + hook
+        assert_eq!(steps[1].command, "powershell");
+        assert_eq!(steps[1].refused_exit, Some(mount::LINK_REFUSED_EXIT));
+        assert!(steps.iter().filter(|s| s.refused_exit.is_some()).count() == 1);
         assert_eq!(steps[2].command, "reg");
         let hook = steps[2].args.join(" ");
         assert!(

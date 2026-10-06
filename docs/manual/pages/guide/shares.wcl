@@ -167,7 +167,7 @@ SRC
   list {
     li "**Linux, virtiofs:** `mkdir -p <guest_path>`, then `mount -t virtiofs <tag> <guest_path>`."
     li "**Linux, SMB:** `mkdir -p <guest_path>`, then `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential."
-    li "**Windows:** the credential is stored once per lab with `cmdkey`. A drive-letter target such as `S:` is mapped with `net use`. A folder-path target becomes a directory symbolic link to the UNC path with `mklink /D`, because a junction cannot target a UNC path."
+    li "**Windows:** the credential is stored once per lab with `cmdkey`. A drive-letter target such as `S:` is mapped with `net use`. A folder-path target becomes a directory symbolic link to the UNC path with `mklink /D`, because a junction cannot target a UNC path. Each `up` keeps a link that already points at the current gateway and replaces one that points at the same share through an old gateway, for example after the machine moved to a segment with another subnet. If the folder path holds anything else, such as a real folder, vmlab leaves it untouched and reports the share as `share.unmountable`."
   }
 
   p <<DOC
