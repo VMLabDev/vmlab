@@ -115,7 +115,8 @@ For an x86 guest the ISO also carries the legacy agent (host-profiles.md,
 `agent_transport = "isa-serial"`) under `legacy/nt`, `legacy/9x` and `legacy/dos`,
 every name 8.3 because DOS reads no Joliet. `install.cmd` defers to `install-nt.cmd`
 on a 4.x or 5.x kernel; `install-9x.bat` registers the agent under RunServices;
-`INSTALL.BAT` appends it to `AUTOEXEC.BAT` and starts it. A DOS or 9x template has
+`INSTALL.BAT` appends it to `FDAUTO.BAT` on FreeDOS (which never reads `AUTOEXEC.BAT`),
+else to `AUTOEXEC.BAT`, and starts it. A DOS or 9x template has
 no unattended hook, so its provision types the install line over the screen, for
 example `D:\INSTALL.BAT` from the CD, or `A:\INSTALL.BAT` from a floppy `media`
 block. The scripts probe drives A, D, E and F for their source.
