@@ -326,8 +326,17 @@ MSG
   }
   p <<DOC
     A host port held by an unrelated process is not detected by the plan.
-    That forward fails at install time, which `up` treats as best effort and
-    reports in the lab log. Change the `host_port` or free the port.
+    That forward fails at install time, which `up` treats as best effort: the
+    rest of the lab still comes up, and `vmlab logs` carries a
+    `forward.skipped` event in the same `{what}: {why}` shape, for example
+    `"vm1": forward: cannot listen on host 0.0.0.0:14330: Address already in use (os error 98)`.
+    Change the `host_port` or free the port.
+  DOC
+  p <<DOC
+    A forward that did install leaves a `forward.installed` event naming its
+    host port and guest address. A forward with neither event was never
+    planned: check that `vmlab validate` lists the segment and that the
+    machine it names has started.
   DOC
 
   h2 "Nested virtualisation is off on WSL 2"

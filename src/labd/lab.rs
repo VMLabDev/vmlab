@@ -1755,20 +1755,30 @@ impl LabRuntime {
             // Drop this machine's forwards from a previous run/lease.
             for (seg, id) in tracked.remove(machine).unwrap_or_default() {
                 if let Some(s) = net.segments.get(&seg).and_then(|s| s.services.as_ref()) {
-                    s.remove_forward(id);
+                    s.remove_forward(id).await;
                 }
             }
             let mut installed = Vec::new();
             for rule in rules {
+                let what = format!("\"{machine}\": {}", rule.source.describe());
+                let HostBinding::Port(host_port) = rule.host;
                 match self.install_forward(&net, rule).await {
-                    Ok(id) => installed.push((rule.segment.clone(), id)),
-                    Err(e) => self.events.emit(
-                        "forward.skipped",
-                        json!({
-                            "what": format!("\"{machine}\": {}", rule.source.describe()),
-                            "reason": e,
-                        }),
-                    ),
+                    Ok(id) => {
+                        installed.push((rule.segment.clone(), id));
+                        self.events.emit(
+                            "forward.installed",
+                            json!({
+                                "what": what,
+                                "host_port": host_port,
+                                "guest": format!("{}:{}", rule.guest_ip, rule.guest_port),
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("{what}: {e}");
+                        self.events
+                            .emit("forward.skipped", json!({"what": what, "reason": e}));
+                    }
                 }
             }
             tracked.insert(machine.to_string(), installed);

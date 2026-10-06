@@ -468,8 +468,9 @@ machine's first agent-reported IPv4 address at the time of the call, so the
 machine must be up and leased. It fails when either port is out of range, when
 the machine does not exist, when the agent reports no IPv4 address yet, when the
 segment has no NAT (a forward needs egress to originate the guest-side
-connection), or on a gone segment or one without network services. Forwards the
-lab file declares are computed up front instead; see networking.md.
+connection), when the host port is already in use, including by a forward the
+lab file declares, or on a gone segment or one without network services.
+Forwards the lab file declares are computed up front instead; see networking.md.
 
 ```wscript
 fn main(lab: Lab) {

@@ -106,6 +106,7 @@ SRC
       | "Event" | "Payload fields" | "When" |
       | "`smb.started`" | "`port`" | "The bundled smbd came up on that host port for the lab's shares." |
       | "`smb.failed`" | "`error`" | "The share plan could not be computed, or smbd failed to start on every candidate port. A start failure carries smbd's own reason, which its log usually lacks." |
+      | "`forward.installed`" | "`what`, `host_port`, `guest`" | "A forward is listening on that host port and leads to `guest` (`ip:port`). Emitted again each time it is re-installed: at readiness, at the end of `up`, and after a restart changes the lease." |
       | "`forward.skipped`" | "`what`, `reason`" | "The forward plan dropped a declared forward, or installing one failed at runtime." |
       | "`forward.conflict`" | "`host_port`, `claimants`" | "Two declarations claim the same host port." |
       | "`segment.peer.up`" | "`segment`, `peer`, `direction`" | "A cross-host trunk for a global segment came up. Host-scoped: emitted by the supervisor with no `lab`." |
