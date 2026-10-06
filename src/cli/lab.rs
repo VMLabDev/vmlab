@@ -57,6 +57,135 @@ pub(super) async fn lab_client_for(lab: Option<String>) -> Result<(String, LabCl
     }
 }
 
+/// [`lab_client_for`] for a verb that boots machines: the daemon it answers
+/// with runs the lab file as it is on disk now (see [`ensure_current_daemon`]).
+///
+/// A `lab/machine` reference names a lab that must already be running, as
+/// it does for every other verb; its file is read from the cwd when the cwd
+/// is that lab, else from the root the supervisor registered for it.
+async fn current_lab_client_for(lab: Option<String>) -> Result<(String, LabClient)> {
+    let (name, root) = match lab {
+        None => current_lab()?,
+        Some(name) => {
+            if daemon::try_lab_daemon(&name).await.is_none() {
+                bail!("lab \"{name}\" is not running");
+            }
+            match current_lab() {
+                Ok((cwd_lab, root)) if cwd_lab == name => (name, root),
+                _ => {
+                    let root = root_for(&registry_labs().await?, &name)
+                        .ok_or_else(|| anyhow!("lab \"{name}\" is not running"))?;
+                    (name, root)
+                }
+            }
+        }
+    };
+    let client = ensure_current_daemon(&name, &root).await?;
+    Ok((name, client))
+}
+
+/// What a verb that boots machines does with the lab daemon it found, given
+/// that daemon's status and the digest of the lab file on disk now.
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonFreshness {
+    /// The daemon loaded this file: use it.
+    Current,
+    /// The file changed and nothing would be lost by replacing the daemon.
+    Restart,
+    /// The file changed, but replacing the daemon would take something with
+    /// it; the message says what and how to proceed.
+    Refuse(String),
+}
+
+/// Decide whether a lab daemon still runs the lab file on disk (PRD §12:
+/// `up` runs the lab file as it is now).
+///
+/// A daemon loads `vmlab.wcl` once, when it starts, and stays up after
+/// `down` to serve status — so without this a `down`, an edit and an `up`
+/// would boot the machines from the configuration the edit replaced. A
+/// fresh daemon is the only way to load the new file, and it cannot adopt a
+/// machine the old one is running or carry on a download the old one is
+/// doing, so either of those refuses rather than being quietly lost.
+fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFreshness {
+    if status.config_digest == digest {
+        return DaemonFreshness::Current;
+    }
+    let running: Vec<&str> = status
+        .machines
+        .iter()
+        .filter(|m| m.state != crate::status::PowerState::Stopped)
+        .map(|m| m.name.as_str())
+        .collect();
+    if !running.is_empty() {
+        return DaemonFreshness::Refuse(format!(
+            "lab \"{name}\": vmlab.wcl has changed since the lab daemon loaded it, \
+             and {running} — the daemon cannot load the new file without \
+             stopping {them}. Run `vmlab down`, then this command again, to apply \
+             the edit (or undo the edit)",
+            running = match running.as_slice() {
+                [one] => format!("{one} is still running"),
+                many => format!("{} are still running", many.join(", ")),
+            },
+            them = if running.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    let mut pulling: Vec<&str> = status.pulls.iter().map(|p| p.reference.as_str()).collect();
+    pulling.sort_unstable();
+    pulling.dedup();
+    if !pulling.is_empty() {
+        return DaemonFreshness::Refuse(format!(
+            "lab \"{name}\": vmlab.wcl has changed since the lab daemon loaded it, \
+             but it is still downloading {} — loading the new file would abandon \
+             the download. Wait for it to finish (or interrupt the `vmlab pull` \
+             that started it), then run this command again",
+            pulling.join(", ")
+        ));
+    }
+    DaemonFreshness::Restart
+}
+
+/// Connect to a lab's daemon for a verb that boots machines (`up`, `pull`,
+/// `vm start`/`restart`), restarting the daemon first when the lab file has
+/// changed since it loaded it.
+///
+/// Every verb that boots a machine builds that machine from the daemon's
+/// configuration, so each must see the file as it is now. What outlives the
+/// restart is everything on disk — clones, snapshots, `.vmlab/state.json`,
+/// the workspace ledgers — because a daemon's restart is not a `destroy`.
+async fn ensure_current_daemon(name: &str, root: &std::path::Path) -> Result<LabClient> {
+    let Some(client) = daemon::try_lab_daemon(name).await else {
+        // A daemon started now reads the file now.
+        return daemon::ensure_lab_daemon(name, root).await;
+    };
+    // The daemon was handed the canonical root (the supervisor registers it
+    // so), and the digest covers it, so load from the same path.
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let digest = crate::config::digest(&load_lab_at(&root)?);
+    match daemon_freshness(name, &lab_status(&client).await?, &digest) {
+        DaemonFreshness::Current => Ok(client),
+        DaemonFreshness::Refuse(why) => bail!(why),
+        DaemonFreshness::Restart => {
+            println!("lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it");
+            let reply = daemon::ensure_supervisor()
+                .await?
+                .send(SupRequest::LabRestart {
+                    name: name.to_string(),
+                    root,
+                })
+                .await
+                .map_err(remote)?;
+            // The old daemon's socket path is reused, but follow the reply
+            // rather than assume it.
+            let socket = std::path::PathBuf::from(
+                reply["socket"]
+                    .as_str()
+                    .context("malformed lab.restart response")?,
+            );
+            Ok(LabClient::connect(&socket).await?)
+        }
+    }
+}
+
 pub(super) fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Runtime::new()?)
 }
@@ -66,7 +195,7 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
         // Validate before any side effect (PRD §5.1: implicitly every verb).
         super::validate::validate_current()?;
         let (name, root) = current_lab()?;
-        let client = daemon::ensure_lab_daemon(&name, &root).await?;
+        let client = ensure_current_daemon(&name, &root).await?;
         client
             .send_streaming(
                 LabRequest::Up {
@@ -110,7 +239,7 @@ pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
     rt()?.block_on(async {
         super::validate::validate_current()?;
         let (name, root) = current_lab()?;
-        let client = daemon::ensure_lab_daemon(&name, &root).await?;
+        let client = ensure_current_daemon(&name, &root).await?;
         let pull = client.send_streaming(
             LabRequest::Pull {
                 machines: vms.clone(),
@@ -822,7 +951,12 @@ impl PowerOp {
 pub fn cmd_machine_power(machine_ref: &str, op: PowerOp, force: bool) -> Result<()> {
     rt()?.block_on(async {
         let (lab, machine) = split_vm_ref(machine_ref)?;
-        let (_name, client) = lab_client_for(lab).await?;
+        // Starting a machine builds it from the daemon's configuration, so
+        // start and restart need the file as it is now; a stop does not.
+        let (_name, client) = match op {
+            PowerOp::Start | PowerOp::Restart => current_lab_client_for(lab).await?,
+            PowerOp::Stop => lab_client_for(lab).await?,
+        };
         client
             .send(op.request(machine, force))
             .await
@@ -1777,8 +1911,9 @@ pub fn cmd_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        LabRequest, PowerOp, Region, backup_notice, format_log_line, listed_state,
-        pulling_machines, region_value, render_dns, render_status, root_for,
+        DaemonFreshness, LabRequest, PowerOp, Region, backup_notice, daemon_freshness,
+        format_log_line, listed_state, pulling_machines, region_value, render_dns, render_status,
+        root_for,
     };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
@@ -1816,6 +1951,104 @@ mod tests {
         assert_eq!(backup_notice(&status, Some("web")), None);
         let no_dev = lab(vec![machine("web", PowerState::Running, true, vm())]);
         assert_eq!(backup_notice(&no_dev, None), None);
+    }
+
+    /// A daemon that loaded the file on disk is used as it is; one that
+    /// loaded an earlier file is replaced when nothing runs under it — the
+    /// `down`, edit, `up` of the reported bug.
+    #[test]
+    fn a_daemon_running_an_edited_away_file_is_replaced_once_the_lab_is_down() {
+        let m = |state| crate::status::fixtures::machine("web", state, false, vm());
+        let mut status = lab(vec![m(PowerState::Stopped)]);
+        status.config_digest = "loaded".into();
+        assert_eq!(
+            daemon_freshness("demo", &status, "loaded"),
+            DaemonFreshness::Current
+        );
+        assert_eq!(
+            daemon_freshness("demo", &status, "edited"),
+            DaemonFreshness::Restart
+        );
+        // Unchanged, a running lab is simply used: `up` on a lab that is up.
+        let mut running = lab(vec![m(PowerState::Running)]);
+        running.config_digest = "loaded".into();
+        assert_eq!(
+            daemon_freshness("demo", &running, "loaded"),
+            DaemonFreshness::Current
+        );
+    }
+
+    /// A daemon from before the digest existed reports none, and is taken to
+    /// be stale rather than trusted.
+    #[test]
+    fn a_daemon_reporting_no_digest_is_stale() {
+        let status = lab(vec![crate::status::fixtures::machine(
+            "web",
+            PowerState::Stopped,
+            false,
+            vm(),
+        )]);
+        assert_eq!(
+            daemon_freshness("demo", &status, "edited"),
+            DaemonFreshness::Restart
+        );
+    }
+
+    /// A fresh daemon cannot adopt a machine the old one runs, so an edit
+    /// over a running machine refuses — naming every machine in the way, in
+    /// any non-stopped state — instead of booting the old configuration or
+    /// stopping anything.
+    #[test]
+    fn an_edit_over_running_machines_refuses_and_names_them() {
+        let m = |name, state| crate::status::fixtures::machine(name, state, false, vm());
+        for state in [
+            PowerState::Running,
+            PowerState::Starting,
+            PowerState::Stopping,
+            PowerState::Suspended,
+        ] {
+            let status = lab(vec![m("web", state), m("db", PowerState::Stopped)]);
+            let DaemonFreshness::Refuse(why) = daemon_freshness("demo", &status, "edited") else {
+                panic!("state {state:?} did not refuse");
+            };
+            assert!(why.contains("web is still running"), "{why}");
+            assert!(!why.contains("db"), "{why}");
+            assert!(why.contains("vmlab down"), "{why}");
+        }
+        let both = lab(vec![
+            m("web", PowerState::Running),
+            m("db", PowerState::Running),
+        ]);
+        let DaemonFreshness::Refuse(why) = daemon_freshness("demo", &both, "edited") else {
+            panic!("did not refuse");
+        };
+        assert!(why.contains("web, db are still running"), "{why}");
+    }
+
+    /// Replacing the daemon would abandon a download it is doing, so that
+    /// refuses too, naming the artefact once however many machines wait on it.
+    #[test]
+    fn an_edit_during_a_download_refuses() {
+        let mut status = lab(vec![crate::status::fixtures::machine(
+            "web",
+            PowerState::Stopped,
+            false,
+            vm(),
+        )]);
+        for machine in ["web", "web2"] {
+            status.pulls.push(PullStatus {
+                machine: machine.into(),
+                kind: PullKind::Template,
+                reference: "ghcr.io/vmlab/win11:1".into(),
+                bytes_done: 0,
+                bytes_total: 0,
+                percent: 0,
+            });
+        }
+        let DaemonFreshness::Refuse(why) = daemon_freshness("demo", &status, "edited") else {
+            panic!("did not refuse");
+        };
+        assert_eq!(why.matches("ghcr.io/vmlab/win11:1").count(), 1, "{why}");
     }
 
     /// A daemon left up by `lab stop` is listed by what runs under it.

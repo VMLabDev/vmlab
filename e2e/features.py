@@ -29,6 +29,8 @@ FEATURES: dict[str, str] = {
     "lab.depends_on": "`depends_on` orders machine start",
     "lab.status": "`vmlab status` and `status -v`",
     "lab.down": "`vmlab down`",
+    "lab.up.reload": "`vmlab up` after `down` runs the edited lab file; an edit over a running machine refuses",
+    "lab.up.template-changed": "`vmlab up` refuses a VM whose template changed while its clone is kept",
     "lab.destroy": "`vmlab destroy`",
     "lab.pull": "`vmlab pull` fetches registry templates and images only",
     "lab.list": "`vmlab lab list`",

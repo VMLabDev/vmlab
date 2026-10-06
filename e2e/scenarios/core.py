@@ -12,8 +12,8 @@ from harness import E2E, ScenarioFailed
 LAB = "e2e-core"
 OWNED = [
     "lab.validate", "lab.validate.reject", "lab.up", "lab.up.partial", "lab.depends_on",
-    "lab.status", "lab.down", "lab.destroy", "vm.start", "vm.stop", "vm.restart",
-    "vm.destroy", "vm.ip", "vm.hw.cpus-memory", "vm.hw.disk", "vm.hw.disk-from",
+    "lab.status", "lab.down", "lab.up.reload", "lab.up.template-changed", "lab.destroy",
+    "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory", "vm.hw.disk", "vm.hw.disk-from",
     "vm.hw.cdrom", "vm.hw.floppy", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
     "vm.hw.qemu_args", "vm.hw.nested", "vm.scratch", "vm.media.iso", "vm.media.floppy",
 ]
@@ -212,6 +212,63 @@ def secure_boot(h):
         )
 
 
+def edit_lab(lab: pathlib.Path, old: str, new: str) -> None:
+    """Edit the lab's vmlab.wcl in place, the way a user would between runs."""
+    path = lab / "vmlab.wcl"
+    text = path.read_text()
+    if old not in text:
+        raise ScenarioFailed(f"vmlab.wcl has no {old!r} to edit")
+    path.write_text(text.replace(old, new, 1))
+
+
+def reload_after_down(h, lab: pathlib.Path) -> None:
+    """The lab daemon outlives `down`. `up` must still run the lab file as it
+    is on disk now, not the one the daemon loaded, and must refuse an edit it
+    cannot apply rather than quietly running the old one."""
+    # An edited qemu_args takes effect on the next `up`.
+    edit_lab(lab, "serial=E2E-QEMU-ARGS\"", "serial=E2E-QEMU-ARGS-2\"")
+    up = h.vmlab("up", "vm01", cwd=lab, timeout=600, check=False)
+    if up.code == 0:
+        h.wait_ready(lab, "vm01")
+    serial = sh(h, lab, "vm01", "cat /sys/class/dmi/id/product_serial", check=False).out.strip()
+    argv = qemu_argv("vm01")
+    applied = up.code == 0 and serial == "E2E-QEMU-ARGS-2" and "type=1,serial=E2E-QEMU-ARGS-2" in argv
+
+    # Edited again while vm01 runs: a fresh daemon cannot adopt it, so `up`
+    # refuses by name and vm01 keeps what it booted with.
+    edit_lab(lab, "serial=E2E-QEMU-ARGS-2\"", "serial=E2E-QEMU-ARGS-3\"")
+    busy = h.vmlab("up", "vm01", cwd=lab, timeout=120, check=False)
+    refused = (
+        busy.code != 0 and "vm01 is still running" in busy.text and "vmlab down" in busy.text
+        and "type=1,serial=E2E-QEMU-ARGS-2" in qemu_argv("vm01")
+    )
+    h.ok(
+        "lab.up.reload",
+        applied and refused,
+        f"after down + edit: up exit {up.code}, guest serial {serial!r}; "
+        f"edit over running vm01: exit {busy.code}, "
+        + next((l.strip() for l in busy.text.splitlines() if "still running" in l), busy.text.strip()[-200:]),
+    )
+
+    # A clone cannot move to another template: `up` refuses before starting
+    # anything and keeps the clone, rather than booting the old template.
+    h.vmlab("down", cwd=lab, check=False, timeout=300)
+    edit_lab(
+        lab,
+        'template = "x86_64/e2e-alpine"',
+        'template = "scratch"\n    arch     = "x86_64"\n    profile  = "linux-generic"\n    disk     = 1GiB',
+    )
+    moved = h.vmlab("up", "vm03", cwd=lab, timeout=300, check=False)
+    h.ok(
+        "lab.up.template-changed",
+        moved.code != 0 and "vmlab vm destroy vm03" in moved.text
+        and state_of(h, lab, "vm03") == "stopped"
+        and (lab / ".vmlab" / "vms" / "vm03" / "disk0.qcow2").exists(),
+        f"exit {moved.code}: "
+        + next((l.strip() for l in moved.text.splitlines() if "clone" in l), moved.text.strip()[-200:]),
+    )
+
+
 def _run(h):
     # A lab validate must refuse, naming what is wrong.
     bad = h.vmlab("validate", cwd=E2E / "labs" / "core-bad", check=False)
@@ -401,6 +458,8 @@ def _run(h):
             and (lab / ".vmlab" / "vms" / "vm01").exists(),
             f"states {states}, clones kept",
         )
+
+        reload_after_down(h, lab)
 
         de = h.vmlab("destroy", cwd=lab, check=False, timeout=300)
         # Checked at once: destroy returns only once the lab daemon is gone.

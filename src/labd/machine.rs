@@ -238,6 +238,15 @@ pub trait Machine: Send + Sync + 'static {
     /// failure mid-`up`.
     fn required_binaries(&self) -> Vec<String>;
 
+    /// Refuse when the disks this machine already has cannot boot under its
+    /// declaration — a VM's clone of a template the lab file no longer names
+    /// (§7.1). `up` asks every target before anything downloads or boots, so
+    /// the refusal is the whole of what it did. A container has no such rule
+    /// (an edited `image =` line just drops its pin, §18), hence the default.
+    fn check_disks(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// This machine as the interface, so the default methods can share one
     /// polling loop. `impl Machine for T { fn as_machine(&self) -> &dyn Machine { self } }`
     /// — trait upcasting would make it unnecessary, and this goes when it lands.

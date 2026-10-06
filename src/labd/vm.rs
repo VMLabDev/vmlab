@@ -188,6 +188,12 @@ impl VmDirs {
     pub fn primary_disk(&self) -> PathBuf {
         self.local.join("disk0.qcow2")
     }
+    /// The template declaration the primary disk was cloned from (see
+    /// [`clone_source`]). Kept beside the clone, so it goes wherever the
+    /// clone goes — a `destroy`, or a hand deleting the directory.
+    pub fn clone_source(&self) -> PathBuf {
+        self.local.join("clone-source")
+    }
     /// Sentinel marking that the template's first-boot provision has completed
     /// for this clone. Written once first-boot succeeds; gates run-once so a
     /// second boot never waits on a marker that is not re-written (PRD §6.1).
@@ -279,6 +285,42 @@ pub struct VmInstance {
     /// [`super::hypervisor`]). Real QEMU in production; a fake in tests, which
     /// is what makes the start ladder and the exit monitor testable.
     hv: Arc<dyn Hypervisor>,
+}
+
+/// What a VM's primary disk is made from, as the lab file declares it: the
+/// template reference (`scratch` for a blank disk), plus the arch a registry
+/// reference is pulled for.
+///
+/// The declaration, not the store entry it resolves to: an unpinned
+/// `<arch>/<name>` resolves to whatever version is highest in the store, and
+/// a newer build of the same template is not a different template — the
+/// clone keeps its backing file, which the store refuses to delete (§7.1).
+pub fn clone_source(cfg: &model::Vm) -> String {
+    match (&cfg.template, &cfg.arch) {
+        (model::TemplateRef::Registry { reference }, Some(arch)) => {
+            format!("{reference} (arch {arch})")
+        }
+        (template, _) => template.to_string(),
+    }
+}
+
+/// Why `vm` cannot boot the disk it has: its clone was made from `recorded`,
+/// and the lab file now declares `declared`. `None` when they agree.
+///
+/// A linked clone is a qcow2 overlay on its template's image (§7.1). It
+/// cannot be rebased onto another template — the guest's blocks are deltas
+/// against the old one — so booting it would silently run the old template,
+/// and replacing it would silently destroy the guest. §7.1 makes clones
+/// disposable by `destroy`, so the way forward is to say so.
+pub fn clone_source_refusal(vm: &str, recorded: &str, declared: &str) -> Option<String> {
+    (recorded != declared).then(|| {
+        format!(
+            "vm \"{vm}\": its disk is a clone of \"{recorded}\", but vmlab.wcl now \
+             declares \"{declared}\" — a clone cannot move to another template. \
+             Run `vmlab vm destroy {vm}` (or `vmlab destroy`) to discard the disk \
+             and recreate it from \"{declared}\", or put the template line back"
+        )
+    })
 }
 
 impl VmInstance {
@@ -498,12 +540,43 @@ impl VmInstance {
         self.agent.drop().await;
     }
 
+    /// Refuse when this VM's disk is a clone of a different template from
+    /// the one the lab file now declares (see [`clone_source_refusal`]).
+    ///
+    /// Checked by `up` before it downloads or starts anything, and again by
+    /// every boot, so neither a whole-lab `up` nor a single `vm start` boots
+    /// a disk the declaration no longer describes.
+    pub fn check_clone_source(&self) -> Result<()> {
+        if !self.dirs.primary_disk().exists() {
+            return Ok(());
+        }
+        let recorded = match std::fs::read_to_string(self.dirs.clone_source()) {
+            Ok(recorded) => recorded,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("reading {}", self.dirs.clone_source().display()));
+            }
+        };
+        match clone_source_refusal(&self.cfg.name, recorded.trim(), &clone_source(&self.cfg)) {
+            Some(why) => bail!(why),
+            None => Ok(()),
+        }
+    }
+
     /// Create disks on first use (PRD §7.1): linked clone of the template,
     /// or a blank qcow2 for scratch; extra disks blank or FAT-from-folder.
     pub async fn ensure_disks(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dirs.local)?;
+        self.check_clone_source()?;
         let primary = self.dirs.primary_disk();
-        if !primary.exists() {
+        if primary.exists() {
+            // A clone made before the source was recorded is taken to be of
+            // the template declared now: nothing on disk says otherwise.
+            if !self.dirs.clone_source().exists() {
+                std::fs::write(self.dirs.clone_source(), clone_source(&self.cfg))?;
+            }
+        } else {
             let t = self.template();
             match (&t.backing, t.disk_size) {
                 (Some(backing), _) => {
@@ -514,6 +587,7 @@ impl VmInstance {
                 }
                 (None, None) => bail!("{}: no backing template and no disk size", self.cfg.name),
             }
+            std::fs::write(self.dirs.clone_source(), clone_source(&self.cfg))?;
         }
         for d in &self.cfg.extra_disks {
             let path = self.dirs.extra_disk(&d.name);
@@ -1267,6 +1341,11 @@ impl super::machine::Machine for VmInstance {
         &self.dirs.run
     }
 
+    /// A clone made from a template the lab file no longer declares (§7.1).
+    fn check_disks(&self) -> Result<()> {
+        self.check_clone_source()
+    }
+
     /// The per-arch emulator, `qemu-img` for the clone, and `swtpm` when the
     /// resolved hardware wants a TPM.
     fn required_binaries(&self) -> Vec<String> {
@@ -1719,7 +1798,46 @@ async fn run_tool(bin: &str, args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::no_agent_hint;
+    use super::{clone_source, clone_source_refusal, no_agent_hint};
+
+    fn vm(decl: &str) -> crate::config::model::Vm {
+        crate::qemu::resolve::testing::vm(decl)
+    }
+
+    /// The source is the declaration: a store reference as written (so an
+    /// unpinned one survives a newer build of the same template), `scratch`,
+    /// and a registry reference with the arch it is pulled for.
+    #[test]
+    fn a_clone_source_is_the_template_as_declared() {
+        assert_eq!(
+            clone_source(&vm(r#"vm "a" { template = "x86_64/alpine-3.23" }"#)),
+            "x86_64/alpine-3.23"
+        );
+        assert_eq!(
+            clone_source(&vm(
+                r#"vm "a" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 1GiB }"#
+            )),
+            "scratch"
+        );
+        assert_eq!(
+            clone_source(&vm(
+                r#"vm "a" { template = "ghcr.io/o/alpine:3" arch = "aarch64" }"#
+            )),
+            "ghcr.io/o/alpine:3 (arch aarch64)"
+        );
+    }
+
+    /// Only a changed declaration refuses, and the refusal names both
+    /// templates and both ways forward.
+    #[test]
+    fn a_changed_template_refuses_with_the_way_out() {
+        assert_eq!(clone_source_refusal("web", "x86_64/a", "x86_64/a"), None);
+        let why = clone_source_refusal("web", "x86_64/a", "x86_64/b").expect("refuses");
+        assert!(why.contains("\"x86_64/a\""), "{why}");
+        assert!(why.contains("\"x86_64/b\""), "{why}");
+        assert!(why.contains("vmlab vm destroy web"), "{why}");
+        assert!(why.contains("vmlab destroy"), "{why}");
+    }
 
     #[test]
     fn a_booting_guest_is_not_told_its_template_lacks_an_agent() {

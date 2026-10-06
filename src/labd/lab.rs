@@ -1586,6 +1586,14 @@ impl LabRuntime {
             output(format!("warning: {}: {problem}\n", nested.join(", ")));
         }
 
+        // A VM whose clone was made from a template the lab file no longer
+        // declares cannot boot it either way — refuse before downloading the
+        // new template or starting anything else, so the refusal is the
+        // whole of what `up` did.
+        for name in &targets {
+            self.machine(name)?.check_disks()?;
+        }
+
         // Deferred template/image downloads happen here — before the binary
         // preflight (pulled meta can change the resolved firmware/TPM needs)
         // and before any clone or boot work, streaming progress to both the
@@ -2262,6 +2270,7 @@ impl LabRuntime {
             segments,
             provisioned: self.provisioned(),
             pulls: self.pulls.lock_recover().snapshot(),
+            config_digest: crate::config::digest(&self.config),
         }
     }
 

@@ -589,6 +589,13 @@ pub struct LabStatus {
     /// `destroy` has something to remove.
     pub provisioned: bool,
     pub pulls: Vec<PullStatus>,
+    /// [`crate::config::digest`] of the lab file this daemon loaded when it
+    /// started. A daemon outlives `down`, so this is how a verb that boots a
+    /// machine tells a daemon still running an edited-away configuration
+    /// from one running the file on disk. Empty from a daemon that predates
+    /// the field, which never matches a digest and so reads as stale.
+    #[serde(default)]
+    pub config_digest: String,
 }
 
 impl LabStatus {
@@ -713,6 +720,7 @@ pub(crate) mod fixtures {
             segments: Vec::new(),
             provisioned: true,
             pulls: Vec::new(),
+            config_digest: String::new(),
         }
     }
 }

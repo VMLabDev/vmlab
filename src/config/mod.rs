@@ -140,6 +140,33 @@ pub fn load_lab_root(root: &Path) -> Result<LabFile, ConfigErrors> {
     load_lab_source(&source, &path.display().to_string(), root)
 }
 
+/// A fingerprint of what a lab file *says*, for telling whether a lab daemon
+/// is still running the file on disk.
+///
+/// A lab daemon loads `vmlab.wcl` once, when it starts, and outlives `down`
+/// to keep serving status. `up` compares this digest of the file as it is now
+/// against the one the daemon reports and restarts the daemon when they
+/// differ, so a machine never boots from a configuration the user has since
+/// edited away.
+///
+/// It hashes the typed model rather than the source bytes, so an import the
+/// lab file pulls in counts and a comment does not. Source spans — byte
+/// offsets kept for diagnostics — are blanked first: they move with every
+/// edit, comments included, while what the lab declares stays the same. The
+/// model holds no maps, so its rendering is deterministic across processes.
+pub fn digest(lab: &LabFile) -> String {
+    use sha2::{Digest, Sha256};
+    use std::sync::OnceLock;
+    static SPAN: OnceLock<regex::Regex> = OnceLock::new();
+    let span = SPAN.get_or_init(|| {
+        regex::Regex::new(r"\b(\w*span): (?:\(\d+, \d+\)|Some\(\(\d+, \d+\)\)|None)")
+            .expect("valid span regex")
+    });
+    let rendered = format!("{lab:?}");
+    let blanked = span.replace_all(&rendered, "$1: _");
+    hex::encode(Sha256::digest(blanked.as_bytes()))
+}
+
 /// Parse a dedicated template file (templates only, no lab required).
 pub fn load_template_source(
     source: &str,
@@ -777,5 +804,50 @@ template "base" {
             m.logins().iter().any(|l| l.label == "dev"),
             "dev-container/dev01 declares no `dev` login"
         );
+    }
+
+    const DIGEST_LAB: &str = r#"import <vmlab.wcl>
+
+lab "web" {
+  segment "lan" { subnet = "10.70.0.0/24" }
+  vm "web" {
+    template  = "x86_64/linux-modern"
+    qemu_args = ["-no-hpet"]
+    nic { segment = "lan" }
+  }
+}
+"#;
+
+    fn digest_of(source: &str) -> String {
+        digest(&load_lab_source(source, "<test>", Path::new("/tmp")).unwrap())
+    }
+
+    /// The digest is a pure function of the file: a daemon and the CLI that
+    /// load the same bytes agree on it.
+    #[test]
+    fn the_same_lab_file_digests_the_same() {
+        assert_eq!(digest_of(DIGEST_LAB), digest_of(DIGEST_LAB));
+    }
+
+    /// A comment moves every span after it but declares nothing, so `up`
+    /// does not replace a daemon over it.
+    #[test]
+    fn a_comment_does_not_change_the_digest() {
+        let commented = DIGEST_LAB.replace(
+            "lab \"web\" {",
+            "// a note that shifts every byte offset below it\nlab \"web\" {",
+        );
+        assert_eq!(digest_of(DIGEST_LAB), digest_of(&commented));
+    }
+
+    /// Both edits from the reported bug — a VM's template and its
+    /// `qemu_args` — are a configuration a daemon loaded earlier no longer
+    /// matches.
+    #[test]
+    fn an_edited_declaration_changes_the_digest() {
+        let template = DIGEST_LAB.replace("x86_64/linux-modern", "x86_64/linux-other");
+        let args = DIGEST_LAB.replace("-no-hpet", "-no-reboot");
+        assert_ne!(digest_of(DIGEST_LAB), digest_of(&template));
+        assert_ne!(digest_of(DIGEST_LAB), digest_of(&args));
     }
 }

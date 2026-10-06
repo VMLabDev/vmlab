@@ -504,6 +504,52 @@ async fn a_tpm_that_never_binds_fails_the_start() {
     assert!(!vm.is_ready().await);
 }
 
+/// A clone made from one template is never booted under a declaration that
+/// names another: the boot refuses, says how to recreate the disk, and
+/// leaves both the disk and the record of what it was cloned from alone.
+#[tokio::test]
+async fn a_clone_of_another_template_refuses_to_boot() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    std::fs::write(vm.dirs.clone_source(), "x86_64/alpine-3.23\n").expect("record");
+    let (cbs, _observed) = callbacks();
+
+    let err = start_vm(&vm, cbs).await.expect_err("start must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("x86_64/alpine-3.23"),
+        "names the old template: {msg}"
+    );
+    assert!(msg.contains("\"scratch\""), "names the declared one: {msg}");
+    assert!(
+        msg.contains("vmlab vm destroy dc01"),
+        "says the way out: {msg}"
+    );
+    assert_eq!(vm.state().await, PowerState::Stopped);
+    assert!(vm.dirs.primary_disk().exists(), "the guest's disk is kept");
+    assert_eq!(
+        std::fs::read_to_string(vm.dirs.clone_source()).expect("record"),
+        "x86_64/alpine-3.23\n"
+    );
+}
+
+/// A clone made before its source was recorded boots, and is taken to be of
+/// the template declared now — which is then what it is checked against.
+#[tokio::test]
+async fn a_clone_with_no_recorded_source_boots_and_is_recorded() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    assert!(!vm.dirs.clone_source().exists());
+    let (cbs, _observed) = callbacks();
+
+    start_vm(&vm, cbs).await.expect("start");
+    assert_eq!(
+        std::fs::read_to_string(vm.dirs.clone_source()).expect("record"),
+        "scratch"
+    );
+    vm.stop(true).await.expect("stop");
+}
+
 /// A filesystem daemon that dies during startup fails the start too — the
 /// guest would otherwise boot with a vhost-user chardev nothing is listening
 /// on, which QEMU turns into a far less legible failure.
