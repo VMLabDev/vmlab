@@ -17,6 +17,9 @@ lab "e2e-network" {
     sinkhole { pattern = "*.blocked.e2e.test" }
 
     forward  { host_port = 18280 to = "vm01:8080" }
+    // To a machine `up` waits on, through its provision: installed when it
+    // becomes ready and again once `up` has provisioned it.
+    forward  { host_port = 18281 to = "router:8080" }
 
     block    { cidr = "@HOST@/32" proto = "tcp" port = 9002 }
     redirect { from = "192.0.2.10:80" to = "@HOST@:9001" proto = "tcp" }
@@ -74,6 +77,7 @@ lab "e2e-network" {
       segment = "island"
       ip      = "10.82.2.254"
     }
+    provision "scripts/router-web.ws" { }
   }
 
   vm "vm03" {

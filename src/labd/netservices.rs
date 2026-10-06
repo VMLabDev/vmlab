@@ -264,7 +264,8 @@ impl SegmentServices {
             Proto::Udp => PortForwarder::spawn_udp_forward(host_addr, engine, guest_ip, guest_port),
             // "both" forwards TCP (the common case); a second call can add UDP.
             _ => PortForwarder::spawn_tcp_forward(host_addr, engine, guest_ip, guest_port),
-        };
+        }
+        .map_err(|e| format!("cannot listen on host {host_addr}: {e}"))?;
         let id = self
             .next_forward_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -276,15 +277,22 @@ impl SegmentServices {
     /// segment forwards live for the lab's lifetime; container `port {}`
     /// forwards are removed and re-installed when a restart changes the
     /// lease.
-    pub fn remove_forward(&self, id: u64) -> bool {
-        let mut fwds = self.forwards.lock_recover();
-        if let Some(pos) = fwds.iter().position(|(fid, _)| *fid == id) {
-            let (_, handle) = fwds.remove(pos);
-            handle.abort();
-            true
-        } else {
-            false
-        }
+    ///
+    /// Returns once the listener is closed, so a forward re-installed on the
+    /// same host port straight after can bind it. Aborting a task only asks
+    /// for it to stop: a rebind issued before the runtime gets round to
+    /// dropping the old listener fails with the port still in use.
+    pub async fn remove_forward(&self, id: u64) -> bool {
+        let handle = {
+            let mut fwds = self.forwards.lock_recover();
+            match fwds.iter().position(|(fid, _)| *fid == id) {
+                Some(pos) => fwds.remove(pos).1,
+                None => return false,
+            }
+        };
+        handle.abort();
+        let _ = handle.await;
+        true
     }
 }
 
@@ -414,5 +422,50 @@ mod tests {
 
         guest.tx.send(syn(GW_IP, 445)).await.unwrap();
         assert!(!accepted(&other).await, "an unexposed port was reached");
+    }
+
+    /// A free loopback port, released for the test to claim.
+    fn free_port() -> std::net::SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    /// Re-installing a forward on the port it was just removed from binds
+    /// every time. Removal used to only abort the listener's task, and on a
+    /// multi-threaded runtime the new bind sometimes ran before the old
+    /// listener was dropped: the new forward died with the port in use, and
+    /// nothing said so (#144).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forward_reinstalled_on_its_own_port_binds() {
+        let (services, _gw, _guest) = segment(true);
+        for _ in 0..50 {
+            let addr = free_port();
+            let first = services
+                .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
+                .unwrap();
+            assert!(services.remove_forward(first).await);
+            let second = services
+                .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
+                .expect("the removed forward's port is free again");
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("the re-installed forward is listening");
+            services.remove_forward(second).await;
+        }
+    }
+
+    /// A host port something else holds is an error from `add_forward`
+    /// itself, for the caller to report, not a warning inside a spawned task.
+    #[tokio::test]
+    async fn a_forward_on_a_taken_port_is_an_error() {
+        let (services, _gw, _guest) = segment(true);
+        let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let addr = holder.local_addr().unwrap();
+        let err = services
+            .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
+            .expect_err("the port is taken");
+        assert!(err.contains(&addr.port().to_string()), "{err}");
     }
 }

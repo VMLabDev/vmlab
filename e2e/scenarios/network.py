@@ -23,6 +23,8 @@ BULK_PAUSE = 2
 BULK_FLOOR = 20e6  # bytes/s over the time spent moving data
 GUEST_MARKER = "e2e-guest-marker"
 FORWARD_PORT = 18280
+PROVISIONED_FORWARD_PORT = 18281
+ROUTER_MARKER = "e2e-router-marker"
 
 
 def host_ip() -> str:
@@ -308,6 +310,28 @@ def forward(h, lab):
         events = h.vmlab("logs", "-o", "jsonl", "-n", "200", cwd=lab, check=False).out
         skips = [l for l in events.splitlines() if "forward.skipped" in l]
         h.ok("net.forward", False, f"host :{FORWARD_PORT} refused after the VM became ready; skips: {skips[-3:]}")
+    forward_provisioned(h, lab)
+
+
+def forward_provisioned(h, lab):
+    """A forward to a machine `up` waited on: installed at readiness, then
+    re-installed on the same host port after the provision. The second
+    install used to lose the port to the first one's closing listener and
+    fail with nothing in the lab log (#144)."""
+    url = f"http://127.0.0.1:{PROVISIONED_FORWARD_PORT}/r"
+    events = h.vmlab("logs", "-o", "jsonl", "-n", "2000", cwd=lab, check=False).out
+    lines = [l for l in events.splitlines() if '"forward.' in l and "router" in l]
+    installed = [l for l in lines if "forward.installed" in l]
+    skipped = [l for l in lines if "forward.skipped" in l]
+    answer = curl(h, url)
+    passed = ROUTER_MARKER in answer and bool(installed) and not skipped
+    h.ok(
+        "net.forward.provisioned",
+        passed,
+        f"host :{PROVISIONED_FORWARD_PORT} answered from router:8080 ({len(installed)} forward.installed)"
+        if passed
+        else f"answer {answer.strip()[:80]!r}; forward events: {lines[-4:]}",
+    )
 
 
 PEER_SERVER = """

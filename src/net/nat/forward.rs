@@ -16,25 +16,41 @@ use super::NatEngine;
 /// Spawners tying host sockets to guest endpoints via a [`NatEngine`].
 pub struct PortForwarder;
 
+/// A non-blocking TCP listener on `listen`, bound the way
+/// [`TcpListener::bind`] binds one (`SO_REUSEADDR`, so a port whose last
+/// connections sit in `TIME_WAIT` can be listened on again) but
+/// synchronously, so the caller learns whether it got the port.
+fn bind_tcp(listen: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(
+        Domain::for_address(listen),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&listen.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
 impl PortForwarder {
     /// Listen on `listen`; every accepted TCP connection becomes a vTCP
     /// active open to `guest_ip:guest_port` with bytes copied both ways.
+    ///
+    /// The bind happens here, before the task is spawned, so a port that is
+    /// already taken is the caller's error to report rather than a warning
+    /// inside a task nobody awaits.
     pub fn spawn_tcp_forward(
         listen: SocketAddr,
         engine: Arc<NatEngine>,
         guest_ip: Ipv4Addr,
         guest_port: u16,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let listener = match TcpListener::bind(listen).await {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!(%listen, error = %e, "tcp forward: bind failed");
-                    return;
-                }
-            };
-            Self::serve_tcp(listener, engine, guest_ip, guest_port).await;
-        })
+    ) -> std::io::Result<JoinHandle<()>> {
+        let listener = TcpListener::from_std(bind_tcp(listen)?)?;
+        Ok(tokio::spawn(Self::serve_tcp(
+            listener, engine, guest_ip, guest_port,
+        )))
     }
 
     /// As [`Self::spawn_tcp_forward`] but on an already-bound listener
@@ -71,23 +87,19 @@ impl PortForwarder {
 
     /// Listen for UDP on `listen`; each distinct remote source address is
     /// mapped to its own engine-side guest flow so replies return to the
-    /// right peer.
+    /// right peer. Binds before spawning, as [`Self::spawn_tcp_forward`].
     pub fn spawn_udp_forward(
         listen: SocketAddr,
         engine: Arc<NatEngine>,
         guest_ip: Ipv4Addr,
         guest_port: u16,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let sock = match UdpSocket::bind(listen).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(%listen, error = %e, "udp forward: bind failed");
-                    return;
-                }
-            };
-            Self::serve_udp(sock, engine, guest_ip, guest_port).await;
-        })
+    ) -> std::io::Result<JoinHandle<()>> {
+        let sock = std::net::UdpSocket::bind(listen)?;
+        sock.set_nonblocking(true)?;
+        let sock = UdpSocket::from_std(sock)?;
+        Ok(tokio::spawn(Self::serve_udp(
+            sock, engine, guest_ip, guest_port,
+        )))
     }
 
     /// As [`Self::spawn_udp_forward`] but on an already-bound socket.
