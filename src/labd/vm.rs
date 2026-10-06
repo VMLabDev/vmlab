@@ -1615,6 +1615,7 @@ impl super::machine::Machine for VmInstance {
             let mut argv = vec![step.command.clone()];
             argv.extend(step.args.iter().cloned());
             let mut last: Option<String> = None;
+            let mut refused = false;
             for attempt in 0..plan.retry.attempts {
                 if attempt > 0 {
                     tokio::time::sleep(plan.retry.delay).await;
@@ -1651,6 +1652,13 @@ impl super::machine::Machine for VmInstance {
                             started.elapsed()
                         );
                         last = Some(err);
+                        // The guest said no in a way another attempt will
+                        // not change; waiting five minutes only delays
+                        // saying so.
+                        if step.refused_exit == Some(r.exit_code) {
+                            refused = true;
+                            break;
+                        }
                     }
                     Err(e) => {
                         tracing::debug!(
@@ -1665,12 +1673,16 @@ impl super::machine::Machine for VmInstance {
                 tracing::warn!("{vm_name}: mount step `{}` failed: {err}", step.command);
                 // A share that never appears is the author's to see, on the
                 // feed, not only in the daemon's log.
-                let reason = format!(
-                    "`{}` still failing after {} attempts: {}",
-                    step.command,
-                    plan.retry.attempts,
-                    err.trim()
-                );
+                let reason = if refused {
+                    format!("`{}` refused: {}", step.command, err.trim())
+                } else {
+                    format!(
+                        "`{}` still failing after {} attempts: {}",
+                        step.command,
+                        plan.retry.attempts,
+                        err.trim()
+                    )
+                };
                 lab.events().emit(
                     "share.unmountable",
                     serde_json::json!({"vm": vm_name, "share": step.share, "reason": reason}),
