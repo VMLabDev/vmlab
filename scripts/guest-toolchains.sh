@@ -11,8 +11,8 @@
 # Usage: scripts/guest-toolchains.sh [stage...]
 #   apt     host packages: cc + gcc-multilib (linux-x86 legacy, i686 musl
 #           link), mingw-w64 (i686 + x86_64), cpio/xz/curl/git/bzip2/make
-#   rust    rustup stable + the four musl targets (rust-lld rides along with
-#           the stable toolchain), and the nightly ebpf/rust-toolchain.toml
+#   rust    rustup's pinned stable (rust-toolchain.toml) + the four musl
+#           targets (rust-lld rides along with that toolchain), and the nightly ebpf/rust-toolchain.toml
 #           pins, with rust-src, for the win7 targets' build-std
 #   msvcrt  the msvcrt-flavoured mingw CRT (guest/build-mingw-msvcrt.sh) at
 #           the version of the installed mingw-w64 headers; skipped when
@@ -61,6 +61,14 @@ stage_apt() {
     gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 binutils-mingw-w64 mingw-w64-common
 }
 
+# The stable toolchain rust-toolchain.toml pins for the host and guest crates.
+pinned_stable() {
+  local stable
+  stable="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")"
+  [[ -n "$stable" ]] || die "no channel in rust-toolchain.toml"
+  echo "$stable"
+}
+
 # The nightly ebpf/rust-toolchain.toml pins: the BPF objects build with it,
 # and the win7 agent targets reuse it for build-std.
 pinned_nightly() {
@@ -74,13 +82,16 @@ stage_rust() {
   if ! command -v rustup >/dev/null 2>&1; then
     log "rust: installing rustup"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-      sh -s -- -y --profile minimal --default-toolchain stable
+      sh -s -- -y --profile minimal --default-toolchain none
   fi
   # shellcheck disable=SC1091
   [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
-  log "rust: stable + musl targets"
-  rustup toolchain install stable --profile minimal
-  rustup target add --toolchain stable \
+  local stable
+  stable="$(pinned_stable)"
+  log "rust: $stable + musl targets"
+  rustup toolchain install "$stable" --profile minimal
+  rustup default "$stable"
+  rustup target add --toolchain "$stable" \
     x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
     riscv64gc-unknown-linux-musl i686-unknown-linux-musl
   local nightly

@@ -3,5 +3,6 @@
 # toolchain stages read, so no source edit invalidates a toolchain layer.
 *
 !scripts/guest-toolchains.sh
+!rust-toolchain.toml
 !ebpf/rust-toolchain.toml
 !guest/build-mingw-msvcrt.sh

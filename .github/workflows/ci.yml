@@ -28,8 +28,9 @@ jobs:
             qemu-efi-aarch64 qemu-efi-riscv64 \
             tesseract-ocr passt \
             xorriso mtools dosfstools samba
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
       - uses: taiki-e/install-action@just
       - uses: Swatinem/rust-cache@v2
@@ -48,8 +49,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, riscv64gc-unknown-linux-musl, x86_64-pc-windows-gnu
       - uses: taiki-e/install-action@just
@@ -192,8 +194,9 @@ jobs:
             suffix: linux-x86_64
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.0  # rust-toolchain.toml
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@just
       - uses: Swatinem/rust-cache@v2

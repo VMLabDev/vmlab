@@ -1,0 +1,20 @@
+# The stable toolchain every build in this repository uses: the host
+# binary, the guest crates, and `just ci::check`. Pinned so a local merge
+# bar runs the same rustc and clippy as CI; a floating `stable` let a
+# 1.99 clippy lint fail CI after a 1.97 local check passed.
+#
+# ci.yml and deploy-site.yml install this exact version, and
+# scripts/guest-toolchains.sh reads it for the buildbox. ebpf/ keeps its own
+# nightly pin in ebpf/rust-toolchain.toml (the nearest file wins). Bump all
+# of them together.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "riscv64gc-unknown-linux-musl",
+    "i686-unknown-linux-musl",
+    "x86_64-pc-windows-gnu",
+]

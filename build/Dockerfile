@@ -42,14 +42,15 @@ COPY scripts/guest-toolchains.sh scripts/
 
 RUN ./scripts/guest-toolchains.sh apt && rm -rf /var/lib/apt/lists/*
 
+COPY rust-toolchain.toml ./
 COPY ebpf/rust-toolchain.toml ebpf/
 RUN ./scripts/guest-toolchains.sh rust
 
 # The merge bar's extras over the bundle's toolchains: ci.yml's check job adds
 # rustfmt + clippy, its guest-crates job the windows-gnu target the agent's
 # Windows code is linted against (`ci::guest-windows-check`).
-RUN rustup component add --toolchain stable rustfmt clippy \
- && rustup target add --toolchain stable x86_64-pc-windows-gnu
+RUN rustup component add --toolchain "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" rustfmt clippy \
+ && rustup target add --toolchain "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" x86_64-pc-windows-gnu
 
 RUN ./scripts/guest-toolchains.sh ebpf \
  && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
