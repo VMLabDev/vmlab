@@ -15,11 +15,12 @@
 //! - **TCP** — a minimal in-process TCP responder ("vTCP", [`vtcp`]). A
 //!   guest SYN triggers a host [`tokio::net::TcpStream`] connect to the
 //!   original destination; on success the guest-side handshake completes
-//!   and bytes are proxied both ways. Out-of-order segments are dropped
-//!   (the guest retransmits), ACKs are cumulative, unacked host→guest data
-//!   retransmits on a fixed 1 s RTO (5 tries), MSS is clamped to
-//!   `mtu - 40`, and a fixed 64 KiB receive window is advertised. Idle
-//!   flows are reset after 5 minutes.
+//!   and bytes are proxied both ways. Out-of-order segments are held for
+//!   reassembly, ACKs are cumulative, unacked host→guest data retransmits
+//!   on a fixed 1 s RTO (5 tries), host→guest data stays inside the
+//!   guest's advertised window (a closed one is probed every RTO), MSS is
+//!   clamped to `mtu - 40`, and a fixed 64 KiB receive window is
+//!   advertised. Idle flows are reset after 5 minutes.
 //! - **UDP** — per-flow connected host sockets with a 60 s idle expiry;
 //!   replies are translated back into frames ([`udp`]).
 //! - **ICMP echo** — *degraded by design*: unprivileged ICMP sockets are

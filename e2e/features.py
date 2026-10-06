@@ -93,6 +93,7 @@ FEATURES: dict[str, str] = {
     "net.dns.sinkhole": "`sinkhole` blocks",
     "net.dns.verb": "`vmlab dns`",
     "net.nat": "NAT egress from a segment",
+    "net.nat.bulk": "a long NAT download keeps its throughput while the guest's receive window closes and reopens",
     "net.isolated": "`nic { isolated = true }`",
     "net.forward": "segment `forward` to a machine port",
     "net.routes": "daemon routing between `routes_to` segments (source kept, rules applied, the rest isolated) and `route` blocks",
