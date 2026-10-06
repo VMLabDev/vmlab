@@ -159,11 +159,13 @@ SRC
 
   p <<DOC
     The agent's mounts run as the agent identity, SYSTEM on Windows, and a
-    drive letter is visible in every session while each logon authenticates
-    separately. So the agent also writes the lab's share credential into
-    every logon it mints, before spawning anything. Without that, a
-    [login](guide_logins) running `vmlab shell` would see the mapped drive
-    and be unable to open it.
+    drive letter or folder link is visible in every session while each logon
+    authenticates separately. An interactive logon picks the credential up
+    from a logon hook. A logon the agent mints is not interactive and cannot
+    store a `cmdkey` credential, so the agent opens an SMB session to the
+    gateway in every logon it mints instead, before spawning anything.
+    Without that, a [login](guide_logins) running `vmlab shell` or
+    `vmlab exec` would see the share and be unable to open it.
   DOC
 
   callout "XP-era guests mount by screen" {

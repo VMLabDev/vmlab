@@ -181,7 +181,7 @@ pub fn spawn_piped(logon: &MintedLogon, spec: ProcessSpec) -> std::io::Result<Sp
         &env,
         cwd.as_deref(),
         &si,
-        0,
+        CREATE_NO_WINDOW,
     )?;
     // The child holds its own copies now.
     drop(stdin_r);
@@ -213,17 +213,24 @@ pub fn spawn_piped(logon: &MintedLogon, spec: ProcessSpec) -> std::io::Result<Sp
 /// inheriting nothing and discarding its output.
 ///
 /// The share-credential injection is the only caller. It takes a command
-/// line rather than an argv because that is what it holds — the `Run` value
-/// the SMB mount plan wrote — and running it verbatim is what the `Run` key
-/// itself would do. The wait is bounded because it happens while the logon
-/// cache is locked: a command that hung would wedge every later attach, and
-/// a share that cannot be authenticated must not stop a developer attaching.
+/// line rather than an argv because that is what it builds from the `Run`
+/// value the SMB mount plan wrote. The wait is bounded because it happens
+/// while the logon cache is locked: a command that hung would wedge every
+/// later attach, and a share that cannot be authenticated must not stop a
+/// developer attaching.
 pub fn run_and_wait(logon: &MintedLogon, cmdline: &str, timeout_ms: u32) -> std::io::Result<i32> {
     let env = env_block(logon, &[])?;
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let guard = spawn_lock();
-    let pi = create_as_user(logon, cmdline, &env, logon.home.as_deref(), &si, 0)?;
+    let pi = create_as_user(
+        logon,
+        cmdline,
+        &env,
+        logon.home.as_deref(),
+        &si,
+        CREATE_NO_WINDOW,
+    )?;
     drop(guard);
     // SAFETY: live process handle, killed if it outstays the timeout.
     unsafe {
@@ -244,15 +251,18 @@ pub fn run_and_wait(logon: &MintedLogon, cmdline: &str, timeout_ms: u32) -> std:
 /// process handle (the thread handle is closed immediately — nothing here
 /// resumes or waits on a thread).
 ///
-/// `extra_flags` is what the caller's startup info implies and this cannot
-/// see — the ConPTY shape passes `EXTENDED_STARTUPINFO_PRESENT`.
+/// `flags` is what the caller's startup info implies and this cannot see.
+/// A piped child passes `CREATE_NO_WINDOW`; the ConPTY shape passes
+/// `EXTENDED_STARTUPINFO_PRESENT` and must not pass `CREATE_NO_WINDOW`:
+/// with it the shell starts but never writes to the pseudoconsole, so the
+/// terminal opens and stays blank.
 pub fn create_as_user(
     logon: &MintedLogon,
     cmdline: &str,
     env: &EnvBlock,
     cwd: Option<&str>,
     si: &STARTUPINFOW,
-    extra_flags: u32,
+    flags: u32,
 ) -> std::io::Result<Owned> {
     let mut cmd = wide(cmdline);
     let cwd = cwd.map(wide);
@@ -267,7 +277,7 @@ pub fn create_as_user(
             std::ptr::null(),
             std::ptr::null(),
             1,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | extra_flags,
+            CREATE_UNICODE_ENVIRONMENT | flags,
             env.as_ptr(),
             cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             si,

@@ -264,11 +264,13 @@ impl LabSmb {
                 }
             }
         }
-        // Drive letters are per-logon-session: the agent's mounts live in
-        // SYSTEM's session, invisible to the console desktop. Drop a
-        // double-clickable connect script on the shared desktop so
-        // interactive users can map the same shares in their own session.
-        if os_hint == OsHint::Windows {
+        // The agent's mounts live in SYSTEM's logon session: every session
+        // sees the drive letters and folder symlinks, but each logon
+        // authenticates to the gateway separately.
+        if os_hint == OsHint::Windows && !plan.shares.is_empty() {
+            // Drop a double-clickable connect script on the shared desktop
+            // naming the letters, so an interactive user can authenticate by
+            // hand.
             let letters: Vec<(&str, &str)> = plan
                 .shares
                 .iter()
@@ -288,16 +290,17 @@ impl LabSmb {
                     args,
                     share: None,
                 });
-                // And authenticate future logons automatically.
-                let (cmd, args) =
-                    mount::windows_logon_cred_cmd(gw, &creds.username, &creds.password);
-                steps.push(MountStep {
-                    os_hint,
-                    command: cmd,
-                    args,
-                    share: None,
-                });
             }
+            // And authenticate future logons automatically — a folder-path
+            // share needs this as much as a letter does, and the agent reads
+            // it back into every logon it mints (§19.2).
+            let (cmd, args) = mount::windows_logon_cred_cmd(gw, &creds.username, &creds.password);
+            steps.push(MountStep {
+                os_hint,
+                command: cmd,
+                args,
+                share: None,
+            });
         }
         steps
     }
@@ -401,8 +404,12 @@ mod tests {
         );
     }
 
+    /// A folder-path share is a symlink to the gateway's UNC path, which any
+    /// logon other than SYSTEM's cannot open without the lab credential — so
+    /// it registers the logon hook too, and the agent reads that hook back
+    /// into every logon it mints (§19.2). No desktop script: it names letters.
     #[test]
-    fn windows_folder_mount_plan_has_two_steps() {
+    fn windows_folder_mount_plan_links_and_registers_the_logon_hook() {
         let vms = vec![(
             "win".to_string(),
             Ipv4Addr::new(10, 0, 0, 1),
@@ -410,9 +417,36 @@ mod tests {
         )];
         let lab = LabSmb::plan("l", Path::new("/lab/.vmlab"), 14451, &vms);
         let steps = lab.mount_plan("win", OsHint::Windows);
-        assert_eq!(steps.len(), 2); // net use auth + mklink
+        assert_eq!(steps.len(), 3, "{steps:#?}"); // net use auth + mklink + hook
         assert_eq!(steps[1].command, "cmd");
         assert!(steps[1].args.join(" ").contains("mklink /D C:\\mnt\\data"));
+        assert_eq!(steps[2].command, "reg");
+        let hook = steps[2].args.join(" ");
+        assert!(
+            hook.contains("CurrentVersion\\Run /v vmlab-shares"),
+            "{hook}"
+        );
+        assert!(hook.contains("cmdkey /add:10.0.0.1 "), "{hook}");
+        assert!(
+            !steps
+                .iter()
+                .any(|s| s.args.join(" ").contains(mount::DESKTOP_SCRIPT))
+        );
+    }
+
+    /// A drive letter gets the connect script naming it, then the same hook.
+    #[test]
+    fn windows_drive_letter_mount_plan_adds_the_desktop_script() {
+        let vms = vec![(
+            "win".to_string(),
+            Ipv4Addr::new(10, 0, 0, 1),
+            vec![share("data", "Z:", false, false)],
+        )];
+        let lab = LabSmb::plan("l", Path::new("/lab/.vmlab"), 14451, &vms);
+        let steps = lab.mount_plan("win", OsHint::Windows);
+        assert_eq!(steps.len(), 4, "{steps:#?}"); // cleanup + map + script + hook
+        assert!(steps[2].args.join(" ").contains(mount::DESKTOP_SCRIPT));
+        assert!(steps[3].args.join(" ").contains("/v vmlab-shares"));
     }
 
     #[test]
