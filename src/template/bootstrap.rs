@@ -14,7 +14,7 @@
 //!                               5.x/4.x kernel it defers to install-nt.cmd
 //! install-nt.cmd                NT4 through XP/2003: the legacy agent as a service
 //! install-9x.bat                Windows 95/98/ME: the legacy agent via RunServices
-//! INSTALL.BAT                   DOS: the legacy agent from AUTOEXEC.BAT
+//! INSTALL.BAT                   DOS: the legacy agent from FDAUTO.BAT / AUTOEXEC.BAT
 //! linux/<arch>/vmlab-agent      static musl binary (when built)
 //! windows/x86_64/vmlab-agent.exe  (when built)
 //! legacy/nt/vmlab-agent-legacy.exe  (when built; PRD §7.4's legacy tier)
@@ -212,6 +212,34 @@ mod tests {
             stage_with_dirs(work.path(), "aarch64", &[assets.path().to_path_buf()]).unwrap();
         assert!(!staged.dir.join("legacy").exists());
         assert_eq!(staged.version_for(AgentOs::WindowsNt), None);
+    }
+
+    /// FreeDOS 1.2+ boots C:\FDAUTO.BAT and never reads AUTOEXEC.BAT, so the
+    /// DOS script registers the agent in FDAUTO.BAT where it exists — a line
+    /// in AUTOEXEC.BAT alone left a FreeDOS clone with no agent after its
+    /// first reboot. The append is preceded by a bare line break, so a file
+    /// ending without one cannot swallow it into its last line.
+    #[test]
+    fn dos_script_registers_in_fdauto_where_it_exists() {
+        let lines: Vec<&str> = INSTALL_DOS_BAT.lines().map(str::trim).collect();
+        let pos = |l: &str| {
+            lines
+                .iter()
+                .position(|x| *x == l)
+                .unwrap_or_else(|| panic!("INSTALL.BAT has no line {l:?}"))
+        };
+        let default = pos(r"SET VMLAUTO=C:\AUTOEXEC.BAT");
+        let freedos = pos(r"IF EXIST C:\FDAUTO.BAT SET VMLAUTO=C:\FDAUTO.BAT");
+        let find = pos(r#"FIND "VMLABAGT" %VMLAUTO% >NUL"#);
+        let gap = pos(r"ECHO.>>%VMLAUTO%");
+        let append = pos(r"ECHO C:\VMLAB\VMLABAGT.EXE>>%VMLAUTO%");
+        assert!(default < freedos && freedos < find && find < gap && gap < append);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| !l.starts_with("REM") && l.contains(">>C:\\AUTOEXEC.BAT")),
+            "the agent line must follow VMLAUTO, not a fixed AUTOEXEC.BAT"
+        );
     }
 
     #[test]
