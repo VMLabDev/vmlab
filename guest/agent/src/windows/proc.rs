@@ -213,11 +213,11 @@ pub fn spawn_piped(logon: &MintedLogon, spec: ProcessSpec) -> std::io::Result<Sp
 /// inheriting nothing and discarding its output.
 ///
 /// The share-credential injection is the only caller. It takes a command
-/// line rather than an argv because that is what it holds — the `Run` value
-/// the SMB mount plan wrote — and running it verbatim is what the `Run` key
-/// itself would do. The wait is bounded because it happens while the logon
-/// cache is locked: a command that hung would wedge every later attach, and
-/// a share that cannot be authenticated must not stop a developer attaching.
+/// line rather than an argv because that is what it builds from the `Run`
+/// value the SMB mount plan wrote. The wait is bounded because it happens
+/// while the logon cache is locked: a command that hung would wedge every
+/// later attach, and a share that cannot be authenticated must not stop a
+/// developer attaching.
 pub fn run_and_wait(logon: &MintedLogon, cmdline: &str, timeout_ms: u32) -> std::io::Result<i32> {
     let env = env_block(logon, &[])?;
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };

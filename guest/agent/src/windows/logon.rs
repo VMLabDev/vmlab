@@ -46,7 +46,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 
 use super::port::wide;
-use crate::logon::{Held, LogonCache, LogonKey};
+use crate::logon::{Held, LogonCache, LogonKey, share_session_command};
 use crate::spawn::{Adopted, Adopter, Identity};
 
 /// `TokenElevationType` values: the account has no split token, this token
@@ -409,12 +409,19 @@ const RUN_VALUE: &str = "vmlab-shares";
 ///
 /// **A correction to §7.5, not an addition.** The agent's own mounts run as
 /// SYSTEM and land in the global DOS-device namespace, so every session
-/// *sees* the drive letters while each logon authenticates separately. The
-/// existing fix is an `HKLM\…\Run` hook — and a minted logon never fires
-/// one, because a `Run` key needs a desktop session and
-/// `NETWORK_CLEARTEXT` + `CreateProcessAsUserW` is not that. Without this an
-/// attached developer lands in exactly the documented failure: `Z:` is
-/// visible and opening it says the password is wrong.
+/// *sees* the drive letters and folder symlinks while each logon
+/// authenticates separately. The existing fix is an `HKLM\…\Run` hook that
+/// stores a `cmdkey` credential — and a minted logon never fires one, because
+/// a `Run` key needs a desktop session and `NETWORK_CLEARTEXT` +
+/// `CreateProcessAsUserW` is not that. Without this an attached developer
+/// lands in exactly the documented failure: the share is visible and opening
+/// it says the password is wrong.
+///
+/// Nor can the hook's command be run here as it stands: a network logon has
+/// no credential store, and `cmdkey` fails in one ("Credentials cannot be
+/// saved from this logon session"). The credential is instead turned into an
+/// SMB session bound to this logon (see
+/// [`share_session_command`](crate::logon::share_session_command)).
 ///
 /// The credential is read back out of that same `Run` value rather than
 /// carried on the wire: the mount plan rewrites it on every mount, so a
@@ -427,14 +434,14 @@ const RUN_VALUE: &str = "vmlab-shares";
 /// a developer attaching. The failure it prevents is visible; the failure it
 /// would cause is total.
 fn inject_share_credential(logon: &MintedLogon) {
-    let Some(command) = run_key_value() else {
+    let Some(command) = run_key_value().and_then(|v| share_session_command(&v)) else {
         return;
     };
     let _ = super::proc::run_and_wait(logon, &command, INJECT_TIMEOUT_MS);
 }
 
 /// How long the credential injection may take before it is abandoned. It is
-/// one `cmdkey` write against the local credential store, so anything near
+/// one SMB session setup against the lab's own gateway, so anything near
 /// this is a hang rather than slowness — and the attach must not wait on it.
 const INJECT_TIMEOUT_MS: u32 = 15_000;
 

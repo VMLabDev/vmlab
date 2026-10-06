@@ -344,12 +344,13 @@ Share contents are outside snapshot scope on both transports (§7.3).
 
 **Correction required by §19.2.** The agent's mounts run as the agent identity
 and land in the global DOS-device namespace, so every session *sees* the drive
-letters while each logon authenticates separately; today's fix is an
-`HKLM\…\Run` hook, which a logon the agent mints never fires because it is not
-a desktop session. **The agent must write the lab's share credential into each
-logon it mints**, before spawning anything — otherwise a developer in a shell
-finds the mapped drive visible and unopenable, reporting a wrong password. Only
-SMB is affected.
+letters and folder symlinks while each logon authenticates separately; today's
+fix is an `HKLM\…\Run` hook storing a `cmdkey` credential, registered for every
+Windows SMB share whatever its target, which a logon the agent mints never fires
+because it is not a desktop session. **The agent must write the lab's share
+credential into each logon it mints**, before spawning anything — otherwise a
+developer in a shell finds the share visible and unopenable, reporting a wrong
+password. Only SMB is affected.
 
 **Guest mounting** is performed through the guest agent once the VM is ready:
 
@@ -1057,9 +1058,14 @@ separately. The existing fix is a `Run`-key hook, and a minted logon never
 fires one — a `Run` key needs a desktop session, and `NETWORK_CLEARTEXT` +
 `CreateProcessAsUserW` is not that. Without the injection a developer in a
 shell lands in exactly the documented failure: `Z:` is visible and opening it says the
-password is wrong. Only SMB is affected; virtiofs mounts through a service-owned
-global device with no credential, and Linux mounts are global in a shared
-namespace.
+password is wrong. The hook's `cmdkey` cannot be replayed in the minted logon
+either: a network logon has no credential store, and `cmdkey` in one fails with
+"Credentials cannot be saved from this logon session". The agent instead opens a
+deviceless `net use \\<gateway>\IPC$` with the same credential as that logon,
+an SMB session bound to its `LogonId` that every later open of a share on the
+gateway rides, and that lives as long as the cached logon does. Only SMB is
+affected; virtiofs mounts through a service-owned global device with no
+credential, and Linux mounts are global in a shared namespace.
 
 **vmlab never creates a guest account.** That is `provision {}`/`playbook {}`'s
 job by §19.1's second clause, and it costs nothing in the flagship case anyway:

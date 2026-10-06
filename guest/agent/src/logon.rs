@@ -166,6 +166,44 @@ fn idle<T>(held: &Arc<Held<T>>) -> bool {
     Arc::strong_count(held) == 1
 }
 
+/// The command that authenticates the lab's shares inside a minted logon,
+/// from the `cmdkey /add:<gateway> /user:<u> /pass:<p>` line the SMB mount
+/// plan records for interactive logons.
+///
+/// That line cannot simply be run: a `NETWORK_CLEARTEXT` logon has no
+/// credential store, and `cmdkey` in one fails with "Credentials cannot be
+/// saved from this logon session". A deviceless `net use` to the gateway's
+/// `IPC$` instead opens an SMB session bound to the logon's `LogonId`, and
+/// every later open of a share on that gateway from the same logon (a folder
+/// symlink, a globally mapped drive letter) rides it. The cached logon keeps
+/// the `LogonId`, and so the session, alive for every channel that shares it.
+///
+/// `None` when the line is not the shape the mount plan writes.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn share_session_command(run_value: &str) -> Option<String> {
+    let mut words = run_value.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("cmdkey") {
+        return None;
+    }
+    let (mut gateway, mut user, mut pass) = (None, None, None);
+    for word in words {
+        if let Some(v) = word.strip_prefix("/add:") {
+            gateway = Some(v);
+        } else if let Some(v) = word.strip_prefix("/user:") {
+            user = Some(v);
+        } else {
+            pass = Some(word.strip_prefix("/pass:")?);
+        }
+    }
+    let (gateway, user, pass) = (gateway?, user?, pass?);
+    if gateway.is_empty() || user.is_empty() {
+        return None;
+    }
+    Some(format!(
+        r"net use \\{gateway}\IPC$ /user:{user} {pass} /persistent:no"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +379,31 @@ mod tests {
         };
         assert!(err.to_string().contains("password is incorrect"));
         assert_eq!(cache.len(), 0);
+    }
+
+    /// The line the SMB mount plan records (`windows_logon_cred_cmd`) becomes
+    /// a deviceless `IPC$` connection: `cmdkey` cannot store anything in a
+    /// network logon, an SMB session bound to its `LogonId` can.
+    #[test]
+    fn the_mount_plans_cmdkey_line_becomes_an_ipc_session() {
+        assert_eq!(
+            share_session_command("cmdkey /add:10.0.0.1 /user:vmlab /pass:Ab-9_xY").as_deref(),
+            Some(r"net use \\10.0.0.1\IPC$ /user:vmlab Ab-9_xY /persistent:no")
+        );
+    }
+
+    /// Anything not in the mount plan's shape is left alone rather than
+    /// guessed at: the agent runs what this returns as the developer.
+    #[test]
+    fn an_unrecognised_line_yields_no_command() {
+        for line in [
+            "",
+            "net use Z: \\\\10.0.0.1\\data",
+            "cmdkey /add:10.0.0.1 /user:vmlab",
+            "cmdkey /add: /user:vmlab /pass:p",
+            "cmdkey /add:10.0.0.1 /user:vmlab /pass:p & calc",
+        ] {
+            assert_eq!(share_session_command(line), None, "{line:?}");
+        }
     }
 }
