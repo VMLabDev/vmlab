@@ -3,7 +3,7 @@ page guide_playbooks {
   chapter_header "Playbooks" {
     kicker       = "The guide · explanation"
     reading_time = "7 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-08"
     version      = "vmlab 0.9"
   }
 
@@ -93,8 +93,19 @@ Both push steps retry with backoff, five attempts over roughly 36 seconds,
 because a Windows guest can hold a freshly written file briefly: a lingering
 config-weave process or antivirus scanning the new binary shows up as a
 "file in use" sharing violation, and the pushes are idempotent. Every retry
-is announced so a streamed run shows what it is waiting on. One config-weave
-invocation has a hard ceiling of one hour.
+is announced so a streamed run shows what it is waiting on.
+DOC
+
+  p <<'DOC'
+Each config-weave invocation is bounded by the block's `timeout`, one hour
+when it is left out, so a hung guest cannot hold `vmlab up` forever. A play
+that installs large products in one stretch can need more: set `timeout = 2h`
+on the `playbook {}` block. The value applies to each run separately, and the
+run after a reboot gets the full value again. When a run times out, the step
+that was running is not stopped in the guest. An installer it started keeps
+going, so wait for it to finish before running `vmlab playbook apply` again,
+or a step whose check still reports drift starts a second installer over the
+first.
 DOC
 
   p <<'DOC'

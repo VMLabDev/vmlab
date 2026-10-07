@@ -491,6 +491,8 @@ type Playbook {
   @inline(0) path: utf8
   @doc("Play name inside the playbook to run (required)")
   play: utf8
+  @doc("Ceiling on each config-weave run, e.g. `2h`; a run after a reboot gets the full value again (default 1h)")
+  @range(1) @default(1h) timeout: std.Duration?
   @doc("Variable overrides passed to config-weave for this machine's run")
   @children("var") vars: list<PlaybookVar>
 }

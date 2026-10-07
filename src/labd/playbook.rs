@@ -121,10 +121,6 @@ pub fn resolve_playbook<'a>(
 // ---- guest layout ----------------------------------------------------------
 
 const MAX_REBOOTS: u32 = 3;
-/// Hard ceiling per config-weave invocation (matches the first-boot policy:
-/// slow is fine, a hung guest must not wedge `up` forever… doubled — applies
-/// converge whole systems).
-const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 /// Attempts for the guest push steps (binary + playbook folder). Windows can
 /// hold files briefly — a lingering config-weave process or the antivirus
 /// scanning a freshly written binary shows up as a "file in use" sharing
@@ -662,7 +658,7 @@ async fn run_inner(
             }
             Err(_) => log_line(&line),
         };
-        let (exit_code, stdout) = exec_streaming(&agent, argv.clone(), on_line).await?;
+        let (exit_code, stdout) = exec_streaming(&agent, argv.clone(), pb, on_line).await?;
         let report = parse_report(&stdout);
 
         if exit_code == 3 && mode == PlaybookMode::Apply {
@@ -767,10 +763,12 @@ fn run_argv(guest_bin: &str, guest_dir: &str, pb: &Playbook, mode: PlaybookMode)
 
 /// Streaming exec: stderr lines go to `on_line` as they arrive (the ndjson
 /// progress feed), stdout accumulates (the final `--json` report). Returns
-/// `(exit_code, stdout)`.
+/// `(exit_code, stdout)`. The run is bounded by the playbook's `timeout` so a
+/// hung guest cannot wedge `up` forever.
 async fn exec_streaming(
     agent: &AgentHandle,
     argv: Vec<String>,
+    pb: &Playbook,
     mut on_line: impl FnMut(String),
 ) -> Result<(i32, String)> {
     let display = argv.join(" ");
@@ -778,11 +776,18 @@ async fn exec_streaming(
     session.eof().await?;
     let mut stdout = Vec::new();
     let mut carry = String::new();
-    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + pb.timeout;
     loop {
         let ev = tokio::time::timeout_at(deadline, session.recv())
             .await
-            .map_err(|_| anyhow!("`{display}` timed out after {RUN_TIMEOUT:?}"))?;
+            .map_err(|_| {
+                anyhow!(
+                    "`{display}` timed out after {:?}; raise `timeout` on playbook \"{}\" \
+                     to allow a longer run",
+                    pb.timeout,
+                    pb.path.display()
+                )
+            })?;
         match ev {
             Some(SessionEvent::Data(b)) => stdout.extend(b),
             Some(SessionEvent::Stderr(b)) => {

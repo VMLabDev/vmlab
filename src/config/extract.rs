@@ -448,6 +448,7 @@ fn extract_playbook(b: &Block, issues: &mut IssueList) -> Option<Playbook> {
     let mut r = Reader::new(b, issues);
     let path = r.label();
     let play = r.required_string("play");
+    let timeout = positive_duration(&mut r, "timeout", Playbook::DEFAULT_TIMEOUT);
     let span = r.span();
     let mut vars = Vec::new();
     for child in r.children() {
@@ -460,9 +461,26 @@ fn extract_playbook(b: &Block, issues: &mut IssueList) -> Option<Playbook> {
     Some(Playbook {
         path: PathBuf::from(path?),
         play: play?.value,
+        timeout,
         vars,
         span,
     })
+}
+
+/// A duration that must be greater than zero, else `default`.
+fn positive_duration(
+    r: &mut Reader,
+    name: &str,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    match r.duration(name).unspan() {
+        Some(d) if d.is_zero() => {
+            r.issue(format!("`{name}` must be greater than zero"));
+            default
+        }
+        Some(d) => d,
+        None => default,
+    }
 }
 
 fn extract_playbook_var(b: &Block, issues: &mut IssueList) -> Option<PlaybookVar> {
@@ -790,19 +808,8 @@ fn extract_healthcheck(b: &Block, issues: &mut IssueList) -> Option<Healthcheck>
         r.issue("healthcheck requires a non-empty `command`");
         return None;
     }
-    /// A duration that must be greater than zero, else the default.
-    fn positive_dur(r: &mut Reader, name: &str, default_secs: u64) -> std::time::Duration {
-        match r.duration(name).unspan() {
-            Some(d) if d.is_zero() => {
-                r.issue(format!("`{name}` must be greater than zero"));
-                std::time::Duration::from_secs(default_secs)
-            }
-            Some(d) => d,
-            None => std::time::Duration::from_secs(default_secs),
-        }
-    }
-    let interval = positive_dur(&mut r, "interval", 10);
-    let timeout = positive_dur(&mut r, "timeout", 5);
+    let interval = positive_duration(&mut r, "interval", std::time::Duration::from_secs(10));
+    let timeout = positive_duration(&mut r, "timeout", std::time::Duration::from_secs(5));
     let start_period = r
         .duration("start_period")
         .unspan()
@@ -1023,6 +1030,36 @@ mod tests {
             assert!(
                 issues.iter().any(|m| m == expected),
                 "{body}: expected `{expected}`, got {issues:?}"
+            );
+        }
+    }
+
+    /// A playbook run is bounded by `timeout`, one hour when left out, and a
+    /// non-positive value is refused rather than defaulted silently.
+    #[test]
+    fn playbook_timeout_defaults_to_an_hour_and_must_be_positive() {
+        let timeout_of = |attr: &str| {
+            let (lab_out, issues) = lab(&format!(
+                "vm \"a\" {{ template = \"x86_64/t\" playbook \"p\" {{ play = \"x\" {attr} }} }}"
+            ));
+            (lab_out.unwrap().vms[0].playbooks[0].timeout, issues)
+        };
+
+        let (t, issues) = timeout_of("");
+        assert_eq!(t, std::time::Duration::from_secs(3600), "{issues:?}");
+        assert!(issues.is_empty(), "{issues:?}");
+
+        let (t, issues) = timeout_of("timeout = 2h");
+        assert_eq!(t, std::time::Duration::from_secs(7200), "{issues:?}");
+        assert!(issues.is_empty(), "{issues:?}");
+
+        for bad in ["timeout = 0s", "timeout = -1"] {
+            let (_, issues) = lab(&format!(
+                "vm \"a\" {{ template = \"x86_64/t\" playbook \"p\" {{ play = \"x\" {bad} }} }}"
+            ));
+            assert!(
+                issues.iter().any(|m| m.contains("`timeout`")),
+                "{bad}: expected a `timeout` issue, got {issues:?}"
             );
         }
     }

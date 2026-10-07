@@ -386,10 +386,12 @@ playbook "playbooks/baseline" {
 | --- | --- | --- | --- |
 | `path` | utf8 (label) | required | Playbook folder containing `playbook.wcl`, relative to the lab root; the inline label. |
 | `play` | utf8 | required | Play name inside the playbook to run. |
+| `timeout` | duration | `1h` | Ceiling on each config-weave run, such as `2h` or `90min`. A run after a reboot gets the full value again. |
 | `var {}` | children | none | Variable overrides passed to config-weave for this machine's run. |
 
 Validation requires a non-empty `play`, a `path` that is a directory holding a
-`playbook.wcl`, and no variable set twice on one block. config-weave ships guest
+`playbook.wcl`, a `timeout` greater than zero, and no variable set twice on one
+block. config-weave ships guest
 binaries for x86_64 only, so a playbook on a VM with another known arch is
 rejected.
 

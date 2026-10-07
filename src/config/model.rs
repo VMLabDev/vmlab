@@ -661,10 +661,18 @@ pub struct Playbook {
     /// Playbook folder, relative to the lab root.
     pub path: PathBuf,
     pub play: String,
+    /// Ceiling on each config-weave invocation; every run after a reboot gets
+    /// the full value again.
+    pub timeout: std::time::Duration,
     /// `--var name=value` overrides for this machine's run, in declaration
     /// order.
     pub vars: Vec<PlaybookVar>,
     pub span: Span,
+}
+
+impl Playbook {
+    /// `timeout` when the block leaves it out.
+    pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 }
 
 /// One variable override passed to config-weave as `--var name=value`.
