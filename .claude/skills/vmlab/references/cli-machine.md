@@ -270,7 +270,7 @@ Reports what this machine can serve, probed live rather than inferred from its k
 | `healthcheck` | `yes` when the machine declares a healthcheck, so its status carries a verdict. |
 | `agent` | The features the agent negotiated at handshake, comma-separated, or `-` when no agent is answering. |
 
-Agent features come from a live handshake, so a machine that is up but not yet answering reports `-`, which reads differently from a feature list that lacks something. The possible features are `terminal`, `exec`, `fileops`, `tail`, `metrics`, `clipboard`, `clipboard_reply`, `eventlog` and `watch`. `clipboard_reply` means the agent answers every clipboard request, so `vmlab clipboard` can confirm a copy and report a refusal at once. The workspace syncer needs `watch` and `fileops` (dev-machines.md).
+Agent features come from a live handshake, so a machine that is up but not yet answering reports `-`, which reads differently from a feature list that lacks something. An agent that restarted inside the guest is handshaken again, so the list is the running agent's. The possible features are `terminal`, `exec`, `fileops`, `tail`, `metrics`, `clipboard`, `clipboard_reply`, `eventlog` and `watch`. `clipboard_reply` means the agent answers every clipboard request, so `vmlab clipboard` can confirm a copy and report a refusal at once. The workspace syncer needs `watch` and `fileops` (dev-machines.md).
 
 ### vmlab machine stats
 

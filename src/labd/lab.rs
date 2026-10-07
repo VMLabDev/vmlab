@@ -1,7 +1,7 @@
 //! Lab runtime: owns the VM instances, network fabric, persisted state, and
 //! the lifecycle verbs (PRD §7). Lives inside the lab daemon.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,13 +80,16 @@ pub struct LabRuntime {
     /// verifies the agent itself, and the artefact it seals must carry the
     /// agent the build staged, not one pushed over it mid-build.
     pub agent_updates: std::sync::atomic::AtomicBool,
-    /// Machines whose agent refresh waits for their next handshake, because
-    /// nothing in the `up` (or `vm start`) that booted them waits on their
-    /// agent (§19.4). Claimed — removed — by whichever comes first, the
-    /// machine's [`before_ready`](super::machine::LabServices::before_ready)
-    /// or the starter seeing the machine already ready, so a refresh runs at
-    /// most once per start. Only eligible machines are ever entered.
-    deferred_refresh: std::sync::Mutex<HashSet<String>>,
+    /// Machines whose readiness waits on an agent refresh (§19.4), and who
+    /// runs it: the machine's own
+    /// [`before_ready`](super::machine::LabServices::before_ready) when
+    /// nothing in the `up` (or `vm start`) that booted it waits on its agent,
+    /// else the `up` that does, with `before_ready` holding readiness until
+    /// it is done. Claimed — removed — by whichever comes first, the
+    /// machine's `before_ready` or the starter seeing the machine already
+    /// ready (or, inline, finishing), so a refresh runs at most once per
+    /// start. Only eligible machines are ever entered.
+    deferred_refresh: std::sync::Mutex<HashMap<String, OwedRefresh>>,
     /// Where a refresh finds the agent asset this host ships for a machine —
     /// [`agent_repair::shipped_asset`](super::agent_repair::shipped_asset),
     /// replaced only by tests, which must not depend on this host's installed
@@ -559,7 +562,7 @@ impl LabRuntime {
             pre_provision: std::sync::RwLock::new(None),
             provisions_wait_ready: std::sync::atomic::AtomicBool::new(true),
             agent_updates: std::sync::atomic::AtomicBool::new(true),
-            deferred_refresh: std::sync::Mutex::new(HashSet::new()),
+            deferred_refresh: std::sync::Mutex::new(HashMap::new()),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
@@ -611,7 +614,7 @@ impl LabRuntime {
             // which a test must not depend on. The tests of the refresh turn
             // it on and supply their own asset.
             agent_updates: std::sync::atomic::AtomicBool::new(false),
-            deferred_refresh: std::sync::Mutex::new(HashSet::new()),
+            deferred_refresh: std::sync::Mutex::new(HashMap::new()),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
@@ -1299,13 +1302,15 @@ impl LabRuntime {
     pub async fn start_with_deferred_refresh(self: &Arc<Self>, m: &Arc<dyn Machine>) -> Result<()> {
         let name = m.name().to_string();
         if self.refresh_could_be_owed(m.as_ref()) {
-            self.deferred_refresh.lock_recover().insert(name.clone());
+            self.deferred_refresh
+                .lock_recover()
+                .insert(name.clone(), OwedRefresh::AtHandshake);
         }
         self.start_machine(&name).await?;
         // Already running and ready, so no handshake is coming: a machine
         // other callers are already using is refreshed beside them, in the
         // background, as `vm start` on a running machine always was.
-        if m.is_ready().await && self.deferred_refresh.lock_recover().remove(&name) {
+        if m.is_ready().await && self.deferred_refresh.lock_recover().remove(&name).is_some() {
             let me = self.arc();
             let m = Arc::clone(m);
             tokio::spawn(async move { me.refresh_agent(&m, &daemon_log(&name)).await });
@@ -1323,23 +1328,67 @@ impl LabRuntime {
             && super::agent_repair::eligible(m, self.config.lab.agent_update_for(m.name())).is_ok()
     }
 
-    /// Run the refresh owed to `machine`'s handshake, if one is, and return
+    /// Hold `m`'s readiness for the agent refresh the caller is about to run
+    /// inline (§19.4), when one could be owed: `up` refreshes a machine it
+    /// waits on itself, so what the refresh says reaches `up`'s output, and
+    /// the machine's handshake must not report it ready while that refresh
+    /// is restarting its agent. The hold ends when the returned sender is
+    /// dropped — once the refresh is done, or with the task that was running
+    /// it — and [`release_inline_refresh`](Self::release_inline_refresh)
+    /// clears what the handshake did not claim.
+    fn hold_for_inline_refresh(&self, m: &dyn Machine) -> Option<tokio::sync::oneshot::Sender<()>> {
+        if !self.refresh_could_be_owed(m) {
+            return None;
+        }
+        let (done, held) = tokio::sync::oneshot::channel();
+        self.deferred_refresh
+            .lock_recover()
+            .insert(m.name().to_string(), OwedRefresh::Inline(held));
+        Some(done)
+    }
+
+    /// The inline refresh behind a
+    /// [`hold_for_inline_refresh`](Self::hold_for_inline_refresh) is done:
+    /// readiness may go ahead, and a hold the handshake never claimed — a
+    /// machine that was already ready — is not left for its next start.
+    fn release_inline_refresh(
+        &self,
+        machine: &str,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        let Some(done) = done else { return };
+        drop(done);
+        let mut owed = self.deferred_refresh.lock_recover();
+        if matches!(owed.get(machine), Some(OwedRefresh::Inline(_))) {
+            owed.remove(machine);
+        }
+    }
+
+    /// Settle the refresh owed to `machine`'s handshake, if one is, and return
     /// once readiness may be reported: when the refresh has finished,
     /// succeeded or failed, or after [`REFRESH_HOLD`] at the latest, the
-    /// refresh then carrying on in the background. Nobody is reading an
-    /// `up`'s output by now, so what it says goes to the daemon log; the event
-    /// and the diverged mark are the same as an inline refresh's.
+    /// refresh then carrying on in the background. One owed to the handshake
+    /// is run here; nobody is reading an `up`'s output by now, so what it says
+    /// goes to the daemon log, and the event and the diverged mark are the
+    /// same as an inline refresh's. One `up` is running inline is waited for.
     async fn run_deferred_refresh(&self, machine: &str) {
-        if !self.deferred_refresh.lock_recover().remove(machine) {
-            return;
-        }
-        let me = self.arc();
-        let Ok(m) = me.machine(machine) else {
+        let Some(owed) = self.deferred_refresh.lock_recover().remove(machine) else {
             return;
         };
-        let log = daemon_log(machine);
-        let refresh = tokio::spawn(async move { me.refresh_agent(&m, &log).await });
-        if tokio::time::timeout(REFRESH_HOLD, refresh).await.is_err() {
+        let finished = match owed {
+            OwedRefresh::AtHandshake => {
+                let me = self.arc();
+                let Ok(m) = me.machine(machine) else {
+                    return;
+                };
+                let log = daemon_log(machine);
+                let refresh = tokio::spawn(async move { me.refresh_agent(&m, &log).await });
+                tokio::time::timeout(REFRESH_HOLD, refresh).await.is_ok()
+            }
+            // Resolves when the inline refresh is done, or its task is gone.
+            OwedRefresh::Inline(held) => tokio::time::timeout(REFRESH_HOLD, held).await.is_ok(),
+        };
+        if !finished {
             tracing::warn!(
                 machine,
                 "agent refresh still running after {}s; reporting the machine ready anyway",
@@ -1628,12 +1677,20 @@ impl LabRuntime {
                 // refresh inline (§19.4); `up` must not start waiting on a
                 // machine nothing waits for — one whose guest can never answer
                 // would hold it for the whole ready timeout.
-                let waited = me.machine(&n)?.pending_first_boot().is_some()
-                    || steps.iter().any(|s| s.machine == n)
-                    || me.has_dependents(&n);
+                let first_boot = me.machine(&n)?.pending_first_boot().is_some();
+                let waited =
+                    first_boot || steps.iter().any(|s| s.machine == n) || me.has_dependents(&n);
                 wave_tasks.spawn(async move {
                     let m = me.machine(&n)?;
+                    // A first-boot machine's readiness is `run_first_boot`'s
+                    // to give, after the refresh; any other's is its
+                    // handshake's, held here until the refresh below is done
+                    // so nobody reaches the agent it is about to restart.
+                    let mut hold = None;
                     if waited {
+                        if !first_boot {
+                            hold = me.hold_for_inline_refresh(m.as_ref());
+                        }
                         me.start_machine(&n).await?;
                     } else {
                         me.start_with_deferred_refresh(&m).await?;
@@ -1644,14 +1701,16 @@ impl LabRuntime {
                     tokio::spawn(Arc::clone(&m).mount_shares(me.services()));
                     // Before this machine can be considered ready (§6.1). A
                     // no-op for machines carrying no first-boot script, so
-                    // leaf timing is unchanged.
+                    // leaf timing is unchanged. It refreshes the agent itself,
+                    // between the script and readiness.
                     me.run_first_boot(&m, &out).await?;
                     // After first-boot, before any provision (§19.4): the
                     // first-boot script is the template's and runs under the
                     // agent the template sealed; every provision after it
                     // sees the current one. Never fails the wave.
-                    if waited {
+                    if waited && !first_boot {
                         me.refresh_agent(&m, &out).await;
+                        me.release_inline_refresh(&n, hold);
                     }
                     // See `LabRuntime::pre_provision`.
                     let hook = me.pre_provision.read().expect("pre_provision lock").clone();
@@ -1904,6 +1963,11 @@ impl LabRuntime {
             .await
             .map_err(|_| anyhow!("first-boot {name}: timed out after 1800s"))?
             .with_context(|| format!("first-boot provision for {name}"))?;
+
+        // The refresh `up` owes a machine it waits on (§19.4), here so the
+        // machine is not reported ready while it restarts the agent. Never
+        // fails the first-boot.
+        self.refresh_agent(m, output).await;
 
         m.first_boot_done().await?;
         self.events.emit(
@@ -2505,6 +2569,16 @@ impl LabRuntime {
 /// removing what the machine was using.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Who runs the agent refresh a machine's readiness waits on (§19.4).
+enum OwedRefresh {
+    /// The machine's `before_ready`, because nothing in the `up` or
+    /// `vm start` that booted it waits on its agent.
+    AtHandshake,
+    /// The `up` that waits on it, inline; `before_ready` waits for this to
+    /// resolve, which it does when that refresh is done or abandoned.
+    Inline(tokio::sync::oneshot::Receiver<()>),
+}
+
 /// The longest a deferred agent refresh holds its machine unready (§19.4).
 /// A backstop only: every step of the refresh carries its own timeout, and
 /// together they come to a little over four minutes on a guest that answers
@@ -2750,6 +2824,9 @@ mod tests {
         /// How long after `start` returns this machine reports ready.
         settle: Duration,
         state: tokio::sync::RwLock<PowerState>,
+        /// The agent has answered — set just before the lab's `before_ready`
+        /// runs, as both real adapters do.
+        agent_up: tokio::sync::RwLock<bool>,
         ready: tokio::sync::RwLock<bool>,
         starts: AtomicU32,
         stops: AtomicU32,
@@ -2772,6 +2849,7 @@ mod tests {
                 boot: Duration::from_millis(0),
                 settle: Duration::from_millis(0),
                 state: tokio::sync::RwLock::new(PowerState::Stopped),
+                agent_up: tokio::sync::RwLock::new(false),
                 ready: tokio::sync::RwLock::new(false),
                 starts: AtomicU32::new(0),
                 stops: AtomicU32::new(0),
@@ -2879,11 +2957,14 @@ mod tests {
             self.stops.fetch_add(1, Ordering::SeqCst);
             self.note("stop").await;
             *self.state.write().await = PowerState::Stopped;
+            *self.agent_up.write().await = false;
             *self.ready.write().await = false;
             Ok(())
         }
 
-        async fn start(self: Arc<Self>, _lab: Arc<dyn LabServices>) -> Result<()> {
+        /// Readiness the way both adapters give it: the agent answers, the
+        /// lab's `before_ready` settles what it owes the boot, then ready.
+        async fn start(self: Arc<Self>, lab: Arc<dyn LabServices>) -> Result<()> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.note("start").await;
             *self.state.write().await = PowerState::Starting;
@@ -2892,6 +2973,8 @@ mod tests {
             let me = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(me.settle).await;
+                *me.agent_up.write().await = true;
+                lab.before_ready(&me.name).await;
                 *me.ready.write().await = true;
                 me.note("ready").await;
             });
@@ -2925,7 +3008,7 @@ mod tests {
                 .ok_or_else(|| anyhow!("{}: no agent in a double", self.name))
         }
         async fn agent_answering(&self) -> bool {
-            *self.ready.read().await
+            *self.agent_up.read().await
         }
         async fn snapshot(&self, _name: &str) -> Result<bool> {
             Ok(false)
@@ -3175,11 +3258,11 @@ lab "t" {
             .expect("up returns without waiting on the agent")
             .expect("up");
         assert!(
-            lab.deferred_refresh.lock_recover().contains("silent"),
+            lab.deferred_refresh.lock_recover().contains_key("silent"),
             "the refresh is owed to the machine's handshake"
         );
         assert!(
-            !lab.deferred_refresh.lock_recover().contains("web"),
+            !lab.deferred_refresh.lock_recover().contains_key("web"),
             "a container is never owed a refresh"
         );
 
@@ -3190,8 +3273,84 @@ lab "t" {
         .await
         .expect("a refresh that cannot run does not hold readiness");
         assert!(
-            !lab.deferred_refresh.lock_recover().contains("silent"),
+            !lab.deferred_refresh.lock_recover().contains_key("silent"),
             "the handshake claims it, once"
+        );
+    }
+
+    /// `up` refreshes the agent of a machine it waits on itself, inline, so
+    /// what the refresh says reaches `up`'s output (§19.4). The machine's
+    /// handshake must still not report it ready until that refresh is done:
+    /// a status poll or a second `exec` let in early lands on the agent the
+    /// refresh is restarting.
+    #[tokio::test]
+    async fn a_machine_up_waits_on_is_not_ready_before_its_inline_refresh_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "db" { template = "x86_64/t" }
+  vm "app" { template = "x86_64/t" depends_on = ["db"] }
+}"#,
+            vec![
+                FakeMachine::new("db", MachineKind::Vm, &sh),
+                FakeMachine::new("app", MachineKind::Vm, &sh),
+            ],
+        );
+        lab.agent_updates
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let asset = dir.path().join("vmlab-agent");
+        std::fs::write(&asset, b"agent").unwrap();
+        *lab.shipped_agent.write().unwrap() = Arc::new(move |_: &dyn Machine| {
+            Ok(crate::agent_asset::AgentAsset {
+                path: asset.clone(),
+                version: "agent=shipped".into(),
+            })
+        });
+        // What `up` says, numbered on the same clock as the machines' log.
+        let said = Arc::new(std::sync::Mutex::new(Vec::<(usize, String)>::new()));
+        let sink: crate::scripting::OutputSink = {
+            let said = said.clone();
+            let seq = sh.seq.clone();
+            Arc::new(move |s: String| {
+                let n = seq.fetch_add(1, Ordering::SeqCst);
+                said.lock().unwrap().push((n, s));
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), lab.up(&[], sink))
+            .await
+            .expect("up finishes")
+            .expect("up never fails on a refresh");
+
+        // The double has no agent to push into, so the refresh ends in its
+        // warning — which is as finished as a refresh gets.
+        let refreshed = said
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, s)| s.contains("could not update \"db\""))
+            .map(|(n, _)| *n)
+            .expect("up refreshed db inline, into its own output");
+        let ready = sh
+            .log
+            .lock()
+            .await
+            .iter()
+            .find_map(|l| {
+                l.strip_suffix(":db:ready")
+                    .and_then(|n| n.parse::<usize>().ok())
+            })
+            .expect("db became ready");
+        assert!(
+            refreshed < ready,
+            "db was reported ready (#{ready}) before its refresh finished (#{refreshed})"
+        );
+        assert!(
+            !lab.deferred_refresh.lock_recover().contains_key("db"),
+            "the hold is released once the refresh is done"
         );
     }
 

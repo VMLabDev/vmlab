@@ -48,6 +48,9 @@ pub struct AgentInfo {
     pub agent_version: String,
     pub os: String,
     pub features: Vec<String>,
+    /// The agent process that answered, which its pongs repeat; `None` from
+    /// an agent too old to name one, and from the legacy tier.
+    pub instance: Option<String>,
 }
 
 /// One metrics sample.
@@ -158,8 +161,8 @@ struct Inner {
     next_id: AtomicU32,
     /// The handshake result (`None` until the token echo arrives).
     hello: watch::Sender<Option<AgentInfo>>,
-    /// Incremented per `pong`.
-    pong: watch::Sender<u64>,
+    /// Incremented per `pong`, with the agent instance that sent it.
+    pong: watch::Sender<(u64, Option<String>)>,
     /// Latest metrics sample.
     metrics: watch::Sender<Option<MetricsSnapshot>>,
     /// Incremented per clipboard report, with the text.
@@ -250,7 +253,7 @@ impl AgentHandle {
             open_waiters: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             hello: watch::Sender::new(None),
-            pong: watch::Sender::new(0),
+            pong: watch::Sender::new((0, None)),
             metrics: watch::Sender::new(None),
             clipboard: watch::Sender::new((0, String::new())),
             clipboard_answer: watch::Sender::new((0, ClipboardAnswer::Set)),
@@ -347,16 +350,40 @@ impl AgentHandle {
         self.inner.open_waiters.lock_recover().clear();
     }
 
-    /// Liveness probe.
+    /// Whether the agent this handle handshook still answers. An agent that
+    /// restarted in the guest answers pings on the very same channel, so the
+    /// pong is also checked against the instance the handshake named: a
+    /// different one means the version, features and sessions this handle
+    /// knows are a former agent's, and the handle is as spent as a silent
+    /// one. Agents that name no instance are taken at their word.
     pub async fn ping(&self, timeout: Duration) -> bool {
         let mut rx = self.inner.pong.subscribe();
         rx.mark_unchanged();
         if self.send_msg(&HostMsg::Ping).await.is_err() {
             return false;
         }
-        tokio::time::timeout(timeout, rx.changed())
+        let answered = tokio::time::timeout(timeout, rx.changed())
             .await
-            .is_ok_and(|r| r.is_ok())
+            .is_ok_and(|r| r.is_ok());
+        if !answered {
+            return false;
+        }
+        let pong = rx.borrow().1.clone();
+        let handshook = self
+            .inner
+            .hello
+            .borrow()
+            .as_ref()
+            .and_then(|info| info.instance.clone());
+        if pong != handshook {
+            tracing::debug!(
+                ?handshook,
+                ?pong,
+                "agent: a different agent instance answered; its handshake is stale"
+            );
+            return false;
+        }
+        true
     }
 
     /// Open a channel and wait for the agent's `opened` (or error).
@@ -1769,6 +1796,7 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             os,
             features,
             token,
+            instance,
         } => {
             if token != inner.token {
                 // Stale reply from before a snapshot restore — not ours.
@@ -1785,6 +1813,7 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
                 agent_version,
                 os,
                 features,
+                instance,
             }));
         }
         AgentMsg::Opened { id } => {
@@ -1851,9 +1880,9 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             let seq = *inner.shutting_down.borrow() + 1;
             let _ = inner.shutting_down.send(seq);
         }
-        AgentMsg::Pong => {
-            let seq = *inner.pong.borrow() + 1;
-            let _ = inner.pong.send(seq);
+        AgentMsg::Pong { instance } => {
+            let seq = inner.pong.borrow().0 + 1;
+            let _ = inner.pong.send((seq, instance));
         }
     }
 }
@@ -2088,6 +2117,7 @@ mod tests {
             // desktop it belongs to (`mock:no-desktop` says nobody is).
             let mut clip = String::new();
             let desktop = !advertised.iter().any(|f| f == "mock:no-desktop");
+            let restarted = advertised.iter().any(|f| f == "mock:restarted");
             let replies = advertised.iter().any(|f| f == features::CLIPBOARD_REPLY);
             let mut pulled = b"pulled-file-content".repeat(1000);
             pulled.truncate(10_000);
@@ -2121,6 +2151,7 @@ mod tests {
                                         os: "linux".into(),
                                         features: vec![],
                                         token: "not-your-token".into(),
+                                        instance: Some("stale".into()),
                                     })
                                     .await;
                                     if answer_hello {
@@ -2130,11 +2161,20 @@ mod tests {
                                             os: "linux".into(),
                                             features: advertised.clone(),
                                             token,
+                                            instance: Some("mock-1".into()),
                                         })
                                         .await;
                                     }
                                 }
-                                HostMsg::Ping => send(AgentMsg::Pong).await,
+                                // `mock:restarted`: the agent that handshook
+                                // was replaced, and its successor answers.
+                                HostMsg::Ping => {
+                                    let instance = if restarted { "mock-2" } else { "mock-1" };
+                                    send(AgentMsg::Pong {
+                                        instance: Some(instance.into()),
+                                    })
+                                    .await
+                                }
                                 HostMsg::OpenTerminal { id, command, .. } => {
                                     if command.as_deref() == Some(&["/no/shell".to_string()]) {
                                         send(AgentMsg::Error {
@@ -2669,6 +2709,7 @@ mod tests {
                                 os: "linux".into(),
                                 features: vec![],
                                 token,
+                                instance: None,
                             });
                             let _ = stream.write_all(&reply).await;
                         }
@@ -2702,6 +2743,17 @@ mod tests {
         assert!(agent.has_feature("terminal"));
         assert!(!agent.has_feature("clipboard"));
         assert!(agent.ping(Duration::from_secs(5)).await);
+    }
+
+    /// The agent in the guest restarted under a live connection: its
+    /// successor answers the ping, but as another instance, so the handle
+    /// that handshook the first one reports itself spent.
+    #[tokio::test]
+    async fn a_ping_answered_by_a_restarted_agent_fails() {
+        let (_dir, path) = mock_agent_with(true, vec!["mock:restarted".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        assert_eq!(agent.info().instance.as_deref(), Some("mock-1"));
+        assert!(!agent.ping(Duration::from_secs(5)).await);
     }
 
     #[tokio::test]

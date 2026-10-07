@@ -67,6 +67,11 @@ pub struct Run {
     /// idle-timeout sleep a Windows client edition takes. It stays asleep
     /// until something wakes it.
     pub sleeps_after: Option<Duration>,
+    /// The guest's agent restarts this long after coming up, as a new
+    /// process answering on the same channel and reporting this version —
+    /// what a service restart, or a guest reboot QEMU outlives, looks like
+    /// from the host.
+    pub agent_restarts: Option<(Duration, String)>,
 }
 
 impl Run {
@@ -252,6 +257,16 @@ impl Hypervisor for FakeHypervisor {
         let machine = Arc::new(FakeProc::new(spec.label.clone()));
         serve_guest(&spec.channels, &machine, &run, self.script.agent)?;
 
+        if let Some((after, version)) = run.agent_restarts.clone() {
+            let machine = machine.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                let mut agent = machine.agent.lock().expect("fake agent lock");
+                agent.instance += 1;
+                agent.version = version;
+            });
+        }
+
         if let Some(exit) = run.exits.clone() {
             let machine = machine.clone();
             tokio::spawn(async move {
@@ -307,6 +322,14 @@ pub(crate) struct FakeProc {
     /// The guest is suspended to RAM; what the control channel's sleep watch
     /// reports.
     asleep: watch::Sender<bool>,
+    /// The agent process the guest is running right now.
+    agent: std::sync::Mutex<FakeAgent>,
+}
+
+/// Which agent process answers, and what it calls itself.
+struct FakeAgent {
+    instance: u32,
+    version: String,
 }
 
 impl FakeProc {
@@ -316,7 +339,17 @@ impl FakeProc {
             exited: watch::Sender::new(None),
             guest_shutdown: AtomicBool::new(false),
             asleep: watch::Sender::new(false),
+            agent: std::sync::Mutex::new(FakeAgent {
+                instance: 1,
+                version: "0.0.0-fake".into(),
+            }),
         }
+    }
+
+    /// The instance the guest's agent names itself by, and its version.
+    fn agent_now(&self) -> (String, String) {
+        let agent = self.agent.lock().expect("fake agent lock");
+        (format!("fake-{}", agent.instance), agent.version.clone())
     }
 
     /// End the machine, if it has not already ended. The first status wins,
@@ -529,6 +562,8 @@ fn serve_ctl(listener: UnixListener, machine: Arc<FakeProc>, timeline: Vec<(Dura
 /// A fake vmlab-agent on `vmlab.agent.0`: enough of the frame protocol to
 /// complete the handshake, answer pings, and act on a shutdown request. Loops
 /// on accept because the host reconnects whenever its cached handle dies.
+/// Hello and pong both name the agent process running at that moment, so a
+/// scripted restart answers the next ping as somebody else.
 fn serve_agent(listener: UnixListener, machine: Arc<FakeProc>) {
     tokio::spawn(async move {
         loop {
@@ -561,15 +596,19 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
             let Ok(msg) = serde_json::from_slice::<HostMsg>(&payload) else {
                 continue;
             };
+            let (instance, agent_version) = machine.agent_now();
             let reply = match msg {
                 HostMsg::Hello { token, .. } => AgentMsg::Hello {
                     proto_version: AGENT_PROTO,
-                    agent_version: "0.0.0-fake".into(),
+                    agent_version,
                     os: "linux".into(),
                     features: vec!["exec".into(), "fileops".into(), "terminal".into()],
                     token,
+                    instance: Some(instance),
                 },
-                HostMsg::Ping => AgentMsg::Pong,
+                HostMsg::Ping => AgentMsg::Pong {
+                    instance: Some(instance),
+                },
                 HostMsg::NetInfo => AgentMsg::NetInfo {
                     interfaces: Vec::new(),
                 },

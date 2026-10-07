@@ -476,6 +476,51 @@ async fn a_vm_that_becomes_ready_tells_the_lab() {
     vm.stop(true).await.expect("stop");
 }
 
+/// An agent that restarts inside a running guest answers pings on the
+/// channel the host already holds. The host must notice it is a different
+/// agent and handshake again, or every surface goes on reporting the version
+/// and features of one that is gone.
+#[tokio::test]
+async fn an_agent_restarted_in_the_guest_is_handshaken_again() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            runs: vec![Run {
+                agent_restarts: Some((Duration::from_secs(1), "0.0.0-fake-2".into())),
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    m.wait_ready(SETTLE).await.expect("ready");
+    let before = m.agent().await.expect("agent").info();
+    assert_eq!(before.agent_version, "0.0.0-fake");
+
+    let after = tokio::time::timeout(SETTLE, async {
+        loop {
+            let info = m.agent().await.expect("agent").info();
+            if info.instance != before.instance {
+                return info;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the restarted agent was never handshaken");
+    assert_eq!(after.agent_version, "0.0.0-fake-2");
+    let crate::status::MachineDetail::Vm(detail) = m.status_detail().await else {
+        panic!("a VM reports VM detail");
+    };
+    assert_eq!(detail.agent_version.as_deref(), Some("0.0.0-fake-2"));
+
+    vm.stop(true).await.expect("stop");
+}
+
 /// A software TPM that never binds its control socket must fail the start
 /// with something a user can act on — not let the emulator spawn and die on a
 /// missing chardev, and not leave the VM wedged in Starting.

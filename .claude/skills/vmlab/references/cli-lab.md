@@ -100,8 +100,8 @@ prints `agent: updated "<vm>" (<old> → <new>)`. It runs after the first-boot s
 `up` never starts waiting on a VM just to refresh it: a VM with no first-boot, no
 provision or playbook and no dependent (and every `vmlab vm start`) is refreshed in
 the background when its agent first answers, its line going to the lab daemon's log;
-the event and `diverged=yes` still report it. Such a VM is **not ready until the
-refresh has finished** (succeeded or failed): `status` shows it `booting`, and
+the event and `diverged=yes` still report it. Either way the VM is **not ready
+until the refresh has finished** (succeeded or failed): `status` shows it `booting`, and
 `wait_ready`, dependents, `vm.ready` and port forwards wait for it — capped at five
 minutes. A VM whose agent is current is held only for the comparison; one that
 cannot be refreshed is not held. A failed refresh never fails `up`: it prints
@@ -256,7 +256,8 @@ the guest is ready. With `--verbose` a second line under each machine carries
 whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md) or by
 `up`'s agent refresh. A VM
 then adds `arch`, `cpus`, `memory` and `agent` (the running agent's handshake
-stamp, or the template's sealed one before an agent answers or while stopped); a
+stamp, or the template's sealed one before an agent answers or while stopped; an
+agent restarted inside the guest is handshaken again, so this follows it); a
 container adds `health`, `exit` and `digest`.
 
 #### Dev machines

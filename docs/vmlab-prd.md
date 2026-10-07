@@ -1185,11 +1185,12 @@ machine just to refresh it**: the refresh runs inline only for a VM `up`
 already waits on — one with a first-boot, a provision or playbook, or a
 dependent. Any other VM (and every `vm start`) is refreshed in the background
 at its next handshake, with the event, the daemon log and the diverged mark as
-its only report; a guest that never answers is never waited for. **Such a
-machine is not reported ready until that refresh has finished**, succeeded or
-failed: the refresh restarts the agent, so a machine reported ready first would
-hand whoever waited on it — `wait_ready`, a dependent, `status` — a channel
-about to close. `vm.ready` is emitted, and forwards installed, at that true
+its only report; a guest that never answers is never waited for. **Either way
+the machine is not reported ready until that refresh has finished**, succeeded
+or failed — whether `up` runs it inline or the handshake does: the refresh
+restarts the agent, so a machine reported ready first would hand whoever waited
+on it — `wait_ready`, a dependent, `status`, a second `exec` — a channel about
+to close. `vm.ready` is emitted, and forwards installed, at that true
 readiness. The hold applies only where a refresh can run — a machine opted out,
 a container, the legacy tier or one with no sealed agent is ready at its
 handshake as before, and one already current is held only for the comparison —
@@ -1215,7 +1216,15 @@ handshake since this start reported, falling back to the template's sealed
 stamp only before an agent has answered or while the machine is stopped. A
 refreshed or repaired machine therefore reads as the agent it now runs, and
 `agent_diverged` (`diverged=yes` in `status -v`) is what says that differs from
-its template.
+its template. **An agent that restarts inside the guest is handshaken again**:
+a service restart, or a guest reboot QEMU's chardev outlives, leaves the host's
+connection open to a new agent that answers its pings, so each agent process
+names itself with an instance id in its handshake and every pong, and a pong
+from another instance makes the host drop the connection and handshake afresh
+the next time anything reaches for the agent. The version, the features every
+surface gates on and the status stamp are then the running agent's. The id is
+an optional field, so `PROTO_VERSION` stays 2; an agent that names none (an
+older one, the legacy tier) is taken at its word as before.
 
 None of that applies to a container. **A container micro-VM's agent lives in the
 initramfs guest asset**, not in any image, so it tracks the host's installed
