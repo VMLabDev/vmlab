@@ -1,6 +1,7 @@
 //! CLI surface (PRD §12). The same binary also hosts the supervisor and lab
 //! daemons via hidden subcommands, re-exec'd from the CLI as needed.
 
+mod broken_pipe;
 pub mod console;
 pub mod daemon;
 pub mod dev;
@@ -603,6 +604,15 @@ pub struct As {
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
+    // The daemons the binary hosts keep std's panic: a daemon whose stdout
+    // has gone must not die of it.
+    let person_facing = !matches!(
+        cli.command,
+        Command::Supervisord | Command::Labd { .. } | Command::Vncbridge { .. }
+    );
+    if person_facing {
+        broken_pipe::install();
+    }
     let result = match cli.command {
         Command::Up { vms } => lab::cmd_up(vms),
         Command::Pull { vms } => lab::cmd_pull(vms),
@@ -747,6 +757,9 @@ pub fn run() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(err) if person_facing && broken_pipe::is_closed_stdout(&err) => {
+            broken_pipe::exit_as_sigpipe()
+        }
         Err(err) => {
             // A config file's issues render as a rich miette report — the
             // offending text underlined in its source — whichever of the four
