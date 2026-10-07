@@ -155,6 +155,12 @@ impl MountReport {
                         "\"{machine}\": share \"{share}\" still mounting; a share that \
                          cannot mount is reported in `vmlab logs`\n"
                     ),
+                    (true, Some(err)) if is_windows_smb_warm_up(err) => format!(
+                        "\"{machine}\": share \"{share}\" not mounted yet: Windows' SMB \
+                         client is still starting, which takes a few minutes after boot; \
+                         vmlab keeps retrying, and a share that cannot mount is reported \
+                         in `vmlab logs`\n"
+                    ),
                     (true, Some(err)) => format!(
                         "WARNING: \"{machine}\": share \"{share}\" not mounted yet, still \
                          retrying (attempt {attempt} of {}): {err}\n",
@@ -165,6 +171,18 @@ impl MountReport {
         }
         out
     }
+}
+
+/// Whether a failed Windows SMB mount is the client still starting rather
+/// than a fault. Early after boot `net use` fails with system error 67 ("The
+/// network name cannot be found") until the SMB client service is up, three to
+/// four minutes on Server 2025 (see [`crate::smb::steps::RetryPolicy`]), which
+/// is past `up`'s wait, so most Windows `up` runs would otherwise warn about a
+/// share that mounts moments later. Error 53 ("The network path was not
+/// found") is not included: an unreachable gateway reports that, and it is a
+/// real fault.
+fn is_windows_smb_warm_up(err: &str) -> bool {
+    err.contains("System error 67") || err.contains("network name cannot be found")
 }
 
 #[cfg(test)]
@@ -220,6 +238,32 @@ mod tests {
             "{lines:?}"
         );
         assert!(lines[0].contains("can't create directory\n"), "{lines:?}");
+    }
+
+    /// Windows' SMB client takes minutes to start after boot, longer than
+    /// `up` waits, and `net use` says error 67 until it has: that is a note,
+    /// not a warning. An unreachable gateway (error 53) is still a warning.
+    #[test]
+    fn windows_smb_warm_up_is_a_note_and_an_unreachable_gateway_is_a_warning() {
+        let r = report(&["c_repo", "c_media"]);
+        r.ready();
+        r.attempt_failed(
+            Some("c_repo"),
+            4,
+            "exited 2: System error 67 has occurred.\r\n\r\nThe network name cannot be found.\r\n",
+        );
+        r.attempt_failed(
+            Some("c_media"),
+            4,
+            "exited 2: System error 53 has occurred.\r\n\r\nThe network path was not found.\r\n",
+        );
+        let lines = r.lines("win", false);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let media = lines.iter().find(|l| l.contains("\"c_media\"")).unwrap();
+        let repo = lines.iter().find(|l| l.contains("\"c_repo\"")).unwrap();
+        assert!(media.starts_with("WARNING: \"win\""), "{media}");
+        assert!(!repo.starts_with("WARNING"), "{repo}");
+        assert!(repo.contains("SMB client is still starting"), "{repo}");
     }
 
     /// Mounting that has not failed yet is said, without a warning.

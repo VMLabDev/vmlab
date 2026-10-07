@@ -110,8 +110,10 @@ remaining steps are skipped.
 is done, and prints `WARNING: "<vm>": share "<share>" will not mount: <reason>`
 for each share that gave up, or `... not mounted yet, still retrying (attempt
 N of 30): <last error>` for one still failing at the bound (it keeps retrying).
-A guest not yet ready is said to be still mounting, without a warning. Exit
-status stays 0.
+A guest not yet ready is said to be still mounting, without a warning, and so
+is a Windows share whose `net use` still fails with system error 67 (the SMB
+client starts three to four minutes after boot). Error 53 stays a warning.
+Exit status stays 0.
 
 - **Linux, virtiofs:** `mkdir -p <guest_path>`, then
   `mount -t virtiofs <tag> <guest_path>`.

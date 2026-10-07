@@ -86,6 +86,9 @@ TXT
   p <<DOC
     A share still retrying when the wait runs out keeps retrying, and its
     `share.unmountable` event reaches [vmlab logs](cmd_logs) if it gives up.
+    On Windows, a share whose `net use` still fails with system error 67 gets
+    a plain line instead of a warning: the SMB client takes a few minutes
+    after boot to start, so the share is expected to mount moments later.
   DOC
 
   p <<DOC
