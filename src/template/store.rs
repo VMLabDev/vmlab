@@ -429,6 +429,45 @@ pub fn resolve_version_pin(versions: &[String], pin: &str) -> Option<String> {
     versions.iter().find(|v| v.as_str() == pin).cloned()
 }
 
+/// Resolve a version `pin` against a registry repository's published `tags`,
+/// taking `latest` — the version the repository's moving `latest` tag names,
+/// when known — as the authority on which version is newest and which
+/// versioning scheme is current (PRD §6.4). Tag order alone is not: a
+/// repository can keep tags from a retired scheme that sort above the current
+/// one (`24.04.20260520` above `24.04.4.2`).
+///
+/// 1. A pin `latest`'s version falls under (equal to it, or a dot-component
+///    prefix of it) resolves to that version, so `24.04` and `24.04.4` both
+///    name what `latest` names.
+/// 2. Otherwise the highest tag under the pin with as many components as
+///    `latest`'s version, so a pin on an older line still skips the tags of a
+///    scheme `latest` no longer uses.
+/// 3. Otherwise [`resolve_version_pin`]'s rule, which is also the whole rule
+///    when `latest` is unknown.
+pub fn resolve_registry_pin(tags: &[String], pin: &str, latest: Option<&str>) -> Option<String> {
+    let dotted = format!("{pin}.");
+    let under = |v: &str| {
+        v.strip_prefix(&dotted).is_some_and(|rest| {
+            rest.split('.')
+                .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
+        })
+    };
+    if let Some(latest) = latest.filter(|l| tags.iter().any(|t| t == l)) {
+        if latest == pin || under(latest) {
+            return Some(latest.to_string());
+        }
+        let shape = latest.split('.').count();
+        let same_scheme = tags
+            .iter()
+            .filter(|t| under(t) && t.split('.').count() == shape)
+            .max_by(|a, b| compare_versions(a, b));
+        if let Some(t) = same_scheme {
+            return Some(t.clone());
+        }
+    }
+    resolve_version_pin(tags, pin)
+}
+
 enum Run<'a> {
     Num(&'a str),
     Text(&'a str),
@@ -661,6 +700,120 @@ mod tests {
             )
             .as_deref(),
             None
+        );
+    }
+
+    // ---- resolve_registry_pin -----------------------------------------------
+
+    /// The tags `ghcr.io/vmlabdev/vmlab-templates/ubuntu-24.04` carried when
+    /// the stale date-scheme tags were found sorting above `latest`.
+    fn ubuntu_tags() -> Vec<String> {
+        [
+            "24.04.20260518",
+            "latest",
+            "24.04.20260519",
+            "24.04.20260520",
+            "24.04.4.0",
+            "24.04.4.2",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[test]
+    fn registry_pin_under_latest_resolves_to_latest() {
+        let tags = ubuntu_tags();
+        let latest = Some("24.04.4.2");
+        // The bare release and the declared prefix both name latest, not the
+        // date-scheme tags that sort above it.
+        assert_eq!(
+            resolve_registry_pin(&tags, "24.04", latest).as_deref(),
+            Some("24.04.4.2")
+        );
+        assert_eq!(
+            resolve_registry_pin(&tags, "24.04.4", latest).as_deref(),
+            Some("24.04.4.2")
+        );
+        assert_eq!(
+            resolve_registry_pin(&tags, "24.04.4.2", latest).as_deref(),
+            Some("24.04.4.2")
+        );
+        // Full tags of either scheme still resolve to themselves.
+        assert_eq!(
+            resolve_registry_pin(&tags, "24.04.4.0", latest).as_deref(),
+            Some("24.04.4.0")
+        );
+        assert_eq!(
+            resolve_registry_pin(&tags, "24.04.20260519", latest).as_deref(),
+            Some("24.04.20260519")
+        );
+        // The alias itself is an exact tag.
+        assert_eq!(
+            resolve_registry_pin(&tags, "latest", latest).as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn registry_pin_under_latest_skips_a_newer_prerelease() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // 26100.1742.11 was pushed with --prerelease; latest stays on .10.
+        let tags = s(&[
+            "26100.1742.10",
+            "26100.1742.11",
+            "latest",
+            "latest-prerelease",
+        ]);
+        assert_eq!(
+            resolve_registry_pin(&tags, "26100.1742", Some("26100.1742.10")).as_deref(),
+            Some("26100.1742.10")
+        );
+        // Named exactly, the prerelease is still reachable.
+        assert_eq!(
+            resolve_registry_pin(&tags, "26100.1742.11", Some("26100.1742.10")).as_deref(),
+            Some("26100.1742.11")
+        );
+    }
+
+    #[test]
+    fn registry_pin_off_latest_prefers_latests_scheme() {
+        let mut tags = ubuntu_tags();
+        tags.push("26.04.1.0".into());
+        // latest moved to another release: a 24.04 pin takes the highest
+        // tag shaped like latest's version, not the date-scheme one.
+        assert_eq!(
+            resolve_registry_pin(&tags, "24.04", Some("26.04.1.0")).as_deref(),
+            Some("24.04.4.2")
+        );
+        // Counter pins on an older line keep working.
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let tags = s(&["26100.1742.3", "26100.1742.10", "26100.1743.0", "latest"]);
+        assert_eq!(
+            resolve_registry_pin(&tags, "26100.1742", Some("26100.1743.0")).as_deref(),
+            Some("26100.1742.10")
+        );
+    }
+
+    #[test]
+    fn registry_pin_without_latest_is_the_store_rule() {
+        let tags = ubuntu_tags();
+        // No latest (or one that names no published tag): the counter rule
+        // alone, which is what tag order gives.
+        for latest in [None, Some("24.04.9.9")] {
+            assert_eq!(
+                resolve_registry_pin(&tags, "24.04", latest).as_deref(),
+                Some("24.04.20260520")
+            );
+        }
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resolve_registry_pin(
+                &s(&["26100.1742.0", "26100.1742.3", "26100.1742.10"]),
+                "26100.1742",
+                None
+            )
+            .as_deref(),
+            Some("26100.1742.10")
         );
     }
 

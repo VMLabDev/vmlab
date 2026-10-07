@@ -81,6 +81,17 @@ page guide_registries {
     store is used offline without contacting the registry at all.
   DOC
 
+  p <<DOC
+    `latest` is the authority on which version is newest, not tag order. A
+    repository can keep tags from an older versioning scheme that sort above
+    the current one, such as `24.04.20260520` beside `24.04.4.2`. A prefix
+    that `latest`'s version falls under resolves to that version, so
+    `ubuntu-24.04:24.04` and `ubuntu-24.04:24.04.4` both pull what `latest`
+    names. A prefix on another line resolves to its newest tag shaped like
+    `latest`'s version, and only a repository with no `latest` falls back to
+    the newest `<prefix>.<N>`. A full version tag always names itself.
+  DOC
+
   h2 "Multi-arch"
 
   p <<DOC
@@ -148,7 +159,9 @@ page guide_registries {
     templates or container images. The namespaces it searches are host-level
     settings managed with `vmlab template registry add | list | remove`.
     They are search roots, not secrets: credentials stay in the Docker
-    config and are looked up by registry host.
+    config and are looked up by registry host. Each template row shows the
+    version the repository's `latest` tag names and every arch published at
+    it.
   DOC
 
   h2 "Published templates"

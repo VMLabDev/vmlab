@@ -1,7 +1,8 @@
 //! Searching an OCI namespace for publishable things (PRD §6.4).
 //!
-//! One repository at a time this resolves the newest usable tag and the
-//! architectures its manifest index publishes, which is what both the
+//! One repository at a time this resolves the newest version — the one a
+//! template repository's `latest` tag names — and the architectures its
+//! manifest index publishes, which is what both the
 //! supervisor's `registry.search` and the web editor's VM/container chooser
 //! render.
 
@@ -89,9 +90,13 @@ fn oci_to_vmlab_arch(arch: String) -> Option<String> {
     }
 }
 
-/// Resolve one repository's display name, latest version and arches, plus the
+/// Resolve one repository's display name, newest version and arches, plus the
 /// warning to report when it could not be read. A repository with no usable
 /// tag yields neither: there is nothing to show and nothing went wrong.
+///
+/// For a template the newest version is the one the moving `latest` tag names,
+/// with the arches of the index it points at — never the highest tag, which a
+/// tag left over from a retired versioning scheme can outrank (PRD §6.4).
 async fn fetch_search_row(
     repo: String,
     ns_prefix: &str,
@@ -105,7 +110,16 @@ async fn fetch_search_row(
         Ok(t) => t,
         Err(e) => return (None, Some(format!("{repo}: {e:#}"))),
     };
-    // Prefer the highest concrete version tag; fall back to `latest`.
+    if !containers
+        && tags.iter().any(|t| t == "latest")
+        && let Ok((version, mut arches)) = registry.tag_version("latest").await
+    {
+        arches.sort();
+        arches.dedup();
+        return (Some(row(name, repo, version, arches)), None);
+    }
+    // No `latest` to name the newest version: the highest concrete version
+    // tag, or `latest` for a container image.
     let versions: Vec<String> = tags
         .iter()
         .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
@@ -139,14 +153,15 @@ async fn fetch_search_row(
     };
     arches.sort();
     arches.dedup();
-    (
-        Some(CatalogSearchRow {
-            name,
-            arches,
-            version: tag.clone(),
-            reference: format!("{repo}:{tag}"),
-            repo,
-        }),
-        None,
-    )
+    (Some(row(name, repo, tag, arches)), None)
+}
+
+fn row(name: String, repo: String, version: String, arches: Vec<String>) -> CatalogSearchRow {
+    CatalogSearchRow {
+        name,
+        arches,
+        reference: format!("{repo}:{version}"),
+        version,
+        repo,
+    }
 }

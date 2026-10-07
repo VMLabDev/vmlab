@@ -188,7 +188,10 @@ SRC
   p <<DOC
     `search` reads the catalog of one namespace, or of every namespace
     `template registry list` shows, and prints `TEMPLATE`, `ARCH`, and
-    `VERSION` per match. A namespace that fails while others answer is
+    `VERSION` per match. For a template, `VERSION` is the version the
+    repository's `latest` tag names and `ARCH` every arch published at it;
+    a repository with no `latest` shows its highest version tag. A
+    namespace that fails while others answer is
     reported as a warning on stderr beside the results. When every namespace
     fails the search itself fails. No match prints how many namespaces were
     searched.
