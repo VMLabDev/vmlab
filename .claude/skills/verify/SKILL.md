@@ -38,7 +38,8 @@ reports fails the run.
   served, machines show stopped); a full `vmlab down`, `lab stop` or `destroy`
   reaps it (status says not running). A later `up` replaces a surviving daemon
   when `vmlab.wcl` has changed since it loaded it.
-- `vmlab up` returns once machines have started, not once they are ready. Poll
+- `vmlab up` returns once machines have started, not once they are ready
+  (a VM with shares holds it up to 30 s more, for its mounts). Poll
   `vmlab status -v` for `ready=yes` before `exec`/`cp`.
 - Run the binary under the name `vmlab`. Under any other name the CLI starts
   the daemons from the `vmlab` on PATH instead, which is usually an older

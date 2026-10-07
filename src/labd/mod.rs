@@ -18,6 +18,7 @@ mod legacy_agent_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 pub mod machine;
+pub mod mount_report;
 pub mod netservices;
 pub mod network;
 pub mod one_shot;
@@ -221,8 +222,23 @@ struct LabdHandler {
 
 /// Output sink for provision/script runs: streamed live to the invoking CLI
 /// and appended to the lab log (PRD §8.3).
-fn stream_sink(lab: &Arc<LabRuntime>, stream: &Streamer) -> crate::scripting::OutputSink {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+///
+/// The lines travel through a task of their own, so the reply could overtake
+/// the last of them: the verb awaits the future returned beside the sink,
+/// which settles once every line sent before it reached the client's stream,
+/// before it replies. [`streamed`] does both.
+fn stream_sink(
+    lab: &Arc<LabRuntime>,
+    stream: &Streamer,
+) -> (
+    crate::scripting::OutputSink,
+    impl std::future::Future<Output = ()> + use<>,
+) {
+    enum Out {
+        Line(String),
+        Drained(tokio::sync::oneshot::Sender<()>),
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Out>();
     let streamer = stream.clone();
     let log_path = crate::paths::state_dir()
         .join("labs")
@@ -231,14 +247,45 @@ fn stream_sink(lab: &Arc<LabRuntime>, stream: &Streamer) -> crate::scripting::Ou
     tokio::spawn(async move {
         // Rotating: provision output is appended for the life of the lab.
         let mut log = crate::logs::AppendLog::open(log_path);
-        while let Some(line) = rx.recv().await {
-            log.write(&line);
-            streamer.chunk(line).await;
+        while let Some(out) = rx.recv().await {
+            match out {
+                Out::Line(line) => {
+                    log.write(&line);
+                    streamer.chunk(line).await;
+                }
+                Out::Drained(done) => {
+                    let _ = done.send(());
+                }
+            }
         }
     });
-    Arc::new(move |line: String| {
-        let _ = tx.send(line);
-    })
+    let drain_tx = tx.clone();
+    let drained = async move {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if drain_tx.send(Out::Drained(done)).is_ok() {
+            let _ = wait.await;
+        }
+    };
+    let sink: crate::scripting::OutputSink = Arc::new(move |line: String| {
+        let _ = tx.send(Out::Line(line));
+    });
+    (sink, drained)
+}
+
+/// Run `op` with a [`stream_sink`] and return once everything it said has
+/// reached the client, so its reply is the last thing the client reads.
+async fn streamed<T, F>(
+    lab: &Arc<LabRuntime>,
+    stream: &Streamer,
+    op: impl FnOnce(crate::scripting::OutputSink) -> F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let (output, drained) = stream_sink(lab, stream);
+    let result = op(output).await;
+    drained.await;
+    result
 }
 
 /// The addressed machine.
@@ -358,8 +405,11 @@ async fn run_playbook(
     )
     .map_err(CommandError::not_found)?
     .clone();
-    let output = stream_sink(lab, stream);
-    let outcome = playbook::run_playbook(lab, &machine, &pb, mode, &output).await?;
+    let outcome = streamed(lab, stream, |output| {
+        let (machine, pb) = (&machine, &pb);
+        async move { playbook::run_playbook(lab, machine, pb, mode, &output).await }
+    })
+    .await?;
     Ok(json!({
         "machine": machine,
         "playbook": pb.path.display().to_string(),
@@ -382,16 +432,17 @@ impl Handler<LabRequest> for LabdHandler {
             LabRequest::Status {} => Ok(json!(lab.status().await)),
             LabRequest::DnsTable {} => Ok(lab.dns_table().await),
             LabRequest::Up { machines } => {
-                let output = stream_sink(&self.lab, stream);
-                lab.up(&machines, output).await?;
+                streamed(lab, stream, |output| lab.up(&machines, output)).await?;
                 Ok(json!(true))
             }
             // Download any pending templates/images without starting anything
             // (`vmlab pull`). The exact code path `up` runs first — same
             // progress events.
             LabRequest::Pull { machines } => {
-                let output = stream_sink(&self.lab, stream);
-                lab.ensure_pulled(&machines, Some(&output)).await?;
+                streamed(lab, stream, |output| async move {
+                    lab.ensure_pulled(&machines, Some(&output)).await
+                })
+                .await?;
                 Ok(json!(true))
             }
             // Abort one machine's running download (Templates page); whatever
@@ -400,8 +451,10 @@ impl Handler<LabRequest> for LabdHandler {
             // Ad-hoc script against the lab (PRD §12: vmlab script).
             LabRequest::Run { script } => {
                 let path = lab.root.join(script);
-                let output = stream_sink(&self.lab, stream);
-                crate::scripting::run_script_file(lab.clone(), &path, None, output).await?;
+                streamed(lab, stream, |output| {
+                    crate::scripting::run_script_file(lab.clone(), &path, None, output)
+                })
+                .await?;
                 Ok(json!(true))
             }
             LabRequest::Down { machines, force } => {
@@ -440,9 +493,11 @@ impl Handler<LabRequest> for LabdHandler {
                 // Pull with CLI-visible progress before the preflight (the
                 // pulled meta can change the resolved firmware/TPM needs);
                 // the internal pull in start is then a no-op.
-                let output = stream_sink(&self.lab, stream);
-                lab.ensure_pulled(std::slice::from_ref(&machine), Some(&output))
-                    .await?;
+                let only = std::slice::from_ref(&machine);
+                streamed(lab, stream, |output| async move {
+                    lab.ensure_pulled(only, Some(&output)).await
+                })
+                .await?;
                 lab.preflight_binaries(std::slice::from_ref(&machine))?;
                 // `vm start` refreshes a stale agent as `up` does (§19.4),
                 // in the background at its handshake — holding its readiness

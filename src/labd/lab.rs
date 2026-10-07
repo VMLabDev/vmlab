@@ -14,6 +14,7 @@ use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
 use super::events::EventLog;
 use super::forward_plan::{self, ForwardPlan, ForwardRule, HostBinding};
 use super::machine::Machine;
+use super::mount_report::{MOUNT_REPORT_HOLD, MountReport};
 use super::network::LabNetwork;
 use super::network::nic_segment_name;
 use super::plan;
@@ -232,6 +233,30 @@ fn daemon_log(machine: &str) -> crate::scripting::OutputSink {
     Arc::new(move |line: String| {
         tracing::info!(machine = %name, "{}", line.trim_end());
     })
+}
+
+/// One machine's share-mount task as `up` started it.
+struct ShareMounts {
+    machine: String,
+    report: Arc<MountReport>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Wait up to `hold` for every mount task to finish, then say what did not
+/// mount (§7.5). A task still running at the deadline keeps running; what it
+/// has not settled yet is said as still being tried.
+async fn report_share_mounts(
+    mounts: Vec<ShareMounts>,
+    hold: Duration,
+    output: &crate::scripting::OutputSink,
+) {
+    let deadline = tokio::time::Instant::now() + hold;
+    for mut m in mounts {
+        let finished = tokio::time::timeout_at(deadline, &mut m.task).await.is_ok();
+        for line in m.report.lines(&m.machine, finished) {
+            output(line);
+        }
+    }
 }
 
 /// The error a cancelled download fails with. A distinct type so the pull
@@ -1609,6 +1634,9 @@ impl LabRuntime {
         let steps = plan.steps.clone();
         let mut next_step = 0usize;
         let mut done: HashSet<String> = HashSet::new();
+        // Every machine's mount task and what it has done so far, reported
+        // before the lab is called up (§7.5).
+        let mounts: Arc<std::sync::Mutex<Vec<ShareMounts>>> = Arc::default();
         for wave in &plan.waves {
             let wave = wave.clone();
 
@@ -1622,6 +1650,7 @@ impl LabRuntime {
                 let me = self.clone();
                 let n = name.clone();
                 let out = output.clone();
+                let mounts = Arc::clone(&mounts);
                 // Whether `up` waits on this machine's agent anyway: a
                 // first-boot runs on it, a provision or playbook is scoped to
                 // it, or a later wave depends on it. Only those get the agent
@@ -1639,9 +1668,18 @@ impl LabRuntime {
                         me.start_with_deferred_refresh(&m).await?;
                     }
                     // Detached, so provisions can rely on the shares (§7.5)
-                    // without the wave blocking on the mount retry window. A
-                    // machine whose guest mounts for itself does nothing here.
-                    tokio::spawn(Arc::clone(&m).mount_shares(me.services()));
+                    // without the wave blocking on the mount retry window;
+                    // `up` reports what it did before it returns. A machine
+                    // whose guest mounts for itself does nothing here.
+                    let report = Arc::new(MountReport::default());
+                    let task = tokio::spawn(
+                        Arc::clone(&m).mount_shares(me.services(), Arc::clone(&report)),
+                    );
+                    mounts.lock_recover().push(ShareMounts {
+                        machine: n.clone(),
+                        report,
+                        task,
+                    });
                     // Before this machine can be considered ready (§6.1). A
                     // no-op for machines carrying no first-boot script, so
                     // leaf timing is unchanged.
@@ -1700,6 +1738,9 @@ impl LabRuntime {
         // (§19.6). The task belongs to this daemon, so the `vmlab` process
         // that asked for the `up` may exit without stopping it.
         self.start_workspaces(&targets, &output).await;
+
+        let mounts = std::mem::take(&mut *mounts.lock_recover());
+        report_share_mounts(mounts, MOUNT_REPORT_HOLD, &output).await;
 
         self.events.emit("lab.up", json!({"vms": targets}));
         Ok(())
@@ -3487,5 +3528,85 @@ lab "t" {
         assert!(caps.agent.is_empty());
         let status: MachineStatus = m.status().await;
         assert_eq!(status.name, "plain");
+    }
+
+    /// `up` reports a share that gave up, and one still retrying when its
+    /// wait ran out, without waiting for the retrying one to finish.
+    #[tokio::test(start_paused = true)]
+    async fn up_reports_unmountable_and_still_retrying_shares_within_its_hold() {
+        let gave_up = Arc::new(MountReport::default());
+        gave_up.planned(["data"], &[], 30);
+        gave_up.ready();
+        gave_up.gave_up(Some("data"), "`mount` refused: exited 64: not empty");
+        let retrying = Arc::new(MountReport::default());
+        retrying.planned(["src"], &[], 30);
+        retrying.ready();
+        retrying.attempt_failed(Some("src"), 0, "exited 1: no such device");
+        let mounts = vec![
+            ShareMounts {
+                machine: "win".into(),
+                report: gave_up,
+                task: tokio::spawn(async {}),
+            },
+            ShareMounts {
+                machine: "lin".into(),
+                report: retrying,
+                task: tokio::spawn(std::future::pending()),
+            },
+        ];
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: crate::scripting::OutputSink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |l| lines.lock().unwrap().push(l))
+        };
+        let started = tokio::time::Instant::now();
+        report_share_mounts(mounts, MOUNT_REPORT_HOLD, &sink).await;
+        assert_eq!(
+            started.elapsed(),
+            MOUNT_REPORT_HOLD,
+            "the hold bounds the wait"
+        );
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("\"win\": share \"data\" will not mount: `mount` refused"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("\"lin\": share \"src\" not mounted yet, still retrying"),
+            "{lines:?}"
+        );
+    }
+
+    /// When every mount finishes, `up` does not wait out the hold.
+    #[tokio::test(start_paused = true)]
+    async fn up_does_not_wait_out_the_hold_once_mounts_finish() {
+        let report = Arc::new(MountReport::default());
+        report.planned(["src"], &[], 30);
+        let task = {
+            let report = Arc::clone(&report);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                report.ready();
+                report.mounted("src");
+            })
+        };
+        let started = tokio::time::Instant::now();
+        let mounts = vec![ShareMounts {
+            machine: "lin".into(),
+            report,
+            task,
+        }];
+        let said = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink: crate::scripting::OutputSink = {
+            let said = Arc::clone(&said);
+            Arc::new(move |_| said.store(true, std::sync::atomic::Ordering::Relaxed))
+        };
+        report_share_mounts(mounts, MOUNT_REPORT_HOLD, &sink).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(
+            !said.load(std::sync::atomic::Ordering::Relaxed),
+            "all mounted says nothing"
+        );
     }
 }

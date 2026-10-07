@@ -16,6 +16,7 @@ OWNED = [
     "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory",
     "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.floppy", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
     "vm.hw.qemu_args", "vm.hw.nested", "vm.scratch", "vm.media.iso", "vm.media.floppy",
+    "share.unmountable",
 ]
 
 
@@ -212,6 +213,24 @@ def secure_boot(h):
         )
 
 
+def unmountable(h):
+    """`up` waits for the share mounts and names the one that cannot mount,
+    with the guest's own error, before `is up` — and still exits 0."""
+    with h.lab("core-unmountable") as lab:
+        up = h.vmlab("up", cwd=lab, timeout=300, check=False)
+        lines = up.out.splitlines()
+        warn = next((i for i, l in enumerate(lines) if l.startswith('WARNING: "um": share "blocked"')), None)
+        is_up = next((i for i, l in enumerate(lines) if 'lab "e2e-core-unmountable" is up' in l), None)
+        good = sh(h, lab, "um", "cat /mnt/good/host.txt", check=False).out.strip()
+        h.ok(
+            "share.unmountable",
+            up.code == 0 and warn is not None and is_up is not None and warn < is_up
+            and "Not a directory" in lines[warn] and 'share "good"' not in up.out and good == "from-host",
+            f"exit {up.code}; warning before `is up`: {lines[warn] if warn is not None else None!r}; "
+            f"the mounted share read {good!r} and was not named",
+        )
+
+
 def edit_lab(lab: pathlib.Path, old: str, new: str) -> None:
     """Edit the lab's vmlab.wcl in place, the way a user would between runs."""
     path = lab / "vmlab.wcl"
@@ -291,6 +310,7 @@ def _run(h):
     )
 
     secure_boot(h)
+    unmountable(h)
 
     with h.lab("core-lab") as lab:
         build_images(h, lab)

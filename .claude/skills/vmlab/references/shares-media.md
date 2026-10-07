@@ -106,6 +106,13 @@ step is retried for five minutes; a step still failing then emits
 `share.unmountable` naming the share and the last error, and that share's
 remaining steps are skipped.
 
+`vmlab up` waits for the mount steps, at most 30 seconds after everything else
+is done, and prints `WARNING: "<vm>": share "<share>" will not mount: <reason>`
+for each share that gave up, or `... not mounted yet, still retrying (attempt
+N of 30): <last error>` for one still failing at the bound (it keeps retrying).
+A guest not yet ready is said to be still mounting, without a warning. Exit
+status stays 0.
+
 - **Linux, virtiofs:** `mkdir -p <guest_path>`, then
   `mount -t virtiofs <tag> <guest_path>`.
 - **Linux, SMB:** `mkdir -p <guest_path>`, then

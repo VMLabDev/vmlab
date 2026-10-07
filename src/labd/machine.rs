@@ -563,10 +563,15 @@ pub trait Machine: Send + Sync + 'static {
     /// Spawned per machine by `up` and expected to take its time — Windows
     /// needs minutes before `net use` stops returning error 67 — so it waits
     /// for readiness itself rather than making the wave wait on the retry
-    /// window. A no-op for machines whose guest mounts its own folders (a
-    /// container's init does it from the spec it was handed).
-    async fn mount_shares(self: Arc<Self>, lab: Arc<dyn LabServices>) {
-        let _ = lab;
+    /// window, recording how far it got in `report` for `up` to print. A
+    /// no-op for machines whose guest mounts its own folders (a container's
+    /// init does it from the spec it was handed).
+    async fn mount_shares(
+        self: Arc<Self>,
+        lab: Arc<dyn LabServices>,
+        report: Arc<super::mount_report::MountReport>,
+    ) {
+        let _ = (lab, report);
     }
 
     // ---- teardown ------------------------------------------------------------
