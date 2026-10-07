@@ -152,8 +152,9 @@ page cmd_up {
     refreshes this way. A guest that never answers is never waited for.
   DOC
   p <<DOC
-    Such a VM is not reported ready until its refresh has finished, whether
-    it succeeded or failed, because the refresh restarts the agent. Until
+    A VM being refreshed, inline by `up` or in the background, is not
+    reported ready until its refresh has finished, whether it succeeded or
+    failed, because the refresh restarts the agent. Until
     then `vmlab status` shows it `booting`, and anything that waits for
     readiness, such as a script's `wait_ready` or a dependent machine, keeps
     waiting. `vm.ready` arrives, and port forwards are installed, once the

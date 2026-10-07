@@ -1183,11 +1183,12 @@ machine just to refresh it**: the refresh runs inline only for a VM `up`
 already waits on — one with a first-boot, a provision or playbook, or a
 dependent. Any other VM (and every `vm start`) is refreshed in the background
 at its next handshake, with the event, the daemon log and the diverged mark as
-its only report; a guest that never answers is never waited for. **Such a
-machine is not reported ready until that refresh has finished**, succeeded or
-failed: the refresh restarts the agent, so a machine reported ready first would
-hand whoever waited on it — `wait_ready`, a dependent, `status` — a channel
-about to close. `vm.ready` is emitted, and forwards installed, at that true
+its only report; a guest that never answers is never waited for. **Either way
+the machine is not reported ready until that refresh has finished**, succeeded
+or failed — whether `up` runs it inline or the handshake does: the refresh
+restarts the agent, so a machine reported ready first would hand whoever waited
+on it — `wait_ready`, a dependent, `status`, a second `exec` — a channel about
+to close. `vm.ready` is emitted, and forwards installed, at that true
 readiness. The hold applies only where a refresh can run — a machine opted out,
 a container, the legacy tier or one with no sealed agent is ready at its
 handshake as before, and one already current is held only for the comparison —
