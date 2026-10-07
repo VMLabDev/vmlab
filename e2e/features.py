@@ -117,6 +117,7 @@ FEATURES: dict[str, str] = {
     "share.smb": "`share` over SMB",
     "share.readonly": "`share { readonly = true }`",
     "share.smb1": "SMB1 shares for legacy guests",
+    "share.unmountable": "`vmlab up` warns, before saying the lab is up, about a share that will not mount",
     "share.virtiofs.old-virtiofsd": "a virtiofs share on a virtiofsd without `--migration-mode` (Ubuntu 24.04's 1.10.0)",
     # -- containers --------------------------------------------------------
     "container.up": "an OCI container runs as a micro-VM",

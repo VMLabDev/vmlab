@@ -1,0 +1,15 @@
+// A share that cannot mount: its guest path lies under a file, so the guest's
+// `mkdir -p` fails on every attempt. `up` must say so, naming the machine,
+// the share and the guest's error, before it says the lab is up. The `good`
+// share comes first and mounts, so `up` must not name it.
+import <vmlab.wcl>
+
+lab "e2e-core-unmountable" {
+  vm "um" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    share { host = "./good" guest = "/mnt/good" name = "good" transport = "virtiofs" }
+    share { host = "./good" guest = "/proc/version/blocked" name = "blocked" transport = "virtiofs" }
+  }
+}

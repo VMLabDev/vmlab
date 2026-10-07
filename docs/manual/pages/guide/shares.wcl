@@ -164,6 +164,16 @@ SRC
     and the last error, and that share's remaining steps are skipped.
   DOC
 
+  p <<DOC
+    [vmlab up](cmd_up) waits for the mount steps before it says the lab is
+    up, for at most 30 seconds once everything else is done. A share that
+    will not mount is printed as a `WARNING:` line naming the machine, the
+    share and the reason. A share whose step is still failing when the wait
+    runs out is printed the same way with its attempt count and last error,
+    and keeps being retried. A guest that is not ready yet is said to be
+    still mounting, without a warning. None of these changes the exit status.
+  DOC
+
   list {
     li "**Linux, virtiofs:** `mkdir -p <guest_path>`, then `mount -t virtiofs <tag> <guest_path>`."
     li "**Linux, SMB:** `mkdir -p <guest_path>`, then `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential."
