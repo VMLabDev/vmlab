@@ -67,7 +67,9 @@ page cmd_status {
     [vmlab up](cmd_up). A VM then adds `arch`, `cpus`,
     `memory` and `agent`: the version of the agent running in the guest, as
     its last handshake reported it, or the version the template sealed
-    before an agent has answered or while the VM is stopped. A container adds
+    before an agent has answered or while the VM is stopped. An agent that
+    restarts inside the guest is handshaken again the next time vmlab
+    reaches it, so the version follows the restart. A container adds
     `health`, `exit` and `digest`.
   DOC
 

@@ -102,6 +102,10 @@ struct MuxInner {
     /// control traffic (data traffic is credit-limited before it gets here).
     out: SyncSender<Vec<u8>>,
     sessions: Mutex<HashMap<u32, Session>>,
+    /// This process, as the handshake and every pong name it: a restarted
+    /// agent answers the host's pings on the same channel, and only a
+    /// different instance tells the host its handshake is stale.
+    instance: String,
 }
 
 /// What the handshake says this agent is: the build stamp
@@ -113,6 +117,18 @@ const AGENT_VERSION: &str = match option_env!("VMLAB_AGENT_STAMP") {
     Some(stamp) => stamp,
     None => env!("CARGO_PKG_VERSION"),
 };
+
+/// A name for this agent process no earlier one on the guest is likely to
+/// have had: std's per-process random hash keys over the pid and the clock,
+/// so it needs no randomness source of its own.
+fn new_instance() -> String {
+    use std::hash::BuildHasher;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let n = std::collections::hash_map::RandomState::new().hash_one((std::process::id(), now));
+    format!("{n:016x}")
+}
 
 /// How many encoded frames may queue for the port writer before senders
 /// block. Sized to absorb bursts, not to buffer a detached host forever.
@@ -144,6 +160,7 @@ impl Mux {
             inner: Arc::new(MuxInner {
                 out,
                 sessions: Mutex::new(HashMap::new()),
+                instance: new_instance(),
             }),
         }
     }
@@ -320,6 +337,7 @@ impl Mux {
                     os: platform.os().to_string(),
                     features: platform.features(),
                     token,
+                    instance: Some(self.inner.instance.clone()),
                 });
             }
             // Everything a person invokes carries the machine's declared
@@ -401,7 +419,9 @@ impl Mux {
             }
             HostMsg::WindowAdjust { id, bytes } => self.grant(id, bytes),
             HostMsg::Close { id } => self.remove(id),
-            HostMsg::Ping => self.send_ctrl(&AgentMsg::Pong),
+            HostMsg::Ping => self.send_ctrl(&AgentMsg::Pong {
+                instance: Some(self.inner.instance.clone()),
+            }),
         }
     }
 }
@@ -497,10 +517,40 @@ mod tests {
     }
 
     #[test]
-    fn ping_pongs() {
+    fn ping_pongs_as_the_instance_that_handshook() {
         let (mux, mut cap) = capture_mux();
-        mux.handle_msg(HostMsg::Ping, &TestPlatform::new());
-        assert_eq!(cap.ctrl(), AgentMsg::Pong);
+        let platform = TestPlatform::new();
+        mux.handle_msg(
+            HostMsg::Hello {
+                proto_version: PROTO_VERSION,
+                token: "tok-1".into(),
+            },
+            &platform,
+        );
+        let AgentMsg::Hello {
+            instance: Some(handshook),
+            ..
+        } = cap.ctrl()
+        else {
+            panic!("the hello names no instance");
+        };
+        mux.handle_msg(HostMsg::Ping, &platform);
+        assert_eq!(
+            cap.ctrl(),
+            AgentMsg::Pong {
+                instance: Some(handshook.clone())
+            }
+        );
+
+        // A restarted agent is a new mux, and answers as someone else.
+        let (restarted, mut cap) = capture_mux();
+        restarted.handle_msg(HostMsg::Ping, &platform);
+        assert_ne!(
+            cap.ctrl(),
+            AgentMsg::Pong {
+                instance: Some(handshook)
+            }
+        );
     }
 
     #[test]

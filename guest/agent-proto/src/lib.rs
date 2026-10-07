@@ -503,18 +503,21 @@ pub enum AgentMsg {
         os: String,
         features: Vec<String>,
         token: String,
+        /// This agent process, picked fresh each time it starts and repeated
+        /// in every [`AgentMsg::Pong`]. A host whose ping is answered under a
+        /// different instance knows the agent it handshook has been replaced
+        /// on the same channel (a service restart, a guest reboot QEMU's
+        /// chardev outlived) and re-handshakes. Absent from older agents and
+        /// the legacy tier, which a host cannot tell apart across a restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
     },
     /// A channel opened by the host is live (terminal spawned, exec started,
     /// file session ready, tail/eventlog following).
-    Opened {
-        id: u32,
-    },
+    Opened { id: u32 },
     /// The channel's process ended (terminal shell exit, exec exit).
     /// `code` is the exit code, or `128 + signal` on Unix signal death.
-    Exited {
-        id: u32,
-        code: i32,
-    },
+    Exited { id: u32, code: i32 },
     /// No more guest->host bytes on this channel, and the channel stays
     /// open: the mirror of [`HostMsg::Eof`], and the one message §19 adds in
     /// this direction. It gives `exec` stdout a clean end without tearing the
@@ -522,9 +525,7 @@ pub enum AgentMsg {
     ///
     /// It is a message, not a channel open, so the guest still never
     /// initiates a stream (ADR-0013).
-    Eof {
-        id: u32,
-    },
+    Eof { id: u32 },
     /// Periodic sample after [`HostMsg::SubscribeMetrics`].
     Metrics {
         cpu_pct: f32,
@@ -534,42 +535,34 @@ pub enum AgentMsg {
     },
     /// Guest clipboard contents (reply to `get_clipboard`, or spontaneous on
     /// guest-side clipboard change).
-    Clipboard {
-        text: String,
-    },
+    Clipboard { text: String },
     /// The text of a [`HostMsg::SetClipboard`] is on the guest clipboard
     /// (only from an agent advertising [`features::CLIPBOARD_REPLY`]).
     ClipboardSet,
     /// A clipboard request could not be served, and why — e.g. nobody is
     /// logged on to a Windows guest's desktop (only from an agent
     /// advertising [`features::CLIPBOARD_REPLY`]).
-    ClipboardFailed {
-        msg: String,
-    },
+    ClipboardFailed { msg: String },
     /// Reply to [`HostMsg::NetInfo`].
-    NetInfo {
-        interfaces: Vec<NetInterface>,
-    },
+    NetInfo { interfaces: Vec<NetInterface> },
     /// Reply to [`HostMsg::OsInfo`].
-    OsInfo {
-        info: OsInfo,
-    },
+    OsInfo { info: OsInfo },
     /// Ack of [`HostMsg::Shutdown`], sent just before the agent executes it.
-    ShuttingDown {
-        mode: ShutdownMode,
-    },
+    ShuttingDown { mode: ShutdownMode },
     /// Grant the host more send credit on a channel.
-    WindowAdjust {
-        id: u32,
-        bytes: u64,
-    },
+    WindowAdjust { id: u32, bytes: u64 },
     /// A channel failed (`id` set) or the agent hit a channel-less error.
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u32>,
         msg: String,
     },
-    Pong,
+    /// Reply to [`HostMsg::Ping`], naming the agent process that answered
+    /// (see [`AgentMsg::Hello`]'s `instance`).
+    Pong {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
+    },
 }
 
 /// One mounted filesystem in [`AgentMsg::Metrics`].
@@ -845,6 +838,7 @@ mod tests {
                 os: "linux".into(),
                 features: vec![features::TERMINAL.into(), features::EXEC.into()],
                 token: "t0".into(),
+                instance: Some("9f1c".into()),
             },
             AgentMsg::Opened { id: 1 },
             AgentMsg::Eof { id: 10 },
@@ -896,7 +890,10 @@ mod tests {
                 id: None,
                 msg: "bad frame".into(),
             },
-            AgentMsg::Pong,
+            AgentMsg::Pong {
+                instance: Some("9f1c".into()),
+            },
+            AgentMsg::Pong { instance: None },
         ] {
             assert_eq!(roundtrip(&m), m);
         }
@@ -915,6 +912,43 @@ mod tests {
                 id: Some(4),
                 msg: "nope".into(),
             }
+        );
+    }
+
+    /// The instance an agent names itself by is additive both ways: an older
+    /// agent's hello and pong parse with none, and a host built before it
+    /// existed, whose pong carried no fields, still reads a newer agent's.
+    #[test]
+    fn the_agent_instance_is_optional_on_the_wire() {
+        assert_eq!(
+            serde_json::from_str::<AgentMsg>(r#"{"event":"pong"}"#).unwrap(),
+            AgentMsg::Pong { instance: None }
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentMsg::Pong { instance: None }).unwrap(),
+            r#"{"event":"pong"}"#
+        );
+        match serde_json::from_str::<AgentMsg>(
+            r#"{"event":"hello","proto_version":2,"agent_version":"0.1.0","os":"linux","features":[],"token":"t"}"#,
+        )
+        .unwrap()
+        {
+            AgentMsg::Hello { instance, .. } => assert_eq!(instance, None),
+            other => panic!("expected hello, got {other:?}"),
+        }
+
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        enum OlderHostView {
+            Pong,
+        }
+        let newer = serde_json::to_string(&AgentMsg::Pong {
+            instance: Some("9f1c".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<OlderHostView>(&newer).unwrap(),
+            OlderHostView::Pong
         );
     }
 

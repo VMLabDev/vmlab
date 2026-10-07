@@ -256,7 +256,8 @@ the guest is ready. With `--verbose` a second line under each machine carries
 whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md) or by
 `up`'s agent refresh. A VM
 then adds `arch`, `cpus`, `memory` and `agent` (the running agent's handshake
-stamp, or the template's sealed one before an agent answers or while stopped); a
+stamp, or the template's sealed one before an agent answers or while stopped; an
+agent restarted inside the guest is handshaken again, so this follows it); a
 container adds `health`, `exit` and `digest`.
 
 #### Dev machines

@@ -627,7 +627,6 @@ impl dyn Machine {
     pub async fn status(self: &Arc<Self>) -> MachineStatus {
         let ready = self.is_ready().await;
         let state = self.state().await;
-        let detail = self.status_detail().await;
         let assigned = if ready {
             self.guest_ips()
                 .await
@@ -635,6 +634,10 @@ impl dyn Machine {
         } else {
             vec![None; self.nics().len()]
         };
+        // After the address lookup, which asks the agent: an agent that
+        // restarted in the guest is handshaken again on the way, so the stamp
+        // this line reports is the one answering now.
+        let detail = self.status_detail().await;
         let nics = self
             .nics()
             .iter()
@@ -815,9 +818,12 @@ pub(super) struct AgentSlot {
 }
 
 impl AgentSlot {
-    /// Connect (or reuse), with the token handshake. A guest reboot leaves the
-    /// old connection open but talking to a fresh agent instance, so a live
-    /// handle is pinged before it is handed out; a dead one is shut down
+    /// Connect (or reuse), with the token handshake. A guest reboot or an
+    /// agent restart leaves the old connection open but talking to a fresh
+    /// agent instance, so a live handle is pinged before it is handed out, and
+    /// a ping answered by another instance counts as no answer (see
+    /// [`AgentHandle::ping`]): the handle is re-handshaken, so the version and
+    /// features it reports are the running agent's. A dead one is shut down
     /// explicitly, because QEMU's chardev serves exactly one client and a
     /// half-dead connection would block every future connect.
     pub async fn connect(&self, name: &str, sock: &Path, hint: &str) -> Result<AgentHandle> {

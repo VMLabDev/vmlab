@@ -20,7 +20,7 @@ VM = "g01"
 OWNED = [
     "agent.exec", "agent.exec.timeout", "agent.shell", "agent.cp.push", "agent.cp.pull",
     "agent.tail", "agent.osinfo", "agent.stats", "agent.capabilities", "agent.clipboard",
-    "agent.update", "agent.repair", "login.default", "login.user", "login.password", "vision.screenshot",
+    "agent.rehandshake", "agent.update", "agent.repair", "login.default", "login.user", "login.password", "vision.screenshot",
     "vision.ocr", "vision.find-image", "vision.sendkeys", "vision.mouse", "console.tcp",
 ]
 
@@ -397,7 +397,7 @@ def _run(h):
         h.ok("console.tcp", banner.startswith(b"RFB ") and con.returncode is not None,
              f"{line.strip()}: server said {banner!r}; bridge ended on Ctrl-C")
 
-        # -- update: `vm start` refreshes a stale agent (it replaces it too) -----
+        # -- rehandshake, then update: `vm start` refreshes a stale agent --------
         # The image carries a second agent stamped `agent=e2e-stale`. Put it in
         # the guest and restart the service, so the guest really runs a stale
         # agent; `vm start` must then push the shipped one, and the agent answering
@@ -410,20 +410,23 @@ def _run(h):
                 "chmod 755 /tmp/vmlab-agent.stale && "
                 "mv -f /tmp/vmlab-agent.stale /usr/local/lib/vmlab/vmlab-agent",
                 cwd=lab)
-        # Boot onto it first with `vm restart`, which refreshes nothing, so
-        # `status -v` is seen naming the agent that answered rather than the
-        # template's sealed stamp: `e2e-stale` is nobody's sealed stamp. (An
-        # in-guest service restart would not show it: the host keeps its
-        # connection, which the new agent answers pings on, and so never
-        # handshakes again.)
-        h.vmlab("vm", "restart", VM, cwd=lab, timeout=180, check=False)
+        # Restart the agent service inside the guest, detached so the exec
+        # carrying the command returns first. The host keeps its connection,
+        # which the new agent answers pings on; only the instance its pongs
+        # name tells the host to handshake again, so `status -v` must come to
+        # name the agent now answering rather than the one before it:
+        # `e2e-stale` is nobody's sealed stamp.
+        h.vmlab("exec", VM, "--user", "root", "--", "/bin/sh", "-c",
+                "(setsid sh -c 'sleep 1; rc-service vmlab-agent restart' >/dev/null 2>&1 &)",
+                cwd=lab)
         seen_stale = "-"
-        try:
-            h.wait_ready(lab, VM, timeout=180)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and seen_stale != "e2e-stale":
+            time.sleep(2)
             found = re.search(r"\bagent=(\S+)", h.machine_line(lab, VM))
             seen_stale = found.group(1) if found else "-"
-        except ScenarioFailed as e:
-            h.log.write(f"g01 did not come back from `vm restart`: {e}\n")
+        h.ok("agent.rehandshake", seen_stale == "e2e-stale",
+             f"status -v after an in-guest service restart onto the stale agent: agent={seen_stale}")
         # The next boot starts the stale agent, and `vm start` must replace it.
         # `vm start` rather than `up`: g01 carries a provision, so `up` would
         # refresh it inline, while `vm start` defers the refresh to the
@@ -454,10 +457,10 @@ def _run(h):
                 and last[1].get("to") == shipped)
         held = last[0] is not None and readies and readies[-1] > last[0]
         h.ok("agent.update",
-             seen_stale == "e2e-stale" and upd.code == 0 and took and held
+             upd.code == 0 and took and held
              and running == shipped.removeprefix("agent=")
              and "diverged=yes" in line and after.code == 0 and after.out.strip() == "dev",
-             f"status -v while the stale agent ran: agent={seen_stale}; vm start exit {upd.code}; machine.agent_updated "
+             f"vm start exit {upd.code}; machine.agent_updated "
              f"{json.dumps(last[1]) if last[0] is not None else 'absent'}; vm.ready after it: {bool(held)}; "
              f"status -v: agent={running} (shipped {shipped}), diverged=yes "
              f"{'present' if 'diverged=yes' in line else 'absent'}; "

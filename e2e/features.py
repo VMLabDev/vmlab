@@ -75,6 +75,7 @@ FEATURES: dict[str, str] = {
     "agent.stats": "`vmlab machine stats`",
     "agent.capabilities": "`vmlab machine capabilities`",
     "agent.clipboard": "`vmlab clipboard set/get`",
+    "agent.rehandshake": "an agent restarted inside the guest is handshaken again: status names the new one",
     "agent.update": "`vm start` refreshes a stale guest agent before reporting ready, marks the machine diverged, and status names the running agent",
     "agent.repair": "`vmlab machine repair-agent` and the diverged mark",
     "agent.eventlog": "`vmlab eventlog` (Windows event log)",
