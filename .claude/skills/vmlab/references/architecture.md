@@ -287,6 +287,10 @@ A command that succeeds exits 0. A CLI-side failure before any request is sent,
 such as no `vmlab.wcl` in any parent directory, also exits non-zero with a
 message and no code.
 
+A command whose standard output is closed before it finishes, such as
+`vmlab template list | head -1`, stops quietly with exit status 141, the
+status a shell reports for a process killed by `SIGPIPE`.
+
 ### The supervisor socket
 
 The supervisor owns the lab registry, the template store, the registry
