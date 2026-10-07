@@ -5,7 +5,8 @@
 # The initramfs contains:
 #   /init                 vmlab-cinit (static musl, built from guest/cinit)
 #   /vmlab-agent          the guest agent (terminals/exec/files over the
-#                         vmlab.agent.0 port; spawned by cinit — guest/agent)
+#                         vmlab.agent.0 port; spawned by cinit — guest/agent),
+#                         built by guest/build-agent.sh with its stamp
 #   /bin/busybox (+sh)    busybox-static: sh, modprobe, ip, udhcpc, ifconfig...
 #   /etc/udhcpc/...       the udhcpc hook script cinit drives (see cinit net.rs)
 #   /sbin/mkfs.ext4       e2fsprogs (dynamic, against the bundled musl + its
@@ -62,6 +63,7 @@ WANTED_MODULES=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE_DIR="$SCRIPT_DIR/.cache/apk"
 DIST_DIR="$SCRIPT_DIR/dist"
+AGENT_DIST_DIR="${VMLAB_AGENT_DIST_DIR:-$DIST_DIR/agent}"
 
 die() {
   echo "build-asset: error: $*" >&2
@@ -222,7 +224,10 @@ build_arch() {
   local target
   target="$(rust_target_for "$arch")"
   build_guest_bin cinit "$target"
-  build_guest_bin agent "$target"
+  # The agent is build-agent.sh's: the same stamp and cargo environment as the
+  # standalone linux-<arch> agent, so a later build-agent.sh run finds cargo's
+  # fingerprint fresh instead of recompiling the crate with a different stamp.
+  "$SCRIPT_DIR/build-agent.sh" "linux-$arch"
 
   local work root extract kextract
   work="$(mktemp -d "${TMPDIR:-/tmp}/vmlab-guest-asset.XXXXXX")"
@@ -256,7 +261,7 @@ build_arch() {
   install -m 0755 "$SCRIPT_DIR/cinit/target/$target/release/vmlab-cinit" "$root/init"
 
   # /vmlab-agent: terminals/exec/files over vmlab.agent.0 (spawned by cinit).
-  install -m 0755 "$SCRIPT_DIR/agent/target/$target/release/vmlab-agent" "$root/vmlab-agent"
+  install -m 0755 "$AGENT_DIST_DIR/linux-$arch/vmlab-agent" "$root/vmlab-agent"
 
   # busybox + the /bin/sh the udhcpc hook needs (cinit calls applets as
   # `busybox <applet>`, so no other symlinks are required).
