@@ -17,6 +17,7 @@ FEATURES: dict[str, str] = {
     "template.registry.push": "`vmlab template push` to an OCI registry",
     "template.registry.pull": "`vmlab template pull` from an OCI registry",
     "template.registry.search": "`vmlab template search --registry`",
+    "template.registry.search-latest": "`vmlab template search` shows the version `latest` names over a higher stale tag",
     "template.registry.list-remote": "`vmlab template list --remote`",
     "template.registry.config": "`vmlab template registry add/list/remove`",
     "template.registry.lab-ref": "a lab VM referencing a registry template pulls it on `up`",

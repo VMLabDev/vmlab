@@ -185,6 +185,84 @@ impl Registry {
         }
     }
 
+    /// The concrete version a template tag carries and the architectures it
+    /// publishes, read from the tag's index (or plain manifest) and the config
+    /// blob of its first entry, with no chunk download. Every entry of an index
+    /// carries the same version — a push merges each arch into its version
+    /// tag's index and points a moving alias at that whole index — so this is
+    /// how `latest` is resolved to the version it names (PRD §6.4).
+    pub async fn tag_version(&self, tag: &str) -> Result<(String, Vec<String>)> {
+        let repo = &self.reference.repository;
+        let top = self
+            .transport
+            .get_manifest(repo, tag)
+            .await?
+            .ok_or_else(|| anyhow!("{}/{repo}:{tag} not found", self.reference.host))?;
+        let (manifest, arches) = match parse_manifest_or_index(&top.body)? {
+            ManifestOrIndex::Manifest(m) => (m, Vec::new()),
+            ManifestOrIndex::Index(index) => {
+                let arches = index
+                    .manifests
+                    .iter()
+                    .filter_map(|d| d.platform.as_ref().map(|p| p.architecture.clone()))
+                    .collect::<Vec<_>>();
+                let first = index
+                    .manifests
+                    .first()
+                    .ok_or_else(|| anyhow!("{repo}:{tag} is an empty index"))?;
+                let fetched = self
+                    .transport
+                    .get_manifest(repo, &first.digest)
+                    .await?
+                    .ok_or_else(|| anyhow!("manifest {} missing from registry", first.digest))?;
+                match parse_manifest_or_index(&fetched.body)? {
+                    ManifestOrIndex::Manifest(m) => (m, arches),
+                    ManifestOrIndex::Index(_) => {
+                        bail!("index entry {} is itself an index", first.digest)
+                    }
+                }
+            }
+        };
+        if !manifest.is_vmlab_template() {
+            bail!("{repo}:{tag} is not a vmlab template");
+        }
+        let config_bytes = self
+            .transport
+            .get_blob(repo, &manifest.config.digest)
+            .await
+            .context("downloading config blob")?;
+        let config = TemplateConfig::from_json(&config_bytes)?;
+        let arches = if arches.is_empty() {
+            vec![config.arch]
+        } else {
+            arches
+        };
+        Ok((config.version, arches))
+    }
+
+    /// The tag a pull of this reference fetches: its own tag resolved against
+    /// the repository's published tags as a version pin, with the version
+    /// `latest` names as the authority on which version is current
+    /// ([`resolve_registry_pin`](crate::template::store::resolve_registry_pin)).
+    /// A moving alias is used as it stands, and so is the tag itself when the
+    /// tags cannot be listed or nothing matches.
+    pub async fn pull_tag(&self) -> String {
+        let pin = self.tag();
+        if matches!(pin, "latest" | "latest-prerelease") {
+            return pin.to_string();
+        }
+        let Ok(tags) = self.list_tags().await else {
+            return pin.to_string();
+        };
+        let latest = if tags.iter().any(|t| t == "latest") {
+            self.tag_version("latest").await.ok().map(|(v, _)| v)
+        } else {
+            None
+        };
+        crate::template::store::resolve_registry_pin(&tags, pin, latest.as_deref())
+            .unwrap_or_else(|| pin.to_string())
+    }
+
     /// OCI platform architectures for either a container image or a vmlab
     /// template. Unlike `index_arches`, a plain manifest reads the standard
     /// container config's `architecture` field rather than template metadata.
@@ -639,15 +717,12 @@ pub async fn ensure_registry_template(
         .unwrap_or_default()
         .to_string();
     // Not cached. Resolve the requested tag against the registry's published
-    // tags first: a build-counter prefix (e.g. 26100.1742) resolves to the
-    // latest 26100.1742.<N>; a moving alias or exact tag is used as-is. Then
-    // resolve that to its real version without downloading the disk, and only
-    // pull when absent.
-    let pull_tag = match registry.list_tags().await {
-        Ok(tags) => crate::template::store::resolve_version_pin(&tags, registry.tag())
-            .unwrap_or_else(|| registry.tag().to_string()),
-        Err(_) => registry.tag().to_string(),
-    };
+    // tags first: a version pin (e.g. 26100.1742, or 24.04) resolves to the
+    // version `latest` names when it falls under the pin, else to the newest
+    // matching tag in `latest`'s scheme; a moving alias or exact tag is used
+    // as-is. Then resolve that to its real version without downloading the
+    // disk, and only pull when absent.
+    let pull_tag = registry.pull_tag().await;
     let registry = if pull_tag.as_str() == registry.tag() {
         registry
     } else {
@@ -1296,6 +1371,90 @@ mod tests {
             }
         }
         Registry::with_transport(Reference::parse(reference).unwrap(), Box::new(Shared(fake)))
+    }
+
+    /// Push a tiny `arch` build of `name@version` to `repo`, moving `alias`.
+    async fn push_version(
+        fake: &std::sync::Arc<FakeRegistry>,
+        repo: &str,
+        arch: &str,
+        version: &str,
+        alias: Option<&str>,
+    ) {
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta(arch);
+        m.version = version.into();
+        make_template(&tdir, &m, b"disk");
+        registry_with_fake(&format!("{repo}:{version}"), fake.clone())
+            .push(&tdir, 1024, arch, &work.path().join("push"), None, alias)
+            .await
+            .unwrap();
+    }
+
+    /// The ubuntu-24.04 shape: date-scheme tags from a retired per-arch
+    /// scheme sorting above the multi-arch `<declared>.<N>` that `latest` names.
+    async fn stale_scheme_repo() -> std::sync::Arc<FakeRegistry> {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let repo = "ghcr.io/owner/ubuntu";
+        for v in ["24.04.20260518", "24.04.20260519", "24.04.20260520"] {
+            push_version(&fake, repo, "aarch64", v, Some("latest")).await;
+        }
+        push_version(&fake, repo, "riscv64", "24.04.20260520", Some("latest")).await;
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            push_version(&fake, repo, arch, "24.04.4.2", Some("latest")).await;
+        }
+        push_version(
+            &fake,
+            repo,
+            "x86_64",
+            "24.04.4.3",
+            Some("latest-prerelease"),
+        )
+        .await;
+        fake
+    }
+
+    #[tokio::test]
+    async fn tag_version_names_latests_version_and_arches() {
+        let fake = stale_scheme_repo().await;
+        let reg = registry_with_fake("ghcr.io/owner/ubuntu", fake);
+        let (version, mut arches) = reg.tag_version("latest").await.unwrap();
+        arches.sort();
+        assert_eq!(version, "24.04.4.2");
+        assert_eq!(arches, ["aarch64", "riscv64", "x86_64"]);
+        // A concrete tag reads the same way.
+        let (version, arches) = reg.tag_version("24.04.20260520").await.unwrap();
+        assert_eq!(version, "24.04.20260520");
+        assert_eq!(arches, ["aarch64", "riscv64"]);
+    }
+
+    #[tokio::test]
+    async fn pull_tag_follows_latest_over_higher_stale_tags() {
+        let fake = stale_scheme_repo().await;
+        let pull_tag = |r: &str| {
+            let reg = registry_with_fake(&format!("ghcr.io/owner/ubuntu:{r}"), fake.clone());
+            async move { reg.pull_tag().await }
+        };
+        assert_eq!(pull_tag("24.04").await, "24.04.4.2");
+        assert_eq!(pull_tag("24.04.4").await, "24.04.4.2");
+        assert_eq!(pull_tag("24.04.4.3").await, "24.04.4.3");
+        assert_eq!(pull_tag("24.04.20260519").await, "24.04.20260519");
+        assert_eq!(pull_tag("latest").await, "latest");
+        assert_eq!(pull_tag("latest-prerelease").await, "latest-prerelease");
+        // Nothing matches: the tag as written, for the pull to report.
+        assert_eq!(pull_tag("22.04").await, "22.04");
+    }
+
+    #[tokio::test]
+    async fn pull_tag_without_latest_keeps_the_counter_rule() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let repo = "ghcr.io/owner/win";
+        for v in ["26100.1742.0", "26100.1742.3", "26100.1742.10"] {
+            push_version(&fake, repo, "x86_64", v, None).await;
+        }
+        let reg = registry_with_fake(&format!("{repo}:26100.1742"), fake);
+        assert_eq!(reg.pull_tag().await, "26100.1742.10");
     }
 
     #[tokio::test]

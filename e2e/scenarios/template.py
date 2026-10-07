@@ -128,6 +128,18 @@ def run(h):
         "template.registry.search",
         lambda: "e2e-alpine" in h.vmlab("template", "search", "--registry", "localhost:5000/e2e", "--json").text,
     )
+    # A tag from a retired versioning scheme that sorts above the version
+    # `latest` names: search still shows what `latest` names.
+    def search_follows_latest():
+        repo = "http://127.0.0.1:5000/v2/e2e/e2e-alpine/manifests"
+        index_type = "application/vnd.oci.image.index.v1+json"
+        index = h.run(["curl", "-sf", "-H", f"Accept: {index_type}", f"{repo}/latest"]).out
+        h.run(["curl", "-sf", "-X", "PUT", "-H", f"Content-Type: {index_type}",
+               "--data-binary", "@-", f"{repo}/1.0.20260520"], input=index)
+        rows = json.loads(h.vmlab("template", "search", "--registry", "localhost:5000/e2e", "e2e-alpine", "--json").out)
+        row = next(r for r in rows if r["name"] == "e2e-alpine")
+        assert row["version"] == "1.0.0", f"search showed {row['version']}, not latest's 1.0.0"
+    h.check("template.registry.search-latest", search_follows_latest)
     h.check("template.registry.list-remote", lambda: h.vmlab("template", "list", "--remote").code == 0)
     rm_all(h, "e2e-alpine")
     h.check(
