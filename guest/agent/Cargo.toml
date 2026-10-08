@@ -65,6 +65,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Environment",
     "Win32_UI_Shell",
     "Win32_System_Shutdown",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
 ] }
 
 [dev-dependencies]

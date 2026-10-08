@@ -1,7 +1,8 @@
 //! Windows platform half: vioserial port I/O (OVERLAPPED, shared exclusive
 //! handle), ConPTY-hosted PowerShell terminals, EvtSubscribe event-log
 //! tailing, GetSystemTimes/GlobalMemoryStatusEx metrics, the user-session
-//! clipboard helper, and the SCM service entry.
+//! clipboard helper, process trees as job objects, and the SCM service
+//! entry.
 
 pub mod clipboard;
 pub mod conpty;
@@ -12,6 +13,7 @@ pub mod port;
 pub mod proc;
 pub mod service;
 pub mod sysinfo;
+pub mod tree;
 
 pub use conpty::kill_process;
 pub use metrics::{cpu_pct, cpu_sample, disk_sample, mem_sample};
@@ -57,8 +59,12 @@ impl Spawner for WindowsSpawner {
 
     fn exec(&self, identity: &Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
         let held = self.logons.resolve(identity)?;
+        // A tree needs its process created suspended and placed in a job
+        // before it runs (see `tree`), which only the hand-built spawn can
+        // do; an ordinary exec as the agent stays on std's.
         let spawned = match held.as_deref() {
-            Some(logon) => proc::spawn_piped(&logon.value, spec)?,
+            Some(logon) => proc::spawn_piped(Some(&logon.value), spec)?,
+            None if spec.tree.is_some() => proc::spawn_piped(None, spec)?,
             None => piped_command(spec, |_| {})?,
         };
         Ok(hold_until_it_exits(spawned, held))
@@ -100,6 +106,7 @@ impl crate::mux::Platform for WindowsPlatform {
             features::EVENTLOG.to_string(),
             features::CLIPBOARD.to_string(),
             features::CLIPBOARD_REPLY.to_string(),
+            features::TREE.to_string(),
         ]
     }
 
@@ -125,6 +132,10 @@ impl crate::mux::Platform for WindowsPlatform {
 
     fn os_info(&self) -> Result<OsInfo, String> {
         sysinfo::os_info()
+    }
+
+    fn tree_status(&self, tree: &str) -> Result<u32, String> {
+        tree::status(tree)
     }
 
     fn shutdown(&self, mux: &Mux, mode: ShutdownMode) {

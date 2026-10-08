@@ -1,0 +1,9 @@
+package "e2eslow" {
+  description = "The one resource the slow e2e playbook needs"
+
+  resource "slow" {
+    description = "Run a long command while /tmp/e2e-slow exists"
+    script = "resources/slow.ws"
+    concurrency = "parallel"
+  }
+}

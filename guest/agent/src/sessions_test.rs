@@ -132,6 +132,7 @@ fn exec_streams_stdio_and_exit_code() {
             env: vec![("VMLAB_TEST".into(), "1".into())],
             cwd: None,
             logon: None,
+            tree: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
@@ -160,6 +161,7 @@ fn exec_missing_binary_reports_error() {
             env: vec![],
             cwd: None,
             logon: None,
+            tree: None,
         },
     );
     match cap.ctrl() {

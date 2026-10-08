@@ -429,8 +429,20 @@ Both push steps retry with backoff, five attempts over roughly 36 seconds,
 because a Windows guest can hold a freshly written file briefly: a lingering
 config-weave process or antivirus scanning the new binary shows up as a "file in
 use" sharing violation, and the pushes are idempotent. Every retry is announced
-so a streamed run shows what it is waiting on. One config-weave invocation has a
-hard ceiling of one hour.
+so a streamed run shows what it is waiting on.
+
+Each config-weave invocation is bounded by the block's `timeout` (default `1h`),
+and the run after a reboot gets the full value again. A run that times out ends
+config-weave and nothing else: an installer one of its steps started keeps
+going. The run executes in a process tree the guest agent tracks (a subreaper on
+Linux, a job object on Windows), and the timeout is recorded against the
+machine. The next `check`, `apply` or `up` run on that machine is refused while
+anything in that tree is alive, so it cannot start a second installer over the
+first; once the tree has drained the record clears and the run goes ahead.
+`vmlab playbook list` shows the record. In a container an orphan of an orphan
+goes to the container's init and is not counted, and on Windows work handed to
+the Windows Installer service is counted only through the `msiexec` waiting on
+it.
 
 Only one run per machine is in flight at a time; a second `apply` against a
 machine already converging is refused rather than queued. The run emits

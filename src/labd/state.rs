@@ -44,6 +44,26 @@ pub struct MachineState {
     /// sealed artefact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repaired_agent: Option<String>,
+    /// The last config-weave run on this machine that hit its `timeout`,
+    /// while what it started may still be running in the guest. The next
+    /// run asks the agent about [`TimedOutRun::tree`] and is refused until
+    /// that tree has drained, which clears this.
+    ///
+    /// Persisted because the guest outlives the lab daemon: a daemon
+    /// restarted between the timeout and the next run must still refuse it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_run: Option<TimedOutRun>,
+}
+
+/// A config-weave run that timed out, and the process tree it ran in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimedOutRun {
+    /// The agent's name for the run's process tree.
+    pub tree: String,
+    /// The playbook folder, as declared.
+    pub playbook: String,
+    pub play: String,
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

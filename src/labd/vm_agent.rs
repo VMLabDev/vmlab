@@ -177,6 +177,11 @@ struct Inner {
     net_info: watch::Sender<(u64, Vec<NetInterface>)>,
     /// Incremented per os_info reply, with the info.
     os_info: watch::Sender<(u64, Option<OsInfo>)>,
+    /// Incremented per tree_status reply, with the tree and its live count.
+    tree_status: watch::Sender<(u64, String, u32)>,
+    /// One tree_status request in flight at a time, so a reply is always
+    /// the answer to the question being waited on.
+    tree_op: Mutex<()>,
     /// Incremented per shutting_down ack.
     shutting_down: watch::Sender<u64>,
     /// Whether `subscribe_metrics` has been sent on this connection.
@@ -260,6 +265,8 @@ impl AgentHandle {
             clipboard_op: Mutex::new(()),
             net_info: watch::Sender::new((0, Vec::new())),
             os_info: watch::Sender::new((0, None)),
+            tree_status: watch::Sender::new((0, String::new(), 0)),
+            tree_op: Mutex::new(()),
             shutting_down: watch::Sender::new(0),
             metrics_subscribed: AtomicBool::new(false),
             token,
@@ -475,8 +482,61 @@ impl AgentHandle {
             env,
             cwd,
             logon,
+            tree: None,
         })
         .await
+    }
+
+    /// [`Self::open_exec`] as the agent identity, inside the process tree
+    /// `tree`: whatever the exec starts stays countable through
+    /// [`Self::tree_alive`] after the session is closed. Needs an agent
+    /// advertising [`features::TREE`].
+    pub async fn open_exec_in_tree(&self, argv: Vec<String>, tree: &str) -> Result<AgentSession> {
+        if !self.has_feature(features::TREE) {
+            bail!(
+                "this guest's agent has no `tree` support — rebuild the template, or push \
+                 the shipped agent with `vmlab machine repair-agent`"
+            );
+        }
+        let tree = tree.to_string();
+        self.open(|id| HostMsg::OpenExec {
+            id,
+            argv,
+            env: Vec::new(),
+            cwd: None,
+            logon: None,
+            tree: Some(tree),
+        })
+        .await
+    }
+
+    /// How many processes of the process tree `tree` are still alive in the
+    /// guest; zero once it has drained or if the guest has restarted since.
+    pub async fn tree_alive(&self, tree: &str, timeout: Duration) -> Result<u32> {
+        if !self.has_feature(features::TREE) {
+            bail!("this guest's agent has no `tree` support");
+        }
+        let _one_at_a_time = self.inner.tree_op.lock().await;
+        let mut rx = self.inner.tree_status.subscribe();
+        rx.mark_unchanged();
+        self.send_msg(&HostMsg::TreeStatus {
+            tree: tree.to_string(),
+        })
+        .await?;
+        let wait = async {
+            loop {
+                rx.changed()
+                    .await
+                    .map_err(|_| anyhow!("agent channel closed"))?;
+                let (_, answered, alive) = rx.borrow_and_update().clone();
+                if answered == tree {
+                    return Ok(alive);
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| anyhow!("agent sent no tree_status within {timeout:?}"))?
     }
 
     /// Follow a guest file (`tail -F`); the session yields `Data` chunks.
@@ -1875,6 +1935,10 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             let seq = inner.os_info.borrow().0 + 1;
             let _ = inner.os_info.send((seq, Some(info)));
         }
+        AgentMsg::TreeStatus { tree, alive } => {
+            let seq = inner.tree_status.borrow().0 + 1;
+            let _ = inner.tree_status.send((seq, tree, alive));
+        }
         AgentMsg::ShuttingDown { mode } => {
             tracing::debug!("agent acked shutdown ({mode:?})");
             let seq = *inner.shutting_down.borrow() + 1;
@@ -2193,7 +2257,11 @@ mod tests {
                                         .await;
                                 }
                                 HostMsg::OpenExec {
-                                    id, argv, logon, ..
+                                    id,
+                                    argv,
+                                    logon,
+                                    tree,
+                                    ..
                                 } => {
                                     send(AgentMsg::Opened { id }).await;
                                     // Echo who the open said to run as, so a
@@ -2202,9 +2270,10 @@ mod tests {
                                     let who = logon
                                         .map(|l| format!(" as:{}:{}", l.user, l.elevated))
                                         .unwrap_or_default();
+                                    let tree = tree.map(|t| format!(" in:{t}")).unwrap_or_default();
                                     send_data(
                                         id,
-                                        format!("ran:{}{who}", argv.join(" ")).into_bytes(),
+                                        format!("ran:{}{who}{tree}", argv.join(" ")).into_bytes(),
                                     )
                                     .await;
                                     let _ = tx
@@ -2263,6 +2332,23 @@ mod tests {
                                         }],
                                     })
                                     .await;
+                                }
+                                // A tree named `<word>-<n>` has n live
+                                // processes. An answer about some other
+                                // tree goes first, which the host must not
+                                // take for its own.
+                                HostMsg::TreeStatus { tree } => {
+                                    send(AgentMsg::TreeStatus {
+                                        tree: "someone-else".into(),
+                                        alive: 99,
+                                    })
+                                    .await;
+                                    let alive = tree
+                                        .rsplit('-')
+                                        .next()
+                                        .and_then(|n| n.parse().ok())
+                                        .unwrap_or(0);
+                                    send(AgentMsg::TreeStatus { tree, alive }).await;
                                 }
                                 HostMsg::OsInfo => {
                                     send(AgentMsg::OsInfo {
@@ -3245,6 +3331,42 @@ mod tests {
         // Directly under the root, and no directory at all.
         assert_eq!(guest_parent("/motd"), None);
         assert_eq!(guest_parent("motd"), None);
+    }
+
+    #[tokio::test]
+    async fn a_tree_exec_and_its_status_round_trip() {
+        let (_dir, path) = mock_agent_with(true, vec!["exec".into(), "tree".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+
+        let mut session = agent
+            .open_exec_in_tree(vec!["config-weave".into()], "pb-7")
+            .await
+            .unwrap();
+        let Some(SessionEvent::Data(out)) = session.recv().await else {
+            panic!("expected the echo");
+        };
+        assert_eq!(out, b"ran:config-weave in:pb-7");
+
+        let wait = Duration::from_secs(5);
+        assert_eq!(agent.tree_alive("pb-3", wait).await.unwrap(), 3);
+        assert_eq!(agent.tree_alive("pb-0", wait).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_trees_is_refused_by_name() {
+        let (_dir, path) = mock_agent_with(true, vec!["exec".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let err = agent
+            .open_exec_in_tree(vec!["x".into()], "pb-1")
+            .await
+            .err()
+            .expect("no tree support");
+        assert!(err.to_string().contains("`tree`"), "{err}");
+        let err = agent
+            .tree_alive("pb-1", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`tree`"), "{err}");
     }
 
     #[tokio::test]

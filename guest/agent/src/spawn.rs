@@ -53,6 +53,10 @@ pub struct ProcessSpec {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<String>,
+    /// The process tree it runs in (`features::TREE`): every process it
+    /// starts stays countable under this name after it exits, until all of
+    /// them have. `None` is an ordinary exec.
+    pub tree: Option<String>,
 }
 
 /// A shell hosted on a terminal — a PTY on Linux, a ConPTY on Windows.

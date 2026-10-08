@@ -1535,6 +1535,22 @@ pub fn cmd_playbook_list() -> Result<()> {
                     run["started"].as_str().unwrap_or("?"),
                 );
             }
+            if let Some(run) = row["timed_out"].as_object() {
+                let at = run["at"].as_str().unwrap_or("?");
+                match run["alive"].as_u64() {
+                    Some(0) => println!(
+                        "  timed out at {at}; everything it started has finished, so the next run can go ahead"
+                    ),
+                    Some(n) => println!(
+                        "  timed out at {at}; {n} process(es) it started are still running, \
+                         and a new run is refused until they finish"
+                    ),
+                    None => println!(
+                        "  timed out at {at}; the guest cannot be asked right now whether what it \
+                         started is still running"
+                    ),
+                }
+            }
         }
         Ok(())
     })
