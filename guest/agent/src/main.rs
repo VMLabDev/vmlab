@@ -59,6 +59,9 @@ fn main() {
     match args.first().map(String::as_str) {
         // Exec trampoline for container sessions (see linux::nsexec_main).
         Some("--nsexec") => linux::nsexec_main(&args[1..]),
+        // The subreaper an exec in a process tree runs under
+        // (see linux::shepherd).
+        Some("--shepherd") => linux::shepherd::main(&args[1..]),
         // cinit spawns the agent with the container config it wrote.
         Some("--container") => {
             let Some(config) = args.get(1) else {

@@ -1,0 +1,18 @@
+// One step that does nothing until the scenario asks it to: while the
+// trigger file exists, `check` reports drift and `apply` starts a long
+// command, which outlives the run's 5 s timeout. Without the trigger it is
+// already converged, so `up` passes straight over it.
+playbook "e2e slow" {
+  description = "A step that outlives its run's timeout"
+  version = "1.0.0"
+
+  play "slow" {
+    description = "Start a long command when triggered"
+
+    step "slow" {
+      description = "Run a long command while the trigger file exists"
+      resource = "e2eslow.slow"
+      properties { }
+    }
+  }
+}

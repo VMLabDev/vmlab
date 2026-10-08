@@ -101,11 +101,31 @@ Each config-weave invocation is bounded by the block's `timeout`, one hour
 when it is left out, so a hung guest cannot hold `vmlab up` forever. A play
 that installs large products in one stretch can need more: set `timeout = 2h`
 on the `playbook {}` block. The value applies to each run separately, and the
-run after a reboot gets the full value again. When a run times out, the step
-that was running is not stopped in the guest. An installer it started keeps
-going, so wait for it to finish before running `vmlab playbook apply` again,
-or a step whose check still reports drift starts a second installer over the
-first.
+run after a reboot gets the full value again.
+DOC
+
+  p <<'DOC'
+A run that times out ends config-weave and nothing else. An installer one of
+its steps started keeps going, because killing an installer partway through
+leaves a product in a worse state than letting it finish. Running the play
+again at that point would repeat the step, whose check still reports the
+product missing, and start a second installer over the first. So each run
+executes inside a process tree the guest agent keeps track of, a subreaper on
+Linux and a job object on Windows, and the timeout is recorded against the
+machine. The next `check`, `apply` or `up` run on that machine asks the agent
+whether anything in that tree is still alive and is refused while it is.
+`vmlab playbook list` shows the timed-out run and whether its processes have
+finished. Once they have, the next run clears the record and goes ahead.
+DOC
+
+  p <<'DOC'
+Two cases fall outside the tree. In a container, a process whose parent dies
+is adopted by the container's own init, so the tree counts config-weave and
+what it still parents, not an orphan of an orphan. On Windows, work an
+installer hands to the Windows Installer service runs in that service, so the
+tree counts the `msiexec` waiting on it rather than the service itself. A
+guest whose agent predates process trees runs as before, with no record and
+no refusal.
 DOC
 
   p <<'DOC'

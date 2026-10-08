@@ -51,6 +51,7 @@ fn terminal_exec_and_files_all_reach_the_seam_as_the_agent() {
             env: vec![("K".into(), "V".into())],
             cwd: Some("/tmp".into()),
             logon: None,
+            tree: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 2 });
@@ -120,6 +121,7 @@ fn an_open_that_carries_a_logon_reaches_the_seam_as_that_account() {
             env: vec![],
             cwd: None,
             logon: Some(dev.clone()),
+            tree: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 2 });
@@ -228,6 +230,7 @@ fn a_logon_that_cannot_be_minted_fails_the_channel_by_name() {
                 secret: "wrong".into(),
                 elevated: true,
             }),
+            tree: None,
         },
     );
     match cap.ctrl() {
@@ -335,6 +338,7 @@ fn exec_splits_stdout_and_stderr_and_closes_stdin_on_eof() {
             env: vec![],
             cwd: None,
             logon: None,
+            tree: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
@@ -368,6 +372,7 @@ fn exec_spawn_failure_names_the_binary() {
             env: vec![],
             cwd: None,
             logon: None,
+            tree: None,
         },
     );
     match cap.ctrl() {
@@ -389,6 +394,7 @@ fn exec_empty_argv_never_reaches_the_seam() {
             env: vec![],
             cwd: None,
             logon: None,
+            tree: None,
         },
     );
     match cap.ctrl() {

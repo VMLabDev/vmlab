@@ -918,15 +918,31 @@ impl Handler<LabRequest> for LabdHandler {
                 // One row per (machine, playbook block) — the blocks live
                 // inside the machine they configure.
                 let cfg = &lab.config.lab;
-                let machines = cfg
+                let machines: Vec<_> = cfg
                     .vms
                     .iter()
                     .map(|v| (&v.name, &v.playbooks))
-                    .chain(cfg.containers.iter().map(|c| (&c.name, &c.playbooks)));
+                    .chain(cfg.containers.iter().map(|c| (&c.name, &c.playbooks)))
+                    .collect();
+                // A timed-out run whose processes may still be alive, on the
+                // row of the block it came from.
+                let mut timed_out = std::collections::HashMap::new();
+                for (machine, _) in &machines {
+                    if let Some(status) = playbook::timed_out_status(lab, machine).await {
+                        timed_out.insert(machine.as_str(), status);
+                    }
+                }
+                let timed_out = &timed_out;
                 Ok(Value::Array(
                     machines
+                        .into_iter()
                         .flat_map(|(machine, playbooks)| {
                             playbooks.iter().map(move |p| {
+                                let path = p.path.display().to_string();
+                                let timed_out = timed_out
+                                    .get(machine.as_str())
+                                    .filter(|(run, _)| run.playbook == path && run.play == p.play)
+                                    .map(|(run, alive)| json!({"at": run.at, "alive": alive}));
                                 json!({
                                     "machine": machine,
                                     "path": p.path.display().to_string(),
@@ -936,6 +952,7 @@ impl Handler<LabRequest> for LabdHandler {
                                         .map(|v| json!({"name": v.name, "value": v.value}))
                                         .collect::<Vec<_>>(),
                                     "running": lab.playbook_ops.op_of(machine),
+                                    "timed_out": timed_out,
                                 })
                             })
                         })

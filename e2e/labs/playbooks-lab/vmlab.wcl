@@ -1,5 +1,6 @@
-// One VM with one config-weave playbook, applied on `up` and then driven by
-// hand with `vmlab playbook check` and `apply`.
+// One VM with two config-weave playbooks, applied on `up` and then driven by
+// hand with `vmlab playbook check` and `apply`. The second one exists to time
+// out on demand.
 import <vmlab.wcl>
 
 lab "e2e-playbooks" {
@@ -14,6 +15,11 @@ lab "e2e-playbooks" {
     playbook "playbooks/marker" {
       play = "marker"
       var "marker_content" { value = "converged-by-vmlab" }
+    }
+
+    playbook "playbooks/slow" {
+      play    = "slow"
+      timeout = 5s
     }
   }
 }

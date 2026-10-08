@@ -17,7 +17,7 @@ use std::thread;
 
 use vmlab_agent_proto::{
     AgentMsg, Frame, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD, NetInterface, OsInfo,
-    PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame,
+    PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame, valid_tree_name,
 };
 
 use crate::spawn::{ProcessSpec, Spawner, TerminalSpec};
@@ -369,13 +369,25 @@ impl Mux {
                 env,
                 cwd,
                 logon,
-            } => crate::exec::open(
-                self,
-                platform.spawner(),
-                &logon.into(),
-                id,
-                ProcessSpec { argv, env, cwd },
-            ),
+                tree,
+            } => {
+                if let Some(name) = tree.as_deref().filter(|n| !valid_tree_name(n)) {
+                    self.send_error(Some(id), format!("exec: bad tree name {name:?}"));
+                    return;
+                }
+                crate::exec::open(
+                    self,
+                    platform.spawner(),
+                    &logon.into(),
+                    id,
+                    ProcessSpec {
+                        argv,
+                        env,
+                        cwd,
+                        tree,
+                    },
+                )
+            }
             HostMsg::Eof { id } => self.route_input(id, Input::Eof),
             // A file session takes the resolver rather than one resolved
             // path: every request in it names its own (§19.5).
@@ -411,6 +423,18 @@ impl Mux {
                 Ok(info) => self.send_ctrl(&AgentMsg::OsInfo { info }),
                 Err(e) => self.send_error(None, format!("os_info: {e}")),
             },
+            // Always answered, so a host waiting on it never times out: a
+            // tree that cannot be read is reported as drained, and why.
+            HostMsg::TreeStatus { tree } => {
+                let alive = match valid_tree_name(&tree) {
+                    true => platform.tree_status(&tree).unwrap_or_else(|e| {
+                        self.send_error(None, format!("tree_status {tree}: {e}"));
+                        0
+                    }),
+                    false => 0,
+                };
+                self.send_ctrl(&AgentMsg::TreeStatus { tree, alive });
+            }
             HostMsg::Shutdown { mode } => {
                 // Ack before executing: the reply may be the last bytes this
                 // guest ever puts on the wire.
@@ -452,6 +476,12 @@ pub trait Platform: Sync {
     fn net_info(&self) -> Result<Vec<NetInterface>, String>;
     /// Structured OS information.
     fn os_info(&self) -> Result<OsInfo, String>;
+    /// How many processes of the named exec tree are still alive. Only
+    /// asked of a platform advertising `features::TREE`; the default has no
+    /// trees to count.
+    fn tree_status(&self, _tree: &str) -> Result<u32, String> {
+        Ok(0)
+    }
     /// Bring the guest down. The `ShuttingDown` ack is already queued;
     /// implementations delay briefly so it flushes, and report failure via
     /// `mux` if the OS refuses.

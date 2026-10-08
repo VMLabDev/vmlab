@@ -9,6 +9,7 @@
 //! session inherits when no `login {}` is declared.
 
 pub mod login;
+pub mod shepherd;
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -345,6 +346,7 @@ impl crate::mux::Platform for LinuxPlatform {
             features::TAIL.to_string(),
             features::METRICS.to_string(),
             features::WATCH.to_string(),
+            features::TREE.to_string(),
         ];
         if self.clipboard.is_some() {
             f.push(features::CLIPBOARD.to_string());
@@ -397,6 +399,10 @@ impl crate::mux::Platform for LinuxPlatform {
 
     fn os_info(&self) -> Result<OsInfo, String> {
         Ok(os_info())
+    }
+
+    fn tree_status(&self, tree: &str) -> Result<u32, String> {
+        shepherd::status(tree)
     }
 
     fn shutdown(&self, mux: &Mux, mode: ShutdownMode) {
@@ -481,6 +487,7 @@ impl LinuxSpawner {
                         ),
                         env,
                         cwd: None,
+                        tree: spec.tree,
                     },
                     credentials: None,
                     fresh_env: false,
@@ -507,6 +514,7 @@ impl LinuxSpawner {
                     ),
                     env: vec![],
                     cwd: None,
+                    tree: spec.tree,
                 },
                 credentials: None,
                 fresh_env: false,
@@ -519,6 +527,7 @@ impl LinuxSpawner {
                         argv: spec.argv,
                         env,
                         cwd: Some(spec.cwd.unwrap_or_else(|| s.account.home.clone())),
+                        tree: spec.tree,
                     },
                     credentials: login::credentials_for(s),
                     fresh_env: true,
@@ -657,6 +666,11 @@ struct ExecPlan {
 
 /// Carry out an [`ExecPlan`].
 fn spawn_piped(plan: ExecPlan) -> std::io::Result<Spawned> {
+    spawn_piped_with(plan, |_| {})
+}
+
+/// Carry out an [`ExecPlan`], with `extra` preparing the command last.
+fn spawn_piped_with(plan: ExecPlan, extra: impl FnOnce(&mut Command)) -> std::io::Result<Spawned> {
     let ExecPlan {
         spec,
         credentials,
@@ -677,6 +691,7 @@ fn spawn_piped(plan: ExecPlan) -> std::io::Result<Spawned> {
                 })
             };
         }
+        extra(cmd);
     })
 }
 
@@ -734,8 +749,14 @@ impl Spawner for LinuxSpawner {
 
     fn exec(&self, identity: &Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
         let held = self.logins.resolve(identity)?;
-        let plan = self.exec_plan(&self.route(&held), spec)?;
-        Ok(hold_until_it_exits(spawn_piped(plan)?, held))
+        let mut plan = self.exec_plan(&self.route(&held), spec)?;
+        // The shepherd wraps the whole plan, `su` and the container
+        // trampoline included, so whatever they start is in the tree too.
+        let spawned = match plan.spec.tree.take() {
+            Some(tree) => shepherd::spawn(plan, &tree)?,
+            None => spawn_piped(plan)?,
+        };
+        Ok(hold_until_it_exits(spawned, held))
     }
 
     fn adopter(&self, identity: &Identity) -> std::io::Result<Adopter> {
@@ -1731,6 +1752,7 @@ mod tests {
                 argv: vec!["true".into()],
                 env: vec![],
                 cwd: None,
+                tree: None,
             },
         ) else {
             panic!("an account this guest does not have must never spawn anything");
@@ -1784,6 +1806,7 @@ mod tests {
                     ],
                     env: vec![("EXTRA".into(), "from the host".into())],
                     cwd: None,
+                    tree: None,
                 },
             )
             .unwrap();
@@ -1814,6 +1837,7 @@ mod tests {
             argv: vec!["cargo".into(), "build".into()],
             env: vec![("RUSTFLAGS".into(), "-C debuginfo=2".into())],
             cwd: Some("/src".into()),
+            tree: None,
         };
 
         let pam = test_session(
@@ -1864,6 +1888,7 @@ mod tests {
                     argv: vec!["pwd".into()],
                     env: vec![],
                     cwd: None,
+                    tree: None,
                 },
             )
             .unwrap();
@@ -1915,6 +1940,7 @@ mod tests {
                     argv: vec!["id".into()],
                     env: vec![],
                     cwd: None,
+                    tree: None,
                 },
             )
             .unwrap();

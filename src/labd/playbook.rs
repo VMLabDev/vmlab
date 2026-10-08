@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::config::model::{Lab, Playbook};
 use crate::labd::lab::LabRuntime;
+use crate::labd::state::TimedOutRun;
 use crate::labd::vm_agent::{AgentHandle, SessionEvent};
 use crate::proto::CommandError;
 use crate::scripting::OutputSink;
@@ -526,6 +527,7 @@ async fn run_inner(
     };
 
     let agent = m.wait_agent(Duration::from_secs(300)).await?;
+    refuse_while_timed_out_run_lives(lab, machine, &agent, &log_line).await?;
     // The profile-name heuristic decides before boot; the agent's handshake
     // is authoritative once connected.
     let os = match agent.info().os.as_str() {
@@ -658,7 +660,19 @@ async fn run_inner(
             }
             Err(_) => log_line(&line),
         };
-        let (exit_code, stdout) = exec_streaming(&agent, argv.clone(), pb, on_line).await?;
+        // Each run gets its own process tree, so a timed-out run is
+        // recognisable after the fact and a run that finished never is.
+        let tree = agent
+            .has_feature(vmlab_agent_proto::features::TREE)
+            .then(|| format!("pb-{}-{op_id}", chrono::Utc::now().timestamp_millis()));
+        let (exit_code, stdout) =
+            match exec_streaming(&agent, argv.clone(), tree.as_deref(), pb.timeout, on_line).await?
+            {
+                Streamed::Exited { code, stdout } => (code, stdout),
+                Streamed::TimedOut => {
+                    return Err(timed_out(lab, machine, pb, &argv, tree).await);
+                }
+            };
         let report = parse_report(&stdout);
 
         if exit_code == 3 && mode == PlaybookMode::Apply {
@@ -761,33 +775,144 @@ fn run_argv(guest_bin: &str, guest_dir: &str, pb: &Playbook, mode: PlaybookMode)
     argv
 }
 
+/// The error a timed-out run fails with. Where the run had a process tree,
+/// the timeout is recorded against the machine first, so the next run is
+/// refused while anything it started is still alive in the guest
+/// ([`refuse_while_timed_out_run_lives`]).
+async fn timed_out(
+    lab: &LabRuntime,
+    machine: &str,
+    pb: &Playbook,
+    argv: &[String],
+    tree: Option<String>,
+) -> anyhow::Error {
+    let what = format!("`{}` timed out after {:?}", argv.join(" "), pb.timeout);
+    let raise = format!(
+        "raise `timeout` on playbook \"{}\" to allow a longer run",
+        pb.path.display()
+    );
+    let Some(tree) = tree else {
+        return anyhow!("{what}; {raise}");
+    };
+    let record = TimedOutRun {
+        tree,
+        playbook: pb.path.display().to_string(),
+        play: pb.play.clone(),
+        at: chrono::Utc::now(),
+    };
+    let saved = {
+        let mut state = lab.state.lock().await;
+        state.machine_mut(machine).timed_out_run = Some(record);
+        state.save(&lab.lab_local)
+    };
+    if let Err(e) = saved {
+        tracing::warn!("recording the timed-out run on {machine}: {e:#}");
+    }
+    anyhow!(
+        "{what}. What it started is still running in the guest, and the next playbook \
+         run on \"{machine}\" is refused until that has finished; {raise}"
+    )
+}
+
+/// Refuse to start a run on `machine` while a timed-out run's processes
+/// are still alive in the guest. A new run would repeat the step they are
+/// part of, and two installers over one product do not end well. Once the
+/// tree has drained the record is cleared and the run goes ahead.
+async fn refuse_while_timed_out_run_lives(
+    lab: &LabRuntime,
+    machine: &str,
+    agent: &AgentHandle,
+    log_line: &impl Fn(&str),
+) -> Result<()> {
+    let Some(run) = timed_out_run(lab, machine).await else {
+        return Ok(());
+    };
+    match agent.tree_alive(&run.tree, Duration::from_secs(30)).await {
+        Ok(0) => {}
+        Ok(alive) => {
+            return Err(anyhow::Error::new(CommandError::conflict(format!(
+                "playbook {} play {} timed out on \"{machine}\" at {}, and {alive} \
+                 process(es) it started are still running in the guest. A new run would \
+                 repeat their work over them; run it again once they have finished \
+                 (`vmlab playbook list` shows when)",
+                run.playbook,
+                run.play,
+                run.at.format("%Y-%m-%d %H:%M:%S UTC"),
+            ))));
+        }
+        // The agent was replaced by one that cannot count trees: nothing
+        // left to wait on that anyone can see.
+        Err(e) => log_line(&format!(
+            "cannot tell whether the timed-out run of {} play {} left processes behind: {e:#}",
+            run.playbook, run.play
+        )),
+    }
+    let mut state = lab.state.lock().await;
+    state.machine_mut(machine).timed_out_run = None;
+    state.save(&lab.lab_local)
+}
+
+/// `machine`'s timed-out run, if one is on record.
+async fn timed_out_run(lab: &LabRuntime, machine: &str) -> Option<TimedOutRun> {
+    let state = lab.state.lock().await;
+    state.machines.get(machine)?.timed_out_run.clone()
+}
+
+/// `machine`'s timed-out run for `vmlab playbook list`, with how many of its
+/// processes are alive: `None` where the guest cannot be asked right now.
+pub async fn timed_out_status(
+    lab: &LabRuntime,
+    machine: &str,
+) -> Option<(TimedOutRun, Option<u32>)> {
+    let run = timed_out_run(lab, machine).await?;
+    let alive = match lab.machine(machine) {
+        Ok(m) => match m.wait_agent(Duration::from_secs(2)).await {
+            Ok(agent) => agent
+                .tree_alive(&run.tree, Duration::from_secs(5))
+                .await
+                .ok(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    Some((run, alive))
+}
+
+/// How one config-weave invocation ended.
+enum Streamed {
+    Exited {
+        code: i32,
+        stdout: String,
+    },
+    /// `timeout` passed first. The session is closed, which ends
+    /// config-weave and nothing it started.
+    TimedOut,
+}
+
 /// Streaming exec: stderr lines go to `on_line` as they arrive (the ndjson
-/// progress feed), stdout accumulates (the final `--json` report). Returns
-/// `(exit_code, stdout)`. The run is bounded by the playbook's `timeout` so a
-/// hung guest cannot wedge `up` forever.
+/// progress feed), stdout accumulates (the final `--json` report). Bounded by
+/// the playbook's `timeout` so a hung guest cannot wedge `up` forever. Runs
+/// inside the process tree `tree` where the agent has them.
 async fn exec_streaming(
     agent: &AgentHandle,
     argv: Vec<String>,
-    pb: &Playbook,
+    tree: Option<&str>,
+    timeout: Duration,
     mut on_line: impl FnMut(String),
-) -> Result<(i32, String)> {
+) -> Result<Streamed> {
     let display = argv.join(" ");
-    let mut session = agent.open_exec(argv, Vec::new(), None, None).await?;
+    let mut session = match tree {
+        Some(tree) => agent.open_exec_in_tree(argv, tree).await?,
+        None => agent.open_exec(argv, Vec::new(), None, None).await?,
+    };
     session.eof().await?;
     let mut stdout = Vec::new();
     let mut carry = String::new();
-    let deadline = tokio::time::Instant::now() + pb.timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let ev = tokio::time::timeout_at(deadline, session.recv())
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "`{display}` timed out after {:?}; raise `timeout` on playbook \"{}\" \
-                     to allow a longer run",
-                    pb.timeout,
-                    pb.path.display()
-                )
-            })?;
+        let Ok(ev) = tokio::time::timeout_at(deadline, session.recv()).await else {
+            return Ok(Streamed::TimedOut);
+        };
         match ev {
             Some(SessionEvent::Data(b)) => stdout.extend(b),
             Some(SessionEvent::Stderr(b)) => {
@@ -800,7 +925,10 @@ async fn exec_streaming(
                 if !tail.is_empty() {
                     on_line(tail.to_string());
                 }
-                return Ok((code, String::from_utf8_lossy(&stdout).into_owned()));
+                return Ok(Streamed::Exited {
+                    code,
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                });
             }
             Some(SessionEvent::Error(msg)) => bail!("`{display}`: {msg}"),
             // The exit code is what ends this loop; the output EOF that

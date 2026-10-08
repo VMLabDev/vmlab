@@ -890,8 +890,10 @@ vmlab playbook list
 
 Prints one line per `playbook {}` block, `<machine> → <path> play <play>`, followed by an
 indented `var <name>=<value>` line for each variable override the block declares, and, when
-a run is in progress on that machine, `<check|apply> running since <time>`. A lab with no
-blocks prints `no playbook blocks declared in this lab`.
+a run is in progress on that machine, `<check|apply> running since <time>`. A block whose last
+run hit its `timeout` adds a `timed out at <time>` line saying whether the processes that run
+started are still running, have finished, or cannot be asked about because the guest is not
+answering. A lab with no blocks prints `no playbook blocks declared in this lab`.
 
 ### vmlab playbook check
 
@@ -915,7 +917,9 @@ Which block runs is resolved from the machine's `playbook {}` blocks. With exact
 is nothing to choose. With several, `--playbook` and `--play` narrow the choice, and a machine
 that still matches more than one block, or none, is refused with the candidates named. Only
 one run may be in flight per machine; a second `check` or `apply` while one runs is refused
-with `<kind> of <path> play <play> already running for "<machine>"`.
+with `<kind> of <path> play <play> already running for "<machine>"`. A run is also refused
+while processes started by a run on that machine that timed out are still alive in the guest
+(see automation.md).
 
 ### vmlab playbook apply
 

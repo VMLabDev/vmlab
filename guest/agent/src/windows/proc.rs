@@ -1,8 +1,11 @@
-//! Starting a process *as* a minted logon (PRD §19.2).
+//! Starting a process *as* a minted logon (PRD §19.2), or inside a process
+//! tree (`features::TREE`).
 //!
-//! `std::process::Command` cannot do this — it has no way to pass a token —
-//! so the piped-stdio shape the seam wants is built by hand here, and the
-//! ConPTY shape borrows [`env_block`] and [`Owned`] from it.
+//! `std::process::Command` can do neither — it has no way to pass a token,
+//! and it neither starts a process suspended for us to place in a job first
+//! nor hands back the thread to resume — so the piped-stdio shape the seam
+//! wants is built by hand here, and the ConPTY shape borrows [`env_block`]
+//! and [`Owned`] from it.
 //!
 //! Two things the environment must carry, both of which are silent when
 //! missed: the block comes from `CreateEnvironmentBlock` **against the
@@ -22,13 +25,14 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
-    INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
-    WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 use super::logon::MintedLogon;
 use super::port::wide;
+use super::tree;
 use crate::spawn::{ProcessSpec, Spawned, command_line};
 
 /// A handle we own and close exactly once.
@@ -142,7 +146,8 @@ unsafe fn read_block(ptr: *const u16) -> Vec<String> {
 /// finishes but never ends. Holding this across create-then-spawn means no
 /// other inheritable end exists while the spawn runs.
 ///
-/// Every caller of [`create_as_user`] must hold it, not just the one that
+/// Every caller of [`create_as_user`] (and of the agent-identity tree spawn
+/// in [`spawn_piped`]) must hold it, not just the one that
 /// makes the pipes: a terminal opening mid-exec inherits the exec's ends
 /// just as readily.
 static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -152,16 +157,34 @@ pub fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
     SPAWN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Start `spec` as `session` with piped stdio — the exec shape of the seam.
-pub fn spawn_piped(logon: &MintedLogon, spec: ProcessSpec) -> std::io::Result<Spawned> {
+/// Start `spec` with piped stdio — the exec shape of the seam — as `logon`,
+/// or as the agent when there is none.
+///
+/// The agent identity comes here only for an exec in a tree: an ordinary
+/// one is `piped_command`'s, and stays there. The two differ in how a bare
+/// `argv[0]` is found — `CreateProcessW` searches the agent's directory and
+/// the working directory before `PATH`, where std searches the child's
+/// `PATH` — which a tree's exec (a full path, or a system binary) does not
+/// meet in practice.
+pub fn spawn_piped(logon: Option<&MintedLogon>, spec: ProcessSpec) -> std::io::Result<Spawned> {
     if spec.argv.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "empty argv",
         ));
     }
-    let env = env_block(logon, &spec.env)?;
-    let cwd = spec.cwd.clone().or_else(|| logon.home.clone());
+    let (env, cwd) = match logon {
+        Some(logon) => (
+            Some(env_block(logon, &spec.env)?),
+            spec.cwd.clone().or_else(|| logon.home.clone()),
+        ),
+        // The agent identity inherits our environment; a block is built
+        // only when the open carried overrides.
+        None => (
+            (!spec.env.is_empty()).then(|| agent_env_block(&spec.env)),
+            spec.cwd.clone(),
+        ),
+    };
 
     let guard = spawn_lock();
     let (stdin_r, stdin_w) = pipe(PipeEnd::Read)?;
@@ -175,13 +198,14 @@ pub fn spawn_piped(logon: &MintedLogon, spec: ProcessSpec) -> std::io::Result<Sp
     si.hStdOutput = stdout_w.0;
     si.hStdError = stderr_w.0;
 
-    let pi = create_as_user(
+    let pi = create(
         logon,
         &command_line(&spec.argv),
-        &env,
+        env.as_ref(),
         cwd.as_deref(),
         &si,
         CREATE_NO_WINDOW,
+        spec.tree.as_deref(),
     )?;
     // The child holds its own copies now.
     drop(stdin_r);
@@ -196,6 +220,7 @@ pub fn spawn_piped(logon: &MintedLogon, spec: ProcessSpec) -> std::io::Result<Sp
 
     let process = Arc::new(pi);
     let kill = process.clone();
+    let tree = spec.tree;
     Ok(Spawned {
         input: Box::new(input),
         output: Box::new(output),
@@ -205,7 +230,16 @@ pub fn spawn_piped(logon: &MintedLogon, spec: ProcessSpec) -> std::io::Result<Sp
             // SAFETY: live process handle held by the Arc.
             unsafe { TerminateProcess(kill.0, 137) };
         }),
-        wait: Box::new(move || wait_for(process.0)),
+        wait: Box::new(move || {
+            let code = wait_for(process.0);
+            // The job's handle goes once nothing is left in it; a member
+            // that outlived us keeps it (and its name) until `status`
+            // counts zero.
+            if let Some(tree) = tree {
+                tree::release_if_empty(&tree);
+            }
+            code
+        }),
     })
 }
 
@@ -264,32 +298,105 @@ pub fn create_as_user(
     si: &STARTUPINFOW,
     flags: u32,
 ) -> std::io::Result<Owned> {
+    create(Some(logon), cmdline, Some(env), cwd, si, flags, None)
+}
+
+/// Start a process as `logon` (`CreateProcessAsUserW`) or as the agent
+/// (`CreateProcessW`), in `tree`'s job when there is one.
+///
+/// A tree's process is created suspended, assigned, and only then resumed:
+/// a process that ran even briefly before assignment could start a child
+/// outside the job, and that child would never be counted. If the job
+/// cannot take it, the process is terminated before this returns — a spawn
+/// that fails leaves nothing suspended behind. Without a tree nothing here
+/// differs from a plain create.
+fn create(
+    logon: Option<&MintedLogon>,
+    cmdline: &str,
+    env: Option<&EnvBlock>,
+    cwd: Option<&str>,
+    si: &STARTUPINFOW,
+    flags: u32,
+    tree: Option<&str>,
+) -> std::io::Result<Owned> {
+    let joining = tree.map(tree::join).transpose()?;
+    let suspended = if joining.is_some() {
+        CREATE_SUSPENDED
+    } else {
+        0
+    };
+    let flags = CREATE_UNICODE_ENVIRONMENT | flags | suspended;
+    let env = env.map_or(std::ptr::null(), |e| e.as_ptr());
     let mut cmd = wide(cmdline);
     let cwd = cwd.map(wide);
+    let cwd = cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: every pointer lives across the call; `bInheritHandles` is TRUE
     // because the stdio handles in `si` were created inheritable.
     let ok = unsafe {
-        CreateProcessAsUserW(
-            logon.token(),
-            std::ptr::null(),
-            cmd.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-            CREATE_UNICODE_ENVIRONMENT | flags,
-            env.as_ptr(),
-            cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-            si,
-            &mut pi,
-        )
+        match logon {
+            Some(logon) => CreateProcessAsUserW(
+                logon.token(),
+                std::ptr::null(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                env,
+                cwd,
+                si,
+                &mut pi,
+            ),
+            None => CreateProcessW(
+                std::ptr::null(),
+                cmd.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                env,
+                cwd,
+                si,
+                &mut pi,
+            ),
+        }
     };
     if ok == 0 {
-        return Err(std::io::Error::last_os_error());
+        let e = std::io::Error::last_os_error();
+        if let Some(joining) = joining {
+            joining.abandon();
+        }
+        return Err(e);
     }
-    // SAFETY: our handle, closed once; the process handle is kept.
-    unsafe { CloseHandle(pi.hThread) };
-    Ok(Owned(pi.hProcess))
+    let process = Owned(pi.hProcess);
+    let thread = Owned(pi.hThread);
+    if let Some(joining) = joining {
+        let placed = joining.assign(process.0).and_then(|()| {
+            // SAFETY: the primary thread of the process we just created
+            // suspended; its handle is ours. A suspend count of 1 drops to 0.
+            match unsafe { ResumeThread(thread.0) } {
+                u32::MAX => Err(std::io::Error::last_os_error()),
+                _ => Ok(()),
+            }
+        });
+        if let Err(e) = placed {
+            // SAFETY: our live process handle. Waiting is bounded and only
+            // makes sure the process is gone before the job is looked at.
+            unsafe {
+                TerminateProcess(process.0, 1);
+                WaitForSingleObject(process.0, 5_000);
+            }
+            joining.abandon();
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("process tree {}: {e}", tree.unwrap_or_default()),
+            ));
+        }
+    }
+    // The thread handle is closed here; the process handle is kept.
+    drop(thread);
+    Ok(process)
 }
 
 fn wait_for(process: HANDLE) -> i32 {

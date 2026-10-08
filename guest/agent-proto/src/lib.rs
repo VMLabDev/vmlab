@@ -83,6 +83,22 @@ pub mod features {
     /// The recursive guest tree watch backing the workspace syncer
     /// (§19.4, [`crate::watch`]).
     pub const WATCH: &str = "watch";
+    /// Process trees: [`HostMsg::OpenExec`] honours `tree`, and the agent
+    /// answers [`HostMsg::TreeStatus`]. An agent without it ignores `tree`
+    /// (unknown fields are dropped), so a host checks for this before
+    /// relying on one.
+    pub const TREE: &str = "tree";
+}
+
+/// Whether `name` is usable as a process-tree name: 1 to 64 ASCII letters,
+/// digits, `-` or `_`. The agent turns it into a file name and a Windows
+/// object name, so nothing else is accepted.
+pub fn valid_tree_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// How `vmlab-cinit` tells a container micro-VM's agent about the container
@@ -378,6 +394,13 @@ pub enum HostMsg {
     /// Run `argv` (no PTY) on channel `id`: stdin = host DATA frames,
     /// stdout = guest DATA frames, stderr = guest DATA_ERR frames, exit via
     /// [`AgentMsg::Exited`].
+    ///
+    /// `tree` (from an agent advertising [`features::TREE`]) names the
+    /// process tree the exec runs in: every process it starts stays a member
+    /// of that tree, including one orphaned by its parent's death, so a
+    /// [`HostMsg::TreeStatus`] can tell whether any of them is still alive
+    /// after the channel is closed. Closing the channel still kills only the
+    /// process `argv` started.
     OpenExec {
         id: u32,
         argv: Vec<String>,
@@ -387,6 +410,8 @@ pub enum HostMsg {
         cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         logon: Option<Logon>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tree: Option<String>,
     },
     /// No more host->guest bytes on this channel (exec stdin EOF — see
     /// [`AgentMsg::Eof`] for the other direction).
@@ -471,6 +496,13 @@ pub enum HostMsg {
     /// Ask for structured OS information; the agent replies
     /// [`AgentMsg::OsInfo`].
     OsInfo,
+    /// Ask how many processes of the tree `tree` (an [`HostMsg::OpenExec`]
+    /// `tree`) are still alive; the agent replies [`AgentMsg::TreeStatus`].
+    /// A tree the agent has no record of has none: it never existed, every
+    /// member has exited, or the guest restarted since.
+    TreeStatus {
+        tree: String,
+    },
     /// Shut the guest down. The agent replies [`AgentMsg::ShuttingDown`]
     /// *before* executing (the reply may be the last bytes on the wire); the
     /// host must treat a vanishing connection after this as success.
@@ -547,6 +579,9 @@ pub enum AgentMsg {
     NetInfo { interfaces: Vec<NetInterface> },
     /// Reply to [`HostMsg::OsInfo`].
     OsInfo { info: OsInfo },
+    /// Reply to [`HostMsg::TreeStatus`]: how many processes of `tree` are
+    /// alive, zero once the tree has drained.
+    TreeStatus { tree: String, alive: u32 },
     /// Ack of [`HostMsg::Shutdown`], sent just before the agent executes it.
     ShuttingDown { mode: ShutdownMode },
     /// Grant the host more send credit on a channel.
@@ -784,6 +819,7 @@ mod tests {
                     secret: "hunter2".into(),
                     elevated: false,
                 }),
+                tree: Some("pb-1".into()),
             },
             HostMsg::Eof { id: 3 },
             HostMsg::OpenFileOps { id: 4, logon: None },
@@ -815,6 +851,9 @@ mod tests {
             HostMsg::UnsubscribeMetrics,
             HostMsg::NetInfo,
             HostMsg::OsInfo,
+            HostMsg::TreeStatus {
+                tree: "pb-1".into(),
+            },
             HostMsg::Shutdown {
                 mode: ShutdownMode::Reboot,
             },
@@ -877,6 +916,10 @@ mod tests {
                     arch: "x86_64".into(),
                     hostname: "vm0".into(),
                 },
+            },
+            AgentMsg::TreeStatus {
+                tree: "pb-1".into(),
+                alive: 2,
             },
             AgentMsg::ShuttingDown {
                 mode: ShutdownMode::Powerdown,
@@ -1023,6 +1066,39 @@ mod tests {
     /// wire — an agent built before §19.2 still parses these, and a host
     /// built before it still parses an open that carries one.
     #[test]
+    fn a_tree_name_is_a_short_plain_word() {
+        assert!(valid_tree_name("pb-1700000000000-3"));
+        assert!(valid_tree_name("a_b"));
+        for bad in ["", "a/b", "..", "a b", "a\\b", &"x".repeat(65)] {
+            assert!(!valid_tree_name(bad), "{bad:?}");
+        }
+    }
+
+    /// An exec without a tree is the exact message an older agent parses,
+    /// and an older host's open parses as one with no tree.
+    #[test]
+    fn an_exec_tree_is_optional_on_the_wire() {
+        let old = r#"{"cmd":"open_exec","id":1,"argv":["true"],"env":[]}"#;
+        let HostMsg::OpenExec { tree, .. } = serde_json::from_str(old).unwrap() else {
+            panic!("not an exec");
+        };
+        assert_eq!(tree, None);
+        let with = serde_json::to_string(&HostMsg::OpenExec {
+            id: 1,
+            argv: vec!["true".into()],
+            env: vec![],
+            cwd: None,
+            logon: None,
+            tree: Some("pb-1".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            with,
+            r#"{"cmd":"open_exec","id":1,"argv":["true"],"env":[],"tree":"pb-1"}"#
+        );
+    }
+
+    #[test]
     fn a_logon_is_optional_and_self_contained() {
         assert_eq!(
             serde_json::to_string(&HostMsg::OpenTail {
@@ -1044,6 +1120,7 @@ mod tests {
                     secret: "vmlab123!".into(),
                     elevated: true,
                 }),
+                tree: None,
             })
             .unwrap(),
             r#"{"cmd":"open_exec","id":3,"argv":["whoami"],"env":[],"logon":{"user":"PROBE\\dev","secret":"vmlab123!","elevated":true}}"#

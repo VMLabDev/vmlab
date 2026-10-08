@@ -152,6 +152,7 @@ FEATURES: dict[str, str] = {
     "playbook.up": "a `playbook` block applied on `up`",
     "playbook.list": "`vmlab playbook list`",
     "playbook.check-apply": "`vmlab playbook check` and `apply`",
+    "playbook.timeout": "a run past its `timeout` fails, and the next run is refused until what it started has finished",
     # -- dev machines ------------------------------------------------------
     "dev.sync.host-to-guest": "workspace host edits reach the guest",
     "dev.sync.guest-to-host": "workspace guest edits reach the host",
