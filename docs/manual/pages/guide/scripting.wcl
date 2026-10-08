@@ -117,7 +117,7 @@ reported at call time by naming the capability: `screenshot` on a machine with
 no display fails with "machine `api` has no display", never with "no such
 method" and never with a claim about its kind. The methods fall into six
 groups: lifecycle and state (`start`, `stop`, `stop_force`, `restart`,
-`poweroff`, `state`, `wait_ready`, `is_ready`, `is_healthy`,
+`poweroff`, `eject_cdrom`, `state`, `wait_ready`, `is_ready`, `is_healthy`,
 `agent_answering`, `wait_shutdown`, `ip`, `ip_nic`, `logs`), snapshots
 (`snapshot`, `restore`, `restore_discarding_workspace`, `snapshots`,
 `delete_snapshot`), input and screen (covered in
@@ -130,8 +130,10 @@ DOC
   p <<'DOC'
 `poweroff` is a clean QMP quit that flushes block caches first, unlike
 `stop_force`, which kills QEMU. For a guest with no ACPI it is the only way to
-seal a consistent disk. Snapshot calls go through the lab runtime so the
-records, events and pin-guarding stay in one place; see
+seal a consistent disk. `eject_cdrom` forces the medium out of the install
+CD-ROM, and only that drive, until QEMU restarts, so an installer that reboots
+from CD falls through to the disk. Snapshot calls go through the lab runtime
+so the records, events and pin-guarding stay in one place; see
 [Snapshots](guide_snapshots) for what a restore does to a dev machine's
 workspace.
 DOC

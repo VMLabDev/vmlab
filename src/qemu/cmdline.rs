@@ -25,6 +25,11 @@ pub struct VmPaths {
     pub extra_disks: Vec<(String, PathBuf)>,
     /// CD-ROM attachments (paths to ISOs, including built media).
     pub cdroms: Vec<PathBuf>,
+    /// `cdroms[0]` is the machine's *install* CD-ROM — the VM's `cdrom =`,
+    /// which a template build's `source "iso"` renders to — rather than built
+    /// media. Its device then carries the qdev id [`INSTALL_CDROM_ID`], the
+    /// one drive `eject_cdrom()` addresses.
+    pub install_cdrom: bool,
     /// Floppy attachment.
     pub floppy: Option<PathBuf>,
     /// NIC attachments in declaration order.
@@ -46,6 +51,11 @@ pub struct VmPaths {
     /// the RAM to a shared memory-backend-memfd (§7.5).
     pub virtiofs_shares: Vec<(String, PathBuf)>,
 }
+
+/// The qdev id of a VM's install CD-ROM device (see
+/// [`VmPaths::install_cdrom`]). Only that drive carries an id, so nothing
+/// addressed by it can reach built media or the VMLAB bootstrap ISO.
+pub const INSTALL_CDROM_ID: &str = "install-cd";
 
 /// One NIC attachment for the argv builder.
 #[derive(Debug, Clone)]
@@ -412,12 +422,19 @@ pub fn build_args(
         } else {
             String::new()
         };
+        // The install CD-ROM gets a qdev id: QMP `eject` addresses a drive
+        // by it, a `-blockdev` drive having no backend name to give.
+        let id = if i == 0 && paths.install_cdrom {
+            format!(",id={INSTALL_CDROM_ID}")
+        } else {
+            String::new()
+        };
         if virt {
-            a.push(format!("virtio-blk-pci,drive=cd{i}{boot}"));
+            a.push(format!("virtio-blk-pci,drive=cd{i}{boot}{id}"));
         } else {
             let (bus, unit) = ide_slot(sata_disks + i, &machine_kind);
             a.push(format!(
-                "ide-cd,drive=cd{i},bus=ide.{bus},unit={unit}{boot}"
+                "ide-cd,drive=cd{i},bus=ide.{bus},unit={unit}{boot}{id}"
             ));
         }
     }
@@ -972,6 +989,30 @@ mod tests {
         assert!(s.contains("ide-cd,drive=cd0,bus=ide.0,unit=1"), "{s}");
         assert!(s.contains("ide-cd,drive=cd1,bus=ide.1,unit=0"), "{s}");
         assert!(s.contains("ide-cd,drive=cd2,bus=ide.1,unit=1"), "{s}");
+    }
+
+    /// Only the install CD-ROM carries the qdev id `eject_cdrom()` addresses;
+    /// built media and the bootstrap ISO stay unnamed, and a VM whose first
+    /// CD-ROM is built media names none.
+    #[test]
+    fn only_the_install_cdrom_carries_the_eject_id() {
+        let vm = resolved("windows-legacy", "x86_64");
+        let mut p = paths();
+        p.cdroms = vec![
+            "/isos/installer.iso".into(),
+            "/lab/.vmlab/media/vmlab.iso".into(),
+        ];
+        p.install_cdrom = true;
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(
+            s.contains("ide-cd,drive=cd0,bus=ide.0,unit=1,bootindex=0,id=install-cd"),
+            "{s}"
+        );
+        assert_eq!(s.matches("id=install-cd").count(), 1, "{s}");
+
+        p.install_cdrom = false;
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(!s.contains("id=install-cd"), "{s}");
     }
 
     /// The disk is addressed on q35 too, where a slot is a whole AHCI port.

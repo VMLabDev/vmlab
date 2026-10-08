@@ -658,6 +658,8 @@ impl VmInstance {
                 .map(|d| (d.name.clone(), self.dirs.extra_disk(&d.name)))
                 .collect(),
             cdroms: self.cdroms.clone(),
+            // The lab builder puts the `cdrom =` attachment first.
+            install_cdrom: self.cfg.cdrom.is_some(),
             floppy: self.floppy.clone(),
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
@@ -1389,6 +1391,17 @@ impl super::machine::Machine for VmInstance {
 
     async fn poweroff(&self) -> Result<()> {
         super::machine::quit_and_settle(self, VmInstance::qmp(self).await).await
+    }
+
+    async fn eject_cdrom(&self) -> Result<()> {
+        if self.cfg.cdrom.is_none() {
+            return Err(super::machine::no_install_cdrom(&self.cfg.name));
+        }
+        VmInstance::qmp(self)
+            .await?
+            .eject(qemu::cmdline::INSTALL_CDROM_ID)
+            .await
+            .with_context(|| format!("vm \"{}\": ejecting the install CD-ROM", self.cfg.name))
     }
 
     /// Wire this VM's NICs into the lab fabric — taps on the fast path where
