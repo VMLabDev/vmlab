@@ -674,6 +674,13 @@ pub fn lab_module() -> Module {
         .method("poweroff", |h: &MachineHandle| -> Result<(), String> {
             h.block(h.machine.poweroff()).map_err(estr)
         })
+        // Force the medium out of the install CD-ROM (the `cdrom =` drive, a
+        // template build's `source "iso"`) and no other drive, so an installer
+        // that reboots from CD falls through to the disk. Out until QEMU
+        // restarts; a guest reboot keeps it out.
+        .method("eject_cdrom", |h: &MachineHandle| -> Result<(), String> {
+            h.block(h.machine.eject_cdrom()).map_err(estr)
+        })
         // The power state's own wire spelling — `suspended` included, for a
         // guest that went to sleep — so a script reads what `status` shows.
         .method("state", |h: &MachineHandle| -> String {
@@ -1518,6 +1525,19 @@ fn handle(event: Event, lab: Lab) {
 }
 "#;
         check_script_source(src).expect("a crash handler can explicitly start the machine");
+    }
+
+    /// `eject_cdrom` is registered on the machine handle and returns the
+    /// `Result[unit, string]` every fallible machine method does.
+    #[test]
+    fn eject_cdrom_is_a_machine_method() {
+        let src = r#"
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("w95") else { return }
+    let r: Result[unit, string] = m.eject_cdrom()
+}
+"#;
+        check_script_source(src).expect("eject_cdrom type-checks on a machine handle");
     }
 
     #[test]

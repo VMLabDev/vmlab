@@ -270,6 +270,18 @@ pub trait Machine: Send + Sync + 'static {
         self.wait_state(PowerState::Stopped, POWEROFF_SETTLE).await
     }
 
+    /// Eject the medium from this machine's install CD-ROM — the drive a
+    /// VM's `cdrom =` (or a template build's `source "iso"`) attaches — and
+    /// no other drive. Forced, since an installer locks the tray. The medium
+    /// stays out until the emulator restarts; a guest reboot inside the same
+    /// run keeps it out, which is the point: an installer that reboots from
+    /// CD falls through to the disk. Ejecting twice is not an error.
+    ///
+    /// The default is the refusal for a machine with no such drive.
+    async fn eject_cdrom(&self) -> Result<()> {
+        Err(no_install_cdrom(self.name()))
+    }
+
     /// Boot this machine, wiring its NICs into the lab fabric and reporting
     /// its lifecycle on the lab's event log. A no-op when it is already up.
     ///
@@ -708,6 +720,16 @@ pub(super) async fn attach_all_nics(
         );
     }
     Ok(attachments)
+}
+
+/// [`Machine::eject_cdrom`]'s refusal for a machine that has no install
+/// CD-ROM, naming it and saying which machines do.
+/// Named by capability, like every other refusal on the interface.
+pub(super) fn no_install_cdrom(name: &str) -> anyhow::Error {
+    anyhow!(
+        "machine `{name}` has no install CD-ROM to eject — only a VM with a \
+         `cdrom` attachment, or a template build from `source \"iso\"`, has one"
+    )
 }
 
 /// [`Machine::poweroff`] for a machine QEMU is running: a clean QMP `quit`,

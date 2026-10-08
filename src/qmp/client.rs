@@ -234,6 +234,20 @@ impl QmpClient {
         Ok(RunState::from_status(status))
     }
 
+    // --- removable media ----------------------------------------------------
+
+    /// Eject the medium from the removable drive whose *qdev* id is `id`
+    /// (`eject` with `id` and `force: true`).
+    ///
+    /// Addressed by the device's qdev id, not by the `device` (backend name)
+    /// argument QEMU deprecated: a `-blockdev` drive has no backend name to
+    /// give. `force` ejects even when the guest has locked the tray, which an
+    /// installer usually has. Ejecting an empty drive succeeds.
+    pub async fn eject(&self, id: &str) -> Result<(), QmpError> {
+        let args = json!({"id": id, "force": true});
+        self.execute("eject", Some(args)).await.map(|_| ())
+    }
+
     // --- screen and input --------------------------------------------------
 
     /// Dump the guest display to `filename` on the host (`screendump`,

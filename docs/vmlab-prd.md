@@ -560,6 +560,7 @@ m.is_ready() -> bool   m.is_healthy() -> bool   m.agent_answering() -> bool
 m.wait_shutdown(timeout)
 m.ip() -> string   m.ip_nic(i) -> string     # from lease table / agent
 m.logs(lines) -> string              # console log, where the machine keeps one
+m.eject_cdrom()                      # install CD-ROM only; out until QEMU restarts
 ```
 
 Inside a machine's **own first-boot provision**, `is_ready` / `wait_ready` mean

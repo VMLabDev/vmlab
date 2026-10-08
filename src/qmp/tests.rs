@@ -176,6 +176,22 @@ async fn screendump_arg_shape() {
 }
 
 #[tokio::test]
+async fn eject_addresses_the_qdev_id_and_forces() {
+    let mock = spawn_mock(|msg| vec![ok(msg, json!({}))]);
+
+    let client = QmpClient::connect(&mock.path).await.expect("connect");
+    client.eject("install-cd").await.expect("eject");
+
+    let received = mock.received.lock().unwrap();
+    let msg = received
+        .iter()
+        .find(|m| execute_name(m) == "eject")
+        .expect("eject command sent");
+    // `id` (the qdev id), never the deprecated `device` backend name.
+    assert_eq!(msg["arguments"], json!({"id": "install-cd", "force": true}));
+}
+
+#[tokio::test]
 async fn send_key_arg_shape() {
     let mock = spawn_mock(|msg| vec![ok(msg, json!({}))]);
 

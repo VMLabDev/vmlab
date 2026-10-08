@@ -10,8 +10,8 @@ kind. A container with no display fails `screenshot` with
 Method groups:
 
 - Lifecycle and state: `name`, `kind`, `start`, `stop`, `stop_force`,
-  `restart`, `poweroff`, `state`, `is_ready`, `wait_ready`, `is_healthy`,
-  `agent_answering`, `wait_shutdown`, `ip`, `ip_nic`.
+  `restart`, `poweroff`, `eject_cdrom`, `state`, `is_ready`, `wait_ready`,
+  `is_healthy`, `agent_answering`, `wait_shutdown`, `ip`, `ip_nic`.
 - Snapshots: `snapshot`, `restore`, `restore_discarding_workspace`,
   `snapshots`, `delete_snapshot`.
 - Input: `send_keys`, `type_text`, `type_text_paced`, `mouse_move`,
@@ -174,6 +174,33 @@ drop unflushed writes. The error carries the reason the machine did not settle.
 fn main(lab: Lab) {
     let Ok(m) = lab.vm("dos") else { return }
     let r = m.poweroff()
+}
+```
+
+## Machine.eject_cdrom
+
+Eject the medium from the machine's install CD-ROM.
+
+```wscript
+fn eject_cdrom(self) -> Result[unit, string]
+```
+
+Forces the medium out of the drive a VM's `cdrom` attachment provides, or a
+template build's `source "iso"`, even when the guest has locked the tray. No
+other drive is touched: `media { kind = "iso" }` drives and the VMLAB bootstrap
+ISO a template build attaches stay loaded. The install CD-ROM boots first, so
+an installer that reboots itself mid-install, such as Windows 95 Setup, lands
+back in the installer; ejecting once Setup has copied its files makes the next
+reboot fall through to the disk. The medium stays out until the emulator
+restarts, so a reboot inside the guest keeps it out and the next `start` loads
+it again. Ejecting an empty drive succeeds. A machine with no install CD-ROM,
+such as a container or a VM with no `cdrom`, fails with "machine `<name>` has
+no install CD-ROM to eject"; otherwise the error carries the emulator's reason.
+
+```wscript
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("w95") else { return }
+    let r = m.eject_cdrom()
 }
 ```
 

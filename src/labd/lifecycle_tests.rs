@@ -393,6 +393,24 @@ async fn stopping_a_stopped_container_is_a_no_op() {
     stops_idempotently(ctr).await;
 }
 
+/// `eject_cdrom` on a machine with no install CD-ROM — a VM declaring no
+/// `cdrom`, or any container — refuses by naming the missing drive, before
+/// asking the emulator anything (neither is running here).
+#[tokio::test]
+async fn ejecting_a_cdrom_that_is_not_there_says_so() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let (ctr, _hv) = container(&dirs, WORKLOAD, Script::healthy());
+    for m in [vm as Arc<dyn Machine>, ctr as Arc<dyn Machine>] {
+        let err = m.eject_cdrom().await.expect_err("no install CD-ROM");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("machine `{}` has no install CD-ROM", m.name())),
+            "{msg}"
+        );
+    }
+}
+
 /// A VM reports the hardware it resolved to (VM > template > profile), not
 /// what it declared: one that leaves its arch or size to its template must
 /// not show a dash for each.
