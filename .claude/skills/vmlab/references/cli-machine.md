@@ -69,7 +69,7 @@ vmlab vm stop [OPTIONS] <VM>
 | `--force` | Hard kill instead of the graceful ladder. |
 | `-h`, `--help` | Print help. |
 
-Stops one VM through the graceful ladder: a shutdown through the guest agent, then an ACPI power-down, then a hard kill, each with a timeout (the rungs and timeouts are `vmlab down`'s, in cli-lab.md). `--force` kills QEMU at once. Unlike `down`, this stops only the named VM; machines that depend on it keep running. A VM that is already stopped is a no-op. Nothing is printed on success.
+Stops one VM through the graceful ladder: a shutdown through the guest agent, then an ACPI power-down, then a clean emulator quit (QMP `quit`, which flushes the disk caches), then a hard kill, each with a timeout (the rungs and timeouts are `vmlab down`'s, in cli-lab.md). `--force` kills QEMU at once. Unlike `down`, this stops only the named VM; machines that depend on it keep running. A VM that is already stopped is a no-op. Nothing is printed on success.
 
 ### vmlab vm restart
 

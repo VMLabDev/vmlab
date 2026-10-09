@@ -174,7 +174,8 @@ Each VM stops through the graceful ladder (see architecture.md):
 
 1. A shutdown request to the guest agent, waiting up to 30 seconds for QEMU to exit.
 2. An ACPI power-down through the QEMU control channel, waiting another 30 seconds.
-3. A hard kill.
+3. A QMP `quit`, which ends QEMU after it flushes the disk caches, waiting another 30 seconds. This is where a guest that halts at "It's now safe to turn off your computer" (Windows 9x, DOS) stops.
+4. A hard kill.
 
 A container asks its init to signal the entrypoint and power off after the image's
 stop grace, then falls through to the agent and to a kill. `--force` skips the

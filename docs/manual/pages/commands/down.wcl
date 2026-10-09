@@ -49,6 +49,7 @@ page cmd_down {
     style = :numbered
     li "A shutdown request to the guest agent, waiting up to 30 seconds for QEMU to exit."
     li "An ACPI power-down through the QEMU control channel, waiting another 30 seconds."
+    li "A QMP `quit`, which ends QEMU after it flushes the disk caches, waiting another 30 seconds. This is where a guest that halts at \"It's now safe to turn off your computer\" (Windows 9x, DOS) stops."
     li "A hard kill."
   }
 

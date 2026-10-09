@@ -63,6 +63,9 @@ pub struct Run {
     /// accepts it); nothing happens, which is what forces a stop ladder onto
     /// its next rung.
     pub ignores_powerdown: bool,
+    /// The emulator itself is wedged and ignores a QMP `quit`, which is what
+    /// leaves the stop ladder nothing but the kill.
+    pub ignores_quit: bool,
     /// The guest suspends itself to RAM this long after coming up — the
     /// idle-timeout sleep a Windows client edition takes. It stays asleep
     /// until something wakes it.
@@ -292,6 +295,7 @@ impl Hypervisor for FakeHypervisor {
             control: Arc::new(FakeControl {
                 machine: machine.clone(),
                 ignores_powerdown: run.ignores_powerdown,
+                ignores_quit: run.ignores_quit,
             }),
             proc: machine,
         })
@@ -415,6 +419,7 @@ impl Process for FakeProc {
 struct FakeControl {
     machine: Arc<FakeProc>,
     ignores_powerdown: bool,
+    ignores_quit: bool,
 }
 
 #[async_trait::async_trait]
@@ -434,7 +439,9 @@ impl Control for FakeControl {
     }
 
     async fn quit(&self) -> Result<()> {
-        self.machine.end("exit status: 0");
+        if !self.ignores_quit {
+            self.machine.end("exit status: 0");
+        }
         Ok(())
     }
 

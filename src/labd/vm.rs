@@ -1076,7 +1076,7 @@ impl VmInstance {
     }
 
     /// Graceful stop ladder (PRD §7.2): guest-agent shutdown → ACPI
-    /// powerdown → hard kill, each with a timeout.
+    /// powerdown → emulator quit → hard kill, each with a timeout.
     async fn stop_ladder(&self, force: bool) -> Result<()> {
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
@@ -1130,14 +1130,34 @@ impl VmInstance {
         // Rung 2: ACPI powerdown. Delivery succeeding says nothing about the
         // guest acting on it — a guest with no ACPI daemon, or one sitting at
         // a "really shut down?" dialog, ignores it entirely.
-        if let Some(control) = self.control.lock().await.clone() {
+        // The handle is taken out of the lock first: the exit monitor's
+        // teardown clears `control`, so a guard held across the wait below
+        // would keep the machine from ever settling at Stopped.
+        let control = self.control.lock().await.clone();
+        if let Some(control) = &control {
             let _ = control.powerdown().await;
             if proc.wait_exit(Duration::from_secs(30)).await.is_ok() {
                 return self.settle_stopped(STOP_SETTLE).await;
             }
         }
 
-        // Rung 3: hard kill.
+        // Rung 3: tell the emulator to quit. The guest is not shut down, but
+        // QEMU flushes its block caches on the way out; a SIGKILL drops the
+        // qcow2 metadata it still holds, and the disk then reads as empty or
+        // unbootable. A guest that halts at "It's now safe to turn off your
+        // computer" (Windows 9x, DOS) ends every graceful stop here.
+        if let Some(control) = &control {
+            tracing::warn!(
+                "{}: guest ignored shutdown, quitting the emulator",
+                self.cfg.name
+            );
+            let _ = control.quit().await;
+            if proc.wait_exit(Duration::from_secs(30)).await.is_ok() {
+                return self.settle_stopped(STOP_SETTLE).await;
+            }
+        }
+
+        // Rung 4: hard kill.
         tracing::warn!("{}: graceful stop timed out, killing", self.cfg.name);
         proc.kill().await;
         let _ = proc.wait_exit(Duration::from_secs(10)).await;
