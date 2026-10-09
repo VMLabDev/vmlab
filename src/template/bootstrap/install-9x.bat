@@ -1,5 +1,5 @@
 @echo off
-rem vmlab guest bootstrap, legacy tier (PRD §7.4): Windows 95/98/ME. The
+rem vmlab guest bootstrap, legacy tier (PRD 7.4): Windows 95/98/ME. The
 rem agent is vmlab-agent-legacy on COM1; --install registers it under
 rem HKLM\...\RunServices (before logon, no accounts on 9x) and starts it.
 rem Run from the VMLAB ISO by the template's provision, e.g. from
