@@ -48,6 +48,12 @@ pub struct ResolvedVm {
     /// template's `nested` reaches its build VM, never the VMs made from it
     /// (ADR-0009), and profiles do not carry it.
     pub nested: bool,
+    /// The QEMU `-cpu` model (§5.2), VM > template > profile. `None` keeps
+    /// the accelerator default — the host CPU under KVM, `max` under TCG.
+    /// Named for guests the host CPU's CPUID breaks (Windows 9x Setup on a
+    /// modern host), and exclusive with `nested`: the model decides the
+    /// CPU features, so there is no host VMX/SVM left to pass through.
+    pub cpu_model: Option<String>,
     pub gpu: Option<Gpu>,
     pub qemu_args: Vec<String>,
 }
@@ -172,6 +178,39 @@ pub fn default_profile() -> Profile {
     }
 }
 
+/// The QEMU `-cpu` model a VM resolves to, and the layer that named it —
+/// `None` when no layer does. Split out of [`resolve_vm`] so validation can
+/// name the layer a `nested` conflict was inherited from (§5.1).
+pub fn resolve_cpu_model(
+    lab_vm: &Vm,
+    template: Option<&TemplateMeta>,
+    profile: &Profile,
+) -> Option<(String, Layer)> {
+    pick(
+        lab_vm.cpu_model.clone(),
+        template.and_then(|t| t.cpu_model.clone()),
+        profile.cpu_model.clone(),
+    )
+}
+
+/// Why `nested = true` cannot stand beside a named CPU model. `nested` is a
+/// vm-block flag only, but the model may have been inherited from a layer
+/// the lab author never looked at, so the message names it. One wording,
+/// whether validation reports it against a span or the resolver refuses.
+pub fn nested_cpu_model_conflict(
+    machine: &str,
+    model: &str,
+    layer: Layer,
+    profile_name: Option<&str>,
+) -> String {
+    format!(
+        "vm \"{machine}\": nested = true but cpu_model = \"{model}\" (from {}) — a named CPU \
+         model decides the guest's CPU features, so there is no host VMX/SVM for `nested` to \
+         pass through; drop `nested` or the `cpu_model` (PRD §5.2)",
+        layer.label(profile_name),
+    )
+}
+
 /// Resolve firmware and secure boot for one VM. Split out of
 /// [`resolve_vm`] so validation can reach the same chain — and the layers
 /// behind it — without a template store or a full resolve (§5.1).
@@ -290,6 +329,20 @@ pub fn resolve_vm(
         anyhow::bail!(firmware_choice.conflict_message(&lab_vm.name, profile_name.as_deref()));
     }
 
+    let cpu_model = resolve_cpu_model(lab_vm, template, profile);
+    // Validation reports this too, but like secure boot it cannot always see
+    // the template layer; every layer is in hand here.
+    if lab_vm.nested
+        && let Some((model, layer)) = &cpu_model
+    {
+        anyhow::bail!(nested_cpu_model_conflict(
+            &lab_vm.name,
+            model,
+            *layer,
+            profile_name.as_deref()
+        ));
+    }
+
     let display_device = lab_vm
         .display
         .clone()
@@ -329,6 +382,7 @@ pub fn resolve_vm(
         input_transport: profile.input_transport,
         virtiofs: profile.virtiofs,
         nested: lab_vm.nested,
+        cpu_model: cpu_model.map(|(model, _)| model),
         gpu: lab_vm.gpu.clone(),
         qemu_args: lab_vm.qemu_args.clone(),
     })
@@ -457,6 +511,7 @@ mod tests {
             tpm: None,
             secure_boot: None,
             display: None,
+            cpu_model: None,
             created: chrono::Utc::now(),
             origin: None,
             registry: None,
@@ -482,6 +537,85 @@ mod tests {
         assert!(r.secure_boot);
         assert_eq!(r.machine, "q35");
         assert_eq!(r.firmware, Some(FirmwareKind::Ovmf));
+    }
+
+    /// Shipped profiles plus one user profile, `period`, that pins a CPU
+    /// model — no shipped profile does, and none should (templates opt in).
+    fn profiles_with_a_cpu_model() -> (tempfile::TempDir, ProfileSet) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("period.wcl"),
+            "import <vmlab-profile.wcl>\nprofile \"period\" { cpu_model = \"pentium2\" }\n",
+        )
+        .unwrap();
+        let set = ProfileSet::load(dir.path()).unwrap();
+        (dir, set)
+    }
+
+    /// `cpu_model` resolves VM block > template > profile like every other
+    /// §5.2 hardware field, and nothing naming one leaves it unset.
+    #[test]
+    fn cpu_model_precedence_vm_over_template_over_profile() {
+        let (_dir, profiles) = profiles_with_a_cpu_model();
+        let model = |src: &str, meta: Option<&TemplateMeta>| {
+            resolve_vm(&vm(src), meta, &profiles).unwrap().cpu_model
+        };
+        let pinned = TemplateMeta {
+            cpu_model: Some("pentium3".into()),
+            profile: Some("period".into()),
+            ..meta()
+        };
+        // Profile floor only.
+        assert_eq!(
+            model(
+                "vm \"a\" { template = \"x86_64/win\" profile = \"period\" }",
+                Some(&meta())
+            )
+            .as_deref(),
+            Some("pentium2")
+        );
+        // The template wins over the profile.
+        assert_eq!(
+            model("vm \"a\" { template = \"x86_64/win\" }", Some(&pinned)).as_deref(),
+            Some("pentium3")
+        );
+        // The vm block wins over both.
+        assert_eq!(
+            model(
+                "vm \"a\" { template = \"x86_64/win\" cpu_model = \"qemu32\" }",
+                Some(&pinned)
+            )
+            .as_deref(),
+            Some("qemu32")
+        );
+        // No layer names one: the accelerator default stays in charge.
+        assert_eq!(
+            model("vm \"a\" { template = \"x86_64/win\" }", Some(&meta())),
+            None
+        );
+    }
+
+    /// `nested` asks for the host CPU's VMX/SVM; a named model replaces the
+    /// host CPU. The resolver refuses the pair, naming where the model came
+    /// from — validation cannot always see the template layer.
+    #[test]
+    fn nested_with_an_inherited_cpu_model_is_refused() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let pinned = TemplateMeta {
+            cpu_model: Some("pentium3".into()),
+            ..meta()
+        };
+        let v = vm("vm \"a\" { template = \"x86_64/win\" nested = true }");
+        let err = resolve_vm(&v, Some(&pinned), &profiles)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nested = true"), "{err}");
+        assert!(
+            err.contains("cpu_model = \"pentium3\" (from the template)"),
+            "{err}"
+        );
+        // `nested` alone is untouched.
+        assert!(resolve_vm(&v, Some(&meta()), &profiles).unwrap().nested);
     }
 
     #[test]

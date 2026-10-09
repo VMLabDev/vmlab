@@ -215,16 +215,15 @@ pub fn build_args(
             ),
         );
     }
-    match accel {
-        Accel::Kvm => {
-            arg(&mut a, "accel", "kvm".into());
-            arg(&mut a, "cpu", kvm_cpu_model(vm));
-        }
-        Accel::Tcg => {
-            arg(&mut a, "accel", "tcg".into());
-            arg(&mut a, "cpu", "max".into());
-        }
-    }
+    // A named model (§5.2) replaces the accelerator default under either
+    // accelerator: it is the CPU the guest was declared to see. QEMU owns the
+    // catalogue, so an unknown name is refused by QEMU at start.
+    let (accel_name, default_cpu) = match accel {
+        Accel::Kvm => ("kvm", kvm_cpu_model(vm)),
+        Accel::Tcg => ("tcg", "max".to_string()),
+    };
+    arg(&mut a, "accel", accel_name.into());
+    arg(&mut a, "cpu", vm.cpu_model.clone().unwrap_or(default_cpu));
     arg(&mut a, "smp", vm.cpus.to_string());
     arg(&mut a, "m", format!("{}M", vm.memory >> 20));
 
@@ -769,6 +768,37 @@ mod tests {
         let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
         let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
         assert!(s.contains("-cpu host "), "{s}");
+    }
+
+    /// A resolved `cpu_model` replaces the accelerator default under both
+    /// KVM and TCG — the guest sees the CPU it was declared, not the host's
+    /// (Windows 9x Setup on a modern host). Unset, both defaults stand.
+    #[test]
+    fn a_cpu_model_replaces_the_default_under_kvm_and_tcg() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let v = super::super::resolve::testing::vm(
+            "vm \"t\" { template = \"scratch\" arch = \"x86\" profile = \"windows-9x\" disk = 1GiB cpu_model = \"pentium3\" }",
+        );
+        let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
+        for accel in [Accel::Kvm, Accel::Tcg] {
+            let args = build_args("l", &vm, &paths(), accel).unwrap();
+            let cpus: Vec<&String> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "-cpu")
+                .map(|(i, _)| &args[i + 1])
+                .collect();
+            assert_eq!(cpus, ["pentium3"], "{accel:?}");
+        }
+
+        let unset = resolved("windows-9x", "x86");
+        assert_eq!(unset.cpu_model, None);
+        let kvm = build_args("l", &unset, &paths(), Accel::Kvm).unwrap();
+        let cpu = kvm.iter().position(|a| a == "-cpu").unwrap();
+        assert_eq!(kvm[cpu + 1], "host,vmx=off,svm=off");
+        let tcg = build_args("l", &unset, &paths(), Accel::Tcg).unwrap();
+        let cpu = tcg.iter().position(|a| a == "-cpu").unwrap();
+        assert_eq!(tcg[cpu + 1], "max");
     }
 
     /// Non-x86 KVM has no VMX/SVM to mask.

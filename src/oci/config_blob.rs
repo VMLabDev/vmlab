@@ -38,6 +38,9 @@ pub struct TemplateConfig {
     pub secure_boot: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub display: Option<String>,
+    /// QEMU `-cpu` model (§5.2).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cpu_model: Option<String>,
     /// RFC 3339 creation timestamp.
     pub created: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -71,6 +74,7 @@ impl TemplateConfig {
             tpm: meta.tpm,
             secure_boot: meta.secure_boot,
             display: meta.display.clone(),
+            cpu_model: meta.cpu_model.clone(),
             created: meta.created.to_rfc3339(),
             origin: meta.origin.clone(),
             registry: meta.registry.clone(),
@@ -100,6 +104,7 @@ impl TemplateConfig {
             tpm: self.tpm,
             secure_boot: self.secure_boot,
             display: self.display,
+            cpu_model: self.cpu_model,
             created,
             origin: origin_override.or(self.origin),
             registry: self.registry,
@@ -139,6 +144,7 @@ mod tests {
             tpm: Some(true),
             secure_boot: Some(true),
             display: Some("vnc".into()),
+            cpu_model: Some("pentium3".into()),
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),

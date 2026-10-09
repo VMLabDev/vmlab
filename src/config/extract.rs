@@ -527,6 +527,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let agent_update = r.bool("agent_update").unspan();
     let prevent_sleep = r.bool("prevent_sleep").unspan().unwrap_or(false);
     let display = r.string("display").unspan();
+    let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
@@ -596,6 +597,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         agent_update,
         prevent_sleep,
         display,
+        cpu_model,
         firmware,
         tpm,
         secure_boot,
@@ -871,6 +873,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let memory = r.size("memory").unspan();
     let disk = r.size("disk").unspan();
     let display = r.string("display").unspan();
+    let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
@@ -893,6 +896,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         memory,
         disk,
         display,
+        cpu_model,
         firmware,
         tpm,
         secure_boot,

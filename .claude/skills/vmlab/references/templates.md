@@ -8,7 +8,8 @@ and version, clone it into any number of labs.
 
 A store entry is two files: `disk.qcow2`, the sealed image, and `template.wcl`,
 its metadata. The metadata records the hardware the template was built with
-(profile, CPUs, memory, disk size, firmware, TPM, secure boot, display), where
+(profile, CPUs, memory, disk size, firmware, TPM, secure boot, display, CPU
+model), where
 it came from, the version of `vmlab-agent` baked into it, the wscript surface
 version its embedded scripts were written against, an optional first-boot
 script, and the OCI repository it publishes to. The hardware fields form the
@@ -207,6 +208,7 @@ template "<name>" {
   memory      = 4GiB
   disk        = 20GiB
   display     = "virtio-vga"
+  cpu_model   = "pentium3"
   firmware    = "ovmf"
   tpm         = false
   secure_boot = false
@@ -235,6 +237,7 @@ template "<name>" {
 | `memory` | ByteSize | from profile | RAM for the build VM, for example `8GiB`. Inherited by clones. |
 | `disk` | ByteSize | from source | Working disk size for the build, for example `64GiB`. Required for a `scratch` source. |
 | `display` | utf8 | from profile | QEMU display device string for the build VM. |
+| `cpu_model` | utf8 | from profile | QEMU `-cpu` model for the build VM, for example `pentium3`, replacing the accelerator default. Inherited by clones. Cannot be combined with `nested = true`. |
 | `firmware` | utf8 | from profile | Firmware: `ovmf` or `seabios`. |
 | `tpm` | bool | from profile | Enable a TPM 2.0 device. |
 | `secure_boot` | bool | from profile | Enable secure boot; OVMF only. |
