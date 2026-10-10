@@ -435,8 +435,18 @@ long proc_read(struct plat_proc *p, int which, void *buf, long cap)
         *closed = 1;
         return -1;
     }
-    if (avail == 0)
+    if (avail == 0) {
+        /* A 9x anonymous pipe never reports a broken pipe: once the child has
+         * gone, PeekNamedPipe keeps succeeding with nothing available, so the
+         * end of output is never seen and the exec never finishes. What the
+         * child wrote before it exited is already in the pipe, so an empty
+         * pipe after exit is the end. NT reports the broken pipe itself. */
+        if (is_win9x && WaitForSingleObject(p->process, 0) == WAIT_OBJECT_0) {
+            *closed = 1;
+            return -1;
+        }
         return 0;
+    }
     if ((long)avail < cap)
         cap = (long)avail;
     if (!ReadFile(h, buf, (DWORD)cap, &got, NULL)) {
