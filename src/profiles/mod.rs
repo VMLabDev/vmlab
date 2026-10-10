@@ -93,6 +93,9 @@ pub struct Profile {
     pub disk_bus: Option<DiskBus>,
     pub nic_model: Option<String>,
     pub display: Option<String>,
+    /// QEMU `-cpu` model (§5.2) — for guests that cannot run on the host
+    /// CPU's CPUID, such as Windows 9x. None = the accelerator default.
+    pub cpu_model: Option<String>,
     pub cpus: Option<u32>,
     pub memory: Option<u64>,
     /// The agent channel's device (§7.4). `agent_channel = false` in an
@@ -243,6 +246,9 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             .unspan(),
         nic_model: r.string("nic_model").unspan(),
         display: r.string("display").unspan(),
+        cpu_model: r
+            .parsed("cpu_model", crate::config::model::parse_cpu_model)
+            .unspan(),
         cpus: r.int_at_least("cpus", 1).unspan(),
         memory: r.size("memory").unspan(),
         agent_transport: {
@@ -286,6 +292,33 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile may pin a QEMU CPU model (§5.2), but not an empty one; no
+    /// shipped profile pins one — templates opt in.
+    #[test]
+    fn cpu_model_is_read_and_an_empty_one_refused() {
+        let ok = parse_profiles(
+            "import <vmlab-profile.wcl>\nprofile \"p\" { cpu_model = \"pentium3\" }\n",
+            "<test>",
+        )
+        .unwrap();
+        assert_eq!(ok[0].cpu_model.as_deref(), Some("pentium3"));
+
+        let err = parse_profiles(
+            "import <vmlab-profile.wcl>\nprofile \"p\" { cpu_model = \"\" }\n",
+            "<test>",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`cpu_model` must name a QEMU CPU model"),
+            "{err:#}"
+        );
+
+        let shipped = ProfileSet::shipped().unwrap();
+        for name in shipped.names() {
+            assert_eq!(shipped.get(name).unwrap().cpu_model, None, "{name}");
+        }
+    }
 
     #[test]
     fn shipped_profiles_load() {

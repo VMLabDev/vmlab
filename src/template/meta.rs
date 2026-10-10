@@ -38,6 +38,8 @@ pub struct TemplateMeta {
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
     pub display: Option<String>,
+    /// QEMU `-cpu` model the template pins for its clones (§5.2).
+    pub cpu_model: Option<String>,
     pub created: DateTime<Utc>,
     /// Where the template came from — source ISO URL, registry ref, …
     pub origin: Option<String>,
@@ -100,6 +102,9 @@ impl TemplateMeta {
         }
         if let Some(d) = &self.display {
             let _ = writeln!(out, "  display = {}", quote(d));
+        }
+        if let Some(c) = &self.cpu_model {
+            let _ = writeln!(out, "  cpu_model = {}", quote(c));
         }
         let _ = writeln!(out, "  created = {}", quote(&self.created.to_rfc3339()));
         if let Some(o) = &self.origin {
@@ -190,6 +195,9 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
     let tpm = r.bool("tpm").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
     let display = r.string("display").unspan();
+    let cpu_model = r
+        .parsed("cpu_model", crate::config::model::parse_cpu_model)
+        .unspan();
     let origin = r.string("origin").unspan();
     let registry = r.string("registry").unspan();
     let sha256 = r.string("sha256").unspan();
@@ -212,6 +220,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         tpm,
         secure_boot,
         display,
+        cpu_model,
         origin,
         registry,
         sha256,
@@ -278,6 +287,7 @@ mod tests {
             tpm: Some(true),
             secure_boot: Some(true),
             display: Some("vnc".into()),
+            cpu_model: Some("pentium3".into()),
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),
@@ -303,6 +313,7 @@ mod tests {
             tpm: None,
             secure_boot: None,
             display: None,
+            cpu_model: None,
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
             registry: None,

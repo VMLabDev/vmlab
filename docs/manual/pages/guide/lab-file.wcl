@@ -108,6 +108,7 @@ page guide_lab_file {
     li "A `provision`, `playbook` or `on` handler whose file is missing, and any wscript that does not compile."
     li "A `scratch` VM missing `arch`, `profile` or `disk`, and a `disk` size on a cloned VM."
     li "`secure_boot = true` on a VM whose firmware resolves to SeaBIOS. Either value may have been inherited, so the message names the layer each came from."
+    li "`nested = true` on a VM whose `cpu_model` resolves to a named model, which decides the CPU features itself. The model may have been inherited, so the message names the layer it came from."
     li "A `share` that is not explicitly virtiofs, a container `volume`, or a container `port` on a machine with no NIC, because SMB shares, volumes and forwards need a segment to reach the gateway on."
     li "A container that neither declares `cpus` and `memory` nor names a profile supplying them."
     li "A playbook `var` whose name is not a WCL identifier, or is set twice on one block."

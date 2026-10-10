@@ -684,6 +684,7 @@ struct EffectiveHardware {
     tpm: Option<bool>,
     secure_boot: Option<bool>,
     display: Option<String>,
+    cpu_model: Option<String>,
 }
 
 impl EffectiveHardware {
@@ -705,6 +706,10 @@ impl EffectiveHardware {
                 .display
                 .clone()
                 .or_else(|| source.and_then(|m| m.display.clone())),
+            cpu_model: def
+                .cpu_model
+                .clone()
+                .or_else(|| source.and_then(|m| m.cpu_model.clone())),
         }
     }
 
@@ -857,6 +862,7 @@ fn seal_meta(
         tpm: hw.tpm,
         secure_boot: hw.secure_boot,
         display: hw.display.clone(),
+        cpu_model: hw.cpu_model.clone(),
         created: chrono::Utc::now(),
         origin: source_origin(&def.source),
         registry: def.registry.clone(),
@@ -951,6 +957,7 @@ fn synth_lab(
         tpm,
         secure_boot,
         display,
+        cpu_model,
     } = hw;
     let mut s = String::from("import <vmlab.wcl>\n\n");
     writeln!(s, "lab {} {{", wcl_str(lab_name)).unwrap();
@@ -982,6 +989,9 @@ fn synth_lab(
     // with the profile as the floor beneath them.
     if let Some(d) = display {
         writeln!(s, "    display  = {}", wcl_str(d)).unwrap();
+    }
+    if let Some(c) = cpu_model {
+        writeln!(s, "    cpu_model = {}", wcl_str(c)).unwrap();
     }
     if let Some(f) = firmware {
         writeln!(s, "    firmware = {}", wcl_str(f.as_str())).unwrap();
@@ -1216,6 +1226,7 @@ mod tests {
             tpm: None,
             secure_boot: None,
             display: None,
+            cpu_model: None,
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
             registry: None,
@@ -1237,6 +1248,7 @@ mod tests {
             tpm: Some(true),
             secure_boot: Some(true),
             display: Some("virtio-vga".into()),
+            cpu_model: Some("pentium3".into()),
             ..source_meta()
         }
     }
@@ -1524,6 +1536,41 @@ mod tests {
         assert_eq!(build.qemu_args, ["-device", "weird-thing"]);
     }
 
+    /// A template's `cpu_model` is hardware for its build VM too: Windows 9x
+    /// Setup has to see the period CPU while it installs, not only the clones.
+    #[test]
+    fn a_declared_cpu_model_reaches_the_build_vm() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86\" version = \"1\"\n",
+            "  profile   = \"windows-9x\"\n",
+            "  cpu_model = \"pentium3\"\n",
+            "  disk      = 1GiB\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let wcl = render(&d);
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root")).unwrap();
+        assert_eq!(lf.lab.vms[0].cpu_model.as_deref(), Some("pentium3"));
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let resolved = crate::qemu::resolve::resolve_vm(&lf.lab.vms[0], None, &profiles).unwrap();
+        assert_eq!(resolved.cpu_model.as_deref(), Some("pentium3"));
+    }
+
+    /// A `cpu_model` inherited from a layered source meets the block's own
+    /// `nested` at the build's pre-flight, which refuses the pair (§5.2).
+    #[test]
+    fn nested_over_an_inherited_cpu_model_refuses_the_build() {
+        let d = layered("  nested = true\n");
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let hw = EffectiveHardware::resolve(&d, Some(&source_meta_full()));
+        let err = super::check_build_hardware(&d, &hw, "build", Path::new("/root"), &profiles)
+            .expect_err("nested over a named CPU model must refuse the build");
+        let report = format!("{err:#}");
+        assert!(report.contains("cpu_model = \"pentium3\""), "{report}");
+        assert!(report.contains("nested = true"), "{report}");
+    }
+
     /// …and the resolved hardware really is the template's, not the profile
     /// floor underneath it: `linux-modern` is OVMF, the block said SeaBIOS.
     #[test]
@@ -1696,6 +1743,7 @@ mod tests {
         assert_eq!(hw.tpm, Some(true));
         assert_eq!(hw.secure_boot, Some(true));
         assert_eq!(hw.display.as_deref(), Some("virtio-vga"));
+        assert_eq!(hw.cpu_model.as_deref(), Some("pentium3"));
     }
 
     /// Where both layers declare a value the block wins — the same precedence
@@ -1710,6 +1758,7 @@ mod tests {
             "  tpm         = false\n",
             "  secure_boot = false\n",
             "  display     = \"std\"\n",
+            "  cpu_model   = \"pentium2\"\n",
         ));
         let hw = EffectiveHardware::resolve(&d, Some(&source_meta_full()));
         assert_eq!(hw.profile.as_deref(), Some("linux-generic"));
@@ -1719,6 +1768,7 @@ mod tests {
         assert_eq!(hw.tpm, Some(false));
         assert_eq!(hw.secure_boot, Some(false));
         assert_eq!(hw.display.as_deref(), Some("std"));
+        assert_eq!(hw.cpu_model.as_deref(), Some("pentium2"));
     }
 
     /// A field neither layer declares stays absent: the profile beneath is a
@@ -1896,6 +1946,7 @@ mod tests {
         assert_eq!(sealed.tpm, Some(true));
         assert_eq!(sealed.secure_boot, Some(true));
         assert_eq!(sealed.display.as_deref(), Some("virtio-vga"));
+        assert_eq!(sealed.cpu_model.as_deref(), Some("pentium3"));
         assert_eq!(sealed.disk, Some(64 << 30));
         assert_eq!(sealed.origin.as_deref(), Some("x86_64/win11@26100.1"));
         assert_eq!(
@@ -1931,6 +1982,7 @@ mod tests {
         assert_eq!(sealed.tpm, None);
         assert_eq!(sealed.secure_boot, None);
         assert_eq!(sealed.display, None);
+        assert_eq!(sealed.cpu_model, None);
     }
 
     /// The bootstrap ISO decision follows the *effective* profile: a layered

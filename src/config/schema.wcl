@@ -262,6 +262,8 @@ type Vm {
   prevent_sleep: bool?
   @doc("QEMU display string; inherited from template→profile if omitted")
   display: utf8?
+  @doc("QEMU `-cpu` model, e.g. `pentium3`, replacing the accelerator default; inherited from template→profile; conflicts with `nested`")
+  cpu_model: utf8?
   @doc("Firmware: `ovmf` | `seabios`; inherited from template→profile")
   @options(["ovmf", "seabios"]) firmware: utf8?
   @doc("Enable a TPM 2.0 device; inherited from template→profile")
@@ -539,6 +541,8 @@ type TemplateDef {
   disk: std.ByteSize?
   @doc("QEMU display string for the build VM")
   display: utf8?
+  @doc("QEMU `-cpu` model, e.g. `pentium3`, for the build VM; inherited by clones; conflicts with `nested`")
+  cpu_model: utf8?
   @doc("Firmware: `ovmf` | `seabios`")
   @options(["ovmf", "seabios"]) firmware: utf8?
   @doc("Enable a TPM 2.0 device")

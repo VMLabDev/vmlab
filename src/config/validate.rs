@@ -9,7 +9,8 @@ use super::model::*;
 use super::{Issue, IssueList};
 use crate::profiles::Profile;
 use crate::qemu::resolve::{
-    Layer, default_profile, effective_profile_name, resolve_firmware, vm_arch,
+    Layer, default_profile, effective_profile_name, nested_cpu_model_conflict, resolve_cpu_model,
+    resolve_firmware, vm_arch,
 };
 use crate::template::TemplateMeta;
 
@@ -556,6 +557,23 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         {
             issues.push(Issue::at(t.span, format!("unknown profile \"{p}\"")));
         }
+        // A template's `nested` reaches its build VM, and so does its
+        // `cpu_model`: the same conflict as on a vm block (§5.2). One the
+        // build inherits from a layered source is refused by the build's
+        // hardware pre-flight, which resolves the rendered lab.
+        if t.nested
+            && let Some(model) = &t.cpu_model
+        {
+            issues.push(Issue::at(
+                t.span,
+                format!(
+                    "template \"{}\": nested = true but cpu_model = \"{model}\" — a named CPU \
+                     model decides the guest's CPU features, so there is no host VMX/SVM for \
+                     `nested` to pass through; drop `nested` or the `cpu_model` (PRD §5.2)",
+                    t.name
+                ),
+            ));
+        }
         match &t.source {
             TemplateSource::Template {
                 from:
@@ -722,6 +740,37 @@ fn check_vm_hardware(
         issues.push(Issue::at(vm.span, format!("unknown profile \"{p}\"")));
     }
     check_secure_boot(vm, ctx, issues);
+    check_nested_cpu_model(vm, ctx, issues);
+}
+
+/// `nested = true` passes the host CPU's VMX/SVM through; a named
+/// `cpu_model` replaces the host CPU, so the two cannot both hold (§5.2).
+/// `nested` is vm-block only, but the model may be inherited, so this
+/// resolves the chain and names the layer that supplied it.
+fn check_nested_cpu_model(vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueList) {
+    if !vm.nested {
+        return;
+    }
+    let layer = TemplateLayer::of(vm, ctx);
+    let profile_name = effective_profile_name(vm, layer.meta());
+    let profile = match &profile_name {
+        Some(name) => match ctx.profile(name) {
+            Some(p) => p,
+            // Unknown profile: reported on its own. The vm block's own
+            // model is still certain.
+            None => default_profile(),
+        },
+        None => default_profile(),
+    };
+    let Some((model, from)) = resolve_cpu_model(vm, layer.meta(), &profile) else {
+        return;
+    };
+    // Certain even with the template layer unknown: a template validation
+    // cannot see could swap the model for another, never remove it.
+    issues.push(Issue::at(
+        vm.span,
+        nested_cpu_model_conflict(&vm.name, &model, from, profile_name.as_deref()),
+    ));
 }
 
 /// Secure boot exists only under UEFI: with SeaBIOS the cmdline builder has
@@ -1290,6 +1339,7 @@ pub(crate) mod tests {
             tpm: None,
             secure_boot: None,
             display: None,
+            cpu_model: None,
             created: chrono::Utc::now(),
             origin: None,
             registry: None,
@@ -1527,6 +1577,95 @@ lab "l" { vm "a" { template = "ghcr.io/acme/win:1" arch = "x86_64" firmware = "s
             r#"import <vmlab.wcl>
 lab "l" { vm "a" { template = "x86_64/t" profile = "windows-legacy" secure_boot = true } }"#,
         );
+    }
+
+    /// `cpu_model` names any QEMU model — QEMU owns the catalogue — but
+    /// never nothing, on whichever block declares it.
+    #[test]
+    fn an_empty_cpu_model_is_rejected() {
+        for body in [
+            r#"lab "l" { vm "a" { template = "x86_64/t" cpu_model = "" } }"#,
+            r#"lab "l" { vm "a" { template = "x86_64/t" cpu_model = "  " } }"#,
+            r#"lab "l" { }
+template "t" { arch = "x86" version = "1" disk = 1GiB cpu_model = ""
+  source "scratch" { } }"#,
+        ] {
+            assert_any_err(
+                &format!("import <vmlab.wcl>\n{body}"),
+                "`cpu_model` must name a QEMU CPU model",
+            );
+        }
+        // Any non-empty name is QEMU's to judge, not vmlab's.
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" cpu_model = "Westmere,+aes" } }"#,
+        );
+        assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
+    }
+
+    fn assert_nested_cpu_model_conflict(ctx: &Hardware, src: &str, needle: &str) {
+        let es = hw_errs(ctx, src);
+        let found = es
+            .iter()
+            .find(|m| m.contains("nested = true but cpu_model"))
+            .unwrap_or_else(|| panic!("expected a nested/cpu_model conflict, got: {es:#?}"));
+        assert!(found.contains(needle), "missing {needle:?} in {found:?}");
+        assert!(
+            found.contains("decides the guest's CPU features"),
+            "{found}"
+        );
+    }
+
+    /// `nested = true` and a named `cpu_model` cannot both hold: the model
+    /// decides the CPU features, so there is no host VMX/SVM to pass through.
+    /// The model may be inherited, so the message names its layer.
+    #[test]
+    fn nested_with_a_cpu_model_is_rejected_whichever_layer_named_it() {
+        assert_nested_cpu_model_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nested = true cpu_model = "pentium3" } }"#,
+            "(from the vm block)",
+        );
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.cpu_model = Some("pentium3".into());
+        assert_nested_cpu_model_conflict(
+            &Hardware::with_meta(meta),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nested = true } }"#,
+            "(from the template)",
+        );
+        // A registry template is not pulled at validate time, but the vm
+        // block's own model is certain.
+        assert_nested_cpu_model_conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "ghcr.io/acme/w98:1" arch = "x86" nested = true
+  cpu_model = "pentium3" } }"#,
+            "(from the vm block)",
+        );
+        // A template block's `nested` and `cpu_model` both reach its build VM.
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "w98" { arch = "x86" version = "1" disk = 1GiB nested = true cpu_model = "pentium3"
+  source "scratch" { } }"#,
+            "template \"w98\": nested = true but cpu_model = \"pentium3\"",
+        );
+    }
+
+    /// Either alone is fine, and `nested` without a model is untouched.
+    #[test]
+    fn nested_or_a_cpu_model_alone_validates() {
+        for src in [
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nested = true } }"#,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" cpu_model = "pentium3" } }"#,
+        ] {
+            let es = hw_errs(&Hardware::blank(), src);
+            assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
+        }
     }
 
     fn lab(src: &str) -> LabFile {

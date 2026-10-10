@@ -587,6 +587,7 @@ mod tests {
             tpm: None,
             secure_boot: None,
             display: None,
+            cpu_model: None,
             created: chrono::Utc::now(),
             origin: None,
             registry: None,

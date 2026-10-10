@@ -344,6 +344,9 @@ pub struct Vm {
     /// through template or profile (ADR-0008 resolves hardware).
     pub prevent_sleep: bool,
     pub display: Option<String>,
+    /// QEMU `-cpu` model (§5.2); None = inherit template→profile, and with
+    /// no layer naming one the builder's accelerator default applies.
+    pub cpu_model: Option<String>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
@@ -709,6 +712,8 @@ pub struct TemplateDef {
     pub memory: Option<u64>,
     pub disk: Option<u64>,
     pub display: Option<String>,
+    /// QEMU `-cpu` model for the build VM, recorded for clones (§5.2).
+    pub cpu_model: Option<String>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
@@ -796,6 +801,19 @@ pub const KNOWN_ARCHES: &[&str] = &[
     "s390x",
     "ppc64",
 ];
+
+/// Parse a `cpu_model =` value (§5.2): the QEMU `-cpu` model a machine runs
+/// as, e.g. `pentium3`. Any name is accepted — QEMU owns the catalogue and
+/// refuses one it does not know at start — but a blank one would hand QEMU
+/// an empty `-cpu`, so it is refused here, wherever the field is declared.
+pub fn parse_cpu_model(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err(
+            "`cpu_model` must name a QEMU CPU model (e.g. \"pentium3\"), not be empty".to_string(),
+        );
+    }
+    Ok(s.to_string())
+}
 
 /// Parse a `template =` value (PRD §6.2/§6.4/§6.5).
 pub fn parse_template_ref(s: &str) -> Result<TemplateRef, String> {

@@ -32,6 +32,7 @@ vm "<name>" {
   gui         = false
   agent_update = true
   display     = "virtio-vga"
+  cpu_model   = "pentium3"
   firmware    = "ovmf"
   tpm         = false
   secure_boot = false
@@ -63,6 +64,7 @@ vm "<name>" {
 | `gui` | bool | lab `gui` | Open a VNC viewer on `up`. The VM always runs headless. |
 | `agent_update` | bool | lab `agent_update`, else `true` | Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. Ignored on the legacy agent tier. |
 | `display` | utf8 | inherited | QEMU display device string. Inherited from template, then profile. |
+| `cpu_model` | utf8 | inherited | QEMU `-cpu` model, for example `pentium3`, `pentium2`, `qemu32` or `Westmere`, replacing the default (`host` under KVM, `max` under TCG) under either accelerator. For guests the host CPU breaks, such as Windows 9x Setup. Inherited from template, then profile. Any non-empty name is accepted; QEMU refuses an unknown one at start. Cannot be combined with `nested = true`. |
 | `firmware` | utf8 | inherited | Firmware: `ovmf` or `seabios`. Inherited from template, then profile. |
 | `tpm` | bool | inherited | Enable a TPM 2.0 device. Inherited from template, then profile. |
 | `secure_boot` | bool | inherited | Enable secure boot; OVMF only. Inherited from template, then profile. |

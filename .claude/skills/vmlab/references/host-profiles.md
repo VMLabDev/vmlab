@@ -221,6 +221,7 @@ in the config.
 | `machine` | The QEMU machine type: `q35` or `pc` (i440fx). |
 | `firmware`, `secure_boot`, `tpm` | OVMF or SeaBIOS, secure boot under OVMF, and an swtpm 2.0 device. |
 | `disk_bus`, `nic_model`, `display` | The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std` or `cirrus-vga`. |
+| `cpu_model` | The QEMU `-cpu` model the guest sees instead of the host CPU (KVM) or `max` (TCG), for guests a modern CPUID breaks. No shipped profile sets one; a template pins it for its clones. |
 | `cpus`, `memory` | The hardware floor a VM or container inherits when neither its block nor its template says. |
 | `agent_transport` | The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias. |
 | `input_transport` | How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc` (see snapshots-vision.md). |
@@ -312,6 +313,7 @@ profile "<name>" {
   disk_bus        = "virtio"
   nic_model       = "virtio-net-pci"
   display         = "virtio-vga"
+  cpu_model       = "pentium3"
   cpus            = 2
   memory          = 4GiB
   agent_transport = "virtio-serial"
@@ -332,6 +334,7 @@ profile "<name>" {
 | `disk_bus` | utf8 | QEMU default | Primary disk bus: `virtio`, `ide` or `sata`. |
 | `nic_model` | utf8 | QEMU default | NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`. |
 | `display` | utf8 | QEMU default | Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`. |
+| `cpu_model` | utf8 | unset | QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. No shipped profile sets one. |
 | `cpus` | i64 | unset | Default vCPU count, at least 1. |
 | `memory` | ByteSize | unset | Default RAM, for example `4GiB`. |
 | `agent_transport` | utf8 | `virtio-serial` | The guest agent channel's device: `virtio-serial`, `isa-serial` (a 16550 on COM1 for the legacy agent; the serial log moves to COM2), or `none` (no agent; never ready by handshake). |
@@ -341,8 +344,9 @@ profile "<name>" {
 | `workspace_guest` | utf8 | unset | Guest path an `@dev` workspace lands at when the decorator names none. |
 
 The parser enforces the keyword sets above for `machine`, `firmware`, `disk_bus` and
-`input_transport`, `cpus` at least 1, and a non-negative `memory`. `nic_model` and
-`display` are passed to QEMU as written. A profile that sets no `workspace_guest`
+`input_transport`, `cpus` at least 1, and a non-negative `memory`. `nic_model`,
+`display` and `cpu_model` are passed to QEMU as written; an empty `cpu_model` is
+refused. A profile that sets no `workspace_guest`
 still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` machine a
 `virtio-vga` display is downgraded to `virtio-gpu-pci`, which has no legacy VGA.
 
