@@ -83,8 +83,8 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
     }
     std::fs::write(dir.join("install.cmd"), INSTALL_CMD)?;
     std::fs::write(dir.join("install-nt.cmd"), INSTALL_NT_CMD)?;
-    std::fs::write(dir.join("install-9x.bat"), INSTALL_9X_BAT)?;
-    std::fs::write(dir.join("INSTALL.BAT"), INSTALL_DOS_BAT)?;
+    std::fs::write(dir.join("install-9x.bat"), dos_batch(INSTALL_9X_BAT))?;
+    std::fs::write(dir.join("INSTALL.BAT"), dos_batch(INSTALL_DOS_BAT))?;
 
     let legacy_capable = matches!(arch, "x86" | "x86_64");
     let mut flavours = vec![AgentOs::Linux, AgentOs::Windows];
@@ -133,9 +133,39 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
     Ok(StagedGuestIso { dir, versions })
 }
 
+/// A batch file as COMMAND.COM reads it: CRLF line endings. Windows 9x's
+/// COMMAND.COM runs an LF-only batch as one unparseable line ("Bad command or
+/// file name"); FreeDOS tolerates LF, which is how this went unnoticed until a
+/// 9x guest ran one.
+fn dos_batch(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// COMMAND.COM on Windows 9x and MS-DOS reads CRLF, plain-ASCII batch
+    /// files; an LF-only one fails as "Bad command or file name".
+    #[test]
+    fn dos_batch_files_are_staged_crlf_and_ascii() {
+        let assets = tempfile::tempdir().unwrap();
+        let agent_dir = assets.path().join("agent/linux-x86_64");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("vmlab-agent"), b"elf").unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let staged =
+            stage_with_dirs(work.path(), "x86_64", &[assets.path().to_path_buf()]).unwrap();
+        for name in ["install-9x.bat", "INSTALL.BAT"] {
+            let bytes = std::fs::read(staged.dir.join(name)).unwrap();
+            assert!(bytes.is_ascii(), "{name} is not plain ASCII");
+            let lf = bytes.iter().filter(|&&b| b == b'\n').count();
+            let crlf = bytes.windows(2).filter(|w| w == b"\r\n").count();
+            assert!(lf > 0, "{name} is empty");
+            assert_eq!(lf, crlf, "{name} has a bare LF");
+        }
+        assert_eq!(dos_batch("a\r\nb\nc\n"), "a\r\nb\r\nc\r\n");
+    }
 
     #[test]
     fn stages_scripts_and_available_binaries() {
