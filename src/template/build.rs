@@ -467,8 +467,35 @@ async fn run_build(
             let abort = task.abort_handle();
             match tokio::time::timeout(grace, task).await {
                 Ok(joined) => {
-                    let version = joined
-                        .map_err(|e| anyhow::anyhow!("agent verify task panicked: {e}"))??;
+                    let waited =
+                        joined.map_err(|e| anyhow::anyhow!("agent verify task panicked: {e}"))?;
+                    let version = match waited {
+                        Ok(version) => version,
+                        // The background wait has a fixed deadline from boot,
+                        // and a provision that installs the OS can outlast it:
+                        // Windows 9x Setup takes about two hours on a loaded
+                        // host. The provisions are done now, so an agent they
+                        // installed answers at once; only a VM that is still
+                        // up can be asked.
+                        Err(e) if vm.state().await != crate::labd::vm::PowerState::Stopped => {
+                            log(format!(
+                                "agent: the background wait gave up ({e:#}); verifying again now that the provisions are done\n"
+                            ));
+                            let vlog = {
+                                let out = log.clone();
+                                move |s: String| out(s)
+                            };
+                            super::agent_install::verify(
+                                &(vm.clone() as Arc<dyn Machine>),
+                                wants_agent,
+                                staged.as_deref(),
+                                std::time::Duration::from_secs(120),
+                                &vlog,
+                            )
+                            .await?
+                        }
+                        Err(e) => return Err(e),
+                    };
                     *agent_version.lock().expect("agent_version lock") = version;
                 }
                 Err(_) => {
