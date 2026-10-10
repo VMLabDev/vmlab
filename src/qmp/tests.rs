@@ -189,6 +189,17 @@ async fn eject_addresses_the_qdev_id_and_forces() {
         .expect("eject command sent");
     // `id` (the qdev id), never the deprecated `device` backend name.
     assert_eq!(msg["arguments"], json!({"id": "install-cd", "force": true}));
+    // The tray is closed again on the now-empty drive.
+    let close = received
+        .iter()
+        .position(|m| execute_name(m) == "blockdev-close-tray")
+        .expect("blockdev-close-tray sent");
+    let eject = received
+        .iter()
+        .position(|m| execute_name(m) == "eject")
+        .unwrap();
+    assert!(close > eject, "the tray closes after the eject");
+    assert_eq!(received[close]["arguments"], json!({"id": "install-cd"}));
 }
 
 #[tokio::test]

@@ -184,7 +184,8 @@ SRC
     CD-ROM boots first, so an installer that reboots itself mid-install, such
     as Windows 95 Setup, lands back in the installer; ejecting once Setup has
     copied its files makes the next reboot fall through to the disk. The
-    medium stays out until the emulator restarts, so a reboot inside the
+    tray is closed again afterwards, so the guest sees an empty drive rather
+    than an open tray, which Windows 95 hangs on. The medium stays out until the emulator restarts, so a reboot inside the
     guest keeps it out and the next `start` loads it again. Ejecting an empty
     drive succeeds. A machine with no install CD-ROM, such as a container or
     a VM with no `cdrom`, fails with "machine `<name>` has no install CD-ROM

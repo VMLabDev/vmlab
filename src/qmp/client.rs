@@ -243,9 +243,17 @@ impl QmpClient {
     /// argument QEMU deprecated: a `-blockdev` drive has no backend name to
     /// give. `force` ejects even when the guest has locked the tray, which an
     /// installer usually has. Ejecting an empty drive succeeds.
+    ///
+    /// The tray is then closed again (`blockdev-close-tray`), so the guest
+    /// sees an empty drive rather than an open tray. Windows 95 blocks on an
+    /// open tray: whatever touches the drive (its Welcome screen does) holds
+    /// the shared 16-bit lock while it waits, and the whole desktop hangs.
     pub async fn eject(&self, id: &str) -> Result<(), QmpError> {
         let args = json!({"id": id, "force": true});
-        self.execute("eject", Some(args)).await.map(|_| ())
+        self.execute("eject", Some(args)).await?;
+        self.execute("blockdev-close-tray", Some(json!({"id": id})))
+            .await
+            .map(|_| ())
     }
 
     // --- screen and input --------------------------------------------------
