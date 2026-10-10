@@ -28,6 +28,7 @@ DOC
       | "`firmware`, `secure_boot`, `tpm`" | "OVMF or SeaBIOS, secure boot under OVMF, and an swtpm 2.0 device." |
       | "`disk_bus`, `nic_model`, `display`" | "The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std` or `cirrus-vga`." |
       | "`cpu_model`" | "The QEMU `-cpu` model the guest sees instead of the host CPU (KVM) or `max` (TCG), for guests a modern CPUID breaks. No shipped profile sets one; a template pins it for its clones." |
+      | "`accel`" | "The accelerator: `kvm` (required, no fallback) or `tcg` (always emulated, even where KVM works, for guests KVM cannot run reliably). Unset, KVM when usable, else TCG. No shipped profile sets one." |
       | "`cpus`, `memory`" | "The hardware floor a VM or container inherits when neither its block nor its template says." |
       | "`agent_transport`" | "The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias." |
       | "`input_transport`" | "How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc`. See [Screens, input and vision](guide_vision)." |

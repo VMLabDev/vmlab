@@ -8,7 +8,7 @@ use anyhow::Result;
 use vmlab_agent_proto::PORT_NAME as AGENT_PORT_NAME;
 
 use super::resolve::ResolvedVm;
-use crate::config::model::{GpuMode, MacAddr};
+use crate::config::model::{AccelMode, GpuMode, MacAddr};
 use crate::profiles::{AgentTransport, DiskBus, FirmwareKind};
 
 /// Per-VM runtime paths and attachments supplied by the lab daemon.
@@ -94,12 +94,67 @@ pub fn qemu_arch(arch: &str) -> &str {
 
 /// Pick the accelerator: KVM when /dev/kvm is usable and the target arch is
 /// the host arch; TCG otherwise — slow but functional, warn loudly (PRD §14).
+/// A machine that declares no `accel` gets this; a VM that may declare one
+/// goes through [`plan_accel`].
 pub fn pick_accel(arch: &str) -> Accel {
-    let host = std::env::consts::ARCH;
-    if kvm_available() && qemu_arch(arch) == host {
+    if kvm_usable(arch) {
         Accel::Kvm
     } else {
         Accel::Tcg
+    }
+}
+
+/// Whether KVM can run a guest of `arch` here: /dev/kvm opens read/write
+/// and the guest arch is the host's.
+pub fn kvm_usable(arch: &str) -> bool {
+    kvm_available() && qemu_arch(arch) == std::env::consts::ARCH
+}
+
+/// The accelerator a VM launches under, decided before the emulator
+/// spawns (ADR-0003) — so a refusal happens before anything is started,
+/// and the caller's only branch is whether to warn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelPlan {
+    /// KVM: declared, or vmlab's choice where it is usable.
+    Kvm,
+    /// TCG because the VM declared `accel = "tcg"` — nothing to warn about.
+    Tcg,
+    /// TCG because KVM is unusable and no layer declared an `accel`: the
+    /// slow fallback, which the caller warns about.
+    TcgFallback,
+}
+
+impl AccelPlan {
+    pub fn accel(self) -> Accel {
+        match self {
+            AccelPlan::Kvm => Accel::Kvm,
+            AccelPlan::Tcg | AccelPlan::TcgFallback => Accel::Tcg,
+        }
+    }
+}
+
+/// Decide a VM's accelerator from its resolved `accel` (§5.2) and whether
+/// KVM is usable for its arch ([`kvm_usable`], injected so the decision is
+/// testable on any host). Unset keeps vmlab's choice with the fallback;
+/// `tcg` always emulates; `kvm` refuses rather than fall back.
+pub fn plan_accel(vm: &ResolvedVm, kvm_usable: bool) -> Result<AccelPlan> {
+    match &vm.accel {
+        None if kvm_usable => Ok(AccelPlan::Kvm),
+        None => Ok(AccelPlan::TcgFallback),
+        Some(req) => match req.mode {
+            AccelMode::Tcg => Ok(AccelPlan::Tcg),
+            AccelMode::Kvm if kvm_usable => Ok(AccelPlan::Kvm),
+            AccelMode::Kvm => anyhow::bail!(
+                "vm \"{}\": accel = \"kvm\" (from {}) but KVM is not usable for a {} guest \
+                 on this {} host — /dev/kvm must open read/write and the guest arch must be the \
+                 host's; drop the `accel` to allow the TCG fallback, or set accel = \"tcg\" \
+                 (PRD §5.2)",
+                vm.name,
+                req.from,
+                vm.arch,
+                std::env::consts::ARCH,
+            ),
+        },
     }
 }
 
@@ -816,6 +871,59 @@ mod tests {
         let tcg = build_args("l", &unset, &paths(), Accel::Tcg).unwrap();
         let cpu = tcg.iter().position(|a| a == "-cpu").unwrap();
         assert_eq!(tcg[cpu + 1], "max");
+    }
+
+    /// Unset `accel` keeps vmlab's choice: KVM where usable, else the TCG
+    /// fallback the caller warns about. `tcg` always emulates — with or
+    /// without KVM, and never as a fallback. `kvm` refuses, naming the
+    /// setting and its layer, rather than falling back.
+    #[test]
+    fn plan_accel_follows_the_declared_setting() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let with = |accel: &str| {
+            let v = super::super::resolve::testing::vm(&format!(
+                "vm \"t\" {{ template = \"scratch\" arch = \"x86\" profile = \"windows-9x\" disk = 1GiB {accel} }}"
+            ));
+            super::super::resolve::resolve_vm(&v, None, &profiles).unwrap()
+        };
+        let unset = with("");
+        assert_eq!(plan_accel(&unset, true).unwrap(), AccelPlan::Kvm);
+        assert_eq!(plan_accel(&unset, false).unwrap(), AccelPlan::TcgFallback);
+
+        let tcg = with("accel = \"tcg\"");
+        assert_eq!(plan_accel(&tcg, true).unwrap(), AccelPlan::Tcg);
+        assert_eq!(plan_accel(&tcg, false).unwrap(), AccelPlan::Tcg);
+
+        let kvm = with("accel = \"kvm\"");
+        assert_eq!(plan_accel(&kvm, true).unwrap(), AccelPlan::Kvm);
+        let err = plan_accel(&kvm, false).unwrap_err().to_string();
+        assert!(
+            err.contains("vm \"t\": accel = \"kvm\" (from the vm block) but KVM is not usable"),
+            "{err}"
+        );
+
+        assert_eq!(AccelPlan::Kvm.accel(), Accel::Kvm);
+        assert_eq!(AccelPlan::Tcg.accel(), Accel::Tcg);
+        assert_eq!(AccelPlan::TcgFallback.accel(), Accel::Tcg);
+    }
+
+    /// A requested TCG emits `-accel tcg` with TCG's own `-cpu max` default,
+    /// unless a `cpu_model` names another (Windows 95 on an AMD host).
+    #[test]
+    fn a_requested_tcg_builds_a_tcg_argv() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let build = |extra: &str| {
+            let v = super::super::resolve::testing::vm(&format!(
+                "vm \"t\" {{ template = \"scratch\" arch = \"x86\" profile = \"windows-9x\" disk = 1GiB accel = \"tcg\" {extra} }}"
+            ));
+            let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
+            let plan = plan_accel(&vm, true).unwrap();
+            joined(&build_args("l", &vm, &paths(), plan.accel()).unwrap())
+        };
+        let s = build("");
+        assert!(s.contains("-accel tcg -cpu max "), "{s}");
+        let s = build("cpu_model = \"pentium3\"");
+        assert!(s.contains("-accel tcg -cpu pentium3 "), "{s}");
     }
 
     /// Non-x86 KVM has no VMX/SVM to mask.

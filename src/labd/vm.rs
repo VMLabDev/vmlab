@@ -805,6 +805,9 @@ impl VmInstance {
         // pull can't swap them mid-boot under us).
         let t = self.template();
         let run = async {
+            // Decided before anything is created or spawned: a declared
+            // `accel = "kvm"` that KVM cannot honour refuses here (§5.2).
+            let plan = qemu::plan_accel(&t.resolved, qemu::kvm_usable(&t.resolved.arch))?;
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
             self.ensure_disks().await?;
@@ -833,14 +836,15 @@ impl VmInstance {
                 *self.swtpm.lock().await = Some(swtpm);
             }
 
-            let accel = qemu::pick_accel(&t.resolved.arch);
-            if accel == qemu::Accel::Tcg {
+            let accel = plan.accel();
+            if plan == qemu::AccelPlan::TcgFallback {
                 tracing::warn!(
                     "{}: KVM unavailable for {} — falling back to TCG (slow)",
                     self.cfg.name,
                     t.resolved.arch
                 );
-            } else if t.resolved.nested
+            } else if plan == qemu::AccelPlan::Kvm
+                && t.resolved.nested
                 && let Some(problem) = qemu::host_nested_problem()
             {
                 tracing::warn!("{}: {problem}", self.cfg.name);

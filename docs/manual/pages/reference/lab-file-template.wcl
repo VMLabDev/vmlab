@@ -37,6 +37,7 @@ template "<name>" {
   disk        = 20GiB
   display     = "virtio-vga"
   cpu_model   = "pentium3"
+  accel       = "tcg"
   firmware    = "ovmf"
   tpm         = false
   secure_boot = false
@@ -67,6 +68,7 @@ SRC
       | "`disk`" | "ByteSize" | "from source" | "Working disk size for the build, for example `64GiB`. Required for a `scratch` source." |
       | "`display`" | "utf8" | "from profile" | "QEMU display device string for the build VM." |
       | "`cpu_model`" | "utf8" | "from profile" | "QEMU `-cpu` model for the build VM, for example `pentium3`, replacing the accelerator default. Inherited by clones. Cannot be combined with `nested = true`." |
+      | "`accel`" | "utf8" | "from profile" | "Accelerator for the build VM: `kvm` or `tcg`. Inherited by clones. `tcg` cannot be combined with `nested = true`." |
       | "`firmware`" | "utf8" | "from profile" | "Firmware: `ovmf` or `seabios`." |
       | "`tpm`" | "bool" | "from profile" | "Enable a TPM 2.0 device." |
       | "`secure_boot`" | "bool" | "from profile" | "Enable secure boot; OVMF only." |

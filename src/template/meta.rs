@@ -40,6 +40,8 @@ pub struct TemplateMeta {
     pub display: Option<String>,
     /// QEMU `-cpu` model the template pins for its clones (§5.2).
     pub cpu_model: Option<String>,
+    /// QEMU accelerator the template pins for its clones (§5.2).
+    pub accel: Option<crate::config::model::AccelMode>,
     pub created: DateTime<Utc>,
     /// Where the template came from — source ISO URL, registry ref, …
     pub origin: Option<String>,
@@ -105,6 +107,9 @@ impl TemplateMeta {
         }
         if let Some(c) = &self.cpu_model {
             let _ = writeln!(out, "  cpu_model = {}", quote(c));
+        }
+        if let Some(a) = self.accel {
+            let _ = writeln!(out, "  accel = {}", quote(a.as_str()));
         }
         let _ = writeln!(out, "  created = {}", quote(&self.created.to_rfc3339()));
         if let Some(o) = &self.origin {
@@ -198,6 +203,12 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
     let cpu_model = r
         .parsed("cpu_model", crate::config::model::parse_cpu_model)
         .unspan();
+    // Lenient, like `firmware`: a spelling this build does not know reads
+    // as unset rather than making the store entry unreadable.
+    let accel = r
+        .string("accel")
+        .unspan()
+        .and_then(|s| crate::config::model::AccelMode::parse(&s));
     let origin = r.string("origin").unspan();
     let registry = r.string("registry").unspan();
     let sha256 = r.string("sha256").unspan();
@@ -221,6 +232,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         secure_boot,
         display,
         cpu_model,
+        accel,
         origin,
         registry,
         sha256,
@@ -288,6 +300,7 @@ mod tests {
             secure_boot: Some(true),
             display: Some("vnc".into()),
             cpu_model: Some("pentium3".into()),
+            accel: Some(crate::config::model::AccelMode::Tcg),
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),
@@ -314,6 +327,7 @@ mod tests {
             secure_boot: None,
             display: None,
             cpu_model: None,
+            accel: None,
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
             registry: None,

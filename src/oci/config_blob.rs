@@ -41,6 +41,10 @@ pub struct TemplateConfig {
     /// QEMU `-cpu` model (§5.2).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cpu_model: Option<String>,
+    /// QEMU accelerator (§5.2), by its schema spelling. Free text so a
+    /// spelling a newer build wrote reads as unset rather than failing.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub accel: Option<String>,
     /// RFC 3339 creation timestamp.
     pub created: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -75,6 +79,7 @@ impl TemplateConfig {
             secure_boot: meta.secure_boot,
             display: meta.display.clone(),
             cpu_model: meta.cpu_model.clone(),
+            accel: meta.accel.map(|a| a.as_str().to_string()),
             created: meta.created.to_rfc3339(),
             origin: meta.origin.clone(),
             registry: meta.registry.clone(),
@@ -105,6 +110,10 @@ impl TemplateConfig {
             secure_boot: self.secure_boot,
             display: self.display,
             cpu_model: self.cpu_model,
+            accel: self
+                .accel
+                .as_deref()
+                .and_then(crate::config::model::AccelMode::parse),
             created,
             origin: origin_override.or(self.origin),
             registry: self.registry,
@@ -145,6 +154,7 @@ mod tests {
             secure_boot: Some(true),
             display: Some("vnc".into()),
             cpu_model: Some("pentium3".into()),
+            accel: Some(crate::config::model::AccelMode::Tcg),
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),

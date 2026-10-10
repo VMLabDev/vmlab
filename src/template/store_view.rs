@@ -62,6 +62,7 @@ pub struct TemplateSummary {
     pub secure_boot: Option<bool>,
     pub display: Option<String>,
     pub cpu_model: Option<String>,
+    pub accel: Option<String>,
     /// RFC 3339.
     pub created: String,
     pub origin: Option<String>,
@@ -85,6 +86,7 @@ impl From<&TemplateMeta> for TemplateSummary {
             secure_boot: t.secure_boot,
             display: t.display.clone(),
             cpu_model: t.cpu_model.clone(),
+            accel: t.accel.map(|a| a.as_str().to_string()),
             created: t.created.to_rfc3339(),
             origin: t.origin.clone(),
             registry: t.registry.clone(),

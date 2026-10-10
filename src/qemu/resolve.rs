@@ -8,7 +8,7 @@
 //! because the hardware surfaces differ: a container micro-VM has no
 //! firmware, TPM, display or disk bus to choose.
 
-use crate::config::model::{Container, Firmware, Gpu, TemplateRef, Vm};
+use crate::config::model::{AccelMode, Container, Firmware, Gpu, TemplateRef, Vm};
 use crate::profiles::{
     AgentTransport, DiskBus, FirmwareKind, InputTransport, Machine, Profile, ProfileSet,
 };
@@ -54,6 +54,11 @@ pub struct ResolvedVm {
     /// modern host), and exclusive with `nested`: the model decides the
     /// CPU features, so there is no host VMX/SVM left to pass through.
     pub cpu_model: Option<String>,
+    /// The accelerator a layer asked for (§5.2), VM > template > profile,
+    /// with the layer that asked. `None` keeps vmlab's choice — KVM when
+    /// usable, TCG otherwise; the launch decision itself is
+    /// [`crate::qemu::plan_accel`]'s.
+    pub accel: Option<AccelRequest>,
     pub gpu: Option<Gpu>,
     pub qemu_args: Vec<String>,
 }
@@ -73,6 +78,15 @@ pub struct ResolvedContainer {
     /// Bytes.
     pub memory: u64,
     pub machine: String,
+}
+
+/// A declared `accel`, and where it was declared — rendered for messages,
+/// because a launch refusing on it has to say which layer to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccelRequest {
+    pub mode: AccelMode,
+    /// How the declaring layer reads in a message ("the template", …).
+    pub from: String,
 }
 
 /// Which layer of the §5.2 precedence chain supplied a resolved value.
@@ -190,6 +204,29 @@ pub fn resolve_cpu_model(
         lab_vm.cpu_model.clone(),
         template.and_then(|t| t.cpu_model.clone()),
         profile.cpu_model.clone(),
+    )
+}
+
+/// The accelerator a VM asks for, and the layer that asked — `None` when
+/// no layer does. Split out of [`resolve_vm`] so validation can name the
+/// layer a `nested` conflict was inherited from (§5.1).
+pub fn resolve_accel(
+    lab_vm: &Vm,
+    template: Option<&TemplateMeta>,
+    profile: &Profile,
+) -> Option<(AccelMode, Layer)> {
+    pick(lab_vm.accel, template.and_then(|t| t.accel), profile.accel)
+}
+
+/// Why `nested = true` cannot stand beside `accel = "tcg"`: nested
+/// virtualisation is the host CPU's VMX/SVM passed through, which only KVM
+/// has. One wording, whether validation or the resolver refuses.
+pub fn nested_tcg_conflict(machine: &str, layer: Layer, profile_name: Option<&str>) -> String {
+    format!(
+        "vm \"{machine}\": nested = true but accel = \"tcg\" (from {}) — nested \
+         virtualisation passes the host CPU's VMX/SVM through, which needs KVM; drop `nested` \
+         or the `accel` (PRD §5.2)",
+        layer.label(profile_name),
     )
 }
 
@@ -343,6 +380,22 @@ pub fn resolve_vm(
         ));
     }
 
+    let accel = resolve_accel(lab_vm, template, profile);
+    // As for `cpu_model`: validation cannot always see the template layer.
+    if lab_vm.nested
+        && let Some((AccelMode::Tcg, layer)) = accel
+    {
+        anyhow::bail!(nested_tcg_conflict(
+            &lab_vm.name,
+            layer,
+            profile_name.as_deref()
+        ));
+    }
+    let accel = accel.map(|(mode, layer)| AccelRequest {
+        mode,
+        from: layer.label(profile_name.as_deref()),
+    });
+
     let display_device = lab_vm
         .display
         .clone()
@@ -383,6 +436,7 @@ pub fn resolve_vm(
         virtiofs: profile.virtiofs,
         nested: lab_vm.nested,
         cpu_model: cpu_model.map(|(model, _)| model),
+        accel,
         gpu: lab_vm.gpu.clone(),
         qemu_args: lab_vm.qemu_args.clone(),
     })
@@ -512,6 +566,7 @@ mod tests {
             secure_boot: None,
             display: None,
             cpu_model: None,
+            accel: None,
             created: chrono::Utc::now(),
             origin: None,
             registry: None,
@@ -616,6 +671,83 @@ mod tests {
         );
         // `nested` alone is untouched.
         assert!(resolve_vm(&v, Some(&meta()), &profiles).unwrap().nested);
+    }
+
+    /// `accel` resolves VM block > template > profile like every other
+    /// §5.2 hardware field, carrying the layer that declared it.
+    #[test]
+    fn accel_precedence_vm_over_template_over_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("emulated.wcl"),
+            "import <vmlab-profile.wcl>\nprofile \"emulated\" { accel = \"tcg\" }\n",
+        )
+        .unwrap();
+        let profiles = ProfileSet::load(dir.path()).unwrap();
+        let accel = |src: &str, meta: Option<&TemplateMeta>| {
+            resolve_vm(&vm(src), meta, &profiles).unwrap().accel
+        };
+        let req = |mode, from: &str| {
+            Some(AccelRequest {
+                mode,
+                from: from.into(),
+            })
+        };
+        let pinned = TemplateMeta {
+            accel: Some(AccelMode::Kvm),
+            profile: Some("emulated".into()),
+            ..meta()
+        };
+        // Profile floor only.
+        assert_eq!(
+            accel(
+                "vm \"a\" { template = \"x86_64/win\" profile = \"emulated\" }",
+                Some(&meta())
+            ),
+            req(AccelMode::Tcg, "profile \"emulated\"")
+        );
+        // The template wins over the profile.
+        assert_eq!(
+            accel("vm \"a\" { template = \"x86_64/win\" }", Some(&pinned)),
+            req(AccelMode::Kvm, "the template")
+        );
+        // The vm block wins over both.
+        assert_eq!(
+            accel(
+                "vm \"a\" { template = \"x86_64/win\" accel = \"tcg\" }",
+                Some(&pinned)
+            ),
+            req(AccelMode::Tcg, "the vm block")
+        );
+        // No layer names one: vmlab's choice stands.
+        assert_eq!(
+            accel("vm \"a\" { template = \"x86_64/win\" }", Some(&meta())),
+            None
+        );
+    }
+
+    /// `nested` needs KVM; an inherited `accel = "tcg"` is refused by the
+    /// resolver, naming its layer. `nested` beside `accel = "kvm"` stands.
+    #[test]
+    fn nested_with_an_inherited_tcg_is_refused() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let tcg = TemplateMeta {
+            accel: Some(AccelMode::Tcg),
+            ..meta()
+        };
+        let v = vm("vm \"a\" { template = \"x86_64/win\" nested = true }");
+        let err = resolve_vm(&v, Some(&tcg), &profiles)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nested = true but accel = \"tcg\" (from the template)"),
+            "{err}"
+        );
+        let kvm = TemplateMeta {
+            accel: Some(AccelMode::Kvm),
+            ..meta()
+        };
+        assert!(resolve_vm(&v, Some(&kvm), &profiles).unwrap().nested);
     }
 
     #[test]

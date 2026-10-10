@@ -586,6 +586,7 @@ mod tests {
             secure_boot: None,
             display: None,
             cpu_model: None,
+            accel: None,
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
             registry: None,

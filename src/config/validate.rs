@@ -9,8 +9,8 @@ use super::model::*;
 use super::{Issue, IssueList};
 use crate::profiles::Profile;
 use crate::qemu::resolve::{
-    Layer, default_profile, effective_profile_name, nested_cpu_model_conflict, resolve_cpu_model,
-    resolve_firmware, vm_arch,
+    Layer, default_profile, effective_profile_name, nested_cpu_model_conflict, nested_tcg_conflict,
+    resolve_accel, resolve_cpu_model, resolve_firmware, vm_arch,
 };
 use crate::template::TemplateMeta;
 
@@ -574,6 +574,18 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 ),
             ));
         }
+        // Likewise its `accel`: nested virtualisation needs KVM (§5.2).
+        if t.nested && t.accel == Some(AccelMode::Tcg) {
+            issues.push(Issue::at(
+                t.span,
+                format!(
+                    "template \"{}\": nested = true but accel = \"tcg\" — nested \
+                     virtualisation passes the host CPU's VMX/SVM through, which needs KVM; \
+                     drop `nested` or the `accel` (PRD §5.2)",
+                    t.name
+                ),
+            ));
+        }
         match &t.source {
             TemplateSource::Template {
                 from:
@@ -741,6 +753,35 @@ fn check_vm_hardware(
     }
     check_secure_boot(vm, ctx, issues);
     check_nested_cpu_model(vm, ctx, issues);
+    check_nested_tcg(vm, ctx, issues);
+}
+
+/// `nested = true` passes the host CPU's VMX/SVM through, which only KVM
+/// has, so `accel = "tcg"` cannot stand beside it (§5.2). The `accel` may be
+/// inherited; unlike a CPU model, a template validation cannot see could
+/// replace an inherited `tcg` with `kvm`, so below the vm block it is
+/// reported only when the template layer is known. The resolver catches the
+/// rest at start.
+fn check_nested_tcg(vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueList) {
+    if !vm.nested {
+        return;
+    }
+    let layer = TemplateLayer::of(vm, ctx);
+    let profile_name = effective_profile_name(vm, layer.meta());
+    let profile = profile_name
+        .as_deref()
+        .and_then(|name| ctx.profile(name))
+        .unwrap_or_else(default_profile);
+    let Some((AccelMode::Tcg, from)) = resolve_accel(vm, layer.meta(), &profile) else {
+        return;
+    };
+    if from != Layer::Vm && !layer.is_known() {
+        return;
+    }
+    issues.push(Issue::at(
+        vm.span,
+        nested_tcg_conflict(&vm.name, from, profile_name.as_deref()),
+    ));
 }
 
 /// `nested = true` passes the host CPU's VMX/SVM through; a named
@@ -1340,6 +1381,7 @@ pub(crate) mod tests {
             secure_boot: None,
             display: None,
             cpu_model: None,
+            accel: None,
             created: chrono::Utc::now(),
             origin: None,
             registry: None,
@@ -1666,6 +1708,69 @@ lab "l" { vm "a" { template = "x86_64/t" cpu_model = "pentium3" } }"#,
             let es = hw_errs(&Hardware::blank(), src);
             assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
         }
+    }
+
+    /// `accel` is one of two spellings, on whichever block declares it.
+    #[test]
+    fn an_unknown_accel_is_rejected() {
+        for body in [
+            r#"lab "l" { vm "a" { template = "x86_64/t" accel = "hvf" } }"#,
+            r#"lab "l" { }
+template "t" { arch = "x86" version = "1" disk = 1GiB accel = "whpx"
+  source "scratch" { } }"#,
+        ] {
+            assert_any_err(
+                &format!("import <vmlab.wcl>\n{body}"),
+                "`accel` must be one of kvm, tcg",
+            );
+        }
+        for ok in ["kvm", "tcg"] {
+            let es = errs(&format!(
+                "import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"x86_64/t\" accel = \"{ok}\" }} }}"
+            ));
+            assert!(es.iter().all(|m| !m.contains("accel")), "{es:#?}");
+        }
+    }
+
+    /// `nested = true` needs KVM, so `accel = "tcg"` beside it is refused,
+    /// naming the layer the `tcg` came from; `accel = "kvm"` is fine.
+    #[test]
+    fn nested_with_tcg_is_rejected_whichever_layer_named_it() {
+        let conflict = |ctx: &Hardware, src: &str, needle: &str| {
+            let es = hw_errs(ctx, src);
+            let found = es
+                .iter()
+                .find(|m| m.contains("nested = true but accel = \"tcg\""))
+                .unwrap_or_else(|| panic!("expected a nested/tcg conflict, got: {es:#?}"));
+            assert!(found.contains(needle), "missing {needle:?} in {found:?}");
+        };
+        conflict(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nested = true accel = "tcg" } }"#,
+            "(from the vm block)",
+        );
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.accel = Some(AccelMode::Tcg);
+        conflict(
+            &Hardware::with_meta(meta),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nested = true } }"#,
+            "(from the template)",
+        );
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "w95" { arch = "x86" version = "1" disk = 1GiB nested = true accel = "tcg"
+  source "scratch" { } }"#,
+            "template \"w95\": nested = true but accel = \"tcg\"",
+        );
+        let es = hw_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" nested = true accel = "kvm" } }"#,
+        );
+        assert!(es.iter().all(|m| !m.contains("accel")), "{es:#?}");
     }
 
     fn lab(src: &str) -> LabFile {

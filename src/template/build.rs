@@ -712,6 +712,7 @@ struct EffectiveHardware {
     secure_boot: Option<bool>,
     display: Option<String>,
     cpu_model: Option<String>,
+    accel: Option<crate::config::model::AccelMode>,
 }
 
 impl EffectiveHardware {
@@ -737,6 +738,7 @@ impl EffectiveHardware {
                 .cpu_model
                 .clone()
                 .or_else(|| source.and_then(|m| m.cpu_model.clone())),
+            accel: def.accel.or_else(|| source.and_then(|m| m.accel)),
         }
     }
 
@@ -890,6 +892,7 @@ fn seal_meta(
         secure_boot: hw.secure_boot,
         display: hw.display.clone(),
         cpu_model: hw.cpu_model.clone(),
+        accel: hw.accel,
         created: chrono::Utc::now(),
         origin: source_origin(&def.source),
         registry: def.registry.clone(),
@@ -985,6 +988,7 @@ fn synth_lab(
         secure_boot,
         display,
         cpu_model,
+        accel,
     } = hw;
     let mut s = String::from("import <vmlab.wcl>\n\n");
     writeln!(s, "lab {} {{", wcl_str(lab_name)).unwrap();
@@ -1019,6 +1023,9 @@ fn synth_lab(
     }
     if let Some(c) = cpu_model {
         writeln!(s, "    cpu_model = {}", wcl_str(c)).unwrap();
+    }
+    if let Some(a) = accel {
+        writeln!(s, "    accel = {}", wcl_str(a.as_str())).unwrap();
     }
     if let Some(f) = firmware {
         writeln!(s, "    firmware = {}", wcl_str(f.as_str())).unwrap();
@@ -1254,6 +1261,7 @@ mod tests {
             secure_boot: None,
             display: None,
             cpu_model: None,
+            accel: None,
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
             registry: None,
@@ -1276,6 +1284,7 @@ mod tests {
             secure_boot: Some(true),
             display: Some("virtio-vga".into()),
             cpu_model: Some("pentium3".into()),
+            accel: Some(crate::config::model::AccelMode::Kvm),
             ..source_meta()
         }
     }
@@ -1598,6 +1607,51 @@ mod tests {
         assert!(report.contains("nested = true"), "{report}");
     }
 
+    /// A template's `accel` is hardware for its build VM too: Windows 95
+    /// Setup has to install under TCG on an AMD host, not only its clones.
+    #[test]
+    fn a_declared_accel_reaches_the_build_vm() {
+        use crate::config::model::AccelMode;
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86\" version = \"1\"\n",
+            "  profile = \"windows-9x\"\n",
+            "  accel   = \"tcg\"\n",
+            "  disk    = 1GiB\n",
+            "  source \"scratch\" { }\n",
+            "}\n"
+        ));
+        let wcl = render(&d);
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root")).unwrap();
+        assert_eq!(lf.lab.vms[0].accel, Some(AccelMode::Tcg));
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let resolved = crate::qemu::resolve::resolve_vm(&lf.lab.vms[0], None, &profiles).unwrap();
+        assert_eq!(
+            crate::qemu::plan_accel(&resolved, true).unwrap(),
+            crate::qemu::AccelPlan::Tcg
+        );
+    }
+
+    /// A `tcg` inherited from a layered source meets the block's own
+    /// `nested` at the build's pre-flight, which refuses the pair (§5.2).
+    #[test]
+    fn nested_over_an_inherited_tcg_refuses_the_build() {
+        let d = layered("  nested = true\n");
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let source = TemplateMeta {
+            accel: Some(crate::config::model::AccelMode::Tcg),
+            ..source_meta()
+        };
+        let hw = EffectiveHardware::resolve(&d, Some(&source));
+        let err = super::check_build_hardware(&d, &hw, "build", Path::new("/root"), &profiles)
+            .expect_err("nested over TCG must refuse the build");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("nested = true but accel = \"tcg\""),
+            "{report}"
+        );
+    }
+
     /// …and the resolved hardware really is the template's, not the profile
     /// floor underneath it: `linux-modern` is OVMF, the block said SeaBIOS.
     #[test]
@@ -1771,6 +1825,7 @@ mod tests {
         assert_eq!(hw.secure_boot, Some(true));
         assert_eq!(hw.display.as_deref(), Some("virtio-vga"));
         assert_eq!(hw.cpu_model.as_deref(), Some("pentium3"));
+        assert_eq!(hw.accel, Some(crate::config::model::AccelMode::Kvm));
     }
 
     /// Where both layers declare a value the block wins — the same precedence
@@ -1786,6 +1841,7 @@ mod tests {
             "  secure_boot = false\n",
             "  display     = \"std\"\n",
             "  cpu_model   = \"pentium2\"\n",
+            "  accel       = \"tcg\"\n",
         ));
         let hw = EffectiveHardware::resolve(&d, Some(&source_meta_full()));
         assert_eq!(hw.profile.as_deref(), Some("linux-generic"));
@@ -1796,6 +1852,7 @@ mod tests {
         assert_eq!(hw.secure_boot, Some(false));
         assert_eq!(hw.display.as_deref(), Some("std"));
         assert_eq!(hw.cpu_model.as_deref(), Some("pentium2"));
+        assert_eq!(hw.accel, Some(crate::config::model::AccelMode::Tcg));
     }
 
     /// A field neither layer declares stays absent: the profile beneath is a
@@ -1974,6 +2031,7 @@ mod tests {
         assert_eq!(sealed.secure_boot, Some(true));
         assert_eq!(sealed.display.as_deref(), Some("virtio-vga"));
         assert_eq!(sealed.cpu_model.as_deref(), Some("pentium3"));
+        assert_eq!(sealed.accel, Some(crate::config::model::AccelMode::Kvm));
         assert_eq!(sealed.disk, Some(64 << 30));
         assert_eq!(sealed.origin.as_deref(), Some("x86_64/win11@26100.1"));
         assert_eq!(
@@ -2010,6 +2068,7 @@ mod tests {
         assert_eq!(sealed.secure_boot, None);
         assert_eq!(sealed.display, None);
         assert_eq!(sealed.cpu_model, None);
+        assert_eq!(sealed.accel, None);
     }
 
     /// The bootstrap ISO decision follows the *effective* profile: a layered

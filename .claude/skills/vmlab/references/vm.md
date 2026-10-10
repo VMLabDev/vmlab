@@ -33,6 +33,7 @@ vm "<name>" {
   agent_update = true
   display     = "virtio-vga"
   cpu_model   = "pentium3"
+  accel       = "tcg"
   firmware    = "ovmf"
   tpm         = false
   secure_boot = false
@@ -65,6 +66,7 @@ vm "<name>" {
 | `agent_update` | bool | lab `agent_update`, else `true` | Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. Ignored on the legacy agent tier. |
 | `display` | utf8 | inherited | QEMU display device string. Inherited from template, then profile. |
 | `cpu_model` | utf8 | inherited | QEMU `-cpu` model, for example `pentium3`, `pentium2`, `qemu32` or `Westmere`, replacing the default (`host` under KVM, `max` under TCG) under either accelerator. For guests the host CPU breaks, such as Windows 9x Setup. Inherited from template, then profile. Any non-empty name is accepted; QEMU refuses an unknown one at start. Cannot be combined with `nested = true`. |
+| `accel` | utf8 | inherited | Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. `tcg` always emulates, even where KVM works, for guests KVM cannot run reliably, such as Windows 95 on an AMD host; `-cpu` stays `max` unless `cpu_model` names one. `kvm` refuses to start the VM when KVM is unusable rather than falling back. Inherited from template, then profile. `tcg` cannot be combined with `nested = true`. |
 | `firmware` | utf8 | inherited | Firmware: `ovmf` or `seabios`. Inherited from template, then profile. |
 | `tpm` | bool | inherited | Enable a TPM 2.0 device. Inherited from template, then profile. |
 | `secure_boot` | bool | inherited | Enable secure boot; OVMF only. Inherited from template, then profile. |

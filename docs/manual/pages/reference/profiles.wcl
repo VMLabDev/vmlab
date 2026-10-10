@@ -61,6 +61,7 @@ profile "<name>" {
   nic_model       = "virtio-net-pci"
   display         = "virtio-vga"
   cpu_model       = "pentium3"
+  accel           = "tcg"
   cpus            = 2
   memory          = 4GiB
   agent_transport = "virtio-serial"
@@ -83,6 +84,7 @@ SRC
       | "`nic_model`" | "utf8" | "QEMU default" | "NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`." |
       | "`display`" | "utf8" | "QEMU default" | "Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`." |
       | "`cpu_model`" | "utf8" | "unset" | "QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. No shipped profile sets one." |
+      | "`accel`" | "utf8" | "unset" | "Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. No shipped profile sets one." |
       | "`cpus`" | "i64" | "unset" | "Default vCPU count, at least 1." |
       | "`memory`" | "ByteSize" | "unset" | "Default RAM, for example `4GiB`." |
       | "`agent_transport`" | "utf8" | "`virtio-serial`" | "The guest agent channel's device: `virtio-serial`, `isa-serial` (a 16550 on COM1 for the legacy agent; the serial log moves to COM2), or `none` (no agent; never ready by handshake)." |
@@ -93,7 +95,7 @@ SRC
   }
   p <<DOC
     The parser enforces the keyword sets above for `machine`, `firmware`,
-    `disk_bus` and `input_transport`, `cpus` at least 1, and a non-negative
+    `disk_bus`, `accel` and `input_transport`, `cpus` at least 1, and a non-negative
     `memory`. `nic_model`, `display` and `cpu_model` are passed to QEMU as
     written; an empty `cpu_model` is refused. A
     profile that sets no `workspace_guest` still hosts a dev machine; the

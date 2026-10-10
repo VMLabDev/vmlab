@@ -96,6 +96,8 @@ pub struct Profile {
     /// QEMU `-cpu` model (§5.2) — for guests that cannot run on the host
     /// CPU's CPUID, such as Windows 9x. None = the accelerator default.
     pub cpu_model: Option<String>,
+    /// QEMU accelerator (§5.2). None = KVM when usable, else TCG.
+    pub accel: Option<crate::config::model::AccelMode>,
     pub cpus: Option<u32>,
     pub memory: Option<u64>,
     /// The agent channel's device (§7.4). `agent_channel = false` in an
@@ -249,6 +251,7 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
         cpu_model: r
             .parsed("cpu_model", crate::config::model::parse_cpu_model)
             .unspan(),
+        accel: r.keyword("accel", crate::config::model::ACCELS).unspan(),
         cpus: r.int_at_least("cpus", 1).unspan(),
         memory: r.size("memory").unspan(),
         agent_transport: {
@@ -317,6 +320,31 @@ mod tests {
         let shipped = ProfileSet::shipped().unwrap();
         for name in shipped.names() {
             assert_eq!(shipped.get(name).unwrap().cpu_model, None, "{name}");
+        }
+    }
+
+    /// A profile may pick an accelerator (§5.2), only from the two there
+    /// are; no shipped profile picks one.
+    #[test]
+    fn accel_is_read_and_an_unknown_one_refused() {
+        use crate::config::model::AccelMode;
+        let ok = parse_profiles(
+            "import <vmlab-profile.wcl>\nprofile \"p\" { accel = \"tcg\" }\n",
+            "<test>",
+        )
+        .unwrap();
+        assert_eq!(ok[0].accel, Some(AccelMode::Tcg));
+
+        let err = parse_profiles(
+            "import <vmlab-profile.wcl>\nprofile \"p\" { accel = \"hvf\" }\n",
+            "<test>",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("accel"), "{err:#}");
+
+        let shipped = ProfileSet::shipped().unwrap();
+        for name in shipped.names() {
+            assert_eq!(shipped.get(name).unwrap().accel, None, "{name}");
         }
     }
 

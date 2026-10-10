@@ -23,6 +23,7 @@ type TemplateMeta {
   secure_boot: bool?
   display: utf8?
   cpu_model: utf8?    // QEMU -cpu model
+  accel: utf8?        // "kvm" | "tcg"
   created: utf8       // RFC 3339
   origin: utf8?       // source ISO URL / registry reference
   registry: utf8?     // full OCI repo this template publishes to

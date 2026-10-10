@@ -264,6 +264,8 @@ type Vm {
   display: utf8?
   @doc("QEMU `-cpu` model, e.g. `pentium3`, replacing the accelerator default; inherited from template→profile; conflicts with `nested`")
   cpu_model: utf8?
+  @doc("Accelerator: `kvm` (required, no fallback) | `tcg` (always emulate, even where KVM works); unset = KVM when usable, else TCG; inherited from template→profile; `tcg` conflicts with `nested`")
+  @options(["kvm", "tcg"]) accel: utf8?
   @doc("Firmware: `ovmf` | `seabios`; inherited from template→profile")
   @options(["ovmf", "seabios"]) firmware: utf8?
   @doc("Enable a TPM 2.0 device; inherited from template→profile")
@@ -543,6 +545,8 @@ type TemplateDef {
   display: utf8?
   @doc("QEMU `-cpu` model, e.g. `pentium3`, for the build VM; inherited by clones; conflicts with `nested`")
   cpu_model: utf8?
+  @doc("Accelerator for the build VM: `kvm` | `tcg`; inherited by clones; `tcg` conflicts with `nested`")
+  @options(["kvm", "tcg"]) accel: utf8?
   @doc("Firmware: `ovmf` | `seabios`")
   @options(["ovmf", "seabios"]) firmware: utf8?
   @doc("Enable a TPM 2.0 device")

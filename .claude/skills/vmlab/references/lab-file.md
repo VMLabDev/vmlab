@@ -118,6 +118,9 @@ required child blocks. The schema declares these with decorators on each field.
 - `nested = true` on a VM whose `cpu_model` resolves to a named model, which
   decides the CPU features itself. The model may have been inherited, so the
   message names the layer it came from.
+- `nested = true` on a VM whose `accel` resolves to `tcg`, since nested
+  virtualisation needs KVM. The `accel` may have been inherited, so the
+  message names the layer it came from.
 - A `share` that is not explicitly virtiofs, a container `volume`, or a
   container `port` on a machine with no NIC, because SMB shares, volumes and
   forwards need a segment to reach the gateway on.

@@ -347,6 +347,9 @@ pub struct Vm {
     /// QEMU `-cpu` model (§5.2); None = inherit template→profile, and with
     /// no layer naming one the builder's accelerator default applies.
     pub cpu_model: Option<String>,
+    /// QEMU accelerator (§5.2); None = inherit template→profile, and with no
+    /// layer naming one KVM is used when usable, TCG otherwise.
+    pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
@@ -392,6 +395,40 @@ impl Firmware {
             .find(|f| f.as_str() == s)
     }
 }
+
+/// The accelerator a machine asks for (§5.2). Undeclared, vmlab picks KVM
+/// when it is usable and falls back to TCG; declared, the choice is the
+/// machine's — `tcg` even where KVM would work (a guest KVM cannot run
+/// reliably, such as Windows 95 on an AMD host), `kvm` with no fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccelMode {
+    Kvm,
+    Tcg,
+}
+
+impl AccelMode {
+    /// The schema spelling, which every surface that writes one back out
+    /// (rendered lab files, template metadata) names it by.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccelMode::Kvm => "kvm",
+            AccelMode::Tcg => "tcg",
+        }
+    }
+
+    /// The inverse of [`AccelMode::as_str`]. A spelling this build does not
+    /// know is `None`, as for [`Firmware::parse`]: the reader is a store
+    /// entry someone else may have written.
+    pub fn parse(s: &str) -> Option<AccelMode> {
+        [AccelMode::Kvm, AccelMode::Tcg]
+            .into_iter()
+            .find(|a| a.as_str() == s)
+    }
+}
+
+/// The `accel =` keyword table, shared by every block that declares one.
+pub const ACCELS: &[(&str, AccelMode)] = &[("kvm", AccelMode::Kvm), ("tcg", AccelMode::Tcg)];
 
 #[derive(Debug, Clone)]
 pub struct Nic {
@@ -714,6 +751,8 @@ pub struct TemplateDef {
     pub display: Option<String>,
     /// QEMU `-cpu` model for the build VM, recorded for clones (§5.2).
     pub cpu_model: Option<String>,
+    /// QEMU accelerator for the build VM, recorded for clones (§5.2).
+    pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
