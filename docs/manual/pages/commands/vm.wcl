@@ -120,7 +120,8 @@ page cmd_vm {
 
   p <<DOC
     Stops one VM through the graceful ladder: a shutdown through the guest
-    agent, then an ACPI power-down, then a hard kill, each with a timeout. See
+    agent, then an ACPI power-down, then a clean emulator quit, then a hard
+    kill, each with a timeout. See
     [vmlab down](cmd_down) for the rungs and their timeouts. `--force` kills
     QEMU at once. Unlike `down`, this stops only the named VM; machines that
     depend on it keep running. A VM that is already stopped is a no-op.

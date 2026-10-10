@@ -188,7 +188,8 @@ page guide_architecture {
 
   p <<DOC
     The reverse verbs are just as plain. `down` walks the stop ladder on every
-    machine, agent shutdown, then ACPI, then a kill after a timeout, and asks
+    machine, agent shutdown, then ACPI, then an emulator quit that flushes
+    the disks, then a kill after a timeout, and asks
     the supervisor to release the daemon. `destroy` does the same and then
     removes everything in `.vmlab/`.
   DOC

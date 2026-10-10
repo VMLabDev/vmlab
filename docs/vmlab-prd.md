@@ -291,7 +291,7 @@ Because nothing is inherited or fetched, validation requires three things a norm
 
 ### 7.2 Power operations
 
-`start`, graceful `stop` (guest-agent shutdown, falling back to ACPI, falling back to hard kill after a timeout), `force stop`, `restart`. Bring-up order respects `depends_on`: VMs with satisfied dependencies start in parallel; a dependency is satisfied when the VM is **ready** (agent responding) and any provision steps scoped to it have completed.
+`start`, graceful `stop` (guest-agent shutdown, falling back to ACPI, falling back to a QMP `quit` that flushes the disk caches, falling back to hard kill after a timeout), `force stop`, `restart`. Bring-up order respects `depends_on`: VMs with satisfied dependencies start in parallel; a dependency is satisfied when the VM is **ready** (agent responding) and any provision steps scoped to it have completed.
 
 **A guest can put itself to sleep.** QEMU's q35 machine advertises ACPI S3, and a Windows client edition takes it after an idle timeout: QEMU stays alive holding the guest's memory, the vCPUs stop, and nothing in the guest — the agent included — answers. The lab daemon follows QMP's `SUSPEND` and `WAKEUP` and reports such a VM as **`suspended`**, a power state of its own beside `stopped`, `starting`, `running` and `stopping`, in `vmlab status`, the status projection and wscript's `state()`; `vm.suspended` and `vm.woken` (carrying who woke it) go on the event log. It is never read as stopped. While a VM is suspended:
 

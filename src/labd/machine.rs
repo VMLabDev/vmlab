@@ -261,9 +261,10 @@ pub trait Machine: Send + Sync + 'static {
 
     /// Exit the emulator *gracefully*, flushing block-device caches first.
     ///
-    /// The only safe seal for guests with no ACPI (DOS, Win 3.x): the stop
-    /// ladder's bottom rung is a SIGKILL, which can drop unflushed qcow2
-    /// writes and leave the disk unbootable. The default falls back to the
+    /// The direct seal for guests with no ACPI (DOS, Win 3.x): it skips the
+    /// ladder's agent and ACPI rungs, which such a guest ignores, and goes
+    /// straight to the clean quit the ladder only reaches after their
+    /// timeouts. The default falls back to the
     /// ladder for a machine with no such control channel.
     async fn poweroff(&self) -> Result<()> {
         self.stop(false).await?;

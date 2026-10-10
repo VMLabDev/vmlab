@@ -1050,6 +1050,7 @@ async fn the_stop_ladder_falls_through_to_the_kill() {
             agent: false,
             runs: vec![Run {
                 ignores_powerdown: true,
+                ignores_quit: true,
                 ..Run::forever()
             }],
             ..Script::default()
@@ -1067,6 +1068,35 @@ async fn the_stop_ladder_falls_through_to_the_kill() {
         exit.status, "signal: 9",
         "the guest ignored every graceful rung, so the last one killed it"
     );
+}
+
+/// A guest that ignores ACPI — Windows 9x and DOS halt at "It's now safe to
+/// turn off your computer" — is ended by the emulator quitting, not by a kill:
+/// QEMU flushes its block caches on `quit`, where a SIGKILL would drop the
+/// qcow2 metadata it holds and leave the disk reading as empty.
+#[tokio::test(start_paused = true)]
+async fn a_guest_that_ignores_acpi_ends_at_a_clean_quit() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            agent: false,
+            runs: vec![Run {
+                ignores_powerdown: true,
+                ..Run::forever()
+            }],
+            ..Script::default()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+
+    vm.stop(false).await.expect("graceful stop");
+
+    let exit = observed.exit().await;
+    assert_eq!(exit.reason, StopReason::Requested);
+    assert_eq!(exit.status, "exit status: 0", "quit, not killed");
 }
 
 /// A forced stop skips the graceful rungs outright. That is the whole of the
