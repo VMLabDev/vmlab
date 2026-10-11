@@ -138,6 +138,11 @@ long port_read(void *buf, long cap)
             ClearCommError(port, &errs, NULL);
             return 0;
         }
+        {
+            char msg[64];
+            _snprintf(msg, sizeof msg, "read: error %lu", (unsigned long)e);
+            plat_log(msg);
+        }
         return -1;
     }
     return (long)got;
@@ -690,6 +695,56 @@ static int reclaim_port_from_serial_mouse(void)
     return 1;
 }
 
+/* 9x (OSR2 and later): serenum.vxd probes each COM port at boot for a Plug
+ * and Play serial device, and the host's hellos queued on the agent channel
+ * can answer that probe. The enumerator then keeps the port, and every open
+ * is refused for the whole boot. The agent's port is not a place a device can
+ * be plugged in, so its enumerator is removed from the port's driver key.
+ * That takes effect on the next boot; the template build boots enough times
+ * that a sealed image carries it. */
+static void stop_enumerating_port(void)
+{
+    static const char *const buses[] = {"Enum\\Root", "Enum\\BIOS"};
+    char dev[128], inst[128], path[320], name[64], driver[128];
+    HKEY bus, devkey, key;
+    DWORD i, j, len, type;
+    int b;
+    for (b = 0; b < 2; b++) {
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, buses[b], 0, KEY_READ, &bus) != ERROR_SUCCESS)
+            continue;
+        for (i = 0; RegEnumKeyA(bus, i, dev, sizeof dev) == ERROR_SUCCESS; i++) {
+            if (RegOpenKeyExA(bus, dev, 0, KEY_READ, &devkey) != ERROR_SUCCESS)
+                continue;
+            for (j = 0; RegEnumKeyA(devkey, j, inst, sizeof inst) == ERROR_SUCCESS; j++) {
+                if (RegOpenKeyExA(devkey, inst, 0, KEY_READ, &key) != ERROR_SUCCESS)
+                    continue;
+                len = sizeof name;
+                if (RegQueryValueExA(key, "PortName", NULL, &type, (BYTE *)name, &len) != ERROR_SUCCESS ||
+                    _stricmp(name, port_name) != 0) {
+                    RegCloseKey(key);
+                    continue;
+                }
+                len = sizeof driver;
+                if (RegQueryValueExA(key, "Driver", NULL, &type, (BYTE *)driver, &len) != ERROR_SUCCESS) {
+                    RegCloseKey(key);
+                    continue;
+                }
+                RegCloseKey(key);
+                _snprintf(path, sizeof path, "System\\CurrentControlSet\\Services\\Class\\%s", driver);
+                if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, path, 0, KEY_READ | KEY_WRITE, &key) == ERROR_SUCCESS) {
+                    if (RegDeleteValueA(key, "Enumerator") == ERROR_SUCCESS) {
+                        plat_log("stopped serial Plug and Play enumeration of the agent's port");
+                        RegFlushKey(HKEY_LOCAL_MACHINE);
+                    }
+                    RegCloseKey(key);
+                }
+            }
+            RegCloseKey(devkey);
+        }
+        RegCloseKey(bus);
+    }
+}
+
 /* Serve forever: reopen the port when it fails, exit on a shutdown. */
 static void serve(void)
 {
@@ -895,6 +950,8 @@ int main(int argc, char **argv)
         else if (run_as_nt_service() == 0)
             return 0;
     }
+    if (is_win9x)
+        stop_enumerating_port();
     serve();
     return 0;
 }
