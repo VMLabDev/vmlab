@@ -683,6 +683,9 @@ static int reclaim_port_from_serial_mouse(void)
     }
     plat_log("the port is held by a serial mouse Setup detected on the agent channel; "
              "removed it, restarting");
+    /* Windows 95 can hang for good on its way down; the removal must already
+     * be on disk when it does, so a forced reset still finds the port free. */
+    RegFlushKey(HKEY_LOCAL_MACHINE);
     ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
     return 1;
 }
