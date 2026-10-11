@@ -22,6 +22,7 @@
 #include "plat.h"
 
 static HANDLE port = INVALID_HANDLE_VALUE;
+static DWORD port_error; /* why the last port_open failed */
 static int console_mode = 0;
 static int is_win9x = 0;
 static HANDLE log_file = INVALID_HANDLE_VALUE;
@@ -86,7 +87,8 @@ int port_open(const char *spec, char *err, int errcap)
         _snprintf(path, sizeof path, "\\\\.\\%s", spec);
     port = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (port == INVALID_HANDLE_VALUE) {
-        _snprintf(err, (size_t)errcap, "open %s: error %lu", spec, (unsigned long)GetLastError());
+        port_error = GetLastError();
+        _snprintf(err, (size_t)errcap, "open %s: error %lu", spec, (unsigned long)port_error);
         return -1;
     }
     SetupComm(port, 65536, 65536);
@@ -649,6 +651,42 @@ void plat_log(const char *msg)
 
 static char port_name[64] = "COM1";
 
+/* 9x: Windows 95 Setup's hardware detection probes the serial ports for a
+ * mouse, and the agent channel answering on COM1 can pass for one. Setup then
+ * installs a serial mouse there, whose driver holds the port for good, so
+ * every open is refused ("access denied") and the agent never serves. Remove
+ * that legacy-detected device and restart once: nothing claims the port on
+ * the next boot. A marker stops a second restart if that did not help.
+ * Returns 1 when a restart is under way. */
+static int reclaim_port_from_serial_mouse(void)
+{
+    static const char mouse[] = "Enum\\Root\\*PNP0F0C";
+    HKEY key;
+    DWORD done = 0, one = 1, type, len = sizeof done;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\vmlab", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        if (RegQueryValueExA(key, "PortReclaimed", NULL, &type, (BYTE *)&done, &len) != ERROR_SUCCESS)
+            done = 0;
+        RegCloseKey(key);
+        if (done)
+            return 0;
+    }
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, mouse, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return 0;
+    RegCloseKey(key);
+    /* On 9x RegDeleteKey removes the whole subtree. */
+    if (RegDeleteKeyA(HKEY_LOCAL_MACHINE, mouse) != ERROR_SUCCESS)
+        return 0;
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, "Software\\vmlab", 0, NULL, 0, KEY_WRITE, NULL, &key,
+                        NULL) == ERROR_SUCCESS) {
+        RegSetValueExA(key, "PortReclaimed", 0, REG_DWORD, (const BYTE *)&one, sizeof one);
+        RegCloseKey(key);
+    }
+    plat_log("the port is held by a serial mouse Setup detected on the agent channel; "
+             "removed it, restarting");
+    ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
+    return 1;
+}
+
 /* Serve forever: reopen the port when it fails, exit on a shutdown. */
 static void serve(void)
 {
@@ -656,6 +694,8 @@ static void serve(void)
     for (;;) {
         if (port_open(port_name, err, (int)sizeof err) < 0) {
             plat_log(err);
+            if (is_win9x && port_error == ERROR_ACCESS_DENIED && reclaim_port_from_serial_mouse())
+                return;
             Sleep(2000);
             continue;
         }
