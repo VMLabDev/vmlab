@@ -24,6 +24,13 @@ pub fn build_iso(src_folder: &Path, out: &Path, label: Option<&str>) -> Result<(
     if let Some(label) = label {
         validate_iso_label(label)?;
     }
+    // A symlinked source folder, and links inside it, are taken as what they
+    // point at, as the media hash takes them: with Rock Ridge a link would go
+    // into the image as a link, which a guest reading plain ISO 9660 (DOS,
+    // Windows 9x) sees as an empty file.
+    let src_folder = &src_folder
+        .canonicalize()
+        .with_context(|| format!("resolving {}", src_folder.display()))?;
 
     // (program, leading args) in preference order.
     let tools: &[(&str, &[&str])] = &[
@@ -36,7 +43,7 @@ pub fn build_iso(src_folder: &Path, out: &Path, label: Option<&str>) -> Result<(
         let mut cmd = Command::new(program);
         cmd.args(*lead);
         cmd.arg("-o").arg(out);
-        cmd.args(["-J", "-R"]);
+        cmd.args(["-J", "-R", "-f"]);
         if let Some(label) = label {
             cmd.arg("-V").arg(label);
         }
@@ -113,6 +120,48 @@ mod tests {
         assert!(listing.contains("autounattend.xml"), "listing: {listing}");
         assert!(listing.contains("drivers"), "listing: {listing}");
         assert!(listing.contains("virtio.inf"), "listing: {listing}");
+    }
+
+    /// A symlinked folder, and a symlinked file inside it, go into the image
+    /// as their contents, not as links: DOS reads no Rock Ridge.
+    #[test]
+    fn follows_symlinks_to_their_contents() {
+        let real = tempfile::tempdir().unwrap();
+        fs::write(real.path().join("payload.txt"), b"payload").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join("linked.txt"), b"linked").unwrap();
+        std::os::unix::fs::symlink(
+            other.path().join("linked.txt"),
+            real.path().join("link.txt"),
+        )
+        .unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let src = links.path().join("src");
+        std::os::unix::fs::symlink(real.path(), &src).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let iso = out_dir.path().join("media.iso");
+        build_iso(&src, &iso, Some("LINKED")).expect("ISO build should succeed");
+
+        let listing = iso_listing(&iso);
+        assert!(listing.contains("payload.txt"), "listing: {listing}");
+        assert!(listing.contains("link.txt"), "listing: {listing}");
+        let extracted = out_dir.path().join("link.txt");
+        let status = Command::new("xorriso")
+            .args(["-osirrox", "on", "-indev"])
+            .arg(&iso)
+            .args(["-extract", "/link.txt"])
+            .arg(&extracted)
+            .output()
+            .expect("xorriso should be runnable");
+        assert!(status.status.success(), "{status:?}");
+        assert!(
+            !fs::symlink_metadata(&extracted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&extracted).unwrap(), b"linked");
     }
 
     #[test]
