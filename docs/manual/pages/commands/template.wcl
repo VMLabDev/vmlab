@@ -116,7 +116,7 @@ SRC
     rows:
       | "Option" | "Meaning" |
       | "`<NAME>`" | "Template name, as the file declares it." |
-      | "`--arch <ARCH>`" | "Architecture, when the name is declared for more than one. Default: `x86_64`." |
+      | "`--arch <ARCH>`" | "Architecture, when the name is declared for more than one. Without it, the arch the lab file here declares the template for." |
       | "`-h`, `--help`" | "Print help." |
   }
 

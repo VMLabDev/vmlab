@@ -56,8 +56,8 @@ pub enum TemplateCmd {
         /// Template name, as the file declares it
         name: String,
         /// Architecture, when the name is declared for more than one
-        #[arg(long, default_value = "x86_64")]
-        arch: String,
+        #[arg(long)]
+        arch: Option<String>,
     },
     /// List templates in the store
     List {
@@ -437,7 +437,44 @@ async fn build(
 /// different requests; a user with one running operation should not have to
 /// know which. So this asks to stop the build, and takes the supervisor's
 /// "that one is a push" as the answer to which command to send instead.
-async fn stop(sup: &SupClient, name: String, arch: String) -> Result<()> {
+/// The arch a template name is declared for in the lab file here, when
+/// `stop` was not told one: the only one, or an error naming them all.
+async fn declared_arch(sup: &SupClient, cwd: &Path, name: &str) -> Result<String> {
+    let root = crate::paths::find_lab_root(cwd)
+        .context("no lab file here to find the template's arch in; pass --arch")?;
+    let path = root.join(crate::paths::LAB_FILE);
+    let declared: Vec<DeclaredTemplate> = ask(
+        sup,
+        SupRequest::TemplateList {
+            lab: lab_of(&root),
+            root: root.clone(),
+            file: Some(path.clone()),
+        },
+    )
+    .await?;
+    let arches: Vec<String> = declared
+        .into_iter()
+        .filter(|t| t.name == name)
+        .map(|t| t.arch)
+        .collect();
+    match arches.as_slice() {
+        [arch] => Ok(arch.clone()),
+        [] => bail!(
+            "no template named \"{name}\" in {}; pass --arch",
+            path.display()
+        ),
+        _ => bail!(
+            "\"{name}\" is declared for {}; pass --arch",
+            arches.join(", ")
+        ),
+    }
+}
+
+async fn stop(sup: &SupClient, name: String, arch: Option<String>) -> Result<()> {
+    let arch = match arch {
+        Some(arch) => arch,
+        None => declared_arch(sup, &std::env::current_dir()?, &name).await?,
+    };
     let lab = lab_here();
     let build = SupRequest::TemplateStopBuild {
         lab: lab.clone(),
@@ -997,11 +1034,57 @@ mod tests {
         let _server = Server::bind(&sock, handler.clone()).await.unwrap();
         let sup = SupClient::connect(&sock).await.unwrap();
 
-        stop(&sup, "base".into(), "x86_64".into()).await.unwrap();
+        stop(&sup, "base".into(), Some("x86_64".into()))
+            .await
+            .unwrap();
         assert_eq!(
             *handler.asked.lock().unwrap(),
             ["template.stop_build", "store.stop_push"]
         );
+    }
+
+    /// A supervisor whose lab file declares one template for one arch, and
+    /// that records the arch each stop request names.
+    #[derive(Default)]
+    struct Declares {
+        stopped: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler<SupRequest> for Declares {
+        async fn handle(&self, req: SupRequest, _s: &Streamer) -> Result<Value, CommandError> {
+            match req {
+                SupRequest::TemplateList { .. } => Ok(json!([
+                    {"arch": "x86", "name": "windows-95"},
+                    {"arch": "x86_64", "name": "base"},
+                    {"arch": "aarch64", "name": "base"},
+                ])),
+                SupRequest::TemplateStopBuild { arch, .. } => {
+                    self.stopped.lock().unwrap().push(arch);
+                    Ok(Value::Bool(true))
+                }
+                _ => Ok(Value::Bool(true)),
+            }
+        }
+    }
+
+    /// Without `--arch`, `stop` takes the arch the lab file declares the
+    /// template for, and refuses to guess between two.
+    #[tokio::test]
+    async fn stopping_without_an_arch_takes_the_declared_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(crate::paths::LAB_FILE), "").unwrap();
+        let sock = dir.path().join("vmlabd.sock");
+        let handler = Arc::new(Declares::default());
+        let _server = Server::bind(&sock, handler.clone()).await.unwrap();
+        let sup = SupClient::connect(&sock).await.unwrap();
+
+        let arch = declared_arch(&sup, dir.path(), "windows-95").await.unwrap();
+        assert_eq!(arch, "x86");
+        let err = declared_arch(&sup, dir.path(), "base").await.unwrap_err();
+        assert!(err.to_string().contains("x86_64, aarch64"), "{err}");
+        let err = declared_arch(&sup, dir.path(), "nope").await.unwrap_err();
+        assert!(err.to_string().contains("pass --arch"), "{err}");
     }
 
     /// The reason the answers are typed: a supervisor of a different build
