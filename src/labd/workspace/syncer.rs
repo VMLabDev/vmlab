@@ -3538,14 +3538,16 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
 
-        // A second, uncontested file, so the halt can be seen to stop the
-        // whole workspace rather than one path.
-        std::fs::write(dir.path().join("other.rs"), "host only").unwrap();
         diverge(dir.path(), &guest, &sessions);
 
         let halt = halt_of(&syncers, "dev01").await.expect("nothing halted");
         assert_eq!(halt.machine, "dev01");
         assert_eq!(halt.paths(), vec!["main.rs".to_string()]);
+
+        // A second, uncontested file, written once the halt is in force, so
+        // the halt can be seen to stop the whole workspace rather than one
+        // path. Written before the halt, it could cross first and rightly.
+        std::fs::write(dir.path().join("other.rs"), "host only").unwrap();
 
         // Neither copy was written and neither was deleted.
         assert_eq!(
@@ -3558,7 +3560,7 @@ mod tests {
         );
         // …and the other direction is stopped too: an uncontested host file
         // does not cross while the workspace is halted.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
             guest.get("/src/other.rs").is_none(),
             "the halt was per path, not per workspace: {:?}",
