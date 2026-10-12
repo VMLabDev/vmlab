@@ -648,8 +648,13 @@ void plat_log(const char *msg)
     OutputDebugStringA(line);
     if (console_mode)
         fprintf(stderr, "%s", line);
-    if (log_file != INVALID_HANDLE_VALUE)
+    if (log_file != INVALID_HANDLE_VALUE) {
         WriteFile(log_file, line, (DWORD)strlen(line), &n, NULL);
+        /* The lines that matter most precede a forced restart, or the hang
+         * Windows 95 can make of one, which the write-behind cache does not
+         * survive. */
+        FlushFileBuffers(log_file);
+    }
 }
 
 /* ---- entry ---------------------------------------------------------- */
