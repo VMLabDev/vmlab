@@ -87,7 +87,7 @@ profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
 `guest/agent-legacy` serving `exec` only over COM1, the bootstrap ISO's
 `legacy/` builds and install scripts, and the Rust agent's own serial fallback
 for old Linux. Verified live on FreeDOS; the NT build is verified under Wine,
-and the 9x build awaits a guest (#128).
+and the 9x build live on Windows 95 (950, OSR2, OSR2.5) and 98 (FE, SE).
 
 Module map under `src/`:
 
