@@ -34,11 +34,12 @@ pub(crate) fn is_legacy_agent(agent_version: &str) -> bool {
 }
 
 /// Which staged flavour answered, from the handshake's OS and that judgement.
-fn agent_flavour(os: &str, legacy: bool) -> AgentOs {
+fn agent_flavour(os: &str, legacy: bool, profile: Option<&str>) -> AgentOs {
     match (os, legacy) {
         ("windows", false) => AgentOs::Windows,
-        // The NT and 9x builds both say "windows"; their stamps are one
-        // build's, so either staged flavour names it.
+        // The NT and 9x builds both say "windows"; the machine's profile
+        // tells them apart.
+        ("windows", true) if profile == Some("windows-9x") => AgentOs::Windows9x,
         ("windows", true) => AgentOs::WindowsNt,
         ("dos", _) => AgentOs::Dos,
         ("templeos", _) => AgentOs::TempleOs,
@@ -95,7 +96,7 @@ pub async fn verify(
 
     let info = handle.info();
     let legacy = is_legacy_agent(&info.agent_version);
-    let os = agent_flavour(&info.os, legacy);
+    let os = agent_flavour(&info.os, legacy, machine.profile().as_deref());
     // The staged stamp identifies what the ISO carried; the handshake's own
     // version is the fallback if the flavour somehow wasn't staged — and is
     // the answer for the legacy agent, whose stamp *is* its version string.
@@ -126,11 +127,11 @@ mod tests {
     fn the_rust_agent_is_not_a_legacy_agent() {
         assert!(!is_legacy_agent("0.1.0"));
         assert_eq!(
-            agent_flavour("windows", is_legacy_agent("0.1.0")),
+            agent_flavour("windows", is_legacy_agent("0.1.0"), None),
             AgentOs::Windows
         );
         assert_eq!(
-            agent_flavour("linux", is_legacy_agent("0.1.0")),
+            agent_flavour("linux", is_legacy_agent("0.1.0"), None),
             AgentOs::Linux
         );
     }
@@ -141,15 +142,23 @@ mod tests {
         assert!(is_legacy_agent("agent-legacy=1a2b3c4"));
         assert!(is_legacy_agent("agent-templeos=1a2b3c4"));
         assert_eq!(
-            agent_flavour("windows", is_legacy_agent("agent-legacy=1a2b3c4")),
+            agent_flavour("windows", is_legacy_agent("agent-legacy=1a2b3c4"), None),
             AgentOs::WindowsNt
         );
         assert_eq!(
-            agent_flavour("dos", is_legacy_agent("agent-legacy=1a2b3c4")),
+            agent_flavour(
+                "windows",
+                is_legacy_agent("agent-legacy=1a2b3c4"),
+                Some("windows-9x")
+            ),
+            AgentOs::Windows9x
+        );
+        assert_eq!(
+            agent_flavour("dos", is_legacy_agent("agent-legacy=1a2b3c4"), None),
             AgentOs::Dos
         );
         assert_eq!(
-            agent_flavour("templeos", is_legacy_agent("agent-templeos=1a2b3c4")),
+            agent_flavour("templeos", is_legacy_agent("agent-templeos=1a2b3c4"), None),
             AgentOs::TempleOs
         );
     }
