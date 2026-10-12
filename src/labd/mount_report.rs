@@ -7,9 +7,15 @@
 //! to finish and then prints [`MountReport::lines`] — a warning for every
 //! share that will not mount, and one for every share still failing when the
 //! wait ran out, so neither is left for the user to discover by using it.
+//!
+//! A machine's provisions and playbooks wait for its mount task to settle
+//! ([`MountReport::settled`]) and print its report there, since a step that
+//! reads a share must not race the mount; the end of `up` then reports only
+//! the machines no step waited on.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// How long `up`, once everything else is done, waits for the mount tasks to
@@ -21,6 +27,22 @@ pub const MOUNT_REPORT_HOLD: Duration = Duration::from_secs(30);
 #[derive(Debug, Default)]
 pub struct MountReport {
     inner: Mutex<Inner>,
+    /// The mount task has ended, however it ended.
+    done: AtomicBool,
+    settle: tokio::sync::Notify,
+    /// `up` has printed this report's lines.
+    reported: AtomicBool,
+}
+
+/// Settles a [`MountReport`] when dropped, so a mount task that ends by panic
+/// or abort still releases whatever waits on it.
+pub struct SettleOnDrop(pub std::sync::Arc<MountReport>);
+
+impl Drop for SettleOnDrop {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::SeqCst);
+        self.0.settle.notify_waiters();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -122,6 +144,27 @@ impl MountReport {
                 *state = ShareState::Unmountable(reason.to_string());
             }
         }
+    }
+
+    /// Whether the mount task has ended.
+    pub fn is_settled(&self) -> bool {
+        self.done.load(Ordering::SeqCst)
+    }
+
+    /// Wait for the mount task to end: every share mounted or given up.
+    pub async fn settled(&self) {
+        loop {
+            let notified = self.settle.notified();
+            if self.is_settled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Claim the printing of this report: true the first time only.
+    pub fn take_report(&self) -> bool {
+        !self.reported.swap(true, Ordering::SeqCst)
     }
 
     /// What `up` prints for `machine`: nothing when every share mounted.
@@ -276,6 +319,31 @@ mod tests {
         assert!(!lines[0].starts_with("WARNING"), "{lines:?}");
         r.ready();
         assert!(r.lines("lin01", false)[0].contains("still mounting"));
+    }
+
+    /// Whatever waits on a mount task is released when the task ends, even
+    /// one that ends by being aborted.
+    #[tokio::test]
+    async fn an_aborted_mount_task_still_settles_its_report() {
+        let r = std::sync::Arc::new(report(&["src"]));
+        assert!(!r.is_settled());
+        let guard = SettleOnDrop(std::sync::Arc::clone(&r));
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let waiter = {
+            let r = std::sync::Arc::clone(&r);
+            tokio::spawn(async move { r.settled().await })
+        };
+        task.abort();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter was never released")
+            .unwrap();
+        assert!(r.is_settled());
+        assert!(r.take_report());
+        assert!(!r.take_report(), "a report is printed once");
     }
 
     /// Plan notes and share-less steps that gave up are warnings too.

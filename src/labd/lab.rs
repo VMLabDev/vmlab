@@ -14,7 +14,7 @@ use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
 use super::events::EventLog;
 use super::forward_plan::{self, ForwardPlan, ForwardRule, HostBinding};
 use super::machine::Machine;
-use super::mount_report::{MOUNT_REPORT_HOLD, MountReport};
+use super::mount_report::{MOUNT_REPORT_HOLD, MountReport, SettleOnDrop};
 use super::network::LabNetwork;
 use super::network::nic_segment_name;
 use super::plan;
@@ -247,7 +247,8 @@ struct ShareMounts {
 
 /// Wait up to `hold` for every mount task to finish, then say what did not
 /// mount (§7.5). A task still running at the deadline keeps running; what it
-/// has not settled yet is said as still being tried.
+/// has not settled yet is said as still being tried. A machine whose report
+/// a provision or playbook already waited for and printed is not repeated.
 async fn report_share_mounts(
     mounts: Vec<ShareMounts>,
     hold: Duration,
@@ -255,6 +256,9 @@ async fn report_share_mounts(
 ) {
     let deadline = tokio::time::Instant::now() + hold;
     for mut m in mounts {
+        if !m.report.take_report() {
+            continue;
+        }
         let finished = tokio::time::timeout_at(deadline, &mut m.task).await.is_ok();
         for line in m.report.lines(&m.machine, finished) {
             output(line);
@@ -1724,24 +1728,35 @@ impl LabRuntime {
                     } else {
                         me.start_with_deferred_refresh(&m).await?;
                     }
-                    // Detached, so provisions can rely on the shares (§7.5)
-                    // without the wave blocking on the mount retry window;
-                    // `up` reports what it did before it returns. A machine
-                    // whose guest mounts for itself does nothing here.
-                    let report = Arc::new(MountReport::default());
-                    let task = tokio::spawn(
-                        Arc::clone(&m).mount_shares(me.services(), Arc::clone(&report)),
-                    );
-                    mounts.lock_recover().push(ShareMounts {
-                        machine: n.clone(),
-                        report,
-                        task,
-                    });
                     // Before this machine can be considered ready (§6.1). A
                     // no-op for machines carrying no first-boot script, so
                     // leaf timing is unchanged. It refreshes the agent itself,
                     // between the script and readiness.
                     me.run_first_boot(&m, &out).await?;
+                    // Detached, so the wave does not block on the mount
+                    // retry window; this machine's provisions and playbooks
+                    // wait for it instead, and `up` reports what it did before
+                    // it returns (§7.5). Only now: a first-boot script may run
+                    // for as long as half an hour, past the mount task's own
+                    // wait for readiness, and may reboot the guest under a
+                    // mount made before it. A machine whose guest mounts for
+                    // itself does nothing here.
+                    let report = Arc::new(MountReport::default());
+                    let task = tokio::spawn({
+                        let m = Arc::clone(&m);
+                        let services = me.services();
+                        let guard = SettleOnDrop(Arc::clone(&report));
+                        let report = Arc::clone(&report);
+                        async move {
+                            let _settle = guard;
+                            m.mount_shares(services, report).await;
+                        }
+                    });
+                    mounts.lock_recover().push(ShareMounts {
+                        machine: n.clone(),
+                        report,
+                        task,
+                    });
                     // After first-boot, before any provision (§19.4): the
                     // first-boot script is the template's and runs under the
                     // agent the template sealed; every provision after it
@@ -1782,12 +1797,12 @@ impl LabRuntime {
             // provision/playbook whose machine has already started, so a VM
             // depending on "dc01" starts only after dc01's configuration
             // steps completed (§7.2).
-            self.run_up_steps(&steps, &mut next_step, &done, &output)
+            self.run_up_steps(&steps, &mut next_step, &done, &mounts, &output)
                 .await?;
         }
 
         // Final pass: the last wave's steps.
-        self.run_up_steps(&steps, &mut next_step, &done, &output)
+        self.run_up_steps(&steps, &mut next_step, &done, &mounts, &output)
             .await?;
 
         self.install_forwards(&targets).await;
@@ -1895,6 +1910,7 @@ impl LabRuntime {
         steps: &[plan::Step],
         next: &mut usize,
         started: &HashSet<String>,
+        mounts: &std::sync::Mutex<Vec<ShareMounts>>,
         output: &crate::scripting::OutputSink,
     ) -> Result<()> {
         while *next < steps.len() {
@@ -1902,6 +1918,27 @@ impl LabRuntime {
             let m = &step.machine;
             if !started.contains(m) {
                 return Ok(());
+            }
+            // A step may read the machine's shares, so it starts once they
+            // have mounted or given up, and says which (§7.5).
+            let report = mounts
+                .lock_recover()
+                .iter()
+                .find(|s| s.machine == *m)
+                .map(|s| Arc::clone(&s.report));
+            if let Some(report) = report {
+                if !report.is_settled() {
+                    output(format!(
+                        "\"{m}\": waiting for its shares to mount before its provisions and \
+                         playbooks\n"
+                    ));
+                }
+                report.settled().await;
+                if report.take_report() {
+                    for line in report.lines(m, true) {
+                        output(line);
+                    }
+                }
             }
             let machine = self.machine(m)?;
             // The machine's own budget, never a literal: a VM may still be
@@ -2879,6 +2916,12 @@ mod tests {
         /// questions that are about what the agent said (§19.4). `None` — the
         /// usual case for a double — is a machine with no agent at all.
         agent: Option<super::super::vm_agent::AgentHandle>,
+        /// A first-boot script still to run; until it has, the machine is
+        /// not ready, as a real one is not (§6.1).
+        first_boot: std::sync::Mutex<Option<String>>,
+        /// A share "data" that takes this long to mount once the machine is
+        /// ready, under the same wait for readiness a VM's mount task makes.
+        mount: Option<Duration>,
     }
 
     impl FakeMachine {
@@ -2898,7 +2941,26 @@ mod tests {
                 seq: shared.seq.clone(),
                 dir: shared.dir.join(name),
                 agent: None,
+                first_boot: std::sync::Mutex::new(None),
+                mount: None,
             })
+        }
+
+        /// A double with a share that takes `mount` to mount, a readiness
+        /// budget of `ready_timeout`, and optionally a first-boot script.
+        fn sharing(
+            name: &str,
+            shared: &Shared,
+            mount: Duration,
+            ready_timeout: Duration,
+            first_boot: Option<&str>,
+        ) -> Arc<Self> {
+            let mut m =
+                Arc::into_inner(Self::new(name, MachineKind::Vm, shared)).expect("sole owner");
+            m.mount = Some(mount);
+            m.ready_timeout = ready_timeout;
+            m.first_boot = std::sync::Mutex::new(first_boot.map(str::to_string));
+            Arc::new(m)
         }
 
         /// A double that starts but never reports ready — the guest of an
@@ -2992,7 +3054,37 @@ mod tests {
             *self.state.read().await
         }
         async fn is_ready(&self) -> bool {
-            *self.ready.read().await
+            *self.ready.read().await && self.first_boot.lock().unwrap().is_none()
+        }
+        fn pending_first_boot(&self) -> Option<super::super::machine::FirstBootProvision> {
+            let source = self.first_boot.lock().unwrap().clone()?;
+            Some(super::super::machine::FirstBootProvision {
+                template: "t".into(),
+                script: crate::scripting::EmbeddedWscript {
+                    source,
+                    surface_version: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+                },
+            })
+        }
+        async fn first_boot_done(&self) -> Result<()> {
+            *self.first_boot.lock().unwrap() = None;
+            Ok(())
+        }
+        async fn mount_shares(
+            self: Arc<Self>,
+            _lab: Arc<dyn LabServices>,
+            report: Arc<MountReport>,
+        ) {
+            let Some(mount) = self.mount else { return };
+            report.planned(["data"], &[], 30);
+            if self.wait_ready(self.ready_timeout).await.is_err() {
+                report.abandoned("the guest never became ready");
+                return;
+            }
+            report.ready();
+            tokio::time::sleep(mount).await;
+            self.note("mounted").await;
+            report.mounted("data");
         }
         async fn stop(&self, _force: bool) -> Result<()> {
             self.stops.fetch_add(1, Ordering::SeqCst);
@@ -3687,6 +3779,122 @@ lab "t" {
         assert!(caps.agent.is_empty());
         let status: MachineStatus = m.status().await;
         assert_eq!(status.name, "plain");
+    }
+
+    /// Every line `up` said, with its place on the machines' clock.
+    type Said = Arc<std::sync::Mutex<Vec<(usize, String)>>>;
+
+    /// What `up` says, numbered on the same clock as the machines' log.
+    fn numbered(sh: &Shared) -> (crate::scripting::OutputSink, Said) {
+        let said = Arc::new(std::sync::Mutex::new(Vec::<(usize, String)>::new()));
+        let sink: crate::scripting::OutputSink = {
+            let said = said.clone();
+            let seq = sh.seq.clone();
+            Arc::new(move |s: String| {
+                let n = seq.fetch_add(1, Ordering::SeqCst);
+                said.lock().unwrap().push((n, s));
+            })
+        };
+        (sink, said)
+    }
+
+    /// A first-boot script outlasting the mount task's wait for readiness no
+    /// longer costs the machine its shares (#153): the mounts start once the
+    /// script is done, so a slow first boot mounts them like any other.
+    #[tokio::test]
+    async fn a_first_boot_longer_than_the_ready_wait_still_mounts_its_shares() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "win" { template = "x86_64/t" }
+}"#,
+            vec![FakeMachine::sharing(
+                "win",
+                &sh,
+                Duration::from_millis(100),
+                Duration::from_millis(500),
+                Some("use vmlab\n\nfn main(lab: Lab) {\n    vmlab::sleep_ms(1500)\n}\n"),
+            )],
+        );
+        let (sink, said) = numbered(&sh);
+        tokio::time::timeout(Duration::from_secs(30), lab.up(&[], sink))
+            .await
+            .expect("up finishes")
+            .expect("up");
+        assert!(
+            sh.log
+                .lock()
+                .await
+                .iter()
+                .any(|l| l.ends_with(":win:mounted")),
+            "the share never mounted"
+        );
+        let said = said.lock().unwrap();
+        assert!(
+            !said.iter().any(|(_, s)| s.contains("will not mount")),
+            "{said:?}"
+        );
+    }
+
+    /// A machine's provisions start once its shares have mounted, not while
+    /// the mount is still running (#153): a step may read the share.
+    #[tokio::test]
+    async fn a_machines_provisions_wait_for_its_shares_to_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        std::fs::write(
+            dir.path().join("p.ws"),
+            "use vmlab\n\nfn main(lab: Lab) {\n}\n",
+        )
+        .unwrap();
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "win" {
+    template = "x86_64/t"
+    provision "p.ws" { }
+  }
+}"#,
+            vec![FakeMachine::sharing(
+                "win",
+                &sh,
+                Duration::from_millis(1500),
+                Duration::from_secs(10),
+                None,
+            )],
+        );
+        let (sink, said) = numbered(&sh);
+        tokio::time::timeout(Duration::from_secs(30), lab.up(&[], sink))
+            .await
+            .expect("up finishes")
+            .expect("up");
+        let mounted = sh
+            .log
+            .lock()
+            .await
+            .iter()
+            .find(|l| l.ends_with(":win:mounted"))
+            .and_then(|l| l.split(':').next()?.parse::<usize>().ok())
+            .expect("the share never mounted");
+        let said = said.lock().unwrap();
+        let provision = said
+            .iter()
+            .find(|(_, s)| s.starts_with("provision: p.ws"))
+            .map(|(n, _)| *n)
+            .expect("the provision never ran");
+        assert!(
+            mounted < provision,
+            "the provision started before the share mounted: {said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|(_, s)| s.contains("waiting for its shares to mount")),
+            "{said:?}"
+        );
     }
 
     /// `up` reports a share that gave up, and one still retrying when its

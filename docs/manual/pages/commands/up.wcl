@@ -51,9 +51,9 @@ page cmd_up {
     li "The bundled SMB server starts when the lab declares [shared folders](guide_shares), so shares are reachable during provisioning."
     li "Each wave boots in parallel. A machine carrying a first-boot script runs it before it counts as ready. If one machine in a wave fails, the rest of the wave is aborted and the verb fails; the machine that failed is left running for inspection."
     li "For a VM that `up` waits on anyway, because it has a first-boot script, a provision or playbook, or a dependent, `up` refreshes the agent if it is out of date once it answers: after the first-boot script and before any provision (see below)."
-    li "Between waves the daemon runs every provision script and playbook whose machine has started, in declaration order, waiting for each machine's readiness first."
+    li "Between waves the daemon runs every provision script and playbook whose machine has started, in declaration order, waiting for each machine's readiness and for its [share mounts](guide_shares) to finish first."
     li "Port forwards are installed, and the workspace syncer starts for every dev machine that declares a workspace (see [Dev machines and the workspace syncer](guide_dev))."
-    li "The verb waits, for at most 30 seconds, for every VM's [share mounts](guide_shares) to finish, and prints a `WARNING:` line for each share that will not mount or is still failing when the wait runs out."
+    li "The verb waits, for at most 30 seconds, for the [share mounts](guide_shares) of every VM no provision or playbook waited on to finish, and prints a `WARNING:` line for each share that will not mount or is still failing when the wait runs out."
   }
 
   p <<DOC
@@ -65,10 +65,12 @@ page cmd_up {
   DOC
 
   p <<DOC
-    Shared folders are mounted once each VM is ready, alongside its
-    provisions, and a mount step may retry for five minutes. So that a share
-    that cannot mount is not left for you to find by using it, `up` waits for
-    the mounts before its last line. The wait ends as soon as every mount
+    Shared folders are mounted once each VM is ready, after its first-boot
+    script, and a mount step may retry for five minutes. A VM's provisions
+    and playbooks wait for its mounts to finish, and `up` prints its mount
+    report before the first of them runs. So that a share that cannot mount
+    is not left for you to find by using it, `up` also waits for the mounts
+    of every other VM before its last line. The wait ends as soon as every mount
     task has finished, and at most 30 seconds after the rest of `up` is done.
     A VM with shares that nothing else waits on therefore holds `up` until
     its guest answers and its shares are mounted, or for those 30 seconds.

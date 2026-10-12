@@ -155,8 +155,8 @@ SRC
   h2 "Mounting in the guest"
 
   p <<DOC
-    Once a VM is ready, the lab daemon runs the share plan's **mount steps**
-    through the agent. The steps are a value computed per guest OS before
+    Once a VM is ready, after its first-boot script if it carries one, the
+    lab daemon runs the share plan's **mount steps** through the agent. The steps are a value computed per guest OS before
     anything runs, so what a Windows guest will be told to do can be read
     without booting one. Each step is retried for five minutes, because a
     freshly booted Windows guest cannot run `net use` for its first few. A
@@ -165,8 +165,17 @@ SRC
   DOC
 
   p <<DOC
-    [vmlab up](cmd_up) waits for the mount steps before it says the lab is
-    up, for at most 30 seconds once everything else is done. A share that
+    A machine's provisions and playbooks start only once its mount steps
+    have finished, every share mounted or given up, so a step can read a
+    share. `up` prints `"<vm>": waiting for its shares to mount before its
+    provisions and playbooks` while it holds them, and prints that machine's
+    mount report before the first step runs.
+  DOC
+
+  p <<DOC
+    For a machine no step waited on, [vmlab up](cmd_up) waits for the mount
+    steps before it says the lab is up, for at most 30 seconds once
+    everything else is done. A share that
     will not mount is printed as a `WARNING:` line naming the machine, the
     share and the reason. A share whose step is still failing when the wait
     runs out is printed the same way with its attempt count and last error,
