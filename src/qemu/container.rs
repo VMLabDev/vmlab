@@ -119,6 +119,9 @@ pub(crate) fn build_container_args_with_accel(
     }
     arg(&mut a, "smp", container.cpus.to_string());
     arg(&mut a, "m", format!("{}M", container.memory >> 20));
+    if let Some(base) = &container.rtc_base {
+        arg(&mut a, "rtc", format!("base={base}"));
+    }
 
     // Fully headless: no display, and no default VGA either (a micro-VM has
     // no console to look at — the serial log is the console). No USB, no
@@ -382,6 +385,18 @@ mod tests {
     /// The kernel-cmdline device names are positional: `vmlab.root=/dev/vda`
     /// must be the *first* virtio-blk device (rootfs), `vmlab.scratch=/dev/vdb`
     /// the second (scratch).
+    /// A container's fixed clock starts its RTC there too (§7.3).
+    #[test]
+    fn a_fixed_clock_sets_the_rtc_base() {
+        let c = resolved(
+            "container \"c\" { image = \"alpine\" profile = \"container\" clock = \"1999-12-31T23:59:00Z\" }",
+            "x86_64",
+        );
+        let args = build_container_args_with_accel("l", &c, &paths(), Accel::Kvm).unwrap();
+        let rtc = args.iter().position(|a| a == "-rtc").expect("-rtc");
+        assert_eq!(args[rtc + 1], "base=1999-12-31T23:59:00");
+    }
+
     #[test]
     fn blockdev_order_matches_cmdline_device_names() {
         let c = resolved(

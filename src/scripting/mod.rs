@@ -762,6 +762,7 @@ pub fn lab_module() -> Module {
                 let machine = h.name().to_string();
                 let snap = name.to_string();
                 h.block(async move { runtime.restore(&machine, &snap, false).await })
+                    .map(|_warnings| ())
                     .map_err(estr)
             },
         )
@@ -778,6 +779,7 @@ pub fn lab_module() -> Module {
                 let machine = h.name().to_string();
                 let snap = name.to_string();
                 h.block(async move { runtime.restore(&machine, &snap, true).await })
+                    .map(|_warnings| ())
                     .map_err(estr)
             },
         )

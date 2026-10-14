@@ -238,6 +238,38 @@ fn daemon_log(machine: &str) -> crate::scripting::OutputSink {
     })
 }
 
+/// How long a restore waits for the restored guest's agent before giving up
+/// on setting its clock (§7.3). The guest was running when it was captured,
+/// so its agent answers within seconds of the load.
+const CLOCK_AGENT_WAIT: Duration = Duration::from_secs(60);
+/// How long the agent has to answer `set_time`.
+const CLOCK_SET_WAIT: Duration = Duration::from_secs(10);
+
+/// What an online restore did with the guest clock (§7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClockAfterRestore {
+    /// Set to the host's time.
+    Set,
+    /// Left at capture time: the machine declares `clock = "snapshot"`.
+    Kept,
+    /// Left alone: the machine declares a fixed clock.
+    Fixed,
+    /// Should have been set and was not, for this reason.
+    NotSet(String),
+}
+
+impl ClockAfterRestore {
+    /// The `clock` field of the `snapshot.restored` event.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Kept => "kept",
+            Self::Fixed => "fixed",
+            Self::NotSet(_) => "not_set",
+        }
+    }
+}
+
 /// One machine's share-mount task as `up` started it.
 struct ShareMounts {
     machine: String,
@@ -2524,7 +2556,14 @@ impl LabRuntime {
     /// outright would be obstruction — wanting to throw the guest copy away is
     /// frequently *why* someone restores — but a restore destroys the guest
     /// copy of every conflicting path, so it is asked for by name.
-    pub async fn restore(self: &Arc<Self>, name: &str, snap: &str, discard: bool) -> Result<()> {
+    /// Restore `snap` on machine `name` (§7.3). Answers with what the
+    /// restore could not do but did not fail over: the warnings to show.
+    pub async fn restore(
+        self: &Arc<Self>,
+        name: &str,
+        snap: &str,
+        discard: bool,
+    ) -> Result<Vec<String>> {
         let record = {
             let mut state = self.state.lock().await;
             state.machine_mut(name).snapshots.get(snap).cloned()
@@ -2583,7 +2622,11 @@ impl LabRuntime {
         // a syncer coming back to a rolled-back tree it was never told about
         // is exactly the propagation this bracket exists to prevent.
         let restored = match noted {
-            Ok(()) => m.restore(self.services(), snap, record.online).await,
+            Ok(()) => {
+                Arc::clone(&m)
+                    .restore(self.services(), snap, record.online)
+                    .await
+            }
             Err(e) => Err(e),
         };
         // Put back on **both** paths. A workspace whose syncer quietly never
@@ -2612,11 +2655,63 @@ impl LabRuntime {
             );
         }
         restored?;
-        self.events.emit(
-            "snapshot.restored",
-            json!({"vm": name, "name": snap, "online": record.online}),
-        );
-        Ok(())
+        let mut warnings = Vec::new();
+        let mut event = json!({"vm": name, "name": snap, "online": record.online});
+        if record.online {
+            let clock = self.set_clock_after_restore(&m).await;
+            event["clock"] = json!(clock.as_str());
+            if let ClockAfterRestore::NotSet(why) = &clock {
+                tracing::warn!("{name}: guest clock not set after restore: {why}");
+                warnings.push(format!(
+                    "\"{name}\": the guest clock was not set to the host's time, so it \
+                     resumes at the time the snapshot was taken: {why}"
+                ));
+            }
+        }
+        self.events.emit("snapshot.restored", event);
+        Ok(warnings)
+    }
+
+    /// A machine's declared clock (§7.3).
+    fn clock_of(&self, name: &str) -> crate::config::model::Clock {
+        let lab = &self.config.lab;
+        lab.vms
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| v.clock)
+            .or_else(|| {
+                lab.containers
+                    .iter()
+                    .find(|c| c.name == name)
+                    .map(|c| c.clock)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Bring a guest restored from an online snapshot back to the host's
+    /// time (§7.3): it resumes with the clock it was captured with. Never
+    /// fails the restore, which has already happened; a clock that could not
+    /// be set is said instead.
+    async fn set_clock_after_restore(&self, m: &Arc<dyn Machine>) -> ClockAfterRestore {
+        use crate::config::model::Clock;
+        match self.clock_of(m.name()) {
+            Clock::Snapshot => return ClockAfterRestore::Kept,
+            Clock::Fixed(_) => return ClockAfterRestore::Fixed,
+            Clock::Host => {}
+        }
+        let agent = match m.wait_agent(CLOCK_AGENT_WAIT).await {
+            Ok(agent) => agent,
+            Err(e) => {
+                return ClockAfterRestore::NotSet(format!("its agent did not answer: {e:#}"));
+            }
+        };
+        match agent
+            .set_time(std::time::SystemTime::now(), CLOCK_SET_WAIT)
+            .await
+        {
+            Ok(()) => ClockAfterRestore::Set,
+            Err(e) => ClockAfterRestore::NotSet(format!("{e:#}")),
+        }
     }
 
     pub async fn delete_snapshot(&self, vm_name: &str, snap: &str) -> Result<()> {

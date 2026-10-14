@@ -526,6 +526,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let gui = r.bool("gui").unspan();
     let agent_update = r.bool("agent_update").unspan();
     let prevent_sleep = r.bool("prevent_sleep").unspan().unwrap_or(false);
+    let clock = r.parsed("clock", parse_clock).unspan().unwrap_or_default();
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
@@ -597,6 +598,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         gui,
         agent_update,
         prevent_sleep,
+        clock,
         display,
         cpu_model,
         accel,
@@ -645,6 +647,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         )
         .unspan()
         .unwrap_or_default();
+    let clock = r.parsed("clock", parse_clock).unspan().unwrap_or_default();
     let entrypoint = r.opt_string_list("entrypoint");
     let command = r.opt_string_list("command");
     let workdir = r.string("workdir").unspan();
@@ -706,6 +709,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         image: image.value,
         image_span: image.span,
         mode,
+        clock,
         entrypoint,
         command,
         workdir,

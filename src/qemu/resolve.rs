@@ -48,6 +48,9 @@ pub struct ResolvedVm {
     /// template's `nested` reaches its build VM, never the VMs made from it
     /// (ADR-0009), and profiles do not carry it.
     pub nested: bool,
+    /// QEMU `-rtc base=` for a machine declaring a fixed clock (§7.3);
+    /// declared on the VM alone, never inherited.
+    pub rtc_base: Option<String>,
     /// The QEMU `-cpu` model (§5.2), VM > template > profile. `None` keeps
     /// the accelerator default — the host CPU under KVM, `max` under TCG.
     /// Named for guests the host CPU's CPUID breaks (Windows 9x Setup on a
@@ -78,6 +81,8 @@ pub struct ResolvedContainer {
     /// Bytes.
     pub memory: u64,
     pub machine: String,
+    /// QEMU `-rtc base=` for a fixed clock (§7.3).
+    pub rtc_base: Option<String>,
 }
 
 /// A declared `accel`, and where it was declared — rendered for messages,
@@ -435,6 +440,7 @@ pub fn resolve_vm(
         input_transport: profile.input_transport,
         virtiofs: profile.virtiofs,
         nested: lab_vm.nested,
+        rtc_base: lab_vm.clock.rtc_base(),
         cpu_model: cpu_model.map(|(model, _)| model),
         accel,
         gpu: lab_vm.gpu.clone(),
@@ -496,6 +502,7 @@ pub fn resolve_container(
         memory: layered(container.memory, profile.and_then(|p| p.memory))
             .ok_or_else(|| required("memory"))?,
         machine: machine.to_string(),
+        rtc_base: container.clock.rtc_base(),
     })
 }
 

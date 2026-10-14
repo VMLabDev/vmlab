@@ -291,6 +291,11 @@ pub fn build_args(
     arg(&mut a, "cpu", vm.cpu_model.clone().unwrap_or(default_cpu));
     arg(&mut a, "smp", vm.cpus.to_string());
     arg(&mut a, "m", format!("{}M", vm.memory >> 20));
+    // A fixed clock starts the RTC at the declared instant (§7.3); without
+    // one QEMU's default, the host's UTC time, applies.
+    if let Some(base) = &vm.rtc_base {
+        arg(&mut a, "rtc", format!("base={base}"));
+    }
 
     // Always headless, with a VNC display on a unix socket (§11). A
     // `gui = true` window is a *separate* VNC viewer the CLI launches on
@@ -840,6 +845,24 @@ mod tests {
         let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
         let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
         assert!(s.contains("-cpu host "), "{s}");
+    }
+
+    /// A fixed clock starts the RTC at the declared instant; any other clock
+    /// leaves QEMU's default, the host's UTC time (§7.3).
+    #[test]
+    fn a_fixed_clock_sets_the_rtc_base() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let v = super::super::resolve::testing::vm(
+            "vm \"t\" { template = \"scratch\" arch = \"x86_64\" profile = \"linux-generic\" disk = 1GiB clock = \"2020-01-01T00:00:00Z\" }",
+        );
+        let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
+        let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
+        let rtc = args.iter().position(|a| a == "-rtc").expect("-rtc");
+        assert_eq!(args[rtc + 1], "base=2020-01-01T00:00:00");
+
+        let host = resolved("linux-generic", "x86_64");
+        let args = build_args("l", &host, &paths(), Accel::Kvm).unwrap();
+        assert!(!args.iter().any(|a| a == "-rtc"), "{args:?}");
     }
 
     /// A resolved `cpu_model` replaces the accelerator default under both

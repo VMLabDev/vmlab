@@ -260,6 +260,8 @@ type Vm {
   agent_update: bool?
   @doc("Keep the guest awake: wake it with `system_wakeup` the moment it suspends to RAM (ACPI S3) (default false)")
   prevent_sleep: bool?
+  @doc("Guest clock: `host` (default) sets it to the host's time after an online snapshot restore; `snapshot` leaves a restored guest at the time it was captured; an RFC 3339 date-time, e.g. `2020-01-01T00:00:00Z`, starts the machine at that time and never moves it")
+  clock: utf8?
   @doc("QEMU display string; inherited from template→profile if omitted")
   display: utf8?
   @doc("QEMU `-cpu` model, e.g. `pentium3`, replacing the accelerator default; inherited from template→profile; conflicts with `nested`")
@@ -344,6 +346,8 @@ type Container {
   image: utf8
   @doc("Runtime mode: `:workload` (default) starts the OCI process; `:idle` keeps the micro-VM available for exec without running it")
   @default(:workload) mode: ContainerMode?
+  @doc("Guest clock: `host` (default) sets it to the host's time after an online snapshot restore; `snapshot` leaves a restored guest at the time it was captured; an RFC 3339 date-time, e.g. `2020-01-01T00:00:00Z`, starts the machine at that time and never moves it")
+  clock: utf8?
   @doc("Override the image entrypoint (exec form, e.g. [\"/bin/sh\", \"-c\"])")
   entrypoint: list<utf8>?
   @doc("Override the image cmd (exec form)")

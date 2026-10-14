@@ -1001,8 +1001,9 @@ impl Handler<LabRequest> for LabdHandler {
                 machine,
                 discard,
             } => {
+                let mut warnings = Vec::new();
                 match machine {
-                    Some(machine) => lab.restore(&machine, &name, discard).await?,
+                    Some(machine) => warnings = lab.restore(&machine, &name, discard).await?,
                     None => {
                         let names: Vec<String> = lab
                             .vms
@@ -1011,11 +1012,11 @@ impl Handler<LabRequest> for LabdHandler {
                             .cloned()
                             .collect();
                         for vm in names {
-                            lab.restore(&vm, &name, discard).await?;
+                            warnings.extend(lab.restore(&vm, &name, discard).await?);
                         }
                     }
                 }
-                Ok(json!(true))
+                Ok(json!({"warnings": warnings}))
             }
             LabRequest::SnapshotDelete { machine, name } => {
                 lab.delete_snapshot(&machine, &name).await?;

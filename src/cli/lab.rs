@@ -1802,7 +1802,7 @@ pub fn cmd_restore(vm_ref: Option<String>, name: String, discard: bool) -> Resul
             None => (None, None),
         };
         let (_lab_name, client) = lab_client_for(lab).await?;
-        client
+        let reply = client
             .send(LabRequest::SnapshotRestore {
                 name: name.clone(),
                 machine: vm.clone(),
@@ -1811,6 +1811,13 @@ pub fn cmd_restore(vm_ref: Option<String>, name: String, discard: bool) -> Resul
             .await
             .map_err(remote)?;
         println!("snapshot \"{name}\" restored");
+        // What the restore did not do but did not fail over, such as a guest
+        // clock it could not set (§7.3). An older daemon answers `true`.
+        for warning in reply["warnings"].as_array().into_iter().flatten() {
+            if let Some(warning) = warning.as_str() {
+                eprintln!("WARNING: {warning}");
+            }
+        }
         say_backup_notice(&client, vm.as_deref()).await;
         Ok(())
     })

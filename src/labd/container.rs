@@ -1497,6 +1497,7 @@ mod tests {
             },
             image_span: (0, 0),
             mode: model::ContainerMode::Workload,
+            clock: Default::default(),
             entrypoint: None,
             command: None,
             workdir: None,

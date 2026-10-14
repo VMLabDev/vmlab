@@ -343,6 +343,9 @@ pub struct Vm {
     /// advertised, so it is declared on the VM alone and never resolved
     /// through template or profile (ADR-0008 resolves hardware).
     pub prevent_sleep: bool,
+    /// The guest clock (§7.3): runtime policy plus the RTC's start time, so
+    /// declared on the machine alone like `prevent_sleep`.
+    pub clock: Clock,
     pub display: Option<String>,
     /// QEMU `-cpu` model (§5.2); None = inherit template→profile, and with
     /// no layer naming one the builder's accelerator default applies.
@@ -544,6 +547,8 @@ pub struct Container {
     /// Workload mode runs the OCI process; idle mode keeps only the
     /// micro-VM and guest agent running for exec-driven use.
     pub mode: ContainerMode,
+    /// The guest clock (§7.3), as for a VM.
+    pub clock: Clock,
     /// Entrypoint override (exec form); `None` = image default.
     pub entrypoint: Option<Vec<String>>,
     /// Cmd override (exec form); `None` = image default.
@@ -845,6 +850,51 @@ pub const KNOWN_ARCHES: &[&str] = &[
 /// as, e.g. `pentium3`. Any name is accepted — QEMU owns the catalogue and
 /// refuses one it does not know at start — but a blank one would hand QEMU
 /// an empty `-cpu`, so it is refused here, wherever the field is declared.
+/// What a machine's guest clock does (§7.3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Clock {
+    /// Runs from the host's time, and is set to it again after an online
+    /// snapshot restore, which would otherwise resume it at capture time.
+    #[default]
+    Host,
+    /// Runs from the host's time, but a restored guest keeps the time it was
+    /// captured at.
+    Snapshot,
+    /// Starts at this instant on every boot and is never set by vmlab.
+    Fixed(chrono::DateTime<chrono::Utc>),
+}
+
+impl Clock {
+    /// Whether an online restore sets the guest clock to the host's time.
+    pub fn syncs_on_restore(self) -> bool {
+        self == Clock::Host
+    }
+
+    /// QEMU `-rtc base=` for a fixed clock: UTC, without a zone suffix.
+    pub fn rtc_base(self) -> Option<String> {
+        match self {
+            Clock::Fixed(at) => Some(at.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            Clock::Host | Clock::Snapshot => None,
+        }
+    }
+}
+
+/// Parse a `clock =` value: `host`, `snapshot`, or an RFC 3339 date-time.
+pub fn parse_clock(s: &str) -> Result<Clock, String> {
+    match s {
+        "host" => Ok(Clock::Host),
+        "snapshot" => Ok(Clock::Snapshot),
+        _ => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|at| Clock::Fixed(at.with_timezone(&chrono::Utc)))
+            .map_err(|_| {
+                format!(
+                    "`clock` must be `host`, `snapshot`, or an RFC 3339 date-time such as \
+                     `2020-01-01T00:00:00Z`, not `{s}`"
+                )
+            }),
+    }
+}
+
 pub fn parse_cpu_model(s: &str) -> Result<String, String> {
     if s.trim().is_empty() {
         return Err(
@@ -1074,5 +1124,23 @@ mod tests {
         assert_eq!(hp.port, Some(80));
         assert_eq!(parse_host_port("10.0.0.1").unwrap().port, None);
         assert!(parse_host_port("nope:80").is_err());
+    }
+
+    /// `clock` is `host`, `snapshot`, or an RFC 3339 instant, which is kept
+    /// in UTC and given to QEMU without a zone (§7.3).
+    #[test]
+    fn clocks() {
+        assert_eq!(parse_clock("host").unwrap(), Clock::Host);
+        assert_eq!(parse_clock("snapshot").unwrap(), Clock::Snapshot);
+        let fixed = parse_clock("2020-01-01T10:00:00+10:00").unwrap();
+        assert_eq!(fixed.rtc_base().as_deref(), Some("2020-01-01T00:00:00"));
+        assert!(!fixed.syncs_on_restore());
+        assert!(Clock::Host.syncs_on_restore());
+        assert!(!Clock::Snapshot.syncs_on_restore());
+        assert_eq!(Clock::Host.rtc_base(), None);
+        assert_eq!(Clock::default(), Clock::Host);
+        let err = parse_clock("2020-01-01").unwrap_err();
+        assert!(err.contains("RFC 3339"), "{err}");
+        assert!(parse_clock("Host").is_err());
     }
 }
