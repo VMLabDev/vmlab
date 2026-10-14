@@ -372,6 +372,38 @@ int plat_shutdown(const char *mode)
     return apm_power_off();
 }
 
+/* INT 21h AH=2Bh sets the date, AH=2Dh the time; both answer AL=0 on
+ * success and FFh for a value DOS rejects. DOS keeps local time and has no
+ * zone to convert with, so the clock is set to UTC as given. */
+int plat_set_time(const struct plat_time *t, char *err, int errcap)
+{
+    union REGS r;
+    memset(&r, 0, sizeof r);
+    r.h.ah = 0x2B;
+    r.w.cx = (unsigned short)t->year;
+    r.h.dh = (unsigned char)t->month;
+    r.h.dl = (unsigned char)t->day;
+    int386(0x21, &r, &r);
+    if (r.h.al != 0) {
+        _snprintf(err, (size_t)errcap, "set_time: DOS refused the date %04d-%02d-%02d",
+                  t->year, t->month, t->day);
+        return -1;
+    }
+    memset(&r, 0, sizeof r);
+    r.h.ah = 0x2D;
+    r.h.ch = (unsigned char)t->hour;
+    r.h.cl = (unsigned char)t->minute;
+    r.h.dh = (unsigned char)t->second;
+    r.h.dl = 0; /* hundredths */
+    int386(0x21, &r, &r);
+    if (r.h.al != 0) {
+        _snprintf(err, (size_t)errcap, "set_time: DOS refused the time %02d:%02d:%02d",
+                  t->hour, t->minute, t->second);
+        return -1;
+    }
+    return 0;
+}
+
 void plat_log(const char *msg)
 {
     printf("vmlab-agent-legacy: %s\n", msg);

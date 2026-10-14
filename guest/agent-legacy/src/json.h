@@ -47,6 +47,13 @@ int json_str(const char *js, const struct json_tok *toks, int i, char *out, int 
 /* Unsigned integer value of primitive token `i`. Returns 0 on success. */
 int json_ulong(const char *js, const struct json_tok *toks, int i, unsigned long *out);
 
+/* Primitive token `i`, a non-negative count of milliseconds, as whole
+ * seconds (truncated). The wire's `unix_ms` outgrows 32 bits, so the
+ * milliseconds are never held: the last three digits are dropped as the
+ * number is read. Returns -1 when it is negative, not a number, or past
+ * what 32 bits of seconds hold (the year 2106). */
+int json_ms_to_secs(const char *js, const struct json_tok *toks, int i, unsigned long *out);
+
 /* Append JSON text to a buffer. `json_out` tracks overflow so callers check
  * once, at the end. */
 struct json_out {

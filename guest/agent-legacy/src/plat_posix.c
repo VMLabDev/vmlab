@@ -402,6 +402,18 @@ int plat_shutdown(const char *mode)
     return 0;
 }
 
+int plat_set_time(const struct plat_time *t, char *err, int errcap)
+{
+    struct timespec ts;
+    ts.tv_sec = (time_t)t->unix_seconds;
+    ts.tv_nsec = 0;
+    if (clock_settime(CLOCK_REALTIME, &ts) < 0) {
+        snprintf(err, (size_t)errcap, "set_time: clock_settime: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 void plat_log(const char *msg)
 {
     fprintf(stderr, "%s\n", msg);
