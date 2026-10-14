@@ -184,6 +184,10 @@ struct Inner {
     tree_op: Mutex<()>,
     /// Incremented per shutting_down ack.
     shutting_down: watch::Sender<u64>,
+    /// Incremented per `time_set` / `time_set_failed`, with the failure.
+    time_set: watch::Sender<(u64, Option<String>)>,
+    /// One set_time request in flight at a time: the answers carry no id.
+    time_op: Mutex<()>,
     /// Whether `subscribe_metrics` has been sent on this connection.
     metrics_subscribed: AtomicBool,
     token: String,
@@ -268,6 +272,8 @@ impl AgentHandle {
             tree_status: watch::Sender::new((0, String::new(), 0)),
             tree_op: Mutex::new(()),
             shutting_down: watch::Sender::new(0),
+            time_set: watch::Sender::new((0, None)),
+            time_op: Mutex::new(()),
             metrics_subscribed: AtomicBool::new(false),
             token,
         });
@@ -781,6 +787,32 @@ impl AgentHandle {
             .map_err(|_| anyhow!("agent channel closed"))?;
         let (_, info) = rx.borrow().clone();
         info.ok_or_else(|| anyhow!("agent sent no os_info"))
+    }
+
+    /// Set the guest's system clock to `at` (§7.3). Refused on an agent that
+    /// does not advertise [`features::SET_TIME`], which would drop the
+    /// request unanswered.
+    pub async fn set_time(&self, at: std::time::SystemTime, timeout: Duration) -> Result<()> {
+        if !self.has_feature(features::SET_TIME) {
+            bail!("the guest's agent cannot set the clock (no `set_time` feature)");
+        }
+        let unix_ms = at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| anyhow!("a time before 1970 cannot be sent"))?
+            .as_millis();
+        let unix_ms = i64::try_from(unix_ms).map_err(|_| anyhow!("time out of range"))?;
+        let _op = self.inner.time_op.lock().await;
+        let mut rx = self.inner.time_set.subscribe();
+        rx.mark_unchanged();
+        self.send_msg(&HostMsg::SetTime { unix_ms }).await?;
+        tokio::time::timeout(timeout, rx.changed())
+            .await
+            .map_err(|_| anyhow!("agent did not answer set_time within {timeout:?}"))?
+            .map_err(|_| anyhow!("agent channel closed"))?;
+        match rx.borrow().1.clone() {
+            None => Ok(()),
+            Some(msg) => Err(anyhow!("the guest refused to set its clock: {msg}")),
+        }
     }
 
     /// Ask the guest to shut down. The agent acks and then the whole
@@ -1944,6 +1976,14 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             let seq = *inner.shutting_down.borrow() + 1;
             let _ = inner.shutting_down.send(seq);
         }
+        AgentMsg::TimeSet => {
+            let seq = inner.time_set.borrow().0 + 1;
+            let _ = inner.time_set.send((seq, None));
+        }
+        AgentMsg::TimeSetFailed { msg } => {
+            let seq = inner.time_set.borrow().0 + 1;
+            let _ = inner.time_set.send((seq, Some(msg)));
+        }
         AgentMsg::Pong { instance } => {
             let seq = inner.pong.borrow().0 + 1;
             let _ = inner.pong.send((seq, instance));
@@ -2365,6 +2405,18 @@ mod tests {
                                 }
                                 HostMsg::Shutdown { mode } => {
                                     send(AgentMsg::ShuttingDown { mode }).await;
+                                }
+                                // A clock before 2000 is refused, as a guest
+                                // without the privilege would refuse any.
+                                HostMsg::SetTime { unix_ms } => {
+                                    send(if unix_ms < 946_684_800_000 {
+                                        AgentMsg::TimeSetFailed {
+                                            msg: "privilege not held".into(),
+                                        }
+                                    } else {
+                                        AgentMsg::TimeSet
+                                    })
+                                    .await;
                                 }
                                 // What the agent does: with `clipboard_reply`
                                 // every request is answered; without it a set
@@ -3350,6 +3402,35 @@ mod tests {
         let wait = Duration::from_secs(5);
         assert_eq!(agent.tree_alive("pb-3", wait).await.unwrap(), 3);
         assert_eq!(agent.tree_alive("pb-0", wait).await.unwrap(), 0);
+    }
+
+    /// `set_time` round-trips, carries the guest's refusal back as an error,
+    /// and is refused by name on an agent that cannot set the clock.
+    #[tokio::test]
+    async fn set_time_round_trips_and_is_refused_without_the_feature() {
+        let wait = Duration::from_secs(5);
+        let (_dir, path) = mock_agent_with(true, vec!["exec".into(), "set_time".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        agent
+            .set_time(std::time::SystemTime::now(), wait)
+            .await
+            .expect("set");
+        let refused = agent
+            .set_time(std::time::UNIX_EPOCH + Duration::from_secs(86_400), wait)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("privilege not held"),
+            "{refused}"
+        );
+
+        let (_dir, path) = mock_agent_with(true, vec!["exec".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let err = agent
+            .set_time(std::time::SystemTime::now(), wait)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("set_time"), "{err}");
     }
 
     #[tokio::test]

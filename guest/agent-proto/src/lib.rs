@@ -88,6 +88,11 @@ pub mod features {
     /// (unknown fields are dropped), so a host checks for this before
     /// relying on one.
     pub const TREE: &str = "tree";
+    /// The agent sets the guest's system clock: it answers
+    /// [`HostMsg::SetTime`] with [`AgentMsg::TimeSet`] or
+    /// [`AgentMsg::TimeSetFailed`]. The host uses it to bring a guest
+    /// restored from an online snapshot back to the host's time (§7.3).
+    pub const SET_TIME: &str = "set_time";
 }
 
 /// Whether `name` is usable as a process-tree name: 1 to 64 ASCII letters,
@@ -509,6 +514,13 @@ pub enum HostMsg {
     Shutdown {
         mode: ShutdownMode,
     },
+    /// Set the guest's system clock to `unix_ms`, milliseconds since the Unix
+    /// epoch, UTC. The agent replies [`AgentMsg::TimeSet`] once the clock is
+    /// set, or [`AgentMsg::TimeSetFailed`] naming why it could not be. Only
+    /// sent to an agent advertising [`features::SET_TIME`].
+    SetTime {
+        unix_ms: i64,
+    },
     /// Grant the guest more send credit on a channel.
     WindowAdjust {
         id: u32,
@@ -584,6 +596,10 @@ pub enum AgentMsg {
     TreeStatus { tree: String, alive: u32 },
     /// Ack of [`HostMsg::Shutdown`], sent just before the agent executes it.
     ShuttingDown { mode: ShutdownMode },
+    /// Reply to [`HostMsg::SetTime`]: the guest clock is set.
+    TimeSet,
+    /// Reply to [`HostMsg::SetTime`]: the guest clock could not be set.
+    TimeSetFailed { msg: String },
     /// Grant the host more send credit on a channel.
     WindowAdjust { id: u32, bytes: u64 },
     /// A channel failed (`id` set) or the agent hit a channel-less error.
@@ -924,6 +940,10 @@ mod tests {
             AgentMsg::ShuttingDown {
                 mode: ShutdownMode::Powerdown,
             },
+            AgentMsg::TimeSet,
+            AgentMsg::TimeSetFailed {
+                msg: "privilege not held".into(),
+            },
             AgentMsg::WindowAdjust { id: 2, bytes: 1 },
             AgentMsg::Error {
                 id: Some(9),
@@ -1167,5 +1187,29 @@ mod tests {
         assert_eq!(f.channel, 0);
         let m: HostMsg = serde_json::from_slice(&f.payload).unwrap();
         assert_eq!(m, HostMsg::Ping);
+    }
+
+    /// The legacy C agent parses and writes these by hand, so their JSON shape
+    /// is pinned rather than left to serde's defaults.
+    #[test]
+    fn set_time_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(HostMsg::SetTime {
+                unix_ms: 1_760_000_000_123
+            })
+            .unwrap(),
+            serde_json::json!({"cmd": "set_time", "unix_ms": 1_760_000_000_123_i64})
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentMsg>(serde_json::json!({"event": "time_set"})).unwrap(),
+            AgentMsg::TimeSet
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentMsg>(
+                serde_json::json!({"event": "time_set_failed", "msg": "no"})
+            )
+            .unwrap(),
+            AgentMsg::TimeSetFailed { msg: "no".into() }
+        );
     }
 }
