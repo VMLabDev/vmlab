@@ -219,6 +219,8 @@ NAT, routes, port forwards and L3 filtering — with no taps, bridges, or
 `CAP_NET_ADMIN`. An optional eBPF fast path (`VMLAB_FASTPATH=auto`, AF_XDP
 tier) accelerates it where the host allows; `vmlab fastpath` reports the
 selected tier, and an unavailable fast path silently falls back to userspace.
+The fast path needs `CAP_BPF` and `CAP_NET_ADMIN`, which `install.sh` offers
+to grant the binary with `sudo setcap` (`--fastpath` / `--no-fastpath`).
 
 ## WSL2
 

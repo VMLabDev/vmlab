@@ -53,6 +53,24 @@ page gs_install {
     setting that points vmlab at it.
   DOC
 
+  p <<DOC
+    The network fabric needs no privilege. Its optional eBPF fast path, which
+    [vmlab fastpath](cmd_fastpath) reports on, needs `CAP_BPF` and
+    `CAP_NET_ADMIN`. Installed as an ordinary user from a terminal, the
+    installer asks whether to grant the binary those two capabilities, and on
+    yes runs `sudo setcap cap_bpf,cap_net_admin+ep` on it. Any program running
+    as you can then use them through vmlab. `--fastpath` grants them without
+    asking, `--no-fastpath` never offers, and `VMLAB_FASTPATH_CAPS=yes|no|ask`
+    sets the same choice. With no terminal to ask on, the installer prints the
+    `setcap` command instead. It offers nothing when run as root, whose
+    daemons hold every capability already, or on WSL 2, which cannot run the
+    fast path, and it says so when the binary sits on a `nosuid` mount, where
+    the kernel ignores file capabilities. Replacing the binary drops its
+    capabilities, so every install asks again, defaulting to yes when the
+    binary it replaced had them. Daemons already running keep the privileges
+    they started with: run `vmlab daemon stop` before `vmlab fastpath`.
+  DOC
+
   h3 "Build from source instead"
 
   p <<DOC

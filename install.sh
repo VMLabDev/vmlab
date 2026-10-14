@@ -15,6 +15,9 @@
 #   --guest-dir <dir> install the guest assets into <dir> (default: $VMLAB_GUEST_DIR,
 #                     else ~/.local/share/vmlab/guest — where vmlab looks for them)
 #   --no-guest        install the binary only, not the guest assets
+#   --fastpath        grant the binary the eBPF network fast path's capabilities
+#                     (CAP_BPF, CAP_NET_ADMIN) through sudo, without asking
+#   --no-fastpath     do not offer them; or set VMLAB_FASTPATH_CAPS=yes|no
 #   --skip-checks     do not report missing runtime tools after installing
 #   --help            show this help
 #
@@ -29,6 +32,12 @@
 # (vmlab-guest-<version>.tar.gz, checked against its .sha256) and replace
 # whatever an older install left in the guest directory. A release without
 # them, or a failed download, costs only the guest assets: the binary stays.
+#
+# The network fabric needs no privilege. Its optional eBPF fast path needs
+# CAP_BPF and CAP_NET_ADMIN, which an install as an ordinary user can give the
+# binary as file capabilities (`sudo setcap`). Run from a terminal, the
+# installer asks; otherwise it says how. Replacing the binary drops them, so
+# every install asks again.
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
 # Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
@@ -46,6 +55,7 @@ BASE_URL="${VMLAB_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
 PRE=0
 SKIP_CHECKS=0
 NO_GUEST=0
+FASTPATH="${VMLAB_FASTPATH_CAPS:-ask}"
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 warn() { printf '\nwarning: %s\n' "$1" >&2; }
@@ -67,12 +77,21 @@ while [ $# -gt 0 ]; do
     --guest-dir) [ $# -ge 2 ] || err "--guest-dir needs an argument"; GUEST_DIR="$2"; shift 2 ;;
     --guest-dir=*) GUEST_DIR="${1#--guest-dir=}"; shift ;;
     --no-guest) NO_GUEST=1; shift ;;
+    --fastpath) FASTPATH=yes; shift ;;
+    --no-fastpath) FASTPATH=no; shift ;;
     --skip-checks) SKIP_CHECKS=1; shift ;;
     -h|--help) usage 0 ;;
     -*) err "unknown option: $1 (try --help)" ;;
     *) [ -z "$VERSION" ] || err "unexpected argument: $1"; VERSION="$1"; shift ;;
   esac
 done
+
+case "$FASTPATH" in
+  ask|yes|no) ;;
+  *) err "VMLAB_FASTPATH_CAPS must be yes, no or ask, not '$FASTPATH'" ;;
+esac
+
+have() { command -v "$1" >/dev/null 2>&1; }
 
 # ── HTTP helper (curl or wget) ──────────────────────────────────────────────
 if command -v curl >/dev/null 2>&1; then
@@ -134,6 +153,14 @@ The release may not exist or may lack a $suffix asset. See https://github.com/$R
 
 chmod +x "$tmp"
 mkdir -p "$BIN_DIR"
+# Whether the binary being replaced had the fast path's capabilities: the new
+# file does not inherit them, and the question below defaults to keeping them.
+HAD_CAPS=0
+if have getcap && [ -f "$BIN_DIR/vmlab" ]; then
+  case "$(getcap "$BIN_DIR/vmlab" 2>/dev/null)" in
+    *cap_bpf*) HAD_CAPS=1 ;;
+  esac
+fi
 mv "$tmp" "$BIN_DIR/vmlab"
 trap - EXIT INT TERM
 
@@ -144,6 +171,82 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) printf '\n%s is not on your PATH. Add it, e.g.:\n  export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR" ;;
 esac
+
+# ── eBPF fast path ──────────────────────────────────────────────────────────
+# The kernel fast-path tiers need CAP_BPF and CAP_NET_ADMIN (vmlab fastpath).
+# Every daemon proves a tier works before using it and falls back to the
+# userspace fabric otherwise, so this is an optimisation, never a requirement.
+# Nothing here can fail the install: the binary is already in place.
+CAPS="cap_bpf,cap_net_admin+ep"
+
+fastpath_hint() {
+  printf '\nThe eBPF network fast path needs CAP_BPF and CAP_NET_ADMIN. To grant them:\n'
+  printf '  sudo setcap %s %s\n' "$CAPS" "$BIN_DIR/vmlab"
+  printf 'Without them vmlab uses its userspace network fabric, which needs no privilege.\n'
+}
+
+# Ask on the terminal: under `curl | sh` the script itself is stdin.
+fastpath_ask() {
+  if [ "$HAD_CAPS" -eq 1 ]; then choices="[Y/n]"; else choices="[y/N]"; fi
+  printf '\nGrant vmlab CAP_BPF and CAP_NET_ADMIN for the eBPF network fast path?\n' >/dev/tty
+  printf 'This runs: sudo setcap %s %s\n' "$CAPS" "$BIN_DIR/vmlab" >/dev/tty
+  printf 'Any program running as you can then use those capabilities through vmlab. %s ' "$choices" >/dev/tty
+  read -r answer </dev/tty || answer=""
+  case "$answer" in
+    [Yy]|[Yy][Ee][Ss]) return 0 ;;
+    "") [ "$HAD_CAPS" -eq 1 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+fastpath_caps() {
+  # root's daemons hold every capability already.
+  [ "$(id -u)" -eq 0 ] && return 0
+  [ "$FASTPATH" = no ] && return 0
+  if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+    [ "$FASTPATH" = yes ] && printf '\nWSL 2 cannot run the eBPF fast path, so no capabilities were granted.\n'
+    return 0
+  fi
+  if ! have setcap; then
+    printf '\nsetcap is not installed (libcap2-bin on Debian/Ubuntu, libcap elsewhere).\n'
+    fastpath_hint
+    return 0
+  fi
+  # The kernel ignores file capabilities on a nosuid mount.
+  if have findmnt; then
+    case ",$(findmnt -no OPTIONS -T "$BIN_DIR" 2>/dev/null)," in
+      *,nosuid,*)
+        printf '\n%s is on a nosuid mount, where file capabilities do nothing; the eBPF\n' "$BIN_DIR"
+        printf 'fast path needs vmlab installed elsewhere (--bin-dir).\n'
+        return 0 ;;
+    esac
+  fi
+  if [ "$FASTPATH" = ask ]; then
+    # In a subshell: a failed redirect on `:`, a special builtin, would end
+    # this shell.
+    if ! ( : </dev/tty ) 2>/dev/null; then
+      fastpath_hint
+      return 0
+    fi
+    fastpath_ask || { printf 'Not granted. '; fastpath_hint; return 0; }
+  fi
+  if ! have sudo; then
+    printf '\nsudo is not installed.\n'
+    fastpath_hint
+    return 0
+  fi
+  # sudo asks for its password on the terminal, not on stdin.
+  if sudo setcap "$CAPS" "$BIN_DIR/vmlab"; then
+    printf 'Granted: %s\n' "$(getcap "$BIN_DIR/vmlab" 2>/dev/null || echo "$CAPS")"
+    printf 'Daemons already running keep their old privileges: run `vmlab daemon stop`,\n'
+    printf 'then `vmlab fastpath` shows the tier the next daemon selects.\n'
+  else
+    warn "setcap failed; the binary is installed without the fast path's capabilities."
+    fastpath_hint
+  fi
+}
+
+fastpath_caps
 
 # ── Guest assets ────────────────────────────────────────────────────────────
 # The container micro-VM kernel/initramfs, every in-guest agent build and the
@@ -240,8 +343,6 @@ install_guest() {
 # who can install it is still watching. Missing tools are a warning, never an
 # error — most of them matter only to the features that use them.
 [ "$SKIP_CHECKS" -eq 1 ] && exit 0
-
-have() { command -v "$1" >/dev/null 2>&1; }
 
 # Package name per manager, for the one-line install hint below.
 pkg_for() {
