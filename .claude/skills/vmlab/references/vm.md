@@ -31,6 +31,7 @@ vm "<name>" {
   nested      = false
   gui         = false
   agent_update = true
+  clock       = "host"         // or "snapshot", or "2020-01-01T00:00:00Z"
   display     = "virtio-vga"
   cpu_model   = "pentium3"
   accel       = "tcg"
@@ -64,6 +65,7 @@ vm "<name>" {
 | `nested` | bool | `false` | Expose hardware virtualisation (VMX/SVM) to the guest. Without it, an x86 guest under KVM has both masked. `up` warns when the host's KVM module has nested virtualisation off. No effect under TCG or on other architectures. |
 | `gui` | bool | lab `gui` | Open a VNC viewer on `up`. The VM always runs headless. |
 | `agent_update` | bool | lab `agent_update`, else `true` | Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. Ignored on the legacy agent tier. |
+| `clock` | utf8 | `host` | Guest clock policy. `host`: the RTC runs from the host's time, and after an online snapshot restore the lab daemon sets the guest's clock to the host's current time through the agent (a failure warns and the restore still succeeds). `snapshot`: a restored guest keeps the time it was captured at. An RFC 3339 date-time such as `2020-01-01T00:00:00Z` (any offset, converted to UTC): the RTC starts at that instant on every boot and runs forward, and vmlab never sets it, after a restore included. The guest's own NTP or w32time can still move it. Declared on the machine block only, never inherited. Also accepted on a `container {}`. |
 | `display` | utf8 | inherited | QEMU display device string. Inherited from template, then profile. |
 | `cpu_model` | utf8 | inherited | QEMU `-cpu` model, for example `pentium3`, `pentium2`, `qemu32` or `Westmere`, replacing the default (`host` under KVM, `max` under TCG) under either accelerator. For guests the host CPU breaks, such as Windows 9x Setup. Inherited from template, then profile. Any non-empty name is accepted; QEMU refuses an unknown one at start. Cannot be combined with `nested = true`. |
 | `accel` | utf8 | inherited | Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. `tcg` always emulates, even where KVM works, for guests KVM cannot run reliably, such as Windows 95 on an AMD host; `-cpu` stays `max` unless `cpu_model` names one. `kvm` refuses to start the VM when KVM is unusable rather than falling back. Inherited from template, then profile. `tcg` cannot be combined with `nested = true`. |
@@ -110,6 +112,8 @@ Known architectures are `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`,
   VMs and containers has no cycle.
 - `profile`, if set, names a known profile.
 - `cdrom` and `floppy` name files that exist under the lab root.
+- `clock` is `host`, `snapshot`, or an RFC 3339 date-time such as
+  `2020-01-01T00:00:00Z`.
 - `secure_boot = true` is rejected when the firmware resolves to `seabios`.
   Either value may have been inherited, so the message names the layer each came
   from.

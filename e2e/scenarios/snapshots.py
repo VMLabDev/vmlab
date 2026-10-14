@@ -1,6 +1,9 @@
 """Snapshots: a VM online and offline, the whole lab, list and delete, a
-container, and a VM whose virtiofs share rides a virtiofsd too old to carry
-its state through a snapshot."""
+container, the guest clock a restore leaves (set, kept, fixed), and a VM whose
+virtiofs share rides a virtiofsd too old to carry its state through a
+snapshot."""
+
+import time
 
 from harness import WORK
 
@@ -33,6 +36,18 @@ def snap(h, lab, *args, **kw):
     return h.vmlab("snapshot", *args, cwd=lab, timeout=300, **kw)
 
 
+def drift(h, lab, machine, container=False) -> int:
+    """Seconds the guest clock is behind the host's."""
+    verb = ["container", "exec"] if container else ["exec"]
+    guest = int(h.vmlab(*verb, machine, "--", "date", "+%s", cwd=lab).out.strip())
+    return int(time.time()) - guest
+
+
+# How long a restored guest is left captured before it is restored: long
+# enough that a clock nobody set is plainly behind.
+CLOCK_GAP = 30
+
+
 def state(h, lab, machine) -> str:
     line = h.machine_line(lab, machine)
     return line.split()[0] if line else ""
@@ -41,7 +56,7 @@ def state(h, lab, machine) -> str:
 def run(h):
     with h.lab(LAB) as lab:
         h.vmlab("up", cwd=lab, timeout=900)
-        h.wait_ready(lab, "vm01", "c01")
+        h.wait_ready(lab, "vm01", "c01", "c02", "c03")
 
         # -- snapshot.vm.online ---------------------------------------------
         def online():
@@ -89,6 +104,38 @@ def run(h):
             return "created" in c.out and "restored" in r.out
 
         h.check("snapshot.lab", lab_wide, "both machines rewound to 'lab-before'")
+
+        # -- snapshot.clock.*: what a restore does to the guest clock -------
+        def clock_set():
+            snap(h, lab, "create", "--vm", "vm01", "clk1")
+            snap(h, lab, "create", "--vm", "c01", "clk1")
+            snap(h, lab, "create", "--vm", "c02", "clk1")
+            time.sleep(CLOCK_GAP)
+            r = snap(h, lab, "restore", "--vm", "vm01", "clk1")
+            snap(h, lab, "restore", "--vm", "c01", "clk1")
+            get(h, lab, "vm01")
+            vm = drift(h, lab, "vm01")
+            ct = drift(h, lab, "c01", container=True)
+            assert "WARNING" not in r.text, r.text
+            assert abs(vm) <= 5 and abs(ct) <= 5, f"vm01 {vm}s, c01 {ct}s behind after the restore"
+            return True
+
+        h.check("snapshot.clock.set", clock_set, f"vm01 and c01 within 5s of the host after a {CLOCK_GAP}s gap")
+
+        def clock_kept():
+            snap(h, lab, "restore", "--vm", "c02", "clk1")
+            behind = drift(h, lab, "c02", container=True)
+            assert behind >= CLOCK_GAP - 5, f"c02 only {behind}s behind; its clock was set"
+            return True
+
+        h.check("snapshot.clock.kept", clock_kept, "c02 still behind by the gap")
+
+        def clock_fixed():
+            year = h.vmlab("container", "exec", "c03", "--", "date", "-u", "+%Y", cwd=lab).out.strip()
+            assert year == "2020", f"c03 thinks it is {year}"
+            return True
+
+        h.check("snapshot.clock.fixed", clock_fixed, "c03 booted on 2020-01-01")
 
         # -- snapshot.vm.offline --------------------------------------------
         def offline():

@@ -79,7 +79,7 @@ SRC
     rows:
       | "Event" | "Payload fields" | "When" |
       | "`snapshot.created`" | "`vm`, `name`, `online`" | "A snapshot was taken, of a VM or a container alike, after the workspace pre-flight flush." |
-      | "`snapshot.restored`" | "`vm`, `name`, `online`" | "A snapshot was restored, after the pin check and the syncer bracket." |
+      | "`snapshot.restored`" | "`vm`, `name`, `online`, `clock`" | "A snapshot was restored, after the pin check and the syncer bracket. `clock` is present for an online restore only: `set` (set to the host's time), `kept` (the machine's `clock` is `snapshot`), `fixed` (a fixed date-time) or `not_set` (it should have been set and could not, and the reason is in the daemon log and the CLI warning)." |
   }
   p "Deleting a snapshot emits nothing."
 

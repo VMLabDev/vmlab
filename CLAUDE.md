@@ -84,7 +84,7 @@ and `dev use`, `attachable`, and the agent's `tunnel` vocabulary. A dev
 machine is reached with `vmlab shell` and `vmlab exec`.
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the
 profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
-`guest/agent-legacy` serving `exec` only over COM1, the bootstrap ISO's
+`guest/agent-legacy` serving `exec` and `set_time` only over COM1, the bootstrap ISO's
 `legacy/` builds and install scripts, and the Rust agent's own serial fallback
 for old Linux. Verified live on FreeDOS; the NT build is verified under Wine,
 and the 9x build live on Windows 95 (950, OSR2, OSR2.5) and 98 (FE, SE).
@@ -120,7 +120,7 @@ Module map under `src/`:
   the C89 agent for guests with no virtio-serial (§7.4's legacy tier: NT4
   through XP/2003, Windows 9x/ME, DOS), speaking the same protocol over a
   16550 on COM1 (`agent_transport = "isa-serial"`) and advertising `exec`
-  only; one polling loop (`agent.c`) behind three adapters (`plat_win32.c`,
+  and `set_time` only; one polling loop (`agent.c`) behind three adapters (`plat_win32.c`,
   `plat_dos.c`, `plat_posix.c`). Conformance runs the POSIX build through
   the daemon's own client in `src/labd/legacy_agent_tests.rs`. Staged on
   the bootstrap ISO under `legacy/` with an install script each.

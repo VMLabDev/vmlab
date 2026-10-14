@@ -256,6 +256,7 @@ container "<name>" {
 | `name` | utf8 (label) | required | Container name, a DNS label, unique per lab. VMs and containers share one namespace; the inline block label. |
 | `image` | utf8 | required | OCI image reference, for example `nginx:1.27` or `ghcr.io/owner/app@sha256:…`. |
 | `mode` | symbol | `:workload` | `:workload` starts the OCI process; `:idle` keeps the micro-VM available for exec without running it. |
+| `clock` | utf8 | `host` | Guest clock across an online restore: `host` sets it to the host's time after the restore, `snapshot` keeps the captured time, an RFC 3339 date-time such as `2020-01-01T00:00:00Z` starts the micro-VM at that instant and is never set. Declared here only. |
 | `entrypoint` | list<utf8> | image default | Override the image entrypoint, in exec form. |
 | `command` | list<utf8> | image default | Override the image cmd, in exec form. |
 | `workdir` | utf8 | image default | Working directory inside the container. |

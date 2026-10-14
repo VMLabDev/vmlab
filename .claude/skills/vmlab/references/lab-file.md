@@ -126,6 +126,8 @@ required child blocks. The schema declares these with decorators on each field.
   forwards need a segment to reach the gateway on.
 - A container that neither declares `cpus` and `memory` nor names a profile
   supplying them.
+- A `clock` on a `vm` or `container` that is not `host`, `snapshot`, or an
+  RFC 3339 date-time such as `2020-01-01T00:00:00Z`.
 - A playbook `var` whose name is not a WCL identifier, or is set twice on one
   block.
 - The dev-machine rules: more than one `@dev(default = true)`, a Windows `login`

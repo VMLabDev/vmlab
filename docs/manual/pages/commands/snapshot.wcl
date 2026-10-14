@@ -104,6 +104,24 @@ page cmd_snapshot {
   DOC
 
   p <<DOC
+    After an online restore, each machine whose `clock` is `host`, the
+    default, has its clock set to the host's current time through the guest
+    agent, which the restore waits up to 60 seconds for. A machine whose
+    clock cannot be set is still restored, and the verb prints this on
+    stderr:
+  DOC
+
+  code text { source = "WARNING: \"<machine>\": the guest clock was not set to the host's time, so it resumes at the time the snapshot was taken: <reason>" }
+
+  p <<DOC
+    The reason is that no agent answered, the agent predates the `set_time`
+    feature (`vmlab machine repair-agent` replaces it), or the guest refused.
+    `clock = "snapshot"` on the machine keeps the captured time instead, and
+    a fixed date-time is never touched. An offline restore does not set the
+    clock. See [The guest clock after a restore](guide_snapshots).
+  DOC
+
+  p <<DOC
     For a dev machine with a workspace, restore is bracketed too. A restore
     rewinds the guest by hundreds of files at once, which a bidirectional
     syncer cannot tell from the developer having edited them and would carry

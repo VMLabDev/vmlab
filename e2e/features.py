@@ -136,6 +136,9 @@ FEATURES: dict[str, str] = {
     "snapshot.lab": "`vmlab snapshot create` for the whole lab",
     "snapshot.list-delete": "`vmlab snapshot list` and `delete`",
     "snapshot.container": "snapshots of a container",
+    "snapshot.clock.set": "an online restore sets the guest clock to the host's time (VM and container)",
+    "snapshot.clock.kept": "`clock = \"snapshot\"` keeps the time a restored guest was captured at",
+    "snapshot.clock.fixed": "a fixed `clock` starts the guest at the declared date",
     "snapshot.virtiofs.old-virtiofsd": "online snapshots refused, offline ones taken, on a virtiofsd too old to migrate",
     # -- scripting and events ----------------------------------------------
     "script.run": "`vmlab script` runs a wscript against the lab",

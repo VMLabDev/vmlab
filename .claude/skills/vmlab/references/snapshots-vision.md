@@ -27,6 +27,15 @@ When an online snapshot is restored, the daemon drops its agent connection
 before resuming, because the rewound guest replays serial bytes the host
 already consumed, and reconnects on next use.
 
+A restored guest resumes with the clock it was captured with. After an online
+restore the daemon waits up to 60 s for the agent and sets the guest clock to
+the host's time (agent feature `set_time`). If it cannot, the restore still
+succeeds and `vmlab snapshot restore` prints a `WARNING:` line; the
+`snapshot.restored` event's `clock` field says `set`, `kept`, `fixed` or
+`not_set`. A machine's `clock` attribute opts out: `snapshot` keeps the
+captured time, and an RFC 3339 date-time starts the machine at that instant
+and is never set.
+
 Containers snapshot with the same verbs and the same semantics. The
 per-container scratch disk holds the snapshot, the image's read-only root is
 outside it, and each snapshot records the image digest it was taken against

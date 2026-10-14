@@ -1,5 +1,6 @@
 // Snapshots: one VM and one idle container, snapshotted online, offline and
-// lab-wide.
+// lab-wide, plus two idle containers for the clock a restore leaves: one that
+// keeps the restored time and one started at a fixed date.
 import <vmlab.wcl>
 
 lab "e2e-snapshots" {
@@ -16,6 +17,22 @@ lab "e2e-snapshots" {
     image   = "alpine:3.22"
     profile = "container"
     mode    = :idle
+    nic { segment = "lan" }
+  }
+
+  container "c02" {
+    image   = "alpine:3.22"
+    profile = "container"
+    mode    = :idle
+    clock   = "snapshot"
+    nic { segment = "lan" }
+  }
+
+  container "c03" {
+    image   = "alpine:3.22"
+    profile = "container"
+    mode    = :idle
+    clock   = "2020-01-01T00:00:00Z"
     nic { segment = "lan" }
   }
 }

@@ -61,6 +61,68 @@ page guide_snapshots {
     depends on cross-machine consistency should quiesce the guests first.
   DOC
 
+  h2 "The guest clock after a restore"
+
+  p <<DOC
+    An online snapshot holds the guest's clock along with its RAM, so a
+    restored guest resumes at the time the snapshot was taken. A guest
+    restored a week later believes it is a week ago, and certificates,
+    Kerberos tickets and anything else that checks the time can fail until
+    the guest's own time sync catches up, if it has one. So by default, after
+    an online restore, the lab daemon waits up to 60 seconds for the
+    restored guest's agent and sets the guest's clock to the host's current
+    time. An offline restore needs nothing: the machine boots later with its
+    clock read from the host. A lab-wide restore does this per machine.
+  DOC
+
+  p <<DOC
+    Setting the clock is not allowed to fail the restore. When it cannot be
+    done, because no agent answered, the agent predates the `set_time`
+    feature, or the guest refused, the restore still succeeds and
+    `vmlab snapshot restore` prints a warning naming the machine and the
+    reason. An agent baked into a template before this feature existed is
+    replaced by `vmlab machine repair-agent`, or by `up`'s automatic agent
+    update. The legacy agent sets the clock too. The TempleOS agent does not.
+  DOC
+
+  p <<DOC
+    The `clock` attribute on a `vm {}` or `container {}` block changes this.
+    It is declared on the machine block only and never inherited from the
+    template or profile.
+  DOC
+
+  table {
+    rows:
+      | "`clock`" | "After an online restore" | "At boot" |
+      | "`host` (default)" | "Set to the host's current time." | "The RTC starts at the host's time." |
+      | "`snapshot`" | "Kept at the time the snapshot was taken." | "The RTC starts at the host's time." |
+      | "An RFC 3339 date-time" | "Never set by vmlab." | "The RTC starts at that instant and runs forward from it." |
+  }
+
+  p <<DOC
+    A fixed date-time is for testing software that depends on the date: a
+    licence that expires, a certificate that is not yet valid, a job that
+    runs at the end of a month. Any offset is accepted and converted to UTC.
+    The machine starts at that instant on every boot, and a restore leaves
+    its clock where the snapshot had it.
+  DOC
+
+  code wcl { source = <<'SRC'
+vm "y2k" {
+  template = "x86_64/windows-11"
+  clock    = "1999-12-31T23:55:00Z"
+}
+SRC
+  }
+
+  p <<DOC
+    vmlab does not stop a guest from moving its own clock. A guest that
+    syncs time over the network, through NTP or Windows' w32time, can still
+    pull a fixed clock back to the present. Turn that sync off in the guest,
+    or keep the machine off a segment with a route to a time server, when the
+    date must hold.
+  DOC
+
   h2 "What a snapshot does not hold"
 
   callout "Shares, volumes and workspaces are host state" {
