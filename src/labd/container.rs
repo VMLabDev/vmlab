@@ -1181,6 +1181,10 @@ impl super::machine::Machine for ContainerInstance {
         self.cfg.profile.clone()
     }
 
+    fn clock(&self) -> model::Clock {
+        self.cfg.clock
+    }
+
     fn nics(&self) -> &[model::Nic] {
         &self.cfg.nics
     }

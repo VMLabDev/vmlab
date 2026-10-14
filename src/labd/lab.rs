@@ -2672,29 +2672,13 @@ impl LabRuntime {
         Ok(warnings)
     }
 
-    /// A machine's declared clock (§7.3).
-    fn clock_of(&self, name: &str) -> crate::config::model::Clock {
-        let lab = &self.config.lab;
-        lab.vms
-            .iter()
-            .find(|v| v.name == name)
-            .map(|v| v.clock)
-            .or_else(|| {
-                lab.containers
-                    .iter()
-                    .find(|c| c.name == name)
-                    .map(|c| c.clock)
-            })
-            .unwrap_or_default()
-    }
-
     /// Bring a guest restored from an online snapshot back to the host's
     /// time (§7.3): it resumes with the clock it was captured with. Never
     /// fails the restore, which has already happened; a clock that could not
     /// be set is said instead.
     async fn set_clock_after_restore(&self, m: &Arc<dyn Machine>) -> ClockAfterRestore {
         use crate::config::model::Clock;
-        match self.clock_of(m.name()) {
+        match m.clock() {
             Clock::Snapshot => return ClockAfterRestore::Kept,
             Clock::Fixed(_) => return ClockAfterRestore::Fixed,
             Clock::Host => {}
@@ -3017,6 +3001,9 @@ mod tests {
         /// A share "data" that takes this long to mount once the machine is
         /// ready, under the same wait for readiness a VM's mount task makes.
         mount: Option<Duration>,
+        /// Snapshots it takes are online ones (RAM included).
+        online_snapshots: bool,
+        clock: crate::config::model::Clock,
     }
 
     impl FakeMachine {
@@ -3038,7 +3025,18 @@ mod tests {
                 agent: None,
                 first_boot: std::sync::Mutex::new(None),
                 mount: None,
+                online_snapshots: false,
+                clock: crate::config::model::Clock::Host,
             })
+        }
+
+        /// A running double whose snapshots are online, declaring `clock`.
+        fn clocked(name: &str, shared: &Shared, clock: crate::config::model::Clock) -> Arc<Self> {
+            let mut m =
+                Arc::into_inner(Self::new(name, MachineKind::Vm, shared)).expect("sole owner");
+            m.online_snapshots = true;
+            m.clock = clock;
+            Arc::new(m)
         }
 
         /// A double with a share that takes `mount` to mount, a readiness
@@ -3239,7 +3237,10 @@ mod tests {
             *self.agent_up.read().await
         }
         async fn snapshot(&self, _name: &str) -> Result<bool> {
-            Ok(false)
+            Ok(self.online_snapshots)
+        }
+        fn clock(&self) -> crate::config::model::Clock {
+            self.clock
         }
         async fn delete_snapshot(&self, _name: &str) -> Result<()> {
             Ok(())
@@ -3990,6 +3991,49 @@ lab "t" {
                 .any(|(_, s)| s.contains("waiting for its shares to mount")),
             "{said:?}"
         );
+    }
+
+    /// An online restore sets the guest clock unless the machine declares it
+    /// should not (#157); one it should set but cannot is a warning the
+    /// restore answers with, never a failed restore.
+    #[tokio::test]
+    async fn an_online_restore_sets_the_clock_or_says_why_not() {
+        use crate::config::model::Clock;
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let fixed = Clock::Fixed(chrono::DateTime::UNIX_EPOCH);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "host" { template = "x86_64/t" }
+  vm "kept" { template = "x86_64/t" }
+  vm "pinned" { template = "x86_64/t" }
+}"#,
+            vec![
+                FakeMachine::clocked("host", &sh, Clock::Host),
+                FakeMachine::clocked("kept", &sh, Clock::Snapshot),
+                FakeMachine::clocked("pinned", &sh, fixed),
+            ],
+        );
+        for name in ["host", "kept", "pinned"] {
+            assert!(lab.snapshot(name, "s1").await.unwrap(), "{name}: online");
+        }
+        // The double has no agent, so the clock it should set it cannot.
+        let warnings =
+            tokio::time::timeout(Duration::from_secs(30), lab.restore("host", "s1", false))
+                .await
+                .expect("restore returns")
+                .expect("restore succeeds without the clock");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("\"host\": the guest clock was not set"),
+            "{warnings:?}"
+        );
+        for name in ["kept", "pinned"] {
+            let warnings = lab.restore(name, "s1", false).await.unwrap();
+            assert!(warnings.is_empty(), "{name}: {warnings:?}");
+        }
     }
 
     /// `up` reports a share that gave up, and one still retrying when its

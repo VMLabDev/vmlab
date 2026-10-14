@@ -192,6 +192,11 @@ pub trait Machine: Send + Sync + 'static {
     /// itself takes no part in — the dev defaults in [`crate::dev`] are the
     /// first — so the answer is the profile, not the thing resolved from it.
     fn profile(&self) -> Option<String>;
+    /// What the guest clock does across a restore (§7.3): the machine's own
+    /// declaration, never inherited.
+    fn clock(&self) -> model::Clock {
+        model::Clock::default()
+    }
     fn nics(&self) -> &[model::Nic];
     fn macs(&self) -> &[MacAddr];
     /// The identities this machine declares (§19.2), in declaration order.

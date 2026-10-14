@@ -1329,6 +1329,10 @@ impl super::machine::Machine for VmInstance {
         self.template().resolved.profile.clone()
     }
 
+    fn clock(&self) -> model::Clock {
+        self.cfg.clock
+    }
+
     fn nics(&self) -> &[model::Nic] {
         &self.cfg.nics
     }
