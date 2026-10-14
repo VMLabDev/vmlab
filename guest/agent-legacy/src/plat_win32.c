@@ -594,7 +594,10 @@ typedef BOOL(WINAPI *LookupPrivilegeFn)(LPCSTR, LPCSTR, PLUID);
 typedef BOOL(WINAPI *AdjustPrivilegesFn)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD,
                                          PTOKEN_PRIVILEGES, PDWORD);
 
-static void take_shutdown_privilege(void)
+/* Enable one privilege on the agent's own token. NT only: 9x has no
+ * tokens, and lacks these advapi32 entry points, hence the run-time
+ * lookup. Best effort; the call it guards reports the failure. */
+static void take_privilege(const char *name)
 {
     HMODULE adv = GetModuleHandleA("advapi32.dll");
     OpenProcessTokenFn open_tok;
@@ -613,7 +616,7 @@ static void take_shutdown_privilege(void)
         return;
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (lookup(NULL, "SeShutdownPrivilege", &tp.Privileges[0].Luid))
+    if (lookup(NULL, name, &tp.Privileges[0].Luid))
         adjust(tok, FALSE, &tp, 0, NULL, NULL);
     CloseHandle(tok);
 }
@@ -627,7 +630,7 @@ int plat_shutdown(const char *mode)
             flags = EWX_POWEROFF;
         return ExitWindowsEx(flags | EWX_FORCE, 0) ? 0 : -1;
     }
-    take_shutdown_privilege();
+    take_privilege("SeShutdownPrivilege");
     {
         HMODULE adv = GetModuleHandleA("advapi32.dll");
         InitiateShutdownFn init =
@@ -638,6 +641,29 @@ int plat_shutdown(const char *mode)
             return 0;
     }
     return ExitWindowsEx((reboot ? EWX_REBOOT : EWX_POWEROFF) | EWX_FORCE, 0) ? 0 : -1;
+}
+
+/* SetSystemTime takes UTC on 9x and NT alike; NT wants the privilege
+ * enabled first, and LocalSystem holds it disabled. */
+int plat_set_time(const struct plat_time *t, char *err, int errcap)
+{
+    SYSTEMTIME st;
+    memset(&st, 0, sizeof st);
+    st.wYear = (WORD)t->year;
+    st.wMonth = (WORD)t->month;
+    st.wDayOfWeek = (WORD)t->weekday;
+    st.wDay = (WORD)t->day;
+    st.wHour = (WORD)t->hour;
+    st.wMinute = (WORD)t->minute;
+    st.wSecond = (WORD)t->second;
+    if (!is_win9x)
+        take_privilege("SeSystemtimePrivilege");
+    if (!SetSystemTime(&st)) {
+        _snprintf(err, (size_t)errcap, "set_time: SetSystemTime: error %lu",
+                  (unsigned long)GetLastError());
+        return -1;
+    }
+    return 0;
 }
 
 void plat_log(const char *msg)

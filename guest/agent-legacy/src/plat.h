@@ -72,6 +72,22 @@ void plat_os_info(struct os_info *info);
 /* `mode` is "powerdown", "reboot" or "halt". 0 when initiated. */
 int plat_shutdown(const char *mode);
 
+/* A UTC instant to set the clock to, at whole-second resolution. The core
+ * fills both shapes from the wire's `unix_ms`, so an adapter takes whichever
+ * its OS wants: POSIX the epoch seconds, Win32 and DOS the civil fields. */
+struct plat_time {
+    unsigned long unix_seconds;
+    int year;    /* e.g. 2026 */
+    int month;   /* 1-12 */
+    int day;     /* 1-31 */
+    int weekday; /* 0 = Sunday */
+    int hour, minute, second;
+};
+
+/* Set the system clock (`set_time`). 0 once set, or -1 with the reason in
+ * `err`. DOS has no time zone, so its clock is simply set to UTC. */
+int plat_set_time(const struct plat_time *t, char *err, int errcap);
+
 /* Diagnostics: a service log, stderr, or nowhere. */
 void plat_log(const char *msg);
 

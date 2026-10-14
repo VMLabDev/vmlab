@@ -82,11 +82,14 @@ fn spawn_agent() -> Option<Agent> {
 }
 
 #[tokio::test]
-async fn legacy_agent_answers_the_handshake_with_exec_only() {
+async fn legacy_agent_answers_the_handshake_with_exec_and_set_time() {
     let Some(agent) = spawn_agent() else { return };
     let handle = AgentHandle::connect(&agent.sock, HANDSHAKE).await.unwrap();
     let info = handle.info();
-    assert_eq!(info.features, vec!["exec".to_string()]);
+    assert_eq!(
+        info.features,
+        vec!["exec".to_string(), "set_time".to_string()]
+    );
     assert_eq!(info.os, "linux");
     assert_eq!(info.agent_version, "agent-legacy=test");
     assert!(handle.ping(Duration::from_secs(2)).await);
@@ -194,6 +197,31 @@ async fn legacy_agent_multiplexes_channels() {
         assert_eq!(code, i as i32);
         assert_eq!(out, format!("chan{i}\n").into_bytes());
     }
+}
+
+/// `set_time` is answered either way, and a refusal comes back carrying the
+/// guest's own reason. The test process cannot set the host's clock, so
+/// what is asserted is the round trip and the `time_set_failed` path; as
+/// root the clock would really be set, so that case is skipped rather than
+/// stepping the host's clock.
+#[tokio::test]
+async fn legacy_agent_answers_set_time_with_the_guests_refusal() {
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("skipping: running as root would really set the clock");
+        return;
+    }
+    let Some(agent) = spawn_agent() else { return };
+    let handle = AgentHandle::connect(&agent.sock, HANDSHAKE).await.unwrap();
+    let err = handle
+        .set_time(std::time::SystemTime::now(), Duration::from_secs(5))
+        .await
+        .expect_err("an unprivileged agent cannot set the clock");
+    let err = err.to_string();
+    assert!(err.contains("the guest refused to set its clock"), "{err}");
+    assert!(err.contains("clock_settime"), "{err}");
+    assert!(err.contains("Operation not permitted"), "{err}");
+    // The connection is still good after the refusal.
+    assert!(handle.ping(Duration::from_secs(2)).await);
 }
 
 /// What the agent does not do, it refuses by name on the channel that

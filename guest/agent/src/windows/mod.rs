@@ -107,6 +107,7 @@ impl crate::mux::Platform for WindowsPlatform {
             features::CLIPBOARD.to_string(),
             features::CLIPBOARD_REPLY.to_string(),
             features::TREE.to_string(),
+            features::SET_TIME.to_string(),
         ]
     }
 
@@ -147,5 +148,9 @@ impl crate::mux::Platform for WindowsPlatform {
                 mux.send_error(None, format!("shutdown: {e}"));
             }
         });
+    }
+
+    fn set_time(&self, unix_ms: i64) -> Result<(), String> {
+        sysinfo::set_time(unix_ms)
     }
 }

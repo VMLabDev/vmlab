@@ -3,8 +3,8 @@
  * no threads (a Win32 stdin writer aside, hidden behind plat.h), so the
  * same loop runs under a DOS extender.
  *
- * It speaks guest/agent-proto version 2 and advertises one feature, `exec`.
- * Everything else the wire can ask for is answered by name with an error,
+ * It speaks guest/agent-proto version 2 and advertises two features, `exec`
+ * and `set_time`. Everything else the wire can ask for is answered by name with an error,
  * which is what lets the host's feature ladder (PRD §19.4) degrade rather
  * than guess: a terminal or a file session refuses; readiness,
  * exec and the stop ladder work.
@@ -149,7 +149,7 @@ static int send_hello(const char *token)
     jo_str(&o, plat_os_tag());
     jo_raw(&o, ",");
     jo_key(&o, "features");
-    jo_raw(&o, "[\"exec\"]");
+    jo_raw(&o, "[\"exec\",\"set_time\"]");
     jo_raw(&o, ",");
     jo_key(&o, "token");
     jo_str(&o, token);
@@ -207,6 +207,61 @@ static int send_shutting_down(const char *mode)
     jo_str(&o, mode);
     jo_raw(&o, "}");
     return send_ctrl(&o);
+}
+
+static int send_time_set_failed(const char *msg)
+{
+    struct json_out o;
+    begin(&o, "time_set_failed");
+    jo_raw(&o, ",");
+    jo_key(&o, "msg");
+    jo_str(&o, msg);
+    jo_raw(&o, "}");
+    return send_ctrl(&o);
+}
+
+/* ---- set_time ------------------------------------------------------- */
+
+/* Epoch seconds as UTC civil fields: Howard Hinnant's civil_from_days, in
+ * unsigned arithmetic because the instant is never before 1970. */
+static void civil_from_unix(unsigned long secs, struct plat_time *t)
+{
+    unsigned long days = secs / 86400UL, rem = secs % 86400UL;
+    unsigned long z = days + 719468UL;
+    unsigned long era = z / 146097UL;
+    unsigned long doe = z - era * 146097UL;
+    unsigned long yoe = (doe - doe / 1460UL + doe / 36524UL - doe / 146096UL) / 365UL;
+    unsigned long doy = doe - (365UL * yoe + yoe / 4UL - yoe / 100UL);
+    unsigned long mp = (5UL * doy + 2UL) / 153UL;
+    t->unix_seconds = secs;
+    t->day = (int)(doy - (153UL * mp + 2UL) / 5UL + 1UL);
+    t->month = (int)(mp < 10UL ? mp + 3UL : mp - 9UL);
+    t->year = (int)(yoe + era * 400UL) + (t->month <= 2 ? 1 : 0);
+    t->weekday = (int)((days + 4UL) % 7UL); /* 1970-01-01 was a Thursday */
+    t->hour = (int)(rem / 3600UL);
+    t->minute = (int)(rem / 60UL % 60UL);
+    t->second = (int)(rem % 60UL);
+}
+
+/* Always answered, one way or the other: the host is waiting on it. */
+static void handle_set_time(const char *js, int ntok)
+{
+    struct plat_time t;
+    unsigned long secs;
+    char err[256];
+    int ut = json_get(js, toks, ntok, 0, "unix_ms");
+    if (ut < 0 || json_ms_to_secs(js, toks, ut, &secs) < 0) {
+        send_time_set_failed("set_time: unix_ms missing or out of range");
+        return;
+    }
+    memset(&t, 0, sizeof t);
+    civil_from_unix(secs, &t);
+    err[0] = 0;
+    if (plat_set_time(&t, err, (int)sizeof err) < 0) {
+        send_time_set_failed(err[0] ? err : "set_time: the clock could not be set");
+        return;
+    }
+    send_simple("time_set", -1);
 }
 
 /* ---- sessions ------------------------------------------------------- */
@@ -448,23 +503,25 @@ static int handle_ctrl(const unsigned char *payload, unsigned long len)
         if (plat_shutdown(mode) == 0)
             return -1;
         send_error(-1, "shutdown: not supported on this guest");
+    } else if (strcmp(cmd, "set_time") == 0) {
+        handle_set_time(js, ntok);
     } else if (strcmp(cmd, "open_terminal") == 0) {
-        send_error((long)id, "legacy agent: no terminal (features: exec)");
+        send_error((long)id, "legacy agent: no terminal (features: exec, set_time)");
     } else if (strcmp(cmd, "open_fileops") == 0) {
-        send_error((long)id, "legacy agent: no fileops (features: exec)");
+        send_error((long)id, "legacy agent: no fileops (features: exec, set_time)");
     } else if (strcmp(cmd, "open_tail") == 0) {
-        send_error((long)id, "legacy agent: no tail (features: exec)");
+        send_error((long)id, "legacy agent: no tail (features: exec, set_time)");
     } else if (strcmp(cmd, "open_watch") == 0) {
-        send_error((long)id, "legacy agent: no watch (features: exec)");
+        send_error((long)id, "legacy agent: no watch (features: exec, set_time)");
     } else if (strcmp(cmd, "open_eventlog") == 0) {
-        send_error((long)id, "legacy agent: no eventlog (features: exec)");
+        send_error((long)id, "legacy agent: no eventlog (features: exec, set_time)");
     } else if (strcmp(cmd, "resize") == 0) {
         /* No terminals, so nothing to resize; silently fine. */
     } else if (strcmp(cmd, "subscribe_metrics") == 0 ||
                strcmp(cmd, "unsubscribe_metrics") == 0 ||
                strcmp(cmd, "get_clipboard") == 0 ||
                strcmp(cmd, "set_clipboard") == 0) {
-        send_error(-1, "legacy agent: not available (features: exec)");
+        send_error(-1, "legacy agent: not available (features: exec, set_time)");
     } else {
         send_error(-1, "legacy agent: unknown command");
     }

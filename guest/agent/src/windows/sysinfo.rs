@@ -3,12 +3,16 @@
 //! manifest compatibility, the registry does not), and
 //! InitiateSystemShutdownExW with the SeShutdownPrivilege enabled — the
 //! LocalSystem service account holds the privilege but it starts disabled.
+//! Setting the clock is the same dance: SetSystemTime under
+//! SeSystemtimePrivilege.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode};
 
-use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS, HANDLE, LUID};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS, HANDLE, LUID, SYSTEMTIME,
+};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
     IP_ADAPTER_ADDRESSES_LH,
@@ -27,7 +31,7 @@ use windows_sys::Win32::System::Shutdown::{
 use windows_sys::Win32::System::SystemInformation::{
     ComputerNamePhysicalDnsHostname, GetComputerNameExW, GetNativeSystemInfo,
     PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM64, PROCESSOR_ARCHITECTURE_INTEL,
-    SYSTEM_INFO,
+    SYSTEM_INFO, SetSystemTime,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -136,7 +140,7 @@ pub fn os_info() -> Result<OsInfo, String> {
 /// distinct halt). `force = TRUE` matches QGA semantics: hung apps must not
 /// wedge the lab's stop ladder.
 pub fn shutdown(mode: ShutdownMode) -> Result<(), String> {
-    enable_shutdown_privilege()?;
+    enable_privilege("SeShutdownPrivilege")?;
     let reboot = matches!(mode, ShutdownMode::Reboot);
     // SAFETY: plain API call; wide strings outlive it.
     let ok = unsafe {
@@ -158,7 +162,54 @@ pub fn shutdown(mode: ShutdownMode) -> Result<(), String> {
     Ok(())
 }
 
-fn enable_shutdown_privilege() -> Result<(), String> {
+/// Set the system clock to `unix_ms` milliseconds since the Unix epoch.
+/// SetSystemTime takes UTC, which is what the wire carries.
+pub fn set_time(unix_ms: i64) -> Result<(), String> {
+    let st = system_time(unix_ms)?;
+    enable_privilege("SeSystemtimePrivilege")?;
+    // SAFETY: plain API call reading one initialised SYSTEMTIME.
+    if unsafe { SetSystemTime(&st) } == 0 {
+        return Err(format!(
+            "SetSystemTime failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// `unix_ms` as a UTC SYSTEMTIME, in civil-calendar arithmetic (Howard
+/// Hinnant's civil-from-days) rather than through FILETIME.
+fn system_time(unix_ms: i64) -> Result<SYSTEMTIME, String> {
+    let days = unix_ms.div_euclid(86_400_000);
+    let ms_of_day = unix_ms.rem_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    if !(1601..=30827).contains(&year) {
+        return Err(format!("time {unix_ms} ms is outside SYSTEMTIME's range"));
+    }
+    Ok(SYSTEMTIME {
+        wYear: year as u16,
+        wMonth: month as u16,
+        // 1970-01-01 was a Thursday (4).
+        wDayOfWeek: (days + 4).rem_euclid(7) as u16,
+        wDay: day as u16,
+        wHour: (ms_of_day / 3_600_000) as u16,
+        wMinute: (ms_of_day / 60_000 % 60) as u16,
+        wSecond: (ms_of_day / 1000 % 60) as u16,
+        wMilliseconds: (ms_of_day % 1000) as u16,
+    })
+}
+
+/// Enable one privilege (`SeShutdownPrivilege`, `SeSystemtimePrivilege`)
+/// on the agent's own token. LocalSystem holds both, disabled.
+fn enable_privilege(privilege: &str) -> Result<(), String> {
     // SAFETY: standard token-privilege dance on our own process token.
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
@@ -170,21 +221,26 @@ fn enable_shutdown_privilege() -> Result<(), String> {
         {
             return Err("OpenProcessToken failed".to_string());
         }
-        let mut luid: LUID = std::mem::zeroed();
-        let name = wide("SeShutdownPrivilege");
-        if LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) == 0 {
-            return Err("LookupPrivilegeValueW failed".to_string());
-        }
-        let mut tp: TOKEN_PRIVILEGES = std::mem::zeroed();
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Luid = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        if AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut()) == 0
-        {
-            return Err("AdjustTokenPrivileges failed".to_string());
-        }
+        let outcome = (|| {
+            let mut luid: LUID = std::mem::zeroed();
+            let name = wide(privilege);
+            if LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) == 0 {
+                return Err(format!("LookupPrivilegeValueW({privilege}) failed"));
+            }
+            let mut tp: TOKEN_PRIVILEGES = std::mem::zeroed();
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut())
+                == 0
+            {
+                return Err(format!("AdjustTokenPrivileges({privilege}) failed"));
+            }
+            Ok(())
+        })();
+        CloseHandle(token);
+        outcome
     }
-    Ok(())
 }
 
 fn native_arch() -> String {

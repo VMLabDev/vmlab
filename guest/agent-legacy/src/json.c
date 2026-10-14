@@ -316,6 +316,27 @@ int json_ulong(const char *js, const struct json_tok *toks, int i, unsigned long
     return 0;
 }
 
+int json_ms_to_secs(const char *js, const struct json_tok *toks, int i, unsigned long *out)
+{
+    int p, end;
+    unsigned long v = 0;
+    if (toks[i].type != JSON_PRIMITIVE || toks[i].end == toks[i].start)
+        return -1;
+    for (p = toks[i].start; p < toks[i].end; p++)
+        if (js[p] < '0' || js[p] > '9')
+            return -1;
+    /* Everything but the last three digits is the seconds. */
+    end = toks[i].end - 3;
+    for (p = toks[i].start; p < end; p++) {
+        unsigned long d = (unsigned long)(js[p] - '0');
+        if (v > (0xFFFFFFFFUL - d) / 10)
+            return -1;
+        v = v * 10 + d;
+    }
+    *out = v;
+    return 0;
+}
+
 void jo_init(struct json_out *o, char *buf, int cap)
 {
     o->buf = buf;
