@@ -239,12 +239,18 @@ impl Spawner for FakeSpawner {
 /// fixed value, and every session comes from the fake seam.
 pub struct TestPlatform {
     pub spawner: Arc<FakeSpawner>,
+    /// Every time `set_time` has set, in order.
+    pub clock: Mutex<Vec<i64>>,
+    /// When set, `set_time` refuses with this message instead.
+    pub clock_refusal: Mutex<Option<String>>,
 }
 
 impl TestPlatform {
     pub fn new() -> TestPlatform {
         TestPlatform {
             spawner: Arc::new(FakeSpawner::new()),
+            clock: Mutex::new(Vec::new()),
+            clock_refusal: Mutex::new(None),
         }
     }
 }
@@ -287,6 +293,15 @@ impl Platform for TestPlatform {
         })
     }
     fn shutdown(&self, _: &Mux, _: ShutdownMode) {}
+    fn set_time(&self, unix_ms: i64) -> Result<(), String> {
+        match self.clock_refusal.lock().unwrap().clone() {
+            Some(msg) => Err(msg),
+            None => {
+                self.clock.lock().unwrap().push(unix_ms);
+                Ok(())
+            }
+        }
+    }
 }
 
 // ---- in-memory stdio -------------------------------------------------------

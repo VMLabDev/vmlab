@@ -347,6 +347,7 @@ impl crate::mux::Platform for LinuxPlatform {
             features::METRICS.to_string(),
             features::WATCH.to_string(),
             features::TREE.to_string(),
+            features::SET_TIME.to_string(),
         ];
         if self.clipboard.is_some() {
             f.push(features::CLIPBOARD.to_string());
@@ -414,6 +415,27 @@ impl crate::mux::Platform for LinuxPlatform {
                 mux.send_error(None, format!("shutdown: {e}"));
             }
         });
+    }
+
+    fn set_time(&self, unix_ms: i64) -> Result<(), String> {
+        set_realtime_clock(unix_ms)
+    }
+}
+
+/// Set CLOCK_REALTIME. The system clock only — the hardware clock is left
+/// to the guest's own sync, and nothing is shelled out to.
+fn set_realtime_clock(unix_ms: i64) -> Result<(), String> {
+    let ts = libc::timespec {
+        tv_sec: unix_ms.div_euclid(1000) as libc::time_t,
+        tv_nsec: (unix_ms.rem_euclid(1000) * 1_000_000) as libc::c_long,
+    };
+    // SAFETY: a plain syscall reading one initialised timespec.
+    match unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } {
+        0 => Ok(()),
+        _ => Err(format!(
+            "clock_settime(CLOCK_REALTIME): {}",
+            std::io::Error::last_os_error()
+        )),
     }
 }
 

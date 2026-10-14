@@ -441,6 +441,12 @@ impl Mux {
                 self.send_ctrl(&AgentMsg::ShuttingDown { mode });
                 platform.shutdown(self, mode);
             }
+            // Always answered, one way or the other: the host is waiting on
+            // it to know whether a restored guest's clock caught up.
+            HostMsg::SetTime { unix_ms } => match platform.set_time(unix_ms) {
+                Ok(()) => self.send_ctrl(&AgentMsg::TimeSet),
+                Err(msg) => self.send_ctrl(&AgentMsg::TimeSetFailed { msg }),
+            },
             HostMsg::WindowAdjust { id, bytes } => self.grant(id, bytes),
             HostMsg::Close { id } => self.remove(id),
             HostMsg::Ping => self.send_ctrl(&AgentMsg::Pong {
@@ -486,6 +492,11 @@ pub trait Platform: Sync {
     /// implementations delay briefly so it flushes, and report failure via
     /// `mux` if the OS refuses.
     fn shutdown(&self, mux: &Mux, mode: ShutdownMode);
+    /// Set the guest's system clock to `unix_ms` milliseconds since the Unix
+    /// epoch, UTC — a guest restored from an online snapshot wakes at
+    /// capture time. Only asked of a platform advertising
+    /// `features::SET_TIME`; the error names why the OS refused.
+    fn set_time(&self, unix_ms: i64) -> Result<(), String>;
 }
 
 /// Standard guest→host output pump: read chunks from `src`, respect the
@@ -621,6 +632,40 @@ mod tests {
                 mode: ShutdownMode::Reboot
             }
         );
+    }
+
+    #[test]
+    fn set_time_is_answered_time_set_once_the_clock_is_set() {
+        let (mux, mut cap) = capture_mux();
+        let platform = TestPlatform::new();
+        mux.handle_msg(
+            HostMsg::SetTime {
+                unix_ms: 1_760_000_000_123,
+            },
+            &platform,
+        );
+        assert_eq!(cap.ctrl(), AgentMsg::TimeSet);
+        assert_eq!(*platform.clock.lock().unwrap(), vec![1_760_000_000_123]);
+    }
+
+    #[test]
+    fn set_time_is_answered_time_set_failed_with_the_refusal() {
+        let (mux, mut cap) = capture_mux();
+        let platform = TestPlatform::new();
+        *platform.clock_refusal.lock().unwrap() = Some("privilege not held".into());
+        mux.handle_msg(
+            HostMsg::SetTime {
+                unix_ms: 1_760_000_000_123,
+            },
+            &platform,
+        );
+        assert_eq!(
+            cap.ctrl(),
+            AgentMsg::TimeSetFailed {
+                msg: "privilege not held".into()
+            }
+        );
+        assert!(platform.clock.lock().unwrap().is_empty());
     }
 
     #[test]
