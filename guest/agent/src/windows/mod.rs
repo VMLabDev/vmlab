@@ -1,8 +1,8 @@
 //! Windows platform half: vioserial port I/O (OVERLAPPED, shared exclusive
 //! handle), ConPTY-hosted PowerShell terminals, EvtSubscribe event-log
 //! tailing, GetSystemTimes/GlobalMemoryStatusEx metrics, the user-session
-//! clipboard helper, process trees as job objects, and the SCM service
-//! entry.
+//! clipboard helper, process trees as job objects, the guest side of a
+//! shared app over RDP RemoteApp, and the SCM service entry.
 
 pub mod clipboard;
 pub mod conpty;
@@ -11,6 +11,7 @@ pub mod logon;
 pub mod metrics;
 pub mod port;
 pub mod proc;
+pub mod rdp;
 pub mod service;
 pub mod sysinfo;
 pub mod tree;
@@ -108,6 +109,7 @@ impl crate::mux::Platform for WindowsPlatform {
             features::CLIPBOARD_REPLY.to_string(),
             features::TREE.to_string(),
             features::SET_TIME.to_string(),
+            features::APP_RDP.to_string(),
         ]
     }
 

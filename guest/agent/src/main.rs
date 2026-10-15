@@ -18,6 +18,10 @@ mod fileops;
 mod logon;
 mod metrics;
 mod mux;
+// What preparing a Windows guest for RDP RemoteApp decides: portable so it
+// is tested on any host, compiled only where it is used.
+#[cfg(any(windows, test))]
+mod rdp;
 mod spawn;
 mod tail;
 mod terminal;
@@ -105,6 +109,10 @@ fn main() {
             "--clipboard-helper" => {
                 windows::clipboard::helper_main();
             }
+            // Undocumented live-test aid: run the shared-app RDP preparation
+            // once for an account and print what it changed (PRD §20.3).
+            #[cfg(windows)]
+            "--rdp-prepare" => rdp_prepare_main(args_iter.as_slice()),
             "--version" => {
                 println!("vmlab-agent {}", env!("CARGO_PKG_VERSION"));
                 return;
@@ -123,6 +131,28 @@ fn main() {
     }
     let _ = console;
     run();
+}
+
+#[cfg(windows)]
+fn rdp_prepare_main(args: &[String]) -> ! {
+    let [user, secret] = args else {
+        eprintln!("vmlab-agent: --rdp-prepare needs <user> <password>");
+        std::process::exit(2);
+    };
+    let logon = vmlab_agent_proto::Logon {
+        user: user.clone(),
+        secret: secret.clone(),
+        elevated: false,
+    };
+    match windows::rdp::prepare_reporting(&logon) {
+        Ok(changed) if changed.is_empty() => println!("rdp-prepare: nothing to change"),
+        Ok(changed) => changed.iter().for_each(|c| println!("rdp-prepare: {c}")),
+        Err(e) => {
+            println!("rdp-prepare: {e}");
+            std::process::exit(1);
+        }
+    }
+    std::process::exit(0);
 }
 
 fn run() -> ! {
