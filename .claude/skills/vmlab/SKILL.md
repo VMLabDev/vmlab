@@ -45,7 +45,8 @@ recalling vmlab behaviour or reading vmlab's source.
 | Shared folders, `vmlab cp`, clipboard transfer (the `media {}` block is in `vm.md`) | `references/shares-media.md` |
 | The host config file, WSL 2, guest OS profiles | `references/host-profiles.md` |
 | Lab-level CLI verbs: `up`, `down`, `status`, `validate`, `destroy`, `pull`, `lab`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`, `script` | `references/cli-lab.md` |
-| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `console`, `cp`, `clipboard`, `snapshot`, `dev` | `references/cli-machine.md` |
+| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `cp`, `clipboard`, `snapshot`, `dev` | `references/cli-machine.md` |
+| Shared apps: a guest program's windows on the host desktop over waypipe, X11 or RDP (`vmlab app run`) | `references/cli-machine.md` |
 | `vmlab template` and its subcommands | `references/cli-template.md` |
 | A command that failed, or a message the user is asking about | `references/troubleshooting.md` |
 | What a vmlab term means | `references/glossary.md` |

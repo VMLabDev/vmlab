@@ -79,6 +79,19 @@ Usual causes, in order of likelihood: the template was built without the agent, 
 
 If the guest is up and the agent is absent, rebuild the template so the bake installs the agent this vmlab ships, or push one into the running machine with `vmlab machine repair-agent`. A container's agent comes from the host's guest asset, so on a container the message ends with `there is nothing to rebuild or repair — an agent that is not answering here is a machine to restart, or a guest asset to reinstall (§19.4)`.
 
+## A shared app is refused
+
+`vmlab app run` refuses before any window opens; cli-machine.md (`vmlab app`) has the full refusal table. The common ones:
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set` | The command ran outside a desktop session (over SSH, a virtual console, a service). | Run it from a terminal inside the desktop session. |
+| ``` no FreeRDP 3 on this host: shared apps from a Windows guest need `xfreerdp3` or `xfreerdp` on PATH, or `freerdp` in config.wcl ``` | A Windows guest's host end is FreeRDP, and none was found. | Install FreeRDP 3 (`xfreerdp3` on Arch and Debian, `xfreerdp` on Fedora), or set `freerdp` in the host config. |
+| ``` `{machine}` has no `waypipe` on PATH for `{login}` ``` | The guest has no `waypipe` for the login (`{login}` may read `the agent identity`), and the host has no `DISPLAY` to fall back to X11 on. With `DISPLAY` set the same words end in `; falling back to X11 through Xwayland` and the session continues. | Install `waypipe` in the guest on that login's `PATH`, e.g. `vmlab exec --user root <machine> -- apk add waypipe`. |
+| ``` the agent on `{machine}` predates shared apps over `{mode}`; run `vmlab machine repair-agent {machine}` ``` | The agent advertises no `app_waypipe`/`app_x11`/`app_rdp`. The legacy agent tier never does. | `vmlab machine repair-agent <machine>`, or rebuild the template (see the section below). |
+| ``` {machine}: Windows `{edition}` has no Remote Desktop host; shared apps need Pro, Enterprise, Education or Server ``` | `EditionID` is a Home edition (`Core`, `CoreN`, `CoreSingleLanguage`, `CoreCountrySpecific`). | Build the template from a Pro, Enterprise, Education or Server image. |
+| ``` RDP needs an account: declare a `login {}` on `{machine}` or pass --user/--password ``` | RDP cannot log on as SYSTEM; the machine has no `login {}` and no `--user` was given, or `--user SYSTEM` was. | Declare a `login {}` with a `password` (logins.md), or pass `--user` and `--password`. |
+
 ## `vmlab machine repair-agent` refused
 
 A machine whose agent is older than the host's lacks features the host expects; `vmlab machine capabilities <machine>` lists the ones it negotiated. `vmlab up` and `vmlab vm start` normally refresh it by themselves when the VM's agent stamp differs from the shipped agent's, printing `agent: updated "<vm>" (<old> → <new>)`, or `warning: agent: could not update "<vm>" …` with the reason, leaving the old agent in place and carrying on; `agent_update = false` on the `vm` or `lab` block turns that off. Rebuilding the template is the durable remedy. `vmlab machine repair-agent <machine>` pushes the host's shipped agent into the running machine over its own channel and marks the machine *diverged* in `vmlab status`, so you remember the clone no longer matches its template. It refuses on three conditions:

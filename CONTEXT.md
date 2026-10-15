@@ -145,6 +145,17 @@ today; one running a display server could, so absence is reported as "this
 machine has no display", never as "containers cannot have displays".
 _Avoid_: console, screen, VNC, framebuffer (alone)
 
+**Shared app**:
+One guest program whose windows appear on the host's own desktop, beside the
+host's windows, started by `vmlab app run` and ended when the program (or, for
+RDP, the client) exits. vmlab writes no window protocol: the guest family's
+own one — waypipe, X11, or RDP RemoteApp — rides the agent channel, its host
+end runs in the CLI because only a process in the user's desktop session can
+reach the compositor, and the lab daemon stays headless. Runs as the declared
+login, like `exec`. A CLI act on a running machine, never a declaration and
+never a wscript call. Unrelated to the **display**, which it does not use.
+_Avoid_: remote app, seamless window, app forwarding, share (that is a folder)
+
 ### Templates and images
 
 **Template**:

@@ -16,10 +16,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use vmlab_agent_proto::{
-    AgentMsg, Frame, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD, NetInterface, OsInfo,
+    AgentMsg, Frame, FrameKind, HostMsg, INITIAL_WINDOW, Logon, MAX_PAYLOAD, NetInterface, OsInfo,
     PROTO_VERSION, ShutdownMode, encode_ctrl, encode_frame, valid_tree_name,
 };
 
+use crate::app::{AppSpec, Apps};
+#[cfg(unix)]
+use crate::spawn::Identity;
 use crate::spawn::{ProcessSpec, Spawner, TerminalSpec};
 
 /// How a platform maps a host-supplied guest path. Shared rather than called
@@ -106,6 +109,8 @@ struct MuxInner {
     /// agent answers the host's pings on the same channel, and only a
     /// different instance tells the host its handshake is stale.
     instance: String,
+    /// Live shared-app sessions (PRD §20), which `open_app_conn` looks up.
+    apps: Apps,
 }
 
 /// What the handshake says this agent is: the build stamp
@@ -161,6 +166,7 @@ impl Mux {
                 out,
                 sessions: Mutex::new(HashMap::new()),
                 instance: new_instance(),
+                apps: Apps::default(),
             }),
         }
     }
@@ -174,6 +180,11 @@ impl Mux {
     pub fn send_data(&self, kind: FrameKind, channel: u32, payload: &[u8]) {
         debug_assert!(payload.len() <= MAX_PAYLOAD);
         let _ = self.inner.out.send(encode_frame(kind, channel, payload));
+    }
+
+    /// The shared-app session table.
+    pub fn apps(&self) -> &Apps {
+        &self.inner.apps
     }
 
     pub fn send_error(&self, id: Option<u32>, msg: impl Into<String>) {
@@ -447,6 +458,15 @@ impl Mux {
                 Ok(()) => self.send_ctrl(&AgentMsg::TimeSet),
                 Err(msg) => self.send_ctrl(&AgentMsg::TimeSetFailed { msg }),
             },
+            HostMsg::OpenApp {
+                id,
+                mode,
+                argv,
+                env,
+                cwd,
+                logon,
+            } => crate::app::open(self, platform, id, mode, AppSpec { argv, env, cwd }, logon),
+            HostMsg::OpenAppConn { id, app } => crate::app::open_conn(self, id, app),
             HostMsg::WindowAdjust { id, bytes } => self.grant(id, bytes),
             HostMsg::Close { id } => self.remove(id),
             HostMsg::Ping => self.send_ctrl(&AgentMsg::Pong {
@@ -497,6 +517,19 @@ pub trait Platform: Sync {
     /// capture time. Only asked of a platform advertising
     /// `features::SET_TIME`; the error names why the OS refused.
     fn set_time(&self, unix_ms: i64) -> Result<(), String>;
+    /// Make the guest able to serve `logon` a RemoteApp session (PRD §20.3):
+    /// Remote Desktop on, unlisted programs allowed, the account able to log
+    /// on remotely. The error is what the open fails with.
+    fn app_rdp_prepare(&self, _logon: &Logon) -> Result<(), String> {
+        Err("shared apps over RDP need a Windows guest".into())
+    }
+    /// Make a waypipe or X11 session's private directory, named `name`,
+    /// owned by `identity` with mode 0700, and say where it and the X socket
+    /// directory are — for the agent and for the program.
+    #[cfg(unix)]
+    fn app_home(&self, _identity: &Identity, _name: &str) -> Result<crate::app::AppHome, String> {
+        Err("shared apps over waypipe and X11 need a Linux guest".into())
+    }
 }
 
 /// Standard guest→host output pump: read chunks from `src`, respect the

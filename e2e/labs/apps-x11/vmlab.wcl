@@ -1,0 +1,14 @@
+// One container whose image has Python and no X client: xclient.py, copied in
+// by the scenario, is the guest program `vmlab app run` shows on the
+// container's Xvfb.
+import <vmlab.wcl>
+
+lab "e2e-apps" {
+  container "app01" {
+    image   = "python:3.12-alpine"
+    profile = "container"
+    cpus    = 1
+    memory  = 512MiB
+    mode    = :idle
+  }
+}

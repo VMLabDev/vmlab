@@ -86,6 +86,7 @@ the code is the contract.
 | `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16`, `user: Option<String>`, `password: Option<String>` | `cli` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
 | `machine.repair_agent` | `machine: String` | `cli` | Push the host's shipped vmlab-agent into a running machine and mark it **diverged** (PRD §19.4). Never fires by itself: an automatic refresh would make the template's sealed `agent_version` a lie. |
 | `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli` | Resize an open terminal session. |
+| `machine.app_open` | `machine: String`, `mode: String`, `argv: Vec<String>`, `cwd: Option<String>`, `cookie: Option<String>`, `user: Option<String>`, `password: Option<String>` | `cli` | Open a **shared app** session (PRD §20): start `argv` in the guest and carry its windows' protocol to the caller, which owns the host desktop end. The reply is `{"session", "control", "conns"}`, plus `"rdp": {"user", "password"}` in `rdp` mode. `control` is a unix socket relaying the session's length-prefixed app records, closed by the caller to end the session; every connection to `conns` becomes one transport connection of the session. In `waypipe` mode a guest with no `waypipe` for that identity answers `unsupported`. |
 | `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
 | `machine.pull_file` | `machine: String`, `from: String`, `to: Option<String>` | `cli` | Copy a file out of the guest: to `to`, a host path the daemon can write, or — with `to` omitted — back inline as base64, for a caller that wants the bytes rather than a file on the daemon's host. |
 | `machine.tail` | `machine: String`, `path: String` | `cli` | Follow a guest file (`tail -F` semantics), streamed as chunks until the caller hangs up or the machine stops. |
@@ -108,7 +109,7 @@ the code is the contract.
 
 ## Coverage
 
-- `cli` — the `vmlab` verb surface (`src/cli`, `src/template/cli.rs`)
+- `cli` — the `vmlab` verb surface (`src/cli`, `src/template/cli.rs`, `src/appshare`)
 - `daemon` — one daemon calling another (`src/labd`, `src/supervisor`)
 
 Asymmetry is not automatically wrong — some commands only make sense from one place.
@@ -135,6 +136,7 @@ Deliberate, with the reason recorded beside the declaration:
 - `machine.exec` — The scripted counterpart to the console's interactive terminals: one command, its output collected, an exit code to branch on. The console opens a shell and lets a human type instead.
 - `machine.osinfo` — A live guest probe with a timeout, so it does not belong on a panel that refreshes; the status projection already carries what the console shows about a machine. Its CLI help calls it fit for scripting, which is what it is.
 - `machine.repair_agent` — A deliberate, machine-changing act with a rebuild as its alternative — the console offering it as a button would invite exactly the reflex the verb exists to keep manual, and its audience is whoever is iterating on the agent itself, at a terminal.
+- `machine.app_open` — The host end of a shared app is a window-protocol client running in the user's own desktop session, which only a process started there has; the daemon is headless by design (§11).
 - `machine.tail` — An open-ended stream of an arbitrary guest path, which is what a terminal is for. The console follows a machine's console log through `machine.logs`.
 - `machine.eventlog` — A stream into a terminal, for the same reason as `machine.tail`.
 - `playbook.list` — One flat table is the shape a shell wants. The console builds its playbook list from the lab's declarations directly and asks the daemon only which runs are in flight.

@@ -36,7 +36,13 @@ pub struct Surface {
 pub const SURFACES: &[Surface] = &[
     Surface {
         name: "cli",
-        roots: &[("src/cli", None), ("src/template/cli.rs", None)],
+        // `appshare` is the host end of a shared app, which runs in the CLI
+        // process because only it has the user's desktop session (PRD §20.3).
+        roots: &[
+            ("src/cli", None),
+            ("src/template/cli.rs", None),
+            ("src/appshare", None),
+        ],
         blurb: "the `vmlab` verb surface",
     },
     Surface {

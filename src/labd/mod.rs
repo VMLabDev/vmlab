@@ -4,6 +4,7 @@
 //! supervisor; the CLI talks to it directly for lab-scoped operations.
 
 pub mod agent_repair;
+pub mod app_share;
 pub mod container;
 pub mod container_ctl;
 pub mod display;
@@ -703,6 +704,36 @@ impl Handler<LabRequest> for LabdHandler {
                     .await
                     .map_err(|e| CommandError::failed(format!("{e:#}")))?;
                 Ok(serde_json::to_value(report).unwrap_or_default())
+            }
+            // A shared app (PRD §20.3): the daemon opens the agent session
+            // and brokers it as two sockets; the window protocol's host end
+            // runs in the CLI, which has the desktop.
+            LabRequest::MachineAppOpen {
+                machine,
+                mode,
+                argv,
+                cwd,
+                cookie,
+                user,
+                password,
+            } => {
+                let m = machine_of(lab, &machine)?;
+                let agent = m.agent().await?;
+                let target = app_share::Target {
+                    name: machine.clone(),
+                    guest_os: m.guest_os(),
+                    run_dir: m.run_dir().to_path_buf(),
+                };
+                let req = app_share::AppRequest {
+                    mode,
+                    argv,
+                    cwd,
+                    cookie,
+                };
+                app_share::open(&target, &agent, req, || {
+                    logon_for(m.as_ref(), user.as_deref(), password.as_deref())
+                })
+                .await
             }
             LabRequest::MachineTtyResize {
                 machine,

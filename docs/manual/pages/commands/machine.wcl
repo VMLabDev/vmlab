@@ -67,11 +67,12 @@ page cmd_machine {
     not yet answering reports `-`, which reads differently from a feature
     list that lacks something. An agent that restarted inside the guest is
     handshaken again, so the list is the running agent's. The possible features are `terminal`, `exec`,
-    `fileops`, `tail`, `metrics`, `clipboard`, `clipboard_reply`, `eventlog`
-    and `watch`. `clipboard_reply` means the agent answers every clipboard
+    `fileops`, `tail`, `metrics`, `clipboard`, `clipboard_reply`, `eventlog`,
+    `watch`, `app_waypipe`, `app_x11` and `app_rdp`. `clipboard_reply` means the agent answers every clipboard
     request, so [vmlab clipboard](cmd_clipboard) can confirm a copy and
     report a refusal at once. A [dev machine](guide_dev)'s workspace syncer
-    needs `fileops` and `watch`.
+    needs `fileops` and `watch`, and [vmlab app](cmd_app) needs the
+    `app_*` feature of the protocol it uses.
   DOC
 
   h2 "vmlab machine stats"

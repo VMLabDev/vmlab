@@ -35,6 +35,7 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | scratch VM | A VM with `template = "scratch"`: a blank qcow2 with no backing image and no template layer in its hardware chain, for installing an OS from nothing. See templates.md. |
 | segment | A `segment {}` in a lab: one L2 network with its own subnet, DHCP, DNS and optional NAT egress, routes and forwards. See networking.md. |
 | share | A `share {}` on a machine: a host folder mounted in the guest, over virtiofs on Linux or the bundled SMB server on Windows. See shares-media.md. |
+| shared app | One guest program whose windows appear on the host desktop beside the host's own, started by `vmlab app run`. Its windows ride the guest family's own protocol over the agent channel: waypipe or X11 from Linux, RDP RemoteApp from Windows. Not to be confused with a share, which is a folder. See cli-machine.md. |
 | snapshot | A saved state of a machine's disk and memory, captured and restored by `vmlab snapshot`. Not a workspace backup: a dev machine's source lives on the host. See snapshots-vision.md. |
 | stat-walk | The syncer's full walk of the guest tree, run only on a watch discontinuity: the first sync, ledger loss, a watch overflow or a dropped channel. An overflow blocks both directions until it completes. See dev-machines.md. |
 | store | The per-user directory of installed templates, keyed `arch/name@version`, written only by the supervisor. `vmlab template list` reads it. See templates.md. |

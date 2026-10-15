@@ -31,6 +31,7 @@ use tokio::sync::{Mutex, Notify, mpsc, watch};
 use vmlab_agent_proto::fileops::{self, Request, Response};
 // The file vocabulary itself, re-exported so callers of this client never
 // have to reach past it to name an operation (§19.5).
+pub use vmlab_agent_proto::app::AppMode;
 pub use vmlab_agent_proto::fileops::{Attrs, DirEntry, ErrorCode, LinkKind, Op, OpenFlags, Reply};
 pub use vmlab_agent_proto::watch::{EntryKind, StatRecord};
 use vmlab_agent_proto::watch::{RecordDecoder, WatchRecord, encode_record};
@@ -579,6 +580,38 @@ impl AgentHandle {
         self.open(|id| HostMsg::OpenEventLog { id, filter }).await
     }
 
+    /// Open a **shared app** session (PRD §20): the guest end of `mode`'s
+    /// window protocol, with `argv` started as `logon` for waypipe and X11.
+    /// The session's data bytes are length-prefixed [`app`] records, and its
+    /// [`SessionEvent::Exited`] is the program's exit.
+    ///
+    /// [`app`]: vmlab_agent_proto::app
+    pub async fn open_app(
+        &self,
+        mode: AppMode,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+        logon: Option<Logon>,
+    ) -> Result<AgentSession> {
+        self.open(|id| HostMsg::OpenApp {
+            id,
+            mode,
+            argv,
+            env,
+            cwd,
+            logon,
+        })
+        .await
+    }
+
+    /// One transport connection of the app session `app` (an
+    /// [`Self::open_app`] channel id), as a raw byte channel that half-closes
+    /// like an exec's.
+    pub async fn open_app_conn(&self, app: u32) -> Result<AgentSession> {
+        self.open(|id| HostMsg::OpenAppConn { id, app }).await
+    }
+
     /// Run to completion, collecting output. `128 + signal` codes on Unix.
     pub async fn exec(
         &self,
@@ -961,21 +994,24 @@ impl AgentSession {
 
     /// Send host→guest bytes (terminal input, exec stdin, pushed file data),
     /// respecting the guest's credit window.
-    pub async fn send(&self, mut bytes: &[u8]) -> Result<()> {
-        while !bytes.is_empty() {
-            let n = self.credit.take(bytes.len()).await;
-            if n == 0 {
-                bail!("agent channel closed");
-            }
-            self.handle.send_data(self.id, &bytes[..n]).await?;
-            bytes = &bytes[n..];
-        }
-        Ok(())
+    pub async fn send(&self, bytes: &[u8]) -> Result<()> {
+        self.sender().send(bytes).await
     }
 
     /// No more host→guest bytes (exec stdin EOF / end of pushed file).
     pub async fn eof(&self) -> Result<()> {
-        self.handle.send_msg(&HostMsg::Eof { id: self.id }).await
+        self.sender().eof().await
+    }
+
+    /// This session's host→guest half, for a consumer that sends from one
+    /// task while another drains [`Self::recv`] — a splice, where waiting
+    /// on either direction must not stop the other.
+    pub fn sender(&self) -> SessionSender {
+        SessionSender {
+            handle: self.handle.clone(),
+            id: self.id,
+            credit: self.credit.clone(),
+        }
     }
 
     /// Resize this terminal session's PTY.
@@ -1017,6 +1053,35 @@ impl Drop for AgentSession {
             handle.inner.sessions.lock().await.remove(&id);
             let _ = handle.send_msg(&HostMsg::Close { id }).await;
         });
+    }
+}
+
+/// The host→guest half of an [`AgentSession`]. It does not keep the channel
+/// open: once the session is closed, sending fails.
+#[derive(Clone)]
+pub struct SessionSender {
+    handle: AgentHandle,
+    id: u32,
+    credit: Arc<SendCredit>,
+}
+
+impl SessionSender {
+    /// See [`AgentSession::send`].
+    pub async fn send(&self, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            let n = self.credit.take(bytes.len()).await;
+            if n == 0 {
+                bail!("agent channel closed");
+            }
+            self.handle.send_data(self.id, &bytes[..n]).await?;
+            bytes = &bytes[n..];
+        }
+        Ok(())
+    }
+
+    /// See [`AgentSession::eof`].
+    pub async fn eof(&self) -> Result<()> {
+        self.handle.send_msg(&HostMsg::Eof { id: self.id }).await
     }
 }
 

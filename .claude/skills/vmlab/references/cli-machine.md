@@ -1,6 +1,6 @@
 # vmlab CLI: machine-level verbs
 
-Per-machine commands: `vm`, `machine`, `container`, `exec`, `shell`, `console`, `cp`, `clipboard`, `snapshot`, `dev`. Lab-level verbs (`up`, `down`, `destroy`, `status`, `validate`, `lab`) are in cli-lab.md.
+Per-machine commands: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `cp`, `clipboard`, `snapshot`, `dev`. Lab-level verbs (`up`, `down`, `destroy`, `status`, `validate`, `lab`) are in cli-lab.md.
 
 Machine references take the form `[lab/]name`. A bare name resolves against the lab in the current directory and starts the lab daemon if none is running. The qualified form addresses a lab already running, from any directory, and never starts one; it fails with `lab "<name>" is not running` otherwise. A malformed reference such as `lab/` is refused before anything is contacted. Exceptions are noted per verb (`console` and `dev sync` never start a daemon).
 
@@ -270,7 +270,7 @@ Reports what this machine can serve, probed live rather than inferred from its k
 | `healthcheck` | `yes` when the machine declares a healthcheck, so its status carries a verdict. |
 | `agent` | The features the agent negotiated at handshake, comma-separated, or `-` when no agent is answering. |
 
-Agent features come from a live handshake, so a machine that is up but not yet answering reports `-`, which reads differently from a feature list that lacks something. An agent that restarted inside the guest is handshaken again, so the list is the running agent's. The possible features are `terminal`, `exec`, `fileops`, `tail`, `metrics`, `clipboard`, `clipboard_reply`, `eventlog` and `watch`. `clipboard_reply` means the agent answers every clipboard request, so `vmlab clipboard` can confirm a copy and report a refusal at once. The workspace syncer needs `watch` and `fileops` (dev-machines.md).
+Agent features come from a live handshake, so a machine that is up but not yet answering reports `-`, which reads differently from a feature list that lacks something. An agent that restarted inside the guest is handshaken again, so the list is the running agent's. The possible features are `terminal`, `exec`, `fileops`, `tail`, `metrics`, `clipboard`, `clipboard_reply`, `eventlog`, `watch`, `app_waypipe`, `app_x11` and `app_rdp`. `clipboard_reply` means the agent answers every clipboard request, so `vmlab clipboard` can confirm a copy and report a refusal at once. The workspace syncer needs `watch` and `fileops` (dev-machines.md); `vmlab app run` needs the `app_*` feature of its protocol.
 
 ### vmlab machine stats
 
@@ -556,6 +556,74 @@ vmlab shell --user admin dc01
 ```
 
 Exit status is 0 when the session ends normally. `not_found` (4) means the lab declares no machine by that name. `failed` (1) covers a machine that is not running, an agent that does not answer, and a login that cannot be minted.
+
+## vmlab app
+
+Shared apps: one guest program's windows on the host desktop, beside the host's own windows, with no VNC console. One subcommand, `run`. The windows ride the guest family's own window protocol over the agent's virtio-serial channel, so no guest network and no port is involved. VMs and containers both answer. Nothing in the lab file declares a shared app, and wscript has no call for it: scripts run in the headless lab daemon.
+
+### vmlab app run
+
+```sh
+vmlab app run [OPTIONS] <MACHINE> [-- <CMD>...]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `<MACHINE>` | The machine, as `[lab/]name`. |
+| `[CMD]...` | The program and its arguments, after `--`. No guest shell is involved. |
+| `--via <VIA>` | The window protocol: `waypipe`, `x11` or `rdp`. Default: chosen from the guest family and this desktop session. |
+| `--detach` | Hand the session to a background helper and return at once. |
+| `--cwd <DIR>` | Guest working directory for the program. |
+| `--user <LOGIN>` | Run as this login: the label a `login {}` block declares, or the account name as an alias. Default: the machine's default login. `SYSTEM` on Windows or `root` on Linux is the agent identity. |
+| `--password <PASSWORD>` | Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`. |
+| `-h`, `--help` | Print help. |
+
+The guest family comes from the machine's effective profile: a name starting with `windows` is Windows, everything else (containers included) is Linux. The host session comes from the command's own environment: `WAYLAND_DISPLAY` set is Wayland, else `DISPLAY` set is X11, else it refuses with `no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set`. Run it from a terminal inside the desktop session.
+
+| Guest | Host session | Protocol | Guest needs | Host needs |
+| --- | --- | --- | --- | --- |
+| Linux | Wayland | waypipe | `waypipe` on the login's `PATH`, built with lz4, and `/bin/sh` | `waypipe` |
+| Linux | Wayland, either side without waypipe | X11 through Xwayland | nothing | `DISPLAY` set |
+| Linux | X11 | X11 | nothing | the X server |
+| Windows | Wayland or X11 | RDP RemoteApp | Pro, Enterprise, Education or Server edition | FreeRDP 3: `xfreerdp3`, then `xfreerdp`, on `PATH` |
+
+The host config keys `waypipe` and `freerdp` name the host binaries instead (host-profiles.md); the CLI reads them itself, so no restart is needed. waypipe → X11 is the only automatic fallback; it prints the reason on stderr followed by `; falling back to X11 through Xwayland`. `--via` never falls back, and a protocol the guest family cannot serve is refused by name. Prefer waypipe on Wayland: X11 has no compression, and a program without an X11 backend does not run under it.
+
+Identity follows logins.md exactly as for `exec`. RDP cannot log on as the agent identity, so a Windows machine needs a `login {}` with a password or `--user`/`--password`. On Windows the agent turns Remote Desktop on, allows unlisted RemoteApp programs, adds the account to Remote Desktop Users unless it is an administrator, and starts TermService, changing each only where it differs and leaving it changed. FreeRDP gets the credentials on stdin and `--cwd` as the `/app` working directory; an argument FreeRDP's `/app` parser would alter, such as one with an apostrophe, is refused.
+
+On a client edition of Windows, and on Server while "Restrict each user to a single session" is on (its default), the RDP logon disconnects the same account's console session, so `vmlab console` shows the lock screen. A second `app run` against the same machine and account takes the session over: both apps' windows move to the newest FreeRDP and the first command returns. The first shared app on a machine waits about 40 seconds for TermService's listener, printing `[<machine>] waiting for Remote Desktop to listen on 127.0.0.1:3389`.
+
+For X11 the CLI mints a cookie that the agent writes into a private Xauthority (display `:10` up); the CLI checks it on every connection and swaps in the host display's real cookie. A connected X11 program has the reach of `ssh -X` into the host X server, including reading other X clients' input.
+
+The command stays in the foreground: a waypipe or X11 session ends when the program exits, an RDP session when FreeRDP exits. Ctrl-C closes a waypipe or X11 session and kills the guest program; on RDP it disconnects the Windows session, the program keeps running, and its windows return with the account's next shared app on that machine. `--detach` makes the same protocol choice, re-runs itself as a background helper, prints ``sharing `<cmd>` from <machine> in the background (it ends when the program does)`` and returns; the helper has no terminal, so a daemon refusal is lost. Re-run without `--detach` to see one.
+
+```sh
+vmlab app run nix01 -- foot
+vmlab exec --user root dev01 -- apk add waypipe foot
+vmlab app run --detach dev01 -- foot
+vmlab app run --via x11 nix01 -- xterm
+vmlab app run --user admin win01 -- notepad.exe
+vmlab app run --cwd 'C:\Users\dev' win01 -- notepad.exe notes.txt
+```
+
+Refusals (troubleshooting.md has causes and fixes):
+
+| Message | When |
+| --- | --- |
+| `no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set` | No desktop session in the command's environment. |
+| `nothing to run — usage: vmlab app run [lab/]machine -- <cmd> [args...]` | Nothing after `--`. |
+| ``` `--via {mode}` shares apps from {family} guests; `{machine}` is a {other family} guest ``` | `--via` the guest family cannot serve. |
+| ``` `--via waypipe` needs a Wayland session: WAYLAND_DISPLAY is not set ``` | `--via waypipe` on X11. |
+| ``` `--via x11` needs an X server: DISPLAY is not set ``` | `--via x11` with no `DISPLAY`. |
+| ``` this host has no `waypipe` on PATH (or `waypipe` in config.wcl), and DISPLAY is not set, so there is no X11 to fall back to ``` | Wayland host, no host waypipe, no Xwayland. |
+| ``` no FreeRDP 3 on this host: shared apps from a Windows guest need `xfreerdp3` or `xfreerdp` on PATH, or `freerdp` in config.wcl ``` | Windows guest, no FreeRDP. |
+| ``` `{machine}` has no `waypipe` on PATH for `{login}` ``` | Guest has no waypipe and the host has no `DISPLAY`. |
+| ``` the agent on `{machine}` predates shared apps over `{mode}`; run `vmlab machine repair-agent {machine}` ``` | Old agent, or the legacy agent tier. |
+| ``` RDP needs an account: declare a `login {}` on `{machine}` or pass --user/--password ``` | Windows with no login, or `--user SYSTEM`. |
+| ``` {machine}: Windows `{edition}` has no Remote Desktop host; shared apps need Pro, Enterprise, Education or Server ``` | Windows Home. |
+| ``` FreeRDP's `/app` option cannot carry `{value}` intact: its comma, quote and backslash rules would change it ``` | A Windows argument FreeRDP would alter. |
+
+Exit status is the guest program's code (waypipe, X11) or FreeRDP's (RDP); Ctrl-C exits 130 and SIGTERM 143. Exit 2 (`invalid_argument`) is an RDP session with no account. Exit 6 (`unsupported`) is a guest with no waypipe or an agent that predates shared apps. Exit 1 (`failed`) covers the CLI's own refusals, a machine that is not running, a login that cannot be minted, Windows Home, and a host client that exits mid-session.
 
 ## vmlab console
 

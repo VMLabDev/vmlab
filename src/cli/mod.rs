@@ -1,6 +1,7 @@
 //! CLI surface (PRD §12). The same binary also hosts the supervisor and lab
 //! daemons via hidden subcommands, re-exec'd from the CLI as needed.
 
+pub mod app;
 mod broken_pipe;
 pub mod console;
 pub mod daemon;
@@ -184,6 +185,11 @@ pub enum Command {
         #[command(flatten)]
         run_as: As,
     },
+    /// Shared apps: a guest program's windows on this desktop (PRD §20)
+    App {
+        #[command(subcommand)]
+        cmd: AppCmd,
+    },
     /// Dev machines: the workspace syncer and its halts (PRD §19.6, §19.7)
     Dev {
         #[command(subcommand)]
@@ -248,6 +254,9 @@ pub enum Command {
         #[arg(long)]
         vm: String,
     },
+    /// Internal: hold a detached `app run` session
+    #[command(name = "__appsession", hide = true)]
+    Appsession(app::RunArgs),
     /// Internal: run the supervisor daemon in the foreground
     #[command(name = "__supervisord", hide = true)]
     Supervisord,
@@ -324,6 +333,21 @@ pub enum DevSyncCmd {
         #[arg(long)]
         machine: Option<String>,
     },
+}
+
+/// Shared apps (PRD §20).
+#[derive(Subcommand)]
+pub enum AppCmd {
+    /// Run a guest program and show its windows on this desktop
+    ///
+    /// The protocol follows the guest and this session: waypipe for a Linux
+    /// guest on Wayland (X11 through Xwayland when either side lacks
+    /// waypipe), X11 on an X11 desktop, RDP RemoteApp for a Windows guest.
+    /// Exits with the program's code. Ctrl-C ends a waypipe or X11 session
+    /// and the program with it, and disconnects an RDP session, leaving the
+    /// program running in it. Windows allows one session per account, so the
+    /// RDP logon takes over the account's console session.
+    Run(app::RunArgs),
 }
 
 /// Per-VM power control and interaction (PRD §12, §10.3).
@@ -588,7 +612,7 @@ pub enum PlaybookCmd {
 /// why clap requires the one with the other. Every verb that attaches
 /// flattens the same pair in, so the two flags read identically wherever
 /// they appear.
-#[derive(clap::Args, Clone, Debug, Default)]
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct As {
     /// Run as this login: the label a `login {}` block declares, or the
     /// account name as an alias. Defaults to the machine's default login;
@@ -608,7 +632,10 @@ pub fn run() -> ExitCode {
     // has gone must not die of it.
     let person_facing = !matches!(
         cli.command,
-        Command::Supervisord | Command::Labd { .. } | Command::Vncbridge { .. }
+        Command::Supervisord
+            | Command::Labd { .. }
+            | Command::Vncbridge { .. }
+            | Command::Appsession(_)
     );
     if person_facing {
         broken_pipe::install();
@@ -720,6 +747,10 @@ pub fn run() -> ExitCode {
             cmd,
         } => lab::cmd_exec(&vm, timeout, cmd, run_as),
         Command::Shell { vm, run_as } => lab::cmd_shell(&vm, run_as),
+        Command::App { cmd } => match cmd {
+            AppCmd::Run(args) => app::cmd_app_run(args),
+        },
+        Command::Appsession(args) => app::cmd_app_run(args),
         Command::Dev { cmd } => match cmd {
             DevCmd::Sync { cmd } => match cmd {
                 DevSyncCmd::Status { machine } => dev::cmd_dev_sync_status(machine),

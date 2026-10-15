@@ -1,8 +1,8 @@
 //! Windows platform half: vioserial port I/O (OVERLAPPED, shared exclusive
 //! handle), ConPTY-hosted PowerShell terminals, EvtSubscribe event-log
 //! tailing, GetSystemTimes/GlobalMemoryStatusEx metrics, the user-session
-//! clipboard helper, process trees as job objects, and the SCM service
-//! entry.
+//! clipboard helper, process trees as job objects, the guest side of a
+//! shared app over RDP RemoteApp, and the SCM service entry.
 
 pub mod clipboard;
 pub mod conpty;
@@ -11,6 +11,7 @@ pub mod logon;
 pub mod metrics;
 pub mod port;
 pub mod proc;
+pub mod rdp;
 pub mod service;
 pub mod sysinfo;
 pub mod tree;
@@ -19,7 +20,7 @@ pub use conpty::kill_process;
 pub use metrics::{cpu_pct, cpu_sample, disk_sample, mem_sample};
 pub use port::open_port;
 
-use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode, features};
+use vmlab_agent_proto::{Logon, NetInterface, OsInfo, ShutdownMode, features};
 
 use std::sync::Arc;
 
@@ -108,6 +109,7 @@ impl crate::mux::Platform for WindowsPlatform {
             features::CLIPBOARD_REPLY.to_string(),
             features::TREE.to_string(),
             features::SET_TIME.to_string(),
+            features::APP_RDP.to_string(),
         ]
     }
 
@@ -152,5 +154,9 @@ impl crate::mux::Platform for WindowsPlatform {
 
     fn set_time(&self, unix_ms: i64) -> Result<(), String> {
         sysinfo::set_time(unix_ms)
+    }
+
+    fn app_rdp_prepare(&self, logon: &Logon) -> Result<(), String> {
+        rdp::prepare(logon)
     }
 }

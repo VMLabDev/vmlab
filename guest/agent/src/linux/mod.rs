@@ -31,6 +31,7 @@ use std::os::unix::process::CommandExt;
 
 use vmlab_agent_proto::{DiskUsage, NetInterface, OsInfo, PORT_NAME, ShutdownMode, features};
 
+use crate::app::AppHome;
 use crate::logon::Held;
 use crate::mux::Mux;
 use crate::spawn::{
@@ -235,6 +236,25 @@ pub struct LinuxPlatform {
     /// container instead of the init namespace.
     container: Option<Arc<ContainerCtx>>,
     spawner: LinuxSpawner,
+    app_paths: AppPaths,
+}
+
+/// Where shared-app sessions (PRD §20) put their guest end, as the program
+/// sees it — inside a container these resolve under its root filesystem.
+struct AppPaths {
+    /// The parent of every session's private directory.
+    run: String,
+    /// The X socket directory every X client looks in.
+    x11_unix: String,
+}
+
+impl Default for AppPaths {
+    fn default() -> AppPaths {
+        AppPaths {
+            run: "/run/vmlab-app".to_string(),
+            x11_unix: "/tmp/.X11-unix".to_string(),
+        }
+    }
 }
 
 /// The Linux half of the process/handle seam: PTY terminals, piped exec, and
@@ -295,6 +315,20 @@ pub fn new_platform() -> LinuxPlatform {
             container: None,
             logins,
         },
+        app_paths: AppPaths::default(),
+    }
+}
+
+impl LinuxPlatform {
+    /// Put shared-app sessions somewhere a test can write and look, rather
+    /// than `/run` and the build host's own `/tmp/.X11-unix`.
+    #[cfg(test)]
+    pub fn with_app_paths(mut self, run: &str, x11_unix: &str) -> LinuxPlatform {
+        self.app_paths = AppPaths {
+            run: run.to_string(),
+            x11_unix: x11_unix.to_string(),
+        };
+        self
     }
 }
 
@@ -330,6 +364,7 @@ pub fn new_platform_container(config_path: &str) -> LinuxPlatform {
             container: Some(container),
             logins,
         },
+        app_paths: AppPaths::default(),
     }
 }
 
@@ -348,6 +383,10 @@ impl crate::mux::Platform for LinuxPlatform {
             features::WATCH.to_string(),
             features::TREE.to_string(),
             features::SET_TIME.to_string(),
+            // Whether `waypipe` is installed is the login's business, and
+            // the host learns it from the open failing; X11 needs nothing.
+            features::APP_WAYPIPE.to_string(),
+            features::APP_X11.to_string(),
         ];
         if self.clipboard.is_some() {
             f.push(features::CLIPBOARD.to_string());
@@ -420,6 +459,50 @@ impl crate::mux::Platform for LinuxPlatform {
     fn set_time(&self, unix_ms: i64) -> Result<(), String> {
         set_realtime_clock(unix_ms)
     }
+
+    fn app_home(&self, identity: &Identity, name: &str) -> Result<AppHome, String> {
+        let held = self
+            .spawner
+            .logins
+            .resolve(identity)
+            .map_err(|e| e.to_string())?;
+        let owner = owner(&self.spawner.route(&held)).map(|a| (a.uid, a.gid));
+        let resolve = self.path_resolver();
+        let seen = format!("{}/{name}", self.app_paths.run);
+        let dir = PathBuf::from(resolve(seen.clone()));
+        make_app_dir(
+            &PathBuf::from(resolve(self.app_paths.run.clone())),
+            &dir,
+            owner,
+        )
+        .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+        Ok(AppHome {
+            dir,
+            seen,
+            x11_unix: PathBuf::from(resolve(self.app_paths.x11_unix.clone())),
+            owner,
+            hostname: uname().2,
+        })
+    }
+}
+
+/// A session's private directory: under a parent anyone may pass through but
+/// nobody else may list, replacing whatever an earlier agent left at the
+/// name, mode 0700 and the session's own.
+fn make_app_dir(parent: &Path, dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+    if !parent.is_dir() {
+        fs::create_dir_all(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o711))?;
+    }
+    if dir.exists() {
+        fs::remove_dir_all(dir)?;
+    }
+    fs::create_dir(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(dir, Some(uid), Some(gid))?;
+    }
+    Ok(())
 }
 
 /// Set CLOCK_REALTIME. The system clock only — the hardware clock is left
@@ -1671,6 +1754,7 @@ mod tests {
                 container: Some(ctx),
                 logins,
             },
+            app_paths: AppPaths::default(),
         }
     }
 
@@ -1700,6 +1784,29 @@ mod tests {
         );
         let host = new_platform();
         assert_eq!(host.resolve_path("/etc/passwd".into()), "/etc/passwd");
+    }
+
+    /// A container's shared-app session lives inside its root filesystem,
+    /// where the program can reach it, and the program is told the path as
+    /// it sees it from in there (PRD §20.3).
+    #[test]
+    fn a_container_app_session_lives_inside_the_rootfs() {
+        use crate::mux::Platform as _;
+        let rootfs = tempfile::tempdir().unwrap();
+        let p = container_platform(test_ctx(rootfs.path().to_str().unwrap(), vec![]));
+        let home = p.app_home(&Identity::Agent, "1-7").unwrap();
+        assert_eq!(home.seen, "/run/vmlab-app/1-7");
+        assert_eq!(home.dir, rootfs.path().join("run/vmlab-app/1-7"));
+        assert_eq!(home.x11_unix, rootfs.path().join("tmp/.X11-unix"));
+        assert_eq!(
+            fs::metadata(&home.dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(home.owner, None, "the floor here is the agent itself");
+        // A directory an earlier agent left at the name is replaced.
+        fs::write(home.dir.join("stale"), b"").unwrap();
+        let again = p.app_home(&Identity::Agent, "1-7").unwrap();
+        assert!(!again.dir.join("stale").exists());
     }
 
     /// Container exec still goes through the nsexec trampoline — now behind

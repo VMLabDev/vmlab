@@ -31,6 +31,7 @@ import "./pages/guide/scripting.wcl"
 import "./pages/guide/vision.wcl"
 import "./pages/guide/playbooks.wcl"
 import "./pages/guide/logins.wcl"
+import "./pages/guide/apps.wcl"
 import "./pages/guide/dev.wcl"
 import "./pages/guide/profiles.wcl"
 import "./pages/guide/host.wcl"
@@ -69,6 +70,7 @@ import "./pages/commands/console.wcl"
 import "./pages/commands/script.wcl"
 import "./pages/commands/exec.wcl"
 import "./pages/commands/shell.wcl"
+import "./pages/commands/app.wcl"
 import "./pages/commands/dev.wcl"
 import "./pages/commands/cp.wcl"
 import "./pages/commands/tail.wcl"
@@ -128,6 +130,7 @@ site manual {
       chapter "Screens, input and vision"            { page = guide_vision }
       chapter "Playbooks"                            { page = guide_playbooks }
       chapter "Logins"                                { page = guide_logins }
+      chapter "Shared apps"                          { page = guide_apps }
       chapter "Dev machines and the workspace syncer" { page = guide_dev }
       chapter "Guest OS profiles"                    { page = guide_profiles }
       chapter "Host configuration and WSL 2"         { page = guide_host }
@@ -166,6 +169,7 @@ site manual {
       chapter "vmlab script"     { page = cmd_script }
       chapter "vmlab exec"       { page = cmd_exec }
       chapter "vmlab shell"      { page = cmd_shell }
+      chapter "vmlab app"        { page = cmd_app }
       chapter "vmlab dev"        { page = cmd_dev }
       chapter "vmlab cp"         { page = cmd_cp }
       chapter "vmlab tail"       { page = cmd_tail }

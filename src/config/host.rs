@@ -1,6 +1,7 @@
 //! Host-level daemon configuration (PRD §9.4 pool override, §9.5 suffix,
-//! §9.2 PSK, §8.1 watchdog threshold, §11 viewer, §6.4 chunk size), read
-//! from `~/.config/vmlab/config.wcl`. Every field optional; defaults apply.
+//! §9.2 PSK, §8.1 watchdog threshold, §11 viewer, §6.4 chunk size, §20.4
+//! shared-app clients), read from `~/.config/vmlab/config.wcl`. Every field
+//! optional; defaults apply.
 
 use std::path::Path;
 
@@ -28,6 +29,12 @@ pub struct HostConfig {
     /// TCP listen port for inbound cross-host segment trunks (§9.2).
     pub trunk_port: u16,
     pub viewer: Option<String>,
+    /// The host's waypipe client for shared apps (PRD §20.4); `None` =
+    /// `waypipe` on `PATH`.
+    pub waypipe: Option<std::path::PathBuf>,
+    /// The FreeRDP client for shared apps from Windows guests (PRD §20.4);
+    /// `None` = `xfreerdp3`, then `xfreerdp`, on `PATH`.
+    pub freerdp: Option<std::path::PathBuf>,
     pub oci_chunk_size: u64,
     /// Network fast-path tier selection (§9.1 substitutable backend).
     pub fastpath: crate::net::fastpath::FastpathMode,
@@ -55,6 +62,8 @@ impl Default for HostConfig {
             psk: None,
             trunk_port: 13947,
             viewer: None,
+            waypipe: None,
+            freerdp: None,
             oci_chunk_size: crate::oci::chunking::DEFAULT_CHUNK_SIZE,
             fastpath: crate::net::fastpath::FastpathMode::Auto,
             config_weave_bin_dir: None,
@@ -112,6 +121,8 @@ impl HostConfig {
                 cfg.trunk_port = v;
             }
             cfg.viewer = r.string("viewer").unspan();
+            cfg.waypipe = r.path("waypipe").unspan();
+            cfg.freerdp = r.path("freerdp").unspan();
             if let Some(v) = r
                 .keyword("fastpath", crate::net::fastpath::FastpathMode::NAMES)
                 .unspan()
@@ -237,6 +248,8 @@ host {
   fastpath         = "sockmap"
   workspace_max_file = 2GiB
   firmware_dir     = "/opt/edk2"
+  waypipe          = "/opt/waypipe/bin/waypipe"
+  freerdp          = "/usr/bin/sdl-freerdp3"
 }
 "#,
             "<test>",
@@ -251,6 +264,14 @@ host {
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
         assert_eq!(cfg.workspace_max_file, 2 << 30);
         assert_eq!(cfg.firmware_dir.as_deref(), Some(Path::new("/opt/edk2")));
+        assert_eq!(
+            cfg.waypipe.as_deref(),
+            Some(Path::new("/opt/waypipe/bin/waypipe"))
+        );
+        assert_eq!(
+            cfg.freerdp.as_deref(),
+            Some(Path::new("/usr/bin/sdl-freerdp3"))
+        );
     }
 
     /// The diagnostics a host-config author now gets — same wording as a
