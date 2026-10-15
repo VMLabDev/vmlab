@@ -860,17 +860,31 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let mut xvfb = std::process::Command::new("Xvfb")
-            .arg(":97")
-            .arg("-auth")
-            .arg(&auth)
-            // No reset when a client leaves: the next one would race it.
-            .args(["-nolisten", "tcp", "-noreset"])
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        /// Kills Xvfb however the test ends, so a failed assertion leaves no
+        /// server holding `:97` or the caller's output pipe.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                self.0.kill().ok();
+                self.0.wait().ok();
+            }
+        }
+        let xvfb = Reap(
+            std::process::Command::new("Xvfb")
+                .arg(":97")
+                .arg("-auth")
+                .arg(&auth)
+                // No reset when a client leaves: the next one would race it.
+                .args(["-nolisten", "tcp", "-noreset"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // The socket file appears at bind, before the server listens; ready
+        // is when a connect succeeds.
         for _ in 0..100 {
-            if Path::new("/tmp/.X11-unix/X97").exists() {
+            if UnixStream::connect("/tmp/.X11-unix/X97").await.is_ok() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -889,8 +903,7 @@ mod tests {
         };
         let unauthorized =
             live_setup(no_host_cookie, &session, &decode_cookie(&session).unwrap()).await;
-        xvfb.kill().ok();
-        xvfb.wait().ok();
+        drop(xvfb);
         std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(ok[0], 1, "Xvfb answered {:?}", String::from_utf8_lossy(&ok));
