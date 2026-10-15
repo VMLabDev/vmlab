@@ -248,8 +248,9 @@ fn serve(
     };
     let app = session.id;
     tokio::spawn(async move {
-        let accepting = tokio::spawn(accept_conns(conns_listener, agent, app));
-        relay_control(session, control_listener).await;
+        let (notes_tx, notes) = tokio::sync::mpsc::unbounded_channel();
+        let accepting = tokio::spawn(accept_conns(conns_listener, agent, app, notes_tx));
+        relay_control(session, control_listener, notes).await;
         // Dropping the accept loop drops every splice it runs, and each
         // dropped channel is closed on the agent.
         accepting.abort();
@@ -302,7 +303,15 @@ fn relay_of(ev: Option<SessionEvent>) -> Option<Relay> {
 /// before the CLI connects wait here instead. A session that ends before then
 /// still reaches the client, so a program that exits at once still reports
 /// its code.
-async fn relay_control(mut session: AgentSession, listener: UnixListener) {
+///
+/// `notes` are the daemon's own lines for the CLI — a connection the agent
+/// would not open — sent as `log` records beside the agent's.
+async fn relay_control(
+    mut session: AgentSession,
+    listener: UnixListener,
+    mut notes: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let note = |text: String| app::encode_record(&AppRecord::Log { text });
     let grace = tokio::time::sleep(ACCEPT_GRACE);
     tokio::pin!(grace);
     let mut backlog = Vec::new();
@@ -311,6 +320,7 @@ async fn relay_control(mut session: AgentSession, listener: UnixListener) {
         tokio::select! {
             accepted = listener.accept() => break accepted.ok().map(|(stream, _)| stream),
             _ = &mut grace => break None,
+            Some(text) = notes.recv(), if !over => backlog.extend(note(text)),
             ev = session.recv(), if !over => match relay_of(ev) {
                 Some(Relay::More(bytes)) => {
                     backlog.extend(bytes);
@@ -357,6 +367,12 @@ async fn relay_control(mut session: AgentSession, listener: UnixListener) {
                 session.close().await;
                 return;
             },
+            Some(text) = notes.recv() => {
+                if client_tx.write_all(&note(text)).await.is_err() {
+                    session.close().await;
+                    return;
+                }
+            }
             ev = session.recv() => match relay_of(ev) {
                 Some(Relay::More(bytes)) => {
                     if client_tx.write_all(&bytes).await.is_err() {
@@ -389,14 +405,20 @@ async fn finish_unread(
     }
 }
 
-/// Accept transport connections for the app session `app` until aborted.
-async fn accept_conns(listener: UnixListener, agent: AgentHandle, app: u32) {
+/// Accept transport connections for the app session `app` until aborted,
+/// telling `notes` of each one the agent would not open.
+async fn accept_conns(
+    listener: UnixListener,
+    agent: AgentHandle,
+    app: u32,
+    notes: tokio::sync::mpsc::UnboundedSender<String>,
+) {
     let mut splices = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    splices.spawn(conn(stream, agent.clone(), app));
+                    splices.spawn(conn(stream, agent.clone(), app, notes.clone()));
                 }
                 Err(e) => {
                     tracing::warn!("app session {app}: accepting a connection failed: {e}");
@@ -409,12 +431,21 @@ async fn accept_conns(listener: UnixListener, agent: AgentHandle, app: u32) {
 }
 
 /// One transport connection: its own agent channel, spliced both ways.
-async fn conn(stream: UnixStream, agent: AgentHandle, app: u32) {
+async fn conn(
+    stream: UnixStream,
+    agent: AgentHandle,
+    app: u32,
+    notes: tokio::sync::mpsc::UnboundedSender<String>,
+) {
     match agent.open_app_conn(app).await {
         Ok(session) => splice(stream, session).await,
         // Only this connection fails: dropping the stream closes it, and the
         // protocol's own client decides what one refused connection means.
-        Err(e) => tracing::warn!("app session {app}: opening a connection failed: {e:#}"),
+        // Its client sees only the close, so the reason goes to the CLI.
+        Err(e) => {
+            tracing::warn!("app session {app}: opening a connection failed: {e:#}");
+            let _ = notes.send(format!("a connection could not be opened: {e:#}"));
+        }
     }
 }
 
@@ -954,12 +985,13 @@ mod tests {
         assert_eq!(got, b"late-reply");
     }
 
-    /// A connection the agent will not open closes that client only; the
-    /// next connection is served.
+    /// A connection the agent will not open closes that client only, and
+    /// the CLI is told why, since that client sees only the close; the next
+    /// connection is served.
     #[tokio::test]
     async fn a_refused_connection_closes_only_that_client() {
         let (_dir, mut agent, _app, reply) = x11_session().await;
-        let _control = UnixStream::connect(path_of(&reply, "control"))
+        let mut control = UnixStream::connect(path_of(&reply, "control"))
             .await
             .unwrap();
         let mut refused = UnixStream::connect(path_of(&reply, "conns")).await.unwrap();
@@ -975,6 +1007,12 @@ mod tests {
         let mut got = Vec::new();
         refused.read_to_end(&mut got).await.unwrap();
         assert!(got.is_empty());
+        assert_eq!(
+            read_record(&mut control).await,
+            AppRecord::Log {
+                text: "a connection could not be opened: no parked connection".into()
+            }
+        );
 
         let _next = UnixStream::connect(path_of(&reply, "conns")).await.unwrap();
         assert!(matches!(
