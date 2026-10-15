@@ -343,9 +343,10 @@ pub enum AppCmd {
     /// The protocol follows the guest and this session: waypipe for a Linux
     /// guest on Wayland (X11 through Xwayland when either side lacks
     /// waypipe), X11 on an X11 desktop, RDP RemoteApp for a Windows guest.
-    /// Exits with the program's code; Ctrl-C ends the session and the
-    /// program with it. On a client edition of Windows the RDP logon takes
-    /// over the account's console session.
+    /// Exits with the program's code. Ctrl-C ends a waypipe or X11 session
+    /// and the program with it, and disconnects an RDP session, leaving the
+    /// program running in it. Windows allows one session per account, so the
+    /// RDP logon takes over the account's console session.
     Run(app::RunArgs),
 }
 
