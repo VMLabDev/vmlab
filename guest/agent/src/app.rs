@@ -640,6 +640,54 @@ mod parking {
         }
     }
 
+    /// The environment variable that tags every process of one session.
+    pub(crate) const SESSION_VAR: &str = "VMLAB_APP_SESSION";
+
+    /// Makes each session's tag unique within this agent process; the agent's
+    /// pid in front makes it unique across agents.
+    static NEXT_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// SIGKILL every process whose environment carries
+    /// `VMLAB_APP_SESSION=<tag>`, repeating while a pass still finds one so a
+    /// process forked mid-scan is caught too. Processes that dropped the
+    /// variable, or whose environment this agent cannot read, are missed.
+    pub(crate) fn kill_tagged(tag: &str) {
+        let marker = format!("{SESSION_VAR}={tag}");
+        let me = std::process::id();
+        for _ in 0..5 {
+            let mut found = false;
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if pid == me {
+                    continue;
+                }
+                let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
+                    continue;
+                };
+                if environ
+                    .split(|b| *b == 0)
+                    .any(|var| var == marker.as_bytes())
+                {
+                    crate::platform::kill_process(pid);
+                    found = true;
+                }
+            }
+            if !found {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     pub fn open(
         mux: &Mux,
         platform: &dyn Platform,
@@ -671,11 +719,16 @@ mod parking {
                 return;
             }
         };
+        // Every process the program starts inherits the tag, so closing the
+        // session can find them all, not only the one it started.
+        let tag = format!("{name}-{}", NEXT_TAG.fetch_add(1, Ordering::Relaxed));
+        let mut env = spec.env;
+        env.push((SESSION_VAR.into(), tag.clone()));
         let (argv, env, display) = match &protocol {
-            Protocol::Waypipe => (waypipe_argv(&home.seen, spec.argv), spec.env, None),
+            Protocol::Waypipe => (waypipe_argv(&home.seen, spec.argv), env, None),
             Protocol::X11 { .. } => {
                 let display = endpoint.display.expect("an X11 endpoint has a display");
-                let mut env = spec.env;
+                let mut env = env;
                 env.push(("DISPLAY".into(), format!(":{display}")));
                 env.push(("XAUTHORITY".into(), format!("{}/Xauthority", home.seen)));
                 (spec.argv, env, Some(format!(":{display}")))
@@ -727,6 +780,10 @@ mod parking {
                 if !kill_done.load(Ordering::SeqCst) {
                     session_kill();
                 }
+                // The program's children outlive a kill of the program, and
+                // hold its output open, which would keep the session from
+                // ever ending.
+                kill_tagged(&tag);
                 end_mux.apps().end(id);
             })),
         ) else {

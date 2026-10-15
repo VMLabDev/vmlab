@@ -353,6 +353,70 @@ fn the_xauthority_file_holds_the_cookie_twice_and_only_for_its_owner() {
     assert!(!file.exists(), "closing removes the private directory");
 }
 
+/// Closing a session kills what the program started as well as the program:
+/// a child left holding the program's output would keep the session from
+/// ever reporting its end, and would run on in the guest.
+#[test]
+fn closing_a_session_kills_the_programs_children_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = platform(tmp.path());
+    let (mux, cap) = capture_mux();
+    let mut host = Host::new(cap);
+    let pidfile = tmp.path().join("child.pid");
+    send(
+        &mux,
+        &p,
+        open_app(
+            AppMode::X11 {
+                cookie: COOKIE.into(),
+            },
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("sleep 60 & echo $! > {}; wait", pidfile.display()),
+            ],
+            vec![],
+        ),
+    );
+    assert!(matches!(host.record(), AppRecord::Ready { .. }));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let child: u32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    send(&mux, &p, HostMsg::Close { id: 1 });
+    assert!(matches!(
+        host.ctrl(|m| matches!(m, AgentMsg::Exited { .. })),
+        AgentMsg::Exited { id: 1, .. }
+    ));
+    let gone = |pid: u32| match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        // A zombie is dead, waiting only for whoever adopted it to reap it.
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !gone(child) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the program's child survived the close"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The encoding itself, against bytes written out by hand from libXau's
 /// format, so the parser above is not only checked against itself.
 #[test]
