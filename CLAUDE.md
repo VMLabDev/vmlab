@@ -88,6 +88,9 @@ profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
 `legacy/` builds and install scripts, and the Rust agent's own serial fallback
 for old Linux. Verified live on FreeDOS; the NT build is verified under Wine,
 and the 9x build live on Windows 95 (950, OSR2, OSR2.5) and 98 (FE, SE).
+**Shared apps are built** (§20, ADR-0016): `vmlab app run` puts one guest
+program's windows on the host desktop over waypipe, X11 or RDP RemoteApp,
+carried on the agent channel.
 
 Module map under `src/`:
 
@@ -104,6 +107,11 @@ Module map under `src/`:
   firmware lookup, process management; `container.rs` builds the micro-VM
   argv for lab containers (§18).
 - `qmp/` — the QMP client.
+- `appshare/` — shared apps (§20): the CLI-side host end, because only the
+  user's desktop session reaches the compositor. `select_mode` picks the
+  protocol from the guest family and the host session; `waypipe.rs` and
+  `rdp.rs` drive the host clients, `x11.rs` the cookie-checking X11 proxy.
+  `cli/app.rs` is the `vmlab app` verb over it.
 - `template/` — store, qemu-img, builds, artefact cache, registry catalog
   search; `cli.rs` is the `vmlab template` surface, a pure protocol client
   since the supervisor took ownership of the store (ADR-0010).
@@ -134,8 +142,11 @@ Module map under `src/`:
   in-guest agent on the `vmlab.agent.0` virtio-serial port: interactive
   terminals (PTY/ConPTY), streaming exec, tail, metrics, clipboard, the
   handle-based file RPC session every transfer runs over (`fileops.rs`,
-  §19.5) and the recursive tree `watch` backing the workspace syncer
-  (`watch/`, §19.5) — none of it touches the guest network. `spawn.rs` is
+  §19.5), the recursive tree `watch` backing the workspace syncer
+  (`watch/`, §19.5) and the shared-app sessions (`app.rs`, §20.3: waypipe
+  and X11 connections parked and announced, RDP dialled to the guest's own
+  3389, which `windows/rdp.rs` prepares) — none of it touches the guest
+  network. `spawn.rs` is
   the one seam every guest process is created through, and that a file
   session borrows
   its identity from (ADR-0015); each platform half mints §19.2's declared
@@ -162,6 +173,9 @@ Module map under `src/`:
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;
   `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18);
+  `app_share.rs` is `machine.app_open` (§20.3), the broker that opens a
+  shared app's agent session and hands the CLI its control and connection
+  sockets;
   `agent_repair.rs` is `machine.repair_agent` (§19.4), the plan for replacing
   a guest's agent binary over its own channel and the divergence it records;
   `workspace/` is the workspace syncer (§19.6, ADR-0014) — the layered

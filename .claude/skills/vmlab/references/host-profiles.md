@@ -76,6 +76,8 @@ host {
 | `psk` | utf8 | none | Pre-shared key authenticating cross-host segment trunks. Set the same value on both hosts. |
 | `trunk_port` | i64 | `13947` | TCP port the supervisor listens on for inbound cross-host segment trunks, 1 to 65535. |
 | `viewer` | utf8 | none (auto-detected) | VNC viewer command; `{}` is replaced by the target. |
+| `waypipe` | utf8 | `waypipe` on `PATH` | Path to the host's waypipe client for shared apps from Linux guests (cli-machine.md, `vmlab app`). Read by the CLI itself, so no restart; not checked until `app run` starts it. |
+| `freerdp` | utf8 | `xfreerdp3`, then `xfreerdp`, on `PATH` | Path to the FreeRDP 3 client for shared apps from Windows guests (cli-machine.md, `vmlab app`). Read by the CLI itself, so no restart; not checked until `app run` starts it. |
 | `fastpath` | utf8 | `auto` | Network fast path: `auto` probes, `off` forces userspace, `sockmap` and `afxdp` force a kernel tier. |
 | `oci_chunk_size` | ByteSize | `512MiB` | OCI layer chunk size for `vmlab template push` (see templates.md). |
 | `config_weave_bin_dir` | utf8 | `~/.local/share/config-weave/bin` | Directory holding the config-weave guest binaries playbooks push (see automation.md). |

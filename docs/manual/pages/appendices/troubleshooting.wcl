@@ -339,6 +339,86 @@ MSG
     machine it names has started.
   DOC
 
+  h2 "A shared app has no desktop to open on"
+  code text { source = "no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set" }
+  p <<DOC
+    `vmlab app run` puts windows on the desktop of the session it runs in,
+    and it found none. It reads `WAYLAND_DISPLAY` and `DISPLAY` from its own
+    environment, so a command started over SSH, from a plain virtual
+    console, or from a service has neither. Run it from a terminal inside
+    your desktop session. See [Shared apps](guide_apps).
+  DOC
+
+  h2 "FreeRDP is not found"
+  code text { source = "no FreeRDP 3 on this host: shared apps from a Windows guest need `xfreerdp3` or `xfreerdp` on PATH, or `freerdp` in config.wcl" }
+  p <<DOC
+    A Windows guest's windows arrive over RDP, and the host end is FreeRDP.
+    Install FreeRDP 3: Arch and Debian name the client `xfreerdp3`, Fedora
+    `xfreerdp`. A client installed elsewhere is named by `freerdp` in the
+    [host config](ref_host).
+  DOC
+
+  h2 "The guest has no waypipe"
+  code text { source = <<'MSG'
+`{machine}` has no `waypipe` on PATH for `{login}`
+MSG
+  }
+  p <<DOC
+    On a Wayland host, a Linux guest's windows arrive over waypipe, and the
+    lab daemon found no `waypipe` on the login's `PATH`. `{login}` is the
+    account the program would run as, or `the agent identity`. When the host
+    has `DISPLAY` set, `vmlab app run` prints the same words followed by
+    `; falling back to X11 through Xwayland` and carries on over X11. You
+    see this message as a refusal only when there is no X11 to fall back to.
+  DOC
+  p <<DOC
+    Install the distribution's `waypipe` package in the guest, for example
+    `vmlab exec --user root <machine> -- apk add waypipe` in an Alpine
+    container. A program installed under a login's home must be on that
+    login's `PATH`, not only root's.
+  DOC
+
+  h2 "The agent predates shared apps"
+  code text { source = <<'MSG'
+the agent on `{machine}` predates shared apps over `{mode}`; run `vmlab machine repair-agent {machine}`
+MSG
+  }
+  p <<DOC
+    The guest agent did not advertise `app_waypipe`, `app_x11` or `app_rdp`
+    at its handshake, because it was built before shared apps.
+    `vmlab machine capabilities <machine>` lists what it offers. Replace it
+    as described in [The machine's agent is out of date](apx_troubleshooting):
+    `vmlab machine repair-agent` for a running VM, a rebuilt template for
+    good. A machine on the legacy agent tier cannot share apps at all.
+  DOC
+
+  h2 "Windows Home has no Remote Desktop host"
+  code text { source = <<'MSG'
+{machine}: Windows `{edition}` has no Remote Desktop host; shared apps need Pro, Enterprise, Education or Server
+MSG
+  }
+  p <<DOC
+    The agent read `EditionID` from the guest's registry and found a Home
+    edition (`Core`, `CoreN`, `CoreSingleLanguage` or
+    `CoreCountrySpecific`). Home cannot accept a RemoteApp logon, and vmlab
+    does not try to change that. Build the machine's template from a Pro,
+    Enterprise, Education or Server image.
+  DOC
+
+  h2 "RDP needs an account"
+  code text { source = <<'MSG'
+RDP needs an account: declare a `login {}` on `{machine}` or pass --user/--password
+MSG
+  }
+  p <<DOC
+    RDP logs an account on with its password, and the program would have run
+    as the agent identity, SYSTEM, which RDP cannot log on as. This happens
+    on a Windows machine with no `login {}` and no `--user`, and with
+    `--user SYSTEM`. Declare a login with its `password`, as
+    [Logins](guide_logins) shows, or pass `--user` and `--password` for an
+    account the guest already has.
+  DOC
+
   h2 "Nested virtualisation is off on WSL 2"
   p <<'DOC'
     vmlab prints nothing specific to WSL 2. When nested virtualisation is

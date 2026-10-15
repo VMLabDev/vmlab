@@ -1,0 +1,142 @@
+page cmd_app {
+  title = "vmlab app"
+  chapter_header "vmlab app" {
+    kicker       = "Commands · reference"
+    reading_time = "6 min read"
+    updated      = "2026-10-15"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab app` puts one guest program's windows on the host desktop, beside
+    the host's own windows, with no VNC console in between. It has one
+    subcommand, `run`. The windows travel over the vmlab agent's
+    virtio-serial channel in the guest family's own window protocol, so a
+    shared app works on a machine with no guest network. A VM and a
+    container answer the same request. [Shared apps](guide_apps) explains
+    which protocol is used and what each side needs installed.
+  DOC
+
+  h2 "vmlab app run"
+
+  code sh { source = "vmlab app run [OPTIONS] <MACHINE> [-- <CMD>...]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<MACHINE>`" | "The machine, as `[lab/]name`." |
+      | "`[CMD]...`" | "The program and its arguments, after `--`." |
+      | "`--via <VIA>`" | "The window protocol: `waypipe`, `x11` or `rdp`. Default: chosen from the guest family and this desktop session." |
+      | "`--detach`" | "Hand the session to a background helper and return at once." |
+      | "`--cwd <DIR>`" | "Guest working directory for the program." |
+      | "`--user <LOGIN>`" | "Run as this login: the label a `login {}` block declares, or the account name as an alias. Default: the machine's default login. `SYSTEM` on Windows or `root` on Linux is the agent identity." |
+      | "`--password <PASSWORD>`" | "Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`." |
+      | "-h`, `--help" | "Print help." |
+  }
+
+  p <<DOC
+    The command reads the guest family from the machine's effective profile
+    in the lab file: a profile whose name starts with `windows` is a Windows
+    guest, and every other machine, containers included, is a Linux guest.
+    It reads the host session from its own environment. `WAYLAND_DISPLAY`
+    set means Wayland. Otherwise `DISPLAY` set means X11. With neither, it
+    refuses before it sends any request.
+  DOC
+
+  table {
+    rows:
+      | "Guest" | "Host session" | "Protocol" |
+      | "Linux" | "Wayland" | "`waypipe`" |
+      | "Linux" | "Wayland, and either side lacks waypipe" | "`x11`, through Xwayland, when `DISPLAY` is set" |
+      | "Linux" | "X11" | "`x11`" |
+      | "Windows" | "Wayland or X11" | "`rdp`, through FreeRDP" |
+  }
+
+  p <<DOC
+    The fall back from `waypipe` to `x11` is the only automatic one. The
+    command prints the reason on standard error, then the words `falling
+    back to X11 through Xwayland`:
+  DOC
+  code text { source = "this host has no `waypipe` on PATH (or `waypipe` in config.wcl); falling back to X11 through Xwayland" }
+  p <<DOC
+    `--via` picks the protocol outright and never falls back. A protocol the
+    guest family cannot serve is refused by name.
+  DOC
+
+  p <<DOC
+    The program runs as the machine's default login, following
+    [Logins](guide_logins), and `--user` and `--password` behave as they do
+    for [vmlab exec](cmd_exec). The first word after `--` is the program and
+    the rest are its arguments. Nothing passes through a guest shell. For a
+    Windows guest, FreeRDP names the program in its `/app` option, and
+    `--cwd` becomes its working directory there. An argument holding an
+    apostrophe, or another character FreeRDP's option parser would change,
+    is refused rather than passed on altered.
+  DOC
+
+  p <<DOC
+    The command stays in the foreground until the session ends. A waypipe
+    or X11 session ends when the program exits. An RDP session ends when
+    FreeRDP exits. Ctrl-C closes the session, which kills the guest program.
+  DOC
+  p <<DOC
+    `--detach` makes the same protocol choice, re-runs the command as a
+    background helper in its own session, prints this line and returns:
+  DOC
+  code text { source = "sharing `<cmd>` from <machine> in the background (it ends when the program does)" }
+  p <<DOC
+    The helper has no terminal, so a refusal from the lab daemon is not
+    printed anywhere. Run the command once without `--detach` to see one.
+  DOC
+
+  callout "RDP takes over the console session" {
+    kind = :warning
+    body = "On a client edition of Windows, one account has one session. The RDP logon disconnects the same account's console session, and `vmlab console` then shows the lock screen. A second `vmlab app run` against the same machine and account moves the first app's windows into the new FreeRDP window, and the first command returns."
+  }
+
+  code sh { source = <<'SRC'
+vmlab app run nix01 -- foot
+vmlab app run --via x11 nix01 -- xterm
+vmlab app run --detach dev01 -- foot
+vmlab app run --user admin win01 -- notepad.exe
+vmlab app run --cwd 'C:\Users\dev' win01 -- notepad.exe notes.txt
+SRC
+  }
+
+  h3 "Refusals"
+
+  p <<DOC
+    Each refusal below is quoted from the source. The parts in braces are
+    filled in, and a message holding backticks of its own is shown as plain
+    text. [Troubleshooting](apx_troubleshooting) gives the cause and fix for
+    the common ones.
+  DOC
+
+  table {
+    rows:
+      | "Message" | "When" |
+      | "`no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set`" | "The command was not started inside a desktop session." |
+      | "`nothing to run — usage: vmlab app run [lab/]machine -- <cmd> [args...]`" | "Nothing follows `--`." |
+      | "`--via {mode}` shares apps from {family} guests; `{machine}` is a {other family} guest" | "`--via` names a protocol the guest family cannot serve, for example `--via rdp` on a Linux guest." |
+      | "`--via waypipe` needs a Wayland session: WAYLAND_DISPLAY is not set" | "`--via waypipe` on an X11 desktop." |
+      | "`--via x11` needs an X server: DISPLAY is not set" | "`--via x11` on a Wayland desktop with no Xwayland." |
+      | "this host has no `waypipe` on PATH (or `waypipe` in config.wcl), and DISPLAY is not set, so there is no X11 to fall back to" | "A Linux guest on a Wayland host with no host waypipe and no Xwayland." |
+      | "no FreeRDP 3 on this host: shared apps from a Windows guest need `xfreerdp3` or `xfreerdp` on PATH, or `freerdp` in config.wcl" | "A Windows guest and no FreeRDP client." |
+      | "`{machine}` has no `waypipe` on PATH for `{login}`" | "The guest has no waypipe for the login, and the host has no `DISPLAY` to fall back to." |
+      | "the agent on `{machine}` predates shared apps over `{mode}`; run `vmlab machine repair-agent {machine}`" | "The guest agent was built before shared apps." |
+      | "RDP needs an account: declare a `login {}` on `{machine}` or pass --user/--password" | "A Windows guest with no login, or `--user SYSTEM`." |
+      | "{machine}: Windows `{edition}` has no Remote Desktop host; shared apps need Pro, Enterprise, Education or Server" | "A Windows Home edition." |
+      | "FreeRDP's `/app` option cannot carry `{value}` intact: its comma, quote and backslash rules would change it" | "A Windows argument FreeRDP would split or alter." |
+  }
+
+  p <<DOC
+    Exit status is the guest program's exit code for a waypipe or X11
+    session, and FreeRDP's for an RDP session. Ctrl-C exits 130 and SIGTERM
+    143. A refusal from the lab daemon exits with its protocol error code:
+    `invalid_argument` (2) for an RDP session with no account, and
+    `unsupported` (6) for a guest with no waypipe or an agent that predates
+    shared apps. `failed` (1) covers a refusal the command makes itself, a
+    machine that is not running, a login that cannot be minted, a Windows
+    edition with no RDP host, and a host client that exits mid-session.
+  DOC
+}
