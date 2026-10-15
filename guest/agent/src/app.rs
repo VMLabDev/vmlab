@@ -37,6 +37,12 @@ use crate::mux::{Credit, Input, Mux, Platform, pump_out};
 /// why rather than as the host giving up on the channel.
 const DIAL_BUDGET: Duration = Duration::from_secs(10);
 
+/// How long an RDP session waits for the guest's listener before `Ready`.
+/// Turning Remote Desktop on starts TermService, whose listener takes about
+/// 40 s to accept on a fresh Windows Server 2022, and a connection dialled
+/// before then is refused.
+const LISTENER_BUDGET: Duration = Duration::from_secs(120);
+
 /// What the open asked to run, for the modes that run something.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub struct AppSpec {
@@ -53,6 +59,8 @@ struct Tuning {
     grace: Duration,
     /// Where an RDP connection is dialled, on the guest's loopback.
     rdp_port: u16,
+    /// How long an RDP session waits for that listener before `Ready`.
+    listener_budget: Duration,
 }
 
 impl Default for Tuning {
@@ -60,6 +68,7 @@ impl Default for Tuning {
         Tuning {
             grace: Duration::from_secs(app::PENDING_GRACE_SECS),
             rdp_port: app::RDP_PORT,
+            listener_budget: LISTENER_BUDGET,
         }
     }
 }
@@ -80,7 +89,14 @@ impl Apps {
     /// needs port 3389.
     #[cfg(test)]
     pub fn tune(&self, grace: Duration, rdp_port: u16) {
-        *self.tuning.lock().unwrap() = Tuning { grace, rdp_port };
+        let mut tuning = self.tuning.lock().unwrap();
+        (tuning.grace, tuning.rdp_port) = (grace, rdp_port);
+    }
+
+    /// Replace how long an RDP session waits for its listener.
+    #[cfg(test)]
+    pub fn tune_listener(&self, budget: Duration) {
+        self.tuning.lock().unwrap().listener_budget = budget;
     }
 
     fn tuning(&self) -> Tuning {
@@ -170,8 +186,12 @@ pub fn open(
 }
 
 /// The RDP half: make sure the guest can serve the account a RemoteApp
-/// session, then hold the session open until the host closes it. It starts
-/// no process — the RDP client names the program.
+/// session, wait for its RDP listener, then hold the session open until the
+/// host closes it. It starts no process — the RDP client names the program.
+///
+/// `Ready` waits for the listener to accept, because preparing the guest may
+/// have just turned Remote Desktop on, and the host starts its RDP client on
+/// `Ready`: a client that dials sooner is refused and gives up.
 fn open_rdp(mux: &Mux, platform: &dyn Platform, id: u32, logon: Option<Logon>) {
     let Some(logon) = logon else {
         mux.send_error(Some(id), "RDP needs an account");
@@ -193,8 +213,67 @@ fn open_rdp(mux: &Mux, platform: &dyn Platform, id: u32, logon: Option<Logon>) {
         return;
     };
     mux.send_ctrl(&AgentMsg::Opened { id });
-    Records::new(mux, id, credit).send(&AppRecord::Ready { display: None });
     drain(mux, id, input);
+    let records = Records::new(mux, id, credit);
+    let Tuning {
+        rdp_port,
+        listener_budget,
+        ..
+    } = mux.apps().tuning();
+    let mux = mux.clone();
+    let alive = {
+        let mux = mux.clone();
+        move || mux.apps().get(id).is_some()
+    };
+    thread::spawn(
+        move || match await_listener(&records, &alive, rdp_port, listener_budget) {
+            Ok(()) => {
+                records.send(&AppRecord::Ready { display: None });
+            }
+            Err(e) => {
+                if alive() {
+                    mux.send_error(Some(id), e);
+                    mux.apps().end(id);
+                    mux.remove_finished(id);
+                }
+            }
+        },
+    );
+}
+
+/// Wait until the guest's RDP listener accepts a connection, saying so on
+/// the record stream the first time it does not. Gives up after `budget`,
+/// or once the session has ended.
+fn await_listener(
+    records: &Records,
+    alive: &dyn Fn() -> bool,
+    port: u16,
+    budget: Duration,
+) -> Result<(), String> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let deadline = std::time::Instant::now() + budget;
+    let mut said = false;
+    loop {
+        if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() {
+            return Ok(());
+        }
+        if !alive() {
+            return Err("app: the session ended".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "app: Remote Desktop is not listening on {addr} after {budget:?}"
+            ));
+        }
+        if !said {
+            said = true;
+            let text = format!("waiting for Remote Desktop to listen on {addr}");
+            if !records.send(&AppRecord::Log { text }) {
+                return Err("app: the session closed".into());
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// `HostMsg::OpenAppConn`: one transport connection of session `app`, as

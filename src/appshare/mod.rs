@@ -321,7 +321,7 @@ async fn attempt(client: &LabClient, req: &Request, mode: Mode, host: &HostEnv) 
     let (control, conns) = (path("control")?, path("conns")?);
     if let HostEnd::Rdp(server) = &mut end {
         let creds = rdp::Credentials::from_reply(&reply["rdp"])?;
-        server.launch(host.freerdp.as_deref(), req, &creds)?;
+        server.prepare(host.freerdp.as_deref(), req, &creds)?;
     }
     drive(&req.machine, &control, &conns, &mut end)
         .await
@@ -400,7 +400,11 @@ async fn drive(machine: &str, control: &Path, conns: &Path, end: &mut HostEnd) -
                 decoder.push(&buf[..n]);
                 while let Some(record) = decoder.next_record().map_err(|e| anyhow!(e))? {
                     match record {
-                        AppRecord::Ready { .. } => {}
+                        AppRecord::Ready { .. } => {
+                            if let HostEnd::Rdp(server) = end {
+                                server.start()?;
+                            }
+                        }
                         AppRecord::Pending => match &adopt {
                             Some(adopt) => splice_pending(machine, conns, adopt.clone()),
                             None => bail!("the agent announced a connection an RDP session never makes"),
@@ -731,6 +735,63 @@ mod tests {
 
         let (_dir, control, conns) = fake_daemon(vec![AppRecord::Exited { code: 3 }]).await;
         assert_eq!(drive("web", &control, &conns, &mut end).await.unwrap(), 3);
+    }
+
+    /// FreeRDP starts on the agent's `ready`, which waits for the guest's RDP
+    /// listener, and not on the daemon's reply: started sooner, its
+    /// connection is refused and it gives up. Its exit code is the
+    /// session's.
+    #[tokio::test]
+    async fn freerdp_starts_on_ready_and_its_exit_ends_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (bin, started) = (
+            bin_dir.path().join("freerdp"),
+            bin_dir.path().join("started"),
+        );
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\ncat > '{}'\nexit 7\n", started.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let req = Request {
+            machine: "win".into(),
+            argv: vec!["notepad.exe".into()],
+            cwd: None,
+            user: None,
+            password: None,
+        };
+        let creds = rdp::Credentials {
+            user: "dev".into(),
+            domain: None,
+            password: Some("pw".into()),
+        };
+        let rdp_end = || {
+            let mut server = rdp::Server::bind().unwrap();
+            server.prepare(Some(&bin), &req, &creds).unwrap();
+            HostEnd::Rdp(server)
+        };
+
+        let (_dir, control, conns) = fake_daemon(vec![
+            AppRecord::Log {
+                text: "waiting for Remote Desktop to listen on 127.0.0.1:3389".into(),
+            },
+            AppRecord::Failed {
+                msg: "no listener".into(),
+            },
+        ])
+        .await;
+        let mut end = rdp_end();
+        assert!(drive("win", &control, &conns, &mut end).await.is_err());
+        assert!(!started.exists(), "FreeRDP started before `ready`");
+
+        let (_dir, control, conns) = fake_daemon(vec![AppRecord::Ready { display: None }]).await;
+        let mut end = rdp_end();
+        assert_eq!(drive("win", &control, &conns, &mut end).await.unwrap(), 7);
+        let stdin = std::fs::read_to_string(&started).unwrap();
+        assert!(stdin.contains("/app:program:notepad.exe\n"), "{stdin}");
     }
 
     /// `failed` ends the session with the daemon's message.

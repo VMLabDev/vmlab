@@ -306,6 +306,9 @@ fn next_comma(buf: &[u8], start: usize) -> Option<usize> {
 pub struct Server {
     listener: UnixListener,
     socket: PathBuf,
+    /// FreeRDP and its stdin, made ready by [`Self::prepare`] and started by
+    /// [`Self::start`].
+    pending: Option<(PathBuf, String)>,
     child: Option<tokio::process::Child>,
     _dir: tempfile::TempDir,
 }
@@ -320,13 +323,20 @@ impl Server {
         Ok(Self {
             listener,
             socket,
+            pending: None,
             child: None,
             _dir: dir,
         })
     }
 
-    /// Start FreeRDP against the socket, handing it its arguments on stdin.
-    pub fn launch(&mut self, bin: Option<&Path>, req: &Request, creds: &Credentials) -> Result<()> {
+    /// Build FreeRDP's arguments, refusing any it cannot be handed, without
+    /// starting it yet.
+    pub fn prepare(
+        &mut self,
+        bin: Option<&Path>,
+        req: &Request,
+        creds: &Credentials,
+    ) -> Result<()> {
         let bin = bin.ok_or_else(|| anyhow!("no FreeRDP 3 on this host"))?;
         let args = freerdp_args(
             &self.socket,
@@ -335,8 +345,19 @@ impl Server {
             req.cwd.as_deref(),
             creds,
         )?;
-        let payload = stdin_payload(&args)?;
-        let mut child = tokio::process::Command::new(bin)
+        self.pending = Some((bin.to_path_buf(), stdin_payload(&args)?));
+        Ok(())
+    }
+
+    /// Start the FreeRDP [`Self::prepare`] made ready, handing it its
+    /// arguments on stdin. The session's `ready` record calls it: until the
+    /// agent says the guest's RDP listener accepts, a connection would be
+    /// refused. Starts nothing the second time.
+    pub fn start(&mut self) -> Result<()> {
+        let Some((bin, payload)) = self.pending.take() else {
+            return Ok(());
+        };
+        let mut child = tokio::process::Command::new(&bin)
             .args(ARGV)
             .stdin(Stdio::piped())
             .kill_on_drop(true)

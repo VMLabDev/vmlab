@@ -73,8 +73,10 @@ pub enum AppMode {
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum AppRecord {
     /// **agent→host**, once: the session is set up and, for waypipe and X11,
-    /// the program has been started. `display` is the X display name the
-    /// program was given (`":12"`), absent for the other modes.
+    /// the program has been started; for RDP, the guest's RDP listener
+    /// accepts connections, so the host starts its RDP client on this record.
+    /// `display` is the X display name the program was given (`":12"`),
+    /// absent for the other modes.
     Ready {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<String>,

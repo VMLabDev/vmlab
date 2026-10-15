@@ -585,6 +585,8 @@ fn rdp_dials_the_local_listener_and_refuses_no_account() {
     send(&mux, &p, open);
     assert_eq!(host.ctrl(|_| true), AgentMsg::Opened { id: 1 });
     assert_eq!(host.record(), AppRecord::Ready { display: None });
+    // The connection that proved the listener up, before `ready`.
+    drop(listener.accept().unwrap());
 
     send(&mux, &p, HostMsg::OpenAppConn { id: 2, app: 1 });
     let (mut server, _) = listener.accept().unwrap();
@@ -606,6 +608,63 @@ fn rdp_dials_the_local_listener_and_refuses_no_account() {
         host.ctrl(|_| true),
         AgentMsg::Error { id: Some(3), .. }
     ));
+}
+
+/// Turning Remote Desktop on leaves the guest's listener refusing
+/// connections for a while (about 40 s on Windows Server 2022), and the host
+/// starts its RDP client on `ready`. So `ready` waits for the listener,
+/// saying once why it waits.
+#[test]
+fn rdp_is_ready_only_once_the_listener_accepts() {
+    let port = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let p = TestPlatform::new();
+    let (mux, cap) = capture_mux();
+    mux.apps().tune(Duration::from_secs(30), port);
+    let mut host = Host::new(cap);
+    let mut open = open_app(AppMode::Rdp, vec![], vec![]);
+    if let HostMsg::OpenApp { logon: l, .. } = &mut open {
+        *l = logon();
+    }
+    send(&mux, &p, open);
+    assert_eq!(host.ctrl(|_| true), AgentMsg::Opened { id: 1 });
+    host.log(&format!(
+        "waiting for Remote Desktop to listen on 127.0.0.1:{port}"
+    ));
+
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    assert_eq!(host.record(), AppRecord::Ready { display: None });
+    drop(listener);
+}
+
+/// A listener that never comes up fails the session once the wait runs out,
+/// rather than leaving the host waiting on a `ready` that cannot come.
+#[test]
+fn rdp_with_no_listener_fails_the_session() {
+    let port = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let p = TestPlatform::new();
+    let (mux, cap) = capture_mux();
+    mux.apps().tune(Duration::from_secs(30), port);
+    mux.apps().tune_listener(Duration::from_millis(500));
+    let mut host = Host::new(cap);
+    let mut open = open_app(AppMode::Rdp, vec![], vec![]);
+    if let HostMsg::OpenApp { logon: l, .. } = &mut open {
+        *l = logon();
+    }
+    send(&mux, &p, open);
+    assert_eq!(host.ctrl(|_| true), AgentMsg::Opened { id: 1 });
+    assert_eq!(
+        host.ctrl(|m| matches!(m, AgentMsg::Error { .. })),
+        AgentMsg::Error {
+            id: Some(1),
+            msg: format!("app: Remote Desktop is not listening on 127.0.0.1:{port} after 500ms"),
+        }
+    );
 }
 
 /// A guest that cannot serve RemoteApp fails the open with its reason; a
