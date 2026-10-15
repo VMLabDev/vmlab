@@ -1975,22 +1975,32 @@ connection (`guest/agent-proto/src/app.rs`):
   not an administrator. It changes each setting only when it differs, and
   leaves them changed. The CLI listens on a private unix socket and starts
   `xfreerdp` with `/v:<that socket>`, `/app:program:<argv0>,cmd:<rest>`, and
-  the login's credentials passed through `/args-from:stdin`, never argv. Each
+  the login's credentials passed through `/args-from:stdin`, never argv. It
+  starts FreeRDP only once the agent says the session is ready, which waits for
+  the guest's RDP listener to accept: the first session on a machine turns
+  Remote Desktop on, and TermService takes about 40 seconds to listen. Each
   connection FreeRDP makes becomes an `open_app_conn`, which the agent dials to
   `127.0.0.1:3389` inside the guest.
 
 Waypipe runs with `--compress lz4` on both ends, because a client and server
 that disagree on compression refuse each other.
 
-Client editions of Windows allow one session per account, and a second RDP
-connection as the same account takes the session over. Its windows move to the
-newest FreeRDP process and the older one exits. So a second `app run` against
-the same Windows machine and account shows both apps, and the first `app run`
-returns.
+Windows allows one session per account: client editions always, and Server
+while "Restrict each user to a single session" (`fSingleSessionPerUser`) is
+on, which is its default. A second RDP connection as the same account takes the
+session over. Its windows move to the newest FreeRDP process and the older one
+exits. So a second `app run` against the same Windows machine and account shows
+both apps, and the first `app run` returns. A Server with that policy off gives
+each `app run` its own session and connection.
 
 The waypipe and X11 sessions end when the program exits, and `app run` exits
-with its code. The RDP session ends when FreeRDP exits. Interrupting `app run`
-closes the session, which kills the guest program. `--detach` hands the session
+with its code. Interrupting `app run` closes the session, which kills the guest
+program. The RDP session ends when FreeRDP exits, and `app run` exits with
+FreeRDP's code. Interrupting it disconnects the Windows session rather than
+logging it off, as closing an RDP client does: the program keeps running there,
+and its windows come back with the account's next shared app on that machine.
+vmlab does not log the session off, because on a client edition it can be the
+account's console session, holding work in other programs. `--detach` hands the session
 to a helper process in its own session, like the VNC bridge (§11), and returns
 at once.
 

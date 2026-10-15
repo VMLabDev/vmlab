@@ -144,14 +144,31 @@ line.
 DOC
 
   p <<'DOC'
-RemoteApp is a real remote logon, and that has a visible cost on a client
-edition of Windows, which allows one session per account. The RDP logon
-disconnects the same account's console session, so `vmlab console` shows the
-lock screen while an app is shared. A second `vmlab app run` against the
-same machine and account takes that session over. The first app's windows
-move into the new FreeRDP process, the old one exits, and the first command
-returns. vmlab states this rather than working around it, because it is how
-Windows behaves.
+The first shared app on a machine is slower to appear. Turning Remote Desktop
+on starts TermService, whose listener takes about 40 seconds to accept a
+connection. The agent waits for it, and `app run` prints
+`[<machine>] waiting for Remote Desktop to listen on 127.0.0.1:3389` while it
+does. FreeRDP starts once the listener is up.
+DOC
+
+  p <<'DOC'
+RemoteApp is a real remote logon, and that has a visible cost, because
+Windows allows one session per account. A client edition always does, and a
+Server edition does while "Restrict each user to a single session" is on,
+which is its default. The RDP logon disconnects the same account's console
+session, so `vmlab console` shows the lock screen while an app is shared. A
+second `vmlab app run` against the same machine and account takes that
+session over. The first app's windows move into the new FreeRDP process, the
+old one exits, and the first command returns. vmlab states this rather than
+working around it, because it is how Windows behaves. On a Server with that
+policy turned off, each `app run` gets its own session.
+DOC
+
+  p <<'DOC'
+Closing FreeRDP, or pressing Ctrl-C on `app run`, disconnects the Windows
+session rather than logging it off. The program keeps running in it, and its
+windows come back with the next shared app for that account on that machine.
+Close the program's own windows to end it.
 DOC
 
   h2 "X11 and the host display"

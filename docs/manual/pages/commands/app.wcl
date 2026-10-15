@@ -76,8 +76,11 @@ page cmd_app {
 
   p <<DOC
     The command stays in the foreground until the session ends. A waypipe
-    or X11 session ends when the program exits. An RDP session ends when
-    FreeRDP exits. Ctrl-C closes the session, which kills the guest program.
+    or X11 session ends when the program exits, and Ctrl-C closes the
+    session, which kills the guest program. An RDP session ends when
+    FreeRDP exits. Ctrl-C there disconnects the Windows session and leaves
+    the program running in it, and its windows return with the account's
+    next shared app on that machine.
   DOC
   p <<DOC
     `--detach` makes the same protocol choice, re-runs the command as a
@@ -91,7 +94,7 @@ page cmd_app {
 
   callout "RDP takes over the console session" {
     kind = :warning
-    body = "On a client edition of Windows, one account has one session. The RDP logon disconnects the same account's console session, and `vmlab console` then shows the lock screen. A second `vmlab app run` against the same machine and account moves the first app's windows into the new FreeRDP window, and the first command returns."
+    body = "On a client edition of Windows, and on Server while its single-session-per-user policy is on (the default), one account has one session. The RDP logon disconnects the same account's console session, and `vmlab console` then shows the lock screen. A second `vmlab app run` against the same machine and account moves the first app's windows into the new FreeRDP window, and the first command returns."
   }
 
   code sh { source = <<'SRC'
