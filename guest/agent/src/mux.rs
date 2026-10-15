@@ -447,6 +447,12 @@ impl Mux {
                 Ok(()) => self.send_ctrl(&AgentMsg::TimeSet),
                 Err(msg) => self.send_ctrl(&AgentMsg::TimeSetFailed { msg }),
             },
+            // Shared apps (PRD §20) are not served by this agent yet, and it
+            // advertises none of the `app_*` features, so a host never sends
+            // these to it; refuse rather than leave the open hanging.
+            HostMsg::OpenApp { id, .. } | HostMsg::OpenAppConn { id, .. } => {
+                self.send_error(Some(id), "shared apps are not supported by this agent")
+            }
             HostMsg::WindowAdjust { id, bytes } => self.grant(id, bytes),
             HostMsg::Close { id } => self.remove(id),
             HostMsg::Ping => self.send_ctrl(&AgentMsg::Pong {

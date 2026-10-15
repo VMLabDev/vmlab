@@ -28,6 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod app;
 pub mod fileops;
 pub mod watch;
 
@@ -93,6 +94,17 @@ pub mod features {
     /// [`AgentMsg::TimeSetFailed`]. The host uses it to bring a guest
     /// restored from an online snapshot back to the host's time (§7.3).
     pub const SET_TIME: &str = "set_time";
+    /// Shared apps over waypipe (PRD §20): [`HostMsg::OpenApp`] with
+    /// [`crate::app::AppMode::Waypipe`]. Advertised by every Linux agent;
+    /// whether the guest has a `waypipe` binary is the host's to probe.
+    pub const APP_WAYPIPE: &str = "app_waypipe";
+    /// Shared apps over X11 (PRD §20): [`HostMsg::OpenApp`] with
+    /// [`crate::app::AppMode::X11`]. Needs nothing installed in the guest.
+    pub const APP_X11: &str = "app_x11";
+    /// Shared apps over RDP RemoteApp (PRD §20): [`HostMsg::OpenApp`] with
+    /// [`crate::app::AppMode::Rdp`]. Advertised by the Windows agent; an
+    /// edition with no RDP host refuses the open by name.
+    pub const APP_RDP: &str = "app_rdp";
 }
 
 /// Whether `name` is usable as a process-tree name: 1 to 64 ASCII letters,
@@ -521,6 +533,38 @@ pub enum HostMsg {
     SetTime {
         unix_ms: i64,
     },
+    /// Open a **shared app** session on channel `id` (PRD §20), which then
+    /// carries length-prefixed [`app`] records rather than raw bytes. For
+    /// waypipe and X11 the agent sets up the guest-side endpoint and starts
+    /// `argv` as `logon` in `cwd` with `env` applied over that identity's
+    /// environment; the program's exit ends the session with
+    /// [`AgentMsg::Exited`]. For RDP `argv` is empty and the session lasts
+    /// until the host closes it. `logon` is who the program runs as (for RDP,
+    /// the account that must be able to log on remotely); absent is the agent
+    /// identity, which RDP refuses.
+    OpenApp {
+        id: u32,
+        #[serde(flatten)]
+        mode: app::AppMode,
+        #[serde(default)]
+        argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logon: Option<Logon>,
+    },
+    /// Open one transport connection of the app session `app` as a raw byte
+    /// channel `id`. For waypipe and X11 it adopts the oldest guest-side
+    /// connection parked under an [`app::AppRecord::Pending`]; with none
+    /// parked the open fails. For RDP the agent dials
+    /// `127.0.0.1:`[`app::RDP_PORT`] and answers [`AgentMsg::Opened`] once
+    /// connected. Either side's EOF half-closes, as for exec.
+    OpenAppConn {
+        id: u32,
+        app: u32,
+    },
     /// Grant the guest more send credit on a channel.
     WindowAdjust {
         id: u32,
@@ -673,6 +717,41 @@ pub struct OsInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `open_app` flattens its mode beside the channel id, and both opens
+    /// round-trip through the spelling the agent and the daemon share.
+    #[test]
+    fn app_opens_round_trip() {
+        let open = HostMsg::OpenApp {
+            id: 7,
+            mode: app::AppMode::X11 {
+                cookie: "ab".repeat(16),
+            },
+            argv: vec!["xeyes".into()],
+            env: vec![],
+            cwd: None,
+            logon: None,
+        };
+        let json = serde_json::to_string(&open).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"cmd":"open_app","id":7,"mode":"x11","cookie":"{}","argv":["xeyes"]}}"#,
+                "ab".repeat(16)
+            )
+        );
+        assert_eq!(serde_json::from_str::<HostMsg>(&json).unwrap(), open);
+        let rdp: HostMsg =
+            serde_json::from_str(r#"{"cmd":"open_app","id":1,"mode":"rdp"}"#).unwrap();
+        assert!(matches!(
+            rdp,
+            HostMsg::OpenApp { mode: app::AppMode::Rdp, ref argv, .. } if argv.is_empty()
+        ));
+        let conn = HostMsg::OpenAppConn { id: 9, app: 7 };
+        let json = serde_json::to_string(&conn).unwrap();
+        assert_eq!(json, r#"{"cmd":"open_app_conn","id":9,"app":7}"#);
+        assert_eq!(serde_json::from_str::<HostMsg>(&json).unwrap(), conn);
+    }
 
     fn roundtrip<T>(v: &T) -> T
     where

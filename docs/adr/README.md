@@ -23,6 +23,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0013](0013-the-host-opens-channels-the-guest-answers.md) | The host opens channels, the guest answers | Accepted |
 | [0014](0014-the-workspace-is-a-guest-local-copy-of-a-canonical-host-tree.md) | The workspace is a guest-local copy of a canonical host tree | Accepted |
 | [0015](0015-one-guest-side-spawner-seam-carries-identity.md) | One guest-side Spawner seam, and identity is its parameter | Accepted |
+| [0016](0016-a-shared-app-rides-the-guest-familys-own-window-protocol.md) | A shared app rides the guest family's own window protocol | Accepted |
 
 ## Format
 

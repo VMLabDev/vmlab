@@ -86,6 +86,7 @@ the code is the contract.
 | `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16`, `user: Option<String>`, `password: Option<String>` | `cli` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
 | `machine.repair_agent` | `machine: String` | `cli` | Push the host's shipped vmlab-agent into a running machine and mark it **diverged** (PRD §19.4). Never fires by itself: an automatic refresh would make the template's sealed `agent_version` a lie. |
 | `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli` | Resize an open terminal session. |
+| `machine.app_open` | `machine: String`, `mode: String`, `argv: Vec<String>`, `cwd: Option<String>`, `cookie: Option<String>`, `user: Option<String>`, `password: Option<String>` | **nothing** | Open a **shared app** session (PRD §20): start `argv` in the guest and carry its windows' protocol to the caller, which owns the host desktop end. The reply is `{"session", "control", "conns"}`, plus `"rdp": {"user", "password"}` in `rdp` mode. `control` is a unix socket relaying the session's length-prefixed app records, closed by the caller to end the session; every connection to `conns` becomes one transport connection of the session. In `waypipe` mode a guest with no `waypipe` for that identity answers `unsupported`. |
 | `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
 | `machine.pull_file` | `machine: String`, `from: String`, `to: Option<String>` | `cli` | Copy a file out of the guest: to `to`, a host path the daemon can write, or — with `to` omitted — back inline as base64, for a caller that wants the bytes rather than a file on the daemon's host. |
 | `machine.tail` | `machine: String`, `path: String` | `cli` | Follow a guest file (`tail -F` semantics), streamed as chunks until the caller hangs up or the machine stops. |
@@ -119,7 +120,7 @@ open gaps below are a worklist rather than a list somebody has to re-derive.
 
 ### Reachable from no surface
 
-Every command has a caller.
+- `machine.app_open`
 
 ### Reachable only from `cli`
 

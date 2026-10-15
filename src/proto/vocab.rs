@@ -661,6 +661,38 @@ vocabulary! {
             #[serde(default = "default_cols")] cols: u16,
             #[serde(default = "default_rows")] rows: u16,
         },
+        /// Open a **shared app** session (PRD §20): start `argv` in the guest
+        /// and carry its windows' protocol to the caller, which owns the host
+        /// desktop end. The reply is `{"session", "control", "conns"}`, plus
+        /// `"rdp": {"user", "password"}` in `rdp` mode. `control` is a unix
+        /// socket relaying the session's length-prefixed app records, closed
+        /// by the caller to end the session; every connection to `conns`
+        /// becomes one transport connection of the session. In `waypipe`
+        /// mode a guest with no `waypipe` for that identity answers
+        /// `unsupported`.
+        #[one_way(
+            "cli",
+            "The host end of a shared app is a window-protocol client running \
+             in the user's own desktop session, which only a process started \
+             there has; the daemon is headless by design (§11)."
+        )]
+        MachineAppOpen = "machine.app_open" {
+            #[serde(alias = "vm", alias = "container")] machine: String,
+            /// `waypipe`, `x11` or `rdp`.
+            mode: String,
+            /// The program and its arguments. Empty for `rdp`, whose client
+            /// names the program itself.
+            #[serde(default)] argv: Vec<String>,
+            /// Guest working directory for the program.
+            #[serde(default)] cwd: Option<String>,
+            /// `x11` only: the 32-hex-digit MIT-MAGIC-COOKIE-1 the caller
+            /// minted and will check on every connection.
+            #[serde(default)] cookie: Option<String>,
+            /// Which of the machine's declared logins the program runs as —
+            /// see [`LabRequest::MachineExec`]. `rdp` needs a real account.
+            #[serde(default)] user: Option<String>,
+            #[serde(default)] password: Option<String>,
+        },
         /// Copy a file into the guest: either `from`, a host path the daemon
         /// can see, or `data`, base64 for a caller that holds bytes.
         MachinePushFile = "machine.push_file" {

@@ -659,6 +659,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab console <vm>` | Attach viewer |
 | `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |
 | `vmlab cp <src> <vm>:<dest>` | Copy a host file/tree into a guest via the agent |
+| `vmlab app run [--via waypipe\|x11\|rdp] [--detach] <machine> -- cmd` | Show one guest program's windows on the host desktop (§20) |
 | `vmlab osinfo <vm>` | Guest OS identification as JSON |
 | `vmlab script <script.ws>` | Ad-hoc script against the current lab |
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
@@ -1888,3 +1889,115 @@ The line that keeps all of this from sliding into a feature:
 - **An editor plugin presenting sync state.** §19.6 leaves it somewhere to read
   — the marker file and `dev sync status` — and building it is a separate effort.
 - **A `rebuild` verb**, for the reasons in §19.7.
+
+---
+
+## 20. Shared apps
+
+A **shared app** is one guest program whose windows appear on the host's own
+desktop, beside the host's windows, with no VNC console in between. `vmlab app
+run lab/win11 -- notepad.exe` opens Notepad as a host window. Closing it ends
+the session.
+
+vmlab writes no window protocol of its own. Each guest family already has one
+that remotes individual windows, and vmlab carries that protocol's bytes over
+the agent channel (§7.4). No guest NIC is involved, so a shared app works on a
+machine with no network at all.
+
+### 20.1 Which protocol carries the windows
+
+The guest family and the host session pick the protocol:
+
+| Guest | Host session | Protocol | Guest needs | Host needs |
+|---|---|---|---|---|
+| Linux | Wayland | waypipe | `waypipe` on the login's `PATH` | `waypipe` |
+| Linux | Wayland, guest without waypipe | X11, through Xwayland | nothing | Xwayland (`DISPLAY` set) |
+| Linux | X11 | X11 | nothing | the X server |
+| Windows | Wayland or X11 | RDP RemoteApp | an edition with an RDP host | FreeRDP 3 (`xfreerdp3` or `xfreerdp`) |
+
+The CLI reads the host session from its own environment. `WAYLAND_DISPLAY` set
+means Wayland, otherwise `DISPLAY` set means X11, otherwise `app run` refuses
+with *"no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set"*.
+`--via waypipe|x11|rdp` overrides the choice. A choice the guest family cannot
+serve is refused by name, for example `--via rdp` on a Linux guest.
+
+The fallback from waypipe to X11 is the only automatic one. It happens when
+the guest has no `waypipe` for the login, or the host has none, and the host
+has `DISPLAY` set. The CLI says it fell back, and why, on stderr. With no
+`DISPLAY` to fall back to, it refuses and names the missing `waypipe`.
+
+Each protocol keeps its own costs. X11 has no compression and no shared
+memory, so a busy app is slower than under waypipe, and an app with no X11
+backend does not run under it at all. RDP RemoteApp logs the account on
+remotely. On a client edition of Windows, which allows one session per
+account, that disconnects the same account's console session, and the VNC
+console (§11) then shows the lock screen.
+
+Windows Home has no RDP host. The agent reads `EditionID` and refuses with
+*"Windows `<edition>` has no Remote Desktop host; shared apps need Pro,
+Enterprise, Education or Server"*.
+
+### 20.2 Identity
+
+A shared app runs as a declared login, resolved exactly as for `exec` and
+`shell` (§19.2): `--user`/`--password`, else the machine's default login, else
+the agent identity. RDP cannot log on as the agent identity, so a Windows
+machine with no login and no `--user` is refused with *"RDP needs an account:
+declare a `login {}` on `<machine>` or pass --user/--password"*.
+
+### 20.3 Session shape
+
+The host end of every protocol runs in the CLI process, because only a process
+started in the user's desktop session can reach the compositor or X server. The
+lab daemon stays headless (§11). It opens the agent session and exposes two
+unix sockets to the CLI, a control socket carrying the session's records and a
+connection socket where each accepted connection becomes one transport
+connection of the protocol (`machine.app_open`, `docs/protocol.md`).
+
+On the agent, `open_app` sets up the guest end and `open_app_conn` carries one
+connection (`guest/agent-proto/src/app.rs`):
+
+- **waypipe.** The agent listens on a private unix socket and starts
+  `waypipe --socket <it> server -- <argv>` as the login. Each connection waypipe
+  makes is parked and announced to the host, which adopts it with
+  `open_app_conn` and splices it to `waypipe client` on the host.
+- **X11.** The agent claims the first free display from `:10` up, listening on
+  both its abstract and its path socket, and writes an Xauthority file holding
+  a cookie the CLI minted for this session. It starts the program as the login
+  with `DISPLAY` and `XAUTHORITY` set. Each X client connection is parked,
+  announced and adopted like waypipe's. On the host, the CLI checks the
+  connection's cookie and swaps in the real cookie of the host's display before
+  splicing it to the host X server. A connection with the wrong cookie is
+  dropped.
+- **RDP.** The agent enables Remote Desktop, allows unlisted RemoteApp programs
+  and adds the account to Remote Desktop Users when it is not an administrator.
+  It changes each setting only when it differs, and leaves them changed. The
+  CLI listens on a loopback TCP port and starts FreeRDP against it with
+  `/app:program:<argv0>,cmd:<rest>` and the login's credentials on stdin. Each
+  connection FreeRDP makes becomes an `open_app_conn`, which the agent dials to
+  `127.0.0.1:3389` inside the guest.
+
+The waypipe and X11 sessions end when the program exits, and `app run` exits
+with its code. The RDP session ends when FreeRDP exits. Interrupting `app run`
+closes the session, which kills the guest program. `--detach` hands the session
+to a helper process in its own session, like the VNC bridge (§11), and returns
+at once.
+
+A container machine (§18) shares apps like any Linux guest. Its sockets live
+inside the container's root filesystem, where the program can reach them.
+
+### 20.4 Configuration
+
+The host config (`config.wcl`, like `viewer` in §11) can name the host-side binaries: `waypipe` for the waypipe
+client and `freerdp` for the RDP client. Unset, the CLI finds `waypipe` on
+`PATH`, and `xfreerdp3` then `xfreerdp` for FreeRDP. The lab file needs nothing.
+Sharing an app is a CLI act on a running machine, not a declaration.
+
+### 20.5 Non-goals
+
+- **A wscript surface.** Scripts run inside the headless lab daemon, which has
+  no desktop to put a window on.
+- **Audio, USB and printer redirection.** The window protocols can carry some
+  of these, and vmlab does not turn them on.
+- **Host launcher entries** (`.desktop` files) for guest apps.
+- **macOS guests and hosts.**

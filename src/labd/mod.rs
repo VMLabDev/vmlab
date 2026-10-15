@@ -704,6 +704,11 @@ impl Handler<LabRequest> for LabdHandler {
                     .map_err(|e| CommandError::failed(format!("{e:#}")))?;
                 Ok(serde_json::to_value(report).unwrap_or_default())
             }
+            // Interim until the shared-app session lands on this branch
+            // (PRD §20); never reaches `main` in this form.
+            LabRequest::MachineAppOpen { machine, .. } => Err(CommandError::unsupported(format!(
+                "{machine}: shared apps are not available in this daemon"
+            ))),
             LabRequest::MachineTtyResize {
                 machine,
                 session,
