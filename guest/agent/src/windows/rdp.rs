@@ -43,7 +43,6 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Make the guest able to serve a RemoteApp session for `logon`'s account,
 /// changing only what differs.
-#[allow(dead_code)] // until `Platform::app_rdp_prepare` exists to call it
 pub fn prepare(logon: &Logon) -> Result<(), String> {
     prepare_reporting(logon).map(|_| ())
 }

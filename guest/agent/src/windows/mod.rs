@@ -20,7 +20,7 @@ pub use conpty::kill_process;
 pub use metrics::{cpu_pct, cpu_sample, disk_sample, mem_sample};
 pub use port::open_port;
 
-use vmlab_agent_proto::{NetInterface, OsInfo, ShutdownMode, features};
+use vmlab_agent_proto::{Logon, NetInterface, OsInfo, ShutdownMode, features};
 
 use std::sync::Arc;
 
@@ -154,5 +154,9 @@ impl crate::mux::Platform for WindowsPlatform {
 
     fn set_time(&self, unix_ms: i64) -> Result<(), String> {
         sysinfo::set_time(unix_ms)
+    }
+
+    fn app_rdp_prepare(&self, logon: &Logon) -> Result<(), String> {
+        rdp::prepare(logon)
     }
 }
