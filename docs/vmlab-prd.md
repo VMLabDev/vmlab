@@ -1970,12 +1970,23 @@ connection (`guest/agent-proto/src/app.rs`):
   splicing it to the host X server. A connection with the wrong cookie is
   dropped.
 - **RDP.** The agent enables Remote Desktop, allows unlisted RemoteApp programs
-  and adds the account to Remote Desktop Users when it is not an administrator.
-  It changes each setting only when it differs, and leaves them changed. The
-  CLI listens on a loopback TCP port and starts FreeRDP against it with
-  `/app:program:<argv0>,cmd:<rest>` and the login's credentials on stdin. Each
+  (both the `fAllowUnlistedRemotePrograms` policy and `TSAppAllowList`'s
+  `fDisabledAllowList`) and adds the account to Remote Desktop Users when it is
+  not an administrator. It changes each setting only when it differs, and
+  leaves them changed. The CLI listens on a private unix socket and starts
+  `xfreerdp` with `/v:<that socket>`, `/app:program:<argv0>,cmd:<rest>`, and
+  the login's credentials passed through `/args-from:stdin`, never argv. Each
   connection FreeRDP makes becomes an `open_app_conn`, which the agent dials to
   `127.0.0.1:3389` inside the guest.
+
+Waypipe runs with `--compress lz4` on both ends, because a client and server
+that disagree on compression refuse each other.
+
+Client editions of Windows allow one session per account, and a second RDP
+connection as the same account takes the session over. Its windows move to the
+newest FreeRDP process and the older one exits. So a second `app run` against
+the same Windows machine and account shows both apps, and the first `app run`
+returns.
 
 The waypipe and X11 sessions end when the program exits, and `app run` exits
 with its code. The RDP session ends when FreeRDP exits. Interrupting `app run`
