@@ -243,6 +243,9 @@ pub struct TestPlatform {
     pub clock: Mutex<Vec<i64>>,
     /// When set, `set_time` refuses with this message instead.
     pub clock_refusal: Mutex<Option<String>>,
+    /// What `app_rdp_prepare` answers: `None` is a guest ready to serve
+    /// RemoteApp, `Some` the refusal it fails the open with.
+    pub rdp_refusal: Mutex<Option<String>>,
 }
 
 impl TestPlatform {
@@ -251,6 +254,7 @@ impl TestPlatform {
             spawner: Arc::new(FakeSpawner::new()),
             clock: Mutex::new(Vec::new()),
             clock_refusal: Mutex::new(None),
+            rdp_refusal: Mutex::new(None),
         }
     }
 }
@@ -293,6 +297,12 @@ impl Platform for TestPlatform {
         })
     }
     fn shutdown(&self, _: &Mux, _: ShutdownMode) {}
+    fn app_rdp_prepare(&self, _: &vmlab_agent_proto::Logon) -> Result<(), String> {
+        match self.rdp_refusal.lock().unwrap().clone() {
+            Some(msg) => Err(msg),
+            None => Ok(()),
+        }
+    }
     fn set_time(&self, unix_ms: i64) -> Result<(), String> {
         match self.clock_refusal.lock().unwrap().clone() {
             Some(msg) => Err(msg),

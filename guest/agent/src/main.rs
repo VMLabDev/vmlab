@@ -9,6 +9,7 @@
 //! Runs as a service (systemd on Linux, SCM on Windows — installed by the
 //! template build) or in the foreground for debugging.
 
+mod app;
 mod clipboard;
 mod exec;
 mod fileops;
@@ -22,6 +23,8 @@ mod tail;
 mod terminal;
 mod watch;
 
+#[cfg(test)]
+mod app_test;
 #[cfg(test)]
 mod fake_spawner;
 #[cfg(test)]
