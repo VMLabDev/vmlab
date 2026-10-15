@@ -47,6 +47,7 @@ RUN apt-get update \
       swtpm swtpm-tools virtiofsd \
       samba xorriso mtools dosfstools squashfs-tools tesseract-ocr \
       python3 util-linux procps iproute2 curl ca-certificates \
+      xvfb x11-utils \
  && rm -rf /var/lib/apt/lists/*
 # Ubuntu 24.04's virtiofsd 1.10.0, which predates --migration-mode and
 # --readonly, for the old-virtiofsd snapshot check. Pinned by digest.

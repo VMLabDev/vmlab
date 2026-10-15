@@ -33,6 +33,7 @@ SCENARIOS = [
     "scripting",
     "playbooks",
     "dev",
+    "apps",
     "peers",
     "admin",
     "unsupported",

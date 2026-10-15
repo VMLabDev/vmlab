@@ -164,6 +164,12 @@ FEATURES: dict[str, str] = {
     "dev.sync.conflict": "a conflict halts, `dev sync diff` shows it, `resolve` clears it",
     "dev.select": "`dev sync` machine selection (argument, VMLAB_DEV_MACHINE)",
     "dev.snapshot-bracket": "snapshot capture flushes; restore re-seeds and `--discard-guest-changes`",
+    # -- shared apps -------------------------------------------------------
+    "app.x11": "`vmlab app run` on an X11-only host picks X11 and shows the guest window there",
+    "app.interrupt": "Ctrl-C on `vmlab app run` exits 130 and kills the guest program",
+    "app.exit-code": "`vmlab app run` exits with the guest program's code",
+    "app.waypipe": "`vmlab app run` over waypipe on a Wayland host",
+    "app.rdp": "`vmlab app run` over RDP RemoteApp from a Windows guest",
     # -- architectures -----------------------------------------------------
     "arch.emulated": "a non-x86 guest under TCG emulation",
 }
