@@ -1,6 +1,7 @@
 //! vmlab as a library: the CLI binary (`src/main.rs`) builds on these modules.
 
 pub mod agent_asset;
+pub mod appshare;
 pub mod cli;
 pub mod config;
 pub mod dev;
