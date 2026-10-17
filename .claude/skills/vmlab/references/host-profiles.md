@@ -111,7 +111,12 @@ A **host GPU**, declared beside `host {}`, zero or more of them. A lab's
 
 ```wcl
 gpu "AMD1"    { address = "0000:72:00.0" }
-gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+gpu "Nvidia1" {
+  address     = "0000:01:00.0"
+  default     = true
+  qemu_binary = "/opt/qemu-vmlab/bin/qemu-system-x86_64"  // patched egl-headless
+  qemu_env    = { VKR_DEBUG: "validate" }                 // record literal: `:` and commas
+}
 gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/nvidia_icd.json" }
 ```
 
@@ -121,11 +126,33 @@ gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/
 | `address` | utf8 | required | Host PCI address (`lspci -D`, `/sys/bus/pci/devices/`). |
 | `vulkan_icd` | utf8 | none | Vulkan ICD JSON a `vulkan` guest's renderer loads (`VK_DRIVER_FILES`), overriding the driver-derived filter. |
 | `default` | bool | `false` | The GPU a lab gets when it names none. At most one; a lone block is the default without it. |
+| `qemu_binary` | utf8 | none | Absolute path to the QEMU every VM on this GPU runs (all modes, passthrough too) instead of `qemu-system-<arch>` on PATH. |
+| `qemu_env` | record of utf8 | none | `{ KEY: "value" }` set in that QEMU's environment, applied last: beats the derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES`. |
 
 Parsing rejects a missing `address`, two labels differing only in case, and a
 second `default = true`. The rest is checked when a lab uses the GPU (validate
 and VM start), naming it: the address must be a PCI device, with a render node
-for virgl/vulkan, and `vulkan_icd` must exist. Read at each VM start.
+for virgl/vulkan, `vulkan_icd` must exist, and `qemu_binary` must be an
+executable file — one named `qemu-system-<a>` for the VM's QEMU arch (another
+arch is refused naming both; any other file name is taken as given). Read at
+each VM start.
+
+With `qemu_binary` set, the VM also gets `-L <stock data dir>` —
+`<prefix>/share/qemu` of the `qemu-system-<arch>` on PATH, only if it exists —
+so a minimal build finds firmware and ROMs; QEMU still searches its own data
+dir after it. `qemu.log`'s `vmlab: env:` line lists every variable vmlab set,
+`qemu_env` included; `vmlab status -v` shows `qemu=<path>` after `host_gpu=`.
+No host-wide default, no CLI override; template builds (no `gpu {}`) always run
+the stock QEMU. Use: NVIDIA's EGL takes a LINEAR dma-buf only as
+`GL_TEXTURE_EXTERNAL_OES`, so stock QEMU 11.1's egl-headless shows a black
+console for a Venus guest; the patched QEMU
+(`VMLabDev/qemu`, branch `vmlab/egl-headless-external-dmabuf`) fixes it.
+
+Known limit: two identical cards both match the driver filter, so a Venus guest
+sees two devices. The loader cannot filter by PCI address and Mesa's
+device-select layer breaks Venus; the guest's default device is the host
+loader's first match. A `VK_EXT_pci_bus_info`-filtering implicit layer is
+planned.
 
 ### UEFI firmware
 

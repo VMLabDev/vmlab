@@ -398,6 +398,48 @@ MSG
     address and kernel driver: declare the one you want as a host GPU.
   DOC
 
+  h2 "A host GPU's qemu_binary is refused"
+  code text { source = <<'MSG'
+vm "{machine}": host GPU `{name}`: qemu_binary {path} does not exist
+vm "{machine}": host GPU `{name}`: qemu_binary {path} is not an executable file
+vm "{machine}": host GPU `{name}`: qemu_binary {path} emulates {theirs}, but this VM is {ours} (it would need qemu-system-{ours})
+MSG
+  }
+  p <<DOC
+    `vmlab validate` and VM start check the `qemu_binary` of the host GPU a
+    VM resolves to, in every GPU mode. The first two errors mean the path
+    does not lead to an executable file: fix the path, or set the
+    executable bit on the file. The third means the file is named
+    `qemu-system-<arch>` for an arch other than the VM's. One binary
+    emulates one arch, so give the GPU the build for the arch your VMs run.
+    A file with any other name is not checked for arch.
+  DOC
+
+  h2 "A Venus guest on NVIDIA has a black console"
+  p <<DOC
+    A `vulkan` guest on an NVIDIA host GPU renders correctly, but its VNC
+    console and `vmlab vm screenshot` go black once the guest presents.
+    QEMU 11.1's `egl-headless` binds the guest's blob scanout, a LINEAR
+    dma-buf, as `GL_TEXTURE_2D`. NVIDIA's EGL accepts a LINEAR dma-buf only
+    as `GL_TEXTURE_EXTERNAL_OES`. AMD and Intel accept both. The fix is a
+    patched QEMU (the `vmlab/egl-headless-external-dmabuf` branch of
+    https://github.com/VMLabDev/qemu). Point the NVIDIA host GPU's
+    `qemu_binary` at it, as [Host GPUs](guide_host) shows.
+  DOC
+
+  h2 "A Venus guest sees two GPUs"
+  p <<DOC
+    On a host with two identical GPUs, such as two RTX 5090s, a `vulkan`
+    guest on one of them lists two Venus devices. vmlab filters the Vulkan
+    loader by driver (`*nvidia*`), and both cards match. The loader cannot
+    filter by PCI address. Mesa's device-select layer could, but it breaks
+    Venus, so vmlab never sets it. The guest's default device is the first
+    matching device in the host loader's order, and `egl-headless` scans out
+    from the declared GPU's render node. A planned implicit Vulkan layer
+    will hide the other card by `VK_EXT_pci_bus_info`. Until then, a host
+    GPU's `qemu_env` can enable such a layer by hand.
+  DOC
+
   h2 "A shared app has no desktop to open on"
   code text { source = "no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set" }
   p <<DOC

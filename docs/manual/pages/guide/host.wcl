@@ -117,6 +117,51 @@ is the default without `default = true`. The fields are in the
 [host configuration file](ref_host) reference.
 DOC
 
+  p <<'DOC'
+A host GPU can also carry the QEMU its VMs run and extra variables for that
+QEMU's environment. This machine needs both for its NVIDIA cards. QEMU
+11.1's `egl-headless` display binds a guest's blob scanout as
+`GL_TEXTURE_2D`, and NVIDIA's EGL accepts that LINEAR dma-buf only as
+`GL_TEXTURE_EXTERNAL_OES`. A Venus guest on `Nvidia1` therefore renders, but
+its console and screenshots stay black. A patched QEMU fixes this. AMD and
+Intel accept the 2D binding, so `AMD1` keeps the stock QEMU:
+DOC
+
+  code wcl { filename = "~/.config/vmlab/config.wcl (this machine)" source = <<'SRC'
+import <vmlab-host.wcl>
+
+gpu "AMD1"    { address = "0000:72:00.0" }
+gpu "Nvidia1" {
+  address     = "0000:01:00.0"
+  default     = true
+  // egl-headless shows an external-only dma-buf scanout
+  qemu_binary = "/opt/qemu-vmlab/bin/qemu-system-x86_64"
+  qemu_env    = { VKR_DEBUG: "validate" }  // virglrenderer debugging; optional
+}
+gpu "Nvidia2" { address = "0000:05:00.0" }
+SRC
+  }
+
+  p <<'DOC'
+Every VM that resolves to `Nvidia1` runs that binary, in every GPU mode, and
+the lab file does not change. vmlab passes the binary `-L` with the stock
+QEMU's data directory, so a minimal build still finds its firmware and ROMs.
+`qemu_env` is applied after the Vulkan loader variable vmlab derives, and an
+explicit host setting wins. `qemu.log`'s `vmlab: env:` line shows every
+variable vmlab set, and `vmlab status -v` shows `qemu=<path>` next to
+`host_gpu=`. Template builds never have a `gpu {}`, so they always run the
+stock QEMU.
+DOC
+
+  p <<'DOC'
+`Nvidia1` and `Nvidia2` are identical cards, so the `*nvidia*` loader filter
+matches both, and a Venus guest on either one sees two devices. The Vulkan
+loader cannot filter by PCI address, and Mesa's device-select layer breaks
+Venus. The guest's default device is the first matching device in the host
+loader's order. A planned implicit Vulkan layer will filter by
+`VK_EXT_pci_bus_info`.
+DOC
+
   h3 "The viewer"
 
   p <<'DOC'

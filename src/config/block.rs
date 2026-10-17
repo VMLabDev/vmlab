@@ -461,6 +461,41 @@ impl<'b, 'i> Reader<'b, 'i> {
         self.has(name).then(|| self.string_list(name))
     }
 
+    /// A record of strings, `{ KEY: "value", … }`, as key/value pairs in
+    /// key order — WCL's spelling of a string map, whose keys are therefore
+    /// identifiers. An absent field reads as empty; a value that is not a
+    /// string is reported by key, and the good pairs still come through.
+    pub fn string_map(&mut self, name: &str) -> Vec<(String, String)> {
+        let Some(v) = self.value(name) else {
+            return Vec::new();
+        };
+        match &v.value {
+            Value::Record { fields, .. } => {
+                let mut out = Vec::new();
+                for (key, item) in fields.iter() {
+                    match item {
+                        Value::Utf8(s) | Value::Ascii(s) | Value::Identifier(s) => {
+                            out.push((key.clone(), s.clone()))
+                        }
+                        other => {
+                            let msg =
+                                format!("`{name}.{key}` must be a string, got {}", describe(other));
+                            self.issue_at(v.span, msg);
+                        }
+                    }
+                }
+                out
+            }
+            other => {
+                self.issue_at(
+                    v.span,
+                    wrong_type(name, "a record of strings, `{ KEY: \"value\" }`", other),
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// A string that must be drawn from a fixed set, kept as a string —
     /// the untyped sibling of [`Reader::keyword`], for sets the model
     /// carries verbatim (an architecture name, say).
@@ -1021,6 +1056,25 @@ mod tests {
         let (v, issues) = read("a = [\"x\", 1]", |r| r.string_list("a"));
         assert_eq!(v, ["x"]);
         assert_eq!(issues, ["`a` must be a list of strings, found an integer"]);
+    }
+
+    #[test]
+    fn string_map_reads_a_record_and_rejects() {
+        let (v, issues) = read("a = { B: \"2\", A: \"1\" }", |r| r.string_map("a"));
+        assert_eq!(
+            v,
+            [("A".to_string(), "1".to_string()), ("B".into(), "2".into())]
+        );
+        assert!(issues.is_empty());
+        let (v, issues) = read("", |r| r.string_map("a"));
+        assert!(v.is_empty() && issues.is_empty());
+        assert_eq!(
+            issue("a = \"x\"", |r| r.string_map("a")),
+            "`a` must be a record of strings, `{ KEY: \"value\" }`, got a string"
+        );
+        let (v, issues) = read("a = { A: \"1\", N: 3 }", |r| r.string_map("a"));
+        assert_eq!(v, [("A".to_string(), "1".to_string())]);
+        assert_eq!(issues, ["`a.N` must be a string, got an integer"]);
     }
 
     #[test]
