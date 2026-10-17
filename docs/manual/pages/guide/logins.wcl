@@ -126,6 +126,17 @@ minted logon before anything spawns, so an SMB share mapped by the agent opens
 without a password prompt in the session.
 DOC
 
+  p <<'DOC'
+A minted logon is not a console session. Nothing appears on the Windows
+desktop, and `query user` lists nobody. A lab that needs a logged-on desktop,
+for a GPU test or a screenshot, sets Winlogon autologon itself
+(`AutoAdminLogon`, `DefaultUserName`, `DefaultPassword` under
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`) and reboots.
+On a fresh clone of an older Windows template, Windows' own OOBE can delete
+those values on the next boot; [Troubleshooting](apx_troubleshooting) has the
+check to run first.
+DOC
+
   h3 "Linux: a real session"
 
   p <<'DOC'
