@@ -79,6 +79,32 @@ Usual causes, in order of likelihood: the template was built without the agent, 
 
 If the guest is up and the agent is absent, rebuild the template so the bake installs the agent this vmlab ships, or push one into the running machine with `vmlab machine repair-agent`. A container's agent comes from the host's guest asset, so on a container the message ends with `there is nothing to rebuild or repair — an agent that is not answering here is a machine to restart, or a guest asset to reinstall (§19.4)`.
 
+## Autologon set on a fresh Windows clone is gone after a reboot
+
+```
+AutoAdminLogon=
+DefaultUserName=
+DefaultPassword set=True
+```
+
+vmlab prints nothing. A lab writes `AutoAdminLogon`, `DefaultUserName` and `DefaultPassword` under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon` on a fresh Windows 11 clone and reboots; afterwards `AutoAdminLogon` and `DefaultUserName` are gone, `DefaultPassword` survives, nobody is logged on. Intermittent.
+
+Cause: Windows' OOBE, replayed on every clone's first boot. `msoobe.exe` enables autologon for its temporary `defaultuser0`; `CloudExperienceHostBroker.exe` disables it when user OOBE exits, deleting `AutoAdminLogon`, `DefaultUserName` and `SystemAutoLogon` whoever wrote them. A template first-boot script that reports ready, or reboots the clone, before that exit lets user OOBE resume on the next boot and delete the lab's values. `C:\Windows\Panther\UnattendGC\setupact.log` shows `Clearing Auto-logon values per request` stamped after the lab set them. Seen on windows-11 clones; any Windows template whose first-boot script predates the vmlab-templates fix can have it.
+
+Fix: rebuild or re-pull the template once a fixed version is published (its first boot holds `ready` until user OOBE exits). On an older clone, run this until it prints `done`, then set autologon and reboot:
+
+```powershell
+$s = Get-ItemProperty HKLM:\SYSTEM\Setup
+$w = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+$l = Select-String C:\Windows\Panther\UnattendGC\setupact.log `
+       -Pattern 'fEnableAutologon = 1|Clearing Auto-logon values' -ErrorAction SilentlyContinue |
+     Select-Object -Last 1
+if ($s.SystemSetupInProgress -ne 0 -or $s.OOBEInProgress -ne 0 -or $w.SystemAutoLogon -or
+    ($l -and $l.Line -notmatch 'Clearing')) { 'waiting' } else { 'done' }
+```
+
+A leftover `AutoLogonCount` is a different cause with the same symptom (Windows counts it down per autologon and clears the logon at zero); remove it when setting the values.
+
 ## A shared app is refused
 
 `vmlab app run` refuses before any window opens; cli-machine.md (`vmlab app`) has the full refusal table. The common ones:

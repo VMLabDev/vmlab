@@ -110,6 +110,14 @@ is unloaded when it goes. The lab's share credential is injected into each
 minted logon before anything spawns, so an SMB share mapped by the agent opens
 without a password prompt in the minted session.
 
+A minted logon is not a console session: nothing appears on the Windows
+desktop and `query user` lists nobody. A lab that needs a logged-on desktop sets
+Winlogon autologon itself (`AutoAdminLogon`, `DefaultUserName`,
+`DefaultPassword` under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`)
+and reboots. On a fresh clone of an older Windows template, Windows' own OOBE
+can delete those values on the next boot; troubleshooting.md has the check to
+run first.
+
 ### Linux: a real session
 
 A Linux session is a real login, not a bare `setuid`. Where the guest has PAM,
