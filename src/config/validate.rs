@@ -2164,7 +2164,7 @@ lab "l" {
             Ok(())
         }
         fn check_host_gpu(&self, gpu: &Gpu, arch: Option<&str>) -> Result<(), String> {
-            crate::qemu::hostgpu::render_plan(Some(gpu), arch, &self.1, &self.0)
+            crate::qemu::hostgpu::render_plan(Some(gpu), arch, &self.1, &self.0, Path::new("/data"))
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
         }

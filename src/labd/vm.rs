@@ -692,6 +692,7 @@ impl VmInstance {
             Some(&t.resolved.arch),
             &host,
             &qemu::hostgpu::Sysfs::host(),
+            &crate::paths::data_dir(),
         )
         .with_context(|| format!("{}: gpu", self.cfg.name))?;
         if let Some(warning) = &plan.warning {
@@ -887,6 +888,11 @@ impl VmInstance {
 
             let (nic_specs, nic_fds) = self.nic_specs().await?;
             let render = self.render_plan(&t)?;
+            if let Some(dir) = &render.vk_layer {
+                qemu::vk_layer::install(dir).with_context(|| {
+                    format!("{}: installing the Vulkan PCI-filter layer", self.cfg.name)
+                })?;
+            }
             let args = qemu::build_args(
                 &self.lab,
                 &t.resolved,

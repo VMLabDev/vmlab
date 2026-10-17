@@ -163,10 +163,15 @@ SRC
     build loses nothing. With no stock QEMU on `PATH`, vmlab adds no `-L`.
   DOC
   p <<DOC
-    vmlab first removes the inherited `VK_*` loader variables from the QEMU
-    process's environment and sets the ones it derives. `qemu_env` is applied
-    after that, and an explicit host setting beats a derived one: a
-    `VK_LOADER_DRIVERS_SELECT` in `qemu_env` replaces vmlab's. The
+    vmlab first removes the inherited `VK_*` loader variables and the
+    PCI-filter layer's variables from the QEMU process's environment, then
+    sets the ones it derives: the driver filter and, under `vulkan`,
+    `VK_ADD_IMPLICIT_LAYER_PATH` and `VMLAB_VK_PCI_ADDRESS` for vmlab's
+    `VK_LAYER_VMLAB_pci_filter`, which leaves the guest only the device at
+    this GPU's `address`. `qemu_env` is applied after that, and an explicit
+    host setting beats a derived one: a `VK_LOADER_DRIVERS_SELECT` in
+    `qemu_env` replaces vmlab's, and `VMLAB_VK_PCI_FILTER_DISABLE: "1"`
+    turns the layer off. The
     `vmlab: env:` line in `qemu.log` lists every variable vmlab set,
     `qemu_env` included, with its value. `vmlab status -v` shows
     `qemu=<path>` after `host_gpu=` for a VM that ran a `qemu_binary`.

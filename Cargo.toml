@@ -97,6 +97,12 @@ command-fds = { version = "0.3", optional = true }
 # `git` reads is the silent-divergence failure class §19.6 exists to refuse.
 ignore = "0.4"
 
+# build.rs compiles the Vulkan PCI-filter layer (src/qemu/vk_pci_filter.c)
+# into a shared object the binary embeds. `cc` is already in the tree for
+# ring, zstd-sys and aws-lc-sys; it is only asked for the target's C compiler.
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

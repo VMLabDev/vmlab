@@ -8,6 +8,7 @@ pub mod hostgpu;
 pub mod process;
 pub mod resolve;
 pub mod virtiofsd;
+pub mod vk_layer;
 
 pub use cmdline::{
     Accel, AccelPlan, NicBackend, NicSpec, VmPaths, build_args, emulator_binary,

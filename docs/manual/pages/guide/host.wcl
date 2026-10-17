@@ -155,11 +155,27 @@ DOC
 
   p <<'DOC'
 `Nvidia1` and `Nvidia2` are identical cards, so the `*nvidia*` loader filter
-matches both, and a Venus guest on either one sees two devices. The Vulkan
-loader cannot filter by PCI address, and Mesa's device-select layer breaks
-Venus. The guest's default device is the first matching device in the host
-loader's order. A planned implicit Vulkan layer will filter by
-`VK_EXT_pci_bus_info`.
+matches both. The Vulkan loader cannot filter by PCI address, and Mesa's
+device-select layer breaks Venus, so vmlab ships its own Vulkan layer for it.
+A `vulkan` VM's QEMU loads `VK_LAYER_VMLAB_pci_filter`, which hides every
+physical device but the one at the host GPU's `address`. A Venus guest on
+`Nvidia2` therefore sees one device, the card at `0000:05:00.0`, the same card
+`egl-headless` scans out from. The layer is built into `vmlab`, and vmlab
+writes it under `~/.local/share/vmlab/vk-layer/` the first time a VM needs
+it. `qemu.log` shows what it decided:
+DOC
+
+  code text {
+    source = <<'SRC'
+vmlab: env: VK_LOADER_DRIVERS_SELECT=*nvidia* VK_ADD_IMPLICIT_LAYER_PATH=/home/you/.local/share/vmlab/vk-layer/e7eb826ffa68b2aa VMLAB_VK_PCI_ADDRESS=0000:05:00.0
+vmlab-pci-filter: 0000:05:00.0: kept NVIDIA GeForce RTX 5090, hid 1
+SRC
+  }
+
+  p <<'DOC'
+To turn the layer off for one host GPU, set
+`qemu_env = { VMLAB_VK_PCI_FILTER_DISABLE: "1" }` on it. The guest then sees
+every card that matches the driver filter.
 DOC
 
   h3 "The viewer"

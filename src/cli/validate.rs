@@ -68,6 +68,7 @@ impl ValidationContext for HostContext {
             arch,
             &host,
             &crate::qemu::hostgpu::Sysfs::host(),
+            &crate::paths::data_dir(),
         )
         .map(|_| ())
         .map_err(|e| format!("{e:#}"))
