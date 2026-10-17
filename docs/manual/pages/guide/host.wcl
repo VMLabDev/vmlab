@@ -60,7 +60,6 @@ SRC
       | "`config_weave_bin_dir`" | "The directory holding the config-weave guest binaries. See [Playbooks](guide_playbooks)." | "`~/.local/share/config-weave/bin`" |
       | "`workspace_max_file`" | "The workspace syncer's per-file size guard; a larger file is refused by name." | "`256MiB`" |
       | "`firmware_dir`" | "A UEFI firmware override, laid out `<dir>/<arch>/`. See the UEFI firmware section below." | "vmlab's bundled firmware" |
-      | "`gpu_address`" | "The host GPU a virgl or vulkan `gpu {}` renders on when the lab names none. Set it on a multi-GPU host so labs need not name a PCI address." | "QEMU's choice" |
   }
 
   p <<'DOC'
@@ -71,6 +70,51 @@ XDG default. `workspace_max_file` is host config rather than a `@dev`
 argument because the cap is about your link to your guest, not about the lab
 everyone shares, and the refusal message names it so "raise the cap" points
 somewhere.
+DOC
+
+  h3 "Host GPUs"
+
+  p <<'DOC'
+A lab's `gpu {}` never carries a PCI address: which GPU sits at which address
+is a fact about one machine, and the lab file travels. Each machine's host
+config names its own GPUs instead, beside `host {}`, and marks one the
+default. A lab names a host GPU with `host_gpu`, or takes the default. The
+same lab then runs on two machines with different cards:
+DOC
+
+  code wcl { filename = "~/.config/vmlab/config.wcl (this machine)" source = <<'SRC'
+import <vmlab-host.wcl>
+
+gpu "AMD1"    { address = "0000:72:00.0" }
+gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+gpu "Nvidia2" { address = "0000:05:00.0" }
+SRC
+  }
+
+  code wcl { filename = "~/.config/vmlab/config.wcl (a second machine)" source = <<'SRC'
+import <vmlab-host.wcl>
+
+gpu "Nvidia1" { address = "0000:0a:00.0"  default = true }
+gpu "Intel1"  { address = "0000:00:02.0" }
+SRC
+  }
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+vm "gl01" { template = "x86_64/fedora-44" gpu { mode = "vulkan" } }
+vm "gl02" { template = "x86_64/fedora-44" gpu { mode = "vulkan" host_gpu = "AMD1" } }
+SRC
+  }
+
+  p <<'DOC'
+`gl01` renders on `Nvidia1` on both machines, at whichever address it has
+there. `gl02` renders on `AMD1` here; the second machine has no `AMD1`, so
+there it warns that `AMD1` is not declared on this host and renders on the
+default, `Nvidia1`. A `passthrough` GPU never falls back like that,
+because handing the guest a different card takes it from the host: it
+refuses instead. Find a card's address with `lspci -D`, or under
+`/sys/bus/pci/devices/`. Labels match case-insensitively; a lone `gpu` block
+is the default without `default = true`. The fields are in the
+[host configuration file](ref_host) reference.
 DOC
 
   h3 "The viewer"

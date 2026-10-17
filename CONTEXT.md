@@ -576,6 +576,19 @@ per-block cursor is `Reader`, and what each caller keeps is a *field mapping*.
 See ADR-0006.
 _Avoid_: parser (wcl parses; this reads a parsed block), deserializer
 
+**Host GPU**:
+A GPU on this machine, declared by name in the user's host config
+(`gpu "AMD1" { address = "0000:72:00.0" }`) with its PCI address and an
+optional `vulkan_icd`; at most one is the default, and a lone one is the
+default without saying so. A lab's `gpu {}` names one with `host_gpu`, or
+takes the default — never an address, because which card sits where is a
+fact about one machine and a lab file travels. Names match
+case-insensitively. A paravirtual mode falls back to the default from a name
+this host lacks; `passthrough` refuses. Picked by the lab daemon at VM start
+(`qemu::hostgpu::pick`). PRD §5.2.
+_Avoid_: GPU address (the address is a host GPU's field), render node (the
+node is what sysfs resolves the address to)
+
 **Lab status**:
 The typed projection of a lab's machines, segments and pulls that the lab
 daemon produces once and every surface renders unchanged. Carries the

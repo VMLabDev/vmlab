@@ -11,7 +11,8 @@ page ref_host {
     The host configuration file holds the settings that belong to this
     machine rather than to any lab: the subnet pool, the DNS suffix, the
     pre-shared key for cross-host segments, the viewer command, the
-    shared-app clients, and the workspace syncer's size guard.
+    shared-app clients, the workspace syncer's size guard, and the host's
+    GPUs.
     [Host configuration and WSL 2](guide_host) explains when to change each one; this chapter lists the fields.
   DOC
 
@@ -40,7 +41,8 @@ SRC
 
   h2 "host {}"
   p <<DOC
-    The one block the file carries. Every field is an override: an absent
+    The block of host-wide settings; the file carries at most one, beside
+    any host GPUs (below). Every field is an override: an absent
     field leaves the default in place, and a malformed one is reported with
     its line rather than silently ignored.
   DOC
@@ -60,7 +62,6 @@ host {
   config_weave_bin_dir = "~/.local/share/config-weave/bin"
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
-  gpu_address          = "0000:72:00.0"
 }
 SRC
   }
@@ -81,7 +82,6 @@ SRC
       | "`config_weave_bin_dir`" | "utf8" | "`~/.local/share/config-weave/bin`" | "Directory holding the config-weave guest binaries playbooks push." |
       | "`workspace_max_file`" | "ByteSize" | "`256MiB`" | "Workspace syncer per-file size guard. A larger file is refused by name." |
       | "`firmware_dir`" | "utf8" | "none" | "UEFI firmware override, laid out `<dir>/<arch>/` with the bundled set's file names. Searched before vmlab's bundled firmware and the host's." |
-      | "`gpu_address`" | "utf8" | "none" | "Host PCI address of the GPU a virgl or vulkan `gpu {}` renders on when the lab names none. Keeps labs portable between hosts. See [gpu {}](ref_vm)." |
   }
   p "The parser enforces these rules, and reports every violation in one pass:"
   list {
@@ -91,6 +91,7 @@ SRC
     li "`fastpath` is one of `auto`, `off`, `sockmap`, `afxdp`. The `VMLAB_FASTPATH` environment variable selects the same values."
     li "`oci_chunk_size` and `workspace_max_file` are non-negative sizes."
     li "A field the schema does not name is rejected with its position."
+    li "`gpu_address`, removed after v0.24, is rejected with a message naming the `gpu` block that replaced it."
   }
   p <<DOC
     `workspace_max_file` is host config
@@ -108,6 +109,40 @@ SRC
     Neither path is checked when the file is read. A wrong one fails when
     `vmlab app run` starts it, naming the path. See [Shared apps](guide_apps).
   DOC
+  h2 "gpu \"<name>\" {}"
+  p <<DOC
+    A host GPU: a GPU on this machine, named so a lab's `gpu {}` can ask for
+    it with `host_gpu` rather than carry a PCI address. Declare zero or more,
+    beside `host {}`. See [gpu {}](ref_vm) for how a lab picks one.
+  DOC
+  code wcl { source = <<'SRC'
+gpu "AMD1"    { address = "0000:72:00.0" }
+gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/nvidia_icd.json" }
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "label" | "utf8" | "required" | "The name. A lab's `host_gpu` matches it case-insensitively." |
+      | "`address`" | "utf8" | "required" | "Host PCI address, as under `/sys/bus/pci/devices/`." |
+      | "`vulkan_icd`" | "utf8" | "none" | "Path to a Vulkan ICD JSON a `vulkan` guest's renderer loads, set as `VK_DRIVER_FILES`. Overrides the driver picked from the GPU's kernel driver." |
+      | "`default`" | "bool" | "`false`" | "The GPU a lab gets when it names none, or names one this host lacks under virgl or vulkan. A lone `gpu` block is the default without it." |
+  }
+  p "The parser enforces these rules:"
+  list {
+    li "Every block has a label and an `address`."
+    li "Two labels that differ only in case are one name declared twice, which is an error."
+    li "At most one block carries `default = true`."
+  }
+  p <<DOC
+    The rest is checked when a lab uses the GPU, by `vmlab validate` and at
+    VM start, naming the GPU: its address must name a PCI device, a virgl or
+    vulkan guest needs that device to have a DRM render node, and its
+    `vulkan_icd` must exist. A GPU bound to `vfio-pci` for passthrough has no
+    render node and needs none.
+  DOC
+
   callout "A neutral fast path" { kind = :info body = <<DOC
     `auto` never selects `sockmap`; it was measured slower than the userspace
     fabric and exists for explicit evaluation. Both kernel tiers need CAP_BPF
