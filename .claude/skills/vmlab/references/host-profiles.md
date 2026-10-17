@@ -11,7 +11,8 @@ honouring `XDG_CONFIG_HOME`.
 
 - The file is optional. Absent file means every default applies.
 - Every field is an override; an absent field leaves the default in place.
-- It must start with `import <vmlab-host.wcl>` and contain one `host { … }` block.
+- It must start with `import <vmlab-host.wcl>`, and carries one `host { … }` block
+  and zero or more `gpu "<name>" { … }` host GPUs.
   A file without the import is rejected with an error naming the missing line.
 - A malformed value is reported at its line, with the same wording a lab file gets.
   Every mistake in the file is reported in one pass.
@@ -48,7 +49,7 @@ host {
 
 ### `host {}`
 
-The one block the file carries.
+The block of host-wide settings; the file carries at most one.
 
 ```wcl
 host {
@@ -64,7 +65,6 @@ host {
   config_weave_bin_dir = "~/.local/share/config-weave/bin"
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
-  gpu_address          = "0000:72:00.0"
 }
 ```
 
@@ -84,7 +84,6 @@ host {
 | `config_weave_bin_dir` | utf8 | `~/.local/share/config-weave/bin` | Directory holding the config-weave guest binaries playbooks push (see automation.md). |
 | `workspace_max_file` | ByteSize | `256MiB` | Workspace syncer per-file size guard. A larger file is refused by name (see dev-machines.md). |
 | `firmware_dir` | utf8 | none | UEFI firmware override, `<dir>/<arch>/` with the bundled set's file names; searched before vmlab's bundled firmware and the host's (see "UEFI firmware" below). |
-| `gpu_address` | utf8 | none | Host PCI address of the GPU a `virgl`/`vulkan` `gpu {}` renders on when the lab names none, so labs stay portable between hosts (see vm.md, `gpu {}`). Read at each VM start. |
 
 Parser rules, all violations reported in one pass:
 
@@ -94,7 +93,8 @@ Parser rules, all violations reported in one pass:
 - `fastpath` is one of `auto`, `off`, `sockmap`, `afxdp`. The `VMLAB_FASTPATH`
   environment variable selects the same values.
 - `oci_chunk_size` and `workspace_max_file` are non-negative sizes.
-- A field the schema does not name is rejected with its position.
+- A field the schema does not name is rejected with its position; the removed
+  `gpu_address` is rejected with a message pointing at `gpu "<name>" {}`.
 
 `config_weave_bin_dir` is a location knob rather than a switch: it is the first
 rung of a three-rung lookup, ahead of the `VMLAB_CONFIG_WEAVE_DIR` environment
@@ -103,6 +103,29 @@ variable and the XDG default.
 `workspace_max_file` is host config rather than a `@dev` argument because the cap
 is about this developer's link to the guest, not the lab everyone shares; the
 refusal message names the field.
+
+### gpu "<name>" {}
+
+A **host GPU**, declared beside `host {}`, zero or more of them. A lab's
+`gpu {}` names one with `host_gpu` or takes the default (vm.md, `gpu {}`).
+
+```wcl
+gpu "AMD1"    { address = "0000:72:00.0" }
+gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/nvidia_icd.json" }
+```
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| label | utf8 | required | The name; matched case-insensitively against a lab's `host_gpu`. |
+| `address` | utf8 | required | Host PCI address (`lspci -D`, `/sys/bus/pci/devices/`). |
+| `vulkan_icd` | utf8 | none | Vulkan ICD JSON a `vulkan` guest's renderer loads (`VK_DRIVER_FILES`), overriding the driver-derived filter. |
+| `default` | bool | `false` | The GPU a lab gets when it names none. At most one; a lone block is the default without it. |
+
+Parsing rejects a missing `address`, two labels differing only in case, and a
+second `default = true`. The rest is checked when a lab uses the GPU (validate
+and VM start), naming it: the address must be a PCI device, with a render node
+for virgl/vulkan, and `vulkan_icd` must exist. Read at each VM start.
 
 ### UEFI firmware
 

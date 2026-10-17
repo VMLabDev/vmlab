@@ -113,11 +113,29 @@ pub(crate) fn schema_issues(doc: &Document) -> IssueList {
         .collect()
 }
 
+/// Replace the schema's issues about a field a release removed with the
+/// issue saying where it went (`moved`): an unknown-field complaint at the
+/// same text would only bury the instruction.
+pub(crate) fn supersede(issues: &mut IssueList, moved: IssueList) {
+    let overlaps = |a: &miette::SourceSpan, b: &miette::SourceSpan| {
+        a.offset() < b.offset() + b.len().max(1) && b.offset() < a.offset() + a.len().max(1)
+    };
+    issues.retain(|i| {
+        !i.span.is_some_and(|s| {
+            moved
+                .iter()
+                .any(|m| m.span.is_some_and(|ms| overlaps(&s, &ms)))
+        })
+    });
+    issues.extend(moved);
+}
+
 /// Parse + schema-check + extract a lab file. Semantic validation (§5.1) is
 /// a separate pass — see [`validate`].
 pub fn load_lab_source(source: &str, name: &str, root: &Path) -> Result<LabFile, ConfigErrors> {
     let doc = open(source, name, Some(root))?;
     let mut issues = schema_issues(&doc);
+    supersede(&mut issues, extract::moved_fields(&doc));
     let lab = extract::extract_lab_file(&doc, root, &mut issues);
     match lab {
         Some(lab) if issues.is_empty() => Ok(lab),
@@ -598,6 +616,42 @@ lab "l" {
             "expected a position-applicability error, got: {:?}",
             err.issues
         );
+    }
+
+    /// v0.24's lab `gpu.address` and `gpu.vulkan_icd` moved to the host
+    /// config (PRD §5.2): each is refused with the words that say where,
+    /// in place of the schema's unknown-field complaint, at the field.
+    #[test]
+    fn a_lab_gpu_address_or_vulkan_icd_is_refused_with_the_migration() {
+        let src = "import <vmlab.wcl>\nlab \"x\" {\n  vm \"a\" {\n    template = \"x86_64/t\"\n    \
+                   gpu {\n      mode = \"vulkan\"\n      address = \"0000:72:00.0\"\n      \
+                   vulkan_icd = \"/opt/icd.json\"\n    }\n  }\n}\n";
+        let err = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        let messages: Vec<&str> = err.issues.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "gpu `address` moved to the host config: declare \
+                 `gpu \"<name>\" { address = \"0000:01:00.0\" }` in ~/.config/vmlab/config.wcl \
+                 and name it here with `host_gpu = \"<name>\"` (or mark it `default = true`) (PRD §5.2)",
+                "gpu `vulkan_icd` moved to the host config: declare \
+                 `gpu \"<name>\" { address = \"0000:01:00.0\"  vulkan_icd = \"/usr/share/vulkan/icd.d/<driver>_icd.json\" }` \
+                 in ~/.config/vmlab/config.wcl and name it here with `host_gpu = \"<name>\"` \
+                 (or mark it `default = true`) (PRD §5.2)",
+            ],
+            "{messages:#?}"
+        );
+        let span = err.issues[0].span.expect("positioned");
+        assert_eq!(
+            &src[span.offset()..span.offset() + span.len()],
+            "address = \"0000:72:00.0\""
+        );
+        // `host_gpu` is the field that replaced them.
+        let ok = "import <vmlab.wcl>\nlab \"x\" { vm \"a\" { template = \"x86_64/t\" \
+                  gpu { mode = \"vulkan\" host_gpu = \"AMD1\" } } }\n";
+        let file = load_lab_source(ok, "<test>", Path::new("/tmp")).unwrap();
+        let gpu = file.lab.vms[0].gpu.as_ref().unwrap();
+        assert_eq!(gpu.host_gpu.as_deref(), Some("AMD1"));
     }
 
     /// A declared decorator's arguments are typed, so a wrong-typed or

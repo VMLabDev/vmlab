@@ -346,40 +346,52 @@ Validation requires `from` to be a directory under the lab root.
 
 GPU acceleration for the VM. At most one per VM. Passthrough hands a host device
 to the VM exclusively; virgl and vulkan render on the host GPU, which stays
-shared.
+shared. The GPU is a **host GPU** declared by name in the host config
+(host-profiles.md, `gpu "<name>" {}`): a lab never carries a PCI address.
 
 ```wcl
-gpu { mode = "passthrough" address = "0000:01:00.0" }
+gpu { mode = "vulkan" }                    // the host's default GPU
+gpu { mode = "vulkan" host_gpu = "AMD1" }  // a named one
 ```
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `mode` | utf8 | required | `passthrough`, `virgl` or `vulkan`. |
-| `address` | utf8 | host `gpu_address` | Host PCI address, for example `0000:01:00.0`. Under `passthrough` the device handed to the VM, and required. Under `virgl`/`vulkan` the host GPU that renders; without it, and without a host config default, QEMU chooses. |
-| `vulkan_icd` | utf8 | none | Path to a Vulkan ICD JSON, set as `VK_DRIVER_FILES`; overrides the driver-derived filter. `vulkan` only. |
+| `host_gpu` | utf8 | the host's default GPU | Name of a host GPU in the host config, matched case-insensitively. The device handed over under `passthrough`; the GPU that renders under `virgl`/`vulkan`. |
+
+The lab daemon picks at VM start: a declared `host_gpu` is used; one this host
+does not declare warns and falls back to the default under `virgl`/`vulkan`
+(``host GPU `X` is not declared on this host; using the default `Y` ``) but is
+refused under `passthrough`, naming the declared GPUs; no `host_gpu` takes the
+default. With nothing to pick (none declared, or a missing name and no default)
+`virgl`/`vulkan` render where QEMU puts them and `passthrough` refuses
+(``passthrough needs a host GPU: declare `gpu "<name>" { address = ... }` ``).
+`vmlab status -v` shows the pick as `host_gpu=<name>`.
 
 A paravirtual GPU is the guest's only display adapter: `virtio-vga-gl` on x86,
 `virtio-gpu-gl` plus `-vga none` on `virt`; `vulkan` adds
-`venus=true,blob=true,hostmem=4G`.
+`venus=true,blob=true,hostmem=4G`. `passthrough` emits
+`-device vfio-pci,host=<address>`.
 
-On a multi-GPU host, name the GPU that renders. vmlab resolves the address
-through `/sys/bus/pci/devices/<address>/`: the render node goes on
-`-display egl-headless,rendernode=…`, and under `vulkan` the kernel driver sets
-`VK_LOADER_DRIVERS_SELECT` in QEMU's own environment (`amdgpu` → `*radeon*`,
-`i915`/`xe` → `*intel*`, `nvidia` → `*nvidia*`). Every QEMU starts with
-`VK_DRIVER_FILES`, `VK_ICD_FILENAMES`, `VK_LOADER_DRIVERS_SELECT` and
+vmlab resolves the picked GPU's address through `/sys/bus/pci/devices/<address>/`:
+the render node goes on `-display egl-headless,rendernode=…`, and under `vulkan`
+the kernel driver sets `VK_LOADER_DRIVERS_SELECT` in QEMU's own environment
+(`amdgpu` → `*radeon*`, `i915`/`xe` → `*intel*`, `nvidia` → `*nvidia*`); the
+host GPU's `vulkan_icd` replaces that with `VK_DRIVER_FILES`. Every QEMU starts
+with `VK_DRIVER_FILES`, `VK_ICD_FILENAMES`, `VK_LOADER_DRIVERS_SELECT` and
 `MESA_VK_DEVICE_SELECT` cleared; `MESA_VK_DEVICE_SELECT` is never set (it breaks
-Venus). `up` warns when a virgl/vulkan VM names no GPU and the host has more
-than one render node. Each run's `qemu.log` opens with the QEMU argv and the
-variables vmlab set.
+Venus). `up` and `validate` warn when a virgl/vulkan VM gets no host GPU and the
+host has more than one render node. Each run's `qemu.log` opens with the QEMU
+argv and the variables vmlab set.
 
-```wcl
-gpu { mode = "vulkan" address = "0000:72:00.0" }
-```
-
-Validation rejects `passthrough` without an `address`; a virgl/vulkan
-`address` with no PCI device or no render node; a `vulkan_icd` that does not
-exist; and `vulkan_icd` outside `vulkan` mode.
+Validation runs the same pick: it rejects an empty `host_gpu`, a `passthrough`
+name the host lacks or `passthrough` with nothing to pick, a picked GPU whose
+address names no PCI device (or no render node, for virgl/vulkan), and a
+`vulkan_icd` that does not exist. A virgl/vulkan name the host lacks is a
+warning. The v0.24 lab fields `address` and `vulkan_icd` are gone: a lab still
+carrying one fails with ``gpu `address` moved to the host config: declare
+`gpu "<name>" { address = "0000:01:00.0" }` in ~/.config/vmlab/config.wcl and
+name it here with `host_gpu = "<name>"` (or mark it `default = true`)``.
 
 ## provision {}
 

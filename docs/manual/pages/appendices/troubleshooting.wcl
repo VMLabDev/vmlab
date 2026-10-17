@@ -339,6 +339,65 @@ MSG
     machine it names has started.
   DOC
 
+  h2 "A lab gpu {} still names an address"
+  code text { source = <<'MSG'
+gpu `address` moved to the host config: declare `gpu "<name>" { address = "0000:01:00.0" }` in ~/.config/vmlab/config.wcl and name it here with `host_gpu = "<name>"` (or mark it `default = true`) (PRD §5.2)
+MSG
+  }
+  p <<DOC
+    vmlab 0.24 let a lab's `gpu {}` carry the host PCI address and a
+    `vulkan_icd`, and let the host config carry a default `gpu_address`. A PCI
+    address is a fact about one machine, so all three moved into named
+    [host GPUs](ref_host). A lab still carrying `address` or `vulkan_icd`, or a
+    host config still carrying `gpu_address`, fails every verb with a message
+    of this shape.
+  DOC
+  p <<DOC
+    Move the address, and any `vulkan_icd`, into a `gpu "<name>" {}` block
+    beside `host {}` in `~/.config/vmlab/config.wcl`. Then delete the fields
+    from the lab and either write `host_gpu = "<name>"` in its `gpu {}` or
+    leave it out and let the host's default apply. A lone `gpu` block is the
+    default without `default = true`.
+  DOC
+
+  h2 "A host GPU is not declared on this host"
+  code text { source = <<'MSG'
+{machine}: host GPU `{name}` is not declared on this host; using the default `{default}`
+MSG
+  }
+  p <<DOC
+    A warning from `vmlab validate`, `vmlab up` and the lab daemon's log: the
+    lab's `host_gpu` names a GPU this machine's host config does not declare,
+    and the VM's mode is `virgl` or `vulkan`, which render on any GPU, so it
+    falls back to the host's default. With no default either, the message
+    says so and QEMU picks the render node. Declare a `gpu` block with that
+    name on this machine, or mark the GPU you want `default = true`. Names
+    match case-insensitively.
+  DOC
+  p <<DOC
+    Under `passthrough` the same mismatch is an error instead, naming the
+    GPUs this host does declare: passing through a different card would take
+    it away from the host. `passthrough` with no `host_gpu` and no default
+    fails too, and so does a host with several GPUs and no default:
+  DOC
+  code text { source = <<'MSG'
+passthrough needs a host GPU: declare `gpu "<name>" { address = ... }` in ~/.config/vmlab/config.wcl
+MSG
+  }
+
+  h2 "No host GPU was picked on a host with several render nodes"
+  code text { source = <<'MSG'
+this host has {n} render nodes and no host GPU was picked for a virgl/vulkan gpu {}: {nodes} — declare `gpu "<name>" { address = ... }` in ~/.config/vmlab/config.wcl (a lone one is the default, else mark one `default = true`) (PRD §5.2)
+MSG
+  }
+  p <<DOC
+    `vmlab up` and `vmlab validate` warn when a `virgl` or `vulkan` VM gets no
+    host GPU and the host has more than one render node. QEMU then renders on
+    whichever node it finds first, and Venus sees every Vulkan driver on the
+    host, so the console can come up black. Each node is listed with its PCI
+    address and kernel driver: declare the one you want as a host GPU.
+  DOC
+
   h2 "A shared app has no desktop to open on"
   code text { source = "no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set" }
   p <<DOC

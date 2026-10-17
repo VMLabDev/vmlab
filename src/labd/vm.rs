@@ -263,6 +263,8 @@ pub struct VmInstance {
     /// guest reports itself running again. `None` there means the guest woke
     /// by itself. Std lock: never held across an await.
     wake_cause: std::sync::Mutex<Option<WakeCause>>,
+    /// The declared host GPU the last start picked (§5.2), for status.
+    host_gpu: std::sync::Mutex<Option<String>>,
     qemu: Mutex<Option<Arc<dyn Process>>>,
     swtpm: Mutex<Option<Arc<dyn Process>>>,
     /// Per-share virtiofsd daemons of the current run (§7.5). Killed on
@@ -352,6 +354,7 @@ impl VmInstance {
             ready: RwLock::new(false),
             stop_requested: RwLock::new(false),
             wake_cause: std::sync::Mutex::new(None),
+            host_gpu: std::sync::Mutex::new(None),
             qemu: Mutex::new(None),
             swtpm: Mutex::new(None),
             virtiofsd: Mutex::new(Vec::new()),
@@ -669,21 +672,28 @@ impl VmInstance {
             serial_log: Some(self.dirs.logs.join("serial.log")),
             virtiofs_shares,
             gpu_render_node: render.gpu.as_ref().map(|g| g.render_node.clone()),
+            gpu_passthrough: render.passthrough.clone(),
         })
     }
 
-    /// The host GPU a `virgl`/`vulkan` `gpu {}` renders on and the emulator
-    /// environment that follows from it (PRD §5.2): the lab's `address`,
-    /// else the host config's `gpu_address`, resolved through sysfs. A host
-    /// probe, so it happens here rather than in the argv builder (ADR-0008).
+    /// The host GPU a `gpu {}` gets and the emulator environment that
+    /// follows from it (PRD §5.2): the host config's GPU the lab's
+    /// `host_gpu` names, else the host's default, resolved through sysfs. A
+    /// host probe, so it happens here rather than in the argv builder
+    /// (ADR-0008). A name this host lacks warns here, once per start.
     fn render_plan(&self, t: &TemplateParts) -> Result<qemu::hostgpu::RenderPlan> {
-        let host_default = crate::config::host::HostConfig::load_default()?.gpu_address;
-        qemu::hostgpu::render_plan(
+        let host = crate::config::host::HostConfig::load_default()?;
+        let plan = qemu::hostgpu::render_plan(
             t.resolved.gpu.as_ref(),
-            host_default.as_deref(),
+            &host,
             &qemu::hostgpu::Sysfs::host(),
         )
-        .with_context(|| format!("{}: host GPU", self.cfg.name))
+        .with_context(|| format!("{}: gpu", self.cfg.name))?;
+        if let Some(warning) = &plan.warning {
+            tracing::warn!("{}: {warning}", self.cfg.name);
+        }
+        *self.host_gpu.lock_recover() = plan.name.clone();
+        Ok(plan)
     }
 
     /// Spawn one virtiofsd per virtiofs share (listening before QEMU
@@ -1815,6 +1825,7 @@ impl super::machine::Machine for VmInstance {
                 .agent
                 .answered_version()
                 .or_else(|| self.template().agent_version.clone()),
+            host_gpu: self.host_gpu.lock_recover().clone(),
         })
     }
 }

@@ -193,9 +193,12 @@ pub(super) fn rt() -> Result<tokio::runtime::Runtime> {
 pub fn cmd_up(vms: Vec<String>) -> Result<()> {
     rt()?.block_on(async {
         // Validate before any side effect (PRD §5.1: implicitly every verb).
-        super::validate::validate_current()?;
+        let file = super::validate::validate_current()?;
         let (name, root) = current_lab()?;
-        warn_unpicked_render_gpu(&root, &vms);
+        let picked = |vm: &crate::config::model::Vm| vms.is_empty() || vms.contains(&vm.name);
+        for warning in super::validate::gpu_warnings(&file, picked) {
+            eprintln!("WARNING: {warning}");
+        }
         let client = ensure_current_daemon(&name, &root).await?;
         client
             .send_streaming(
@@ -225,32 +228,6 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
         }
         Ok(())
     })
-}
-
-/// Warn, once per `up`, when a `virgl`/`vulkan` machine being started names
-/// no host GPU, the host config gives no default, and the host has several:
-/// the display and Venus then land wherever QEMU and the Vulkan loader put
-/// them, which on a mixed host need not be the same GPU (PRD §5.2).
-fn warn_unpicked_render_gpu(root: &std::path::Path, vms: &[String]) {
-    let Ok(file) = crate::config::load_lab_root(root) else {
-        return;
-    };
-    let host_default = crate::config::host::HostConfig::load_default()
-        .ok()
-        .and_then(|c| c.gpu_address);
-    let gpus = file
-        .lab
-        .vms
-        .iter()
-        .filter(|vm| vms.is_empty() || vms.contains(&vm.name))
-        .filter_map(|vm| vm.gpu.as_ref());
-    if !crate::qemu::hostgpu::render_gpu_unpicked(gpus, host_default.as_deref()) {
-        return;
-    }
-    let host = crate::qemu::hostgpu::Sysfs::host().render_gpus();
-    if let Some(warning) = crate::qemu::hostgpu::unpicked_warning(&host) {
-        eprintln!("WARNING: {warning}");
-    }
 }
 
 /// `vmlab pull [vms…]`: download missing registry templates/images with
@@ -618,6 +595,11 @@ fn machine_detail(m: &MachineStatus) -> String {
                 .as_deref()
                 .map(|v| v.strip_prefix("agent=").unwrap_or(v));
             field("agent", or_dash(agent).to_string());
+            // Only with a `gpu {}`: which of the host's declared GPUs the
+            // last start picked (§5.2).
+            if let Some(gpu) = &vm.host_gpu {
+                field("host_gpu", gpu.clone());
+            }
         }
         MachineDetail::Container(c) => {
             field(
@@ -2314,6 +2296,26 @@ mod tests {
         );
         assert!(out.contains(" agent=12858e1"), "got:\n{out}");
         assert!(!out.contains("agent=agent="), "got:\n{out}");
+    }
+
+    /// A VM with a `gpu {}` names the host GPU its start picked (§5.2); a
+    /// VM without one says nothing about GPUs.
+    #[test]
+    fn verbose_names_the_picked_host_gpu() {
+        let MachineDetail::Vm(mut detail) = vm() else {
+            unreachable!()
+        };
+        detail.host_gpu = Some("AMD1".into());
+        let out = render_status(
+            &lab(vec![
+                addressed("gl01", PowerState::Running, true, MachineDetail::Vm(detail)),
+                addressed("dc01", PowerState::Running, true, vm()),
+            ]),
+            true,
+        );
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("state=")).collect();
+        assert!(lines[0].ends_with(" host_gpu=AMD1"), "got:\n{out}");
+        assert!(!lines[1].contains("host_gpu"), "got:\n{out}");
     }
 
     /// A machine a repair verb changed in place says so wherever its state is

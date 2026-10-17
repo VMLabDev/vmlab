@@ -246,6 +246,11 @@ pub struct VmStatus {
     /// metadata carries it), and a machine running an agent other than that
     /// one is marked by `agent_diverged`.
     pub agent_version: Option<String>,
+    /// The declared host GPU (§5.2) the last start picked for the VM's
+    /// `gpu {}`; `None` with no `gpu {}`, before a start, or when no host
+    /// GPU resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_gpu: Option<String>,
 }
 
 /// What a container has and a VM does not.
@@ -624,6 +629,7 @@ pub(crate) mod fixtures {
             cpus: Some(4),
             memory: Some(8 << 30),
             agent_version: Some("0.1.0".into()),
+            host_gpu: None,
         })
     }
 

@@ -539,12 +539,11 @@ impl GpuMode {
 #[derive(Debug, Clone)]
 pub struct Gpu {
     pub mode: GpuMode,
-    /// Host PCI address: the device itself under `passthrough`, the GPU that
-    /// renders under `virgl`/`vulkan` (§5.2).
-    pub address: Option<String>,
-    /// Vulkan ICD JSON overriding the driver-derived loader filter
-    /// (`vulkan` only).
-    pub vulkan_icd: Option<PathBuf>,
+    /// The host GPU by name (§5.2), declared in the host config rather than
+    /// here because a PCI address is a fact about one machine: the device
+    /// itself under `passthrough`, the GPU that renders under
+    /// `virgl`/`vulkan`. `None` takes the host's default.
+    pub host_gpu: Option<String>,
     pub span: Span,
 }
 

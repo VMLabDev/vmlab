@@ -57,11 +57,11 @@ impl ValidationContext for HostContext {
         crate::scripting::check_script_source(&source)
     }
 
-    fn check_gpu_address(&self, address: &str) -> Result<(), String> {
-        crate::qemu::hostgpu::Sysfs::host()
-            .resolve(address)
+    fn check_host_gpu(&self, gpu: &crate::config::model::Gpu) -> Result<(), String> {
+        let host = crate::config::host::HostConfig::load_default().map_err(|e| format!("{e:#}"))?;
+        crate::qemu::hostgpu::render_plan(Some(gpu), &host, &crate::qemu::hostgpu::Sysfs::host())
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("{e:#}"))
     }
 
     fn check_virtiofs_share(&self, share: &crate::config::model::Share) -> Result<(), String> {
@@ -137,6 +137,9 @@ pub fn validate_source(content: &str, root: &Path) -> std::result::Result<(), Ve
 
 pub fn cmd_validate() -> Result<()> {
     let file = validate_current()?;
+    for warning in gpu_warnings(&file, |_| true) {
+        eprintln!("WARNING: {warning}");
+    }
     println!(
         "ok: lab \"{}\" — {} vm(s), {} container(s), {} segment(s)",
         file.lab.name,
@@ -145,6 +148,26 @@ pub fn cmd_validate() -> Result<()> {
         file.lab.segments.len()
     );
     Ok(())
+}
+
+/// What the chosen VMs' `gpu {}` blocks earn on this host short of an error
+/// (PRD §5.2): a `host_gpu` this host lacks that a paravirtual mode falls
+/// back from, and a render GPU nothing picked on a host with several. An
+/// unreadable host config says nothing here; validation already said it.
+pub fn gpu_warnings(
+    file: &crate::config::LabFile,
+    chosen: impl Fn(&crate::config::model::Vm) -> bool,
+) -> Vec<String> {
+    let Ok(host) = crate::config::host::HostConfig::load_default() else {
+        return Vec::new();
+    };
+    let gpus = file
+        .lab
+        .vms
+        .iter()
+        .filter(|vm| chosen(vm))
+        .filter_map(|vm| Some((vm.name.as_str(), vm.gpu.as_ref()?)));
+    crate::qemu::hostgpu::warnings(gpus, &host, &crate::qemu::hostgpu::Sysfs::host())
 }
 
 /// Full validation of the cwd's lab; every side-effecting verb runs this

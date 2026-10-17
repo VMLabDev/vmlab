@@ -5,6 +5,7 @@
 @document
 type HostDoc {
   @child("host") host: HostConfig?
+  @children("gpu") gpus: list<HostGpu>
 }
 
 @block("host")
@@ -37,6 +38,18 @@ type HostConfig {
   workspace_max_file: std.ByteSize?
   @doc("UEFI firmware override, laid out `<dir>/<arch>/` like the bundled set; default: vmlab's bundled firmware, then the host's")
   firmware_dir: utf8?
-  @doc("Host PCI address of the GPU a `virgl`/`vulkan` `gpu {}` renders on when the lab names none, e.g. `0000:72:00.0`; default: QEMU's choice")
-  gpu_address: utf8?
+}
+
+// A host GPU (§5.2): a GPU on this host, named so a lab file can ask for it
+// with `host_gpu` without carrying a PCI address from one machine to another.
+@block("gpu")
+type HostGpu {
+  @doc("The host GPU's name, matched case-insensitively against a lab's `host_gpu`; the inline label")
+  @inline(0) name: utf8
+  @doc("Host PCI address, e.g. `0000:72:00.0` (required)")
+  address: utf8
+  @doc("Vulkan ICD JSON a `vulkan` guest's renderer loads, overriding the one picked from the GPU's driver")
+  vulkan_icd: utf8?
+  @doc("The GPU a lab gets when it names none; at most one block; a lone block is the default without it")
+  default: bool?
 }

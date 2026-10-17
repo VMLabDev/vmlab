@@ -50,11 +50,30 @@ pub struct HostConfig {
     /// bundled `firmware/` set. `None` = vmlab's bundled firmware, then the
     /// host's (see `qemu::firmware`).
     pub firmware_dir: Option<std::path::PathBuf>,
-    /// The host GPU a `virgl`/`vulkan` `gpu {}` renders on when the lab
-    /// names none (PRD §5.2) — host config so a lab stays portable between
-    /// hosts with different GPUs. `None` = QEMU's choice.
-    pub gpu_address: Option<String>,
+    /// The host GPUs (PRD §5.2), in declaration order: every host-specific
+    /// GPU fact lives here, named, so a lab file names a GPU rather than a
+    /// PCI address and stays portable between hosts.
+    pub gpus: Vec<HostGpu>,
 }
+
+/// One declared host GPU (PRD §5.2): `gpu "<name>" { address = … }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostGpu {
+    /// The label; a lab's `host_gpu` matches it case-insensitively.
+    pub name: String,
+    /// Host PCI address, `0000:72:00.0`.
+    pub address: String,
+    /// Vulkan ICD JSON overriding the driver-derived loader filter.
+    pub vulkan_icd: Option<std::path::PathBuf>,
+    /// Marked `default = true`. [`HostConfig::default_gpu`] is the one to
+    /// ask: a lone block is the default without it.
+    pub default: bool,
+}
+
+/// What `gpu_address` says now that it is gone (PRD §5.2).
+pub const GPU_ADDRESS_MOVED: &str = "host `gpu_address` was replaced by named host GPUs: \
+     declare `gpu \"<name>\" { address = \"0000:01:00.0\" }` beside `host {}` in \
+     ~/.config/vmlab/config.wcl — a lone block is the default, or mark one `default = true` (PRD §5.2)";
 
 impl Default for HostConfig {
     fn default() -> Self {
@@ -73,7 +92,7 @@ impl Default for HostConfig {
             config_weave_bin_dir: None,
             workspace_max_file: DEFAULT_WORKSPACE_MAX_FILE,
             firmware_dir: None,
-            gpu_address: None,
+            gpus: Vec::new(),
         }
     }
 }
@@ -107,6 +126,7 @@ impl HostConfig {
         .map_err(|e| anyhow!("parse error in {name}: {e}"))?;
         let mut issues = super::schema_issues(&doc);
         let mut cfg = Self::default();
+        let mut moved = Vec::new();
         if let Some(block) = doc.blocks().find(|b| b.kind() == "host") {
             let mut r = Reader::new(&block, &mut issues);
             // Every field is an override: absent (or malformed, which is
@@ -136,7 +156,9 @@ impl HostConfig {
             }
             cfg.config_weave_bin_dir = r.path("config_weave_bin_dir").unspan();
             cfg.firmware_dir = r.path("firmware_dir").unspan();
-            cfg.gpu_address = r.string("gpu_address").unspan();
+            if let Some(span) = r.field_span("gpu_address") {
+                moved.push(super::Issue::at(span, GPU_ADDRESS_MOVED));
+            }
             if let Some(v) = r.size("oci_chunk_size").unspan() {
                 cfg.oci_chunk_size = v;
             }
@@ -144,7 +166,57 @@ impl HostConfig {
                 cfg.workspace_max_file = v;
             }
         }
+        for block in doc.blocks().filter(|b| b.kind() == "gpu") {
+            let mut r = Reader::new(&block, &mut issues);
+            let (Some(name), Some(address)) = (r.label(), r.required_string("address")) else {
+                continue;
+            };
+            let gpu = HostGpu {
+                name,
+                address: address.value,
+                vulkan_icd: r.path("vulkan_icd").unspan(),
+                default: r.bool("default").unspan().unwrap_or(false),
+            };
+            if let Some(prev) = cfg
+                .gpus
+                .iter()
+                .find(|g| g.name.eq_ignore_ascii_case(&gpu.name))
+            {
+                r.issue(format!(
+                    "host gpu \"{}\" is declared twice (as \"{}\" too); names match case-insensitively",
+                    gpu.name, prev.name
+                ));
+                continue;
+            }
+            if gpu.default
+                && let Some(prev) = cfg.gpus.iter().find(|g| g.default)
+            {
+                r.issue(format!(
+                    "host gpu \"{}\" is marked `default = true`, and so is \"{}\": at most one may be",
+                    gpu.name, prev.name
+                ));
+            }
+            cfg.gpus.push(gpu);
+        }
+        super::supersede(&mut issues, moved);
         Ok(finish(name, source, issues, Some(cfg))?)
+    }
+
+    /// The host GPU named `name`, matched case-insensitively.
+    pub fn gpu(&self, name: &str) -> Option<&HostGpu> {
+        self.gpus.iter().find(|g| g.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The host GPU a lab gets when it names none, or names one this host
+    /// lacks: the one marked `default = true`, else a lone declared GPU.
+    pub fn default_gpu(&self) -> Option<&HostGpu> {
+        self.gpus
+            .iter()
+            .find(|g| g.default)
+            .or(match self.gpus.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            })
     }
 
     /// Where a segment's DNS forwards what it cannot answer (PRD §9.5):
@@ -238,7 +310,7 @@ mod tests {
         assert_eq!(cfg.oci_chunk_size, 512 << 20);
         assert_eq!(cfg.workspace_max_file, DEFAULT_WORKSPACE_MAX_FILE);
         assert_eq!(cfg.firmware_dir, None);
-        assert_eq!(cfg.gpu_address, None);
+        assert!(cfg.gpus.is_empty() && cfg.default_gpu().is_none());
     }
 
     #[test]
@@ -257,7 +329,6 @@ host {
   firmware_dir     = "/opt/edk2"
   waypipe          = "/opt/waypipe/bin/waypipe"
   freerdp          = "/usr/bin/sdl-freerdp3"
-  gpu_address      = "0000:72:00.0"
 }
 "#,
             "<test>",
@@ -272,7 +343,6 @@ host {
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
         assert_eq!(cfg.workspace_max_file, 2 << 30);
         assert_eq!(cfg.firmware_dir.as_deref(), Some(Path::new("/opt/edk2")));
-        assert_eq!(cfg.gpu_address.as_deref(), Some("0000:72:00.0"));
         assert_eq!(
             cfg.waypipe.as_deref(),
             Some(Path::new("/opt/waypipe/bin/waypipe"))
@@ -280,6 +350,90 @@ host {
         assert_eq!(
             cfg.freerdp.as_deref(),
             Some(Path::new("/usr/bin/sdl-freerdp3"))
+        );
+    }
+
+    /// Host GPUs are named by their label, in declaration order, and the one
+    /// marked `default = true` is the default.
+    #[test]
+    fn parses_named_host_gpus() {
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0" }
+gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/nvidia_icd.json" }
+"#,
+            "<test>",
+        )
+        .unwrap();
+        let names: Vec<&str> = cfg.gpus.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["AMD1", "Nvidia1", "Nvidia2"]);
+        assert_eq!(cfg.gpus[0].address, "0000:72:00.0");
+        assert_eq!(
+            cfg.gpus[2].vulkan_icd.as_deref(),
+            Some(Path::new("/usr/share/vulkan/icd.d/nvidia_icd.json"))
+        );
+        assert_eq!(cfg.default_gpu().unwrap().name, "Nvidia1");
+        assert_eq!(cfg.gpu("nvidia2").unwrap().name, "Nvidia2");
+        assert!(cfg.gpu("Nope").is_none());
+    }
+
+    /// One declared GPU is the default without saying so; two unmarked
+    /// ones leave no default.
+    #[test]
+    fn a_lone_host_gpu_is_the_default() {
+        let one = HostConfig::parse(
+            "import <vmlab-host.wcl>\ngpu \"Intel1\" { address = \"0000:00:02.0\" }\n",
+            "<t>",
+        )
+        .unwrap();
+        assert_eq!(one.default_gpu().unwrap().name, "Intel1");
+        let two = HostConfig::parse(
+            "import <vmlab-host.wcl>\n\
+             gpu \"A\" { address = \"0000:00:02.0\" }\n\
+             gpu \"B\" { address = \"0000:01:00.0\" }\n",
+            "<t>",
+        )
+        .unwrap();
+        assert!(two.default_gpu().is_none());
+    }
+
+    /// Names match case-insensitively, so two that differ only in case are
+    /// one name declared twice; and at most one GPU is the default.
+    #[test]
+    fn rejects_duplicate_names_and_two_defaults() {
+        let err = host_err(
+            "gpu \"nvidia1\" { address = \"0000:01:00.0\" }\n\
+             gpu \"Nvidia1\" { address = \"0000:05:00.0\" }\n",
+        );
+        assert!(err.starts_with("1 error(s)"), "{err}");
+        assert!(
+            err.contains(
+                "config.wcl:3:1: host gpu \"Nvidia1\" is declared twice (as \"nvidia1\" too)"
+            ),
+            "{err}"
+        );
+        let err = host_err(
+            "gpu \"A\" { address = \"0000:01:00.0\"  default = true }\n\
+             gpu \"B\" { address = \"0000:05:00.0\"  default = true }\n",
+        );
+        assert!(
+            err.contains("host gpu \"B\" is marked `default = true`, and so is \"A\""),
+            "{err}"
+        );
+        let err = host_err("gpu \"A\" { default = true }\n");
+        assert!(err.contains("address"), "{err}");
+    }
+
+    /// v0.24's `gpu_address` is refused with where it went, not the
+    /// schema's bare unknown-field complaint.
+    #[test]
+    fn gpu_address_is_refused_with_the_migration() {
+        let err = host_err("host { gpu_address = \"0000:72:00.0\" }\n");
+        assert!(err.starts_with("1 error(s)"), "{err}");
+        assert!(
+            err.contains(&format!("config.wcl:2:8: {GPU_ADDRESS_MOVED}")),
+            "{err}"
         );
     }
 

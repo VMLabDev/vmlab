@@ -207,6 +207,12 @@ impl<'b, 'i> Reader<'b, 'i> {
         self.block.field(name).is_some()
     }
 
+    /// Span of the field as written, when it is.
+    pub fn field_span(&self, name: &str) -> Option<Span> {
+        let field = self.block.field(name)?;
+        Some((field.span().start, field.span().end))
+    }
+
     /// The block's first label, as a name. A block that needs a label and
     /// has none is an issue.
     pub fn label(&mut self) -> Option<String> {
