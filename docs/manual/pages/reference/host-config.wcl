@@ -117,7 +117,12 @@ SRC
   DOC
   code wcl { source = <<'SRC'
 gpu "AMD1"    { address = "0000:72:00.0" }
-gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+gpu "Nvidia1" {
+  address     = "0000:01:00.0"
+  default     = true
+  qemu_binary = "/opt/qemu-vmlab/bin/qemu-system-x86_64"
+  qemu_env    = { VKR_DEBUG: "validate" }
+}
 gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/nvidia_icd.json" }
 SRC
   }
@@ -128,19 +133,44 @@ SRC
       | "`address`" | "utf8" | "required" | "Host PCI address, as under `/sys/bus/pci/devices/`." |
       | "`vulkan_icd`" | "utf8" | "none" | "Path to a Vulkan ICD JSON a `vulkan` guest's renderer loads, set as `VK_DRIVER_FILES`. Overrides the driver picked from the GPU's kernel driver." |
       | "`default`" | "bool" | "`false`" | "The GPU a lab gets when it names none, or names one this host lacks under virgl or vulkan. A lone `gpu` block is the default without it." |
+      | "`qemu_binary`" | "utf8" | "none" | "Absolute path to the QEMU every VM on this GPU runs, in every mode including passthrough, instead of `qemu-system-<arch>` from `PATH`. vmlab also passes it `-L <dir>` (see below)." |
+      | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives." |
   }
   p "The parser enforces these rules:"
   list {
     li "Every block has a label and an `address`."
     li "Two labels that differ only in case are one name declared twice, which is an error."
     li "At most one block carries `default = true`."
+    li "`qemu_binary` is an absolute path."
+    li "Every `qemu_env` value is a string. Each key is a WCL identifier, so it is never empty and never contains `=`."
   }
   p <<DOC
     The rest is checked when a lab uses the GPU, by `vmlab validate` and at
     VM start, naming the GPU: its address must name a PCI device, a virgl or
     vulkan guest needs that device to have a DRM render node, and its
     `vulkan_icd` must exist. A GPU bound to `vfio-pci` for passthrough has no
-    render node and needs none.
+    render node and needs none. Its `qemu_binary` must be an executable
+    file. A file named `qemu-system-<arch>` must also match the VM's QEMU
+    arch, or the check refuses it and names both arches. A file with any
+    other name is used as given.
+  DOC
+  p <<DOC
+    A VM whose host GPU sets `qemu_binary` gets `-L <dir>`, where `<dir>` is
+    the stock QEMU's data directory: `<prefix>/share/qemu` for the
+    `qemu-system-<arch>` on `PATH`, if that directory exists. A minimal build
+    therefore finds the firmware and option ROMs it was not installed with.
+    QEMU searches its own data directory after the `-L` paths, so a full
+    build loses nothing. With no stock QEMU on `PATH`, vmlab adds no `-L`.
+  DOC
+  p <<DOC
+    vmlab first removes the inherited `VK_*` loader variables from the QEMU
+    process's environment and sets the ones it derives. `qemu_env` is applied
+    after that, and an explicit host setting beats a derived one: a
+    `VK_LOADER_DRIVERS_SELECT` in `qemu_env` replaces vmlab's. The
+    `vmlab: env:` line in `qemu.log` lists every variable vmlab set,
+    `qemu_env` included, with its value. `vmlab status -v` shows
+    `qemu=<path>` after `host_gpu=` for a VM that ran a `qemu_binary`.
+    Template builds never have a `gpu {}`, so they always run the stock QEMU.
   DOC
 
   callout "A neutral fast path" { kind = :info body = <<DOC
