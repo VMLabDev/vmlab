@@ -14,6 +14,7 @@ mod error;
 mod types;
 
 pub use client::QmpClient;
+pub use error::QmpError;
 
 #[cfg(test)]
 mod tests;

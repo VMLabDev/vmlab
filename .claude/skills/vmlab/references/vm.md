@@ -355,9 +355,31 @@ gpu { mode = "passthrough" address = "0000:01:00.0" }
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `mode` | utf8 | required | `passthrough`, `virgl` or `vulkan`. |
-| `address` | utf8 | none | Host PCI address, for example `0000:01:00.0`. Required for `passthrough`. |
+| `address` | utf8 | host `gpu_address` | Host PCI address, for example `0000:01:00.0`. Under `passthrough` the device handed to the VM, and required. Under `virgl`/`vulkan` the host GPU that renders; without it, and without a host config default, QEMU chooses. |
+| `vulkan_icd` | utf8 | none | Path to a Vulkan ICD JSON, set as `VK_DRIVER_FILES`; overrides the driver-derived filter. `vulkan` only. |
 
-Validation rejects `passthrough` without an `address`.
+A paravirtual GPU is the guest's only display adapter: `virtio-vga-gl` on x86,
+`virtio-gpu-gl` plus `-vga none` on `virt`; `vulkan` adds
+`venus=true,blob=true,hostmem=4G`.
+
+On a multi-GPU host, name the GPU that renders. vmlab resolves the address
+through `/sys/bus/pci/devices/<address>/`: the render node goes on
+`-display egl-headless,rendernode=…`, and under `vulkan` the kernel driver sets
+`VK_LOADER_DRIVERS_SELECT` in QEMU's own environment (`amdgpu` → `*radeon*`,
+`i915`/`xe` → `*intel*`, `nvidia` → `*nvidia*`). Every QEMU starts with
+`VK_DRIVER_FILES`, `VK_ICD_FILENAMES`, `VK_LOADER_DRIVERS_SELECT` and
+`MESA_VK_DEVICE_SELECT` cleared; `MESA_VK_DEVICE_SELECT` is never set (it breaks
+Venus). `up` warns when a virgl/vulkan VM names no GPU and the host has more
+than one render node. Each run's `qemu.log` opens with the QEMU argv and the
+variables vmlab set.
+
+```wcl
+gpu { mode = "vulkan" address = "0000:72:00.0" }
+```
+
+Validation rejects `passthrough` without an `address`; a virgl/vulkan
+`address` with no PCI device or no render node; a `vulkan_icd` that does not
+exist; and `vulkan_icd` outside `vulkan` mode.
 
 ## provision {}
 

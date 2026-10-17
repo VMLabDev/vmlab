@@ -321,6 +321,9 @@ fn rooted_vm_config(
     root: &std::path::Path,
 ) -> crate::config::model::Vm {
     let mut cfg = vm_cfg.clone();
+    if let Some(icd) = cfg.gpu.as_mut().and_then(|g| g.vulkan_icd.as_mut()) {
+        *icd = root.join(&*icd);
+    }
     for d in &mut cfg.extra_disks {
         if let Some(from) = &d.from {
             d.from = Some(root.join(from));

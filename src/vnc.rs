@@ -1,4 +1,4 @@
-//! Minimal RFB (VNC) input client for scripted keyboard/pointer events.
+//! Minimal RFB (VNC) client for scripted input and framebuffer capture.
 //!
 //! vmlab normally injects input via QMP (`send-key` / `input-send-event`),
 //! but `send-key` only drives QEMU's PS/2 keyboard. USB-HID-only guests —
@@ -12,10 +12,17 @@
 //! Selected per VM via `input_transport = "vnc"` (profile). Pointer
 //! coordinates are framebuffer pixels — the same space screenshots use, so
 //! no scaling is needed (unlike the QMP abs path).
+//!
+//! The same connection also reads the framebuffer ([`VncClient::capture`]).
+//! QMP `screendump` answers `no surface` on a GL display (`gpu.mode` virgl or
+//! vulkan under egl-headless), whose scanout lives in a GPU texture; QEMU's
+//! VNC server reads that texture back for its clients, so a plain RFB update
+//! is the one capture path that works there (PRD §10.3).
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use image::RgbImage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -24,13 +31,48 @@ pub const BTN_LEFT: u8 = 1;
 pub const BTN_MIDDLE: u8 = 1 << 1;
 pub const BTN_RIGHT: u8 = 1 << 2;
 
-pub struct VncInput {
+/// Client-to-server message types (RFB 7.5).
+const MSG_SET_PIXEL_FORMAT: u8 = 0;
+const MSG_SET_ENCODINGS: u8 = 2;
+const MSG_FB_UPDATE_REQUEST: u8 = 3;
+
+/// Server-to-client message types (RFB 7.6).
+const MSG_FB_UPDATE: u8 = 0;
+const MSG_SET_COLOUR_MAP: u8 = 1;
+const MSG_BELL: u8 = 2;
+const MSG_SERVER_CUT_TEXT: u8 = 3;
+
+/// Rectangle encodings (RFB 7.7, 7.8).
+const ENC_RAW: i32 = 0;
+const ENC_DESKTOP_SIZE: i32 = -223;
+
+/// The pixel format a capture asks for: 32 bpp, depth 24, little-endian
+/// true colour with 8 bits per channel, red in the third byte — so a pixel
+/// arrives as the bytes `B G R x`.
+const CAPTURE_PIXEL_FORMAT: [u8; 16] = [
+    32, // bits-per-pixel
+    24, // depth
+    0,  // big-endian-flag
+    1,  // true-colour-flag
+    0, 255, // red-max
+    0, 255, // green-max
+    0, 255, // blue-max
+    16,  // red-shift
+    8,   // green-shift
+    0,   // blue-shift
+    0, 0, 0, // padding
+];
+
+/// How long a capture may take end to end before it is given up on.
+const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+pub struct VncClient {
     stream: UnixStream,
     pub width: u16,
     pub height: u16,
 }
 
-impl VncInput {
+impl VncClient {
     /// Connect to a VM's VNC unix socket and complete the RFB 3.8 handshake
     /// (Security type "None" — QEMU's default on these sockets).
     pub async fn connect(sock: &Path) -> Result<Self> {
@@ -138,4 +180,154 @@ impl VncInput {
         self.pointer(x, y, 0).await?;
         Ok(())
     }
+
+    /// Read the whole framebuffer once: ask for 32 bpp raw pixels, request
+    /// one non-incremental update of the full screen, and assemble the
+    /// rectangles that answer it. Server messages that are not framebuffer
+    /// updates (`Bell`, `ServerCutText`, colour maps) are read past. A
+    /// `DesktopSize` rectangle resizes the canvas and asks again.
+    pub async fn capture(&mut self) -> Result<RgbImage> {
+        tokio::time::timeout(CAPTURE_TIMEOUT, self.capture_inner())
+            .await
+            .context("VNC framebuffer capture timed out")?
+    }
+
+    async fn capture_inner(&mut self) -> Result<RgbImage> {
+        let mut msg = Vec::with_capacity(20);
+        msg.extend_from_slice(&[MSG_SET_PIXEL_FORMAT, 0, 0, 0]);
+        msg.extend_from_slice(&CAPTURE_PIXEL_FORMAT);
+        self.stream.write_all(&msg).await?;
+
+        let mut msg = vec![MSG_SET_ENCODINGS, 0];
+        msg.extend_from_slice(&1u16.to_be_bytes());
+        msg.extend_from_slice(&ENC_RAW.to_be_bytes());
+        self.stream.write_all(&msg).await?;
+
+        let mut canvas = Canvas::new(self.width, self.height)?;
+        self.request_full_update().await?;
+        loop {
+            match self.stream.read_u8().await.context("reading VNC message")? {
+                MSG_FB_UPDATE => {
+                    let _pad = self.stream.read_u8().await?;
+                    let rects = self.stream.read_u16().await?;
+                    for _ in 0..rects {
+                        self.read_rect(&mut canvas).await?;
+                    }
+                    if canvas.complete() {
+                        return Ok(canvas.image);
+                    }
+                    // A resize or a partial answer: ask for the whole
+                    // (possibly new) screen again.
+                    self.request_full_update().await?;
+                }
+                MSG_SET_COLOUR_MAP => {
+                    let mut head = [0u8; 5];
+                    self.stream.read_exact(&mut head).await?;
+                    let count = u16::from_be_bytes([head[3], head[4]]) as usize;
+                    self.skip(count * 6).await?;
+                }
+                MSG_BELL => {}
+                MSG_SERVER_CUT_TEXT => {
+                    let mut pad = [0u8; 3];
+                    self.stream.read_exact(&mut pad).await?;
+                    let len = self.stream.read_u32().await? as usize;
+                    self.skip(len).await?;
+                }
+                other => bail!("VNC server sent unsupported message type {other}"),
+            }
+        }
+    }
+
+    /// `FramebufferUpdateRequest` (type 3), non-incremental, whole screen.
+    async fn request_full_update(&mut self) -> Result<()> {
+        let mut msg = [0u8; 10];
+        msg[0] = MSG_FB_UPDATE_REQUEST;
+        msg[1] = 0; // incremental: no
+        msg[6..8].copy_from_slice(&self.width.to_be_bytes());
+        msg[8..10].copy_from_slice(&self.height.to_be_bytes());
+        self.stream.write_all(&msg).await?;
+        Ok(())
+    }
+
+    /// One rectangle of a `FramebufferUpdate`, painted onto `canvas`.
+    async fn read_rect(&mut self, canvas: &mut Canvas) -> Result<()> {
+        let x = self.stream.read_u16().await?;
+        let y = self.stream.read_u16().await?;
+        let w = self.stream.read_u16().await?;
+        let h = self.stream.read_u16().await?;
+        match self.stream.read_i32().await? {
+            ENC_RAW => {
+                let mut px = vec![0u8; w as usize * h as usize * 4];
+                self.stream.read_exact(&mut px).await?;
+                canvas.paint(x, y, w, h, &px)
+            }
+            ENC_DESKTOP_SIZE => {
+                self.width = w;
+                self.height = h;
+                *canvas = Canvas::new(w, h)?;
+                Ok(())
+            }
+            other => bail!("VNC server sent unrequested encoding {other}"),
+        }
+    }
+
+    /// Read and discard `n` bytes.
+    async fn skip(&mut self, n: usize) -> Result<()> {
+        let mut buf = vec![0u8; n];
+        self.stream.read_exact(&mut buf).await?;
+        Ok(())
+    }
 }
+
+/// A framebuffer being assembled from update rectangles, with a record of
+/// which pixels have arrived so a capture knows when it has the whole screen.
+struct Canvas {
+    image: RgbImage,
+    covered: Vec<bool>,
+    remaining: usize,
+}
+
+impl Canvas {
+    fn new(width: u16, height: u16) -> Result<Self> {
+        if width == 0 || height == 0 {
+            bail!("VNC framebuffer is empty ({width}x{height})");
+        }
+        let n = width as usize * height as usize;
+        Ok(Self {
+            image: RgbImage::new(width.into(), height.into()),
+            covered: vec![false; n],
+            remaining: n,
+        })
+    }
+
+    /// Paint a raw rectangle of `B G R x` pixels at `(x, y)`.
+    fn paint(&mut self, x: u16, y: u16, w: u16, h: u16, px: &[u8]) -> Result<()> {
+        let (fw, fh) = (self.image.width(), self.image.height());
+        if u32::from(x) + u32::from(w) > fw || u32::from(y) + u32::from(h) > fh {
+            bail!("VNC rectangle {w}x{h}+{x}+{y} lies outside the {fw}x{fh} framebuffer");
+        }
+        for row in 0..u32::from(h) {
+            for col in 0..u32::from(w) {
+                let i = ((row * u32::from(w) + col) * 4) as usize;
+                let (px_x, px_y) = (u32::from(x) + col, u32::from(y) + row);
+                self.image
+                    .put_pixel(px_x, px_y, image::Rgb([px[i + 2], px[i + 1], px[i]]));
+                let seen = &mut self.covered[(px_y * fw + px_x) as usize];
+                if !*seen {
+                    *seen = true;
+                    self.remaining -= 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn complete(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fake;
+#[cfg(test)]
+mod tests;

@@ -71,9 +71,17 @@ impl Hypervisor for Qemu {
     }
 
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running> {
+        crate::qemu::process::write_launch_header(&spec.log, &spec.binary, &spec.args, &spec.env)?;
         let log_from = crate::qemu::process::log_offset(&spec.log);
-        let proc = Proc::spawn_with_fds(&spec.label, &spec.binary, &spec.args, &spec.log, spec.fds)
-            .await?;
+        let proc = Proc::spawn_with_fds(
+            &spec.label,
+            &spec.binary,
+            &spec.args,
+            &spec.env,
+            &spec.log,
+            spec.fds,
+        )
+        .await?;
         let qmp = connect_qmp_retry(&spec.qmp_sock, &proc, &spec.log, log_from).await?;
         // QEMU binds the guest channels itself, from the argv — this adapter
         // has nothing to stand up, only to say where they landed. It is the
@@ -246,6 +254,7 @@ mod tests {
                 "echo 'qemu-system-x86_64: Could not access KVM kernel module' >&2; exit 1"
                     .to_string(),
             ],
+            &crate::qemu::process::ChildEnv::default(),
             &log,
         )
         .await

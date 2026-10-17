@@ -755,6 +755,9 @@ impl ContainerInstance {
                     label: format!("qemu:{}", self.cfg.name),
                     binary: qemu::emulator_binary(&self.resolved.arch),
                     args,
+                    // A micro-VM has no GPU, but its emulator still starts
+                    // with the Vulkan loader variables cleared.
+                    env: qemu::hostgpu::emulator_env(false, None, None),
                     log: qemu_log.clone(),
                     qmp_sock: self.dirs.qmp_sock(),
                     fds: Vec::new(),

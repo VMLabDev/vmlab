@@ -101,6 +101,12 @@ path it wrote. With an empty string it chooses a name of the form
 QEMU's own screendump is a PPM, and the image loader sniffs formats by
 content rather than extension, so a screenshot, a PNG crop and a BMP are all
 accepted anywhere a reference image is expected.
+
+The framebuffer comes from QEMU's `screendump`, except on a VM whose
+`gpu.mode` is `virgl` or `vulkan`. There the guest's screen is a GL texture on
+the host, which `screendump` cannot read, so every capture is taken over the
+VM's own VNC socket instead. A VM whose `screendump` reports `no surface`
+for any other reason is retried over VNC once.
 DOC
 
   h2 "Template matching"
@@ -189,7 +195,7 @@ ready, so a script targeting one relies on screen and time waits alone. Use the
 screen for the part of a template build before the agent is installed and for
 the rare interactive step no command line reaches. Image matching is exact and
 fast but tied to one look; OCR survives theme and resolution changes but is
-slower and approximate. Both are available in every GPU mode, because the VM
-always renders to a host-side framebuffer that VNC and screenshots read.
+slower and approximate. Both are available in every GPU mode: with a GL
+display the capture is read over VNC, which sees the host-rendered framebuffer.
 DOC
 }

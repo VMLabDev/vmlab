@@ -195,6 +195,7 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
         // Validate before any side effect (PRD §5.1: implicitly every verb).
         super::validate::validate_current()?;
         let (name, root) = current_lab()?;
+        warn_unpicked_render_gpu(&root, &vms);
         let client = ensure_current_daemon(&name, &root).await?;
         client
             .send_streaming(
@@ -224,6 +225,32 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Warn, once per `up`, when a `virgl`/`vulkan` machine being started names
+/// no host GPU, the host config gives no default, and the host has several:
+/// the display and Venus then land wherever QEMU and the Vulkan loader put
+/// them, which on a mixed host need not be the same GPU (PRD §5.2).
+fn warn_unpicked_render_gpu(root: &std::path::Path, vms: &[String]) {
+    let Ok(file) = crate::config::load_lab_root(root) else {
+        return;
+    };
+    let host_default = crate::config::host::HostConfig::load_default()
+        .ok()
+        .and_then(|c| c.gpu_address);
+    let gpus = file
+        .lab
+        .vms
+        .iter()
+        .filter(|vm| vms.is_empty() || vms.contains(&vm.name))
+        .filter_map(|vm| vm.gpu.as_ref());
+    if !crate::qemu::hostgpu::render_gpu_unpicked(gpus, host_default.as_deref()) {
+        return;
+    }
+    let host = crate::qemu::hostgpu::Sysfs::host().render_gpus();
+    if let Some(warning) = crate::qemu::hostgpu::unpicked_warning(&host) {
+        eprintln!("WARNING: {warning}");
+    }
 }
 
 /// `vmlab pull [vms…]`: download missing registry templates/images with

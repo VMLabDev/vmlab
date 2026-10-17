@@ -64,6 +64,7 @@ host {
   config_weave_bin_dir = "~/.local/share/config-weave/bin"
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
+  gpu_address          = "0000:72:00.0"
 }
 ```
 
@@ -83,6 +84,7 @@ host {
 | `config_weave_bin_dir` | utf8 | `~/.local/share/config-weave/bin` | Directory holding the config-weave guest binaries playbooks push (see automation.md). |
 | `workspace_max_file` | ByteSize | `256MiB` | Workspace syncer per-file size guard. A larger file is refused by name (see dev-machines.md). |
 | `firmware_dir` | utf8 | none | UEFI firmware override, `<dir>/<arch>/` with the bundled set's file names; searched before vmlab's bundled firmware and the host's (see "UEFI firmware" below). |
+| `gpu_address` | utf8 | none | Host PCI address of the GPU a `virgl`/`vulkan` `gpu {}` renders on when the lab names none, so labs stay portable between hosts (see vm.md, `gpu {}`). Read at each VM start. |
 
 Parser rules, all violations reported in one pass:
 

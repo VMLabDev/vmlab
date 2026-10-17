@@ -60,6 +60,7 @@ SRC
       | "`config_weave_bin_dir`" | "The directory holding the config-weave guest binaries. See [Playbooks](guide_playbooks)." | "`~/.local/share/config-weave/bin`" |
       | "`workspace_max_file`" | "The workspace syncer's per-file size guard; a larger file is refused by name." | "`256MiB`" |
       | "`firmware_dir`" | "A UEFI firmware override, laid out `<dir>/<arch>/`. See the UEFI firmware section below." | "vmlab's bundled firmware" |
+      | "`gpu_address`" | "The host GPU a virgl or vulkan `gpu {}` renders on when the lab names none. Set it on a multi-GPU host so labs need not name a PCI address." | "QEMU's choice" |
   }
 
   p <<'DOC'

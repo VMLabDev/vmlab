@@ -528,10 +528,23 @@ pub enum GpuMode {
     Vulkan,
 }
 
+impl GpuMode {
+    /// Whether the guest's scanout is a host GL texture (egl-headless) rather
+    /// than a 2D surface — the modes QMP `screendump` cannot capture.
+    pub fn gl_display(self) -> bool {
+        matches!(self, GpuMode::Virgl | GpuMode::Vulkan)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Gpu {
     pub mode: GpuMode,
+    /// Host PCI address: the device itself under `passthrough`, the GPU that
+    /// renders under `virgl`/`vulkan` (§5.2).
     pub address: Option<String>,
+    /// Vulkan ICD JSON overriding the driver-derived loader filter
+    /// (`vulkan` only).
+    pub vulkan_icd: Option<PathBuf>,
     pub span: Span,
 }
 

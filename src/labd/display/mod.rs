@@ -9,8 +9,9 @@
 //! `Display` like anything else.
 //!
 //! What a display needs from the machine underneath it is [`DisplayHost`] — a
-//! QMP channel, a VNC socket, somewhere to drop a capture, and which of the
-//! two input transports the guest actually listens to. That is the whole
+//! QMP channel, a VNC socket, somewhere to drop a capture, which of the two
+//! input transports the guest actually listens to, and whether its scanout is
+//! a GL texture that only the VNC path can capture. That is the whole
 //! contract, and it is why this module lives beside the machine rather than
 //! inside the wscript host: the lab daemon takes screenshots for
 //! `machine.screenshot` with no script anywhere in sight, and the dependency
@@ -49,6 +50,10 @@ pub trait DisplayHost: Send + Sync + 'static {
     /// Whether input goes over QMP or VNC — a resolved hardware fact, not a
     /// preference (USB-HID-only guests such as macOS ignore QMP `send-key`).
     fn input_transport(&self) -> InputTransport;
+    /// Whether the scanout is a host GL texture (`gpu.mode` virgl or vulkan
+    /// under egl-headless). QMP `screendump` answers `no surface` there, so
+    /// captures go over VNC, which reads the texture back.
+    fn gl_display(&self) -> bool;
 }
 
 /// A machine's display, with the operations that read and drive it.
@@ -75,12 +80,28 @@ impl Display {
     /// the server's messages can desync and drop later input on real-mode
     /// guests (DOS/9x TUIs); a fresh connection per op mirrors an external
     /// viewer's reliable behaviour.
-    async fn vnc(&self) -> Result<crate::vnc::VncInput> {
-        crate::vnc::VncInput::connect(&self.host.vnc_sock()).await
+    async fn vnc(&self) -> Result<crate::vnc::VncClient> {
+        crate::vnc::VncClient::connect(&self.host.vnc_sock()).await
+    }
+
+    /// Capture the framebuffer. A GL display is read over VNC; anything else
+    /// through QMP `screendump`, falling back to VNC once if QEMU answers
+    /// `no surface` (a GL scanout the host did not report).
+    pub async fn grab(&self) -> Result<RgbImage> {
+        if self.host.gl_display() {
+            return self.grab_vnc().await;
+        }
+        match self.grab_qmp().await {
+            Err(e) if is_no_surface(&e) => self
+                .grab_vnc()
+                .await
+                .map_err(|vnc| e.context(format!("VNC capture fallback failed too: {vnc:#}"))),
+            other => other,
+        }
     }
 
     /// QMP screendump → decoded image.
-    pub async fn grab(&self) -> Result<RgbImage> {
+    async fn grab_qmp(&self) -> Result<RgbImage> {
         let qmp = self.host.qmp().await?;
         let tmp = self
             .host
@@ -90,6 +111,11 @@ impl Display {
         let img = vision::load_screen(&tmp)?;
         let _ = std::fs::remove_file(&tmp);
         Ok(img)
+    }
+
+    /// One full framebuffer update over RFB.
+    async fn grab_vnc(&self) -> Result<RgbImage> {
+        self.vnc().await?.capture().await
     }
 
     /// Current screen dimensions, needed to scale absolute mouse coordinates.
@@ -246,6 +272,15 @@ impl Display {
     }
 }
 
+/// Whether a capture failed because QEMU's console has no 2D surface — the
+/// answer `screendump` gives for a GL scanout.
+fn is_no_surface(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<crate::qmp::QmpError>(),
+        Some(crate::qmp::QmpError::Command { desc, .. }) if desc == "no surface"
+    )
+}
+
 /// RFB button mask for a button name.
 fn vnc_button(button: &str) -> Result<u8> {
     match button {
@@ -255,3 +290,6 @@ fn vnc_button(button: &str) -> Result<u8> {
         other => Err(anyhow!("unknown mouse button `{other}`")),
     }
 }
+
+#[cfg(test)]
+mod tests;

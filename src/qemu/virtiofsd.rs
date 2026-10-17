@@ -369,6 +369,7 @@ pub async fn spawn(
         &format!("virtiofsd:{name}"),
         &vfsd.path.display().to_string(),
         &args,
+        &super::process::ChildEnv::default(),
         log_path,
     )
     .await?;

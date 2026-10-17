@@ -476,8 +476,10 @@ type Media {
 type Gpu {
   @doc("Mode: `passthrough` | `virgl` | `vulkan` (required)")
   @options(["passthrough", "virgl", "vulkan"]) mode: utf8
-  @doc("Host PCI address, e.g. `0000:01:00.0` — required for `passthrough`")
+  @doc("Host PCI address, e.g. `0000:01:00.0`: the device for `passthrough` (required); for `virgl`/`vulkan` the host GPU that renders (default: the host config's `gpu_address`, else QEMU's choice)")
   address: utf8?
+  @doc("Vulkan ICD JSON the renderer loads, overriding the one picked from the GPU's driver; `vulkan` only")
+  vulkan_icd: utf8?
 }
 
 // Provision script run during `vmlab up`, declared inside the `vm`/`container`

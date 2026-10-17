@@ -31,15 +31,25 @@ pub struct ChildFd {
     pub child: i32,
 }
 
+/// Changes to the environment a child inherits from this process: `remove`
+/// is applied first, then `set`. The default leaves it untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildEnv {
+    pub remove: Vec<String>,
+    pub set: Vec<(String, String)>,
+}
+
 impl Proc {
-    /// Spawn `binary` with `args`, stdout+stderr appended to `log_path`.
+    /// Spawn `binary` with `args` under `env`, stdout+stderr appended to
+    /// `log_path`.
     pub async fn spawn(
         name: &str,
         binary: &str,
         args: &[String],
+        env: &ChildEnv,
         log_path: &Path,
     ) -> Result<Arc<Proc>> {
-        Self::spawn_with_fds(name, binary, args, log_path, Vec::new()).await
+        Self::spawn_with_fds(name, binary, args, env, log_path, Vec::new()).await
     }
 
     /// [`Proc::spawn`], additionally installing `fds` at their fixed
@@ -48,6 +58,7 @@ impl Proc {
         name: &str,
         binary: &str,
         args: &[String],
+        env: &ChildEnv,
         log_path: &Path,
         fds: Vec<ChildFd>,
     ) -> Result<Arc<Proc>> {
@@ -67,6 +78,10 @@ impl Proc {
             .stdout(log)
             .stderr(log_err)
             .kill_on_drop(false);
+        for var in &env.remove {
+            cmd.env_remove(var);
+        }
+        cmd.envs(env.set.iter().map(|(k, v)| (k, v)));
         #[cfg(feature = "ebpf")]
         if !fds.is_empty() {
             use command_fds::CommandFdExt as _;
@@ -167,6 +182,43 @@ pub fn log_offset(log: &Path) -> u64 {
     std::fs::metadata(log).map(|m| m.len()).unwrap_or(0)
 }
 
+/// What starts the lines vmlab itself writes into an emulator's log, so a
+/// startup-failure tail can leave them out.
+pub const LAUNCH_LOG_PREFIX: &str = "vmlab: ";
+
+/// Append the emulator's argv and the variables vmlab set in its environment
+/// to `log`, ahead of anything the emulator writes there: the first thing
+/// anyone debugging a device line or a GPU pick needs, and otherwise only
+/// recoverable from `/proc` while it runs.
+pub fn write_launch_header(
+    log: &Path,
+    binary: &str,
+    args: &[String],
+    env: &ChildEnv,
+) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .with_context(|| format!("opening {}", log.display()))?;
+    let set: Vec<String> = env.set.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    writeln!(
+        f,
+        "{LAUNCH_LOG_PREFIX}argv: {binary} {}\n{LAUNCH_LOG_PREFIX}env: {}",
+        args.join(" "),
+        if set.is_empty() {
+            "(none set)".to_string()
+        } else {
+            set.join(" ")
+        }
+    )?;
+    Ok(())
+}
+
 /// The error for a process that exited before it answered: its exit status,
 /// plus the last lines it wrote to `log` past `from`. The status alone
 /// (`exit status: 1`) never says why, and the reason otherwise only lives in
@@ -201,7 +253,10 @@ pub fn log_tail_since(log: &Path, from: u64, max: usize) -> Vec<String> {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with(LAUNCH_LOG_PREFIX))
+        .collect();
     lines[lines.len().saturating_sub(max)..]
         .iter()
         .map(|l| l.to_string())
@@ -235,7 +290,14 @@ pub async fn spawn_swtpm(
         format!("type=unixio,path={}", ctrl_sock.display()),
         "--terminate".to_string(),
     ];
-    Proc::spawn(&format!("swtpm:{vm_name}"), "swtpm", &args, log_path).await
+    Proc::spawn(
+        &format!("swtpm:{vm_name}"),
+        "swtpm",
+        &args,
+        &ChildEnv::default(),
+        log_path,
+    )
+    .await
 }
 
 /// The argv fragments that identify a process as belonging to `lab`:
@@ -365,6 +427,29 @@ mod tests {
         assert_eq!(quiet.to_string(), "QEMU exited during startup: signal: 6");
     }
 
+    /// The launch header records the argv and what vmlab set, and a
+    /// startup-failure tail leaves it out.
+    #[test]
+    fn the_launch_header_leads_the_log_and_stays_out_of_the_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("qemu.log");
+        let env = ChildEnv {
+            remove: vec!["VK_DRIVER_FILES".into()],
+            set: vec![("VK_LOADER_DRIVERS_SELECT".into(), "*radeon*".into())],
+        };
+        write_launch_header(&log, "qemu-system-x86_64", &["-S".into()], &env).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"qemu: boom\n"))
+            .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "vmlab: argv: qemu-system-x86_64 -S");
+        assert_eq!(lines[1], "vmlab: env: VK_LOADER_DRIVERS_SELECT=*radeon*");
+        assert_eq!(log_tail_since(&log, 0, 5), vec!["qemu: boom"]);
+    }
+
     #[test]
     fn the_tail_keeps_the_last_lines() {
         let tmp = tempfile::tempdir().unwrap();
@@ -380,9 +465,15 @@ mod tests {
     async fn spawn_watch_exit() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("p.log");
-        let p = Proc::spawn("t", "sh", &["-c".into(), "echo hi; exit 3".into()], &log)
-            .await
-            .unwrap();
+        let p = Proc::spawn(
+            "t",
+            "sh",
+            &["-c".into(), "echo hi; exit 3".into()],
+            &ChildEnv::default(),
+            &log,
+        )
+        .await
+        .unwrap();
         let status = p
             .wait_exit(std::time::Duration::from_secs(5))
             .await
@@ -394,12 +485,43 @@ mod tests {
         assert_eq!(logged.trim(), "hi");
     }
 
+    /// A child sees `remove`d variables gone even when this process has
+    /// them, and `set` ones with their value.
+    #[tokio::test]
+    async fn a_child_env_removes_then_sets_variables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("p.log");
+        // PATH is always in the test's environment, so its removal shows.
+        let env = ChildEnv {
+            remove: vec!["PATH".into()],
+            set: vec![("VMLAB_SPAWN_TEST".into(), "*radeon*".into())],
+        };
+        let p = Proc::spawn("t", "/usr/bin/env", &[], &env, &log)
+            .await
+            .unwrap();
+        p.wait_exit(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(!logged.lines().any(|l| l.starts_with("PATH=")), "{logged}");
+        assert!(
+            logged.lines().any(|l| l == "VMLAB_SPAWN_TEST=*radeon*"),
+            "{logged}"
+        );
+    }
+
     #[tokio::test]
     async fn kill_terminates_even_after_waiter_starts() {
         let tmp = tempfile::tempdir().unwrap();
-        let p = Proc::spawn("t", "sleep", &["30".into()], &tmp.path().join("p.log"))
-            .await
-            .unwrap();
+        let p = Proc::spawn(
+            "t",
+            "sleep",
+            &["30".into()],
+            &ChildEnv::default(),
+            &tmp.path().join("p.log"),
+        )
+        .await
+        .unwrap();
         assert!(p.is_running());
         // Let the waiter task start waiting first — this order used to
         // deadlock when the waiter held a lock across child.wait().

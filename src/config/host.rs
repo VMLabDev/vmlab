@@ -50,6 +50,10 @@ pub struct HostConfig {
     /// bundled `firmware/` set. `None` = vmlab's bundled firmware, then the
     /// host's (see `qemu::firmware`).
     pub firmware_dir: Option<std::path::PathBuf>,
+    /// The host GPU a `virgl`/`vulkan` `gpu {}` renders on when the lab
+    /// names none (PRD §5.2) — host config so a lab stays portable between
+    /// hosts with different GPUs. `None` = QEMU's choice.
+    pub gpu_address: Option<String>,
 }
 
 impl Default for HostConfig {
@@ -69,6 +73,7 @@ impl Default for HostConfig {
             config_weave_bin_dir: None,
             workspace_max_file: DEFAULT_WORKSPACE_MAX_FILE,
             firmware_dir: None,
+            gpu_address: None,
         }
     }
 }
@@ -131,6 +136,7 @@ impl HostConfig {
             }
             cfg.config_weave_bin_dir = r.path("config_weave_bin_dir").unspan();
             cfg.firmware_dir = r.path("firmware_dir").unspan();
+            cfg.gpu_address = r.string("gpu_address").unspan();
             if let Some(v) = r.size("oci_chunk_size").unspan() {
                 cfg.oci_chunk_size = v;
             }
@@ -232,6 +238,7 @@ mod tests {
         assert_eq!(cfg.oci_chunk_size, 512 << 20);
         assert_eq!(cfg.workspace_max_file, DEFAULT_WORKSPACE_MAX_FILE);
         assert_eq!(cfg.firmware_dir, None);
+        assert_eq!(cfg.gpu_address, None);
     }
 
     #[test]
@@ -250,6 +257,7 @@ host {
   firmware_dir     = "/opt/edk2"
   waypipe          = "/opt/waypipe/bin/waypipe"
   freerdp          = "/usr/bin/sdl-freerdp3"
+  gpu_address      = "0000:72:00.0"
 }
 "#,
             "<test>",
@@ -264,6 +272,7 @@ host {
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
         assert_eq!(cfg.workspace_max_file, 2 << 30);
         assert_eq!(cfg.firmware_dir.as_deref(), Some(Path::new("/opt/edk2")));
+        assert_eq!(cfg.gpu_address.as_deref(), Some("0000:72:00.0"));
         assert_eq!(
             cfg.waypipe.as_deref(),
             Some(Path::new("/opt/waypipe/bin/waypipe"))

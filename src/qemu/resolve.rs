@@ -544,6 +544,17 @@ pub(crate) mod testing {
         resolve_vm(&v, None, &profiles).unwrap()
     }
 
+    /// [`resolved_vm`] on the `linux-modern` profile with a `gpu {}` of
+    /// `mode`.
+    pub fn resolved_gpu_vm(mode: &str, arch: &str) -> ResolvedVm {
+        let profiles = ProfileSet::shipped().unwrap();
+        let v = vm(&format!(
+            "vm \"t\" {{ template = \"scratch\" arch = \"{arch}\" profile = \"linux-modern\" \
+             disk = 10GiB gpu {{ mode = \"{mode}\" }} }}"
+        ));
+        resolve_vm(&v, None, &profiles).unwrap()
+    }
+
     /// A container declaration resolved on `arch` against the shipped
     /// profiles — `src` is the full `container "…" { … }` block, so a test
     /// says what it declares and the chain decides the rest.
