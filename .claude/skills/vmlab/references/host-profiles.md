@@ -127,7 +127,7 @@ gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/
 | `vulkan_icd` | utf8 | none | Vulkan ICD JSON a `vulkan` guest's renderer loads (`VK_DRIVER_FILES`), overriding the driver-derived filter. |
 | `default` | bool | `false` | The GPU a lab gets when it names none. At most one; a lone block is the default without it. |
 | `qemu_binary` | utf8 | none | Absolute path to the QEMU every VM on this GPU runs (all modes, passthrough too) instead of `qemu-system-<arch>` on PATH. |
-| `qemu_env` | record of utf8 | none | `{ KEY: "value" }` set in that QEMU's environment, applied last: beats the derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES`. |
+| `qemu_env` | record of utf8 | none | `{ KEY: "value" }` set in that QEMU's environment, applied last: beats the derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and the PCI-filter variables (`VMLAB_VK_PCI_FILTER_DISABLE: "1"` turns the layer off). |
 
 Parsing rejects a missing `address`, two labels differing only in case, and a
 second `default = true`. The rest is checked when a lab uses the GPU (validate
@@ -148,11 +148,20 @@ the stock QEMU. Use: NVIDIA's EGL takes a LINEAR dma-buf only as
 console for a Venus guest; the patched QEMU
 (`VMLabDev/qemu`, branch `vmlab/egl-headless-external-dmabuf`) fixes it.
 
-Known limit: two identical cards both match the driver filter, so a Venus guest
-sees two devices. The loader cannot filter by PCI address and Mesa's
-device-select layer breaks Venus; the guest's default device is the host
-loader's first match. A `VK_EXT_pci_bus_info`-filtering implicit layer is
-planned.
+Identical cards: two RTX 5090s both match the `*nvidia*` driver filter, the
+loader cannot filter by PCI address, and Mesa's device-select layer breaks
+Venus. So every `vulkan` VM on a picked GPU gets vmlab's own implicit layer,
+`VK_LAYER_VMLAB_pci_filter` (C, built into the `vmlab` binary, written to
+`~/.local/share/vmlab/vk-layer/<digest>/` at VM start). It answers
+`vkEnumeratePhysicalDevices`/`vkEnumeratePhysicalDeviceGroups` with only the
+device whose `VK_EXT_pci_bus_info` address is the GPU's `address`, so the guest
+sees exactly one Venus device, the card `egl-headless` scans out from. Always
+on, identical cards or not. `qemu.log` shows `VK_ADD_IMPLICIT_LAYER_PATH` and
+`VMLAB_VK_PCI_ADDRESS` on the `vmlab: env:` line, then the layer's own
+`vmlab-pci-filter: 0000:05:00.0: kept NVIDIA GeForce RTX 5090, hid 1`. No such
+line after the guest used Vulkan means the host loader is too old to honour
+`VK_ADD_IMPLICIT_LAYER_PATH`; `qemu_env = { VMLAB_VK_PCI_FILTER_DISABLE: "1" }`
+turns the layer off.
 
 ### UEFI firmware
 

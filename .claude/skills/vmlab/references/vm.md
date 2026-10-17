@@ -377,10 +377,15 @@ vmlab resolves the picked GPU's address through `/sys/bus/pci/devices/<address>/
 the render node goes on `-display egl-headless,rendernode=…`, and under `vulkan`
 the kernel driver sets `VK_LOADER_DRIVERS_SELECT` in QEMU's own environment
 (`amdgpu` → `*radeon*`, `i915`/`xe` → `*intel*`, `nvidia` → `*nvidia*`); the
-host GPU's `vulkan_icd` replaces that with `VK_DRIVER_FILES`. Every QEMU starts
-with `VK_DRIVER_FILES`, `VK_ICD_FILENAMES`, `VK_LOADER_DRIVERS_SELECT` and
-`MESA_VK_DEVICE_SELECT` cleared; `MESA_VK_DEVICE_SELECT` is never set (it breaks
-Venus). `up` and `validate` warn when a virgl/vulkan VM gets no host GPU and the
+host GPU's `vulkan_icd` replaces that with `VK_DRIVER_FILES`. Under `vulkan`
+QEMU also loads vmlab's implicit layer `VK_LAYER_VMLAB_pci_filter`
+(`VK_ADD_IMPLICIT_LAYER_PATH=<data dir>/vk-layer/<digest>`,
+`VMLAB_VK_PCI_ADDRESS=<address>`), which hides every physical device but the one
+at the GPU's PCI address — so the guest sees one Venus device even when two
+identical cards match the driver filter. Every QEMU starts with
+`VK_DRIVER_FILES`, `VK_ICD_FILENAMES`, `VK_LOADER_DRIVERS_SELECT`,
+`MESA_VK_DEVICE_SELECT` and the layer's three variables cleared;
+`MESA_VK_DEVICE_SELECT` is never set (it breaks Venus). `up` and `validate` warn when a virgl/vulkan VM gets no host GPU and the
 host has more than one render node. Each run's `qemu.log` opens with the QEMU
 argv and the variables vmlab set.
 

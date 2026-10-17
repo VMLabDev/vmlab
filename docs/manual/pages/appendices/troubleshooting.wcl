@@ -429,16 +429,18 @@ MSG
 
   h2 "A Venus guest sees two GPUs"
   p <<DOC
-    On a host with two identical GPUs, such as two RTX 5090s, a `vulkan`
-    guest on one of them lists two Venus devices. vmlab filters the Vulkan
-    loader by driver (`*nvidia*`), and both cards match. The loader cannot
-    filter by PCI address. Mesa's device-select layer could, but it breaks
-    Venus, so vmlab never sets it. The guest's default device is the first
-    matching device in the host loader's order, and `egl-headless` scans out
-    from the declared GPU's render node. A planned implicit Vulkan layer
-    will hide the other card by `VK_EXT_pci_bus_info`. Until then, a host
-    GPU's `qemu_env` can enable such a layer by hand.
+    A `vulkan` guest on a declared host GPU should list one Venus device,
+    plus the guest's own `llvmpipe`. vmlab filters the Vulkan loader by
+    driver (`*nvidia*`), which two identical cards both match, so it also
+    loads its own layer, `VK_LAYER_VMLAB_pci_filter`, which hides every
+    device but the one at the host GPU's PCI address. When the guest still
+    lists two, look in the VM's `qemu.log`:
   DOC
+  list {
+    li "The `vmlab: env:` line sets `VMLAB_VK_PCI_FILTER_DISABLE=1`. The host GPU's `qemu_env` turned the filter off; remove that key."
+    li "The `vmlab: env:` line has `VK_ADD_IMPLICIT_LAYER_PATH`, but no `vmlab-pci-filter:` line follows it after the guest has used Vulkan. The host's Vulkan loader is too old to honour `VK_ADD_IMPLICIT_LAYER_PATH`. Update the loader package (`vulkan-icd-loader`, `libvulkan1`)."
+    li "A `vmlab-pci-filter: <address>: no Vulkan device at this address` line means the driver at that address reports no `VK_EXT_pci_bus_info`, and the guest sees no device at all. Check `vulkaninfo` on the host for that card."
+  }
 
   h2 "A shared app has no desktop to open on"
   code text { source = "no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set" }

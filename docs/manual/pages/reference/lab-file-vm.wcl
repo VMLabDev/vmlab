@@ -354,9 +354,13 @@ SRC
     `egl-headless` display. Under `vulkan` the driver sets
     `VK_LOADER_DRIVERS_SELECT` in QEMU's environment: `*radeon*` for
     `amdgpu`, `*intel*` for `i915` and `xe`, `*nvidia*` for `nvidia`; a host
-    GPU's `vulkan_icd` replaces that with `VK_DRIVER_FILES`. The other Vulkan
-    loader variables are cleared, and `MESA_VK_DEVICE_SELECT` is never set,
-    because it breaks Venus. `vmlab up` warns when a virgl or vulkan VM gets
+    GPU's `vulkan_icd` replaces that with `VK_DRIVER_FILES`. vmlab also loads
+    its own implicit layer, `VK_LAYER_VMLAB_pci_filter`, through
+    `VK_ADD_IMPLICIT_LAYER_PATH`, with `VMLAB_VK_PCI_ADDRESS` set to the
+    GPU's address. The layer hides every other physical device, so the guest
+    sees one Venus device even when two identical cards both match the
+    driver filter. The other Vulkan loader variables are cleared, and
+    `MESA_VK_DEVICE_SELECT` is never set, because it breaks Venus. `vmlab up` warns when a virgl or vulkan VM gets
     no host GPU and the host has more than one render node. Each run's
     `qemu.log` starts with the QEMU command line and the variables vmlab set.
     Under `passthrough` the address becomes `-device vfio-pci,host=<address>`.

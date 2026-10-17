@@ -589,6 +589,16 @@ this host lacks; `passthrough` refuses. Picked by the lab daemon at VM start
 _Avoid_: GPU address (the address is a host GPU's field), render node (the
 node is what sysfs resolves the address to)
 
+**PCI filter**:
+vmlab's own implicit Vulkan layer, `VK_LAYER_VMLAB_pci_filter`, loaded into
+every `vulkan` VM's QEMU on a picked host GPU. It hides every physical device
+but the one at that host GPU's PCI address (`VK_EXT_pci_bus_info`), so a
+Venus guest sees one device even where two identical cards both pass the
+driver filter. Built into the binary (`qemu::vk_layer`), written to the data
+directory at VM start. PRD §5.2.
+_Avoid_: device select (Mesa's layer, which breaks Venus), driver filter (the
+loader's `VK_LOADER_DRIVERS_SELECT`, which matches a driver, not a device)
+
 **Lab status**:
 The typed projection of a lab's machines, segments and pulls that the lab
 daemon produces once and every surface renders unchanged. Carries the

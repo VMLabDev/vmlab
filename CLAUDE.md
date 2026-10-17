@@ -105,7 +105,10 @@ Module map under `src/`:
 - `profiles/` — guest OS profiles (WCL data, user-overridable).
 - `qemu/` — hardware resolution (VM>template>profile), cmdline builder,
   firmware lookup, process management; `container.rs` builds the micro-VM
-  argv for lab containers (§18).
+  argv for lab containers (§18); `hostgpu.rs` picks a VM's host GPU and its
+  emulator environment, and `vk_layer.rs` embeds the Vulkan PCI filter
+  (`vk_pci_filter.c`, compiled by `build.rs`) that leaves a Venus guest only
+  that GPU (§5.2).
 - `qmp/` — the QMP client.
 - `appshare/` — shared apps (§20): the CLI-side host end, because only the
   user's desktop session reaches the compositor. `select_mode` picks the
