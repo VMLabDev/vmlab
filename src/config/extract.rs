@@ -430,10 +430,51 @@ fn extract_gpu(b: &Block, issues: &mut IssueList) -> Option<Gpu> {
     })?;
     Some(Gpu {
         mode: mode.value,
-        address: r.string("address").unspan(),
-        vulkan_icd: r.path("vulkan_icd").unspan(),
+        host_gpu: r.string("host_gpu").unspan(),
         span: r.span(),
     })
+}
+
+/// A lab `gpu {}` field v0.24 had and the host config now owns, with the
+/// words that say so. The value as written is not to hand — the schema does
+/// not declare the field — so the example is generic.
+fn gpu_field_moved(field: &str) -> String {
+    let example = match field {
+        "address" => "gpu \"<name>\" { address = \"0000:01:00.0\" }",
+        _ => {
+            "gpu \"<name>\" { address = \"0000:01:00.0\"  vulkan_icd = \"/usr/share/vulkan/icd.d/<driver>_icd.json\" }"
+        }
+    };
+    format!(
+        "gpu `{field}` moved to the host config: declare `{example}` in \
+         ~/.config/vmlab/config.wcl and name it here with `host_gpu = \"<name>\"` \
+         (or mark it `default = true`) (PRD §5.2)"
+    )
+}
+
+/// Every lab `gpu {}` field that moved to the host config (PRD §5.2), as the
+/// issue saying where it went; [`super::supersede`] puts these in place of
+/// the schema's unknown-field complaint about the same text.
+pub fn moved_fields(doc: &Document) -> IssueList {
+    fn walk(b: &Block, in_vm: bool, out: &mut IssueList) {
+        if in_vm && b.kind() == "gpu" {
+            let mut scratch = IssueList::new();
+            let r = Reader::new(b, &mut scratch);
+            for field in ["address", "vulkan_icd"] {
+                if let Some(span) = r.field_span(field) {
+                    out.push(Issue::at(span, gpu_field_moved(field)));
+                }
+            }
+        }
+        for child in b.blocks() {
+            walk(&child, b.kind() == "vm", out);
+        }
+    }
+    let mut out = IssueList::new();
+    for block in doc.blocks() {
+        walk(&block, false, &mut out);
+    }
+    out
 }
 
 fn extract_provision(b: &Block, issues: &mut IssueList) -> Option<Provision> {

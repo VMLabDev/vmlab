@@ -112,10 +112,10 @@ def gpu(h):
 """)
     v = h.vmlab("validate", cwd=good, check=False)
     if v.code == 0 or "address" not in v.text:
-        h.ok("vm.hw.gpu", False, f"validate accepted passthrough with no address: {v.text.strip()[-200:]!r}")
+        h.ok("vm.hw.gpu", False, f"validate accepted passthrough with no host GPU: {v.text.strip()[-200:]!r}")
         return
     untested = ("passthrough (needs a VFIO-bound physical GPU) and vulkan are not exercised; validate rejects "
-                "passthrough without `address`")
+                "passthrough with no host GPU to pick")
     nodes = sorted(pathlib.Path("/dev/dri").glob("renderD*"))
     if not nodes:
         h.skip("vm.hw.gpu", f"no /dev/dri render node in the container for virgl to render on; {untested}")

@@ -54,6 +54,9 @@ pub struct VmPaths {
     /// renders on (`hostgpu::Sysfs::resolve`). Resolved by the lab daemon from
     /// sysfs; `None` leaves QEMU's choice.
     pub gpu_render_node: Option<PathBuf>,
+    /// The host PCI address a `passthrough` GPU hands the guest: the
+    /// declared host GPU the lab daemon picked (`hostgpu::render_plan`).
+    pub gpu_passthrough: Option<String>,
 }
 
 /// The qdev id of a VM's install CD-ROM device (see
@@ -566,10 +569,10 @@ pub fn build_args(
     match &vm.gpu {
         Some(gpu) => match gpu.mode {
             GpuMode::Passthrough => {
-                // §5.1 validation rejects a passthrough gpu with no address;
-                // keep a real error in case a config path skips validation.
-                let addr = gpu.address.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("gpu passthrough requires an `address` (PRD §5.2)")
+                // The lab daemon's host GPU pick refuses passthrough with
+                // nothing to pick; keep a real error in case a path skips it.
+                let addr = paths.gpu_passthrough.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("gpu passthrough needs a host GPU (PRD §5.2)")
                 })?;
                 arg(&mut a, "device", format!("vfio-pci,host={addr}"));
                 if let Some(d) = &vm.display_device {
@@ -1127,6 +1130,21 @@ mod tests {
         );
         assert!(s.contains("-device virtio-gpu-gl "), "{s}");
         assert!(s.contains("-vga none"), "{s}");
+    }
+
+    /// `passthrough` hands the guest the declared host GPU's address the
+    /// lab daemon picked, and with none picked refuses rather than guess.
+    #[test]
+    fn passthrough_hands_over_the_picked_host_gpu() {
+        let vm = resolved_gpu("passthrough", "x86_64");
+        let mut p = paths();
+        let e = build_args("l", &vm, &p, Accel::Kvm)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("needs a host GPU"), "{e}");
+        p.gpu_passthrough = Some("0000:01:00.0".into());
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(s.contains("-device vfio-pci,host=0000:01:00.0"), "{s}");
     }
 
     /// A resolved host GPU puts its render node on the `egl-headless`

@@ -43,10 +43,13 @@ pub trait ValidationContext {
         Ok(())
     }
 
-    /// Does this host have the GPU a `virgl`/`vulkan` `gpu {}` names to
-    /// render on — a PCI device with a DRM render node? The reason when not.
-    /// A permissive context answers `Ok`.
-    fn check_gpu_address(&self, _address: &str) -> Result<(), String> {
+    /// Can this host give a `gpu {}` its host GPU (PRD §5.2)? The same
+    /// pick and sysfs resolution a start runs: a passthrough `host_gpu` this
+    /// host lacks, or nothing to pick, or a picked GPU sysfs or its
+    /// `vulkan_icd` does not bear out. The reason when not. A paravirtual
+    /// name this host lacks is a warning, not this. A permissive context
+    /// answers `Ok`.
+    fn check_host_gpu(&self, _gpu: &Gpu) -> Result<(), String> {
         Ok(())
     }
 
@@ -290,7 +293,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             check_disk_block(&file.root, d, &mut issues);
         }
         if let Some(gpu) = &vm.gpu {
-            check_gpu(&file.root, &vm.name, gpu, ctx, &mut issues);
+            check_gpu(&vm.name, gpu, ctx, &mut issues);
         }
         for path in [&vm.cdrom, &vm.floppy].into_iter().flatten() {
             if !file.root.join(path).is_file() {
@@ -1283,40 +1286,18 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
     }
 }
 
-/// A VM's `gpu {}` (PRD §5.2): `passthrough` needs the device's address; a
-/// `virgl`/`vulkan` address must name a host GPU with a render node; and
-/// `vulkan_icd` belongs to `vulkan` alone and must exist.
-fn check_gpu(
-    root: &Path,
-    vm: &str,
-    gpu: &Gpu,
-    ctx: &dyn ValidationContext,
-    issues: &mut IssueList,
-) {
-    match (gpu.mode, &gpu.address) {
-        (GpuMode::Passthrough, None) => issues.push(Issue::at(
+/// A VM's `gpu {}` (PRD §5.2): `host_gpu`, when written, names something,
+/// and this host can give the block its host GPU.
+fn check_gpu(vm: &str, gpu: &Gpu, ctx: &dyn ValidationContext, issues: &mut IssueList) {
+    if gpu.host_gpu.as_deref().is_some_and(|n| n.trim().is_empty()) {
+        issues.push(Issue::at(
             gpu.span,
-            "gpu passthrough requires `address = \"<host PCI address>\"` (PRD §5.2)",
-        )),
-        (GpuMode::Virgl | GpuMode::Vulkan, Some(address)) => {
-            if let Err(why) = ctx.check_gpu_address(address) {
-                issues.push(Issue::at(gpu.span, format!("vm \"{vm}\": {why}")));
-            }
-        }
-        _ => {}
+            format!("vm \"{vm}\": `host_gpu` must name a host GPU, got an empty string"),
+        ));
+        return;
     }
-    if let Some(icd) = &gpu.vulkan_icd {
-        if gpu.mode != GpuMode::Vulkan {
-            issues.push(Issue::at(
-                gpu.span,
-                format!("vm \"{vm}\": `vulkan_icd` applies only to mode = \"vulkan\" (PRD §5.2)"),
-            ));
-        } else if !root.join(icd).is_file() {
-            issues.push(Issue::at(
-                gpu.span,
-                format!("vm \"{vm}\": vulkan_icd {} does not exist", icd.display()),
-            ));
-        }
+    if let Err(why) = ctx.check_host_gpu(gpu) {
+        issues.push(Issue::at(gpu.span, format!("vm \"{vm}\": {why}")));
     }
 }
 
@@ -2157,9 +2138,10 @@ lab "l" {
         assert_eq!(es, ["v needs virtiofsd 1.13.0"], "{es:#?}");
     }
 
-    /// A context whose host has exactly the GPUs of a fake sysfs tree, so
-    /// `gpu.address` is checked by the same resolution `up` runs.
-    struct FakeGpus(crate::qemu::hostgpu::Sysfs);
+    /// A context whose host declares this brief's GPUs over a fake sysfs
+    /// tree, so `gpu {}` is checked by the same pick and resolution `up`
+    /// runs.
+    struct FakeGpus(crate::qemu::hostgpu::Sysfs, crate::config::host::HostConfig);
     impl ValidationContext for FakeGpus {
         fn template_meta(&self, a: &str, n: &str, v: Option<&str>) -> Option<TemplateMeta> {
             Permissive.template_meta(a, n, v)
@@ -2173,61 +2155,61 @@ lab "l" {
         fn check_script(&self, _: &Path) -> Result<(), String> {
             Ok(())
         }
-        fn check_gpu_address(&self, address: &str) -> Result<(), String> {
-            self.0
-                .resolve(address)
+        fn check_host_gpu(&self, gpu: &Gpu) -> Result<(), String> {
+            crate::qemu::hostgpu::render_plan(Some(gpu), &self.1, &self.0)
                 .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("{e:#}"))
         }
     }
 
     fn gpu_errs(gpu: &str) -> Vec<String> {
         let sys = crate::qemu::hostgpu::testing::fake_host();
+        let host = crate::config::host::HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0" }
+gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+gpu "Vfio1"   { address = "0000:03:00.0" }
+"#,
+            "<host>",
+        )
+        .unwrap();
         let f = lab(&format!(
             r#"import <vmlab.wcl>
 lab "l" {{ vm "a" {{ template = "x86_64/t" gpu {{ {gpu} }} }} }}"#
         ));
-        validate(&f, &FakeGpus(crate::qemu::hostgpu::Sysfs::new(sys.path())))
-            .into_iter()
-            .map(|i| i.message)
-            .collect()
+        validate(
+            &f,
+            &FakeGpus(crate::qemu::hostgpu::Sysfs::new(sys.path()), host),
+        )
+        .into_iter()
+        .map(|i| i.message)
+        .collect()
     }
 
-    /// A render GPU the host has passes; an address with no PCI device, or
-    /// a device with no render node, fails naming the address.
+    /// A declared host GPU passes, and so does a paravirtual name this host
+    /// lacks — that warns rather than fails; passthrough refuses one, and a
+    /// paravirtual GPU with no render node fails naming it.
     #[test]
-    fn a_gpu_address_must_name_a_host_render_gpu() {
-        assert!(gpu_errs(r#"mode = "vulkan" address = "0000:72:00.0""#).is_empty());
-        let es = gpu_errs(r#"mode = "vulkan" address = "0000:99:00.0""#);
+    fn a_gpu_host_gpu_is_checked_against_this_hosts_gpus() {
+        assert!(gpu_errs(r#"mode = "vulkan" host_gpu = "amd1""#).is_empty());
+        assert!(gpu_errs(r#"mode = "vulkan""#).is_empty());
+        assert!(gpu_errs(r#"mode = "virgl" host_gpu = "Nope""#).is_empty());
+        let es = gpu_errs(r#"mode = "passthrough" host_gpu = "Nope""#);
         assert!(
-            es.len() == 1 && es[0].contains("0000:99:00.0") && es[0].contains("no such PCI device"),
+            es.len() == 1 && es[0].contains("`Nope` is not declared on this host"),
             "{es:#?}"
         );
-        let es = gpu_errs(r#"mode = "virgl" address = "0000:03:00.0""#);
+        let es = gpu_errs(r#"mode = "virgl" host_gpu = "Vfio1""#);
         assert!(
-            es.len() == 1 && es[0].contains("0000:03:00.0") && es[0].contains("no DRM render node"),
+            es.len() == 1
+                && es[0].contains("host GPU `Vfio1`")
+                && es[0].contains("no DRM render node"),
             "{es:#?}"
         );
         // passthrough's device is bound to vfio and has no render node.
-        assert!(gpu_errs(r#"mode = "passthrough" address = "0000:03:00.0""#).is_empty());
-    }
-
-    /// `vulkan_icd` must exist, and means nothing outside `vulkan`.
-    #[test]
-    fn a_vulkan_icd_must_exist_and_belongs_to_vulkan_mode() {
-        let icd = tempfile::NamedTempFile::new().unwrap();
-        let icd = icd.path().display();
-        assert!(gpu_errs(&format!(r#"mode = "vulkan" vulkan_icd = "{icd}""#)).is_empty());
-        let es = gpu_errs(r#"mode = "vulkan" vulkan_icd = "/nonexistent/radeon_icd.json""#);
-        assert!(
-            es.len() == 1 && es[0].contains("/nonexistent/radeon_icd.json does not exist"),
-            "{es:#?}"
-        );
-        let es = gpu_errs(&format!(r#"mode = "virgl" vulkan_icd = "{icd}""#));
-        assert!(
-            es.len() == 1 && es[0].contains("applies only to mode = \"vulkan\""),
-            "{es:#?}"
-        );
+        assert!(gpu_errs(r#"mode = "passthrough" host_gpu = "Vfio1""#).is_empty());
+        let es = gpu_errs(r#"mode = "vulkan" host_gpu = """#);
+        assert!(es.len() == 1 && es[0].contains("empty string"), "{es:#?}");
     }
 
     /// §19.2's first rule: the Windows agent is LocalSystem and mints the
