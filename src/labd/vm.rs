@@ -645,6 +645,7 @@ impl VmInstance {
         firmware: Option<&qemu::firmware::UefiFirmware>,
         nics: Vec<qemu::NicSpec>,
         virtiofs_shares: Vec<(String, PathBuf)>,
+        render: &qemu::hostgpu::RenderPlan,
     ) -> Result<VmPaths> {
         Ok(VmPaths {
             qmp_sock: self.dirs.qmp_sock(),
@@ -667,7 +668,22 @@ impl VmInstance {
             tpm_sock: t.resolved.tpm.then(|| self.dirs.tpm_sock()),
             serial_log: Some(self.dirs.logs.join("serial.log")),
             virtiofs_shares,
+            gpu_render_node: render.gpu.as_ref().map(|g| g.render_node.clone()),
         })
+    }
+
+    /// The host GPU a `virgl`/`vulkan` `gpu {}` renders on and the emulator
+    /// environment that follows from it (PRD §5.2): the lab's `address`,
+    /// else the host config's `gpu_address`, resolved through sysfs. A host
+    /// probe, so it happens here rather than in the argv builder (ADR-0008).
+    fn render_plan(&self, t: &TemplateParts) -> Result<qemu::hostgpu::RenderPlan> {
+        let host_default = crate::config::host::HostConfig::load_default()?.gpu_address;
+        qemu::hostgpu::render_plan(
+            t.resolved.gpu.as_ref(),
+            host_default.as_deref(),
+            &qemu::hostgpu::Sysfs::host(),
+        )
+        .with_context(|| format!("{}: host GPU", self.cfg.name))
     }
 
     /// Spawn one virtiofsd per virtiofs share (listening before QEMU
@@ -854,10 +870,11 @@ impl VmInstance {
             let vfs_devices = self.start_virtiofsds().await?;
 
             let (nic_specs, nic_fds) = self.nic_specs().await?;
+            let render = self.render_plan(&t)?;
             let args = qemu::build_args(
                 &self.lab,
                 &t.resolved,
-                &self.build_paths(&t, firmware.as_ref(), nic_specs, vfs_devices)?,
+                &self.build_paths(&t, firmware.as_ref(), nic_specs, vfs_devices, &render)?,
                 accel,
             )?;
             // The machine answers control shortly after spawn (-S leaves CPUs
@@ -868,6 +885,7 @@ impl VmInstance {
                     label: format!("qemu:{}", self.cfg.name),
                     binary: qemu::emulator_binary(&t.resolved.arch),
                     args,
+                    env: render.env,
                     log: self.dirs.logs.join("qemu.log"),
                     qmp_sock: self.dirs.qmp_sock(),
                     fds: nic_fds,

@@ -50,6 +50,10 @@ pub struct VmPaths {
     /// The daemons must be listening before QEMU spawns; non-empty switches
     /// the RAM to a shared memory-backend-memfd (§7.5).
     pub virtiofs_shares: Vec<(String, PathBuf)>,
+    /// The host render node a `virgl`/`vulkan` GPU's `egl-headless` display
+    /// renders on (`hostgpu::Sysfs::resolve`). Resolved by the lab daemon from
+    /// sysfs; `None` leaves QEMU's choice.
+    pub gpu_render_node: Option<PathBuf>,
 }
 
 /// The qdev id of a VM's install CD-ROM device (see
@@ -572,17 +576,35 @@ pub fn build_args(
                     arg(&mut a, "device", d.clone());
                 }
             }
-            GpuMode::Virgl => {
-                arg(&mut a, "device", "virtio-gpu-gl".into());
-                arg(&mut a, "display", "egl-headless".into());
-            }
-            GpuMode::Vulkan => {
-                arg(
-                    &mut a,
-                    "device",
-                    "virtio-gpu-gl,venus=true,hostmem=4G".into(),
-                );
-                arg(&mut a, "display", "egl-headless".into());
+            GpuMode::Virgl | GpuMode::Vulkan => {
+                // One display adapter, the GL one. x86 machines take the
+                // VGA-compatible form, which keeps firmware and the boot
+                // console on it and stops q35/pc adding their default std
+                // VGA; `virt` has no legacy VGA, so the pure device plus an
+                // explicit `-vga none`. A second adapter in the guest leaves
+                // Venus enumerating no device at all.
+                let dev = match machine_kind {
+                    MachineKind::Virt => "virtio-gpu-gl",
+                    MachineKind::Q35 | MachineKind::LegacyPc => "virtio-vga-gl",
+                };
+                // QEMU refuses Venus without blob resources and a hostmem
+                // window.
+                let opts = if gpu.mode == GpuMode::Vulkan {
+                    ",venus=true,blob=true,hostmem=4G"
+                } else {
+                    ""
+                };
+                arg(&mut a, "device", format!("{dev}{opts}"));
+                if matches!(machine_kind, MachineKind::Virt) {
+                    arg(&mut a, "vga", "none".into());
+                }
+                // The scanout has to come from the GPU Venus renders on, or
+                // the console is black.
+                let display = match &paths.gpu_render_node {
+                    Some(node) => format!("egl-headless,rendernode={}", node.display()),
+                    None => "egl-headless".into(),
+                };
+                arg(&mut a, "display", display);
             }
         },
         None => {
@@ -634,6 +656,7 @@ mod tests {
     // The real resolver, on real declarations: an argv test that hand-built
     // its resolved hardware would be asserting against a copy of the
     // precedence chain rather than against the chain (ADR-0008).
+    use super::super::resolve::testing::resolved_gpu_vm as resolved_gpu;
     use super::super::resolve::testing::resolved_vm as resolved;
 
     /// Runtime paths the lab daemon would hand the builder, including the
@@ -1050,6 +1073,76 @@ mod tests {
         assert!(s.contains("ide-cd,drive=cd0"));
         assert!(s.contains("ide-cd,drive=cd1"));
         assert!(s.contains("if=floppy,format=raw,file=/lab/.vmlab/media/drivers.img"));
+    }
+
+    /// `vulkan` on q35 is the VGA-compatible Venus device with blob
+    /// resources, so q35 adds no std VGA beside it.
+    #[test]
+    fn vulkan_on_q35_is_one_vga_venus_device_with_blob() {
+        let s = joined(
+            &build_args("l", &resolved_gpu("vulkan", "x86_64"), &paths(), Accel::Kvm).unwrap(),
+        );
+        assert!(s.contains("-machine q35"), "{s}");
+        assert!(
+            s.contains("-device virtio-vga-gl,venus=true,blob=true,hostmem=4G"),
+            "{s}"
+        );
+        assert!(!s.contains("virtio-gpu-gl"), "{s}");
+        assert!(!s.contains("-vga none"), "{s}");
+        assert!(s.contains("-display egl-headless"), "{s}");
+    }
+
+    /// `vulkan` on `virt` has no VGA form: the pure device and `-vga none`.
+    #[test]
+    fn vulkan_on_virt_is_the_pure_device_with_no_vga() {
+        let s = joined(
+            &build_args(
+                "l",
+                &resolved_gpu("vulkan", "aarch64"),
+                &paths(),
+                Accel::Tcg,
+            )
+            .unwrap(),
+        );
+        assert!(s.contains("-machine virt"), "{s}");
+        assert!(
+            s.contains("-device virtio-gpu-gl,venus=true,blob=true,hostmem=4G"),
+            "{s}"
+        );
+        assert!(s.contains("-vga none"), "{s}");
+    }
+
+    /// `virgl` gets the same one-adapter treatment, without the Venus
+    /// options.
+    #[test]
+    fn virgl_is_one_gl_adapter_on_q35_and_virt() {
+        let s = joined(
+            &build_args("l", &resolved_gpu("virgl", "x86_64"), &paths(), Accel::Kvm).unwrap(),
+        );
+        assert!(s.contains("-device virtio-vga-gl "), "{s}");
+        assert!(!s.contains("venus"), "{s}");
+        assert!(!s.contains("-vga none"), "{s}");
+        let s = joined(
+            &build_args("l", &resolved_gpu("virgl", "aarch64"), &paths(), Accel::Tcg).unwrap(),
+        );
+        assert!(s.contains("-device virtio-gpu-gl "), "{s}");
+        assert!(s.contains("-vga none"), "{s}");
+    }
+
+    /// A resolved host GPU puts its render node on the `egl-headless`
+    /// display, so the scanout comes from the GPU that renders.
+    #[test]
+    fn a_resolved_render_node_lands_on_the_egl_display() {
+        let mut p = paths();
+        p.gpu_render_node = Some("/dev/dri/renderD129".into());
+        for mode in ["virgl", "vulkan"] {
+            let s =
+                joined(&build_args("l", &resolved_gpu(mode, "x86_64"), &p, Accel::Kvm).unwrap());
+            assert!(
+                s.contains("-display egl-headless,rendernode=/dev/dri/renderD129"),
+                "{s}"
+            );
+        }
     }
 
     /// QEMU is always headless with VNC on a socket; a `gui = true` window

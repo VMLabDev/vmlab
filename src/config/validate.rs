@@ -43,6 +43,13 @@ pub trait ValidationContext {
         Ok(())
     }
 
+    /// Does this host have the GPU a `virgl`/`vulkan` `gpu {}` names to
+    /// render on — a PCI device with a DRM render node? The reason when not.
+    /// A permissive context answers `Ok`.
+    fn check_gpu_address(&self, _address: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn template_exists(&self, arch: &str, name: &str, version: Option<&str>) -> bool {
         self.template_meta(arch, name, version).is_some()
     }
@@ -282,14 +289,8 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &vm.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
-        if let Some(gpu) = &vm.gpu
-            && gpu.mode == GpuMode::Passthrough
-            && gpu.address.is_none()
-        {
-            issues.push(Issue::at(
-                gpu.span,
-                "gpu passthrough requires `address = \"<host PCI address>\"` (PRD §5.2)",
-            ));
+        if let Some(gpu) = &vm.gpu {
+            check_gpu(&file.root, &vm.name, gpu, ctx, &mut issues);
         }
         for path in [&vm.cdrom, &vm.floppy].into_iter().flatten() {
             if !file.root.join(path).is_file() {
@@ -1282,6 +1283,43 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
     }
 }
 
+/// A VM's `gpu {}` (PRD §5.2): `passthrough` needs the device's address; a
+/// `virgl`/`vulkan` address must name a host GPU with a render node; and
+/// `vulkan_icd` belongs to `vulkan` alone and must exist.
+fn check_gpu(
+    root: &Path,
+    vm: &str,
+    gpu: &Gpu,
+    ctx: &dyn ValidationContext,
+    issues: &mut IssueList,
+) {
+    match (gpu.mode, &gpu.address) {
+        (GpuMode::Passthrough, None) => issues.push(Issue::at(
+            gpu.span,
+            "gpu passthrough requires `address = \"<host PCI address>\"` (PRD §5.2)",
+        )),
+        (GpuMode::Virgl | GpuMode::Vulkan, Some(address)) => {
+            if let Err(why) = ctx.check_gpu_address(address) {
+                issues.push(Issue::at(gpu.span, format!("vm \"{vm}\": {why}")));
+            }
+        }
+        _ => {}
+    }
+    if let Some(icd) = &gpu.vulkan_icd {
+        if gpu.mode != GpuMode::Vulkan {
+            issues.push(Issue::at(
+                gpu.span,
+                format!("vm \"{vm}\": `vulkan_icd` applies only to mode = \"vulkan\" (PRD §5.2)"),
+            ));
+        } else if !root.join(icd).is_file() {
+            issues.push(Issue::at(
+                gpu.span,
+                format!("vm \"{vm}\": vulkan_icd {} does not exist", icd.display()),
+            ));
+        }
+    }
+}
+
 fn check_media(root: &Path, m: &Media, issues: &mut IssueList) {
     if !root.join(&m.from).is_dir() {
         issues.push(Issue::at(
@@ -2117,6 +2155,79 @@ lab "l" {
             .map(|i| i.message)
             .collect();
         assert_eq!(es, ["v needs virtiofsd 1.13.0"], "{es:#?}");
+    }
+
+    /// A context whose host has exactly the GPUs of a fake sysfs tree, so
+    /// `gpu.address` is checked by the same resolution `up` runs.
+    struct FakeGpus(crate::qemu::hostgpu::Sysfs);
+    impl ValidationContext for FakeGpus {
+        fn template_meta(&self, a: &str, n: &str, v: Option<&str>) -> Option<TemplateMeta> {
+            Permissive.template_meta(a, n, v)
+        }
+        fn profile(&self, name: &str) -> Option<Profile> {
+            Permissive.profile(name)
+        }
+        fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
+            Ok(())
+        }
+        fn check_script(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn check_gpu_address(&self, address: &str) -> Result<(), String> {
+            self.0
+                .resolve(address)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    fn gpu_errs(gpu: &str) -> Vec<String> {
+        let sys = crate::qemu::hostgpu::testing::fake_host();
+        let f = lab(&format!(
+            r#"import <vmlab.wcl>
+lab "l" {{ vm "a" {{ template = "x86_64/t" gpu {{ {gpu} }} }} }}"#
+        ));
+        validate(&f, &FakeGpus(crate::qemu::hostgpu::Sysfs::new(sys.path())))
+            .into_iter()
+            .map(|i| i.message)
+            .collect()
+    }
+
+    /// A render GPU the host has passes; an address with no PCI device, or
+    /// a device with no render node, fails naming the address.
+    #[test]
+    fn a_gpu_address_must_name_a_host_render_gpu() {
+        assert!(gpu_errs(r#"mode = "vulkan" address = "0000:72:00.0""#).is_empty());
+        let es = gpu_errs(r#"mode = "vulkan" address = "0000:99:00.0""#);
+        assert!(
+            es.len() == 1 && es[0].contains("0000:99:00.0") && es[0].contains("no such PCI device"),
+            "{es:#?}"
+        );
+        let es = gpu_errs(r#"mode = "virgl" address = "0000:03:00.0""#);
+        assert!(
+            es.len() == 1 && es[0].contains("0000:03:00.0") && es[0].contains("no DRM render node"),
+            "{es:#?}"
+        );
+        // passthrough's device is bound to vfio and has no render node.
+        assert!(gpu_errs(r#"mode = "passthrough" address = "0000:03:00.0""#).is_empty());
+    }
+
+    /// `vulkan_icd` must exist, and means nothing outside `vulkan`.
+    #[test]
+    fn a_vulkan_icd_must_exist_and_belongs_to_vulkan_mode() {
+        let icd = tempfile::NamedTempFile::new().unwrap();
+        let icd = icd.path().display();
+        assert!(gpu_errs(&format!(r#"mode = "vulkan" vulkan_icd = "{icd}""#)).is_empty());
+        let es = gpu_errs(r#"mode = "vulkan" vulkan_icd = "/nonexistent/radeon_icd.json""#);
+        assert!(
+            es.len() == 1 && es[0].contains("/nonexistent/radeon_icd.json does not exist"),
+            "{es:#?}"
+        );
+        let es = gpu_errs(&format!(r#"mode = "virgl" vulkan_icd = "{icd}""#));
+        assert!(
+            es.len() == 1 && es[0].contains("applies only to mode = \"vulkan\""),
+            "{es:#?}"
+        );
     }
 
     /// §19.2's first rule: the Windows agent is LocalSystem and mints the

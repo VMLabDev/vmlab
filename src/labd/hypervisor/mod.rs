@@ -31,7 +31,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::guest_asset::GuestAsset;
-use crate::qemu::process::ChildFd;
+use crate::qemu::process::{ChildEnv, ChildFd};
 use crate::qmp::QmpClient;
 
 mod qemu;
@@ -140,6 +140,9 @@ pub struct LaunchSpec {
     /// Emulator binary (`qemu-system-x86_64`).
     pub binary: String,
     pub args: Vec<String>,
+    /// The emulator's environment changes — the Vulkan loader variables a
+    /// `gpu {}` owns (`qemu::hostgpu::emulator_env`).
+    pub env: ChildEnv,
     /// Where the emulator's stdout/stderr goes.
     pub log: PathBuf,
     /// The QMP socket the emulator will bind, connected once it is up.

@@ -431,6 +431,7 @@ fn extract_gpu(b: &Block, issues: &mut IssueList) -> Option<Gpu> {
     Some(Gpu {
         mode: mode.value,
         address: r.string("address").unspan(),
+        vulkan_icd: r.path("vulkan_icd").unspan(),
         span: r.span(),
     })
 }

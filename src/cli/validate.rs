@@ -57,6 +57,13 @@ impl ValidationContext for HostContext {
         crate::scripting::check_script_source(&source)
     }
 
+    fn check_gpu_address(&self, address: &str) -> Result<(), String> {
+        crate::qemu::hostgpu::Sysfs::host()
+            .resolve(address)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     fn check_virtiofs_share(&self, share: &crate::config::model::Share) -> Result<(), String> {
         use crate::qemu::virtiofsd::{Probe, probe};
         match probe() {
