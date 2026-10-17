@@ -1272,8 +1272,9 @@ impl VmInstance {
     }
 }
 
-/// A VM's display is QEMU's: screendumps over QMP, input over QMP or RFB
-/// depending on what the guest actually listens to.
+/// A VM's display is QEMU's: screendumps over QMP (or RFB where the scanout
+/// is a GL texture), input over QMP or RFB depending on what the guest
+/// actually listens to.
 #[async_trait::async_trait]
 impl super::display::DisplayHost for VmInstance {
     fn name(&self) -> &str {
@@ -1294,6 +1295,14 @@ impl super::display::DisplayHost for VmInstance {
 
     fn input_transport(&self) -> crate::profiles::InputTransport {
         self.template().resolved.input_transport
+    }
+
+    fn gl_display(&self) -> bool {
+        self.template()
+            .resolved
+            .gpu
+            .as_ref()
+            .is_some_and(|g| g.mode.gl_display())
     }
 }
 

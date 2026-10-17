@@ -609,6 +609,8 @@ m.wait_for_text(pattern, opts) -> Match     # OCR-based wait, regex pattern
 
 Reference images are paths relative to the lab (convention: `images/` beside `vmlab.wcl`). Matching is normalised template matching with a similarity threshold (default ~0.9, overridable). `Match` carries location + score, so a found image can anchor a relative mouse click.
 
+Every capture — `screenshot`, `ocr`, `find_image` and the waits built on them, from wscript and the CLI alike — reads the framebuffer through QMP `screendump`, except on a GL display. When `gpu.mode` is `virgl` or `vulkan` the scanout is a host GL texture and `screendump` answers `no surface`, so the capture is one full, non-incremental RFB update (32 bpp, Raw) read from the VM's own VNC socket, which egl-headless already feeds. Any other VM whose `screendump` answers `no surface` falls back to that VNC read once; when it fails as well, the QMP error is reported with the VNC failure beside it.
+
 **Guest agent**
 
 ```

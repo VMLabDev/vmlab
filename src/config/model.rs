@@ -528,6 +528,14 @@ pub enum GpuMode {
     Vulkan,
 }
 
+impl GpuMode {
+    /// Whether the guest's scanout is a host GL texture (egl-headless) rather
+    /// than a 2D surface — the modes QMP `screendump` cannot capture.
+    pub fn gl_display(self) -> bool {
+        matches!(self, GpuMode::Virgl | GpuMode::Vulkan)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Gpu {
     pub mode: GpuMode,
