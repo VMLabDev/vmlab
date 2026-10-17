@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use super::process::ChildEnv;
+use super::vk_layer;
 use crate::config::host::{HostConfig, HostGpu};
 use crate::config::model::{Gpu, GpuMode};
 
@@ -130,24 +131,36 @@ fn driver(dev: &Path) -> Option<String> {
     Some(target.file_name()?.to_string_lossy().into_owned())
 }
 
-/// The Vulkan loader variables vmlab owns in the emulator's environment.
-/// Every one is removed before anything is set, so nothing a supervisor was
-/// started with leaks into a guest's renderer. `MESA_VK_DEVICE_SELECT` is in
-/// the list but never set: Mesa's device-select layer breaks Venus
+/// The Vulkan loader variables vmlab owns in the emulator's environment,
+/// with the PCI-filter layer's own ([`vk_layer`]). Every one is removed
+/// before anything is set, so nothing a supervisor was started with leaks
+/// into a guest's renderer. `MESA_VK_DEVICE_SELECT` is in the list but never
+/// set: Mesa's device-select layer breaks Venus
 /// (`vkr: venus driver is required to call vkEnumeratePhysicalDevices first`).
-pub const VULKAN_ENV_VARS: [&str; 4] = [
+pub const VULKAN_ENV_VARS: [&str; 7] = [
     "VK_DRIVER_FILES",
     "VK_ICD_FILENAMES",
     "VK_LOADER_DRIVERS_SELECT",
     "MESA_VK_DEVICE_SELECT",
+    vk_layer::PATH_VAR,
+    vk_layer::ADDRESS_VAR,
+    vk_layer::DISABLE_VAR,
 ];
 
 /// The emulator's environment for a VM (§5.2): the Vulkan loader
 /// variables always cleared, and under `vulkan` a filter that leaves the
 /// loader only the selected GPU's driver. An explicit `vulkan_icd` wins over
 /// the driver mapping; a GPU whose driver maps to no ICD, or no GPU at all,
-/// gets no filter.
-pub fn emulator_env(vulkan: bool, gpu: Option<&RenderGpu>, vulkan_icd: Option<&Path>) -> ChildEnv {
+/// gets no filter. A GPU with an address under `vulkan` also gets the
+/// PCI-filter layer from `layer_dir`, which hides every device but that
+/// address's from the guest — the driver filter alone cannot tell two
+/// identical cards apart.
+pub fn emulator_env(
+    vulkan: bool,
+    gpu: Option<&RenderGpu>,
+    vulkan_icd: Option<&Path>,
+    layer_dir: Option<&Path>,
+) -> ChildEnv {
     let mut env = ChildEnv {
         remove: VULKAN_ENV_VARS.iter().map(|v| v.to_string()).collect(),
         set: Vec::new(),
@@ -164,6 +177,12 @@ pub fn emulator_env(vulkan: bool, gpu: Option<&RenderGpu>, vulkan_icd: Option<&P
     {
         env.set
             .push(("VK_LOADER_DRIVERS_SELECT".into(), select.into()));
+    }
+    if let (Some(gpu), Some(dir)) = (gpu, layer_dir) {
+        env.set
+            .push((vk_layer::PATH_VAR.into(), dir.display().to_string()));
+        env.set
+            .push((vk_layer::ADDRESS_VAR.into(), gpu.address.clone()));
     }
     env
 }
@@ -269,6 +288,10 @@ pub struct RenderPlan {
     /// The host GPU's `qemu_binary`, checked: run in place of
     /// `qemu-system-<arch>` on PATH. `None` runs the stock emulator.
     pub qemu_binary: Option<PathBuf>,
+    /// The directory the PCI-filter layer must be installed in before the
+    /// emulator spawns ([`vk_layer::install`]); set when the environment
+    /// names it.
+    pub vk_layer: Option<PathBuf>,
     /// A missing `host_gpu` the plan fell back from ([`Picked::warning`]).
     pub warning: Option<String>,
     pub env: ChildEnv,
@@ -364,16 +387,18 @@ pub fn apply_qemu_env(gpu: &str, env: &mut ChildEnv, extra: &[(String, String)])
 /// `passthrough`, a render node for `virgl`/`vulkan` — and name the GPU in
 /// any refusal. Its `vulkan_icd` must exist; its `qemu_binary`, in every
 /// mode, must run and suit `arch` (the VM's arch, when known); its
-/// `qemu_env` goes on last.
+/// `qemu_env` goes on last. A `vulkan` GPU's PCI-filter layer is planned
+/// under `data` ([`vk_layer::dir`]), not written.
 pub fn render_plan(
     gpu: Option<&Gpu>,
     arch: Option<&str>,
     host: &HostConfig,
     sysfs: &Sysfs,
+    data: &Path,
 ) -> Result<RenderPlan> {
     let Some(gpu) = gpu else {
         return Ok(RenderPlan {
-            env: emulator_env(false, None, None),
+            env: emulator_env(false, None, None, None),
             ..Default::default()
         });
     };
@@ -392,7 +417,7 @@ pub fn render_plan(
         let decl = decl.expect("pick refuses passthrough with no host GPU");
         sysfs.device(&decl.address).with_context(context)?;
         plan.passthrough = Some(decl.address.clone());
-        plan.env = emulator_env(false, None, None);
+        plan.env = emulator_env(false, None, None, None);
     } else {
         plan.gpu = decl
             .map(|g| sysfs.resolve(&g.address))
@@ -407,7 +432,10 @@ pub fn render_plan(
         {
             bail!("{}: vulkan_icd {} does not exist", context(), icd.display());
         }
-        plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd);
+        if vulkan && plan.gpu.is_some() {
+            plan.vk_layer = Some(vk_layer::dir(data));
+        }
+        plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd, plan.vk_layer.as_deref());
     }
     if let Some(decl) = decl {
         if let Some(binary) = &decl.qemu_binary {
@@ -551,7 +579,7 @@ mod tests {
         let gpu = Sysfs::new(sys.path()).resolve("0000:72:00.0").unwrap();
         assert_eq!(gpu.render_node, Path::new("/dev/dri/renderD129"));
         assert_eq!(gpu.driver.as_deref(), Some("amdgpu"));
-        let env = emulator_env(true, Some(&gpu), None);
+        let env = emulator_env(true, Some(&gpu), None, None);
         assert_eq!(set(&env), [("VK_LOADER_DRIVERS_SELECT", "*radeon*")]);
     }
 
@@ -561,7 +589,7 @@ mod tests {
         let sys = fake_host();
         let gpu = Sysfs::new(sys.path()).resolve("0000:05:00.0").unwrap();
         assert_eq!(gpu.render_node, Path::new("/dev/dri/renderD130"));
-        let env = emulator_env(true, Some(&gpu), None);
+        let env = emulator_env(true, Some(&gpu), None, None);
         assert_eq!(set(&env), [("VK_LOADER_DRIVERS_SELECT", "*nvidia*")]);
     }
 
@@ -571,7 +599,7 @@ mod tests {
         let sys = fake_host();
         let gpu = Sysfs::new(sys.path()).resolve("0000:00:02.0").unwrap();
         assert_eq!(gpu.render_node, Path::new("/dev/dri/renderD131"));
-        let env = emulator_env(true, Some(&gpu), None);
+        let env = emulator_env(true, Some(&gpu), None, None);
         assert_eq!(set(&env), [("VK_LOADER_DRIVERS_SELECT", "*intel*")]);
         assert_eq!(loader_driver_select("xe"), Some("*intel*"));
     }
@@ -582,7 +610,7 @@ mod tests {
         let sys = fake_host();
         let gpu = Sysfs::new(sys.path()).resolve("0000:72:00.0").unwrap();
         let icd = Path::new("/opt/icd/my_icd.json");
-        let env = emulator_env(true, Some(&gpu), Some(icd));
+        let env = emulator_env(true, Some(&gpu), Some(icd), None);
         assert_eq!(set(&env), [("VK_DRIVER_FILES", "/opt/icd/my_icd.json")]);
     }
 
@@ -593,18 +621,19 @@ mod tests {
         let sys = fake_host();
         let gpu = Sysfs::new(sys.path()).resolve("0000:72:00.0").unwrap();
         for env in [
-            emulator_env(false, None, None),
-            emulator_env(false, Some(&gpu), None),
-            emulator_env(true, None, None),
-            emulator_env(true, Some(&gpu), None),
+            emulator_env(false, None, None, None),
+            emulator_env(false, Some(&gpu), None, None),
+            emulator_env(true, None, None, None),
+            emulator_env(true, Some(&gpu), None, None),
+            emulator_env(true, Some(&gpu), None, Some(Path::new("/run/layer"))),
         ] {
             for var in VULKAN_ENV_VARS {
                 assert!(env.remove.iter().any(|r| r == var), "{var} not cleared");
             }
             assert!(env.set.iter().all(|(k, _)| k != "MESA_VK_DEVICE_SELECT"));
         }
-        assert!(emulator_env(false, Some(&gpu), None).set.is_empty());
-        assert!(emulator_env(true, None, None).set.is_empty());
+        assert!(emulator_env(false, Some(&gpu), None, None).set.is_empty());
+        assert!(emulator_env(true, None, None, None).set.is_empty());
     }
 
     /// An address sysfs does not know, and a device with no render node, are
@@ -625,10 +654,30 @@ mod tests {
         );
     }
 
+    /// The data directory every plan here puts the layer under.
+    const DATA: &str = "/home/u/.local/share/vmlab";
+
     /// [`super::render_plan`] for an x86_64 VM, the arch every test here
     /// but the arch checks runs.
     fn render_plan(gpu: Option<&Gpu>, host: &HostConfig, sysfs: &Sysfs) -> Result<RenderPlan> {
-        super::render_plan(gpu, Some("x86_64"), host, sysfs)
+        super::render_plan(gpu, Some("x86_64"), host, sysfs, Path::new(DATA))
+    }
+
+    /// The layer variables a `vulkan` plan on `address` sets after the
+    /// driver filter.
+    fn layer_env(address: &str) -> [(String, String); 2] {
+        [
+            (
+                vk_layer::PATH_VAR.into(),
+                vk_layer::dir(Path::new(DATA)).display().to_string(),
+            ),
+            (vk_layer::ADDRESS_VAR.into(), address.into()),
+        ]
+    }
+
+    /// `set` as owned pairs, to compare against a built list.
+    fn owned(env: &ChildEnv) -> Vec<(String, String)> {
+        env.set.clone()
     }
 
     fn gpu(mode: GpuMode, host_gpu: Option<&str>) -> Gpu {
@@ -672,7 +721,8 @@ mod tests {
         let plan = render_plan(Some(&gpu(GpuMode::Vulkan, Some("amd1"))), &host(), &sysfs).unwrap();
         assert_eq!(plan.name.as_deref(), Some("AMD1"));
         assert_eq!(plan.gpu.unwrap().address, "0000:72:00.0");
-        assert_eq!(set(&plan.env), [("VK_LOADER_DRIVERS_SELECT", "*radeon*")]);
+        assert_eq!(set(&plan.env)[0], ("VK_LOADER_DRIVERS_SELECT", "*radeon*"));
+        assert_eq!(owned(&plan.env)[1..], layer_env("0000:72:00.0"));
         assert_eq!(plan.warning, None);
     }
 
@@ -806,7 +856,11 @@ mod tests {
         let mut h = host();
         h.gpus[2].vulkan_icd = Some(icd.clone());
         let plan = render_plan(Some(&gpu(GpuMode::Vulkan, Some("Nvidia2"))), &h, &sysfs).unwrap();
-        assert_eq!(set(&plan.env), [("VK_DRIVER_FILES", icd.to_str().unwrap())]);
+        assert_eq!(
+            set(&plan.env)[0],
+            ("VK_DRIVER_FILES", icd.to_str().unwrap())
+        );
+        assert_eq!(owned(&plan.env)[1..], layer_env("0000:05:00.0"));
         let plan = render_plan(Some(&gpu(GpuMode::Virgl, Some("Nvidia2"))), &h, &sysfs).unwrap();
         assert!(plan.env.set.is_empty());
         h.gpus[2].vulkan_icd = Some("/nonexistent/icd.json".into());
@@ -963,7 +1017,16 @@ mod tests {
                 && e.contains("emulates aarch64, but this VM is x86_64"),
             "{e}"
         );
-        assert!(super::render_plan(Some(&gpu(GpuMode::Vulkan, None)), None, &h, &sysfs).is_ok());
+        assert!(
+            super::render_plan(
+                Some(&gpu(GpuMode::Vulkan, None)),
+                None,
+                &h,
+                &sysfs,
+                Path::new(DATA)
+            )
+            .is_ok()
+        );
         let odd = fake_qemu(&sys.path().join("opt/bin"), "qemu-vmlab");
         let h = host_with_qemu(&odd, &[]);
         let plan = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs).unwrap();
@@ -972,7 +1035,14 @@ mod tests {
         let bin = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-x86_64");
         let h = host_with_qemu(&bin, &[]);
         assert!(
-            super::render_plan(Some(&gpu(GpuMode::Vulkan, None)), Some("x86"), &h, &sysfs).is_ok()
+            super::render_plan(
+                Some(&gpu(GpuMode::Vulkan, None)),
+                Some("x86"),
+                &h,
+                &sysfs,
+                Path::new(DATA)
+            )
+            .is_ok()
         );
     }
 
@@ -1081,18 +1151,43 @@ mod tests {
         let bin = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-x86_64");
         let h = host_with_qemu(&bin, &[("VKR_DEBUG", "validate")]);
         let plan = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs).unwrap();
+        let [path, address] = layer_env("0000:01:00.0");
         assert_eq!(
-            set(&plan.env),
+            owned(&plan.env),
             [
-                ("VK_LOADER_DRIVERS_SELECT", "*nvidia*"),
-                ("VKR_DEBUG", "validate")
+                ("VK_LOADER_DRIVERS_SELECT".into(), "*nvidia*".into()),
+                path.clone(),
+                address.clone(),
+                ("VKR_DEBUG".into(), "validate".into())
             ]
         );
         let h = host_with_qemu(&bin, &[("VK_LOADER_DRIVERS_SELECT", "*nvidia_icd*")]);
         let plan = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs).unwrap();
         assert_eq!(
-            set(&plan.env),
-            [("VK_LOADER_DRIVERS_SELECT", "*nvidia_icd*")]
+            owned(&plan.env),
+            [
+                path.clone(),
+                address,
+                ("VK_LOADER_DRIVERS_SELECT".into(), "*nvidia_icd*".into())
+            ]
+        );
+        // The layer's own variables obey the same rule.
+        let h = host_with_qemu(
+            &bin,
+            &[
+                (vk_layer::ADDRESS_VAR, "0000:05:00.0"),
+                (vk_layer::DISABLE_VAR, "1"),
+            ],
+        );
+        let plan = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs).unwrap();
+        assert_eq!(
+            owned(&plan.env),
+            [
+                ("VK_LOADER_DRIVERS_SELECT".into(), "*nvidia*".into()),
+                path,
+                (vk_layer::ADDRESS_VAR.into(), "0000:05:00.0".into()),
+                (vk_layer::DISABLE_VAR.into(), "1".into())
+            ]
         );
         // The inherited loader variables are still stripped first.
         assert_eq!(plan.env.remove.len(), VULKAN_ENV_VARS.len());
@@ -1122,6 +1217,67 @@ mod tests {
                 e,
                 format!("host GPU `Nvidia1`: qemu_env has {why}: `{key}`")
             );
+        }
+    }
+
+    /// Every `vulkan` guest on a picked host GPU gets the PCI-filter layer
+    /// keyed to that GPU's address — the two identical NVIDIA cards each
+    /// their own, the AMD iGPU its own — and the plan names the directory to
+    /// install it in.
+    #[test]
+    fn a_vulkan_host_gpu_gets_the_pci_filter_layer_on_its_own_address() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        for (name, address, select) in [
+            ("Nvidia1", "0000:01:00.0", "*nvidia*"),
+            ("Nvidia2", "0000:05:00.0", "*nvidia*"),
+            ("AMD1", "0000:72:00.0", "*radeon*"),
+        ] {
+            let plan =
+                render_plan(Some(&gpu(GpuMode::Vulkan, Some(name))), &host(), &sysfs).unwrap();
+            let mut want = vec![("VK_LOADER_DRIVERS_SELECT".to_string(), select.to_string())];
+            want.extend(layer_env(address));
+            assert_eq!(owned(&plan.env), want, "{name}");
+            assert_eq!(
+                plan.vk_layer.as_deref(),
+                Some(vk_layer::dir(Path::new(DATA)).as_path())
+            );
+        }
+    }
+
+    /// `virgl`, `passthrough`, no `gpu {}` and a `vulkan` guest with no host
+    /// GPU resolved get no layer, though its variables are still stripped
+    /// from what the emulator inherits.
+    #[test]
+    fn only_a_vulkan_guest_with_a_resolved_host_gpu_gets_the_layer() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let mut h = host();
+        h.gpus.push(decl("Vfio1", "0000:03:00.0", false));
+        let plans = [
+            render_plan(Some(&gpu(GpuMode::Virgl, Some("Nvidia2"))), &h, &sysfs),
+            render_plan(Some(&gpu(GpuMode::Passthrough, Some("Vfio1"))), &h, &sysfs),
+            render_plan(None, &h, &sysfs),
+            render_plan(
+                Some(&gpu(GpuMode::Vulkan, None)),
+                &HostConfig::default(),
+                &sysfs,
+            ),
+        ];
+        for plan in plans {
+            let plan = plan.unwrap();
+            assert_eq!(plan.vk_layer, None);
+            assert!(plan.env.set.is_empty(), "{:?}", plan.env.set);
+            for var in [
+                vk_layer::PATH_VAR,
+                vk_layer::ADDRESS_VAR,
+                vk_layer::DISABLE_VAR,
+            ] {
+                assert!(
+                    plan.env.remove.iter().any(|r| r == var),
+                    "{var} not cleared"
+                );
+            }
         }
     }
 }

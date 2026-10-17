@@ -2507,6 +2507,7 @@ dependencies = [
  "aya",
  "base64",
  "bytes",
+ "cc",
  "chrono",
  "clap",
  "command-fds",

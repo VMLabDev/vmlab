@@ -757,7 +757,7 @@ impl ContainerInstance {
                     args,
                     // A micro-VM has no GPU, but its emulator still starts
                     // with the Vulkan loader variables cleared.
-                    env: qemu::hostgpu::emulator_env(false, None, None),
+                    env: qemu::hostgpu::emulator_env(false, None, None, None),
                     log: qemu_log.clone(),
                     qmp_sock: self.dirs.qmp_sock(),
                     fds: Vec::new(),
