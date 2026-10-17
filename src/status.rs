@@ -251,6 +251,10 @@ pub struct VmStatus {
     /// GPU resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_gpu: Option<String>,
+    /// The host GPU's own QEMU the last start ran in place of the stock
+    /// emulator (§5.2); `None` for the stock one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qemu_binary: Option<String>,
 }
 
 /// What a container has and a VM does not.
@@ -630,6 +634,7 @@ pub(crate) mod fixtures {
             memory: Some(8 << 30),
             agent_version: Some("0.1.0".into()),
             host_gpu: None,
+            qemu_binary: None,
         })
     }
 

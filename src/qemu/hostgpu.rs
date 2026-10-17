@@ -257,7 +257,7 @@ pub fn pick<'h>(gpu: &'h Gpu, host: &'h HostConfig) -> Result<Picked<'h>> {
 
 /// What a VM's `gpu {}` asks of the host GPU: which declared GPU it got,
 /// the device `passthrough` hands over or the render GPU a paravirtual mode
-/// renders on, and the emulator's environment.
+/// renders on, the emulator that runs it and that emulator's environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderPlan {
     /// The declared host GPU's name, for status.
@@ -266,16 +266,111 @@ pub struct RenderPlan {
     pub passthrough: Option<String>,
     /// The GPU a `virgl`/`vulkan` guest renders on.
     pub gpu: Option<RenderGpu>,
+    /// The host GPU's `qemu_binary`, checked: run in place of
+    /// `qemu-system-<arch>` on PATH. `None` runs the stock emulator.
+    pub qemu_binary: Option<PathBuf>,
     /// A missing `host_gpu` the plan fell back from ([`Picked::warning`]).
     pub warning: Option<String>,
     pub env: ChildEnv,
 }
 
+impl RenderPlan {
+    /// The emulator to spawn: the host GPU's `qemu_binary`, else
+    /// `qemu-system-<arch>` from PATH.
+    pub fn emulator(&self, arch: &str) -> String {
+        match &self.qemu_binary {
+            Some(path) => path.display().to_string(),
+            None => super::emulator_binary(arch),
+        }
+    }
+
+    /// The `-L` directory a host GPU's own QEMU is handed (§5.2): the stock
+    /// QEMU's data directory, so a minimal build finds the firmware and
+    /// option ROMs it was never installed beside. QEMU still searches its
+    /// own data directory after `-L`, so a full build loses nothing. `None`
+    /// for the stock emulator, which needs no help, and when `PATH` holds
+    /// no stock QEMU with a data directory.
+    pub fn data_dir(&self, arch: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+        self.qemu_binary.as_ref()?;
+        stock_data_dir(arch, path)
+    }
+}
+
+/// The stock QEMU's data directory: `<prefix>/share/qemu` for the
+/// `qemu-system-<arch>` the search path `path` finds (symlinks followed,
+/// so a `/usr/local/bin` link into `/opt/qemu/bin` reads `/opt/qemu`), and
+/// only when that directory exists.
+pub fn stock_data_dir(arch: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let bin = super::emulator_binary(arch);
+    let found = std::env::split_paths(path?)
+        .map(|d| d.join(&bin))
+        .find(|p| p.is_file())?;
+    let real = found.canonicalize().unwrap_or(found);
+    let dir = real.parent()?.parent()?.join("share/qemu");
+    dir.is_dir().then_some(dir)
+}
+
+/// A host GPU's `qemu_binary` must be a runnable file, and one named
+/// `qemu-system-<a>` must be for the VM's QEMU arch; a name of any other
+/// form is taken as given. `arch` is `None` where the VM's arch is not
+/// known yet (validation of a registry template), which skips that check.
+pub fn check_qemu_binary(gpu: &str, binary: &Path, arch: Option<&str>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable =
+        std::fs::metadata(binary).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if !runnable {
+        let why = if binary.exists() {
+            "is not an executable file"
+        } else {
+            "does not exist"
+        };
+        bail!("host GPU `{gpu}`: qemu_binary {} {why}", binary.display());
+    }
+    if let Some(arch) = arch
+        && let Some(theirs) = binary
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("qemu-system-"))
+    {
+        let ours = super::qemu_arch(arch);
+        if theirs != ours {
+            bail!(
+                "host GPU `{gpu}`: qemu_binary {} emulates {theirs}, but this VM is {ours} \
+                 (it would need qemu-system-{ours})",
+                binary.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Lay a host GPU's `qemu_env` over the derived environment (§5.2): each
+/// variable replaces any value vmlab derived for the same name, because an
+/// explicit host setting beats a derived one. A name that is empty or
+/// carries `=` is refused by the GPU's name.
+pub fn apply_qemu_env(gpu: &str, env: &mut ChildEnv, extra: &[(String, String)]) -> Result<()> {
+    for (key, value) in extra {
+        if let Some(why) = crate::config::host::env_key_problem(key) {
+            bail!("host GPU `{gpu}`: qemu_env has {why}: `{key}`");
+        }
+        env.set.retain(|(k, _)| k != key);
+        env.set.push((key.clone(), value.clone()));
+    }
+    Ok(())
+}
+
 /// Decide a VM's [`RenderPlan`] before the emulator spawns (ADR-0003): pick
 /// the host GPU, then ask sysfs about its address — a PCI device for
 /// `passthrough`, a render node for `virgl`/`vulkan` — and name the GPU in
-/// any refusal. Its `vulkan_icd` must exist.
-pub fn render_plan(gpu: Option<&Gpu>, host: &HostConfig, sysfs: &Sysfs) -> Result<RenderPlan> {
+/// any refusal. Its `vulkan_icd` must exist; its `qemu_binary`, in every
+/// mode, must run and suit `arch` (the VM's arch, when known); its
+/// `qemu_env` goes on last.
+pub fn render_plan(
+    gpu: Option<&Gpu>,
+    arch: Option<&str>,
+    host: &HostConfig,
+    sysfs: &Sysfs,
+) -> Result<RenderPlan> {
     let Some(gpu) = gpu else {
         return Ok(RenderPlan {
             env: emulator_env(false, None, None),
@@ -298,22 +393,29 @@ pub fn render_plan(gpu: Option<&Gpu>, host: &HostConfig, sysfs: &Sysfs) -> Resul
         sysfs.device(&decl.address).with_context(context)?;
         plan.passthrough = Some(decl.address.clone());
         plan.env = emulator_env(false, None, None);
-        return Ok(plan);
+    } else {
+        plan.gpu = decl
+            .map(|g| sysfs.resolve(&g.address))
+            .transpose()
+            .with_context(context)?;
+        let vulkan = gpu.mode == GpuMode::Vulkan;
+        let icd = decl
+            .and_then(|g| g.vulkan_icd.as_deref())
+            .filter(|_| vulkan);
+        if let Some(icd) = icd
+            && !icd.is_file()
+        {
+            bail!("{}: vulkan_icd {} does not exist", context(), icd.display());
+        }
+        plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd);
     }
-    plan.gpu = decl
-        .map(|g| sysfs.resolve(&g.address))
-        .transpose()
-        .with_context(context)?;
-    let vulkan = gpu.mode == GpuMode::Vulkan;
-    let icd = decl
-        .and_then(|g| g.vulkan_icd.as_deref())
-        .filter(|_| vulkan);
-    if let Some(icd) = icd
-        && !icd.is_file()
-    {
-        bail!("{}: vulkan_icd {} does not exist", context(), icd.display());
+    if let Some(decl) = decl {
+        if let Some(binary) = &decl.qemu_binary {
+            check_qemu_binary(&decl.name, binary, arch)?;
+            plan.qemu_binary = Some(binary.clone());
+        }
+        apply_qemu_env(&decl.name, &mut plan.env, &decl.qemu_env)?;
     }
-    plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd);
     Ok(plan)
 }
 
@@ -523,6 +625,12 @@ mod tests {
         );
     }
 
+    /// [`super::render_plan`] for an x86_64 VM, the arch every test here
+    /// but the arch checks runs.
+    fn render_plan(gpu: Option<&Gpu>, host: &HostConfig, sysfs: &Sysfs) -> Result<RenderPlan> {
+        super::render_plan(gpu, Some("x86_64"), host, sysfs)
+    }
+
     fn gpu(mode: GpuMode, host_gpu: Option<&str>) -> Gpu {
         Gpu {
             mode,
@@ -537,6 +645,8 @@ mod tests {
             address: address.into(),
             vulkan_icd: None,
             default,
+            qemu_binary: None,
+            qemu_env: Vec::new(),
         }
     }
 
@@ -790,5 +900,228 @@ mod tests {
                 ("0000:00:02.0", "i915"),
             ]
         );
+    }
+
+    /// An executable file with `name` under `dir`, standing in for a QEMU.
+    fn fake_qemu(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = dir.join(name);
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// This host with `Nvidia1` carrying its own QEMU and environment.
+    fn host_with_qemu(binary: &Path, env: &[(&str, &str)]) -> HostConfig {
+        let mut h = host();
+        h.gpus[1].qemu_binary = Some(binary.to_path_buf());
+        h.gpus[1].qemu_env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        h
+    }
+
+    /// Every VM on a host GPU with a `qemu_binary` runs it — passthrough
+    /// included — and a VM on another GPU runs the stock emulator.
+    #[test]
+    fn a_host_gpus_qemu_binary_runs_its_vms_in_every_mode() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let bin = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-x86_64");
+        let mut h = host_with_qemu(&bin, &[]);
+        h.gpus[1].address = "0000:03:00.0".into();
+        let pt = render_plan(Some(&gpu(GpuMode::Passthrough, None)), &h, &sysfs).unwrap();
+        assert_eq!(pt.qemu_binary.as_deref(), Some(bin.as_path()));
+        assert_eq!(pt.emulator("x86_64"), bin.display().to_string());
+        let h = host_with_qemu(&bin, &[]);
+        for mode in [GpuMode::Virgl, GpuMode::Vulkan] {
+            let plan = render_plan(Some(&gpu(mode, None)), &h, &sysfs).unwrap();
+            assert_eq!(plan.qemu_binary.as_deref(), Some(bin.as_path()));
+        }
+        let amd = render_plan(Some(&gpu(GpuMode::Vulkan, Some("AMD1"))), &h, &sysfs).unwrap();
+        assert_eq!(amd.qemu_binary, None);
+        assert_eq!(amd.emulator("x86_64"), "qemu-system-x86_64");
+        assert_eq!(render_plan(None, &h, &sysfs).unwrap().qemu_binary, None);
+    }
+
+    /// A `qemu_binary` named for another arch is refused, naming both; a
+    /// name of another form is taken as given; an unknown VM arch skips
+    /// the check.
+    #[test]
+    fn a_qemu_binary_for_another_arch_is_refused_naming_both() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let arm = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-aarch64");
+        let h = host_with_qemu(&arm, &[]);
+        let e = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("host GPU `Nvidia1`")
+                && e.contains("emulates aarch64, but this VM is x86_64"),
+            "{e}"
+        );
+        assert!(super::render_plan(Some(&gpu(GpuMode::Vulkan, None)), None, &h, &sysfs).is_ok());
+        let odd = fake_qemu(&sys.path().join("opt/bin"), "qemu-vmlab");
+        let h = host_with_qemu(&odd, &[]);
+        let plan = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs).unwrap();
+        assert_eq!(plan.qemu_binary.as_deref(), Some(odd.as_path()));
+        // `x86` is QEMU's `x86_64`.
+        let bin = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-x86_64");
+        let h = host_with_qemu(&bin, &[]);
+        assert!(
+            super::render_plan(Some(&gpu(GpuMode::Vulkan, None)), Some("x86"), &h, &sysfs).is_ok()
+        );
+    }
+
+    /// A `qemu_binary` that is missing, or is there but cannot run, is
+    /// refused naming the host GPU and the path.
+    #[test]
+    fn a_missing_or_non_executable_qemu_binary_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let gone = sys.path().join("nope/qemu-system-x86_64");
+        let e = render_plan(
+            Some(&gpu(GpuMode::Vulkan, None)),
+            &host_with_qemu(&gone, &[]),
+            &sysfs,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            e,
+            format!(
+                "host GPU `Nvidia1`: qemu_binary {} does not exist",
+                gone.display()
+            )
+        );
+        let flat = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-x86_64");
+        std::fs::set_permissions(&flat, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = render_plan(
+            Some(&gpu(GpuMode::Vulkan, None)),
+            &host_with_qemu(&flat, &[]),
+            &sysfs,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            e,
+            format!(
+                "host GPU `Nvidia1`: qemu_binary {} is not an executable file",
+                flat.display()
+            )
+        );
+        let dir = sys.path().join("opt");
+        let e = render_plan(
+            Some(&gpu(GpuMode::Vulkan, None)),
+            &host_with_qemu(&dir, &[]),
+            &sysfs,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("is not an executable file"), "{e}");
+    }
+
+    /// `-L` is the stock QEMU's `<prefix>/share/qemu`, handed only to a
+    /// host GPU's own QEMU and only when the directory exists.
+    #[test]
+    fn data_dir_is_the_stock_prefix_and_only_for_a_host_gpus_qemu() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let prefix = sys.path().join("usr");
+        fake_qemu(&prefix.join("bin"), "qemu-system-x86_64");
+        let path = std::env::join_paths([sys.path().join("empty"), prefix.join("bin")]).unwrap();
+        let path = Some(path.as_os_str());
+        let own = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-x86_64");
+        let h = host_with_qemu(&own, &[]);
+        let plan = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs).unwrap();
+        // No share/qemu under the stock prefix: nothing to hand over.
+        assert_eq!(plan.data_dir("x86_64", path), None);
+        std::fs::create_dir_all(prefix.join("share/qemu")).unwrap();
+        assert_eq!(
+            plan.data_dir("x86_64", path),
+            Some(prefix.join("share/qemu").canonicalize().unwrap())
+        );
+        // The stock emulator finds its own data; no stock QEMU, no `-L`.
+        let amd = render_plan(Some(&gpu(GpuMode::Vulkan, Some("AMD1"))), &h, &sysfs).unwrap();
+        assert_eq!(amd.data_dir("x86_64", path), None);
+        assert_eq!(plan.data_dir("aarch64", path), None);
+        assert_eq!(plan.data_dir("x86_64", None), None);
+    }
+
+    /// A stock QEMU reached through a symlink reads the prefix it lives in.
+    #[test]
+    fn the_stock_data_dir_follows_a_symlinked_emulator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = fake_qemu(&tmp.path().join("opt/qemu/bin"), "qemu-system-x86_64");
+        std::fs::create_dir_all(tmp.path().join("opt/qemu/share/qemu")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("local/bin")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("local/bin/qemu-system-x86_64")).unwrap();
+        let path = tmp.path().join("local/bin");
+        assert_eq!(
+            stock_data_dir("x86_64", Some(path.as_os_str())),
+            Some(
+                tmp.path()
+                    .join("opt/qemu/share/qemu")
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
+    }
+
+    /// `qemu_env` lands after the derived loader filter and wins over it:
+    /// an explicit host setting beats a derived one.
+    #[test]
+    fn qemu_env_is_applied_after_the_derived_filter_and_wins() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let bin = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-x86_64");
+        let h = host_with_qemu(&bin, &[("VKR_DEBUG", "validate")]);
+        let plan = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs).unwrap();
+        assert_eq!(
+            set(&plan.env),
+            [
+                ("VK_LOADER_DRIVERS_SELECT", "*nvidia*"),
+                ("VKR_DEBUG", "validate")
+            ]
+        );
+        let h = host_with_qemu(&bin, &[("VK_LOADER_DRIVERS_SELECT", "*nvidia_icd*")]);
+        let plan = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs).unwrap();
+        assert_eq!(
+            set(&plan.env),
+            [("VK_LOADER_DRIVERS_SELECT", "*nvidia_icd*")]
+        );
+        // The inherited loader variables are still stripped first.
+        assert_eq!(plan.env.remove.len(), VULKAN_ENV_VARS.len());
+        // Passthrough runs under it too.
+        let mut h = host_with_qemu(&bin, &[("VKR_DEBUG", "validate")]);
+        h.gpus[1].address = "0000:03:00.0".into();
+        let pt = render_plan(Some(&gpu(GpuMode::Passthrough, None)), &h, &sysfs).unwrap();
+        assert_eq!(set(&pt.env), [("VKR_DEBUG", "validate")]);
+    }
+
+    /// A `qemu_env` name that is empty or carries `=` is refused by the
+    /// host GPU's name, however the declaration was made.
+    #[test]
+    fn a_bad_qemu_env_key_is_refused_by_name() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let bin = fake_qemu(&sys.path().join("opt/bin"), "qemu-system-x86_64");
+        for (key, why) in [
+            ("", "an empty variable name"),
+            ("A=B", "a variable name containing `=`"),
+        ] {
+            let h = host_with_qemu(&bin, &[(key, "x")]);
+            let e = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &h, &sysfs)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                e,
+                format!("host GPU `Nvidia1`: qemu_env has {why}: `{key}`")
+            );
+        }
     }
 }

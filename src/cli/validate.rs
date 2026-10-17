@@ -57,11 +57,20 @@ impl ValidationContext for HostContext {
         crate::scripting::check_script_source(&source)
     }
 
-    fn check_host_gpu(&self, gpu: &crate::config::model::Gpu) -> Result<(), String> {
+    fn check_host_gpu(
+        &self,
+        gpu: &crate::config::model::Gpu,
+        arch: Option<&str>,
+    ) -> Result<(), String> {
         let host = crate::config::host::HostConfig::load_default().map_err(|e| format!("{e:#}"))?;
-        crate::qemu::hostgpu::render_plan(Some(gpu), &host, &crate::qemu::hostgpu::Sysfs::host())
-            .map(|_| ())
-            .map_err(|e| format!("{e:#}"))
+        crate::qemu::hostgpu::render_plan(
+            Some(gpu),
+            arch,
+            &host,
+            &crate::qemu::hostgpu::Sysfs::host(),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
     }
 
     fn check_virtiofs_share(&self, share: &crate::config::model::Share) -> Result<(), String> {

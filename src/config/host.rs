@@ -68,6 +68,27 @@ pub struct HostGpu {
     /// Marked `default = true`. [`HostConfig::default_gpu`] is the one to
     /// ask: a lone block is the default without it.
     pub default: bool,
+    /// The QEMU every VM on this GPU runs in place of `qemu-system-<arch>`
+    /// on PATH — a patched build the GPU's driver needs. Absolute; whether
+    /// it exists, runs and suits the VM's arch is asked at resolution
+    /// (`qemu::hostgpu::render_plan`), since a host config is read on
+    /// machines that never start a VM.
+    pub qemu_binary: Option<std::path::PathBuf>,
+    /// Variables set in the QEMU process's own environment, in key order,
+    /// after vmlab's derived Vulkan loader variables — so these win.
+    pub qemu_env: Vec<(String, String)>,
+}
+
+/// Why `key` cannot name an environment variable: empty, or carrying the
+/// `=` that ends a name in `environ`. `None` for a usable name.
+pub fn env_key_problem(key: &str) -> Option<&'static str> {
+    if key.is_empty() {
+        Some("an empty variable name")
+    } else if key.contains('=') {
+        Some("a variable name containing `=`")
+    } else {
+        None
+    }
 }
 
 /// What `gpu_address` says now that it is gone (PRD §5.2).
@@ -171,11 +192,35 @@ impl HostConfig {
             let (Some(name), Some(address)) = (r.label(), r.required_string("address")) else {
                 continue;
             };
+            let qemu_binary = r.path("qemu_binary");
+            if let Some(path) = &qemu_binary
+                && !path.value.is_absolute()
+            {
+                r.issue_at(
+                    path.span,
+                    format!(
+                        "host gpu \"{name}\": `qemu_binary` must be an absolute path, got `{}`",
+                        path.value.display()
+                    ),
+                );
+            }
+            let mut qemu_env = r.string_map("qemu_env");
+            qemu_env.retain(|(key, _)| match env_key_problem(key) {
+                Some(why) => {
+                    r.issue(format!(
+                        "host gpu \"{name}\": `qemu_env` has {why}: `{key}`"
+                    ));
+                    false
+                }
+                None => true,
+            });
             let gpu = HostGpu {
                 name,
                 address: address.value,
                 vulkan_icd: r.path("vulkan_icd").unspan(),
                 default: r.bool("default").unspan().unwrap_or(false),
+                qemu_binary: qemu_binary.unspan(),
+                qemu_env,
             };
             if let Some(prev) = cfg
                 .gpus
@@ -376,6 +421,76 @@ gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/
         assert_eq!(cfg.default_gpu().unwrap().name, "Nvidia1");
         assert_eq!(cfg.gpu("nvidia2").unwrap().name, "Nvidia2");
         assert!(cfg.gpu("Nope").is_none());
+    }
+
+    /// A host GPU carries its own QEMU and the variables that QEMU runs
+    /// under; a GPU that names neither has neither.
+    #[test]
+    fn parses_a_host_gpus_qemu_binary_and_env() {
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1" { address = "0000:72:00.0" }
+gpu "Nvidia1" {
+  address     = "0000:01:00.0"
+  default     = true
+  qemu_binary = "/opt/qemu-vmlab/bin/qemu-system-x86_64"
+  qemu_env    = { VKR_DEBUG: "validate", RENDER_SERVER_EXEC_PATH: "/opt/virgl/virgl_render_server" }
+}
+"#,
+            "<test>",
+        )
+        .unwrap();
+        let nv = cfg.gpu("Nvidia1").unwrap();
+        assert_eq!(
+            nv.qemu_binary.as_deref(),
+            Some(Path::new("/opt/qemu-vmlab/bin/qemu-system-x86_64"))
+        );
+        assert_eq!(
+            nv.qemu_env,
+            [
+                (
+                    "RENDER_SERVER_EXEC_PATH".to_string(),
+                    "/opt/virgl/virgl_render_server".to_string()
+                ),
+                ("VKR_DEBUG".into(), "validate".into()),
+            ]
+        );
+        let amd = cfg.gpu("AMD1").unwrap();
+        assert!(amd.qemu_binary.is_none() && amd.qemu_env.is_empty());
+    }
+
+    /// A relative `qemu_binary` would resolve against whatever directory
+    /// the daemon runs in, and a `qemu_env` value must be a string.
+    #[test]
+    fn rejects_a_relative_qemu_binary_and_a_non_string_env_value() {
+        let err = host_err(
+            "gpu \"Nvidia1\" { address = \"0000:01:00.0\"  qemu_binary = \"bin/qemu\" }\n",
+        );
+        assert!(
+            err.contains(
+                "host gpu \"Nvidia1\": `qemu_binary` must be an absolute path, got `bin/qemu`"
+            ),
+            "{err}"
+        );
+        let err = host_err("gpu \"Nvidia1\" { address = \"0000:01:00.0\"  qemu_env = { N: 3 } }\n");
+        assert!(err.contains("`qemu_env.N` must be a string"), "{err}");
+        let err = host_err("gpu \"Nvidia1\" { address = \"0000:01:00.0\"  qemu_env = \"A=1\" }\n");
+        assert!(
+            err.contains("`qemu_env` must be a record of strings"),
+            "{err}"
+        );
+    }
+
+    /// An environment name may be neither empty nor carry `=`, which ends
+    /// a name in `environ`.
+    #[test]
+    fn an_empty_or_equals_bearing_env_key_is_refused() {
+        assert_eq!(env_key_problem(""), Some("an empty variable name"));
+        assert_eq!(
+            env_key_problem("A=B"),
+            Some("a variable name containing `=`")
+        );
+        assert_eq!(env_key_problem("VKR_DEBUG"), None);
     }
 
     /// One declared GPU is the default without saying so; two unmarked

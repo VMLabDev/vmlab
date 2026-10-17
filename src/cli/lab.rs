@@ -600,6 +600,10 @@ fn machine_detail(m: &MachineStatus) -> String {
             if let Some(gpu) = &vm.host_gpu {
                 field("host_gpu", gpu.clone());
             }
+            // Only when that host GPU ran its own QEMU, not the stock one.
+            if let Some(qemu) = &vm.qemu_binary {
+                field("qemu", qemu.clone());
+            }
         }
         MachineDetail::Container(c) => {
             field(
@@ -2316,6 +2320,31 @@ mod tests {
         let lines: Vec<&str> = out.lines().filter(|l| l.contains("state=")).collect();
         assert!(lines[0].ends_with(" host_gpu=AMD1"), "got:\n{out}");
         assert!(!lines[1].contains("host_gpu"), "got:\n{out}");
+        assert!(!out.contains(" qemu="), "got:\n{out}");
+    }
+
+    /// A VM whose host GPU ran its own QEMU names it beside the GPU (§5.2).
+    #[test]
+    fn verbose_names_a_host_gpus_own_qemu() {
+        let MachineDetail::Vm(mut detail) = vm() else {
+            unreachable!()
+        };
+        detail.host_gpu = Some("Nvidia1".into());
+        detail.qemu_binary = Some("/opt/qemu-vmlab/bin/qemu-system-x86_64".into());
+        let out = render_status(
+            &lab(vec![addressed(
+                "gl01",
+                PowerState::Running,
+                true,
+                MachineDetail::Vm(detail),
+            )]),
+            true,
+        );
+        let line = out.lines().find(|l| l.contains("state=")).unwrap();
+        assert!(
+            line.ends_with(" host_gpu=Nvidia1 qemu=/opt/qemu-vmlab/bin/qemu-system-x86_64"),
+            "got:\n{out}"
+        );
     }
 
     /// A machine a repair verb changed in place says so wherever its state is

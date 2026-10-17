@@ -46,10 +46,12 @@ pub trait ValidationContext {
     /// Can this host give a `gpu {}` its host GPU (PRD §5.2)? The same
     /// pick and sysfs resolution a start runs: a passthrough `host_gpu` this
     /// host lacks, or nothing to pick, or a picked GPU sysfs or its
-    /// `vulkan_icd` does not bear out. The reason when not. A paravirtual
+    /// `vulkan_icd` or `qemu_binary` does not bear out — the latter judged
+    /// against `arch`, the VM's arch where it is known. The reason when not.
+    /// A paravirtual
     /// name this host lacks is a warning, not this. A permissive context
     /// answers `Ok`.
-    fn check_host_gpu(&self, _gpu: &Gpu) -> Result<(), String> {
+    fn check_host_gpu(&self, _gpu: &Gpu, _arch: Option<&str>) -> Result<(), String> {
         Ok(())
     }
 
@@ -293,7 +295,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             check_disk_block(&file.root, d, &mut issues);
         }
         if let Some(gpu) = &vm.gpu {
-            check_gpu(&vm.name, gpu, ctx, &mut issues);
+            check_gpu(&vm.name, gpu, vm_arch(vm).as_deref(), ctx, &mut issues);
         }
         for path in [&vm.cdrom, &vm.floppy].into_iter().flatten() {
             if !file.root.join(path).is_file() {
@@ -1288,7 +1290,13 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
 
 /// A VM's `gpu {}` (PRD §5.2): `host_gpu`, when written, names something,
 /// and this host can give the block its host GPU.
-fn check_gpu(vm: &str, gpu: &Gpu, ctx: &dyn ValidationContext, issues: &mut IssueList) {
+fn check_gpu(
+    vm: &str,
+    gpu: &Gpu,
+    arch: Option<&str>,
+    ctx: &dyn ValidationContext,
+    issues: &mut IssueList,
+) {
     if gpu.host_gpu.as_deref().is_some_and(|n| n.trim().is_empty()) {
         issues.push(Issue::at(
             gpu.span,
@@ -1296,7 +1304,7 @@ fn check_gpu(vm: &str, gpu: &Gpu, ctx: &dyn ValidationContext, issues: &mut Issu
         ));
         return;
     }
-    if let Err(why) = ctx.check_host_gpu(gpu) {
+    if let Err(why) = ctx.check_host_gpu(gpu, arch) {
         issues.push(Issue::at(gpu.span, format!("vm \"{vm}\": {why}")));
     }
 }
@@ -2155,8 +2163,8 @@ lab "l" {
         fn check_script(&self, _: &Path) -> Result<(), String> {
             Ok(())
         }
-        fn check_host_gpu(&self, gpu: &Gpu) -> Result<(), String> {
-            crate::qemu::hostgpu::render_plan(Some(gpu), &self.1, &self.0)
+        fn check_host_gpu(&self, gpu: &Gpu, arch: Option<&str>) -> Result<(), String> {
+            crate::qemu::hostgpu::render_plan(Some(gpu), arch, &self.1, &self.0)
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
         }
@@ -2210,6 +2218,45 @@ lab "l" {{ vm "a" {{ template = "x86_64/t" gpu {{ {gpu} }} }} }}"#
         assert!(gpu_errs(r#"mode = "passthrough" host_gpu = "Vfio1""#).is_empty());
         let es = gpu_errs(r#"mode = "vulkan" host_gpu = """#);
         assert!(es.len() == 1 && es[0].contains("empty string"), "{es:#?}");
+    }
+
+    /// The VM's arch reaches the host GPU check, so a `qemu_binary` for
+    /// another arch, or one that is not there, fails validation (§5.2).
+    #[test]
+    fn a_host_gpus_qemu_binary_is_checked_against_the_vms_arch() {
+        use std::os::unix::fs::PermissionsExt;
+        let sys = crate::qemu::hostgpu::testing::fake_host();
+        let arm = sys.path().join("qemu-system-aarch64");
+        std::fs::write(&arm, "").unwrap();
+        std::fs::set_permissions(&arm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let errs = |binary: &Path| -> Vec<String> {
+            let host = crate::config::host::HostConfig::parse(
+                &format!(
+                    "import <vmlab-host.wcl>\ngpu \"Nvidia1\" {{ address = \"0000:01:00.0\"  qemu_binary = \"{}\" }}\n",
+                    binary.display()
+                ),
+                "<host>",
+            )
+            .unwrap();
+            let f = lab(r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" gpu { mode = "vulkan" } } }"#);
+            validate(
+                &f,
+                &FakeGpus(crate::qemu::hostgpu::Sysfs::new(sys.path()), host),
+            )
+            .into_iter()
+            .map(|i| i.message)
+            .collect()
+        };
+        let es = errs(&arm);
+        assert!(
+            es.len() == 1
+                && es[0].starts_with("vm \"a\": host GPU `Nvidia1`")
+                && es[0].contains("emulates aarch64, but this VM is x86_64"),
+            "{es:#?}"
+        );
+        let es = errs(&sys.path().join("gone/qemu-system-x86_64"));
+        assert!(es.len() == 1 && es[0].contains("does not exist"), "{es:#?}");
     }
 
     /// §19.2's first rule: the Windows agent is LocalSystem and mints the

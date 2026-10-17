@@ -265,6 +265,8 @@ pub struct VmInstance {
     wake_cause: std::sync::Mutex<Option<WakeCause>>,
     /// The declared host GPU the last start picked (§5.2), for status.
     host_gpu: std::sync::Mutex<Option<String>>,
+    /// That host GPU's `qemu_binary`, when the last start ran one (§5.2).
+    qemu_binary: std::sync::Mutex<Option<PathBuf>>,
     qemu: Mutex<Option<Arc<dyn Process>>>,
     swtpm: Mutex<Option<Arc<dyn Process>>>,
     /// Per-share virtiofsd daemons of the current run (§7.5). Killed on
@@ -355,6 +357,7 @@ impl VmInstance {
             stop_requested: RwLock::new(false),
             wake_cause: std::sync::Mutex::new(None),
             host_gpu: std::sync::Mutex::new(None),
+            qemu_binary: std::sync::Mutex::new(None),
             qemu: Mutex::new(None),
             swtpm: Mutex::new(None),
             virtiofsd: Mutex::new(Vec::new()),
@@ -673,6 +676,7 @@ impl VmInstance {
             virtiofs_shares,
             gpu_render_node: render.gpu.as_ref().map(|g| g.render_node.clone()),
             gpu_passthrough: render.passthrough.clone(),
+            qemu_data_dir: render.data_dir(&t.resolved.arch, std::env::var_os("PATH").as_deref()),
         })
     }
 
@@ -685,6 +689,7 @@ impl VmInstance {
         let host = crate::config::host::HostConfig::load_default()?;
         let plan = qemu::hostgpu::render_plan(
             t.resolved.gpu.as_ref(),
+            Some(&t.resolved.arch),
             &host,
             &qemu::hostgpu::Sysfs::host(),
         )
@@ -693,6 +698,7 @@ impl VmInstance {
             tracing::warn!("{}: {warning}", self.cfg.name);
         }
         *self.host_gpu.lock_recover() = plan.name.clone();
+        *self.qemu_binary.lock_recover() = plan.qemu_binary.clone();
         Ok(plan)
     }
 
@@ -893,7 +899,7 @@ impl VmInstance {
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
-                    binary: qemu::emulator_binary(&t.resolved.arch),
+                    binary: render.emulator(&t.resolved.arch),
                     args,
                     env: render.env,
                     log: self.dirs.logs.join("qemu.log"),
@@ -1414,13 +1420,21 @@ impl super::machine::Machine for VmInstance {
     }
 
     /// The per-arch emulator, `qemu-img` for the clone, and `swtpm` when the
-    /// resolved hardware wants a TPM.
+    /// resolved hardware wants a TPM. A VM whose host GPU carries its own
+    /// `qemu_binary` needs no emulator on PATH: the start checks that one
+    /// itself, naming the GPU (§5.2).
     fn required_binaries(&self) -> Vec<String> {
         let t = self.template();
-        let mut needed = vec![
-            "qemu-img".to_string(),
-            qemu::emulator_binary(&t.resolved.arch),
-        ];
+        let mut needed = vec!["qemu-img".to_string()];
+        let own_qemu = t.resolved.gpu.as_ref().is_some_and(|gpu| {
+            crate::config::host::HostConfig::load_default().is_ok_and(|host| {
+                qemu::hostgpu::pick(gpu, &host)
+                    .is_ok_and(|p| p.gpu.is_some_and(|g| g.qemu_binary.is_some()))
+            })
+        });
+        if !own_qemu {
+            needed.push(qemu::emulator_binary(&t.resolved.arch));
+        }
         if t.resolved.tpm {
             needed.push("swtpm".to_string());
         }
@@ -1826,6 +1840,11 @@ impl super::machine::Machine for VmInstance {
                 .answered_version()
                 .or_else(|| self.template().agent_version.clone()),
             host_gpu: self.host_gpu.lock_recover().clone(),
+            qemu_binary: self
+                .qemu_binary
+                .lock_recover()
+                .as_ref()
+                .map(|p| p.display().to_string()),
         })
     }
 }

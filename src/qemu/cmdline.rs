@@ -57,6 +57,10 @@ pub struct VmPaths {
     /// The host PCI address a `passthrough` GPU hands the guest: the
     /// declared host GPU the lab daemon picked (`hostgpu::render_plan`).
     pub gpu_passthrough: Option<String>,
+    /// A data directory searched ahead of QEMU's own (`-L`): the stock
+    /// QEMU's, handed to a host GPU's `qemu_binary` so a minimal build finds
+    /// its firmware and ROMs (`hostgpu::RenderPlan::data_dir`).
+    pub qemu_data_dir: Option<PathBuf>,
 }
 
 /// The qdev id of a VM's install CD-ROM device (see
@@ -266,6 +270,9 @@ pub fn build_args(
     let mut a: Vec<String> = Vec::new();
 
     arg(&mut a, "name", format!("vmlab:{lab}/{}", vm.name));
+    if let Some(dir) = &paths.qemu_data_dir {
+        arg(&mut a, "L", dir.display().to_string());
+    }
     // vhost-user-fs shares need the guest RAM in shared memory. Only VMs
     // that carry one get the memfd backend: it renames the RAM block in
     // internal snapshots (pc.ram → mem0), so the plain `-m` shape stays
@@ -1145,6 +1152,19 @@ mod tests {
         p.gpu_passthrough = Some("0000:01:00.0".into());
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(s.contains("-device vfio-pci,host=0000:01:00.0"), "{s}");
+    }
+
+    /// A data directory the lab daemon resolved becomes `-L`; without one
+    /// the argv names none.
+    #[test]
+    fn a_qemu_data_dir_becomes_dash_l() {
+        let vm = resolved_gpu("vulkan", "x86_64");
+        let mut p = paths();
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(!s.contains("-L "), "{s}");
+        p.qemu_data_dir = Some("/usr/share/qemu".into());
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(s.contains(" -L /usr/share/qemu "), "{s}");
     }
 
     /// A resolved host GPU puts its render node on the `egl-headless`

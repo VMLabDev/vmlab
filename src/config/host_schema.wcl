@@ -52,4 +52,13 @@ type HostGpu {
   vulkan_icd: utf8?
   @doc("The GPU a lab gets when it names none; at most one block; a lone block is the default without it")
   default: bool?
+  @doc("Absolute path to the QEMU every VM on this GPU runs instead of `qemu-system-<arch>` on PATH; its arch must be the VM's")
+  qemu_binary: utf8?
+  @doc("Variables set in the QEMU process's environment, `{ KEY: \"value\" }`; they win over the Vulkan loader variables vmlab derives")
+  @schemaless qemu_env: QemuEnv?
 }
+
+// `qemu_env`'s shape: a record of strings, keyed by variable name. WCL has
+// no map type, so the field is schemaless and the extractor checks each
+// value is a string.
+type QemuEnv {}
