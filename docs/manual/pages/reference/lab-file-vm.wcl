@@ -328,9 +328,34 @@ SRC
     rows:
       | "Field" | "Type" | "Default" | "Meaning" |
       | "`mode`" | "utf8" | "required" | "`passthrough`, `virgl` or `vulkan`." |
-      | "`address`" | "utf8" | "none" | "Host PCI address, for example `0000:01:00.0`. Required for `passthrough`." |
+      | "`address`" | "utf8" | "host `gpu_address`" | "Host PCI address, for example `0000:01:00.0`. Under `passthrough` the device handed to the VM, and required. Under `virgl` and `vulkan` the host GPU that renders; without it, and without a host config default, QEMU chooses." |
+      | "`vulkan_icd`" | "utf8" | "none" | "Path to a Vulkan ICD JSON the renderer loads, set as `VK_DRIVER_FILES`. Overrides the driver picked from the GPU at `address`. `vulkan` only." |
   }
-  p "Validation rejects `passthrough` without an `address`."
+  p <<DOC
+    A paravirtual GPU is the guest's only display adapter: `virtio-vga-gl` on
+    x86 machines, `virtio-gpu-gl` with `-vga none` on `virt`. `vulkan` adds
+    `venus=true,blob=true,hostmem=4G`.
+  DOC
+  p <<DOC
+    On a host with several GPUs, name the one that renders. vmlab reads its
+    render node and kernel driver from `/sys/bus/pci/devices/<address>/`. The
+    render node goes on the `egl-headless` display. Under `vulkan` the driver
+    sets `VK_LOADER_DRIVERS_SELECT` in QEMU's environment: `*radeon*` for
+    `amdgpu`, `*intel*` for `i915` and `xe`, `*nvidia*` for `nvidia`. The other
+    Vulkan loader variables are cleared, and `MESA_VK_DEVICE_SELECT` is never
+    set, because it breaks Venus. `vmlab up` warns when a virgl or vulkan VM
+    names no GPU and the host has more than one render node. Each run's
+    `qemu.log` starts with the QEMU command line and the variables vmlab set.
+  DOC
+  code wcl { source = <<'SRC'
+gpu { mode = "vulkan" address = "0000:72:00.0" }
+SRC
+  }
+  p <<DOC
+    Validation rejects `passthrough` without an `address`; a virgl or vulkan
+    `address` with no PCI device or no render node; a `vulkan_icd` that does
+    not exist; and `vulkan_icd` outside `vulkan` mode.
+  DOC
 
   h2 "provision {}"
   p <<DOC

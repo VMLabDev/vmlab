@@ -60,6 +60,7 @@ host {
   config_weave_bin_dir = "~/.local/share/config-weave/bin"
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
+  gpu_address          = "0000:72:00.0"
 }
 SRC
   }
@@ -80,6 +81,7 @@ SRC
       | "`config_weave_bin_dir`" | "utf8" | "`~/.local/share/config-weave/bin`" | "Directory holding the config-weave guest binaries playbooks push." |
       | "`workspace_max_file`" | "ByteSize" | "`256MiB`" | "Workspace syncer per-file size guard. A larger file is refused by name." |
       | "`firmware_dir`" | "utf8" | "none" | "UEFI firmware override, laid out `<dir>/<arch>/` with the bundled set's file names. Searched before vmlab's bundled firmware and the host's." |
+      | "`gpu_address`" | "utf8" | "none" | "Host PCI address of the GPU a virgl or vulkan `gpu {}` renders on when the lab names none. Keeps labs portable between hosts. See [gpu {}](ref_vm)." |
   }
   p "The parser enforces these rules, and reports every violation in one pass:"
   list {
