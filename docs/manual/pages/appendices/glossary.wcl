@@ -20,6 +20,7 @@ page apx_glossary {
     rows:
       | "Term" | "Meaning" |
       | "agent" | "`vmlab-agent`, the process vmlab runs inside every guest, listening on the `vmlab.agent.0` virtio-serial port. It carries exec, terminals, file transfer, the workspace watch, metrics and the clipboard. It is baked into a template at build time and shipped with the host for containers. See [How vmlab runs a lab](guide_architecture)." |
+      | "base" | "The one disk of a template version its variants are built on. Unsealed on a template with variants, so a lab machine cannot clone it: `#base` is refused outside a build. See [Templates](guide_templates)." |
       | "dev machine" | "A machine carrying the `@dev` decorator: a machine with a synced workspace, which vmlab keeps in step with a host directory. A lab may mark one of them `default = true`. See [Dev machines and the workspace syncer](guide_dev)." |
       | "event" | "A named occurrence in a lab, such as `vm.crashed` or `host.disk_low`, carried on the lab's event stream and written to the event log. See [Events and handlers](guide_events) and the [Events](ref_events) reference." |
       | "fabric" | "The userspace network vmlab runs every segment on: frame codecs, an L2 switch, DHCP, DNS, a gateway and a NAT engine, all in the lab daemon's process. No tap, bridge or macvlan. See [Networking](guide_networking)." |
@@ -58,6 +59,7 @@ page apx_glossary {
       | "syncer" | "The workspace syncer: the loop in the lab daemon that keeps a dev machine's workspace and the host tree in step, both ways, as the machine's default login. See [Dev machines and the workspace syncer](guide_dev)." |
       | "template" | "A sealed, read-only disk image in the store that VMs clone from. Built from an ISO or cloud image by a `template {}` file, or pulled from a registry. See [Templates and the store](guide_templates)." |
       | "trunk" | "The PSK-authenticated TCP link two supervisors bridge a global segment over, so machines on two hosts share one L2 segment. The listen port is `trunk_port` in host config. See [Networking](guide_networking)." |
+      | "variant" | "A named, sealed disk state of a template version, stored as a qcow2 overlay on its base and selected with `#<name>`. A reference without `#` selects the default variant. Not a snapshot. See [Templates](guide_templates)." |
       | "viewer" | "The VNC client `vmlab up` opens for a machine with `gui = true` and `vmlab console` opens on demand. Chosen from host config, else found on `PATH`. See [Screens, input and vision](guide_vision)." |
       | "VM" | "A `vm {}` in a lab: a QEMU guest booted from a linked clone of a template, or from a blank disk when scratch. See [Lab file: vm and its children](ref_vm)." |
       | "watchdog" | "A supervisor check that fires an event on a host condition, such as `host.disk_low` when the filesystem under the store or a lab's clones passes the configured threshold. See [Events and handlers](guide_events)." |

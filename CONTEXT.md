@@ -160,8 +160,29 @@ _Avoid_: remote app, seamless window, app forwarding, share (that is a folder)
 
 **Template**:
 A sealed, read-only qcow2 disk image in the store, referenced by
-`<arch>/<name>[@<version>]`. Labs boot linked clones of it.
-_Avoid_: image (an image is an OCI container image), base, golden image
+`<arch>/<name>[@<version>][#<variant>]`. Labs boot linked clones of it. A
+template version is one **base** and zero or more **variants**; one with none
+is base-only and is its base.
+_Avoid_: image (an image is an OCI container image), golden image
+
+**Base**:
+The one disk of a template version every variant is built on —
+`<version>/disk.qcow2`. On a template with variants it is *unsealed* (a
+Windows base is installed and updated but not generalized), so a lab machine
+may not clone it: `#base` names it in build contexts only, a variant build or a
+layered `from`. On a base-only template the base is the template, as it always
+was. Its `sha256` is what a variant's `base_sha256` must match.
+_Avoid_: parent, root image
+
+**Variant**:
+A named, sealed disk state of one template version, built from its base and
+stored as a qcow2 overlay on it (`variants/<name>/disk.qcow2`, backed by
+`../../disk.qcow2`). Selected with `#<name>`; a reference with no `#` selects
+the **default variant** — the one marked `default = true`, or a lone one. Its
+metadata is the base's overridden field by field (the **effective metadata**).
+One whose `base_sha256` no longer matches the base is **stale** and refused
+until rebuilt. See ADR-0017.
+_Avoid_: snapshot (that is a VM snapshot, §7.3), flavour, edition, layer
 
 **Linked clone**:
 A copy-on-write qcow2 overlay a machine boots, backed by a template. The

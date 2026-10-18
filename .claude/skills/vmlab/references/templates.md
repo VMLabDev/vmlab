@@ -17,10 +17,49 @@ template layer of the resolution chain (VM > template > profile): a VM that
 does not set `memory` inherits it from here. See lab-file.md and vm.md.
 
 Templates are keyed by **arch, name and version**. A reference is written
-`<arch>/<name>[@<version>]`. The arch is mandatory and never inferred from the
-host, because it selects which QEMU system emulator boots the image. Omitting
-the version means the highest in the store. `vmlab validate` rejects an
-archless reference.
+`<arch>/<name>[@<version>][#<variant>]`. The arch is mandatory and never
+inferred from the host, because it selects which QEMU system emulator boots the
+image. Omitting the version means the highest in the store. `vmlab validate`
+rejects an archless reference.
+
+## Variants
+
+A template version has one **base** disk and zero or more **variants**: named,
+sealed disk states built from the base. The Windows case: the base is installed
+and updated but not sysprepped; variant `standard` only generalizes; variant
+`win3d` installs a GPU driver package, then generalizes, with `secure_boot =
+false`. A template with no variants is base-only and behaves as templates always
+have. Never call a variant a "snapshot" — that is a VM snapshot.
+
+| Reference | Template with variants | Template without variants |
+| --- | --- | --- |
+| no `#` | the default variant | the base |
+| `#<name>` | that variant; unknown names error, listing the variants | error: no variants |
+| `#base` | refused for a lab VM (every clone would share one identity); the base in a variant build or a layered `from` | the base |
+
+- A variant name is `[a-z0-9][a-z0-9-]{0,31}`; `base` is reserved. Registry
+  refs take the suffix after the tag or digest:
+  `ghcr.io/o/windows-11:26100.1742#win3d`.
+- Exactly one variant has `default = true`; a lone variant is the default
+  implicitly. Two or more without exactly one default is invalid metadata.
+- Layout: `<version>/variants/<name>/disk.qcow2`, a qcow2 overlay whose backing
+  file is `../../disk.qcow2` (relative). The version's single `template.wcl`
+  holds a `variant "<name>" { … }` block per variant: `created`, `sha256`,
+  `base_sha256`, optional `default`, `description`, `first_boot_script`,
+  `wscript_surface`, `agent_version`, and hardware overrides (`profile`, `cpus`,
+  `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`).
+  A variant counts only when both its block and its overlay exist.
+- **Effective metadata**: the base's fields with the variant's in their place.
+  Hardware resolution, first boot, the surface check and agent staleness all
+  read it.
+- **Stale**: `base_sha256` differs from the base's `sha256` (the base was
+  rebuilt). Refused until the variant is rebuilt; `template list` flags it.
+- A clone of a variant is the chain clone → variant → base. `clone-source`
+  records the ref with its `#variant`; changing the variant refuses reuse like a
+  changed pin. `status -v` shows `variant=<name>`.
+- `template rm <arch>/<name>@<version>#<variant>` removes one variant; it is
+  refused while a clone is backed by it, for the default while others remain,
+  and for the last one. Removing the version removes every variant.
 
 ## The store
 

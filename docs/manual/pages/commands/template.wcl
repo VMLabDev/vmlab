@@ -160,10 +160,22 @@ SRC
     `--json` the remote answer is folded into each entry as a `remote` field.
   DOC
 
+  p <<DOC
+    A version with variants lists each one on its own line beneath it, as
+    `#<name>` in the `TEMPLATE` column. The `VERSION` column reads `default`
+    for the default variant and `STALE` for one built on an earlier base,
+    which is refused until it is rebuilt. `SIZE` is the variant overlay's own
+    size. Under `--json` each entry carries a `variants` array of objects
+    with `name`, `default`, `stale`, `description`, `created`, `sha256` and
+    `size`; it is empty for a base-only template.
+  DOC
+
   code sh { source = <<'SRC'
 $ vmlab template list
 ARCH     TEMPLATE                          VERSION          SIZE     CREATED
 x86_64   ghcr.io/vmlabdev/win2022          1.2.0            9.8G     2026-08-30
+           #standard                       default          410.2M   2026-08-30
+           #win3d                                           1.1G     2026-08-30
 x86_64   alpine                            0.3.1            180.0M   2026-08-12
 SRC
   }
@@ -212,21 +224,33 @@ SRC
   table {
     rows:
       | "Option" | "Meaning" |
-      | "`<REFERENCE>`" | "The version to remove, `<arch>/<name>[@<version>]`." |
+      | "`<REFERENCE>`" | "The version to remove, `<arch>/<name>@<version>`, or one variant of it, `<arch>/<name>@<version>#<variant>`." |
       | "`--force`" | "Remove even if it backs existing clones." |
       | "`-h`, `--help`" | "Print help." |
   }
 
   p <<DOC
-    `rm` removes one exact store version and prints `removed <arch>/<name>@<version>`.
-    A version that backs a machine's clone is refused unless `--force` is
-    given, because the clone reads its base image from the store. Removing
-    such a version with `--force` breaks every machine cloned from it.
+    `rm` removes one exact store version, with all of its variants, and
+    prints `removed <arch>/<name>@<version>`. A version whose base or any
+    variant backs a machine's clone is refused unless `--force` is given,
+    because the clone reads its image from the store; the refusal names the
+    machines. Removing such a version with `--force` breaks every machine
+    cloned from it.
+  DOC
+
+  p <<DOC
+    With `#<variant>`, `rm` removes that one variant's overlay and its block
+    in the version's metadata, and prints `removed
+    <arch>/<name>@<version>#<variant>`. It is refused while a clone is
+    backed by that variant, unless `--force` is given. It is always refused
+    for the default variant while other variants remain, and for the last
+    variant: either would leave a reference without `#` selecting the
+    unsealed base. Remove the version instead.
   DOC
 
   code sh { source = "vmlab template rm x86_64/win2022@1.1.0" }
 
-  p "Exit status is 0 on success and `failed` (1) when the reference does not resolve or the version backs a clone."
+  p "Exit status is 0 on success and `failed` (1) when the reference does not resolve, the version or variant backs a clone, or the variant cannot be removed on its own."
 
   h2 "vmlab template clean"
 

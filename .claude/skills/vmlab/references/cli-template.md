@@ -29,8 +29,10 @@ vmlab template <COMMAND>
 | `registry` | Manage the OCI namespaces `search` looks in. |
 | `-h`, `--help` | Print help. |
 
-Store references are spelled `<arch>/<name>[@<version>]`. Without a version the
-reference resolves to the newest version in the store. Registry references are
+Store references are spelled `<arch>/<name>[@<version>][#<variant>]`. Without a
+version the reference resolves to the newest version in the store; without a
+`#<variant>`, to the template's default variant (or its only disk when it has no
+variants). See templates.md. Registry references are
 spelled `ghcr.io/owner/name[:version]`.
 
 Exit status is 0 on success. Failures from the supervisor carry the protocol
@@ -132,10 +134,17 @@ version is published, `no` when the registry is reachable and does not have it,
 reference could not be asked. Under `--json` the remote answer is folded into
 each entry as a `remote` field.
 
+A version with variants lists each one beneath it as `#<name>`; the `VERSION`
+column reads `default` for the default and `STALE` for one built on an earlier
+base, and `SIZE` is the overlay's own size. `--json` entries carry a `variants`
+array (`name`, `default`, `stale`, `description`, `created`, `sha256`, `size`).
+
 ```sh
 $ vmlab template list
 ARCH     TEMPLATE                          VERSION          SIZE     CREATED
 x86_64   ghcr.io/vmlabdev/win2022          1.2.0            9.8G     2026-08-30
+           #standard                       default          410.2M   2026-08-30
+           #win3d                                           1.1G     2026-08-30
 x86_64   alpine                            0.3.1            180.0M   2026-08-12
 ```
 
@@ -180,15 +189,20 @@ vmlab template rm [OPTIONS] <REFERENCE>
 
 | Option | Meaning |
 | --- | --- |
-| `<REFERENCE>` | The version to remove, `<arch>/<name>[@<version>]`. |
+| `<REFERENCE>` | The version to remove, `<arch>/<name>@<version>`, or one variant, `…#<variant>`. |
 | `--force` | Remove even if it backs existing clones. |
 | `-h`, `--help` | Print help. |
 
-`rm` removes one exact store version and prints `removed
-<arch>/<name>@<version>`. A version that backs a machine's clone is refused
-unless `--force` is given, because the clone reads its base image from the
-store. Removing such a version with `--force` breaks every machine cloned from
-it.
+`rm` removes one exact store version, with all its variants, and prints
+`removed <arch>/<name>@<version>`. A version whose base or any variant backs a
+machine's clone is refused unless `--force` is given, naming the machines,
+because the clone reads its image from the store. Removing such a version with
+`--force` breaks every machine cloned from it.
+
+With `#<variant>` it removes that variant's overlay and metadata block alone.
+That is refused while a clone is backed by the variant (unless `--force`), and
+always for the default variant while others remain and for the last variant —
+either would leave a bare reference selecting the unsealed base.
 
 ```sh
 vmlab template rm x86_64/win2022@1.1.0

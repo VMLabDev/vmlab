@@ -5,6 +5,7 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | Term | Meaning |
 | --- | --- |
 | agent | `vmlab-agent`, the process vmlab runs inside every guest, listening on the `vmlab.agent.0` virtio-serial port. It carries exec, terminals, file transfer, the workspace watch, metrics and the clipboard. It is baked into a template at build time and shipped with the host for containers. See architecture.md. |
+| base | The one disk of a template version its variants are built on. Unsealed on a template with variants, so `#base` is refused for a lab VM. See templates.md. |
 | dev machine | A machine with a synced workspace: one carrying the `@dev` decorator, onto which vmlab syncs a host directory both ways. A lab may mark one of them `default = true`. See dev-machines.md. |
 | event | A named occurrence in a lab, such as `vm.crashed` or `host.disk_low`, carried on the lab's event stream and written to the event log. See automation.md. |
 | fabric | The userspace network vmlab runs every segment on: frame codecs, an L2 switch, DHCP, DNS, a gateway and a NAT engine, all in the lab daemon's process. No tap, bridge or macvlan. See networking.md. |
@@ -43,6 +44,7 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | syncer | The workspace syncer: the loop in the lab daemon that keeps a dev machine's workspace and the host tree in step, both ways, as the machine's default login. See dev-machines.md. |
 | template | A sealed, read-only disk image in the store that VMs clone from. Built from an ISO or cloud image by a `template {}` file, or pulled from a registry. See templates.md. |
 | trunk | The PSK-authenticated TCP link two supervisors bridge a global segment over, so machines on two hosts share one L2 segment. The listen port is `trunk_port` in host config. See networking.md. |
+| variant | A named, sealed disk state of a template version, stored as a qcow2 overlay on its base and selected with `#<name>`; no `#` selects the default variant. Not a snapshot. See templates.md. |
 | viewer | The VNC client `vmlab up` opens for a machine with `gui = true` and `vmlab console` opens on demand. Chosen from host config, else found on `PATH`. See snapshots-vision.md. |
 | VM | A `vm {}` in a lab: a QEMU guest booted from a linked clone of a template, or from a blank disk when scratch. See vm.md. |
 | watchdog | A supervisor check that fires an event on a host condition, such as `host.disk_low` when the filesystem under the store or a lab's clones passes the configured threshold. See automation.md. |

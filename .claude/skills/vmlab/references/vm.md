@@ -19,7 +19,7 @@ guest OS profile (see host-profiles.md).
 
 ```wcl
 vm "<name>" {
-  template    = "<arch>/<name>[@<version>]"   // or "scratch", or a registry ref
+  template    = "<arch>/<name>[@<version>][#<variant>]"   // or "scratch", or a registry ref
   arch        = "x86_64"
   profile     = "linux-modern"
   cpus        = 2
@@ -53,7 +53,7 @@ vm "<name>" {
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `name` | utf8 (label) | required | VM name, a DNS label, unique per lab; the inline block label. |
-| `template` | utf8 | required | `<arch>/<name>[@<version>]` from the store, `scratch`, or an OCI registry reference. |
+| `template` | utf8 | required | `<arch>/<name>[@<version>][#<variant>]` from the store, `scratch`, or an OCI registry reference with an optional `#<variant>`. |
 | `arch` | utf8 | from template | Architecture. Required for `scratch` and for registry references. |
 | `profile` | utf8 | from template | Guest OS profile supplying hardware defaults. Required for `scratch`. |
 | `cpus` | i64 | inherited | vCPU count, greater than 0. Inherited from template, then profile, if omitted. |
@@ -87,8 +87,10 @@ vm "<name>" {
 The `template` value takes one of three forms, and the form decides what else
 the block must say.
 
-- **Store reference** `<arch>/<name>[@<version>]`, such as
-  `x86_64/windows-11@26100.1`. The arch is always written; a bare `windows-11`
+- **Store reference** `<arch>/<name>[@<version>][#<variant>]`, such as
+  `x86_64/windows-11@26100.1` or `x86_64/windows-11#win3d` (no `#` = the
+  default variant; `#base` is refused for a VM on a template with variants —
+  see templates.md). The arch is always written; a bare `windows-11`
   is rejected. Without a version the highest version in the store is used. The
   template must be in the store, and an `arch` field, if present, must match.
 - **Registry reference**, such as `ghcr.io/owner/ubuntu-24.04:1.0`. Recognised

@@ -24,6 +24,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0014](0014-the-workspace-is-a-guest-local-copy-of-a-canonical-host-tree.md) | The workspace is a guest-local copy of a canonical host tree | Accepted |
 | [0015](0015-one-guest-side-spawner-seam-carries-identity.md) | One guest-side Spawner seam, and identity is its parameter | Accepted |
 | [0016](0016-a-shared-app-rides-the-guest-familys-own-window-protocol.md) | A shared app rides the guest family's own window protocol | Accepted |
+| [0017](0017-a-template-version-is-a-base-plus-sealed-variants.md) | A template version is a base plus sealed variants, stored as overlays | Accepted |
 
 ## Format
 

@@ -288,9 +288,9 @@ Build flow: create working qcow2 → boot per template hardware → run build pr
 
 ### 6.2 Store, addressing, export
 
-- Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store. `vmlab validate` rejects archless references.
+- Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>][#<variant>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store; the `#<variant>` suffix selects one disk of a version that has variants (§6.6). `vmlab validate` rejects archless references.
 - Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle.
-- `vmlab template list / rm` manage the store.
+- `vmlab template list / rm` manage the store. `list` shows each version's variants beneath it, the default marked and a stale one flagged; `rm <arch>/<name>@<version>` removes the version with all its variants, and `rm …#<variant>` removes that one variant (§6.6).
 - `vmlab template export` produces a single portable archive (qcow2 + metadata); `vmlab template import` installs one — the offline/sneakernet sharing path.
 - The online sharing path is OCI registries (§6.4).
 
@@ -319,17 +319,48 @@ Templates are distributable through standard OCI registries (GHCR, Docker Hub, H
 
 Because nothing is inherited or fetched, validation requires three things a normal template would otherwise supply: an explicit `arch` (which selects the QEMU system emulator — never inferred, consistent with §6.2), a `profile`, and a primary `disk` size. Boot media is the user's problem by design — typically a `cdrom`/floppy attachment, often built from a folder (§6.3). `scratch` never appears in the store, cannot be pushed/pulled, and `template build` blocks may also use it as their source for building templates from pure installer media.
 
+### 6.6 Template variants
+
+A template version has one **base** disk and zero or more **variants**. A variant is a named, sealed disk state built from the base. The motivating case is Windows: the base is installed and updated but **not** sysprepped; variant `standard` runs only the generalize, and variant `win3d` installs a GPU driver package and then generalizes, with `secure_boot = false`. The shared install is stored and built once and each variant costs only its delta. Every template built without variants is **base-only** and behaves exactly as it always has. The word is *variant* everywhere — "snapshot" means a VM snapshot (§7.3). See ADR-0017.
+
+**References.** `<arch>/<name>[@<version>][#<variant>]`. A variant name is `[a-z0-9][a-z0-9-]{0,31}`. `base` is reserved: it names the base disk and is never a variant's name. A registry reference takes the same suffix after its tag or digest (`ghcr.io/owner/windows-11:26100.1742#win3d`); the arch still comes from the VM's `arch` (§6.4).
+
+**Resolution.**
+
+| Reference | Template with variants | Template without variants |
+|---|---|---|
+| no `#` | the **default variant** | the base, as before |
+| `#<name>` | that variant; an unknown name is an error listing the template's variants | an error: the template has no variants |
+| `#base` | the base, **in build contexts only** — a variant build or a layered `from`. A lab machine referencing it is refused, because the unsealed base would give every clone the same identity | the base, everywhere |
+
+Exactly one variant carries `default = true`; a lone variant is the default without it. Two or more with no default, or with several, is invalid metadata: the build refuses to write it and the store reader reports the version as unreadable. `vmlab validate` and `up` refuse a reference that does not resolve, naming the template's variants.
+
+**Store layout.**
+
+    <root>/<arch>/<name>/<version>/
+      disk.qcow2                       # the base
+      template.wcl                     # template_meta, with a variant block per variant
+      variants/<variant>/disk.qcow2    # qcow2 overlay; backing file "../../disk.qcow2", format qcow2
+
+A variant's overlay holds only its delta from the base. The backing path is relative, so moving the store or importing an export keeps it attached. A version counts as installed only when `template.wcl` exists, as before; a variant counts only when both its block in `template.wcl` and its overlay exist.
+
+**Metadata.** `template_meta` gains `variant "<name>" { … }` child blocks. Each records `created`, its overlay's `sha256`, the `base_sha256` it was built on, optionally `default`, `description`, `first_boot_script`, `wscript_surface` and `agent_version`, and any overrides of the base's hardware fields (`profile`, `cpus`, `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`). A variant's **effective metadata** is the base's `template_meta` overridden field by field by the variant's own fields. Everything downstream of a resolution — the hardware chain (§5.2, ADR-0008), first boot, the wscript-surface check (§6.2) and agent staleness (§19.4) — reads the effective metadata of whatever the reference resolved to. A variant whose `base_sha256` is not the base's `sha256` is **stale**: it is refused with a message to rebuild the variant, so a rebuilt base never has an old delta replayed on top of it. A base that records no `sha256` vouches for no variant.
+
+**Clones.** A VM's primary disk is a linked clone backed by the absolute path of the resolved disk: the variant's overlay, giving the chain clone → variant → base, or the base for a base-only template. `clone-source` records the full reference text including `#<variant>`, so a changed variant refuses reuse exactly as a changed pin does (§7.1). `vmlab status -v` shows the variant each VM runs, including the default a bare reference picked. Removal is guarded per disk: a variant backing a clone cannot be removed, nor the version whose base or any variant backs one, unless `--force`. Removing a version removes all of its variants; removing one variant is refused for the default while others remain and for the last one, either of which would let a bare reference fall through to the unsealed base.
+
+**Building and distribution.** How a `template {}` block declares variants and how a variant build boots, seals and records one is §6.1's to say; how pushes and pulls carry the base and every variant over a registry, and how export and import carry `variants/`, is §6.4's.
+
 ---
 
 ## 7. VM lifecycle
 
 ### 7.1 Clones
 
-`vmlab up` creates each VM's disk as a qcow2 **linked clone** backed by the template image in the store (`scratch` VMs get a blank qcow2 instead, §6.5). Clones live in `.vmlab/` and are disposable: `destroy` deletes them; `down` powers off but keeps them. Templates are never written to by labs; deleting a template that backs existing clones must be refused (or require `--force` with a clear warning).
+`vmlab up` creates each VM's disk as a qcow2 **linked clone** backed by the template image in the store (for a template with variants, the selected variant's overlay, itself backed by the base, §6.6; `scratch` VMs get a blank qcow2 instead, §6.5). Clones live in `.vmlab/` and are disposable: `destroy` deletes them; `down` powers off but keeps them. Templates are never written to by labs; deleting a template that backs existing clones must be refused (or require `--force` with a clear warning).
 
 **`up` runs the lab file as it is on disk now.** A lab daemon reads `vmlab.wcl` once, when it starts. A full `down` reaps it, so the next `up` starts a fresh one; but a daemon outlives a partial `down`, a `vm stop` of every machine and a failed `up`, so a daemon from an earlier run may hold a version of the file the user has since edited. Every verb that builds a machine from the daemon's configuration — `up`, `pull`, `vm start`/`restart` and their container spellings — compares a digest of what the file declares now (the typed model, so a comment or whitespace edit does not count) with the digest the daemon reports in its status projection. When they differ and no machine of the lab is running and no download is in flight, the verb replaces the daemon (the `lab.restart` path) before doing anything else, and says so in one line. A replacement is not a `destroy`: clones, snapshots, `.vmlab/state.json` and the workspace ledgers all persist. When a machine is running (or starting, stopping or suspended) or a download is in flight, the verb refuses, naming them — a fresh daemon cannot adopt a running QEMU or a transfer, and quietly running the old configuration is the failure this rule exists to prevent. `vmlab validate` always reads the file afresh in the CLI and needs no daemon.
 
-**A clone cannot change template.** A linked clone is an overlay on the template image it was made from, so the template reference it was cloned from is recorded beside it (`.vmlab/vms/<vm>/clone-source`). When the lab file names a different template (compared as written: an unpinned `<arch>/<name>` keeps its clone across newer builds of that template; a changed reference, version pin, registry arch, or a switch to or from `scratch` does not) while the clone exists, `up` refuses before downloading or starting anything and `vm start` refuses to boot it; neither boots the old template nor deletes the clone. The refusal names both references and the way forward: `vmlab vm destroy <vm>` (or `vmlab destroy`), or putting the template line back. A container's `image =` line is not a clone and keeps its §18 rule: editing it clears the pin.
+**A clone cannot change template.** A linked clone is an overlay on the template image it was made from, so the template reference it was cloned from is recorded beside it (`.vmlab/vms/<vm>/clone-source`). When the lab file names a different template (compared as written: an unpinned `<arch>/<name>` keeps its clone across newer builds of that template; a changed reference, version pin, `#<variant>`, registry arch, or a switch to or from `scratch` does not) while the clone exists, `up` refuses before downloading or starting anything and `vm start` refuses to boot it; neither boots the old template nor deletes the clone. The refusal names both references and the way forward: `vmlab vm destroy <vm>` (or `vmlab destroy`), or putting the template line back. A container's `image =` line is not a clone and keeps its §18 rule: editing it clears the pin.
 
 ### 7.2 Power operations
 

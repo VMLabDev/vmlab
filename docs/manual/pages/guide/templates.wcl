@@ -34,10 +34,54 @@ page guide_templates {
 
   p <<DOC
     Templates are keyed by **arch, name and version**, and a reference is
-    written `<arch>/<name>[@<version>]`. The arch is mandatory and never
-    inferred from the host, because it selects which QEMU system emulator
-    boots the image. Omitting the version means the highest in the store.
-    `vmlab validate` rejects an archless reference.
+    written `<arch>/<name>[@<version>][#<variant>]`. The arch is mandatory
+    and never inferred from the host, because it selects which QEMU system
+    emulator boots the image. Omitting the version means the highest in the
+    store. `vmlab validate` rejects an archless reference. The `#<variant>`
+    suffix is described in the next section.
+  DOC
+
+  h2 "Variants"
+
+  p <<DOC
+    A template version can hold more than one sealed disk. It has one
+    **base** and zero or more **variants**, each a named disk state built
+    from the base. The case they exist for is Windows. The base is installed
+    and updated but not generalized. Variant `standard` runs only the
+    generalize. Variant `win3d` installs a GPU driver package first, then
+    generalizes, with secure boot off. The hours of install and update are
+    stored and built once, and each variant costs only its own changes. A
+    template with no variants is base-only and works as every template
+    always has.
+  DOC
+
+  table {
+    rows:
+      | "Reference" | "Template with variants" | "Template without variants" |
+      | "no `#`" | "The default variant." | "The base." |
+      | "`#<name>`" | "That variant. An unknown name is an error that lists the variants." | "An error: the template has no variants." |
+      | "`#base`" | "Refused for a lab machine, because every clone of the unsealed base would share one machine identity. Allowed in a variant build or a layered `from`." | "The base." |
+  }
+
+  p <<DOC
+    Exactly one variant is marked `default = true`, and a lone variant is the
+    default without the mark. On disk a variant is a qcow2 overlay at
+    `<version>/variants/<name>/disk.qcow2`, whose backing file is the base,
+    `../../disk.qcow2`, by relative path. Its block in the version's
+    `template.wcl` records its digest, the digest of the base it was built
+    on, and any fields it overrides: hardware, the first-boot script, the
+    wscript surface and the agent version. A clone of a variant runs on the
+    base's metadata with the variant's fields in their place. If the base is
+    rebuilt, a variant built on the old one is **stale** and refused until
+    it is rebuilt too.
+  DOC
+
+  p <<DOC
+    `vmlab template list` shows each variant on its own line under its
+    version, marks the default and flags a stale one. `vmlab status -v`
+    shows the variant each VM runs, including the one a reference without
+    `#` picked. `vmlab template rm <arch>/<name>@<version>#<variant>` removes
+    one variant; removing the version removes all of them.
   DOC
 
   h2 "The store"
@@ -180,7 +224,11 @@ page guide_templates {
 
   p <<DOC
     `vmlab up` creates each VM's disk as a qcow2 overlay whose backing file
-    is the template's disk in the store. The template is never written to.
+    is the template's disk in the store: the variant's overlay for a
+    template with variants, which is itself backed by the base. The template
+    is never written to. The reference the clone was made from, `#<variant>`
+    included, is recorded beside it, and `up` refuses to reuse the clone for
+    a different one.
     Clones live in `.vmlab/`, survive `down`, and are deleted by `destroy`,
     after which the next `up` makes fresh ones. Clones grow as the guest
     writes, which is why the supervisor watches free space on the
