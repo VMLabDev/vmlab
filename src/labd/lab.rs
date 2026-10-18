@@ -3004,6 +3004,9 @@ mod tests {
         /// Snapshots it takes are online ones (RAM included).
         online_snapshots: bool,
         clock: crate::config::model::Clock,
+        /// What `boot_id` answers, in turn; the last answer repeats. Empty is
+        /// a machine with no boot identity to read.
+        boot_ids: std::sync::Mutex<Vec<Result<&'static str, &'static str>>>,
     }
 
     impl FakeMachine {
@@ -3027,6 +3030,7 @@ mod tests {
                 mount: None,
                 online_snapshots: false,
                 clock: crate::config::model::Clock::Host,
+                boot_ids: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -3236,6 +3240,15 @@ mod tests {
         async fn agent_answering(&self) -> bool {
             *self.agent_up.read().await
         }
+        async fn boot_id(&self) -> Result<String> {
+            let mut ids = self.boot_ids.lock().unwrap();
+            let next = match ids.len() {
+                0 => Err("no boot identity in a double"),
+                1 => ids[0],
+                _ => ids.remove(0),
+            };
+            next.map(String::from).map_err(|e| anyhow!(e))
+        }
         async fn snapshot(&self, _name: &str) -> Result<bool> {
             Ok(self.online_snapshots)
         }
@@ -3318,6 +3331,88 @@ lab "t" {
 
         assert_eq!(container.starts.load(Ordering::SeqCst), 1);
         assert_eq!(container.state().await, PowerState::Running);
+    }
+
+    /// A running, ready double whose boot identity answers `ids` in turn.
+    async fn booted(
+        name: &str,
+        shared: &Shared,
+        ids: Vec<Result<&'static str, &'static str>>,
+    ) -> Arc<FakeMachine> {
+        let m = FakeMachine::new(name, MachineKind::Vm, shared);
+        *m.boot_ids.lock().unwrap() = ids;
+        *m.state.write().await = PowerState::Running;
+        *m.agent_up.write().await = true;
+        *m.ready.write().await = true;
+        m
+    }
+
+    const REBOOT_SCRIPT: &str = r#"use vmlab
+
+fn main(lab: Lab) {
+    let Ok(m) = lab.machine("box") else { return }
+    let before = m.boot_id().expect("boot id")
+    lab.log("before " + before)
+    match m.wait_rebooted(before, 4) {
+        Ok(_) => lab.log("after " + m.boot_id().expect("boot id")),
+        Err(e) => lab.log("not rebooted: " + e),
+    }
+}
+"#;
+
+    async fn run_reboot_script(m: Arc<FakeMachine>) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of(
+            dir.path(),
+            "import <vmlab.wcl>\nlab \"t\" { vm \"box\" { template = \"x86_64/t\" } }",
+            vec![m],
+        );
+        let said = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: crate::scripting::OutputSink = {
+            let said = said.clone();
+            Arc::new(move |s: String| said.lock().unwrap().push(s.trim_end().to_string()))
+        };
+        crate::scripting::run_script_source(
+            lab,
+            REBOOT_SCRIPT.into(),
+            "reboot.ws",
+            dir.path().to_path_buf(),
+            None,
+            sink,
+        )
+        .await
+        .expect("script");
+        said.lock().unwrap().clone()
+    }
+
+    /// `wait_rebooted` rides out a guest still on its old boot and one that
+    /// is down, and returns once the identity changes (§10.3).
+    #[tokio::test]
+    async fn wait_rebooted_sees_the_identity_change_through_a_down_guest() {
+        let sh = shared(tempfile::tempdir().unwrap().path());
+        let m = booted(
+            "box",
+            &sh,
+            vec![Ok("a"), Ok("a"), Err("agent: not connected"), Ok("b")],
+        )
+        .await;
+        let said = run_reboot_script(m).await;
+        assert!(said.iter().any(|s| s == "before a"), "{said:?}");
+        assert!(said.iter().any(|s| s == "after b"), "{said:?}");
+    }
+
+    /// A guest that never reboots times `wait_rebooted` out, naming the
+    /// identity it kept seeing.
+    #[tokio::test]
+    async fn wait_rebooted_times_out_with_the_last_identity_seen() {
+        let sh = shared(tempfile::tempdir().unwrap().path());
+        let m = booted("box", &sh, vec![Ok("a")]).await;
+        let said = run_reboot_script(m).await;
+        assert!(
+            said.iter()
+                .any(|s| s == "not rebooted: box: no reboot seen within 4s (boot id still `a`)"),
+            "{said:?}"
+        );
     }
 
     /// `@dev` reaches every surface through the status projection (§19.1,

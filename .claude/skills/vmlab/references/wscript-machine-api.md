@@ -11,7 +11,8 @@ Method groups:
 
 - Lifecycle and state: `name`, `kind`, `start`, `stop`, `stop_force`,
   `restart`, `poweroff`, `eject_cdrom`, `state`, `is_ready`, `wait_ready`,
-  `is_healthy`, `agent_answering`, `wait_shutdown`, `ip`, `ip_nic`.
+  `is_healthy`, `agent_answering`, `boot_id`, `wait_rebooted`, `wait_shutdown`,
+  `ip`, `ip_nic`.
 - Snapshots: `snapshot`, `restore`, `restore_discarding_workspace`,
   `snapshots`, `delete_snapshot`.
 - Input: `send_keys`, `type_text`, `type_text_paced`, `mouse_move`,
@@ -146,7 +147,7 @@ Runs `Machine.stop`, waits up to sixty seconds for the power state to reach
 stopped, then runs `Machine.start`. It fails with "<name> did not stop for
 restart" when the machine does not settle in time, and otherwise with the stop
 or start error. This restarts the emulator; a reboot the guest performs itself
-is watched with `Machine.agent_answering` instead.
+is watched with `Machine.wait_rebooted` instead.
 
 ```wscript
 fn main(lab: Lab) {
@@ -234,7 +235,8 @@ fn is_ready(self) -> bool
 
 Ready means the agent has come up and any first-boot work has completed. The
 flag is sticky: it stays set while the emulator runs, even through a reboot the
-guest performs itself. Use `Machine.agent_answering` for a live signal. Inside
+guest performs itself. Use `Machine.agent_answering` for a live signal, and
+`Machine.wait_rebooted` to see a reboot. Inside
 the machine's own first-boot provision this returns the live agent probe
 instead. It never fails.
 
@@ -298,17 +300,81 @@ Whether the guest agent answers a ping right now.
 fn agent_answering(self) -> bool
 ```
 
-The live probe, on every handle. It goes false while the guest is down or
-mid-reboot even though `Machine.is_ready` stays true, which is what a build
-provision needs to watch a reboot it asked the guest to perform. It never
-fails.
+The live probe, on every handle. It goes false while the guest is down or mid-
+reboot even though `Machine.is_ready` stays true. It never fails.
+
+It cannot see a reboot that finishes between two probes: a guest that reboots
+quickly, as Windows often does, answers the next ping through the new boot's
+agent, and the drop is never observed. To watch a reboot you asked the guest to
+perform, compare boot identities with `Machine.boot_id` and
+`Machine.wait_rebooted` instead.
 
 ```wscript
 fn main(lab: Lab) {
     let Ok(m) = lab.vm("box") else { return }
-    let r = m.exec("shutdown", ["/r", "/t", "0"])
-    while m.agent_answering() { vmlab::sleep_ms(1000) }
-    while !m.agent_answering() { vmlab::sleep_ms(2000) }
+    if !m.agent_answering() { lab.log("box's agent is not answering") }
+}
+```
+
+## Machine.boot_id
+
+An identity that is the same for one guest boot and different after any reboot.
+
+```wscript
+fn boot_id(self) -> Result[string, string]
+```
+
+An opaque string, compared and never parsed. It is read over the agent's
+`exec`, so it needs the agent answering, and it works on the legacy agent tier
+too. A Linux guest, a container's micro-VM included, reads
+`/proc/sys/kernel/random/boot_id`. A Windows guest reads the kernel's boot
+counter, `BootId` under the prefetcher's registry key, which a clock change
+does not move; where that value is missing (NT4 through XP/2003) it falls back
+to the last boot time from WMI, normalised to UTC. Windows 9x/ME, DOS and
+TempleOS have no boot identity to read, and fail with "<family> has no boot
+identity vmlab can read". It also fails when the agent does not answer.
+
+```wscript
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("box") else { return }
+    match m.boot_id() {
+        Ok(id) => lab.log("boot " + id),
+        Err(e) => lab.log("no boot id: " + e),
+    }
+}
+```
+
+## Machine.wait_rebooted
+
+Block until the guest has rebooted since `since`, then until it is ready again.
+
+```wscript
+fn wait_rebooted(self, since: string, timeout_secs: int) -> Result[unit, string]
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `since` | string | A `Machine.boot_id` read before the reboot was asked for. |
+| `timeout_secs` | int | The whole budget, reboot and readiness together, in seconds. A negative value is treated as zero. |
+
+Asks `Machine.boot_id` once a second until it answers something other than
+`since`, tolerating failed probes while the guest is down, then waits for the
+machine to be ready in the sense `Machine.wait_ready` uses here, inside the
+same budget. A reboot that finished before the first probe is still seen, which
+is what `Machine.agent_answering` cannot promise. On timeout it fails with
+"<name>: no reboot seen within <n>s", naming the last boot identity it read or
+the last probe's failure. Read `since` before asking for the reboot: read
+afterwards, it may already be the new boot's.
+
+```wscript
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("win") else { return }
+    let Ok(before) = m.boot_id() else { return }
+    let r = m.exec("cmd.exe", ["/c", "shutdown /r /t 0 /f"])
+    match m.wait_rebooted(before, 1800) {
+        Ok(_) => lab.log("rebooted"),
+        Err(e) => lab.log("no reboot: " + e),
+    }
 }
 ```
 

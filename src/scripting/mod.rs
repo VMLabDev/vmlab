@@ -722,6 +722,32 @@ pub fn lab_module() -> Module {
         .method("agent_answering", |h: &MachineHandle| -> bool {
             h.block(h.machine.agent_answering())
         })
+        // The reboot signal `agent_answering` cannot give: a guest that
+        // reboots between two pings answers the next one through the new
+        // boot's agent. Compare boot identities instead.
+        .method("boot_id", |h: &MachineHandle| -> Result<String, String> {
+            h.block(h.machine.boot_id()).map_err(estr)
+        })
+        // Until the boot identity differs from `since`, then until the machine
+        // is ready again — in the same sense `wait_ready` means here — inside
+        // one budget.
+        .method(
+            "wait_rebooted",
+            |h: &MachineHandle, since: String, timeout_secs: i64| -> Result<(), String> {
+                let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
+                let deadline = tokio::time::Instant::now() + timeout;
+                h.block(async {
+                    h.machine.wait_rebooted(&since, timeout).await?;
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if h.first_boot_gated {
+                        h.machine.wait_agent_answering(left).await
+                    } else {
+                        h.machine.wait_ready(left).await
+                    }
+                })
+                .map_err(estr)
+            },
+        )
         .method(
             "wait_shutdown",
             |h: &MachineHandle, timeout_secs: i64| -> Result<(), String> {

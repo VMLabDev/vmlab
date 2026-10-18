@@ -609,6 +609,8 @@ m.name() -> string   m.kind() -> "vm" | "container"
 m.state() -> Running | Stopped | ...
 m.wait_ready(timeout)                # fully usable: agent up, first-boot done
 m.is_ready() -> bool   m.is_healthy() -> bool   m.agent_answering() -> bool
+m.boot_id() -> string                # same for one guest boot, new after any reboot
+m.wait_rebooted(since, timeout)      # boot_id differs from `since`, then ready again
 m.wait_shutdown(timeout)
 m.ip() -> string   m.ip_nic(i) -> string     # from lease table / agent
 m.logs(lines) -> string              # console log, where the machine keeps one
@@ -619,6 +621,15 @@ Inside a machine's **own first-boot provision**, `is_ready` / `wait_ready` mean
 agent-level readiness rather than full readiness: full readiness is unreachable
 until that script returns, and a first-boot script that reboots its guest needs
 to wait for it to come back. Everywhere else they mean full readiness.
+
+`agent_answering` is a live ping, so it cannot see a reboot that finishes
+between two probes: a fast guest answers the next one through the new boot's
+agent. A script that asks its guest to reboot reads `boot_id` first and calls
+`wait_rebooted` after. `boot_id` is read over the agent's `exec`, on every agent
+tier: Linux's `/proc/sys/kernel/random/boot_id` (container micro-VMs included),
+Windows' kernel boot counter (`BootId` under the prefetcher's registry key),
+falling back to WMI's last boot time in UTC where that counter is missing.
+Windows 9x/ME, DOS and TempleOS have no boot identity and say so.
 
 **Snapshots**
 
