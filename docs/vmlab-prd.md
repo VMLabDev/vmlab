@@ -289,7 +289,7 @@ Build flow: create working qcow2 → boot per template hardware → run build pr
 ### 6.2 Store, addressing, export
 
 - Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store. `vmlab validate` rejects archless references.
-- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted.
+- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle.
 - `vmlab template list / rm` manage the store.
 - `vmlab template export` produces a single portable archive (qcow2 + metadata); `vmlab template import` installs one — the offline/sneakernet sharing path.
 - The online sharing path is OCI registries (§6.4).

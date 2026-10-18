@@ -24,13 +24,20 @@ pub(crate) struct EmbeddedWscript {
     pub surface_version: Option<WscriptSurfaceVersion>,
 }
 
-/// Surface written into templates built by this host. Version zero predates
-/// the explicit contract; one is the first stamped surface.
-pub(crate) const WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(1);
+/// Surface written into templates built by this host, and the newest one it
+/// compiles. Version zero predates the explicit contract; one is the first
+/// stamped surface. Two adds, on the machine handle, `logins()`,
+/// `as_login()`/`as_account()` (§19.2's wscript rung), `eject_cdrom()`,
+/// `boot_id()` and `wait_rebooted()`; and makes `seg.route_to()` /
+/// `seg.unroute_to()` work rather than fail.
+pub(crate) const WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(2);
 /// Oldest stamped surface this host promises to compile. Unstamped templates
 /// are legacy and remain accepted through compatibility aliases.
 const MIN_WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(1);
 
+/// Refuse a template whose embedded scripts this host cannot promise to
+/// compile, by name and before any of them is compiled: below the floor it
+/// wants rebuilding, above `WSCRIPT_SURFACE_VERSION` it wants a newer vmlab.
 pub(crate) fn ensure_wscript_surface_supported(
     template: &str,
     recorded: Option<WscriptSurfaceVersion>,
@@ -41,6 +48,14 @@ pub(crate) fn ensure_wscript_surface_supported(
         return Err(format!(
             "template `{template}` records wscript surface {version}, below this host's supported \
              floor {MIN_WSCRIPT_SURFACE_VERSION}; rebuild the template with this vmlab version"
+        ));
+    }
+    if let Some(version) = recorded
+        && version > WSCRIPT_SURFACE_VERSION
+    {
+        return Err(format!(
+            "template `{template}` records wscript surface {version}, newer than this host's \
+             {WSCRIPT_SURFACE_VERSION}; upgrade vmlab to use it"
         ));
     }
     Ok(())
