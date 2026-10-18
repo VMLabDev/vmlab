@@ -798,10 +798,19 @@ fn resolve_layered_source(
     else {
         bail!("layered build source must be a store reference");
     };
-    store
+    let resolved = store
         .resolve(arch, name, version.as_deref())
-        .context("resolving layered build source")
-        .map(Some)
+        .context("resolving layered build source")?;
+    // The source's first-boot provision runs on the build boot; refuse a
+    // surface this host cannot compile before anything is fetched or booted.
+    if let Some(script) = resolved.meta.first_boot() {
+        crate::scripting::ensure_wscript_surface_supported(
+            &from.to_string(),
+            script.surface_version,
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
+    Ok(Some(resolved))
 }
 
 /// Whether the build stages the VMLAB bootstrap ISO (agent binaries + install
@@ -1169,6 +1178,7 @@ mod tests {
         synth_lab, wcl_str,
     };
     use crate::template::meta::TemplateMeta;
+    use crate::template::store::{DISK_FILE, TemplateStore};
     use std::path::Path;
 
     /// Two builds of one short name — the same template for two
@@ -2069,6 +2079,40 @@ mod tests {
         assert_eq!(sealed.display, None);
         assert_eq!(sealed.cpu_model, None);
         assert_eq!(sealed.accel, None);
+    }
+
+    /// A layered source whose first-boot provision targets a newer wscript
+    /// surface is refused by name before anything is fetched or booted: the
+    /// build boot would run that script.
+    #[test]
+    fn a_layered_source_from_a_newer_surface_is_refused_before_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TemplateStore::new(dir.path().join("templates"));
+        std::fs::create_dir_all(store.root()).unwrap();
+        let staging = tempfile::tempdir_in(store.root()).unwrap();
+        std::fs::write(staging.path().join(DISK_FILE), b"").unwrap();
+        let mut meta = source_meta();
+        meta.first_boot_script = Some("use vmlab\nfn main(lab: Lab) {}\n".into());
+        meta.wscript_surface = Some(3.into());
+        store.install(&staging.keep(), &meta, false).unwrap();
+
+        let err = super::resolve_layered_source(&layered(""), &store).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "template `x86_64/win11@26100.1` records wscript surface 3, newer than this host's \
+             2; upgrade vmlab to use it"
+        );
+
+        meta.wscript_surface = Some(crate::scripting::WSCRIPT_SURFACE_VERSION);
+        meta.version = "26100.2".into();
+        let staging = tempfile::tempdir_in(store.root()).unwrap();
+        std::fs::write(staging.path().join(DISK_FILE), b"").unwrap();
+        store.install(&staging.keep(), &meta, false).unwrap();
+        let d = def("import <vmlab.wcl>\n\
+             template \"t\" { arch = \"x86_64\" version = \"1\"\n\
+             \x20 source \"template\" { from = \"x86_64/win11@26100.2\" }\n\
+             }\n");
+        assert!(super::resolve_layered_source(&d, &store).unwrap().is_some());
     }
 
     /// The bootstrap ISO decision follows the *effective* profile: a layered

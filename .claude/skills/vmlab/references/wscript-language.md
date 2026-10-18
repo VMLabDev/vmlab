@@ -177,9 +177,13 @@ The documented signatures use the parameter names the host registers; the
 generated interface file spells them `a0`, `a1` and so on.
 
 Note: a template stores the wscript surface version its scripts compiled against.
-A template below this host's supported floor is refused with one message telling
-you to rebuild it with this vmlab version, rather than a cascade of compiler
-errors.
+This host compiles surfaces from its supported floor up to its own (surface 2,
+which added `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and
+`as_account`). A template below the floor is refused with one message telling
+you to rebuild it with this vmlab version; a template recording a newer surface
+than the host's is refused by name with one telling you to upgrade vmlab. Either
+refusal comes before any embedded script compiles, rather than a cascade of
+compiler errors.
 
 ## Error handling
 

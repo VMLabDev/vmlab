@@ -1519,10 +1519,23 @@ fn main(lab: Lab) {
     }
 
     #[test]
-    fn unstamped_and_newer_template_surfaces_are_accepted() {
+    fn unstamped_and_supported_template_surfaces_are_accepted() {
         ensure_wscript_surface_supported("x86_64/win11@legacy", None).unwrap();
-        ensure_wscript_surface_supported("x86_64/win11@current", Some(1.into())).unwrap();
-        ensure_wscript_surface_supported("x86_64/win11@newer", Some(2.into())).unwrap();
+        ensure_wscript_surface_supported("x86_64/win11@v1", Some(1.into())).unwrap();
+        ensure_wscript_surface_supported("x86_64/win11@v2", Some(2.into())).unwrap();
+        ensure_wscript_surface_supported("x86_64/win11@current", Some(WSCRIPT_SURFACE_VERSION))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_template_above_the_surface_ceiling_asks_for_a_newer_vmlab() {
+        let err =
+            ensure_wscript_surface_supported("x86_64/win11@newer", Some(3.into())).unwrap_err();
+        assert_eq!(
+            err,
+            "template `x86_64/win11@newer` records wscript surface 3, newer than this host's 2; \
+             upgrade vmlab to use it"
+        );
     }
 
     #[test]
