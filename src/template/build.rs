@@ -339,6 +339,12 @@ async fn build_variants(
         if let Some(started) = &control.on_variant {
             started(&v.name);
         }
+        // A rebuild replaces the overlay, and a clone of it is a delta
+        // against the bytes being replaced: refuse before booting anything.
+        let installed = base.variant_disk(&v.name);
+        if installed.is_file() {
+            refuse_in_use(control, &installed, &base.reference(), &v.name).await?;
+        }
         let work = builds_dir().join(format!(
             "{}-{}-{}-variant-{}",
             def.arch, def.name, def.version, v.name
@@ -415,12 +421,7 @@ async fn build_variant(
     let spec = BuildSpec::variant(def, v, base.meta.disk);
     check_spec_hardware(def, &spec, &hw, build_vm, root, profiles)?;
 
-    // A rebuild replaces the overlay, and a clone of it is a delta against
-    // the bytes being replaced.
     let installed = base.variant_disk(&v.name);
-    if installed.is_file() {
-        refuse_in_use(control, &installed, &base.reference(), &v.name).await?;
-    }
 
     let wants_agent = wants_agent(def, &hw, profiles);
     let staged: Option<Arc<super::bootstrap::StagedGuestIso>> = if wants_agent {
@@ -579,8 +580,9 @@ async fn build_variant(
             agent_version: agent_version.lock().expect("agent_version lock").clone(),
         },
     );
-    // Again at the swap: a clone made while the variant was building is
-    // backed by the overlay about to be replaced.
+    // Checked again at the swap (first by the caller, before the boot): a
+    // clone made while the variant was building is backed by the overlay
+    // about to be replaced.
     if installed.is_file() {
         refuse_in_use(control, &installed, &base.reference(), &v.name).await?;
     }
