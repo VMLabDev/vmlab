@@ -86,7 +86,8 @@ pub enum TemplateCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a template (`<arch>/<name>[@<version>]`)
+    /// Remove a template version (`<arch>/<name>@<version>`) with all its
+    /// variants, or one variant (`…#<variant>`)
     Rm {
         reference: String,
         /// Remove even if it backs existing clones
@@ -574,6 +575,7 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
             .iter()
             .map(|row| {
                 let mut meta = serde_json::to_value(&row.meta).unwrap_or(Value::Null);
+                meta["variants"] = serde_json::to_value(&row.variants).unwrap_or(Value::Null);
                 if let Some(status) = row.remote {
                     meta["remote"] = Value::String(status.as_str().into());
                 }
@@ -591,9 +593,25 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
     fn name_of(row: &StoreEntry) -> &str {
         row.meta.registry.as_deref().unwrap_or(&row.meta.name)
     }
+    // A variant sits on its own line under its version, `  #<name>` in the
+    // TEMPLATE column and its marks in the VERSION one (§6.6).
+    fn variant_label(v: &crate::template::store_view::VariantSummary) -> String {
+        format!("  #{}", v.name)
+    }
+    fn variant_marks(v: &crate::template::store_view::VariantSummary) -> String {
+        match (v.default, v.stale) {
+            (true, true) => "default, STALE".into(),
+            (true, false) => "default".into(),
+            (false, true) => "STALE".into(),
+            (false, false) => String::new(),
+        }
+    }
     let name_w = rows
         .iter()
-        .map(|row| name_of(row).len())
+        .flat_map(|row| {
+            std::iter::once(name_of(row).len())
+                .chain(row.variants.iter().map(|v| variant_label(v).len()))
+        })
         .max()
         .unwrap_or(0)
         .max(8);
@@ -630,6 +648,21 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
                 size,
             ),
         }
+        for v in &row.variants {
+            let created: String = v.created.chars().take(10).collect();
+            let remote = if check_remote { "        " } else { "" };
+            println!(
+                "{:<8} {:<name_w$} {:<16} {:<8} {remote}{created}",
+                "",
+                variant_label(v),
+                variant_marks(v),
+                human_size(v.size),
+            );
+        }
+    }
+    if rows.iter().flat_map(|r| &r.variants).any(|v| v.stale) {
+        println!();
+        println!("a STALE variant was built on an earlier base and is refused until it is rebuilt");
     }
     Ok(())
 }

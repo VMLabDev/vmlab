@@ -385,6 +385,7 @@ async fn run_build(
             disk_size: parts.disk_size,
             first_boot: Some(first_boot),
             agent_version: parts.agent_version.clone(),
+            variant: parts.variant.clone(),
         });
     }
 
@@ -794,12 +795,20 @@ fn resolve_layered_source(
         arch,
         name,
         version,
+        variant,
     } = from
     else {
         bail!("layered build source must be a store reference");
     };
+    // A layered `from` is a build context: `#base` names the base (§6.6).
     let resolved = store
-        .resolve(arch, name, version.as_deref())
+        .resolve(
+            arch,
+            name,
+            version.as_deref(),
+            variant.as_ref(),
+            crate::template::store::Purpose::Build,
+        )
         .context("resolving layered build source")?;
     // The source's first-boot provision runs on the build boot; refuse a
     // surface this host cannot compile before anything is fetched or booted.
@@ -909,6 +918,7 @@ fn seal_meta(
         first_boot_script: image.first_boot_script,
         agent_version: image.agent_version,
         wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+        variants: Vec::new(),
     }
 }
 
@@ -1279,6 +1289,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants: Vec::new(),
         }
     }
 

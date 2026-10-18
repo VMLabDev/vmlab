@@ -26,12 +26,13 @@ use serde_json::{Value, json};
 
 use super::Supervisor;
 use super::templates::op_sink;
-use crate::config::model::{TemplateRef, parse_template_ref};
+use crate::config::model::{TemplateRef, VariantRef, parse_template_ref};
 use crate::proto::{CommandError, Event};
 use crate::template::TemplateStore;
 use crate::template::meta::TemplateMeta;
 use crate::template::store_view::{
     PrunePlan, PushStarted, RemoteStatus, StoreEntry, StoredVersion, TemplateSummary,
+    VariantSummary,
 };
 
 /// Serialise a typed answer, which cannot realistically fail — every view in
@@ -44,17 +45,43 @@ fn store() -> TemplateStore {
     TemplateStore::new(crate::paths::template_store_dir())
 }
 
-/// Split `<arch>/<name>[@<version>]`, refusing anything that is not a local
-/// store reference.
-fn parse_store_ref(reference: &str) -> Result<(String, String, Option<String>)> {
+/// A local store reference, split.
+struct StoreRef {
+    arch: String,
+    name: String,
+    version: Option<String>,
+    variant: Option<VariantRef>,
+}
+
+/// Split `<arch>/<name>[@<version>][#<variant>]`, refusing anything that is
+/// not a local store reference.
+fn parse_store_ref(reference: &str) -> Result<StoreRef> {
     match parse_template_ref(reference).map_err(|e| anyhow!(e))? {
         TemplateRef::Store {
             arch,
             name,
             version,
-        } => Ok((arch, name, version)),
+            variant,
+        } => Ok(StoreRef {
+            arch,
+            name,
+            version,
+            variant,
+        }),
         _ => bail!("expected a local store reference `<arch>/<name>[@<version>]`"),
     }
+}
+
+/// Split a reference that names a whole version, refusing a `#<variant>`.
+fn parse_version_ref(reference: &str) -> Result<(String, String, Option<String>)> {
+    let r = parse_store_ref(reference)?;
+    if let Some(v) = r.variant {
+        bail!(
+            "`{reference}` names one variant (`#{v}`); this command works on a whole version — \
+             drop the `#{v}`"
+        );
+    }
+    Ok((r.arch, r.name, r.version))
 }
 
 fn disk_path(store: &TemplateStore, t: &TemplateMeta) -> PathBuf {
@@ -66,20 +93,63 @@ fn disk_path(store: &TemplateStore, t: &TemplateMeta) -> PathBuf {
         .join(crate::template::store::DISK_FILE)
 }
 
+/// The base disk, then every variant overlay, of one listed version.
+fn disks(store: &TemplateStore, t: &TemplateMeta) -> Vec<PathBuf> {
+    let base = disk_path(store, t);
+    let dir = base.parent().map(PathBuf::from).unwrap_or_default();
+    let mut out = vec![base];
+    out.extend(
+        t.variants
+            .iter()
+            .map(|v| dir.join(crate::template::meta::variant_disk_rel(&v.name))),
+    );
+    out
+}
+
+fn file_size(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Everything one version occupies: the base and its variant overlays.
 fn disk_size(store: &TemplateStore, t: &TemplateMeta) -> u64 {
-    std::fs::metadata(disk_path(store, t))
-        .map(|m| m.len())
-        .unwrap_or(0)
+    disks(store, t).iter().map(|d| file_size(d)).sum()
+}
+
+/// A listed version's variants as `template list` shows them: the default
+/// marked, a stale one flagged, each overlay's own size.
+fn variant_rows(store: &TemplateStore, t: &TemplateMeta) -> Vec<VariantSummary> {
+    let default = t.default_variant().map(|d| d.name.clone());
+    let dir = disk_path(store, t)
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    t.variants
+        .iter()
+        .map(|v| VariantSummary {
+            name: v.name.clone(),
+            default: default.as_deref() == Some(v.name.as_str()),
+            stale: t.is_stale(v),
+            description: v.description.clone(),
+            created: v.created.to_rfc3339(),
+            sha256: v.sha256.clone(),
+            size: file_size(&dir.join(crate::template::meta::variant_disk_rel(&v.name))),
+        })
+        .collect()
 }
 
 /// `store.list`: every template in the store with its disk size, and — when
 /// asked — whether that exact version and architecture is already published.
 pub async fn list(remote: bool) -> Result<Value, CommandError> {
-    let (templates, sizes) = tokio::task::spawn_blocking(move || -> Result<_> {
+    let (templates, sizes, variants) = tokio::task::spawn_blocking(move || -> Result<_> {
         let store = store();
         let templates = store.list()?;
-        let sizes: Vec<u64> = templates.iter().map(|t| disk_size(&store, t)).collect();
-        Ok((templates, sizes))
+        let sizes: Vec<u64> = templates
+            .iter()
+            .map(|t| file_size(&disk_path(&store, t)))
+            .collect();
+        let variants: Vec<Vec<VariantSummary>> =
+            templates.iter().map(|t| variant_rows(&store, t)).collect();
+        Ok((templates, sizes, variants))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -110,6 +180,7 @@ pub async fn list(remote: bool) -> Result<Value, CommandError> {
             meta: TemplateSummary::from(t),
             size: sizes[i],
             remote: statuses.get(i).copied(),
+            variants: variants[i].clone(),
         })
         .collect();
     answer(rows)
@@ -130,32 +201,70 @@ async fn registry_status(registry: Option<String>, version: String, arch: String
     }
 }
 
-/// `store.remove`: drop one exact version.
+/// `store.remove`: drop one exact version — the base and every variant — or,
+/// for `<arch>/<name>@<version>#<variant>`, that one variant (§6.6).
+///
+/// Refused, unless forced, while a clone in a registered lab is backed by a
+/// disk the removal would delete: the base or a variant overlay for a
+/// version, the overlay alone for a variant.
 pub async fn remove(reference: String, force: bool) -> Result<Value, CommandError> {
+    let r = parse_store_ref(&reference).map_err(|e| format!("{e:#}"))?;
+    let in_use = if force {
+        Vec::new()
+    } else {
+        clones_by_backing().await
+    };
     let removed = tokio::task::spawn_blocking(move || -> Result<StoredVersion> {
-        let (arch, name, version) = parse_store_ref(&reference)?;
+        let StoreRef {
+            arch,
+            name,
+            version,
+            variant,
+        } = r;
         let version = version.ok_or_else(|| {
             anyhow!("specify the exact version to remove, e.g. {arch}/{name}@<version>")
         })?;
-        store().remove(&arch, &name, &version, force, &|_| {
-            if force {
-                None
-            } else {
-                Some(
-                    "deleting a template may break existing linked clones; re-run with --force"
-                        .to_string(),
-                )
-            }
-        })?;
+        let variant = variant.map(|v| v.as_str().to_string());
+        store().remove(
+            &arch,
+            &name,
+            &version,
+            variant.as_deref(),
+            force,
+            &|doomed| backed_clones_reason(&in_use, doomed),
+        )?;
         Ok(StoredVersion {
             arch,
             name,
             version,
+            variant,
         })
     })
     .await
     .map_err(|e| e.to_string())??;
     answer(removed)
+}
+
+/// Why `doomed` cannot be deleted: the clones (`lab/vm`) backed by one of
+/// them. `None` when none is.
+fn backed_clones_reason(clones: &[(PathBuf, String)], doomed: &[PathBuf]) -> Option<String> {
+    let doomed: HashSet<PathBuf> = doomed
+        .iter()
+        .map(|d| d.canonicalize().unwrap_or_else(|_| d.clone()))
+        .collect();
+    let users: Vec<&str> = clones
+        .iter()
+        .filter(|(backing, _)| doomed.contains(backing))
+        .map(|(_, who)| who.as_str())
+        .collect();
+    match users.as_slice() {
+        [] => None,
+        [one] => Some(format!("the clone of machine {one} is backed by it")),
+        many => Some(format!(
+            "the clones of machines {} are backed by it",
+            many.join(", ")
+        )),
+    }
 }
 
 /// `store.prune`: per `<arch>/<name>` family, keep the `keep` newest builds
@@ -189,18 +298,26 @@ pub async fn prune(
 
     // In-use protection: store disks currently backing a clone are skipped
     // unless forced.
-    let in_use = if force || candidates.is_empty() {
+    let in_use: HashSet<PathBuf> = if force || candidates.is_empty() {
         HashSet::new()
     } else {
-        backing_disks_in_use().await
+        clones_by_backing()
+            .await
+            .into_iter()
+            .map(|(backing, _)| backing)
+            .collect()
     };
 
     let mut to_remove = Vec::new();
     let mut skipped = Vec::new();
     for t in candidates {
-        let disk = disk_path(&store, &t);
-        let canon = disk.canonicalize().unwrap_or(disk);
-        if in_use.contains(&canon) {
+        // A version is held back while a clone leans on its base or on any
+        // of its variants (§6.6).
+        let held = disks(&store, &t).into_iter().any(|disk| {
+            let canon = disk.canonicalize().unwrap_or(disk);
+            in_use.contains(&canon)
+        });
+        if held {
             skipped.push(t);
         } else {
             to_remove.push(t);
@@ -220,7 +337,7 @@ pub async fn prune(
     tokio::task::spawn_blocking(move || -> Result<()> {
         for t in &to_remove {
             store
-                .remove(&t.arch, &t.name, &t.version, true, &|_| None)
+                .remove(&t.arch, &t.name, &t.version, None, true, &|_| None)
                 .with_context(|| format!("removing {}/{}@{}", t.arch, t.name, t.version))?;
         }
         Ok(())
@@ -273,11 +390,12 @@ fn family_matches(filter: Option<&str>, arch: &str, name: &str) -> bool {
     }
 }
 
-/// Canonical store disk paths (`<version>/disk.qcow2`) currently backing a
-/// linked clone in any registered lab. Best-effort: unreadable labs/clones are
-/// skipped, so a scan hiccup never blocks a prune.
-async fn backing_disks_in_use() -> HashSet<PathBuf> {
-    let mut in_use = HashSet::new();
+/// Every linked clone in a registered lab, as (canonical backing disk,
+/// `lab/vm`). The backing disk is a version's base or one of its variant
+/// overlays (§6.6). Best-effort: unreadable labs/clones are skipped, so a
+/// scan hiccup never blocks a prune.
+async fn clones_by_backing() -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
     let reg = super::registry::Registry::load();
     for lab in reg.labs() {
         let vms = crate::paths::lab_local_dir(&lab.root).join("vms");
@@ -293,17 +411,18 @@ async fn backing_disks_in_use() -> HashSet<PathBuf> {
                 && let Some(backing) = info.backing_file
                 && let Ok(canon) = backing.canonicalize()
             {
-                in_use.insert(canon);
+                let vm = e.file_name().to_string_lossy().into_owned();
+                out.push((canon, format!("{}/{vm}", lab.name)));
             }
         }
     }
-    in_use
+    out
 }
 
 /// `store.export`: write one template to a portable archive.
 pub async fn export(reference: String, out: PathBuf) -> Result<Value, CommandError> {
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let (arch, name, version) = parse_store_ref(&reference)?;
+        let (arch, name, version) = parse_version_ref(&reference)?;
         store().export(&arch, &name, version.as_deref(), &out)?;
         Ok(())
     })
@@ -348,8 +467,8 @@ pub async fn push(
     lab: String,
 ) -> Result<Value, CommandError> {
     let resolved = tokio::task::spawn_blocking(move || -> Result<_> {
-        let (arch, name, version) = parse_store_ref(&reference)?;
-        let resolved = store().resolve(&arch, &name, version.as_deref())?;
+        let (arch, name, version) = parse_version_ref(&reference)?;
+        let resolved = store().resolve_version(&arch, &name, version.as_deref())?;
         Ok(resolved)
     })
     .await
@@ -596,6 +715,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants: Vec::new(),
         }
     }
 
@@ -636,14 +756,43 @@ mod tests {
         );
     }
 
+    /// The in-use check names the machines whose clone is backed by one of
+    /// the doomed disks, and only those (§6.6: per variant).
+    #[test]
+    fn in_use_names_the_clones_backed_by_a_doomed_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let standard = dir.path().join("standard.qcow2");
+        let extra = dir.path().join("extra.qcow2");
+        std::fs::write(&standard, b"s").unwrap();
+        std::fs::write(&extra, b"e").unwrap();
+        let clones = vec![
+            (extra.canonicalize().unwrap(), "lab/x".to_string()),
+            (extra.canonicalize().unwrap(), "lab/y".to_string()),
+        ];
+        assert_eq!(
+            backed_clones_reason(&clones, std::slice::from_ref(&standard)),
+            None
+        );
+        let why = backed_clones_reason(&clones, &[standard, extra]).expect("in use");
+        assert!(why.contains("lab/x, lab/y"), "{why}");
+    }
+
+    #[test]
+    fn a_variant_reference_is_refused_where_a_version_is_meant() {
+        let err = parse_version_ref("x86_64/win11@1#extra").unwrap_err();
+        assert!(err.to_string().contains("drop the `#extra`"), "{err}");
+        let r = parse_store_ref("x86_64/win11@1#extra").unwrap();
+        assert_eq!(r.variant, Some(VariantRef::Named("extra".into())));
+    }
+
     #[test]
     fn a_store_reference_needs_arch_and_name() {
-        let (arch, name, version) = parse_store_ref("x86_64/win11@26100.1").unwrap();
+        let (arch, name, version) = parse_version_ref("x86_64/win11@26100.1").unwrap();
         assert_eq!((arch.as_str(), name.as_str()), ("x86_64", "win11"));
         assert_eq!(version.as_deref(), Some("26100.1"));
-        let (_, _, version) = parse_store_ref("x86_64/win11").unwrap();
+        let (_, _, version) = parse_version_ref("x86_64/win11").unwrap();
         assert_eq!(version, None);
         // A registry reference is not a store reference.
-        assert!(parse_store_ref("ghcr.io/owner/name:1.0").is_err());
+        assert!(parse_version_ref("ghcr.io/owner/name:1.0").is_err());
     }
 }

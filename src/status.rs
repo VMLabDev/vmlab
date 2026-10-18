@@ -231,6 +231,11 @@ pub struct NicStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmStatus {
     pub template: String,
+    /// The template variant the clone is backed on (§6.6) — what a reference
+    /// with no `#` resolved to, too. `None` for a base-only template, scratch,
+    /// and a registry template not yet pulled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     pub arch: Option<String>,
     pub cpus: Option<u32>,
     /// Bytes.
@@ -628,6 +633,7 @@ pub(crate) mod fixtures {
 
     pub(crate) fn vm() -> MachineDetail {
         MachineDetail::Vm(VmStatus {
+            variant: None,
             template: "x86_64/win11".into(),
             arch: Some("x86_64".into()),
             cpus: Some(4),

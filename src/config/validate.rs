@@ -13,6 +13,7 @@ use crate::qemu::resolve::{
     resolve_accel, resolve_cpu_model, resolve_firmware, vm_arch,
 };
 use crate::template::TemplateMeta;
+use crate::template::meta::Purpose;
 
 /// Host facilities the validator consults. The CLI wires the real template
 /// store and wscript compiler; tests substitute fakes.
@@ -22,7 +23,9 @@ use crate::template::TemplateMeta;
 /// about hardware have to resolve it first — a VM's firmware or secure boot
 /// may have been inherited from either layer (§5.2).
 pub trait ValidationContext {
-    /// Recorded metadata for a template in the store, if it is there.
+    /// Recorded metadata for a template version in the store, if it is there,
+    /// with its installed variants (§6.6). Validation selects the variant a
+    /// reference names itself, through [`TemplateMeta::select_variant`].
     fn template_meta(&self, arch: &str, name: &str, version: Option<&str>) -> Option<TemplateMeta>;
     /// A named guest OS profile, if it is known.
     fn profile(&self, name: &str) -> Option<Profile>;
@@ -599,10 +602,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         arch,
                         name,
                         version,
+                        variant,
                     },
                 span,
             } => {
-                if !ctx.template_exists(arch, name, version.as_deref()) {
+                if let Some(meta) = ctx.template_meta(arch, name, version.as_deref()) {
+                    // A layered `from` is a build context, so `#base` passes.
+                    if let Err(why) = meta.select_variant(variant.as_ref(), Purpose::Build) {
+                        issues.push(Issue::at(*span, format!("layered build source: {why}")));
+                    }
+                } else {
                     issues.push(Issue::at(
                         *span,
                         format!(
@@ -688,6 +697,7 @@ fn check_vm_template(file: &LabFile, vm: &Vm, ctx: &dyn ValidationContext, issue
             arch,
             name,
             version,
+            variant,
         } => {
             if let Some(vm_arch) = &vm.arch
                 && vm_arch != arch
@@ -700,7 +710,16 @@ fn check_vm_template(file: &LabFile, vm: &Vm, ctx: &dyn ValidationContext, issue
                     ),
                 ));
             }
-            if !ctx.template_exists(arch, name, version.as_deref()) {
+            let meta = ctx.template_meta(arch, name, version.as_deref());
+            if let Some(meta) = &meta
+                && let Err(why) = meta.select_variant(variant.as_ref(), Purpose::Lab)
+            {
+                issues.push(Issue::at(
+                    vm.template_span,
+                    format!("vm \"{}\": {why}", vm.name),
+                ));
+            }
+            if meta.is_none() {
                 let local_def = file
                     .templates
                     .iter()
@@ -733,7 +752,7 @@ fn check_vm_template(file: &LabFile, vm: &Vm, ctx: &dyn ValidationContext, issue
                 ));
             }
         }
-        TemplateRef::Registry { reference } => {
+        TemplateRef::Registry { reference, .. } => {
             if vm.arch.is_none() {
                 issues.push(Issue::at(
                     vm.template_span,
@@ -876,12 +895,19 @@ impl TemplateLayer {
     fn of(vm: &Vm, ctx: &dyn ValidationContext) -> Self {
         match &vm.template {
             TemplateRef::Scratch => Self::Absent,
+            // The effective metadata of the variant the reference selects
+            // (§6.6). One it cannot select is reported by
+            // `check_vm_template`, and leaves the layer unknown.
             TemplateRef::Store {
                 arch,
                 name,
                 version,
+                variant,
             } => match ctx.template_meta(arch, name, version.as_deref()) {
-                Some(meta) => Self::Known(Box::new(meta)),
+                Some(meta) => match meta.select_variant(variant.as_ref(), Purpose::Lab) {
+                    Ok(chosen) => Self::Known(Box::new(meta.effective(chosen))),
+                    Err(_) => Self::Unknown,
+                },
                 None => Self::Unknown,
             },
             TemplateRef::Registry { .. } => Self::Unknown,
@@ -1416,6 +1442,7 @@ pub(crate) mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants: Vec::new(),
         }
     }
 
@@ -1518,6 +1545,100 @@ pub(crate) mod tests {
         assert!(
             !es.iter().any(|m| m.contains("secure boot needs UEFI")),
             "unexpected secure-boot conflict: {es:#?}"
+        );
+    }
+
+    /// A template version with variants (§6.6): `standard` (the default),
+    /// which records OVMF, and `legacy`, which records SeaBIOS.
+    fn variant_meta() -> TemplateMeta {
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.sha256 = Some("ab".repeat(32));
+        let variant = |name: &str, default: bool| crate::template::meta::VariantMeta {
+            name: name.into(),
+            default,
+            created: chrono::Utc::now(),
+            sha256: "cd".repeat(32),
+            base_sha256: "ab".repeat(32),
+            description: None,
+            first_boot_script: None,
+            agent_version: None,
+            wscript_surface: None,
+            profile: None,
+            cpus: None,
+            memory: None,
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            cpu_model: None,
+            accel: None,
+        };
+        let mut legacy = variant("legacy", false);
+        legacy.firmware = Some("seabios".into());
+        let mut standard = variant("standard", true);
+        standard.firmware = Some("ovmf".into());
+        meta.variants = vec![standard, legacy];
+        meta
+    }
+
+    /// `vmlab validate` reports a variant reference the template cannot
+    /// serve, naming the template's variants; and `#base` is refused for a
+    /// lab machine.
+    #[test]
+    fn a_bad_variant_reference_lists_the_templates_variants() {
+        let ctx = Hardware::with_meta(variant_meta());
+        let es = hw_errs(
+            &ctx,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t#ghost" } }"#,
+        );
+        let found = es
+            .iter()
+            .find(|m| m.contains("no variant `ghost`"))
+            .unwrap_or_else(|| panic!("expected an unknown-variant error, got: {es:#?}"));
+        assert!(found.contains("standard (default), legacy"), "{found}");
+        assert!(found.contains("vm \"a\""), "{found}");
+
+        let es = hw_errs(
+            &ctx,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t#base" } }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("#base is refused")), "{es:#?}");
+
+        // A good reference, bare or named, raises nothing about variants.
+        for t in ["x86_64/t", "x86_64/t#legacy", "x86_64/t#standard"] {
+            let es = hw_errs(
+                &ctx,
+                &format!("import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"{t}\" }} }}"),
+            );
+            assert!(!es.iter().any(|m| m.contains("variant")), "{t}: {es:#?}");
+        }
+
+        // `#name` on a base-only template.
+        let es = hw_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t#standard" } }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("has no variants")), "{es:#?}");
+    }
+
+    /// The hardware checks read the selected variant's effective metadata:
+    /// `legacy`'s SeaBIOS conflicts with secure boot, the default's does not.
+    #[test]
+    fn hardware_checks_read_the_variants_effective_metadata() {
+        let ctx = Hardware::with_meta(variant_meta());
+        assert_secure_boot_conflict(
+            &ctx,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t#legacy" secure_boot = true } }"#,
+            ["firmware = \"seabios\" (from the template)"].as_slice(),
+        );
+        assert_no_secure_boot_conflict(
+            &ctx,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" secure_boot = true } }"#,
         );
     }
 

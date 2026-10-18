@@ -653,7 +653,7 @@ impl Registry {
 /// Whether a stored template's disk is the image a manifest's whole-image
 /// digest names. The digest recorded at install answers without reading the
 /// disk; an entry that never recorded one is hashed.
-fn same_disk(local: &crate::template::store::ResolvedTemplate, whole: &str) -> Result<bool> {
+fn same_disk(local: &crate::template::store::TemplateVersion, whole: &str) -> Result<bool> {
     let want = whole
         .strip_prefix("sha256:")
         .unwrap_or(whole)
@@ -671,11 +671,15 @@ fn same_disk(local: &crate::template::store::ResolvedTemplate, whole: &str) -> R
 /// deferred pulls (labd build placeholders, status `template_cached`). A
 /// moving alias (`latest`) never resolves here until its first pull records
 /// a concrete version.
+///
+/// A store *version*: the reference's `#<variant>` is the caller's to apply
+/// ([`crate::template::store::TemplateVersion::select`]), since machines with
+/// different variants of one reference share its pull.
 pub fn cached_registry_template(
     reference: &str,
     arch: &str,
     store: &TemplateStore,
-) -> Result<Option<crate::template::store::ResolvedTemplate>> {
+) -> Result<Option<crate::template::store::TemplateVersion>> {
     let registry = Registry::new(reference)?;
     // Templates live at `host/owner/[group/]name:VERSION`; the store name is
     // the last repository path component.
@@ -685,7 +689,9 @@ pub fn cached_registry_template(
         .next()
         .unwrap_or_default()
         .to_string();
-    Ok(store.resolve(arch, &store_name, Some(registry.tag())).ok())
+    Ok(store
+        .resolve_version(arch, &store_name, Some(registry.tag()))
+        .ok())
 }
 
 /// Resolve a `registry` template reference to a cached store entry, pulling it
@@ -704,7 +710,7 @@ pub async fn ensure_registry_template(
     arch: &str,
     store: &TemplateStore,
     progress: &mut (dyn FnMut(PullProgress) + Send),
-) -> Result<crate::template::store::ResolvedTemplate> {
+) -> Result<crate::template::store::TemplateVersion> {
     // Tag is a concrete, already-cached version: stay offline.
     if let Some(r) = cached_registry_template(reference, arch, store)? {
         return Ok(r);
@@ -732,7 +738,7 @@ pub async fn ensure_registry_template(
         .resolve_version(Some(arch))
         .await
         .with_context(|| format!("resolving {reference}"))?;
-    if let Ok(r) = store.resolve(arch, &store_name, Some(&real)) {
+    if let Ok(r) = store.resolve_version(arch, &store_name, Some(&real)) {
         return Ok(r);
     }
     // Its own staging directory, on the store's filesystem: two labs pulling
@@ -744,7 +750,7 @@ pub async fn ensure_registry_template(
         .pull_with_progress(Some(arch), store, work.path(), false, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
-    store.resolve(&meta.arch, &meta.name, Some(&meta.version))
+    store.resolve_version(&meta.arch, &meta.name, Some(&meta.version))
 }
 
 /// `sha256:<hex>` of a byte slice.
@@ -1327,6 +1333,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants: Vec::new(),
         }
     }
 
@@ -1524,7 +1531,9 @@ mod tests {
         assert_eq!(pulled.name, "alpine");
         assert_eq!(pulled.origin.as_deref(), Some("ghcr.io/owner/alpine:3.20"));
         // disk reassembled identically
-        let resolved = store.resolve("x86_64", "alpine", Some("3.20")).unwrap();
+        let resolved = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap();
         assert_eq!(std::fs::read(&resolved.disk_path).unwrap(), disk);
     }
 
@@ -1581,7 +1590,7 @@ mod tests {
 
         // A different disk under the same name and version is refused.
         store
-            .remove("x86_64", "alpine", "3.20", true, &|_| None)
+            .remove("x86_64", "alpine", "3.20", None, true, &|_| None)
             .unwrap();
         let mut other = m.clone();
         other.sha256 = Some("00".repeat(32));
@@ -1735,7 +1744,7 @@ mod tests {
         assert_eq!(
             std::fs::read(
                 &store
-                    .resolve("x86_64", "alpine", Some("3.20"))
+                    .resolve_version("x86_64", "alpine", Some("3.20"))
                     .unwrap()
                     .disk_path
             )
@@ -1745,7 +1754,7 @@ mod tests {
         assert_eq!(
             std::fs::read(
                 &store
-                    .resolve("aarch64", "alpine", Some("3.20"))
+                    .resolve_version("aarch64", "alpine", Some("3.20"))
                     .unwrap()
                     .disk_path
             )
@@ -1870,6 +1879,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants: Vec::new(),
         };
         std::fs::create_dir_all(store.root()).unwrap();
         let staging = tempfile::tempdir_in(store.root()).unwrap();

@@ -1,6 +1,9 @@
 //! The template store (PRD §4, §6.1, §6.2, §7.1).
 //!
-//! Layout: `<root>/<arch>/<name>/<version>/{disk.qcow2, template.wcl}`.
+//! Layout: `<root>/<arch>/<name>/<version>/{disk.qcow2, template.wcl}`,
+//! plus `variants/<variant>/disk.qcow2` per sealed variant — a qcow2 overlay
+//! whose backing file is the base, `../../disk.qcow2`, by relative path
+//! (§6.6).
 //! Reads are lock-free; every mutation (install / remove / import) holds
 //! an exclusive flock on `<root>/.lock` so concurrent vmlab processes
 //! cannot corrupt the store (PRD §3). The only way content enters the
@@ -15,19 +18,111 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 
-use super::meta::{META_FILE, TemplateMeta};
+use super::meta::{META_FILE, TemplateMeta, VARIANTS_DIR, variant_disk_rel};
+use crate::config::model::{BASE_VARIANT, VariantRef};
 
 /// Disk image file name inside a version directory.
 pub const DISK_FILE: &str = "disk.qcow2";
 const LOCK_FILE: &str = ".lock";
 const STAGING_PREFIX: &str = ".staging-";
 
-/// A resolved store entry: its directory, disk image and metadata.
+/// One installed template version, as stored: its directory, its base disk,
+/// and its metadata as the file records it — base fields and the variant
+/// blocks whose overlays are present (a variant counts only when both its
+/// block and its disk exist, §6.6).
+///
+/// Nothing that boots a machine reads this directly: [`Self::select`] turns
+/// it into the disk and effective metadata a reference names.
 #[derive(Debug, Clone)]
-pub struct ResolvedTemplate {
+pub struct TemplateVersion {
     pub dir: PathBuf,
+    /// The base disk, `<version>/disk.qcow2`.
     pub disk_path: PathBuf,
     pub meta: TemplateMeta,
+}
+
+pub use super::meta::Purpose;
+
+/// A reference resolved to one disk of one version (§6.6): the disk a clone
+/// is backed on, and the effective metadata — the base's overridden by the
+/// variant's ([`TemplateMeta::effective`]) — that everything downstream reads.
+#[derive(Debug, Clone)]
+pub struct ResolvedTemplate {
+    /// The version directory.
+    pub dir: PathBuf,
+    /// The base disk, or the variant's overlay.
+    pub disk_path: PathBuf,
+    /// Effective metadata; lists no variants.
+    pub meta: TemplateMeta,
+    /// The variant resolved to; `None` for the base.
+    pub variant: Option<String>,
+}
+
+impl ResolvedTemplate {
+    /// `<arch>/<name>@<version>[#<variant>]` — exactly what was resolved.
+    pub fn reference(&self) -> String {
+        let m = &self.meta;
+        match &self.variant {
+            Some(v) => format!("{}/{}@{}#{v}", m.arch, m.name, m.version),
+            None => format!("{}/{}@{}", m.arch, m.name, m.version),
+        }
+    }
+}
+
+impl TemplateVersion {
+    /// `<arch>/<name>@<version>`.
+    pub fn reference(&self) -> String {
+        format!(
+            "{}/{}@{}",
+            self.meta.arch, self.meta.name, self.meta.version
+        )
+    }
+
+    /// Absolute path of a variant's overlay.
+    pub fn variant_disk(&self, name: &str) -> PathBuf {
+        self.dir.join(variant_disk_rel(name))
+    }
+
+    /// Every disk this version holds — the base, then each variant overlay.
+    /// What a removal of the whole version deletes.
+    pub fn disks(&self) -> Vec<PathBuf> {
+        let mut out = vec![self.disk_path.clone()];
+        out.extend(
+            self.meta
+                .variants
+                .iter()
+                .map(|v| self.variant_disk(&v.name)),
+        );
+        out
+    }
+
+    /// The variant names, each marked when it is the default, for messages.
+    pub fn variant_list(&self) -> String {
+        self.meta.variant_list()
+    }
+
+    /// Resolve the `#<variant>` part of a reference against this version
+    /// (§6.6) — [`TemplateMeta::select_variant`]'s answer, turned into the
+    /// disk it names and its effective metadata.
+    pub fn select(
+        &self,
+        variant: Option<&VariantRef>,
+        purpose: Purpose,
+    ) -> Result<ResolvedTemplate> {
+        let chosen = self
+            .meta
+            .select_variant(variant, purpose)
+            .map_err(anyhow::Error::msg)?;
+        Ok(ResolvedTemplate {
+            dir: self.dir.clone(),
+            disk_path: match chosen {
+                Some(v) => self.variant_disk(&v.name),
+                None => self.disk_path.clone(),
+            },
+            meta: self.meta.effective(chosen),
+            variant: chosen.map(|v| v.name.clone()),
+        })
+    }
 }
 
 /// Handle on a template store root. Callers normally pass
@@ -53,8 +148,9 @@ impl TemplateStore {
     // ---- reads (lock-free) -------------------------------------------------
 
     /// All templates in the store, sorted by arch, name, then version
-    /// (natural order). Entries with unreadable metadata are skipped
-    /// with a warning rather than failing the whole listing.
+    /// (natural order), each with the variants whose disks are installed.
+    /// Entries with unreadable metadata — invalid variant blocks included —
+    /// are skipped with a warning rather than failing the whole listing.
     pub fn list(&self) -> Result<Vec<TemplateMeta>> {
         let mut out = Vec::new();
         for arch in subdirs(&self.root)? {
@@ -64,7 +160,7 @@ impl TemplateStore {
                     if !meta_path.is_file() {
                         continue;
                     }
-                    match TemplateMeta::read_from(&meta_path) {
+                    match read_meta(&version) {
                         Ok(meta) => out.push(meta),
                         Err(e) => tracing::warn!(
                             "skipping unreadable template metadata {}: {e:#}",
@@ -92,18 +188,34 @@ impl TemplateStore {
         }
     }
 
-    /// Resolve `<arch>/<name>[@version]` to a store entry. `version`
-    /// of `None` selects the highest version by natural-sort order
-    /// (PRD §6.2). A `version` that is a build-counter prefix (e.g. the
-    /// 2-component `26100.1742`) resolves to the highest `<version>.<N>`
-    /// sub-build present, falling back to an exact match (see
-    /// [`resolve_version_pin`]).
+    /// Resolve `<arch>/<name>[@version][#variant]` to the disk a clone or a
+    /// build is backed on, with its effective metadata (§6.6): the version by
+    /// [`Self::resolve_version`], then the variant by
+    /// [`TemplateVersion::select`].
     pub fn resolve(
         &self,
         arch: &str,
         name: &str,
         version: Option<&str>,
+        variant: Option<&VariantRef>,
+        purpose: Purpose,
     ) -> Result<ResolvedTemplate> {
+        self.resolve_version(arch, name, version)?
+            .select(variant, purpose)
+    }
+
+    /// Resolve `<arch>/<name>[@version]` to a store version. `version`
+    /// of `None` selects the highest version by natural-sort order
+    /// (PRD §6.2). A `version` that is a build-counter prefix (e.g. the
+    /// 2-component `26100.1742`) resolves to the highest `<version>.<N>`
+    /// sub-build present, falling back to an exact match (see
+    /// [`resolve_version_pin`]).
+    pub fn resolve_version(
+        &self,
+        arch: &str,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<TemplateVersion> {
         let version = match version {
             Some(v) => resolve_version_pin(&self.versions_of(arch, name).unwrap_or_default(), v)
                 .ok_or_else(|| anyhow!("template {arch}/{name}@{v} not found in the store"))?,
@@ -113,22 +225,8 @@ impl TemplateStore {
                 .max_by(|a, b| compare_versions(a, b))
                 .ok_or_else(|| anyhow!("template {arch}/{name} not found in the store"))?,
         };
-        let dir = self.version_dir(arch, name, &version);
-        let meta_path = dir.join(META_FILE);
-        if !meta_path.is_file() {
-            bail!("template {arch}/{name}@{version} not found in the store");
-        }
-        let meta = TemplateMeta::read_from(&meta_path)?;
-        let disk_path = dir.join(DISK_FILE);
-        ensure!(
-            disk_path.is_file(),
-            "template {arch}/{name}@{version} is corrupt: missing {DISK_FILE}"
-        );
-        Ok(ResolvedTemplate {
-            disk_path,
-            dir,
-            meta,
-        })
+        self.installed(arch, name, &version)?
+            .ok_or_else(|| anyhow!("template {arch}/{name}@{version} not found in the store"))
     }
 
     /// `<arch>/<name>@<version>` exactly as named — no pin resolution —
@@ -138,19 +236,18 @@ impl TemplateStore {
         arch: &str,
         name: &str,
         version: &str,
-    ) -> Result<Option<ResolvedTemplate>> {
+    ) -> Result<Option<TemplateVersion>> {
         let dir = self.version_dir(arch, name, version);
-        let meta_path = dir.join(META_FILE);
-        if !meta_path.is_file() {
+        if !dir.join(META_FILE).is_file() {
             return Ok(None);
         }
-        let meta = TemplateMeta::read_from(&meta_path)?;
+        let meta = read_meta(&dir)?;
         let disk_path = dir.join(DISK_FILE);
         ensure!(
             disk_path.is_file(),
             "template {arch}/{name}@{version} is corrupt: missing {DISK_FILE}"
         );
-        Ok(Some(ResolvedTemplate {
+        Ok(Some(TemplateVersion {
             disk_path,
             dir,
             meta,
@@ -241,25 +338,41 @@ impl TemplateStore {
         }
     }
 
-    /// Remove `<arch>/<name>@<version>`. `in_use` reports why the
-    /// template cannot go (e.g. clones backed by it, PRD §7.1); a
-    /// `Some(reason)` refuses the removal unless `force` is set.
+    /// Remove `<arch>/<name>@<version>` — the base and every variant — or,
+    /// with `variant`, that one variant alone (§6.6). `in_use` is handed the
+    /// disks the removal would delete and reports why they cannot go (clones
+    /// backed by one of them, PRD §7.1); a `Some(reason)` refuses the removal
+    /// unless `force` is set.
+    ///
+    /// A variant removal deletes `variants/<name>/` and rewrites
+    /// `template.wcl` without its block. It refuses the default variant while
+    /// others remain, and the last variant — either would leave the
+    /// unsealed base as the disk a bare reference selects.
     pub fn remove(
         &self,
         arch: &str,
         name: &str,
         version: &str,
+        variant: Option<&str>,
         force: bool,
-        in_use: &dyn Fn(&TemplateMeta) -> Option<String>,
+        in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
     ) -> Result<()> {
         let _lock = self.lock()?;
+        if let Some(variant) = variant {
+            return self.remove_variant_locked(arch, name, version, variant, force, in_use);
+        }
         let dir = self.version_dir(arch, name, version);
         if !dir.is_dir() {
             bail!("template {arch}/{name}@{version} not found in the store");
         }
-        match TemplateMeta::read_from(&dir.join(META_FILE)) {
+        match read_meta(&dir) {
             Ok(meta) => {
-                if let Some(reason) = in_use(&meta)
+                let found = TemplateVersion {
+                    disk_path: dir.join(DISK_FILE),
+                    dir: dir.clone(),
+                    meta,
+                };
+                if let Some(reason) = in_use(&found.disks())
                     && !force
                 {
                     bail!(
@@ -283,10 +396,78 @@ impl TemplateStore {
         Ok(())
     }
 
+    fn remove_variant_locked(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+        variant: &str,
+        force: bool,
+        in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
+    ) -> Result<()> {
+        let found = self
+            .installed(arch, name, version)?
+            .ok_or_else(|| anyhow!("template {arch}/{name}@{version} not found in the store"))?;
+        let reference = format!("{arch}/{name}@{version}#{variant}");
+        if variant == BASE_VARIANT {
+            bail!(
+                "`#{BASE_VARIANT}` is the version itself — remove {arch}/{name}@{version} to \
+                 remove the base with its variants"
+            );
+        }
+        let Some(v) = found.meta.variant(variant) else {
+            if found.meta.variants.is_empty() {
+                bail!("template {arch}/{name}@{version} has no variants");
+            }
+            bail!(
+                "template {arch}/{name}@{version} has no variant `{variant}` (its variants: {})",
+                found.variant_list()
+            );
+        };
+        if found.meta.variants.len() == 1 {
+            bail!(
+                "refusing to remove {reference}: it is the version's only variant, and without it \
+                 a bare reference would select the unsealed base — remove {arch}/{name}@{version} \
+                 instead"
+            );
+        }
+        if found.meta.default_variant().map(|d| d.name.as_str()) == Some(variant) {
+            bail!(
+                "refusing to remove {reference}: it is the default variant, and the version's \
+                 other variants ({}) would be left with none — remove {arch}/{name}@{version} \
+                 instead, or rebuild it with another default",
+                found
+                    .meta
+                    .variants
+                    .iter()
+                    .filter(|o| o.name != variant)
+                    .map(|o| o.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let disk = found.variant_disk(&v.name);
+        if let Some(reason) = in_use(std::slice::from_ref(&disk))
+            && !force
+        {
+            bail!("refusing to remove {reference}: {reason} (use --force to remove anyway)");
+        }
+        // The block goes first: a crash between the two steps leaves an
+        // overlay with no block, which counts as not installed, rather than a
+        // block naming a disk that is gone.
+        let mut on_disk = TemplateMeta::read_from(&found.dir.join(META_FILE))?;
+        on_disk.variants.retain(|o| o.name != variant);
+        write_meta_atomic(&found.dir, &on_disk)?;
+        let vdir = found.dir.join(VARIANTS_DIR).join(variant);
+        fs::remove_dir_all(&vdir).with_context(|| format!("cannot remove {}", vdir.display()))?;
+        let _ = fs::remove_dir(found.dir.join(VARIANTS_DIR));
+        Ok(())
+    }
+
     /// Export a template as a single portable `tar.zst` archive holding
     /// `template.wcl` + `disk.qcow2` (PRD §6.2). Read-only, so no lock.
     pub fn export(&self, arch: &str, name: &str, version: Option<&str>, out: &Path) -> Result<()> {
-        let resolved = self.resolve(arch, name, version)?;
+        let resolved = self.resolve_version(arch, name, version)?;
         let file = File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
         let encoder = zstd::Encoder::new(file, 0).context("cannot start zstd stream")?;
         let mut tar = tar::Builder::new(encoder);
@@ -352,6 +533,26 @@ impl TemplateStore {
         Flock::lock(file, FlockArg::LockExclusive)
             .map_err(|(_, errno)| anyhow!("cannot lock template store: {errno}"))
     }
+}
+
+/// A version directory's metadata with the variants it can actually serve:
+/// a variant block whose overlay is missing does not count (§6.6).
+fn read_meta(dir: &Path) -> Result<TemplateMeta> {
+    let mut meta = TemplateMeta::read_from(&dir.join(META_FILE))?;
+    meta.variants
+        .retain(|v| dir.join(variant_disk_rel(&v.name)).is_file());
+    Ok(meta)
+}
+
+/// Replace `template.wcl` in `dir` by writing a sibling and renaming it over,
+/// so a reader never sees half a file.
+fn write_meta_atomic(dir: &Path, meta: &TemplateMeta) -> Result<()> {
+    let tmp = dir.join(format!(".{META_FILE}.{:08x}", rand::random::<u32>()));
+    meta.write_to(&tmp)?;
+    fs::rename(&tmp, dir.join(META_FILE)).with_context(|| {
+        let _ = fs::remove_file(&tmp);
+        format!("cannot replace {}", dir.join(META_FILE).display())
+    })
 }
 
 /// Streaming hex SHA-256 of a file.
@@ -594,6 +795,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants: Vec::new(),
         }
     }
 
@@ -851,18 +1053,24 @@ mod tests {
         assert!(!store.exists("riscv64", "alpine", None));
 
         // explicit version
-        let r = store.resolve("x86_64", "alpine", Some("3.19")).unwrap();
+        let r = store
+            .resolve_version("x86_64", "alpine", Some("3.19"))
+            .unwrap();
         assert_eq!(fs::read(&r.disk_path).unwrap(), b"old");
         assert_eq!(r.meta.version, "3.19");
         assert_eq!(r.dir, r.disk_path.parent().unwrap());
 
         // None means highest by natural sort
-        let r = store.resolve("x86_64", "alpine", None).unwrap();
+        let r = store.resolve_version("x86_64", "alpine", None).unwrap();
         assert_eq!(r.meta.version, "3.20");
         assert_eq!(fs::read(&r.disk_path).unwrap(), b"new");
 
-        assert!(store.resolve("x86_64", "alpine", Some("9.9")).is_err());
-        assert!(store.resolve("x86_64", "ghost", None).is_err());
+        assert!(
+            store
+                .resolve_version("x86_64", "alpine", Some("9.9"))
+                .is_err()
+        );
+        assert!(store.resolve_version("x86_64", "ghost", None).is_err());
     }
 
     #[test]
@@ -870,7 +1078,7 @@ mod tests {
         let (_tmp, store) = new_store();
         install(&store, &meta("x86_64", "win", "9.9"), b"a").unwrap();
         install(&store, &meta("x86_64", "win", "10.2"), b"b").unwrap();
-        let r = store.resolve("x86_64", "win", None).unwrap();
+        let r = store.resolve_version("x86_64", "win", None).unwrap();
         assert_eq!(r.meta.version, "10.2");
     }
 
@@ -881,19 +1089,19 @@ mod tests {
         install(&store, &meta("x86_64", "windows-11", "26100.1742.2"), b"b").unwrap();
         // A 2-component pin resolves to the highest matching sub-build.
         let r = store
-            .resolve("x86_64", "windows-11", Some("26100.1742"))
+            .resolve_version("x86_64", "windows-11", Some("26100.1742"))
             .unwrap();
         assert_eq!(r.meta.version, "26100.1742.2");
         assert_eq!(fs::read(&r.disk_path).unwrap(), b"b");
         // An exact sub-build pin still resolves exactly.
         let r = store
-            .resolve("x86_64", "windows-11", Some("26100.1742.0"))
+            .resolve_version("x86_64", "windows-11", Some("26100.1742.0"))
             .unwrap();
         assert_eq!(r.meta.version, "26100.1742.0");
         // A prefix with no sub-builds present is not found.
         assert!(
             store
-                .resolve("x86_64", "windows-11", Some("26100.9999"))
+                .resolve_version("x86_64", "windows-11", Some("26100.9999"))
                 .is_err()
         );
     }
@@ -924,7 +1132,7 @@ mod tests {
         };
         store.move_in(&staging, &dest, &cross_device).unwrap();
 
-        let r = store.resolve("x86_64", "t", Some("1")).unwrap();
+        let r = store.resolve_version("x86_64", "t", Some("1")).unwrap();
         assert_eq!(fs::read(&r.disk_path).unwrap(), b"disk");
         assert_eq!(fs::read(r.dir.join("extra").join("note")).unwrap(), b"n");
         assert!(!staging.exists(), "the original staging dir is removed");
@@ -943,7 +1151,7 @@ mod tests {
         let err = install(&store, &meta("x86_64", "t", "1"), b"two").unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         // original untouched
-        let r = store.resolve("x86_64", "t", Some("1")).unwrap();
+        let r = store.resolve_version("x86_64", "t", Some("1")).unwrap();
         assert_eq!(fs::read(&r.disk_path).unwrap(), b"one");
 
         // with overwrite it replaces
@@ -952,7 +1160,7 @@ mod tests {
         store
             .install(&staging.keep(), &meta("x86_64", "t", "1"), true)
             .unwrap();
-        let r = store.resolve("x86_64", "t", Some("1")).unwrap();
+        let r = store.resolve_version("x86_64", "t", Some("1")).unwrap();
         assert_eq!(fs::read(&r.disk_path).unwrap(), b"two");
     }
 
@@ -976,13 +1184,15 @@ mod tests {
         let (_tmp, store) = new_store();
         install(&store, &meta("x86_64", "t", "1"), b"x").unwrap();
 
-        let busy = |_: &TemplateMeta| Some("2 clones in lab \"dev\" are backed by it".to_string());
-        let err = store.remove("x86_64", "t", "1", false, &busy).unwrap_err();
+        let busy = |_: &[PathBuf]| Some("2 clones in lab \"dev\" are backed by it".to_string());
+        let err = store
+            .remove("x86_64", "t", "1", None, false, &busy)
+            .unwrap_err();
         assert!(err.to_string().contains("2 clones"), "{err}");
         assert!(err.to_string().contains("--force"), "{err}");
         assert!(store.exists("x86_64", "t", Some("1")));
 
-        store.remove("x86_64", "t", "1", true, &busy).unwrap();
+        store.remove("x86_64", "t", "1", None, true, &busy).unwrap();
         assert!(!store.exists("x86_64", "t", None));
         // empty parents pruned
         assert!(!store.root().join("x86_64").exists());
@@ -993,7 +1203,9 @@ mod tests {
         let (_tmp, store) = new_store();
         install(&store, &meta("x86_64", "t", "1"), b"x").unwrap();
         install(&store, &meta("x86_64", "t", "2"), b"y").unwrap();
-        store.remove("x86_64", "t", "1", false, &|_| None).unwrap();
+        store
+            .remove("x86_64", "t", "1", None, false, &|_| None)
+            .unwrap();
         assert!(!store.exists("x86_64", "t", Some("1")));
         assert!(store.exists("x86_64", "t", Some("2")), "siblings survive");
     }
@@ -1002,7 +1214,7 @@ mod tests {
     fn remove_missing_errors() {
         let (_tmp, store) = new_store();
         let err = store
-            .remove("x86_64", "ghost", "1", false, &|_| None)
+            .remove("x86_64", "ghost", "1", None, false, &|_| None)
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
     }
@@ -1025,7 +1237,7 @@ mod tests {
         let (_tmp2, other) = new_store();
         let imported = other.import(&archive, false).unwrap();
         assert_eq!(imported, m);
-        let r = other.resolve("x86_64", "alpine", None).unwrap();
+        let r = other.resolve_version("x86_64", "alpine", None).unwrap();
         assert_eq!(r.meta, m);
         assert_eq!(fs::read(&r.disk_path).unwrap(), disk_bytes);
 
@@ -1083,6 +1295,439 @@ mod tests {
         fs::write(&junk, b"not an archive").unwrap();
         assert!(store.import(&junk, false).is_err());
         assert!(store.list().unwrap().is_empty());
+    }
+
+    // ---- variants (§6.6) --------------------------------------------------------
+
+    fn have_qemu_img() -> bool {
+        let found = std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("qemu-img").is_file())
+        });
+        if !found {
+            eprintln!("skipping: qemu-img not found on PATH");
+        }
+        found
+    }
+
+    fn qemu_img(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("qemu-img")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "qemu-img {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn qemu_img_info(path: &Path) -> serde_json::Value {
+        let out = std::process::Command::new("qemu-img")
+            .args(["info", "--output=json"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    fn variant_meta(name: &str, default: bool, base_sha256: &str) -> VariantMeta {
+        VariantMeta {
+            name: name.into(),
+            default,
+            created: "2026-07-01T00:00:00Z".parse().unwrap(),
+            sha256: "cd".repeat(32),
+            base_sha256: base_sha256.into(),
+            description: None,
+            first_boot_script: None,
+            agent_version: None,
+            wscript_surface: None,
+            profile: None,
+            cpus: None,
+            memory: None,
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            cpu_model: None,
+            accel: None,
+        }
+    }
+
+    use super::super::meta::VariantMeta;
+
+    /// A store holding real qcow2 files, laid out as §6.6 says:
+    /// `x86_64/win@1` with a base and the overlays `standard` (default) and
+    /// `extra` (`memory` overridden), each backed on `../../disk.qcow2`; and
+    /// `x86_64/plain@1`, base-only.
+    fn variant_store() -> (tempfile::TempDir, TemplateStore) {
+        let (tmp, store) = new_store();
+        let dir = store.version_dir("x86_64", "win", "1");
+        fs::create_dir_all(&dir).unwrap();
+        qemu_img(&dir, &["create", "-q", "-f", "qcow2", DISK_FILE, "16M"]);
+        let base_sha = sha256_file(&dir.join(DISK_FILE)).unwrap();
+        for v in ["standard", "extra"] {
+            let vdir = dir.join(VARIANTS_DIR).join(v);
+            fs::create_dir_all(&vdir).unwrap();
+            qemu_img(
+                &vdir,
+                &[
+                    "create",
+                    "-q",
+                    "-f",
+                    "qcow2",
+                    "-b",
+                    "../../disk.qcow2",
+                    "-F",
+                    "qcow2",
+                    DISK_FILE,
+                ],
+            );
+        }
+        let mut m = meta("x86_64", "win", "1");
+        m.sha256 = Some(base_sha.clone());
+        m.first_boot_script = Some("base script".into());
+        let mut extra = variant_meta("extra", false, &base_sha);
+        extra.memory = Some(8 << 30);
+        m.variants = vec![variant_meta("standard", true, &base_sha), extra];
+        m.write_to(&dir.join(META_FILE)).unwrap();
+
+        let plain = store.version_dir("x86_64", "plain", "1");
+        fs::create_dir_all(&plain).unwrap();
+        qemu_img(&plain, &["create", "-q", "-f", "qcow2", DISK_FILE, "16M"]);
+        meta("x86_64", "plain", "1")
+            .write_to(&plain.join(META_FILE))
+            .unwrap();
+        (tmp, store)
+    }
+
+    fn named(n: &str) -> VariantRef {
+        VariantRef::Named(n.into())
+    }
+
+    /// Row 1: no `#` — the default variant with variants, the base without.
+    #[test]
+    fn resolve_without_a_variant() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let r = store
+            .resolve("x86_64", "win", None, None, Purpose::Lab)
+            .unwrap();
+        assert_eq!(r.variant.as_deref(), Some("standard"));
+        assert_eq!(r.disk_path, r.dir.join("variants/standard/disk.qcow2"));
+        assert_eq!(r.reference(), "x86_64/win@1#standard");
+        assert!(r.meta.variants.is_empty(), "effective metadata is flat");
+
+        let r = store
+            .resolve("x86_64", "plain", None, None, Purpose::Lab)
+            .unwrap();
+        assert_eq!(r.variant, None);
+        assert_eq!(r.disk_path, r.dir.join(DISK_FILE));
+    }
+
+    /// Row 2: `#<name>` — that variant (with its effective metadata), an
+    /// unknown name listing the variants, and an error on a base-only one.
+    #[test]
+    fn resolve_a_named_variant() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let r = store
+            .resolve(
+                "x86_64",
+                "win",
+                Some("1"),
+                Some(&named("extra")),
+                Purpose::Lab,
+            )
+            .unwrap();
+        assert_eq!(r.variant.as_deref(), Some("extra"));
+        assert_eq!(r.disk_path, r.dir.join("variants/extra/disk.qcow2"));
+        assert_eq!(r.meta.memory, Some(8 << 30), "the variant's override");
+        assert_eq!(r.meta.cpus, Some(2), "the base's own value");
+        assert_eq!(r.meta.first_boot_script.as_deref(), Some("base script"));
+        // The overlay is a real qcow2 on the base, by relative path.
+        let info = qemu_img_info(&r.disk_path);
+        assert_eq!(info["backing-filename"], "../../disk.qcow2");
+        assert_eq!(info["virtual-size"], 16 << 20);
+
+        let err = store
+            .resolve("x86_64", "win", None, Some(&named("ghost")), Purpose::Lab)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no variant `ghost`"), "{err}");
+        assert!(err.contains("standard (default), extra"), "{err}");
+
+        let err = store
+            .resolve(
+                "x86_64",
+                "plain",
+                None,
+                Some(&named("extra")),
+                Purpose::Build,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no variants"), "{err}");
+    }
+
+    /// Row 3: `#base` — refused for a lab on a template with variants, the
+    /// base in a build context, and the base everywhere without variants.
+    #[test]
+    fn resolve_the_base() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let base = VariantRef::Base;
+        let err = store
+            .resolve("x86_64", "win", None, Some(&base), Purpose::Lab)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("x86_64/win@1#base is refused"), "{err}");
+        assert!(err.contains("unsealed base"), "{err}");
+        assert!(err.contains("standard (default), extra"), "{err}");
+
+        let r = store
+            .resolve("x86_64", "win", None, Some(&base), Purpose::Build)
+            .unwrap();
+        assert_eq!(r.variant, None);
+        assert_eq!(r.disk_path, r.dir.join(DISK_FILE));
+        assert_eq!(r.meta.memory, Some(4 << 30), "the base's own metadata");
+
+        for purpose in [Purpose::Lab, Purpose::Build] {
+            let r = store
+                .resolve("x86_64", "plain", None, Some(&base), purpose)
+                .unwrap();
+            assert_eq!(r.disk_path, r.dir.join(DISK_FILE));
+        }
+    }
+
+    /// A variant counts only with both its block and its overlay; a stale one
+    /// is refused by name.
+    #[test]
+    fn missing_overlays_and_stale_variants() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let dir = store.version_dir("x86_64", "win", "1");
+        fs::remove_dir_all(dir.join("variants/extra")).unwrap();
+        let v = store.resolve_version("x86_64", "win", None).unwrap();
+        let names: Vec<_> = v.meta.variants.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["standard"]);
+        assert!(
+            store
+                .resolve("x86_64", "win", None, Some(&named("extra")), Purpose::Lab)
+                .is_err()
+        );
+        let listed = store.list().unwrap();
+        let win = listed.iter().find(|m| m.name == "win").unwrap();
+        assert_eq!(
+            win.variants.len(),
+            1,
+            "list exposes installed variants only"
+        );
+
+        // Rebuild the base under the variant: it goes stale.
+        qemu_img(&dir, &["create", "-q", "-f", "qcow2", DISK_FILE, "32M"]);
+        let mut m = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
+        m.sha256 = Some(sha256_file(&dir.join(DISK_FILE)).unwrap());
+        m.write_to(&dir.join(META_FILE)).unwrap();
+        let err = store
+            .resolve("x86_64", "win", None, None, Purpose::Lab)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("variant `standard`"), "{err}");
+        assert!(err.contains("rebuild the variant"), "{err}");
+    }
+
+    /// Invalid default rules make the store entry unreadable to resolution
+    /// and leave it out of the listing.
+    #[test]
+    fn an_ambiguous_default_is_reported_by_the_reader() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let dir = store.version_dir("x86_64", "win", "1");
+        let text = fs::read_to_string(dir.join(META_FILE)).unwrap();
+        fs::write(
+            dir.join(META_FILE),
+            text.replace("    default = true\n", ""),
+        )
+        .unwrap();
+        let err = format!(
+            "{:#}",
+            store
+                .resolve("x86_64", "win", None, None, Purpose::Lab)
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("exactly one variant must be the default"),
+            "{err}"
+        );
+        assert!(store.list().unwrap().iter().all(|m| m.name != "win"));
+    }
+
+    /// A linked clone of the resolved disk chains clone → variant → base.
+    #[test]
+    fn a_clone_of_a_variant_chains_to_the_base() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (tmp, store) = variant_store();
+        let r = store
+            .resolve("x86_64", "win", None, Some(&named("extra")), Purpose::Lab)
+            .unwrap();
+        let backing = r.disk_path.canonicalize().unwrap();
+        qemu_img(
+            tmp.path(),
+            &[
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-b",
+                backing.to_str().unwrap(),
+                "-F",
+                "qcow2",
+                "clone.qcow2",
+            ],
+        );
+        let out = std::process::Command::new("qemu-img")
+            .args(["info", "--backing-chain", "--output=json"])
+            .arg(tmp.path().join("clone.qcow2"))
+            .output()
+            .unwrap();
+        let chain: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(chain.len(), 3, "clone, variant, base");
+        assert_eq!(chain[0]["backing-filename"], backing.to_str().unwrap());
+        let base = PathBuf::from(chain[2]["filename"].as_str().unwrap());
+        assert_eq!(
+            base.canonicalize().unwrap(),
+            r.dir.join(DISK_FILE).canonicalize().unwrap()
+        );
+    }
+
+    /// Removing a variant drops its overlay and its block alone, and is
+    /// refused while a clone is backed by that overlay; removing the version
+    /// hands every disk — base and overlays — to the in-use check.
+    #[test]
+    fn remove_one_variant() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let dir = store.version_dir("x86_64", "win", "1");
+        let extra = dir.join("variants/extra/disk.qcow2");
+        let standard = dir.join("variants/standard/disk.qcow2");
+
+        // In use: a clone is backed by `extra`.
+        let backed_on_extra = |doomed: &[PathBuf]| {
+            doomed
+                .iter()
+                .any(|d| d == &extra)
+                .then(|| "the clone of machine lab/vm is backed by it".to_string())
+        };
+        let err = store
+            .remove("x86_64", "win", "1", Some("extra"), false, &backed_on_extra)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("x86_64/win@1#extra"), "{err}");
+        assert!(err.contains("lab/vm"), "{err}");
+        assert!(extra.is_file());
+        // The same clone does not hold `standard`'s check, nor the base's
+        // when only a variant goes.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let record = |doomed: &[PathBuf]| {
+            seen.borrow_mut().extend_from_slice(doomed);
+            None
+        };
+        store
+            .remove("x86_64", "win", "1", Some("extra"), false, &record)
+            .unwrap();
+        assert_eq!(*seen.borrow(), std::slice::from_ref(&extra));
+        assert!(!extra.exists());
+        assert!(!dir.join("variants/extra").exists());
+        assert!(standard.is_file(), "the other variant stays");
+        assert!(dir.join(DISK_FILE).is_file(), "the base stays");
+        let v = store.resolve_version("x86_64", "win", None).unwrap();
+        assert!(v.meta.variant("extra").is_none(), "its block is gone");
+        assert!(v.meta.variant("standard").is_some());
+        // Re-read from disk, not just filtered.
+        let on_disk = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
+        assert_eq!(on_disk.variants.len(), 1);
+
+        // The last variant cannot go on its own.
+        let err = store
+            .remove("x86_64", "win", "1", Some("standard"), false, &|_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only variant"), "{err}");
+        // Nor can `#base`, nor a name it does not have.
+        assert!(
+            store
+                .remove("x86_64", "win", "1", Some("base"), false, &|_| None)
+                .is_err()
+        );
+        let err = store
+            .remove("x86_64", "win", "1", Some("ghost"), false, &|_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no variant `ghost`"), "{err}");
+    }
+
+    #[test]
+    fn remove_the_default_variant_is_refused() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let err = store
+            .remove("x86_64", "win", "1", Some("standard"), false, &|_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default variant"), "{err}");
+        assert!(err.contains("extra"), "{err}");
+    }
+
+    #[test]
+    fn remove_a_version_removes_its_variants() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let dir = store.version_dir("x86_64", "win", "1");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let busy = |doomed: &[PathBuf]| {
+            seen.borrow_mut().extend_from_slice(doomed);
+            doomed
+                .iter()
+                .any(|d| d.ends_with("variants/standard/disk.qcow2"))
+                .then(|| "a clone is backed by it".to_string())
+        };
+        let err = store
+            .remove("x86_64", "win", "1", None, false, &busy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a clone is backed by it"), "{err}");
+        assert_eq!(
+            *seen.borrow(),
+            [
+                dir.join(DISK_FILE),
+                dir.join("variants/standard/disk.qcow2"),
+                dir.join("variants/extra/disk.qcow2"),
+            ]
+        );
+        store
+            .remove("x86_64", "win", "1", None, false, &|_| None)
+            .unwrap();
+        assert!(!dir.exists(), "base and variants go together");
     }
 
     // ---- misc -------------------------------------------------------------------

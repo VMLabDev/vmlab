@@ -229,6 +229,9 @@ pub struct TemplateParts {
     /// vmlab-agent stamp the template build baked in (`None` = the template
     /// predates agent support — no terminal, exec, copy or readiness).
     pub agent_version: Option<String>,
+    /// The template variant the backing disk is (§6.6); `None` for the base
+    /// of a base-only template, scratch, or a pull not yet bound.
+    pub variant: Option<String>,
 }
 
 pub struct VmInstance {
@@ -301,9 +304,10 @@ pub struct VmInstance {
 /// clone keeps its backing file, which the store refuses to delete (§7.1).
 pub fn clone_source(cfg: &model::Vm) -> String {
     match (&cfg.template, &cfg.arch) {
-        (model::TemplateRef::Registry { reference }, Some(arch)) => {
-            format!("{reference} (arch {arch})")
-        }
+        (model::TemplateRef::Registry { reference, variant }, Some(arch)) => match variant {
+            Some(v) => format!("{reference}#{v} (arch {arch})"),
+            None => format!("{reference} (arch {arch})"),
+        },
         (template, _) => template.to_string(),
     }
 }
@@ -1834,6 +1838,7 @@ impl super::machine::Machine for VmInstance {
         let resolved = &self.template().resolved;
         super::machine::MachineDetail::Vm(crate::status::VmStatus {
             template: self.cfg.template.to_string(),
+            variant: self.template().variant.clone(),
             arch: Some(resolved.arch.clone()),
             cpus: Some(resolved.cpus),
             memory: Some(resolved.memory),
@@ -1970,6 +1975,28 @@ mod tests {
                 r#"vm "a" { template = "ghcr.io/o/alpine:3" arch = "aarch64" }"#
             )),
             "ghcr.io/o/alpine:3 (arch aarch64)"
+        );
+    }
+
+    /// The source carries the `#<variant>` as written (§6.6), so changing
+    /// the variant a clone was made from refuses reuse exactly as a changed
+    /// pin does — and so does adding a `#` that names the default.
+    #[test]
+    fn a_clone_source_records_the_variant() {
+        let extra = clone_source(&vm(r#"vm "a" { template = "x86_64/win@1#extra" }"#));
+        assert_eq!(extra, "x86_64/win@1#extra");
+        let standard = clone_source(&vm(r#"vm "a" { template = "x86_64/win@1#standard" }"#));
+        let bare = clone_source(&vm(r#"vm "a" { template = "x86_64/win@1" }"#));
+        assert_eq!(clone_source_refusal("a", &extra, &extra), None);
+        let why = clone_source_refusal("a", &standard, &extra).expect("refuses");
+        assert!(why.contains("\"x86_64/win@1#standard\""), "{why}");
+        assert!(why.contains("\"x86_64/win@1#extra\""), "{why}");
+        assert!(clone_source_refusal("a", &bare, &standard).is_some());
+        assert_eq!(
+            clone_source(&vm(
+                r#"vm "a" { template = "ghcr.io/o/win:1#extra" arch = "x86_64" }"#
+            )),
+            "ghcr.io/o/win:1#extra (arch x86_64)"
         );
     }
 

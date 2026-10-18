@@ -121,6 +121,9 @@ impl TemplateConfig {
             first_boot_script: self.first_boot_script,
             agent_version: self.agent_version,
             wscript_surface: self.wscript_surface,
+            // Variants travel as their own manifests (§6.6), not in the
+            // base's config blob.
+            variants: Vec::new(),
         })
     }
 
@@ -162,6 +165,7 @@ mod tests {
             first_boot_script: Some("use vmlab\nfn main(lab) { let vm = lab.this_vm() }\n".into()),
             agent_version: Some("agent=abc123".into()),
             wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+            variants: Vec::new(),
         }
     }
 

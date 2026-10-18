@@ -15,12 +15,15 @@ use serde::{Deserialize, Serialize};
 
 use super::meta::TemplateMeta;
 
-/// One exact version in the store, as `<arch>/<name>@<version>`.
+/// One exact version in the store, as `<arch>/<name>@<version>` — or one
+/// variant of it, `…#<variant>`, where a command acted on just that (§6.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredVersion {
     pub arch: String,
     pub name: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 impl StoredVersion {
@@ -29,13 +32,18 @@ impl StoredVersion {
             arch: meta.arch.clone(),
             name: meta.name.clone(),
             version: meta.version.clone(),
+            variant: None,
         }
     }
 }
 
 impl std::fmt::Display for StoredVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}@{}", self.arch, self.name, self.version)
+        write!(f, "{}/{}@{}", self.arch, self.name, self.version)?;
+        match &self.variant {
+            Some(v) => write!(f, "#{v}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -130,11 +138,32 @@ impl RemoteStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreEntry {
     pub meta: TemplateSummary,
-    /// Size of `disk.qcow2` in bytes; 0 when it cannot be read.
+    /// Size of the base `disk.qcow2` in bytes; 0 when it cannot be read.
     pub size: u64,
     /// Absent unless the caller asked for the registry check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteStatus>,
+    /// The version's installed variants (§6.6), in metadata order; empty for
+    /// a base-only template.
+    #[serde(default)]
+    pub variants: Vec<VariantSummary>,
+}
+
+/// One installed variant of a listed version (§6.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariantSummary {
+    pub name: String,
+    /// The variant a reference with no `#` selects.
+    pub default: bool,
+    /// Built on a base other than the version's current one; refused until
+    /// rebuilt.
+    pub stale: bool,
+    pub description: Option<String>,
+    /// RFC 3339.
+    pub created: String,
+    pub sha256: String,
+    /// Size of the overlay alone, in bytes.
+    pub size: u64,
 }
 
 /// What `store.prune` would do, or did.

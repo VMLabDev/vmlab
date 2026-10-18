@@ -581,6 +581,11 @@ fn machine_detail(m: &MachineStatus) -> String {
     let mut field = |k: &str, v: String| detail.push_str(&format!(" {k}={v}"));
     match &m.detail {
         MachineDetail::Vm(vm) => {
+            // Only for a template with variants (§6.6): which one the clone
+            // runs, including the default a bare reference picked.
+            if let Some(variant) = &vm.variant {
+                field("variant", variant.clone());
+            }
             field("arch", or_dash(vm.arch.as_deref()).to_string());
             field("cpus", vm.cpus.map_or("-".into(), |c| c.to_string()));
             field(
@@ -1219,8 +1224,15 @@ pub(super) fn effective_profile_name(
                     arch,
                     name,
                     version,
+                    variant,
                 } => crate::template::TemplateStore::new(crate::paths::template_store_dir())
-                    .resolve(arch, name, version.as_deref())
+                    .resolve(
+                        arch,
+                        name,
+                        version.as_deref(),
+                        variant.as_ref(),
+                        crate::template::store::Purpose::Lab,
+                    )
                     .ok()
                     .map(|t| t.meta),
                 // A registry reference not yet pulled, and `scratch`, have no

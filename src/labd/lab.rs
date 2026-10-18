@@ -30,6 +30,7 @@ use crate::profiles::ProfileSet;
 use crate::status::{LabStatus, SegmentFrames, SegmentStatus};
 use crate::sync::LockRecover;
 use crate::template::TemplateStore;
+use crate::template::store::Purpose;
 
 pub struct LabRuntime {
     pub name: String,
@@ -348,20 +349,33 @@ impl LabRuntime {
 
         let mut vms = BTreeMap::new();
         for vm_cfg in &config.lab.vms {
-            // Backing template + recorded hardware.
-            let (backing, meta, disk_size) = match &vm_cfg.template {
-                TemplateRef::Scratch => (None, None, vm_cfg.disk),
+            // Backing disk + effective metadata: the variant the reference
+            // resolves to, or the base (§6.6).
+            let (backing, meta, variant, disk_size) = match &vm_cfg.template {
+                TemplateRef::Scratch => (None, None, None, vm_cfg.disk),
                 TemplateRef::Store {
                     arch,
                     name: tname,
                     version,
+                    variant,
                 } => {
                     let resolved = store
-                        .resolve(arch, tname, version.as_deref())
+                        .resolve(
+                            arch,
+                            tname,
+                            version.as_deref(),
+                            variant.as_ref(),
+                            Purpose::Lab,
+                        )
                         .with_context(|| format!("vm \"{}\"", vm_cfg.name))?;
-                    (Some(resolved.disk_path.clone()), Some(resolved.meta), None)
+                    (
+                        Some(resolved.disk_path),
+                        Some(resolved.meta),
+                        resolved.variant,
+                        None,
+                    )
                 }
-                TemplateRef::Registry { reference } => {
+                TemplateRef::Registry { reference, variant } => {
                     // A registry reference is pulled on first `up` if absent
                     // from the store, never re-pulled implicitly (PRD §6.4).
                     // Build NEVER downloads: an uncached template becomes a
@@ -375,8 +389,16 @@ impl LabRuntime {
                         )
                     })?;
                     match crate::oci::cached_registry_template(reference, &arch, &store)? {
-                        Some(resolved) => {
-                            (Some(resolved.disk_path.clone()), Some(resolved.meta), None)
+                        Some(version) => {
+                            let resolved = version
+                                .select(variant.as_ref(), Purpose::Lab)
+                                .with_context(|| format!("vm \"{}\"", vm_cfg.name))?;
+                            (
+                                Some(resolved.disk_path),
+                                Some(resolved.meta),
+                                resolved.variant,
+                                None,
+                            )
                         }
                         None => {
                             pending.insert(
@@ -386,7 +408,7 @@ impl LabRuntime {
                                     arch,
                                 },
                             );
-                            (None, None, None)
+                            (None, None, None, None)
                         }
                     }
                 }
@@ -476,6 +498,7 @@ impl LabRuntime {
                     disk_size,
                     first_boot,
                     agent_version,
+                    variant,
                 },
             );
             vms.insert(vm_cfg.name.clone(), vm);
@@ -842,10 +865,13 @@ impl LabRuntime {
     /// Bind a freshly pulled template into each VM waiting on it: the
     /// hardware re-resolves against the template meta the pull just made
     /// available.
+    ///
+    /// The pull fetched a version; each machine selects its own variant of it
+    /// (§6.6), since the batch is keyed by the bare registry reference.
     fn bind_template(
         &self,
         batch: &PullBatch,
-        resolved: &crate::template::store::ResolvedTemplate,
+        version: &crate::template::store::TemplateVersion,
     ) -> Result<()> {
         for vm_name in &batch.machines {
             let vm_cfg = self
@@ -855,6 +881,9 @@ impl LabRuntime {
                 .iter()
                 .find(|v| &v.name == vm_name)
                 .ok_or_else(|| anyhow!("no vm \"{vm_name}\" in the lab config"))?;
+            let resolved = version
+                .select(vm_cfg.template.variant(), Purpose::Lab)
+                .with_context(|| format!("vm \"{vm_name}\""))?;
             let resolved_vm =
                 crate::qemu::resolve_vm(vm_cfg, Some(&resolved.meta), &self.profiles)?;
             // kind-aware: binding a downloaded template needs the concrete
@@ -866,6 +895,7 @@ impl LabRuntime {
                 disk_size: None,
                 first_boot: resolved.meta.first_boot(),
                 agent_version: resolved.meta.agent_version.clone(),
+                variant: resolved.variant.clone(),
             });
         }
         Ok(())
