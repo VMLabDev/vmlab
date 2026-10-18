@@ -60,6 +60,12 @@ pub struct TemplateMeta {
     /// Host wscript surface this template's embedded scripts were built
     /// against. `None` means a legacy, pre-versioning template and is accepted.
     pub wscript_surface: Option<crate::scripting::WscriptSurfaceVersion>,
+    /// The base was built from a definition that declares variants, so it is
+    /// unsealed (§6.6): with no default variant installed — between the base
+    /// landing and its default variant, after every variant build failed, or
+    /// once the overlays are gone — a lab ref is refused rather than cloning
+    /// it. Written `variants_expected = true`; absent means false.
+    pub variants_expected: bool,
     /// The version's sealed variants, in the order the file lists them
     /// (§6.6). Empty for a base-only template. A file that reads back always
     /// obeys the default-variant rule (see [`TemplateMeta::default_variant`]).
@@ -161,7 +167,10 @@ impl TemplateMeta {
     /// | `#<name>` | that variant, else an error listing them | an error |
     /// | `#base` | the base, [`Purpose::Build`] only | the base |
     ///
-    /// A stale variant is refused with the word to rebuild it.
+    /// A stale variant is refused with the word to rebuild it. A base marked
+    /// [`variants_expected`](Self::variants_expected) with no default variant
+    /// installed refuses every [`Purpose::Lab`] reference and a bare build
+    /// one; only a build's `#base` (or `#<name>`) still resolves.
     pub fn select_variant(
         &self,
         variant: Option<&VariantRef>,
@@ -169,6 +178,12 @@ impl TemplateMeta {
     ) -> Result<Option<&VariantMeta>, String> {
         let reference = format!("{}/{}@{}", self.arch, self.name, self.version);
         let has_variants = !self.variants.is_empty();
+        if self.variants_expected
+            && self.default_variant().is_none()
+            && (purpose == Purpose::Lab || variant.is_none())
+        {
+            return Err(self.unbuilt_variants(&reference));
+        }
         let chosen = match variant {
             None if !has_variants => return Ok(None),
             None => self.default_variant().ok_or_else(|| {
@@ -215,6 +230,28 @@ impl TemplateMeta {
         Ok(Some(chosen))
     }
 
+    /// Why a variant-bearing base with no default variant installed is
+    /// refused, and the build that fixes it.
+    fn unbuilt_variants(&self, reference: &str) -> String {
+        let build = format!(
+            "vmlab template build {}@{} --variant <variant>",
+            self.name, self.version
+        );
+        if self.variants.is_empty() {
+            format!(
+                "template {reference} is built from a definition with variants, but its variants \
+                 are not built yet, and its base is unsealed — every clone of it would share one \
+                 machine identity. Build them with `{build}`"
+            )
+        } else {
+            format!(
+                "template {reference} has variants ({}) but its default variant is not \
+                 installed, and its base is unsealed — build the default with `{build}`",
+                self.variant_list()
+            )
+        }
+    }
+
     /// Whether `variant` was built on a base other than this version's: its
     /// `base_sha256` is not the base's `sha256`. A base that records no
     /// digest cannot vouch for any variant, so every variant of it is stale.
@@ -236,6 +273,7 @@ impl TemplateMeta {
         let mut m = self.clone();
         m.variants.clear();
         let Some(v) = variant else { return m };
+        m.variants_expected = false;
         fn over<T: Clone>(slot: &mut Option<T>, value: &Option<T>) {
             if value.is_some() {
                 slot.clone_from(value);
@@ -325,6 +363,9 @@ impl TemplateMeta {
         }
         if let Some(v) = self.wscript_surface {
             let _ = writeln!(out, "  wscript_surface = {v}");
+        }
+        if self.variants_expected {
+            let _ = writeln!(out, "  variants_expected = true");
         }
         for v in &self.variants {
             write_variant(&mut out, v);
@@ -481,6 +522,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         .int_at_least::<u32>("wscript_surface", 0)
         .map(|version| version.map(Into::into))
         .unspan();
+    let variants_expected = r.bool("variants_expected").unspan().unwrap_or(false);
     let variants = extract_variants(&mut r);
     Some(TemplateMeta {
         name: name?,
@@ -503,6 +545,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         first_boot_script,
         agent_version,
         wscript_surface,
+        variants_expected,
         variants: variants?,
     })
 }
@@ -682,6 +725,7 @@ mod tests {
             ),
             agent_version: Some("agent=abc123".into()),
             wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+            variants_expected: false,
             variants: Vec::new(),
         }
     }
@@ -708,6 +752,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
             variants: Vec::new(),
         }
     }
@@ -1051,6 +1096,91 @@ mod tests {
         assert_eq!(plain.secure_boot, Some(true));
         assert_eq!(plain.first_boot_script, base.first_boot_script);
         assert!(plain.variants.is_empty());
+    }
+
+    /// `variants_expected` writes only when set and reads back; a file
+    /// without it is an ordinary base.
+    #[test]
+    fn round_trip_variants_expected() {
+        let mut meta = full_meta();
+        assert!(!meta.to_wcl().contains("variants_expected"));
+        meta.variants_expected = true;
+        let text = meta.to_wcl();
+        assert!(text.contains("  variants_expected = true\n"), "{text}");
+        let back = TemplateMeta::from_wcl(&text, "<test>").unwrap();
+        assert_eq!(back, meta);
+        let mut built = with_variants(vec![variant("standard")]);
+        built.variants_expected = true;
+        let back = TemplateMeta::from_wcl(&built.to_wcl(), "<test>").unwrap();
+        assert_eq!(back, built);
+        // A variant's effective metadata is sealed: it carries no marker.
+        assert!(!built.effective(built.variants.first()).variants_expected);
+    }
+
+    /// A variant-bearing base with no default variant installed refuses every
+    /// lab reference — bare, `#<name>` and `#base` — naming the build that
+    /// fixes it; a build's `#base` and `#<name>` still resolve, its bare ref
+    /// does not.
+    #[test]
+    fn an_unbuilt_variant_bearing_base_is_never_cloned() {
+        let base_ref = VariantRef::Base;
+        let named = VariantRef::Named("extra".into());
+        let refs = [None, Some(&named), Some(&base_ref)];
+
+        let mut none = full_meta();
+        none.variants_expected = true;
+        for r in refs {
+            let err = none.select_variant(r, Purpose::Lab).unwrap_err();
+            assert!(err.contains("template x86_64/win11@26100.1 "), "{err}");
+            assert!(err.contains("variants are not built yet"), "{err}");
+            assert!(
+                err.contains("vmlab template build win11@26100.1 --variant <variant>"),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            none.select_variant(Some(&base_ref), Purpose::Build),
+            Ok(None)
+        );
+        let err = none.select_variant(None, Purpose::Build).unwrap_err();
+        assert!(err.contains("variants are not built yet"), "{err}");
+
+        // Two variants left, the default's overlay gone: no default.
+        let mut headless = with_variants(vec![variant("extra"), variant("other")]);
+        headless.variants_expected = true;
+        for r in refs {
+            let err = headless.select_variant(r, Purpose::Lab).unwrap_err();
+            assert!(err.contains("default variant is not installed"), "{err}");
+            assert!(err.contains("extra, other"), "{err}");
+            assert!(err.contains("--variant <variant>"), "{err}");
+        }
+        assert_eq!(
+            headless.select_variant(Some(&base_ref), Purpose::Build),
+            Ok(None)
+        );
+        assert_eq!(
+            headless
+                .select_variant(Some(&named), Purpose::Build)
+                .unwrap()
+                .map(|v| v.name.as_str()),
+            Some("extra")
+        );
+
+        // Once the default lands, the marker changes nothing.
+        let mut built = with_variants(vec![variant("standard")]);
+        built.variants_expected = true;
+        assert_eq!(
+            built
+                .select_variant(None, Purpose::Lab)
+                .unwrap()
+                .map(|v| v.name.as_str()),
+            Some("standard")
+        );
+        assert!(built.select_variant(Some(&base_ref), Purpose::Lab).is_err());
+        assert_eq!(
+            built.select_variant(Some(&base_ref), Purpose::Build),
+            Ok(None)
+        );
     }
 
     #[test]

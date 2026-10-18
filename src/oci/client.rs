@@ -1751,6 +1751,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
             variants: Vec::new(),
         }
     }
@@ -2299,6 +2300,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
             variants: Vec::new(),
         };
         std::fs::create_dir_all(store.root()).unwrap();
@@ -2791,6 +2793,74 @@ mod tests {
             );
         }
         v.meta
+    }
+
+    /// A variant-bearing base pushed before any variant was built keeps its
+    /// `variants_expected` marker through the registry: the pulled version
+    /// refuses a lab, as the pushed one did, and still serves a build its
+    /// `#base`.
+    #[tokio::test]
+    async fn a_pulled_unbuilt_base_keeps_its_marker() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        std::fs::create_dir_all(&tdir).unwrap();
+        run(
+            &tdir,
+            "qemu-img",
+            &["create", "-q", "-f", "qcow2", DISK_FILE, "4M"],
+        );
+        let mut m = meta("x86_64");
+        m.sha256 = Some(sha256_file(&tdir.join(DISK_FILE)).unwrap());
+        m.variants_expected = true;
+        m.write_to(&tdir.join(META_FILE)).unwrap();
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let config = config_json(&fake, &arch_manifest(&fake, "3.20").await).await;
+        assert_eq!(config["variants_expected"], serde_json::Value::Bool(true));
+
+        let store = store_in(work.path(), "pulled");
+        pull_want(
+            &fake,
+            "ghcr.io/owner/alpine:3.20",
+            &store,
+            &VariantWant::default(),
+        )
+        .await
+        .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap();
+        assert!(held.meta.variants_expected);
+        assert!(held.meta.variants.is_empty());
+        let err = store
+            .resolve("x86_64", "alpine", Some("3.20"), None, Purpose::Lab)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("variants are not built yet"),
+            "{err:#}"
+        );
+        store
+            .resolve(
+                "x86_64",
+                "alpine",
+                Some("3.20"),
+                Some(&crate::config::model::VariantRef::Base),
+                Purpose::Build,
+            )
+            .unwrap();
     }
 
     /// `#<variant>` brings the base, the default and the variant named; the

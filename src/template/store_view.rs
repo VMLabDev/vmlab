@@ -121,6 +121,10 @@ pub struct TemplateSummary {
     pub origin: Option<String>,
     pub registry: Option<String>,
     pub sha256: Option<String>,
+    /// Built from a definition with variants (§6.6): with no default variant
+    /// among `variants`, a lab refuses every reference to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub variants_expected: bool,
 }
 
 impl From<&TemplateMeta> for TemplateSummary {
@@ -144,6 +148,7 @@ impl From<&TemplateMeta> for TemplateSummary {
             origin: t.origin.clone(),
             registry: t.registry.clone(),
             sha256: t.sha256.clone(),
+            variants_expected: t.variants_expected,
         }
     }
 }

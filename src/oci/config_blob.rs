@@ -63,6 +63,11 @@ pub struct TemplateConfig {
     /// Host wscript surface used by embedded scripts.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wscript_surface: Option<crate::scripting::WscriptSurfaceVersion>,
+    /// A base built from a definition with variants (§6.6): with no default
+    /// variant installed, a lab never clones it. A client that predates the
+    /// marker ignores it and pulls a base-only template.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub variants_expected: bool,
     /// Set on a variant's config blob only (§6.6): which variant the
     /// effective metadata above belongs to. A client that predates variants
     /// ignores it.
@@ -107,6 +112,7 @@ impl TemplateConfig {
             first_boot_script: meta.first_boot_script.clone(),
             agent_version: meta.agent_version.clone(),
             wscript_surface: meta.wscript_surface,
+            variants_expected: meta.variants_expected,
             variant: None,
         }
     }
@@ -195,6 +201,7 @@ impl TemplateConfig {
             first_boot_script: self.first_boot_script,
             agent_version: self.agent_version,
             wscript_surface: self.wscript_surface,
+            variants_expected: self.variants_expected,
             // Variants travel as their own manifests (§6.6), not in the
             // base's config blob.
             variants: Vec::new(),
@@ -239,6 +246,7 @@ mod tests {
             first_boot_script: Some("use vmlab\nfn main(lab) { let vm = lab.this_vm() }\n".into()),
             agent_version: Some("agent=abc123".into()),
             wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+            variants_expected: false,
             variants: Vec::new(),
         }
     }
@@ -271,6 +279,46 @@ mod tests {
         let config: TemplateConfig = serde_json::from_value(value).unwrap();
         assert_eq!(config.wscript_surface, None);
         assert_eq!(config.into_meta(None).unwrap().wscript_surface, None);
+    }
+
+    /// The base's blob carries `variants_expected` as a JSON key only when
+    /// set, and back; a variant's blob — sealed, effective metadata — never
+    /// does. A blob without the key reads as an ordinary base.
+    #[test]
+    fn variants_expected_rides_the_base_blob() {
+        let mut m = meta();
+        let plain = TemplateConfig::from_meta(&m).to_json().unwrap();
+        assert!(!String::from_utf8_lossy(&plain).contains("variants_expected"));
+        m.variants_expected = true;
+        let json = TemplateConfig::from_meta(&m).to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["variants_expected"], serde_json::Value::Bool(true));
+        let back = TemplateConfig::from_json(&json)
+            .unwrap()
+            .into_meta(None)
+            .unwrap();
+        assert_eq!(back, m);
+        let v = VariantMeta {
+            name: "standard".into(),
+            default: true,
+            created: "2026-07-01T00:00:00Z".parse().unwrap(),
+            sha256: "cd".repeat(32),
+            base_sha256: "ab".repeat(32),
+            description: None,
+            first_boot_script: None,
+            agent_version: None,
+            wscript_surface: None,
+            profile: None,
+            cpus: None,
+            memory: None,
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            cpu_model: None,
+            accel: None,
+        };
+        assert!(!TemplateConfig::from_variant(&m, &v).variants_expected);
     }
 
     /// A variant's config blob carries its effective metadata; turned back

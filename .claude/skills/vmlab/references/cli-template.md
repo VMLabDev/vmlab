@@ -148,6 +148,9 @@ A version with variants lists each one beneath it as `#<name>`; the `VERSION`
 column reads `default` for the default and `STALE` for one built on an earlier
 base, and `SIZE` is the overlay's own size. `--json` entries carry a `variants`
 array (`name`, `default`, `stale`, `description`, `created`, `sha256`, `size`).
+A version built with variants but no default installed reads `variants not
+built` (or `default variant not built`) after its date, and its `--json` entry
+carries `variants_expected: true`; a lab refuses it until `--variant` builds them.
 
 ```sh
 $ vmlab template list

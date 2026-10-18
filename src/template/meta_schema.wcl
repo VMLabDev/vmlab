@@ -4,7 +4,9 @@
 // One `template_meta` block per file; sizes are `std.ByteSize` literals
 // (`8GiB`), stored and re-emitted as byte counts. A `variant` child block
 // records one sealed variant of the version (§6.6); its disk is
-// `variants/<name>/disk.qcow2`, an overlay on the base.
+// `variants/<name>/disk.qcow2`, an overlay on the base. `variants_expected`
+// marks a base built from a definition that declares variants: unsealed, so
+// a lab never clones it, even before (or without) a variant installed.
 
 @document
 type MetaDoc {
@@ -33,6 +35,7 @@ type TemplateMeta {
   first_boot_script: utf8?  // embedded wscript script run on first instantiation
   agent_version: utf8?      // vmlab-agent stamp baked in by the template build
   wscript_surface: i64?     // host scripting surface used by embedded scripts
+  variants_expected: bool?  // built from a definition with variants: never cloned bare
   @children("variant") variants: list<VariantMeta>
 }
 

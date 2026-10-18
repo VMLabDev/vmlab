@@ -592,6 +592,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
             variants: Vec::new(),
         }
     }

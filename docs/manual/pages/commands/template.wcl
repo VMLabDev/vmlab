@@ -98,6 +98,9 @@ page cmd_template {
     the build with the base and every variant before it installed, and the
     error names the variant and the `--variant` command that retries it. See
     [Lab file: template and source](ref_template) for what a variant build does.
+    The base is recorded with `variants_expected = true`, so until its
+    default variant is installed a lab refuses every reference to the
+    version rather than cloning the unsealed base.
   DOC
 
   p <<DOC
@@ -191,6 +194,15 @@ SRC
     size. Under `--json` each entry carries a `variants` array of objects
     with `name`, `default`, `stale`, `description`, `created`, `sha256` and
     `size`; it is empty for a base-only template.
+  DOC
+
+  p <<DOC
+    A version built from a definition with variants that has no default
+    variant installed reads `variants not built` after its `CREATED` date,
+    or `default variant not built` when other variants remain. A lab refuses
+    it until `vmlab template build <name>@<version> --variant <variant>`
+    builds them. Under `--json` such an entry carries `variants_expected:
+    true` with no default in its `variants` array.
   DOC
 
   code sh { source = <<'SRC'
@@ -394,6 +406,14 @@ SRC
     variant, how many chunks it uploaded and how many the registry already
     held. A stale variant refuses the push before anything is uploaded;
     rebuild or remove it first.
+  DOC
+
+  p <<DOC
+    The base's config blob carries `variants_expected` when the version was
+    built with variants, and a pull keeps it, so a pulled base whose variants
+    are not built is refused by a lab exactly as the pushed one is. A vmlab
+    release older than the marker pulls such a base as an ordinary base-only
+    template.
   DOC
 
   p <<DOC

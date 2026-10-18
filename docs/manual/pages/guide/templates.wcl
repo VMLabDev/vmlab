@@ -96,6 +96,19 @@ page guide_templates {
     others.
   DOC
 
+  p <<DOC
+    The base of a template with variants is unsealed, so a lab never clones
+    it. The build marks it `variants_expected = true` in its metadata. Until
+    the default variant is installed, every lab reference to that version is
+    refused, with or without `#`, and the message gives the command that
+    builds the variants: `vmlab template build <name>@<version> --variant
+    <variant>`. This covers a build whose variants all failed and a version
+    whose overlays were deleted. `vmlab template list` shows such a version
+    as `variants not built`. The marker travels with a push, pull, export
+    and import. A vmlab release older than the marker pulls such a base as
+    an ordinary base-only template.
+  DOC
+
   h2 "The store"
 
   p <<DOC

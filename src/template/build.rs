@@ -1604,6 +1604,7 @@ fn seal_meta(
         first_boot_script: image.first_boot_script,
         agent_version: image.agent_version,
         wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+        variants_expected: !def.variants.is_empty(),
         variants: Vec::new(),
     }
 }
@@ -2045,6 +2046,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
             variants: Vec::new(),
         }
     }
@@ -3090,6 +3092,38 @@ mod tests {
         assert_eq!(
             super::base_first_boot(&plain).map(|p| p.display().to_string()),
             Some("fb.ws".into())
+        );
+    }
+
+    /// A definition that declares variants seals a base marked
+    /// `variants_expected`, so no lab clones it before (or without) a
+    /// variant; one that declares none does not.
+    #[test]
+    fn a_base_with_variants_is_marked_variant_bearing() {
+        let image = || SealedImage {
+            disk: 8 << 30,
+            sha256: "ab".repeat(32),
+            first_boot_script: None,
+            agent_version: None,
+        };
+        let d = with_variants(r#"variant "standard" { }"#);
+        let hw = EffectiveHardware::resolve(&d, None);
+        let sealed = seal_meta(&d, &hw, "1", image());
+        assert!(sealed.variants_expected);
+        assert!(sealed.to_wcl().contains("variants_expected = true"));
+        let err = sealed
+            .select_variant(None, crate::template::store::Purpose::Lab)
+            .unwrap_err();
+        assert!(err.contains("variants are not built yet"), "{err}");
+        let plain = def(r#"import <vmlab.wcl>
+               template "p" { arch = "x86_64" version = "1"
+                 source "iso" { path = "/i.iso" } }"#);
+        let hw = EffectiveHardware::resolve(&plain, None);
+        let sealed = seal_meta(&plain, &hw, "1", image());
+        assert!(!sealed.variants_expected);
+        assert_eq!(
+            sealed.select_variant(None, crate::template::store::Purpose::Lab),
+            Ok(None)
         );
     }
 

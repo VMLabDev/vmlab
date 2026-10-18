@@ -676,7 +676,11 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
         let meta = &row.meta;
         let size = human_size(row.size);
         // The wire carries RFC 3339; the table has always shown the date.
-        let created: String = meta.created.chars().take(10).collect();
+        let mut created: String = meta.created.chars().take(10).collect();
+        if let Some(note) = unbuilt_note(row) {
+            created.push_str("  ");
+            created.push_str(note);
+        }
         match row.remote {
             Some(status) => println!(
                 "{:<8} {:<name_w$} {:<16} {:<8} {:<7} {created}",
@@ -710,7 +714,27 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
         println!();
         println!("a STALE variant was built on an earlier base and is refused until it is rebuilt");
     }
+    if rows.iter().any(|r| unbuilt_note(r).is_some()) {
+        println!();
+        println!(
+            "a version whose variants are not built holds only its unsealed base, which a lab \
+             refuses — build them with `vmlab template build <name>@<version> --variant <variant>`"
+        );
+    }
     Ok(())
+}
+
+/// What `template list` says of a variant-bearing version a lab would refuse
+/// (§6.6): one with no default variant installed.
+fn unbuilt_note(row: &StoreEntry) -> Option<&'static str> {
+    if !row.meta.variants_expected || row.variants.iter().any(|v| v.default) {
+        return None;
+    }
+    Some(if row.variants.is_empty() {
+        "variants not built"
+    } else {
+        "default variant not built"
+    })
 }
 
 async fn rm(sup: &SupClient, reference: String, force: bool) -> Result<()> {

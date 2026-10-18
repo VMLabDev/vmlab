@@ -457,6 +457,7 @@ impl TemplateStore {
         // block naming a disk that is gone.
         let mut on_disk = TemplateMeta::read_from(&found.dir.join(META_FILE))?;
         on_disk.variants.retain(|o| o.name != variant);
+        on_disk.variants_expected = true;
         write_meta_atomic(&found.dir, &on_disk)?;
         let vdir = found.dir.join(VARIANTS_DIR).join(variant);
         fs::remove_dir_all(&vdir).with_context(|| format!("cannot remove {}", vdir.display()))?;
@@ -548,7 +549,14 @@ impl TemplateStore {
         overwrite: bool,
     ) -> Result<()> {
         verify_variants(staging_dir, meta, meta.sha256.as_deref())?;
-        self.install(staging_dir, meta, overwrite)
+        if meta.variants.is_empty() || meta.variants_expected {
+            return self.install(staging_dir, meta, overwrite);
+        }
+        // A base that carries variants is unsealed whoever pushed it, so it
+        // keeps the marker after its overlays are gone (§6.6).
+        let mut marked = meta.clone();
+        marked.variants_expected = true;
+        self.install(staging_dir, &marked, overwrite)
     }
 
     /// Add variants to a version the store already holds (§6.6): each
@@ -597,6 +605,9 @@ impl TemplateStore {
                 None => on_disk.variants.push(v.clone()),
             }
         }
+        // A base that carries variants is unsealed (§6.6): mark it, so losing
+        // the overlays later never lets a lab clone it.
+        on_disk.variants_expected = true;
         write_meta_atomic(&found.dir, &on_disk)?;
         read_meta(&found.dir)
     }
@@ -988,6 +999,7 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
             variants: Vec::new(),
         }
     }
@@ -1599,6 +1611,50 @@ mod tests {
         VariantRef::Named(n.into())
     }
 
+    /// A variant-bearing base whose overlays were deleted by hand reads with
+    /// no variants, and is still never cloned by a lab: the marker refuses a
+    /// bare ref, `#<name>` and `#base`, while a build's `#base` resolves.
+    #[test]
+    fn a_marked_base_without_its_variants_is_refused() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let dir = store.version_dir("x86_64", "win", "1");
+        let mut m = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
+        m.variants_expected = true;
+        m.write_to(&dir.join(META_FILE)).unwrap();
+        fs::remove_dir_all(dir.join(VARIANTS_DIR)).unwrap();
+
+        let v = store.resolve_version("x86_64", "win", None).unwrap();
+        assert!(v.meta.variants.is_empty());
+        for variant in [None, Some(named("standard")), Some(VariantRef::Base)] {
+            let err = format!(
+                "{:#}",
+                store
+                    .resolve("x86_64", "win", None, variant.as_ref(), Purpose::Lab)
+                    .unwrap_err()
+            );
+            assert!(err.contains("x86_64/win@1"), "{err}");
+            assert!(err.contains("variants are not built yet"), "{err}");
+            assert!(
+                err.contains("vmlab template build win@1 --variant <variant>"),
+                "{err}"
+            );
+        }
+        let r = store
+            .resolve(
+                "x86_64",
+                "win",
+                None,
+                Some(&VariantRef::Base),
+                Purpose::Build,
+            )
+            .unwrap();
+        assert_eq!(r.disk_path, dir.join(DISK_FILE));
+        assert_eq!(r.variant, None);
+    }
+
     /// Row 1: no `#` — the default variant with variants, the base without.
     #[test]
     fn resolve_without_a_variant() {
@@ -1855,6 +1911,10 @@ mod tests {
         // Re-read from disk, not just filtered.
         let on_disk = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
         assert_eq!(on_disk.variants.len(), 1);
+        assert!(
+            on_disk.variants_expected,
+            "a base that carried variants is marked, whoever built it"
+        );
 
         // The last variant cannot go on its own.
         let err = store

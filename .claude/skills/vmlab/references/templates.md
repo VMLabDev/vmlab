@@ -95,6 +95,14 @@ template "windows-11" {
   so there is nothing to specialize. First boot is for the variant's clones.
 - A failed variant stops the build, names the variant, and leaves the base and
   earlier variants installed with nothing partial behind.
+- The base of a definition with variants is recorded `variants_expected = true`.
+  With no default variant installed (not built yet, every variant build failed,
+  overlays deleted) a lab refuses **every** ref to that version — bare,
+  `#<name>`, `#base` — and the error gives `vmlab template build
+  <name>@<version> --variant <variant>`. `template list` shows it as `variants
+  not built`. A build's `#base`/`#<name>` still resolve. The marker rides the
+  base's config blob through push/pull and export/import; an older vmlab pulls
+  such a base as plain base-only.
 - `vmlab template build <name>[@<version>] --variant <v>[,<v2>]` builds or
   rebuilds just those variants onto the installed version. Refused while a
   clone is backed by a variant it would replace.
