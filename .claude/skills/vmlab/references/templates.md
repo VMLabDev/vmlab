@@ -215,15 +215,19 @@ Two paths carry a template off the host it was built on. Both preserve the
 metadata, so a moved template inherits into VMs exactly as it did at home.
 
 - **Export and import.** `vmlab template export` writes one portable `.tar.zst`
-  archive holding the disk and its metadata; `import` installs it into another
-  store. This is the offline path.
+  archive holding the disk, its metadata and every variant's overlay; `import`
+  installs it into another store after checking each variant's `sha256`, its
+  `base_sha256` against the base, and its `../../disk.qcow2` backing — one bad
+  variant refuses the archive. This is the offline path.
 - **Registries.** `vmlab template push` publishes a template to any OCI
   registry, and `pull` installs it from one.
 
 A lab's `template =` may also name a registry reference directly, with an
 explicit `arch` on the VM. `vmlab up` pulls it when it is absent from the store
 and never re-pulls it implicitly. Updates are explicit, through `vmlab pull` or
-`vmlab template pull`.
+`vmlab template pull`. A registry reference takes `#<variant>` too; a pull always
+brings the default variant with the base, and a machine naming a variant the
+store's copy lacks pulls just that overlay.
 
 ## template {}
 
@@ -440,6 +444,35 @@ of the `aarch64` build of a template adds a platform entry to the index beside
 the `x86_64` one. Consistent with the store, the arch is always explicit. `vmlab
 template pull` requires `--arch` when the tag resolves to an index with more than
 one platform, and never silently assumes the host's.
+
+### Variants
+
+A version with variants publishes the base as usual, and each variant as its own
+manifest tagged `<version>--<variant>`: the base's chunk layers in order, then the
+overlay's, on one running chunk index, each layer annotated with its part
+(`vnd.vmlab.template.part` = `base`/`variant`). Annotations record where the base
+ends (`vnd.vmlab.template.base.layers`) and each part's digest, size and chunk
+count; there is no whole-image digest. The config blob is the variant's
+effective metadata plus `variant: {name, base_sha256, default, description}`.
+The base's chunks are already in the registry, so a variant uploads only its
+overlay; the push log prints uploaded/already-held counts per part. A stale
+variant refuses the push.
+
+Discovery is through the base: its per-arch manifest annotates
+`vnd.vmlab.template.variants` (names, in order), `…variant.default`, and
+`…variant.manifest.<name>` = the variant manifest's digest. So `latest#win3d`
+works with no tag of its own. `--` tags are never treated as versions (pin
+resolution, `template search`).
+
+Pull: `#<variant>` fetches base + default + that variant; a bare ref base +
+default; `--all-variants` every one. The default always comes so a bare ref
+resolves the same locally as in the registry. A base or variant already held
+with the same digest is not downloaded again; arriving variants are verified
+(digest, built on this base), given the relative backing, and merged into the
+version's `template.wcl`, keeping those already installed.
+
+An older vmlab pulling the version tag gets a valid base-only template; pointed
+at a `--` tag it refuses for the missing whole-image digest.
 
 ### Push and pull
 

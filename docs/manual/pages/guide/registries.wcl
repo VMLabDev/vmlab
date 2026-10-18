@@ -3,7 +3,7 @@ page guide_registries {
   chapter_header "Distributing templates over registries" {
     kicker       = "The guide · explanation"
     reading_time = "7 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-18"
     version      = "vmlab 0.9"
   }
 
@@ -102,6 +102,48 @@ page guide_registries {
     with the store, the arch is always explicit. `vmlab template pull`
     requires `--arch` when the tag resolves to an index with more than one
     platform, and never silently assumes the host's.
+  DOC
+
+  h2 "Variants"
+
+  p <<DOC
+    A template version with [variants](guide_templates) publishes the base
+    exactly as a base-only template does, and each variant beside it as a
+    manifest of its own. A variant's layers are the base's chunks, in order,
+    followed by its overlay's chunks. Its annotations say how many leading
+    layers are the base's and what each part assembles to, and its config
+    blob is the metadata a clone of the variant runs on, with the variant's
+    name and the digest of the base it was built on. A registry stores blobs
+    by digest, and the base's chunks are already there, so pushing a
+    variant uploads only its overlay. A 20 GiB Windows base with two
+    variants uploads 20 GiB once and each variant's few hundred megabytes.
+  DOC
+
+  p <<DOC
+    Each variant's manifest is tagged `<version>--<variant>`, such as
+    `26100.1742.6--win3d`. The tag is there to be inspected; vmlab finds a
+    variant through the base. The base's manifest for each architecture
+    names its variants, the default among them, and each variant manifest's
+    digest. So `latest#win3d` needs no tag of its own: it reads the base
+    manifest `latest` points at and follows the digest it names. vmlab never
+    takes a `--` tag for a version.
+  DOC
+
+  p <<DOC
+    A pull always brings the default variant with the base, so a reference
+    without `#` picks the same variant in your store as it does in the
+    registry. `#<variant>` adds that variant, and `--all-variants` adds every
+    one. A base the store already holds is never downloaded again: pulling a
+    second variant of a version you have fetches only that variant's
+    overlay, checks it was built on your base, and adds its block to the
+    version's `template.wcl` beside the variants already there.
+  DOC
+
+  p <<DOC
+    An older vmlab that predates variants pulling the version tag sees only
+    the base manifest, and installs the base as a base-only template. Asked
+    for a `--` tag, it refuses the manifest for its missing whole-image
+    digest rather than assembling base and overlay into a broken disk.
   DOC
 
   h2 "Push and pull"

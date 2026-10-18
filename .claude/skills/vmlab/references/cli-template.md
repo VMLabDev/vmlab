@@ -256,7 +256,8 @@ vmlab template export <REFERENCE> <OUT>
 | `-h`, `--help` | Print help. |
 
 `export` writes one store version, disk and metadata, to a portable archive the
-supervisor creates at `OUT`. A relative `OUT` is resolved against the shell's
+supervisor creates at `OUT`. A version with variants takes each
+`variants/<variant>/disk.qcow2` and the full `template.wcl` along. A relative `OUT` is resolved against the shell's
 directory. It prints `exported to <OUT>` when done.
 
 ```sh
@@ -279,16 +280,19 @@ vmlab template import [OPTIONS] <ARCHIVE>
 | `-h`, `--help` | Print help. |
 
 `import` reads a template back out of an archive into the store and prints
-`imported <arch>/<name>@<version>`. The version comes from the archive's
-metadata. A version the store already holds is refused unless `--overwrite` is
-given.
+`imported <arch>/<name>@<version>`, then `with variants <names>` when it has
+any. The version comes from the archive's metadata. Every variant is checked
+first — its overlay must hash to its block's `sha256`, its `base_sha256` must be
+the archive's base, its backing must be `../../disk.qcow2` — and one failing
+refuses the whole archive. A version the store already holds is refused unless
+`--overwrite` is given.
 
 ```sh
 vmlab template import alpine-0.3.1.tar.zst
 ```
 
-Exit status is 0 on success and `failed` (1) when the archive cannot be read or
-the version already exists.
+Exit status is 0 on success and `failed` (1) when the archive cannot be read, a
+variant fails its checks, or the version already exists.
 
 ## vmlab template push
 
@@ -311,6 +315,12 @@ push's log the way `build` does and prints `pushed <arch>/<name>@<version> to
 <target> (moved <tag>)` at the end, with the source link when one was sent.
 Ctrl-C stops the push.
 
+A version with variants pushes each as its own manifest tagged
+`<version>--<variant>` (base chunks, then overlay chunks); the base's chunks are
+already there, so a variant uploads only its overlay. The log prints, per part,
+chunks uploaded and chunks the registry already held. A stale variant refuses
+the push before anything uploads.
+
 The registry needs credentials from `template login` first. A template with no
 `registry` field and no `TARGET` is refused with `no push target`. A push
 already running for the template is refused with `conflict`.
@@ -331,9 +341,10 @@ vmlab template pull [OPTIONS] <TARGET>
 
 | Option | Meaning |
 | --- | --- |
-| `<TARGET>` | Registry reference, for example `ghcr.io/owner/name:version`. |
+| `<TARGET>` | Registry reference, for example `ghcr.io/owner/name:version`. A `#<variant>` suffix also pulls that variant. |
 | `--arch <ARCH>` | Architecture to pull. Required when the reference is a multi-architecture index. |
 | `--overwrite` | Replace the version if the store already has it with a different disk. |
+| `--all-variants` | Pull every variant, not only the default and the one named. |
 | `-h`, `--help` | Print help. |
 
 `pull` downloads a published template into the store and prints `pulled
@@ -345,13 +356,22 @@ as it stands when its disk is the published image, and refused without
 machine's template on demand, so this verb is for fetching ahead of time or for
 a template no lab file names yet.
 
+A template with variants always brings its default variant, so a bare reference
+picks the same variant locally as in the registry; `#<variant>` adds one,
+`--all-variants` all, and an unknown name is refused listing the variants. A
+base or variant already held with the same digest is not downloaded again;
+arrivals merge into the version, keeping installed variants. Output: `pulled
+<arch>/<name>@<version> with variants standard (default), win3d into the store`.
+
 ```sh
 vmlab template pull ghcr.io/vmlabdev/alpine:0.3.1 --arch x86_64
+vmlab template pull 'ghcr.io/vmlabdev/windows-11:latest#win3d' --arch x86_64
 ```
 
 Exit status is 0 on success and `failed` (1) when the registry refuses, the
-architecture is missing, or the version already exists with a different disk
-and no `--overwrite`.
+architecture is missing, the variant is unknown, a chunk or reassembled disk
+fails its digest, or the version already exists with a different disk and no
+`--overwrite`.
 
 ## vmlab template login
 

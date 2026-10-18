@@ -303,7 +303,9 @@ SRC
 
   p <<DOC
     `export` writes one store version, disk and metadata, to a portable
-    archive the supervisor creates at `OUT`. A relative `OUT` is resolved
+    archive the supervisor creates at `OUT`. A version with variants takes
+    them along: each `variants/<variant>/disk.qcow2` and the full
+    `template.wcl` with every variant block. A relative `OUT` is resolved
     against the shell's directory. It prints `exported to <OUT>` when done.
   DOC
 
@@ -325,14 +327,18 @@ SRC
 
   p <<DOC
     `import` reads a template back out of an archive into the store and
-    prints `imported <arch>/<name>@<version>`. The version comes from the
-    archive's metadata. A version the store already holds is refused unless
-    `--overwrite` is given.
+    prints `imported <arch>/<name>@<version>`, followed by `with variants
+    <names>` when it has any. The version comes from the archive's metadata.
+    Every variant is checked before anything is installed: its overlay must
+    hash to its block's `sha256`, its `base_sha256` must be the archive's
+    base, and its backing file must be `../../disk.qcow2`. A variant that
+    fails any of them refuses the whole archive. A version the store already
+    holds is refused unless `--overwrite` is given.
   DOC
 
   code sh { source = "vmlab template import alpine-0.3.1.tar.zst" }
 
-  p "Exit status is 0 on success and `failed` (1) when the archive cannot be read or the version already exists."
+  p "Exit status is 0 on success and `failed` (1) when the archive cannot be read, a variant fails its checks, or the version already exists."
 
   h2 "vmlab template push"
 
@@ -358,6 +364,16 @@ SRC
   DOC
 
   p <<DOC
+    A version with variants pushes each variant as a manifest of its own,
+    tagged `<version>--<variant>`: the base's chunks, then the overlay's.
+    The base's chunks are already in the registry by then, so a variant
+    uploads only its overlay. The log says, for the base and for each
+    variant, how many chunks it uploaded and how many the registry already
+    held. A stale variant refuses the push before anything is uploaded;
+    rebuild or remove it first.
+  DOC
+
+  p <<DOC
     The registry needs credentials from `template login` first. A template
     with no `registry` field and no `TARGET` is refused with
     `no push target`. A push already running for the template is refused
@@ -375,9 +391,10 @@ SRC
   table {
     rows:
       | "Option" | "Meaning" |
-      | "`<TARGET>`" | "Registry reference, for example `ghcr.io/owner/name:version`." |
+      | "`<TARGET>`" | "Registry reference, for example `ghcr.io/owner/name:version`. A `#<variant>` suffix also pulls that variant." |
       | "`--arch <ARCH>`" | "Architecture to pull. Required when the reference is a multi-architecture index." |
       | "`--overwrite`" | "Overwrite the version if the store already has it." |
+      | "`--all-variants`" | "Pull every variant of the version, not only the default and the one named." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -392,9 +409,22 @@ SRC
     fetching ahead of time or for a template no lab file names yet.
   DOC
 
-  code sh { source = "vmlab template pull ghcr.io/vmlabdev/alpine:0.3.1 --arch x86_64" }
+  p <<DOC
+    A template with variants always brings its default variant, so a
+    reference without `#` picks the same variant in the store as in the
+    registry. `#<variant>` adds that variant, `--all-variants` adds every
+    one, and an unknown name is refused with the list of variants the
+    template has. A base or a variant the store already holds with the same
+    digest is not downloaded again, and what arrives is added to the version,
+    keeping the variants already installed. The answer lists them:
+    `pulled <arch>/<name>@<version> with variants standard (default), win3d
+    into the store`.
+  DOC
 
-  p "Exit status is 0 on success and `failed` (1) when the registry refuses, the architecture is missing, or the version already exists with a different disk and no `--overwrite`."
+  code sh { source = "vmlab template pull ghcr.io/vmlabdev/alpine:0.3.1 --arch x86_64" }
+  code sh { source = "vmlab template pull 'ghcr.io/vmlabdev/windows-11:latest#win3d' --arch x86_64" }
+
+  p "Exit status is 0 on success and `failed` (1) when the registry refuses, the architecture is missing, the variant is unknown, a chunk or a reassembled disk fails its digest, or the version already exists with a different disk and no `--overwrite`."
 
   h2 "vmlab template login"
 
