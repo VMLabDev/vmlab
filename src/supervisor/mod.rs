@@ -613,8 +613,18 @@ impl Handler<SupRequest> for SupervisorHandler {
                 arch,
                 version,
                 file,
+                variants,
             } => {
-                templates::start_build(sup.clone(), lab, root, template, arch, version, file).await
+                templates::start_build(
+                    sup.clone(),
+                    lab,
+                    root,
+                    template,
+                    arch,
+                    templates::BuildTarget { version, variants },
+                    file,
+                )
+                .await
             }
             SupRequest::TemplateStopBuild {
                 lab,

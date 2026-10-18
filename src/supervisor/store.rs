@@ -247,7 +247,10 @@ pub async fn remove(reference: String, force: bool) -> Result<Value, CommandErro
 
 /// Why `doomed` cannot be deleted: the clones (`lab/vm`) backed by one of
 /// them. `None` when none is.
-fn backed_clones_reason(clones: &[(PathBuf, String)], doomed: &[PathBuf]) -> Option<String> {
+pub(super) fn backed_clones_reason(
+    clones: &[(PathBuf, String)],
+    doomed: &[PathBuf],
+) -> Option<String> {
     let doomed: HashSet<PathBuf> = doomed
         .iter()
         .map(|d| d.canonicalize().unwrap_or_else(|_| d.clone()))
@@ -394,7 +397,7 @@ fn family_matches(filter: Option<&str>, arch: &str, name: &str) -> bool {
 /// `lab/vm`). The backing disk is a version's base or one of its variant
 /// overlays (§6.6). Best-effort: unreadable labs/clones are skipped, so a
 /// scan hiccup never blocks a prune.
-async fn clones_by_backing() -> Vec<(PathBuf, String)> {
+pub(super) async fn clones_by_backing() -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     let reg = super::registry::Registry::load();
     for lab in reg.labs() {

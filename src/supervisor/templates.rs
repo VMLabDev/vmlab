@@ -21,6 +21,8 @@ const LOG_CAP: usize = 500;
 struct OpState {
     kind: &'static str,
     started: chrono::DateTime<chrono::Utc>,
+    /// The variant a build is on, once it is past the base (§6.6).
+    variant: Option<String>,
     log: VecDeque<String>,
     /// Structured playbook progress (`playbook.op.*` from the synthetic build
     /// lab, forwarded live as `template.op.step`), kept for resync.
@@ -69,6 +71,7 @@ impl TemplateOps {
             OpState {
                 kind,
                 started: chrono::Utc::now(),
+                variant: None,
                 log: VecDeque::new(),
                 steps: VecDeque::new(),
                 console: None,
@@ -99,6 +102,13 @@ impl TemplateOps {
                 op.steps.pop_front();
             }
             op.steps.push_back(step);
+        }
+    }
+
+    fn set_variant(&self, lab: &str, arch: &str, template: &str, variant: &str) {
+        let mut ops = self.inner.lock_recover();
+        if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
+            op.variant = Some(variant.to_string());
         }
     }
 
@@ -162,7 +172,11 @@ impl TemplateOps {
     fn op_of(&self, lab: &str, arch: &str, template: &str) -> Value {
         let ops = self.inner.lock_recover();
         match ops.get(&(lab.to_string(), arch.to_string(), template.to_string())) {
-            Some(op) => json!({"kind": op.kind, "started": op.started.to_rfc3339()}),
+            Some(op) => json!({
+                "kind": op.kind,
+                "started": op.started.to_rfc3339(),
+                "variant": op.variant,
+            }),
             None => Value::Null,
         }
     }
@@ -270,6 +284,15 @@ pub async fn list(
     Ok(Value::Array(rows))
 }
 
+/// Which build of a template a `template.build` asks for.
+pub struct BuildTarget {
+    /// A pinned version: the one to build, or with `variants` the installed
+    /// one to build them onto.
+    pub version: Option<String>,
+    /// Only these variants, onto an installed version (§6.6).
+    pub variants: Option<Vec<String>>,
+}
+
 /// `template.build`: kick off a background build of `template` from the lab's
 /// config, streaming progress as `template.op.*` events. Returns as soon as
 /// the build is claimed and spawned.
@@ -279,9 +302,10 @@ pub async fn start_build(
     root: PathBuf,
     template: String,
     arch: Option<String>,
-    version: Option<String>,
+    target: BuildTarget,
     file: Option<PathBuf>,
 ) -> Result<Value, CommandError> {
+    let BuildTarget { version, variants } = target;
     let (def, profiles) = {
         let (root, template, arch, file) =
             (root.clone(), template.clone(), arch.clone(), file.clone());
@@ -350,16 +374,52 @@ pub async fn start_build(
             );
             step_sup.emit(Event::new("template.op.step", &*step_lab, payload));
         });
+        // Each variant's start is a stage of the one build: kept on the op
+        // for `template.list` and announced as `template.op.variant`.
+        let variant_sup = sup.clone();
+        let (variant_lab, variant_arch, variant_template) =
+            (lab.clone(), arch.clone(), template.clone());
+        let on_variant: crate::template::build::VariantStarted = Arc::new(move |variant| {
+            variant_sup.template_ops.set_variant(
+                &variant_lab,
+                &variant_arch,
+                &variant_template,
+                variant,
+            );
+            variant_sup.emit(Event::new(
+                "template.op.variant",
+                &*variant_lab,
+                json!({
+                    "template": variant_template,
+                    "arch": variant_arch,
+                    "kind": "build",
+                    "variant": variant,
+                }),
+            ));
+        });
+        // A variant rebuild must not replace an overlay a clone is backed by;
+        // the registered labs are asked at the time, not when the build began.
+        let in_use: crate::template::build::InUse = Arc::new(|disks| {
+            Box::pin(async move {
+                let clones = super::store::clones_by_backing().await;
+                super::store::backed_clones_reason(&clones, &disks)
+            })
+        });
         let result = crate::template::build::build_template(
             &def,
             &root,
             &store,
             &profiles,
             log,
-            version.as_deref(),
+            crate::template::build::BuildTarget {
+                version: version.as_deref(),
+                variants: variants.as_deref(),
+            },
             crate::template::build::BuildControl {
                 console_ready: Some(console_ready),
                 on_event: Some(on_event),
+                on_variant: Some(on_variant),
+                in_use: Some(in_use),
                 cancel: cancel.clone(),
             },
         )

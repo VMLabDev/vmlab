@@ -45,12 +45,19 @@ pub enum TemplateCmd {
         /// File containing `template {}` blocks (default: ./vmlab.wcl)
         #[arg(short, long)]
         file: Option<PathBuf>,
-        /// Build only the named template (default: all in the file)
+        /// Build only the named template (default: all in the file);
+        /// `<name>@<version>` is the same as `--version`
         name: Option<String>,
         /// Pin an explicit version instead of auto-incrementing (requires a
-        /// single target template)
+        /// single target template); with `--variant`, the installed version
+        /// to build the variants onto
         #[arg(long)]
         version: Option<String>,
+        /// Build or rebuild only these variants, comma-separated, onto the
+        /// newest installed version (or the pinned one), leaving the base and
+        /// every other variant as they are
+        #[arg(long, value_delimiter = ',', value_name = "VARIANT")]
+        variant: Vec<String>,
     },
     /// Stop a build or push running for a template — one this terminal
     /// started, or one the console did
@@ -218,7 +225,8 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 file,
                 name,
                 version,
-            } => build(&sup, file, name, version).await,
+                variant,
+            } => build(&sup, file, name, version, variant).await,
             TemplateCmd::Stop { name, arch } => stop(&sup, name, arch).await,
             TemplateCmd::List { json, remote } => list(&sup, json, remote).await,
             TemplateCmd::Search {
@@ -368,7 +376,15 @@ async fn build(
     file: Option<PathBuf>,
     only: Option<String>,
     version: Option<String>,
+    variants: Vec<String>,
 ) -> Result<()> {
+    let (only, version) = split_build_target(only, version)?;
+    if !variants.is_empty() && only.is_none() {
+        bail!(
+            "--variant needs the template it belongs to: `vmlab template build <name> --variant …`"
+        );
+    }
+    let variants = (!variants.is_empty()).then_some(variants);
     let cwd = std::env::current_dir()?;
     let path = match file {
         // Absolutize: a bare `-f vmlab.wcl` has an EMPTY parent(), which used
@@ -422,6 +438,7 @@ async fn build(
                 arch: Some(arch.clone()),
                 version: version.clone(),
                 file: Some(path.clone()),
+                variants: variants.clone(),
             },
         )
         .await
@@ -436,6 +453,28 @@ async fn build(
             .into_result(&what)?;
     }
     Ok(())
+}
+
+/// Split `<name>@<version>` into the name and a pinned version, which is the
+/// same pin `--version` gives; both at once is refused rather than guessed
+/// between.
+fn split_build_target(
+    name: Option<String>,
+    version: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(name) = name else {
+        return Ok((None, version));
+    };
+    match name.split_once('@') {
+        None => Ok((Some(name), version)),
+        Some((n, v)) if n.is_empty() || v.is_empty() => {
+            bail!("malformed template `{name}`: expected `<name>[@<version>]`")
+        }
+        Some(_) if version.is_some() => {
+            bail!("`{name}` pins a version and so does --version — give one")
+        }
+        Some((n, v)) => Ok((Some(n.to_string()), Some(v.to_string()))),
+    }
 }
 
 /// `vmlab template stop`: cancel an operation somebody else started — from
@@ -1212,5 +1251,28 @@ mod tests {
         // a local path is not a web URL
         assert_eq!(normalize_git_url("/srv/git/repo.git"), None);
         assert_eq!(normalize_git_url(""), None);
+    }
+
+    /// `<name>@<version>` pins like `--version`; both at once is refused.
+    #[test]
+    fn a_build_target_may_carry_its_version() {
+        let split = |n: Option<&str>, v: Option<&str>| {
+            super::split_build_target(n.map(Into::into), v.map(Into::into))
+        };
+        assert_eq!(
+            split(Some("win"), None).unwrap(),
+            (Some("win".into()), None)
+        );
+        assert_eq!(
+            split(Some("win@1.2"), None).unwrap(),
+            (Some("win".into()), Some("1.2".into()))
+        );
+        assert_eq!(
+            split(Some("win"), Some("1.2")).unwrap(),
+            (Some("win".into()), Some("1.2".into()))
+        );
+        assert!(split(Some("win@1"), Some("2")).is_err());
+        assert!(split(Some("win@"), None).is_err());
+        assert_eq!(split(None, Some("3")).unwrap(), (None, Some("3".into())));
     }
 }

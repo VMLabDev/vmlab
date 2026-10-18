@@ -38,7 +38,7 @@ the code is the contract.
 | `global.detach` | `name: String`, `lab: Option<String>` | `daemon` | Leave a global segment. |
 | `global.list` | — | `daemon` | Every global segment this host knows. |
 | `template.list` | `lab: String`, `root: std::path::PathBuf`, `file: Option<std::path::PathBuf>` | `cli` | The templates a file declares, with their store and build state. |
-| `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>` | `cli` | Start building one declared template. |
+| `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>`, `variants: Option<Vec<String>>` | `cli` | Start building one declared template. |
 | `template.stop_build` | `lab: String`, `arch: String`, `template: String` | `cli` | Abort a running build. |
 | `store.list` | `remote: bool` | `cli` | Every template in the store, with its size and, on request, whether that exact version is published. |
 | `store.remove` | `reference: String`, `force: bool` | `cli` | Remove one exact store version `<arch>/<name>@<version>`. |

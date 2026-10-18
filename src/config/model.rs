@@ -898,6 +898,66 @@ pub struct TemplateDef {
     pub playbooks: Vec<Playbook>,
     pub nics: Vec<Nic>,
     pub extra_disks: Vec<DiskBlock>,
+    /// Sealed variants built on the base after it seals, in declaration
+    /// order (§6.6). Empty for a base-only template.
+    pub variants: Vec<TemplateVariantDef>,
+}
+
+impl TemplateDef {
+    /// The variant a reference with no `#` selects once built: the one
+    /// declaring `default = true`, or a lone variant. `None` for a base-only
+    /// template, and for declarations §5.1 refuses (several defaults, or
+    /// several variants and no default).
+    pub fn default_variant(&self) -> Option<&TemplateVariantDef> {
+        match self.variants.as_slice() {
+            [] => None,
+            [only] if only.default != Some(false) => Some(only),
+            several => {
+                let mut defaults = several.iter().filter(|v| v.default == Some(true));
+                match (defaults.next(), defaults.next()) {
+                    (Some(d), None) => Some(d),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// The variant declared as `name`.
+    pub fn variant(&self, name: &str) -> Option<&TemplateVariantDef> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+}
+
+/// One `variant "<name>" {}` inside a template definition (§6.6): the steps
+/// that turn the sealed base into this variant, and the hardware its build
+/// boot and its clones run on where it differs from the base's.
+#[derive(Debug, Clone)]
+pub struct TemplateVariantDef {
+    pub name: String,
+    pub span: Span,
+    /// `default = ...` as declared; `None` when absent.
+    pub default: Option<bool>,
+    pub description: Option<String>,
+    /// First-boot wscript for clones of this variant, relative to the
+    /// template root; `None` inherits the template's `first_boot`.
+    pub first_boot: Option<PathBuf>,
+    pub profile: Option<String>,
+    pub cpus: Option<u32>,
+    pub memory: Option<u64>,
+    pub display: Option<String>,
+    pub cpu_model: Option<String>,
+    pub accel: Option<AccelMode>,
+    pub firmware: Option<Firmware>,
+    pub tpm: Option<bool>,
+    pub secure_boot: Option<bool>,
+    /// Replaces the template's `qemu_args` for this variant's build boot.
+    pub qemu_args: Option<Vec<String>>,
+    pub media: Vec<Media>,
+    pub provisions: Vec<Provision>,
+    pub playbooks: Vec<Playbook>,
+    /// Replaces the template's NICs for this variant's build boot when any
+    /// are declared.
+    pub nics: Vec<Nic>,
 }
 
 #[derive(Debug, Clone)]

@@ -887,6 +887,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let mut playbooks = Vec::new();
     let mut nics = Vec::new();
     let mut extra_disks = Vec::new();
+    let mut variants = Vec::new();
     for child in r.children() {
         match child.kind() {
             "source" => source = extract_source(&child, r.issues()),
@@ -909,6 +910,11 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
             "disk" => {
                 if let Some(d) = extract_disk_block(&child, r.issues()) {
                     extra_disks.push(d);
+                }
+            }
+            "variant" => {
+                if let Some(v) = extract_template_variant(&child, r.issues()) {
+                    variants.push(v);
                 }
             }
             _ => {}
@@ -960,6 +966,72 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         playbooks,
         nics,
         extra_disks,
+        variants,
+    })
+}
+
+fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<TemplateVariantDef> {
+    let mut r = Reader::new(b, issues);
+    let name = r.label();
+    let span = r.span();
+    let mut media = Vec::new();
+    let mut provisions = Vec::new();
+    let mut playbooks = Vec::new();
+    let mut nics = Vec::new();
+    for child in r.children() {
+        match child.kind() {
+            "media" => {
+                if let Some(m) = extract_media(&child, r.issues()) {
+                    media.push(m);
+                }
+            }
+            "provision" => {
+                if let Some(p) = extract_provision(&child, r.issues()) {
+                    provisions.push(p);
+                }
+            }
+            "playbook" => {
+                if let Some(p) = extract_playbook(&child, r.issues()) {
+                    playbooks.push(p);
+                }
+            }
+            "nic" => nics.push(extract_nic(&child, r.issues())),
+            _ => {}
+        }
+    }
+    let default = r.bool("default").unspan();
+    let description = r.string("description").unspan();
+    let first_boot = r.path("first_boot").unspan();
+    let profile = r.string("profile").unspan();
+    let cpus = r.int_at_least("cpus", 0).unspan();
+    let memory = r.size("memory").unspan();
+    let display = r.string("display").unspan();
+    let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
+    let accel = r.keyword("accel", ACCELS).unspan();
+    let firmware = r.keyword("firmware", FIRMWARES).unspan();
+    let tpm = r.bool("tpm").unspan();
+    let secure_boot = r.bool("secure_boot").unspan();
+    let qemu_args = r.opt_string_list("qemu_args");
+    Some(TemplateVariantDef {
+        name: name?,
+        span,
+        default,
+        description,
+        first_boot,
+        profile,
+        cpus,
+        memory,
+        display,
+        cpu_model,
+        accel,
+        firmware,
+        tpm,
+        secure_boot,
+        qemu_args,
+        media,
+        provisions,
+        playbooks,
+        nics,
     })
 }
 

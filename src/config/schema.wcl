@@ -579,6 +579,52 @@ type TemplateDef {
   @children("nic")       nics: list<Nic>
   @doc("Additional disks attached during the build")
   @children("disk")      extra_disks: list<DiskBlock>
+  @doc("Sealed variants built on the base, each its own disk state (§6.6); in declaration order")
+  @children("variant")   variants: list<TemplateVariant>
+}
+
+// One variant of a template (PRD §6.6): a named, sealed disk state built on
+// the template's base by booting an overlay on it and running the variant's
+// own steps. Every hardware field overrides the base's for the variant's build
+// boot and is recorded for its clones; an absent one inherits the base's.
+@block("variant")
+type TemplateVariant {
+  @doc("Variant name, `[a-z0-9][a-z0-9-]{0,31}`; `base` is reserved; the inline block label")
+  @inline(0) name: utf8
+  @doc("The variant a reference with no `#` selects; exactly one variant sets it, unless there is only one")
+  default: bool?
+  @doc("One line saying what the variant is for, shown by `vmlab template list`")
+  description: utf8?
+  @doc("wscript run on first instantiation of a clone of this variant, before ready; default: the template's `first_boot`")
+  first_boot: utf8?
+  @doc("Guest OS profile for this variant; default: the base's")
+  profile: utf8?
+  @doc("vCPU count for this variant; default: the base's")
+  cpus: i64?
+  @doc("RAM for this variant, e.g. `8GiB`; default: the base's")
+  memory: std.ByteSize?
+  @doc("QEMU display string for this variant; default: the base's")
+  display: utf8?
+  @doc("QEMU `-cpu` model for this variant; default: the base's")
+  cpu_model: utf8?
+  @doc("Accelerator for this variant: `kvm` | `tcg`; default: the base's")
+  @options(["kvm", "tcg"]) accel: utf8?
+  @doc("Firmware for this variant: `ovmf` | `seabios`; default: the base's")
+  @options(["ovmf", "seabios"]) firmware: utf8?
+  @doc("Enable a TPM 2.0 device for this variant; default: the base's")
+  tpm: bool?
+  @doc("Enable secure boot (OVMF only) for this variant; default: the base's")
+  secure_boot: bool?
+  @doc("Raw QEMU flags for the variant's build VM, replacing the template's; default: the template's")
+  qemu_args: list<utf8>?
+  @doc("ISO/floppy images attached to the variant's build")
+  @children("media")     media: list<Media>
+  @doc("Provision scripts the variant's build runs on the base, interleaved with its playbooks in declaration order")
+  @children("provision") provisions: list<Provision>
+  @doc("config-weave playbooks applied to the variant's build VM")
+  @children("playbook")  playbooks: list<Playbook>
+  @doc("NICs for the variant's build VM, replacing the template's; default: the template's")
+  @children("nic")       nics: list<Nic>
 }
 
 // Template build source: exactly one of the four forms.
@@ -592,6 +638,6 @@ type TemplateSource {
   url: utf8?
   @doc("SHA-256 of the remote artefact; required with `url`")
   sha256: utf8?
-  @doc("Source template `<arch>/<name>[@<version>]` — kind `template` (layered build)")
+  @doc("Source template `<arch>/<name>[@<version>][#<variant>]` — kind `template` (layered build); no `#` seeds from the default variant, `#base` from the base")
   from: utf8?
 }

@@ -964,6 +964,10 @@ vocabulary! {
             #[serde(default)] version: Option<String>,
             /// The file declaring it; `root`'s `vmlab.wcl` when omitted.
             #[serde(default)] file: Option<std::path::PathBuf>,
+            /// Build only these variants (§6.6) onto the installed version —
+            /// the newest, or the one `version` pins — instead of the whole
+            /// template.
+            #[serde(default)] variants: Option<Vec<String>>,
         },
         /// Abort a running build.
         TemplateStopBuild = "template.stop_build" {
@@ -1374,6 +1378,7 @@ mod tests {
                 arch: None,
                 version: None,
                 file: None,
+                variants: None,
             }
         );
     }
