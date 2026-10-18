@@ -92,9 +92,14 @@ pub async fn create_linked_clone(backing: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Inspect an image via `qemu-img info --output=json`.
+///
+/// `-U` (force-share): the image may be a running machine's disk, which QEMU
+/// holds a write lock on, and reading its header is all this does. Without
+/// it the in-use check behind `template rm` and `clean` could not see the
+/// clones of running machines — exactly the ones it must protect.
 pub async fn image_info(path: &Path) -> Result<ImageInfo> {
     let path_arg = path_str(path);
-    let stdout = run(&["info", "--output=json", &path_arg]).await?;
+    let stdout = run(&["info", "-U", "--output=json", &path_arg]).await?;
     serde_json::from_slice(&stdout).map_err(|e| QemuImgError::Parse {
         path: path.to_path_buf(),
         source: e,
