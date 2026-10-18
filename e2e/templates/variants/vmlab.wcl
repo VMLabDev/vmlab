@@ -1,0 +1,20 @@
+// The variants scenario's template (PRD §6.6): layered on the e2e template,
+// with two variants that each leave a marker file. `standard` is the default.
+
+import <vmlab.wcl>
+
+template "e2e-variants" {
+  arch    = "x86_64"
+  version = "1.0"
+  source "template" { from = "x86_64/e2e-alpine" }
+
+  variant "standard" {
+    default = true
+    provision "scripts/mark-standard.ws" { }
+  }
+
+  variant "extra" {
+    memory = 768MiB
+    provision "scripts/mark-extra.ws" { }
+  }
+}

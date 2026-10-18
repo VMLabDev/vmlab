@@ -278,13 +278,28 @@ Templates are defined in `template {}` blocks — in a dedicated WCL file or alo
 - **Source** — one of:
   - `iso` — installer ISO, local path or URL + required hash (`sha256 = "..."`). URL artefacts are downloaded to a cache and verified before use.
   - `qcow2` — existing disk image, local path or URL + hash. Imported as the base.
-  - another template (`from = "<arch>/<name>@<version>"`) — layered builds: take an existing template, run more provisioning, seal as a new template.
+  - another template (`from = "<arch>/<name>@<version>[#<variant>]"`) — layered builds: take an existing template, run more provisioning, seal as a new template. The reference resolves as a build context (§6.6): no `#` seeds from the source's default variant (its base, when it has none), `#<variant>` from that variant, `#base` from the base. Seeding flattens the selected disk's chain into the working disk. The surface check and the first-boot script the build boot runs come from the *effective* metadata of what was selected; `#base` runs no first-boot script.
   - `scratch` (§6.5) — blank disk; the build's attached installer media and provision script do everything.
 - **Hardware** — disk size, profile, and any §5.2 attributes; these are recorded into the template's metadata and become the inheritance layer for VMs.
 - **Media** — additional ISO/floppy attachments for the build, including images built from folders (§6.3) — unattend files, driver media, agent installers.
 - **Provision scripts** — the same wscript machinery as labs (§10): the build boots the source, the script drives the installer with keystrokes/screen matching, configures, and seals. The vmlab guest agent is installed by the guest's own unattended-install hook from the auto-attached VMLAB bootstrap ISO, and the build verifies its handshake before sealing.
 
 Build flow: create working qcow2 → boot per template hardware → run build provision scripts → graceful shutdown → move qcow2 + metadata into the store under `<arch>/<name>/<version>/`. Metadata records both the baked `agent_version` and the host wscript-surface version used by embedded first-boot scripts. A failed build leaves nothing in the store.
+
+**Variants (§6.6).** A template block may declare `variant "<name>" { … }` children. Each takes `default`, `description` and `first_boot`; overrides of the base hardware (`profile`, `cpus`, `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`, `qemu_args`, and `nic`/`media` children); and `provision`/`playbook` children, run in declaration order. §5.1 checks the names (the variant grammar, `base` reserved, no duplicates) and the default rule (exactly one `default = true`, or a lone variant); the build checks them again, because it reads its file without the lab validator.
+
+On a definition with variants, `vmlab template build` builds and seals the base exactly as above, recording its `sha256` — but the base embeds no first-boot script: the template-level `first_boot` is each variant's inheritable default, and a variant's own `first_boot` overrides it. Then it builds the variants, the default first and the rest in declaration order (a failure stops the build, and a version holding several variants but not its default would be invalid metadata). Each variant build:
+
+1. creates a linked overlay on the sealed base;
+2. boots it with the variant's **effective** hardware — the variant block over the base's recorded metadata, so `secure_boot = false` really boots without Secure Boot. The template's installer media and extra disks stay with the base; its `qemu_args` and NICs carry over unless the variant declares its own;
+3. verifies the agent and runs the variant's provisions and playbooks. **The build boot runs no first-boot script** — the base was sealed without being generalized, so there is nothing for one to specialize; first boot is for the variant's clones;
+4. shuts down gracefully, as the base seal does;
+5. rewrites the overlay's backing file to `../../disk.qcow2` (`qemu-img rebase -u`);
+6. hashes the overlay and, under the store lock, installs it as `variants/<name>/disk.qcow2` with its block in `template.wcl` — `created`, `sha256`, `base_sha256`, the embedded `first_boot_script` with its `wscript_surface`, `agent_version`, and only the hardware the variant declares. Each block's `default` is rewritten to match the definition's.
+
+A failed variant build reports which variant failed and stops; the base and every variant installed before it stay installed, and no partial overlay or block is left behind. Progress names each variant as it starts (`building variant <ref>#<name> (n/m)`), and the running build's `template.list` entry carries it.
+
+`vmlab template build <name>[@<version>] --variant <v>[,<v2>]` builds or rebuilds only those variants, onto the newest installed version or the pinned one, leaving the base and every other variant as they are. It refuses when the base is not installed, when the definition does not declare a named variant, and when the result would hold several variants but not the default. A rebuild replaces the overlay and its block together — the new overlay is staged inside the version directory, swapped in by rename, and the block written last, the old overlay put back if any step fails — and is refused while a clone is backed by the overlay it would replace, since a clone is a delta against those bytes.
 
 ### 6.2 Store, addressing, export
 
@@ -352,7 +367,7 @@ A variant's overlay holds only its delta from the base. The backing path is rela
 
 **Clones.** A VM's primary disk is a linked clone backed by the absolute path of the resolved disk: the variant's overlay, giving the chain clone → variant → base, or the base for a base-only template. `clone-source` records the full reference text including `#<variant>`, so a changed variant refuses reuse exactly as a changed pin does (§7.1). `vmlab status -v` shows the variant each VM runs, including the default a bare reference picked. Removal is guarded per disk: a variant backing a clone cannot be removed, nor the version whose base or any variant backs one, unless `--force`. Removing a version removes all of its variants; removing one variant is refused for the default while others remain and for the last one, either of which would let a bare reference fall through to the unsealed base.
 
-**Building and distribution.** How a `template {}` block declares variants and how a variant build boots, seals and records one is §6.1's to say. A push carries the base and every variant over a registry, each variant as its own manifest that lists the base's chunks and then its overlay's, so the base uploads once; a pull fetches the base and the default variant, plus any variant named, and merges what arrives into the version already held (§6.4). Export and import carry `variants/` and the full `template.wcl`, and import verifies each variant against its digest and its base (§6.2).
+**Building and distribution.** How a `template {}` block declares variants and how a variant build boots, seals and records one is §6.1's to say — including that a variant's build boot runs no first-boot script and that `--variant` rebuilds one variant in place. A push carries the base and every variant over a registry, each variant as its own manifest that lists the base's chunks and then its overlay's, so the base uploads once; a pull fetches the base and the default variant, plus any variant named, and merges what arrives into the version already held (§6.4). Export and import carry `variants/` and the full `template.wcl`, and import verifies each variant against its digest and its base (§6.2).
 
 ---
 

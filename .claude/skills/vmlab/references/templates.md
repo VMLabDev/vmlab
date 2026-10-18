@@ -61,6 +61,47 @@ have. Never call a variant a "snapshot" — that is a VM snapshot.
   refused while a clone is backed by it, for the default while others remain,
   and for the last one. Removing the version removes every variant.
 
+### Declaring and building variants
+
+```wcl
+template "windows-11" {
+  …                                  // base: source, provisions ending in a clean shutdown, NO sysprep
+  first_boot = "scripts/firstboot.ws"  // inherited by every variant; the base embeds none
+  variant "standard" {
+    default = true
+    provision "scripts/generalize.ws" { }
+  }
+  variant "win3d" {
+    secure_boot = false              // the variant's build boot and its clones run without SB
+    provision "scripts/win3d-setup.ws" { }
+    provision "scripts/generalize.ws" { }
+  }
+}
+```
+
+- A `variant` block takes `default`, `description`, `first_boot`, the hardware
+  overrides (`profile cpus memory display cpu_model accel firmware tpm
+  secure_boot`), `qemu_args` (replaces the template's), `nic` (replaces the
+  template's when declared), `media`, and `provision`/`playbook` steps run in
+  declaration order. Validation: legal unique names, not `base`; exactly one
+  `default = true` unless there is only one variant.
+- `vmlab template build` seals the base, then builds each variant (default
+  first, rest in file order): a linked overlay on the sealed base, booted on the
+  variant's **effective** hardware (variant over the base's recorded metadata),
+  agent verified, the variant's steps run, graceful shutdown, overlay rebased to
+  `../../disk.qcow2`, hashed, installed with its block under the store lock.
+  The template's installer media and extra disks stay with the base build.
+- A variant's build boot runs **no first-boot script**: the base is unsealed,
+  so there is nothing to specialize. First boot is for the variant's clones.
+- A failed variant stops the build, names the variant, and leaves the base and
+  earlier variants installed with nothing partial behind.
+- `vmlab template build <name>[@<version>] --variant <v>[,<v2>]` builds or
+  rebuilds just those variants onto the installed version. Refused while a
+  clone is backed by a variant it would replace.
+- A layered `source "template" { from = … }` resolves as a build context: no `#`
+  seeds from the default variant, `#<v>` from that one, `#base` from the base
+  (and runs no first-boot script). Seeding flattens the chain.
+
 ## The store
 
 The store lives at `~/.local/share/vmlab/templates/`, laid out as
@@ -297,6 +338,7 @@ template "<name>" {
 | `playbook {}` | children | none | config-weave playbooks applied to the build VM, interleaved with provisions in declaration order. Steps stream as structured build progress. |
 | `nic {}` | children | none | NICs for the build VM. Optional; the build VM may be air-gapped. |
 | `disk {}` | children | none | Additional disks attached during the build. |
+| `variant {}` | children | none | Sealed variants built on the base; see "Declaring and building variants" above. |
 
 `media`, `provision`, `playbook`, `nic` and `disk` are the same blocks a `vm`
 carries; see vm.md.
@@ -344,7 +386,7 @@ template without one.
 source "iso"      { path = "./installer.iso" }
 source "iso"      { url = "https://…/installer.iso" sha256 = "…" }
 source "qcow2"    { path = "./base.qcow2" }
-source "template" { from = "x86_64/ubuntu-24.04@24.04.4" }
+source "template" { from = "x86_64/ubuntu-24.04@24.04.4" }   // [#<variant>|#base]
 source "scratch"  { }
 ```
 
@@ -354,7 +396,7 @@ source "scratch"  { }
 | `path` | utf8 | none | Local file path, for `iso` and `qcow2`. Mutually exclusive with `url`. |
 | `url` | utf8 | none | Remote artefact URL, for `iso` and `qcow2`. Requires `sha256`. |
 | `sha256` | utf8 | none | SHA-256 of the remote artefact. Required with `url`. |
-| `from` | utf8 | none | Source template `<arch>/<name>[@<version>]`, for kind `template`: a layered build. |
+| `from` | utf8 | none | Source template `<arch>/<name>[@<version>][#<variant>]`, for kind `template`: a layered build. No `#` seeds from the default variant; `#base` from the base. |
 
 The four kinds:
 

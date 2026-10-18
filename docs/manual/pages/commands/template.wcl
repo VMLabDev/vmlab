@@ -40,8 +40,9 @@ page cmd_template {
   }
 
   p <<DOC
-    Store references are spelled `<arch>/<name>[@<version>]`. Without a
-    version the reference resolves to the newest version in the store.
+    Store references are spelled `<arch>/<name>[@<version>][#<variant>]`.
+    Without a version the reference resolves to the newest version in the
+    store.
     Registry references are spelled `ghcr.io/owner/name[:version]`.
   DOC
 
@@ -64,9 +65,10 @@ page cmd_template {
   table {
     rows:
       | "Option" | "Meaning" |
-      | "`[NAME]`" | "Build only the named template. Default: every template in the file." |
+      | "`[NAME]`" | "Build only the named template. Default: every template in the file. `<name>@<version>` pins the version, the same as `--version`." |
       | "`-f`, `--file <FILE>`" | "File containing `template {}` blocks. Default: the `vmlab.wcl` of the lab the shell is in." |
-      | "`--version <VERSION>`" | "Pin an explicit version instead of auto-incrementing. Requires a single target template." |
+      | "`--version <VERSION>`" | "Pin an explicit version instead of auto-incrementing. Requires a single target template. With `--variant`, the installed version to build the variants onto." |
+      | "`--variant <VARIANT>[,<VARIANT>…]`" | "Build or rebuild only these variants onto the newest installed version, or the pinned one, leaving the base and every other variant as they are. Requires `NAME`." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -89,6 +91,25 @@ page cmd_template {
   DOC
 
   p <<DOC
+    A template that declares `variant {}` blocks builds its base first and
+    then each variant on it, the default first and the rest in file order;
+    the log names each as it starts (`building variant
+    x86_64/windows-11@26100.1742.6#win3d (2/2)`). A variant that fails stops
+    the build with the base and every variant before it installed, and the
+    error names the variant and the `--variant` command that retries it. See
+    [Lab file: template and source](ref_template) for what a variant build does.
+  DOC
+
+  p <<DOC
+    `--variant` skips the base and builds only the named variants onto a
+    version already in the store. It is refused when the base is not
+    installed, when the file does not declare a named variant, when the
+    result would leave several variants installed but not the default, and
+    while a machine's clone is backed by a variant it would replace. A
+    rebuilt variant replaces the old one's disk and metadata together.
+  DOC
+
+  p <<DOC
     It refuses locally, with exit status 1, when the file declares no
     `template {}` block, when `NAME` matches nothing in the file, and when
     `--version` is given with more than one target. The supervisor answers
@@ -103,6 +124,8 @@ page cmd_template {
 cd examples/templates
 vmlab template build win2022
 vmlab template build -f templates.wcl --version 1.4.0 alpine
+vmlab template build windows-11 --variant win3d
+vmlab template build windows-11@26100.1742.6 --variant standard,win3d
 SRC
   }
 

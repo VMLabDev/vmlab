@@ -24,6 +24,7 @@ from harness import RESULTS, Harness, ScenarioFailed  # noqa: E402
 # Order matters: later scenarios use the template `template` builds.
 SCENARIOS = [
     "template",
+    "variants",
     "core",
     "sleep",
     "guest",

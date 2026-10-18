@@ -51,9 +51,10 @@ vmlab template build [OPTIONS] [NAME]
 
 | Option | Meaning |
 | --- | --- |
-| `[NAME]` | Build only the named template. Default: every template in the file. |
+| `[NAME]` | Build only the named template. Default: every template in the file. `<name>@<version>` pins the version, like `--version`. |
 | `-f`, `--file <FILE>` | File containing `template {}` blocks. Default: the `vmlab.wcl` of the lab the shell is in. |
-| `--version <VERSION>` | Pin an explicit version instead of auto-incrementing. Requires a single target template. |
+| `--version <VERSION>` | Pin an explicit version instead of auto-incrementing. Requires a single target template. With `--variant`, the installed version to build onto. |
+| `--variant <V>[,<V2>…]` | Build or rebuild only these variants onto the newest installed version (or the pinned one); the base and other variants are untouched. Requires `NAME`. |
 | `-h`, `--help` | Print help. |
 
 `build` asks the supervisor which templates the file declares, filters them by
@@ -68,6 +69,15 @@ prints every `template.op.log` line as it arrives until the operation reports
 done, cancelled, or an error. One Ctrl-C sends a stop request and keeps
 following until the supervisor has cleaned up. A second Ctrl-C exits
 immediately and warns that the build may still be running.
+
+A template with `variant {}` blocks builds its base, then each variant on it —
+the default first, the rest in file order — logging `building variant
+<ref>#<name> (n/m)` as each starts. A failed variant stops the build; the base
+and the variants before it stay installed, and the error names the
+`--variant` command that retries it. `--variant` is refused when the base is
+not installed, when a named variant is not declared, when the result would hold
+several variants but not the default, and while a clone is backed by a variant
+it would replace.
 
 It refuses locally, with exit status 1, when the file declares no `template {}`
 block, when `NAME` matches nothing in the file, and when `--version` is given

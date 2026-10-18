@@ -52,6 +52,7 @@ template "<name>" {
   playbook "…"  { … }
   nic         { … }
   disk "…"    { … }
+  variant "…" { … }
 }
 SRC
   }
@@ -83,6 +84,7 @@ SRC
       | "`playbook {}`" | "children" | "none" | "config-weave playbooks applied to the build VM, interleaved with provisions in declaration order. Steps stream as structured build progress." |
       | "`nic {}`" | "children" | "none" | "NICs for the build VM. Optional; the build VM may be air-gapped." |
       | "`disk {}`" | "children" | "none" | "Additional disks attached during the build." |
+      | "`variant {}`" | "children" | "none" | "Sealed variants built on the base after it seals, each its own disk state. See the variant {} section below." |
   }
   p <<DOC
     `media`, `provision`, `playbook`, `nic` and `disk` are the same blocks a
@@ -119,6 +121,7 @@ SRC
     li "`first_boot` and every `provision` script exist under the template's root and compile."
     li "A `playbook` on a template whose `arch` is not `x86_64` is rejected."
     li "Every `media` and `disk` source folder exists."
+    li "Variant names match `[a-z0-9][a-z0-9-]{0,31}`, are not `base`, and do not repeat; exactly one variant sets `default = true`, unless there is only one."
   }
   code wcl {
     filename    = "examples/templates/ubuntu-24.04/vmlab.wcl"
@@ -146,18 +149,98 @@ SRC
       | "`path`" | "utf8" | "none" | "Local file path, for `iso` and `qcow2`. Mutually exclusive with `url`." |
       | "`url`" | "utf8" | "none" | "Remote artefact URL, for `iso` and `qcow2`. Requires `sha256`." |
       | "`sha256`" | "utf8" | "none" | "SHA-256 of the remote artefact. Required with `url`." |
-      | "`from`" | "utf8" | "none" | "Source template `<arch>/<name>[@<version>]`, for kind `template`: a layered build." |
+      | "`from`" | "utf8" | "none" | "Source template `<arch>/<name>[@<version>][#<variant>]`, for kind `template`: a layered build. No `#` seeds from the default variant, `#base` from the base." |
   }
   p "The four kinds:"
   list {
     li "**`iso`**: an installer ISO. The build boots it with the attached media and lets the provision script drive the installer. A remote artefact is downloaded to the cache and verified against `sha256` before use."
     li "**`qcow2`**: an existing disk image, imported as the base."
-    li "**`template`**: a layered build. An existing store template is the base, more provisioning runs, and the result seals as a new template. `from` must be a local store reference; a registry reference or `scratch` is rejected here."
+    li "**`template`**: a layered build. An existing store template is the base, more provisioning runs, and the result seals as a new template. `from` must be a local store reference; a registry reference or `scratch` is rejected here. On a source with variants, no `#` seeds from its default variant, `#<variant>` from that variant, and `#base` from its base; the build boot runs the first-boot script of what was selected, and none for `#base`. The selected disk and everything beneath it are flattened into the working disk."
     li "**`scratch`**: a blank disk of the template's `disk` size. The attached installer media and provision script do everything."
   }
   p <<DOC
     Validation requires exactly one of `path` and `url` for `iso` and
     `qcow2`, `sha256` whenever `url` is set, a `path` file that exists, and a
     `from` template that is in the store. An unknown kind is rejected.
+  DOC
+
+  h2 "variant {}"
+  p <<DOC
+    One variant of the template: a named, sealed disk state built on the
+    base by booting an overlay on it and running the variant's own steps. A
+    template with variants is referenced as `<arch>/<name>#<variant>`, and
+    a reference without `#` selects the default variant; see
+    [Templates and the store](guide_templates). The motivating case is
+    Windows: the base is installed and updated but not generalized, and each
+    variant generalizes after its own changes.
+  DOC
+  code wcl { source = <<'SRC'
+template "windows-11" {
+  …base build: source, provisions ending in a clean shutdown, no sysprep…
+  first_boot = "scripts/firstboot.ws"
+
+  variant "standard" {
+    default = true
+    provision "scripts/generalize.ws" { }
+  }
+  variant "win3d" {
+    description = "GPU driver installed"
+    secure_boot = false
+    provision "scripts/win3d-setup.ws" { }
+    provision "scripts/generalize.ws" { }
+  }
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`name`" | "utf8 (label)" | "required" | "Variant name, `[a-z0-9][a-z0-9-]{0,31}`. `base` is reserved." |
+      | "`default`" | "bool" | "see meaning" | "The variant a reference with no `#` selects. Exactly one variant sets it, unless there is only one." |
+      | "`description`" | "utf8" | "none" | "One line saying what the variant is for, shown by `vmlab template list`." |
+      | "`first_boot`" | "utf8" | "the template's" | "wscript run on the first instantiation of a clone of this variant, before it turns ready." |
+      | "`profile`" | "utf8" | "the base's" | "Guest OS profile for this variant." |
+      | "`cpus`" | "i64" | "the base's" | "vCPU count." |
+      | "`memory`" | "ByteSize" | "the base's" | "RAM, for example `8GiB`." |
+      | "`display`" | "utf8" | "the base's" | "QEMU display device string." |
+      | "`cpu_model`" | "utf8" | "the base's" | "QEMU `-cpu` model." |
+      | "`accel`" | "utf8" | "the base's" | "Accelerator: `kvm` or `tcg`." |
+      | "`firmware`" | "utf8" | "the base's" | "Firmware: `ovmf` or `seabios`." |
+      | "`tpm`" | "bool" | "the base's" | "Enable a TPM 2.0 device." |
+      | "`secure_boot`" | "bool" | "the base's" | "Enable secure boot; OVMF only." |
+      | "`qemu_args`" | "list<utf8>" | "the template's" | "Raw QEMU flags for the variant's build VM, replacing the template's." |
+      | "`media {}`" | "children" | "none" | "ISO or floppy images attached to the variant's build. The template's own media stay with the base build." |
+      | "`provision {}`" | "children" | "none" | "Provision scripts the variant's build runs, interleaved with its playbooks in declaration order." |
+      | "`playbook {}`" | "children" | "none" | "config-weave playbooks applied to the variant's build VM." |
+      | "`nic {}`" | "children" | "the template's" | "NICs for the variant's build VM, replacing the template's when any are declared." |
+  }
+  p <<DOC
+    The hardware fields override what the base recorded, field by field, for
+    the variant's build boot and for every clone of the variant; a field the
+    variant leaves out follows the base. `secure_boot = false` on a variant
+    of a Secure Boot base boots its build, and its clones, on the firmware
+    without Secure Boot.
+  DOC
+  h3 "How a variant builds"
+  p <<DOC
+    `vmlab template build` seals the base first. On a template with
+    variants the base embeds no first-boot script: the template's
+    `first_boot` is each variant's to inherit, and a variant's own
+    `first_boot` replaces it. Then each variant builds, the default first and
+    the rest in file order. A variant build creates an overlay on the sealed
+    base, boots it on the variant's hardware, waits for the agent, runs the
+    variant's provisions and playbooks, and shuts down gracefully. It runs
+    **no first-boot script**: the base was never generalized, so there is
+    nothing to specialize until a clone of the finished variant starts. The
+    overlay is then pointed at its base by the relative path
+    `../../disk.qcow2`, hashed, and installed with its metadata under the
+    store lock.
+  DOC
+  p <<DOC
+    A failed variant stops the build; the base and every variant installed
+    before it stay installed, and nothing of the failed one is left behind.
+    `vmlab template build <name> --variant <v>` builds or rebuilds just that
+    variant onto the installed version. A rebuild is refused while a
+    machine's clone is backed by the variant: destroy those machines first.
   DOC
 }

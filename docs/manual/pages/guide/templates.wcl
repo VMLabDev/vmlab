@@ -84,6 +84,18 @@ page guide_templates {
     one variant; removing the version removes all of them.
   DOC
 
+  p <<DOC
+    Variants are declared as `variant "<name>" { }` blocks inside the
+    `template {}` block, each with its own provisions and any hardware it
+    changes; [Lab file: template and source](ref_template) has the fields.
+    `vmlab template build` seals the base, then builds each variant on it:
+    an overlay on the base, booted on the variant's hardware, running the
+    variant's steps and no first-boot script, shut down and installed beside
+    the base. `vmlab template build <name> --variant <v>` rebuilds one
+    variant onto the installed version without touching the base or the
+    others.
+  DOC
+
   h2 "The store"
 
   p <<DOC

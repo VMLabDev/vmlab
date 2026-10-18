@@ -22,6 +22,9 @@ FEATURES: dict[str, str] = {
     "template.registry.config": "`vmlab template registry add/list/remove`",
     "template.registry.lab-ref": "a lab VM referencing a registry template pulls it on `up`",
     "template.event": "the `template.built` event",
+    "template.variant.build": "build a template definition with variants: the base, then each variant on it",
+    "template.variant.select": "lab VMs select the default variant, a named `#variant`, and are refused `#base`",
+    "template.variant.rebuild": "`vmlab template build <name> --variant <v>` rebuilds one variant, leaving the others",
     # -- lab lifecycle -----------------------------------------------------
     "lab.validate": "`vmlab validate` accepts a good lab",
     "lab.validate.reject": "`vmlab validate` rejects a bad lab with a named error",
