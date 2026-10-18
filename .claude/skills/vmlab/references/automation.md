@@ -34,7 +34,9 @@ mean agent-level readiness rather than full readiness, because full readiness
 is unreachable until that script returns; a first-boot script that reboots its
 guest uses them to wait for it to come back. Everywhere else they mean full
 readiness. `agent_answering` is the ungated live probe and goes false while a
-guest is down or mid-reboot.
+guest is down or mid-reboot, but it cannot see a reboot that finishes between
+two probes. To watch a reboot the script asked for, read `boot_id` before
+asking and call `wait_rebooted` after.
 
 An **ad-hoc run** is `vmlab script scripts/whatever.ws`, given a path relative
 to the lab root. It uses the same `main(lab)` entry point against the running

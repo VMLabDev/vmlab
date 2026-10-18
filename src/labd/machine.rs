@@ -435,6 +435,26 @@ pub trait Machine: Send + Sync + 'static {
         .await
     }
 
+    /// An opaque string that is the same for the whole of one guest boot and
+    /// different after any reboot ([`super::boot_id`]). Read over the agent's
+    /// `exec`, so it needs the agent answering, and fails by name on a family
+    /// with no boot identity to read.
+    async fn boot_id(&self) -> Result<String> {
+        super::boot_id::read(self.as_machine()).await
+    }
+
+    /// Wait until [`boot_id`](Machine::boot_id) answers something other than
+    /// `since`, and return it — the reboot signal [`agent_answering`]
+    /// (Machine::agent_answering) cannot give, since a guest that reboots
+    /// between two pings answers the next one through the new boot's agent.
+    /// Failed probes while the guest is down are expected and tolerated.
+    async fn wait_rebooted(&self, since: &str, timeout: Duration) -> Result<String> {
+        super::boot_id::wait_changed(self.name(), since, timeout, super::boot_id::POLL, || {
+            self.boot_id()
+        })
+        .await
+    }
+
     /// Ask the guest to reboot in place, leaving the machine running.
     ///
     /// Not every machine can: a container micro-VM restarts from a fresh

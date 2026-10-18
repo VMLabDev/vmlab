@@ -179,6 +179,8 @@ Module map under `src/`:
   `app_share.rs` is `machine.app_open` (§20.3), the broker that opens a
   shared app's agent session and hands the CLI its control and connection
   sockets;
+  `boot_id.rs` is the per-family boot identity read over the agent's `exec`
+  and the loop `wait_rebooted` waits on it with (§10.3);
   `agent_repair.rs` is `machine.repair_agent` (§19.4), the plan for replacing
   a guest's agent binary over its own channel and the divergence it records;
   `workspace/` is the workspace syncer (§19.6, ADR-0014) — the layered
