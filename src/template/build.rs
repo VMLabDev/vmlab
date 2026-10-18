@@ -284,6 +284,31 @@ fn check_default_survives(
             after.push(&v.name);
         }
     }
+    // A block is installed default only when it is the definition's default,
+    // and taking the default clears it elsewhere; so the store's default
+    // moves only by building the declared one. Rebuilding the store's
+    // default while the definition names another would leave none.
+    if let Some(current) = installed.default_variant()
+        && current.name != default.name
+        && !order.iter().any(|v| v.name == default.name)
+        && after.len() > 1
+    {
+        bail!(
+            "{}/{}@{} has default variant `{}` but the definition names `{}` — include it to move \
+             the default: `--variant {},{}`",
+            installed.arch,
+            installed.name,
+            installed.version,
+            current.name,
+            default.name,
+            default.name,
+            order
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     if after.len() > 1 && !after.contains(&default.name.as_str()) {
         bail!(
             "{}/{}@{} would hold variants {} but not its default `{}`, which is not installed — \
@@ -387,11 +412,6 @@ struct VariantRun<'a> {
     default: &'a str,
     control: &'a BuildControl,
 }
-
-/// Where a variant overlay's backing file points once it is installed:
-/// `variants/<name>/disk.qcow2` → the version's base disk, relative, so the
-/// store can move (§6.6).
-const VARIANT_BACKING: &str = "../../disk.qcow2";
 
 /// Build one variant (§6.6): boot a linked overlay on the sealed base with
 /// the variant's effective hardware, run its steps, shut down gracefully,
@@ -558,7 +578,7 @@ async fn build_variant(
     // The overlay was written against the base by its absolute path; the
     // store keeps it beside the base and must survive being moved, so the
     // reference becomes relative. `-u`: the bytes behind it are the same.
-    super::qimg::rebase_unsafe(&disk0, VARIANT_BACKING).await?;
+    super::qimg::rebase_unsafe(&disk0, super::store::VARIANT_BACKING).await?;
     let sha = super::store::sha256_file(&disk0).context("hashing the variant overlay")?;
     let first_boot = v.first_boot.as_ref().or(def.first_boot.as_ref());
     let first_boot_script = match first_boot {
@@ -571,7 +591,7 @@ async fn build_variant(
         }
         None => None,
     };
-    let meta = variant_meta(
+    let mut meta = variant_meta(
         v,
         VariantImage {
             sha256: sha,
@@ -586,15 +606,12 @@ async fn build_variant(
     if installed.is_file() {
         refuse_in_use(control, &installed, &base.reference(), &v.name).await?;
     }
-    store
-        .install_variant(
-            &base.meta.arch,
-            &base.meta.name,
-            &base.meta.version,
-            &disk0,
-            meta,
-            run.default,
-        )
+    // The store's own installer takes a staged `variants/<name>/disk.qcow2`,
+    // checks the digest, the base and the relative backing, moves it in and
+    // merges the block — overlay first, block after. A default block takes
+    // the default from whichever variant held it.
+    meta.default = v.name == run.default;
+    install_built_variant(store, base, &disk0, &work.join("variant-staging"), &meta)
         .context("installing the variant into the store")?;
     events.emit(
         "template.built",
@@ -604,6 +621,29 @@ async fn build_variant(
         }),
     );
     Ok(())
+}
+
+/// Stage a built overlay as `<staging>/variants/<name>/disk.qcow2` and hand
+/// it to the store, which verifies its digest, its base and its relative
+/// backing file before moving it in and merging `meta` into `template.wcl`.
+/// A refusal leaves the store as it was.
+fn install_built_variant(
+    store: &TemplateStore,
+    base: &super::store::TemplateVersion,
+    overlay: &Path,
+    staging: &Path,
+    meta: &super::meta::VariantMeta,
+) -> Result<TemplateMeta> {
+    let staged = staging.join(super::meta::variant_disk_rel(&meta.name));
+    std::fs::create_dir_all(staged.parent().expect("a disk has a parent"))?;
+    std::fs::rename(overlay, &staged).with_context(|| format!("staging {}", overlay.display()))?;
+    store.add_variants(
+        &base.meta.arch,
+        &base.meta.name,
+        &base.meta.version,
+        staging,
+        std::slice::from_ref(meta),
+    )
 }
 
 /// Refuse to replace `disk` while the caller's in-use check names a clone
@@ -3019,6 +3059,23 @@ mod tests {
         let only = order(&["win3d"]);
         let plan = super::plan_variants(&d, Some(&only)).unwrap();
         super::check_default_survives(&d, &installed, &plan).unwrap();
+
+        // The store's default is `win3d` beside `standard`, and the definition
+        // names `standard`: rebuilding `win3d` alone would leave no default.
+        let mut standard = installed.variants[0].clone();
+        standard.name = "standard".into();
+        installed.variants[0].default = true;
+        installed.variants.push(standard);
+        let only = order(&["win3d"]);
+        let plan = super::plan_variants(&d, Some(&only)).unwrap();
+        let err = super::check_default_survives(&d, &installed, &plan).unwrap_err();
+        assert!(
+            err.to_string().contains("include it to move the default"),
+            "{err}"
+        );
+        let only = order(&["win3d", "standard"]);
+        let plan = super::plan_variants(&d, Some(&only)).unwrap();
+        super::check_default_survives(&d, &installed, &plan).unwrap();
     }
 
     /// The base of a template with variants embeds no first-boot script: the
@@ -3340,5 +3397,135 @@ mod tests {
         let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         assert!(info.get("backing-filename").is_none(), "{info}");
         assert_eq!(info["virtual-size"], 16 << 20);
+    }
+
+    /// A built overlay the way `build_variant` leaves one: written against
+    /// the base by absolute path, then rebased `-u` to `../../disk.qcow2`.
+    fn built_overlay(base: &Path, scratch: &Path, file: &str) -> std::path::PathBuf {
+        let base = base.canonicalize().unwrap();
+        qemu_img(
+            scratch,
+            &[
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-b",
+                base.to_str().unwrap(),
+                "-F",
+                "qcow2",
+                file,
+            ],
+        );
+        qemu_img(
+            scratch,
+            &[
+                "rebase",
+                "-u",
+                "-b",
+                "../../disk.qcow2",
+                "-F",
+                "qcow2",
+                file,
+            ],
+        );
+        scratch.join(file)
+    }
+
+    fn built_block(
+        name: &str,
+        overlay: &Path,
+        base_sha: &str,
+        default: bool,
+    ) -> crate::template::meta::VariantMeta {
+        let d = with_variants(&format!(r#"variant "{name}" {{ memory = 3GiB }}"#));
+        let mut m = super::variant_meta(
+            &d.variants[0],
+            super::VariantImage {
+                sha256: crate::template::store::sha256_file(overlay).unwrap(),
+                base_sha256: base_sha.into(),
+                first_boot_script: None,
+                agent_version: None,
+            },
+        );
+        m.default = default;
+        m
+    }
+
+    /// A rebuilt variant replaces its overlay and its block together and
+    /// leaves the other variant alone; a new default takes the default over;
+    /// one built on another base is refused with the store unchanged.
+    #[test]
+    fn a_built_variant_installs_atomically() {
+        if !have_qemu_img() {
+            return;
+        }
+        use crate::template::store::sha256_file;
+        let (tmp, store) = variant_store();
+        let base = store
+            .installed("x86_64", "win11", "26100.1")
+            .unwrap()
+            .unwrap();
+        let base_sha = base.meta.sha256.clone().unwrap();
+        let standard_before = sha256_file(&base.variant_disk("standard")).unwrap();
+        let work = |n: &str| {
+            let w = tmp.path().join(n);
+            std::fs::create_dir_all(&w).unwrap();
+            w
+        };
+
+        let w = work("extra");
+        let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
+        let block = built_block("extra", &overlay, &base_sha, false);
+        let digest = block.sha256.clone();
+        let meta =
+            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
+                .unwrap();
+        let extra = meta.variant("extra").unwrap();
+        assert_eq!(
+            (extra.sha256.as_str(), extra.memory),
+            (digest.as_str(), Some(3 << 30))
+        );
+        assert_eq!(meta.default_variant().unwrap().name, "standard");
+        assert_eq!(sha256_file(&base.variant_disk("extra")).unwrap(), digest);
+        assert_eq!(
+            sha256_file(&base.variant_disk("standard")).unwrap(),
+            standard_before,
+            "the other variant is untouched"
+        );
+        let extra_ref = crate::config::model::VariantRef::Named("extra".into());
+        let r = store
+            .resolve(
+                "x86_64",
+                "win11",
+                None,
+                Some(&extra_ref),
+                crate::template::store::Purpose::Lab,
+            )
+            .unwrap();
+        assert_eq!(r.meta.memory, Some(3 << 30));
+
+        // A new variant that is the definition's default takes it over.
+        let w = work("third");
+        let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
+        let block = built_block("third", &overlay, &base_sha, true);
+        let meta =
+            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
+                .unwrap();
+        assert_eq!(meta.default_variant().unwrap().name, "third");
+        assert!(!meta.variant("standard").unwrap().default);
+
+        // Built on another base: refused, nothing moves.
+        let wcl_path = base.dir.join(crate::template::meta::META_FILE);
+        let wcl = std::fs::read_to_string(&wcl_path).unwrap();
+        let w = work("stale");
+        let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
+        let block = built_block("extra", &overlay, &"ef".repeat(32), false);
+        assert!(
+            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&wcl_path).unwrap(), wcl);
+        assert_eq!(sha256_file(&base.variant_disk("extra")).unwrap(), digest);
     }
 }
