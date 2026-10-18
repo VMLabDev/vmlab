@@ -47,6 +47,51 @@ impl std::fmt::Display for StoredVersion {
     }
 }
 
+/// A version a pull or an import installed, with the variants it now holds
+/// (§6.6) — those already there included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledVersion {
+    #[serde(flatten)]
+    pub version: StoredVersion,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_variant: Option<String>,
+}
+
+impl InstalledVersion {
+    pub fn of(meta: &TemplateMeta) -> Self {
+        Self {
+            version: StoredVersion::of(meta),
+            variants: meta.variants.iter().map(|v| v.name.clone()).collect(),
+            default_variant: meta.default_variant().map(|d| d.name.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for InstalledVersion {
+    /// `x86_64/win@1`, then ` with variants standard (default), win3d` when
+    /// it has any.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.version)?;
+        if self.variants.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = self
+            .variants
+            .iter()
+            .map(|v| {
+                if self.default_variant.as_deref() == Some(v.as_str()) {
+                    format!("{v} (default)")
+                } else {
+                    v.clone()
+                }
+            })
+            .collect();
+        write!(f, " with variants {}", names.join(", "))
+    }
+}
+
 /// A template's recorded metadata, in the fixed shape `--json` prints.
 ///
 /// Field for field what `template.wcl` holds, minus the two a listing has no

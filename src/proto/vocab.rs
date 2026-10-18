@@ -1024,6 +1024,7 @@ vocabulary! {
             target: String,
             #[serde(default)] arch: Option<String>,
             #[serde(default)] overwrite: bool,
+            #[serde(default)] all_variants: bool,
         },
         /// Start uploading one store version to an OCI registry.
         #[one_way("cli", "Store management, for the reason on `store.list`.")]

@@ -464,17 +464,31 @@ impl TemplateStore {
         Ok(())
     }
 
-    /// Export a template as a single portable `tar.zst` archive holding
-    /// `template.wcl` + `disk.qcow2` (PRD §6.2). Read-only, so no lock.
+    /// Export a template version as a single portable `tar.zst` archive
+    /// holding `template.wcl`, `disk.qcow2` and every installed variant's
+    /// `variants/<name>/disk.qcow2` (PRD §6.2, §6.6). The `template.wcl` it
+    /// carries is the one the store serves — variant blocks whose overlay is
+    /// missing are left out. Read-only, so no lock.
     pub fn export(&self, arch: &str, name: &str, version: Option<&str>, out: &Path) -> Result<()> {
         let resolved = self.resolve_version(arch, name, version)?;
         let file = File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
         let encoder = zstd::Encoder::new(file, 0).context("cannot start zstd stream")?;
         let mut tar = tar::Builder::new(encoder);
-        tar.append_path_with_name(resolved.dir.join(META_FILE), META_FILE)
+        let wcl = resolved.meta.to_wcl();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(wcl.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(resolved.meta.created.timestamp().max(0) as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, META_FILE, wcl.as_bytes())
             .context("cannot archive template.wcl")?;
         tar.append_path_with_name(&resolved.disk_path, DISK_FILE)
             .context("cannot archive disk.qcow2")?;
+        for v in &resolved.meta.variants {
+            let rel = variant_disk_rel(&v.name);
+            tar.append_path_with_name(resolved.dir.join(&rel), &rel)
+                .with_context(|| format!("cannot archive {}", rel.display()))?;
+        }
         let encoder = tar.into_inner().context("cannot finish archive")?;
         encoder.finish().context("cannot finish zstd stream")?;
         Ok(())
@@ -482,8 +496,9 @@ impl TemplateStore {
 
     /// Import an archive produced by [`Self::export`]. Unpacks to a
     /// staging dir inside the store root (same filesystem, so the final
-    /// move is an atomic rename), verifies the disk digest against the
-    /// metadata when recorded, then installs.
+    /// move is an atomic rename), verifies the base disk against its
+    /// recorded digest and every variant against its own and its base's
+    /// (§6.6), then installs.
     pub fn import(&self, archive: &Path, overwrite: bool) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let staging = StagingDir::create(&self.root)?;
@@ -503,6 +518,7 @@ impl TemplateStore {
             "{} is not a vmlab template archive: missing {DISK_FILE}",
             archive.display()
         );
+        let mut base_digest = None;
         if let Some(expected) = &meta.sha256 {
             let actual = sha256_file(&disk)?;
             ensure!(
@@ -513,9 +529,76 @@ impl TemplateStore {
                 meta.name,
                 meta.version
             );
+            base_digest = Some(actual);
         }
+        verify_variants(staging.path(), &meta, base_digest.as_deref())?;
         self.install_locked(staging.path(), &meta, overwrite)?;
         Ok(meta)
+    }
+
+    /// Install a staged directory holding a whole version — `disk.qcow2` and
+    /// the `variants/<name>/disk.qcow2` of every variant `meta` lists — after
+    /// checking each variant belongs to this base and its disk is the one
+    /// its block names (§6.6). What a pull of a version the store does not
+    /// hold yet installs.
+    pub fn install_with_variants(
+        &self,
+        staging_dir: &Path,
+        meta: &TemplateMeta,
+        overwrite: bool,
+    ) -> Result<()> {
+        verify_variants(staging_dir, meta, meta.sha256.as_deref())?;
+        self.install(staging_dir, meta, overwrite)
+    }
+
+    /// Add variants to a version the store already holds (§6.6): each
+    /// `variants/<name>/disk.qcow2` staged under `staging_dir` moves in, and
+    /// its block is merged into `template.wcl`, replacing a block of the same
+    /// name and keeping every other. An incoming default takes the default
+    /// from any variant already installed.
+    ///
+    /// Each variant must have been built on the installed base. The overlay
+    /// moves first and the block is written after, so a failure between the
+    /// two leaves an overlay with no block — which does not count — never a
+    /// block naming a disk that is not there.
+    pub fn add_variants(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+        staging_dir: &Path,
+        variants: &[super::meta::VariantMeta],
+    ) -> Result<TemplateMeta> {
+        let _lock = self.lock()?;
+        let found = self
+            .installed(arch, name, version)?
+            .ok_or_else(|| anyhow!("template {arch}/{name}@{version} not found in the store"))?;
+        let mut incoming = found.meta.clone();
+        incoming.variants = variants.to_vec();
+        verify_variants(staging_dir, &incoming, found.meta.sha256.as_deref())?;
+
+        let mut on_disk = TemplateMeta::read_from(&found.dir.join(META_FILE))?;
+        for v in variants {
+            let vdir = found.dir.join(VARIANTS_DIR).join(&v.name);
+            if vdir.exists() {
+                fs::remove_dir_all(&vdir)
+                    .with_context(|| format!("cannot replace {}", vdir.display()))?;
+            }
+            fs::create_dir_all(found.dir.join(VARIANTS_DIR))?;
+            fs::rename(staging_dir.join(VARIANTS_DIR).join(&v.name), &vdir)
+                .with_context(|| format!("cannot move variant `{}` into the store", v.name))?;
+            if v.default {
+                for other in &mut on_disk.variants {
+                    other.default = false;
+                }
+            }
+            match on_disk.variants.iter_mut().find(|o| o.name == v.name) {
+                Some(slot) => *slot = v.clone(),
+                None => on_disk.variants.push(v.clone()),
+            }
+        }
+        write_meta_atomic(&found.dir, &on_disk)?;
+        read_meta(&found.dir)
     }
 
     /// Exclusive advisory lock on the store. Held for the lifetime of
@@ -537,7 +620,7 @@ impl TemplateStore {
 
 /// A version directory's metadata with the variants it can actually serve:
 /// a variant block whose overlay is missing does not count (§6.6).
-fn read_meta(dir: &Path) -> Result<TemplateMeta> {
+pub(crate) fn read_meta(dir: &Path) -> Result<TemplateMeta> {
     let mut meta = TemplateMeta::read_from(&dir.join(META_FILE))?;
     meta.variants
         .retain(|v| dir.join(variant_disk_rel(&v.name)).is_file());
@@ -562,6 +645,116 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     crate::hashing::feed(&mut file, &mut hasher)
         .with_context(|| format!("cannot hash {}", path.display()))?;
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// The backing file a variant overlay names: its base, two directories up
+/// (§6.6). Relative, so a moved store or an imported export keeps working.
+pub const VARIANT_BACKING: &str = "../../disk.qcow2";
+
+/// The backing file name a qcow2 image's header records, `None` when it has
+/// none. Read straight from the header — no `qemu-img`, and no lock to
+/// contend with.
+pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut header = [0u8; 20];
+    f.read_exact(&mut header)
+        .with_context(|| format!("{} is too short to be a qcow2 image", path.display()))?;
+    ensure!(
+        header[..4] == *b"QFI\xfb",
+        "{} is not a qcow2 image",
+        path.display()
+    );
+    let offset = u64::from_be_bytes(header[8..16].try_into().expect("8 bytes"));
+    let size = u32::from_be_bytes(header[16..20].try_into().expect("4 bytes"));
+    if offset == 0 || size == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        size <= 1023,
+        "{} records a {size}-byte backing file name",
+        path.display()
+    );
+    let mut name = vec![0u8; size as usize];
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(&mut name)
+        .with_context(|| format!("cannot read {}'s backing file name", path.display()))?;
+    Ok(Some(String::from_utf8_lossy(&name).into_owned()))
+}
+
+/// Make a variant overlay name its base by [`VARIANT_BACKING`], the store's
+/// layout (§6.6). `true` when it had to be rewritten — which changes its
+/// bytes, so the caller re-hashes it.
+pub fn ensure_variant_backing(overlay: &Path) -> Result<bool> {
+    if qcow2_backing_file(overlay)?.as_deref() == Some(VARIANT_BACKING) {
+        return Ok(false);
+    }
+    let out = std::process::Command::new("qemu-img")
+        .args(["rebase", "-u", "-b", VARIANT_BACKING, "-F", "qcow2"])
+        .arg(overlay)
+        .output()
+        .context("cannot run qemu-img")?;
+    ensure!(
+        out.status.success(),
+        "cannot point {} at {VARIANT_BACKING}: {}",
+        overlay.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(true)
+}
+
+/// Check every variant a staged version directory's `meta` lists, before it
+/// enters the store (§6.6): its overlay is there, hashes to its `sha256`,
+/// names the base by [`VARIANT_BACKING`], and was built on this base —
+/// `base_sha256` equal to the digest of the staged `disk.qcow2`, which
+/// `base_digest` is when known.
+fn verify_variants(dir: &Path, meta: &TemplateMeta, base_digest: Option<&str>) -> Result<()> {
+    if meta.variants.is_empty() {
+        return Ok(());
+    }
+    let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
+    let base = match base_digest {
+        Some(d) => d.to_string(),
+        None => sha256_file(&dir.join(DISK_FILE))?,
+    };
+    for v in &meta.variants {
+        let overlay = dir.join(variant_disk_rel(&v.name));
+        ensure!(
+            overlay.is_file(),
+            "variant `{}` of {reference} has no {}",
+            v.name,
+            variant_disk_rel(&v.name).display()
+        );
+        let actual = sha256_file(&overlay)?;
+        ensure!(
+            digest_matches(&actual, &v.sha256),
+            "variant `{}` of {reference}: disk digest mismatch, expected {}, got {actual} \
+             — the archive is corrupt",
+            v.name,
+            v.sha256
+        );
+        ensure!(
+            digest_matches(&base, &v.base_sha256),
+            "variant `{}` of {reference} was built on base {} but the base here is {base} \
+             — refusing a variant that does not belong to this base",
+            v.name,
+            v.base_sha256
+        );
+        let backing = qcow2_backing_file(&overlay)?;
+        ensure!(
+            backing.as_deref() == Some(VARIANT_BACKING),
+            "variant `{}` of {reference} is backed by {} rather than {VARIANT_BACKING}",
+            v.name,
+            backing.as_deref().unwrap_or("nothing")
+        );
+    }
+    Ok(())
+}
+
+/// Two hex digests, either maybe `sha256:`-prefixed, compared without case.
+fn digest_matches(a: &str, b: &str) -> bool {
+    let strip = |d: &str| d.strip_prefix("sha256:").unwrap_or(d).to_ascii_lowercase();
+    strip(a) == strip(b)
 }
 
 /// Natural-sort version comparison: the strings are split into numeric
@@ -1782,5 +1975,147 @@ mod tests {
         t1.join().unwrap();
         t2.join().unwrap();
         assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    /// Write `entries` (name, bytes) into a `tar.zst` the way an export does.
+    fn repack(out: &Path, from: &Path, entries: &[&str]) {
+        let file = File::create(out).unwrap();
+        let mut tar = tar::Builder::new(zstd::Encoder::new(file, 0).unwrap());
+        for e in entries {
+            tar.append_path_with_name(from.join(e), e).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn unpack(archive: &Path, to: &Path) {
+        let decoder = zstd::Decoder::new(File::open(archive).unwrap()).unwrap();
+        tar::Archive::new(decoder).unpack(to).unwrap();
+    }
+
+    /// Give `variant_store`'s overlays real digests, so an import can check
+    /// them.
+    fn record_variant_digests(store: &TemplateStore) {
+        let dir = store.version_dir("x86_64", "win", "1");
+        let mut m = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
+        for v in &mut m.variants {
+            v.sha256 = sha256_file(&dir.join(variant_disk_rel(&v.name))).unwrap();
+        }
+        m.write_to(&dir.join(META_FILE)).unwrap();
+    }
+
+    /// An export carries `variants/` and the full `template.wcl`; an import
+    /// restores both, every overlay still backed on `../../disk.qcow2`.
+    #[test]
+    fn export_import_round_trip_with_variants() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (tmp, store) = variant_store();
+        record_variant_digests(&store);
+        let archive = tmp.path().join("win.tar.zst");
+        store.export("x86_64", "win", Some("1"), &archive).unwrap();
+
+        let listing = tmp.path().join("listing");
+        unpack(&archive, &listing);
+        for f in [
+            "template.wcl",
+            "disk.qcow2",
+            "variants/standard/disk.qcow2",
+            "variants/extra/disk.qcow2",
+        ] {
+            assert!(listing.join(f).is_file(), "{f} missing from the export");
+        }
+
+        let (_tmp2, other) = new_store();
+        let imported = other.import(&archive, false).unwrap();
+        let original = store.resolve_version("x86_64", "win", Some("1")).unwrap();
+        assert_eq!(imported, original.meta);
+        let back = other.resolve_version("x86_64", "win", Some("1")).unwrap();
+        assert_eq!(back.meta, original.meta);
+        for v in ["standard", "extra"] {
+            let disk = back.variant_disk(v);
+            assert_eq!(
+                fs::read(&disk).unwrap(),
+                fs::read(original.variant_disk(v)).unwrap()
+            );
+            assert_eq!(
+                qcow2_backing_file(&disk).unwrap().as_deref(),
+                Some(VARIANT_BACKING)
+            );
+            let info = qemu_img_info(&disk);
+            assert_eq!(info["backing-filename"], VARIANT_BACKING);
+        }
+        let r = other
+            .resolve(
+                "x86_64",
+                "win",
+                Some("1"),
+                Some(&named("extra")),
+                Purpose::Lab,
+            )
+            .unwrap();
+        assert_eq!(r.meta.memory, Some(8 << 30));
+    }
+
+    /// An import refuses a variant whose overlay is not the one its block
+    /// names, one built on another base, and one whose overlay is missing —
+    /// and installs nothing.
+    #[test]
+    fn import_refuses_a_tampered_variant() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (tmp, store) = variant_store();
+        record_variant_digests(&store);
+        let archive = tmp.path().join("win.tar.zst");
+        store.export("x86_64", "win", Some("1"), &archive).unwrap();
+        let entries = [
+            "template.wcl",
+            "disk.qcow2",
+            "variants/standard/disk.qcow2",
+            "variants/extra/disk.qcow2",
+        ];
+
+        let refused = |name: &str, tamper: &dyn Fn(&Path), want: &str| {
+            let dir = tmp.path().join(name);
+            unpack(&archive, &dir);
+            tamper(&dir);
+            let bad = tmp.path().join(format!("{name}.tar.zst"));
+            let present: Vec<&str> = entries
+                .iter()
+                .copied()
+                .filter(|e| dir.join(e).is_file())
+                .collect();
+            repack(&bad, &dir, &present);
+            let (_t, other) = new_store();
+            let err = format!("{:#}", other.import(&bad, false).unwrap_err());
+            assert!(err.contains(want), "{name}: {err}");
+            assert!(other.list().unwrap().is_empty(), "{name}: installed anyway");
+        };
+
+        refused(
+            "overlay",
+            &|dir| {
+                let disk = dir.join("variants/extra/disk.qcow2");
+                let mut bytes = fs::read(&disk).unwrap();
+                bytes.push(0);
+                fs::write(&disk, bytes).unwrap();
+            },
+            "variant `extra`",
+        );
+        refused(
+            "base",
+            &|dir| {
+                let mut m = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
+                m.variants[0].base_sha256 = "00".repeat(32);
+                m.write_to(&dir.join(META_FILE)).unwrap();
+            },
+            "built on base",
+        );
+        refused(
+            "missing",
+            &|dir| fs::remove_file(dir.join("variants/standard/disk.qcow2")).unwrap(),
+            "has no variants/standard/disk.qcow2",
+        );
     }
 }

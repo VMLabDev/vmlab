@@ -367,7 +367,7 @@ pub fn check_variant_name(s: &str) -> Result<(), String> {
 }
 
 /// Split a trailing `#<variant>` off a template reference.
-fn split_variant(s: &str) -> Result<(&str, Option<VariantRef>), String> {
+pub(crate) fn split_variant(s: &str) -> Result<(&str, Option<VariantRef>), String> {
     let Some((head, v)) = s.split_once('#') else {
         return Ok((s, None));
     };

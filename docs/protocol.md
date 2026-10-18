@@ -45,7 +45,7 @@ the code is the contract.
 | `store.prune` | `filter: Option<String>`, `keep: usize`, `apply: bool`, `force: bool` | `cli` | Plan a prune of superseded builds, and carry it out when `apply`. |
 | `store.export` | `reference: String`, `out: std::path::PathBuf` | `cli` | Write one store version to a portable archive. |
 | `store.import` | `archive: std::path::PathBuf`, `overwrite: bool` | `cli` | Read a template back out of an archive. |
-| `store.pull` | `target: String`, `arch: Option<String>`, `overwrite: bool` | `cli` | Download a published template into the store. |
+| `store.pull` | `target: String`, `arch: Option<String>`, `overwrite: bool`, `all_variants: bool` | `cli` | Download a published template into the store. |
 | `store.push` | `reference: String`, `target: Option<String>`, `source: Option<String>`, `prerelease: bool`, `lab: String` | `cli` | Start uploading one store version to an OCI registry. |
 | `store.stop_push` | `lab: String`, `arch: String`, `template: String` | `cli` | Abort a running store push. |
 | `registry.search` | `query: Option<String>`, `namespace: Option<String>`, `arch: Option<String>`, `containers: bool` | `cli` | Search one OCI namespace, or every configured one, for published templates or container images. |

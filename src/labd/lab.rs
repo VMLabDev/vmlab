@@ -388,7 +388,13 @@ impl LabRuntime {
                             vm_cfg.name
                         )
                     })?;
-                    match crate::oci::cached_registry_template(reference, &arch, &store)? {
+                    // A version in the store without the variant this
+                    // machine names is still a pull: of that variant.
+                    let cached = crate::oci::cached_registry_template(reference, &arch, &store)?
+                        .filter(|v| {
+                            crate::oci::client::VariantWant::of(variant.as_ref()).held_by(&v.meta)
+                        });
+                    match cached {
                         Some(version) => {
                             let resolved = version
                                 .select(variant.as_ref(), Purpose::Lab)
@@ -819,6 +825,14 @@ impl LabRuntime {
         if let Some(out) = output {
             out(format!("pull: {reference} ({arch})\n"));
         }
+        // The batch is keyed by the bare reference; it fetches every variant
+        // its machines name between them (§6.6).
+        let mut want = crate::oci::client::VariantWant::default();
+        for vm_name in &batch.machines {
+            if let Some(vm_cfg) = self.config.lab.vms.iter().find(|v| &v.name == vm_name) {
+                want.add(vm_cfg.template.variant());
+            }
+        }
         // The download runs as its own task so `cancel_pull` can abort it.
         let me = Arc::clone(self);
         let owned = batch.clone();
@@ -836,7 +850,8 @@ impl LabRuntime {
                     },
                 );
             };
-            crate::oci::ensure_registry_template(&ref_s, &arch_s, &store, &mut progress).await
+            crate::oci::ensure_registry_template(&ref_s, &arch_s, &store, &want, &mut progress)
+                .await
         });
         match self.join_pull(batch, task).await {
             Ok(resolved) => match self.bind_template(batch, &resolved) {

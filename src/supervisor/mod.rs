@@ -639,7 +639,8 @@ impl Handler<SupRequest> for SupervisorHandler {
                 target,
                 arch,
                 overwrite,
-            } => store::pull(target, arch, overwrite).await,
+                all_variants,
+            } => store::pull(target, arch, overwrite, all_variants).await,
             SupRequest::StorePush {
                 reference,
                 target,

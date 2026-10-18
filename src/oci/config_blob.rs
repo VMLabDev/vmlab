@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::template::TemplateMeta;
+use crate::template::meta::VariantMeta;
 
 /// JSON form of [`TemplateMeta`] for the config blob. Field names are
 /// stable wire keys; absent optionals are omitted.
@@ -62,6 +63,25 @@ pub struct TemplateConfig {
     /// Host wscript surface used by embedded scripts.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wscript_surface: Option<crate::scripting::WscriptSurfaceVersion>,
+    /// Set on a variant's config blob only (§6.6): which variant the
+    /// effective metadata above belongs to. A client that predates variants
+    /// ignores it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub variant: Option<VariantConfig>,
+}
+
+/// What a variant's config blob adds to its effective metadata: the
+/// variant's identity and the base it was built on. Its `created` and
+/// `sha256` are the config's own, the variant's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariantConfig {
+    pub name: String,
+    /// `sha256` of the base the overlay was built on.
+    pub base_sha256: String,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub description: Option<String>,
 }
 
 impl TemplateConfig {
@@ -87,7 +107,61 @@ impl TemplateConfig {
             first_boot_script: meta.first_boot_script.clone(),
             agent_version: meta.agent_version.clone(),
             wscript_surface: meta.wscript_surface,
+            variant: None,
         }
+    }
+
+    /// A variant's config blob (§6.6): `base`'s metadata as the variant
+    /// sees it ([`TemplateMeta::effective`]), plus the variant's name,
+    /// default flag, description and the base digest it was built on.
+    pub fn from_variant(base: &TemplateMeta, variant: &VariantMeta) -> Self {
+        let mut config = Self::from_meta(&base.effective(Some(variant)));
+        config.variant = Some(VariantConfig {
+            name: variant.name.clone(),
+            base_sha256: variant.base_sha256.clone(),
+            default: variant.default,
+            description: variant.description.clone(),
+        });
+        config
+    }
+
+    /// The `variant` block a variant's config blob stands for, against the
+    /// `base` it is pulled onto. The blob carries effective metadata, so a
+    /// field is an override exactly where it differs from the base's — which
+    /// resolves to the same effective metadata as the block it was pushed
+    /// from.
+    pub fn into_variant(self, base: &TemplateMeta) -> Result<VariantMeta> {
+        let Some(v) = self.variant.clone() else {
+            anyhow::bail!("the config blob is a base's, not a variant's");
+        };
+        let sha256 = self
+            .sha256
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("variant `{}`'s config blob has no sha256", v.name))?;
+        let m = self.into_meta(None)?;
+        fn over<T: PartialEq + Clone>(effective: &Option<T>, base: &Option<T>) -> Option<T> {
+            (effective != base).then(|| effective.clone()).flatten()
+        }
+        Ok(VariantMeta {
+            name: v.name,
+            default: v.default,
+            created: m.created,
+            sha256,
+            base_sha256: v.base_sha256,
+            description: v.description,
+            first_boot_script: over(&m.first_boot_script, &base.first_boot_script),
+            agent_version: over(&m.agent_version, &base.agent_version),
+            wscript_surface: over(&m.wscript_surface, &base.wscript_surface),
+            profile: over(&m.profile, &base.profile),
+            cpus: over(&m.cpus, &base.cpus),
+            memory: over(&m.memory, &base.memory),
+            firmware: over(&m.firmware, &base.firmware),
+            tpm: over(&m.tpm, &base.tpm),
+            secure_boot: over(&m.secure_boot, &base.secure_boot),
+            display: over(&m.display, &base.display),
+            cpu_model: over(&m.cpu_model, &base.cpu_model),
+            accel: over(&m.accel, &base.accel),
+        })
     }
 
     /// Convert back into a [`TemplateMeta`]. `origin_override`, when set,
@@ -197,5 +271,59 @@ mod tests {
         let config: TemplateConfig = serde_json::from_value(value).unwrap();
         assert_eq!(config.wscript_surface, None);
         assert_eq!(config.into_meta(None).unwrap().wscript_surface, None);
+    }
+
+    /// A variant's config blob carries its effective metadata; turned back
+    /// into a block against the same base, it resolves to the same effective
+    /// metadata, and keeps the variant's identity.
+    #[test]
+    fn variant_config_round_trip() {
+        let base = meta();
+        let v = VariantMeta {
+            name: "win3d".into(),
+            default: false,
+            created: "2026-07-01T00:00:00Z".parse().unwrap(),
+            sha256: "cd".repeat(32),
+            base_sha256: "ab".repeat(32),
+            description: Some("3D".into()),
+            first_boot_script: Some("variant script".into()),
+            agent_version: None,
+            wscript_surface: None,
+            profile: None,
+            cpus: Some(4), // the base's own value: no override
+            memory: Some(16 << 30),
+            firmware: None,
+            tpm: None,
+            secure_boot: Some(false),
+            display: None,
+            cpu_model: None,
+            accel: None,
+        };
+        let config = TemplateConfig::from_variant(&base, &v);
+        assert_eq!(config.sha256.as_deref(), Some(v.sha256.as_str()));
+        assert_eq!(config.memory, Some(16 << 30));
+        assert_eq!(config.secure_boot, Some(false));
+        let json = config.to_json().unwrap();
+        let back = TemplateConfig::from_json(&json)
+            .unwrap()
+            .into_variant(&base)
+            .unwrap();
+        assert_eq!(base.effective(Some(&back)), base.effective(Some(&v)));
+        assert_eq!(back.name, "win3d");
+        assert_eq!(back.base_sha256, v.base_sha256);
+        assert_eq!(back.description.as_deref(), Some("3D"));
+        assert_eq!(back.cpus, None, "equal to the base's, so inherited");
+        assert_eq!(back.memory, Some(16 << 30));
+
+        // A base's blob is no variant's.
+        assert!(
+            TemplateConfig::from_meta(&base)
+                .into_variant(&base)
+                .is_err()
+        );
+        // Read as a client that predates variants reads it, it is a template.
+        let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        value.as_object_mut().unwrap().remove("variant");
+        assert!(serde_json::from_value::<TemplateConfig>(value).is_ok());
     }
 }

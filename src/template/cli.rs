@@ -26,7 +26,9 @@ use crate::proto::client::SupClient;
 use crate::proto::{Event, SupRequest};
 use crate::template::catalog::CatalogSearch;
 use crate::template::registries::RegistryEntry;
-use crate::template::store_view::{PrunePlan, PushStarted, StoreEntry, StoredVersion};
+use crate::template::store_view::{
+    InstalledVersion, PrunePlan, PushStarted, StoreEntry, StoredVersion,
+};
 
 /// The two fields a build needs from `template.list`: which templates the
 /// file declares, and how each is addressed.
@@ -140,9 +142,10 @@ pub enum TemplateCmd {
         #[arg(long)]
         prerelease: bool,
     },
-    /// Pull a template from an OCI registry
+    /// Pull a template from an OCI registry, with its default variant
     Pull {
-        /// Registry reference, e.g. ghcr.io/owner/name:version
+        /// Registry reference, e.g. ghcr.io/owner/name:version; `#<variant>`
+        /// also pulls that variant
         target: String,
         /// Architecture to pull (required for multi-arch indexes)
         #[arg(long)]
@@ -150,6 +153,9 @@ pub enum TemplateCmd {
         /// Overwrite an existing version in the store
         #[arg(long)]
         overwrite: bool,
+        /// Pull every variant, not just the default and the one named
+        #[arg(long)]
+        all_variants: bool,
     },
     /// Log in to an OCI registry
     Login {
@@ -241,7 +247,8 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 target,
                 arch,
                 overwrite,
-            } => pull(&sup, target, arch, overwrite).await,
+                all_variants,
+            } => pull(&sup, target, arch, overwrite, all_variants).await,
             TemplateCmd::Login {
                 registry,
                 username,
@@ -737,7 +744,8 @@ async fn export(sup: &SupClient, reference: String, out: PathBuf) -> Result<()> 
 
 async fn import(sup: &SupClient, archive: PathBuf, overwrite: bool) -> Result<()> {
     let archive = abs_path(&archive)?;
-    let imported: StoredVersion = ask(sup, SupRequest::StoreImport { archive, overwrite }).await?;
+    let imported: InstalledVersion =
+        ask(sup, SupRequest::StoreImport { archive, overwrite }).await?;
     println!("imported {imported}");
     Ok(())
 }
@@ -747,13 +755,15 @@ async fn pull(
     target: String,
     arch: Option<String>,
     overwrite: bool,
+    all_variants: bool,
 ) -> Result<()> {
-    let pulled: StoredVersion = ask(
+    let pulled: InstalledVersion = ask(
         sup,
         SupRequest::StorePull {
             target,
             arch,
             overwrite,
+            all_variants,
         },
     )
     .await?;

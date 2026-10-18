@@ -31,8 +31,8 @@ use crate::proto::{CommandError, Event};
 use crate::template::TemplateStore;
 use crate::template::meta::TemplateMeta;
 use crate::template::store_view::{
-    PrunePlan, PushStarted, RemoteStatus, StoreEntry, StoredVersion, TemplateSummary,
-    VariantSummary,
+    InstalledVersion, PrunePlan, PushStarted, RemoteStatus, StoreEntry, StoredVersion,
+    TemplateSummary, VariantSummary,
 };
 
 /// Serialise a typed answer, which cannot realistically fail — every view in
@@ -431,27 +431,37 @@ pub async fn export(reference: String, out: PathBuf) -> Result<Value, CommandErr
     Ok(Value::Null)
 }
 
-/// `store.import`: read a template back out of an archive.
+/// `store.import`: read a template back out of an archive, with its
+/// variants (§6.6).
 pub async fn import(archive: PathBuf, overwrite: bool) -> Result<Value, CommandError> {
     let meta = tokio::task::spawn_blocking(move || store().import(&archive, overwrite))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{e:#}"))?;
-    answer(StoredVersion::of(&meta))
+    answer(InstalledVersion::of(&meta))
 }
 
-/// `store.pull`: download a published template into the store.
+/// `store.pull`: download a published template into the store — the base,
+/// its default variant, and the variant a `#<variant>` names or, with
+/// `all_variants`, every one (§6.6).
 pub async fn pull(
     target: String,
     arch: Option<String>,
     overwrite: bool,
+    all_variants: bool,
 ) -> Result<Value, CommandError> {
     let store = store();
-    let meta = crate::template::oci_bridge::pull(&target, arch.as_deref(), &store, overwrite)
-        .await
-        .context("pulling from registry")
-        .map_err(|e| format!("{e:#}"))?;
-    answer(StoredVersion::of(&meta))
+    let meta = crate::template::oci_bridge::pull(
+        &target,
+        arch.as_deref(),
+        &store,
+        overwrite,
+        all_variants,
+    )
+    .await
+    .context("pulling from registry")
+    .map_err(|e| format!("{e:#}"))?;
+    answer(InstalledVersion::of(&meta))
 }
 
 /// `store.push`: start uploading one store version, reporting progress the
@@ -527,7 +537,12 @@ pub async fn push(
                 sup.emit(Event::new("template.op.cancelled", &*lab, done));
             }
             result = upload => match result {
-                Ok(()) => sup.emit(Event::new("template.op.done", &*lab, done)),
+                Ok(report) => {
+                    for line in report.lines() {
+                        log(format!("{line}\n"));
+                    }
+                    sup.emit(Event::new("template.op.done", &*lab, done));
+                }
                 Err(e) => {
                     let mut error = format!("{e:#}");
                     if error.contains("401") || error.to_lowercase().contains("unauthorized") {
