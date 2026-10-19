@@ -183,6 +183,13 @@ starts the agent, but never runs the entrypoint. The container then stays up for
 `exec` and `shell` until you stop it. That is what a dev
 container wants, since it has no service to be.
 
+`exec` and `shell` run with the image's own `PATH` (else the `login.defs`
+superuser path) plus `/.vmlab/bin` appended **last**: a static BusyBox cinit
+copies into every container's scratch layer, so a distroless image with no shell
+still answers `vmlab shell`. Because it comes last, the image's tools win
+(`command -v mount` in `debian:12` is `/usr/bin/mount`) and BusyBox answers only
+for what the image lacks.
+
 ## Readiness and health
 
 Readiness is two-stage. The first stage is cinit reporting `started`, or `idle`

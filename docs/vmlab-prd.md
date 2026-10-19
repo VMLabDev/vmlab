@@ -890,6 +890,15 @@ VM and container names share one namespace: DNS, `depends_on` waves,
 across both kinds. A container with no NICs is valid — air-gapped, still
 reachable via `exec`/`cp` over the agent channel — unless it declares
 volumes, which are network-mounted (validation error, mirroring §7.5).
+**The BusyBox shim is a fallback, last on `PATH`.** cinit copies a static
+BusyBox into every container's scratch layer at `/.vmlab/busybox`, with an
+applet directory `/.vmlab/bin`, so a distroless image with no shell still gets
+a working `vmlab exec` and `vmlab shell`. The agent appends that directory to
+the **end** of the `PATH` an exec or shell runs with (the image's own, else the
+`login.defs` superuser path), so the image's `mount`, `ps` and the rest win
+and BusyBox answers only for what the image lacks; ahead of them it shadowed
+util-linux's `mount` in a `debian:12` container, which silently remounted
+without the `/etc/fstab` options.
 
 **Architecture.** Every container runs in a **micro-VM**: a pinned Alpine
 `linux-virt` kernel + purpose-built initramfs (`vmlab-cinit` as PID 1,
