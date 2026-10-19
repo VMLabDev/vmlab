@@ -98,6 +98,7 @@ rejects an `on {}` that names anything else:
 | `lab.daemon_crashed` | Emitted by the supervisor when a lab daemon dies unexpectedly; the lab is marked failed and not restarted. |
 | `snapshot.created`, `snapshot.restored` | A snapshot taken or restored on a machine. See snapshots-vision.md. |
 | `template.built` | A template build sealed. See templates.md. |
+| `usb.attached`, `usb.detached` | A host USB device hot-plugged into a VM, or taken out of it. See cli-machine.md (`vmlab usb`). |
 | `playbook.applied`, `playbook.failed` | A play converged, or a run ended non-zero or failed to run. |
 | `host.disk_low` | The free-space watchdog crossed its threshold. |
 
@@ -256,6 +257,15 @@ status and `exit_code` the container's.
 | `snapshot.restored` | `vm`, `name`, `online` | A snapshot was restored, after the pin check and the syncer bracket. |
 
 Deleting a snapshot emits nothing.
+
+### Host USB devices
+
+| Event | Payload fields | When |
+| --- | --- | --- |
+| `usb.attached` | `vm`, `port`, `id`, `product`, `qdev_id` | A host USB device was hot-plugged into a VM. `id` is `vid:pid`; `qdev_id` is `usbhost-<port>`. |
+| `usb.detached` | `vm`, `port`, `id`, `product`, `qdev_id`, `reason` | A host USB device left a VM. `reason` is absent for a requested detach, `unplugged` when it left the host, `restore` when an online restore removed it first. |
+
+A VM stop releases its devices with no `usb.detached` per device; `vm.stopped` says it.
 
 ### Downloads
 

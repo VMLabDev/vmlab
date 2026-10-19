@@ -258,6 +258,34 @@ SRC
     [vm and its children](ref_vm).
   DOC
 
+  h2 "UsbDevice"
+  p "One host USB device, returned by `Lab.usb_devices` and `Machine.usb_attached`."
+  code wscript { source = <<'SRC'
+struct UsbDevice {
+    id: string,
+    vendor_id: string,
+    product_id: string,
+    serial: Option[string],
+    port: string,
+    product: Option[string],
+    manufacturer: Option[string],
+    attached_to: Option[string],
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`id`" | "string" | "none" | "The selector naming exactly this device, `port:<bus>-<port>`. Pass it to `usb_attach` when vendor and product ids are not unique." |
+      | "`vendor_id`" | "string" | "none" | "Four lowercase hex digits, e.g. `046d`." |
+      | "`product_id`" | "string" | "none" | "Four lowercase hex digits." |
+      | "`serial`" | "Option[string]" | "`None`" | "The serial number, where the device reports one." |
+      | "`port`" | "string" | "none" | "The kernel's port path, `<bus>-<port>[.<port>...]`." |
+      | "`product`" | "Option[string]" | "`None`" | "The product string, where reported." |
+      | "`manufacturer`" | "Option[string]" | "`None`" | "The manufacturer string, where reported." |
+      | "`attached_to`" | "Option[string]" | "`None`" | "The machine holding it, as `lab/vm`; `None` while it is free." |
+  }
+
   h2 "GuestStats"
   p "One sample of guest metrics, returned by `Machine.stats`."
   code wscript { source = <<'SRC'

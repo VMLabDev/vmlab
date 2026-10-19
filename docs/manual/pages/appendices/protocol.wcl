@@ -78,6 +78,7 @@ SRC
       | "Liveness" | "`ping`, `version`, `fastpath`, `status`, `shutdown`" | "CLI, and daemons for `ping` and `shutdown`" |
       | "Lab daemons" | "`lab.ensure`, `lab.release`, `lab.restart`" | "CLI" |
       | "Global segments" | "`global.attach`, `global.detach`, `global.list`" | "Lab daemons only" |
+      | "Host USB" | "`usb.list`" | "CLI, and lab daemons for a script's `lab.usb_devices()`" |
       | "Template builds" | "`template.list`, `template.build`, `template.stop_build`" | "CLI" |
       | "The store" | "`store.list`, `store.remove`, `store.prune`, `store.export`, `store.import`, `store.pull`, `store.push`, `store.stop_push`" | "CLI" |
       | "Registries" | "`registry.search`, `registry.login`, `registry.namespaces`, `registry.namespace_add`, `registry.namespace_remove`" | "CLI" |
@@ -96,11 +97,14 @@ SRC
       | "Display and input" | "`machine.screenshot`, `machine.sendkeys`, `machine.mouse_move`, `machine.mouse_click`, `machine.mouse_drag`, `machine.ocr`, `machine.find_image`" |
       | "Guest agent" | "`machine.exec`, `machine.tty_open`, `machine.tty_resize`, `machine.push_file`, `machine.pull_file`, `machine.tail`, `machine.eventlog`, `machine.clipboard_get`, `machine.clipboard_set`" |
       | "Playbooks" | "`playbook.list`, `playbook.check`, `playbook.apply`" |
+      | "Host USB" | "`machine.usb_attach`, `machine.usb_detach`, `machine.usb_attached`" |
       | "Snapshots" | "`snapshot.take`, `snapshot.restore`, `snapshot.delete`, `snapshot.list`" |
       | "Workspace" | "`workspace.flush`, `workspace.resolve`, `workspace.diff`" |
   }
   p <<DOC
-    Every lab-daemon command is called by the CLI. `machine.tty_open`
+    Every lab-daemon command is called by the CLI except
+    `machine.usb_attached`, which the supervisor calls on every running lab
+    to build `usb.list`. `machine.tty_open`
     answers with the path of a second unix socket the caller connects to and
     pipes a raw terminal over, which is what [vmlab shell](cmd_shell)
     does.

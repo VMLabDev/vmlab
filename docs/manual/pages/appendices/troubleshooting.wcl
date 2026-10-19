@@ -333,6 +333,36 @@ MSG
     refusals ride the ledger, so they apply to a stopped machine too.
   DOC
 
+  h2 "A USB device node cannot be opened"
+  code text { source = <<'MSG'
+cannot open /dev/bus/usb/{bus}/{dev} for {vid}:{pid} {device} at port {port} — vmlab runs as {user} and needs read-write access to it.
+  for now:   sudo setfacl -m u:{user}:rw /dev/bus/usb/{bus}/{dev}
+  for good:  a udev rule, e.g. SUBSYSTEM=="usb", ATTR{idVendor}=="{vid}", ATTR{idProduct}=="{pid}", TAG+="uaccess" in /etc/udev/rules.d/70-vmlab-usb.rules
+MSG
+  }
+  p <<DOC
+    [`vmlab usb attach`](cmd_usb) hands the device node to QEMU, which runs
+    as you, and a stock node is `root:root 0664`: readable, not writable. The
+    `setfacl` line grants your user access to that node until the device is
+    unplugged or the host reboots, since the device number in the path
+    changes on every replug. The udev rule grants it for good: write it to
+    the file named, run `sudo udevadm control --reload` and
+    `sudo udevadm trigger`, then replug the device. Run the attach again
+    either way.
+  DOC
+
+  h2 "A VM has no USB controller to attach to"
+  code text { source = "\"{machine}\" has no USB controller to attach to — set `usb = true` on {machine} and restart it" }
+  p <<DOC
+    Host USB devices hot-plug onto an xHCI controller that a VM gets only
+    when it starts with `usb = true` on its `vm` block or its profile. Add it
+    and restart the VM with `vmlab vm restart {machine}`; a running VM cannot
+    gain the controller. It is off by default because it changes the VM's
+    hardware: an online snapshot taken before you added it no longer
+    restores. A container refuses differently, with `USB passthrough is for
+    VMs`, and has no setting that changes that.
+  DOC
+
   h2 "Large reads fail on a Windows virtiofs share"
   code text { source = <<'MSG'
 WARNING: vm "{machine}": share "{share}" rides virtiofs into a Windows guest; virtio-win 0.1.302's VioFS driver fails large reads there at random ("Error performing inpage operation") and can leave a copy that reported success unreadable; use transport = "smb" (or "auto", which picks SMB on Windows) unless the template carries a VioFS without the fault, such as 0.1.285

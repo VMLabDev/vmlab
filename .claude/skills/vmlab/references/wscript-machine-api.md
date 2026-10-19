@@ -22,6 +22,8 @@ Method groups:
 - Guest agent: `exec`, `exec_timeout`, `copy_to`, `copy_from`, `logs`,
   `terminal`, `stats`.
 - Identity: `logins`, `as_login`, `as_account`.
+- Host USB (surface 3): `usb_attach`, `usb_attach_force`, `usb_detach`,
+  `usb_detach_all`, `usb_attached`.
 
 Two conventions apply throughout. Relative host paths, for reference images,
 screenshots and file transfers, resolve against the directory the running
@@ -1210,4 +1212,76 @@ fn main(lab: Lab) {
         Err(e) => lab.log(e),
     }
 }
+```
+
+## Machine.usb_attach
+
+Hot-plug a host USB device into this VM (wscript surface 3).
+
+```wscript
+fn usb_attach(self, selector: string) -> Result[UsbDevice, string]
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `selector` | string | `<vid>:<pid>`, `<vid>:<pid>@<serial>` or `port:<bus>-<port>[.<port>...]`. |
+
+Attaches the one host device `selector` names and returns it as a `UsbDevice`
+(wscript-lab-api.md) whose `attached_to` is this machine. The VM must be
+running and have started with `usb = true` (vm.md). The error carries the
+refusal, in order: a container ("USB passthrough is for VMs"), a VM not
+running or without the controller ("set `usb = true` on <vm> and restart it"),
+a selector matching no device or several (candidates listed by `port:`), a
+device another machine holds (named `lab/vm`), a HID boot keyboard or mouse,
+and a device node vmlab cannot open read-write (naming a `setfacl` command and
+a udev rule). Emits `usb.attached`.
+
+```wscript
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("u1") else { return }
+    match m.usb_attach("0781:5581@BB22") {
+        Ok(d) => lab.log("attached " + d.id),
+        Err(e) => lab.log(e),
+    }
+}
+```
+
+## Machine.usb_attach_force
+
+`usb_attach` without the keyboard-and-mouse refusal — the CLI's `--force`. A
+separate method because wscript has no optional arguments, and
+`usb_attach(sel, true)` would not say what the `true` takes from the host.
+Every other refusal still applies.
+
+```wscript
+fn usb_attach_force(self, selector: string) -> Result[UsbDevice, string]
+```
+
+## Machine.usb_detach
+
+Unplug one host USB device from this VM and give it back to the host.
+
+```wscript
+fn usb_detach(self, selector: string) -> Result[unit, string]
+```
+
+The selector is matched against the VM's attachments, not the host, so a
+device already unplugged can still be named. Returns once QEMU reports the
+device deleted. Emits `usb.detached`.
+
+## Machine.usb_detach_all
+
+Unplug every host USB device this VM holds; holding none is not an error.
+
+```wscript
+fn usb_detach_all(self) -> Result[unit, string]
+```
+
+## Machine.usb_attached
+
+The host USB devices this machine holds now, as `UsbDevice` records. A
+container, or a stopped machine, holds none: attachments are runtime only.
+
+```wscript
+fn usb_attached(self) -> Result[List[UsbDevice], string]
 ```

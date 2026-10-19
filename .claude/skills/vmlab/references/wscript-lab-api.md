@@ -249,6 +249,29 @@ fn main(lab: Lab) {
 }
 ```
 
+## Lab.usb_devices
+
+Every USB device plugged into the host, hubs hidden, in port order, with the
+machine holding each (wscript surface 3) — the rows of `vmlab usb list`.
+
+```wscript
+fn usb_devices(self) -> Result[List[UsbDevice], string]
+```
+
+`attached_to` names the holder as `lab/vm` across every running lab, or is
+`None` for a free device.
+
+```wscript
+fn main(lab: Lab) {
+    for d in lab.usb_devices().expect("usb") {
+        match d.attached_to {
+            Some(h) => lab.log(d.port + " held by " + h),
+            None => lab.log(d.port + " free"),
+        }
+    }
+}
+```
+
 ## Segment.name
 
 The segment's name.
@@ -820,6 +843,35 @@ secret to an account-creation command by accident. `elevated` and `default` cros
 resolved rather than as written, so a script asking "is this the default" gets
 the answer vmlab acts on. See logins.md and the `login {}` block in
 vm.md.
+
+## UsbDevice
+
+One host USB device, returned by `Lab.usb_devices`, `Machine.usb_attach` and
+`Machine.usb_attached`.
+
+```wscript
+struct UsbDevice {
+    id: string,
+    vendor_id: string,
+    product_id: string,
+    serial: Option[string],
+    port: string,
+    product: Option[string],
+    manufacturer: Option[string],
+    attached_to: Option[string],
+}
+```
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `id` | string | none | The selector naming exactly this device, `port:<bus>-<port>`. |
+| `vendor_id` | string | none | Four lowercase hex digits. |
+| `product_id` | string | none | Four lowercase hex digits. |
+| `serial` | Option[string] | `None` | Serial number, where reported. |
+| `port` | string | none | Kernel port path, `<bus>-<port>[.<port>...]`. |
+| `product` | Option[string] | `None` | Product string, where reported. |
+| `manufacturer` | Option[string] | `None` | Manufacturer string, where reported. |
+| `attached_to` | Option[string] | `None` | Holder as `lab/vm`; `None` while free. |
 
 ## GuestStats
 

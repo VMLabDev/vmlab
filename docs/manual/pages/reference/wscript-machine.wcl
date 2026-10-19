@@ -31,7 +31,8 @@ page ref_ws_machine {
     `wait_for_image_opts`, `wait_for_any`, `find_image`, `ocr`, `ocr_region`,
     `wait_for_text`. Guest agent: `exec`, `exec_timeout`, `copy_to`,
     `copy_from`, `logs`, `terminal`, `stats`. Identity: `logins`, `as_login`,
-    `as_account`.
+    `as_account`. Host USB: `usb_attach`, `usb_attach_force`, `usb_detach`,
+    `usb_detach_all`, `usb_attached`.
   DOC
 
   p <<DOC
@@ -1127,6 +1128,109 @@ fn main(lab: Lab) {
         Ok(s) => { for d in s.disks { lab.log(d.mount) } }
         Err(e) => lab.log(e),
     }
+}
+SRC
+  }
+
+  h2 "Machine.usb_attach"
+  p "Hot-plug a host USB device into this VM (wscript surface 3)."
+  code wscript { source = "fn usb_attach(self, selector: string) -> Result[UsbDevice, string]" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`selector`" | "string" | "`<vid>:<pid>`, `<vid>:<pid>@<serial>` or `port:<bus>-<port>[.<port>...]`." |
+  }
+  p <<DOC
+    Attaches the one host device `selector` names and returns it as a
+    [UsbDevice](ref_ws_types) whose `attached_to` is this machine. The VM must
+    be running and have started with `usb = true`. The error carries the
+    refusal, in the order [vmlab usb attach](cmd_usb) lists them: a container,
+    a VM not running or without the controller, a selector matching no device
+    or several, a device another machine holds, a HID keyboard or mouse, and
+    a device node vmlab cannot open. Emits `usb.attached`.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("u1") else { return }
+    match m.usb_attach("0781:5581@BB22") {
+        Ok(d) => lab.log("attached " + d.id),
+        Err(e) => lab.log(e),
+    }
+}
+SRC
+  }
+
+  h2 "Machine.usb_attach_force"
+  p "Hot-plug a host USB device, a HID keyboard or mouse included."
+  code wscript { source = "fn usb_attach_force(self, selector: string) -> Result[UsbDevice, string]" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`selector`" | "string" | "As for `usb_attach`." |
+  }
+  p <<DOC
+    `usb_attach` without the keyboard-and-mouse refusal — the `--force` of
+    [vmlab usb attach](cmd_usb). It is a separate method because wscript has
+    no optional arguments, and `usb_attach(sel, true)` would not say what the
+    `true` takes away from the host. Every other refusal still applies.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("u1") else { return }
+    let r = m.usb_attach_force("046d:c547")
+}
+SRC
+  }
+
+  h2 "Machine.usb_detach"
+  p "Unplug one host USB device from this VM and give it back to the host."
+  code wscript { source = "fn usb_detach(self, selector: string) -> Result[unit, string]" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`selector`" | "string" | "As for `usb_attach`, matched against what this VM holds." |
+  }
+  p <<DOC
+    Returns once QEMU reports the device deleted. The selector is matched
+    against the VM's attachments rather than the host, so a device already
+    unplugged can still be named. The error names a selector matching none of
+    them, or several. Emits `usb.detached`.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("u1") else { return }
+    let r = m.usb_detach("port:1-3")
+}
+SRC
+  }
+
+  h2 "Machine.usb_detach_all"
+  p "Unplug every host USB device this VM holds."
+  code wscript { source = "fn usb_detach_all(self) -> Result[unit, string]" }
+  p <<DOC
+    Detaches each in turn, emitting `usb.detached` for each. Holding nothing
+    is not an error.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("u1") else { return }
+    let r = m.usb_detach_all()
+}
+SRC
+  }
+
+  h2 "Machine.usb_attached"
+  p "The host USB devices this machine holds now."
+  code wscript { source = "fn usb_attached(self) -> Result[[UsbDevice], string]" }
+  p <<DOC
+    One [UsbDevice](ref_ws_types) per attachment, `attached_to` set to this
+    machine. A container, or a VM that has never been given one, holds none.
+    Attachments are runtime only: a stopped machine holds nothing.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(m) = lab.vm("u1") else { return }
+    for d in m.usb_attached().expect("attached") { lab.log(d.port) }
 }
 SRC
   }

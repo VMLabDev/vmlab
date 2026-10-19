@@ -83,6 +83,15 @@ SRC
   }
   p "Deleting a snapshot emits nothing."
 
+  h2 "Host USB devices"
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`usb.attached`" | "`vm`, `port`, `id`, `product`, `qdev_id`" | "A host USB device was hot-plugged into a VM ([vmlab usb](cmd_usb)). `id` is `vid:pid`; `qdev_id` is the QEMU device id, `usbhost-<port>`." |
+      | "`usb.detached`" | "`vm`, `port`, `id`, `product`, `qdev_id`, `reason`" | "A host USB device left a VM. `reason` is absent for a detach someone asked for, `unplugged` when the device left the host, and `restore` when an online restore removed it first." |
+  }
+  p "A VM stop releases every device it holds without a `usb.detached` for each; `vm.stopped` says it."
+
   h2 "Downloads"
   p <<DOC
     Deferred downloads emit under two prefixes: `template.pull` for a VM's

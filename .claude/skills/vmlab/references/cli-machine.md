@@ -1,6 +1,6 @@
 # vmlab CLI: machine-level verbs
 
-Per-machine commands: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `cp`, `clipboard`, `snapshot`, `dev`. Lab-level verbs (`up`, `down`, `destroy`, `status`, `validate`, `lab`) are in cli-lab.md.
+Per-machine commands: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `cp`, `clipboard`, `usb`, `snapshot`, `dev`. Lab-level verbs (`up`, `down`, `destroy`, `status`, `validate`, `lab`) are in cli-lab.md.
 
 Machine references take the form `[lab/]name`. A bare name resolves against the lab in the current directory and starts the lab daemon if none is running. The qualified form addresses a lab already running, from any directory, and never starts one; it fails with `lab "<name>" is not running` otherwise. A malformed reference such as `lab/` is refused before anything is contacted. Exceptions are noted per verb (`console` and `dev sync` never start a daemon).
 
@@ -752,6 +752,36 @@ token=$(vmlab clipboard get buildbox)
 ### Exit status
 
 0 when the clipboard was read or written. Exit 4 (`not_found`) means the lab declares no machine by that name. Exit 6 (`unsupported`) means the agent lacks the `clipboard` feature. A machine that is not running, an agent that is not answering, a guest the agent cannot reach the clipboard of (nobody logged on to a Windows desktop), and a request that times out all exit 1 (`failed`). A qualified reference to a lab that is not running exits 1. A usage error exits 2.
+
+## vmlab usb
+
+Passes USB devices plugged into the host through to running VMs (PRD §5.2.1). The device leaves the host while a VM holds it.
+
+```sh
+vmlab usb list [--json]
+vmlab usb attach [--force] [--json] <VM> <SELECTOR>
+vmlab usb detach [--json] <VM> (<SELECTOR> | --all)
+```
+
+**Selectors**: `<vid>:<pid>` (`046d:c547`), `<vid>:<pid>@<serial>`, or `port:<bus>-<port>[.<port>...]` (`port:1-2.1.4`, always exactly one device). Matching nothing is refused; matching several is refused with every candidate listed by its `port:` selector.
+
+### vmlab usb list
+
+One row per host device, hubs hidden, in port order: `PORT`, `ID`, `SERIAL`, `SPEED` (`low`/`full`/`high`/`super`/`super+`), `ATTACHED TO` (`lab/vm` or `-`), `DEVICE`. Holders come from the supervisor's `usb.list`, which asks every running lab daemon (`machine.usb_attached`). With no supervisor running there are no labs, so sysfs alone is printed and no supervisor is started. `--json` is an array of the device records plus `attached_to`.
+
+### vmlab usb attach
+
+The VM must be running and have started with `usb = true` (vm.md). Refused, in order, when: the machine is a container (`"web" is a container — USB passthrough is for VMs`); the VM is not running, or has no controller (`"plain" has no USB controller to attach to — set `usb = true` on plain and restart it`); the selector is malformed, unknown or ambiguous; another VM in any lab holds the device (named `lab/vm`); the device has a HID boot keyboard or mouse interface and `--force` was not given; the vmlab process cannot open `/dev/bus/usb/BBB/DDD` read-write (the message gives `sudo setfacl -m u:<user>:rw <node>` and a udev rule — troubleshooting.md). On success: `attached 046d:c547 Logitech USB Receiver at port 1-2.1.4.1.4 to usbtest/u1`, and a `usb.attached` event.
+
+The attach is QMP `device_add usb-host` on `usbx.0`, pinned by `hostbus`, `hostport` and `hostaddr` (device number), qdev id `usbhost-<port>`. Unplugging the device from the host drops it from the VM within ~2 s (`usb.detached`, `reason = "unplugged"`); replugging returns it to the host, never to the VM.
+
+### vmlab usb detach
+
+Matches the selector against what the VM holds (not the host), or takes everything with `--all`; waits for QEMU's `DEVICE_DELETED`. Prints `detached … from lab/vm` per device. A VM stop releases everything too (no per-device event). Attachments are never persisted. Online snapshots are refused while any device is attached; an online restore detaches them first (`reason = "restore"`).
+
+### Exit status
+
+0 on success. Exit 4 (`not_found`) for an unknown machine. Every refusal exits 1 (`failed`). A usage error (`detach` with neither a selector nor `--all`) exits 2.
 
 ## vmlab snapshot
 
