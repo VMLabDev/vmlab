@@ -31,7 +31,7 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
         };
         // Ensure the lab daemon is up so the socket exists.
         let _client = daemon::try_lab_daemon(&lab)
-            .await
+            .await?
             .ok_or_else(|| anyhow!("lab \"{lab}\" is not running — `vmlab up` first"))?;
 
         let sock = crate::paths::lab_runtime_dir(&lab)

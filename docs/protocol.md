@@ -61,6 +61,7 @@ the code is the contract.
 | command | arguments | called by | what it does |
 |---|---|---|---|
 | `ping` | — | `cli`, `daemon` | Liveness check; answers `"pong"`. |
+| `version` | — | `cli` | This daemon's build (`vmlab::version::BUILD`): what the CLI compares with its own before it drives the daemon, since one build cannot drive another's. |
 | `status` | — | `cli` | The whole lab's runtime status: machines, segments, readiness. |
 | `dns.table` | — | `cli` | The DNS zones the lab's segments serve. |
 | `up` | `machines: Vec<String>` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
@@ -130,6 +131,7 @@ Every command has a caller.
 
 Deliberate, with the reason recorded beside the declaration:
 
+- `version` — The build check is the CLI's: it is the one process that can be a different build from the daemon it connects to, and a script runs inside the daemon that would answer.
 - `run` — A scratch script is a shell verb: it comes from a file the caller already has and streams its output back to the terminal that ran it. What the console runs is declared playbooks.
 - `machine.ip` — A scripting shortcut over data the console already holds: the lab status projection carries every machine's address, so the console reads it there rather than asking a second time.
 - `machine.mouse_move` — The console drives a machine through a live VNC canvas, where a human moves the pointer themselves. Scripted pointer input is for callers that have no canvas.
