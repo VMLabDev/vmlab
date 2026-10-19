@@ -526,6 +526,7 @@ async fn build_variant(
     )
     .await?;
 
+    log_build_gpu(&spec, &def.arch, log);
     log(format!("booting variant build VM ({})\n", v.name));
     if def.gui {
         crate::viewer::open_when_ready(vm.dirs.vnc_sock());
@@ -1039,6 +1040,7 @@ async fn run_build(
     }
 
     // Boot + run build provision scripts (PRD §6.1, §10.4).
+    log_build_gpu(&BuildSpec::base(def), &def.arch, log);
     log("booting build VM\n".to_string());
     // `gui = true` builds get a viewer once QEMU creates the VNC socket;
     // up() below blocks through provisioning, so this watches concurrently.
@@ -1559,6 +1561,61 @@ fn check_spec_hardware(
     Ok(())
 }
 
+/// Say which host GPU the build VM's `gpu {}` gets (§6.1), the way
+/// `status -v` names a lab VM's: the same pick the lab daemon makes at the
+/// start, run here beforehand so the line is in the build log whatever the
+/// boot then does. A `host_gpu` this host lacks warns here as a lab's does.
+/// A pick this host refuses is left to the start, which refuses with the
+/// same words; nothing is said for a build with no `gpu {}`.
+fn log_build_gpu(spec: &BuildSpec<'_>, arch: &str, log: &OutputSink) {
+    let Some(gpu) = spec.gpu else {
+        return;
+    };
+    let Ok(host) = crate::config::host::HostConfig::load_default() else {
+        return;
+    };
+    let plan = crate::qemu::hostgpu::render_plan(
+        Some(gpu),
+        Some(arch),
+        &host,
+        &crate::qemu::hostgpu::Sysfs::host(),
+        &crate::paths::data_dir(),
+    );
+    let Ok(plan) = plan else {
+        return;
+    };
+    if let Some(warning) = &plan.warning {
+        log(format!("warning: build VM: {warning}\n"));
+    }
+    log(gpu_log_line(gpu, &plan));
+}
+
+/// The build log's one line about the build VM's GPU: the mode asked for and
+/// the host GPU the plan picked by name, `host_gpu=<name>` as `status -v`
+/// spells it — or that nothing was picked, when the host config declares no
+/// GPU for a paravirtual mode to render on.
+fn gpu_log_line(
+    gpu: &crate::config::model::Gpu,
+    plan: &crate::qemu::hostgpu::RenderPlan,
+) -> String {
+    let mut line = format!("build VM gpu: mode={}", gpu.mode.as_str());
+    match &plan.name {
+        Some(name) => {
+            use std::fmt::Write;
+            write!(line, " host_gpu={name}").unwrap();
+            if let Some(g) = &plan.gpu {
+                write!(line, " render_node={}", g.render_node.display()).unwrap();
+            }
+            if let Some(b) = &plan.qemu_binary {
+                write!(line, " qemu={}", b.display()).unwrap();
+            }
+        }
+        None => line.push_str(" host_gpu=(none declared; QEMU's default render node)"),
+    }
+    line.push('\n');
+    line
+}
+
 /// Facts about the sealed image that only exist once the build has run.
 struct SealedImage {
     /// Virtual size of the flattened disk, in bytes.
@@ -1685,6 +1742,11 @@ struct BuildSpec<'a> {
     gui: bool,
     nested: bool,
     qemu_args: &'a [String],
+    /// The build VM's `gpu {}` (§6.1): build-time hardware like `qemu_args`,
+    /// resolved on the building host, never part of [`EffectiveHardware`]
+    /// and so never sealed into the metadata — a clone's GPU is the lab's
+    /// choice.
+    gpu: Option<&'a crate::config::model::Gpu>,
     nics: &'a [crate::config::model::Nic],
     extra_disks: &'a [crate::config::model::DiskBlock],
     media: &'a [crate::config::model::Media],
@@ -1701,6 +1763,7 @@ impl<'a> BuildSpec<'a> {
             gui: def.gui,
             nested: def.nested,
             qemu_args: &def.qemu_args,
+            gpu: def.gpu.as_ref(),
             nics: &def.nics,
             extra_disks: &def.extra_disks,
             media: &def.media,
@@ -1710,8 +1773,8 @@ impl<'a> BuildSpec<'a> {
     }
 
     /// A variant's build on the sealed base, `base_disk` bytes big: the
-    /// variant's own media and steps, its `qemu_args` and NICs where it
-    /// declares them and the template's where it does not. The template's
+    /// variant's own media and steps, its `qemu_args`, `gpu {}` and NICs
+    /// where it declares them and the template's where it does not. The template's
     /// extra disks are build-time scratch for the base install and do not
     /// carry over; neither does its media — the installer's, by and large.
     fn variant(def: &'a TemplateDef, v: &'a TemplateVariantDef, base_disk: Option<u64>) -> Self {
@@ -1721,6 +1784,7 @@ impl<'a> BuildSpec<'a> {
             gui: def.gui,
             nested: def.nested,
             qemu_args: v.qemu_args.as_deref().unwrap_or(&def.qemu_args),
+            gpu: v.gpu.as_ref().or(def.gpu.as_ref()),
             nics: if v.nics.is_empty() {
                 &def.nics
             } else {
@@ -1822,6 +1886,19 @@ fn synth_spec_lab(
     if !def.qemu_args.is_empty() {
         let args: Vec<String> = def.qemu_args.iter().map(wcl_str).collect();
         writeln!(s, "    qemu_args = [{}]", args.join(", ")).unwrap();
+    }
+    // The build VM's GPU (§6.1) lands on the vm block as a lab VM's would, so
+    // the lab daemon picks the host GPU — by `host_gpu`, else the host's
+    // default — with the render node, loader filter, PCI-filter layer and
+    // the host config's emulator and environment that choice entails (§5.2).
+    // Build-time only: `EffectiveHardware` does not carry it, so the sealed
+    // metadata cannot.
+    if let Some(gpu) = def.gpu {
+        let mut attrs = format!("mode = {}", wcl_str(gpu.mode.as_str()));
+        if let Some(name) = &gpu.host_gpu {
+            write!(attrs, " host_gpu = {}", wcl_str(name)).unwrap();
+        }
+        writeln!(s, "    gpu {{ {attrs} }}").unwrap();
     }
     // Template-declared NICs carry over. The synthetic lab declares no
     // segments, so only NAT NICs make sense here — segment references are
@@ -3212,6 +3289,169 @@ mod tests {
                 .unwrap();
         assert!(wcl.contains("\"-b\"") && !wcl.contains("-base"), "{wcl}");
         assert!(wcl.contains(":02") && !wcl.contains(":01"), "{wcl}");
+    }
+
+    /// A template's `gpu {}` is the build VM's (§6.1): the rendered build lab
+    /// carries it on the vm block as a lab VM would write it, so the lab
+    /// daemon picks the host GPU for the build as it does for a lab; a
+    /// variant's replaces the template's for its own build, and a variant
+    /// declaring none builds on the template's.
+    #[test]
+    fn a_build_gpu_reaches_the_build_vm_and_a_variants_replaces_it() {
+        let d = def(r#"import <vmlab.wcl>
+               template "win" { arch = "x86_64" version = "1"
+                 gpu { mode = "virgl" }
+                 source "iso" { path = "/i.iso" }
+                 variant "plain" { default = true }
+                 variant "win3d" { gpu { mode = "vulkan" host_gpu = "AMD1" } }
+               }"#);
+        let base = render(&d);
+        assert!(base.contains("    gpu { mode = \"virgl\" }\n"), "{base}");
+        crate::config::load_lab_source(&base, "<test>", Path::new("/root")).unwrap();
+
+        let plain = super::BuildSpec::variant(&d, &d.variants[0], Some(1 << 30));
+        let wcl = super::synth_spec_lab(
+            &plain,
+            &hw(&d),
+            "l",
+            "build",
+            Path::new("/root"),
+            install(None),
+        )
+        .unwrap();
+        assert!(wcl.contains("gpu { mode = \"virgl\" }"), "{wcl}");
+
+        let win3d = super::BuildSpec::variant(&d, &d.variants[1], Some(1 << 30));
+        let wcl = super::synth_spec_lab(
+            &win3d,
+            &hw(&d),
+            "l",
+            "build",
+            Path::new("/root"),
+            install(None),
+        )
+        .unwrap();
+        assert!(
+            wcl.contains("    gpu { mode = \"vulkan\" host_gpu = \"AMD1\" }\n"),
+            "{wcl}"
+        );
+        assert!(!wcl.contains("virgl"), "{wcl}");
+        let lf = crate::config::load_lab_source(&wcl, "<test>", Path::new("/root")).unwrap();
+        let gpu = lf.lab.vms[0].gpu.as_ref().expect("the build VM's gpu");
+        assert_eq!(gpu.mode, crate::config::model::GpuMode::Vulkan);
+        assert_eq!(gpu.host_gpu.as_deref(), Some("AMD1"));
+        // The profile's own display stays: the GL device line is the `gpu`'s
+        // to emit at the start, not a `display` the metadata would record.
+        assert!(!wcl.contains("display"), "{wcl}");
+    }
+
+    /// A build's `gpu {}` is never sealed into the metadata — not the base's
+    /// block, not a variant's — because a clone's GPU is the lab's choice
+    /// (§6.1); and so a clone of the variant gets the profile's plain display.
+    #[test]
+    fn a_build_gpu_is_not_recorded_for_clones() {
+        let d = def(r#"import <vmlab.wcl>
+               template "win" { arch = "x86_64" version = "1" profile = "windows-11"
+                 gpu { mode = "virgl" }
+                 source "iso" { path = "/i.iso" }
+                 variant "win3d" { secure_boot = false gpu { mode = "vulkan" host_gpu = "AMD1" } }
+               }"#);
+        let hw = EffectiveHardware::resolve(&d, None);
+        let mut sealed = seal_meta(
+            &d,
+            &hw,
+            "1",
+            SealedImage {
+                disk: 8 << 30,
+                sha256: "ab".repeat(32),
+                first_boot_script: None,
+                agent_version: None,
+            },
+        );
+        sealed.variants.push(super::variant_meta(
+            &d.variants[0],
+            super::VariantImage {
+                sha256: "cd".repeat(32),
+                base_sha256: "ab".repeat(32),
+                first_boot_script: None,
+                agent_version: None,
+            },
+        ));
+        let wcl = sealed.to_wcl();
+        assert!(!wcl.contains("gpu"), "{wcl}");
+        assert!(!wcl.contains("AMD1"), "{wcl}");
+        assert!(!wcl.contains("display"), "{wcl}");
+        let eff = sealed.effective(sealed.variants.first());
+        assert_eq!(eff.display, None);
+        assert_eq!(eff.secure_boot, Some(false));
+    }
+
+    /// The build log names the host GPU the build VM's `gpu {}` picked, as
+    /// `status -v` does for a lab VM: `host_gpu=<name>` with the render node
+    /// it resolved to, the host's default when the block names none, and a
+    /// name this host lacks falls back with a warning rather than failing.
+    #[test]
+    fn the_build_log_names_the_picked_host_gpu() {
+        let sys = crate::qemu::hostgpu::testing::fake_host();
+        let host = crate::config::host::HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0" }
+gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+"#,
+            "<host>",
+        )
+        .unwrap();
+        let plan = |gpu: &crate::config::model::Gpu| {
+            crate::qemu::hostgpu::render_plan(
+                Some(gpu),
+                Some("x86_64"),
+                &host,
+                &crate::qemu::hostgpu::Sysfs::new(sys.path()),
+                Path::new("/data"),
+            )
+            .unwrap()
+        };
+        let d = def(r#"import <vmlab.wcl>
+               template "win" { arch = "x86_64" version = "1"
+                 source "iso" { path = "/i.iso" }
+                 variant "amd" { gpu { mode = "vulkan" host_gpu = "AMD1" } }
+                 variant "default" { gpu { mode = "virgl" } }
+                 variant "gone" { gpu { mode = "vulkan" host_gpu = "Nope" } }
+               }"#);
+        let gpu = |i: usize| d.variants[i].gpu.as_ref().unwrap();
+        assert_eq!(
+            super::gpu_log_line(gpu(0), &plan(gpu(0))),
+            "build VM gpu: mode=vulkan host_gpu=AMD1 render_node=/dev/dri/renderD129\n"
+        );
+        assert_eq!(
+            super::gpu_log_line(gpu(1), &plan(gpu(1))),
+            "build VM gpu: mode=virgl host_gpu=Nvidia1 render_node=/dev/dri/renderD128\n"
+        );
+        let fallen = plan(gpu(2));
+        assert!(
+            fallen
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("Nope")),
+            "{fallen:?}"
+        );
+        assert_eq!(
+            super::gpu_log_line(gpu(2), &fallen),
+            "build VM gpu: mode=vulkan host_gpu=Nvidia1 render_node=/dev/dri/renderD128\n"
+        );
+        // A host config declaring no GPU leaves QEMU's own render node.
+        let none = crate::qemu::hostgpu::render_plan(
+            Some(gpu(1)),
+            Some("x86_64"),
+            &crate::config::host::HostConfig::default(),
+            &crate::qemu::hostgpu::Sysfs::new(sys.path()),
+            Path::new("/data"),
+        )
+        .unwrap();
+        assert_eq!(
+            super::gpu_log_line(gpu(1), &none),
+            "build VM gpu: mode=virgl host_gpu=(none declared; QEMU's default render node)\n"
+        );
     }
 
     /// A variant's block records what it declares and nothing it inherits,

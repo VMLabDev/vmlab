@@ -203,6 +203,8 @@ pub fn load_template_source(
 ) -> Result<TemplateFile, ConfigErrors> {
     let doc = open(source, name, Some(root))?;
     let mut issues = schema_issues(&doc);
+    // A build VM's `gpu {}` (§6.1) earns the lab's migration words too.
+    supersede(&mut issues, extract::moved_fields(&doc));
     let tf = extract::extract_template_file(&doc, &mut issues);
     if issues.is_empty() {
         Ok(tf)
@@ -652,6 +654,54 @@ lab "l" {
         let file = load_lab_source(ok, "<test>", Path::new("/tmp")).unwrap();
         let gpu = file.lab.vms[0].gpu.as_ref().unwrap();
         assert_eq!(gpu.host_gpu.as_deref(), Some("AMD1"));
+    }
+
+    /// A template's build VM takes a `gpu {}` as a lab VM does (PRD §6.1),
+    /// and a variant's replaces the template's for its own build boot, the
+    /// way `nic` does; a variant declaring none inherits the template's at
+    /// build time (that is `BuildSpec`'s to do — here it is simply absent).
+    #[test]
+    fn a_template_and_its_variants_take_a_build_gpu() {
+        let src = "import <vmlab.wcl>\n\
+                   template \"t\" {\n  arch = \"x86_64\"  version = \"1\"  disk = 1GiB\n  \
+                   source \"scratch\" { }\n  \
+                   gpu { mode = \"virgl\" }\n  \
+                   variant \"plain\" { default = true }\n  \
+                   variant \"win3d\" { gpu { mode = \"vulkan\" host_gpu = \"AMD1\" } }\n\
+                   }\n";
+        let tf = load_template_source(src, "<test>", Path::new("/tmp")).unwrap();
+        let t = &tf.templates[0];
+        let gpu = t.gpu.as_ref().expect("the template's gpu");
+        assert_eq!((gpu.mode, gpu.host_gpu.as_deref()), (GpuMode::Virgl, None));
+        assert!(t.variants[0].gpu.is_none());
+        let gpu = t.variants[1].gpu.as_ref().expect("the variant's gpu");
+        assert_eq!(
+            (gpu.mode, gpu.host_gpu.as_deref()),
+            (GpuMode::Vulkan, Some("AMD1"))
+        );
+    }
+
+    /// The build VM's `gpu {}` is the same block as a lab VM's, so it is
+    /// validated by the same words: a mode it does not know, and the v0.24
+    /// fields that moved to the host config, are refused in a template or a
+    /// variant exactly as in a vm block.
+    #[test]
+    fn a_template_gpu_is_checked_like_a_vms() {
+        let src = "import <vmlab.wcl>\n\
+                   template \"t\" {\n  arch = \"x86_64\"  version = \"1\"  disk = 1GiB\n  \
+                   source \"scratch\" { }\n  \
+                   gpu { mode = \"cuda\" }\n  \
+                   variant \"win3d\" { gpu { mode = \"vulkan\" address = \"0000:72:00.0\" } }\n\
+                   }\n";
+        let err = load_template_source(src, "<test>", Path::new("/tmp")).unwrap_err();
+        let messages: Vec<&str> = err.issues.iter().map(|i| i.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("cuda")), "{messages:#?}");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("gpu `address` moved to the host config")),
+            "{messages:#?}"
+        );
     }
 
     /// A declared decorator's arguments are typed, so a wrong-typed or

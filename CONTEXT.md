@@ -629,7 +629,9 @@ takes the default — never an address, because which card sits where is a
 fact about one machine and a lab file travels. Names match
 case-insensitively. A paravirtual mode falls back to the default from a name
 this host lacks; `passthrough` refuses. Picked by the lab daemon at VM start
-(`qemu::hostgpu::pick`). PRD §5.2.
+(`qemu::hostgpu::pick`). A template's or variant's `gpu {}` is the build VM's
+(`template::build::BuildSpec::gpu`), picked the same way and never sealed into
+the metadata. PRD §5.2, §6.1.
 _Avoid_: GPU address (the address is a host GPU's field), render node (the
 node is what sysfs resolves the address to)
 

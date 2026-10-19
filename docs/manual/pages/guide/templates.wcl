@@ -95,6 +95,14 @@ page guide_templates {
     variant onto the installed version without touching the base or the
     others.
   DOC
+  p <<DOC
+    A build that needs a GPU declares `gpu { mode = "vulkan" }` on the
+    template or the variant, the same block a VM carries. The build VM then
+    gets a host GPU exactly as a lab VM does, named with `host_gpu` or the
+    host's default, and the build log says which (`host_gpu=<name>`). The
+    block is for the build VM only; the template records nothing about it,
+    so clones choose their own GPU, or none.
+  DOC
 
   p <<DOC
     The base of a template with variants is unsealed, so a lab never clones

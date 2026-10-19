@@ -298,7 +298,13 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             check_disk_block(&file.root, d, &mut issues);
         }
         if let Some(gpu) = &vm.gpu {
-            check_gpu(&vm.name, gpu, vm_arch(vm).as_deref(), ctx, &mut issues);
+            check_gpu(
+                &format!("vm \"{}\"", vm.name),
+                gpu,
+                vm_arch(vm).as_deref(),
+                ctx,
+                &mut issues,
+            );
         }
         for path in [&vm.cdrom, &vm.floppy].into_iter().flatten() {
             if !file.root.join(path).is_file() {
@@ -655,6 +661,29 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         }
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
+        }
+        // A build VM's `gpu {}` (§6.1) is a lab VM's, resolved on the host
+        // that builds: the same check, including `passthrough`, which a
+        // build may ask for on the same terms a lab VM may.
+        if let Some(gpu) = &t.gpu {
+            check_gpu(
+                &format!("template \"{}\"", t.name),
+                gpu,
+                Some(&t.arch),
+                ctx,
+                &mut issues,
+            );
+        }
+        for v in &t.variants {
+            if let Some(gpu) = &v.gpu {
+                check_gpu(
+                    &format!("template \"{}\" variant \"{}\"", t.name, v.name),
+                    gpu,
+                    Some(&t.arch),
+                    ctx,
+                    &mut issues,
+                );
+            }
         }
         // Build playbooks run on the synthetic "build" VM, and config-weave
         // is x86_64-only (§10.4).
@@ -1428,10 +1457,12 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
     }
 }
 
-/// A VM's `gpu {}` (PRD §5.2): `host_gpu`, when written, names something,
-/// and this host can give the block its host GPU.
+/// A `gpu {}` (PRD §5.2) — a VM's, or the build VM's a template or variant
+/// declares (§6.1): `host_gpu`, when written, names something, and this host
+/// can give the block its host GPU. `who` is the block it sits in, as the
+/// issue names it (`vm "a"`, `template "t" variant "v"`).
 fn check_gpu(
-    vm: &str,
+    who: &str,
     gpu: &Gpu,
     arch: Option<&str>,
     ctx: &dyn ValidationContext,
@@ -1440,12 +1471,12 @@ fn check_gpu(
     if gpu.host_gpu.as_deref().is_some_and(|n| n.trim().is_empty()) {
         issues.push(Issue::at(
             gpu.span,
-            format!("vm \"{vm}\": `host_gpu` must name a host GPU, got an empty string"),
+            format!("{who}: `host_gpu` must name a host GPU, got an empty string"),
         ));
         return;
     }
     if let Err(why) = ctx.check_host_gpu(gpu, arch) {
-        issues.push(Issue::at(gpu.span, format!("vm \"{vm}\": {why}")));
+        issues.push(Issue::at(gpu.span, format!("{who}: {why}")));
     }
 }
 
@@ -2575,6 +2606,60 @@ lab "l" {{ vm "a" {{ template = "x86_64/t" gpu {{ {gpu} }} }} }}"#
         assert!(gpu_errs(r#"mode = "passthrough" host_gpu = "Vfio1""#).is_empty());
         let es = gpu_errs(r#"mode = "vulkan" host_gpu = """#);
         assert!(es.len() == 1 && es[0].contains("empty string"), "{es:#?}");
+    }
+
+    /// A template's build-VM `gpu {}` and a variant's are checked against
+    /// this host's GPUs exactly as a lab VM's (PRD §6.1), each issue naming
+    /// the block it sits in: passthrough of a GPU this host lacks is refused
+    /// for a build as for a lab, an empty `host_gpu` likewise, and a
+    /// paravirtual name the host lacks passes — it warns at the build.
+    #[test]
+    fn a_templates_build_gpu_is_checked_against_this_hosts_gpus() {
+        let sys = crate::qemu::hostgpu::testing::fake_host();
+        let host = crate::config::host::HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0" }
+gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+"#,
+            "<host>",
+        )
+        .unwrap();
+        let errs = |template_gpu: &str, variant_gpu: &str| -> Vec<String> {
+            let f = lab(&format!(
+                r#"import <vmlab.wcl>
+lab "l" {{ }}
+template "t" {{
+  arch = "x86_64"  version = "1"  disk = 1GiB
+  source "scratch" {{ }}
+  gpu {{ {template_gpu} }}
+  variant "win3d" {{ gpu {{ {variant_gpu} }} }}
+}}"#
+            ));
+            validate(
+                &f,
+                &FakeGpus(crate::qemu::hostgpu::Sysfs::new(sys.path()), host.clone()),
+            )
+            .into_iter()
+            .map(|i| i.message)
+            .collect()
+        };
+        assert!(errs(r#"mode = "virgl""#, r#"mode = "vulkan" host_gpu = "amd1""#).is_empty());
+        assert!(errs(r#"mode = "vulkan" host_gpu = "Nope""#, r#"mode = "virgl""#).is_empty());
+        let es = errs(
+            r#"mode = "passthrough" host_gpu = "Nope""#,
+            r#"mode = "vulkan" host_gpu = """#,
+        );
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(
+            es[0].starts_with("template \"t\": ")
+                && es[0].contains("`Nope` is not declared on this host"),
+            "{es:#?}"
+        );
+        assert!(
+            es[1].starts_with("template \"t\" variant \"win3d\": ")
+                && es[1].contains("empty string"),
+            "{es:#?}"
+        );
     }
 
     /// The VM's arch reaches the host GPU check, so a `qemu_binary` for
