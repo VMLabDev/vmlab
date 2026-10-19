@@ -273,6 +273,10 @@ pub struct VmInstance {
     host_gpu: std::sync::Mutex<Option<String>>,
     /// That host GPU's `qemu_binary`, when the last start ran one (§5.2).
     qemu_binary: std::sync::Mutex<Option<PathBuf>>,
+    /// The variables the last start set in QEMU's environment (§5.2): what
+    /// `qemu.log`'s `vmlab: env:` line was written from, kept so status
+    /// answers from the start and not from a host config edited since.
+    qemu_env: std::sync::Mutex<Vec<(String, String)>>,
     qemu: Mutex<Option<Arc<dyn Process>>>,
     swtpm: Mutex<Option<Arc<dyn Process>>>,
     /// Per-share virtiofsd daemons of the current run (§7.5). Killed on
@@ -369,6 +373,7 @@ impl VmInstance {
             wake_cause: std::sync::Mutex::new(None),
             host_gpu: std::sync::Mutex::new(None),
             qemu_binary: std::sync::Mutex::new(None),
+            qemu_env: std::sync::Mutex::new(Vec::new()),
             qemu: Mutex::new(None),
             swtpm: Mutex::new(None),
             virtiofsd: Mutex::new(Vec::new()),
@@ -712,6 +717,7 @@ impl VmInstance {
         }
         *self.host_gpu.lock_recover() = plan.name.clone();
         *self.qemu_binary.lock_recover() = plan.qemu_binary.clone();
+        *self.qemu_env.lock_recover() = plan.env.set.clone();
         Ok(plan)
     }
 
@@ -1930,6 +1936,7 @@ impl super::machine::Machine for VmInstance {
                 .lock_recover()
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            qemu_env: self.qemu_env.lock_recover().iter().cloned().collect(),
         })
     }
 }

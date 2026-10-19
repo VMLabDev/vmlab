@@ -646,7 +646,10 @@ loader's `VK_LOADER_DRIVERS_SELECT`, which matches a driver, not a device)
 **Lab status**:
 The typed projection of a lab's machines, segments and pulls that the lab
 daemon produces once and every surface renders unchanged. Carries the
-state-to-label derivation, so every surface speaks one vocabulary. See
+state-to-label derivation, so every surface speaks one vocabulary. A VM's
+entry records what its last start decided — the host GPU, its `qemu_binary`
+and the environment vmlab set on QEMU (`qemu_env`) — not what the host
+config says now. `vmlab status --json` prints it as it arrived. See
 ADR-0004.
 _Avoid_: state (a machine has a power state), snapshot, summary
 

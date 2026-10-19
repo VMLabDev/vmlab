@@ -149,7 +149,10 @@ QEMU's data directory, so a minimal build still finds its firmware and ROMs.
 `qemu_env` is applied after the Vulkan loader variable vmlab derives, and an
 explicit host setting wins. `qemu.log`'s `vmlab: env:` line shows every
 variable vmlab set, and `vmlab status -v` shows `qemu=<path>` next to
-`host_gpu=`. Template builds never have a `gpu {}`, so they always run the
+`host_gpu=`, then the same variables as `env=NAME=value,...`, recorded at
+the start, so a config edited later does not change what a running VM
+reports. `vmlab status --json` carries them as the VM's `qemu_env` object.
+Template builds never have a `gpu {}`, so they always run the
 stock QEMU.
 DOC
 
