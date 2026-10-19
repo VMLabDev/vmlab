@@ -156,12 +156,56 @@ login, like `exec`. A CLI act on a running machine, never a declaration and
 never a wscript call. Unrelated to the **display**, which it does not use.
 _Avoid_: remote app, seamless window, app forwarding, share (that is a folder)
 
+**USB passthrough**:
+Handing a USB device plugged into the host to a running VM, and giving it
+back, with no restart. Needs the VM to have booted with `usb = true` — an
+opt-in hot-plug xHCI controller, because adding it changes the VM's hardware.
+A CLI and wscript act on a running machine, never a declaration; a container
+refuses it. Unrelated to **shared apps** and to `-usb`'s tablet.
+_Avoid_: USB redirection (that is SPICE's client-side feature), USB sharing
+
+**Attachment**:
+One host USB device held by one running VM — the device as listed when it was
+attached, pinned to that plug-in by bus, port and device number. Runtime only:
+tracked by the lab daemon in memory, released by a detach, a VM stop, an
+online restore, or the device leaving the host. The supervisor tracks none; its
+listing asks every lab who holds what.
+_Avoid_: claim, binding, mount
+
+**Selector** (USB):
+How a person names one host USB device: `<vid>:<pid>`,
+`<vid>:<pid>@<serial>`, or `port:<bus>-<port>[.<port>...]`. Resolves to
+exactly one device or is refused — with the candidates listed when it matches
+several. A detach resolves it against the VM's attachments, not the host.
+_Avoid_: device id (that is the `vid:pid` pair alone), filter
+
 ### Templates and images
 
 **Template**:
 A sealed, read-only qcow2 disk image in the store, referenced by
-`<arch>/<name>[@<version>]`. Labs boot linked clones of it.
-_Avoid_: image (an image is an OCI container image), base, golden image
+`<arch>/<name>[@<version>][#<variant>]`. Labs boot linked clones of it. A
+template version is one **base** and zero or more **variants**; one with none
+is base-only and is its base.
+_Avoid_: image (an image is an OCI container image), golden image
+
+**Base**:
+The one disk of a template version every variant is built on —
+`<version>/disk.qcow2`. On a template with variants it is *unsealed* (a
+Windows base is installed and updated but not generalized), so a lab machine
+may not clone it: `#base` names it in build contexts only, a variant build or a
+layered `from`. On a base-only template the base is the template, as it always
+was. Its `sha256` is what a variant's `base_sha256` must match.
+_Avoid_: parent, root image
+
+**Variant**:
+A named, sealed disk state of one template version, built from its base and
+stored as a qcow2 overlay on it (`variants/<name>/disk.qcow2`, backed by
+`../../disk.qcow2`). Selected with `#<name>`; a reference with no `#` selects
+the **default variant** — the one marked `default = true`, or a lone one. Its
+metadata is the base's overridden field by field (the **effective metadata**).
+One whose `base_sha256` no longer matches the base is **stale** and refused
+until rebuilt. See ADR-0017.
+_Avoid_: snapshot (that is a VM snapshot, §7.3), flavour, edition, layer
 
 **Linked clone**:
 A copy-on-write qcow2 overlay a machine boots, backed by a template. The

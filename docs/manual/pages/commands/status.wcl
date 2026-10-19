@@ -64,7 +64,9 @@ page cmd_status {
     machine carries `state=`, `ready=` and `cached=`, plus
     `diverged=yes` on a machine whose agent was replaced by
     [vmlab machine repair-agent](cmd_machine) or by the agent refresh in
-    [vmlab up](cmd_up). A VM then adds `arch`, `cpus`,
+    [vmlab up](cmd_up). A VM on a template with variants then adds
+    `variant=`, the variant its clone is backed on, including the default a
+    reference without `#` picked. Every VM adds `arch`, `cpus`,
     `memory` and `agent`: the version of the agent running in the guest, as
     its last handshake reported it, or the version the template sealed
     before an agent has answered or while the VM is stopped. An agent that

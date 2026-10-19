@@ -40,8 +40,9 @@ page cmd_template {
   }
 
   p <<DOC
-    Store references are spelled `<arch>/<name>[@<version>]`. Without a
-    version the reference resolves to the newest version in the store.
+    Store references are spelled `<arch>/<name>[@<version>][#<variant>]`.
+    Without a version the reference resolves to the newest version in the
+    store.
     Registry references are spelled `ghcr.io/owner/name[:version]`.
   DOC
 
@@ -64,9 +65,10 @@ page cmd_template {
   table {
     rows:
       | "Option" | "Meaning" |
-      | "`[NAME]`" | "Build only the named template. Default: every template in the file." |
+      | "`[NAME]`" | "Build only the named template. Default: every template in the file. `<name>@<version>` pins the version, the same as `--version`." |
       | "`-f`, `--file <FILE>`" | "File containing `template {}` blocks. Default: the `vmlab.wcl` of the lab the shell is in." |
-      | "`--version <VERSION>`" | "Pin an explicit version instead of auto-incrementing. Requires a single target template." |
+      | "`--version <VERSION>`" | "Pin an explicit version instead of auto-incrementing. Requires a single target template. With `--variant`, the installed version to build the variants onto." |
+      | "`--variant <VARIANT>[,<VARIANT>…]`" | "Build or rebuild only these variants onto the newest installed version, or the pinned one, leaving the base and every other variant as they are. Requires `NAME`." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -89,6 +91,28 @@ page cmd_template {
   DOC
 
   p <<DOC
+    A template that declares `variant {}` blocks builds its base first and
+    then each variant on it, the default first and the rest in file order;
+    the log names each as it starts (`building variant
+    x86_64/windows-11@26100.1742.6#win3d (2/2)`). A variant that fails stops
+    the build with the base and every variant before it installed, and the
+    error names the variant and the `--variant` command that retries it. See
+    [Lab file: template and source](ref_template) for what a variant build does.
+    The base is recorded with `variants_expected = true`, so until its
+    default variant is installed a lab refuses every reference to the
+    version rather than cloning the unsealed base.
+  DOC
+
+  p <<DOC
+    `--variant` skips the base and builds only the named variants onto a
+    version already in the store. It is refused when the base is not
+    installed, when the file does not declare a named variant, when the
+    result would leave several variants installed but not the default, and
+    while a machine's clone is backed by a variant it would replace. A
+    rebuilt variant replaces the old one's disk and metadata together.
+  DOC
+
+  p <<DOC
     It refuses locally, with exit status 1, when the file declares no
     `template {}` block, when `NAME` matches nothing in the file, and when
     `--version` is given with more than one target. The supervisor answers
@@ -103,6 +127,8 @@ page cmd_template {
 cd examples/templates
 vmlab template build win2022
 vmlab template build -f templates.wcl --version 1.4.0 alpine
+vmlab template build windows-11 --variant win3d
+vmlab template build windows-11@26100.1742.6 --variant standard,win3d
 SRC
   }
 
@@ -160,10 +186,31 @@ SRC
     `--json` the remote answer is folded into each entry as a `remote` field.
   DOC
 
+  p <<DOC
+    A version with variants lists each one on its own line beneath it, as
+    `#<name>` in the `TEMPLATE` column. The `VERSION` column reads `default`
+    for the default variant and `STALE` for one built on an earlier base,
+    which is refused until it is rebuilt. `SIZE` is the variant overlay's own
+    size. Under `--json` each entry carries a `variants` array of objects
+    with `name`, `default`, `stale`, `description`, `created`, `sha256` and
+    `size`; it is empty for a base-only template.
+  DOC
+
+  p <<DOC
+    A version built from a definition with variants that has no default
+    variant installed reads `variants not built` after its `CREATED` date,
+    or `default variant not built` when other variants remain. A lab refuses
+    it until `vmlab template build <name>@<version> --variant <variant>`
+    builds them. Under `--json` such an entry carries `variants_expected:
+    true` with no default in its `variants` array.
+  DOC
+
   code sh { source = <<'SRC'
 $ vmlab template list
 ARCH     TEMPLATE                          VERSION          SIZE     CREATED
 x86_64   ghcr.io/vmlabdev/win2022          1.2.0            9.8G     2026-08-30
+           #standard                       default          410.2M   2026-08-30
+           #win3d                                           1.1G     2026-08-30
 x86_64   alpine                            0.3.1            180.0M   2026-08-12
 SRC
   }
@@ -212,21 +259,33 @@ SRC
   table {
     rows:
       | "Option" | "Meaning" |
-      | "`<REFERENCE>`" | "The version to remove, `<arch>/<name>[@<version>]`." |
+      | "`<REFERENCE>`" | "The version to remove, `<arch>/<name>@<version>`, or one variant of it, `<arch>/<name>@<version>#<variant>`." |
       | "`--force`" | "Remove even if it backs existing clones." |
       | "`-h`, `--help`" | "Print help." |
   }
 
   p <<DOC
-    `rm` removes one exact store version and prints `removed <arch>/<name>@<version>`.
-    A version that backs a machine's clone is refused unless `--force` is
-    given, because the clone reads its base image from the store. Removing
-    such a version with `--force` breaks every machine cloned from it.
+    `rm` removes one exact store version, with all of its variants, and
+    prints `removed <arch>/<name>@<version>`. A version whose base or any
+    variant backs a machine's clone is refused unless `--force` is given,
+    because the clone reads its image from the store; the refusal names the
+    machines. Removing such a version with `--force` breaks every machine
+    cloned from it.
+  DOC
+
+  p <<DOC
+    With `#<variant>`, `rm` removes that one variant's overlay and its block
+    in the version's metadata, and prints `removed
+    <arch>/<name>@<version>#<variant>`. It is refused while a clone is
+    backed by that variant, unless `--force` is given. It is always refused
+    for the default variant while other variants remain, and for the last
+    variant: either would leave a reference without `#` selecting the
+    unsealed base. Remove the version instead.
   DOC
 
   code sh { source = "vmlab template rm x86_64/win2022@1.1.0" }
 
-  p "Exit status is 0 on success and `failed` (1) when the reference does not resolve or the version backs a clone."
+  p "Exit status is 0 on success and `failed` (1) when the reference does not resolve, the version or variant backs a clone, or the variant cannot be removed on its own."
 
   h2 "vmlab template clean"
 
@@ -279,7 +338,9 @@ SRC
 
   p <<DOC
     `export` writes one store version, disk and metadata, to a portable
-    archive the supervisor creates at `OUT`. A relative `OUT` is resolved
+    archive the supervisor creates at `OUT`. A version with variants takes
+    them along: each `variants/<variant>/disk.qcow2` and the full
+    `template.wcl` with every variant block. A relative `OUT` is resolved
     against the shell's directory. It prints `exported to <OUT>` when done.
   DOC
 
@@ -301,14 +362,18 @@ SRC
 
   p <<DOC
     `import` reads a template back out of an archive into the store and
-    prints `imported <arch>/<name>@<version>`. The version comes from the
-    archive's metadata. A version the store already holds is refused unless
-    `--overwrite` is given.
+    prints `imported <arch>/<name>@<version>`, followed by `with variants
+    <names>` when it has any. The version comes from the archive's metadata.
+    Every variant is checked before anything is installed: its overlay must
+    hash to its block's `sha256`, its `base_sha256` must be the archive's
+    base, and its backing file must be `../../disk.qcow2`. A variant that
+    fails any of them refuses the whole archive. A version the store already
+    holds is refused unless `--overwrite` is given.
   DOC
 
   code sh { source = "vmlab template import alpine-0.3.1.tar.zst" }
 
-  p "Exit status is 0 on success and `failed` (1) when the archive cannot be read or the version already exists."
+  p "Exit status is 0 on success and `failed` (1) when the archive cannot be read, a variant fails its checks, or the version already exists."
 
   h2 "vmlab template push"
 
@@ -334,6 +399,24 @@ SRC
   DOC
 
   p <<DOC
+    A version with variants pushes each variant as a manifest of its own,
+    tagged `<version>--<variant>`: the base's chunks, then the overlay's.
+    The base's chunks are already in the registry by then, so a variant
+    uploads only its overlay. The log says, for the base and for each
+    variant, how many chunks it uploaded and how many the registry already
+    held. A stale variant refuses the push before anything is uploaded;
+    rebuild or remove it first.
+  DOC
+
+  p <<DOC
+    The base's config blob carries `variants_expected` when the version was
+    built with variants, and a pull keeps it, so a pulled base whose variants
+    are not built is refused by a lab exactly as the pushed one is. A vmlab
+    release older than the marker pulls such a base as an ordinary base-only
+    template.
+  DOC
+
+  p <<DOC
     The registry needs credentials from `template login` first. A template
     with no `registry` field and no `TARGET` is refused with
     `no push target`. A push already running for the template is refused
@@ -351,9 +434,10 @@ SRC
   table {
     rows:
       | "Option" | "Meaning" |
-      | "`<TARGET>`" | "Registry reference, for example `ghcr.io/owner/name:version`." |
+      | "`<TARGET>`" | "Registry reference, for example `ghcr.io/owner/name:version`. A `#<variant>` suffix also pulls that variant." |
       | "`--arch <ARCH>`" | "Architecture to pull. Required when the reference is a multi-architecture index." |
       | "`--overwrite`" | "Overwrite the version if the store already has it." |
+      | "`--all-variants`" | "Pull every variant of the version, not only the default and the one named." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -368,9 +452,22 @@ SRC
     fetching ahead of time or for a template no lab file names yet.
   DOC
 
-  code sh { source = "vmlab template pull ghcr.io/vmlabdev/alpine:0.3.1 --arch x86_64" }
+  p <<DOC
+    A template with variants always brings its default variant, so a
+    reference without `#` picks the same variant in the store as in the
+    registry. `#<variant>` adds that variant, `--all-variants` adds every
+    one, and an unknown name is refused with the list of variants the
+    template has. A base or a variant the store already holds with the same
+    digest is not downloaded again, and what arrives is added to the version,
+    keeping the variants already installed. The answer lists them:
+    `pulled <arch>/<name>@<version> with variants standard (default), win3d
+    into the store`.
+  DOC
 
-  p "Exit status is 0 on success and `failed` (1) when the registry refuses, the architecture is missing, or the version already exists with a different disk and no `--overwrite`."
+  code sh { source = "vmlab template pull ghcr.io/vmlabdev/alpine:0.3.1 --arch x86_64" }
+  code sh { source = "vmlab template pull 'ghcr.io/vmlabdev/windows-11:latest#win3d' --arch x86_64" }
+
+  p "Exit status is 0 on success and `failed` (1) when the registry refuses, the architecture is missing, the variant is unknown, a chunk or a reassembled disk fails its digest, or the version already exists with a different disk and no `--overwrite`."
 
   h2 "vmlab template login"
 

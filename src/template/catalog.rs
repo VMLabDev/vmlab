@@ -123,6 +123,8 @@ async fn fetch_search_row(
     let versions: Vec<String> = tags
         .iter()
         .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        // A variant's tag (`<version>--<variant>`, §6.6) is not a version.
+        .filter(|t| !crate::oci::client::is_variant_tag(t))
         .cloned()
         .collect();
     let newest_version = versions

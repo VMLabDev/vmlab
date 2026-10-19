@@ -1,0 +1,18 @@
+// The variants scenario's lab: one machine on the default variant, one on
+// `#extra`, and one on `#base`, which a lab is refused (PRD §6.6). The
+// scenario drops the `#base` machine once the refusal is seen.
+import <vmlab.wcl>
+
+lab "e2e-variants" {
+  vm "plain" {
+    template = "x86_64/e2e-variants"
+  }
+
+  vm "extra" {
+    template = "x86_64/e2e-variants#extra"
+  }
+
+  vm "base" {
+    template = "x86_64/e2e-variants#base"
+  }
+}

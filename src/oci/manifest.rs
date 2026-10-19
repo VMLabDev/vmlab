@@ -37,6 +37,38 @@ pub mod annotations {
     /// as GHCR read it to connect a pushed package to its repo; not
     /// vmlab-namespaced.
     pub const IMAGE_SOURCE: &str = "org.opencontainers.image.source";
+
+    // ---- variants (§6.6) ----------------------------------------------------
+    //
+    // A base manifest names its variants; each variant is a manifest of its
+    // own whose layers are the base's chunks, in order, then the overlay's.
+
+    /// Base manifest: the variant names, comma-separated, in the order the
+    /// version's `template.wcl` lists them.
+    pub const VARIANTS: &str = "vnd.vmlab.template.variants";
+    /// Base manifest: the default variant's name.
+    pub const VARIANT_DEFAULT: &str = "vnd.vmlab.template.variant.default";
+    /// Base manifest: prefix of `<prefix><name>` = the digest of that
+    /// variant's manifest, which the puller fetches by digest.
+    pub const VARIANT_MANIFEST_PREFIX: &str = "vnd.vmlab.template.variant.manifest.";
+    /// Variant manifest: the variant's name.
+    pub const VARIANT: &str = "vnd.vmlab.template.variant";
+    /// Variant manifest: how many leading layers are the base's — where the
+    /// base ends and the overlay begins.
+    pub const BASE_LAYERS: &str = "vnd.vmlab.template.base.layers";
+    /// Variant manifest: the assembled base image's digest, size and chunks.
+    pub const BASE_DIGEST: &str = "vnd.vmlab.template.base.digest";
+    pub const BASE_SIZE: &str = "vnd.vmlab.template.base.size";
+    pub const BASE_CHUNK_COUNT: &str = "vnd.vmlab.template.base.chunk.count";
+    /// Variant manifest: the assembled overlay's digest, size and chunks.
+    pub const VARIANT_DIGEST: &str = "vnd.vmlab.template.variant.digest";
+    pub const VARIANT_SIZE: &str = "vnd.vmlab.template.variant.size";
+    pub const VARIANT_CHUNK_COUNT: &str = "vnd.vmlab.template.variant.chunk.count";
+    /// Per-layer, variant manifest: which part the chunk belongs to,
+    /// [`PART_BASE`] or [`PART_VARIANT`].
+    pub const PART: &str = "vnd.vmlab.template.part";
+    pub const PART_BASE: &str = "base";
+    pub const PART_VARIANT: &str = "variant";
 }
 
 /// An OCI content descriptor.
@@ -179,6 +211,206 @@ pub fn build_manifest(set: &ChunkSet, config: Descriptor) -> Manifest {
         config,
         layers,
         annotations: Some(ann),
+    }
+}
+
+/// Build a variant's manifest (§6.6): the base's chunk layers in order, then
+/// the overlay's, under one running chunk index so [`Manifest::layers_in_order`]
+/// keeps them in sequence. Each layer is marked with the part it belongs to,
+/// and the manifest records where the base ends and each part's assembled
+/// digest, size and chunk count.
+///
+/// It carries no whole-image digest: the layers do not assemble into one
+/// image, and a client that predates variants refuses a manifest without one
+/// rather than concatenating base and overlay into nonsense.
+pub fn build_variant_manifest(
+    name: &str,
+    base: &ChunkSet,
+    overlay: &ChunkSet,
+    config: Descriptor,
+) -> Manifest {
+    let mut layers = Vec::with_capacity(base.chunks.len() + overlay.chunks.len());
+    let parts = [
+        (annotations::PART_BASE, base),
+        (annotations::PART_VARIANT, overlay),
+    ];
+    for (part, set) in parts {
+        let mut ordered = set.chunks.clone();
+        ordered.sort_by_key(|c| c.index);
+        for c in &ordered {
+            let mut ann = BTreeMap::new();
+            ann.insert(
+                annotations::CHUNK_INDEX.to_string(),
+                layers.len().to_string(),
+            );
+            ann.insert(
+                annotations::CHUNK_UNCOMPRESSED_SIZE.to_string(),
+                c.uncompressed_size.to_string(),
+            );
+            ann.insert(annotations::PART.to_string(), part.to_string());
+            layers.push(Descriptor {
+                media_type: media_types::CHUNK_ZSTD.to_string(),
+                digest: c.compressed_digest.clone(),
+                size: c.compressed_size,
+                annotations: Some(ann),
+                platform: None,
+            });
+        }
+    }
+
+    let ann: BTreeMap<String, String> = [
+        (annotations::VARIANT, name.to_string()),
+        (annotations::CHUNK_COUNT, layers.len().to_string()),
+        (annotations::CHUNK_SIZE, base.chunk_size.to_string()),
+        (annotations::BASE_LAYERS, base.chunks.len().to_string()),
+        (annotations::BASE_DIGEST, base.whole_digest.clone()),
+        (annotations::BASE_SIZE, base.total_size.to_string()),
+        (annotations::BASE_CHUNK_COUNT, base.chunk_count.to_string()),
+        (annotations::VARIANT_DIGEST, overlay.whole_digest.clone()),
+        (annotations::VARIANT_SIZE, overlay.total_size.to_string()),
+        (
+            annotations::VARIANT_CHUNK_COUNT,
+            overlay.chunk_count.to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+
+    Manifest {
+        schema_version: 2,
+        media_type: media_types::OCI_MANIFEST.to_string(),
+        artifact_type: Some(media_types::ARTIFACT_TYPE_TEMPLATE.to_string()),
+        config,
+        layers,
+        annotations: Some(ann),
+    }
+}
+
+/// One variant a base manifest names: its name and its manifest's digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantEntry {
+    pub name: String,
+    pub manifest: String,
+}
+
+/// A variant manifest read back: where its base ends, and what each part
+/// assembles to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantLayout {
+    pub name: String,
+    /// The base's chunk layers, in order.
+    pub base: Vec<Descriptor>,
+    /// `sha256:<hex>` of the assembled base.
+    pub base_digest: String,
+    /// The overlay's chunk layers, in order.
+    pub overlay: Vec<Descriptor>,
+    /// `sha256:<hex>` of the assembled overlay.
+    pub overlay_digest: String,
+}
+
+impl Manifest {
+    fn annotation(&self, key: &str) -> Option<&str> {
+        self.annotations
+            .as_ref()
+            .and_then(|a| a.get(key))
+            .map(String::as_str)
+    }
+
+    /// Record a base manifest's variants: their names in order, the default,
+    /// and each one's manifest digest.
+    pub fn set_variants(&mut self, entries: &[VariantEntry], default: Option<&str>) {
+        if entries.is_empty() {
+            return;
+        }
+        let ann = self.annotations.get_or_insert_with(BTreeMap::new);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        ann.insert(annotations::VARIANTS.to_string(), names.join(","));
+        if let Some(d) = default {
+            ann.insert(annotations::VARIANT_DEFAULT.to_string(), d.to_string());
+        }
+        for e in entries {
+            ann.insert(
+                format!("{}{}", annotations::VARIANT_MANIFEST_PREFIX, e.name),
+                e.manifest.clone(),
+            );
+        }
+    }
+
+    /// The variants a base manifest names, in order, and its default. Empty
+    /// for a base-only template, and for one pushed before variants existed.
+    pub fn variants(&self) -> Result<(Vec<VariantEntry>, Option<String>)> {
+        let Some(list) = self.annotation(annotations::VARIANTS) else {
+            return Ok((Vec::new(), None));
+        };
+        let mut entries = Vec::new();
+        for name in list.split(',').filter(|n| !n.is_empty()) {
+            let key = format!("{}{name}", annotations::VARIANT_MANIFEST_PREFIX);
+            let manifest = self.annotation(&key).ok_or_else(|| {
+                anyhow!("the manifest names variant `{name}` but not its manifest")
+            })?;
+            entries.push(VariantEntry {
+                name: name.to_string(),
+                manifest: manifest.to_string(),
+            });
+        }
+        let default = match self.annotation(annotations::VARIANT_DEFAULT) {
+            Some(d) => Some(d.to_string()),
+            None if entries.len() == 1 => Some(entries[0].name.clone()),
+            None => None,
+        };
+        if let Some(d) = &default
+            && !entries.iter().any(|e| &e.name == d)
+        {
+            bail!("the manifest's default variant `{d}` is not one of its variants");
+        }
+        Ok((entries, default))
+    }
+
+    /// Read a variant manifest's layout: its layers split where the base
+    /// ends, and each part's assembled digest. Errors when the manifest is
+    /// not a variant's, or its annotations disagree with its layers.
+    pub fn variant_layout(&self) -> Result<VariantLayout> {
+        let name = self
+            .annotation(annotations::VARIANT)
+            .ok_or_else(|| anyhow!("not a variant manifest: no `{}`", annotations::VARIANT))?
+            .to_string();
+        let need = |key: &str| {
+            self.annotation(key)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("variant manifest `{name}` is missing `{key}`"))
+        };
+        let base_layers: usize = need(annotations::BASE_LAYERS)?
+            .parse()
+            .map_err(|_| anyhow!("variant manifest `{name}`: malformed base layer count"))?;
+        let ordered: Vec<Descriptor> = self.layers_in_order().into_iter().cloned().collect();
+        if base_layers == 0 || base_layers >= ordered.len() {
+            bail!(
+                "variant manifest `{name}` says {base_layers} of its {} layers are the base",
+                ordered.len()
+            );
+        }
+        let (base, overlay) = ordered.split_at(base_layers);
+        let part_is = |layers: &[Descriptor], want: &str| {
+            layers.iter().all(|d| {
+                d.annotations
+                    .as_ref()
+                    .and_then(|a| a.get(annotations::PART))
+                    .is_none_or(|p| p == want)
+            })
+        };
+        if !part_is(base, annotations::PART_BASE) || !part_is(overlay, annotations::PART_VARIANT) {
+            bail!(
+                "variant manifest `{name}`: its layers' parts disagree with its base layer count"
+            );
+        }
+        Ok(VariantLayout {
+            base_digest: need(annotations::BASE_DIGEST)?,
+            overlay_digest: need(annotations::VARIANT_DIGEST)?,
+            base: base.to_vec(),
+            overlay: overlay.to_vec(),
+            name,
+        })
     }
 }
 
@@ -527,5 +759,112 @@ mod tests {
             annotations: None,
         };
         assert!(!manifest.is_vmlab_template());
+    }
+
+    fn overlay_set() -> ChunkSet {
+        ChunkSet {
+            chunks: vec![ChunkInfo {
+                index: 0,
+                compressed_path: PathBuf::from("/tmp/v/chunk-0000.zst"),
+                compressed_digest: "sha256:dd".to_string(),
+                compressed_size: 30,
+                uncompressed_size: 300,
+            }],
+            whole_digest: "sha256:ee".to_string(),
+            total_size: 300,
+            chunk_size: 1024,
+            chunk_count: 1,
+        }
+    }
+
+    /// A variant's manifest: the base's layers first, then the overlay's,
+    /// on one running index; each part's digest, size and count recorded;
+    /// no whole-image digest. Read back, the layout splits where the base
+    /// ends — whatever order the layers arrive in.
+    #[test]
+    fn variant_manifest_layout() {
+        let config = Descriptor::new(media_types::CONFIG_TEMPLATE_JSON, "sha256:cc", 42);
+        let mut m = build_variant_manifest("extra", &sample_set(), &overlay_set(), config);
+        assert!(m.is_vmlab_template());
+        assert_eq!(m.whole_digest(), None);
+        let digests: Vec<&str> = m.layers.iter().map(|d| d.digest.as_str()).collect();
+        assert_eq!(digests, ["sha256:aa", "sha256:bb", "sha256:dd"]);
+        let ann = m.annotations.clone().unwrap();
+        assert_eq!(ann[annotations::VARIANT], "extra");
+        assert_eq!(ann[annotations::BASE_LAYERS], "2");
+        assert_eq!(ann[annotations::CHUNK_COUNT], "3");
+        assert_eq!(ann[annotations::BASE_DIGEST], "sha256:ff");
+        assert_eq!(ann[annotations::BASE_SIZE], "1536");
+        assert_eq!(ann[annotations::BASE_CHUNK_COUNT], "2");
+        assert_eq!(ann[annotations::VARIANT_DIGEST], "sha256:ee");
+        assert_eq!(ann[annotations::VARIANT_SIZE], "300");
+        assert_eq!(ann[annotations::VARIANT_CHUNK_COUNT], "1");
+        let parts: Vec<&str> = m
+            .layers
+            .iter()
+            .map(|d| d.annotations.as_ref().unwrap()[annotations::PART].as_str())
+            .collect();
+        assert_eq!(parts, ["base", "base", "variant"]);
+
+        m.layers.reverse();
+        let layout = m.variant_layout().unwrap();
+        assert_eq!(layout.name, "extra");
+        assert_eq!(layout.base_digest, "sha256:ff");
+        assert_eq!(layout.overlay_digest, "sha256:ee");
+        let base: Vec<&str> = layout.base.iter().map(|d| d.digest.as_str()).collect();
+        assert_eq!(base, ["sha256:aa", "sha256:bb"]);
+        assert_eq!(layout.overlay[0].digest, "sha256:dd");
+
+        // A base layer count the layers contradict is refused.
+        m.annotations
+            .as_mut()
+            .unwrap()
+            .insert(annotations::BASE_LAYERS.into(), "1".into());
+        assert!(m.variant_layout().is_err());
+        m.annotations
+            .as_mut()
+            .unwrap()
+            .insert(annotations::BASE_LAYERS.into(), "3".into());
+        assert!(m.variant_layout().is_err());
+        // A base manifest is not a variant's.
+        let base = build_manifest(
+            &sample_set(),
+            Descriptor::new(media_types::CONFIG_TEMPLATE_JSON, "sha256:cc", 42),
+        );
+        assert!(base.variant_layout().is_err());
+    }
+
+    /// The base manifest names its variants, their order, the default and
+    /// each one's manifest digest; one pushed before variants names none.
+    #[test]
+    fn base_manifest_names_its_variants() {
+        let config = Descriptor::new(media_types::CONFIG_TEMPLATE_JSON, "sha256:cc", 42);
+        let mut m = build_manifest(&sample_set(), config);
+        assert_eq!(m.variants().unwrap(), (Vec::new(), None));
+        let entries = vec![
+            VariantEntry {
+                name: "standard".into(),
+                manifest: "sha256:01".into(),
+            },
+            VariantEntry {
+                name: "win3d".into(),
+                manifest: "sha256:02".into(),
+            },
+        ];
+        m.set_variants(&entries, Some("standard"));
+        assert_eq!(
+            m.variants().unwrap(),
+            (entries.clone(), Some("standard".to_string()))
+        );
+        // The base's own reassembly annotations are untouched.
+        assert_eq!(m.whole_digest(), Some("sha256:ff"));
+        assert_eq!(m.layers.len(), 2);
+
+        let ann = m.annotations.as_mut().unwrap();
+        ann.remove(&format!("{}win3d", annotations::VARIANT_MANIFEST_PREFIX));
+        assert!(
+            m.variants().is_err(),
+            "a named variant without its manifest"
+        );
     }
 }

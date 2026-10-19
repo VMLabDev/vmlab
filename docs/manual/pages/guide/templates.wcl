@@ -34,10 +34,79 @@ page guide_templates {
 
   p <<DOC
     Templates are keyed by **arch, name and version**, and a reference is
-    written `<arch>/<name>[@<version>]`. The arch is mandatory and never
-    inferred from the host, because it selects which QEMU system emulator
-    boots the image. Omitting the version means the highest in the store.
-    `vmlab validate` rejects an archless reference.
+    written `<arch>/<name>[@<version>][#<variant>]`. The arch is mandatory
+    and never inferred from the host, because it selects which QEMU system
+    emulator boots the image. Omitting the version means the highest in the
+    store. `vmlab validate` rejects an archless reference. The `#<variant>`
+    suffix is described in the next section.
+  DOC
+
+  h2 "Variants"
+
+  p <<DOC
+    A template version can hold more than one sealed disk. It has one
+    **base** and zero or more **variants**, each a named disk state built
+    from the base. The case they exist for is Windows. The base is installed
+    and updated but not generalized. Variant `standard` runs only the
+    generalize. Variant `win3d` installs a GPU driver package first, then
+    generalizes, with secure boot off. The hours of install and update are
+    stored and built once, and each variant costs only its own changes. A
+    template with no variants is base-only and works as every template
+    always has.
+  DOC
+
+  table {
+    rows:
+      | "Reference" | "Template with variants" | "Template without variants" |
+      | "no `#`" | "The default variant." | "The base." |
+      | "`#<name>`" | "That variant. An unknown name is an error that lists the variants." | "An error: the template has no variants." |
+      | "`#base`" | "Refused for a lab machine, because every clone of the unsealed base would share one machine identity. Allowed in a variant build or a layered `from`." | "The base." |
+  }
+
+  p <<DOC
+    Exactly one variant is marked `default = true`, and a lone variant is the
+    default without the mark. On disk a variant is a qcow2 overlay at
+    `<version>/variants/<name>/disk.qcow2`, whose backing file is the base,
+    `../../disk.qcow2`, by relative path. Its block in the version's
+    `template.wcl` records its digest, the digest of the base it was built
+    on, and any fields it overrides: hardware, the first-boot script, the
+    wscript surface and the agent version. A clone of a variant runs on the
+    base's metadata with the variant's fields in their place. If the base is
+    rebuilt, a variant built on the old one is **stale** and refused until
+    it is rebuilt too.
+  DOC
+
+  p <<DOC
+    `vmlab template list` shows each variant on its own line under its
+    version, marks the default and flags a stale one. `vmlab status -v`
+    shows the variant each VM runs, including the one a reference without
+    `#` picked. `vmlab template rm <arch>/<name>@<version>#<variant>` removes
+    one variant; removing the version removes all of them.
+  DOC
+
+  p <<DOC
+    Variants are declared as `variant "<name>" { }` blocks inside the
+    `template {}` block, each with its own provisions and any hardware it
+    changes; [Lab file: template and source](ref_template) has the fields.
+    `vmlab template build` seals the base, then builds each variant on it:
+    an overlay on the base, booted on the variant's hardware, running the
+    variant's steps and no first-boot script, shut down and installed beside
+    the base. `vmlab template build <name> --variant <v>` rebuilds one
+    variant onto the installed version without touching the base or the
+    others.
+  DOC
+
+  p <<DOC
+    The base of a template with variants is unsealed, so a lab never clones
+    it. The build marks it `variants_expected = true` in its metadata. Until
+    the default variant is installed, every lab reference to that version is
+    refused, with or without `#`, and the message gives the command that
+    builds the variants: `vmlab template build <name>@<version> --variant
+    <variant>`. This covers a build whose variants all failed and a version
+    whose overlays were deleted. `vmlab template list` shows such a version
+    as `variants not built`. The marker travels with a push, pull, export
+    and import. A vmlab release older than the marker pulls such a base as
+    an ordinary base-only template.
   DOC
 
   h2 "The store"
@@ -180,7 +249,11 @@ page guide_templates {
 
   p <<DOC
     `vmlab up` creates each VM's disk as a qcow2 overlay whose backing file
-    is the template's disk in the store. The template is never written to.
+    is the template's disk in the store: the variant's overlay for a
+    template with variants, which is itself backed by the base. The template
+    is never written to. The reference the clone was made from, `#<variant>`
+    included, is recorded beside it, and `up` refuses to reuse the clone for
+    a different one.
     Clones live in `.vmlab/`, survive `down`, and are deleted by `destroy`,
     after which the next `up` makes fresh ones. Clones grow as the guest
     writes, which is why the supervisor watches free space on the
@@ -206,7 +279,7 @@ page guide_templates {
   DOC
 
   list {
-    li "**Export and import.** `vmlab template export` writes one portable `.tar.zst` archive holding the disk and its metadata, and `import` installs it into another store. This is the offline path."
+    li "**Export and import.** `vmlab template export` writes one portable `.tar.zst` archive holding the disk, its metadata and every variant's overlay, and `import` installs it into another store after checking each variant against its digest and its base. This is the offline path."
     li "**Registries.** `vmlab template push` publishes a template to any OCI registry, and `pull` installs it from one. [Distributing templates over registries](guide_registries) explains how a template is laid out as an OCI artifact."
   }
 
@@ -214,6 +287,10 @@ page guide_templates {
     A lab's `template =` may also name a registry reference directly, with
     an explicit `arch` on the VM. `vmlab up` pulls it when it is absent from
     the store and never re-pulls it implicitly. Updates are explicit, through
-    `vmlab pull` or `vmlab template pull`.
+    `vmlab pull` or `vmlab template pull`. A registry reference takes the
+    same `#<variant>` suffix as a store reference. A pull always brings the
+    template's default variant along with the base, and adds a variant a
+    machine names when the store's copy of the version lacks it, without
+    downloading the base again.
   DOC
 }

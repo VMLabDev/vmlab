@@ -26,7 +26,9 @@ use crate::proto::client::SupClient;
 use crate::proto::{Event, SupRequest};
 use crate::template::catalog::CatalogSearch;
 use crate::template::registries::RegistryEntry;
-use crate::template::store_view::{PrunePlan, PushStarted, StoreEntry, StoredVersion};
+use crate::template::store_view::{
+    InstalledVersion, PrunePlan, PushStarted, StoreEntry, StoredVersion,
+};
 
 /// The two fields a build needs from `template.list`: which templates the
 /// file declares, and how each is addressed.
@@ -43,12 +45,19 @@ pub enum TemplateCmd {
         /// File containing `template {}` blocks (default: ./vmlab.wcl)
         #[arg(short, long)]
         file: Option<PathBuf>,
-        /// Build only the named template (default: all in the file)
+        /// Build only the named template (default: all in the file);
+        /// `<name>@<version>` is the same as `--version`
         name: Option<String>,
         /// Pin an explicit version instead of auto-incrementing (requires a
-        /// single target template)
+        /// single target template); with `--variant`, the installed version
+        /// to build the variants onto
         #[arg(long)]
         version: Option<String>,
+        /// Build or rebuild only these variants, comma-separated, onto the
+        /// newest installed version (or the pinned one), leaving the base and
+        /// every other variant as they are
+        #[arg(long, value_delimiter = ',', value_name = "VARIANT")]
+        variant: Vec<String>,
     },
     /// Stop a build or push running for a template — one this terminal
     /// started, or one the console did
@@ -86,7 +95,8 @@ pub enum TemplateCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a template (`<arch>/<name>[@<version>]`)
+    /// Remove a template version (`<arch>/<name>@<version>`) with all its
+    /// variants, or one variant (`…#<variant>`)
     Rm {
         reference: String,
         /// Remove even if it backs existing clones
@@ -139,9 +149,10 @@ pub enum TemplateCmd {
         #[arg(long)]
         prerelease: bool,
     },
-    /// Pull a template from an OCI registry
+    /// Pull a template from an OCI registry, with its default variant
     Pull {
-        /// Registry reference, e.g. ghcr.io/owner/name:version
+        /// Registry reference, e.g. ghcr.io/owner/name:version; `#<variant>`
+        /// also pulls that variant
         target: String,
         /// Architecture to pull (required for multi-arch indexes)
         #[arg(long)]
@@ -149,6 +160,9 @@ pub enum TemplateCmd {
         /// Overwrite an existing version in the store
         #[arg(long)]
         overwrite: bool,
+        /// Pull every variant, not just the default and the one named
+        #[arg(long)]
+        all_variants: bool,
     },
     /// Log in to an OCI registry
     Login {
@@ -211,7 +225,8 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 file,
                 name,
                 version,
-            } => build(&sup, file, name, version).await,
+                variant,
+            } => build(&sup, file, name, version, variant).await,
             TemplateCmd::Stop { name, arch } => stop(&sup, name, arch).await,
             TemplateCmd::List { json, remote } => list(&sup, json, remote).await,
             TemplateCmd::Search {
@@ -240,7 +255,8 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 target,
                 arch,
                 overwrite,
-            } => pull(&sup, target, arch, overwrite).await,
+                all_variants,
+            } => pull(&sup, target, arch, overwrite, all_variants).await,
             TemplateCmd::Login {
                 registry,
                 username,
@@ -360,7 +376,15 @@ async fn build(
     file: Option<PathBuf>,
     only: Option<String>,
     version: Option<String>,
+    variants: Vec<String>,
 ) -> Result<()> {
+    let (only, version) = split_build_target(only, version)?;
+    if !variants.is_empty() && only.is_none() {
+        bail!(
+            "--variant needs the template it belongs to: `vmlab template build <name> --variant …`"
+        );
+    }
+    let variants = (!variants.is_empty()).then_some(variants);
     let cwd = std::env::current_dir()?;
     let path = match file {
         // Absolutize: a bare `-f vmlab.wcl` has an EMPTY parent(), which used
@@ -414,6 +438,7 @@ async fn build(
                 arch: Some(arch.clone()),
                 version: version.clone(),
                 file: Some(path.clone()),
+                variants: variants.clone(),
             },
         )
         .await
@@ -428,6 +453,28 @@ async fn build(
             .into_result(&what)?;
     }
     Ok(())
+}
+
+/// Split `<name>@<version>` into the name and a pinned version, which is the
+/// same pin `--version` gives; both at once is refused rather than guessed
+/// between.
+fn split_build_target(
+    name: Option<String>,
+    version: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(name) = name else {
+        return Ok((None, version));
+    };
+    match name.split_once('@') {
+        None => Ok((Some(name), version)),
+        Some((n, v)) if n.is_empty() || v.is_empty() => {
+            bail!("malformed template `{name}`: expected `<name>[@<version>]`")
+        }
+        Some(_) if version.is_some() => {
+            bail!("`{name}` pins a version and so does --version — give one")
+        }
+        Some((n, v)) => Ok((Some(n.to_string()), Some(v.to_string()))),
+    }
 }
 
 /// `vmlab template stop`: cancel an operation somebody else started — from
@@ -574,6 +621,7 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
             .iter()
             .map(|row| {
                 let mut meta = serde_json::to_value(&row.meta).unwrap_or(Value::Null);
+                meta["variants"] = serde_json::to_value(&row.variants).unwrap_or(Value::Null);
                 if let Some(status) = row.remote {
                     meta["remote"] = Value::String(status.as_str().into());
                 }
@@ -591,9 +639,25 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
     fn name_of(row: &StoreEntry) -> &str {
         row.meta.registry.as_deref().unwrap_or(&row.meta.name)
     }
+    // A variant sits on its own line under its version, `  #<name>` in the
+    // TEMPLATE column and its marks in the VERSION one (§6.6).
+    fn variant_label(v: &crate::template::store_view::VariantSummary) -> String {
+        format!("  #{}", v.name)
+    }
+    fn variant_marks(v: &crate::template::store_view::VariantSummary) -> String {
+        match (v.default, v.stale) {
+            (true, true) => "default, STALE".into(),
+            (true, false) => "default".into(),
+            (false, true) => "STALE".into(),
+            (false, false) => String::new(),
+        }
+    }
     let name_w = rows
         .iter()
-        .map(|row| name_of(row).len())
+        .flat_map(|row| {
+            std::iter::once(name_of(row).len())
+                .chain(row.variants.iter().map(|v| variant_label(v).len()))
+        })
         .max()
         .unwrap_or(0)
         .max(8);
@@ -612,7 +676,11 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
         let meta = &row.meta;
         let size = human_size(row.size);
         // The wire carries RFC 3339; the table has always shown the date.
-        let created: String = meta.created.chars().take(10).collect();
+        let mut created: String = meta.created.chars().take(10).collect();
+        if let Some(note) = unbuilt_note(row) {
+            created.push_str("  ");
+            created.push_str(note);
+        }
         match row.remote {
             Some(status) => println!(
                 "{:<8} {:<name_w$} {:<16} {:<8} {:<7} {created}",
@@ -630,8 +698,43 @@ async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
                 size,
             ),
         }
+        for v in &row.variants {
+            let created: String = v.created.chars().take(10).collect();
+            let remote = if check_remote { "        " } else { "" };
+            println!(
+                "{:<8} {:<name_w$} {:<16} {:<8} {remote}{created}",
+                "",
+                variant_label(v),
+                variant_marks(v),
+                human_size(v.size),
+            );
+        }
+    }
+    if rows.iter().flat_map(|r| &r.variants).any(|v| v.stale) {
+        println!();
+        println!("a STALE variant was built on an earlier base and is refused until it is rebuilt");
+    }
+    if rows.iter().any(|r| unbuilt_note(r).is_some()) {
+        println!();
+        println!(
+            "a version whose variants are not built holds only its unsealed base, which a lab \
+             refuses — build them with `vmlab template build <name>@<version> --variant <variant>`"
+        );
     }
     Ok(())
+}
+
+/// What `template list` says of a variant-bearing version a lab would refuse
+/// (§6.6): one with no default variant installed.
+fn unbuilt_note(row: &StoreEntry) -> Option<&'static str> {
+    if !row.meta.variants_expected || row.variants.iter().any(|v| v.default) {
+        return None;
+    }
+    Some(if row.variants.is_empty() {
+        "variants not built"
+    } else {
+        "default variant not built"
+    })
 }
 
 async fn rm(sup: &SupClient, reference: String, force: bool) -> Result<()> {
@@ -704,7 +807,8 @@ async fn export(sup: &SupClient, reference: String, out: PathBuf) -> Result<()> 
 
 async fn import(sup: &SupClient, archive: PathBuf, overwrite: bool) -> Result<()> {
     let archive = abs_path(&archive)?;
-    let imported: StoredVersion = ask(sup, SupRequest::StoreImport { archive, overwrite }).await?;
+    let imported: InstalledVersion =
+        ask(sup, SupRequest::StoreImport { archive, overwrite }).await?;
     println!("imported {imported}");
     Ok(())
 }
@@ -714,13 +818,15 @@ async fn pull(
     target: String,
     arch: Option<String>,
     overwrite: bool,
+    all_variants: bool,
 ) -> Result<()> {
-    let pulled: StoredVersion = ask(
+    let pulled: InstalledVersion = ask(
         sup,
         SupRequest::StorePull {
             target,
             arch,
             overwrite,
+            all_variants,
         },
     )
     .await?;
@@ -1169,5 +1275,28 @@ mod tests {
         // a local path is not a web URL
         assert_eq!(normalize_git_url("/srv/git/repo.git"), None);
         assert_eq!(normalize_git_url(""), None);
+    }
+
+    /// `<name>@<version>` pins like `--version`; both at once is refused.
+    #[test]
+    fn a_build_target_may_carry_its_version() {
+        let split = |n: Option<&str>, v: Option<&str>| {
+            super::split_build_target(n.map(Into::into), v.map(Into::into))
+        };
+        assert_eq!(
+            split(Some("win"), None).unwrap(),
+            (Some("win".into()), None)
+        );
+        assert_eq!(
+            split(Some("win@1.2"), None).unwrap(),
+            (Some("win".into()), Some("1.2".into()))
+        );
+        assert_eq!(
+            split(Some("win"), Some("1.2")).unwrap(),
+            (Some("win".into()), Some("1.2".into()))
+        );
+        assert!(split(Some("win@1"), Some("2")).is_err());
+        assert!(split(Some("win@"), None).is_err());
+        assert_eq!(split(None, Some("3")).unwrap(), (None, Some("3".into())));
     }
 }

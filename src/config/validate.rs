@@ -13,6 +13,7 @@ use crate::qemu::resolve::{
     resolve_accel, resolve_cpu_model, resolve_firmware, vm_arch,
 };
 use crate::template::TemplateMeta;
+use crate::template::meta::Purpose;
 
 /// Host facilities the validator consults. The CLI wires the real template
 /// store and wscript compiler; tests substitute fakes.
@@ -22,7 +23,9 @@ use crate::template::TemplateMeta;
 /// about hardware have to resolve it first — a VM's firmware or secure boot
 /// may have been inherited from either layer (§5.2).
 pub trait ValidationContext {
-    /// Recorded metadata for a template in the store, if it is there.
+    /// Recorded metadata for a template version in the store, if it is there,
+    /// with its installed variants (§6.6). Validation selects the variant a
+    /// reference names itself, through [`TemplateMeta::select_variant`].
     fn template_meta(&self, arch: &str, name: &str, version: Option<&str>) -> Option<TemplateMeta>;
     /// A named guest OS profile, if it is known.
     fn profile(&self, name: &str) -> Option<Profile>;
@@ -530,6 +533,14 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         if let Some(fb) = &t.first_boot {
             scripts.push((fb, t.span));
         }
+        for v in &t.variants {
+            for p in &v.provisions {
+                scripts.push((&p.script, p.span));
+            }
+            if let Some(fb) = &v.first_boot {
+                scripts.push((fb, v.span));
+            }
+        }
     }
     for (script, span) in scripts {
         let path = file.root.join(script);
@@ -599,10 +610,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         arch,
                         name,
                         version,
+                        variant,
                     },
                 span,
             } => {
-                if !ctx.template_exists(arch, name, version.as_deref()) {
+                if let Some(meta) = ctx.template_meta(arch, name, version.as_deref()) {
+                    // A layered `from` is a build context, so `#base` passes.
+                    if let Err(why) = meta.select_variant(variant.as_ref(), Purpose::Build) {
+                        issues.push(Issue::at(*span, format!("layered build source: {why}")));
+                    }
+                } else {
                     issues.push(Issue::at(
                         *span,
                         format!(
@@ -641,7 +658,8 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         }
         // Build playbooks run on the synthetic "build" VM, and config-weave
         // is x86_64-only (§10.4).
-        for p in &t.playbooks {
+        let variant_playbooks = t.variants.iter().flat_map(|v| &v.playbooks);
+        for p in t.playbooks.iter().chain(variant_playbooks) {
             check_playbook(p, &file.root, &mut issues);
             if t.arch != "x86_64" {
                 issues.push(Issue::at(
@@ -654,9 +672,114 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 ));
             }
         }
+        check_template_variants(t, ctx, &file.root, &mut issues);
     }
 
     issues
+}
+
+/// §5.1 for a template's `variant` blocks (§6.6): each name is a legal,
+/// unreserved and unique variant name, and the declaration says which one a
+/// bare reference selects — exactly one `default = true`, or a lone variant
+/// that does not refuse it.
+fn check_template_variants(
+    t: &TemplateDef,
+    ctx: &dyn ValidationContext,
+    root: &Path,
+    issues: &mut IssueList,
+) {
+    if t.variants.is_empty() {
+        return;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for v in &t.variants {
+        if let Err(why) = check_variant_name(&v.name) {
+            issues.push(Issue::at(
+                v.span,
+                format!("template \"{}\" variant \"{}\": {why}", t.name, v.name),
+            ));
+        }
+        if !seen.insert(&v.name) {
+            issues.push(Issue::at(
+                v.span,
+                format!(
+                    "template \"{}\" declares variant \"{}\" twice",
+                    t.name, v.name
+                ),
+            ));
+        }
+        if let Some(p) = &v.profile
+            && !ctx.profile_exists(p)
+        {
+            issues.push(Issue::at(
+                v.span,
+                format!("variant \"{}\": unknown profile \"{p}\"", v.name),
+            ));
+        }
+        if t.nested
+            && let Some(model) = &v.cpu_model
+        {
+            issues.push(Issue::at(
+                v.span,
+                format!(
+                    "variant \"{}\": cpu_model = \"{model}\" on a template with nested = true \
+                     — a named CPU model leaves no host VMX/SVM for `nested` to pass through \
+                     (PRD §5.2)",
+                    v.name
+                ),
+            ));
+        }
+        if t.nested && v.accel == Some(AccelMode::Tcg) {
+            issues.push(Issue::at(
+                v.span,
+                format!(
+                    "variant \"{}\": accel = \"tcg\" on a template with nested = true — nested \
+                     virtualisation needs KVM (PRD §5.2)",
+                    v.name
+                ),
+            ));
+        }
+        for m in &v.media {
+            check_media(root, m, issues);
+        }
+    }
+    let defaults: Vec<&TemplateVariantDef> = t
+        .variants
+        .iter()
+        .filter(|v| v.default == Some(true))
+        .collect();
+    match (t.variants.as_slice(), defaults.as_slice()) {
+        ([only], []) if only.default == Some(false) => issues.push(Issue::at(
+            only.span,
+            format!(
+                "template \"{}\": its only variant \"{}\" sets default = false, so a reference \
+                 with no `#` would select nothing — drop the `default = false` (PRD §6.6)",
+                t.name, only.name
+            ),
+        )),
+        ([_], _) | (_, [_]) => {}
+        (_, []) => issues.push(Issue::at(
+            t.span,
+            format!(
+                "template \"{}\" declares {} variants and none sets default = true — mark the \
+                 one a reference with no `#` selects (PRD §6.6)",
+                t.name,
+                t.variants.len()
+            ),
+        )),
+        (_, several) => issues.push(Issue::at(
+            several[1].span,
+            format!(
+                "template \"{}\": variants {} all set default = true — exactly one may (PRD §6.6)",
+                t.name,
+                several
+                    .iter()
+                    .map(|v| format!("\"{}\"", v.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
 }
 
 fn check_vm_template(file: &LabFile, vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueList) {
@@ -688,6 +811,7 @@ fn check_vm_template(file: &LabFile, vm: &Vm, ctx: &dyn ValidationContext, issue
             arch,
             name,
             version,
+            variant,
         } => {
             if let Some(vm_arch) = &vm.arch
                 && vm_arch != arch
@@ -700,7 +824,16 @@ fn check_vm_template(file: &LabFile, vm: &Vm, ctx: &dyn ValidationContext, issue
                     ),
                 ));
             }
-            if !ctx.template_exists(arch, name, version.as_deref()) {
+            let meta = ctx.template_meta(arch, name, version.as_deref());
+            if let Some(meta) = &meta
+                && let Err(why) = meta.select_variant(variant.as_ref(), Purpose::Lab)
+            {
+                issues.push(Issue::at(
+                    vm.template_span,
+                    format!("vm \"{}\": {why}", vm.name),
+                ));
+            }
+            if meta.is_none() {
                 let local_def = file
                     .templates
                     .iter()
@@ -733,7 +866,7 @@ fn check_vm_template(file: &LabFile, vm: &Vm, ctx: &dyn ValidationContext, issue
                 ));
             }
         }
-        TemplateRef::Registry { reference } => {
+        TemplateRef::Registry { reference, .. } => {
             if vm.arch.is_none() {
                 issues.push(Issue::at(
                     vm.template_span,
@@ -876,12 +1009,19 @@ impl TemplateLayer {
     fn of(vm: &Vm, ctx: &dyn ValidationContext) -> Self {
         match &vm.template {
             TemplateRef::Scratch => Self::Absent,
+            // The effective metadata of the variant the reference selects
+            // (§6.6). One it cannot select is reported by
+            // `check_vm_template`, and leaves the layer unknown.
             TemplateRef::Store {
                 arch,
                 name,
                 version,
+                variant,
             } => match ctx.template_meta(arch, name, version.as_deref()) {
-                Some(meta) => Self::Known(Box::new(meta)),
+                Some(meta) => match meta.select_variant(variant.as_ref(), Purpose::Lab) {
+                    Ok(chosen) => Self::Known(Box::new(meta.effective(chosen))),
+                    Err(_) => Self::Unknown,
+                },
                 None => Self::Unknown,
             },
             TemplateRef::Registry { .. } => Self::Unknown,
@@ -1416,6 +1556,8 @@ pub(crate) mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
+            variants: Vec::new(),
         }
     }
 
@@ -1518,6 +1660,100 @@ pub(crate) mod tests {
         assert!(
             !es.iter().any(|m| m.contains("secure boot needs UEFI")),
             "unexpected secure-boot conflict: {es:#?}"
+        );
+    }
+
+    /// A template version with variants (§6.6): `standard` (the default),
+    /// which records OVMF, and `legacy`, which records SeaBIOS.
+    fn variant_meta() -> TemplateMeta {
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.sha256 = Some("ab".repeat(32));
+        let variant = |name: &str, default: bool| crate::template::meta::VariantMeta {
+            name: name.into(),
+            default,
+            created: chrono::Utc::now(),
+            sha256: "cd".repeat(32),
+            base_sha256: "ab".repeat(32),
+            description: None,
+            first_boot_script: None,
+            agent_version: None,
+            wscript_surface: None,
+            profile: None,
+            cpus: None,
+            memory: None,
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            cpu_model: None,
+            accel: None,
+        };
+        let mut legacy = variant("legacy", false);
+        legacy.firmware = Some("seabios".into());
+        let mut standard = variant("standard", true);
+        standard.firmware = Some("ovmf".into());
+        meta.variants = vec![standard, legacy];
+        meta
+    }
+
+    /// `vmlab validate` reports a variant reference the template cannot
+    /// serve, naming the template's variants; and `#base` is refused for a
+    /// lab machine.
+    #[test]
+    fn a_bad_variant_reference_lists_the_templates_variants() {
+        let ctx = Hardware::with_meta(variant_meta());
+        let es = hw_errs(
+            &ctx,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t#ghost" } }"#,
+        );
+        let found = es
+            .iter()
+            .find(|m| m.contains("no variant `ghost`"))
+            .unwrap_or_else(|| panic!("expected an unknown-variant error, got: {es:#?}"));
+        assert!(found.contains("standard (default), legacy"), "{found}");
+        assert!(found.contains("vm \"a\""), "{found}");
+
+        let es = hw_errs(
+            &ctx,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t#base" } }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("#base is refused")), "{es:#?}");
+
+        // A good reference, bare or named, raises nothing about variants.
+        for t in ["x86_64/t", "x86_64/t#legacy", "x86_64/t#standard"] {
+            let es = hw_errs(
+                &ctx,
+                &format!("import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"{t}\" }} }}"),
+            );
+            assert!(!es.iter().any(|m| m.contains("variant")), "{t}: {es:#?}");
+        }
+
+        // `#name` on a base-only template.
+        let es = hw_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t#standard" } }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("has no variants")), "{es:#?}");
+    }
+
+    /// The hardware checks read the selected variant's effective metadata:
+    /// `legacy`'s SeaBIOS conflicts with secure boot, the default's does not.
+    #[test]
+    fn hardware_checks_read_the_variants_effective_metadata() {
+        let ctx = Hardware::with_meta(variant_meta());
+        assert_secure_boot_conflict(
+            &ctx,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t#legacy" secure_boot = true } }"#,
+            ["firmware = \"seabios\" (from the template)"].as_slice(),
+        );
+        assert_no_secure_boot_conflict(
+            &ctx,
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" secure_boot = true } }"#,
         );
     }
 
@@ -1803,6 +2039,127 @@ lab "l" { vm "a" { template = "x86_64/t" nested = true accel = "kvm" } }"#,
     fn lab(src: &str) -> LabFile {
         let tmp = std::env::temp_dir();
         load_lab_source(src, "<test>", &tmp).expect("source should parse")
+    }
+
+    /// The §5.1 messages for a lab declaring one template whose body (beside
+    /// its source) is `variants`.
+    fn variant_errs(variants: &str) -> Vec<String> {
+        errs(&format!(
+            r#"import <vmlab.wcl>
+lab "l" {{ }}
+template "t" {{
+  arch = "x86_64"
+  version = "1"
+  disk = 1GiB
+  source "scratch" {{ }}
+  {variants}
+}}"#
+        ))
+    }
+
+    /// The default rules (§6.6): exactly one `default = true`, or a lone
+    /// variant that does not refuse it.
+    #[test]
+    fn template_variant_defaults() {
+        for ok in [
+            r#"variant "standard" { }"#,
+            r#"variant "standard" { default = true }"#,
+            r#"variant "standard" { default = true } variant "win3d" { secure_boot = false }"#,
+            r#"variant "a" { default = false } variant "b" { default = true }"#,
+        ] {
+            let es = variant_errs(ok);
+            assert!(es.is_empty(), "{ok}: {es:#?}");
+        }
+        let es = variant_errs(r#"variant "a" { } variant "b" { }"#);
+        assert!(
+            es.iter().any(|m| m.contains("none sets default = true")),
+            "{es:#?}"
+        );
+        let es = variant_errs(r#"variant "a" { default = true } variant "b" { default = true }"#);
+        assert!(
+            es.iter()
+                .any(|m| m.contains("\"a\", \"b\" all set default = true")),
+            "{es:#?}"
+        );
+        let es = variant_errs(r#"variant "a" { default = false }"#);
+        assert!(es.iter().any(|m| m.contains("only variant")), "{es:#?}");
+    }
+
+    /// Names follow the reference grammar, `base` is reserved, and none
+    /// repeats.
+    #[test]
+    fn template_variant_names() {
+        let es = variant_errs(r#"variant "base" { }"#);
+        assert!(es.iter().any(|m| m.contains("reserved")), "{es:#?}");
+        let es = variant_errs(r#"variant "Win3D" { }"#);
+        assert!(
+            es.iter().any(|m| m.contains("malformed variant name")),
+            "{es:#?}"
+        );
+        let es = variant_errs(r#"variant "a" { default = true } variant "a" { }"#);
+        assert!(es.iter().any(|m| m.contains("twice")), "{es:#?}");
+    }
+
+    /// A variant's steps and first-boot script are checked like the
+    /// template's own.
+    #[test]
+    fn template_variant_scripts_must_exist() {
+        let es = variant_errs(
+            r#"variant "a" { first_boot = "nope/fb.ws" provision "nope/step.ws" { } }"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("script nope/step.ws does not exist")),
+            "{es:#?}"
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("script nope/fb.ws does not exist")),
+            "{es:#?}"
+        );
+    }
+
+    /// A variant block parses into the model with its overrides and steps in
+    /// declaration order.
+    #[test]
+    fn template_variant_block_parses() {
+        let f = lab(r#"import <vmlab.wcl>
+lab "l" { }
+template "t" {
+  arch = "x86_64"
+  version = "1"
+  disk = 1GiB
+  source "scratch" { }
+  variant "standard" { default = true description = "generalized" }
+  variant "win3d" {
+    secure_boot = false
+    memory = 8GiB
+    qemu_args = ["-no-hpet"]
+    provision "a.ws" { }
+    provision "b.ws" { }
+  }
+}"#);
+        let t = &f.templates[0];
+        assert_eq!(t.variants.len(), 2);
+        assert_eq!(
+            t.default_variant().map(|v| v.name.as_str()),
+            Some("standard")
+        );
+        let w = t.variant("win3d").unwrap();
+        assert_eq!(w.secure_boot, Some(false));
+        assert_eq!(w.memory, Some(8 << 30));
+        assert_eq!(w.qemu_args.as_deref(), Some(&["-no-hpet".to_string()][..]));
+        let steps: Vec<_> = w
+            .provisions
+            .iter()
+            .map(|p| p.script.display().to_string())
+            .collect();
+        assert_eq!(steps, ["a.ws", "b.ws"]);
+        assert_eq!(
+            t.variant("standard").unwrap().description.as_deref(),
+            Some("generalized")
+        );
+        assert_eq!(t.variant("standard").unwrap().qemu_args, None);
     }
 
     fn errs(src: &str) -> Vec<String> {

@@ -288,30 +288,136 @@ pub struct SinkholeRule {
 pub enum TemplateRef {
     /// `scratch` — blank disk, no backing image (§6.5).
     Scratch,
-    /// `<arch>/<name>[@<version>]` — local store.
+    /// `<arch>/<name>[@<version>][#<variant>]` — local store.
     Store {
         arch: String,
         name: String,
         version: Option<String>,
+        /// `None`: the template's default variant, or its base when it has
+        /// no variants (§6.6).
+        variant: Option<VariantRef>,
     },
     /// OCI registry reference, e.g. `ghcr.io/owner/name:version`; arch comes
-    /// from the VM's explicit `arch` attribute (§6.4).
-    Registry { reference: String },
+    /// from the VM's explicit `arch` attribute (§6.4). `reference` is the
+    /// registry reference alone, without the `#<variant>` suffix.
+    Registry {
+        reference: String,
+        variant: Option<VariantRef>,
+    },
+}
+
+/// The `#<variant>` suffix of a template reference: which disk of a template
+/// version it selects (§6.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariantRef {
+    /// `#base` — the unsealed base disk; build contexts only when the
+    /// template has variants.
+    Base,
+    /// `#<name>` — one sealed variant.
+    Named(String),
+}
+
+impl VariantRef {
+    /// The name as written after `#`.
+    pub fn as_str(&self) -> &str {
+        match self {
+            VariantRef::Base => BASE_VARIANT,
+            VariantRef::Named(n) => n,
+        }
+    }
+}
+
+impl std::fmt::Display for VariantRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The reserved `#base` selector: names a template version's base disk and is
+/// never a variant's name (§6.6).
+pub const BASE_VARIANT: &str = "base";
+
+/// A variant name is `[a-z0-9][a-z0-9-]{0,31}` (§6.6). `base` passes here —
+/// it is reserved for variant *names* by [`check_variant_name`], and means
+/// the base disk in a reference.
+pub fn variant_name_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// Whether `s` can name a variant: the §6.6 grammar, and not `base`.
+pub fn check_variant_name(s: &str) -> Result<(), String> {
+    if s == BASE_VARIANT {
+        return Err(format!(
+            "`{BASE_VARIANT}` is reserved — it names the template's base disk, not a variant"
+        ));
+    }
+    if !variant_name_ok(s) {
+        return Err(format!(
+            "malformed variant name `{s}`: a variant name is 1-32 characters of lowercase \
+             letters, digits and `-`, starting with a letter or digit"
+        ));
+    }
+    Ok(())
+}
+
+/// Split a trailing `#<variant>` off a template reference.
+pub(crate) fn split_variant(s: &str) -> Result<(&str, Option<VariantRef>), String> {
+    let Some((head, v)) = s.split_once('#') else {
+        return Ok((s, None));
+    };
+    if v.is_empty() {
+        return Err(format!(
+            "malformed template reference `{s}`: empty variant after `#`"
+        ));
+    }
+    if v == BASE_VARIANT {
+        return Ok((head, Some(VariantRef::Base)));
+    }
+    if !variant_name_ok(v) {
+        return Err(format!(
+            "malformed template reference `{s}`: variant `{v}` must be 1-32 characters of \
+             lowercase letters, digits and `-`, starting with a letter or digit"
+        ));
+    }
+    Ok((head, Some(VariantRef::Named(v.to_string()))))
+}
+
+impl TemplateRef {
+    /// The `#<variant>` suffix, if the reference carries one.
+    pub fn variant(&self) -> Option<&VariantRef> {
+        match self {
+            TemplateRef::Scratch => None,
+            TemplateRef::Store { variant, .. } | TemplateRef::Registry { variant, .. } => {
+                variant.as_ref()
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for TemplateRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TemplateRef::Scratch => write!(f, "scratch"),
+            TemplateRef::Scratch => return write!(f, "scratch"),
             TemplateRef::Store {
                 arch,
                 name,
                 version,
+                ..
             } => match version {
-                Some(v) => write!(f, "{arch}/{name}@{v}"),
-                None => write!(f, "{arch}/{name}"),
+                Some(v) => write!(f, "{arch}/{name}@{v}")?,
+                None => write!(f, "{arch}/{name}")?,
             },
-            TemplateRef::Registry { reference } => write!(f, "{reference}"),
+            TemplateRef::Registry { reference, .. } => write!(f, "{reference}")?,
+        }
+        match self.variant() {
+            Some(v) => write!(f, "#{v}"),
+            None => Ok(()),
         }
     }
 }
@@ -355,6 +461,9 @@ pub struct Vm {
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
+    /// A hot-plug xHCI controller for host USB passthrough (§5.2.1); None =
+    /// inherit the profile's, and with neither saying, off.
+    pub usb: Option<bool>,
     pub secure_boot: Option<bool>,
     pub qemu_args: Vec<String>,
     pub gpu: Option<Gpu>,
@@ -792,6 +901,66 @@ pub struct TemplateDef {
     pub playbooks: Vec<Playbook>,
     pub nics: Vec<Nic>,
     pub extra_disks: Vec<DiskBlock>,
+    /// Sealed variants built on the base after it seals, in declaration
+    /// order (§6.6). Empty for a base-only template.
+    pub variants: Vec<TemplateVariantDef>,
+}
+
+impl TemplateDef {
+    /// The variant a reference with no `#` selects once built: the one
+    /// declaring `default = true`, or a lone variant. `None` for a base-only
+    /// template, and for declarations §5.1 refuses (several defaults, or
+    /// several variants and no default).
+    pub fn default_variant(&self) -> Option<&TemplateVariantDef> {
+        match self.variants.as_slice() {
+            [] => None,
+            [only] if only.default != Some(false) => Some(only),
+            several => {
+                let mut defaults = several.iter().filter(|v| v.default == Some(true));
+                match (defaults.next(), defaults.next()) {
+                    (Some(d), None) => Some(d),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// The variant declared as `name`.
+    pub fn variant(&self, name: &str) -> Option<&TemplateVariantDef> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+}
+
+/// One `variant "<name>" {}` inside a template definition (§6.6): the steps
+/// that turn the sealed base into this variant, and the hardware its build
+/// boot and its clones run on where it differs from the base's.
+#[derive(Debug, Clone)]
+pub struct TemplateVariantDef {
+    pub name: String,
+    pub span: Span,
+    /// `default = ...` as declared; `None` when absent.
+    pub default: Option<bool>,
+    pub description: Option<String>,
+    /// First-boot wscript for clones of this variant, relative to the
+    /// template root; `None` inherits the template's `first_boot`.
+    pub first_boot: Option<PathBuf>,
+    pub profile: Option<String>,
+    pub cpus: Option<u32>,
+    pub memory: Option<u64>,
+    pub display: Option<String>,
+    pub cpu_model: Option<String>,
+    pub accel: Option<AccelMode>,
+    pub firmware: Option<Firmware>,
+    pub tpm: Option<bool>,
+    pub secure_boot: Option<bool>,
+    /// Replaces the template's `qemu_args` for this variant's build boot.
+    pub qemu_args: Option<Vec<String>>,
+    pub media: Vec<Media>,
+    pub provisions: Vec<Provision>,
+    pub playbooks: Vec<Playbook>,
+    /// Replaces the template's NICs for this variant's build boot when any
+    /// are declared.
+    pub nics: Vec<Nic>,
 }
 
 #[derive(Debug, Clone)]
@@ -921,6 +1090,8 @@ pub fn parse_template_ref(s: &str) -> Result<TemplateRef, String> {
     if s == "scratch" {
         return Ok(TemplateRef::Scratch);
     }
+    let whole = s;
+    let (s, variant) = split_variant(s)?;
     // Registry references contain a registry host (dot or :port before the
     // first slash) — e.g. ghcr.io/owner/name:1.2.
     if let Some((first, _)) = s.split_once('/')
@@ -928,39 +1099,43 @@ pub fn parse_template_ref(s: &str) -> Result<TemplateRef, String> {
     {
         return Ok(TemplateRef::Registry {
             reference: s.to_string(),
+            variant,
         });
     }
     let Some((arch, rest)) = s.split_once('/') else {
         return Err(format!(
-            "malformed template reference `{s}`: expected `<arch>/<name>[@<version>]` — arch is \
-             always explicit (PRD §6.2)"
+            "malformed template reference `{whole}`: expected \
+             `<arch>/<name>[@<version>][#<variant>]` — arch is always explicit (PRD §6.2)"
         ));
     };
     if arch.is_empty() || rest.is_empty() {
-        return Err(format!("malformed template reference `{s}`"));
+        return Err(format!("malformed template reference `{whole}`"));
     }
     if !KNOWN_ARCHES.contains(&arch) {
         return Err(format!(
-            "unknown arch `{arch}` in template reference `{s}` (known: {})",
+            "unknown arch `{arch}` in template reference `{whole}` (known: {})",
             KNOWN_ARCHES.join(", ")
         ));
     }
     let (name, version) = match rest.split_once('@') {
         Some((n, v)) => {
             if v.is_empty() {
-                return Err(format!("malformed template reference `{s}`: empty version"));
+                return Err(format!(
+                    "malformed template reference `{whole}`: empty version"
+                ));
             }
             (n, Some(v.to_string()))
         }
         None => (rest, None),
     };
     if name.is_empty() || name.contains('/') {
-        return Err(format!("malformed template reference `{s}`"));
+        return Err(format!("malformed template reference `{whole}`"));
     }
     Ok(TemplateRef::Store {
         arch: arch.to_string(),
         name: name.to_string(),
         version,
+        variant,
     })
 }
 
@@ -1074,7 +1249,8 @@ mod tests {
             TemplateRef::Store {
                 arch: "x86_64".into(),
                 name: "windows-11".into(),
-                version: Some("26100.1".into())
+                version: Some("26100.1".into()),
+                variant: None,
             }
         );
         assert_eq!(
@@ -1082,7 +1258,8 @@ mod tests {
             TemplateRef::Store {
                 arch: "aarch64".into(),
                 name: "linux-router".into(),
-                version: None
+                version: None,
+                variant: None,
             }
         );
         assert!(matches!(
@@ -1093,6 +1270,98 @@ mod tests {
         assert!(parse_template_ref("windows-11").is_err());
         assert!(parse_template_ref("bogusarch/win").is_err());
         assert!(parse_template_ref("x86_64/win@").is_err());
+    }
+
+    /// `#<variant>` on store and registry refs (§6.6): `#base` is its own
+    /// selector, a bare `#` and a malformed name are refused, and display
+    /// round-trips the text.
+    #[test]
+    fn template_refs_with_variants() {
+        let store = |s: &str| match parse_template_ref(s).unwrap() {
+            TemplateRef::Store {
+                version, variant, ..
+            } => (version, variant),
+            other => panic!("{s}: not a store ref: {other:?}"),
+        };
+        assert_eq!(
+            store("x86_64/windows-11#win3d"),
+            (None, Some(VariantRef::Named("win3d".into())))
+        );
+        assert_eq!(
+            store("x86_64/windows-11@26100.1#standard"),
+            (
+                Some("26100.1".into()),
+                Some(VariantRef::Named("standard".into()))
+            )
+        );
+        assert_eq!(
+            store("x86_64/windows-11#base"),
+            (None, Some(VariantRef::Base))
+        );
+        assert_eq!(store("x86_64/windows-11"), (None, None));
+        // The grammar's edges: one char, 32 chars, digits first, hyphens.
+        assert!(parse_template_ref("x86_64/w#a").is_ok());
+        assert!(parse_template_ref(&format!("x86_64/w#{}", "a".repeat(32))).is_ok());
+        assert!(parse_template_ref("x86_64/w#3d-gpu").is_ok());
+
+        for bad in [
+            "x86_64/w#",
+            "x86_64/w@1#",
+            "x86_64/w@#v",
+            "x86_64/#v",
+            "x86_64/w#Win3d",
+            "x86_64/w#-lead",
+            "x86_64/w#under_score",
+            "x86_64/w#a#b",
+            "x86_64/w#has.dot",
+            "ghcr.io/o/w:1#",
+            "ghcr.io/o/w:1#BAD",
+        ] {
+            assert!(parse_template_ref(bad).is_err(), "expected `{bad}` to fail");
+        }
+        let long = format!("x86_64/w#{}", "a".repeat(33));
+        assert!(parse_template_ref(&long).is_err(), "33 chars");
+        let err = parse_template_ref("x86_64/w#").unwrap_err();
+        assert!(err.contains("empty variant"), "{err}");
+
+        // Registry plus variant: the reference stays bare, the variant apart.
+        assert_eq!(
+            parse_template_ref("ghcr.io/o/win11:26100.1#win3d").unwrap(),
+            TemplateRef::Registry {
+                reference: "ghcr.io/o/win11:26100.1".into(),
+                variant: Some(VariantRef::Named("win3d".into())),
+            }
+        );
+        assert_eq!(
+            parse_template_ref("ghcr.io/o/win11:1#base").unwrap(),
+            TemplateRef::Registry {
+                reference: "ghcr.io/o/win11:1".into(),
+                variant: Some(VariantRef::Base),
+            }
+        );
+
+        for text in [
+            "x86_64/windows-11",
+            "x86_64/windows-11#win3d",
+            "x86_64/windows-11@26100.1#standard",
+            "x86_64/windows-11#base",
+            "ghcr.io/o/win11:26100.1#win3d",
+            "localhost:5000/o/w@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef#extra",
+        ] {
+            assert_eq!(parse_template_ref(text).unwrap().to_string(), text);
+        }
+    }
+
+    /// A variant *name* follows the ref grammar and may not be `base`.
+    #[test]
+    fn variant_names() {
+        assert!(check_variant_name("standard").is_ok());
+        assert!(check_variant_name("win3d").is_ok());
+        let err = check_variant_name("base").unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(check_variant_name("").is_err());
+        assert!(check_variant_name("Standard").is_err());
+        assert!(check_variant_name(&"a".repeat(33)).is_err());
     }
 
     #[test]

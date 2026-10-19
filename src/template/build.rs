@@ -15,7 +15,9 @@ use anyhow::{Context, Result, bail};
 
 use super::meta::TemplateMeta;
 use super::store::{ResolvedTemplate, TemplateStore};
-use crate::config::model::{ArtefactSource, Firmware, TemplateDef, TemplateRef, TemplateSource};
+use crate::config::model::{
+    ArtefactSource, Firmware, TemplateDef, TemplateRef, TemplateSource, TemplateVariantDef,
+};
 use crate::labd::machine::Machine;
 use crate::scripting::OutputSink;
 
@@ -28,26 +30,80 @@ pub type ConsoleReady = Arc<dyn Fn(PathBuf) + Send + Sync>;
 /// per-step progress instead of opaque log lines.
 pub type BuildEvent = Arc<dyn Fn(crate::proto::Event) + Send + Sync>;
 
+/// Asked before a variant's overlay is replaced (§6.6): why the given disks
+/// cannot go — the clones backed by them — or `None` when nothing leans on
+/// them. A clone's data is a delta against the overlay it was made from, so
+/// replacing that overlay underneath it would corrupt it.
+pub type InUse = Arc<
+    dyn Fn(
+            Vec<PathBuf>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Called as each variant's build starts, with the variant's name, so a
+/// build UI can say which one is running.
+pub type VariantStarted = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Which build of a definition [`build_template`] runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildTarget<'a> {
+    /// Pin this version instead of auto-incrementing; with `variants`, the
+    /// installed version to build them onto.
+    pub version: Option<&'a str>,
+    /// Build only these variants onto an installed version (§6.6).
+    pub variants: Option<&'a [String]>,
+}
+
 /// Optional controls supplied by an interactive build caller.
 #[derive(Default)]
 pub struct BuildControl {
     pub console_ready: Option<ConsoleReady>,
     pub on_event: Option<BuildEvent>,
+    pub on_variant: Option<VariantStarted>,
+    pub in_use: Option<InUse>,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Build `def` (from a parsed lab/template file rooted at `root`) and install
 /// the result into `store`. `log` streams progress. The build version is
 /// auto-incremented (PRD §6.4) unless `version_override` pins it.
+///
+/// A definition with variants (§6.6) seals and installs the base, then builds
+/// each variant on it. With `target.variants`, nothing but those variants is
+/// built, onto the newest installed version or the one `target.version`
+/// pins. Either way the answer is the version's metadata as installed.
 pub async fn build_template(
     def: &TemplateDef,
     root: &Path,
     store: &TemplateStore,
     profiles: &crate::profiles::ProfileSet,
     log: OutputSink,
-    version_override: Option<&str>,
+    target: BuildTarget<'_>,
     control: BuildControl,
 ) -> Result<TemplateMeta> {
+    let BuildTarget {
+        version: version_override,
+        variants: only_variants,
+    } = target;
+    // The declaration is checked before anything is fetched or booted: a
+    // base that builds for an hour and then has no default to install its
+    // variants under helps nobody.
+    let order = plan_variants(def, only_variants)?;
+    if only_variants.is_some() {
+        return build_onto_installed(
+            def,
+            root,
+            store,
+            profiles,
+            &log,
+            version_override,
+            &order,
+            &control,
+        )
+        .await;
+    }
     let version = match version_override {
         Some(v) => v.to_string(),
         None => cancelable(&control.cancel, next_version(def, store, &log)).await?,
@@ -79,12 +135,592 @@ pub async fn build_template(
         &log,
         BuildRun {
             version: &version,
-            control,
+            control: &control,
         },
     )
     .await;
     drop(guard); // always clean up the workdir
-    result
+    let meta = result?;
+    if order.is_empty() {
+        return Ok(meta);
+    }
+    build_variants(
+        def,
+        root,
+        store,
+        profiles,
+        &log,
+        &meta.version,
+        &order,
+        &control,
+    )
+    .await?;
+    Ok(store
+        .installed(&meta.arch, &meta.name, &meta.version)?
+        .map(|v| v.meta)
+        .unwrap_or(meta))
+}
+
+/// The variants a build builds, in the order it builds them (§6.6), after
+/// checking the declaration the way §5.1 does — the build reads its file
+/// without the lab validator, so it cannot assume it was checked.
+///
+/// The default variant goes first and the rest follow in declaration order.
+/// A failed variant stops the build with every earlier one installed, and a
+/// version holding two variants but not its default is invalid metadata — so
+/// the default must already be in place before any other lands beside it.
+///
+/// `only` restricts the build to the variants named (`--variant`); each must
+/// be declared.
+fn plan_variants<'d>(
+    def: &'d TemplateDef,
+    only: Option<&[String]>,
+) -> Result<Vec<&'d TemplateVariantDef>> {
+    let reference = format!("{}/{}", def.arch, def.name);
+    if def.variants.is_empty() {
+        if only.is_some() {
+            bail!("template {reference} declares no variants, so `--variant` has nothing to build");
+        }
+        return Ok(Vec::new());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for v in &def.variants {
+        crate::config::model::check_variant_name(&v.name)
+            .map_err(|why| anyhow::anyhow!("template {reference} variant \"{}\": {why}", v.name))?;
+        if !seen.insert(v.name.as_str()) {
+            bail!("template {reference} declares variant \"{}\" twice", v.name);
+        }
+    }
+    let default = def.default_variant().with_context(|| {
+        format!(
+            "template {reference} declares {} variants but not exactly one with default = true — \
+             mark the one a reference with no `#` selects",
+            def.variants.len()
+        )
+    })?;
+    let wanted = |v: &TemplateVariantDef| only.is_none_or(|names| names.contains(&v.name));
+    if let Some(names) = only {
+        if names.is_empty() {
+            bail!("`--variant` names no variant");
+        }
+        for n in names {
+            if def.variant(n).is_none() {
+                bail!(
+                    "template {reference} declares no variant `{n}` (its variants: {})",
+                    def.variants
+                        .iter()
+                        .map(|v| v.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
+    Ok(std::iter::once(default)
+        .filter(|d| wanted(d))
+        .chain(
+            def.variants
+                .iter()
+                .filter(|v| v.name != default.name && wanted(v)),
+        )
+        .collect())
+}
+
+/// `--variant`: build only `order` onto an installed version — the newest,
+/// or the one `version` pins — leaving the base and every other variant as
+/// they are.
+#[allow(clippy::too_many_arguments)]
+async fn build_onto_installed(
+    def: &TemplateDef,
+    root: &Path,
+    store: &TemplateStore,
+    profiles: &crate::profiles::ProfileSet,
+    log: &OutputSink,
+    version: Option<&str>,
+    order: &[&TemplateVariantDef],
+    control: &BuildControl,
+) -> Result<TemplateMeta> {
+    let base = store
+        .resolve_version(&def.arch, &def.name, version)
+        .with_context(|| {
+            format!(
+                "cannot build variants of {}/{}: its base is not in the store — build the template \
+             first",
+                def.arch, def.name
+            )
+        })?;
+    check_default_survives(def, &base.meta, order)?;
+    build_variants(
+        def,
+        root,
+        store,
+        profiles,
+        log,
+        &base.meta.version,
+        order,
+        control,
+    )
+    .await?;
+    Ok(store
+        .installed(&def.arch, &def.name, &base.meta.version)?
+        .map(|v| v.meta)
+        .unwrap_or(base.meta))
+}
+
+/// Refuse a `--variant` build that would leave a version with several
+/// variants and no default (§6.6): one adding a variant beside another while
+/// the declared default is in neither the store nor the build.
+fn check_default_survives(
+    def: &TemplateDef,
+    installed: &TemplateMeta,
+    order: &[&TemplateVariantDef],
+) -> Result<()> {
+    let Some(default) = def.default_variant() else {
+        return Ok(());
+    };
+    let mut after: Vec<&str> = installed.variants.iter().map(|v| v.name.as_str()).collect();
+    for v in order {
+        if !after.contains(&v.name.as_str()) {
+            after.push(&v.name);
+        }
+    }
+    // A block is installed default only when it is the definition's default,
+    // and taking the default clears it elsewhere; so the store's default
+    // moves only by building the declared one. Rebuilding the store's
+    // default while the definition names another would leave none.
+    if let Some(current) = installed.default_variant()
+        && current.name != default.name
+        && !order.iter().any(|v| v.name == default.name)
+        && after.len() > 1
+    {
+        bail!(
+            "{}/{}@{} has default variant `{}` but the definition names `{}` — include it to move \
+             the default: `--variant {},{}`",
+            installed.arch,
+            installed.name,
+            installed.version,
+            current.name,
+            default.name,
+            default.name,
+            order
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    if after.len() > 1 && !after.contains(&default.name.as_str()) {
+        bail!(
+            "{}/{}@{} would hold variants {} but not its default `{}`, which is not installed — \
+             include it: `--variant {},{}`",
+            installed.arch,
+            installed.name,
+            installed.version,
+            after.join(", "),
+            default.name,
+            default.name,
+            order
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    Ok(())
+}
+
+/// Build `order` onto `<arch>/<name>@<version>` one at a time. The first
+/// failure stops it, naming the variant; the base and every variant
+/// installed before it stay installed.
+#[allow(clippy::too_many_arguments)]
+async fn build_variants(
+    def: &TemplateDef,
+    root: &Path,
+    store: &TemplateStore,
+    profiles: &crate::profiles::ProfileSet,
+    log: &OutputSink,
+    version: &str,
+    order: &[&TemplateVariantDef],
+    control: &BuildControl,
+) -> Result<()> {
+    let default = def
+        .default_variant()
+        .context("a template with variants has a default (checked by the plan)")?
+        .name
+        .clone();
+    let total = order.len();
+    for (i, v) in order.iter().enumerate() {
+        if control.cancel.is_cancelled() {
+            bail!("build cancelled");
+        }
+        let base = store
+            .installed(&def.arch, &def.name, version)?
+            .with_context(|| format!("{}/{}@{version} left the store", def.arch, def.name))?;
+        let reference = format!("{}#{}", base.reference(), v.name);
+        log(format!(
+            "building variant {reference} ({}/{total})\n",
+            i + 1
+        ));
+        if let Some(started) = &control.on_variant {
+            started(&v.name);
+        }
+        // A rebuild replaces the overlay, and a clone of it is a delta
+        // against the bytes being replaced: refuse before booting anything.
+        let installed = base.variant_disk(&v.name);
+        if installed.is_file() {
+            refuse_in_use(control, &installed, &base.reference(), &v.name).await?;
+        }
+        let work = builds_dir().join(format!(
+            "{}-{}-{}-variant-{}",
+            def.arch, def.name, def.version, v.name
+        ));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
+        let guard = WorkdirGuard(work.clone());
+        let built = build_variant(
+            def,
+            v,
+            root,
+            &work,
+            store,
+            profiles,
+            log,
+            VariantRun {
+                base: &base,
+                default: &default,
+                control,
+            },
+        )
+        .await;
+        drop(guard);
+        built.with_context(|| {
+            format!(
+                "variant `{}` failed to build — the base and every variant installed before it \
+                 are kept; rebuild it with `vmlab template build {} --variant {}`",
+                v.name, def.name, v.name
+            )
+        })?;
+        log(format!("installed {reference}\n"));
+    }
+    Ok(())
+}
+
+struct VariantRun<'a> {
+    /// The installed version the variant is built on.
+    base: &'a super::store::TemplateVersion,
+    /// The variant the definition marks as default.
+    default: &'a str,
+    control: &'a BuildControl,
+}
+
+/// Build one variant (§6.6): boot a linked overlay on the sealed base with
+/// the variant's effective hardware, run its steps, shut down gracefully,
+/// point the overlay's backing file at `../../disk.qcow2`, hash it, and
+/// install it with its block.
+#[allow(clippy::too_many_arguments)]
+async fn build_variant(
+    def: &TemplateDef,
+    v: &TemplateVariantDef,
+    root: &Path,
+    work: &Path,
+    store: &TemplateStore,
+    profiles: &crate::profiles::ProfileSet,
+    log: &OutputSink,
+    run: VariantRun<'_>,
+) -> Result<()> {
+    let base = run.base;
+    let control = run.control;
+    let base_sha = base.meta.sha256.clone().with_context(|| {
+        format!(
+            "{} records no sha256 for its base disk, so no variant built on it could be vouched for",
+            base.reference()
+        )
+    })?;
+    let build_vm = "build";
+    let hw = EffectiveHardware::for_variant(v, &base.meta);
+    let spec = BuildSpec::variant(def, v, base.meta.disk);
+    check_spec_hardware(def, &spec, &hw, build_vm, root, profiles)?;
+
+    let installed = base.variant_disk(&v.name);
+
+    let wants_agent = wants_agent(def, &hw, profiles);
+    let staged: Option<Arc<super::bootstrap::StagedGuestIso>> = if wants_agent {
+        Some(Arc::new(super::bootstrap::stage_guest_iso_dir(
+            work, &def.arch,
+        )?))
+    } else {
+        None
+    };
+
+    let lab_name = build_lab_name(def);
+    // No bootstrap ISO: the base already carries the agent it was sealed
+    // with, and the staged copy is only what its handshake is checked
+    // against.
+    let lab_wcl = synth_spec_lab(
+        &spec,
+        &hw,
+        &lab_name,
+        build_vm,
+        root,
+        BuildBoot::Install {
+            cdrom: None,
+            guest_iso: None,
+        },
+    )?;
+    std::fs::write(work.join("vmlab.wcl"), &lab_wcl)?;
+    let labfile = crate::config::load_lab_source(&lab_wcl, "<variant build>", work)
+        .map_err(|e| anyhow::anyhow!("internal variant build lab invalid: {e:?}"))?;
+    let (events_tx, _) = tokio::sync::broadcast::channel::<crate::proto::Event>(256);
+    bridge_playbook_events(&events_tx, control.on_event.clone());
+    let event_log = Arc::new(crate::labd::events::EventLog::new(&lab_name, events_tx)?);
+    let runtime = cancelable(
+        &control.cancel,
+        crate::labd::lab::LabRuntime::build(labfile, event_log, profiles),
+    )
+    .await?;
+    let vm = runtime.vm(build_vm)?;
+    runtime
+        .provisions_wait_ready
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    runtime
+        .agent_updates
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // The base boots an installed OS whose agent answers promptly, as a
+    // layered source does: verify it before the variant's first step.
+    let agent_version: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    {
+        let wants_agent = def.agent;
+        let staged = staged.clone();
+        let agent_version = agent_version.clone();
+        *runtime.pre_provision.write().expect("pre_provision lock") =
+            Some(Arc::new(move |machine, out| {
+                let staged = staged.clone();
+                let agent_version = agent_version.clone();
+                Box::pin(async move {
+                    let log = move |s: String| out(s);
+                    let version = super::agent_install::verify(
+                        &machine,
+                        wants_agent,
+                        staged.as_deref(),
+                        std::time::Duration::from_secs(600),
+                        &log,
+                    )
+                    .await?;
+                    *agent_version.lock().expect("agent_version lock") = version;
+                    Ok(())
+                })
+            }));
+    }
+    // The build boot of a variant runs no first-boot script — not the
+    // variant's, not the template's. The base was sealed without being
+    // generalized (no sysprep), so it has no machine identity left to
+    // specialize; the first-boot script belongs to the variant's clones,
+    // which are. The scratch build VM carries none, and nothing sets one.
+
+    let disk0 = vm.dirs.primary_disk();
+    std::fs::create_dir_all(disk0.parent().expect("a disk has a parent"))?;
+    cancelable(
+        &control.cancel,
+        super::qimg::create_linked_clone(&base.disk_path, &disk0),
+    )
+    .await?;
+
+    log(format!("booting variant build VM ({})\n", v.name));
+    if def.gui {
+        crate::viewer::open_when_ready(vm.dirs.vnc_sock());
+    }
+    let console_watch = control.console_ready.clone().map(|ready| {
+        let sock = vm.dirs.vnc_sock();
+        tokio::spawn(async move {
+            loop {
+                if sock.exists() {
+                    ready(sock);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+    });
+    let up_result = tokio::select! {
+        result = runtime.up(&[], log.clone()) => Some(result),
+        () = control.cancel.cancelled() => None,
+    };
+    if let Some(watch) = console_watch {
+        watch.abort();
+    }
+    let sealed = async {
+        match up_result {
+            Some(result) => result.context("variant build boot/provision failed")?,
+            None => bail!("build cancelled"),
+        }
+        log("sealing variant: graceful shutdown\n".to_string());
+        vm.stop(false)
+            .await
+            .context("variant build VM did not shut down")?;
+        vm.wait_state(
+            crate::labd::vm::PowerState::Stopped,
+            std::time::Duration::from_secs(120),
+        )
+        .await?;
+        Ok(())
+    };
+    if let Err(e) = sealed.await {
+        let _ = runtime.down(&[], true).await;
+        return Err(e);
+    }
+    if control.cancel.is_cancelled() {
+        bail!("build cancelled");
+    }
+    let events = runtime.events.clone();
+    drop(runtime);
+
+    // The overlay was written against the base by its absolute path; the
+    // store keeps it beside the base and must survive being moved, so the
+    // reference becomes relative. `-u`: the bytes behind it are the same.
+    super::qimg::rebase_unsafe(&disk0, super::store::VARIANT_BACKING).await?;
+    let sha = super::store::sha256_file(&disk0).context("hashing the variant overlay")?;
+    let first_boot = v.first_boot.as_ref().or(def.first_boot.as_ref());
+    let first_boot_script = match first_boot {
+        Some(path) => {
+            let full = root.join(path);
+            Some(
+                std::fs::read_to_string(&full)
+                    .with_context(|| format!("reading first-boot script {}", full.display()))?,
+            )
+        }
+        None => None,
+    };
+    let mut meta = variant_meta(
+        v,
+        VariantImage {
+            sha256: sha,
+            base_sha256: base_sha,
+            first_boot_script,
+            agent_version: agent_version.lock().expect("agent_version lock").clone(),
+        },
+    );
+    // Checked again at the swap (first by the caller, before the boot): a
+    // clone made while the variant was building is backed by the overlay
+    // about to be replaced.
+    if installed.is_file() {
+        refuse_in_use(control, &installed, &base.reference(), &v.name).await?;
+    }
+    // The store's own installer takes a staged `variants/<name>/disk.qcow2`,
+    // checks the digest, the base and the relative backing, moves it in and
+    // merges the block — overlay first, block after. A default block takes
+    // the default from whichever variant held it.
+    meta.default = v.name == run.default;
+    install_built_variant(store, base, &disk0, &work.join("variant-staging"), &meta)
+        .context("installing the variant into the store")?;
+    events.emit(
+        "template.built",
+        serde_json::json!({
+            "arch": base.meta.arch, "name": base.meta.name, "version": base.meta.version,
+            "variant": v.name,
+        }),
+    );
+    Ok(())
+}
+
+/// Stage a built overlay as `<staging>/variants/<name>/disk.qcow2` and hand
+/// it to the store, which verifies its digest, its base and its relative
+/// backing file before moving it in and merging `meta` into `template.wcl`.
+/// A refusal leaves the store as it was.
+fn install_built_variant(
+    store: &TemplateStore,
+    base: &super::store::TemplateVersion,
+    overlay: &Path,
+    staging: &Path,
+    meta: &super::meta::VariantMeta,
+) -> Result<TemplateMeta> {
+    let staged = staging.join(super::meta::variant_disk_rel(&meta.name));
+    std::fs::create_dir_all(staged.parent().expect("a disk has a parent"))?;
+    std::fs::rename(overlay, &staged).with_context(|| format!("staging {}", overlay.display()))?;
+    store.add_variants(
+        &base.meta.arch,
+        &base.meta.name,
+        &base.meta.version,
+        staging,
+        std::slice::from_ref(meta),
+    )
+}
+
+/// Refuse to replace `disk` while the caller's in-use check names a clone
+/// backed by it.
+async fn refuse_in_use(
+    control: &BuildControl,
+    disk: &Path,
+    reference: &str,
+    variant: &str,
+) -> Result<()> {
+    if let Some(in_use) = &control.in_use
+        && let Some(why) = in_use(vec![disk.to_path_buf()]).await
+    {
+        bail!(
+            "refusing to rebuild {reference}#{variant}: {why} — rebuilding replaces the disk a \
+             clone is a delta against; destroy those machines first"
+        );
+    }
+    Ok(())
+}
+
+/// Facts about a built variant overlay that only exist once it has run.
+struct VariantImage {
+    sha256: String,
+    base_sha256: String,
+    first_boot_script: Option<String>,
+    agent_version: Option<String>,
+}
+
+/// The block a built variant installs (§6.6). Hardware is what the variant
+/// block declares and nothing else — an absent field inherits the base's at
+/// resolution, so a variant follows the base it was built on. `default` is
+/// left for the store to set from the definition at install.
+fn variant_meta(v: &TemplateVariantDef, image: VariantImage) -> super::meta::VariantMeta {
+    super::meta::VariantMeta {
+        name: v.name.clone(),
+        default: false,
+        created: chrono::Utc::now(),
+        sha256: image.sha256,
+        base_sha256: image.base_sha256,
+        description: v.description.clone(),
+        first_boot_script: image.first_boot_script,
+        agent_version: image.agent_version,
+        wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+        profile: v.profile.clone(),
+        cpus: v.cpus,
+        memory: v.memory,
+        firmware: v.firmware.map(|f| f.as_str().to_string()),
+        tpm: v.tpm,
+        secure_boot: v.secure_boot,
+        display: v.display.clone(),
+        cpu_model: v.cpu_model.clone(),
+        accel: v.accel,
+    }
+}
+
+/// Forward the synthetic build lab's `playbook.*` events — config-weave's
+/// step stream — to the caller, who would otherwise never see them.
+fn bridge_playbook_events(
+    events_tx: &tokio::sync::broadcast::Sender<crate::proto::Event>,
+    on_event: Option<BuildEvent>,
+) {
+    let Some(on_event) = on_event else { return };
+    let mut rx = events_tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    if ev.event.starts_with("playbook.") {
+                        on_event(ev);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// Pick the next build version (PRD §6.4). The declared `version` is a fixed
@@ -265,22 +901,7 @@ async fn run_build(
     // playbook engine narrates step progress as `playbook.op.*` (incl. the
     // raw config-weave ndjson on `playbook.op.step`), which would otherwise
     // be discarded with this receiver.
-    if let Some(on_event) = run.control.on_event.clone() {
-        let mut rx = events_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        if ev.event.starts_with("playbook.") {
-                            on_event(ev);
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
+    bridge_playbook_events(&events_tx, run.control.on_event.clone());
     let event_log = Arc::new(crate::labd::events::EventLog::new(&lab_name, events_tx)?);
     let runtime = cancelable(
         &run.control.cancel,
@@ -385,6 +1006,7 @@ async fn run_build(
             disk_size: parts.disk_size,
             first_boot: Some(first_boot),
             agent_version: parts.agent_version.clone(),
+            variant: parts.variant.clone(),
         });
     }
 
@@ -423,7 +1045,7 @@ async fn run_build(
     if def.gui {
         crate::viewer::open_when_ready(vm.dirs.vnc_sock());
     }
-    let console_watch = run.control.console_ready.map(|ready| {
+    let console_watch = run.control.console_ready.clone().map(|ready| {
         let sock = vm.dirs.vnc_sock();
         tokio::spawn(async move {
             loop {
@@ -603,7 +1225,7 @@ async fn run_build(
     // Embed the first-boot provision script (run on first instantiation, before
     // ready). It rides in the metadata, so the file is read relative to the
     // template root and baked in here (PRD §6.1).
-    let first_boot_script = match &def.first_boot {
+    let first_boot_script = match base_first_boot(def) {
         Some(path) => {
             let full = root.join(path);
             Some(
@@ -641,6 +1263,14 @@ async fn run_build(
     Ok(meta)
 }
 
+/// The first-boot script the base's own metadata embeds: the template's
+/// `first_boot` — except on a template with variants, whose base is unsealed
+/// and never cloned by a lab; there the template's `first_boot` is each
+/// variant's to inherit (§6.6).
+fn base_first_boot(def: &TemplateDef) -> Option<&PathBuf> {
+    def.first_boot.as_ref().filter(|_| def.variants.is_empty())
+}
+
 enum SeedDisk {
     Blank(u64),
     CopyFrom(PathBuf),
@@ -648,7 +1278,7 @@ enum SeedDisk {
 
 struct BuildRun<'a> {
     version: &'a str,
-    control: BuildControl,
+    control: &'a BuildControl,
 }
 
 async fn cancelable<T, E>(
@@ -719,26 +1349,63 @@ impl EffectiveHardware {
     /// Merge the template block over `source` — the recorded metadata of the
     /// template a layered build layers on, `None` for every other source kind.
     fn resolve(def: &TemplateDef, source: Option<&TemplateMeta>) -> Self {
+        Self::declared(def).over(source)
+    }
+
+    /// A variant's build hardware (§6.6): what the variant block declares over
+    /// what its sealed base recorded — the same two-layer merge, with the base
+    /// as the source. `secure_boot = false` on the variant reaches its build
+    /// boot, not just its metadata.
+    fn for_variant(v: &TemplateVariantDef, base: &TemplateMeta) -> Self {
+        Self {
+            profile: v.profile.clone(),
+            cpus: v.cpus,
+            memory: v.memory,
+            firmware: v.firmware,
+            tpm: v.tpm,
+            secure_boot: v.secure_boot,
+            display: v.display.clone(),
+            cpu_model: v.cpu_model.clone(),
+            accel: v.accel,
+        }
+        .over(Some(base))
+    }
+
+    /// Exactly what a template block declares, nothing inherited.
+    fn declared(def: &TemplateDef) -> Self {
+        Self {
+            profile: def.profile.clone(),
+            cpus: def.cpus,
+            memory: def.memory,
+            firmware: def.firmware,
+            tpm: def.tpm,
+            secure_boot: def.secure_boot,
+            display: def.display.clone(),
+            cpu_model: def.cpu_model.clone(),
+            accel: def.accel,
+        }
+    }
+
+    /// This layer over `source`'s recorded hardware: each field this layer
+    /// leaves unset is taken from the source, the firmware pair as a pair.
+    fn over(self, source: Option<&TemplateMeta>) -> Self {
         let (source_firmware, source_secure_boot) = source_firmware(source);
         Self {
-            profile: def
+            profile: self
                 .profile
-                .clone()
                 .or_else(|| source.and_then(|m| m.profile.clone())),
-            cpus: def.cpus.or_else(|| source.and_then(|m| m.cpus)),
-            memory: def.memory.or_else(|| source.and_then(|m| m.memory)),
-            firmware: def.firmware.or(source_firmware),
-            tpm: def.tpm.or_else(|| source.and_then(|m| m.tpm)),
-            secure_boot: def.secure_boot.or(source_secure_boot),
-            display: def
+            cpus: self.cpus.or_else(|| source.and_then(|m| m.cpus)),
+            memory: self.memory.or_else(|| source.and_then(|m| m.memory)),
+            firmware: self.firmware.or(source_firmware),
+            tpm: self.tpm.or_else(|| source.and_then(|m| m.tpm)),
+            secure_boot: self.secure_boot.or(source_secure_boot),
+            display: self
                 .display
-                .clone()
                 .or_else(|| source.and_then(|m| m.display.clone())),
-            cpu_model: def
+            cpu_model: self
                 .cpu_model
-                .clone()
                 .or_else(|| source.and_then(|m| m.cpu_model.clone())),
-            accel: def.accel.or_else(|| source.and_then(|m| m.accel)),
+            accel: self.accel.or_else(|| source.and_then(|m| m.accel)),
         }
     }
 
@@ -794,13 +1461,30 @@ fn resolve_layered_source(
         arch,
         name,
         version,
+        variant,
     } = from
     else {
         bail!("layered build source must be a store reference");
     };
-    let resolved = store
-        .resolve(arch, name, version.as_deref())
+    // A layered `from` is a build context: `#base` names the base (§6.6).
+    let mut resolved = store
+        .resolve(
+            arch,
+            name,
+            version.as_deref(),
+            variant.as_ref(),
+            crate::template::store::Purpose::Build,
+        )
         .context("resolving layered build source")?;
+    // `#base` seeds from the unsealed base of a template with variants, which
+    // was never generalized: there is nothing for a first-boot script to
+    // specialize, and on such a template the base carries none anyway. A
+    // base-only template's `#base` is the same — the explicit spelling asks
+    // for the disk alone. No `#`, or `#<variant>`, runs the selected disk's own
+    // (effective) script.
+    if matches!(variant, Some(crate::config::model::VariantRef::Base)) {
+        resolved.meta.first_boot_script = None;
+    }
     // The source's first-boot provision runs on the build boot; refuse a
     // surface this host cannot compile before anything is fetched or booted.
     if let Some(script) = resolved.meta.first_boot() {
@@ -842,12 +1526,23 @@ fn check_build_hardware(
     root: &Path,
     profiles: &crate::profiles::ProfileSet,
 ) -> Result<()> {
-    // Hardware-only probe: the bare variant carries none of the build-time
+    check_spec_hardware(def, &BuildSpec::base(def), hw, build_vm, root, profiles)
+}
+
+fn check_spec_hardware(
+    def: &TemplateDef,
+    spec: &BuildSpec<'_>,
+    hw: &EffectiveHardware,
+    build_vm: &str,
+    root: &Path,
+    profiles: &crate::profiles::ProfileSet,
+) -> Result<()> {
+    // Hardware-only probe: the bare render carries none of the build-time
     // attachments (extra disks, media, steps), and none of them can change the
     // hardware this resolves. Its own source label, so an issue reported
     // against the render names the render that produced it.
     let lab_name = build_lab_name(def);
-    let wcl = synth_lab(def, hw, &lab_name, build_vm, root, BuildBoot::Bare)?;
+    let wcl = synth_spec_lab(spec, hw, &lab_name, build_vm, root, BuildBoot::Bare)?;
     let labfile = crate::config::load_lab_source(&wcl, "<preflight>", root)
         .map_err(|e| anyhow::anyhow!("internal build lab invalid: {e:?}"))?;
     let vm = labfile
@@ -909,6 +1604,8 @@ fn seal_meta(
         first_boot_script: image.first_boot_script,
         agent_version: image.agent_version,
         wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+        variants_expected: !def.variants.is_empty(),
+        variants: Vec::new(),
     }
 }
 
@@ -974,6 +1671,77 @@ fn synth_lab(
     root: &Path,
     boot: BuildBoot<'_>,
 ) -> Result<String> {
+    synth_spec_lab(&BuildSpec::base(def), hw, lab_name, vm, root, boot)
+}
+
+/// What a build VM is rendered from besides its hardware: the template's own
+/// attachments and steps for the base build, a variant's for a variant build
+/// (§6.6). Both describe one machine of one architecture.
+struct BuildSpec<'a> {
+    arch: &'a str,
+    /// The primary disk's size. A variant build boots an overlay that already
+    /// has the base's size, so this only has to agree with it.
+    disk: u64,
+    gui: bool,
+    nested: bool,
+    qemu_args: &'a [String],
+    nics: &'a [crate::config::model::Nic],
+    extra_disks: &'a [crate::config::model::DiskBlock],
+    media: &'a [crate::config::model::Media],
+    provisions: &'a [crate::config::model::Provision],
+    playbooks: &'a [crate::config::model::Playbook],
+}
+
+impl<'a> BuildSpec<'a> {
+    /// The base build: everything the template block declares.
+    fn base(def: &'a TemplateDef) -> Self {
+        Self {
+            arch: &def.arch,
+            disk: def.disk.unwrap_or(20 << 30),
+            gui: def.gui,
+            nested: def.nested,
+            qemu_args: &def.qemu_args,
+            nics: &def.nics,
+            extra_disks: &def.extra_disks,
+            media: &def.media,
+            provisions: &def.provisions,
+            playbooks: &def.playbooks,
+        }
+    }
+
+    /// A variant's build on the sealed base, `base_disk` bytes big: the
+    /// variant's own media and steps, its `qemu_args` and NICs where it
+    /// declares them and the template's where it does not. The template's
+    /// extra disks are build-time scratch for the base install and do not
+    /// carry over; neither does its media — the installer's, by and large.
+    fn variant(def: &'a TemplateDef, v: &'a TemplateVariantDef, base_disk: Option<u64>) -> Self {
+        Self {
+            arch: &def.arch,
+            disk: base_disk.or(def.disk).unwrap_or(20 << 30),
+            gui: def.gui,
+            nested: def.nested,
+            qemu_args: v.qemu_args.as_deref().unwrap_or(&def.qemu_args),
+            nics: if v.nics.is_empty() {
+                &def.nics
+            } else {
+                &v.nics
+            },
+            extra_disks: &[],
+            media: &v.media,
+            provisions: &v.provisions,
+            playbooks: &v.playbooks,
+        }
+    }
+}
+
+fn synth_spec_lab(
+    def: &BuildSpec<'_>,
+    hw: &EffectiveHardware,
+    lab_name: &str,
+    vm: &str,
+    root: &Path,
+    boot: BuildBoot<'_>,
+) -> Result<String> {
     use std::fmt::Write;
     let (cdrom, guest_iso) = match boot {
         BuildBoot::Install { cdrom, guest_iso } => (cdrom, guest_iso),
@@ -1003,12 +1771,11 @@ fn synth_lab(
     writeln!(s, "lab {} {{", wcl_str(lab_name)).unwrap();
     writeln!(s, "  vm {} {{", wcl_str(vm)).unwrap();
     writeln!(s, "    template = \"scratch\"").unwrap();
-    writeln!(s, "    arch     = {}", wcl_str(&def.arch)).unwrap();
+    writeln!(s, "    arch     = {}", wcl_str(def.arch)).unwrap();
     writeln!(s, "    profile  = {}", wcl_str(hw.profile_or_default())).unwrap();
     // Bare integers: `disk`/`memory` are std.ByteSize in the schema, which
     // takes byte counts or size literals — never quoted strings.
-    let disk = def.disk.unwrap_or(20 << 30);
-    writeln!(s, "    disk     = {disk}").unwrap();
+    writeln!(s, "    disk     = {}", def.disk).unwrap();
     if let Some(cpus) = cpus {
         writeln!(s, "    cpus     = {cpus}").unwrap();
     }
@@ -1063,7 +1830,7 @@ fn synth_lab(
     if def.nics.is_empty() {
         writeln!(s, "    nic {{ nat = true }}").unwrap();
     } else {
-        for n in &def.nics {
+        for n in def.nics {
             let mut attrs = String::from("nat = true");
             if let Some(mac) = &n.mac {
                 write!(attrs, " mac = {}", wcl_str(mac)).unwrap();
@@ -1080,7 +1847,7 @@ fn synth_lab(
         // build" (schema) — build-time scratch a provision can write to, gone
         // once the primary disk is sealed and moved into the store (§6.1).
         // `from` folders rebase absolute against the template root, like media.
-        for d in &def.extra_disks {
+        for d in def.extra_disks {
             write!(s, "    disk {} {{", wcl_str(&d.name)).unwrap();
             if let Some(size) = d.size {
                 write!(s, " size = {size}").unwrap();
@@ -1091,7 +1858,7 @@ fn synth_lab(
             writeln!(s, " }}").unwrap();
         }
         // Media: driver/answer-file ISOs and floppies built from folders (§6.3).
-        for m in &def.media {
+        for m in def.media {
             let kind = match m.kind {
                 crate::config::model::MediaKind::Iso => "iso",
                 crate::config::model::MediaKind::Floppy => "floppy",
@@ -1279,6 +2046,8 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
+            variants: Vec::new(),
         }
     }
 
@@ -2093,14 +2862,14 @@ mod tests {
         std::fs::write(staging.path().join(DISK_FILE), b"").unwrap();
         let mut meta = source_meta();
         meta.first_boot_script = Some("use vmlab\nfn main(lab: Lab) {}\n".into());
-        meta.wscript_surface = Some(3.into());
+        meta.wscript_surface = Some(4.into());
         store.install(&staging.keep(), &meta, false).unwrap();
 
         let err = super::resolve_layered_source(&layered(""), &store).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "template `x86_64/win11@26100.1` records wscript surface 3, newer than this host's \
-             2; upgrade vmlab to use it"
+            "template `x86_64/win11@26100.1` records wscript surface 4, newer than this host's \
+             3; upgrade vmlab to use it"
         );
 
         meta.wscript_surface = Some(crate::scripting::WSCRIPT_SURFACE_VERSION);
@@ -2149,5 +2918,648 @@ mod tests {
         // …as does a source that records nothing (the default floor).
         let d = layered("");
         assert!(super::wants_agent(&d, &hw(&d), &profiles));
+    }
+
+    // ---- variants (§6.6) ----------------------------------------------------
+
+    /// A template with variants, as SPEC.md's Windows example declares it.
+    fn with_variants(variants: &str) -> crate::config::model::TemplateDef {
+        def(&format!(
+            "import <vmlab.wcl>\n\
+             template \"win\" {{ arch = \"x86_64\" version = \"1\" disk = 1GiB\n\
+             \x20 first_boot = \"scripts/firstboot.ws\"\n\
+             \x20 source \"iso\" {{ path = \"/i.iso\" }}\n\
+             \x20 media {{ kind = \"iso\" from = \"/drivers\" }}\n\
+             \x20 disk \"scratch\" {{ size = 1GiB }}\n\
+             \x20 provision \"scripts/install.ws\" {{ }}\n\
+             {variants}\n\
+             }}\n"
+        ))
+    }
+
+    fn names(order: &[&crate::config::model::TemplateVariantDef]) -> Vec<String> {
+        order.iter().map(|v| v.name.clone()).collect()
+    }
+
+    /// The default is built first, the rest in declaration order — a failure
+    /// then never leaves two variants installed without their default.
+    #[test]
+    fn variants_build_default_first_then_in_declaration_order() {
+        let d = with_variants(
+            r#"variant "win3d" { } variant "standard" { default = true } variant "extra" { }"#,
+        );
+        let order = super::plan_variants(&d, None).unwrap();
+        assert_eq!(names(&order), ["standard", "win3d", "extra"]);
+        // Base-only: nothing to plan.
+        let plain = def(r#"import <vmlab.wcl>
+               template "p" { arch = "x86_64" version = "1" source "iso" { path = "/i.iso" } }"#);
+        assert!(super::plan_variants(&plain, None).unwrap().is_empty());
+    }
+
+    /// `--variant` builds only what it names, each of which must be declared,
+    /// and a definition without variants has nothing for it.
+    #[test]
+    fn only_the_named_variants_are_targeted() {
+        let d = with_variants(
+            r#"variant "standard" { default = true } variant "win3d" { } variant "extra" { }"#,
+        );
+        let only = ["extra".to_string(), "standard".to_string()];
+        let order = super::plan_variants(&d, Some(&only)).unwrap();
+        assert_eq!(names(&order), ["standard", "extra"]);
+        let only = ["win3d".to_string()];
+        assert_eq!(
+            names(&super::plan_variants(&d, Some(&only)).unwrap()),
+            ["win3d"]
+        );
+
+        let err = super::plan_variants(&d, Some(&["nope".to_string()])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "template x86_64/win declares no variant `nope` (its variants: standard, win3d, extra)"
+        );
+        let plain = def(r#"import <vmlab.wcl>
+               template "p" { arch = "x86_64" version = "1" source "iso" { path = "/i.iso" } }"#);
+        let err = super::plan_variants(&plain, Some(&["a".to_string()])).unwrap_err();
+        assert!(err.to_string().contains("declares no variants"), "{err}");
+    }
+
+    /// The build reads its file without the lab validator, so it refuses a
+    /// declaration §5.1 would have.
+    #[test]
+    fn the_build_refuses_a_declaration_without_one_default() {
+        let d = with_variants(r#"variant "a" { } variant "b" { }"#);
+        let err = super::plan_variants(&d, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not exactly one with default = true"),
+            "{err}"
+        );
+        let d = with_variants(r#"variant "base" { }"#);
+        assert!(
+            super::plan_variants(&d, None)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+        let d = with_variants(r#"variant "a" { default = true } variant "a" { }"#);
+        assert!(
+            super::plan_variants(&d, None)
+                .unwrap_err()
+                .to_string()
+                .contains("twice")
+        );
+    }
+
+    /// A `--variant` build that would leave several variants installed and
+    /// none of them the default is refused before anything boots.
+    #[test]
+    fn a_targeted_build_keeps_a_default_installed() {
+        let d = with_variants(
+            r#"variant "standard" { default = true } variant "win3d" { } variant "extra" { }"#,
+        );
+        let mut installed = source_meta();
+        let order =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| s.to_string()).collect() };
+
+        // Nothing installed: one variant alone is its own default.
+        let only = order(&["win3d"]);
+        let plan = super::plan_variants(&d, Some(&only)).unwrap();
+        super::check_default_survives(&d, &installed, &plan).unwrap();
+
+        // win3d installed, adding extra without standard: refused.
+        installed.variants = vec![crate::template::meta::VariantMeta {
+            name: "win3d".into(),
+            default: false,
+            created: "2026-01-02T03:04:05Z".parse().unwrap(),
+            sha256: "cd".repeat(32),
+            base_sha256: "ab".repeat(32),
+            description: None,
+            first_boot_script: None,
+            agent_version: None,
+            wscript_surface: None,
+            profile: None,
+            cpus: None,
+            memory: None,
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            cpu_model: None,
+            accel: None,
+        }];
+        let only = order(&["extra"]);
+        let plan = super::plan_variants(&d, Some(&only)).unwrap();
+        let err = super::check_default_survives(&d, &installed, &plan).unwrap_err();
+        assert!(
+            err.to_string().contains("`--variant standard,extra`"),
+            "{err}"
+        );
+        // …and allowed with the default in the build, or rebuilding win3d alone.
+        let only = order(&["extra", "standard"]);
+        let plan = super::plan_variants(&d, Some(&only)).unwrap();
+        super::check_default_survives(&d, &installed, &plan).unwrap();
+        let only = order(&["win3d"]);
+        let plan = super::plan_variants(&d, Some(&only)).unwrap();
+        super::check_default_survives(&d, &installed, &plan).unwrap();
+
+        // The store's default is `win3d` beside `standard`, and the definition
+        // names `standard`: rebuilding `win3d` alone would leave no default.
+        let mut standard = installed.variants[0].clone();
+        standard.name = "standard".into();
+        installed.variants[0].default = true;
+        installed.variants.push(standard);
+        let only = order(&["win3d"]);
+        let plan = super::plan_variants(&d, Some(&only)).unwrap();
+        let err = super::check_default_survives(&d, &installed, &plan).unwrap_err();
+        assert!(
+            err.to_string().contains("include it to move the default"),
+            "{err}"
+        );
+        let only = order(&["win3d", "standard"]);
+        let plan = super::plan_variants(&d, Some(&only)).unwrap();
+        super::check_default_survives(&d, &installed, &plan).unwrap();
+    }
+
+    /// The base of a template with variants embeds no first-boot script: the
+    /// template's `first_boot` is the variants' to inherit.
+    #[test]
+    fn a_base_with_variants_embeds_no_first_boot() {
+        let d = with_variants(r#"variant "standard" { }"#);
+        assert_eq!(super::base_first_boot(&d), None);
+        let plain = def(r#"import <vmlab.wcl>
+               template "p" { arch = "x86_64" version = "1" first_boot = "fb.ws"
+                 source "iso" { path = "/i.iso" } }"#);
+        assert_eq!(
+            super::base_first_boot(&plain).map(|p| p.display().to_string()),
+            Some("fb.ws".into())
+        );
+    }
+
+    /// A definition that declares variants seals a base marked
+    /// `variants_expected`, so no lab clones it before (or without) a
+    /// variant; one that declares none does not.
+    #[test]
+    fn a_base_with_variants_is_marked_variant_bearing() {
+        let image = || SealedImage {
+            disk: 8 << 30,
+            sha256: "ab".repeat(32),
+            first_boot_script: None,
+            agent_version: None,
+        };
+        let d = with_variants(r#"variant "standard" { }"#);
+        let hw = EffectiveHardware::resolve(&d, None);
+        let sealed = seal_meta(&d, &hw, "1", image());
+        assert!(sealed.variants_expected);
+        assert!(sealed.to_wcl().contains("variants_expected = true"));
+        let err = sealed
+            .select_variant(None, crate::template::store::Purpose::Lab)
+            .unwrap_err();
+        assert!(err.contains("variants are not built yet"), "{err}");
+        let plain = def(r#"import <vmlab.wcl>
+               template "p" { arch = "x86_64" version = "1"
+                 source "iso" { path = "/i.iso" } }"#);
+        let hw = EffectiveHardware::resolve(&plain, None);
+        let sealed = seal_meta(&plain, &hw, "1", image());
+        assert!(!sealed.variants_expected);
+        assert_eq!(
+            sealed.select_variant(None, crate::template::store::Purpose::Lab),
+            Ok(None)
+        );
+    }
+
+    /// The sealed base an OVMF + Secure Boot Windows build records.
+    fn secure_base() -> TemplateMeta {
+        let mut m = source_meta();
+        m.profile = Some("windows-11".into());
+        m.firmware = Some("ovmf".into());
+        m.secure_boot = Some(true);
+        m.tpm = Some(true);
+        m.memory = Some(4 << 30);
+        m.disk = Some(64 << 30);
+        m.sha256 = Some("ab".repeat(32));
+        m
+    }
+
+    /// A variant boots its build on the base's hardware under its own
+    /// overrides: `secure_boot = false` reaches the build VM, the rest is the
+    /// base's.
+    #[test]
+    fn a_variant_builds_on_its_effective_hardware() {
+        let d = with_variants(r#"variant "win3d" { secure_boot = false cpus = 4 }"#);
+        let v = &d.variants[0];
+        let base = secure_base();
+        let hw = EffectiveHardware::for_variant(v, &base);
+        assert_eq!(hw.secure_boot, Some(false));
+        assert_eq!(hw.firmware, Some(crate::config::model::Firmware::Ovmf));
+        assert_eq!(hw.tpm, Some(true));
+        assert_eq!(hw.cpus, Some(4));
+        assert_eq!(hw.memory, Some(4 << 30));
+        assert_eq!(hw.profile.as_deref(), Some("windows-11"));
+
+        let spec = super::BuildSpec::variant(&d, v, base.disk);
+        let wcl = super::synth_spec_lab(
+            &spec,
+            &hw,
+            "build-x86_64-win",
+            "build",
+            Path::new("/root"),
+            install(None),
+        )
+        .unwrap();
+        assert!(wcl.contains("secure_boot = false"), "{wcl}");
+        assert!(wcl.contains("firmware = \"ovmf\""), "{wcl}");
+        assert!(
+            wcl.contains(&format!("disk     = {}", 64u64 << 30)),
+            "{wcl}"
+        );
+        // The base install's media, scratch disk and steps stay with the base.
+        assert!(!wcl.contains("/drivers"), "{wcl}");
+        assert!(!wcl.contains("disk \"scratch\""), "{wcl}");
+        assert!(!wcl.contains("install.ws"), "{wcl}");
+        crate::config::load_lab_source(&wcl, "<test>", Path::new("/root")).unwrap();
+
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        super::check_spec_hardware(&d, &spec, &hw, "build", Path::new("/root"), &profiles)
+            .map_err(|e| format!("{e:#}"))
+            .unwrap();
+    }
+
+    /// A variant's own steps run in declaration order, and its `qemu_args`
+    /// and NICs replace the template's where it declares them.
+    #[test]
+    fn a_variant_build_renders_its_own_steps() {
+        let d = def(r#"import <vmlab.wcl>
+               template "win" { arch = "x86_64" version = "1" qemu_args = ["-base"]
+                 nic { mac = "52:54:00:00:00:01" }
+                 source "iso" { path = "/i.iso" }
+                 variant "a" { default = true provision "a1.ws" { } playbook "pb" { play = "p" } provision "a2.ws" { } }
+                 variant "b" { qemu_args = ["-b"] nic { mac = "52:54:00:00:00:02" } }
+               }"#);
+        let a = super::BuildSpec::variant(&d, &d.variants[0], Some(1 << 30));
+        let wcl =
+            super::synth_spec_lab(&a, &hw(&d), "l", "build", Path::new("/root"), install(None))
+                .unwrap();
+        let (p1, pb, p2) = (
+            wcl.find("/root/a1.ws").unwrap(),
+            wcl.find("/root/pb").unwrap(),
+            wcl.find("/root/a2.ws").unwrap(),
+        );
+        assert!(p1 < pb && pb < p2, "{wcl}");
+        assert!(wcl.contains("\"-base\"") && wcl.contains(":01"), "{wcl}");
+        let b = super::BuildSpec::variant(&d, &d.variants[1], Some(1 << 30));
+        let wcl =
+            super::synth_spec_lab(&b, &hw(&d), "l", "build", Path::new("/root"), install(None))
+                .unwrap();
+        assert!(wcl.contains("\"-b\"") && !wcl.contains("-base"), "{wcl}");
+        assert!(wcl.contains(":02") && !wcl.contains(":01"), "{wcl}");
+    }
+
+    /// A variant's block records what it declares and nothing it inherits,
+    /// so it follows the base it was built on.
+    #[test]
+    fn a_variant_block_records_only_its_overrides() {
+        let d = with_variants(r#"variant "win3d" { secure_boot = false description = "3D" }"#);
+        let m = super::variant_meta(
+            &d.variants[0],
+            super::VariantImage {
+                sha256: "cd".repeat(32),
+                base_sha256: "ab".repeat(32),
+                first_boot_script: Some("fb".into()),
+                agent_version: Some("agent=x".into()),
+            },
+        );
+        assert_eq!(m.secure_boot, Some(false));
+        assert_eq!(
+            (m.firmware.as_ref(), m.tpm, m.memory, m.profile.as_ref()),
+            (None, None, None, None)
+        );
+        assert_eq!(m.base_sha256, "ab".repeat(32));
+        assert_eq!(m.description.as_deref(), Some("3D"));
+        assert_eq!(m.first_boot_script.as_deref(), Some("fb"));
+        assert_eq!(
+            m.wscript_surface,
+            Some(crate::scripting::WSCRIPT_SURFACE_VERSION)
+        );
+        // And a clone of it resolves to the base's hardware with the override.
+        let mut base = secure_base();
+        base.variants = vec![m];
+        let eff = base.effective(base.variants.first());
+        assert_eq!(
+            (eff.secure_boot, eff.firmware.as_deref(), eff.tpm),
+            (Some(false), Some("ovmf"), Some(true))
+        );
+    }
+
+    fn have_qemu_img() -> bool {
+        std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("qemu-img").is_file())
+        })
+    }
+
+    fn qemu_img(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("qemu-img")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `x86_64/win11@26100.1` with a real base and two real overlays:
+    /// `standard` (default, its own first-boot script at a surface this host
+    /// does not have) and `extra`. The base records a first-boot script too.
+    fn variant_store() -> (tempfile::TempDir, TemplateStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TemplateStore::new(tmp.path().join("templates"));
+        let dir = store.root().join("x86_64/win11/26100.1");
+        std::fs::create_dir_all(&dir).unwrap();
+        qemu_img(&dir, &["create", "-q", "-f", "qcow2", DISK_FILE, "16M"]);
+        let base_sha = crate::template::store::sha256_file(&dir.join(DISK_FILE)).unwrap();
+        let mut m = source_meta();
+        m.sha256 = Some(base_sha.clone());
+        m.first_boot_script = Some("base script".into());
+        m.wscript_surface = Some(crate::scripting::WSCRIPT_SURFACE_VERSION);
+        for (name, default) in [("standard", true), ("extra", false)] {
+            let vdir = dir.join("variants").join(name);
+            std::fs::create_dir_all(&vdir).unwrap();
+            qemu_img(
+                &vdir,
+                &[
+                    "create",
+                    "-q",
+                    "-f",
+                    "qcow2",
+                    "-b",
+                    "../../disk.qcow2",
+                    "-F",
+                    "qcow2",
+                    DISK_FILE,
+                ],
+            );
+            m.variants.push(crate::template::meta::VariantMeta {
+                name: name.into(),
+                default,
+                created: "2026-01-02T03:04:05Z".parse().unwrap(),
+                sha256: "cd".repeat(32),
+                base_sha256: base_sha.clone(),
+                description: None,
+                first_boot_script: Some(format!("{name} script")),
+                agent_version: None,
+                wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
+                profile: None,
+                cpus: None,
+                memory: (name == "extra").then_some(2 << 30),
+                firmware: None,
+                tpm: None,
+                secure_boot: None,
+                display: None,
+                cpu_model: None,
+                accel: None,
+            });
+        }
+        m.write_to(&dir.join(crate::template::meta::META_FILE))
+            .unwrap();
+        (tmp, store)
+    }
+
+    fn layered_from(from: &str) -> crate::config::model::TemplateDef {
+        def(&format!(
+            "import <vmlab.wcl>\n\
+             template \"t\" {{ arch = \"x86_64\" version = \"1\"\n\
+             \x20 source \"template\" {{ from = \"{from}\" }}\n\
+             }}\n"
+        ))
+    }
+
+    /// A layered `from` is a build context (§6.6): no `#` seeds from the
+    /// default variant and runs its first-boot script, `#<variant>` from that
+    /// one, and `#base` from the base with no first-boot script at all.
+    #[test]
+    fn a_layered_build_seeds_from_the_selected_disk() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let seed = |from: &str| {
+            super::resolve_layered_source(&layered_from(from), &store)
+                .unwrap()
+                .unwrap()
+        };
+
+        let r = seed("x86_64/win11");
+        assert!(
+            r.disk_path
+                .ends_with("26100.1/variants/standard/disk.qcow2"),
+            "{}",
+            r.disk_path.display()
+        );
+        assert_eq!(
+            r.meta.first_boot().map(|f| f.source).as_deref(),
+            Some("standard script")
+        );
+
+        let r = seed("x86_64/win11#extra");
+        assert!(r.disk_path.ends_with("variants/extra/disk.qcow2"));
+        assert_eq!(
+            r.meta.memory,
+            Some(2 << 30),
+            "the variant's effective hardware"
+        );
+
+        let r = seed("x86_64/win11@26100.1#base");
+        assert!(
+            r.disk_path.ends_with("26100.1/disk.qcow2"),
+            "{}",
+            r.disk_path.display()
+        );
+        assert!(r.variant.is_none());
+        assert!(
+            r.meta.first_boot().is_none(),
+            "#base runs no first-boot script"
+        );
+    }
+
+    /// The surface check reads the selected variant's script: a default whose
+    /// script targets a newer surface refuses the layered build, while
+    /// `#base` — which runs no script — does not.
+    #[test]
+    fn the_layered_surface_check_reads_the_selected_variant() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (_tmp, store) = variant_store();
+        let path = store
+            .root()
+            .join("x86_64/win11/26100.1")
+            .join(crate::template::meta::META_FILE);
+        let mut m = TemplateMeta::read_from(&path).unwrap();
+        m.variants[0].wscript_surface = Some(99.into());
+        m.write_to(&path).unwrap();
+        let err = super::resolve_layered_source(&layered_from("x86_64/win11"), &store).unwrap_err();
+        assert!(
+            err.to_string().contains("records wscript surface 99"),
+            "{err}"
+        );
+        assert!(super::resolve_layered_source(&layered_from("x86_64/win11#extra"), &store).is_ok());
+        assert!(super::resolve_layered_source(&layered_from("x86_64/win11#base"), &store).is_ok());
+    }
+
+    /// Seeding from a variant flattens overlay and base into one standalone
+    /// working disk.
+    #[tokio::test]
+    async fn seeding_from_a_variant_flattens_the_chain() {
+        if !have_qemu_img() {
+            return;
+        }
+        let (tmp, store) = variant_store();
+        let r = super::resolve_layered_source(&layered_from("x86_64/win11"), &store)
+            .unwrap()
+            .unwrap();
+        let seeded = tmp.path().join("seeded.qcow2");
+        crate::template::qimg::convert_to_qcow2(&r.disk_path, &seeded)
+            .await
+            .unwrap();
+        let out = std::process::Command::new("qemu-img")
+            .args(["info", "--output=json"])
+            .arg(&seeded)
+            .output()
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(info.get("backing-filename").is_none(), "{info}");
+        assert_eq!(info["virtual-size"], 16 << 20);
+    }
+
+    /// A built overlay the way `build_variant` leaves one: written against
+    /// the base by absolute path, then rebased `-u` to `../../disk.qcow2`.
+    fn built_overlay(base: &Path, scratch: &Path, file: &str) -> std::path::PathBuf {
+        let base = base.canonicalize().unwrap();
+        qemu_img(
+            scratch,
+            &[
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-b",
+                base.to_str().unwrap(),
+                "-F",
+                "qcow2",
+                file,
+            ],
+        );
+        qemu_img(
+            scratch,
+            &[
+                "rebase",
+                "-u",
+                "-b",
+                "../../disk.qcow2",
+                "-F",
+                "qcow2",
+                file,
+            ],
+        );
+        scratch.join(file)
+    }
+
+    fn built_block(
+        name: &str,
+        overlay: &Path,
+        base_sha: &str,
+        default: bool,
+    ) -> crate::template::meta::VariantMeta {
+        let d = with_variants(&format!(r#"variant "{name}" {{ memory = 3GiB }}"#));
+        let mut m = super::variant_meta(
+            &d.variants[0],
+            super::VariantImage {
+                sha256: crate::template::store::sha256_file(overlay).unwrap(),
+                base_sha256: base_sha.into(),
+                first_boot_script: None,
+                agent_version: None,
+            },
+        );
+        m.default = default;
+        m
+    }
+
+    /// A rebuilt variant replaces its overlay and its block together and
+    /// leaves the other variant alone; a new default takes the default over;
+    /// one built on another base is refused with the store unchanged.
+    #[test]
+    fn a_built_variant_installs_atomically() {
+        if !have_qemu_img() {
+            return;
+        }
+        use crate::template::store::sha256_file;
+        let (tmp, store) = variant_store();
+        let base = store
+            .installed("x86_64", "win11", "26100.1")
+            .unwrap()
+            .unwrap();
+        let base_sha = base.meta.sha256.clone().unwrap();
+        let standard_before = sha256_file(&base.variant_disk("standard")).unwrap();
+        let work = |n: &str| {
+            let w = tmp.path().join(n);
+            std::fs::create_dir_all(&w).unwrap();
+            w
+        };
+
+        let w = work("extra");
+        let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
+        let block = built_block("extra", &overlay, &base_sha, false);
+        let digest = block.sha256.clone();
+        let meta =
+            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
+                .unwrap();
+        let extra = meta.variant("extra").unwrap();
+        assert_eq!(
+            (extra.sha256.as_str(), extra.memory),
+            (digest.as_str(), Some(3 << 30))
+        );
+        assert_eq!(meta.default_variant().unwrap().name, "standard");
+        assert_eq!(sha256_file(&base.variant_disk("extra")).unwrap(), digest);
+        assert_eq!(
+            sha256_file(&base.variant_disk("standard")).unwrap(),
+            standard_before,
+            "the other variant is untouched"
+        );
+        let extra_ref = crate::config::model::VariantRef::Named("extra".into());
+        let r = store
+            .resolve(
+                "x86_64",
+                "win11",
+                None,
+                Some(&extra_ref),
+                crate::template::store::Purpose::Lab,
+            )
+            .unwrap();
+        assert_eq!(r.meta.memory, Some(3 << 30));
+
+        // A new variant that is the definition's default takes it over.
+        let w = work("third");
+        let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
+        let block = built_block("third", &overlay, &base_sha, true);
+        let meta =
+            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
+                .unwrap();
+        assert_eq!(meta.default_variant().unwrap().name, "third");
+        assert!(!meta.variant("standard").unwrap().default);
+
+        // Built on another base: refused, nothing moves.
+        let wcl_path = base.dir.join(crate::template::meta::META_FILE);
+        let wcl = std::fs::read_to_string(&wcl_path).unwrap();
+        let w = work("stale");
+        let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
+        let block = built_block("extra", &overlay, &"ef".repeat(32), false);
+        assert!(
+            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&wcl_path).unwrap(), wcl);
+        assert_eq!(sha256_file(&base.variant_disk("extra")).unwrap(), digest);
     }
 }

@@ -628,10 +628,21 @@ pub fn build_args(
     // The `virt` machine has no default USB host controller, so `-usb` is a
     // no-op there and usb-tablet has nothing to plug into — add an explicit
     // xHCI controller. x86 q35/pc have a default controller via `-usb`.
+    //
+    // `usb = true` (§5.2.1) wants an xHCI with a known id for host devices
+    // to hot-plug onto. `virt` already has one, so it only gains the id; x86
+    // gains a second controller beside `-usb`'s. QEMU then places the
+    // unaddressed tablet on the xHCI (verified on q35, QEMU 11.1) — one more
+    // reason the flag is opt-in: the guest's USB topology changes with it.
+    let usbx = format!("qemu-xhci,id={}", crate::usb::CONTROLLER_ID);
     if virt {
-        arg(&mut a, "device", "qemu-xhci".into());
+        let xhci = if vm.usb { usbx } else { "qemu-xhci".into() };
+        arg(&mut a, "device", xhci);
     } else {
         a.push("-usb".into());
+        if vm.usb {
+            arg(&mut a, "device", usbx);
+        }
     }
     arg(&mut a, "device", "usb-tablet".into());
 
@@ -1219,6 +1230,37 @@ mod tests {
         assert!(s.contains("virtio-gpu-pci"), "{s}");
         assert!(s.contains("tpm-tis-device,tpmdev=tpm0"), "{s}");
         assert!(s.contains("virtio-blk-pci,drive=disk0"), "{s}");
+    }
+
+    /// `usb = true` (§5.2.1): an xHCI with the fixed id host devices
+    /// hot-plug onto. q35 gains it beside `-usb`; `virt` names the xHCI it
+    /// already has rather than adding a second.
+    #[test]
+    fn usb_passthrough_controller() {
+        let p = paths();
+        let mut vm = resolved("linux-modern", "x86_64");
+        assert!(!vm.usb, "off by default");
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(!s.contains("qemu-xhci"), "no controller unasked: {s}");
+        assert!(s.contains("-usb "), "{s}");
+
+        vm.usb = true;
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(s.contains("-device qemu-xhci,id=usbx"), "{s}");
+        assert!(s.contains("-usb "), "the default controllers stay: {s}");
+
+        let mut vm = resolved("linux-modern", "aarch64");
+        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
+        assert!(s.contains("-device qemu-xhci "), "{s}");
+        assert!(!s.contains("id=usbx"), "{s}");
+        vm.usb = true;
+        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
+        assert_eq!(
+            s.matches("qemu-xhci").count(),
+            1,
+            "one controller on virt: {s}"
+        );
+        assert!(s.contains("-device qemu-xhci,id=usbx"), "{s}");
     }
 
     /// riscv64 shares the aarch64 `virt` path (virtio CD-ROMs, explicit

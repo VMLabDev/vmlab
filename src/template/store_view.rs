@@ -15,12 +15,15 @@ use serde::{Deserialize, Serialize};
 
 use super::meta::TemplateMeta;
 
-/// One exact version in the store, as `<arch>/<name>@<version>`.
+/// One exact version in the store, as `<arch>/<name>@<version>` — or one
+/// variant of it, `…#<variant>`, where a command acted on just that (§6.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredVersion {
     pub arch: String,
     pub name: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 impl StoredVersion {
@@ -29,13 +32,63 @@ impl StoredVersion {
             arch: meta.arch.clone(),
             name: meta.name.clone(),
             version: meta.version.clone(),
+            variant: None,
         }
     }
 }
 
 impl std::fmt::Display for StoredVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}@{}", self.arch, self.name, self.version)
+        write!(f, "{}/{}@{}", self.arch, self.name, self.version)?;
+        match &self.variant {
+            Some(v) => write!(f, "#{v}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A version a pull or an import installed, with the variants it now holds
+/// (§6.6) — those already there included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledVersion {
+    #[serde(flatten)]
+    pub version: StoredVersion,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_variant: Option<String>,
+}
+
+impl InstalledVersion {
+    pub fn of(meta: &TemplateMeta) -> Self {
+        Self {
+            version: StoredVersion::of(meta),
+            variants: meta.variants.iter().map(|v| v.name.clone()).collect(),
+            default_variant: meta.default_variant().map(|d| d.name.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for InstalledVersion {
+    /// `x86_64/win@1`, then ` with variants standard (default), win3d` when
+    /// it has any.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.version)?;
+        if self.variants.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = self
+            .variants
+            .iter()
+            .map(|v| {
+                if self.default_variant.as_deref() == Some(v.as_str()) {
+                    format!("{v} (default)")
+                } else {
+                    v.clone()
+                }
+            })
+            .collect();
+        write!(f, " with variants {}", names.join(", "))
     }
 }
 
@@ -68,6 +121,10 @@ pub struct TemplateSummary {
     pub origin: Option<String>,
     pub registry: Option<String>,
     pub sha256: Option<String>,
+    /// Built from a definition with variants (§6.6): with no default variant
+    /// among `variants`, a lab refuses every reference to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub variants_expected: bool,
 }
 
 impl From<&TemplateMeta> for TemplateSummary {
@@ -91,6 +148,7 @@ impl From<&TemplateMeta> for TemplateSummary {
             origin: t.origin.clone(),
             registry: t.registry.clone(),
             sha256: t.sha256.clone(),
+            variants_expected: t.variants_expected,
         }
     }
 }
@@ -130,11 +188,32 @@ impl RemoteStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreEntry {
     pub meta: TemplateSummary,
-    /// Size of `disk.qcow2` in bytes; 0 when it cannot be read.
+    /// Size of the base `disk.qcow2` in bytes; 0 when it cannot be read.
     pub size: u64,
     /// Absent unless the caller asked for the registry check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteStatus>,
+    /// The version's installed variants (§6.6), in metadata order; empty for
+    /// a base-only template.
+    #[serde(default)]
+    pub variants: Vec<VariantSummary>,
+}
+
+/// One installed variant of a listed version (§6.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariantSummary {
+    pub name: String,
+    /// The variant a reference with no `#` selects.
+    pub default: bool,
+    /// Built on a base other than the version's current one; refused until
+    /// rebuilt.
+    pub stale: bool,
+    pub description: Option<String>,
+    /// RFC 3339.
+    pub created: String,
+    pub sha256: String,
+    /// Size of the overlay alone, in bytes.
+    pub size: u64,
 }
 
 /// What `store.prune` would do, or did.

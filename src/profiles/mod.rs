@@ -90,6 +90,9 @@ pub struct Profile {
     pub firmware: Option<FirmwareKind>,
     pub secure_boot: Option<bool>,
     pub tpm: Option<bool>,
+    /// Boot with the hot-plug xHCI controller USB passthrough attaches to
+    /// (§5.2.1). None = off.
+    pub usb: Option<bool>,
     pub disk_bus: Option<DiskBus>,
     pub nic_model: Option<String>,
     pub display: Option<String>,
@@ -236,6 +239,7 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             .unspan(),
         secure_boot: r.bool("secure_boot").unspan(),
         tpm: r.bool("tpm").unspan(),
+        usb: r.bool("usb").unspan(),
         disk_bus: r
             .keyword(
                 "disk_bus",

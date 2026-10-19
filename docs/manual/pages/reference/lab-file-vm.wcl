@@ -25,7 +25,7 @@ page ref_vm {
   DOC
   code wcl { source = <<'SRC'
 vm "<name>" {
-  template    = "<arch>/<name>[@<version>]"   // or "scratch", or a registry ref
+  template    = "<arch>/<name>[@<version>][#<variant>]"   // or "scratch", or a registry ref
   arch        = "x86_64"
   profile     = "linux-modern"
   cpus        = 2
@@ -61,7 +61,7 @@ SRC
     rows:
       | "Field" | "Type" | "Default" | "Meaning" |
       | "`name`" | "utf8 (label)" | "required" | "VM name, a DNS label, unique per lab; the inline block label." |
-      | "`template`" | "utf8" | "required" | "`<arch>/<name>[@<version>]` from the store, `scratch`, or an OCI registry reference." |
+      | "`template`" | "utf8" | "required" | "`<arch>/<name>[@<version>][#<variant>]` from the store, `scratch`, or an OCI registry reference with an optional `#<variant>`." |
       | "`arch`" | "utf8" | "from template" | "Architecture. Required for `scratch` and for registry references." |
       | "`profile`" | "utf8" | "from template" | "Guest OS profile supplying hardware defaults. Required for `scratch`." |
       | "`cpus`" | "i64" | "inherited" | "vCPU count, greater than 0. Inherited from template, then profile, if omitted." |
@@ -80,6 +80,7 @@ SRC
       | "`accel`" | "utf8" | "inherited" | "Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. `tcg` always emulates, even where KVM works, for guests KVM cannot run reliably, such as Windows 95 on an AMD host; `-cpu` stays `max` unless `cpu_model` names one. `kvm` refuses to start the VM when KVM is unusable rather than falling back. Inherited from template, then profile. `tcg` cannot be combined with `nested = true`." |
       | "`firmware`" | "utf8" | "inherited" | "Firmware: `ovmf` or `seabios`. Inherited from template, then profile." |
       | "`tpm`" | "bool" | "inherited" | "Enable a TPM 2.0 device. Inherited from template, then profile." |
+      | "`usb`" | "bool" | "inherited" | "Boot with a hot-plug xHCI controller so [vmlab usb](cmd_usb) can pass host USB devices in. Inherited from the profile only — a template has no say; off when neither sets it. Changes the VM's hardware, so online snapshots taken without it no longer restore." |
       | "`secure_boot`" | "bool" | "inherited" | "Enable secure boot; OVMF only. Inherited from template, then profile." |
       | "`qemu_args`" | "list<utf8>" | "none" | "Raw QEMU flags appended last. The escape hatch; they win over everything vmlab generates." |
       | "`gpu {}`" | "child" | "none" | "GPU acceleration: passthrough, virgl or vulkan." |
@@ -94,16 +95,25 @@ SRC
   h3 "Template references"
   p "The `template` value takes one of three forms, and the form decides what else the block must say."
   list {
-    li "**Store reference** `<arch>/<name>[@<version>]`, such as `x86_64/windows-11@26100.1`. The arch is always written; a bare `windows-11` is rejected. Without a version the highest version in the store is used. The template must be in the store, and an `arch` field, if present, must match."
-    li "**Registry reference**, such as `ghcr.io/owner/ubuntu-24.04:1.0`. Recognised by a first path segment holding a dot, a colon or `localhost`. It requires an explicit `arch`. `vmlab up` pulls it if it is absent from the store and never re-pulls it implicitly. See [Distributing templates over registries](guide_registries)."
+    li "**Store reference** `<arch>/<name>[@<version>][#<variant>]`, such as `x86_64/windows-11@26100.1` or `x86_64/windows-11#win3d`. The arch is always written; a bare `windows-11` is rejected. Without a version the highest version in the store is used. The template must be in the store, and an `arch` field, if present, must match."
+    li "**Registry reference**, such as `ghcr.io/owner/ubuntu-24.04:1.0`, with an optional `#<variant>` after the tag or digest. Recognised by a first path segment holding a dot, a colon or `localhost`. It requires an explicit `arch`. `vmlab up` pulls it if it is absent from the store and never re-pulls it implicitly. See [Distributing templates over registries](guide_registries)."
     li "**`scratch`**: no backing image. The VM gets a blank disk and no template layer. It requires `arch`, `profile` and `disk`, and boot media is yours to attach."
   }
   p "Known architectures are `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`, `s390x` and `ppc64`."
+  p <<DOC
+    The `#<variant>` suffix selects one disk of a template version that has
+    variants. Without it the template's default variant is used, or its only
+    disk when it has none. A variant name is 1 to 32 lowercase letters,
+    digits and hyphens, starting with a letter or digit. `#base` names the
+    unsealed base disk and is refused on a template that has variants. The
+    rules are in [Templates](guide_templates).
+  DOC
   h3 "Validation"
   list {
     li "The name is a DNS label and no other VM or container in the lab has it."
     li "`cpus` is at least 1. `memory` and `disk` are non-negative sizes."
     li "`disk` on a store or registry template is an error; clones inherit the template's disk. Use `disk \"name\" {}` blocks for extra disks."
+    li "A `#<variant>` names a variant the store template has, and is not `#base` on a template with variants. The error lists the template's variants, the default marked."
     li "Every name in `depends_on` exists in the lab, and the dependency graph across VMs and containers has no cycle."
     li "`profile`, if set, names a known profile."
     li "`cdrom` and `floppy` name files that exist under the lab root."

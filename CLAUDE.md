@@ -90,7 +90,12 @@ for old Linux. Verified live on FreeDOS; the NT build is verified under Wine,
 and the 9x build live on Windows 95 (950, OSR2, OSR2.5) and 98 (FE, SE).
 **Shared apps are built** (§20, ADR-0016): `vmlab app run` puts one guest
 program's windows on the host desktop over waypipe, X11 or RDP RemoteApp,
-carried on the agent channel.
+carried on the agent channel. **USB passthrough is built** (§5.2.1):
+`usb = true` boots a VM with a hot-plug xHCI (`usbx`), and `vmlab usb
+list/attach/detach` (wscript surface 3) hand it host USB devices at runtime —
+runtime-only attachments in the lab daemon, holders gathered by the
+supervisor's `usb.list` from every lab, unplugs swept from sysfs, online
+snapshots refused while any are attached.
 
 Module map under `src/`:
 
@@ -162,6 +167,9 @@ Module map under `src/`:
   per-target binaries (musl + windows-gnu).
 - `media/` — folder → ISO/floppy with content-addressed cache.
 - `vision/` — screenshot, template matching, OCR.
+- `usb/` — host USB passthrough (§5.2.1), pure over its inputs: the sysfs
+  scan (root injectable), selectors and their resolution, and `plan_attach`,
+  every attach refusal plus the `device_add` arguments as a value (ADR-0003).
 - `net/` — userspace fabric: frame codecs, L2 switch, DHCP, DNS, gateway,
   NAT engine, L3 rules.
 - `proto/` — JSON-lines daemon wire protocol (client + server). `vocab.rs`
@@ -181,6 +189,10 @@ Module map under `src/`:
   sockets;
   `boot_id.rs` is the per-family boot identity read over the agent's `exec`
   and the loop `wait_rebooted` waits on it with (§10.3);
+  `usb.rs` is USB passthrough's lab-wide half (§5.2.1) — selector resolution
+  against the host, who else holds a device (via the supervisor), the
+  `usb.*` events and the sysfs watch that drops unplugged devices; each
+  machine attaches and tracks its own (`Machine::usb_*`);
   `agent_repair.rs` is `machine.repair_agent` (§19.4), the plan for replacing
   a guest's agent binary over its own channel and the divergence it records;
   `workspace/` is the workspace syncer (§19.6, ADR-0014) — the layered
@@ -215,7 +227,9 @@ Module map under `src/`:
 - `cli/` — the `vmlab` verb surface; `dev.rs` is `vmlab dev` (§19.7), which
   holds only what is meaningless for a machine that is not `@dev` — the
   `sync` verbs a halt is resolved through (§19.6), which live here because
-  ADR-0013 leaves no guest→host control path to offer them from.
+  ADR-0013 leaves no guest→host control path to offer them from. `usb.rs` is
+  `vmlab usb` (§5.2.1): `list` from the supervisor (or sysfs alone when none
+  runs), `attach`/`detach` to the VM's lab daemon.
 
 The user manual is a wdoc book at `docs/manual/` (`just manual-build`,
 `just manual-serve`; audited with `/technical-book audit`, whose surface

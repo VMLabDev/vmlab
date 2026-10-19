@@ -396,6 +396,7 @@ profile "<name>" {
 | `firmware` | utf8 | QEMU default | Firmware: `ovmf` or `seabios`. |
 | `secure_boot` | bool | unset | Enable secure boot; OVMF only. |
 | `tpm` | bool | unset | Attach a swtpm 2.0 device. |
+| `usb` | bool | unset | Boot with the hot-plug xHCI controller host USB passthrough needs. A VM's own `usb` wins; unset is off. |
 | `disk_bus` | utf8 | QEMU default | Primary disk bus: `virtio`, `ide` or `sata`. |
 | `nic_model` | utf8 | QEMU default | NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`. |
 | `display` | utf8 | QEMU default | Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`. |

@@ -91,10 +91,26 @@ pub async fn create_linked_clone(backing: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite `path`'s backing-file reference to `backing` (as written, so a
+/// relative path stays relative to `path`'s own directory) without touching
+/// its data: `qemu-img rebase -u`. Only correct when `backing` names the same
+/// image the overlay was written against — a variant overlay moving from its
+/// build's absolute backing path to the store's `../../disk.qcow2` (§6.6).
+pub async fn rebase_unsafe(path: &Path, backing: &str) -> Result<()> {
+    let path = path_str(path);
+    run(&["rebase", "-u", "-b", backing, "-F", "qcow2", &path]).await?;
+    Ok(())
+}
+
 /// Inspect an image via `qemu-img info --output=json`.
+///
+/// `-U` (force-share): the image may be a running machine's disk, which QEMU
+/// holds a write lock on, and reading its header is all this does. Without
+/// it the in-use check behind `template rm` and `clean` could not see the
+/// clones of running machines — exactly the ones it must protect.
 pub async fn image_info(path: &Path) -> Result<ImageInfo> {
     let path_arg = path_str(path);
-    let stdout = run(&["info", "--output=json", &path_arg]).await?;
+    let stdout = run(&["info", "-U", "--output=json", &path_arg]).await?;
     serde_json::from_slice(&stdout).map_err(|e| QemuImgError::Parse {
         path: path.to_path_buf(),
         source: e,

@@ -17,10 +17,98 @@ template layer of the resolution chain (VM > template > profile): a VM that
 does not set `memory` inherits it from here. See lab-file.md and vm.md.
 
 Templates are keyed by **arch, name and version**. A reference is written
-`<arch>/<name>[@<version>]`. The arch is mandatory and never inferred from the
-host, because it selects which QEMU system emulator boots the image. Omitting
-the version means the highest in the store. `vmlab validate` rejects an
-archless reference.
+`<arch>/<name>[@<version>][#<variant>]`. The arch is mandatory and never
+inferred from the host, because it selects which QEMU system emulator boots the
+image. Omitting the version means the highest in the store. `vmlab validate`
+rejects an archless reference.
+
+## Variants
+
+A template version has one **base** disk and zero or more **variants**: named,
+sealed disk states built from the base. The Windows case: the base is installed
+and updated but not sysprepped; variant `standard` only generalizes; variant
+`win3d` installs a GPU driver package, then generalizes, with `secure_boot =
+false`. A template with no variants is base-only and behaves as templates always
+have. Never call a variant a "snapshot" — that is a VM snapshot.
+
+| Reference | Template with variants | Template without variants |
+| --- | --- | --- |
+| no `#` | the default variant | the base |
+| `#<name>` | that variant; unknown names error, listing the variants | error: no variants |
+| `#base` | refused for a lab VM (every clone would share one identity); the base in a variant build or a layered `from` | the base |
+
+- A variant name is `[a-z0-9][a-z0-9-]{0,31}`; `base` is reserved. Registry
+  refs take the suffix after the tag or digest:
+  `ghcr.io/o/windows-11:26100.1742#win3d`.
+- Exactly one variant has `default = true`; a lone variant is the default
+  implicitly. Two or more without exactly one default is invalid metadata.
+- Layout: `<version>/variants/<name>/disk.qcow2`, a qcow2 overlay whose backing
+  file is `../../disk.qcow2` (relative). The version's single `template.wcl`
+  holds a `variant "<name>" { … }` block per variant: `created`, `sha256`,
+  `base_sha256`, optional `default`, `description`, `first_boot_script`,
+  `wscript_surface`, `agent_version`, and hardware overrides (`profile`, `cpus`,
+  `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`).
+  A variant counts only when both its block and its overlay exist.
+- **Effective metadata**: the base's fields with the variant's in their place.
+  Hardware resolution, first boot, the surface check and agent staleness all
+  read it.
+- **Stale**: `base_sha256` differs from the base's `sha256` (the base was
+  rebuilt). Refused until the variant is rebuilt; `template list` flags it.
+- A clone of a variant is the chain clone → variant → base. `clone-source`
+  records the ref with its `#variant`; changing the variant refuses reuse like a
+  changed pin. `status -v` shows `variant=<name>`.
+- `template rm <arch>/<name>@<version>#<variant>` removes one variant; it is
+  refused while a clone is backed by it, for the default while others remain,
+  and for the last one. Removing the version removes every variant.
+
+### Declaring and building variants
+
+```wcl
+template "windows-11" {
+  …                                  // base: source, provisions ending in a clean shutdown, NO sysprep
+  first_boot = "scripts/firstboot.ws"  // inherited by every variant; the base embeds none
+  variant "standard" {
+    default = true
+    provision "scripts/generalize.ws" { }
+  }
+  variant "win3d" {
+    secure_boot = false              // the variant's build boot and its clones run without SB
+    provision "scripts/win3d-setup.ws" { }
+    provision "scripts/generalize.ws" { }
+  }
+}
+```
+
+- A `variant` block takes `default`, `description`, `first_boot`, the hardware
+  overrides (`profile cpus memory display cpu_model accel firmware tpm
+  secure_boot`), `qemu_args` (replaces the template's), `nic` (replaces the
+  template's when declared), `media`, and `provision`/`playbook` steps run in
+  declaration order. Validation: legal unique names, not `base`; exactly one
+  `default = true` unless there is only one variant.
+- `vmlab template build` seals the base, then builds each variant (default
+  first, rest in file order): a linked overlay on the sealed base, booted on the
+  variant's **effective** hardware (variant over the base's recorded metadata),
+  agent verified, the variant's steps run, graceful shutdown, overlay rebased to
+  `../../disk.qcow2`, hashed, installed with its block under the store lock.
+  The template's installer media and extra disks stay with the base build.
+- A variant's build boot runs **no first-boot script**: the base is unsealed,
+  so there is nothing to specialize. First boot is for the variant's clones.
+- A failed variant stops the build, names the variant, and leaves the base and
+  earlier variants installed with nothing partial behind.
+- The base of a definition with variants is recorded `variants_expected = true`.
+  With no default variant installed (not built yet, every variant build failed,
+  overlays deleted) a lab refuses **every** ref to that version — bare,
+  `#<name>`, `#base` — and the error gives `vmlab template build
+  <name>@<version> --variant <variant>`. `template list` shows it as `variants
+  not built`. A build's `#base`/`#<name>` still resolve. The marker rides the
+  base's config blob through push/pull and export/import; an older vmlab pulls
+  such a base as plain base-only.
+- `vmlab template build <name>[@<version>] --variant <v>[,<v2>]` builds or
+  rebuilds just those variants onto the installed version. Refused while a
+  clone is backed by a variant it would replace.
+- A layered `source "template" { from = … }` resolves as a build context: no `#`
+  seeds from the default variant, `#<v>` from that one, `#base` from the base
+  (and runs no first-boot script). Seeding flattens the chain.
 
 ## The store
 
@@ -176,15 +264,19 @@ Two paths carry a template off the host it was built on. Both preserve the
 metadata, so a moved template inherits into VMs exactly as it did at home.
 
 - **Export and import.** `vmlab template export` writes one portable `.tar.zst`
-  archive holding the disk and its metadata; `import` installs it into another
-  store. This is the offline path.
+  archive holding the disk, its metadata and every variant's overlay; `import`
+  installs it into another store after checking each variant's `sha256`, its
+  `base_sha256` against the base, and its `../../disk.qcow2` backing — one bad
+  variant refuses the archive. This is the offline path.
 - **Registries.** `vmlab template push` publishes a template to any OCI
   registry, and `pull` installs it from one.
 
 A lab's `template =` may also name a registry reference directly, with an
 explicit `arch` on the VM. `vmlab up` pulls it when it is absent from the store
 and never re-pulls it implicitly. Updates are explicit, through `vmlab pull` or
-`vmlab template pull`.
+`vmlab template pull`. A registry reference takes `#<variant>` too; a pull always
+brings the default variant with the base, and a machine naming a variant the
+store's copy lacks pulls just that overlay.
 
 ## template {}
 
@@ -254,6 +346,7 @@ template "<name>" {
 | `playbook {}` | children | none | config-weave playbooks applied to the build VM, interleaved with provisions in declaration order. Steps stream as structured build progress. |
 | `nic {}` | children | none | NICs for the build VM. Optional; the build VM may be air-gapped. |
 | `disk {}` | children | none | Additional disks attached during the build. |
+| `variant {}` | children | none | Sealed variants built on the base; see "Declaring and building variants" above. |
 
 `media`, `provision`, `playbook`, `nic` and `disk` are the same blocks a `vm`
 carries; see vm.md.
@@ -301,7 +394,7 @@ template without one.
 source "iso"      { path = "./installer.iso" }
 source "iso"      { url = "https://…/installer.iso" sha256 = "…" }
 source "qcow2"    { path = "./base.qcow2" }
-source "template" { from = "x86_64/ubuntu-24.04@24.04.4" }
+source "template" { from = "x86_64/ubuntu-24.04@24.04.4" }   // [#<variant>|#base]
 source "scratch"  { }
 ```
 
@@ -311,7 +404,7 @@ source "scratch"  { }
 | `path` | utf8 | none | Local file path, for `iso` and `qcow2`. Mutually exclusive with `url`. |
 | `url` | utf8 | none | Remote artefact URL, for `iso` and `qcow2`. Requires `sha256`. |
 | `sha256` | utf8 | none | SHA-256 of the remote artefact. Required with `url`. |
-| `from` | utf8 | none | Source template `<arch>/<name>[@<version>]`, for kind `template`: a layered build. |
+| `from` | utf8 | none | Source template `<arch>/<name>[@<version>][#<variant>]`, for kind `template`: a layered build. No `#` seeds from the default variant; `#base` from the base. |
 
 The four kinds:
 
@@ -401,6 +494,35 @@ of the `aarch64` build of a template adds a platform entry to the index beside
 the `x86_64` one. Consistent with the store, the arch is always explicit. `vmlab
 template pull` requires `--arch` when the tag resolves to an index with more than
 one platform, and never silently assumes the host's.
+
+### Variants
+
+A version with variants publishes the base as usual, and each variant as its own
+manifest tagged `<version>--<variant>`: the base's chunk layers in order, then the
+overlay's, on one running chunk index, each layer annotated with its part
+(`vnd.vmlab.template.part` = `base`/`variant`). Annotations record where the base
+ends (`vnd.vmlab.template.base.layers`) and each part's digest, size and chunk
+count; there is no whole-image digest. The config blob is the variant's
+effective metadata plus `variant: {name, base_sha256, default, description}`.
+The base's chunks are already in the registry, so a variant uploads only its
+overlay; the push log prints uploaded/already-held counts per part. A stale
+variant refuses the push.
+
+Discovery is through the base: its per-arch manifest annotates
+`vnd.vmlab.template.variants` (names, in order), `…variant.default`, and
+`…variant.manifest.<name>` = the variant manifest's digest. So `latest#win3d`
+works with no tag of its own. `--` tags are never treated as versions (pin
+resolution, `template search`).
+
+Pull: `#<variant>` fetches base + default + that variant; a bare ref base +
+default; `--all-variants` every one. The default always comes so a bare ref
+resolves the same locally as in the registry. A base or variant already held
+with the same digest is not downloaded again; arriving variants are verified
+(digest, built on this base), given the relative backing, and merged into the
+version's `template.wcl`, keeping those already installed.
+
+An older vmlab pulling the version tag gets a valid base-only template; pointed
+at a `--` tag it refuses for the missing whole-image digest.
 
 ### Push and pull
 

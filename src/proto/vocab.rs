@@ -654,6 +654,43 @@ vocabulary! {
         MachineRepairAgent = "machine.repair_agent" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
+        /// Hot-plug the host USB device `selector` names into a running VM
+        /// booted with `usb = true` (PRD §5.2.1): `<vid>:<pid>`,
+        /// `<vid>:<pid>@<serial>` or `port:<bus>-<port>`. A HID keyboard or
+        /// mouse is refused without `force`. Answers with the attachment.
+        #[one_way(
+            "cli",
+            "A script attaches through the lab runtime it is bound to, not \
+             over the socket, so the verb is the one caller that crosses it."
+        )]
+        MachineUsbAttach = "machine.usb_attach" {
+            #[serde(alias = "vm", alias = "container")] machine: String,
+            selector: String,
+            #[serde(default)] force: bool,
+        },
+        /// Unplug a host USB device from a VM — the one `selector` names, or
+        /// with `all` every one it holds. Answers with what was detached.
+        #[one_way(
+            "cli",
+            "The other half of `machine.usb_attach`, and one-way for the same \
+             reason."
+        )]
+        MachineUsbDetach = "machine.usb_detach" {
+            #[serde(alias = "vm", alias = "container")] machine: String,
+            #[serde(default)] selector: Option<String>,
+            #[serde(default)] all: bool,
+        },
+        /// The host USB devices one machine holds — or, with `machine`
+        /// omitted, every machine in the lab.
+        #[one_way(
+            "daemon",
+            "The supervisor asks every lab to fold holders into `usb.list`, \
+             which is the listing the CLI shows; a per-machine view of the \
+             same rows would be a second way to read one fact."
+        )]
+        MachineHeldUsb = "machine.usb_attached" {
+            #[serde(default, alias = "vm", alias = "container")] machine: Option<String>,
+        },
         /// Resize an open terminal session.
         MachineTtyResize = "machine.tty_resize" {
             #[serde(alias = "vm", alias = "container")] machine: String,
@@ -947,6 +984,10 @@ vocabulary! {
         )]
         GlobalList = "global.list" {},
 
+        /// Every USB device plugged into this host (PRD §5.2.1), hubs
+        /// hidden, each with the `lab/vm` holding it, if one does.
+        UsbList = "usb.list" {},
+
         /// The templates a file declares, with their store and build state.
         TemplateList = "template.list" {
             lab: String,
@@ -964,6 +1005,10 @@ vocabulary! {
             #[serde(default)] version: Option<String>,
             /// The file declaring it; `root`'s `vmlab.wcl` when omitted.
             #[serde(default)] file: Option<std::path::PathBuf>,
+            /// Build only these variants (§6.6) onto the installed version —
+            /// the newest, or the one `version` pins — instead of the whole
+            /// template.
+            #[serde(default)] variants: Option<Vec<String>>,
         },
         /// Abort a running build.
         TemplateStopBuild = "template.stop_build" {
@@ -1024,6 +1069,7 @@ vocabulary! {
             target: String,
             #[serde(default)] arch: Option<String>,
             #[serde(default)] overwrite: bool,
+            #[serde(default)] all_variants: bool,
         },
         /// Start uploading one store version to an OCI registry.
         #[one_way("cli", "Store management, for the reason on `store.list`.")]
@@ -1373,6 +1419,7 @@ mod tests {
                 arch: None,
                 version: None,
                 file: None,
+                variants: None,
             }
         );
     }

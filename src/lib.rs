@@ -28,6 +28,7 @@ mod smb;
 mod supervisor;
 mod sync;
 pub mod template;
+mod usb;
 mod viewer;
 mod vision;
 mod vnc;

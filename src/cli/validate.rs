@@ -27,14 +27,18 @@ impl ValidationContext for HostContext {
     /// Resolved through the store, so a version pin resolves the same way
     /// it will at `up` (PRD §6.2) and a half-installed entry — metadata
     /// without its disk, or the reverse — reads as absent rather than
-    /// present-but-unusable.
+    /// present-but-unusable. A variant whose overlay is missing is likewise
+    /// absent from the answer (§6.6).
     fn template_meta(
         &self,
         arch: &str,
         name: &str,
         version: Option<&str>,
     ) -> Option<crate::template::TemplateMeta> {
-        self.store.resolve(arch, name, version).ok().map(|t| t.meta)
+        self.store
+            .resolve_version(arch, name, version)
+            .ok()
+            .map(|t| t.meta)
     }
 
     fn profile(&self, name: &str) -> Option<crate::profiles::Profile> {

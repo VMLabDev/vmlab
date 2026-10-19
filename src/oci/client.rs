@@ -28,13 +28,13 @@ use super::auth::{self, BearerChallenge, Credential};
 use super::chunking;
 use super::config_blob::TemplateConfig;
 use super::manifest::{
-    Descriptor, ImageIndex, Manifest, ManifestOrIndex, annotations, build_manifest,
-    parse_manifest_or_index,
+    Descriptor, ImageIndex, Manifest, ManifestOrIndex, VariantEntry, annotations, build_manifest,
+    build_variant_manifest, parse_manifest_or_index,
 };
 use super::media_types;
 use super::reference::Reference;
+use crate::template::TemplateMeta;
 use crate::template::store::{DISK_FILE, TemplateStore};
-use crate::template::{META_FILE, TemplateMeta};
 
 /// A blob or manifest body plus the media type the server reported.
 #[derive(Debug, Clone)]
@@ -56,6 +56,55 @@ pub struct PullProgress {
     pub chunks: usize,
     pub bytes_done: u64,
     pub bytes_total: u64,
+}
+
+/// How many of a part's chunks a push uploaded, and how many the registry
+/// already held.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UploadCount {
+    pub uploaded: usize,
+    pub reused: usize,
+}
+
+/// What a push uploaded: the base's chunks, then each variant's (§6.6). A
+/// variant's base chunks are never counted — the base's own push already
+/// put them there.
+#[derive(Debug, Clone, Default)]
+pub struct PushReport {
+    pub base: UploadCount,
+    pub variants: Vec<(String, UploadCount)>,
+}
+
+impl PushReport {
+    /// One line per part, for the push's log.
+    pub fn lines(&self) -> Vec<String> {
+        let line = |what: &str, c: &UploadCount| {
+            format!(
+                "{what}: uploaded {} chunk(s), {} already in the registry",
+                c.uploaded, c.reused
+            )
+        };
+        std::iter::once(line("base", &self.base))
+            .chain(
+                self.variants
+                    .iter()
+                    .map(|(name, c)| line(&format!("variant {name}"), c)),
+            )
+            .collect()
+    }
+}
+
+/// The tag a variant's manifest is published under: `<tag>--<variant>`
+/// (§6.6). A version never contains `--`, and a variant name never starts
+/// with `-`, so the split is unambiguous; [`is_variant_tag`] recognises one.
+pub fn variant_tag(tag: &str, variant: &str) -> String {
+    format!("{tag}--{variant}")
+}
+
+/// Whether a published tag is a variant's ([`variant_tag`]) rather than a
+/// version or a moving alias — what a listing of versions leaves out.
+pub fn is_variant_tag(tag: &str) -> bool {
+    tag.contains("--")
 }
 
 /// The distribution-API surface push/pull is written against. Digests are
@@ -296,12 +345,18 @@ impl Registry {
         }
     }
 
-    /// Push a template directory (containing `disk.qcow2` + `template.wcl`)
-    /// to the reference for the given `arch`. Chunks the disk, uploads each
-    /// chunk blob (skipping any already present), uploads the config blob,
-    /// PUTs the per-arch manifest, then merges that manifest into the tag's
-    /// index so repeated pushes for different arches build a multi-arch
-    /// index (PRD §6.4).
+    /// Push a template directory (containing `disk.qcow2` + `template.wcl`,
+    /// and `variants/<name>/disk.qcow2` per variant) to the reference for the
+    /// given `arch`. Chunks the disk, uploads each chunk blob (skipping any
+    /// already present), uploads the config blob, PUTs the per-arch manifest,
+    /// then merges that manifest into the tag's index so repeated pushes for
+    /// different arches build a multi-arch index (PRD §6.4).
+    ///
+    /// Each variant goes up first, as its own manifest — the base's chunks,
+    /// then the overlay's — tagged `<tag>--<variant>`; the registry already
+    /// holds the base's chunks by then, so only the overlay's are uploaded.
+    /// The base manifest then names every variant's manifest by digest, which
+    /// is how a pull finds them (§6.6).
     pub async fn push(
         &self,
         template_dir: &Path,
@@ -310,68 +365,178 @@ impl Registry {
         work_dir: &Path,
         source: Option<&str>,
         moving_tag: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<PushReport> {
         let repo = self.reference.repository.clone();
-        let meta = TemplateMeta::read_from(&template_dir.join(META_FILE)).with_context(|| {
+        // The variants the store serves: a block whose overlay is missing
+        // does not count (§6.6).
+        let meta = crate::template::store::read_meta(template_dir).with_context(|| {
             format!(
                 "cannot read template metadata in {}",
                 template_dir.display()
             )
         })?;
-        let disk = template_dir.join(DISK_FILE);
-
-        // 1. Chunk + compress.
-        let chunks_dir = work_dir.join("chunks");
-        let set = chunking::chunk_and_compress(&disk, chunk_size, &chunks_dir)?;
-
-        // 2. Upload chunk blobs (skip if present).
-        for c in &set.chunks {
-            if self
-                .transport
-                .blob_exists(&repo, &c.compressed_digest)
-                .await?
-            {
-                tracing::debug!(digest = %c.compressed_digest, "chunk already present, skipping");
-                continue;
-            }
-            self.transport
-                .put_blob_file(&repo, &c.compressed_digest, &c.compressed_path)
-                .await
-                .with_context(|| format!("uploading chunk {}", c.index))?;
+        if let Some(stale) = meta.variants.iter().find(|v| meta.is_stale(v)) {
+            bail!(
+                "variant `{}` of {}/{}@{} is stale — it was built on an earlier base; rebuild it \
+                 or remove it before pushing",
+                stale.name,
+                meta.arch,
+                meta.name,
+                meta.version
+            );
         }
+        let disk = template_dir.join(DISK_FILE);
+        let mut report = PushReport::default();
 
-        // 3. Upload the config blob.
+        // 1 + 2. Chunk, compress and upload the base.
+        let set = chunking::chunk_and_compress(&disk, chunk_size, &work_dir.join("chunks"))?;
+        report.base = self.upload_chunks(&repo, &set).await?;
+
+        // 3. The variants, each a manifest of its own.
         let mut config_meta = meta.clone();
         config_meta.arch = arch.to_string();
-        let config_bytes = TemplateConfig::from_meta(&config_meta).to_json()?;
-        let config_digest = digest_of(&config_bytes);
-        if !self.transport.blob_exists(&repo, &config_digest).await? {
-            self.transport
-                .put_blob(&repo, &config_digest, config_bytes.clone())
+        let mut entries = Vec::new();
+        for v in &meta.variants {
+            let overlay = template_dir.join(crate::template::meta::variant_disk_rel(&v.name));
+            let ensured = crate::template::store::qcow2_backing_file(&overlay)?;
+            ensure!(
+                ensured.as_deref() == Some(crate::template::store::VARIANT_BACKING),
+                "variant `{}` is backed by {} rather than {} — not a store overlay",
+                v.name,
+                ensured.as_deref().unwrap_or("nothing"),
+                crate::template::store::VARIANT_BACKING
+            );
+            let vset = chunking::chunk_and_compress(
+                &overlay,
+                chunk_size,
+                &work_dir.join("variants").join(&v.name),
+            )?;
+            let uploaded = self.upload_chunks(&repo, &vset).await?;
+            let config = self
+                .put_config(&repo, &TemplateConfig::from_variant(&config_meta, v))
+                .await?;
+            let mut manifest = build_variant_manifest(&v.name, &set, &vset, config);
+            if let Some(src) = source {
+                manifest
+                    .annotations
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(annotations::IMAGE_SOURCE.to_string(), src.to_string());
+            }
+            let tag = variant_tag(&self.reference.tag, &v.name);
+            let digest = self
+                .put_arch_manifest(&repo, arch, &manifest, &tag, None, source)
                 .await
-                .context("uploading config blob")?;
+                .with_context(|| format!("pushing variant `{}`", v.name))?;
+            tracing::info!(
+                variant = %v.name,
+                uploaded = uploaded.uploaded,
+                reused = uploaded.reused,
+                "pushed variant"
+            );
+            report.variants.push((v.name.clone(), uploaded));
+            entries.push(VariantEntry {
+                name: v.name.clone(),
+                manifest: digest,
+            });
         }
-        let config_desc = Descriptor::new(
-            media_types::CONFIG_TEMPLATE_JSON,
-            &config_digest,
-            config_bytes.len() as u64,
-        );
 
-        // 4. Build + PUT the per-arch manifest (addressed by its digest so
-        // the index can reference it stably). Stamp the source-repo
-        // annotation so registries connect the package to its repo (GHCR).
+        // 4. The base's config blob and manifest, naming its variants.
+        // Stamp the source-repo annotation so registries connect the package
+        // to its repo (GHCR).
+        let mut base_config = config_meta.clone();
+        base_config.variants.clear();
+        let config_desc = self
+            .put_config(&repo, &TemplateConfig::from_meta(&base_config))
+            .await?;
         let mut manifest = build_manifest(&set, config_desc);
+        manifest.set_variants(&entries, meta.default_variant().map(|d| d.name.as_str()));
         if let Some(src) = source {
             manifest
                 .annotations
                 .get_or_insert_with(BTreeMap::new)
                 .insert(annotations::IMAGE_SOURCE.to_string(), src.to_string());
         }
-        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        // 5. Merge into the tag's index, and re-point a moving alias
+        // (`latest` / `latest-prerelease`) at the same merged index — no blob
+        // re-upload (PRD §6.4). Each arch push leaves the alias on the latest
+        // complete index.
+        self.put_arch_manifest(
+            &repo,
+            arch,
+            &manifest,
+            &self.reference.tag,
+            moving_tag,
+            source,
+        )
+        .await?;
+
+        tracing::info!(
+            reference = %self.reference.canonical(),
+            arch,
+            chunks = set.chunk_count,
+            variants = entries.len(),
+            "pushed template"
+        );
+        Ok(report)
+    }
+
+    /// Upload a chunk set's blobs, skipping each the registry already holds.
+    async fn upload_chunks(&self, repo: &str, set: &chunking::ChunkSet) -> Result<UploadCount> {
+        let mut count = UploadCount::default();
+        for c in &set.chunks {
+            if self
+                .transport
+                .blob_exists(repo, &c.compressed_digest)
+                .await?
+            {
+                tracing::debug!(digest = %c.compressed_digest, "chunk already present, skipping");
+                count.reused += 1;
+                continue;
+            }
+            self.transport
+                .put_blob_file(repo, &c.compressed_digest, &c.compressed_path)
+                .await
+                .with_context(|| format!("uploading chunk {}", c.index))?;
+            count.uploaded += 1;
+        }
+        Ok(count)
+    }
+
+    /// Upload a config blob unless present, returning its descriptor.
+    async fn put_config(&self, repo: &str, config: &TemplateConfig) -> Result<Descriptor> {
+        let bytes = config.to_json()?;
+        let digest = digest_of(&bytes);
+        if !self.transport.blob_exists(repo, &digest).await? {
+            self.transport
+                .put_blob(repo, &digest, bytes.clone())
+                .await
+                .context("uploading config blob")?;
+        }
+        Ok(Descriptor::new(
+            media_types::CONFIG_TEMPLATE_JSON,
+            &digest,
+            bytes.len() as u64,
+        ))
+    }
+
+    /// PUT a per-arch manifest by its digest (so an index can reference it
+    /// stably), merge it into `tag`'s index — creating it if absent, promoting
+    /// a plain manifest tag into one — and point `moving_tag` at the same
+    /// index. Returns the manifest's digest.
+    async fn put_arch_manifest(
+        &self,
+        repo: &str,
+        arch: &str,
+        manifest: &Manifest,
+        tag: &str,
+        moving_tag: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<String> {
+        let manifest_bytes = serde_json::to_vec(manifest)?;
         let manifest_digest = digest_of(&manifest_bytes);
         self.transport
             .put_manifest(
-                &repo,
+                repo,
                 &manifest_digest,
                 media_types::OCI_MANIFEST,
                 manifest_bytes.clone(),
@@ -379,13 +544,7 @@ impl Registry {
             .await
             .context("uploading manifest")?;
 
-        // 5. Merge into the tag's index (creating it if absent / promoting
-        // a plain manifest tag into an index).
-        let mut index = match self
-            .transport
-            .get_manifest(&repo, &self.reference.tag)
-            .await?
-        {
+        let mut index = match self.transport.get_manifest(repo, tag).await? {
             Some(f) => match parse_manifest_or_index(&f.body)? {
                 ManifestOrIndex::Index(i) => i,
                 ManifestOrIndex::Manifest(_) => ImageIndex::new(),
@@ -408,32 +567,16 @@ impl Registry {
         }
         let index_bytes = serde_json::to_vec(&index)?;
         self.transport
-            .put_manifest(
-                &repo,
-                &self.reference.tag,
-                media_types::OCI_INDEX,
-                index_bytes.clone(),
-            )
+            .put_manifest(repo, tag, media_types::OCI_INDEX, index_bytes.clone())
             .await
-            .context("uploading tag index")?;
-
-        // Re-point a moving alias (`latest` / `latest-prerelease`) at the same
-        // merged index — no blob re-upload (PRD §6.4). Each arch push leaves the
-        // alias on the latest complete index.
+            .with_context(|| format!("uploading the index for tag {tag}"))?;
         if let Some(alias) = moving_tag {
             self.transport
-                .put_manifest(&repo, alias, media_types::OCI_INDEX, index_bytes)
+                .put_manifest(repo, alias, media_types::OCI_INDEX, index_bytes)
                 .await
                 .with_context(|| format!("updating moving tag {alias}"))?;
         }
-
-        tracing::info!(
-            reference = %self.reference.canonical(),
-            arch,
-            chunks = set.chunk_count,
-            "pushed template"
-        );
-        Ok(())
+        Ok(manifest_digest)
     }
 
     /// Resolve this reference's tag to the per-arch [`Manifest`] and its
@@ -504,12 +647,8 @@ impl Registry {
         Ok(self.resolve_manifest_meta(arch).await?.1.version)
     }
 
-    /// Pull the reference for `arch` into `dest_store`. Fetches the tag
-    /// (resolving the index when present — `arch` required unless single),
-    /// verifies the manifest is a vmlab artifact, downloads chunks in
-    /// order, assembles, verifies the whole-image digest, then installs
-    /// into the store recording the originating reference as the origin
-    /// (PRD §6.4).
+    /// [`Self::pull_with_progress`] of the default variant alone, unwatched.
+    #[cfg(test)]
     pub async fn pull(
         &self,
         arch: Option<&str>,
@@ -517,21 +656,43 @@ impl Registry {
         work_dir: &Path,
         overwrite: bool,
     ) -> Result<TemplateMeta> {
-        self.pull_with_progress(arch, dest_store, work_dir, overwrite, &mut |_| {})
-            .await
+        self.pull_with_progress(
+            arch,
+            dest_store,
+            work_dir,
+            overwrite,
+            &VariantWant::default(),
+            &mut |_| {},
+        )
+        .await
     }
 
-    /// [`pull`](Self::pull) that reports chunk-download progress. `progress`
-    /// is called once before the first chunk (`chunk == 0`) and after each
-    /// chunk completes, carrying the compressed bytes downloaded so far out
-    /// of the manifest's total — enough for a UI progress bar (PRD §6.4,
+    /// Pull the reference for `arch` into `dest_store`. Fetches the tag
+    /// (resolving the index when present — `arch` required unless single),
+    /// verifies the manifest is a vmlab artifact, downloads chunks in
+    /// order, assembles, verifies the whole-image digest, then installs
+    /// into the store recording the originating reference as the origin
+    /// (PRD §6.4).
+    ///
+    /// `progress` is called once before the first chunk (`chunk == 0`) and
+    /// after each chunk completes, carrying the compressed bytes downloaded
+    /// so far out of the total — enough for a UI progress bar (PRD §6.4,
     /// issue #1). Byte totals are the compressed (downloaded) sizes.
+    ///
+    /// Variants (§6.6): the base manifest names each variant's manifest. A
+    /// pull takes the default variant whatever `want` says — so a bare
+    /// reference resolves in this store to the variant it resolves to in the
+    /// registry — plus every variant `want` names. A base the store already
+    /// holds is not downloaded again, nor is a variant it holds with the same
+    /// digest; what arrives is merged into the version, keeping the variants
+    /// already there.
     pub async fn pull_with_progress(
         &self,
         arch: Option<&str>,
         dest_store: &TemplateStore,
         work_dir: &Path,
         overwrite: bool,
+        want: &VariantWant,
         progress: &mut (dyn FnMut(PullProgress) + Send),
     ) -> Result<TemplateMeta> {
         let repo = &self.reference.repository;
@@ -539,81 +700,118 @@ impl Registry {
         // Steps 1-3: resolve the tag to the per-arch manifest + metadata
         // (no chunk download yet).
         let (manifest, meta) = self.resolve_manifest_meta(arch).await?;
+        let whole = manifest
+            .whole_digest()
+            .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
+            .to_string();
+        let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
+        let (listed, default) = manifest.variants()?;
+        let chosen = want.choose(&listed, default.as_deref(), &reference)?;
 
         // The same version already in the store: the same artefact is used
         // as it stands, and only a different one is refused. The store name
         // comes from the template's metadata, not the repository path, so a
         // template pushed from this store and referenced back by registry
         // lands here rather than in an offline cache hit.
-        if !overwrite
-            && let Some(local) = dest_store.installed(&meta.arch, &meta.name, &meta.version)?
-        {
-            let whole = manifest
-                .whole_digest()
-                .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
-                .to_string();
-            let local_meta = local.meta.clone();
-            let same = tokio::task::spawn_blocking(move || same_disk(&local, &whole))
+        let local = if overwrite {
+            None
+        } else {
+            dest_store.installed(&meta.arch, &meta.name, &meta.version)?
+        };
+        if let Some(local) = &local {
+            let held = local.clone();
+            let whole = whole.clone();
+            let same = tokio::task::spawn_blocking(move || same_disk(&held, &whole))
                 .await
                 .map_err(|e| anyhow!("template digest task: {e}"))??;
             ensure!(
                 same,
-                "template {}/{}@{} is already in the store with a different disk than {} \
+                "template {reference} is already in the store with a different disk than {} \
                  — remove it first, or pull with overwrite to replace it",
-                meta.arch,
-                meta.name,
-                meta.version,
                 self.reference.canonical()
             );
-            return Ok(local_meta);
         }
 
-        // 4. Download chunks in order to a temp dir.
-        let chunks_dir = work_dir.join("chunks");
-        std::fs::create_dir_all(&chunks_dir)
-            .with_context(|| format!("cannot create {}", chunks_dir.display()))?;
-        let ordered = manifest.layers_in_order();
-        let chunks = ordered.len();
-        let bytes_total: u64 = ordered.iter().map(|d| d.size).sum();
-        let mut bytes_done: u64 = 0;
-        progress(PullProgress {
-            chunk: 0,
-            chunks,
-            bytes_done,
-            bytes_total,
-        });
-        let mut chunk_paths = Vec::new();
-        for (i, layer) in ordered.into_iter().enumerate() {
-            let bytes = self
-                .transport
-                .get_blob(repo, &layer.digest)
-                .await
-                .with_context(|| format!("downloading chunk {i}"))?;
-            // Verify each chunk's compressed digest as we go.
-            let got = digest_of(&bytes);
-            if !got.eq_ignore_ascii_case(&layer.digest) {
+        // The variants to fetch: each one's manifest and config blob, which
+        // say what its overlay assembles to and the block it stands for.
+        let mut parts: Vec<(crate::template::meta::VariantMeta, Vec<Descriptor>, String)> =
+            Vec::new();
+        for entry in chosen {
+            let vm = self.fetch_manifest(repo, &entry.manifest).await?;
+            if !vm.is_vmlab_template() {
                 bail!(
-                    "chunk {i} digest mismatch: expected {}, got {got}",
-                    layer.digest
+                    "variant `{}`'s manifest is not a vmlab template",
+                    entry.name
                 );
             }
-            let path = chunks_dir.join(format!("chunk-{i:04}.zst"));
-            std::fs::write(&path, &bytes)
-                .with_context(|| format!("cannot write {}", path.display()))?;
-            chunk_paths.push(path);
-            bytes_done += layer.size;
-            progress(PullProgress {
-                chunk: i + 1,
-                chunks,
-                bytes_done,
-                bytes_total,
-            });
+            let layout = vm.variant_layout()?;
+            ensure!(
+                layout.name == entry.name,
+                "the manifest named for variant `{}` is variant `{}`'s",
+                entry.name,
+                layout.name
+            );
+            ensure!(
+                digest_eq(&layout.base_digest, &whole),
+                "variant `{}` was pushed on base {} but the tag's base is {whole} — the tag \
+                 changed mid-pull or was pushed inconsistently; pull again",
+                entry.name,
+                layout.base_digest
+            );
+            if let Some(held) = local.as_ref().and_then(|l| l.meta.variant(&entry.name))
+                && digest_eq(&held.sha256, &layout.overlay_digest)
+            {
+                continue;
+            }
+            let config_bytes = self
+                .transport
+                .get_blob(repo, &vm.config.digest)
+                .await
+                .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
+            let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(&meta)?;
+            ensure!(
+                variant.name == entry.name && digest_eq(&variant.sha256, &layout.overlay_digest),
+                "variant `{}`'s config blob disagrees with its manifest",
+                entry.name
+            );
+            parts.push((variant, layout.overlay, layout.overlay_digest));
+        }
+        if let Some(local) = &local
+            && parts.is_empty()
+        {
+            return Ok(local.meta.clone());
         }
 
-        // 5 + 6. Decompress the chunks into the disk image, verify the
+        // 4. Download chunks in order — the base's only when the store does
+        // not already hold it — verifying each chunk's digest as it lands.
+        let chunks_dir = work_dir.join("chunks");
+        let base_layers: Vec<Descriptor> = if local.is_none() {
+            manifest.layers_in_order().into_iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let mut download = Download::new(
+            std::iter::once(&base_layers)
+                .chain(parts.iter().map(|(_, layers, _)| layers))
+                .flatten(),
+            progress,
+        );
+        let base_paths = self
+            .download_layers(repo, &base_layers, &chunks_dir.join("base"), &mut download)
+            .await?;
+        let mut overlays = Vec::new();
+        for (variant, layers, digest) in parts {
+            let dir = chunks_dir.join("variants").join(&variant.name);
+            let paths = self
+                .download_layers(repo, layers.as_slice(), &dir, &mut download)
+                .await?;
+            overlays.push((variant, paths, digest));
+        }
+
+        // 5 + 6. Decompress the chunks into the disk images, verify each
         // whole-image digest, and install into the store (a work_dir under
         // the store root keeps the install a plain rename; one elsewhere
-        // costs a copy). Record the disk digest if absent.
+        // costs a copy). Record the base digest if absent.
         //
         // All of this is multi-GB CPU and disk work — a Windows template is
         // tens of GB — so it runs on a blocking thread. Inline, it stalled the
@@ -622,38 +820,248 @@ impl Registry {
         let staging = work_dir.join("staging");
         std::fs::create_dir_all(&staging)
             .with_context(|| format!("cannot create {}", staging.display()))?;
-        let whole = manifest
-            .whole_digest()
-            .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
-            .to_string();
         let store = dest_store.clone();
-        let staging_for_task = staging.clone();
         let meta = tokio::task::spawn_blocking(move || -> Result<TemplateMeta> {
-            let disk = staging_for_task.join(DISK_FILE);
-            chunking::assemble(&chunk_paths, &disk)?;
-            chunking::verify_whole(&disk, &whole)?;
-            let mut meta = meta;
-            if meta.sha256.is_none() {
-                meta.sha256 = Some(crate::template::store::sha256_file(&disk)?);
+            let mut variants = Vec::new();
+            for (mut variant, paths, digest) in overlays {
+                let disk = staging.join(crate::template::meta::variant_disk_rel(&variant.name));
+                chunking::assemble(&paths, &disk)?;
+                chunking::verify_whole(&disk, &digest)
+                    .with_context(|| format!("variant `{}`", variant.name))?;
+                if crate::template::store::ensure_variant_backing(&disk)? {
+                    variant.sha256 = crate::template::store::sha256_file(&disk)?;
+                }
+                variants.push(variant);
             }
-            store.install(&staging_for_task, &meta, overwrite)?;
-            Ok(meta)
+            match local {
+                Some(held) => store.add_variants(
+                    &held.meta.arch,
+                    &held.meta.name,
+                    &held.meta.version,
+                    &staging,
+                    &variants,
+                ),
+                None => {
+                    let disk = staging.join(DISK_FILE);
+                    chunking::assemble(&base_paths, &disk)?;
+                    chunking::verify_whole(&disk, &whole)?;
+                    let mut meta = meta;
+                    if meta.sha256.is_none() {
+                        meta.sha256 = Some(
+                            whole
+                                .strip_prefix("sha256:")
+                                .unwrap_or(&whole)
+                                .to_ascii_lowercase(),
+                        );
+                    }
+                    meta.variants = variants;
+                    store.install_with_variants(&staging, &meta, overwrite)?;
+                    Ok(meta)
+                }
+            }
         })
         .await
         .map_err(|e| anyhow!("template install task: {e}"))??;
         tracing::info!(
             reference = %self.reference.canonical(),
             arch = %meta.arch,
+            variants = meta.variants.len(),
             "pulled template into store"
         );
         Ok(meta)
     }
+
+    /// GET a manifest by digest, checking the body is the one the digest
+    /// names.
+    async fn fetch_manifest(&self, repo: &str, digest: &str) -> Result<Manifest> {
+        let fetched = self
+            .transport
+            .get_manifest(repo, digest)
+            .await?
+            .ok_or_else(|| anyhow!("manifest {digest} missing from registry"))?;
+        let got = digest_of(&fetched.body);
+        ensure!(
+            digest_eq(&got, digest),
+            "manifest {digest} digest mismatch: got {got}"
+        );
+        match parse_manifest_or_index(&fetched.body)? {
+            ManifestOrIndex::Manifest(m) => Ok(m),
+            ManifestOrIndex::Index(_) => bail!("{digest} is an index, not a manifest"),
+        }
+    }
+
+    /// Download `layers` in order into `dir`, verifying each compressed
+    /// chunk's digest, and return the chunk files in that order.
+    async fn download_layers(
+        &self,
+        repo: &str,
+        layers: &[Descriptor],
+        dir: &Path,
+        download: &mut Download<'_>,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        let mut paths = Vec::with_capacity(layers.len());
+        for (i, layer) in layers.iter().enumerate() {
+            let chunk = download.chunk;
+            let bytes = self
+                .transport
+                .get_blob(repo, &layer.digest)
+                .await
+                .with_context(|| format!("downloading chunk {chunk}"))?;
+            let got = digest_of(&bytes);
+            if !got.eq_ignore_ascii_case(&layer.digest) {
+                bail!(
+                    "chunk {chunk} digest mismatch: expected {}, got {got}",
+                    layer.digest
+                );
+            }
+            let path = dir.join(format!("chunk-{i:04}.zst"));
+            std::fs::write(&path, &bytes)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            paths.push(path);
+            download.done(layer.size);
+        }
+        Ok(paths)
+    }
+}
+
+/// Which variants a pull fetches beyond the default, which it always does
+/// (§6.6): the names a `#<variant>` asked for, or every variant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VariantWant {
+    pub names: std::collections::BTreeSet<String>,
+    pub all: bool,
+}
+
+impl VariantWant {
+    /// Every variant (`template pull --all-variants`).
+    pub fn all() -> Self {
+        Self {
+            names: Default::default(),
+            all: true,
+        }
+    }
+
+    /// What a reference's `#<variant>` asks for: a named variant, or nothing
+    /// beyond the default for no `#` and for `#base`.
+    pub fn of(variant: Option<&crate::config::model::VariantRef>) -> Self {
+        let mut want = Self::default();
+        want.add(variant);
+        want
+    }
+
+    /// Add what another reference's `#<variant>` asks for.
+    pub fn add(&mut self, variant: Option<&crate::config::model::VariantRef>) {
+        if let Some(crate::config::model::VariantRef::Named(n)) = variant {
+            self.names.insert(n.clone());
+        }
+    }
+
+    /// Whether a store version already holds everything this asks for, as
+    /// far as can be told offline: every named variant installed. Every
+    /// variant cannot be known without asking the registry.
+    pub fn held_by(&self, meta: &TemplateMeta) -> bool {
+        !self.all && self.names.iter().all(|n| meta.variant(n).is_some())
+    }
+
+    /// The variants of a base manifest's `listed` this pull fetches, in
+    /// listed order: the default, and every one asked for. A name the
+    /// manifest does not list is an error naming those it does.
+    fn choose(
+        &self,
+        listed: &[VariantEntry],
+        default: Option<&str>,
+        reference: &str,
+    ) -> Result<Vec<VariantEntry>> {
+        if listed.is_empty() {
+            if let Some(name) = self.names.iter().next() {
+                bail!("template {reference} has no variants, so `#{name}` names nothing");
+            }
+            return Ok(Vec::new());
+        }
+        for name in &self.names {
+            if !listed.iter().any(|e| &e.name == name) {
+                let names: Vec<String> = listed
+                    .iter()
+                    .map(|e| {
+                        if Some(e.name.as_str()) == default {
+                            format!("{} (default)", e.name)
+                        } else {
+                            e.name.clone()
+                        }
+                    })
+                    .collect();
+                bail!(
+                    "template {reference} has no variant `{name}` (its variants: {})",
+                    names.join(", ")
+                );
+            }
+        }
+        Ok(listed
+            .iter()
+            .filter(|e| {
+                self.all || Some(e.name.as_str()) == default || self.names.contains(&e.name)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+/// The running count behind a pull's progress reports, across every part it
+/// downloads.
+struct Download<'a> {
+    chunk: usize,
+    chunks: usize,
+    bytes_done: u64,
+    bytes_total: u64,
+    progress: &'a mut (dyn FnMut(PullProgress) + Send),
+}
+
+impl<'a> Download<'a> {
+    /// Start counting `layers`, reporting the 0-of-N update.
+    fn new<'l>(
+        layers: impl Iterator<Item = &'l Descriptor>,
+        progress: &'a mut (dyn FnMut(PullProgress) + Send),
+    ) -> Self {
+        let (chunks, bytes_total) = layers.fold((0, 0), |(n, b), d| (n + 1, b + d.size));
+        let mut d = Self {
+            chunk: 0,
+            chunks,
+            bytes_done: 0,
+            bytes_total,
+            progress,
+        };
+        d.report();
+        d
+    }
+
+    fn done(&mut self, size: u64) {
+        self.chunk += 1;
+        self.bytes_done += size;
+        self.report();
+    }
+
+    fn report(&mut self) {
+        (self.progress)(PullProgress {
+            chunk: self.chunk,
+            chunks: self.chunks,
+            bytes_done: self.bytes_done,
+            bytes_total: self.bytes_total,
+        });
+    }
+}
+
+/// Two `sha256` digests, either maybe `sha256:`-prefixed, compared without
+/// case.
+fn digest_eq(a: &str, b: &str) -> bool {
+    let strip = |d: &str| d.strip_prefix("sha256:").unwrap_or(d).to_ascii_lowercase();
+    strip(a) == strip(b)
 }
 
 /// Whether a stored template's disk is the image a manifest's whole-image
 /// digest names. The digest recorded at install answers without reading the
 /// disk; an entry that never recorded one is hashed.
-fn same_disk(local: &crate::template::store::ResolvedTemplate, whole: &str) -> Result<bool> {
+fn same_disk(local: &crate::template::store::TemplateVersion, whole: &str) -> Result<bool> {
     let want = whole
         .strip_prefix("sha256:")
         .unwrap_or(whole)
@@ -671,11 +1079,15 @@ fn same_disk(local: &crate::template::store::ResolvedTemplate, whole: &str) -> R
 /// deferred pulls (labd build placeholders, status `template_cached`). A
 /// moving alias (`latest`) never resolves here until its first pull records
 /// a concrete version.
+///
+/// A store *version*: the reference's `#<variant>` is the caller's to apply
+/// ([`crate::template::store::TemplateVersion::select`]), since machines with
+/// different variants of one reference share its pull.
 pub fn cached_registry_template(
     reference: &str,
     arch: &str,
     store: &TemplateStore,
-) -> Result<Option<crate::template::store::ResolvedTemplate>> {
+) -> Result<Option<crate::template::store::TemplateVersion>> {
     let registry = Registry::new(reference)?;
     // Templates live at `host/owner/[group/]name:VERSION`; the store name is
     // the last repository path component.
@@ -685,7 +1097,9 @@ pub fn cached_registry_template(
         .next()
         .unwrap_or_default()
         .to_string();
-    Ok(store.resolve(arch, &store_name, Some(registry.tag())).ok())
+    Ok(store
+        .resolve_version(arch, &store_name, Some(registry.tag()))
+        .ok())
 }
 
 /// Resolve a `registry` template reference to a cached store entry, pulling it
@@ -703,10 +1117,14 @@ pub async fn ensure_registry_template(
     reference: &str,
     arch: &str,
     store: &TemplateStore,
+    want: &VariantWant,
     progress: &mut (dyn FnMut(PullProgress) + Send),
-) -> Result<crate::template::store::ResolvedTemplate> {
-    // Tag is a concrete, already-cached version: stay offline.
-    if let Some(r) = cached_registry_template(reference, arch, store)? {
+) -> Result<crate::template::store::TemplateVersion> {
+    // Tag is a concrete, already-cached version holding every variant asked
+    // for: stay offline.
+    if let Some(r) = cached_registry_template(reference, arch, store)?
+        && want.held_by(&r.meta)
+    {
         return Ok(r);
     }
     let registry = Registry::new(reference)?;
@@ -732,7 +1150,9 @@ pub async fn ensure_registry_template(
         .resolve_version(Some(arch))
         .await
         .with_context(|| format!("resolving {reference}"))?;
-    if let Ok(r) = store.resolve(arch, &store_name, Some(&real)) {
+    if let Ok(r) = store.resolve_version(arch, &store_name, Some(&real))
+        && want.held_by(&r.meta)
+    {
         return Ok(r);
     }
     // Its own staging directory, on the store's filesystem: two labs pulling
@@ -741,10 +1161,10 @@ pub async fn ensure_registry_template(
         &crate::paths::template_store_dir().join(".oci-pull"),
     )?;
     let meta = registry
-        .pull_with_progress(Some(arch), store, work.path(), false, progress)
+        .pull_with_progress(Some(arch), store, work.path(), false, want, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
-    store.resolve(&meta.arch, &meta.name, Some(&meta.version))
+    store.resolve_version(&meta.arch, &meta.name, Some(&meta.version))
 }
 
 /// `sha256:<hex>` of a byte slice.
@@ -1207,6 +1627,7 @@ async fn backoff(attempt: u32) {
 mod tests {
     use super::*;
     use crate::oci::chunking;
+    use crate::template::META_FILE;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1216,6 +1637,8 @@ mod tests {
     struct FakeRegistry {
         blobs: Mutex<HashMap<String, Vec<u8>>>,
         manifests: Mutex<HashMap<String, (String, Vec<u8>)>>,
+        /// Every blob digest PUT, in order — what a push uploaded.
+        puts: Mutex<Vec<String>>,
     }
 
     fn key(repo: &str, id: &str) -> String {
@@ -1239,6 +1662,7 @@ mod tests {
             // verify the digest like a real registry does
             let got = digest_of(&data);
             assert_eq!(got, digest, "fake registry: digest mismatch on put");
+            self.puts.lock().unwrap().push(digest.to_string());
             self.blobs.lock().unwrap().insert(key(repo, digest), data);
             Ok(())
         }
@@ -1327,6 +1751,8 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
+            variants: Vec::new(),
         }
     }
 
@@ -1524,7 +1950,9 @@ mod tests {
         assert_eq!(pulled.name, "alpine");
         assert_eq!(pulled.origin.as_deref(), Some("ghcr.io/owner/alpine:3.20"));
         // disk reassembled identically
-        let resolved = store.resolve("x86_64", "alpine", Some("3.20")).unwrap();
+        let resolved = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap();
         assert_eq!(std::fs::read(&resolved.disk_path).unwrap(), disk);
     }
 
@@ -1569,6 +1997,7 @@ mod tests {
                 &store,
                 &store_root.join(".oci-pull"),
                 false,
+                &VariantWant::default(),
                 &mut |_| downloads += 1,
             )
             .await
@@ -1581,7 +2010,7 @@ mod tests {
 
         // A different disk under the same name and version is refused.
         store
-            .remove("x86_64", "alpine", "3.20", true, &|_| None)
+            .remove("x86_64", "alpine", "3.20", None, true, &|_| None)
             .unwrap();
         let mut other = m.clone();
         other.sha256 = Some("00".repeat(32));
@@ -1627,6 +2056,7 @@ mod tests {
             &store,
             &store_root.join(".oci-pull"),
             false,
+            &VariantWant::default(),
             &mut |p| updates.push(p),
         )
         .await
@@ -1735,7 +2165,7 @@ mod tests {
         assert_eq!(
             std::fs::read(
                 &store
-                    .resolve("x86_64", "alpine", Some("3.20"))
+                    .resolve_version("x86_64", "alpine", Some("3.20"))
                     .unwrap()
                     .disk_path
             )
@@ -1745,7 +2175,7 @@ mod tests {
         assert_eq!(
             std::fs::read(
                 &store
-                    .resolve("aarch64", "alpine", Some("3.20"))
+                    .resolve_version("aarch64", "alpine", Some("3.20"))
                     .unwrap()
                     .disk_path
             )
@@ -1870,6 +2300,8 @@ mod tests {
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
+            variants_expected: false,
+            variants: Vec::new(),
         };
         std::fs::create_dir_all(store.root()).unwrap();
         let staging = tempfile::tempdir_in(store.root()).unwrap();
@@ -1963,5 +2395,726 @@ mod tests {
         assert!(!session_lost(reqwest::StatusCode::PAYLOAD_TOO_LARGE));
         assert!(!session_lost(reqwest::StatusCode::UNAUTHORIZED));
         assert!(!session_lost(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    // ---- variants (§6.6) ----------------------------------------------------
+
+    use crate::template::meta::{VariantMeta, variant_disk_rel};
+    use crate::template::store::sha256_file;
+
+    fn have_qemu_tools() -> bool {
+        let found = std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths)
+                .any(|dir| dir.join("qemu-img").is_file() && dir.join("qemu-io").is_file())
+        });
+        if !found {
+            eprintln!("skipping: qemu-img/qemu-io not found on PATH");
+        }
+        found
+    }
+
+    fn run(dir: &Path, tool: &str, args: &[&str]) {
+        let out = std::process::Command::new(tool)
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{tool} {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn variant(name: &str, default: bool, sha256: String, base_sha256: &str) -> VariantMeta {
+        VariantMeta {
+            name: name.into(),
+            default,
+            created: "2026-07-01T00:00:00Z".parse().unwrap(),
+            sha256,
+            base_sha256: base_sha256.into(),
+            description: None,
+            first_boot_script: None,
+            agent_version: None,
+            wscript_surface: None,
+            profile: None,
+            cpus: None,
+            memory: None,
+            firmware: None,
+            tpm: None,
+            secure_boot: None,
+            display: None,
+            cpu_model: None,
+            accel: None,
+        }
+    }
+
+    /// A template directory laid out as the store lays a version out: a real
+    /// qcow2 base, and the overlays `standard` (default) and `extra`
+    /// (`memory` and `first_boot_script` overridden, described), each
+    /// backed on `../../disk.qcow2` and each holding data of its own.
+    fn variant_template(dir: &Path) -> TemplateMeta {
+        std::fs::create_dir_all(dir).unwrap();
+        run(
+            dir,
+            "qemu-img",
+            &["create", "-q", "-f", "qcow2", DISK_FILE, "4M"],
+        );
+        run(
+            dir,
+            "qemu-io",
+            &["-c", "write -q -P 0xaa 0 256k", DISK_FILE],
+        );
+        let base_sha = sha256_file(&dir.join(DISK_FILE)).unwrap();
+        let mut m = meta("x86_64");
+        m.sha256 = Some(base_sha.clone());
+        m.first_boot_script = Some("base script".into());
+        for (name, pattern) in [("standard", "0x11"), ("extra", "0x22")] {
+            let vdir = dir.join("variants").join(name);
+            std::fs::create_dir_all(&vdir).unwrap();
+            run(
+                &vdir,
+                "qemu-img",
+                &[
+                    "create",
+                    "-q",
+                    "-f",
+                    "qcow2",
+                    "-b",
+                    "../../disk.qcow2",
+                    "-F",
+                    "qcow2",
+                    DISK_FILE,
+                ],
+            );
+            run(
+                &vdir,
+                "qemu-io",
+                &["-c", &format!("write -q -P {pattern} 1M 128k"), DISK_FILE],
+            );
+            let sha = sha256_file(&vdir.join(DISK_FILE)).unwrap();
+            let mut v = variant(name, name == "standard", sha, &base_sha);
+            if name == "extra" {
+                v.memory = Some(8 << 30);
+                v.first_boot_script = Some("extra script".into());
+                v.description = Some("more memory".into());
+            }
+            m.variants.push(v);
+        }
+        m.write_to(&dir.join(META_FILE)).unwrap();
+        m
+    }
+
+    const SMALL_CHUNKS: u64 = 64 * 1024;
+
+    /// Push `variant_template` to `ghcr.io/owner/alpine:3.20`, moving
+    /// `latest`.
+    async fn push_variants(
+        fake: &std::sync::Arc<FakeRegistry>,
+        work: &Path,
+    ) -> (TemplateMeta, PushReport) {
+        let tdir = work.join("tmpl");
+        let m = variant_template(&tdir);
+        let report = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.join("push"),
+                None,
+                Some("latest"),
+            )
+            .await
+            .unwrap();
+        (m, report)
+    }
+
+    async fn arch_manifest(fake: &FakeRegistry, tag: &str) -> Manifest {
+        let index = fake
+            .get_manifest("owner/alpine", tag)
+            .await
+            .unwrap()
+            .unwrap();
+        let ManifestOrIndex::Index(index) = parse_manifest_or_index(&index.body).unwrap() else {
+            panic!("{tag} is not an index");
+        };
+        let desc = index.resolve(Some("x86_64")).unwrap();
+        let body = fake
+            .get_manifest("owner/alpine", &desc.digest)
+            .await
+            .unwrap()
+            .unwrap();
+        let ManifestOrIndex::Manifest(m) = parse_manifest_or_index(&body.body).unwrap() else {
+            panic!("index entry is not a manifest");
+        };
+        m
+    }
+
+    async fn config_json(fake: &FakeRegistry, m: &Manifest) -> serde_json::Value {
+        serde_json::from_slice(
+            &fake
+                .get_blob("owner/alpine", &m.config.digest)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The layout a push gives a variant: its own manifest under
+    /// `<version>--<variant>`, the base's layers first and in order, then the
+    /// overlay's; annotations saying where the base ends and what each part
+    /// assembles to; a config blob of effective metadata naming the variant
+    /// and its base. The base manifest names each variant's manifest. No blob
+    /// goes up twice, so a variant uploads only its overlay's chunks.
+    #[tokio::test]
+    async fn a_variant_pushes_as_base_layers_then_its_overlay() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let (m, report) = push_variants(&fake, work.path()).await;
+
+        let base = arch_manifest(&fake, "3.20").await;
+        let (entries, default) = base.variants().unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["standard", "extra"]
+        );
+        assert_eq!(default.as_deref(), Some("standard"));
+        assert_eq!(
+            base.whole_digest().unwrap(),
+            format!("sha256:{}", m.sha256.as_deref().unwrap())
+        );
+        // `latest` names the same base, so `latest#extra` finds the variant.
+        assert_eq!(arch_manifest(&fake, "latest").await, base);
+        // The base's config blob is the base's alone.
+        let base_config = config_json(&fake, &base).await;
+        assert!(base_config.get("variant").is_none(), "{base_config}");
+
+        for entry in &entries {
+            let tagged = arch_manifest(&fake, &variant_tag("3.20", &entry.name)).await;
+            assert_eq!(
+                digest_of(&serde_json::to_vec(&tagged).unwrap()),
+                entry.manifest
+            );
+            assert!(tagged.is_vmlab_template());
+            assert_eq!(
+                tagged.whole_digest(),
+                None,
+                "no whole digest for an old client to trust"
+            );
+
+            let layout = tagged.variant_layout().unwrap();
+            assert_eq!(layout.name, entry.name);
+            let base_layers: Vec<&str> = base
+                .layers_in_order()
+                .iter()
+                .map(|d| d.digest.as_str())
+                .collect();
+            assert_eq!(
+                layout
+                    .base
+                    .iter()
+                    .map(|d| d.digest.as_str())
+                    .collect::<Vec<_>>(),
+                base_layers,
+                "the base's layers, first and in order"
+            );
+            assert_eq!(layout.base_digest, base.whole_digest().unwrap());
+            let v = m.variant(&entry.name).unwrap();
+            assert_eq!(layout.overlay_digest, format!("sha256:{}", v.sha256));
+            let ann = tagged.annotations.as_ref().unwrap();
+            assert_eq!(ann[annotations::BASE_LAYERS], base_layers.len().to_string());
+            assert_eq!(
+                ann[annotations::VARIANT_CHUNK_COUNT],
+                layout.overlay.len().to_string()
+            );
+            assert_eq!(
+                ann[annotations::CHUNK_COUNT],
+                (base_layers.len() + layout.overlay.len()).to_string()
+            );
+            // Running chunk indexes, the part marked on each layer.
+            for (i, d) in tagged.layers.iter().enumerate() {
+                let a = d.annotations.as_ref().unwrap();
+                assert_eq!(a[annotations::CHUNK_INDEX], i.to_string());
+                let part = if i < base_layers.len() {
+                    annotations::PART_BASE
+                } else {
+                    annotations::PART_VARIANT
+                };
+                assert_eq!(a[annotations::PART], part);
+            }
+
+            // The config blob: effective metadata, plus name and base.
+            let config = config_json(&fake, &tagged).await;
+            assert_eq!(config["variant"]["name"], entry.name.as_str());
+            assert_eq!(
+                config["variant"]["base_sha256"],
+                m.sha256.as_deref().unwrap()
+            );
+            assert_eq!(config["variant"]["default"], entry.name == "standard");
+            assert_eq!(config["sha256"], v.sha256.as_str());
+            let effective = m.effective(Some(v));
+            assert_eq!(config["memory"], serde_json::json!(effective.memory));
+            assert_eq!(
+                config["first_boot_script"],
+                serde_json::json!(effective.first_boot_script)
+            );
+        }
+
+        // Every blob went up once; a variant's uploads are its overlay's.
+        let puts = fake.puts.lock().unwrap().clone();
+        let mut unique = puts.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(puts.len(), unique.len(), "a blob was uploaded twice");
+        assert_eq!(report.base.uploaded + report.base.reused, base.layers.len());
+        for (name, count) in &report.variants {
+            let layout = arch_manifest(&fake, &variant_tag("3.20", name))
+                .await
+                .variant_layout()
+                .unwrap();
+            assert_eq!(count.uploaded + count.reused, layout.overlay.len());
+            assert!(count.uploaded > 0);
+            for d in &layout.base {
+                let at = puts.iter().position(|p| p == &d.digest).unwrap();
+                assert!(
+                    at < report.base.uploaded,
+                    "base chunk {} uploaded outside the base's push",
+                    d.digest
+                );
+            }
+        }
+
+        // A re-push uploads nothing.
+        let again = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &work.path().join("tmpl"),
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.path().join("push2"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.base.uploaded, 0);
+        assert!(again.variants.iter().all(|(_, c)| c.uploaded == 0));
+    }
+
+    /// A stale variant is not published.
+    #[tokio::test]
+    async fn a_stale_variant_is_not_pushed() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = variant_template(&tdir);
+        m.variants[1].base_sha256 = "00".repeat(32);
+        m.write_to(&tdir.join(META_FILE)).unwrap();
+        let err = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.path().join("p"),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`extra`") && err.contains("stale"), "{err}");
+    }
+
+    fn store_in(work: &Path, name: &str) -> TemplateStore {
+        let root = work.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        TemplateStore::new(root)
+    }
+
+    async fn pull_want(
+        fake: &std::sync::Arc<FakeRegistry>,
+        reference: &str,
+        store: &TemplateStore,
+        want: &VariantWant,
+    ) -> Result<(TemplateMeta, usize)> {
+        let mut chunks = 0;
+        let meta = registry_with_fake(reference, fake.clone())
+            .pull_with_progress(
+                Some("x86_64"),
+                store,
+                &store
+                    .root()
+                    .join(".oci-pull")
+                    .join(rand::random::<u32>().to_string()),
+                false,
+                want,
+                &mut |p| chunks = p.chunks,
+            )
+            .await?;
+        Ok((meta, chunks))
+    }
+
+    /// What a pull put in the store: the version's variant names, and
+    /// whether each disk is byte-for-byte the pushed one, its overlay backed
+    /// on `../../disk.qcow2`.
+    fn assert_pulled(store: &TemplateStore, pushed: &Path, want: &[&str]) -> TemplateMeta {
+        let v = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap();
+        assert_eq!(
+            v.meta
+                .variants
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>(),
+            want
+        );
+        assert_eq!(
+            std::fs::read(&v.disk_path).unwrap(),
+            std::fs::read(pushed.join(DISK_FILE)).unwrap()
+        );
+        for name in want {
+            let disk = v.variant_disk(name);
+            assert_eq!(
+                std::fs::read(&disk).unwrap(),
+                std::fs::read(pushed.join(variant_disk_rel(name))).unwrap(),
+                "variant {name}"
+            );
+            assert_eq!(
+                crate::template::store::qcow2_backing_file(&disk)
+                    .unwrap()
+                    .as_deref(),
+                Some("../../disk.qcow2")
+            );
+        }
+        v.meta
+    }
+
+    /// A variant-bearing base pushed before any variant was built keeps its
+    /// `variants_expected` marker through the registry: the pulled version
+    /// refuses a lab, as the pushed one did, and still serves a build its
+    /// `#base`.
+    #[tokio::test]
+    async fn a_pulled_unbuilt_base_keeps_its_marker() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        std::fs::create_dir_all(&tdir).unwrap();
+        run(
+            &tdir,
+            "qemu-img",
+            &["create", "-q", "-f", "qcow2", DISK_FILE, "4M"],
+        );
+        let mut m = meta("x86_64");
+        m.sha256 = Some(sha256_file(&tdir.join(DISK_FILE)).unwrap());
+        m.variants_expected = true;
+        m.write_to(&tdir.join(META_FILE)).unwrap();
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let config = config_json(&fake, &arch_manifest(&fake, "3.20").await).await;
+        assert_eq!(config["variants_expected"], serde_json::Value::Bool(true));
+
+        let store = store_in(work.path(), "pulled");
+        pull_want(
+            &fake,
+            "ghcr.io/owner/alpine:3.20",
+            &store,
+            &VariantWant::default(),
+        )
+        .await
+        .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap();
+        assert!(held.meta.variants_expected);
+        assert!(held.meta.variants.is_empty());
+        let err = store
+            .resolve("x86_64", "alpine", Some("3.20"), None, Purpose::Lab)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("variants are not built yet"),
+            "{err:#}"
+        );
+        store
+            .resolve(
+                "x86_64",
+                "alpine",
+                Some("3.20"),
+                Some(&crate::config::model::VariantRef::Base),
+                Purpose::Build,
+            )
+            .unwrap();
+    }
+
+    /// `#<variant>` brings the base, the default and the variant named; the
+    /// pulled blocks resolve to the effective metadata the pushed ones did.
+    /// A bare reference brings the default; `--all-variants` every one. A
+    /// name the template does not have is refused, naming those it does.
+    #[tokio::test]
+    async fn pull_a_variant_into_an_empty_store() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let (m, _) = push_variants(&fake, work.path()).await;
+        let pushed = work.path().join("tmpl");
+        let reference = "ghcr.io/owner/alpine:3.20";
+
+        let store = store_in(work.path(), "named");
+        pull_want(
+            &fake,
+            reference,
+            &store,
+            &VariantWant::of(Some(&VariantRefNamed("extra"))),
+        )
+        .await
+        .unwrap();
+        let pulled = assert_pulled(&store, &pushed, &["standard", "extra"]);
+        for v in &m.variants {
+            let got = pulled.variant(&v.name).unwrap();
+            assert_eq!(pulled.effective(Some(got)), {
+                let mut e = m.effective(Some(v));
+                e.origin = pulled.origin.clone();
+                e
+            });
+            assert_eq!(got.description, v.description);
+            assert_eq!(got.default, v.default);
+        }
+        let r = store
+            .resolve(
+                "x86_64",
+                "alpine",
+                Some("3.20"),
+                Some(&VariantRefNamed("extra")),
+                Purpose::Lab,
+            )
+            .unwrap();
+        assert_eq!(r.meta.memory, Some(8 << 30));
+
+        let bare = store_in(work.path(), "bare");
+        pull_want(&fake, reference, &bare, &VariantWant::default())
+            .await
+            .unwrap();
+        assert_pulled(&bare, &pushed, &["standard"]);
+        let r = bare
+            .resolve("x86_64", "alpine", Some("3.20"), None, Purpose::Lab)
+            .unwrap();
+        assert_eq!(r.variant.as_deref(), Some("standard"));
+
+        // `latest` resolves the same way.
+        let all = store_in(work.path(), "all");
+        pull_want(
+            &fake,
+            "ghcr.io/owner/alpine:latest",
+            &all,
+            &VariantWant::all(),
+        )
+        .await
+        .unwrap();
+        assert_pulled(&all, &pushed, &["standard", "extra"]);
+
+        let none = store_in(work.path(), "unknown");
+        let err = pull_want(
+            &fake,
+            reference,
+            &none,
+            &VariantWant::of(Some(&VariantRefNamed("nope"))),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no variant `nope`") && err.contains("standard (default), extra"),
+            "{err}"
+        );
+        assert!(none.list().unwrap().is_empty());
+    }
+
+    #[allow(non_snake_case)]
+    fn VariantRefNamed(n: &str) -> crate::config::model::VariantRef {
+        crate::config::model::VariantRef::Named(n.into())
+    }
+
+    use crate::template::store::Purpose;
+
+    /// A variant pulled onto a version the store holds merges into its
+    /// `template.wcl`, keeping the variant already there, and downloads only
+    /// its overlay — never the base again.
+    #[tokio::test]
+    async fn a_pulled_variant_merges_into_the_held_version() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let pushed = work.path().join("tmpl");
+        let reference = "ghcr.io/owner/alpine:3.20";
+        let store = store_in(work.path(), "store");
+
+        pull_want(&fake, reference, &store, &VariantWant::default())
+            .await
+            .unwrap();
+        assert_pulled(&store, &pushed, &["standard"]);
+        let before = std::fs::metadata(
+            store
+                .resolve_version("x86_64", "alpine", None)
+                .unwrap()
+                .disk_path,
+        )
+        .unwrap()
+        .modified()
+        .unwrap();
+
+        let (_, chunks) = pull_want(
+            &fake,
+            reference,
+            &store,
+            &VariantWant::of(Some(&VariantRefNamed("extra"))),
+        )
+        .await
+        .unwrap();
+        let extra = arch_manifest(&fake, &variant_tag("3.20", "extra"))
+            .await
+            .variant_layout()
+            .unwrap();
+        assert_eq!(
+            chunks,
+            extra.overlay.len(),
+            "only the overlay's chunks downloaded"
+        );
+        let merged = assert_pulled(&store, &pushed, &["standard", "extra"]);
+        assert_eq!(merged.default_variant().unwrap().name, "standard");
+        assert_eq!(
+            std::fs::metadata(
+                store
+                    .resolve_version("x86_64", "alpine", None)
+                    .unwrap()
+                    .disk_path
+            )
+            .unwrap()
+            .modified()
+            .unwrap(),
+            before,
+            "the base was left alone"
+        );
+
+        // Everything held: nothing downloads.
+        let (_, chunks) = pull_want(&fake, reference, &store, &VariantWant::all())
+            .await
+            .unwrap();
+        assert_eq!(chunks, 0);
+    }
+
+    /// A corrupt overlay chunk fails the pull on its digest, and nothing of
+    /// the version is installed.
+    #[tokio::test]
+    async fn a_corrupt_variant_chunk_fails_the_pull() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let extra = arch_manifest(&fake, &variant_tag("3.20", "extra"))
+            .await
+            .variant_layout()
+            .unwrap();
+        let target = key("owner/alpine", &extra.overlay[0].digest);
+        fake.blobs
+            .lock()
+            .unwrap()
+            .get_mut(&target)
+            .unwrap()
+            .push(0xFF);
+
+        let store = store_in(work.path(), "store");
+        let err = pull_want(
+            &fake,
+            "ghcr.io/owner/alpine:3.20",
+            &store,
+            &VariantWant::of(Some(&VariantRefNamed("extra"))),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mismatch"), "{err}");
+        assert!(store.list().unwrap().is_empty(), "nothing installed");
+    }
+
+    /// What a client that predates variants sees at the version tag: the
+    /// base manifest, whose layers are the base's chunks alone and assemble
+    /// to the base's digest, and a config blob it reads as before. The
+    /// variant annotations are simply more annotations.
+    #[tokio::test]
+    async fn an_old_client_pulls_the_base_alone() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let (m, _) = push_variants(&fake, work.path()).await;
+        let base = arch_manifest(&fake, "3.20").await;
+        // The old algorithm: every layer in order, assembled, checked whole.
+        let dir = work.path().join("old");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Vec::new();
+        for (i, d) in base.layers_in_order().iter().enumerate() {
+            let p = dir.join(format!("{i}.zst"));
+            std::fs::write(&p, fake.get_blob("owner/alpine", &d.digest).await.unwrap()).unwrap();
+            paths.push(p);
+        }
+        chunking::assemble(&paths, &dir.join(DISK_FILE)).unwrap();
+        chunking::verify_whole(&dir.join(DISK_FILE), base.whole_digest().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join(DISK_FILE)).unwrap(),
+            std::fs::read(work.path().join("tmpl").join(DISK_FILE)).unwrap()
+        );
+        // Its config blob, read as an old client's would.
+        let mut config = config_json(&fake, &base).await;
+        config
+            .as_object_mut()
+            .unwrap()
+            .retain(|k, _| k != "variant");
+        let old: TemplateConfig = serde_json::from_value(config).unwrap();
+        let old = old.into_meta(None).unwrap();
+        assert!(old.variants.is_empty());
+        assert_eq!(old.sha256, m.sha256);
+
+        // And a variant's tag holds nothing such a client would install: no
+        // whole-image digest, which it refuses.
+        assert!(
+            arch_manifest(&fake, &variant_tag("3.20", "extra"))
+                .await
+                .whole_digest()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn variant_tags_are_told_from_versions() {
+        assert_eq!(variant_tag("3.23.10", "extra"), "3.23.10--extra");
+        assert!(is_variant_tag("3.23.10--extra"));
+        assert!(!is_variant_tag("3.23.10"));
+        assert!(!is_variant_tag("latest"));
+        assert!(!is_variant_tag("1.2-rc1"));
     }
 }

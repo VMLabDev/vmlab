@@ -22,6 +22,9 @@ FEATURES: dict[str, str] = {
     "template.registry.config": "`vmlab template registry add/list/remove`",
     "template.registry.lab-ref": "a lab VM referencing a registry template pulls it on `up`",
     "template.event": "the `template.built` event",
+    "template.variant.build": "build a template definition with variants: the base, then each variant on it",
+    "template.variant.select": "lab VMs select the default variant, a named `#variant`, and are refused `#base`",
+    "template.variant.rebuild": "`vmlab template build <name> --variant <v>` rebuilds one variant, leaving the others",
     # -- lab lifecycle -----------------------------------------------------
     "lab.validate": "`vmlab validate` accepts a good lab",
     "lab.validate.reject": "`vmlab validate` rejects a bad lab with a named error",
@@ -62,6 +65,11 @@ FEATURES: dict[str, str] = {
     "vm.hw.qemu_args": "`qemu_args` passthrough",
     "vm.hw.nested": "`nested = true`",
     "vm.hw.gpu": "`gpu {}` passthrough / virgl",
+    # -- host USB passthrough (§5.2.1) ---------------------------------------
+    "usb.list": "`vmlab usb list` (and `--json`) lists the host's devices, or says it has none",
+    "usb.controller": "`usb = true` boots the VM with an xHCI controller; a VM without it gets none",
+    "usb.refusals": "`vmlab usb attach` refuses a VM without `usb = true`, a container, a bad selector and an unknown device, by name",
+    "usb.attach": "`vmlab usb attach`/`detach` pass a host device through and back",
     "vm.scratch": "a `template = \"scratch\"` VM",
     "vm.media.iso": "`media` built from a folder as an ISO",
     "vm.media.floppy": "`media` built from a folder as a floppy",

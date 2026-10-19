@@ -1,0 +1,164 @@
+page cmd_usb {
+  title = "vmlab usb"
+  chapter_header "vmlab usb" {
+    kicker       = "Commands · reference"
+    reading_time = "4 min read"
+    updated      = "2026-10-19"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab usb` passes USB devices plugged into the host through to running
+    VMs. It lists what the host has and which VM holds each device, attaches
+    one to a VM, and gives it back. The device leaves the host while a VM
+    holds it. See [Host USB devices](guide_usb) for the walkthrough.
+  DOC
+
+  code sh { source = "vmlab usb <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`list`" | "List the host's USB devices (hubs hidden) and the VM holding each." |
+      | "`attach`" | "Hot-plug a host USB device into a running VM that has `usb = true`." |
+      | "`detach`" | "Unplug a host USB device from a VM and give it back to the host." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  h2 "Selectors"
+
+  p <<DOC
+    `attach` and `detach` name a device with a selector. `vmlab usb list`
+    shows the parts of each.
+  DOC
+
+  table {
+    rows:
+      | "Selector" | "Names" |
+      | "`<vid>:<pid>`" | "The device with that vendor and product id, four hex digits each, e.g. `046d:c547`." |
+      | "`<vid>:<pid>@<serial>`" | "The same, narrowed to one serial number." |
+      | "`port:<bus>-<port>[.<port>...]`" | "The device in that socket, e.g. `port:1-2.1.4`. Always exactly one device." |
+  }
+
+  p <<DOC
+    A selector that matches no device is refused. One that matches several,
+    such as two identical flash drives without a serial, is refused with every
+    candidate listed by its `port:` selector.
+  DOC
+
+  h2 "vmlab usb list"
+
+  code sh { source = "vmlab usb list [OPTIONS]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`--json`" | "Emit a JSON array instead of a table." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    One row per device, in port order: `PORT`, `ID` (`vid:pid`), `SERIAL`,
+    `SPEED` (`low`, `full`, `high`, `super`, `super+`), `ATTACHED TO`
+    (`lab/vm`, or `-` while free) and `DEVICE` (manufacturer and product).
+    Root hubs and hubs are hidden. The holders come from the supervisor, which
+    asks every running lab. With no supervisor running there are no labs, so
+    the host's own device list is printed with nothing held, and no supervisor
+    is started.
+  DOC
+
+  code text {
+    source = <<TXT
+      PORT         ID         SERIAL  SPEED  ATTACHED TO  DEVICE
+      1-2.1.4.1.4  046d:c547  -       full   usbtest/u1   Logitech USB Receiver
+      1-3          0781:5581  BB22    super  -            SanDisk Ultra
+    TXT
+  }
+
+  h2 "vmlab usb attach"
+
+  code sh { source = "vmlab usb attach [OPTIONS] <VM> <SELECTOR>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]vm`." |
+      | "`<SELECTOR>`" | "The device; see Selectors above." |
+      | "`--force`" | "Attach a HID keyboard or mouse, which the host is probably using." |
+      | "`--json`" | "Emit the attachment as JSON." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The VM must be running and must have been started with `usb = true` on
+    its `vm` block or its profile ([Lab file: vm](ref_vm)). The attach is
+    refused, in this order, when:
+  DOC
+
+  list {
+    li "the machine is a container: `\"web\" is a container — USB passthrough is for VMs`;"
+    li "the VM is not running, or was started without the controller: `\"plain\" has no USB controller to attach to — set usb = true on plain and restart it`;"
+    li "the selector is malformed, matches nothing, or matches several devices;"
+    li "another VM, in this lab or any other, already holds the device — the message names it as `lab/vm`;"
+    li "the device has a HID boot keyboard or mouse interface and `--force` was not given — the host loses it while it is attached;"
+    li "the vmlab process cannot open the device node `/dev/bus/usb/BBB/DDD` read-write. The message names the node and gives a `setfacl` command for now and a udev rule for good; see [Troubleshooting](apx_troubleshooting)."
+  }
+
+  p <<DOC
+    On success it prints `attached 046d:c547 Logitech USB Receiver at port
+    1-2.1.4.1.4 to usbtest/u1` and emits `usb.attached`. The attachment is
+    pinned to that plug-in of the device: unplugging it from the host detaches
+    it from the VM within about two seconds (`usb.detached`, reason
+    `unplugged`), and plugging it back in does not reattach it.
+  DOC
+
+  h2 "vmlab usb detach"
+
+  code sh { source = "vmlab usb detach [OPTIONS] <VM> [SELECTOR]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]vm`." |
+      | "`[SELECTOR]`" | "The device, as for `attach`. Required unless `--all` is given." |
+      | "`--all`" | "Detach every device the VM holds." |
+      | "`--json`" | "Emit what was detached as JSON." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The selector is matched against what the VM holds, not against the host,
+    so a device that has already gone can still be named. The verb returns
+    once QEMU reports the device deleted, and the device is back on the host.
+    Stopping the VM releases every device it holds as well. Online snapshots
+    are refused while a VM holds any device; see [Snapshots](guide_snapshots).
+  DOC
+
+  h2 "Examples"
+
+  p "Find a device and hand it to a VM, then take it back:"
+  code sh {
+    source = <<SH
+      vmlab usb list
+      vmlab usb attach u1 0781:5581@BB22
+      vmlab usb detach u1 0781:5581@BB22
+    SH
+  }
+
+  p "Lend a VM the host's wireless mouse receiver, then release everything:"
+  code sh {
+    source = <<SH
+      vmlab usb attach usbtest/u1 port:1-2.1.4.1.4 --force
+      vmlab usb detach usbtest/u1 --all
+    SH
+  }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 on success. Exit 4 (`not_found`) means the lab declares
+    no machine by that name. Every refusal above exits 1 (`failed`). A
+    qualified reference to a lab that is not running exits 1. A usage error,
+    such as `detach` with neither a selector nor `--all`, exits 2.
+  DOC
+}

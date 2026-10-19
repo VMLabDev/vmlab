@@ -156,7 +156,7 @@ deployments.
 
 | Path | Holds |
 | --- | --- |
-| `templates/` | The template store, laid out as `<arch>/<name>/<version>/` with `disk.qcow2` and `template.wcl` in each. See templates.md. |
+| `templates/` | The template store, laid out as `<arch>/<name>/<version>/` with `disk.qcow2` and `template.wcl` in each, plus `variants/<variant>/disk.qcow2` per variant. See templates.md. |
 | `templates/.lock` | The advisory lock every store mutation holds. |
 | `templates/.oci-pull/` | Staging for a registry pull in progress. |
 | `oci/` | The digest-addressed container-image cache: `blobs/sha256/`, `images/sha256/<manifest>/` with `manifest.json`, `config.json` and `rootfs.sqfs`, and `refs/<host>/<repo>/<tag>` recording the last digest a tag resolved to. See containers.md. |

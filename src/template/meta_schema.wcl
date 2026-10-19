@@ -1,8 +1,12 @@
-// Schema for template store metadata (`template.wcl`, PRD §6.1, §6.2).
+// Schema for template store metadata (`template.wcl`, PRD §6.1, §6.2, §6.6).
 //
 // Store metadata files opt in with `import <vmlab-meta.wcl>` at the top.
 // One `template_meta` block per file; sizes are `std.ByteSize` literals
-// (`8GiB`), stored and re-emitted as byte counts.
+// (`8GiB`), stored and re-emitted as byte counts. A `variant` child block
+// records one sealed variant of the version (§6.6); its disk is
+// `variants/<name>/disk.qcow2`, an overlay on the base. `variants_expected`
+// marks a base built from a definition that declares variants: unsealed, so
+// a lab never clones it, even before (or without) a variant installed.
 
 @document
 type MetaDoc {
@@ -31,4 +35,30 @@ type TemplateMeta {
   first_boot_script: utf8?  // embedded wscript script run on first instantiation
   agent_version: utf8?      // vmlab-agent stamp baked in by the template build
   wscript_surface: i64?     // host scripting surface used by embedded scripts
+  variants_expected: bool?  // built from a definition with variants: never cloned bare
+  @children("variant") variants: list<VariantMeta>
+}
+
+// One sealed variant. Every optional field overrides the base's own, field
+// by field; an absent one inherits it (§6.6).
+@block("variant")
+type VariantMeta {
+  @inline(0) name: utf8
+  default: bool?            // the variant a ref with no `#` selects
+  created: utf8             // RFC 3339
+  sha256: utf8              // hex digest of variants/<name>/disk.qcow2
+  base_sha256: utf8         // the base `sha256` it was built on; differs = stale
+  description: utf8?
+  first_boot_script: utf8?
+  agent_version: utf8?
+  wscript_surface: i64?
+  profile: utf8?
+  cpus: i64?
+  memory: std.ByteSize?
+  firmware: utf8?
+  tpm: bool?
+  secure_boot: bool?
+  display: utf8?
+  cpu_model: utf8?
+  accel: utf8?
 }

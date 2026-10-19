@@ -14,7 +14,7 @@ pub async fn push(
     arch: &str,
     source: Option<&str>,
     moving_tag: Option<&str>,
-) -> Result<()> {
+) -> Result<crate::oci::client::PushReport> {
     let registry = crate::oci::Registry::new(target)?;
     // Chunks stage anywhere, but each push needs its own directory: they are
     // named by index, so two pushes sharing one would upload each other's
@@ -40,18 +40,31 @@ pub(crate) fn fresh_work_dir(base: &Path) -> Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new().prefix("op-").tempdir_in(base)?)
 }
 
+/// Pull `target` — a registry reference, maybe ending `#<variant>` — into
+/// `store`: the base, its default variant, and the variant named or, with
+/// `all_variants`, every one (§6.6).
 pub async fn pull(
     target: &str,
     arch: Option<&str>,
     store: &TemplateStore,
     overwrite: bool,
+    all_variants: bool,
 ) -> Result<TemplateMeta> {
-    let registry = crate::oci::Registry::new(target)?;
+    let (reference, variant) =
+        crate::config::model::split_variant(target).map_err(anyhow::Error::msg)?;
+    let want = if all_variants {
+        crate::oci::client::VariantWant::all()
+    } else {
+        crate::oci::client::VariantWant::of(variant.as_ref())
+    };
+    let registry = crate::oci::Registry::new(reference)?;
     // Pull staging must share the store's filesystem for the atomic install
     // rename (the OCI module documents this), and each pull gets its own
     // directory so a concurrent one cannot delete it.
     let work = fresh_work_dir(&crate::paths::template_store_dir().join(".oci-pull"))?;
-    registry.pull(arch, store, work.path(), overwrite).await
+    registry
+        .pull_with_progress(arch, store, work.path(), overwrite, &want, &mut |_| {})
+        .await
 }
 
 pub async fn login(registry: &str, user: &str, pass: &str) -> Result<()> {

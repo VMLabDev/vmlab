@@ -1,0 +1,148 @@
+page guide_usb {
+  title = "Host USB devices"
+  chapter_header "Host USB devices" {
+    kicker       = "The guide · explanation"
+    reading_time = "6 min read"
+    updated      = "2026-10-19"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+A running VM can be handed a USB device plugged into the host — a flash
+drive, a hardware token, a serial adapter, a mouse — and given it back, with
+no restart. While the VM holds the device the host does not have it: its host
+driver lets go, and the guest sees the device as if it had just been plugged
+in. This chapter covers the controller a VM needs, how you name a device, the
+refusals an attach can meet, and what happens on unplug, stop and snapshot.
+The verbs are in [vmlab usb](cmd_usb).
+DOC
+
+  h2 "Give the VM a controller"
+
+  p <<'DOC'
+A device hot-plugs onto a USB 3 (xHCI) controller that the VM gets only when
+it starts with `usb = true`. Set it on the `vm` block, or on a
+[profile](guide_profiles) to give every VM of that profile one; a template
+has no say in it. It is off by default.
+DOC
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+import <vmlab.wcl>
+
+lab "usbtest" {
+  vm "u1" {
+    template = "x86_64/alpine-3.23"
+    usb      = true
+  }
+}
+SRC
+  }
+
+  p <<'DOC'
+The flag is opt-in because it changes the VM's hardware. An online snapshot
+taken without the controller does not restore once it is there, and on `q35`
+the absolute-pointer tablet moves onto the new controller. On `virt`
+(aarch64, riscv64), which already has an xHCI, nothing is added: the existing
+controller is the one devices attach to. A container has no USB bus and
+refuses every attach.
+DOC
+
+  h2 "Find the device"
+
+  p <<'DOC'
+`vmlab usb list` prints every device the host has, hubs hidden, with the VM
+holding each. It works from any directory: holders are collected from every
+running lab.
+DOC
+
+  code text { source = <<'TXT'
+PORT         ID         SERIAL  SPEED  ATTACHED TO  DEVICE
+1-2.1.4.1.4  046d:c547  -       full   -            Logitech USB Receiver
+1-3          0781:5581  BB22    super  -            SanDisk Ultra
+TXT
+  }
+
+  p <<'DOC'
+Name a device by `vid:pid` (`0781:5581`), by `vid:pid@serial` when two
+identical devices are plugged in (`0781:5581@BB22`), or by the socket it is
+in (`port:1-3`), which always names exactly one. A name that matches several
+devices is refused with each candidate's `port:` selector, so you can pick.
+DOC
+
+  h2 "Attach and detach"
+
+  code sh { source = <<'SH'
+vmlab usb attach u1 0781:5581@BB22
+vmlab exec u1 -- lsusb
+vmlab usb detach u1 0781:5581@BB22
+SH
+  }
+
+  p <<'DOC'
+An attach checks, in order: the VM is running and has the controller; the
+selector names one device; no other VM, in any lab, holds it; the device is
+not a keyboard or mouse; and vmlab can open its device node. Two of these
+need a word.
+DOC
+
+  p <<'DOC'
+**Keyboards and mice.** A device with a HID boot keyboard or mouse interface
+is refused unless you pass `--force`, because the host is probably using it
+and loses it while the VM has it. A wireless receiver often carries both
+interfaces and is named a keyboard. Do not attach the host's only keyboard:
+with it gone there is nothing left to type the detach with.
+DOC
+
+  p <<'DOC'
+**The device node.** QEMU opens `/dev/bus/usb/BBB/DDD` as you, and a stock
+node is not writable by your user. The first attach of a device usually
+stops here, naming the node, a `setfacl` command that grants access until the
+device is replugged, and a udev rule that grants it for good. See
+[Troubleshooting](apx_troubleshooting).
+DOC
+
+  p <<'DOC'
+`vmlab usb detach <vm> --all` gives back everything a VM holds, and stopping
+the VM does the same. Nothing about an attachment is saved: a VM that starts
+again starts with no host devices.
+DOC
+
+  h2 "Unplugging, snapshots and events"
+
+  p <<'DOC'
+An attachment is pinned to one plug-in of the device. Pull it out of the host
+and vmlab notices within about two seconds and drops it from the VM; plug it
+back in and it returns to the host, not to the VM. A different device plugged
+into the same socket is never handed to the guest.
+DOC
+
+  p <<'DOC'
+An online snapshot of a VM holding any host device is refused until you
+detach them, and an online restore detaches them first; see
+[Snapshots](guide_snapshots). Each attach and detach emits `usb.attached` or
+`usb.detached` (see [Events](ref_events)); a detach vmlab made on its own
+carries a `reason`, `unplugged` or `restore`.
+DOC
+
+  h2 "From a script"
+
+  p <<'DOC'
+The same operations exist in wscript: `lab.usb_devices()` lists the host's
+devices, and a machine handle has `usb_attach`, `usb_attach_force`,
+`usb_detach`, `usb_detach_all` and `usb_attached`. They are part of wscript
+surface 3. See [wscript API: Machine](ref_ws_machine).
+DOC
+
+  code ws { filename = "usb.ws" source = <<'SRC'
+use vmlab
+
+fn main(lab: Lab) {
+    let Ok(vm) = lab.machine("u1") else { return }
+    let dev = vm.usb_attach("0781:5581@BB22").expect("attach")
+    lab.log("attached " + dev.id)
+    vm.exec("sh", ["-c", "lsusb"]).expect("lsusb")
+    vm.usb_detach(dev.id).expect("detach")
+}
+SRC
+  }
+}
